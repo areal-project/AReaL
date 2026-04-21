@@ -277,7 +277,11 @@ def _build_adapter_config_dict(
 
 def _monkey_patch_save_hf_adapter():
     """Add save_hf_adapter to AutoBridge when megatron-bridge does not provide it."""
-    from megatron.bridge import AutoBridge
+    try:
+        from megatron.bridge import AutoBridge
+    except ImportError:
+        # megatron-bridge is not installed (e.g. NPU environment); nothing to patch.
+        return
 
     if hasattr(AutoBridge, "save_hf_adapter"):
         # Already exists, no need to patch

@@ -46,8 +46,6 @@ _ms_args_basic.get_full_args = _ms_sanitized_get_full_args
 import mbridge
 import torch
 import torch.distributed as dist
-from megatron.bridge import AutoBridge as MegatronBridgeAutoBridge
-from megatron.bridge.peft.lora import LoRA as MegatronBridgeLoRA
 from megatron.core import parallel_state as mpu
 from megatron.core import tensor_parallel
 from megatron.core.distributed import DistributedDataParallel as DDP
@@ -113,7 +111,7 @@ from areal.engine.megatron_utils.pipeline_parallel import (
     configure_pipeline_layer_splits,
 )
 from areal.infra.dist_rollout import DistRolloutCoordinator
-from areal.infra.platforms import current_platform
+from areal.infra.platforms import current_platform, is_npu_available
 from areal.models.mcore.hf_load import load_weights_from_hf_with_mbridge_fast
 from areal.models.mcore.hf_save import (
     save_critic_value_head,
@@ -157,6 +155,8 @@ from areal.utils.perf_tracer import trace_perf, trace_scope
 from areal.utils.seeding import get_seed
 
 if TYPE_CHECKING:
+    from megatron.bridge.peft.lora import LoRA as MegatronBridgeLoRA
+
     from areal.api import Scheduler
     from areal.api.cli_args import DPOEngineConfig, PPOActorConfig, PPOCriticConfig
 
@@ -272,6 +272,12 @@ class MegatronEngine(TrainEngine):
         )
         self.quantization_config: dict[str, int | str | list[str]] | None = None
         self.bridge_cls: str = getattr(self.mcore_config, "bridge_type", "mbridge")
+        if self.bridge_cls == "megatron-bridge" and is_npu_available:
+            raise ValueError(
+                "bridge_type='megatron-bridge' is not supported on NPU "
+                "(megatron-bridge has CUDA-only dependencies). "
+                "Use bridge_type='mbridge' instead."
+            )
         self.bridge_lora: MegatronBridgeLoRA | None = None
         self.is_vision_model: bool = False
         self.processor = None
@@ -339,6 +345,8 @@ class MegatronEngine(TrainEngine):
                 "linear_fc1",
                 "linear_fc2",
             ]
+        from megatron.bridge.peft.lora import LoRA as MegatronBridgeLoRA
+
         self.bridge_lora = MegatronBridgeLoRA(
             target_modules=target_modules,
             dim=self.config.lora_rank,
@@ -654,6 +662,8 @@ class MegatronEngine(TrainEngine):
                 raise NotImplementedError(
                     "Tree training is not supported with bridge_type='megatron-bridge'."
                 )
+            from megatron.bridge import AutoBridge as MegatronBridgeAutoBridge
+
             self.bridge = MegatronBridgeAutoBridge.from_hf_pretrained(
                 self.config.path,
                 trust_remote_code=True,

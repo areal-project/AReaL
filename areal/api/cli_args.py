@@ -933,6 +933,22 @@ class MegatronEngineConfig:
     account_for_embedding_in_pipeline_split: bool = field(default=False)
     account_for_loss_in_pipeline_split: bool = field(default=False)
 
+    # Bridge backend used for HF<->Megatron conversion/model creation.
+    bridge_type: str = field(
+        default="mbridge",
+        metadata={
+            "help": "Bridge backend for MegatronEngine. Choices: 'mbridge' or 'megatron-bridge'.",
+            "choices": ["mbridge", "megatron-bridge"],
+        },
+    )
+
+    use_mbridge_save: bool = field(
+        default=False,
+        metadata={
+            "help": "Use mbridge's save method to save gpu memory when saving weights."
+        },
+    )
+
 
 @dataclass
 class MindSpeedEngineConfig:
