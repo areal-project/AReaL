@@ -924,6 +924,69 @@ class MegatronEngineConfig:
 
     # FP8 Training Configuration
     fp8_config: FP8EngineConfig | None = None
+    num_layers_in_first_pipeline_stage: int | None = field(
+        default=None, metadata={"help": "Number of layers in the first pipeline stage"}
+    )
+    num_layers_in_last_pipeline_stage: int | None = field(
+        default=None, metadata={"help": "Number of layers in the last pipeline stage"}
+    )
+    account_for_embedding_in_pipeline_split: bool = field(default=False)
+    account_for_loss_in_pipeline_split: bool = field(default=False)
+
+
+@dataclass
+class MindSpeedEngineConfig:
+    """Additional config options for MindSpeed's Megatron adapter
+    Any Megatron-specific settings will be taken from the MegatronEngineConfig
+    Any MindSpeed-exclusive features will be supported here
+    Other MindSpeed parameters can be added below
+    """
+
+    # should always be true in mindspeed
+    use_flash_attn: bool = True
+    context_parallel_algo: str = field(
+        default="megatron_cp_algo",
+        metadata={
+            "help": "Context parallel algorithm used by MindSpeed. "
+            "Options: 'megatron_cp_algo', 'hybrid_cp_algo', 'ulysses_cp_algo"
+        },
+    )
+    sequence_parallel: bool = False
+    use_legacy_models: bool = False
+
+    swap_optimizer: bool = False
+    use_fused_rotary_pos_emb: bool = False
+    use_fused_swiglu: bool = False
+    use_cp_send_recv_overlap: bool = False
+    use_fused_ring_attention_update: bool = False
+    cp_window_size: int = 1
+    moe_alltoall_overlap_comm: bool = False
+    moe_grouped_gemm: bool = True
+    moe_zero_memory: str = field(
+        default="disable",
+        metadata={
+            "help": "MoE zero memory level. Defines how much recomputation occurs in "
+            "experts when using communications overlaps. "
+            "Requires moe_alltoall_overlap_comm. Options: 'disable', 'level0', 'level1'."
+        },
+    )
+    moe_permute_fusion: bool = False
+    gemm_gradient_accumulation_fusion: bool = False
+    position_embedding_type: str = field(
+        default="rope",
+        metadata={"help": "Position embedding type. Options: 'rope', 'alibi'"},
+    )
+    moe_aux_loss_coeff: float = field(default=0.0)
+    moe_router_load_balancing_type: str = field(default="aux_loss")
+    moe_token_dispatcher_type: str = field(
+        default="allgather",
+        metadata={
+            "help": "Type of token dispatcher. Options: 'allgather','alltoall' and 'flex'."
+        },
+    )
+
+    def as_dict(self) -> dict[str, Any]:
+        return asdict(self)
 
     # Bridge backend used for HF<->Megatron conversion/model creation.
     bridge_type: str = field(
@@ -1153,6 +1216,7 @@ class TrainEngineConfig:
     fsdp: FSDPEngineConfig = field(default_factory=FSDPEngineConfig)
     archon: ArchonEngineConfig = field(default_factory=ArchonEngineConfig)
     megatron: MegatronEngineConfig = field(default_factory=MegatronEngineConfig)
+    mindspeed: MindSpeedEngineConfig = field(default_factory=MindSpeedEngineConfig)
 
     # offload
     offload: bool = field(

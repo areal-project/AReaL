@@ -389,9 +389,13 @@ def packed_context_parallel_forward(
         ) from e
 
     model_vp_stage = getattr(model, "vp_stage", None)
-    is_pipeline_last_stage = mpu.is_pipeline_last_stage(
-        ignore_virtual=False, vp_stage=model_vp_stage
-    )
+    try:
+        is_pipeline_last_stage = mpu.is_pipeline_last_stage(
+            ignore_virtual=False, vp_stage=model_vp_stage
+        )
+    except TypeError:
+        # MindSpeed's patched is_pipeline_last_stage may not accept vp_stage
+        is_pipeline_last_stage = mpu.is_pipeline_last_stage(ignore_virtual=False)
 
     # Repack padded output to packed [total_len, ...] for the last PP stage only.
     # Intermediate stages must return their output unchanged so the pipeline

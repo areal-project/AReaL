@@ -77,7 +77,11 @@ def _all_gather_and_concat(
 
     # this is bug in megatron's grouped moe.
     partition_dim = (
-        1 if "linear_fc2.weight" in name and partition_dim == 0 else partition_dim
+        0
+        if "linear_fc1.weight" in name
+        else 1
+        if "linear_fc2.weight" in name and partition_dim == 0
+        else partition_dim
     )
 
     return torch.cat(partitions, dim=partition_dim)
@@ -1338,7 +1342,7 @@ def get_named_parameters(model_module, num_experts):
             except AssertionError:
                 vp_stage = None
 
-        layer_offset = get_transformer_layer_offset(config, vp_stage=vp_stage)
+        layer_offset = get_transformer_layer_offset(config)
         for name, param in single_module.named_parameters():
             # for model without ddp wrap
             if not name.startswith("module.module."):
