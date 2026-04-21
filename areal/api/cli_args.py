@@ -1746,6 +1746,11 @@ class vLLMConfig:
     max_lora_rank: int = 16  # vllm's default
     max_loras: int = 8  # override default
     lora_modules: list[str] | None = None  # lora_modules is automatically filled
+    data_parallel_size: int = 1
+    # will use explicit vllm config tp and pp if specified otherwise use allocmode
+    tensor_parallel_size: int | None = None
+    pipeline_parallel_size: int | None = None
+    enable_expert_parallel: bool = False
 
     @staticmethod
     def build_args(
@@ -1764,10 +1769,13 @@ class vLLMConfig:
             tokenizer=vllm_config.model,
             load_format="auto",
             trust_remote_code=True,
-            tensor_parallel_size=tp_size,
-            pipeline_parallel_size=pp_size,
             **args,
         )
+        if args["tensor_parallel_size"] is None:
+            args["tensor_parallel_size"] = tp_size
+        if args["pipeline_parallel_size"] is None:
+            args["pipeline_parallel_size"] = pp_size
+
         if port is not None:
             args["port"] = port
         if host is not None:
