@@ -480,13 +480,22 @@ def allocate_balanced_mbs_synced(
     group_indices = allocate_balanced_mbs(mb_spec, lens)
     if not dist.is_initialized():
         return group_indices
-    all_n_mbs = [None for _ in range(dist.get_world_size(group))]
-    dist.all_gather_object(all_n_mbs, len(group_indices), group=group)
+    all_n_mbs = all_gather_int(len(group_indices), group=group)
     if all(mbs == len(group_indices) for mbs in all_n_mbs):
         return group_indices
     return allocate_balanced_mbs_synced(
         MicroBatchSpec.new(mb_spec, n_mbs=max(all_n_mbs)), lens, group=group
     )
+
+
+def all_gather_int(value: int, group):
+    world_size = dist.get_world_size(group=group)
+    x = torch.tensor(
+        [value], dtype=torch.int64, device=current_platform.current_device()
+    )
+    out = [torch.empty_like(x) for _ in range(world_size)]
+    dist.all_gather(out, x, group=group)
+    return [int(t.item()) for t in out]
 
 
 def pack_tensor_dict(data: dict[str, Any]) -> dict[str, Any]:

@@ -149,7 +149,9 @@ class DistributedStatsTracker:
             raise ValueError("reduce_type must be a ReduceType enum")
         self.reduce_types[key] = reduce_type
 
-    def export(self, key=None, reduce_group=None, reset=True) -> dict[str, float]:
+    def export(
+        self, key=None, reduce_group=None, reset=True, gloo_group=None
+    ) -> dict[str, float]:
         """Get aggregated statistics"""
         with self.lock:
             if key is not None:
@@ -167,7 +169,7 @@ class DistributedStatsTracker:
             keys = list(self.stats.keys())
             if reduce_group is not None:
                 all_keys = [None for _ in range(dist.get_world_size(reduce_group))]
-                dist.all_gather_object(all_keys, keys, group=reduce_group)
+                dist.all_gather_object(all_keys, keys, group=gloo_group or reduce_group)
                 # Should ensure that the orders are the same
                 keys = sorted(list(set(flat2d(all_keys))))
             results = {}
@@ -312,17 +314,21 @@ def get(name: str = ""):
         return TRACKERS[name]
 
 
-def export_all(reduce_group=None, reset=True) -> dict[str, float]:
+def export_all(reduce_group=None, reset=True, gloo_group=None) -> dict[str, float]:
     stat = {}
     duplicate_keys = set()
     tracker_keys = list(TRACKERS.keys())
-    if reduce_group is not None:
+    if reduce_group is not None or gloo_group is not None:
         all_trackers = [None for _ in range(dist.get_world_size(reduce_group))]
-        dist.all_gather_object(all_trackers, list(TRACKERS.keys()), group=reduce_group)
+        dist.all_gather_object(
+            all_trackers, list(TRACKERS.keys()), group=gloo_group or reduce_group
+        )
         tracker_keys = sorted(list(set(flat2d(all_trackers))))
     for tracker_key in tracker_keys:
         tracker = get(tracker_key)
-        x = tracker.export(reduce_group=reduce_group, reset=reset)
+        x = tracker.export(
+            reduce_group=reduce_group, reset=reset, gloo_group=gloo_group
+        )
         for k in x.keys():
             if k in stat:
                 duplicate_keys.add(k)
