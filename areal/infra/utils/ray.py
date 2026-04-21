@@ -26,10 +26,11 @@ def get_placement_group_master_ip_and_port(
         port = find_free_ports(1, (10000, 32767))[0]
         return host_ip, port
 
+    # 0 resources as task cannot be scheduled in certain scenarios
     future = ray.remote(
-        num_cpus=1,
+        num_cpus=0,
         num_gpus=0,
-        memory=10 * 1024 * 1024,  # Convert MB to bytes
+        memory=0,
         scheduling_strategy=PlacementGroupSchedulingStrategy(
             placement_group=placement_group,
             placement_group_bundle_index=placement_group_bundle_index,

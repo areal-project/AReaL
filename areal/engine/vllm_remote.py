@@ -264,7 +264,9 @@ class VLLMBackend:
             "master_port": str(meta.nccl_master_port),
             "rank_offset": rank_offset,
             "world_size": gen_parallel.world_size + 1,
-            "backend": current_platform.communication_backend,
+            "backend": meta.backend
+            if meta.backend is not None
+            else current_platform.communication_backend,
             "group_name": meta.nccl_group_name,
         }
         return HttpRequest(endpoint="/areal_init_weights_update_group", payload=payload)
