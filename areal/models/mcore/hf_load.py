@@ -9,6 +9,8 @@ from glob import glob
 
 import torch
 import torch.distributed as dist
+
+import areal.utils.mbridge_compat  # noqa: F401, I001  # isort: skip  # must precede mbridge import
 from mbridge.core.bridge import Bridge
 from megatron.core import parallel_state as mpu
 from megatron.core.fp8_utils import is_float8tensor

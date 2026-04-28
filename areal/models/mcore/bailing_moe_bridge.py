@@ -8,6 +8,8 @@ to load and manage BailingMoeV2.5 models with heterogeneous attention layers
 """
 
 import torch
+
+import areal.utils.mbridge_compat  # noqa: F401, I001  # isort: skip  # must precede mbridge import
 from mbridge.core import LLMBridge, register_model
 from megatron.core.transformer import MLATransformerConfig
 from megatron.core.transformer.enums import AttnBackend

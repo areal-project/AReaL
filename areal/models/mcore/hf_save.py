@@ -10,6 +10,8 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 import torch.distributed as dist
+
+import areal.utils.mbridge_compat  # noqa: F401, I001  # isort: skip  # must precede mbridge import
 from mbridge.core import Bridge
 from mbridge.core.util import unwrap_model
 from megatron.core import parallel_state as mpu

@@ -3,6 +3,8 @@
 from contextlib import contextmanager
 
 import torch
+
+import areal.utils.mbridge_compat  # noqa: F401, I001  # isort: skip  # must precede mbridge import
 from mbridge.core import LLMBridge
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer import TransformerConfig

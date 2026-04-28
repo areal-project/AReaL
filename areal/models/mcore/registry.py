@@ -4,6 +4,8 @@ import dataclasses
 from typing import Any
 
 import torch
+
+import areal.utils.mbridge_compat  # noqa: F401, I001  # isort: skip  # must precede mbridge import
 from mbridge.core.bridge import Bridge
 from megatron.core import parallel_state as mpu
 from megatron.core import tensor_parallel
