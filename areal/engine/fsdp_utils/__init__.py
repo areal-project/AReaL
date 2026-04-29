@@ -13,6 +13,7 @@ from torch.distributed.fsdp import (
 )
 from transformers import PreTrainedModel
 
+from areal.engine.fsdp_utils.muon import Muon
 from areal.engine.fsdp_utils.optimizer import (
     AdamKernel,
     OptimKernel,
@@ -33,6 +34,7 @@ __all__ = [
     "apply_fsdp2",
     "fsdp2_load_full_state_dict",
     "get_cosine_schedule_with_warmup",
+    "Muon",
     "PerLayerOptimWrapper",
     "OptimKernel",
     "AdamKernel",

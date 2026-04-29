@@ -7,7 +7,7 @@ from dataclasses import MISSING as dataclass_missing
 from dataclasses import asdict, dataclass, field, fields
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, ClassVar, TypeVar
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, TypeVar
 
 import uvloop
 import yaml
@@ -338,30 +338,46 @@ class OptimizerConfig:
     type: str = field(
         default="adam",
         metadata={
-            "help": "Optimizer type. For FSDP Engine, adam_bf16 enables memory-efficient BF16 optimizer states. "
-            "For Megatron Engine, adam_bf16 requires dtype=bfloat16 and is automatically converted to adam "
-            "with precision-aware optimizer enabled.",
-            "choices": ["adam", "sgd", "adam_bf16"],
+            "help": "Optimizer type. 'adam': AdamW (default). 'adam_bf16': memory-efficient BF16 AdamW "
+            "(FSDP: uses AnyPrecisionAdamW; Megatron: requires dtype=bfloat16, auto-converted to adam "
+            "with precision-aware optimizer). 'sgd': plain SGD. 'muon': Muon optimizer for >=2D params "
+            "with AdamW backend for <2D params (biases, norms, embeddings).",
+            "choices": ["adam", "sgd", "adam_bf16", "muon"],
         },
     )
-    lr: float = field(default=1e-3, metadata={"help": "Learning rate"})
-    weight_decay: float = field(default=0.01, metadata={"help": "Weight decay"})
+    lr: float = field(
+        default=1e-3,
+        metadata={
+            "help": "Learning rate. When type='muon', this is the Muon lr for >=2D params "
+            "(typical value: ~0.02). The AdamW backend lr is controlled by muon_backend_lr."
+        },
+    )
+    weight_decay: float = field(
+        default=0.01,
+        metadata={
+            "help": "Weight decay. Applied to all optimizer types including Muon (>=2D params) "
+            "and AdamW backend (<2D params)."
+        },
+    )
     beta1: float = field(
         default=0.9,
         metadata={
-            "help": "Adam beta1 parameter. Only effective when optimizer_type is adam/adam_bf16"
+            "help": "Adam beta1 parameter. Used by adam/adam_bf16, and by the AdamW backend "
+            "when type='muon'. Not used by the Muon sub-optimizer itself."
         },
     )
     beta2: float = field(
         default=0.999,
         metadata={
-            "help": "Adam beta2 parameter. Only effective when optimizer_type is adam/adam_bf16"
+            "help": "Adam beta2 parameter. Used by adam/adam_bf16, and by the AdamW backend "
+            "when type='muon'. Not used by the Muon sub-optimizer itself."
         },
     )
     eps: float = field(
         default=1e-8,
         metadata={
-            "help": "Adam epsilon parameter. Only effective when optimizer_type is adam/adam_bf16"
+            "help": "Adam epsilon for numerical stability. Used by adam/adam_bf16, and by the "
+            "AdamW backend when type='muon'. Not used by the Muon sub-optimizer itself."
         },
     )
     min_lr_ratio: float = field(
@@ -397,6 +413,45 @@ class OptimizerConfig:
     )
     gradient_clipping: float = field(
         default=1.0, metadata={"help": "Gradient clipping threshold"}
+    )
+    muon_momentum: float = field(
+        default=0.95,
+        metadata={
+            "help": "Muon momentum parameter. Only effective when optimizer_type is muon."
+        },
+    )
+    muon_use_nesterov: bool = field(
+        default=True,
+        metadata={
+            "help": "Whether to use Nesterov momentum in Muon. Only effective when type='muon'. "
+            "Mirrors Megatron-Core OptimizerConfig.muon_use_nesterov."
+        },
+    )
+    muon_num_ns_steps: int = field(
+        default=5,
+        metadata={
+            "help": "Number of Newton-Schulz iteration steps in Muon. Only effective when type='muon'. "
+            "Mirrors Megatron-Core OptimizerConfig.muon_num_ns_steps."
+        },
+    )
+    muon_scale_mode: Literal["rms", "spectral"] = field(
+        default="rms",
+        metadata={
+            "help": "Update-scaling mode for Muon. 'rms' (Moonlight-style) scales the update so its "
+            "RMS matches Adam, allowing a single lr for all parameters (see https://arxiv.org/abs/2502.16982). "
+            "'spectral' uses the Keller Jordan max(1, m/n)^0.5 spectral scaling. "
+            "Only effective when type='muon'. Mirrors Megatron-Core OptimizerConfig.muon_scale_mode.",
+            "choices": ["rms", "spectral"],
+        },
+    )
+    muon_backend_lr: float | None = field(
+        default=None,
+        metadata={
+            "help": "Learning rate for the AdamW backend optimizer in Muon (handles <2D params: "
+            "biases, norms, embeddings). Typical value: ~3e-4. If None, falls back to the main lr "
+            "with a warning (since Muon lr is typically ~100x larger). "
+            "Only effective when type='muon'."
+        },
     )
 
 

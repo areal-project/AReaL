@@ -25,6 +25,7 @@ from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.distributed import finalize_model_grads
 from megatron.core.optimizer import OptimizerConfig as MCoreOptimizerConfig
 from megatron.core.optimizer import get_megatron_optimizer
+from megatron.core.optimizer.muon import get_megatron_muon_optimizer
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.transformer import TransformerConfig
@@ -1286,11 +1287,29 @@ class MegatronEngine(TrainEngine):
         assert self.optimizer_config.type in [
             "adam",
             "sgd",
-        ], "Only AdamW/sgd optimizer is supported in this engine."
+            "muon",
+        ], "MegatronEngine supports 'adam'/'sgd'/'muon' optimizer."
         if self.optimizer_config.type == "sgd":
             self.logger.warning(
                 "Using the 'sgd' optimizer with Megatron may be less stable. Consider using the 'adam' (AdamW) optimizer for improved stability."
             )
+
+        if self.optimizer_config.type == "muon":
+            # Native Megatron Muon has two hard constraints (see
+            # megatron/core/optimizer/muon.py::get_megatron_muon_optimizer):
+            #   - use_distributed_optimizer must be False (grad buffer coupling)
+            #   - fp16 is not supported (bf16 or fp32 only)
+            if use_distributed_optimizer:
+                self.logger.warning(
+                    "Muon is incompatible with Megatron distributed optimizer; "
+                    "forcing use_distributed_optimizer=False for this run."
+                )
+                use_distributed_optimizer = False
+            if self.dtype is torch.float16:
+                raise ValueError(
+                    "Muon optimizer does not support fp16 in Megatron-Core; "
+                    "use bf16 or fp32."
+                )
 
         # Make megatron optimizer config
         mcore_opt_config = MCoreOptimizerConfig(
@@ -1308,6 +1327,31 @@ class MegatronEngine(TrainEngine):
             clip_grad=self.optimizer_config.gradient_clipping,
             fp8_recipe=(self.fp8_config.recipe if self.enable_fp8 else None),
         )
+
+        # Forward Muon-specific hyperparameters onto Megatron-Core's OptimizerConfig.
+        # AReaL's muon_* fields are 1:1 aligned with Megatron-Core >= 0.17, so no
+        # translation is required. Fields not exposed by AReaL (muon_coefficient_type,
+        # muon_split_qkv, muon_tp_mode, muon_extra_scale_factor, muon_fp32_matmul_prec)
+        # keep their Megatron defaults.
+        if self.optimizer_config.type == "muon":
+            muon_passthrough_fields = (
+                "muon_momentum",
+                "muon_use_nesterov",
+                "muon_num_ns_steps",
+                "muon_scale_mode",
+            )
+            for attr in muon_passthrough_fields:
+                if hasattr(mcore_opt_config, attr):
+                    setattr(
+                        mcore_opt_config, attr, getattr(self.optimizer_config, attr)
+                    )
+                else:
+                    self.logger.warning(
+                        f"Megatron-Core OptimizerConfig has no attribute '{attr}'; "
+                        "your Megatron-Core may be too old to fully support Muon."
+                    )
+            # AdamW backend for embeddings/biases/norms (AReaL policy).
+            mcore_opt_config.muon_scalar_optimizer = "adam"
         mcore_opt_config.overlap_param_gather_with_optimizer_step = (
             self.mcore_config.overlap_param_gather_with_optimizer_step
         )
@@ -1325,7 +1369,26 @@ class MegatronEngine(TrainEngine):
             torch, self.mcore_config.exp_avg_sq_dtype
         )
 
-        self.optimizer = get_megatron_optimizer(mcore_opt_config, self.model)
+        # Muon is incompatible with Megatron's precision-aware optimizer path
+        # (OptimizerConfig.__post_init__ asserts ``optimizer == 'adam'``).
+        if (
+            self.optimizer_config.type == "muon"
+            and mcore_opt_config.use_precision_aware_optimizer
+        ):
+            self.logger.warning(
+                "Muon optimizer is incompatible with "
+                "use_precision_aware_optimizer=True; disabling it for this run."
+            )
+            mcore_opt_config.use_precision_aware_optimizer = False
+
+        if self.optimizer_config.type == "muon":
+            # Megatron-LM's native Muon path: builds TensorParallelMuon for 2D
+            # linear weights and chains an Adam optimizer for embeddings,
+            # biases and norms. Returns a ChainedOptimizer that is transparently
+            # compatible with OptimizerParamScheduler and MegatronCheckpointManager.
+            self.optimizer = get_megatron_muon_optimizer(mcore_opt_config, self.model)
+        else:
+            self.optimizer = get_megatron_optimizer(mcore_opt_config, self.model)
 
         warmup_steps_proportion = self.optimizer_config.warmup_steps_proportion
         warmup_steps = int(warmup_steps_proportion * ft_spec.total_train_steps)
@@ -1353,8 +1416,16 @@ class MegatronEngine(TrainEngine):
         )
         self.lr_scheduler = lr_scheduler
 
-        # MegatronCheckpointManager now only support distributed optimizer which lora does not support
-        if not self.config.use_lora:
+        # MegatronCheckpointManager currently requires Megatron's distributed
+        # optimizer for checkpoint format. Two cases fall outside this:
+        #   - LoRA does not use distributed optimizer.
+        #   - Muon is incompatible with distributed optimizer (enforced by
+        #     Megatron's own get_megatron_muon_optimizer) and therefore runs
+        #     with use_distributed_optimizer=False.
+        # In both cases we skip the checkpoint manager; attempting save/load
+        # via self.checkpointer will then raise AttributeError, which is the
+        # correct signal that checkpointing is not wired for this backend combo.
+        if not self.config.use_lora and use_distributed_optimizer:
             self.checkpointer = MegatronCheckpointManager(
                 model=self.model,
                 optimizer=self.optimizer,
@@ -1362,6 +1433,14 @@ class MegatronEngine(TrainEngine):
                 use_distributed_optimizer=use_distributed_optimizer,
                 use_checkpoint_opt_param_scheduler=self.mcore_config.use_checkpoint_opt_param_scheduler,
                 async_save=self.mcore_config.async_save,
+            )
+        elif self.optimizer_config.type == "muon":
+            self.logger.warning(
+                "MegatronCheckpointManager is not constructed because Muon "
+                "forces use_distributed_optimizer=False, and the checkpoint "
+                "manager currently only supports the distributed-optimizer "
+                "format. save_model()/load_model() will be unavailable for "
+                "this run."
             )
 
     def _check_rollout_engine_connected(self) -> None:

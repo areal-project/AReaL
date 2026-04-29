@@ -60,6 +60,10 @@ def create_optimizer(
             eps=eps,
             fused=True,
         )
+    elif optimizer_config.type == "muon":
+        raise NotImplementedError(
+            "Muon optimizer is not yet supported under ArchonEngine. "
+        )
     elif optimizer_config.type == "sgd":
         return torch.optim.SGD(
             params,
