@@ -102,6 +102,7 @@ from areal.engine.megatron_utils.megatron import (
     convert_to_hf,
     get_named_parameters,
     remove_padding,
+    patch_torch_all_gather_object,
 )
 from areal.engine.megatron_utils.megatron_lora import get_vllm_lora_target_modules
 from areal.engine.megatron_utils.packed_context_parallel import (
@@ -2120,26 +2121,27 @@ class MegatronEngine(TrainEngine):
                     strict=not self._mtp_head_dropped,
                 )
         else:
-            if self.mcore_config.use_mbridge_save:
-                # when loading model using AreaL's fast hf load, the safetensor_io is never set
-                if (
-                    not hasattr(self.bridge, "safetensor_io")
-                    or self.bridge.safetensor_io is None
-                ):
-                    self.bridge.safetensor_io = self.bridge._get_safetensor_io(
-                        self.config.path
+            with patch_torch_all_gather_object():
+                if self.mcore_config.use_mbridge_save:
+                    # when loading model using AreaL's fast hf load, the safetensor_io is never set
+                    if (
+                        not hasattr(self.bridge, "safetensor_io")
+                        or self.bridge.safetensor_io is None
+                    ):
+                        self.bridge.safetensor_io = self.bridge._get_safetensor_io(
+                            self.config.path
+                        )
+                    self.bridge.save_weights(models=self.model, weights_path=path)
+                else:
+                    save_weights_to_hf_with_mbridge_fast(
+                        bridge=self.bridge,
+                        models=self.model,
+                        weights_path=path,
+                        base_model_path=base_model_path,
+                        max_shard_size_byte=int(3e9),
+                        max_workers=None,
+                        fp8_direct_convert=self.fp8_direct_convert,
                     )
-                self.bridge.save_weights(models=self.model, weights_path=path)
-            else:
-                save_weights_to_hf_with_mbridge_fast(
-                    bridge=self.bridge,
-                    models=self.model,
-                    weights_path=path,
-                    base_model_path=base_model_path,
-                    max_shard_size_byte=int(3e9),
-                    max_workers=None,
-                    fp8_direct_convert=self.fp8_direct_convert,
-                )
 
             if self.config.is_critic:
                 save_critic_value_head(self.model, path)

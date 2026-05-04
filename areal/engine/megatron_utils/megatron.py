@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-
+import pickle
 import functools
 import inspect
 import re
-
+from typing import Any
+import contextlib
+import numpy as np
 import torch
 import torch.distributed as dist
 from megatron.core import parallel_state as mpu
@@ -23,6 +25,8 @@ from areal.engine.megatron_utils.megatron_lora import (
     convert_qwen3_lora_to_hf,
     convert_qwen3_moe_lora_to_hf,
 )
+
+from areal.infra.platforms import current_platform
 
 
 @functools.cache
@@ -1446,3 +1450,85 @@ def get_named_parameters(model_module, num_experts):
         return
 
     yield from _iter_single(model_module)
+
+
+def all_gather_object_tensor(
+    object_list: list[Any],
+    obj: Any,
+    group: Any | None = None,
+) -> None:
+    world_size = dist.get_world_size(group=group)
+
+    if len(object_list) != world_size:
+        raise ValueError(
+            f"object_list must have length {world_size}, got {len(object_list)}"
+        )
+
+    device = current_platform.current_device()
+
+    # Serialize object.
+    payload = pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
+    local_n = len(payload)
+
+    # Gather byte lengths.
+    local_size = torch.tensor([local_n], dtype=torch.int64, device=device)
+    sizes_tensor = torch.empty(world_size, dtype=torch.int64, device=device)
+
+    dist.all_gather_into_tensor(
+        sizes_tensor,
+        local_size,
+        group=group,
+    )
+
+    sizes = [int(x) for x in sizes_tensor.cpu().tolist()]
+    max_size = max(sizes)
+
+    # Pad on CPU first.
+    payload_u8 = np.frombuffer(payload, dtype=np.uint8)
+    padded_u8 = np.zeros(max_size, dtype=np.uint8)
+    padded_u8[:local_n] = payload_u8
+
+    # Use int32 for NPU collective compatibility.
+    # Values are still 0..255, but dtype is int32.
+    send_np = padded_u8.astype(np.int32)
+    send_buf = torch.from_numpy(send_np).to(device)
+
+    gathered = torch.empty(
+        world_size * max_size,
+        dtype=torch.int32,
+        device=device,
+    )
+
+    dist.all_gather_into_tensor(
+        gathered,
+        send_buf.contiguous(),
+        group=group,
+    )
+
+    # Synchronize once after collective.
+    gathered_cpu = gathered.view(world_size, max_size).cpu().numpy()
+
+    for i, size in enumerate(sizes):
+        data_u8 = gathered_cpu[i, :size].astype(np.uint8, copy=False)
+        object_list[i] = pickle.loads(data_u8.tobytes())
+
+
+# context manager for patching all_gather_object
+# hccl has issues with all_gather_object sometimes where it can run out of input reading the incoming stream
+# this is a context manager that replaces torch's all_gather_object with a variant that
+# pickles cpu objects and turns them into npu tensors before doing a regular all_gather
+# usage:
+#       with patch_torch_all_gather_object():
+#           # code that runs all_gather_object
+@contextlib.contextmanager
+def patch_torch_all_gather_object():
+    old_fn = dist.all_gather_object
+
+    def patched_all_gather_object(object_list, obj, group=None):
+        return all_gather_object_tensor(object_list, obj, group=group)
+
+    dist.all_gather_object = patched_all_gather_object
+    try:
+        yield
+    finally:
+        dist.all_gather_object = old_fn
