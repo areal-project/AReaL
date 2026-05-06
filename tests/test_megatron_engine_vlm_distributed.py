@@ -17,9 +17,14 @@ import subprocess
 import sys
 
 import pytest
-import torch
+
+try:
+    import mindspeed.megatron_adaptor  # noqa: F401 isort: skip  # must precede mbridge on NPU
+except ImportError:
+    pass
 
 from areal.api.alloc_mode import ModelAllocation
+from areal.infra.platforms import current_platform
 from areal.utils.network import find_free_ports
 from areal.utils.testing_utils import DENSE_MODEL_PATHS, MOE_MODEL_PATHS
 
@@ -29,7 +34,13 @@ _TORCHRUN_SCRIPT = (
     / "run_megatron_engine_vlm_distributed.py"
 ).resolve()
 
-CUDA_AVAILABLE = torch.cuda.is_available()
+# Detect any accelerator (CUDA or NPU)
+ACCELERATOR_AVAILABLE = current_platform.device_type in ("cuda", "npu")
+# DCP-format checkpointing is unsupported on NPU: the vendored
+# megatron-core v0.12.1 calls torch's private ``_write_item`` with the
+# pre-``serialization_format`` signature, which fails on torch 2.9+
+# shipped in NPU containers.
+NPU_DCP_UNSUPPORTED = current_platform.device_type == "npu"
 
 
 def _run_vlm_test(
@@ -122,7 +133,7 @@ _VLM_MODELS = [
         {"VLM_MODEL_PATH": MOE_MODEL_PATHS["qwen3_vl_moe"]},
         id="qwen3_vl_moe",
         marks=pytest.mark.skipif(
-            torch.cuda.device_count() < 8,
+            current_platform.device_count() < 8,
             reason="Qwen3-VL-MoE-30B-A3B requires at least 8 GPUs",
         ),
     ),
@@ -131,7 +142,7 @@ _VLM_MODELS = [
 
 @pytest.mark.gpu
 @pytest.mark.slow
-@pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA not available")
+@pytest.mark.skipif(not ACCELERATOR_AVAILABLE, reason="No accelerator available")
 @pytest.mark.parametrize("model_env", _VLM_MODELS)
 def test_engine_initializes(model_env, tmp_path_factory):
     """Verify VLM engine detects vision model and loads processor."""
@@ -141,7 +152,7 @@ def test_engine_initializes(model_env, tmp_path_factory):
 
 @pytest.mark.gpu
 @pytest.mark.slow
-@pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA not available")
+@pytest.mark.skipif(not ACCELERATOR_AVAILABLE, reason="No accelerator available")
 @pytest.mark.parametrize("model_env", _VLM_MODELS)
 def test_simple_forward(model_env, tmp_path_factory):
     """Verify forward pass with VLM inputs completes."""
@@ -151,7 +162,7 @@ def test_simple_forward(model_env, tmp_path_factory):
 
 @pytest.mark.gpu
 @pytest.mark.slow
-@pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA not available")
+@pytest.mark.skipif(not ACCELERATOR_AVAILABLE, reason="No accelerator available")
 @pytest.mark.parametrize("model_env", _VLM_MODELS)
 def test_hf_save_load_weights(model_env, tmp_path_factory):
     """Verify save/load preserves VLM weights and saves processor."""
@@ -168,11 +179,11 @@ def test_hf_save_load_weights(model_env, tmp_path_factory):
 @pytest.mark.gpu
 @pytest.mark.multi_gpu
 @pytest.mark.slow
-@pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA not available")
+@pytest.mark.skipif(not ACCELERATOR_AVAILABLE, reason="No accelerator available")
 @pytest.mark.parametrize("model_env", _VLM_MODELS)
 def test_train_tensor_parallel(model_env, tmp_path_factory):
     """VLM training with TP=2 to avoid single-device OOM."""
-    if torch.cuda.device_count() < 2:
+    if current_platform.device_count() < 2:
         pytest.skip("VLM TP training requires at least 2 GPUs")
     output = str(tmp_path_factory.mktemp("vlm_test") / "train_tp2.out")
     _run_vlm_test(
@@ -191,7 +202,7 @@ def test_train_tensor_parallel(model_env, tmp_path_factory):
 
 @pytest.mark.multi_gpu
 @pytest.mark.slow
-@pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA not available")
+@pytest.mark.skipif(not ACCELERATOR_AVAILABLE, reason="No accelerator available")
 def test_qwen3vl_moe_expert_parallel(tmp_path_factory):
     """Forward smoke test for Qwen3-VL-MoE under ``(attn:d2t4|ffn:d2e4)``.
 
@@ -200,7 +211,7 @@ def test_qwen3vl_moe_expert_parallel(tmp_path_factory):
     ``InvalidAllocationModeError`` (attn=4 vs ffn=8). Validates the hybrid
     attn/ffn parser, EP-aware weight init, and VLM forward path.
     """
-    if torch.cuda.device_count() < 8:
+    if current_platform.device_count() < 8:
         pytest.skip("Qwen3-VL-MoE expert parallel requires 8 GPUs to run")
     output = str(
         tmp_path_factory.mktemp("test_output") / "qwen3vl_moe_expert_parallel.out"
@@ -215,7 +226,12 @@ def test_qwen3vl_moe_expert_parallel(tmp_path_factory):
 
 @pytest.mark.multi_gpu
 @pytest.mark.slow
-@pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA not available")
+@pytest.mark.skipif(not ACCELERATOR_AVAILABLE, reason="No accelerator available")
+@pytest.mark.skipif(
+    NPU_DCP_UNSUPPORTED,
+    reason="DCP save/load unsupported on NPU (mcore 0.12.1 + torch 2.9 _write_item "
+    "signature mismatch); skip until vendored mcore is bumped or monkey-patched.",
+)
 def test_qwen3vl_moe_dcp_save_load(tmp_path_factory):
     """DCP save/load round-trip for Qwen3-VL-MoE under ``(attn:d2p1t4|ffn:d1p1t2e4)``.
 
@@ -223,7 +239,7 @@ def test_qwen3vl_moe_dcp_save_load(tmp_path_factory):
     Drops the ``cp=2`` segment from the dense Qwen3-MoE analog because VLM
     forbids CP>1 (megatron_engine.py:347).
     """
-    if torch.cuda.device_count() < 8:
+    if current_platform.device_count() < 8:
         pytest.skip("Qwen3-VL-MoE DCP save load requires 8 GPUs to run")
     output = str(tmp_path_factory.mktemp("test_output") / "qwen3vl_moe_save_load.out")
     _run_vlm_test(

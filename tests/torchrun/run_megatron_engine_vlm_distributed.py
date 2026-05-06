@@ -19,7 +19,12 @@ import os
 from pathlib import Path
 from typing import Any
 
-import torch
+try:
+    import mindspeed.megatron_adaptor  # noqa: F401  # must precede mbridge on NPU
+except ImportError:
+    pass
+
+import torch  # noqa: I001
 import torch.distributed as dist
 
 from areal.api import FinetuneSpec, SaveLoadMeta
@@ -31,6 +36,7 @@ from areal.api.cli_args import (
     TrainEngineConfig,
 )
 from areal.engine import MegatronEngine
+from areal.infra.platforms import current_platform
 from areal.utils.data import broadcast_tensor_container
 from areal.utils.testing_utils import DENSE_MODEL_PATHS
 
@@ -135,7 +141,7 @@ def _make_input(engine: MegatronEngine) -> dict[str, Any]:
 
 
 def _cleanup(engine: MegatronEngine):
-    torch.cuda.synchronize()
+    current_platform.synchronize()
     dist.barrier()
     engine.destroy()
 
@@ -219,11 +225,26 @@ def test_vlm_dcp_save_load(backend: str, output: str | None = None):
     VLM regardless of input shape. Mirrors ``test_simple_dcp_save_load`` in
     ``run_megatron_engine_distributed.py`` but uses ``make_vlm_engine`` to
     pull processor/tokenizer through the engine init.
+
+    Skipped on NPU: vendored megatron-core v0.12.1 calls torch's private
+    ``_write_item`` with the pre-``serialization_format`` signature, which
+    fails on torch 2.9+ shipped in NPU containers. DCP-format checkpointing
+    is unsupported until vendored mcore is bumped or AReaL monkey-patches
+    the call site.
     """
     import copy
     import tempfile
 
     rank = int(os.environ["RANK"])
+    if current_platform.device_type == "npu":
+        if rank == 0:
+            print(
+                f"rank {rank}: test_vlm_dcp_save_load({backend}) SKIPPED on NPU "
+                "(mcore 0.12.1 + torch 2.9 _write_item signature mismatch)"
+            )
+            if output is not None:
+                write_result(output, "skipped: dcp unsupported on NPU")
+        return
     base_dir = tempfile.gettempdir()
     save_path = Path(base_dir) / "megatron_vlm_simple_dcp_test"
     if rank == 0:
