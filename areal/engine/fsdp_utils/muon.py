@@ -80,14 +80,44 @@ def apply_momentum(
     return update
 
 
-def apply_scaling(grad: Tensor, rms_scale: bool = False) -> Tensor:
-    """Post-NS scaling: either Moonlight RMS or Keller Jordan max(1, m/n)^0.5."""
-    if rms_scale:
-        # https://github.com/MoonshotAI/Moonlight/blob/5afcb6911077e7f182d05865fe90d9f39abcbcbd/examples/toy_train.py#L146
-        grad *= 0.2 * math.sqrt(max(grad.shape[1], grad.shape[0]))
+def apply_scaling(
+    grad: Tensor,
+    mode: str = "spectral",
+    extra_scale_factor: float = 1.0,
+) -> Tensor:
+    """Post-Newton-Schulz update scaling.
+
+    Naming aligned with Megatron-Core / emerging_optimizers (NVIDIA-NeMo).
+
+    Final scale = scale_factor(mode) * extra_scale_factor, where:
+        - 'spectral'      : sqrt(max(m, n))
+          Kimi/Moonlight (arXiv:2502.16982); emerging_optimizers default.
+        - 'unit_rms_norm' : sqrt(m / n)
+          Scion (arXiv:2502.07529) / Bernstein
+          (https://jeremybernste.in/writing/deriving-muon).
+        - 'shape_scaling' : max(1, m / n)**0.5
+          Keller Jordan original (https://kellerjordan.github.io/posts/muon).
+
+    Set extra_scale_factor=0.2 with mode='spectral' to reproduce the legacy
+    Moonlight `https://github.com/MoonshotAI/Moonlight/blob/5afcb6911077e7f182d05865fe90d9f39abcbcbd/examples/toy_train.py#L146`
+    setting (= 0.2 * sqrt(max(m, n))), which
+    approximately matches AdamW's update RMS norm so a single lr works for
+    both Muon and the AdamW backend.
+    """
+    m = grad.size(-2)
+    n = grad.size(-1)
+    if mode == "spectral":
+        scale = math.sqrt(max(m, n))
+    elif mode == "unit_rms_norm":
+        scale = math.sqrt(m / n)
+    elif mode == "shape_scaling":
+        scale = max(1, m / n) ** 0.5
     else:
-        # https://github.com/KellerJordan/Muon/blob/f90a42b28e00b8d9d2d05865fe90d9f39abcbcbd/muon.py#L40
-        grad *= max(1, grad.size(-2) / grad.size(-1)) ** 0.5
+        raise ValueError(
+            f"Invalid muon_scale_mode {mode!r}. Valid: "
+            "{'spectral', 'unit_rms_norm', 'shape_scaling'}."
+        )
+    grad *= scale * extra_scale_factor
     return grad
 
 
@@ -194,7 +224,11 @@ class Fsdp1dWork:
         else:
             scatter(grad.to_local(), None, src=dest_rank, group=pg, async_op=False)
 
-        update = apply_scaling(grad, self.group["rms_scale"])
+        update = apply_scaling(
+            grad,
+            self.group["scale_mode"],
+            self.group["extra_scale_factor"],
+        )
 
         self.param.mul_(1 - self.group["lr"] * self.group["weight_decay"])
         self.param.add_(update.reshape(self.param.shape), alpha=-self.group["lr"])
@@ -272,7 +306,11 @@ class TpFsdp2dWork:
         new_local = distribute_tensor(g_full, mesh, placements).to_local()
         grad.to_local().copy_(new_local)
 
-        update = apply_scaling(grad, self.group["rms_scale"])
+        update = apply_scaling(
+            grad,
+            self.group["scale_mode"],
+            self.group["extra_scale_factor"],
+        )
 
         self.param.mul_(1 - self.group["lr"] * self.group["weight_decay"])
         self.param.add_(update.reshape(self.param.shape), alpha=-self.group["lr"])
@@ -309,7 +347,11 @@ class SingleDeviceWork:
         )
         update = zeropower_via_newtonschulz5(update, self.group["ns_steps"])
         update = update.to(self.param.grad.dtype)
-        update = apply_scaling(update, self.group["rms_scale"])
+        update = apply_scaling(
+            update,
+            self.group["scale_mode"],
+            self.group["extra_scale_factor"],
+        )
         self.param.mul_(1 - self.group["lr"] * self.group["weight_decay"])
         self.param.add_(update.reshape(self.param.shape), alpha=-self.group["lr"])
 
@@ -330,7 +372,8 @@ class Muon(torch.optim.Optimizer):
 
     Notable changes:
         - DTensor/FSDP2 native: uses gather/scatter for distributed NS instead of DDP.
-        - ``rms_scale`` argument following the Moonlight paper (https://arxiv.org/abs/2502.16982).
+        - ``scale_mode`` / ``extra_scale_factor`` arguments aligned with Megatron-Core /
+          emerging_optimizers (NVIDIA-NeMo). See :func:`apply_scaling` for details.
 
     Example::
 
@@ -340,7 +383,7 @@ class Muon(torch.optim.Optimizer):
         ])
 
     Param group args (``use_muon=True``):
-        lr, momentum, weight_decay, rms_scale, nesterov, ns_steps
+        lr, momentum, weight_decay, scale_mode, extra_scale_factor, nesterov, ns_steps
 
     Param group args (``use_muon=False``):
         lr, betas, eps, weight_decay
@@ -353,7 +396,8 @@ class Muon(torch.optim.Optimizer):
                 group.setdefault("lr", 0.02)
                 group.setdefault("momentum", 0.95)
                 group.setdefault("weight_decay", 0)
-                group.setdefault("rms_scale", True)
+                group.setdefault("scale_mode", "spectral")
+                group.setdefault("extra_scale_factor", 1.0)
                 group.setdefault("nesterov", True)
                 group.setdefault("ns_steps", 5)
                 assert set(group.keys()) == {
@@ -362,7 +406,8 @@ class Muon(torch.optim.Optimizer):
                     "momentum",
                     "weight_decay",
                     "use_muon",
-                    "rms_scale",
+                    "scale_mode",
+                    "extra_scale_factor",
                     "nesterov",
                     "ns_steps",
                 }
