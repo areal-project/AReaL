@@ -13,6 +13,7 @@ from fastapi import FastAPI, Request  # pyright: ignore[reportMissingImports]
 from fastapi.responses import JSONResponse  # pyright: ignore[reportMissingImports]
 from pydantic import BaseModel  # pyright: ignore[reportMissingImports]
 
+from areal.experimental.weight_update import BACKEND_AWEX, BACKEND_DISK, BACKEND_RDT
 from areal.experimental.weight_update.gateway.auth import require_admin_key
 from areal.experimental.weight_update.gateway.config import (
     PairInfo,
@@ -34,7 +35,7 @@ class ConnectRequest(BaseModel):
     inference_worker_urls: list[str]
     nccl_master_addr: str = ""
     nccl_master_port: int = 0
-    mode: str = "awex"  # "awex" or "disk"
+    mode: str = BACKEND_AWEX  # "awex", BACKEND_DISK, or BACKEND_RDT
     save_path: str = ""
     use_lora: bool = False
     lora_name: str = ""
@@ -203,7 +204,7 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
                 request, pair_name, train_urls, inference_urls
             )
 
-        if body.mode == "disk":
+        if body.mode == BACKEND_DISK:
             if not body.save_path:
                 return JSONResponse(
                     status_code=400,
@@ -225,7 +226,7 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
                 pair_name=pair_name,
                 train_worker_urls=train_urls,
                 inference_worker_urls=inference_urls,
-                mode="disk",
+                mode=BACKEND_DISK,
                 save_path=body.save_path,
                 use_lora=body.use_lora,
                 lora_name=body.lora_name,
@@ -233,6 +234,19 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
             registry.register(pair_info)
             logger.info(
                 "Connected disk pair '%s' (save_path=%s)", pair_name, body.save_path
+            )
+            return ConnectResponse(pair_name=pair_name)
+
+        if body.mode == BACKEND_RDT:
+            session = request.app.state.http_session
+            init_timeout_s = config.init_timeout_s
+            await _rdt_connect(
+                pair_name,
+                train_urls,
+                inference_urls,
+                session,
+                init_timeout_s,
+                config,
             )
             return ConnectResponse(pair_name=pair_name)
 
@@ -301,8 +315,9 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
         kv_store.put(pair_name, "training_params_meta", training_params_meta)
         kv_store.put(pair_name, "infer_params_meta", infer_params_meta)
 
-        master_addr = body.nccl_master_addr
-        master_port = body.nccl_master_port
+        # Auto-generate master_addr/port if not provided
+        master_addr = body.nccl_master_addr or _get_own_ip()
+        master_port = body.nccl_master_port or find_free_ports(1)[0]
 
         # Use the bound host for kv_store_url so workers can reach the
         # gateway.  When bound to 0.0.0.0 any interface works, so fall
@@ -684,6 +699,202 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
                 ]
             )
 
+    async def _rdt_connect(
+        pair_name: str,
+        train_urls: list[str],
+        inference_urls: list[str],
+        session: aiohttp.ClientSession,
+        timeout_s: float,
+        config: WeightUpdateConfig,
+    ) -> PairInfo:
+        """Connect TW-IW pair for RDT mode.
+
+        Flow:
+        1. Get TW actor handles (Base64 encoded) from each TW
+        2. Get IW parallelism info
+        3. Get weight metadata from TW and IW (for TransferPlan building)
+        4. Store metadata in KV store
+        5. Init IW with TW handles via /rdt/init_weight_update_group
+
+        No NCCL process group init needed for RDT.
+        """
+
+        # 1. Get TW actor handles
+        tw_actor_handle_tasks = [
+            _get_json(session, f"{url}/rdt/get_actor_handle", timeout_s)
+            for url in train_urls
+        ]
+        tw_actor_handle_resps = await asyncio.gather(*tw_actor_handle_tasks)
+        tw_actor_bytes_b64_list = [
+            resp["actor_bytes_b64"] for resp in tw_actor_handle_resps
+        ]
+
+        # 2. Get parallelism info from TW and IW
+        train_par, infer_par = await asyncio.gather(
+            _get_json(
+                session,
+                f"{train_urls[0]}/rdt/report_parallelism",
+                timeout_s,
+            ),
+            _get_json(
+                session,
+                f"{inference_urls[0]}/rdt/report_parallelism",
+                timeout_s,
+            ),
+        )
+
+        train_world_size = train_par["world_size"]
+        infer_world_size = infer_par["world_size"]
+        num_engines = len(inference_urls)
+        total_infer_ranks = infer_world_size * num_engines
+
+        # 3. Get weight metadata (for TransferPlan building)
+        train_meta_resps, infer_meta_resps = await asyncio.gather(
+            asyncio.gather(
+                *[
+                    _post_json(session, f"{url}/rdt/report_weight_meta", timeout_s)
+                    for url in train_urls
+                ]
+            ),
+            asyncio.gather(
+                *[
+                    _post_json(session, f"{url}/rdt/report_weight_meta", timeout_s)
+                    for url in inference_urls
+                ]
+            ),
+        )
+
+        # 4. Store metadata in KV store
+        training_params_meta = []
+        for result in train_meta_resps:
+            meta = result.get("result", result.get("meta", result))
+            if isinstance(meta, list):
+                training_params_meta.extend(meta)
+            else:
+                training_params_meta.append(meta)
+        training_params_meta = _merge_training_meta_by_name(training_params_meta)
+
+        infer_params_meta = []
+        for result in infer_meta_resps:
+            meta = result.get("result", result.get("meta", result))
+            if isinstance(meta, list):
+                infer_params_meta.extend(meta)
+            else:
+                infer_params_meta.append(meta)
+
+        kv_store.put(pair_name, "training_params_meta", training_params_meta)
+        kv_store.put(pair_name, "infer_params_meta", infer_params_meta)
+
+        # 5. Build kv_store_url (same as awex)
+        master_addr = _get_own_ip()
+        gateway_addr = master_addr if config.host in ("0.0.0.0", "::") else config.host
+        kv_store_url = f"http://{gateway_addr}:{config.gateway_port}"
+
+        # 6. Init TW with TransferPlan (TW needs to know what to send to each IW)
+        tw_init_tasks = []
+        for i, url in enumerate(train_urls):
+            tw_init_tasks.append(
+                _post(
+                    session,
+                    f"{url}/rdt/init_weight_update_group",
+                    timeout_s,
+                    json_data={
+                        "pair_name": pair_name,
+                        "kv_store_url": kv_store_url,
+                        "infer_world_size": total_infer_ranks,
+                        "train_world_size": train_world_size,
+                        "num_engines": num_engines,
+                        "transfer_rank": total_infer_ranks
+                        + i,  # TW ranks start after IW
+                    },
+                )
+            )
+        await asyncio.gather(*tw_init_tasks)
+
+        # 7. Init IW with TW handles
+        iw_init_payload_base = {
+            "pair_name": pair_name,
+            "kv_store_url": kv_store_url,
+            "tw_actor_bytes_b64_list": tw_actor_bytes_b64_list,
+            "infer_world_size": total_infer_ranks,
+            "train_world_size": train_world_size,
+            "num_engines": num_engines,
+        }
+
+        iw_init_tasks = []
+        for i, url in enumerate(inference_urls):
+            iw_init_tasks.append(
+                _post(
+                    session,
+                    f"{url}/rdt/init_weight_update_group",
+                    timeout_s,
+                    json_data={**iw_init_payload_base, "transfer_rank": i},
+                )
+            )
+        await asyncio.gather(*iw_init_tasks)
+
+        # 8. Create PairInfo
+        pair_info = PairInfo(
+            pair_name=pair_name,
+            train_worker_urls=train_urls,
+            inference_worker_urls=inference_urls,
+            train_world_size=train_world_size,
+            inference_world_size=infer_world_size,
+            mode=BACKEND_RDT,
+        )
+        registry.register(pair_info)
+
+        logger.info("Connected RDT pair '%s'", pair_name)
+        return pair_info
+
+    async def _rdt_transfer_weights(
+        pair_info: PairInfo,
+        version: int,
+        session: aiohttp.ClientSession,
+        timeout_s: float,
+    ) -> dict[str, float]:
+        """Execute RDT weight update.
+
+        Flow:
+        1. TW prepares IPC handles via /rdt/update_weights
+        2. IW pulls weights via /rdt/update_weights (calls TW actor via Ray RPC)
+
+        Returns timing dict for performance analysis.
+        """
+        timings: dict[str, float] = {}
+
+        # 1. TW prepares IPC handles
+        tw_start = time.monotonic()
+        await asyncio.gather(
+            *[
+                _post(
+                    session,
+                    f"{url}/rdt/update_weights",
+                    timeout_s,
+                    json_data={"pair_name": pair_info.pair_name, "version": version},
+                )
+                for url in pair_info.train_worker_urls
+            ]
+        )
+        timings["tw_prepare_ipc_handles"] = (time.monotonic() - tw_start) * 1000
+
+        # 2. IW pulls weights
+        iw_start = time.monotonic()
+        await asyncio.gather(
+            *[
+                _post(
+                    session,
+                    f"{url}/rdt/update_weights",
+                    timeout_s,
+                    json_data={"version": version},
+                )
+                for url in pair_info.inference_worker_urls
+            ]
+        )
+        timings["iw_pull_weights"] = (time.monotonic() - iw_start) * 1000
+
+        return timings
+
     @app.post("/update_weights")
     async def update_weights(
         request: Request, body: UpdateWeightsRequest
@@ -712,9 +923,17 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
                     await _colocate_transfer_weights(
                         pair_info, body.version, session, timeout_s
                     )
-                elif pair_info.mode == "disk":
+                elif pair_info.mode == BACKEND_DISK:
                     await _disk_transfer_weights(
                         pair_info, body.version, session, timeout_s
+                    )
+                elif pair_info.mode == BACKEND_RDT:
+                    timings = await _rdt_transfer_weights(
+                        pair_info, body.version, session, timeout_s
+                    )
+                    logger.info(
+                        "RDT timing breakdown: %s",
+                        ", ".join(f"{k}={v:.1f}ms" for k, v in timings.items()),
                     )
                 else:
                     await _awex_transfer_weights(

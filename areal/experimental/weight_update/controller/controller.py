@@ -9,6 +9,7 @@ from typing import Any
 
 import httpx
 
+from areal.experimental.weight_update import BACKEND_AWEX
 from areal.experimental.weight_update.controller.config import (
     WeightUpdateControllerConfig,
 )
@@ -108,7 +109,7 @@ class WeightUpdateController:
         pair_name: str,
         train_worker_urls: list[str],
         inference_worker_urls: list[str],
-        mode: str = "awex",
+        mode: str = BACKEND_AWEX,
         save_path: str = "",
         use_lora: bool = False,
         lora_name: str = "",

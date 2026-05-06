@@ -114,6 +114,27 @@ class TestConnect:
             timeout=10.0,
         )
 
+    def test_connect_rdt_mode_sends_rdt_mode(self, ctrl):
+        ctrl._session.post.return_value = _mock_response(200, {"pair_name": "pair0"})
+        train_urls = ["http://train1:8000"]
+        infer_urls = ["http://infer1:8000"]
+
+        ctrl.connect("pair0", train_urls, infer_urls, mode="rdt")
+
+        ctrl._session.post.assert_called_once_with(
+            f"{GATEWAY_URL}/connect",
+            json={
+                "pair_name": "pair0",
+                "train_worker_urls": train_urls,
+                "inference_worker_urls": infer_urls,
+                "mode": "rdt",
+                "save_path": "",
+                "use_lora": False,
+                "lora_name": "",
+            },
+            timeout=10.0,
+        )
+
 
 class TestUpdateWeights:
     def test_update_weights_returns_result(self, ctrl):
@@ -163,7 +184,8 @@ class TestDisconnect:
 
 
 class TestLifecycle:
-    def test_full_lifecycle(self, ctrl):
+    @pytest.mark.parametrize("mode", ["awex", "disk", "rdt"])
+    def test_full_lifecycle(self, ctrl, mode):
         connect_resp = _mock_response(200, {"pair_name": "pair0"})
         update_resp = _mock_response(
             200, {"status": "ok", "version": 1, "duration_ms": 50.0, "error": None}
@@ -171,7 +193,16 @@ class TestLifecycle:
         disconnect_resp = _mock_response(200, {"status": "ok", "pair_name": "pair0"})
         ctrl._session.post.side_effect = [connect_resp, update_resp, disconnect_resp]
 
-        ctrl.connect("pair0", ["http://t:8000"], ["http://i:8000"])
+        if mode == "disk":
+            ctrl.connect(
+                "pair0",
+                ["http://t:8000"],
+                ["http://i:8000"],
+                mode=mode,
+                save_path="/tmp/w",
+            )
+        else:
+            ctrl.connect("pair0", ["http://t:8000"], ["http://i:8000"], mode=mode)
         assert ctrl._pair_name == "pair0"
 
         result = ctrl.update_weights(version=1)

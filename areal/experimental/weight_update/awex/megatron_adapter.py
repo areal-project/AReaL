@@ -183,7 +183,11 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
         )
 
     def execute_weight_update(self, version: int) -> None:
+        import time
+
         del version
+        t0 = time.monotonic()
+
         if self._transfer_plan is None:
             raise RuntimeError("Transfer plan is not initialized")
         if self._weights_update_group is None:
@@ -191,15 +195,33 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
         if self._transfer_rank is None:
             raise RuntimeError("Transfer rank is not initialized")
 
+        t1 = time.monotonic()
+
         params = self.get_local_shard_parameters()
+        t2 = time.monotonic()
+
         send_ops, _, _ = nccl_build_send_ops(
             params,
             self._transfer_plan,
             self._weights_update_group,
             copy_rank=self._transfer_rank,
         )
+        t3 = time.monotonic()
+
         batch_send_recv(send_ops=send_ops, recv_ops=[], blocking=True)
+        t4 = time.monotonic()
+
         dist.barrier(group=self._weights_update_group)
+        t5 = time.monotonic()
+
+        logger.info(
+            f"[Awex-TW-Timing] prep={1000 * (t1 - t0):.1f}ms | "
+            f"get_params={1000 * (t2 - t1):.1f}ms | "
+            f"build_ops={1000 * (t3 - t2):.1f}ms | "
+            f"nccl_send={1000 * (t4 - t3):.1f}ms | "
+            f"barrier={1000 * (t5 - t4):.1f}ms | "
+            f"total={1000 * (t5 - t0):.1f}ms"
+        )
 
     def batch_isend_irecv(self, **kwargs) -> None:
         setup_kwargs = {k: v for k, v in kwargs.items() if k != "world_size"}
