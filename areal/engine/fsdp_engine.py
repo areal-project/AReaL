@@ -1177,16 +1177,6 @@ class FSDPEngine(TrainEngine):
                     muon_params.append(p)
                 else:
                     backend_params.append(p)
-            if self.optimizer_config.muon_backend_lr is not None:
-                backend_lr = self.optimizer_config.muon_backend_lr
-            else:
-                backend_lr = lr
-                self.logger.warning(
-                    "muon_backend_lr is not set; falling back to main lr (%.2e) for AdamW backend. "
-                    "Typical Muon setups use a much smaller backend lr (e.g. 3e-4). "
-                    "Set muon_backend_lr explicitly to suppress this warning.",
-                    lr,
-                )
             self.optimizer = MuonOptimizer(
                 [
                     dict(
@@ -1194,14 +1184,15 @@ class FSDPEngine(TrainEngine):
                         lr=lr,
                         momentum=self.optimizer_config.muon_momentum,
                         weight_decay=weight_decay,
-                        rms_scale=self.optimizer_config.muon_scale_mode == "rms",
+                        scale_mode=self.optimizer_config.muon_scale_mode,
+                        extra_scale_factor=self.optimizer_config.muon_extra_scale_factor,
                         nesterov=self.optimizer_config.muon_use_nesterov,
                         ns_steps=self.optimizer_config.muon_num_ns_steps,
                         use_muon=True,
                     ),
                     dict(
                         params=backend_params,
-                        lr=backend_lr,
+                        lr=lr,
                         betas=(beta1, beta2),
                         eps=eps,
                         weight_decay=weight_decay,

@@ -1331,14 +1331,15 @@ class MegatronEngine(TrainEngine):
         # Forward Muon-specific hyperparameters onto Megatron-Core's OptimizerConfig.
         # AReaL's muon_* fields are 1:1 aligned with Megatron-Core >= 0.17, so no
         # translation is required. Fields not exposed by AReaL (muon_coefficient_type,
-        # muon_split_qkv, muon_tp_mode, muon_extra_scale_factor, muon_fp32_matmul_prec)
-        # keep their Megatron defaults.
+        # muon_split_qkv, muon_tp_mode, muon_fp32_matmul_prec) keep their Megatron
+        # defaults.
         if self.optimizer_config.type == "muon":
             muon_passthrough_fields = (
                 "muon_momentum",
                 "muon_use_nesterov",
                 "muon_num_ns_steps",
                 "muon_scale_mode",
+                "muon_extra_scale_factor",
             )
             for attr in muon_passthrough_fields:
                 if hasattr(mcore_opt_config, attr):

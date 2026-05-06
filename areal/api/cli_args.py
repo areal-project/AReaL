@@ -7,7 +7,7 @@ from dataclasses import MISSING as dataclass_missing
 from dataclasses import asdict, dataclass, field, fields
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, ClassVar, Literal, TypeVar
+from typing import TYPE_CHECKING, Any, ClassVar, TypeVar
 
 import uvloop
 import yaml
@@ -348,8 +348,10 @@ class OptimizerConfig:
     lr: float = field(
         default=1e-3,
         metadata={
-            "help": "Learning rate. When type='muon', this is the Muon lr for >=2D params "
-            "(typical value: ~0.02). The AdamW backend lr is controlled by muon_backend_lr."
+            "help": "Learning rate. When type='muon', this is shared by both the Muon sub-optimizer "
+            "(>=2D params) and the AdamW backend (<2D params). Pair "
+            "muon_scale_mode='spectral' with muon_extra_scale_factor=0.2 (Moonlight-style) to "
+            "make Muon's update RMS match AdamW so a single lr works for both."
         },
     )
     weight_decay: float = field(
@@ -434,25 +436,30 @@ class OptimizerConfig:
             "Mirrors Megatron-Core OptimizerConfig.muon_num_ns_steps."
         },
     )
-    muon_scale_mode: Literal["rms", "spectral"] = field(
-        default="rms",
+    muon_scale_mode: str = field(
+        default="spectral",
         metadata={
-            "help": "Update-scaling mode for Muon. 'rms' (Moonlight-style) scales the update so its "
-            "RMS matches Adam, allowing a single lr for all parameters (see https://arxiv.org/abs/2502.16982). "
-            "'spectral' uses the Keller Jordan max(1, m/n)^0.5 spectral scaling. "
-            "Only effective when type='muon'. Mirrors Megatron-Core OptimizerConfig.muon_scale_mode.",
-            "choices": ["rms", "spectral"],
+            "help": "Muon update scaling mode (final scale = mode_factor * muon_extra_scale_factor):"
+            "Only used when type='muon'. Mirrors Megatron-Core OptimizerConfig.muon_scale_mode.",
+            "choices": ["spectral", "unit_rms_norm", "shape_scaling"],
         },
     )
-    muon_backend_lr: float | None = field(
-        default=None,
+    muon_extra_scale_factor: float = field(
+        default=1.0,
         metadata={
-            "help": "Learning rate for the AdamW backend optimizer in Muon (handles <2D params: "
-            "biases, norms, embeddings). Typical value: ~3e-4. If None, falls back to the main lr "
-            "with a warning (since Muon lr is typically ~100x larger). "
-            "Only effective when type='muon'."
+            "help": "Extra multiplier on top of muon_scale_mode. Use 0.2 with "
+            "scale_mode='spectral' for Moonlight-style RMS-matched scaling. "
+            "Only used when type='muon'. Mirrors Megatron-Core OptimizerConfig.muon_extra_scale_factor."
         },
     )
+
+    def __post_init__(self):
+        """Validate optimizer configuration."""
+        valid_muon_scale_modes = {"spectral", "unit_rms_norm", "shape_scaling"}
+        if self.muon_scale_mode not in valid_muon_scale_modes:
+            raise ValueError(
+                f"muon_scale_mode must be one of {valid_muon_scale_modes}, got {self.muon_scale_mode!r}. "
+            )
 
 
 @dataclass
