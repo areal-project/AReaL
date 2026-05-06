@@ -14,6 +14,8 @@ from areal.api import TrainEngine
 from areal.experimental.training_service.worker.awex import create_awex_blueprint
 from areal.experimental.training_service.worker.config import TrainWorkerConfig
 from areal.experimental.training_service.worker.engine import create_engine_module
+from areal.experimental.training_service.worker.rdt import create_rdt_blueprint
+from areal.experimental.weight_update import get_weight_update_backend
 from areal.infra.platforms import current_platform
 from areal.infra.rpc.serialization import deserialize_value, serialize_value
 from areal.utils import logging
@@ -198,14 +200,25 @@ def create_app(config: TrainWorkerConfig):
         )
     )
 
-    app.register_blueprint(
-        create_awex_blueprint(
-            flask_module=flask,
-            get_engine=_get_engine,
-            submit_to_engine_thread=_submit_to_engine_thread,
-            run_endpoint=_run_endpoint,
+    backend = get_weight_update_backend()
+    if backend == "awex":
+        app.register_blueprint(
+            create_awex_blueprint(
+                flask_module=flask,
+                get_engine=_get_engine,
+                submit_to_engine_thread=_submit_to_engine_thread,
+                run_endpoint=_run_endpoint,
+            )
         )
-    )
+    elif backend == "rdt":
+        app.register_blueprint(
+            create_rdt_blueprint(
+                flask_module=flask,
+                get_engine=_get_engine,
+                submit_to_engine_thread=_submit_to_engine_thread,
+                run_endpoint=_run_endpoint,
+            )
+        )
 
     from areal.infra.rpc.guard.data_blueprint import data_bp
 
