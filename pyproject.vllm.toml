@@ -174,7 +174,7 @@ megatron = [
     "megatron-core==0.17.0; python_version >= '3.12' and sys_platform == 'linux' and platform_machine == 'x86_64'",
     "mbridge @ git+https://github.com/ISEEKYAN/mbridge.git@310e8fb; sys_platform == 'linux' and platform_machine == 'x86_64'",
     "megatron-bridge==0.4.0; python_version >= '3.12' and sys_platform == 'linux' and platform_machine == 'x86_64'",
-    "emerging-optimizers @ git+https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git; python_version >= '3.12' and sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "emerging-optimizers @ git+https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git@v0.2.0; python_version >= '3.12' and sys_platform == 'linux' and platform_machine == 'x86_64'",
 ]
 cuda-train = [
     "areal[tms]",
