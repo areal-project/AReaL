@@ -47,6 +47,62 @@ def get_batch_size(data: dict[str, Any]) -> int:
     return 0
 
 
+def extract_valid_token_sequences(
+    input_ids_batch: torch.Tensor,
+    attention_mask: torch.Tensor,
+) -> tuple[list[torch.Tensor], int]:
+    """Extract unpadded token sequences from a [B, S] batch."""
+    if not (torch.is_tensor(input_ids_batch) and torch.is_tensor(attention_mask)):
+        raise TypeError("input_ids_batch and attention_mask must be torch.Tensor.")
+    if input_ids_batch.ndim != 2 or attention_mask.ndim != 2:
+        raise ValueError("input_ids_batch and attention_mask must be rank-2 tensors.")
+    if input_ids_batch.shape != attention_mask.shape:
+        raise ValueError(
+            "input_ids_batch and attention_mask must have identical shapes."
+        )
+
+    max_seq_len = 0
+    input_ids_list: list[torch.Tensor] = []
+    for i in range(input_ids_batch.shape[0]):
+        valid_length = int(attention_mask[i].sum().item())
+        max_seq_len = max(max_seq_len, valid_length)
+        input_ids_list.append(input_ids_batch[i, :valid_length])
+    return input_ids_list, max_seq_len
+
+
+def extract_single_valid_token_sequence(
+    trajectory: dict[str, Any],
+) -> torch.Tensor:
+    """Extract one unpadded token sequence from a trajectory dict.
+
+    Raises
+    ------
+    ValueError
+        If required fields are missing, malformed, or trajectory batch size is not 1.
+    """
+    if "input_ids" not in trajectory or "attention_mask" not in trajectory:
+        raise ValueError(
+            "trajectory must contain both 'input_ids' and 'attention_mask'."
+        )
+
+    input_ids = trajectory["input_ids"]
+    attention_mask = trajectory["attention_mask"]
+    seqs, _ = extract_valid_token_sequences(input_ids, attention_mask)
+    if len(seqs) != 1:
+        raise ValueError(
+            f"trajectory must contain exactly one sequence, got {len(seqs)}."
+        )
+    return seqs[0]
+
+
+def get_total_valid_tokens(trajectory: dict[str, Any]) -> int:
+    """Return total valid token count inferred from attention_mask when available."""
+    attention_mask = trajectory.get("attention_mask")
+    if torch.is_tensor(attention_mask):
+        return int(attention_mask.sum().item())
+    return 0
+
+
 def reorder_list(xs: Sequence, indices: list[int]) -> list:
     assert len(set(indices)) == len(xs)
     return [xs[i] for i in indices]
@@ -355,6 +411,46 @@ def split_and_unpad_tensor(
                     split_result[i][key] = copy.deepcopy(value)
         return split_result
     return result
+
+
+def unpack_groups_to_sequences(
+    item_list: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Flatten grouped trajectories into fully independent sequence-level dicts.
+
+    For example, if an item in item_list has shape [8, seq_len, ...] for 8 samples
+    (group_size=8), it will be split into 8 separate dictionaries, each with
+    shape [1, seq_len, ...]. This is required for algorithms like DTA that operate
+    on individual sequences rather than groups.
+
+    Args:
+        item_list: List of trajectory dictionaries.
+
+    Returns:
+        A new list where every dictionary represents a single sequence.
+    """
+    flat_item_list = []
+    for item in item_list:
+        attn_mask = item.get("attention_mask")
+        if (
+            attn_mask is not None
+            and isinstance(attn_mask, torch.Tensor)
+            and attn_mask.ndim >= 2
+        ):
+            n_seqs = attn_mask.shape[0]
+            if n_seqs > 1:
+                splits = split_and_unpad_tensor(
+                    item, n_trajs=n_seqs, traj_group_sizes=1
+                )
+                if isinstance(splits, list):
+                    flat_item_list.extend(splits)
+                else:
+                    flat_item_list.append(splits)
+            else:
+                flat_item_list.append(item)
+        else:
+            flat_item_list.append(item)
+    return flat_item_list
 
 
 @dataclass
@@ -697,6 +793,7 @@ def split_padded_tensor_dict_into_mb_list(
     data: dict[str, Any],
     mb_spec: MicroBatchSpec,
     group: dist.ProcessGroup | None = None,
+    one_seq_per_mb: bool = False,
 ) -> MicroBatchList:
     """Split a padded dict of tensors into micro-batches based on the attention mask.
 
@@ -704,6 +801,10 @@ def split_padded_tensor_dict_into_mb_list(
         data (Dict): Dictionary containing padded tensors.
         mb_spec (MicroBatchSpec): Specification for micro-batch splitting.
         group (Optional[dist.ProcessGroup]): Process group for distributed synchronization.
+        one_seq_per_mb (bool): If True, each micro-batch contains exactly one sequence
+            and skips cross-rank synchronized micro-batch count alignment.
+            Requires every row's valid token count ``<= mb_spec.max_tokens_per_mb``
+            and ``granularity=1`` (errors in this path mention ``one_seq_per_mb``).
 
     Returns:
         MicroBatchList: A structure containing the split micro-batches and metadata.
@@ -721,6 +822,20 @@ def split_padded_tensor_dict_into_mb_list(
         raise RuntimeError(f"Batch size {bs} cannot divide granularity {granularity}.")
     max_seqlen = data["attention_mask"].shape[1]
     seq_lens = data["attention_mask"].sum(1).long().cpu().numpy().tolist()
+    if one_seq_per_mb:
+        if granularity != 1:
+            raise RuntimeError(
+                f"split_padded_tensor_dict_into_mb_list: one_seq_per_mb=True requires "
+                f"granularity=1, but got granularity={granularity}."
+            )
+        cap = mb_spec.max_tokens_per_mb
+        for i, L in enumerate(seq_lens):
+            if L > cap:
+                raise RuntimeError(
+                    f"split_padded_tensor_dict_into_mb_list: one_seq_per_mb=True, "
+                    f"but sequence at index {i} has {L} valid tokens, which exceeds "
+                    f"max_tokens_per_mb={cap}."
+                )
     input_lens = (
         data["attention_mask"]
         .view(bs // granularity, granularity, -1)
@@ -748,13 +863,19 @@ def split_padded_tensor_dict_into_mb_list(
             not_to_split[key] = value
 
     # split
-    group_indices = allocate_balanced_mbs_synced(mb_spec, input_lens, group=group)
-    group_indices = [
-        seqpack.flat2d(
-            [list(range(i * granularity, (i + 1) * granularity)) for i in group_index]
-        )
-        for group_index in group_indices
-    ]
+    if one_seq_per_mb:
+        group_indices = [[i] for i in range(bs)]
+    else:
+        group_indices = allocate_balanced_mbs_synced(mb_spec, input_lens, group=group)
+        group_indices = [
+            seqpack.flat2d(
+                [
+                    list(range(i * granularity, (i + 1) * granularity))
+                    for i in group_index
+                ]
+            )
+            for group_index in group_indices
+        ]
     splitted_lens = [
         [seq_lens[i] for i in group_index] for group_index in group_indices
     ]

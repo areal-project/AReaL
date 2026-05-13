@@ -77,6 +77,7 @@ def _dispatch_tensors(
     item_list: list[dict[str, Any]],
     dp_size: int,
     group_size: int = 1,
+    packing_algorithm: str = "ffd",
 ) -> tuple[list[list[dict[str, Any]]], list[list[int]]]:
     """Partition trajectories across DP groups by balanced token count.
 
@@ -87,6 +88,34 @@ def _dispatch_tensors(
             partitioning.
     """
     n = len(item_list)
+
+    if packing_algorithm == "dta":
+        has_rtensor = any(
+            _find_in_structure(item, RTensor) is not None for item in item_list
+        )
+
+        if has_rtensor:
+            # DTA requires sequence-level data. If we have grouped RTensors, we MUST
+            # localize everything on the Controller to properly slice the tensors.
+            item_list = RTensor.localize(item_list)
+            has_rtensor = False
+
+        if not has_rtensor:
+            from areal.infra.dist_rollout import _dta_allocate
+            from areal.utils.data import unpack_groups_to_sequences
+
+            # Flatten grouped trajectories into sequence level for DTA
+            flat_item_list = unpack_groups_to_sequences(item_list)
+
+            dta_result = _dta_allocate(flat_item_list, dp_size)
+            stats_tracker.scalar(**dta_result.metrics.to_stats())
+            group_indices = dta_result.group_indices
+            splits: list[list[dict[str, Any]]] = []
+            for gidxs in group_indices:
+                splits.append([flat_item_list[idx] for idx in gidxs])
+
+            return splits, group_indices
+
     if n % group_size != 0:
         raise ValueError(
             f"item count ({n}) must be divisible by group_size ({group_size})"
@@ -535,7 +564,10 @@ class TrainController:
             if _is_tensor_like(item):
                 if group_indices is None:
                     splits, group_indices = _dispatch_tensors(
-                        item, dp_size, group_size=group_size
+                        item,
+                        dp_size,
+                        group_size=group_size,
+                        packing_algorithm=self.config.packing_algorithm,
                     )
                     return splits
                 return [[item[i] for i in idxs] for idxs in group_indices]

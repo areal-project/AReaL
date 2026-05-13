@@ -850,7 +850,7 @@ def test_tau2(tmp_path_factory):
             "econfig.max_steps=3",  # Limit steps for faster testing
             f"econfig.user_llm_base_url={user_llm_base_url}",
             "econfig.user_llm=openai/self-hosted-qwen3",
-            "actor.enable_tree_training=false",  # Disable tree training for simpler test
+            "actor.tree_training_mode=disabled",  # Disable tree training for simpler test
             "scheduler.type=local",
             "stats_logger.wandb.mode=disabled",
             timeout=600,

@@ -48,8 +48,10 @@ from areal.infra import (
 from areal.infra.data_service import DataController
 from areal.infra.data_service.controller.config import DataServiceConfig
 from areal.infra.data_service.rdataset import RDataset
+from areal.infra.rpc.rtensor import RTensor
 from areal.infra.utils.concurrent import call_maybe_async
 from areal.utils import logging, perf_tracer, seeding, stats_tracker
+from areal.utils.data import unpack_groups_to_sequences
 from areal.utils.dataloader import create_dataloader
 from areal.utils.environ import is_single_controller
 from areal.utils.evaluator import Evaluator
@@ -369,6 +371,9 @@ class PPOTrainer:
         )
 
         self._config_perf_tracer()
+        self._cumulative_training_tokens = 0.0
+        self._cumulative_train_step_time = 0.0
+        self._cumulative_step_time = 0.0
         self._apply_initial_offload_policy()
 
     @staticmethod
@@ -567,6 +572,9 @@ class PPOTrainer:
                     group_size=config.gconfig.n_samples,
                     dynamic_bs=self.config.dynamic_bs,
                 )
+                if config.actor.packing_algorithm == "dta":
+                    rollout_batch = RTensor.localize(rollout_batch)
+                    rollout_batch = unpack_groups_to_sequences(rollout_batch)
             if self._should_offload_rollout:
                 self._offload_rollout()
 
@@ -582,6 +590,15 @@ class PPOTrainer:
                     ),
                 ):
                     values = self.critic.compute_values(rollout_batch)
+                    if config.actor.packing_algorithm == "dta":
+                        assert isinstance(values, list), (
+                            f"values must return list under DTA, got {type(values)}"
+                        )
+                        assert len(values) == len(rollout_batch), (
+                            "values length mismatch under DTA: "
+                            f"len(rollout_batch)={len(rollout_batch)}, "
+                            f"len(values)={len(values)}"
+                        )
                     for traj, v in zip(rollout_batch, values):
                         traj["values"] = v
                     self.critic.get_device_stats().log("critic values")
@@ -599,6 +616,16 @@ class PPOTrainer:
                     ),
                 ):
                     ref_logps = self.ref.compute_logp(rollout_batch)
+                    if config.actor.packing_algorithm == "dta":
+                        assert isinstance(ref_logps, list), (
+                            "ref_logps must return list under DTA, "
+                            f"got {type(ref_logps)}"
+                        )
+                        assert len(ref_logps) == len(rollout_batch), (
+                            "ref_logps length mismatch under DTA: "
+                            f"len(rollout_batch)={len(rollout_batch)}, "
+                            f"len(ref_logps)={len(ref_logps)}"
+                        )
                     for traj, logp in zip(rollout_batch, ref_logps):
                         traj["ref_logp"] = logp
                     self.ref.get_device_stats().log("ref logp")
@@ -617,6 +644,16 @@ class PPOTrainer:
                     ),
                 ):
                     teacher_logps = self.teacher.compute_logp(rollout_batch)
+                    if config.actor.packing_algorithm == "dta":
+                        assert isinstance(teacher_logps, list), (
+                            "teacher_logps must return list under DTA, "
+                            f"got {type(teacher_logps)}"
+                        )
+                        assert len(teacher_logps) == len(rollout_batch), (
+                            "teacher_logps length mismatch under DTA: "
+                            f"len(rollout_batch)={len(rollout_batch)}, "
+                            f"len(teacher_logps)={len(teacher_logps)}"
+                        )
                     for traj, logp in zip(rollout_batch, teacher_logps):
                         traj["teacher_logp"] = logp
                         traj["rl_loss_weight"] = self.config.teacher.rl_loss_weight
@@ -639,6 +676,16 @@ class PPOTrainer:
                     ),
                 ):
                     prox_logps = self.actor.compute_logp(rollout_batch)
+                    if config.actor.packing_algorithm == "dta":
+                        assert isinstance(prox_logps, list), (
+                            "prox_logps must return list under DTA, "
+                            f"got {type(prox_logps)}"
+                        )
+                        assert len(prox_logps) == len(rollout_batch), (
+                            "prox_logps length mismatch under DTA: "
+                            f"len(rollout_batch)={len(rollout_batch)}, "
+                            f"len(prox_logps)={len(prox_logps)}"
+                        )
                     for traj, logp in zip(rollout_batch, prox_logps):
                         traj["prox_logp"] = logp
                     self.actor.get_device_stats().log("recompute logp")
@@ -1175,10 +1222,54 @@ class PPOTrainer:
         stats.update(self.rollout.export_stats())
         if self.eval_rollout is not None:
             stats.update(self.eval_rollout.export_stats())
+        self._add_throughput_metrics(stats)
         self.stats_logger.commit(epoch, epoch_step, global_step, stats)
 
         dist.barrier(group=self.actor.cpu_group)
         current_platform.synchronize()
+
+    def _add_throughput_metrics(self, stats: dict[str, float]) -> None:
+        # TODO(agent): Not enabled yet, will be implemented in the future.
+        return
+        if "ppo_actor/update/n_tokens" not in stats:
+            raise ValueError(
+                "Missing required metric `ppo_actor/update/n_tokens` for throughput computation."
+            )
+        if "timeperf/train_step" not in stats:
+            raise ValueError(
+                "Missing required metric `timeperf/train_step` for throughput computation."
+            )
+
+        n_tokens = float(stats["ppo_actor/update/n_tokens"])
+        train_step_time = float(stats["timeperf/train_step"])
+        step_total_time = sum(
+            float(value)
+            for key, value in stats.items()
+            if key.startswith("timeperf/") and not key.endswith("__count")
+        )
+        stats["timeperf/step_total"] = step_total_time
+
+        self._cumulative_training_tokens += n_tokens
+        self._cumulative_train_step_time += max(train_step_time, 0.0)
+        self._cumulative_step_time += max(step_total_time, 0.0)
+        stats["timeperf/cumulative_step_total"] = self._cumulative_step_time
+
+        if n_tokens > 0.0 and train_step_time > 0.0:
+            stats["training_throughput"] = n_tokens / train_step_time
+        if (
+            self._cumulative_training_tokens > 0.0
+            and self._cumulative_train_step_time > 0.0
+        ):
+            stats["cumulative_training_throughput"] = (
+                self._cumulative_training_tokens / self._cumulative_train_step_time
+            )
+
+        if n_tokens > 0.0 and step_total_time > 0.0:
+            stats["throughput"] = n_tokens / step_total_time
+        if self._cumulative_training_tokens > 0.0 and self._cumulative_step_time > 0.0:
+            stats["cumulative_throughput"] = (
+                self._cumulative_training_tokens / self._cumulative_step_time
+            )
 
     def _validate_cfg(self):
         """validate config for incompatible settings before weight initialization, to avoid wasted resources on spawning workers and loading models."""

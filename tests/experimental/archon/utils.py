@@ -2,13 +2,16 @@
 
 import os
 import subprocess
+from collections.abc import Callable
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 import torch
 import torch.distributed as dist
 from datasets import load_dataset
+from torch.distributed.tensor import DTensor
 from transformers import AutoModelForCausalLM
 
 from areal.api import FinetuneSpec, ParallelStrategy
@@ -54,6 +57,15 @@ __all__ = [
     "create_grpo_batch",
     "DualEngineFixture",
     "dual_engines",
+    "create_archon_engine",
+    "create_fsdp_engine",
+    "destroy_test_engine",
+    "create_dta_batch",
+    "load_pt_batch",
+    "dta_dummy_loss_fn",
+    "dta_loss_weight_fn",
+    "snapshot_module_parameters",
+    "strip_wrapper_prefixes",
 ]
 
 
@@ -70,6 +82,11 @@ def get_model_path_for_type(model_type: str) -> str | None:
 
 
 DATASET_PATH = get_dataset_path("/storage/openpsi/data/gsm8k", "openai/gsm8k")
+
+
+def strip_wrapper_prefixes(name: str) -> str:
+    """Drop wrapper-generated path segments from parameter names."""
+    return name.replace("._checkpoint_wrapped_module", "").replace("._orig_mod", "")
 
 
 @dataclass
@@ -468,3 +485,262 @@ def dual_engines():
     fixture.setup()
     yield fixture
     fixture.teardown()
+
+
+# =============================================================================
+# DTA Engine Testing Utilities
+# =============================================================================
+
+
+def create_dta_batch(
+    batch_size: int = 4,
+    seq_len: int = 64,
+    shared_prefix_len: int = 20,
+    vocab_size: int = 151936,
+    device: torch.device | None = None,
+) -> dict[str, Any]:
+    """Build a synthetic batch whose sequences share a common prefix.
+
+    Returns a dict compatible with ``ArchonEngine.train_batch`` (GRPO-style
+    fields included so the default loss path works).
+
+    Args:
+        batch_size: Number of sequences.
+        seq_len: Length of each sequence.
+        shared_prefix_len: Length of the common prefix across all sequences.
+        vocab_size: Vocabulary size for random token generation.
+        device: Target device (defaults to current platform device).
+    """
+    if device is None:
+        device = torch.device(current_platform.device_type)
+
+    torch.manual_seed(42)
+
+    prefix = torch.randint(100, vocab_size - 100, (shared_prefix_len,))
+    rows = []
+    for _ in range(batch_size):
+        suffix = torch.randint(100, vocab_size - 100, (seq_len - shared_prefix_len,))
+        rows.append(torch.cat([prefix, suffix]))
+    input_ids = torch.stack(rows).to(device)
+
+    attention_mask = torch.ones_like(input_ids)
+    loss_mask = torch.ones(batch_size, seq_len, device=device)
+    loss_mask[:, :10] = 0.0
+
+    logprobs = torch.randn(batch_size, seq_len, device=device) * 0.5 - 2.0
+    old_logprobs = logprobs.clone()
+
+    return {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "loss_mask": loss_mask,
+        "logprobs": logprobs,
+        "old_logprobs": old_logprobs,
+        "advantages": torch.randn(batch_size, seq_len, device=device),
+        "rewards": torch.randint(0, 2, (batch_size,), device=device).float(),
+        "values": torch.zeros(batch_size, seq_len, device=device),
+        "prox_logp": old_logprobs.clone(),
+    }
+
+
+def load_pt_batch(
+    test_config: Any,
+    prompt_ratio: float = 0.3,
+    device: torch.device | None = None,
+) -> dict[str, Any]:
+    """Load all token sequences from a ``.pt`` file at full length.
+
+    Each ``.pt`` file contains ``list[Tensor]`` where every tensor is a 1-D
+    ``int64`` sequence with no padding.  All sequences are kept at their
+    original length and right-padded to the longest one.
+
+    GRPO fields (``loss_mask``, ``logprobs``, ``advantages``, …) are filled
+    with synthetic values so the batch works with ``train_batch``.
+
+    Args:
+        test_config: Test config carrying ``dta_data``, ``max_tokens_per_mb``, and optional ``dta_limit``.
+        prompt_ratio: Fraction of each sequence treated as prompt (loss_mask=0).
+        device: Target device (defaults to current platform device).
+    """
+    if device is None:
+        device = torch.device(current_platform.device_type)
+    # print(f"loadbatch on device: {device}")
+
+    pt_path = str(test_config.dta_data)
+    assert pt_path is not None, "dta_data is required but got None"
+    seqs: list[torch.Tensor] = torch.load(
+        pt_path, map_location="cpu", weights_only=True
+    )
+    assert isinstance(seqs, list) and len(seqs) > 0, (
+        f"Expected list[Tensor], got {type(seqs)}"
+    )
+    dta_limit = int(getattr(test_config, "dta_limit", -1))
+    if dta_limit >= 0:
+        seqs = seqs[:dta_limit]
+    assert len(seqs) > 0, "No sequences available after applying dta_limit."
+
+    bs = len(seqs)
+    max_tokens_per_mb = int(test_config.max_tokens_per_mb)
+    lengths = [min(s.numel(), max_tokens_per_mb) for s in seqs]
+    padded_len = max(lengths)
+
+    input_ids = torch.zeros(bs, padded_len, dtype=torch.long)
+    attention_mask = torch.zeros(bs, padded_len, dtype=torch.long)
+    loss_mask = torch.zeros(bs, padded_len)
+
+    for i, (s, length) in enumerate(zip(seqs, lengths)):
+        input_ids[i, :length] = s[:length]
+        attention_mask[i, :length] = 1
+        prompt_len = max(1, int(length * prompt_ratio))
+        loss_mask[i, prompt_len:length] = 1.0
+
+    input_ids = input_ids.to(device)
+    attention_mask = attention_mask.to(device)
+    loss_mask = loss_mask.to(device)
+
+    logprobs = torch.randn(bs, padded_len, device=device) * 0.5 - 2.0
+    old_logprobs = logprobs.clone()
+
+    return {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "loss_mask": loss_mask,
+        "logprobs": logprobs,
+        "old_logprobs": old_logprobs,
+        "advantages": torch.randn(bs, padded_len, device=device),
+        "rewards": torch.randint(0, 2, (bs,), device=device).float(),
+        "values": torch.zeros(bs, padded_len, device=device),
+        "prox_logp": old_logprobs.clone(),
+    }
+
+
+def dta_dummy_loss_fn(logprobs, entropy, input_data, **kwargs):
+    """Minimal loss for DTA smoke tests."""
+    loss_mask = input_data.get("loss_mask")
+    if loss_mask is None:
+        return -logprobs.sum()
+    min_len = min(logprobs.shape[-1], loss_mask.shape[-1])
+    logprobs = logprobs[..., :min_len]
+    loss_mask = loss_mask[..., :min_len]
+    return -(logprobs * loss_mask).sum() / loss_mask.sum().clamp(min=1)
+
+
+def dta_loss_weight_fn(input_data):
+    """Loss weight function for DTA smoke tests."""
+    lm = input_data.get("loss_mask")
+    if lm is not None:
+        return lm.sum()
+    return torch.tensor(1.0)
+
+
+def snapshot_module_parameters(
+    module: torch.nn.Module,
+    to_cpu: bool = False,
+    param_filter: Callable[[str, torch.nn.Parameter], bool] | None = None,
+) -> dict[str, torch.Tensor]:
+    """Snapshot (clone) selected named parameters for later delta comparisons.
+
+    This is intentionally lightweight to reuse the same comparison pattern
+    across tests (similar to how `test_grpo.py` compares weight deltas).
+    """
+    snapshots: dict[str, torch.Tensor] = {}
+    for name, param in module.named_parameters():
+        if param_filter is not None and not param_filter(name, param):
+            continue
+        t = param.full_tensor() if isinstance(param, DTensor) else param
+        t = t.detach().clone()
+        if to_cpu:
+            t = t.cpu()
+        snapshots[name] = t
+    return snapshots
+
+
+def create_archon_engine(
+    test_config: SimpleNamespace,
+    model_path: str | None = None,
+) -> ArchonLMEngine:
+    """Create and initialize a single Archon engine for tests."""
+    setup_distributed_environment()
+    model_path = model_path or MODEL_PATHS["qwen2"]
+    world_size = dist.get_world_size() if dist.is_initialized() else 1
+    parallel_strategy = ParallelStrategy(data_parallel_size=world_size)
+    ft_spec = FinetuneSpec(total_train_epochs=1, dataset_size=4, train_batch_size=4)
+    max_tokens_per_mb = int(test_config.max_tokens_per_mb)
+
+    config = create_engine_config(
+        model_path,
+        "archon_dta" if test_config.tree_training_mode == "dta" else "archon",
+    )
+    config.mb_spec = MicroBatchSpec.new(
+        config.mb_spec, max_tokens_per_mb=max_tokens_per_mb
+    )
+    config.tree_training_mode = test_config.tree_training_mode
+    if os.environ.get("AREAL_DISABLE_TORCH_COMPILE", "").lower() in (
+        "1",
+        "true",
+        "yes",
+    ):
+        config.archon.enable_compile = False
+    config.path = test_config.model_path
+
+    engine = ArchonLMEngine(config)
+    engine.create_process_group(parallel_strategy=parallel_strategy)
+    engine.initialize(addr=None, ft_spec=ft_spec)
+
+    if test_config.use_hf:
+        # Clean up original engine.model to avoid memory leaks (显存残留)
+        if hasattr(engine, "model") and engine.model is not None:
+            try:
+                # Call .cpu() + del + torch.cuda.empty_cache for safety
+                engine.model.cpu()
+            except Exception:
+                pass
+            del engine.model
+            import gc
+
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        # Use the traditional HuggingFace transformer model for DTA smoke tests
+        from transformers import AutoModelForCausalLM
+
+        engine.model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            torch_dtype=torch.bfloat16,
+            device_map=torch.device(current_platform.device_type),
+        )
+
+    return engine
+
+
+def create_fsdp_engine(
+    test_config: SimpleNamespace,
+    model_path: str | None = None,
+) -> FSDPLMEngine:
+    """Create and initialize a single FSDP engine for tests."""
+    setup_distributed_environment()
+    model_path = model_path or MODEL_PATHS["qwen2"]
+    world_size = dist.get_world_size() if dist.is_initialized() else 1
+    parallel_strategy = ParallelStrategy(data_parallel_size=world_size)
+    ft_spec = FinetuneSpec(total_train_epochs=1, dataset_size=4, train_batch_size=4)
+    max_tokens_per_mb = int(test_config.max_tokens_per_mb)
+
+    config = create_engine_config(model_path, "fsdp")
+    config.mb_spec = MicroBatchSpec.new(
+        config.mb_spec, max_tokens_per_mb=max_tokens_per_mb
+    )
+    config.path = test_config.model_path
+
+    engine = FSDPLMEngine(config)
+    engine.create_process_group(parallel_strategy=parallel_strategy)
+    engine.initialize(addr=None, ft_spec=ft_spec)
+    return engine
+
+
+def destroy_test_engine(engine: FSDPLMEngine | ArchonLMEngine | None) -> None:
+    """Destroy a test engine and tear down the process group."""
+    if engine is not None:
+        engine.destroy()
+    if dist.is_initialized():
+        dist.destroy_process_group()

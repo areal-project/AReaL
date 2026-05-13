@@ -3,6 +3,7 @@
 import argparse
 import json
 import os
+import warnings
 from dataclasses import MISSING as dataclass_missing
 from dataclasses import asdict, dataclass, field, fields
 from enum import Enum
@@ -1138,10 +1139,52 @@ class TrainEngineConfig:
         metadata={"help": "peft method type. Only LoRA is supported for now."},
     )
 
-    # Tree training
+    # Tree training (str, not Literal: OmegaConf.structured rejects Literal here)
+    tree_training_mode: str = field(
+        default="disabled",
+        metadata={
+            "help": (
+                "Tree training mode. "
+                "'sparse' enables tree training with Flex Attention module (flex attention), "
+                "'dta' enables Dynamic Tree Attention (dynamic tree training), "
+                "'disabled' disables tree training."
+            ),
+            "choices": ["disabled", "sparse", "dta"],
+        },
+    )
     enable_tree_training: bool = field(
         default=False,
-        metadata={"help": "Enable tree training with flex attention module."},
+        metadata={
+            "help": (
+                "[DEPRECATED] Use tree_training_mode instead. "
+                "enable_tree_training=True maps to tree_training_mode='sparse'. "
+                "If both are set, tree_training_mode takes precedence."
+            )
+        },
+    )
+    dta_block_size: int = field(
+        default=2048,
+        metadata={
+            "help": (
+                "Block size for Dynamic Tree Attention. "
+                "Set to -1 to disable block-size limit. "
+                "Only effective when tree_training_mode='dta'."
+            )
+        },
+    )
+    packing_algorithm: str = field(
+        default="ffd",
+        metadata={
+            "help": (
+                "Trajectory packing across data-parallel ranks during distributed rollout "
+                "(``redistribute_trajectories``). "
+                "'ffd' / 'kk' balance by total sequence length; 'dta' uses DTA DFS-order "
+                "n_tree_tokens. "
+                "Not to be confused with ``mb_spec.packing_algorithm``, which only "
+                "controls micro-batch formation (ffd/kk) during training."
+            ),
+            "choices": ["ffd", "kk", "dta"],
+        },
     )
 
     # Scheduling
@@ -1214,6 +1257,45 @@ class TrainEngineConfig:
                 "memory_efficient_load is for loading pretrained weights on CPU, "
                 "but init_from_scratch creates a model without loading any weights."
             )
+        valid_tree_modes = {"disabled", "sparse", "dta"}
+        if self.tree_training_mode not in valid_tree_modes:
+            raise ValueError(
+                f"tree_training_mode must be one of {valid_tree_modes}, got '{self.tree_training_mode}'"
+            )
+        valid_rollout_packing = {"ffd", "kk", "dta"}
+        if self.packing_algorithm not in valid_rollout_packing:
+            raise ValueError(
+                f"packing_algorithm (rollout) must be one of {valid_rollout_packing}, "
+                f"got '{self.packing_algorithm}'"
+            )
+        if self.tree_training_mode == "dta":
+            if self.dta_block_size == 0 or self.dta_block_size < -1:
+                raise ValueError(
+                    f"dta_block_size must be -1 or a positive integer when tree_training_mode='dta', got {self.dta_block_size}."
+                )
+
+        if self.enable_tree_training:
+            warnings.warn(
+                "`enable_tree_training` is deprecated and will be removed in a future version. "
+                "Use `tree_training_mode='sparse'` instead.",
+                FutureWarning,
+                stacklevel=2,
+            )
+            if self.tree_training_mode != "disabled":
+                warnings.warn(
+                    f"`tree_training_mode` is already set to '{self.tree_training_mode}', "
+                    "`enable_tree_training=True` is ignored.",
+                    FutureWarning,
+                    stacklevel=2,
+                )
+            else:
+                self.tree_training_mode = "sparse"
+                warnings.warn(
+                    "`tree_training_mode` is overridden to 'sparse' from deprecated "
+                    "`enable_tree_training=True`.",
+                    FutureWarning,
+                    stacklevel=2,
+                )
         if self._version not in ("v1", "v2"):
             raise ValueError(
                 f"_version must be either 'v1' or 'v2', got '{self._version}'"
@@ -1581,6 +1663,22 @@ class PPOActorConfig(TrainEngineConfig):
                     "SAPO is not compatible with `use_decoupled_loss=True`. "
                     "Please set `actor.use_decoupled_loss=false` in your configuration."
                 )
+
+        if self.packing_algorithm == "dta":
+            for norm_name in ["adv_norm", "reward_norm"]:
+                norm_config = getattr(self, norm_name)
+                if norm_config is not None:
+                    if (
+                        norm_config.mean_level == "group"
+                        or norm_config.std_level == "group"
+                    ):
+                        raise ValueError(
+                            f"{norm_name} uses 'group' level normalization, which is incompatible "
+                            "with packing_algorithm='dta'. DTA requires sequence-level independence, "
+                            "but 'group' normalization relies on contiguous group slices. Please use "
+                            "'batch' level normalization or set packing_algorithm='ffd'. "
+                            "(Group-level support for DTA will be provided in a future release.)"
+                        )
 
         super().__post_init__()
 

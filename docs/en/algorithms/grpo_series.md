@@ -124,7 +124,7 @@ When `eps_clip_higher` is `None`, symmetric clipping is used: $\text{clip}(r,
 1-\epsilon, 1+\epsilon)$.
 
 When `eps_clip_higher` is set (DAPO-style), asymmetric clipping is used:
-$\text{clip}(r, 1-\epsilon_{\text{low}}, 1+\epsilon_{\text{high}})$.
+$\\text{clip}(r, 1-\\epsilon\_{\\text{low}}, 1+\\epsilon\_{\\text{high}})$.
 
 ### Importance Sampling Level (`actor.importance_sampling_level`)
 
@@ -258,7 +258,7 @@ r_{i,t}(\theta) \hat{A}_{i,t}, \text{clip}\left( r_{i,t}(\theta),
 1-\epsilon_{\text{low}}, 1+\epsilon_{\text{high}} \right) \hat{A}_{i,t}
 \right) \right] $$
 
-where $\hat{A}_{i,t}$ is the group-normalized advantage and $r_{i,t}(\theta)$ is the
+where $\\hat{A}_{i,t}$ is the group-normalized advantage and $r_{i,t}(\\theta)$ is the
 token-level policy ratio.
 
 **Asymmetric clipping parameters:**

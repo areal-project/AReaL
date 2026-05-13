@@ -262,9 +262,14 @@ class FSDPEngine(TrainEngine):
         self.dp_rank: int
 
         self.is_offload: bool = False
+        self.tree_training_mode: str = self.config.tree_training_mode
+        if self.tree_training_mode == "dta":
+            raise ValueError(
+                "tree_training_mode='dta' is only supported by ArchonEngine. "
+                "Please use Archon backend or set tree_training_mode to 'disabled'/'sparse'."
+            )
         self._offload_depth: int = 0
         self._per_layer_optim_wrapper: PerLayerOptimWrapper | None = None
-        self.enable_tree_training: bool = self.config.enable_tree_training
 
     @classmethod
     def from_pretrained(
@@ -384,7 +389,7 @@ class FSDPEngine(TrainEngine):
         # Create device model
         self._create_device_model()
 
-        if self.enable_tree_training and self.parallel_helper.sp_size > 1:
+        if self.tree_training_mode == "sparse" and self.parallel_helper.sp_size > 1:
             raise ValueError(
                 "Tree training currently cannot be enabled with sp_size > 1."
             )
@@ -395,7 +400,7 @@ class FSDPEngine(TrainEngine):
             shard_vision_across_sp=self.config.fsdp.shard_vision_across_sp,
         )
         # Monkey patch: replace attention's forward() with tree attention.
-        patch_fsdp_for_tree_training(enable=self.enable_tree_training)
+        patch_fsdp_for_tree_training(enable=self.tree_training_mode == "sparse")
 
         if self.config.use_lora:
             self._apply_peft_wrapper()
@@ -733,7 +738,7 @@ class FSDPEngine(TrainEngine):
             # module_fsdp.py reads these keys from the **kwargs that transformers
             # forwards through.
             tree_attn_keys: list[str] = []
-            if self.enable_tree_training and ctx.trie_node is not None:
+            if self.tree_training_mode == "sparse" and ctx.trie_node is not None:
                 padded_size = mb_item.padded_to_length
                 assert padded_size is not None
                 tree_kwargs = build_tree_attn_kwargs(
@@ -881,8 +886,8 @@ class FSDPEngine(TrainEngine):
         self.forward_backward_batch(mb_list, process_output, forward_only=True)
 
         # Step 4: Aggregate and reorder outputs
-        if self.enable_tree_training:
-            result = merge_packed_tree_results(outputs, batch_size)
+        if self.tree_training_mode == "sparse":
+            return merge_packed_tree_results(outputs, batch_size)
         else:
             result = reorder_and_pad_outputs(
                 outputs, output_seqlens, mb_list, aggregate_fn
@@ -1719,7 +1724,7 @@ class FSDPEngine(TrainEngine):
         input_ = input_.copy()
 
         # Tree training path
-        if self.enable_tree_training:
+        if self.tree_training_mode == "sparse":
             mb_list = build_packed_tree_batch(
                 input_,
                 mb_spec=self.config.mb_spec,
@@ -1988,12 +1993,12 @@ class FSDPEngine(TrainEngine):
         if local_weight == 0:
             return logits.mean() * 0.0
 
-        if self.config.is_critic and self.enable_tree_training:
+        if self.config.is_critic and self.tree_training_mode == "sparse":
             raise NotImplementedError(
                 "Tree training with critic model is not supported yet."
             )
         if not self.config.is_critic:
-            if self.enable_tree_training:
+            if self.tree_training_mode == "sparse":
                 # Handle dummy trie (empty tree for DP synchronization)
                 # When trie has no sequences, return zero loss with grad connection
                 if ctx.trie_node is None or not ctx.trie_node.all_sequence_ids:
@@ -2051,12 +2056,12 @@ class FSDPEngine(TrainEngine):
         ctx: FSDPTrainContext,
     ) -> torch.Tensor | dict[int, torch.Tensor]:
         """Compute forward output (logprobs or values)."""
-        if self.config.is_critic and self.enable_tree_training:
+        if self.config.is_critic and self.tree_training_mode == "sparse":
             raise NotImplementedError(
                 "Tree training with critic model is not supported yet."
             )
         if not self.config.is_critic:
-            if self.enable_tree_training:
+            if self.tree_training_mode == "sparse":
                 result = _gather_packed_tree_logprobs(
                     logits,
                     ctx.trie_node,

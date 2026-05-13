@@ -45,6 +45,7 @@ from areal.engine.core.train_engine import (
     reorder_and_pad_outputs,
 )
 from areal.engine.fsdp_utils.grad import fsdp2_clip_grad_norm
+from areal.experimental.dta.wrapper import DTAWrapper
 from areal.experimental.engine.archon_checkpoint import (
     load_from_dcp,
     load_model_from_hf,
@@ -64,6 +65,12 @@ from areal.experimental.engine.archon_weight_sync import (
     init_weight_update_group,
     update_weights_from_disk,
     update_weights_from_distributed,
+)
+from areal.experimental.engine.archon_zero1 import (
+    all_reduce_zero1_gradients,
+    create_zero1_optimizer,
+    parallelize_fn_zero1,
+    zero1_clip_grad_norm,
 )
 from areal.experimental.models.archon import (
     ArchonParallelDims,
@@ -151,8 +158,14 @@ class ArchonEngine(TrainEngine):
         # Configuration (immutable after init)
         self.config = config
         self.optimizer_config = config.optimizer
-        self.enable_tree_training = config.enable_tree_training
-
+        self.tree_training_mode = config.tree_training_mode
+        if self.tree_training_mode == "dta" and config.gradient_checkpointing:
+            raise ValueError(
+                "ArchonEngine: gradient_checkpointing=True is incompatible with "
+                "tree_training_mode='dta'. Disable gradient_checkpointing for DTA."
+            )
+        if self.tree_training_mode == "dta":
+            self.dta_wrapper: DTAWrapper
         # Model Configuration (loaded during __init__)
         self.model_config: PretrainedConfig = AutoConfig.from_pretrained(
             pretrained_model_name_or_path=self.config.path,
@@ -343,7 +356,7 @@ class ArchonEngine(TrainEngine):
             config=self.config,
             parallel_dims=self.parallel_dims,
             model_config=self.model_config,
-            enable_tree_training=self.enable_tree_training,
+            tree_training_mode=self.tree_training_mode,
             logger=self.logger,
         )
 
@@ -382,6 +395,19 @@ class ArchonEngine(TrainEngine):
             has_first_stage=self.pp_has_first_stage,
             has_last_stage=self.pp_has_last_stage,
         )
+
+        if self.tree_training_mode == "dta":
+            dta_dtype = getattr(torch, self.config.dtype)
+            self.dta_wrapper = DTAWrapper(
+                model=self.model,
+                model_config=self.model_config,
+                device=self.device,
+                dtype=dta_dtype,
+                max_seq_len=self.config.mb_spec.max_tokens_per_mb,
+                block_size=self.config.dta_block_size,
+                is_critic=self.config.is_critic,
+            )
+            self.logger.info(f"DTA Wrapper created on device {self.device}")
 
         self._initialized = True
 
@@ -482,16 +508,23 @@ class ArchonEngine(TrainEngine):
         assert self.optimizer_config is not None
         assert self.lr_scheduler is not None
 
-        grad_norm = fsdp2_clip_grad_norm(
-            self._get_all_parameters(),
-            max_norm=self.optimizer_config.gradient_clipping,
-            fsdp_group=self.data_parallel_group,
-            tp_group=self._tp_group,
-            pp_group=self.parallel_dims.get_group("pp")
-            if self.parallel_dims.pp_enabled
-            else None,
-            offload_params=self.config.archon.offload_params,
-        )
+        if self.tree_training_mode == "dta":
+            grad_norm = zero1_clip_grad_norm(
+                self._get_all_parameters(),
+                max_norm=self.optimizer_config.gradient_clipping,
+                dp_group=self.data_parallel_group,
+            )
+        else:
+            grad_norm = fsdp2_clip_grad_norm(
+                self._get_all_parameters(),
+                max_norm=self.optimizer_config.gradient_clipping,
+                fsdp_group=self.data_parallel_group,
+                tp_group=self._tp_group,
+                pp_group=self.parallel_dims.get_group("pp")
+                if self.parallel_dims.pp_enabled
+                else None,
+                offload_params=self.config.archon.offload_params,
+            )
 
         if not math.isfinite(grad_norm):
             self.optimizer_zero_grad()
@@ -527,6 +560,7 @@ class ArchonEngine(TrainEngine):
         input_: list[dict[str, Any]] | dict[str, Any],
         loss_fn: Callable[..., torch.Tensor],
         loss_weight_fn: Callable[[dict[str, Any]], torch.Tensor],
+        return_loss: bool = False,
     ) -> dict[str, float]:
         """Train on a batch of data."""
         assert self._initialized
@@ -540,11 +574,36 @@ class ArchonEngine(TrainEngine):
             mb_list, loss_weight_fn, self.data_parallel_group
         )
 
+        if self.tree_training_mode == "dta":
+            # ========== DTA Path ==========
+            self.logger.info("tree_training_mode='dta' in train_batch")
+            self.logger.info(f"total_loss_weight: {total_loss_weight}")
+            dta_stats = self.dta_wrapper.run_backward_with_scaled_loss(
+                mb_list=mb_list,
+                prepare_mb_inputs_fn=self._prepare_mb_inputs,
+                loss_fn=loss_fn,
+                loss_weight_fn=loss_weight_fn,
+                total_loss_weight=total_loss_weight,
+                block_size=self.config.dta_block_size,
+            )
+            self.logger.info(f"DTA backward stats: {dta_stats}")
+            all_reduce_zero1_gradients(
+                self._get_all_parameters(),
+                dp_group=self.data_parallel_group,
+            )
+            result = self.optimizer_step()
+            if return_loss:
+                dta_loss = float(dta_stats.get("dta_loss", float("nan")))
+                result["loss"] = dta_loss
+            return result
+
+        losses: list[torch.Tensor] = []
+
         def process_output(
             logits: torch.Tensor, ctx_dict: dict[str, Any]
         ) -> torch.Tensor:
             ctx = ArchonTrainContext(**ctx_dict)
-            return self._compute_logprobs_and_loss(
+            loss = self._compute_logprobs_and_loss(
                 logits,
                 ctx,
                 loss_fn,
@@ -552,12 +611,28 @@ class ArchonEngine(TrainEngine):
                 total_loss_weight,
                 loss_multiplier=self.data_parallel_world_size,
             )
+            if return_loss:
+                losses.append(loss.detach())
+            return loss
 
         self.forward_backward_batch(mb_list, process_output, forward_only=False)
 
-        stats = self.optimizer_step()
-        stats["num_micro_batches"] = len(mb_list.mbs)
-        return stats
+        result = self.optimizer_step()
+        result["num_micro_batches"] = len(mb_list.mbs)
+        if return_loss:
+            if losses:
+                # Non-DTA path stores per-microbatch scaled loss:
+                #   loss_i * (w_i / W_total) * dp_world_size
+                # Summing over microbatches then dividing by dp_world_size aligns
+                # with DTA's returned objective:
+                #   sum_i loss_i * (w_i / W_total)
+                local_loss = float(torch.stack(losses).sum().item()) / float(
+                    self.data_parallel_world_size
+                )
+            else:
+                local_loss = float("nan")
+            result["loss"] = local_loss
+        return result
 
     @torch.no_grad()
     def eval_batch(
@@ -630,20 +705,31 @@ class ArchonEngine(TrainEngine):
         batch_size = len(output_seqlens)
 
         mb_list = self._prepare_mb_list(input_batched).to(self.device)
+        if self.tree_training_mode == "dta":
+            self.logger.info("tree_training_mode='dta' in forward_batch")
+            dta_out = self.dta_wrapper.run_forward(mb_list=mb_list)
+            # DTA outputs already follow forward micro-batch order.
+            # Align seqlens to the same order and let reorder_and_pad_outputs
+            # restore original batch order via backward_indices.
+            seqlens_fwd = [output_seqlens[i] for i in mb_list.forward_indices]
+            outputs = [
+                dta_out[i, : int(seqlens_fwd[i])] for i in range(len(seqlens_fwd))
+            ]
+        else:
 
-        def process_output(
-            logits: torch.Tensor, ctx_dict: dict[str, Any]
-        ) -> torch.Tensor:
-            ctx = ArchonTrainContext(**ctx_dict)
-            return self._compute_forward_result(logits, ctx)
+            def process_output(
+                logits: torch.Tensor, ctx_dict: dict[str, Any]
+            ) -> torch.Tensor:
+                ctx = ArchonTrainContext(**ctx_dict)
+                return self._compute_forward_result(logits, ctx)
 
-        outputs = self.forward_backward_batch(
-            mb_list, process_output, forward_only=True
-        )
+            outputs = self.forward_backward_batch(
+                mb_list, process_output, forward_only=True
+            )
 
         if self.pp_has_last_stage:
             assert outputs is not None
-            if self.enable_tree_training:
+            if self.tree_training_mode == "sparse":
                 res = merge_packed_tree_results(outputs, batch_size)
             else:
                 res = reorder_and_pad_outputs(
@@ -948,6 +1034,11 @@ class ArchonEngine(TrainEngine):
         enable_compile: bool,
     ) -> None:
         """Apply parallelism using parallelize_fn."""
+        if self.tree_training_mode == "dta":
+            self.model = parallelize_fn_zero1(self.model)
+            self.model_parts = [self.model]
+            return
+
         self.spec.parallelize_fn(
             model=self.model,
             parallel_dims=self.parallel_dims,
@@ -971,7 +1062,7 @@ class ArchonEngine(TrainEngine):
 
         # Tree training: labels are derived from trie structure, not torch.roll.
         # (Tree input_ids is 1D packed format, so roll would be wrong anyway.)
-        if self.enable_tree_training:
+        if self.tree_training_mode == "sparse":
             assert trie_node is not None
             ctx = ArchonTrainContext(
                 mb_input=mb_item.orig_mb,
@@ -1095,7 +1186,7 @@ class ArchonEngine(TrainEngine):
         """Create model structure on meta device without loading weights."""
         # Use tree attention type when tree training is enabled
         attn_type = self.config.archon.attn_type
-        if self.enable_tree_training:
+        if self.tree_training_mode == "sparse":
             if attn_type != "tree":
                 self.logger.warning(
                     f"Tree training enabled, overriding attn_type '{self.config.archon.attn_type}' -> 'tree'"
@@ -1140,6 +1231,22 @@ class ArchonEngine(TrainEngine):
                 for model in self.model_parts:
                     model.init_weights()
 
+        # DTA-only: parallelize_fn is identity, so no tie in parallelize_*; checkpoint
+        # load materializes separate tensors per key. Re-bind after load so embed and
+        # lm_head share storage (disabled path unchanged: tie remains in parallelize_*).
+        if self.tree_training_mode == "dta":
+            for model in self.model_parts:
+                if (
+                    model.model_args.enable_weight_tying
+                    and model.output is not None
+                    and model.tok_embeddings is not None
+                ):
+                    model.output.weight = model.tok_embeddings.weight
+                    self.logger.info(
+                        "DTA: applied weight tying (output.weight = tok_embeddings.weight) "
+                        "after loading weights"
+                    )
+
         for model in self.model_parts:
             model.init_buffers(buffer_device=buffer_device)
 
@@ -1156,9 +1263,16 @@ class ArchonEngine(TrainEngine):
 
         tik = time.perf_counter()
 
-        self.optimizer = create_optimizer(
-            self._get_all_parameters(), self.optimizer_config
-        )
+        if self.tree_training_mode == "dta":
+            self.optimizer = create_zero1_optimizer(
+                self._get_all_parameters(),
+                self.optimizer_config,
+                self.data_parallel_group,
+            )
+        else:
+            self.optimizer = create_optimizer(
+                self._get_all_parameters(), self.optimizer_config
+            )
         self.lr_scheduler = create_lr_scheduler(
             self.optimizer, self.optimizer_config, ft_spec.total_train_steps
         )
@@ -1179,7 +1293,7 @@ class ArchonEngine(TrainEngine):
 
         # Tree training path
         # Note: CP/PP incompatibility is validated in initialize().
-        if self.enable_tree_training:
+        if self.tree_training_mode == "sparse":
             mb_list = build_packed_tree_batch(
                 input_,
                 mb_spec=self.config.mb_spec,
@@ -1195,29 +1309,50 @@ class ArchonEngine(TrainEngine):
 
         input_ = amend_position_ids(input_)
 
-        # Pipeline parallelism requires n_microbatches >= num_total_stages
-        if self.parallel_dims.pp_enabled:
-            pp_size = self.parallel_dims.pp
-            stages_per_rank = len(self.pp_stages)
-            num_total_stages = pp_size * stages_per_rank
-            n_seqs = input_["attention_mask"].shape[0]
-            if n_seqs < num_total_stages:
-                raise RuntimeError(
-                    f"Pipeline parallelism requires at least {num_total_stages} "
-                    f"sequences (pp_size={pp_size} * stages_per_rank="
-                    f"{stages_per_rank}), but got {n_seqs}. "
-                    f"Increase batch size or reduce PP degree/stages."
-                )
-            min_n_mbs = num_total_stages
+        if self.tree_training_mode == "dta":
+            # DTA uses one sequence per microbatch for sequence-level loss via DTAEngine.
+            # PP/CP incompatibility is validated in initialize().
+            n_seqs = input_["input_ids"].shape[0]
             mb_spec = MicroBatchSpec.new(
                 self.config.mb_spec,
-                n_mbs=max(min_n_mbs, self.config.mb_spec.n_mbs or 1),
-                n_mbs_divisor=pp_size,
+                n_mbs=n_seqs,
+                granularity=1,
+                max_tokens_per_mb=self.config.mb_spec.max_tokens_per_mb,
+            )
+            # Keep DTA per-rank independent: one sequence per microbatch, no
+            # cross-rank synced microbatch-count alignment.
+            mb_list = split_padded_tensor_dict_into_mb_list(
+                input_, mb_spec, one_seq_per_mb=True
+            )
+            assert len(mb_list.mbs) == n_seqs, (
+                f"DTA requires one microbatch per sequence, "
+                f"expected {n_seqs} microbatches but got {len(mb_list.mbs)}."
             )
         else:
-            mb_spec = self.config.mb_spec
+            # Pipeline parallelism requires n_microbatches >= num_total_stages.
+            # DTA path above is PP-incompatible and therefore bypasses this branch.
+            if self.parallel_dims.pp_enabled:
+                pp_size = self.parallel_dims.pp
+                stages_per_rank = len(self.pp_stages)
+                num_total_stages = pp_size * stages_per_rank
+                n_seqs = input_["attention_mask"].shape[0]
+                if n_seqs < num_total_stages:
+                    raise RuntimeError(
+                        f"Pipeline parallelism requires at least {num_total_stages} "
+                        f"sequences (pp_size={pp_size} * stages_per_rank="
+                        f"{stages_per_rank}), but got {n_seqs}. "
+                        f"Increase batch size or reduce PP degree/stages."
+                    )
+                min_n_mbs = num_total_stages
+                mb_spec = MicroBatchSpec.new(
+                    self.config.mb_spec,
+                    n_mbs=max(min_n_mbs, self.config.mb_spec.n_mbs or 1),
+                    n_mbs_divisor=pp_size,
+                )
+            else:
+                mb_spec = self.config.mb_spec
+            mb_list = split_padded_tensor_dict_into_mb_list(input_, mb_spec)
 
-        mb_list = split_padded_tensor_dict_into_mb_list(input_, mb_spec)
         mb_list.mbs = [pack_tensor_dict(mb) for mb in mb_list.mbs]
 
         # LCM ensures page-aligned memory and exact CP slicing without extra padding.
@@ -1304,7 +1439,7 @@ class ArchonEngine(TrainEngine):
         ctx: ArchonTrainContext,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None:
         """Compute (logprobs, entropy, vocab_min, vocab_max) for actor training."""
-        if self.enable_tree_training:
+        if self.tree_training_mode == "sparse":
             # Handle dummy trie (empty tree for DP synchronization)
             if ctx.trie_node is None or not ctx.trie_node.all_sequence_ids:
                 return None
@@ -1347,7 +1482,7 @@ class ArchonEngine(TrainEngine):
         ctx: ArchonTrainContext,
     ) -> torch.Tensor | dict[int, torch.Tensor]:
         """Compute actor logprobs for forward-only path."""
-        if self.enable_tree_training:
+        if self.tree_training_mode == "sparse":
             assert ctx.trie_node is not None
             return _gather_packed_tree_logprobs(
                 logits,

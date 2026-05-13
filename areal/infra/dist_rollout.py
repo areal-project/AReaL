@@ -2,20 +2,49 @@
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any
 
+import torch
 import torch.distributed as dist
 from torchdata.stateful_dataloader import StatefulDataLoader
 
 from areal.api import InferenceEngine, TrainEngine, WorkflowLike
 from areal.infra.platforms import current_platform
+from areal.utils import stats_tracker
 from areal.utils.data import (
     all_gather_tensor_container,
     broadcast_tensor_container,
+    extract_single_valid_token_sequence,
+    get_total_valid_tokens,
     split_and_unpad_tensor,
     tensor_container_to,
 )
 from areal.utils.seqpack import get_allocate_fn
+
+
+class _TreeTokenOnlyTimeModel:
+    def pred(self, stats: dict[str, Any]) -> float:
+        return float(stats["n_tree_tokens"])
+
+
+def _validate_group_indices(
+    group_indices: list[list[int]], n_groups: int, n_items: int
+) -> None:
+    if len(group_indices) != n_groups:
+        raise ValueError(
+            f"group_indices must contain exactly {n_groups} groups, got {len(group_indices)}."
+        )
+    flat_indices = [idx for group in group_indices for idx in group]
+    if len(flat_indices) != n_items:
+        raise ValueError(
+            f"group_indices must assign exactly {n_items} items, got {len(flat_indices)}."
+        )
+    if sorted(flat_indices) != list(range(n_items)):
+        raise ValueError(
+            "group_indices must be a permutation of [0, ..., n_items-1] "
+            "(no duplicates, no missing/out-of-range indices)."
+        )
 
 
 @dataclass
@@ -24,6 +53,83 @@ class RedistributedData:
     data: list[dict[str, Any]]
     rank: int
     group_indices: list[list[int]]
+    dta_metrics: "DTAMetrics | None" = None
+
+
+@dataclass(slots=True)
+class DTAMetrics:
+    n_tokens: float
+    n_tree_tokens_before_allocation: float
+    n_tree_tokens_after_allocation: float
+    compression_ratio_before_allocation: float
+    compression_ratio_after_allocation: float
+
+    def to_stats(self) -> dict[str, float]:
+        return {
+            "dta/n_tokens": self.n_tokens,
+            "dta/n_tree_tokens_before_allocation": self.n_tree_tokens_before_allocation,
+            "dta/n_tree_tokens_after_allocation": self.n_tree_tokens_after_allocation,
+            "dta/compression_ratio_before_allocation": self.compression_ratio_before_allocation,
+            "dta/compression_ratio_after_allocation": self.compression_ratio_after_allocation,
+        }
+
+
+@dataclass(slots=True)
+class DTAAllocationResult:
+    group_indices: list[list[int]]
+    metrics: DTAMetrics
+
+
+def _dta_allocate(
+    trajectories: list[dict[str, Any]],
+    n_groups: int,
+) -> DTAAllocationResult:
+    from areal.experimental.dta.dp import LB_by_DFS_and_TM
+    from areal.experimental.dta.token_trie import TokenTrie
+
+    token_seqs: list[torch.Tensor] = []
+    for idx, trajectory in enumerate(trajectories):
+        try:
+            seq = extract_single_valid_token_sequence(trajectory)
+        except (TypeError, ValueError) as err:
+            raise ValueError(
+                f"Invalid trajectory format at index {idx} for DTA partitioning."
+            ) from err
+        token_seqs.append(seq)
+
+    all_stats = TokenTrie(token_seqs).get_stats(mode="backward")
+    n_total_tokens = float(all_stats["n_tokens"])
+    n_tree_tokens_before = float(all_stats["n_tree_tokens"])
+
+    config = SimpleNamespace(K=n_groups, mode="backward", block_size=None)
+    group_indices = LB_by_DFS_and_TM(token_seqs, _TreeTokenOnlyTimeModel(), config)
+
+    n_tree_tokens_after = 0.0
+    for group in group_indices:
+        if not group:
+            continue
+        group_token_seqs = [token_seqs[idx] for idx in group]
+        group_stats = TokenTrie(group_token_seqs).get_stats(mode="backward")
+        n_tree_tokens_after += float(group_stats["n_tree_tokens"])
+
+    compression_ratio_before = (
+        n_total_tokens / n_tree_tokens_before
+        if n_tree_tokens_before > 0
+        else float("nan")
+    )
+    compression_ratio_after = (
+        n_total_tokens / n_tree_tokens_after
+        if n_tree_tokens_after > 0
+        else float("nan")
+    )
+    metrics = DTAMetrics(
+        n_tokens=n_total_tokens,
+        n_tree_tokens_before_allocation=n_tree_tokens_before,
+        n_tree_tokens_after_allocation=n_tree_tokens_after,
+        compression_ratio_before_allocation=compression_ratio_before,
+        compression_ratio_after_allocation=compression_ratio_after,
+    )
+    return DTAAllocationResult(group_indices=group_indices, metrics=metrics)
 
 
 def redistribute_trajectories(
@@ -45,7 +151,9 @@ def redistribute_trajectories(
     group : dist.ProcessGroup, optional
         The process group for communication. If None, uses the default group.
     packing_algorithm : str, optional
-        Packing algorithm to use ("ffd" or "kk"). Default is "ffd".
+        How to pack trajectories across data-parallel ranks: ``"ffd"`` or ``"kk"``
+        balance by total sequence length; ``"dta"`` uses DTA DFS-order partitioning
+        with ``n_tree_tokens`` as cost. Default ``"ffd"``.
 
     Returns
     -------
@@ -65,7 +173,7 @@ def redistribute_trajectories(
         all_data.extend(traj_list)
 
     # Compute sequence lengths for load balancing
-    seqlens = [d["attention_mask"].sum().item() for d in all_data]
+    seqlens = [get_total_valid_tokens(d) for d in all_data]
 
     # Remove pad positions from each trajectory (split_and_unpad_tensor
     # auto-derives trim lengths from attention_mask when traj_seqlens=None)
@@ -76,21 +184,40 @@ def redistribute_trajectories(
         for d in all_data
     ]
 
-    allocate_fn = get_allocate_fn(packing_algorithm)
-    # Allocate trajectories to ranks using the configured packing algorithm
-    # No capacity limit leads to balanced partition across this group
-    group_indices = allocate_fn(
-        seqlens, capacity=int(1e12), min_groups=dist.get_world_size(group)
-    )
-    local_indices = group_indices[dist.get_rank(group=group)]
+    n_groups = dist.get_world_size(group)
+    if packing_algorithm == "dta":
+        # Unpack group-level trajectories into sequence-level for DTA
+        from areal.utils.data import unpack_groups_to_sequences
+
+        all_data = unpack_groups_to_sequences(all_data)
+
+        dta_result = _dta_allocate(all_data, n_groups)
+        group_indices = dta_result.group_indices
+        dta_metrics = dta_result.metrics
+    elif packing_algorithm in ("ffd", "kk"):
+        allocate_fn = get_allocate_fn(packing_algorithm)
+        # Allocate trajectories to ranks using the configured packing algorithm
+        # No capacity limit leads to balanced partition across this group
+        group_indices = allocate_fn(
+            seqlens, capacity=int(1e12), min_groups=dist.get_world_size(group)
+        )
+        dta_metrics = None
+    else:
+        raise ValueError(
+            f"Unsupported packing_algorithm: {packing_algorithm!r}. "
+            "Expected one of {'ffd', 'kk', 'dta'}."
+        )
+    _validate_group_indices(group_indices, n_groups=n_groups, n_items=len(all_data))
 
     # Select assigned trajectories for this rank (no concatenation — deferred to train side)
+    local_indices = group_indices[dist.get_rank(group=group)]
     data = [all_data[i] for i in local_indices]
     return RedistributedData(
         all_data=all_data,
         data=data,
         rank=dist.get_rank(group=group),
         group_indices=group_indices,
+        dta_metrics=dta_metrics,
     )
 
 
@@ -122,21 +249,31 @@ class DistRolloutCoordinator:
         list[dict[str, Any]]
             Redistributed and broadcast batch available on all ranks (list of trajs)
         """
+        rollout_packing = self.train_engine.config.packing_algorithm
+
         if trajectories is not None:
-            config = getattr(self.train_engine, "config", None)
-            mb_spec = getattr(config, "mb_spec", None)
-            packing_algorithm = getattr(mb_spec, "packing_algorithm", "ffd")
             redist = redistribute_trajectories(
                 trajectories,
                 group=self.train_engine.data_parallel_group,
-                packing_algorithm=packing_algorithm,
+                packing_algorithm=rollout_packing,
             )
             batch = redist.data
+            dta_metrics_payload = [redist.dta_metrics]
         else:
             batch = None
+            dta_metrics_payload = [None]
 
         current_platform.synchronize()
         dist.barrier(group=self.train_engine.cpu_group)
+
+        dist.broadcast_object_list(
+            dta_metrics_payload,
+            src=self.train_engine.current_data_parallel_head(),
+            group=self.train_engine.context_and_model_parallel_group,
+        )
+        dta_metrics = dta_metrics_payload[0]
+        if dta_metrics is not None:
+            stats_tracker.scalar(**dta_metrics.to_stats())
 
         batch = broadcast_tensor_container(
             batch,

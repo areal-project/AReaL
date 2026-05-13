@@ -276,6 +276,7 @@ class VarlenAttentionWrapper(nn.Module):
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
         tree_attn_meta: TreeAttentionMeta | None = None,
+        cu_seqlens_k: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Compute attention with varlen_attn.
 
@@ -308,15 +309,20 @@ class VarlenAttentionWrapper(nn.Module):
         v_3d = v.squeeze(0).transpose(0, 1).contiguous()
 
         # Ensure cu_seqlens is int32 (required by flash_attn)
-        cu_seqlens_i32 = cu_seqlens.to(torch.int32)
+        cu_seqlens_q_i32 = cu_seqlens.to(torch.int32)
+
+        if cu_seqlens_k is None:
+            cu_seqlens_k_i32 = cu_seqlens_q_i32
+        else:
+            cu_seqlens_k_i32 = cu_seqlens_k.to(torch.int32)
 
         # Call varlen_attn (self-attention: q and k have same cu_seqlens)
         out = varlen_attn(
             q_3d,
             k_3d,
             v_3d,
-            cu_seqlens_i32,
-            cu_seqlens_i32,
+            cu_seqlens_q_i32,
+            cu_seqlens_k_i32,
             max_seqlen,
             max_seqlen,
             is_causal=True,

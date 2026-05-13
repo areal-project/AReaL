@@ -108,10 +108,10 @@ actor:
 | `eps_clip`        | float         | `0.2`  | 下裁剪边界：比率裁剪到 `[1-eps_clip, ...]`                       |
 | `eps_clip_higher` | float \| None | `None` | 上裁剪边界：设置时，比率裁剪到 `[1-eps_clip, 1+eps_clip_higher]` |
 
-当 `eps_clip_higher` 为 `None` 时，使用对称裁剪： $\text{clip}(r, 1-\epsilon, 1+\epsilon)$。
+当 `eps_clip_higher` 为 `None` 时，使用对称裁剪： $\\text{clip}(r, 1-\\epsilon, 1+\\epsilon)$。
 
-当设置 `eps_clip_higher` 时（DAPO风格），使用非对称裁剪： $\text{clip}(r, 1-\epsilon_{\text{low}},
-1+\epsilon_{\text{high}})$。
+当设置 `eps_clip_higher` 时（DAPO风格），使用非对称裁剪： $\\text{clip}(r, 1-\\epsilon\_{\\text{low}},
+1+\\epsilon\_{\\text{high}})$。
 
 ### 重要性采样级别（`actor.importance_sampling_level`）
 
@@ -197,7 +197,7 @@ SAPO用软sigmoid门替换PPO的硬裁剪，提供平滑梯度和非对称控制
 
 **标准PPO：**
 
-$$ L^{\text{PPO}} = -\mathbb{E}_t[\min(r_t A_t, r_t^{\text{clip}} A_t)] $$
+$$ L^{\\text{PPO}} = -\\mathbb{E}\_t\[\\min(r_t A_t, r_t^{\\text{clip}} A_t)\] $$
 
 **SAPO（带软门）：**
 
@@ -235,7 +235,7 @@ r_{i,t}(\theta) \hat{A}_{i,t}, \text{clip}\left( r_{i,t}(\theta),
 1-\epsilon_{\text{low}}, 1+\epsilon_{\text{high}} \right) \hat{A}_{i,t}
 \right) \right] $$
 
-其中 $\hat{A}_{i,t}$ 是分组归一化优势，$r_{i,t}(\theta)$ 是token级策略比率。
+其中 $\\hat{A}_{i,t}$ 是分组归一化优势，$r_{i,t}(\\theta)$ 是token级策略比率。
 
 **非对称裁剪参数：**
 
