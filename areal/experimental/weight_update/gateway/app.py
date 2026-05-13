@@ -23,6 +23,7 @@ from areal.experimental.weight_update.gateway.kv_store import WeightMetaStore
 from areal.experimental.weight_update.gateway.pair_registry import PairRegistry
 from areal.infra.utils.http import async_http_retry
 from areal.utils import logging
+from areal.utils.network import find_free_ports
 
 logger = logging.getLogger("WeightUpdateGateway")
 
@@ -37,6 +38,7 @@ class ConnectRequest(BaseModel):
     save_path: str = ""
     use_lora: bool = False
     lora_name: str = ""
+    colocate: bool = False
 
 
 class UpdateWeightsRequest(BaseModel):
@@ -195,6 +197,11 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
         pair_name = body.pair_name
         train_urls = body.train_worker_urls
         inference_urls = body.inference_worker_urls
+
+        if body.colocate:
+            return await _connect_colocate(
+                request, pair_name, train_urls, inference_urls
+            )
 
         if body.mode == "disk":
             if not body.save_path:
@@ -363,6 +370,212 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
         logger.info("Connected pair '%s'", pair_name)
         return ConnectResponse(pair_name=pair_name)
 
+    async def _connect_colocate(
+        request: Request,
+        pair_name: str,
+        train_urls: list[str],
+        inference_urls: list[str],
+    ) -> ConnectResponse:
+        session = request.app.state.http_session
+        init_timeout_s = config.init_timeout_s
+
+        train_par, infer_par = await asyncio.gather(
+            _get_json(
+                session,
+                f"{train_urls[0]}/awex/report_parallelism",
+                init_timeout_s,
+            ),
+            _get_json(
+                session,
+                f"{inference_urls[0]}/awex/report_parallelism",
+                init_timeout_s,
+            ),
+        )
+
+        train_world_size = train_par["world_size"]
+        num_engines = len(inference_urls)
+        # report_parallelism returns per-instance world_size (e.g. TP size).
+        # The total inference world for colocate NCCL groups spans all engines.
+        infer_world_size = infer_par["world_size"] * num_engines
+
+        train_meta_resps, infer_meta_resps = await asyncio.gather(
+            asyncio.gather(
+                *[
+                    _post_json(
+                        session, f"{url}/awex/report_weight_meta", init_timeout_s
+                    )
+                    for url in train_urls
+                ]
+            ),
+            asyncio.gather(
+                *[
+                    _post_json(
+                        session, f"{url}/awex/report_weight_meta", init_timeout_s
+                    )
+                    for url in inference_urls
+                ]
+            ),
+        )
+
+        training_params_meta = []
+        for result in train_meta_resps:
+            meta = result.get("result", result.get("meta", result))
+            if isinstance(meta, list):
+                training_params_meta.extend(meta)
+            else:
+                training_params_meta.append(meta)
+        training_params_meta = _merge_training_meta_by_name(training_params_meta)
+
+        infer_params_meta = []
+        for result in infer_meta_resps:
+            meta = result.get("result", result.get("meta", result))
+            if isinstance(meta, list):
+                infer_params_meta.extend(meta)
+            else:
+                infer_params_meta.append(meta)
+
+        kv_store.put(pair_name, "training_params_meta", training_params_meta)
+        kv_store.put(pair_name, "infer_params_meta", infer_params_meta)
+
+        gateway_addr = (
+            _get_own_ip() if config.host in ("0.0.0.0", "::") else config.host
+        )
+        kv_store_url = f"http://{gateway_addr}:{config.gateway_port}"
+
+        [master_port] = find_free_ports(1)
+
+        init_payload_base = {
+            "pair_name": pair_name,
+            "kv_store_url": kv_store_url,
+            "infer_world_size": infer_world_size,
+            "train_world_size": train_world_size,
+            "num_engines": num_engines,
+            "master_port": master_port,
+            "admin_api_key": config.admin_api_key,
+        }
+
+        init_tasks = []
+        for i, url in enumerate(inference_urls):
+            init_tasks.append(
+                _post(
+                    session,
+                    f"{url}/awex/init_colocate_weight_update",
+                    init_timeout_s,
+                    json_data={**init_payload_base, "transfer_rank": i},
+                )
+            )
+        for i, url in enumerate(train_urls):
+            init_tasks.append(
+                _post(
+                    session,
+                    f"{url}/awex/init_colocate_weight_update",
+                    init_timeout_s,
+                    json_data={
+                        **init_payload_base,
+                        "transfer_rank": infer_world_size + i,
+                    },
+                )
+            )
+        await asyncio.gather(*init_tasks)
+
+        pair_info = PairInfo(
+            pair_name=pair_name,
+            train_worker_urls=train_urls,
+            inference_worker_urls=inference_urls,
+            train_world_size=train_world_size,
+            inference_world_size=infer_world_size,
+            colocate=True,
+        )
+        registry.register(pair_info)
+
+        logger.info("Connected colocate pair '%s'", pair_name)
+        return ConnectResponse(pair_name=pair_name)
+
+    async def _colocate_transfer_weights(
+        pair_info: PairInfo,
+        version: int,
+        session: aiohttp.ClientSession,
+        timeout_s: float,
+    ) -> None:
+        await asyncio.gather(
+            *[
+                _post(
+                    session,
+                    f"{url}/awex/release_memory",
+                    timeout_s,
+                    json_data={"tags": ["optimizer"]},
+                )
+                for url in pair_info.train_worker_urls
+            ]
+        )
+
+        await asyncio.gather(
+            *[
+                _post(
+                    session,
+                    f"{url}/awex/resume_memory",
+                    timeout_s,
+                    json_data={"tags": ["weights"]},
+                )
+                for url in pair_info.inference_worker_urls
+            ]
+        )
+
+        await asyncio.gather(
+            *[
+                _post(
+                    session,
+                    f"{url}/awex/execute_colocate_weight_update",
+                    timeout_s,
+                    json_data={"version": version},
+                )
+                for url in pair_info.train_worker_urls
+            ],
+            *[
+                _post(
+                    session,
+                    f"{url}/awex/execute_colocate_weight_update",
+                    timeout_s,
+                    json_data={"version": version},
+                )
+                for url in pair_info.inference_worker_urls
+            ],
+        )
+
+        await asyncio.gather(
+            *[
+                _post(
+                    session,
+                    f"{url}/awex/release_memory",
+                    timeout_s,
+                    json_data={"tags": ["weights"]},
+                )
+                for url in pair_info.train_worker_urls
+            ]
+        )
+
+        await asyncio.gather(
+            *[
+                _post(
+                    session,
+                    f"{url}/awex/resume_memory",
+                    timeout_s,
+                    json_data={"tags": ["kv_cache"]},
+                )
+                for url in pair_info.inference_worker_urls
+            ]
+        )
+
+        # Flush colocate KV keys for this version to prevent accumulation
+        infer_world_size = pair_info.inference_world_size
+        train_world_size = pair_info.train_world_size
+        for i in range(train_world_size):
+            transfer_rank = infer_world_size + i
+            weight_key = f"colocate_weights_rank{transfer_rank}_{version}"
+            done_key = f"colocate_done_rank{transfer_rank}_{version}"
+            kv_store.delete(pair_info.pair_name, weight_key)
+            kv_store.delete(pair_info.pair_name, done_key)
+
     @asynccontextmanager
     async def _inference_paused(
         session: aiohttp.ClientSession,
@@ -495,7 +708,11 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
                 timeout_s,
                 pair_info.pair_name,
             ):
-                if pair_info.mode == "disk":
+                if pair_info.colocate:
+                    await _colocate_transfer_weights(
+                        pair_info, body.version, session, timeout_s
+                    )
+                elif pair_info.mode == "disk":
                     await _disk_transfer_weights(
                         pair_info, body.version, session, timeout_s
                     )

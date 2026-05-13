@@ -60,6 +60,9 @@ class PairInfo:
     use_lora: bool = False
     lora_name: str = ""
 
+    # Colocated mode (training and inference share GPUs)
+    colocate: bool = False
+
     def __post_init__(self):
         if not self.pair_name:
             raise ValueError("pair_name must not be empty")

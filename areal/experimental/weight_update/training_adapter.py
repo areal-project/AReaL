@@ -57,3 +57,30 @@ class AwexTrainingAdapter(Protocol):
     def teardown_weight_update_group(self) -> None:
         """Destroy NCCL group and clear cached state."""
         ...
+
+    def init_colocate_weight_update(
+        self,
+        pair_name: str,
+        kv_store_url: str,
+        transfer_rank: int,
+        infer_world_size: int,
+        train_world_size: int,
+        num_engines: int,
+        master_port: int,
+        admin_api_key: str = "areal-admin-key",
+        timeout_s: float = 120.0,
+    ) -> None:
+        """Register device info in KV store for colocated weight transfer."""
+        ...
+
+    def execute_colocate_weight_update(self, version: int) -> None:
+        """Serialize weights via IPC and put to KV store."""
+        ...
+
+    def release_memory(self, tags: list[str] | None = None) -> None:
+        """Release GPU memory (optimizer/weights) for colocated mode."""
+        ...
+
+    def resume_memory(self, tags: list[str] | None = None) -> None:
+        """Resume GPU memory occupation."""
+        ...

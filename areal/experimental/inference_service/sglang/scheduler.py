@@ -62,6 +62,10 @@ class AwexSchedulerBridge:
             "awex_batch_isend_irecv",
             "awex_get_parameters",
             "awex_randomize_parameters",
+            "awex_init_colocate_weight_update",
+            "awex_execute_colocate_weight_update",
+            "awex_release_memory",
+            "awex_resume_memory",
         ]
         for name in methods:
             setattr(self._scheduler, name, getattr(self, name))
@@ -116,6 +120,18 @@ class AwexSchedulerBridge:
 
     def awex_randomize_parameters(self) -> None:
         self._require_adapter().randomize_parameters()
+
+    def awex_init_colocate_weight_update(self, **kwargs: Any) -> None:
+        self._require_adapter().init_colocate_weight_update(**kwargs)
+
+    def awex_execute_colocate_weight_update(self, version: int = 0) -> None:
+        self._require_adapter().execute_colocate_weight_update(version)
+
+    def awex_release_memory(self, tags: list[str] | None = None) -> None:
+        self._require_adapter().release_memory(tags)
+
+    def awex_resume_memory(self, tags: list[str] | None = None) -> None:
+        self._require_adapter().resume_memory(tags)
 
 
 # ---------------------------------------------------------------------------

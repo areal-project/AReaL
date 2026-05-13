@@ -892,3 +892,329 @@ def test_awex_megatron_dp_ep_e2e_weight_update(
         validate_param_names=_VALIDATE_PARAM_NAMES_MOE,
         init_from_scratch=True,
     )
+
+
+# ---------------------------------------------------------------------------
+# Colocated weight update: Megatron + SGLang on the SAME GPUs (pure DP)
+# ---------------------------------------------------------------------------
+
+
+def _run_megatron_colocate_e2e(
+    *,
+    n_gpus: int,
+    pair_name: str,
+    tag: str,
+    tmp_path_factory,
+    model_path: str | None = None,
+):
+    """Colocated weight transfer: MegatronEngine + SGLang share the same GPUs.
+
+    Unlike the separated tests where inference and training each own a
+    disjoint half of the GPUs, colocated mode puts both on every GPU.
+    The LocalScheduler round-robin counter naturally wraps, giving
+    inference GPUs 0..N-1 and training GPUs 0..N-1 (same devices).
+
+    Only pure DP is supported for colocated mode (TP=1, PP=1, EP=1).
+    """
+    from areal.api import FinetuneSpec
+    from areal.api.cli_args import (
+        InferenceEngineConfig,
+        OptimizerConfig,
+        SchedulingSpec,
+        TrainEngineConfig,
+    )
+    from areal.experimental.inference_service.controller.controller import (
+        RolloutControllerV2,
+    )
+    from areal.experimental.training_service.controller.controller import (
+        GatewayTrainController,
+    )
+    from areal.experimental.weight_update.controller import (
+        WeightUpdateController,
+        WeightUpdateControllerConfig,
+    )
+
+    tmp = tmp_path_factory.mktemp(tag)
+    model_path = model_path or _get_test_model_path()
+    scheduler = _make_local_scheduler(tmp, tag, gpu_devices=list(range(n_gpus)))
+
+    # Both inference and training use ALL n_gpus GPUs (colocated).
+    inf_config = InferenceEngineConfig(
+        tokenizer_path=model_path,
+        backend=f"sglang:d{n_gpus}",
+        scheduling_spec=(
+            SchedulingSpec(
+                gpu=1,
+                cmd="python -m areal.experimental.inference_service.guard",
+            ),
+        ),
+        consumer_batch_size=8,
+        max_head_offpolicyness=1024,
+        setup_timeout=300.0,
+        admin_api_key="test-admin",
+    )
+    inf_ctrl = RolloutControllerV2(config=inf_config, scheduler=scheduler)
+
+    train_config = TrainEngineConfig(
+        backend=f"megatron:d{n_gpus}",
+        experiment_name=f"test-awex-{tag}",
+        trial_name="t0",
+        path=model_path,
+        optimizer=OptimizerConfig(),
+        _version="v2",
+        setup_timeout=300.0,
+        scheduling_spec=(
+            SchedulingSpec(
+                gpu=1,
+                cmd="python -m areal.experimental.training_service.guard",
+                env_vars=dict(NCCL_CUMEM_ENABLE="0", NCCL_NVLS_ENABLE="0"),
+            ),
+        ),
+    )
+    train_ctrl = GatewayTrainController(
+        train_engine="areal.engine.megatron_engine.MegatronLMEngine",
+        config=train_config,
+        scheduler=scheduler,
+    )
+
+    wu_ctrl: WeightUpdateController | None = None
+    try:
+        # -- 1. SGLang inference (uses GPUs 0..N-1) -------------------------
+        inf_ctrl.initialize(
+            role="rollout",
+            server_args={"model_path": model_path, "mem_fraction_static": 0.7},
+        )
+        inf_worker_urls = list(inf_ctrl._inf_addrs)
+
+        # Randomize inference weights so the transfer is NOT a no-op.
+        for url in inf_worker_urls:
+            resp = httpx.post(f"{url}/awex/debug/randomize_parameters", timeout=120.0)
+            assert resp.status_code == 200, f"randomize_parameters failed: {resp.text}"
+
+        # -- 2. Megatron training (wraps to same GPUs 0..N-1) ---------------
+        train_ctrl.initialize(
+            role="actor",
+            ft_spec=FinetuneSpec(
+                total_train_epochs=1, dataset_size=100, train_batch_size=2
+            ),
+        )
+        train_worker_urls = list(train_ctrl._worker_addrs)
+
+        # -- 3. Weight update gateway ---------------------------------------
+        wu_ctrl = WeightUpdateController(
+            config=WeightUpdateControllerConfig(host="127.0.0.1", request_timeout=300.0)
+        )
+        wu_ctrl.initialize()
+        assert wu_ctrl.health_check(), "Weight update gateway health check failed"
+
+        # -- 4. Connect with colocate=True ----------------------------------
+        wu_ctrl.connect(
+            pair_name=pair_name,
+            train_worker_urls=train_worker_urls,
+            inference_worker_urls=inf_worker_urls,
+            colocate=True,
+        )
+
+        # -- 5. Colocated weight update -------------------------------------
+        result = wu_ctrl.update_weights(version=1)
+        assert result.status == "ok"
+        assert result.version == 1
+        wu_ctrl.disconnect()
+
+        # -- 6. Verify inference server still works post-update -------------
+        gen_resp = httpx.post(
+            f"{inf_worker_urls[0]}/generate",
+            json={
+                "text": "Hello",
+                "sampling_params": {"max_new_tokens": 5, "temperature": 0},
+            },
+            timeout=30.0,
+        )
+        assert gen_resp.status_code == 200, (
+            f"Generation failed after weight update: {gen_resp.text}"
+        )
+
+        # -- 7. Validate training ↔ inference parameter equality ------------
+        _validate_weight_update_correctness_megatron(
+            train_worker_urls=train_worker_urls,
+            inf_worker_url=inf_worker_urls[0],
+            param_dir=tmp,
+            tag=tag,
+        )
+    finally:
+        if wu_ctrl is not None:
+            wu_ctrl.destroy()
+        train_ctrl.destroy()
+        inf_ctrl.destroy()
+        scheduler.delete_workers(None)
+
+
+@pytest.mark.multi_gpu
+@pytest.mark.slow
+@pytest.mark.sglang
+@pytest.mark.parametrize("n_gpus", [2, 4, 8], ids=["2gpu", "4gpu", "8gpu"])
+def test_awex_megatron_colocate_dp_e2e_weight_update(n_gpus, tmp_path_factory):
+    """Full round trip: colocated MegatronEngine (pure DP) + SGLang on same GPUs.
+
+    Unlike separated tests that split GPUs between training and inference,
+    colocated mode shares all GPUs.  Weight transfer uses CUDA IPC
+    (zero-copy on same device) instead of NCCL P2P across devices.
+
+    Only pure DP (TP=1, PP=1, EP=1) is supported for colocated mode.
+    """
+    if current_platform.device_count() < n_gpus:
+        pytest.skip(f"This test requires {n_gpus} GPUs")
+    _run_megatron_colocate_e2e(
+        n_gpus=n_gpus,
+        pair_name=f"test_megatron_colocate_dp{n_gpus}",
+        tag=f"megatron_colocate_dp{n_gpus}",
+        tmp_path_factory=tmp_path_factory,
+    )
+
+
+@pytest.mark.multi_gpu
+@pytest.mark.slow
+@pytest.mark.sglang
+def test_awex_megatron_colocate_dp_multi_version_e2e(tmp_path_factory):
+    """Colocated weight update with multiple sequential versions.
+
+    Verifies that the colocated IPC path correctly handles version
+    sequencing: version 1 → version 2.  The KV store keys include
+    the version number, so each round must produce fresh IPC handles.
+    """
+    n_gpus = 2
+    if current_platform.device_count() < n_gpus:
+        pytest.skip(f"This test requires {n_gpus} GPUs")
+
+    from areal.api import FinetuneSpec
+    from areal.api.cli_args import (
+        InferenceEngineConfig,
+        OptimizerConfig,
+        SchedulingSpec,
+        TrainEngineConfig,
+    )
+    from areal.experimental.inference_service.controller.controller import (
+        RolloutControllerV2,
+    )
+    from areal.experimental.training_service.controller.controller import (
+        GatewayTrainController,
+    )
+    from areal.experimental.weight_update.controller import (
+        WeightUpdateController,
+        WeightUpdateControllerConfig,
+    )
+
+    tag = "megatron_colocate_multi_ver"
+    tmp = tmp_path_factory.mktemp(tag)
+    model_path = _get_test_model_path()
+    scheduler = _make_local_scheduler(tmp, tag, gpu_devices=list(range(n_gpus)))
+
+    inf_config = InferenceEngineConfig(
+        tokenizer_path=model_path,
+        backend=f"sglang:d{n_gpus}",
+        scheduling_spec=(
+            SchedulingSpec(
+                gpu=1,
+                cmd="python -m areal.experimental.inference_service.guard",
+            ),
+        ),
+        consumer_batch_size=8,
+        max_head_offpolicyness=1024,
+        setup_timeout=300.0,
+        admin_api_key="test-admin",
+    )
+    inf_ctrl = RolloutControllerV2(config=inf_config, scheduler=scheduler)
+
+    train_config = TrainEngineConfig(
+        backend=f"megatron:d{n_gpus}",
+        experiment_name=f"test-awex-{tag}",
+        trial_name="t0",
+        path=model_path,
+        optimizer=OptimizerConfig(),
+        _version="v2",
+        setup_timeout=300.0,
+        scheduling_spec=(
+            SchedulingSpec(
+                gpu=1,
+                cmd="python -m areal.experimental.training_service.guard",
+                env_vars=dict(NCCL_CUMEM_ENABLE="0", NCCL_NVLS_ENABLE="0"),
+            ),
+        ),
+    )
+    train_ctrl = GatewayTrainController(
+        train_engine="areal.engine.megatron_engine.MegatronLMEngine",
+        config=train_config,
+        scheduler=scheduler,
+    )
+
+    wu_ctrl: WeightUpdateController | None = None
+    try:
+        inf_ctrl.initialize(
+            role="rollout",
+            server_args={"model_path": model_path, "mem_fraction_static": 0.7},
+        )
+        inf_worker_urls = list(inf_ctrl._inf_addrs)
+
+        for url in inf_worker_urls:
+            resp = httpx.post(f"{url}/awex/debug/randomize_parameters", timeout=120.0)
+            assert resp.status_code == 200, f"randomize_parameters failed: {resp.text}"
+
+        train_ctrl.initialize(
+            role="actor",
+            ft_spec=FinetuneSpec(
+                total_train_epochs=1, dataset_size=100, train_batch_size=2
+            ),
+        )
+        train_worker_urls = list(train_ctrl._worker_addrs)
+
+        wu_ctrl = WeightUpdateController(
+            config=WeightUpdateControllerConfig(host="127.0.0.1", request_timeout=300.0)
+        )
+        wu_ctrl.initialize()
+        assert wu_ctrl.health_check()
+
+        wu_ctrl.connect(
+            pair_name="test_colocate_multi_ver",
+            train_worker_urls=train_worker_urls,
+            inference_worker_urls=inf_worker_urls,
+            colocate=True,
+        )
+
+        # Version 1
+        result1 = wu_ctrl.update_weights(version=1)
+        assert result1.status == "ok"
+        assert result1.version == 1
+
+        # Version 2
+        result2 = wu_ctrl.update_weights(version=2)
+        assert result2.status == "ok"
+        assert result2.version == 2
+
+        wu_ctrl.disconnect()
+
+        # Verify inference still works after two sequential updates
+        gen_resp = httpx.post(
+            f"{inf_worker_urls[0]}/generate",
+            json={
+                "text": "Hello",
+                "sampling_params": {"max_new_tokens": 5, "temperature": 0},
+            },
+            timeout=30.0,
+        )
+        assert gen_resp.status_code == 200, (
+            f"Generation failed after weight updates: {gen_resp.text}"
+        )
+
+        # Final parameter equality check
+        _validate_weight_update_correctness_megatron(
+            train_worker_urls=train_worker_urls,
+            inf_worker_url=inf_worker_urls[0],
+            param_dir=tmp,
+            tag=tag,
+        )
+    finally:
+        if wu_ctrl is not None:
+            wu_ctrl.destroy()
+        train_ctrl.destroy()
+        inf_ctrl.destroy()
+        scheduler.delete_workers(None)
