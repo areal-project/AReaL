@@ -104,6 +104,7 @@ dependencies = [
     "python_dateutil",
     "word2number",
     "pebble",
+    "tenacity>=8.2.0",
     "timeout-decorator",
     "prettytable",
     "h5py",
