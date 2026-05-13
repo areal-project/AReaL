@@ -102,6 +102,12 @@ class GroupedRolloutWorkflow(RolloutWorkflow):
                 "trajectories returned None, using remaining results"
             )
 
+        aggregate_group_results = getattr(
+            self.workflow, "aggregate_group_results", None
+        )
+        if callable(aggregate_group_results):
+            return aggregate_group_results(valid_results)
+
         # Check if results are InteractionWithTokenLogpReward dicts
         first = valid_results[0]
         if (
