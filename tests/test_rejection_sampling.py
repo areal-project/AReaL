@@ -833,6 +833,333 @@ class TestConfigValidation:
         with pytest.raises(ValueError, match="metric must be one of"):
             RejectionSamplingConfig(metric="invalid")
 
+
+class TestTwoStageRejectionSampling:
+    """Tests for two-stage Geo-RS + Token-MIS/TIS mode (from closed PR #1084).
+
+    The two-stage pipeline:
+      Stage 1 — Geo-RS: reject sequences whose geometric-mean ratio > upper.
+      Stage 2 — Token-MIS/TIS: on accepted sequences, filter/clamp per-token.
+    """
+
+    # ── Config validation ─────────────────────────────────────────────────────
+
+    def test_token_action_requires_sequence_level(self):
+        """token_action must be combined with level='sequence'."""
+        with pytest.raises(ValueError, match="level='sequence'"):
+            RejectionSamplingConfig(
+                level="token",
+                action="mask",
+                metric="ratio",
+                upper=2.0,
+                token_action="mask",
+            )
+
+    def test_token_action_requires_ratio_metric(self):
+        """token_action is only defined for metric='ratio'."""
+        with pytest.raises(ValueError, match="metric='ratio'"):
+            RejectionSamplingConfig(
+                level="sequence",
+                action="mask",
+                metric="kl_k2",
+                upper=1.0,
+                token_action="mask",
+            )
+
+    def test_token_action_requires_action_mask_at_sequence_level(self):
+        """Sequence-level stage must use action='mask' (hard rejection only)."""
+        with pytest.raises(ValueError, match="action='mask'"):
+            RejectionSamplingConfig(
+                level="sequence",
+                action="clamp",  # invalid for two-stage
+                metric="ratio",
+                upper=2.0,
+                token_action="mask",
+            )
+
+    def test_token_action_invalid_string(self):
+        """token_action must be 'mask', 'clamp', or None."""
+        with pytest.raises(ValueError, match="token_action must be one of"):
+            RejectionSamplingConfig(
+                level="sequence",
+                action="mask",
+                metric="ratio",
+                upper=2.0,
+                token_action="truncate",  # typo / invalid choice
+            )
+
+    def test_valid_two_stage_mis_config(self):
+        """Geo-RS + Token-MIS config constructs without error."""
+        config = RejectionSamplingConfig(
+            level="sequence",
+            action="mask",
+            metric="ratio",
+            agg="mean",
+            upper=2.0,
+            token_action="mask",
+        )
+        assert config.token_action == "mask"
+        assert config.level == "sequence"
+
+    def test_valid_two_stage_tis_config(self):
+        """Geo-RS + Token-TIS config constructs without error."""
+        config = RejectionSamplingConfig(
+            level="sequence",
+            action="mask",
+            metric="ratio",
+            agg="mean",
+            upper=2.0,
+            lower=0.5,
+            token_action="clamp",
+        )
+        assert config.token_action == "clamp"
+        assert config.lower == 0.5
+
+    # ── Functional tests — 2D padded format ──────────────────────────────────
+
+    @staticmethod
+    def _batch_inputs():
+        """
+        Return a 2D padded batch with three sequences of length 4.
+
+        Sequence 0: per-token ratio = 1.5  →  geo-mean = 1.5  (accepted, upper=2.0)
+        Sequence 1: per-token ratio = 3.0  →  geo-mean = 3.0  (rejected, > upper)
+        Sequence 2: per-token ratio = 0.8  →  geo-mean = 0.8  (accepted)
+        """
+        ratios = torch.tensor(
+            [
+                [1.5, 1.5, 1.5, 1.5],
+                [3.0, 3.0, 3.0, 3.0],
+                [0.8, 0.8, 0.8, 0.8],
+            ]
+        )
+        loss_mask = torch.ones(3, 4)
+        proximal_logprobs = torch.log(ratios)
+        old_logprobs = torch.zeros_like(proximal_logprobs)
+        return loss_mask, ratios, proximal_logprobs, old_logprobs
+
+    def test_stage1_rejects_divergent_sequence(self):
+        """Stage 1 (Geo-RS) must fully zero-out the rejected sequence."""
+        config = RejectionSamplingConfig(
+            level="sequence",
+            action="mask",
+            metric="ratio",
+            agg="mean",
+            upper=2.0,
+            token_action="mask",
+        )
+        loss_mask, ratios, proximal_logprobs, old_logprobs = self._batch_inputs()
+        result = apply_rejection_sampling(
+            config=config,
+            loss_mask=loss_mask,
+            cu_seqlens=None,
+            # behave_imp_weight=ratios,
+            proximal_logprobs=proximal_logprobs,
+            old_logprobs=old_logprobs,
+        )
+        new_mask = result.loss_mask
+        # Sequence 1 (geo-mean 3.0 > 2.0) must be fully masked.
+        assert new_mask[1].sum() == 0, "Rejected sequence must be fully zeroed"
+        # Sequences 0 and 2 are accepted and their token ratios ≤ upper → kept.
+        assert new_mask[0].sum() == 4
+        assert new_mask[2].sum() == 4
+
+    def test_stage2_mis_filters_high_token_within_accepted_seq(self):
+        """
+        Stage 2 (Token-MIS) filters individual high-ratio tokens inside
+        a sequence that was accepted by Geo-RS.
+        """
+        config = RejectionSamplingConfig(
+            level="sequence",
+            action="mask",
+            metric="ratio",
+            agg="mean",
+            upper=2.0,
+            token_action="mask",
+        )
+        # Seq 0: geo-mean ≈ exp(mean([0, 0, log(2.5), 0])) ≈ 1.26 → accepted by Geo-RS
+        #        but token[2] = 2.5 > upper → masked by Token-MIS
+        # Seq 1: all ratios = 1.0 → accepted, all tokens kept
+        ratios = torch.tensor(
+            [
+                [1.0, 1.0, 2.5, 1.0],
+                [1.0, 1.0, 1.0, 1.0],
+            ]
+        )
+        loss_mask = torch.ones(2, 4)
+        proximal_logprobs = torch.log(ratios)
+        old_logprobs = torch.zeros_like(proximal_logprobs)
+
+        result = apply_rejection_sampling(
+            config=config,
+            loss_mask=loss_mask,
+            cu_seqlens=None,
+            # behave_imp_weight=ratios,
+            proximal_logprobs=proximal_logprobs,
+            old_logprobs=old_logprobs,
+        )
+        new_mask = result.loss_mask
+        assert new_mask[0, 0] == 1
+        assert new_mask[0, 1] == 1
+        assert new_mask[0, 2] == 0, "Token-MIS must mask the 2.5-ratio token"
+        assert new_mask[0, 3] == 1
+        assert new_mask[1].sum() == 4, "Clean sequence must be fully kept"
+
+    def test_stage2_tis_clamps_token_weights_not_mask(self):
+        """
+        Stage 2 (Token-TIS) clamps per-token weights but must NOT zero loss_mask.
+        All tokens continue to contribute to the gradient.
+        """
+        config = RejectionSamplingConfig(
+            level="sequence",
+            action="mask",
+            metric="ratio",
+            agg="mean",
+            upper=2.0,
+            lower=0.5,
+            token_action="clamp",
+        )
+        # Both sequences accepted by Geo-RS (geo-means ≤ 2.0).
+        ratios = torch.tensor(
+            [
+                [0.2, 1.0, 1.8, 3.5],  # tokens 0 and 3 out of [0.5, 2.0]
+                [0.8, 1.2, 1.5, 0.9],  # all in range
+            ]
+        )
+        loss_mask = torch.ones(2, 4)
+        proximal_logprobs = torch.log(ratios.clamp(min=1e-6))
+        old_logprobs = torch.zeros_like(proximal_logprobs)
+
+        result = apply_rejection_sampling(
+            config=config,
+            loss_mask=loss_mask,
+            cu_seqlens=None,
+            # behave_imp_weight=ratios,
+            proximal_logprobs=proximal_logprobs,
+            old_logprobs=old_logprobs,
+        )
+        new_mask = result.loss_mask
+        new_weight = result.behave_imp_weight
+        # loss_mask must be entirely unchanged — TIS never zeros tokens.
+        assert new_mask.sum() == 8, "Token-TIS must not zero any loss_mask tokens"
+        # Weights clamped to [0.5, 2.0].
+        assert new_weight[0, 0] == pytest.approx(0.5), "0.2 clamped to lower=0.5"
+        assert new_weight[0, 1] == pytest.approx(1.0), "1.0 unchanged"
+        assert new_weight[0, 2] == pytest.approx(1.8), "1.8 unchanged"
+        assert new_weight[0, 3] == pytest.approx(2.0), "3.5 clamped to upper=2.0"
+        assert new_weight[1].allclose(ratios[1]), "Seq 1 weights unchanged"
+
+    def test_stage1_dominates_even_if_stage2_would_pass(self):
+        """
+        Tokens in a Stage-1-rejected sequence must stay masked even if their
+        individual token ratio would have passed the Token-MIS threshold.
+        """
+        config = RejectionSamplingConfig(
+            level="sequence",
+            action="mask",
+            metric="ratio",
+            agg="mean",
+            upper=2.0,
+            token_action="mask",
+        )
+        loss_mask = torch.ones(1, 4)
+        # geo-mean = 4.0 > 2.0 → Stage 1 rejects this sequence entirely.
+        ratios = torch.full((1, 4), 4.0)
+        proximal_logprobs = torch.log(ratios)
+        old_logprobs = torch.zeros_like(proximal_logprobs)
+
+        result = apply_rejection_sampling(
+            config=config,
+            loss_mask=loss_mask,
+            cu_seqlens=None,
+            # behave_imp_weight=ratios,
+            proximal_logprobs=proximal_logprobs,
+            old_logprobs=old_logprobs,
+        )
+        new_mask = result.loss_mask
+        assert new_mask.sum() == 0, "Stage 1 rejection must dominate Stage 2"
+
+    def test_none_token_action_identical_to_pure_sequence_geo_rs(self):
+        """
+        token_action=None must produce results identical to the existing
+        level='sequence', action='mask' mode — no Stage 2 runs.
+        """
+        ratios = torch.tensor(
+            [
+                [1.5, 1.5, 1.5, 1.5],
+                [3.0, 3.0, 3.0, 3.0],
+                [0.8, 0.8, 0.8, 0.8],
+            ]
+        )
+        loss_mask = torch.ones(3, 4)
+        proximal_logprobs = torch.log(ratios)
+        old_logprobs = torch.zeros_like(proximal_logprobs)
+
+        cfg_two_stage_off = RejectionSamplingConfig(
+            level="sequence",
+            action="mask",
+            metric="ratio",
+            agg="mean",
+            upper=2.0,
+            token_action=None,
+        )
+        cfg_original = RejectionSamplingConfig(
+            level="sequence",
+            action="mask",
+            metric="ratio",
+            agg="mean",
+            upper=2.0,
+        )
+
+        result = apply_rejection_sampling(
+            proximal_logprobs, old_logprobs, loss_mask.clone(), None, cfg_two_stage_off
+        )
+        mask_off = result.loss_mask
+        w_off = result.behave_imp_weight
+        result = apply_rejection_sampling(
+            proximal_logprobs, old_logprobs, loss_mask.clone(), None, cfg_original
+        )
+        mask_orig = result.loss_mask
+        w_orig = result.behave_imp_weight
+
+        torch.testing.assert_close(mask_off, mask_orig)
+        torch.testing.assert_close(w_off, w_orig)
+
+    def test_lower_bound_also_applied_in_token_mis(self):
+        """
+        Token-MIS with a `lower` bound must also mask tokens whose ratio
+        falls below `lower` (policy has dropped sharply at that token).
+        """
+        config = RejectionSamplingConfig(
+            level="sequence",
+            action="mask",
+            metric="ratio",
+            agg="mean",
+            upper=3.0,
+            lower=0.5,
+            token_action="mask",
+        )
+        loss_mask = torch.ones(1, 4)
+        # Seq geo-mean ≈ exp(mean(log([0.3, 1.0, 1.0, 1.0]))) ≈ 0.84 → accepted
+        # but token[0] = 0.3 < lower=0.5 → masked by Token-MIS
+        ratios = torch.tensor([[0.3, 1.0, 1.0, 1.0]])
+        proximal_logprobs = torch.log(ratios)
+        old_logprobs = torch.zeros_like(proximal_logprobs)
+
+        result = apply_rejection_sampling(
+            config=config,
+            loss_mask=loss_mask,
+            cu_seqlens=None,
+            # behave_imp_weight=ratios,
+            proximal_logprobs=proximal_logprobs,
+            old_logprobs=old_logprobs,
+        )
+        new_mask = result.loss_mask
+        assert new_mask[0, 0] == 0, "Token below lower bound must be masked"
+        assert new_mask[0, 1] == 1
+        assert new_mask[0, 2] == 1
+        assert new_mask[0, 3] == 1
+
     def test_invalid_agg_raises(self):
         """Invalid agg should raise ValueError."""
         with pytest.raises(ValueError, match="agg must be one of"):
