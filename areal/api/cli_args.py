@@ -929,6 +929,15 @@ class MegatronEngineConfig:
         },
     )
 
+    use_fused_linear_ce: bool = field(
+        default=False,
+        metadata={
+            "help": "Fuse the linear projection with cross-entropy so that the "
+            "[num_tokens, vocab_size] logits tensor is never materialised. "
+            "Only effective for the Megatron actor backend with parallel_output=True."
+        },
+    )
+
 
 class SchedulingStrategyType(str, Enum):
     separation = "separation"

@@ -546,9 +546,13 @@ def grpo_loss_fn(
     if "filtered_fraction" in stat:
         stats_tracker.scalar(rs_filtered_fraction=stat["filtered_fraction"])
 
-    if vocab_min_logits is not None and vocab_max_logits is not None:
+    if vocab_min_logits is not None:
         stats_tracker.stat(
             vocab_min_logits=vocab_min_logits,
+            denominator="n_tokens",
+        )
+    if vocab_max_logits is not None:
+        stats_tracker.stat(
             vocab_max_logits=vocab_max_logits,
             denominator="n_tokens",
         )

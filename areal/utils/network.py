@@ -24,6 +24,22 @@ def gethostip(probe_host: str = "8.8.8.8", probe_port: int = 80) -> str:
         RuntimeError: If no suitable address can be determined
     """
     try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.connect((probe_host, probe_port))
+            return sock.getsockname()[0]
+    except OSError:
+        pass
+
+    try:
+        with socket.socket(socket.AF_INET6, socket.SOCK_DGRAM) as sock:
+            sock.connect(("2001:4860:4860::8888", probe_port))
+            ip6 = sock.getsockname()[0]
+            if ip6 and ip6 != "::1":
+                return ip6
+    except OSError:
+        pass
+
+    try:
         hostname = socket.gethostname()
         infos = socket.getaddrinfo(hostname, None, socket.AF_UNSPEC, socket.SOCK_DGRAM)
         for family, _, _, _, sockaddr in infos:
@@ -38,19 +54,7 @@ def gethostip(probe_host: str = "8.8.8.8", probe_port: int = 80) -> str:
     except socket.gaierror:
         pass
 
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-            sock.connect((probe_host, probe_port))
-            return sock.getsockname()[0]
-    except OSError as e:
-        try:
-            with socket.socket(socket.AF_INET6, socket.SOCK_DGRAM) as sock:
-                sock.connect(("2001:4860:4860::8888", probe_port))
-                ip6 = sock.getsockname()[0]
-                if ip6 and ip6 != "::1":
-                    return ip6
-        except OSError:
-            raise RuntimeError("Could not determine host IP") from e
+    raise RuntimeError("Could not determine host IP")
 
 
 def get_loopback_ip() -> str:

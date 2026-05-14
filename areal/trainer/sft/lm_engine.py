@@ -121,9 +121,13 @@ def compute_packed_sft_loss(
     stats_tracker.stat(ppl=(-seqlogp).exp().float(), denominator="n_seqs")
     stats_tracker.stat(loss=-logprobs.detach(), denominator="n_valid_tokens")
 
-    if vocab_min_logits is not None and vocab_max_logits is not None:
+    if vocab_min_logits is not None:
         stats_tracker.stat(
             vocab_min_logits=vocab_min_logits,
+            denominator="n_tokens",
+        )
+    if vocab_max_logits is not None:
+        stats_tracker.stat(
             vocab_max_logits=vocab_max_logits,
             denominator="n_tokens",
         )
