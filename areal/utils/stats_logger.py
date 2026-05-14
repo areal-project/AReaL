@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 
-import getpass
 import os
 import time
 from dataclasses import asdict
@@ -15,6 +14,10 @@ from areal.api import FinetuneSpec
 from areal.api.cli_args import BaseExperimentConfig, StatsLoggerConfig
 from areal.utils import logging
 from areal.utils.printing import tabulate_stats
+from areal.utils.wandb_system_metrics import (
+    resolve_wandb_run_id,
+    stats_logger_log_path,
+)
 from areal.version import version_info
 
 logger = logging.getLogger("StatsLogger", "system")
@@ -48,10 +51,6 @@ class StatsLogger:
         if self.config.wandb.mode != "disabled":
             wandb.login()
 
-        suffix = self.config.wandb.id_suffix
-        if suffix == "timestamp":
-            suffix = time.strftime("%Y_%m_%d_%H_%M_%S")
-
         exp_config_dict = asdict(self.exp_config)
         exp_config_dict["version_info"] = {
             "commit_id": version_info.commit,
@@ -60,7 +59,15 @@ class StatsLogger:
             "version": version_info.full_version_with_dirty_description,
         }
 
-        wandb.init(
+        wandb_settings = None
+        if self.config.wandb.mode == "shared":
+            wandb_settings = wandb.Settings(
+                mode="shared",
+                x_primary=True,
+                x_label="controller",
+            )
+
+        wandb_init_kwargs = dict(
             mode=self.config.wandb.mode,
             entity=self.config.wandb.entity,
             project=self.config.wandb.project or self.config.experiment_name,
@@ -73,9 +80,12 @@ class StatsLogger:
             config=exp_config_dict,  # save all experiment config to wandb
             dir=self.get_log_path(self.config),
             force=True,
-            id=f"{self.config.experiment_name}_{self.config.trial_name}_{suffix}",
+            id=resolve_wandb_run_id(self.config),
             resume="allow",
         )
+        if wandb_settings is not None:
+            wandb_init_kwargs["settings"] = wandb_settings
+        wandb.init(**wandb_init_kwargs)
 
         swanlab_config = self.config.swanlab
         if swanlab_config.mode != "disabled":
@@ -176,6 +186,10 @@ class StatsLogger:
             raise ValueError(
                 "fileroot, experiment_name, and trial_name must be provided."
             )
-        path = f"{fileroot}/logs/{getpass.getuser()}/{experiment_name}/{trial_name}"
-        os.makedirs(path, exist_ok=True)
-        return path
+        return stats_logger_log_path(
+            StatsLoggerConfig(
+                experiment_name=experiment_name,
+                trial_name=trial_name,
+                fileroot=fileroot,
+            )
+        )
