@@ -295,7 +295,7 @@ stats_logger:
   fileroot: "/path/to/logs"
 
   wandb:
-    mode: "online"  # "online"、"offline" 或 "disabled"
+    mode: "online"  # "online"、"offline"、"shared" 或 "disabled"
     project: "my-project"
     entity: "my-team"
 
@@ -306,6 +306,28 @@ stats_logger:
   tensorboard:
     path: "/path/to/tensorboard/logs"  # null 禁用
 ```
+
+### W&B GPU 系统指标
+
+W&B 会从调用 `wandb.init()` 的进程采集系统指标。在 single-controller 训练中，控制器可能运行在 CPU 节点，而 actor 和
+rollout worker 运行在 GPU 节点上。此时普通的 `wandb.mode: "online"` 只会报告控制器进程指标。
+
+要采集 worker 节点上的 GPU 利用率和显存指标，请使用 W&B shared mode 并启用 worker 系统指标：
+
+```yaml
+stats_logger:
+  wandb:
+    mode: "shared"
+    project: "my-project"
+    entity: "my-team"
+    system_metrics:
+      enabled: true
+      roles: ["actor", "rollout"]  # null 表示启用所有 worker role
+      gpu_device_ids: null         # 让 W&B 使用 worker 可见的 GPU
+```
+
+控制器会初始化 primary W&B run。每个被选中的 worker 会以 `x_primary=False`、 role/rank 标签和
+`x_update_finish_state=False` 初始化 non-primary W&B 客户端， 因此 worker 只贡献系统指标，不会结束该 run。
 
 ## 最佳实践
 

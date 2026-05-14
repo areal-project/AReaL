@@ -17,6 +17,10 @@ from areal.utils.data import (
 )
 from areal.utils.dynamic_import import import_from_string
 from areal.utils.network import find_free_ports
+from areal.utils.wandb_system_metrics import (
+    finish_worker_wandb_system_metrics,
+    init_worker_wandb_system_metrics,
+)
 
 
 @ray.remote
@@ -79,6 +83,7 @@ class RayRPCServer:
 
     def configure(self, config: BaseExperimentConfig, role: str, rank: int) -> None:
         name_resolve.reconfigure(config.cluster.name_resolve)
+        init_worker_wandb_system_metrics(config, role=role, rank=rank)
         # Set seed for any TrainEngine instances
         for engine in self._engines.values():
             if isinstance(engine, TrainEngine):
@@ -219,4 +224,5 @@ class RayRPCServer:
                 )
         self._engines.clear()
         self._default_engine_name = None
+        finish_worker_wandb_system_metrics()
         ray.actor.exit_actor()

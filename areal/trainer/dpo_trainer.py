@@ -143,6 +143,9 @@ class DPOTrainer:
             train_batch_size=config.train_dataset.batch_size,
         )
 
+        # Initialize W&B primary before worker configuration in shared mode.
+        self.stats_logger = StatsLogger(config, ft_spec)
+
         self.actor.initialize(addr=None, ft_spec=ft_spec, role="actor")
         self.ref.initialize(addr=None, ft_spec=ft_spec, role="ref")
 
@@ -173,9 +176,6 @@ class DPOTrainer:
         # Set up save as HF model
         self.saver = Saver(config.saver, ft_spec)
         self.recover_handler = RecoverHandler(config.recover, ft_spec)
-
-        # Set up statistics logging (wandb, tensorboard, etc.)
-        self.stats_logger = StatsLogger(config, ft_spec)
 
         # Set up checkpointing for recover
         self.recover_info = self.recover_handler.load(

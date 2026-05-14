@@ -52,6 +52,7 @@ from areal.utils import logging, name_resolve, names
 from areal.utils.fs import validate_shared_path
 from areal.utils.network import format_hostport, split_hostport
 from areal.utils.offload import get_tms_env_vars
+from areal.utils.wandb_system_metrics import prepare_wandb_run_identity
 
 logger = logging.getLogger("SlurmScheduler")
 
@@ -88,6 +89,8 @@ class SlurmScheduler(Scheduler):
         etcd3_addr: str = "localhost:2379",
         exp_config: BaseExperimentConfig | None = None,
     ):
+        prepare_wandb_run_identity(exp_config)
+
         # Get n_gpus_per_node from parameter or config
         self._n_gpus_per_node = n_gpus_per_node
         if exp_config is not None:

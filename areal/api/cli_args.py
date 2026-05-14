@@ -2536,6 +2536,52 @@ class RecoverConfig(_Timer):
 
 
 @dataclass
+class WandBSystemMetricsConfig:
+    """Worker-side W&B system metrics collection.
+
+    The controller W&B client already records system metrics for the controller
+    process. Enable this config to attach GPU worker processes to the same W&B
+    run so W&B can sample system metrics from the GPU nodes too.
+    """
+
+    enabled: bool = field(
+        default=False,
+        metadata={
+            "help": "Start non-primary W&B clients in worker processes to collect "
+            "worker system metrics. Requires wandb.mode='shared'.",
+        },
+    )
+    roles: list[str] | None = field(
+        default=("actor", "rollout", "critic", "ref", "teacher"),
+        metadata={
+            "help": "Worker roles that should start W&B system metrics clients. "
+            "Set to null to enable every configured worker role.",
+        },
+    )
+    gpu_device_ids: list[int] | None = field(
+        default=None,
+        metadata={
+            "help": "Optional GPU device ids passed to W&B's system metrics "
+            "collector. Leave unset to let W&B use the worker's visible devices.",
+        },
+    )
+
+    def __post_init__(self):
+        if self.roles is not None:
+            if not self.roles:
+                raise ValueError(
+                    "stats_logger.wandb.system_metrics.roles must be null or a non-empty list."
+                )
+            self.roles = list(self.roles)
+        if self.gpu_device_ids is not None:
+            self.gpu_device_ids = list(self.gpu_device_ids)
+            if any(i < 0 for i in self.gpu_device_ids):
+                raise ValueError(
+                    "stats_logger.wandb.system_metrics.gpu_device_ids must contain non-negative integers."
+                )
+
+
+@dataclass
 class WandBConfig:
     """Configuration for Weights & Biases experiment tracking."""
 
@@ -2557,6 +2603,12 @@ class WandBConfig:
     tags: list[str] | None = None
     config: dict | None = None
     id_suffix: str | None = "train"
+    system_metrics: WandBSystemMetricsConfig = field(
+        default_factory=WandBSystemMetricsConfig,
+        metadata={
+            "help": "Worker-side W&B system metrics configuration.",
+        },
+    )
 
     def __post_init__(self):
         """Validate WandB configuration."""
@@ -2564,6 +2616,11 @@ class WandBConfig:
         if self.mode not in valid_modes:
             raise ValueError(
                 f"Invalid wandb mode: '{self.mode}'. Must be one of: {', '.join(valid_modes)}."
+            )
+        if self.system_metrics.enabled and self.mode != "shared":
+            raise ValueError(
+                "stats_logger.wandb.system_metrics.enabled requires "
+                "stats_logger.wandb.mode='shared'."
             )
 
 
