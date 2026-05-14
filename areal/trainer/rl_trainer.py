@@ -282,6 +282,10 @@ class PPOTrainer:
                 train_batch_size=config.train_dataset.batch_size,
             )
 
+        # Initialize the controller W&B client before workers are configured so
+        # worker-side shared-mode clients can attach to an existing primary run.
+        self.stats_logger = StatsLogger(config, ft_spec)
+
         # Initialize engines first — the scheduler must know about roles
         # before the data controller can colocate with them.
         engine_init_kwargs = {"addr": None, "ft_spec": ft_spec}
@@ -403,9 +407,6 @@ class PPOTrainer:
         # Set up save as HF model
         self.saver = Saver(config.saver, ft_spec)
         self.recover_handler = RecoverHandler(config.recover, ft_spec)
-
-        # Set up statistics logging (wandb, tensoboard, etc.)
-        self.stats_logger = StatsLogger(config, ft_spec)
 
         # Set up checkpointing for recover
         self.recover_info = self.recover_handler.load(

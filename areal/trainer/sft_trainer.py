@@ -109,6 +109,8 @@ class SFTTrainer:
             train_batch_size=config.train_dataset.batch_size,
         )
 
+        self.stats_logger = StatsLogger(config, ft_spec)
+
         self.actor.initialize(addr=None, ft_spec=ft_spec, role="actor")
 
         self.valid_dataloader: StatefulDataLoader | None = None
@@ -135,7 +137,6 @@ class SFTTrainer:
         self.evaluator = Evaluator(config.evaluator, ft_spec)
         self.saver = Saver(config.saver, ft_spec)
         self.recover_handler = RecoverHandler(config.recover, ft_spec)
-        self.stats_logger = StatsLogger(config, ft_spec)
         self.recover_info = self.recover_handler.load(
             self.actor,
             self.saver,
