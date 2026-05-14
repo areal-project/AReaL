@@ -17,6 +17,7 @@ from areal.api.cli_args import (
     ValidDatasetConfig,
 )
 from areal.infra import (
+    KubernetesScheduler,
     LocalScheduler,
     RayScheduler,
     SlurmScheduler,
@@ -309,6 +310,8 @@ class SFTTrainer:
             return RayScheduler(exp_config=self.config)
         elif cfg.type == "slurm":
             return SlurmScheduler(exp_config=self.config)
+        elif cfg.type in {"kubernetes", "k8s"}:
+            return KubernetesScheduler(exp_config=self.config)
         raise NotImplementedError(f"Unknown scheduler type: {cfg.type}")
 
     def _create_dataloader(
