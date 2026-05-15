@@ -52,12 +52,12 @@ class RTensorBackend(Protocol):
         """
         ...
 
-    async def delete(self, node_addr: str, shard_ids: list[Any]) -> None:
+    async def delete(self, node_addr: Any, shard_ids: list[Any]) -> None:
         """Delete shards from storage.
 
         Parameters
         ----------
-        node_addr : str
+        node_addr : Any
             The node address where shards are stored
         shard_ids : list[Any]
             List of shard IDs to delete
@@ -76,12 +76,12 @@ class TensorShardInfo:
     ----------
     shard_id : Any
         Unique identifier for the shard.
-    node_addr : str
+    node_addr : Any
         Network address where shard is stored.
     """
 
     shard_id: Any
-    node_addr: str
+    node_addr: Any
 
 
 class HttpRTensorBackend:
@@ -497,7 +497,7 @@ class RTensor:
         return obj
 
     @staticmethod
-    def collect_shards(obj: Any) -> dict[str, list[Any]]:
+    def collect_shards(obj: Any) -> dict[Any, list[Any]]:
         """Collect shard IDs grouped by node address from nested structure.
 
         Parameters
@@ -507,10 +507,10 @@ class RTensor:
 
         Returns
         -------
-        dict[str, list[Any]]
+        dict[Any, list[Any]]
             Mapping of node_addr -> list of shard_ids
         """
-        shards_by_node: dict[str, list[Any]] = {}
+        shards_by_node: dict[Any, list[Any]] = {}
 
         def _collect(o: Any) -> None:
             if isinstance(o, RTensor):
@@ -528,7 +528,7 @@ class RTensor:
         return shards_by_node
 
     @staticmethod
-    async def clear_node(node_addr: str, shard_ids: list[Any]) -> None:
+    async def clear_node(node_addr: Any, shard_ids: list[Any]) -> None:
         """Clear shards from a node and evict them from the fetch buffer.
 
         Parameters
