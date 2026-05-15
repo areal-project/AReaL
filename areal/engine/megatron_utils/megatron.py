@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-import pickle
+import contextlib
 import functools
 import inspect
+import pickle
 import re
 from typing import Any
-import contextlib
+
 import numpy as np
 import torch
 import torch.distributed as dist
@@ -25,7 +26,6 @@ from areal.engine.megatron_utils.megatron_lora import (
     convert_qwen3_lora_to_hf,
     convert_qwen3_moe_lora_to_hf,
 )
-
 from areal.infra.platforms import current_platform
 
 
@@ -68,6 +68,15 @@ def _all_gather_and_concat(
     partitions = [torch.empty_like(tensor) for _ in range(tp_size)]
     dist.all_gather(partitions, tensor, group=tp_group)
 
+    # This is a bug in Megatron's grouped MoE.
+    partition_dim = (
+        0
+        if "experts.linear_fc1.weight" in name
+        else 1
+        if "linear_fc2.weight" in name and partition_dim == 0
+        else partition_dim
+    )
+
     # De-interleave strided partitions. With stride S, each rank stores S interleaved
     # sub-blocks. We split each partition into S chunks and regroup by stride index
     # so that all sub-blocks for stride 0 come first, then stride 1, etc.
@@ -78,15 +87,6 @@ def _all_gather_and_concat(
         partitions = [
             chunks[rank][s] for s in range(partition_stride) for rank in range(tp_size)
         ]
-
-    # this is bug in megatron's grouped moe.
-    partition_dim = (
-        0
-        if "linear_fc1.weight" in name
-        else 1
-        if "linear_fc2.weight" in name and partition_dim == 0
-        else partition_dim
-    )
 
     return torch.cat(partitions, dim=partition_dim)
 
