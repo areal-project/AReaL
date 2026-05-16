@@ -766,6 +766,27 @@ def test_parametrized_version_progression(version):
     assert capacity == min(1000, expected_staleness_capacity)
 
 
+@pytest.mark.parametrize("recovered_version", [5, 10, 50])
+def test_on_version_recovered(recovered_version):
+    """Test that on_version_recovered adjusts accepted so capacity stays bounded."""
+    version_provider = MockVersionProvider(0)
+    manager = StalenessManager(
+        version_provider=version_provider,
+        max_concurrent_rollouts=1000,
+        consumer_batch_size=16,
+        max_staleness=2,
+    )
+
+    # Simulate recovery: version jumps to recovered_version
+    version_provider.set_version(recovered_version)
+    manager.on_version_recovered(recovered_version)
+
+    # After recovery, capacity should be (max_staleness + 1) * consumer_batch_size
+    # regardless of the recovered version value.
+    capacity = manager.get_capacity()
+    assert capacity == (2 + 1) * 16
+
+
 if __name__ == "__main__":
     # Run tests with pytest
     pytest.main([__file__, "-v"])
