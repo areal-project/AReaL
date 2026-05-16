@@ -1381,6 +1381,18 @@ class MegatronEngine(TrainEngine):
 
         return fetch_buffer_stats()
 
+    def clear_all_local_rtensors(self) -> dict[str, int]:
+        """Forcibly drain actor-local RTensor storage at step boundary.
+
+        Run after ``clear_batches`` as a defensive sweep for any RTensors
+        created by auxiliary RPC calls (stats returns, etc.) that aren't
+        in the standard rollout_batch/adv_batch lifecycle. See #1209.
+        """
+        from areal.infra.rpc.rtensor import clear_all_local
+
+        n_storage, n_buffer = clear_all_local()
+        return {"storage_cleared": n_storage, "fetch_buffer_cleared": n_buffer}
+
     def _normalize_adam_bf16_config(self) -> None:
         if self.optimizer_config is None or self.optimizer_config.type != "adam_bf16":
             return

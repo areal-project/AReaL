@@ -624,3 +624,29 @@ def storage_stats() -> dict[str, int]:
     global _storage_stats, _storage_lock, _storage
     with _storage_lock:
         return dict(num_tensors=len(_storage), total_bytes=sum(_storage_stats.values()))
+
+
+def clear_all_local() -> tuple[int, int]:
+    """Forcibly clear all entries from ``_storage`` and ``_fetch_buffer``.
+
+    Defensive step-end sweep for RTensors that weren't explicitly tracked by
+    ``TrainController.clear_batches`` — e.g. small tensors returned by
+    auxiliary RPC calls (``get_device_stats``, ``set_version``, stats from
+    ``clear_batches`` itself, etc.) that accumulate per-step across many
+    workers. Safe to call only after a step's batches are consumed; see
+    inclusionAI/AReaL#1209.
+
+    Returns
+    -------
+    tuple[int, int]
+        ``(storage_cleared, fetch_buffer_cleared)`` — entry counts removed.
+    """
+    global _storage, _storage_lock, _storage_stats
+    with _storage_lock:
+        n_storage = len(_storage)
+        _storage.clear()
+        _storage_stats.clear()
+    with _fetch_buffer_lock:
+        n_buffer = len(_fetch_buffer)
+        _fetch_buffer.clear()
+    return n_storage, n_buffer

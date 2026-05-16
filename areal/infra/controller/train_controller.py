@@ -866,3 +866,40 @@ class TrainController:
                 "clear_batches: _fetch_buffer drained on DP head 0 (role=%s)",
                 self._worker_role,
             )
+
+    def clear_all_local_rtensors(self):
+        """Defensive sweep of every worker's actor-local RTensor storage.
+
+        Complements :meth:`clear_batches`: that one targets specific tracked
+        batches (``rollout_batch`` / ``adv_batch``). This one wipes anything
+        still in ``_storage``/``_fetch_buffer`` after a step end — e.g. small
+        tensors returned by auxiliary RPC calls (``get_device_stats``,
+        ``fetch_buffer_stats`` itself, etc.) that aren't part of the standard
+        batch lifecycle. Without this sweep, those accumulate over steps and
+        eventually exhaust host RAM. See inclusionAI/AReaL#1209.
+
+        Call AFTER :meth:`clear_batches` once all batches for the step have
+        been consumed.
+        """
+        try:
+            stats = self._custom_function_call(
+                "clear_all_local_rtensors", rpc_meta={"broadcast": False}
+            )
+        except Exception as e:
+            logger.debug(
+                "clear_all_local_rtensors RPC failed (role=%s): %s",
+                self._worker_role,
+                e,
+            )
+            return
+        if isinstance(stats, dict):
+            n_storage = stats.get("storage_cleared", 0)
+            n_buffer = stats.get("fetch_buffer_cleared", 0)
+            if n_storage or n_buffer:
+                logger.info(
+                    "clear_all_local_rtensors swept on DP head 0 "
+                    "(role=%s, storage=%d, fetch_buffer=%d)",
+                    self._worker_role,
+                    n_storage,
+                    n_buffer,
+                )

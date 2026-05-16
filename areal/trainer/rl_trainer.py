@@ -845,6 +845,14 @@ class PPOTrainer:
                         self.ref.clear_batches(rollout_batch)
                     if self.data_controller is not None:
                         self.data_controller.clear_batches()
+                    # Defensive sweep: drain RTensors created by auxiliary RPC
+                    # returns (stats dicts, etc.) that aren't tracked by the
+                    # standard batch lifecycle above. See #1209.
+                    self.actor.clear_all_local_rtensors()
+                    if self.critic is not None:
+                        self.critic.clear_all_local_rtensors()
+                    if self.ref is not None:
+                        self.ref.clear_all_local_rtensors()
 
             with perf_tracer.trace_scope(
                 "train.log_stats",
