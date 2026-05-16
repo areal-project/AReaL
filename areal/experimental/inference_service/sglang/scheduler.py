@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""AwexSchedulerBridge + PPSchedulerBridge: compose weight-update methods onto SGLang Scheduler."""
+"""AwexSchedulerBridge/RDTSchedulerBridge + PPSchedulerBridge: compose weight-update methods onto SGLang Scheduler."""
 
 from __future__ import annotations
 
@@ -12,9 +12,16 @@ import torch.distributed as dist
 import zmq
 from sglang.srt.server_args import PortArgs, ServerArgs
 
+from areal.experimental.weight_update import (
+    BACKEND_AWEX,
+    BACKEND_RDT,
+    WEIGHT_UPDATE_BACKEND_ENV,
+    get_weight_update_backend,
+)
 from areal.infra.rpc.serialization import serialize_value
 
 RESULT_IPC_ENV = "AREAL_AWEX_RESULT_IPC"
+RDT_RESULT_IPC_ENV = "AREAL_RDT_RESULT_IPC"
 
 
 class AwexSchedulerBridge:
@@ -118,6 +125,96 @@ class AwexSchedulerBridge:
         self._require_adapter().randomize_parameters()
 
 
+class RDTSchedulerBridge:
+    """Compose RDT weight-update capabilities onto a plain Scheduler instance.
+
+    Lifecycle:
+      1. Created after ``Scheduler.__init__()`` in :func:`areal_run_scheduler_process`
+      2. :meth:`bind` attaches ``rdt_*`` methods to the scheduler via ``setattr``
+      3. ``handle_rpc_request`` dispatches via ``getattr(self, method)`` and finds them
+      4. Methods delegate to :class:`RDTSGLangAdapter` for actual work
+      5. Data-returning methods push results via ZMQ PUSH (tp_rank 0, dp_rank 0 only)
+
+    No inheritance.  No monkey-patch.  The scheduler instance remains a plain
+    ``sglang.srt.managers.scheduler.Scheduler``.
+    """
+
+    def __init__(self, scheduler: Any) -> None:
+        self._scheduler = scheduler
+        self._adapter: Any | None = None
+        self._result_push: zmq.Socket | None = None
+
+        result_ipc = os.environ.get(RDT_RESULT_IPC_ENV)
+        if (
+            result_ipc
+            and scheduler.tp_rank == 0
+            and (getattr(scheduler, "dp_rank", None) is None or scheduler.dp_rank == 0)
+        ):
+            ctx = zmq.Context(1)
+            self._result_push = ctx.socket(zmq.PUSH)
+            self._result_push.connect(result_ipc)
+
+    def bind(self) -> None:
+        """Attach ``rdt_*`` methods to the scheduler instance."""
+        methods = [
+            "rdt_report_weight_meta",
+            "rdt_report_parallelism",
+            "rdt_init_weight_update_group",
+            "rdt_execute_weight_update",
+            "rdt_randomize_parameters",
+            "rdt_get_parameters",
+        ]
+        for name in methods:
+            setattr(self._scheduler, name, getattr(self, name))
+
+    def _require_adapter(self) -> Any:
+        if self._adapter is None:
+            from areal.experimental.weight_update.rdt.sglang_adapter import (
+                RDTSGLangAdapter,
+            )
+
+            self._adapter = RDTSGLangAdapter(self._scheduler)
+        return self._adapter
+
+    def _push_result(self, result: Any) -> None:
+        if self._result_push is not None:
+            self._result_push.send_pyobj(result)
+
+    def rdt_report_weight_meta(self) -> None:
+        adapter = self._require_adapter()
+        local_meta = adapter.get_weight_metadata()
+        s = self._scheduler
+
+        if s.tp_size > 1:
+            gathered: list[list] = [[] for _ in range(s.tp_size)]
+            dist.all_gather_object(gathered, local_meta, group=s.tp_cpu_group)
+            all_meta: list = []
+            for rank_meta in gathered:
+                all_meta.extend(rank_meta)
+            self._push_result(serialize_value(all_meta))
+        else:
+            self._push_result(serialize_value(local_meta))
+
+    def rdt_report_parallelism(self) -> None:
+        self._push_result(self._require_adapter().parallelism_strategy)
+
+    def rdt_init_weight_update_group(self, **kwargs: Any) -> None:
+        self._require_adapter().rdt_init_weight_update_group(**kwargs)
+
+    def rdt_execute_weight_update(self, version: int = 0) -> None:
+        self._require_adapter().rdt_execute_weight_update(version)
+
+    def rdt_randomize_parameters(self) -> None:
+        """Randomize model parameters for testing."""
+        self._require_adapter().randomize_parameters()
+
+    def rdt_get_parameters(
+        self, save_path: str, names: list[str] | None = None
+    ) -> None:
+        """Save parameters to disk for validation."""
+        self._require_adapter().save_parameters(save_path, names)
+
+
 # ---------------------------------------------------------------------------
 # Duplicated from sglang.srt.managers.scheduler.run_scheduler_process
 # (SGLang commit pinned in this repo).
@@ -216,7 +313,11 @@ def areal_run_scheduler_process(
         )
 
         # ---- BEGIN AREAL ----
-        AwexSchedulerBridge(scheduler).bind()
+        backend = get_weight_update_backend()
+        if backend == BACKEND_AWEX:
+            AwexSchedulerBridge(scheduler).bind()
+        elif backend == BACKEND_RDT:
+            RDTSchedulerBridge(scheduler).bind()
         PPSchedulerBridge(scheduler, server_args).bind()
         # ---- END AREAL ----
 
@@ -229,7 +330,23 @@ def areal_run_scheduler_process(
         parent_process.send_signal(signal.SIGQUIT)
 
 
-def create_result_ipc() -> str:
-    path = f"ipc://{tempfile.mktemp(prefix='areal_result_')}"
-    os.environ[RESULT_IPC_ENV] = path
+def create_result_ipc(backend: str) -> str:
+    """Create result IPC path for given backend.
+
+    Sets environment variable for scheduler subprocess to read.
+
+    Args:
+        backend: "awex" or "rdt"
+
+    Returns:
+        IPC path string
+    """
+    path = f"ipc://{tempfile.mktemp(prefix=f'areal_{backend}_result_')}"
+
+    if backend == BACKEND_AWEX:
+        os.environ[RESULT_IPC_ENV] = path
+    elif backend == BACKEND_RDT:
+        os.environ[RDT_RESULT_IPC_ENV] = path
+
+    os.environ[WEIGHT_UPDATE_BACKEND_ENV] = backend
     return path

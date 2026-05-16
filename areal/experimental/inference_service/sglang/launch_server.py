@@ -24,18 +24,21 @@ def areal_launch_server(server_args) -> None:
     from sglang.srt.managers.detokenizer_manager import run_detokenizer_process
 
     # ---- BEGIN AREAL ----
-    from areal.experimental.inference_service.sglang.awex import (
-        register_awex_endpoints,
-    )
+    from areal.experimental.inference_service.sglang.awex import register_awex_endpoints
+    from areal.experimental.inference_service.sglang.rdt import register_rdt_endpoints
     from areal.experimental.inference_service.sglang.rpc_proxy import RpcProxy
     from areal.experimental.inference_service.sglang.scheduler import (
         areal_run_scheduler_process,
         create_result_ipc,
+        get_weight_update_backend,
     )
     # ---- END AREAL ----
 
     # ---- BEGIN AREAL ----
-    result_ipc = create_result_ipc()
+    backend = getattr(server_args, "weight_update_backend", None)
+    if backend is None:
+        backend = get_weight_update_backend()
+    result_ipc = create_result_ipc(backend)
     # ---- END AREAL ----
 
     (
@@ -60,7 +63,10 @@ def areal_launch_server(server_args) -> None:
 
     # ---- BEGIN AREAL ----
     rpc_proxy = RpcProxy(port_args, result_ipc)
-    register_awex_endpoints(app, rpc_proxy)
+    if backend == "awex":
+        register_awex_endpoints(app, rpc_proxy)
+    elif backend == "rdt":
+        register_rdt_endpoints(app, rpc_proxy)
     # ---- END AREAL ----
 
     try:

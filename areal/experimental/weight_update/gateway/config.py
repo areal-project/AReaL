@@ -55,13 +55,18 @@ class PairInfo:
     last_version: int = 0
 
     # Disk-mode fields (used when mode="disk")
-    mode: str = "awex"  # "awex" or "disk"
+    mode: str = "awex"  # "awex", "disk", or "rdt"
     save_path: str = ""
     use_lora: bool = False
     lora_name: str = ""
 
+    # RDT-mode fields (used when mode="rdt")
+    # RDT doesn't need NCCL master_addr/master_port
+
     def __post_init__(self):
         if not self.pair_name:
             raise ValueError("pair_name must not be empty")
-        if self.mode not in ("awex", "disk"):
-            raise ValueError(f"mode must be 'awex' or 'disk', got '{self.mode}'")
+        if self.mode not in ("awex", "disk", "rdt"):
+            raise ValueError(
+                f"mode must be 'awex', 'disk', or 'rdt', got '{self.mode}'"
+            )
