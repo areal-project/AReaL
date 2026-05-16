@@ -112,6 +112,19 @@ class StalenessManager:
             capacity = min(concurrency_capacity, staleness_capacity)
             return capacity
 
+    def on_version_recovered(self, version: int) -> None:
+        """Adjust accepted count after checkpoint recovery.
+
+        When a checkpoint is recovered, the version jumps from 0 to the
+        recovered value. Without adjusting accepted, the capacity formula
+        yields (max_staleness + version + 1) * batch_size instead of the
+        intended (max_staleness + 1) * batch_size, causing a burst of
+        submissions and unbounded staleness growth.
+        """
+        with self.lock:
+            consumer_bs = max(1, self.consumer_batch_size)
+            self.rollout_stat.accepted = version * consumer_bs
+
     def on_rollout_enqueued(self) -> None:
         """Callback when a rollout is enqueued as a pending input task.
 
