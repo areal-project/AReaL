@@ -1449,7 +1449,7 @@ class Normalization:
         x_centered = x - mean
         # mask unrelevant elements as 0
         if loss_mask is not None:
-            x_centered = x_centered * loss_mask
+            x_centered = torch.where(loss_mask.bool(), x_centered, 0.0)
 
         # Step 2: Compute std
         if self.std_level == "batch":
@@ -1517,7 +1517,7 @@ class Normalization:
             x_sum = x.sum(dim=dim, keepdim=True)
         else:
             mask = mask.to(dtype)
-            x_masked = x * mask
+            x_masked = torch.where(mask.bool(), x * mask, torch.zeros_like(x))
             factor = mask.sum(dim, keepdim=True)
             x_sum = x_masked.sum(dim=dim, keepdim=True)
 
@@ -1576,9 +1576,12 @@ class Normalization:
             x_sum_sq = (x_centered**2).sum(dim=dim, keepdim=True)
         else:
             mask = mask.to(dtype)
-            x_masked = x * mask
             factor = mask.sum(dim, keepdim=True)
-            x_centered = x_masked - mean * mask  # only apply mean where mask is 1
+            x_centered = torch.where(
+                mask.bool(),
+                (x - mean) * mask,
+                torch.zeros_like(x),
+            )
             x_sum_sq = (x_centered**2).sum(dim=dim, keepdim=True)
 
         if dist.is_initialized() and all_reduce:
