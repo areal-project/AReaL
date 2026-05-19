@@ -28,105 +28,19 @@
 # (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-import copy
-import enum
 import math
 
 from megatron.core.transformer import TransformerConfig
+from megatron.core.transformer.enums import LayerType  # noqa: F401  re-export
+from megatron.core.transformer.pipeline_parallel_layer_layout import (
+    PipelineParallelLayerLayout,
+)
 from transformers import PretrainedConfig
 
 from areal.api import MegatronParallelStrategy
 from areal.utils import logging
 
 logger = logging.getLogger("MCore PipelineParallel")
-
-
-class LayerType(enum.Enum):
-    """Layer type
-    embedding: embedding layer
-    loss: loss layer
-    encoder: encoder layer, not implemented yet, expect to be used in MLLM models
-    decoder: decoder layer
-    mtp: multi-token prediction layer, not implemented yet
-    """
-
-    embedding = 1
-    loss = 2
-    encoder = 3
-    decoder = 4
-    mtp = 5
-
-
-class PipelineParallelLayerLayout:
-    """Configuration of custom pipeline parallel layer partitioning."""
-
-    def __repr__(self):
-        return self.input_data
-
-    def __init__(self, layout: str | list, pipeline_model_parallel_size: int):
-        """Initialize PipelineParallelLayerLayout from a list or a str.
-        Format validation will be done here.
-        """
-
-        self.input_data = layout
-        if isinstance(layout, str):
-            layout = PipelineParallelLayerLayout.parse_str_to_list(layout)
-        else:
-            layout = copy.deepcopy(layout)
-        assert all(isinstance(row, list) for row in layout), (
-            f"pipeline_model_parallel_layout must be a list of lists, but got"
-            f" {[type(row) for row in layout]=}"
-        )
-
-        # Check PP size and get VPP size
-        assert len(layout) % pipeline_model_parallel_size == 0, (
-            f"pipeline_model_parallel_layout must be divisible"
-            f" by pipeline_model_parallel_size ({len(layout)=},"
-            f" {pipeline_model_parallel_size=})"
-        )
-        virtual_pipeline_model_parallel_size = (
-            len(layout) // pipeline_model_parallel_size
-        )
-
-        # Convert 1D layout to 2D layout
-        layout = [
-            [
-                layout[vpp_rank * pipeline_model_parallel_size + pp_rank]
-                for vpp_rank in range(virtual_pipeline_model_parallel_size)
-            ]
-            for pp_rank in range(pipeline_model_parallel_size)
-        ]
-
-        # Convert all strings in pipeline_model_parallel_layout to LayerType
-        for pp_rank in range(pipeline_model_parallel_size):
-            for vpp_rank in range(virtual_pipeline_model_parallel_size):
-                transferred_layout = []
-                for layer_type in layout[pp_rank][vpp_rank]:
-                    assert isinstance(layer_type, LayerType) or isinstance(
-                        layer_type, str
-                    ), (
-                        f"elements in pipeline_model_parallel_layout must be LayerType or str,"
-                        f" but got {type(layer_type)}."
-                    )
-                    if isinstance(layer_type, str):
-                        layer_type = layer_type.strip().lower()
-                        assert layer_type in LayerType.__members__, (
-                            f"{layer_type} is not a valid LayerType"
-                        )
-                        layer_type = LayerType[layer_type]
-                    transferred_layout.append(layer_type)
-                layout[pp_rank][vpp_rank] = transferred_layout
-
-        # Flatten the pipeline layout in layer id order.
-        flatten_layout = []
-        for vpp_rank in range(virtual_pipeline_model_parallel_size):
-            for row in layout:
-                flatten_layout.extend(row[vpp_rank])
-
-        self.pipeline_model_parallel_size = pipeline_model_parallel_size
-        self.virtual_pipeline_model_parallel_size = virtual_pipeline_model_parallel_size
-        self.layout = layout
-        self.flatten_layout = flatten_layout
 
 
 def configure_pipeline_layer_splits(

@@ -342,7 +342,7 @@ requires-dist = [
     { name = "math-verify", specifier = "==0.8.0" },
     { name = "mathruler", specifier = "==0.1.0" },
     { name = "matplotlib" },
-    { name = "mbridge", git = "https://github.com/ISEEKYAN/mbridge.git?rev=a36c617d" },
+    { name = "mbridge", git = "https://github.com/ISEEKYAN/mbridge.git?rev=08975e6" },
     { name = "mistral-common", specifier = ">=1.11.1" },
     { name = "msgspec" },
     { name = "networkx", specifier = "==3.3" },
@@ -2217,7 +2217,7 @@ wheels = [
 [[package]]
 name = "mbridge"
 version = "0.15.1"
-source = { git = "https://github.com/ISEEKYAN/mbridge.git?rev=a36c617d#a36c617d67892e34a403daee060e5d1f158fcacb" }
+source = { git = "https://github.com/ISEEKYAN/mbridge.git?rev=08975e6#08975e6c9de9b534b29c0ff40bd414168cae4715" }
 
 [[package]]
 name = "mcp"

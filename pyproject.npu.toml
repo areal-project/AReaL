@@ -62,7 +62,7 @@ dependencies = [
     "datasets>=3.0.0",
     "transformers>=5.0,!=5.1.*,!=5.2.*,!=5.3.*,!=5.4.*,!=5.5.0",
     "mistral-common>=1.11.1",
-    "mbridge @ git+https://github.com/ISEEKYAN/mbridge.git@a36c617d",
+    "mbridge @ git+https://github.com/ISEEKYAN/mbridge.git@08975e6",
     "peft<=0.18.1",
     "qwen_agent",
     "openai-agents",

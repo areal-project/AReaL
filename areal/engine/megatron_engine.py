@@ -171,119 +171,48 @@ if TYPE_CHECKING:
     from areal.api.cli_args import DPOEngineConfig, PPOActorConfig, PPOCriticConfig
 
 
-def _patch_te_layernorm_column_parallel_linear_bias():
-    """Fix MindSpeed TE bugs in ``MindSpeedTELayerNormColumnParallelLinear``.
+def _patch_mindspeed_mlp_init_tp_group():
+    """Make MindSpeed's ``mlp_init`` swallow mcore 0.16's ``tp_group`` kwarg.
 
-    1. QKV bias dropped when ``skip_bias_add=False``: ``te_return_bias`` is
-       set to ``self.skip_bias_add and bias``. With ``skip_bias_add=False``
-       (the default for the QKV projection) ``te_return_bias`` evaluates
-       to ``False``, so forward sets ``bias = None`` and never applies it.
-       This silently drops the QKV bias for models that have one (e.g.
-       Qwen2.5 with ``attention_bias=True``), causing massive logprob
-       divergence. Fixed by wrapping ``forward`` to re-add the stored
-       bias when it was skipped.
+    When ``moe_alltoall_overlap_comm=True``, MindSpeed (``core_r0.16.0``)
+    replaces ``megatron.core.transformer.mlp.MLP.__init__`` with
+    ``mindspeed.core.transformer.moe.moe_feature.overlap.moe_common.mlp_init``
+    via its patch manager. That wrapper's signature is
+    ``(self, config, submodules, is_expert=False, input_size=None,
+    with_shared_expert=False)`` — it predates mcore 0.16's addition of a
+    ``tp_group`` kwarg that ``TransformerLayer.__init__`` now propagates
+    into ``build_module(submodules.mlp, ..., tp_group=tp_group)``. Result:
+    ``TypeError: mlp_init() got an unexpected keyword argument 'tp_group'``
+    on every dense MLP construction (e.g. Qwen3-VL vision-encoder blocks).
 
-    2. ``F.layer_norm`` called without ``normalized_shape`` (TypeError).
-       The forward's ``LayerNorm`` branch passes only ``weight``, ``bias``,
-       ``eps`` to ``F.layer_norm``, omitting the required positional
-       ``normalized_shape``. This crashes any VLM whose vision encoder
-       uses LayerNorm and routes through this fused linear (e.g.
-       Qwen3-VL vision attention). Fixed by replacing the module's
-       ``F`` reference with a proxy that defaults ``normalized_shape``
-       to the layer-norm weight's shape.
+    Fix: wrap ``MLP.__init__`` to discard ``tp_group``. Safe because
+    ``mlp_init``'s internal ``build_module`` calls don't forward the
+    parameter anyway — single-group MoE setups always use the default TP
+    group for inner-linear collectives. No-op when ``MLP.__init__`` is
+    mcore's native (e.g. ``moe_alltoall_overlap_comm=False``) since mcore
+    0.16's native ``MLP.__init__`` accepts ``tp_group`` natively.
     """
-    from mindspeed.te.pytorch.module import (
-        layernorm_column_parallel_linear as _ms_lncpl,
-    )
-    from mindspeed.te.pytorch.module.layernorm_column_parallel_linear import (
-        MindSpeedTELayerNormColumnParallelLinear,
-    )
+    from megatron.core.transformer.mlp import MLP
 
-    if getattr(MindSpeedTELayerNormColumnParallelLinear, "_bias_patched", False):
+    cur_init = MLP.__init__
+    if getattr(cur_init, "_areal_mlp_tp_group_patched", False):
+        return
+    # Only patch the MindSpeed replacement; leave mcore's native __init__ alone.
+    if cur_init.__name__ != "mlp_init":
         return
 
-    # Bug 2: replace ``F`` in the MindSpeed module with a proxy that
-    # injects ``normalized_shape`` into ``layer_norm`` calls. Local to this
-    # one module so unrelated callers of ``F.layer_norm`` are unaffected.
-    _torch_F = _ms_lncpl.F
+    @functools.wraps(cur_init)
+    def _wrapped(self, *args, tp_group=None, **kwargs):
+        return cur_init(self, *args, **kwargs)
 
-    class _LayerNormShapeFixingFProxy:
-        """Forwards every attribute to torch.nn.functional except
-        ``layer_norm``, which gets ``normalized_shape`` filled in."""
-
-        @staticmethod
-        def layer_norm(
-            input,
-            normalized_shape=None,
-            weight=None,
-            bias=None,
-            eps=1e-5,
-        ):
-            if normalized_shape is None:
-                if weight is None:
-                    raise RuntimeError(
-                        "F.layer_norm proxy: cannot infer normalized_shape "
-                        "without a weight tensor"
-                    )
-                normalized_shape = weight.shape
-            return _torch_F.layer_norm(
-                input,
-                normalized_shape,
-                weight=weight,
-                bias=bias,
-                eps=eps,
-            )
-
-        def __getattr__(self, name):
-            return getattr(_torch_F, name)
-
-    _ms_lncpl.F = _LayerNormShapeFixingFProxy()
-
-    # Bug 1 — both directions of the broken ``te_return_bias`` logic:
-    #
-    #   Case A (skip_bias_add=False, bias=True)
-    #     te_return_bias = False AND True = False
-    #     forward passes bias=None to the inner linear (no internal add) and
-    #     returns (output, None). Caller doesn't see the bias either, so it
-    #     gets DROPPED. Hits e.g. ``SelfAttention.linear_qkv`` for any LM
-    #     with a QKV bias (Qwen 2.5/3).
-    #
-    #   Case B (skip_bias_add=True, bias=True)
-    #     te_return_bias = True AND True = True
-    #     forward passes bias=self.bias to the inner linear (which adds it
-    #     internally) AND returns (output_with_bias_added, self.bias). The
-    #     caller (Megatron's ``MLP.forward`` / ``MultimodalProjector.forward``)
-    #     then does ``output += bias`` again. Bias is applied TWICE per
-    #     forward. Hits e.g. ``MLP.linear_fc1`` for any model that has MLP
-    #     bias (Qwen2.5-VL / Qwen3-VL vision-encoder blocks; Qwen LMs have
-    #     no MLP bias so they're fine there).
-    #
-    # Reference upstream fix in MindSpeed 26.0.x branch:
-    #   gitcode.com/Ascend/MindSpeed/commit/0d469e0  (only on 26.0.0_core_r0.12.1
-    #   branch; we're pinned to 2.3.0_core_r0.12.1 which lacks it).
-    original_forward = MindSpeedTELayerNormColumnParallelLinear.forward
-
-    @functools.wraps(original_forward)
-    def _forward_with_bias(self, inp, is_first_microbatch=None, fp8_output=False):
-        output, bias = original_forward(self, inp, is_first_microbatch, fp8_output)
-        if self.bias is not None:
-            if not self.skip_bias_add and bias is None:
-                # Case A: bias was silently dropped; add it back.
-                output = output + self.bias
-            elif self.skip_bias_add and bias is not None:
-                # Case B: bias was added inside the linear AND will be added
-                # again by the caller. Subtract one copy here so the net
-                # contribution matches Megatron's standard semantics.
-                output = output - self.bias
-        return output, bias
-
-    MindSpeedTELayerNormColumnParallelLinear.forward = _forward_with_bias
-    MindSpeedTELayerNormColumnParallelLinear._bias_patched = True
+    _wrapped._areal_mlp_tp_group_patched = True
+    MLP.__init__ = _wrapped
 
 
 def _patch_mindspeed_npu_groupmatmul_add_fp32_dtype():
-    """Backport MindSpeed commit ``6cd85e8a`` (in 26.0.0_core_r0.12.1, missing
-    from 2.3.0_core_r0.12.1 used by the Ascend NPU container).
+    """Backport MindSpeed commit ``6cd85e8a`` / ``2b38a9e9`` (landed on
+    ``26.0.0_core_r0.12.1`` but not yet ported to ``core_r0.16.0``, see
+    ``mindspeed/core/transformer/moe/moe_feature/overlap/grouped_mlp_with_comp_and_comm_overlap_all2all.py``).
 
     In ``GroupedMlpWithCompAndCommOverlapAll2All.backward`` (and the
     all2allseq / fb_overlap variants), the recompute_activation branch
@@ -2240,11 +2169,16 @@ class MegatronEngine(TrainEngine):
             "recompute_method": megatron_config.recompute_method,
             "recompute_granularity": megatron_config.recompute_granularity,
             "recompute_num_layers": megatron_config.recompute_num_layers,
+            # MindSpeed ``core_r0.16.0``'s ``SwapOptimizerFeature.validate_args``
+            # asserts ``args.use_distributed_optimizer`` whenever
+            # ``swap_optimizer=True``. Propagate AReaL's DDP setting so the
+            # validation sees the same value the engine actually uses.
+            "use_distributed_optimizer": megatron_config.ddp.use_distributed_optimizer,
         }
 
         config.update(config_overrides)
         repatch(config)
-        _patch_te_layernorm_column_parallel_linear_bias()
+        _patch_mindspeed_mlp_init_tp_group()
         _patch_mindspeed_npu_groupmatmul_add_fp32_dtype()
 
     def _save_model_to_hf(

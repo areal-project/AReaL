@@ -18,22 +18,7 @@ import torch
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_spec,
 )
-
-try:
-    from megatron.core.transformer.enums import LayerType
-except ImportError:
-    import enum
-
-    class LayerType(enum.Enum):
-        """Fallback for megatron-core < 0.13 (e.g. MindSpeed's 0.12.1)."""
-
-        embedding = 1
-        loss = 2
-        encoder = 3
-        decoder = 4
-        mtp = 5
-
-
+from megatron.core.transformer.enums import LayerType
 from megatron.core.transformer.multi_latent_attention import MLATransformerConfig
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import (

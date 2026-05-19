@@ -17,8 +17,9 @@
 
 FROM quay.io/ascend/vllm-ascend:v0.19.1rc1-a3
 
-ARG MEGATRON_TAG=core_v0.12.1
-ARG MINDSPEED_TAG=v2.3.0_core_r0.12.1
+ARG MEGATRON_TAG=core_v0.16.1
+ARG MINDSPEED_BRANCH=core_r0.16.0
+ARG MINDSPEED_COMMIT=73c6c360b3e996038e9de8942cf3c238326acfc1
 ARG SGLANG_TAG=v0.5.7
 
 # Update pip and install uv (bootstrap; remaining deps come from pyproject.npu.toml)
@@ -27,7 +28,8 @@ RUN python3 -m pip install -U pip uv && \
 
 # Install Megatron & MindSpeed
 RUN git clone --depth 1 --branch ${MEGATRON_TAG} https://github.com/NVIDIA/Megatron-LM.git /areal-workspace/Megatron-LM && \
-    git clone --depth 1 --branch ${MINDSPEED_TAG} https://gitcode.com/Ascend/MindSpeed.git /areal-workspace/MindSpeed && \
+    git clone --branch ${MINDSPEED_BRANCH} https://gitcode.com/Ascend/MindSpeed.git /areal-workspace/MindSpeed && \
+    git -C /areal-workspace/MindSpeed checkout ${MINDSPEED_COMMIT} && \
     cp -r /areal-workspace/Megatron-LM/megatron /areal-workspace/MindSpeed/megatron && \
     python3 -m pip install -e /areal-workspace/MindSpeed --no-deps && \
     python3 -m pip cache purge
