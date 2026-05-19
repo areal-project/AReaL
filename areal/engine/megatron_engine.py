@@ -281,6 +281,73 @@ def _patch_te_layernorm_column_parallel_linear_bias():
     MindSpeedTELayerNormColumnParallelLinear._bias_patched = True
 
 
+def _patch_mindspeed_npu_groupmatmul_add_fp32_dtype():
+    """Backport MindSpeed commit ``6cd85e8a`` (in 26.0.0_core_r0.12.1, missing
+    from 2.3.0_core_r0.12.1 used by the Ascend NPU container).
+
+    In ``GroupedMlpWithCompAndCommOverlapAll2All.backward`` (and the
+    all2allseq / fb_overlap variants), the recompute_activation branch
+    rebinds ``mm2_inputs``:
+
+        mm2_inputs = act_without_probs_ * permuted_probs_inputs_detach.unsqueeze(-1)
+
+    When ``moe_router_dtype=fp32`` (mbridge's Qwen3-VL-MoE default),
+    ``permuted_probs_inputs_detach`` is fp32 while ``act_without_probs_`` is
+    bf16, so the product upcasts to fp32. The fp32 ``mm2_inputs`` is then
+    fed to ``npu_groupmatmul_add_fp32(x=mm2_inputs, dy=grad_outs[bf16], ...,
+    main_grad)`` — the op silently produces wrong gradients when ``x.dtype !=
+    dy.dtype``. Upstream 26.0.0 adds ``mm2_inputs = mm2_inputs.to(act_inputs.dtype)``
+    after the multiply; we do the equivalent at the consumer boundary by
+    casting ``x`` to ``dy.dtype`` inside the op wrapper.
+
+    All three preconditions are satisfied by examples/vlm/qwen3-vl-30b-moe.yaml:
+    ``moe_alltoall_overlap_comm=true``, ``moe_router_dtype="fp32"`` (mbridge
+    auto-set), ``moe_zero_memory="level 1"``. Self-correcting: no-op when
+    dtypes already match.
+    """
+    import importlib
+
+    from mindspeed.ops import npu_groupmatmul_add as _mod
+
+    if getattr(_mod, "_areal_dtype_patched", False):
+        return
+
+    _orig = _mod.npu_groupmatmul_add_fp32
+
+    @functools.wraps(_orig)
+    def _wrapped(x, dy, group_list, grad):
+        if x.dtype != dy.dtype:
+            x = x.to(dy.dtype)
+        return _orig(x, dy, group_list, grad)
+
+    _mod.npu_groupmatmul_add_fp32 = _wrapped
+
+    # ``from ... import npu_groupmatmul_add_fp32`` binds a local reference
+    # in each call-site module; replacing ``_mod.npu_groupmatmul_add_fp32``
+    # alone leaves those bindings pointing at the unwrapped function.
+    _call_site_modules = (
+        "mindspeed.core.transformer.moe.moe_feature.overlap."
+        "grouped_mlp_with_comp_and_comm_overlap_all2all",
+        "mindspeed.core.transformer.moe.moe_feature.overlap."
+        "grouped_mlp_with_comp_and_comm_overlap_all2allseq",
+        "mindspeed.core.transformer.moe.moe_feature.overlap."
+        "grouped_mlp_with_comp_and_comm_overlap_allgather",
+        "mindspeed.core.transformer.moe.moe_feature.fb_overlap.modules.experts",
+        "mindspeed.core.transformer.moe.moe_feature.fb_overlap.modules."
+        "weight_grad_store",
+        "mindspeed.ops.gmm",
+    )
+    for modname in _call_site_modules:
+        try:
+            m = importlib.import_module(modname)
+        except ImportError:
+            continue
+        if getattr(m, "npu_groupmatmul_add_fp32", None) is _orig:
+            m.npu_groupmatmul_add_fp32 = _wrapped
+
+    _mod._areal_dtype_patched = True
+
+
 # `model.named_modules()` yields LOCAL layer indices on each PP rank, while
 # `get_named_parameters` rewrites them to GLOBAL indices via layer_offset. Strip
 # the index so the GLU detection set matches across PP ranks. Also strip trailing
@@ -2178,6 +2245,7 @@ class MegatronEngine(TrainEngine):
         config.update(config_overrides)
         repatch(config)
         _patch_te_layernorm_column_parallel_linear_bias()
+        _patch_mindspeed_npu_groupmatmul_add_fp32_dtype()
 
     def _save_model_to_hf(
         self,
