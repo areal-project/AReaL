@@ -32,15 +32,17 @@ from areal.api.alloc_mode import ModelAllocation
 from areal.api.cli_args import (
     MegatronEngineConfig,
     MicroBatchSpec,
+    MindSpeedEngineConfig,
     OptimizerConfig,
     TrainEngineConfig,
 )
 from areal.engine import MegatronEngine
 from areal.infra.platforms import current_platform
 from areal.utils.data import broadcast_tensor_container
-from areal.utils.testing_utils import DENSE_MODEL_PATHS
+from areal.utils.testing_utils import DENSE_MODEL_PATHS, MOE_MODEL_PATHS
 
 VLM_MODEL_PATH = os.environ.get("VLM_MODEL_PATH", DENSE_MODEL_PATHS["qwen2_5_vl"])
+IS_MOE_MODEL = VLM_MODEL_PATH in MOE_MODEL_PATHS.values()
 
 
 def write_result(path: str, result: str):
@@ -110,6 +112,25 @@ def make_vlm_engine(
     hundred MB on the same device.
     """
     bridge_type = os.environ.get("AREAL_TEST_BRIDGE_TYPE", "mbridge")
+    # MindSpeed's TE adaptor aliases ``fused_permute_with_probs`` to bare
+    # ``nn.Module`` on NPU, so any MoE forward that hits that code path
+    # crashes with ``TypeError: Module.__init__() got an unexpected
+    # keyword argument 'num_out_tokens'``. Enabling ``moe_alltoall_overlap_comm``
+    # routes through MindSpeed's overlap dispatcher, which has its own
+    # permute and never calls the broken alias. The rest of these flags
+    # mirror ``examples/vlm/qwen3-vl-30b-moe.yaml`` so the test exercises
+    # the same MindSpeed code paths the user's training uses; ``moe_zero_memory``
+    # is intentionally left disabled because it requires PP>1 with VPP.
+    mindspeed_cfg = MindSpeedEngineConfig()
+    if current_platform.device_type == "npu" and IS_MOE_MODEL:
+        mindspeed_cfg = MindSpeedEngineConfig(
+            use_fused_rotary_pos_emb=True,
+            use_fused_swiglu=True,
+            moe_alltoall_overlap_comm=True,
+            moe_grouped_gemm=True,
+            moe_permute_fusion=True,
+            gemm_gradient_accumulation_fusion=True,
+        )
     config = TrainEngineConfig(
         backend=backend,
         experiment_name="test-vlm",
@@ -120,6 +141,7 @@ def make_vlm_engine(
         megatron=MegatronEngineConfig(
             bridge_type=bridge_type, wrap_with_ddp=wrap_with_ddp
         ),
+        mindspeed=mindspeed_cfg,
         gradient_checkpointing=True,
     )
     alloc_mode = ModelAllocation.from_str(backend)
@@ -182,7 +204,10 @@ def test_vlm_forward(backend: str, output: str | None = None):
 def test_vlm_save_load(backend: str, save_dir: str, output: str | None = None):
     """Test VLM save/load weight round-trip."""
     rank = int(os.environ["RANK"])
-    engine = make_vlm_engine(backend, init_optimizer=False)
+    # No DDP grad buffer — save/load reads/writes parameters directly, no
+    # grad needed. Saves ~2× model bytes per rank so 30B+ MoE on 8 NPUs
+    # doesn't OOM on the HCCL broadcast during mbridge init.
+    engine = make_vlm_engine(backend, init_optimizer=False, wrap_with_ddp=False)
     bcasted_input = _make_input(engine)
 
     engine.eval()

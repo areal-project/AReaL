@@ -113,28 +113,45 @@ def _run_vlm_test(
 
 
 # ──────────────────────────────────────────────────────────────────────
-# Per-model env fixtures.
+# Per-model scenarios.
 #
-# Each parametric scenario below runs once for every entry in _VLM_MODELS.
+# Each entry is ``{"env": <env-vars>, "backend": <override>}``. ``backend``
+# is ``None`` for dense VLMs (the test's own default backend is used) and
+# set explicitly for MoE entries that can't fit the default allocation —
+# Qwen3-VL-MoE-30B-A3B OOMs on ``d1p1t1`` (and on TP-only allocations: TP
+# doesn't shard the expert dimension, so the 128 routed experts per layer
+# stay fully replicated on every rank). The asymmetric ``(attn:d2t4|ffn:d2e4)``
+# allocation puts experts on EP=4 which is the smallest allocation that
+# both fits and exercises the EP code path.
+#
 # To add a new VLM, register the path in ``areal.utils.testing_utils`` and
-# append one tuple here — no test-body changes needed.
+# append one entry here — no test-body changes needed.
 # ──────────────────────────────────────────────────────────────────────
 
 _VLM_MODELS = [
     pytest.param(
-        {"VLM_MODEL_PATH": DENSE_MODEL_PATHS["qwen2_5_vl"]},
+        {
+            "env": {"VLM_MODEL_PATH": DENSE_MODEL_PATHS["qwen2_5_vl"]},
+            "backend": None,
+        },
         id="qwen25_vl",
     ),
     pytest.param(
-        {"VLM_MODEL_PATH": DENSE_MODEL_PATHS["qwen3_vl"]},
+        {
+            "env": {"VLM_MODEL_PATH": DENSE_MODEL_PATHS["qwen3_vl"]},
+            "backend": None,
+        },
         id="qwen3_vl",
     ),
     pytest.param(
-        {"VLM_MODEL_PATH": MOE_MODEL_PATHS["qwen3_vl_moe"]},
+        {
+            "env": {"VLM_MODEL_PATH": MOE_MODEL_PATHS["qwen3_vl_moe"]},
+            "backend": "megatron:(attn:d2t4|ffn:d2e4)",
+        },
         id="qwen3_vl_moe",
         marks=pytest.mark.skipif(
             current_platform.device_count() < 8,
-            reason="Qwen3-VL-MoE-30B-A3B requires at least 8 GPUs",
+            reason="Qwen3-VL-MoE-30B-A3B requires at least 8 GPUs (EP=4)",
         ),
     ),
 ]
@@ -147,7 +164,12 @@ _VLM_MODELS = [
 def test_engine_initializes(model_env, tmp_path_factory):
     """Verify VLM engine detects vision model and loads processor."""
     output = str(tmp_path_factory.mktemp("vlm_test") / "init.out")
-    _run_vlm_test("init", output, env_overrides=model_env)
+    _run_vlm_test(
+        "init",
+        output,
+        backend=model_env["backend"] or "megatron:d1p1t1",
+        env_overrides=model_env["env"],
+    )
 
 
 @pytest.mark.gpu
@@ -157,7 +179,12 @@ def test_engine_initializes(model_env, tmp_path_factory):
 def test_simple_forward(model_env, tmp_path_factory):
     """Verify forward pass with VLM inputs completes."""
     output = str(tmp_path_factory.mktemp("vlm_test") / "forward.out")
-    _run_vlm_test("forward", output, env_overrides=model_env)
+    _run_vlm_test(
+        "forward",
+        output,
+        backend=model_env["backend"] or "megatron:d1p1t1",
+        env_overrides=model_env["env"],
+    )
 
 
 @pytest.mark.gpu
@@ -171,8 +198,9 @@ def test_hf_save_load_weights(model_env, tmp_path_factory):
     _run_vlm_test(
         "save_load",
         output,
+        backend=model_env["backend"] or "megatron:d1p1t1",
         extra_args=[f"--save_dir={save_dir}"],
-        env_overrides=model_env,
+        env_overrides=model_env["env"],
     )
 
 
@@ -182,15 +210,15 @@ def test_hf_save_load_weights(model_env, tmp_path_factory):
 @pytest.mark.skipif(not ACCELERATOR_AVAILABLE, reason="No accelerator available")
 @pytest.mark.parametrize("model_env", _VLM_MODELS)
 def test_train_tensor_parallel(model_env, tmp_path_factory):
-    """VLM training with TP=2 to avoid single-device OOM."""
+    """VLM training with TP=2 (dense) / EP-aware allocation (MoE) to avoid OOM."""
     if current_platform.device_count() < 2:
         pytest.skip("VLM TP training requires at least 2 GPUs")
     output = str(tmp_path_factory.mktemp("vlm_test") / "train_tp2.out")
     _run_vlm_test(
         "train",
         output,
-        backend="megatron:d1p1t2",
-        env_overrides=model_env,
+        backend=model_env["backend"] or "megatron:d1p1t2",
+        env_overrides=model_env["env"],
     )
 
 
@@ -220,6 +248,33 @@ def test_qwen3vl_moe_expert_parallel(tmp_path_factory):
         "forward",
         output,
         backend="megatron:(attn:d2t4|ffn:d2e4)",
+        env_overrides={"VLM_MODEL_PATH": MOE_MODEL_PATHS["qwen3_vl_moe"]},
+    )
+
+
+@pytest.mark.multi_gpu
+@pytest.mark.slow
+@pytest.mark.skipif(not ACCELERATOR_AVAILABLE, reason="No accelerator available")
+def test_qwen3vl_moe_hf_save_load(tmp_path_factory):
+    """HF save/load round-trip for Qwen3-VL-MoE under ``(attn:d2t4|ffn:d2e4)``.
+
+    Mirrors the forward smoke test's allocation (8 devices) and adds an
+    end-to-end ``save → zero → load → forward-match`` cycle in HF
+    safetensors format. This exercises the MoE expert collection / gather
+    path in ``hf_save.py`` for 30B-A3B that DCP save/load can't cover on
+    NPU (vendored mcore 0.12.1 has a torch-2.9 signature mismatch).
+    """
+    if current_platform.device_count() < 8:
+        pytest.skip("Qwen3-VL-MoE HF save load requires 8 GPUs to run")
+    save_dir = str(tmp_path_factory.mktemp("vlm_save_moe"))
+    output = str(
+        tmp_path_factory.mktemp("test_output") / "qwen3vl_moe_hf_save_load.out"
+    )
+    _run_vlm_test(
+        "save_load",
+        output,
+        backend="megatron:(attn:d2t4|ffn:d2e4)",
+        extra_args=[f"--save_dir={save_dir}"],
         env_overrides={"VLM_MODEL_PATH": MOE_MODEL_PATHS["qwen3_vl_moe"]},
     )
 
