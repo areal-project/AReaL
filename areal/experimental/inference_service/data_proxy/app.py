@@ -37,12 +37,18 @@ from areal.experimental.inference_service.inf_bridge import InfBridge
 from areal.experimental.inference_service.sglang.bridge import SGLangBridgeBackend
 from areal.experimental.inference_service.vllm.bridge import VLLMBridgeBackend
 from areal.experimental.openai.client import ArealOpenAI
-from areal.experimental.openai.proxy.server import serialize_interactions
+from areal.experimental.openai.types import (
+    InteractionWithTokenLogpReward,
+    concat_string_interactions,
+)
 from areal.infra.rpc.guard.data_blueprint import (
     data_bp,
 )
+from areal.infra.rpc.rtensor import RTensor
+from areal.infra.rpc.serialization import serialize_value
 from areal.infra.utils.http import create_httpx_client
 from areal.utils import logging
+from areal.utils.data import concat_padded_tensors
 
 logger = logging.getLogger("InferenceDataProxy")
 
@@ -717,9 +723,6 @@ def create_app(config: DataProxyConfig) -> FastAPI:
                 detail="session_ids must be a non-empty list",
             )
 
-        from areal.experimental.openai.types import InteractionWithTokenLogpReward
-        from areal.infra.rpc.rtensor import RTensor
-
         merged: dict[str, InteractionWithTokenLogpReward] = {}
 
         for sid in body.session_ids:
@@ -733,24 +736,22 @@ def create_app(config: DataProxyConfig) -> FastAPI:
                     style=body.style,
                     trajectory_id=body.trajectory_id,
                 )
+                merged.update(interactions)
             except KeyError:
                 continue
 
-            for item in interactions.values():
-                if item.has_tensor_data:
-                    item.to_tensor_dict()
-                    item._cache = RTensor.remotize(
-                        item._cache, node_addr=config.serving_addr
-                    )
-
-            merged.update(interactions)
+        if all(v.has_tensor_data for v in merged.values()):
+            traj = concat_padded_tensors([v.to_tensor_dict() for v in merged.values()])
+            traj = RTensor.remotize(traj, node_addr=config.serving_addr)
+        else:
+            traj = concat_string_interactions(merged)
 
         if body.remove_session:
             for sid in body.session_ids:
                 store.remove_session(sid)
 
-        serialized = serialize_interactions(merged)
-        return ExportTrajectoriesResponse(interactions=serialized)
+        serialized = serialize_value(traj)
+        return ExportTrajectoriesResponse(traj=serialized)
 
     # =========================================================================
     # Runtime backend reconfiguration (for fork-based deployment)

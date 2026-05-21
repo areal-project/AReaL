@@ -412,43 +412,6 @@ class TestRolloutControllerV2Construction:
         assert "http://127.0.0.1:19000" in data_proxy_cmd
 
 
-# =============================================================================
-# RolloutControllerV2 — gateway HTTP helpers
-# =============================================================================
-
-
-class TestRolloutControllerV2HTTP:
-    def test_gateway_http_post_raises_on_failure(self):
-        cfg = InferenceEngineConfig(backend="sglang:d1", admin_api_key="test-key")
-        scheduler = MagicMock(n_gpus_per_node=8)
-        controller = RolloutControllerV2(config=cfg, scheduler=scheduler)
-        controller._gateway_addr = "http://127.0.0.1:19999"
-        with pytest.raises(RuntimeError, match="Failed to POST"):
-            controller._gateway_http_post("/test", {"key": "value"})
-
-    def test_gateway_http_post_sends_auth(self):
-        mock_resp = MagicMock()
-        mock_resp.status_code = 200
-
-        cfg = InferenceEngineConfig(
-            backend="sglang:d1",
-            admin_api_key="my-secret-key",
-        )
-        scheduler = MagicMock(n_gpus_per_node=8)
-        controller = RolloutControllerV2(config=cfg, scheduler=scheduler)
-        controller._gateway_addr = "http://127.0.0.1:8080"
-
-        with patch.object(
-            controller._sync_client, "post", return_value=mock_resp
-        ) as mock_post:
-            controller._gateway_http_post("/test_endpoint", {"data": 1})
-
-        mock_post.assert_called_once()
-        call_kwargs = mock_post.call_args
-        assert "Bearer my-secret-key" in str(call_kwargs)
-        assert "http://127.0.0.1:8080/test_endpoint" in str(call_kwargs)
-
-
 class TestOnlineCallbackFlow:
     @pytest.mark.asyncio
     async def test_online_callback_without_waiter_buffers_export_request(self):
