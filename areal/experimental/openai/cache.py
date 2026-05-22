@@ -99,8 +99,7 @@ class InteractionCache(OrderedDict[str, InteractionWithTokenLogpReward]):
 
         An interaction X is a retry orphan iff:
           1) Some other interaction Y has identical input messages (deep equal).
-          2) Y was inserted into the cache after X.
-          3) X has no children in the parent-child tree (i.e. no later
+          2) X has no children in the parent-child tree (i.e. no later
              interaction adopted X as parent).
 
         This pattern is produced when the upstream Agent SDK times out
@@ -140,9 +139,8 @@ class InteractionCache(OrderedDict[str, InteractionWithTokenLogpReward]):
             ref_msgs = self[cids[0]].messages
             if any(self[c].messages != ref_msgs for c in cids[1:]):
                 continue
-            # All entries except the last (latest) are candidates; only mark
-            # those without children as orphans.
-            for cid in cids[:-1]:
+            # Any entry without children is an orphan.
+            for cid in cids:
                 if cid not in has_children:
                     orphan_ids.add(cid)
         return orphan_ids
