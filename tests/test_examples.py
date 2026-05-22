@@ -163,7 +163,8 @@ def test_countdown_example(tmp_path_factory):
 @pytest.mark.sglang
 @pytest.mark.multi_gpu
 @pytest.mark.ci
-def test_gsm8k_grpo(tmp_path_factory):
+@pytest.mark.parametrize("_version", ["v1", "v2"])
+def test_gsm8k_grpo(tmp_path_factory, _version):
     experiments_path = tmp_path_factory.mktemp("experiments")
     name_resolve_path = tmp_path_factory.mktemp("name_resolve")
     model_path = get_model_path(
@@ -192,9 +193,11 @@ def test_gsm8k_grpo(tmp_path_factory):
         f"cluster.name_resolve.nfs_record_root={str(name_resolve_path)}",
         f"actor.path={model_path}",
         "scheduler.type=local",
+        f"+actor._version={_version}",
+        f"+rollout._version={_version}",
         timeout=900,
     )
-    assert success, "GSM8K GRPO example failed"
+    assert success, f"GSM8K GRPO example failed (_version={_version})"
 
 
 @pytest.mark.parametrize(
