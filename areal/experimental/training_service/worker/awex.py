@@ -113,6 +113,65 @@ def create_awex_blueprint(
             return_result=False,
         )
 
+    @bp.route("/init_colocate_weight_update", methods=["POST"])
+    def init_colocate_weight_update():
+        data = flask_module.request.get_json(force=True)
+
+        def action():
+            adapter = _require_adapter()
+            adapter.init_colocate_weight_update(**data)
+
+        return run_endpoint(
+            "init_colocate_weight_update",
+            lambda: submit_to_engine_thread("init_colocate_weight_update", action),
+            return_result=False,
+        )
+
+    @bp.route("/execute_colocate_weight_update", methods=["POST"])
+    def execute_colocate_weight_update():
+        data = flask_module.request.get_json(force=True)
+        version = data.get("version", 0)
+
+        def action():
+            adapter = _require_adapter()
+            adapter.execute_colocate_weight_update(version)
+
+        return run_endpoint(
+            "execute_colocate_weight_update",
+            lambda: submit_to_engine_thread("execute_colocate_weight_update", action),
+            return_result=False,
+        )
+
+    @bp.route("/release_memory", methods=["POST"])
+    def release_memory():
+        data = flask_module.request.get_json(force=True)
+        tags = data.get("tags")
+
+        def action():
+            adapter = _require_adapter()
+            adapter.release_memory(tags)
+
+        return run_endpoint(
+            "release_memory",
+            lambda: submit_to_engine_thread("release_memory", action),
+            return_result=False,
+        )
+
+    @bp.route("/resume_memory", methods=["POST"])
+    def resume_memory():
+        data = flask_module.request.get_json(force=True)
+        tags = data.get("tags")
+
+        def action():
+            adapter = _require_adapter()
+            adapter.resume_memory(tags)
+
+        return run_endpoint(
+            "resume_memory",
+            lambda: submit_to_engine_thread("resume_memory", action),
+            return_result=False,
+        )
+
     @bp.route("/debug/get_parameters", methods=["POST"])
     def get_parameters():
         """Save local shard parameters to a file for test validation."""

@@ -258,6 +258,43 @@ class TestPPOActorLossFnSequenceLevel:
             stat["importance_weight"][0, 0], stat["importance_weight"][0, 3], atol=1e-5
         )
 
+    def test_sequence_level_2d_advantage_average_ignores_masked_values(self):
+        """Masked padding advantages must not change valid-token sequence loss."""
+        loss_mask = torch.tensor([[True, True, False, False]])
+        logprobs = torch.zeros(1, 4)
+        proximal_logprobs = torch.zeros(1, 4)
+        old_logprobs = torch.zeros(1, 4)
+        clean_advantages = torch.tensor([[1.0, 1.0, 0.0, 0.0]])
+        contaminated_advantages = torch.tensor([[1.0, 1.0, 10.0, 10.0]])
+
+        clean_loss, clean_stat = ppo_actor_loss_fn(
+            logprobs=logprobs,
+            proximal_logprobs=proximal_logprobs,
+            old_logprobs=old_logprobs,
+            advantages=clean_advantages,
+            eps_clip=0.2,
+            loss_mask=loss_mask,
+            importance_sampling_level="sequence",
+        )
+        contaminated_loss, contaminated_stat = ppo_actor_loss_fn(
+            logprobs=logprobs,
+            proximal_logprobs=proximal_logprobs,
+            old_logprobs=old_logprobs,
+            advantages=contaminated_advantages,
+            eps_clip=0.2,
+            loss_mask=loss_mask,
+            importance_sampling_level="sequence",
+        )
+
+        assert torch.allclose(contaminated_loss, clean_loss)
+        assert torch.allclose(
+            contaminated_stat["loss"][loss_mask], clean_stat["loss"][loss_mask]
+        )
+        assert torch.allclose(
+            contaminated_stat["loss"][~loss_mask],
+            torch.zeros_like(contaminated_stat["loss"][~loss_mask]),
+        )
+
     def test_sequence_level_with_mask_1d(self):
         """Test sequence-level with partial masking for 1D tensors (packed sequences)."""
         # Two sequences: [4 tokens, 4 tokens]

@@ -7,6 +7,7 @@
 <a href="./assets/figures/wechat_qrcode.png" target="_blank"><img src="./assets/figures/wechat_icon.png" width="20" style="vertical-align: middle;"> <b>WeChat (微信) Group</b></a> |
   <a href="https://gitcgr.com/areal-project/AReaL">
     <img src="https://gitcgr.com/badge/areal-project/AReaL.svg" alt="gitcgr" />
+  <a href="https://www.bestpractices.dev/projects/12770"><img src="https://www.bestpractices.dev/projects/12770/badge"></a>
   </a>
 </p>
 

@@ -40,7 +40,7 @@ from areal.utils.network import format_hostport
 logger = logging.getLogger("RolloutControllerV2")
 
 _MAX_COMPLETED_ONLINE_RESULTS = 1024
-_DEFAULT_SERVICE_LOG_LEVEL = "info"
+_DEFAULT_SERVICE_LOG_LEVEL = "warning"
 
 
 @dataclass

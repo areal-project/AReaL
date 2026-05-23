@@ -112,6 +112,7 @@ class WeightUpdateController:
         save_path: str = "",
         use_lora: bool = False,
         lora_name: str = "",
+        colocate: bool = False,
     ) -> None:
         self._pair_name = pair_name
         resp = self._http.post(
@@ -124,11 +125,14 @@ class WeightUpdateController:
                 "save_path": save_path,
                 "use_lora": use_lora,
                 "lora_name": lora_name,
+                "colocate": colocate,
             },
             timeout=self.config.request_timeout,
         )
         resp.raise_for_status()
-        logger.info("Connected pair '%s' (mode=%s)", pair_name, mode)
+        logger.info(
+            "Connected pair '%s' (mode=%s, colocate=%s)", pair_name, mode, colocate
+        )
 
     def update_weights(self, version: int) -> WeightUpdateResult:
         if self._pair_name is None:

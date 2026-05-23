@@ -368,6 +368,17 @@ class PPOTrainer:
             weight_update_meta=self.weight_update_meta,
         )
 
+        # After recovery, sync the staleness manager so its capacity formula
+        # stays bounded despite the version jumping from 0 to recovery_version.
+        if self.recover_info is not None:
+            recovery_version = self.recover_info.last_step_info.global_step + 1
+            if is_single_controller():
+                sm = self.rollout.staleness_manager
+            else:
+                sm = self.rollout.workflow_executor.staleness_manager
+            if sm is not None:
+                sm.on_version_recovered(recovery_version)
+
         self._config_perf_tracer()
         self._apply_initial_offload_policy()
 

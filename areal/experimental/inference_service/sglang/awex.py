@@ -94,3 +94,48 @@ def register_awex_endpoints(app: FastAPI, rpc_proxy: RpcProxy) -> None:
         except Exception as e:
             logger.error("Failed to randomize parameters: %s", e)
             return JSONResponse(status_code=500, content={"error": str(e)})
+
+    @app.post("/awex/init_colocate_weight_update")
+    async def init_colocate_weight_update(request: Request) -> JSONResponse:
+        try:
+            data = await request.json()
+            rpc_proxy.collective_rpc("awex_init_colocate_weight_update", **data)
+            return JSONResponse(content={"status": "ok"})
+        except Exception as e:
+            logger.error("Failed to init colocate weight update: %s", e)
+            return JSONResponse(status_code=500, content={"error": str(e)})
+
+    @app.post("/awex/execute_colocate_weight_update")
+    async def execute_colocate_weight_update(request: Request) -> JSONResponse:
+        try:
+            data = await request.json()
+            version = data.get("version", 0)
+            rpc_proxy.collective_rpc(
+                "awex_execute_colocate_weight_update", version=version
+            )
+            return JSONResponse(content={"status": "ok", "version": version})
+        except Exception as e:
+            logger.error("Failed to execute colocate weight update: %s", e)
+            return JSONResponse(status_code=500, content={"error": str(e)})
+
+    @app.post("/awex/release_memory")
+    async def release_memory(request: Request) -> JSONResponse:
+        try:
+            data = await request.json()
+            tags = data.get("tags")
+            rpc_proxy.collective_rpc("awex_release_memory", tags=tags)
+            return JSONResponse(content={"status": "ok"})
+        except Exception as e:
+            logger.error("Failed to release memory: %s", e)
+            return JSONResponse(status_code=500, content={"error": str(e)})
+
+    @app.post("/awex/resume_memory")
+    async def resume_memory(request: Request) -> JSONResponse:
+        try:
+            data = await request.json()
+            tags = data.get("tags")
+            rpc_proxy.collective_rpc("awex_resume_memory", tags=tags)
+            return JSONResponse(content={"status": "ok"})
+        except Exception as e:
+            logger.error("Failed to resume memory: %s", e)
+            return JSONResponse(status_code=500, content={"error": str(e)})

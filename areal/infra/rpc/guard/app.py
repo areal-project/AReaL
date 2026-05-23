@@ -590,10 +590,14 @@ def run_server(
     standalone guard entrypoints.  Handles SIGTERM, cleanup hooks,
     and forked-child cleanup on shutdown.
     """
+    import logging as _logging
+
     from werkzeug.serving import make_server
 
     from areal.api.cli_args import NameResolveConfig
     from areal.utils import name_resolve, names
+
+    _logging.getLogger("werkzeug").setLevel(_logging.WARNING)
 
     server = make_server(bind_host, port, app, threaded=True)
     state.server_port = server.socket.getsockname()[1]
