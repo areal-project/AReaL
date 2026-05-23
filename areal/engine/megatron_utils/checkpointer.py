@@ -147,6 +147,7 @@ class MegatronCheckpointManager:
         use_checkpoint_opt_param_scheduler: bool = False,
         use_dist_checkpointing: bool = True,
         async_save: bool = False,
+        distrib_optim_sharding_type: str = "dp_reshardable",
     ):
         self.model = model
         self.optimizer = optimizer
@@ -160,6 +161,7 @@ class MegatronCheckpointManager:
         self.rank = torch.distributed.get_rank()
         self.use_dist_checkpointing = use_dist_checkpointing
         self.async_save = async_save
+        self.distrib_optim_sharding_type = distrib_optim_sharding_type
         if async_save:
             raise NotImplementedError("Async save not implenmented yet!")
 
@@ -280,7 +282,17 @@ class MegatronCheckpointManager:
         # Optimizer State Dict
         if with_optimizer:
             torch.distributed.barrier()
-            optimizer_sharded_states = self.optimizer.sharded_state_dict(state_dict)
+            # megatron-core >=0.11 removed flattened_range support in
+            # ShardedTensor.validate_metadata_integrity(), but the default
+            # sharding type (fully_sharded_model_space) still sets
+            # flattened_range, causing save/load to fail. Use
+            # dp_reshardable which does not rely on flattened_range.
+            optimizer_sharded_states = self.optimizer.sharded_state_dict(
+                state_dict,
+                metadata={
+                    "distrib_optim_sharding_type": self.distrib_optim_sharding_type
+                },
+            )
             state_dict["optimizer"] = optimizer_sharded_states
 
             if self.lr_scheduler is not None:

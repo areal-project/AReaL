@@ -1358,6 +1358,7 @@ class MegatronEngine(TrainEngine):
                 use_distributed_optimizer=use_distributed_optimizer,
                 use_checkpoint_opt_param_scheduler=self.mcore_config.use_checkpoint_opt_param_scheduler,
                 async_save=self.mcore_config.async_save,
+                distrib_optim_sharding_type=self.mcore_config.distrib_optim_sharding_type,
             )
 
     def _check_rollout_engine_connected(self) -> None:

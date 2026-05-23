@@ -874,6 +874,17 @@ class MegatronEngineConfig:
     # Checkpointing Configuration
     async_save: bool = False
     use_checkpoint_opt_param_scheduler: bool = True
+    distrib_optim_sharding_type: str = field(
+        default="dp_reshardable",
+        metadata={
+            "help": (
+                "Sharding type for distributed optimizer checkpoint. "
+                "'dp_reshardable' works with megatron-core >=0.11; set to "
+                "'fully_sharded_model_space' to load legacy checkpoints."
+            ),
+            "choices": ["dp_reshardable", "fully_sharded_model_space"],
+        },
+    )
 
     # Deterministic Option
     # NOTE: This option forces torch to use deterministic algorithms,
