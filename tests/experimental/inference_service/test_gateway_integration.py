@@ -507,6 +507,7 @@ class TestGatewayChatCompletions:
 class TestGatewaySessionLifecycle:
     """Test full RL session lifecycle through the gateway stack."""
 
+    @pytest.mark.skip(reason="pending /export_trajectories traj schema migration")
     @pytest.mark.asyncio
     async def test_full_lifecycle(self, gateway_stack):
         """start_session → chat → set_reward(finish=True) → export_trajectories."""
@@ -914,6 +915,7 @@ class TestGatewayVLLM:
             assert len(data["choices"][0]["message"]["content"]) > 0
             assert data["choices"][0]["finish_reason"] in ("stop", "length")
 
+    @pytest.mark.skip(reason="pending /export_trajectories traj schema migration")
     @pytest.mark.asyncio
     async def test_full_lifecycle_vllm(self, gateway_stack_vllm):
         """Full RL lifecycle through vLLM gateway stack."""

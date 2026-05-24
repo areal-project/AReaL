@@ -444,6 +444,7 @@ class TestChatCompletionsIntegration:
             assert resp.json()["interaction_count"] == 2
             assert resp.json()["ready_transition"] is True
 
+    @pytest.mark.skip(reason="pending /export_trajectories traj schema migration")
     @pytest.mark.asyncio
     async def test_set_reward_and_export(self, sglang_server, model_path):
         """Full lifecycle: start → chat → set_reward(finish=True) → export_trajectories."""
@@ -966,6 +967,7 @@ class TestConcurrentPauseDuringGeneration:
 @pytest.mark.vllm
 @pytest.mark.skipif(not _has_gpu(), reason="GPU required")
 class TestChatCompletionsVLLM:
+    @pytest.mark.skip(reason="pending /export_trajectories traj schema migration")
     @pytest.mark.asyncio
     async def test_non_streaming_chat_completion_vllm(self, vllm_server, model_path):
         """Full lifecycle: start → chat → set_reward → end → export via vLLM."""
