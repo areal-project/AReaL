@@ -117,20 +117,20 @@ class WeightUpdateController:
         nccl_master_port: int = 0,
     ) -> None:
         self._pair_name = pair_name
+        payload: dict[str, Any] = {
+            "pair_name": pair_name,
+            "train_worker_urls": train_worker_urls,
+            "inference_worker_urls": inference_worker_urls,
+            "mode": mode,
+            "save_path": save_path,
+            "use_lora": use_lora,
+            "lora_name": lora_name,
+            "nccl_master_addr": nccl_master_addr,
+            "nccl_master_port": nccl_master_port,
+        }
         resp = self._http.post(
             f"{self._gateway_url}/connect",
-            json={
-                "pair_name": pair_name,
-                "train_worker_urls": train_worker_urls,
-                "inference_worker_urls": inference_worker_urls,
-                "mode": mode,
-                "save_path": save_path,
-                "use_lora": use_lora,
-                "lora_name": lora_name,
-                "colocate": colocate,
-                "nccl_master_addr": nccl_master_addr,
-                "nccl_master_port": nccl_master_port,
-            },
+            json=payload,
             timeout=self.config.request_timeout,
         )
         resp.raise_for_status()
