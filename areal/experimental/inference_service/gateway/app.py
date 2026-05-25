@@ -253,6 +253,25 @@ def create_app(config: GatewayConfig) -> FastAPI:
             )
         return result
 
+    @app.post("/deregister_model")
+    async def deregister_model(request: Request):
+        require_admin_key(request, config.admin_api_key)
+        body = await request.json()
+        model = body.get("model")
+        if not model:
+            return JSONResponse({"error": "model is required"}, status_code=400)
+        try:
+            await remove_model_from_router(
+                config.router_addr,
+                model,
+                config.admin_api_key,
+                config.router_timeout,
+                client=_client(),
+            )
+        except (RouterUnreachableError, RouterKeyRejectedError) as exc:
+            return _router_error_response(exc)
+        return {"model": model, "status": "deregistered"}
+
     @app.get("/models")
     async def list_models(request: Request):
         require_admin_key(request, config.admin_api_key)

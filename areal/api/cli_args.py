@@ -2693,6 +2693,16 @@ class BaseExperimentConfig:
         default=MISSING,
         metadata={"help": "Name of the trial (no '-' or '/'). Required."},
     )
+    driver: str | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Driver entry function as 'module.path:func', read by the `areal` "
+                "CLI to locate the driver to launch. Ignored by the driver itself. "
+                "Overridable via `areal run --driver MOD:FUNC`."
+            )
+        },
+    )
     cluster: ClusterSpecConfig = field(
         default_factory=ClusterSpecConfig,
         metadata={"help": "Cluster specification. Mainly used by slurm."},

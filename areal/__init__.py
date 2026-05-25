@@ -4,18 +4,29 @@
 
 from .version import __version__  # noqa
 
-from .infra import (
-    RolloutController,
-    StalenessManager,
-    TrainController,
-    WorkflowExecutor,
-    current_platform,
-    workflow_context,
-)
+# Names exposed under ``areal.*`` but lazy-loaded so that simply doing
+# ``import areal`` (e.g., from the CLI) does not pull in the full infra /
+# trainer stack (torch, aiohttp, sglang, ...).
+_LAZY_INFRA = {
+    "RolloutController",
+    "StalenessManager",
+    "TrainController",
+    "WorkflowExecutor",
+    "current_platform",
+    "workflow_context",
+}
+
+_LAZY_TRAINERS = {"DPOTrainer", "PPOTrainer", "RWTrainer", "SFTTrainer"}
 
 
 def __getattr__(name: str):
-    if name in ("DPOTrainer", "PPOTrainer", "RWTrainer", "SFTTrainer"):
+    if name in _LAZY_INFRA:
+        from . import infra
+
+        val = getattr(infra, name)
+        globals()[name] = val
+        return val
+    if name in _LAZY_TRAINERS:
         from .trainer import DPOTrainer, PPOTrainer, RWTrainer, SFTTrainer
 
         _map = {

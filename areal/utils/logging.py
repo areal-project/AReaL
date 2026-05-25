@@ -122,6 +122,8 @@ LOGGER_COLORS_EXACT = {
     "InferenceRouter": "white",
     "InferenceGateway": "white",
     "RPCGuard": "white",
+    # CLI - white (orchestration)
+    "ArealCLI": "white",
 }
 
 # Prefix patterns checked in order (first match wins)
