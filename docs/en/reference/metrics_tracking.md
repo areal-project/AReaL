@@ -243,7 +243,7 @@ RolloutController.export_stats()                 │
 ## StatsLogger: Logging Backends
 
 The
-[`StatsLogger`](https://github.com/inclusionAI/AReaL/blob/main/areal/utils/stats_logger.py)
+[`StatsLogger`](https://github.com/areal-project/AReaL/blob/main/areal/utils/stats_logger.py)
 sends aggregated metrics to external logging backends. It is automatically managed by
 `PPOTrainer` and runs only on rank 0 to avoid duplicate logging.
 

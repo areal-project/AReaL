@@ -316,9 +316,11 @@ async def test_start_session_with_admin_key(client):
     )
     assert resp.status_code == 201
     data = resp.json()
-    assert "session_id" in data
-    assert "api_key" in data
-    assert data["session_id"].startswith("test-task-")
+    assert "group_id" in data
+    assert "sessions" in data
+    assert len(data["sessions"]) == 1
+    assert data["sessions"][0]["session_id"].startswith("test-task-")
+    assert "session_api_key" in data["sessions"][0]
 
 
 @pytest.mark.asyncio
@@ -353,7 +355,7 @@ async def test_chat_completions_with_session_key(client, mock_areal_client):
         json={"task_id": "chat-test"},
         headers=admin_headers(),
     )
-    api_key = resp.json()["api_key"]
+    api_key = resp.json()["sessions"][0]["session_api_key"]
 
     # Call chat/completions (OpenAI-compatible format)
     resp = await client.post(
@@ -416,7 +418,7 @@ async def test_chat_completions_passes_sampling_params(client, mock_areal_client
         json={"task_id": "sp-test"},
         headers=admin_headers(),
     )
-    api_key = resp.json()["api_key"]
+    api_key = resp.json()["sessions"][0]["session_api_key"]
 
     resp = await client.post(
         "/chat/completions",
@@ -450,7 +452,7 @@ async def test_set_reward_success(client):
         json={"task_id": "reward-test"},
         headers=admin_headers(),
     )
-    api_key = resp.json()["api_key"]
+    api_key = resp.json()["sessions"][0]["session_api_key"]
 
     resp = await client.post(
         "/chat/completions",
@@ -484,7 +486,7 @@ async def test_set_reward_no_interactions(client):
         json={"task_id": "reward-empty"},
         headers=admin_headers(),
     )
-    api_key = resp.json()["api_key"]
+    api_key = resp.json()["sessions"][0]["session_api_key"]
 
     resp = await client.post(
         "/rl/set_reward",
@@ -516,7 +518,7 @@ async def test_set_reward_auto_finishes(client):
         json={"task_id": "end-test"},
         headers=admin_headers(),
     )
-    api_key = resp.json()["api_key"]
+    api_key = resp.json()["sessions"][0]["session_api_key"]
 
     resp = await client.post(
         "/chat/completions",
@@ -550,7 +552,7 @@ async def test_set_reward_only_once_allowed(client):
         json={"task_id": "twice-test"},
         headers=admin_headers(),
     )
-    api_key = resp.json()["api_key"]
+    api_key = resp.json()["sessions"][0]["session_api_key"]
 
     resp = await client.post(
         "/chat/completions",
@@ -751,10 +753,11 @@ async def test_online_start_session_returns_generated_session_key(client):
     )
     assert resp.status_code == 201
     data = resp.json()
-    assert "session_id" in data
-    assert "api_key" in data
-    assert data["session_id"].startswith("batch-1-")
-    assert len(data["api_key"]) > 0
+    assert "group_id" in data
+    assert "sessions" in data
+    assert len(data["sessions"]) == 1
+    assert data["sessions"][0]["session_id"].startswith("batch-1-")
+    assert len(data["sessions"][0]["session_api_key"]) > 0
 
 
 @pytest.mark.asyncio
@@ -764,8 +767,8 @@ async def test_batch_session_produces_single_trajectory(client):
         json={"task_id": "batch-traj"},
         headers=admin_headers(),
     )
-    session_api_key = start.json()["api_key"]
-    session_id = start.json()["session_id"]
+    session_api_key = start.json()["sessions"][0]["session_api_key"]
+    session_id = start.json()["sessions"][0]["session_id"]
 
     await client.post(
         "/chat/completions",
@@ -790,8 +793,8 @@ async def test_batch_online_set_reward_completes_that_session(client):
         json={"task_id": "batch-complete"},
         headers=admin_headers(),
     )
-    session_api_key = start.json()["api_key"]
-    session_id = start.json()["session_id"]
+    session_api_key = start.json()["sessions"][0]["session_api_key"]
+    session_id = start.json()["sessions"][0]["session_id"]
 
     await client.post(
         "/chat/completions",
@@ -807,7 +810,7 @@ async def test_batch_online_set_reward_completes_that_session(client):
     export_resp = await client.post(
         "/export_trajectories",
         json={
-            "session_id": session_id,
+            "session_ids": [session_id],
             "trajectory_id": 0,
             "discount": 1.0,
             "style": "individual",
@@ -830,7 +833,7 @@ async def test_hitl_and_batch_can_run_simultaneously(client):
         json={"task_id": "coexist-batch"},
         headers=admin_headers(),
     )
-    batch_key = start.json()["api_key"]
+    batch_key = start.json()["sessions"][0]["session_api_key"]
 
     await client.post(
         "/chat/completions",
@@ -857,7 +860,9 @@ async def test_hitl_and_batch_can_run_simultaneously(client):
     assert hitl_reward.status_code == 200
     assert batch_reward.status_code == 200
     assert hitl_reward.json()["session_id"] == "__hitl__"
-    assert batch_reward.json()["session_id"] == start.json()["session_id"]
+    assert (
+        batch_reward.json()["session_id"] == start.json()["sessions"][0]["session_id"]
+    )
 
     health = await client.get("/health")
     assert health.json()["sessions"] == 2
@@ -874,8 +879,8 @@ async def test_admin_key_still_only_maps_to_hitl_session_while_batch_uses_sessio
         json={"task_id": "mapping"},
         headers=admin_headers(),
     )
-    batch_key = start.json()["api_key"]
-    batch_id = start.json()["session_id"]
+    batch_key = start.json()["sessions"][0]["session_api_key"]
+    batch_id = start.json()["sessions"][0]["session_id"]
 
     await client.post(
         "/chat/completions",
@@ -934,17 +939,18 @@ async def test_chat_completion_without_valid_token_falls_through_to_standalone(
 async def test_export_trajectories_not_found(client):
     resp = await client.post(
         "/export_trajectories",
-        json={"session_id": "nonexistent", "discount": 1.0, "style": "individual"},
+        json={"session_ids": ["nonexistent"], "discount": 1.0, "style": "individual"},
         headers=admin_headers(),
     )
-    assert resp.status_code == 404
+    assert resp.status_code == 200
+    assert resp.json()["interactions"] == {}
 
 
 @pytest.mark.asyncio
 async def test_export_trajectories_without_admin_key(client):
     resp = await client.post(
         "/export_trajectories",
-        json={"session_id": "x", "discount": 1.0, "style": "individual"},
+        json={"session_ids": ["x"], "discount": 1.0, "style": "individual"},
     )
     assert resp.status_code == 401
 
@@ -1060,7 +1066,7 @@ async def test_online_export_latest_ready_without_trajectory_id(client):
 
     export_resp = await client.post(
         "/export_trajectories",
-        json={"session_id": "__hitl__", "discount": 1.0, "style": "individual"},
+        json={"session_ids": ["__hitl__"], "discount": 1.0, "style": "individual"},
         headers=admin_headers(),
     )
     assert export_resp.status_code == 200
@@ -1105,10 +1111,11 @@ async def test_online_export_explicit_trajectory_id(client):
     export_resp = await client.post(
         "/export_trajectories",
         json={
-            "session_id": "__hitl__",
+            "session_ids": ["__hitl__"],
             "trajectory_id": 0,
             "discount": 1.0,
             "style": "individual",
+            "remove_session": False,
         },
         headers=admin_headers(),
     )
@@ -1163,8 +1170,8 @@ async def test_full_session_lifecycle(client, mock_areal_client):
         headers=admin_headers(),
     )
     assert resp.status_code == 201
-    session_id = resp.json()["session_id"]
-    api_key = resp.json()["api_key"]
+    session_id = resp.json()["sessions"][0]["session_id"]
+    api_key = resp.json()["sessions"][0]["session_api_key"]
 
     # 2. Chat completion
     resp = await client.post(
@@ -1191,7 +1198,7 @@ async def test_full_session_lifecycle(client, mock_areal_client):
     # 4. Export trajectories
     resp = await client.post(
         "/export_trajectories",
-        json={"session_id": session_id, "discount": 1.0, "style": "individual"},
+        json={"session_ids": [session_id], "discount": 1.0, "style": "individual"},
         headers=admin_headers(),
     )
     assert resp.status_code == 200

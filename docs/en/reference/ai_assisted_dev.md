@@ -211,5 +211,5 @@ We welcome contributions to both the codebase and AI development configurations:
 - **OpenCode configs**: Edit files in `.opencode/`
 - **Claude Code configs**: Edit files in `.claude/`
 
-See [CONTRIBUTING.md](https://github.com/inclusionAI/AReaL/blob/main/CONTRIBUTING.md)
+See [CONTRIBUTING.md](https://github.com/areal-project/AReaL/blob/main/CONTRIBUTING.md)
 for guidelines.

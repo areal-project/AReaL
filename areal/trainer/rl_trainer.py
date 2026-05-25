@@ -407,6 +407,17 @@ class PPOTrainer:
             weight_update_meta=self.weight_update_meta,
         )
 
+        # After recovery, sync the staleness manager so its capacity formula
+        # stays bounded despite the version jumping from 0 to recovery_version.
+        if self.recover_info is not None:
+            recovery_version = self.recover_info.last_step_info.global_step + 1
+            if is_single_controller():
+                sm = self.rollout.staleness_manager
+            else:
+                sm = self.rollout.workflow_executor.staleness_manager
+            if sm is not None:
+                sm.on_version_recovered(recovery_version)
+
         self._config_perf_tracer()
         self._apply_initial_offload_policy()
 
@@ -841,7 +852,7 @@ class PPOTrainer:
                 # process-local ``_fetch_buffer``; one HTTP DELETE to the
                 # storage owner clears ``_storage`` but not per-consumer
                 # caches. Fan out ``clear_batches`` to every role that
-                # localized the batch — see inclusionAI/AReaL#1209.
+                # localized the batch — see areal-project/AReaL#1209.
                 # SPMD mode never populates ``_fetch_buffer`` (no RTensor
                 # round-trip), so the fan-out is single-controller only.
                 if is_single_controller():
@@ -1044,6 +1055,7 @@ class PPOTrainer:
             server_args = SGLangConfig.build_args(
                 sglang_config=self.config.sglang,
                 tp_size=self.rollout_alloc.parallel.tp_size,
+                pp_size=self.rollout_alloc.parallel.pp_size,
                 base_gpu_id=0,
             )
         elif rollout_backend == "vllm":

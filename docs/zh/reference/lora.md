@@ -9,7 +9,7 @@ RL 微调在硬件资源有限的条件下也更具可行性。
 - 由于显存压力更低，可以支持更大的 batch size，
 - 模型迁移与部署更加简单，因为只需要保存和分发 LoRA adapter，
 - \[Future\] 更高效地并行微调多个 LoRA adapter，以提升硬件利用率（参见 RFC
-  [#609](https://github.com/inclusionAI/AReaL/issues/609)）。
+  [#609](https://github.com/areal-project/AReaL/issues/609)）。
 
 本文档说明如何在 RL 训练中启用 LoRA，并配置相关参数。
 

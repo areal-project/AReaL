@@ -626,7 +626,7 @@ def remove(shard_id: str) -> int:
     goes through the HTTP backend (even for a self-local shard) and caches
     the fetched tensor. Without this pop, RSS grows unboundedly across steps
     on any worker that both stores and localizes the same shard — see
-    inclusionAI/AReaL#1209.
+    areal-project/AReaL#1209.
     """
     global _storage, _storage_lock, _storage_stats
     with _fetch_buffer_lock:

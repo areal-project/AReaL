@@ -813,7 +813,7 @@ class TrainController:
     def clear_batches(self, *targets: dict[str, RTensor]):
         """Clear distributed batch shards from workers to free memory.
 
-        Two fan-outs — see inclusionAI/AReaL#1209:
+        Two fan-outs — see areal-project/AReaL#1209:
 
         1. ``_async_clear_batches``: HTTP DELETE to each storage node,
            dropping ``_storage`` entries (and the owner's ``_fetch_buffer``

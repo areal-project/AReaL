@@ -91,7 +91,7 @@ ${IMAGE}  \
 ```bash
 rm -rf /AReaL
 
-git clone https://github.com/inclusionAI/AReaL
+git clone https://github.com/areal-project/AReaL
 cd AReaL
 
 # 切换到 ascend 分支

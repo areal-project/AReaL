@@ -201,5 +201,5 @@ AReaL/
 - **OpenCode 配置**：编辑 `.opencode/` 中的文件
 - **Claude Code 配置**：编辑 `.claude/` 中的文件
 
-参见 [CONTRIBUTING.md](https://github.com/inclusionAI/AReaL/blob/main/CONTRIBUTING.md)
+参见 [CONTRIBUTING.md](https://github.com/areal-project/AReaL/blob/main/CONTRIBUTING.md)
 获取指南。

@@ -20,7 +20,7 @@ permissions:
 
 env:
   GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
-  IMAGE_NAME: ghcr.io/inclusionai/areal-runtime
+  IMAGE_NAME: ghcr.io/areal-project/areal-runtime
 
 jobs:
   start-builder:
@@ -152,7 +152,7 @@ jobs:
         uses: docker/login-action@v4
         with:
           registry: ghcr.io
-          username: inclusionai
+          username: areal-project
           password: ${{ secrets.GHCR_TOKEN }}
 
       - name: Build and push sglang image

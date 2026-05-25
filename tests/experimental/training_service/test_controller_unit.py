@@ -63,7 +63,7 @@ class _FakeAsyncClient:
             raise next_item
         return next_item
 
-    async def _post(self, _url: str, json=None):
+    async def _post(self, _url: str, json=None, **kwargs):
         _ = json
         next_item = self._responses_or_errors.pop(0)
         if isinstance(next_item, Exception):

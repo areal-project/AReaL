@@ -236,7 +236,7 @@ RolloutController.export_stats()                 │
 
 ## StatsLogger：日志后端
 
-[`StatsLogger`](https://github.com/inclusionAI/AReaL/blob/main/areal/utils/stats_logger.py)
+[`StatsLogger`](https://github.com/areal-project/AReaL/blob/main/areal/utils/stats_logger.py)
 将聚合指标发送到外部日志后端。它由 `PPOTrainer` 自动管理，仅在 rank 0 运行以避免重复日志。
 
 ### 支持的后端

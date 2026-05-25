@@ -3,10 +3,11 @@
 </h1>
 
 <p align="center">
-| <a href="https://arxiv.org/pdf/2505.24298"><b>Paper</b></a> | <a href="https://inclusionai.github.io/AReaL/"><b>Documentation</b></a> | <a href="https://inclusionai.github.io/AReaL/zh/"><b>中文文档</b></a> | <a href="https://deepwiki.com/inclusionAI/AReaL"><b>Ask DeepWiki</b></a> | <a href="https://huggingface.co/collections/inclusionAI/"><b>🤗 Models & Data</b></a> |
+| <a href="https://arxiv.org/pdf/2505.24298"><b>Paper</b></a> | <a href="https://areal-project.github.io/AReaL/"><b>Documentation</b></a> | <a href="https://areal-project.github.io/AReaL/zh/"><b>中文文档</b></a> | <a href="https://deepwiki.com/areal-project/AReaL"><b>Ask DeepWiki</b></a> | <a href="https://huggingface.co/collections/inclusionAI/"><b>🤗 Models & Data</b></a> |
 <a href="./assets/figures/wechat_qrcode.png" target="_blank"><img src="./assets/figures/wechat_icon.png" width="20" style="vertical-align: middle;"> <b>WeChat (微信) Group</b></a> |
-  <a href="https://gitcgr.com/inclusionAI/AReaL">
-    <img src="https://gitcgr.com/badge/inclusionAI/AReaL.svg" alt="gitcgr" />
+  <a href="https://gitcgr.com/areal-project/AReaL">
+    <img src="https://gitcgr.com/badge/areal-project/AReaL.svg" alt="gitcgr" />
+  <a href="https://www.bestpractices.dev/projects/12770"><img src="https://www.bestpractices.dev/projects/12770/badge"></a>
   </a>
 </p>
 
@@ -29,7 +30,7 @@ cost-effective** for a broad community of developers and researchers.
 **AReaL Highlights**
 
 - ⚡ **Flexibility**: Seamless customization for
-  [agentic RL](https://inclusionai.github.io/AReaL/en/tutorial/agentic_rl.html) and
+  [agentic RL](https://areal-project.github.io/AReaL/en/tutorial/agentic_rl.html) and
   [online RL training](https://www.inclusion-ai.org/AReaL/en/tutorial/online_proxy.html)
   for **black-box agent applications** by simply replacing the `base_url`.
 - 📈 **Scalability**: **Stable** fully asynchronous RL training with **industry-leading
@@ -43,7 +44,7 @@ cost-effective** for a broad community of developers and researchers.
 **\[2026/04/23\]** 🚀 We’re excited to release our integration with
 [Scaffoldings](https://github.com/NVIDIA/TensorRT-LLM/tree/main/tensorrt_llm/scaffolding)
 for agentic RL training - now live in our
-[examples](https://github.com/inclusionAI/AReaL/tree/main/examples/scaffolding)! Huge
+[examples](https://github.com/areal-project/AReaL/tree/main/examples/scaffolding)! Huge
 shoutout to @narutolhy and @WeiHaocheng for making this happen 🙌. The modular design of
 the Scaffoldings enables it to achieve a thorough decoupling of agent execution, reward
 calculation, and trajectory acquisition. This enables developers to reuse existing
@@ -53,7 +54,7 @@ innovative modules.
 **\[2026/04/18\]** We are thrilled to announce that **AReaL's first Community Biweekly
 Meeting** was successfully held! Thank you to everyone who joined us. Meeting materials
 are now available
-[here](https://github.com/inclusionAI/AReaL/tree/main/assets/community). Our next
+[here](https://github.com/areal-project/AReaL/tree/main/assets/community). Our next
 meeting is scheduled for **2026/05/01** and will also be conducted in Chinese;
 English-language meetings will be scheduled in the future. We warmly welcome everyone to
 participate! See [Community](./assets/community/README.md) for more details.
@@ -71,7 +72,7 @@ and achieves comparable performance with Gemini 3.0 Pro on $\\tau^2$-bench! Chec
 the [paper](https://arxiv.org/pdf/2601.22607),
 [model](https://huggingface.co/inclusionAI/AReaL-SEA-235B-A22B),
 [data](https://huggingface.co/datasets/inclusionAI/AReaL-tau2-data), and
-[code](https://github.com/inclusionAI/AReaL/tree/main/examples/tau2).
+[code](https://github.com/areal-project/AReaL/tree/main/examples/tau2).
 
 **\[2026/01/15\]** Congrats to our friends at [CAMEL-AI](https://www.camel-ai.org/) for
 open-sourcing [SETA](https://github.com/camel-ai/seta), their terminal agent RL project
@@ -82,8 +83,8 @@ and the [announcement on X](https://x.com/guohao_li/status/2009678513574408636).
 **\[2026/01/01\]** Happy New Year! Thanks to the outstanding contribution from
 @HwVanICI, we are excited to officially announce stable support for AReaL training on
 **Ascend NPU devices**! The code is actively maintained and continuously updated in the
-[`ascend` branch](https://github.com/inclusionAI/AReaL/tree/ascend). Check out
-[our documentation](https://inclusionai.github.io/AReaL/en/tutorial/installation_npu.html)
+[`ascend` branch](https://github.com/areal-project/AReaL/tree/ascend). Check out
+[our documentation](https://areal-project.github.io/AReaL/en/tutorial/installation_npu.html)
 to get started, and feel free to report any issues!
 
 **\[2025/08/30\]** Introducing ASearcher, a state-of-the-art search agent built with
@@ -96,7 +97,7 @@ features an **algorithm-first** API design that prioritizes ease of use and algo
 development, while natively supporting **fully asynchronous agentic RL**. With 80% fewer
 lines of code, AReaL-lite maintains 90% of AReaL's performance and core functionality.
 Check out [our AReaL-lite design documentation](/areal/README.md) and
-[the quickstart guide](https://inclusionai.github.io/AReaL/en/tutorial/quickstart.html)
+[the quickstart guide](https://areal-project.github.io/AReaL/en/tutorial/quickstart.html)
 to begin your journey with **AReaL-lite**!
 
 **\[2025/06/03\] (v0.3, boba²)** We release **boba²** (double-boba) for fully
@@ -122,7 +123,7 @@ state-of-the-art 7B and 32B models for mathematical reasoning. Check out our
 First, install the package:
 
 ```bash
-git clone https://github.com/inclusionAI/AReaL
+git clone https://github.com/areal-project/AReaL
 cd AReaL
 pip install uv
 # Install flash-attn pre-built wheel first to avoid compiling from source
@@ -150,7 +151,7 @@ python3 examples/math/gsm8k_rl.py --config examples/math/gsm8k_grpo.yaml \
 ```
 
 For comprehensive setup instructions, see
-[our quickstart guide](https://inclusionai.github.io/AReaL/en/tutorial/quickstart.html).
+[our quickstart guide](https://areal-project.github.io/AReaL/en/tutorial/quickstart.html).
 
 ## 📚 Examples
 
@@ -322,7 +323,7 @@ git push
 ## 🗺️ Future Roadmap
 
 - **[Full Roadmap](ROADMAP.md)**
-- **[2026 Q1 Roadmap](https://github.com/inclusionAI/AReaL/issues/907)**
+- **[2026 Q1 Roadmap](https://github.com/areal-project/AReaL/issues/907)**
 
 AReaL is under active development with planned minor releases weekly and major releases
 monthly. We warmly welcome community engagement and contributions. We are also

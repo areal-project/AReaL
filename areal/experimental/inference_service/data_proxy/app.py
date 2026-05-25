@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hmac
 import json
+import uuid
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -22,6 +23,7 @@ from areal.experimental.inference_service.data_proxy.session import (
     ExportTrajectoriesRequest,
     ExportTrajectoriesResponse,
     ReadyNotification,
+    SessionCredentials,
     SessionData,
     SessionStore,
     SetRewardRequest,
@@ -39,6 +41,7 @@ from areal.experimental.openai.proxy.server import serialize_interactions
 from areal.infra.rpc.guard.data_blueprint import (
     data_bp,
 )
+from areal.infra.utils.http import create_httpx_client
 from areal.utils import logging
 
 logger = logging.getLogger("InferenceDataProxy")
@@ -230,7 +233,7 @@ async def _post_online_ready_callback(
         if client is not None:
             resp = await _do(client)
         else:
-            async with httpx.AsyncClient(timeout=timeout) as c:
+            async with create_httpx_client(timeout=timeout) as c:
                 resp = await _do(c)
 
         if resp.status_code >= 400:
@@ -323,7 +326,7 @@ def create_app(config: DataProxyConfig) -> FastAPI:
         )
         app.state.session_store.set_admin_key(config.admin_api_key)
         app.state.version = 0
-        app.state.http_client = httpx.AsyncClient(timeout=config.request_timeout)
+        app.state.http_client = create_httpx_client(timeout=config.request_timeout)
 
         if not config.backend_addr:
             app.state.tokenizer = None
@@ -435,6 +438,11 @@ def create_app(config: DataProxyConfig) -> FastAPI:
         if version is None or not isinstance(version, int):
             raise HTTPException(status_code=400, detail="'version' (int) is required")
         app.state.version = version
+
+        # Propagate version to InfBridge so it stamps correct versions on generated tokens
+        if app.state.inf_bridge is not None:
+            app.state.inf_bridge.set_version(version)
+
         return SetVersionResponse(status="ok", version=version)
 
     @app.get("/get_version", response_model=GetVersionResponse)
@@ -451,13 +459,23 @@ def create_app(config: DataProxyConfig) -> FastAPI:
     ) -> StartSessionResponse:
         store: SessionStore = app.state.session_store
         _require_admin_key(request, store)
-        try:
-            session_id, session_api_key = store.start_session(
-                body.task_id, body.api_key
+
+        group_id = f"grp-{uuid.uuid4()}"
+        group_size = max(body.group_size, 1)
+        credentials: list[SessionCredentials] = []
+        for i in range(group_size):
+            try:
+                session_id, session_api_key = store.start_session(
+                    body.task_id, body.api_key if i == 0 else None
+                )
+            except ValueError as e:
+                raise HTTPException(status_code=409, detail=str(e))
+            credentials.append(
+                SessionCredentials(
+                    session_id=session_id, session_api_key=session_api_key
+                )
             )
-        except ValueError as e:
-            raise HTTPException(status_code=409, detail=str(e))
-        return StartSessionResponse(session_id=session_id, api_key=session_api_key)
+        return StartSessionResponse(group_id=group_id, sessions=credentials)
 
     @app.post("/rl/set_reward", response_model=SetRewardResponse)
     async def set_reward(body: SetRewardRequest, request: Request):
@@ -541,7 +559,7 @@ def create_app(config: DataProxyConfig) -> FastAPI:
                 async def _stream_and_cache():
                     success = False
                     try:
-                        async with httpx.AsyncClient(
+                        async with create_httpx_client(
                             timeout=httpx.Timeout(config.request_timeout)
                         ) as stream_client:
                             async with stream_client.stream(
@@ -693,46 +711,46 @@ def create_app(config: DataProxyConfig) -> FastAPI:
         store: SessionStore = app.state.session_store
         _require_admin_key(request, store)
 
-        session = store.get_session(body.session_id)
-        if session is None:
+        if not body.session_ids:
             raise HTTPException(
-                status_code=404, detail=f"Session {body.session_id} not found"
+                status_code=400,
+                detail="session_ids must be a non-empty list",
             )
 
-        try:
-            _, interactions = session.export_trajectory(
-                discount=body.discount,
-                style=body.style,
-                trajectory_id=body.trajectory_id,
-            )
-        except KeyError as exc:
-            detail = str(exc).strip('"')
-            status_code = 404 if body.trajectory_id is not None else 409
-            raise HTTPException(status_code=status_code, detail=detail) from exc
-
-        if body.remove_session:
-            store.remove_session(body.session_id)
-
-        # Serialize for HTTP transport, storing tensors locally as RTensor shards
+        from areal.experimental.openai.types import InteractionWithTokenLogpReward
         from areal.infra.rpc.rtensor import RTensor
 
-        for item in interactions.values():
-            if item.has_tensor_data:
-                # Set the internal cache
-                item.to_tensor_dict()
-                # Remotize the tensor dict cache
-                item._cache = RTensor.remotize(
-                    item._cache, node_addr=config.serving_addr
+        merged: dict[str, InteractionWithTokenLogpReward] = {}
+
+        for sid in body.session_ids:
+            session = store.get_session(sid)
+            if session is None:
+                continue
+
+            try:
+                _, interactions = session.export_trajectory(
+                    discount=body.discount,
+                    style=body.style,
+                    trajectory_id=body.trajectory_id,
                 )
+            except KeyError:
+                continue
 
-        # serialize RTensors
-        serialized = serialize_interactions(interactions)
+            for item in interactions.values():
+                if item.has_tensor_data:
+                    item.to_tensor_dict()
+                    item._cache = RTensor.remotize(
+                        item._cache, node_addr=config.serving_addr
+                    )
+
+            merged.update(interactions)
+
+        if body.remove_session:
+            for sid in body.session_ids:
+                store.remove_session(sid)
+
+        serialized = serialize_interactions(merged)
         return ExportTrajectoriesResponse(interactions=serialized)
-
-    # NOTE: /grant_capacity has been removed from data proxy. Capacity-based
-    # staleness control is now managed at the router level — see
-    # areal.experimental.inference_service.router.app for the /grant_capacity
-    # endpoint.
 
     # =========================================================================
     # Runtime backend reconfiguration (for fork-based deployment)

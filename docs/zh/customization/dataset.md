@@ -75,7 +75,7 @@ for global_step in range(start_step, max_steps):
 Workflow 的多个并发执行中，其中每个分派的数据对应一个单独的 episode。
 
 在以下部分中，我们以
-[`RLVRWorkflow`](https://github.com/inclusionAI/AReaL/blob/main/areal/workflow/rlvr.py)
+[`RLVRWorkflow`](https://github.com/areal-project/AReaL/blob/main/areal/workflow/rlvr.py)
 为例。Agent Workflow 使用输入数据的模式相同。只要符合您的 Workflow 实现，您可以随意修改自定义数据集以包含任何键。
 
 `RLVRWorkflow` 实现从数据字典中提取 "messages" 字段作为生成响应的提示。此外，此数据作为关键字参数传递给

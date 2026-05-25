@@ -361,8 +361,8 @@ rollout:
 
 ## See Also
 
-- [OpenClaw Example](https://github.com/inclusionAI/AReaL/tree/main/examples/openclaw) -
-  Complete end-to-end example with ZeroClaw
+- [OpenClaw Example](https://github.com/areal-project/AReaL/tree/main/examples/openclaw)
+  \- Complete end-to-end example with ZeroClaw
 - [Agentic RL Tutorial](agentic_rl.md) - Agent framework integration (inline/subproc
   modes)
 - [Custom Agent Workflows](../customization/agent.md) - Creating custom agent workflows

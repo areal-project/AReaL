@@ -24,7 +24,7 @@ for this puzzle.
 Before you begin, ensure you have met the following requirements:
 
 - You have installed **AReaL**. Please follow the official
-  [AReaL installation guide](https://inclusionai.github.io/AReaL/en/tutorial/installation.html).
+  [AReaL installation guide](https://areal-project.github.io/AReaL/en/tutorial/installation.html).
 - You have access to the `Qwen/Qwen2.5-3B-Instruct` model on the Hugging Face Hub (or
   have it downloaded locally).
 

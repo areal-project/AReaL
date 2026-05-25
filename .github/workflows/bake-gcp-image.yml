@@ -83,7 +83,7 @@ jobs:
           IMAGE_TAG=$(curl -fsSL -H "$METADATA_HEADER" "$METADATA_URL/image_tag")
           GHCR_TOKEN=$(curl -fsSL -H "$METADATA_HEADER" "$METADATA_URL/ghcr_token" 2>/dev/null || true)
 
-          IMAGE_REPO="ghcr.io/inclusionai/areal-runtime"
+          IMAGE_REPO="ghcr.io/areal-project/areal-runtime"
 
           # Wait for Docker daemon to be ready
           echo "Waiting for Docker daemon..."
@@ -101,7 +101,7 @@ jobs:
 
           # Authenticate to GHCR if token is available
           if [ -n "${GHCR_TOKEN:-}" ]; then
-            echo "$GHCR_TOKEN" | docker login ghcr.io -u inclusionai --password-stdin
+            echo "$GHCR_TOKEN" | docker login ghcr.io -u areal-project --password-stdin
             echo "Authenticated to GHCR."
           fi
 
@@ -274,7 +274,7 @@ jobs:
           |---|---|
           | **New Image** | \`${IMAGE_NAME}\` |
           | **Base Image** | \`${BASE_IMAGE}\` |
-          | **Pre-pulled** | \`ghcr.io/inclusionai/areal-runtime:${IMAGE_TAG}-sglang\`, \`ghcr.io/inclusionai/areal-runtime:${IMAGE_TAG}-vllm\` |
+          | **Pre-pulled** | \`ghcr.io/areal-project/areal-runtime:${IMAGE_TAG}-sglang\`, \`ghcr.io/areal-project/areal-runtime:${IMAGE_TAG}-vllm\` |
 
           ### Next Steps
           Update \`GCP_OS_IMAGE\` in \`.github/workflows/test-areal.yml\`:

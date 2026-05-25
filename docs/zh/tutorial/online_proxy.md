@@ -330,7 +330,7 @@ rollout:
 
 ## 另请参阅
 
-- [OpenClaw 示例](https://github.com/inclusionAI/AReaL/tree/main/examples/openclaw) - 使用
+- [OpenClaw 示例](https://github.com/areal-project/AReaL/tree/main/examples/openclaw) - 使用
   ZeroClaw 的完整端到端示例
 - [智能体 RL 教程](agentic_rl.md) - 智能体框架集成（inline/subproc 模式）
 - [自定义智能体工作流](../customization/agent.md) - 创建自定义智能体工作流

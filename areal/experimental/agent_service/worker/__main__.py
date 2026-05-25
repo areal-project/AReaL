@@ -28,7 +28,13 @@ def main() -> None:
     args = parser.parse_args()
 
     app = create_worker_app(args.agent)
-    uvicorn.run(app, host=args.host, port=args.port, log_level=args.log_level)
+    uvicorn.run(
+        app,
+        host=args.host,
+        port=args.port,
+        log_level=args.log_level,
+        access_log=False,
+    )
 
 
 if __name__ == "__main__":

@@ -113,7 +113,7 @@ def _export_trajectory_with_retry(
         last_response = httpx.post(
             f"{gateway_url}/export_trajectories",
             json={
-                "session_id": session_id,
+                "session_ids": [session_id],
                 "discount": discount,
                 "style": "individual",
             },
@@ -140,16 +140,9 @@ def _make_solid_color_png_b64(width: int, height: int, color: tuple) -> str:
 def _do_vlm_chat_session(
     ctrl, task_id: str, messages: list, *, max_tokens: int = 64
 ) -> dict:
-    """grant_capacity → start_session → chat/completions → end_session."""
+    """start_session → chat/completions → end_session."""
     gw = ctrl._gateway_addr
     admin = "test-admin"
-
-    resp = httpx.post(
-        f"{gw}/grant_capacity",
-        headers={"Authorization": f"Bearer {admin}"},
-        timeout=10.0,
-    )
-    assert resp.status_code == 200, resp.text
 
     resp = httpx.post(
         f"{gw}/rl/start_session",
@@ -158,7 +151,7 @@ def _do_vlm_chat_session(
         timeout=30.0,
     )
     assert resp.status_code == 201, resp.text
-    session_api_key = resp.json()["api_key"]
+    session_api_key = resp.json()["sessions"][0]["session_api_key"]
 
     resp = httpx.post(
         f"{gw}/chat/completions",
@@ -885,14 +878,6 @@ class TestControllerFullInitialization:
         gw = ctrl._gateway_addr
         admin_key = "test-admin"
 
-        # --- grant capacity ---
-        resp = httpx.post(
-            f"{gw}/grant_capacity",
-            headers={"Authorization": f"Bearer {admin_key}"},
-            timeout=10.0,
-        )
-        assert resp.status_code == 200, resp.text
-
         # --- start session ---
         resp = httpx.post(
             f"{gw}/rl/start_session",
@@ -902,7 +887,7 @@ class TestControllerFullInitialization:
         )
         assert resp.status_code == 201, resp.text
         session = resp.json()
-        session_api_key = session["api_key"]
+        session_api_key = session["sessions"][0]["session_api_key"]
 
         # --- non-streaming chat completion ---
         resp = httpx.post(
@@ -1119,13 +1104,6 @@ class TestControllerOnlineWorkflow:
         assert ctrl.config.admin_api_key is not None
         admin_key = ctrl.config.admin_api_key
 
-        grant_resp = httpx.post(
-            f"{gateway_url}/grant_capacity",
-            headers={"Authorization": f"Bearer {admin_key}"},
-            timeout=10.0,
-        )
-        assert grant_resp.status_code == 200, grant_resp.text
-
         start_resp = httpx.post(
             f"{gateway_url}/rl/start_session",
             json={"task_id": "reward-timeout-export"},
@@ -1134,8 +1112,8 @@ class TestControllerOnlineWorkflow:
         )
         assert start_resp.status_code == 201, start_resp.text
         session = start_resp.json()
-        session_id = session["session_id"]
-        session_api_key = session["api_key"]
+        session_id = session["sessions"][0]["session_id"]
+        session_api_key = session["sessions"][0]["session_api_key"]
 
         first_chat = httpx.post(
             f"{gateway_url}/chat/completions",

@@ -20,8 +20,10 @@ def main():
 
     app_module = importlib.import_module("areal.infra.data_service.worker.app")
     config_module = importlib.import_module("areal.infra.data_service.worker.config")
+    logging_module = importlib.import_module("areal.utils.logging")
     create_worker_app = getattr(app_module, "create_worker_app")
     DataWorkerConfig = getattr(config_module, "DataWorkerConfig")
+    suppress_http_loggers = getattr(logging_module, "suppress_http_loggers")
 
     config = DataWorkerConfig(
         host=args.host,
@@ -33,8 +35,15 @@ def main():
     )
     uvicorn = importlib.import_module("uvicorn")
 
+    suppress_http_loggers()
     app = create_worker_app(config)
-    uvicorn.run(app, host=config.host, port=config.port, log_level="warning")
+    uvicorn.run(
+        app,
+        host=config.host,
+        port=config.port,
+        log_level="warning",
+        access_log=False,
+    )
 
 
 if __name__ == "__main__":

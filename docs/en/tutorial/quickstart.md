@@ -10,9 +10,9 @@ function-based rewards. Ensure you've completed
 To run the experiment, you will need:
 
 - Training script:
-  [examples/math/gsm8k_rl.py](https://github.com/inclusionAI/AReaL/blob/main/examples/math/gsm8k_rl.py)
+  [examples/math/gsm8k_rl.py](https://github.com/areal-project/AReaL/blob/main/examples/math/gsm8k_rl.py)
 - Config YAML:
-  [examples/math/gsm8k_grpo.yaml](https://github.com/inclusionAI/AReaL/blob/main/examples/math/gsm8k_grpo.yaml)
+  [examples/math/gsm8k_grpo.yaml](https://github.com/areal-project/AReaL/blob/main/examples/math/gsm8k_grpo.yaml)
 
 Our training scripts will automatically download the dataset (openai/gsm8k) and model
 (Qwen/Qwen2-1.5B-Instruct). To run the example with default configuration, execute from
@@ -28,11 +28,11 @@ python3 examples/math/gsm8k_rl.py --config examples/math/gsm8k_grpo.yaml schedul
 ## Modifying configuration
 
 All available configuration options are listed in
-[areal/api/cli_args.py](https://github.com/inclusionAI/AReaL/blob/main/areal/api/cli_args.py).
+[areal/api/cli_args.py](https://github.com/areal-project/AReaL/blob/main/areal/api/cli_args.py).
 To customize the experiment (models, resources, algorithm options), you can:
 
 1. Edit the YAML file directly at
-   [examples/math/gsm8k_grpo.yaml](https://github.com/inclusionAI/AReaL/blob/main/examples/math/gsm8k_grpo.yaml).
+   [examples/math/gsm8k_grpo.yaml](https://github.com/areal-project/AReaL/blob/main/examples/math/gsm8k_grpo.yaml).
 1. Add command-line options:
    - For existing options in the YAML file, directly add the option:
      `actor.path=Qwen/Qwen3-1.7B`.
@@ -105,7 +105,7 @@ python3 examples/math/gsm8k_rl.py \
 Additional references:
 
 - For more options for schedulers, check `SchedulerConfig` in
-  [areal/api/cli_args.py](https://github.com/inclusionAI/AReaL/blob/main/areal/api/cli_args.py).
+  [areal/api/cli_args.py](https://github.com/areal-project/AReaL/blob/main/areal/api/cli_args.py).
 - Ray cluster setup guide (see installation.md for distributed setup) for a guide on how
   to set up a ray cluster.
 
@@ -158,7 +158,7 @@ sky launch -c areal-test examples/skypilot/ray_cluster.sky.yaml --infra k8s
 ```
 
 Check
-[Running AReaL with SkyPilot](https://github.com/inclusionAI/AReaL/blob/main/examples/skypilot/README.md),
+[Running AReaL with SkyPilot](https://github.com/areal-project/AReaL/blob/main/examples/skypilot/README.md),
 for more details about the examples. Check
 [SkyPilot Documentation](https://docs.skypilot.co/en/latest/docs/index.html) for more
 information about SkyPilot.

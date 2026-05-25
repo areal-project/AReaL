@@ -187,6 +187,7 @@ class SGLangServerWrapper:
                 dist_init_addr=dist_init_addr,
                 n_nodes=n_nodes,
                 node_rank=node_rank,
+                pp_size=self.allocation_mode.gen.pp_size,
             )
             launch_server_args.append((cmd, host_ip, server_port, node_rank))
             server_addresses.append(f"http://{format_hostport(host_ip, server_port)}")

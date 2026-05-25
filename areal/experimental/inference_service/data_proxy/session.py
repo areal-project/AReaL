@@ -27,17 +27,30 @@ SESSION_TIMEOUT_SECONDS = 3600
 
 
 class StartSessionRequest(BaseModel):
-    """Request to start a new offline RL session."""
+    """Request to start one or more offline RL sessions.
+
+    When ``group_size`` is greater than 1, the data proxy creates multiple
+    sessions atomically. The response always contains a flat ``sessions``
+    list — single-session is just ``group_size=1``.
+    """
 
     task_id: str
     api_key: str | None = None  # Reuse a previously-issued key (refresh)
+    group_size: int = 1
+
+
+class SessionCredentials(BaseModel):
+    """One session's identity and authentication key."""
+
+    session_id: str
+    session_api_key: str
 
 
 class StartSessionResponse(BaseModel):
-    """Response from start_session endpoint."""
+    """Response from start_session — always a list of session credentials."""
 
-    session_id: str
-    api_key: str
+    group_id: str
+    sessions: list[SessionCredentials]
 
 
 class SetRewardRequest(BaseModel):
@@ -49,17 +62,23 @@ class SetRewardRequest(BaseModel):
 
 
 class ExportTrajectoriesRequest(BaseModel):
-    """Request to export trajectories for a session."""
+    """Request to export trajectories for one or more sessions.
 
-    session_id: str
+    All sessions are exported and merged into a single interactions dict.
+    ``group_id`` is optional metadata used by the gateway for router cleanup;
+    the data proxy itself does not use it.
+    """
+
+    session_ids: list[str]
+    group_id: str | None = None
     trajectory_id: int | None = None
     discount: float = 1.0
     style: str = "individual"
-    remove_session: bool = False
+    remove_session: bool = True
 
 
 class ExportTrajectoriesResponse(BaseModel):
-    """Response containing serialized interactions."""
+    """Response containing merged serialized interactions."""
 
     interactions: Any
 

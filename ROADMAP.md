@@ -4,12 +4,12 @@ This roadmap outlines the planned features and improvements for AReaL in the nex
 quarter. We welcome community feedback and contributions to help shape the future
 direction of the project.
 
-**Latest Release:** Check [releases](https://github.com/inclusionAI/AReaL/releases) for
-the most recent version.
+**Latest Release:** Check [releases](https://github.com/areal-project/AReaL/releases)
+for the most recent version.
 
 ## 2026 Q1 Roadmap (due April 30, 2026)
 
-[GitHub Issue #907](https://github.com/inclusionAI/AReaL/issues/907).
+[GitHub Issue #907](https://github.com/areal-project/AReaL/issues/907).
 
 This roadmap tracks major planned enhancements through April 30, 2026. Items are
 organized into two categories:
@@ -64,7 +64,7 @@ organized into two categories:
 
 ### 2025 Q4
 
-[GitHub Issue #542](https://github.com/inclusionAI/AReaL/issues/542).
+[GitHub Issue #542](https://github.com/areal-project/AReaL/issues/542).
 
 **Backends**
 
@@ -119,7 +119,7 @@ Carried over to Q1 2026:
 
 ### 2025 Q3
 
-[GitHub Issue #257](https://github.com/inclusionAI/AReaL/issues/257).
+[GitHub Issue #257](https://github.com/areal-project/AReaL/issues/257).
 
 **Backends**
 
@@ -170,13 +170,13 @@ We value community input! Here's how you can help shape AReaL's future:
 ### 💡 Propose New Features
 
 1. **Check Existing Issues:** Search
-   [issues](https://github.com/inclusionAI/AReaL/issues) and
-   [discussions](https://github.com/inclusionAI/AReaL/discussions) to see if your idea
+   [issues](https://github.com/areal-project/AReaL/issues) and
+   [discussions](https://github.com/areal-project/AReaL/discussions) to see if your idea
    already exists
 1. **Create a Feature Request:** Use our
-   [feature request template](https://github.com/inclusionAI/AReaL/issues/new?template=feature.md)
+   [feature request template](https://github.com/areal-project/AReaL/issues/new?template=feature.md)
 1. **Discuss in GitHub Discussions:** Post in
-   [Ideas category](https://github.com/inclusionAI/AReaL/discussions/categories/ideas)
+   [Ideas category](https://github.com/areal-project/AReaL/discussions/categories/ideas)
    for early feedback
 1. **Vote on Features:** Use 👍 reactions on issues to show support
 
@@ -210,5 +210,5 @@ ______________________________________________________________________
 **Last Updated:** 2026-02-06
 
 **Questions about the roadmap?** Open a discussion in
-[GitHub Discussions](https://github.com/inclusionAI/AReaL/discussions) or ask in our
+[GitHub Discussions](https://github.com/areal-project/AReaL/discussions) or ask in our
 [WeChat group](./assets/figures/wechat_qrcode.png).

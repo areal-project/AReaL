@@ -25,7 +25,7 @@ resources:
   cpus: 8+
   memory: 32GB+
   disk_size: 256GB
-  image_id: docker:ghcr.io/inclusionai/areal-runtime:v1.0.4-sglang
+  image_id: docker:ghcr.io/areal-project/areal-runtime:v1.0.4-sglang
 
 num_nodes: 1
 
@@ -78,7 +78,7 @@ Specify the resources and image used to run the experiment.
 ```yaml
 resources:
   accelerators: A100:8
-  image_id: docker:ghcr.io/inclusionai/areal-runtime:v1.0.4-sglang
+  image_id: docker:ghcr.io/areal-project/areal-runtime:v1.0.4-sglang
   memory: 256+
   cpus: 32+
 

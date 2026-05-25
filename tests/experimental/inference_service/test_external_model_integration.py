@@ -88,7 +88,7 @@ class TestGatewayUnifiedExportTrajectories:
 
         resp = await gateway_client.post(
             "/export_trajectories",
-            json={"session_id": "ext-1"},
+            json={"session_ids": ["ext-1"]},
             headers=admin_headers(),
         )
 
@@ -112,7 +112,12 @@ class TestGatewayUnifiedExportTrajectories:
 
         resp = await gateway_client.post(
             "/export_trajectories",
-            json={"session_id": "ses-1", "discount": 1.0, "style": "sft"},
+            json={
+                "session_ids": ["ses-1"],
+                "group_id": "grp-test",
+                "discount": 1.0,
+                "style": "sft",
+            },
             headers=admin_headers(),
         )
 
@@ -139,7 +144,7 @@ class TestGatewayUnifiedExportTrajectories:
         )
 
         assert resp.status_code == 400
-        assert "session_id is required" in resp.json()["error"]
+        assert "session_ids is required" in resp.json()["error"]
         mock_query_router.assert_not_called()
         mock_forward.assert_not_called()
         mock_revoke.assert_not_called()
@@ -373,7 +378,7 @@ async def test_external_model_flow_end_to_end_gateway_router_data_proxy(router_c
 
             exported = await gateway_client.post(
                 "/export_trajectories",
-                json={"session_id": "__hitl__"},
+                json={"session_ids": ["__hitl__"]},
                 headers=admin_headers(),
             )
             assert exported.status_code == 200

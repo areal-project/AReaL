@@ -147,7 +147,7 @@ jobs:
         variant: [sglang, vllm]
     name: Install test (Docker ${{ matrix.variant }} image)
     container:
-      image: ghcr.io/inclusionai/areal-runtime:dev-${{ matrix.variant }}
+      image: ghcr.io/areal-project/areal-runtime:dev-${{ matrix.variant }}
 
     steps:
       - name: Checkout repository

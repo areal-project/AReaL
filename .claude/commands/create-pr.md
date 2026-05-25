@@ -80,12 +80,12 @@ git remote add fork https://github.com/<username>/AReaL.git
 **Store for later use:**
 
 - `PUSH_REMOTE`: The remote to push to (e.g., `origin` or `fork`)
-- `UPSTREAM_REPO`: The upstream repo for PR target (e.g., `inclusionAI/AReaL`)
+- `UPSTREAM_REPO`: The upstream repo for PR target (e.g., `areal-project/AReaL`)
 - `FORK_OWNER`: Fork owner username (for `--head` parameter if needed)
 
 ```bash
 # Example detection script
-UPSTREAM_REPO="inclusionAI/AReaL"
+UPSTREAM_REPO="areal-project/AReaL"
 PUSH_REMOTE=""
 
 # Check if we can push to origin
@@ -386,7 +386,7 @@ Files changed:
 
 Commands to execute:
 1. git push -f -u <fork-remote> feat/vision-rlvr
-2. gh pr create --repo inclusionAI/AReaL --head <username>:feat/vision-rlvr --base main --title "..." --body "..." [--draft]
+2. gh pr create --repo areal-project/AReaL --head <username>:feat/vision-rlvr --base main --title "..." --body "..." [--draft]
 ─────────────────────────────────────────────────
 ```
 
@@ -485,7 +485,7 @@ Add `--draft` flag if requested.
 
 ```
 ✓ PR created/updated successfully!
-https://github.com/inclusionAI/AReaL/pull/123
+https://github.com/areal-project/AReaL/pull/123
 ```
 
 ## Examples

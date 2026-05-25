@@ -25,7 +25,7 @@ with user's request by both using agent tools and guiding users using their tool
 ### Prerequisites
 
 Please make sure AReaL is setup and working following the
-[installation guide](https://inclusionai.github.io/AReaL/en/tutorial/installation.html).
+[installation guide](https://areal-project.github.io/AReaL/en/tutorial/installation.html).
 
 1. Install the (forked) tau2-bench package:
 
@@ -82,7 +82,7 @@ NOTE: Following commands should be executed from root directory of this reposito
 #### Single Node (1.7B Model)
 
 On a single 8x GPU node with our offical image
-(ghcr.io/inclusionai/areal-runtime:latest), run:
+(ghcr.io/areal-project/areal-runtime:latest), run:
 
 ```bash
 python3 examples/tau2/train.py \

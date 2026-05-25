@@ -140,9 +140,11 @@ def _compute_sequence_level_ratio_and_advantages(
         # Average token advantages per sequence
         # This ensures gradient magnitude is independent of sequence length
         seq_lengths = loss_mask.sum(dim=-1, keepdim=True).clamp(min=1)
-        advantages = (advantages.sum(dim=-1, keepdim=True) / seq_lengths).expand_as(
-            log_ratio
-        )
+        masked_advantages = torch.where(loss_mask, advantages, 0.0)
+        advantages = (
+            masked_advantages.sum(dim=-1, keepdim=True) / seq_lengths
+        ).expand_as(log_ratio)
+        advantages = torch.where(loss_mask, advantages, 0.0)
 
     return ratio, advantages
 

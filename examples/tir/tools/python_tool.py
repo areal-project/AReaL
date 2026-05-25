@@ -256,9 +256,14 @@ class PythonTool(BaseTool):
 
         try:
             # Directly call apply to avoid using ProcessPool in async environment
-            result = self.python_executor.apply(code)
-            logger.debug(f"Python execution completed: {str(result)[:100]}...")
-            return str(result), ToolCallStatus.SUCCESS
+            res, report = self.python_executor.apply(code)
+
+            if report != "Done":
+                logger.error(f"Error in Python execution: {report}")
+                return f"Error: {report}", ToolCallStatus.ERROR
+
+            logger.debug(f"Python execution completed: {str(res)[:100]}...")
+            return str(res), ToolCallStatus.SUCCESS
         except Exception as e:
             logger.error(f"Python execution error: {e}")
             return f"Error: {str(e)}", ToolCallStatus.ERROR

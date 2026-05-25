@@ -24,7 +24,7 @@
 | Git LFS                  | 用于下载模型、数据集和 AReaL 代码。请参阅[安装指南](https://docs.github.com/en/repositories/working-with-files/managing-large-files/installing-git-large-file-storage) |
 | Docker                   |                                                                                 27.5.1                                                                                 |
 | NVIDIA Container Toolkit |                             请参阅[安装指南](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)                              |
-| AReaL 镜像               |                                 `ghcr.io/inclusionai/areal-runtime:v1.0.4-sglang`（默认）或 `v1.0.4-vllm`。包含运行时依赖和 Ray 组件。                                 |
+| AReaL 镜像               |                                `ghcr.io/areal-project/areal-runtime:v1.0.4-sglang`（默认）或 `v1.0.4-vllm`。包含运行时依赖和 Ray 组件。                                |
 
 **注意**：本教程不涵盖 NVIDIA 驱动、CUDA 或共享存储挂载的安装，因为这些取决于您具体的节点配置和系统版本。请独立完成这些安装。
 
@@ -37,18 +37,18 @@
 我们推荐使用 Docker 和提供的镜像。Dockerfile 位于 AReaL 仓库的顶级目录。
 
 ```bash
-docker pull ghcr.io/inclusionai/areal-runtime:v1.0.4-sglang
+docker pull ghcr.io/areal-project/areal-runtime:v1.0.4-sglang
 docker run -it --name areal-node1 \
    --privileged --gpus all --network host \
    --shm-size 700g -v /path/to/mount:/path/to/mount \
-   ghcr.io/inclusionai/areal-runtime:v1.0.4-sglang \
+   ghcr.io/areal-project/areal-runtime:v1.0.4-sglang \
    /bin/bash
-git clone https://github.com/inclusionAI/AReaL /path/to/mount/AReaL
+git clone https://github.com/areal-project/AReaL /path/to/mount/AReaL
 cd /path/to/mount/AReaL
 uv pip install -e . --no-deps
 ```
 
-vLLM 变体的 Docker 镜像也可使用： `ghcr.io/inclusionai/areal-runtime:v1.0.4-vllm`。如果您偏好使用 vLLM
+vLLM 变体的 Docker 镜像也可使用： `ghcr.io/areal-project/areal-runtime:v1.0.4-vllm`。如果您偏好使用 vLLM
 作为推理后端，请将上述命令中的镜像标签替换为该变体。
 
 ### 方式 2：自定义环境安装
@@ -58,7 +58,7 @@ vLLM 变体的 Docker 镜像也可使用： `ghcr.io/inclusionai/areal-runtime:v
 1. 克隆仓库：
 
 ```bash
-git clone https://github.com/inclusionAI/AReaL
+git clone https://github.com/areal-project/AReaL
 cd AReaL
 ```
 
@@ -186,7 +186,7 @@ Docker）且需要这些包的优化（例如 FP8 训练、融合 Adam 内核）
 | grouped_gemm      | Megatron 中的 MoE 模型支持        | `uv pip install --no-build-isolation git+https://github.com/fanshiqing/grouped_gemm@v1.1.4`                                                                       |
 | NVIDIA apex       | Megatron 中的融合 Adam 等         | `NVCC_APPEND_FLAGS="--threads 4" APEX_PARALLEL_BUILD=8 APEX_CPP_EXT=1 APEX_CUDA_EXT=1 uv pip install --no-build-isolation git+https://github.com/NVIDIA/apex.git` |
 | TransformerEngine | Megatron 中的 FP8 训练、优化 GEMM | `uv pip install --no-build-isolation git+https://github.com/NVIDIA/TransformerEngine.git@stable`                                                                  |
-| flash-attn-3      | Flash Attention v3（Hopper）      | 从源码构建，请参阅 [Dockerfile](https://github.com/inclusionAI/AReaL/blob/main/Dockerfile)                                                                        |
+| flash-attn-3      | Flash Attention v3（Hopper）      | 从源码构建，请参阅 [Dockerfile](https://github.com/areal-project/AReaL/blob/main/Dockerfile)                                                                      |
 
 **重要**：这些包需要 `--no-build-isolation`，因为它们需要访问已安装的 PyTorch 进行 CUDA 编译。先通过
 `uv sync --extra cuda` 安装 PyTorch，然后再尝试安装这些包。
@@ -194,7 +194,7 @@ Docker）且需要这些包的优化（例如 FP8 训练、融合 Adam 内核）
 ### DeepSeek-V3 优化包（可选）
 
 为了以最佳性能运行 DeepSeek-V3 风格的 MoE 模型，Docker 镜像还包含以下包。这些包有复杂的构建要求和 GPU 架构约束。**请参阅
-[Dockerfile](https://github.com/inclusionAI/AReaL/blob/main/Dockerfile)
+[Dockerfile](https://github.com/areal-project/AReaL/blob/main/Dockerfile)
 获取确切的安装命令和环境变量。**
 
 | 包                     | 用途                             | GPU 要求       |
@@ -268,7 +268,7 @@ sky check
 ```
 
 如果显示 `GCP: enabled` 或 `Kubernetes: enabled`，您就可以将 SkyPilot 与 AReaL 一起使用了。请参阅
-[SkyPilot 示例](https://github.com/inclusionAI/AReaL/blob/main/examples/skypilot/README.md)
+[SkyPilot 示例](https://github.com/areal-project/AReaL/blob/main/examples/skypilot/README.md)
 获取运行 AReaL 的详细指南。更多选项和详细信息，请参阅官方
 [SkyPilot 安装指南](https://docs.skypilot.co/en/latest/getting-started/installation.html)。
 

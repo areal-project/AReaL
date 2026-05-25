@@ -14,7 +14,7 @@ In AReaL, this is especially useful for:
   and shipped,
 - \[Future\] fine-tune multiple LoRA adapters more efficiently in parallel for better
   hardware utilization (see RFC
-  [#609](https://github.com/inclusionAI/AReaL/issues/609)).
+  [#609](https://github.com/areal-project/AReaL/issues/609)).
 
 This guide explains how to enable LoRA in RL training and configure the related
 parameters.

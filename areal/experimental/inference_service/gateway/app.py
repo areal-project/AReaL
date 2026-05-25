@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import traceback
 from contextlib import asynccontextmanager
 
 import httpx
@@ -29,7 +30,6 @@ from areal.experimental.inference_service.gateway.streaming import (
     broadcast_to_workers,
     forward_request,
     forward_sse_stream,
-    grant_capacity_in_router,
     list_models_from_router,
     query_router,
     register_model_in_router,
@@ -38,6 +38,7 @@ from areal.experimental.inference_service.gateway.streaming import (
     resolve_worker_addr,
     revoke_session_in_router,
 )
+from areal.infra.utils.http import create_httpx_client
 from areal.utils import logging
 
 logger = logging.getLogger("InferenceGateway")
@@ -83,7 +84,7 @@ def create_app(config: GatewayConfig) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        app.state.http_client = httpx.AsyncClient(timeout=config.router_timeout)
+        app.state.http_client = create_httpx_client(timeout=config.router_timeout)
         try:
             yield
         finally:
@@ -106,7 +107,7 @@ def create_app(config: GatewayConfig) -> FastAPI:
             return app.state.http_client
         except AttributeError:
             if _fallback_client is None:
-                _fallback_client = httpx.AsyncClient(timeout=config.router_timeout)
+                _fallback_client = create_httpx_client(timeout=config.router_timeout)
             return _fallback_client
 
     # =========================================================================
@@ -297,24 +298,26 @@ def create_app(config: GatewayConfig) -> FastAPI:
             client=_client(),
         )
 
-        # Intercept: if data proxy returned 201, extract session info and register
         if resp.status_code == 201:
             try:
                 resp_data = resp.json()
-                session_api_key = resp_data.get("api_key")
-                session_id = resp_data.get("session_id")
-                if session_api_key and session_id:
-                    await register_session_in_router(
-                        config.router_addr,
-                        session_api_key,
-                        session_id,
-                        worker_addr,
-                        config.router_timeout,
-                        admin_api_key=config.admin_api_key,
-                        client=_client(),
-                    )
+                group_id = resp_data["group_id"]
+                sessions = resp_data.get("sessions", [])
+
+                await register_session_in_router(
+                    config.router_addr,
+                    sessions,
+                    worker_addr,
+                    config.router_timeout,
+                    admin_api_key=config.admin_api_key,
+                    group_id=group_id,
+                    client=_client(),
+                )
+
+                return JSONResponse(resp_data, status_code=201)
             except Exception as exc:
                 logger.error("Failed to register session in router: %s", exc)
+                traceback.print_exc()
                 return JSONResponse(
                     {
                         "error": f"Session created on worker but router registration failed: {exc}"
@@ -474,7 +477,7 @@ def create_app(config: GatewayConfig) -> FastAPI:
         return BroadcastResponse(results=[BroadcastResultItem(**r) for r in results])
 
     # =========================================================================
-    # POST /export_trajectories — admin key ONLY, route by session_id or model field
+    # POST /export_trajectories — admin key ONLY, route by session_ids
     # =========================================================================
 
     @app.post("/export_trajectories")
@@ -487,24 +490,18 @@ def create_app(config: GatewayConfig) -> FastAPI:
         except (json.JSONDecodeError, AttributeError):
             return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
 
-        model = body_json.get("model")
-        session_id = body_json.get("session_id")
+        session_ids: list[str] = body_json.get("session_ids") or []
+        group_id: str | None = body_json.get("group_id")
 
-        if model and not session_id:
-            session_id = model
-            body_json["session_id"] = session_id
-            body = json.dumps(body_json).encode()
-
-        if not session_id:
-            return JSONResponse({"error": "session_id is required"}, status_code=400)
+        if not session_ids:
+            return JSONResponse({"error": "session_ids is required"}, status_code=400)
 
         try:
             worker_addr = await query_router(
                 config.router_addr,
                 timeout=config.router_timeout,
-                session_id=session_id,
+                session_id=session_ids[0],
                 admin_api_key=config.admin_api_key,
-                model=model,
                 client=_client(),
             )
         except (RouterUnreachableError, RouterKeyRejectedError) as exc:
@@ -519,12 +516,12 @@ def create_app(config: GatewayConfig) -> FastAPI:
             client=_client(),
         )
 
-        if resp.status_code == 200:
+        if resp.status_code == 200 and group_id is not None:
             await revoke_session_in_router(
                 config.router_addr,
                 config.admin_api_key,
-                session_id,
-                config.router_timeout,
+                group_id,
+                timeout=config.router_timeout,
                 client=_client(),
             )
 
@@ -598,25 +595,6 @@ def create_app(config: GatewayConfig) -> FastAPI:
             )
         except Exception as exc:
             return JSONResponse({"error": str(exc)}, status_code=502)
-
-    @app.post("/grant_capacity")
-    async def grant_capacity(request: Request):
-        """Forward capacity grant to the Router (not data proxies).
-
-        Staleness control lives at the router level — data proxies do not
-        track capacity.
-        """
-        require_admin_key(request, config.admin_api_key)
-        try:
-            result = await grant_capacity_in_router(
-                config.router_addr,
-                config.admin_api_key,
-                config.router_timeout,
-                client=_client(),
-            )
-        except RouterUnreachableError as exc:
-            return _router_error_response(exc)
-        return result
 
     # =========================================================================
     # Compatibility aliases for RolloutCallback — map /callback/* to endpoints

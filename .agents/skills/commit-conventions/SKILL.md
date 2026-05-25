@@ -63,7 +63,7 @@ Infer scope from the **primary** changed file paths:
 | `areal/infra/`                                               | `infra`                        |
 | `areal/trainer/`                                             | `trainer`                      |
 | `areal/models/`                                              | `models`                       |
-| `areal/experimental/`                                        | `archon`                       |
+| `areal/experimental/`                                        | `experimental`                 |
 | `docs/`                                                      | `docs`                         |
 | `examples/`                                                  | `examples`                     |
 | `AGENTS.md`, `.agents/`, `.claude/`, `.codex/`, `.opencode/` | `agents`                       |

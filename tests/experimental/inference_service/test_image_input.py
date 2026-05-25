@@ -754,8 +754,8 @@ class TestDataProxyImagePassthrough:
             headers={"Authorization": f"Bearer {ADMIN_KEY}"},
         )
         assert resp.status_code == 201
-        session_id = resp.json()["session_id"]
-        api_key = resp.json()["api_key"]
+        session_id = resp.json()["sessions"][0]["session_id"]
+        api_key = resp.json()["sessions"][0]["session_api_key"]
 
         # 2. Chat with image
         resp = await client.post(
@@ -790,7 +790,7 @@ class TestDataProxyImagePassthrough:
         resp = await client.post(
             "/export_trajectories",
             json={
-                "session_id": session_id,
+                "session_ids": [session_id],
                 "discount": 1.0,
                 "style": "individual",
             },

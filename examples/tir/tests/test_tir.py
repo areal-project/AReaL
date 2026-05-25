@@ -60,6 +60,27 @@ async def test_tool_manager():
 
 
 @pytest.mark.asyncio
+async def test_tool_manager_error_handling():
+    """Test tool manager error handling with real execution"""
+    python_manager = ToolManager(timeout=10, enabled_tools="python", debug_mode=False)
+
+    try:
+        # Test ZeroDivisionError
+        zero_result, zero_status = await python_manager.aexecute_tool_call(
+            "```python\n1 / 0\n```"
+        )
+        print(f"Zero division result: {zero_result}, status: {zero_status}")
+        assert zero_status == ToolCallStatus.ERROR
+        assert (
+            "division by zero" in zero_result.lower()
+            or "zerodivisionerror" in zero_result.lower()
+        )
+
+    finally:
+        await python_manager.acleanup()
+
+
+@pytest.mark.asyncio
 async def test_tir_workflow():
     """Test TIR workflow initialization."""
     tokenizer = FakeTokenizer()

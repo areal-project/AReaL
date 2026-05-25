@@ -26,7 +26,7 @@ Please review our [Code of Conduct](CODE_OF_CONDUCT.md) before participating and
 1. **Install Development Dependencies:**
 
    Check our
-   [installation guide](https://inclusionai.github.io/AReaL/en/tutorial/installation.html)
+   [installation guide](https://areal-project.github.io/AReaL/en/tutorial/installation.html)
    for detailed setup instructions.
 
 1. **Set Up Pre-commit Hooks:**
@@ -41,11 +41,11 @@ Please review our [Code of Conduct](CODE_OF_CONDUCT.md) before participating and
 1. **Find an Issue:**
 
    - Browse
-     [good first issues](https://github.com/inclusionAI/AReaL/labels/good%20first%20issue)
-   - Check [help wanted](https://github.com/inclusionAI/AReaL/labels/help%20wanted)
+     [good first issues](https://github.com/areal-project/AReaL/labels/good%20first%20issue)
+   - Check [help wanted](https://github.com/areal-project/AReaL/labels/help%20wanted)
      issues
    - Or create a new issue using our
-     [issue templates](https://github.com/inclusionAI/AReaL/issues/new/choose)
+     [issue templates](https://github.com/areal-project/AReaL/issues/new/choose)
 
 1. **Make Your Changes:**
 
@@ -98,7 +98,7 @@ waste your effort.
 ## Tips for Using AI-Assisted Coding
 
 See the full
-[AI-Assisted Development Guide](https://inclusionai.github.io/AReaL/en/reference/ai_assisted_dev.html)
+[AI-Assisted Development Guide](https://areal-project.github.io/AReaL/en/reference/ai_assisted_dev.html)
 for detailed documentation.
 
 ## CI/CD

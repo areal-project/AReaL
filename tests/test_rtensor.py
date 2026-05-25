@@ -1061,7 +1061,7 @@ class TestFetchBuffer:
     def test_remove_pops_both_storage_and_fetch_buffer(self):
         """remove() drops the shard from both _storage and _fetch_buffer.
 
-        Regression guard for inclusionAI/AReaL#1209: on a worker that is both
+        Regression guard for areal-project/AReaL#1209: on a worker that is both
         storage owner and consumer, ``to_local()`` caches the tensor in
         ``_fetch_buffer``; without this pop, RSS grows unboundedly across
         training steps.

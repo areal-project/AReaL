@@ -1,9 +1,9 @@
 # 在 GSM8K 数据集上运行 GRPO
 
 本指南将逐步介绍 AReaL 如何在 GSM8K 数据集上运行 GRPO 算法。我们将使用示例训练脚本
-[`examples/math/gsm8k_rl.py`](https://github.com/inclusionAI/AReaL/blob/main/examples/math/gsm8k_rl.py)
+[`examples/math/gsm8k_rl.py`](https://github.com/areal-project/AReaL/blob/main/examples/math/gsm8k_rl.py)
 和配置文件
-[`examples/math/gsm8k_grpo.yaml`](https://github.com/inclusionAI/AReaL/blob/main/examples/math/gsm8k_grpo.yaml)
+[`examples/math/gsm8k_grpo.yaml`](https://github.com/areal-project/AReaL/blob/main/examples/math/gsm8k_grpo.yaml)
 逐步解释关键概念。
 
 ## 概述：AReaL 如何工作
@@ -131,7 +131,7 @@ python examples/math/gsm8k_rl.py --config examples/math/gsm8k_grpo.yaml schedule
 ### 配置文件
 
 配置文件是 YAML 文件，指定来自
-[`areal/api/cli_args.py`](https://github.com/inclusionAI/AReaL/blob/main/areal/api/cli_args.py)
+[`areal/api/cli_args.py`](https://github.com/areal-project/AReaL/blob/main/areal/api/cli_args.py)
 的选项。您可以通过 CLI 覆盖设置：
 
 ```bash
@@ -155,7 +155,7 @@ config: GRPOConfig
 ## 训练脚本：入口点
 
 训练脚本
-（[`examples/math/gsm8k_rl.py`](https://github.com/inclusionAI/AReaL/blob/main/examples/math/gsm8k_rl.py)）
+（[`examples/math/gsm8k_rl.py`](https://github.com/areal-project/AReaL/blob/main/examples/math/gsm8k_rl.py)）
 遵循以下模式：
 
 ```python
@@ -194,7 +194,7 @@ def main(args):
 
 ## PPOTrainer：基于控制器的训练
 
-[`PPOTrainer`](https://github.com/inclusionAI/AReaL/blob/main/areal/trainer/rl_trainer.py)
+[`PPOTrainer`](https://github.com/areal-project/AReaL/blob/main/areal/trainer/rl_trainer.py)
 通过初始化调度器并为 actor（策略/评论家）和 rollout 工作进程创建控制器来编排分布式训练。
 
 ### 控制器架构
@@ -237,7 +237,7 @@ trainer.train(
 
 ### RLVRWorkflow：单轮奖励学习
 
-[`RLVRWorkflow`](https://github.com/inclusionAI/AReaL/blob/main/areal/workflow/rlvr.py)
+[`RLVRWorkflow`](https://github.com/areal-project/AReaL/blob/main/areal/workflow/rlvr.py)
 定义了 prompts 如何转化为训练样本。每个轨迹经历以下步骤：
 
 1. **Tokenize 输入**：将聊天模板应用于消息
@@ -251,7 +251,7 @@ trainer.train(
    - `rewards`：标量奖励
 
 **GSM8K 奖励**：二元奖励（正确答案 1.0，否则 0.0）。请参阅
-[`gsm8k_reward_fn`](https://github.com/inclusionAI/AReaL/blob/main/areal/reward/gsm8k.py)。
+[`gsm8k_reward_fn`](https://github.com/areal-project/AReaL/blob/main/areal/reward/gsm8k.py)。
 
 **注意**：此工作流采用推理引擎的低级 API —— `agenerate` API。如果您想更细粒度地控制 token IDs，这是更好的选择。`agenerate` 将
 token IDs 输入推理服务器，并输出 token IDs 供用户处理。我们还提供了高级 API 用于便捷的 agent 工作流编排。请参阅
@@ -293,7 +293,7 @@ TrainController           训练工作进程
 #### 三个并发级别
 
 **级别 1 - 控制器线程**：
-[`BatchTaskDispatcher`](https://github.com/inclusionAI/AReaL/blob/main/areal/core/workflow_executor.py)
+[`BatchTaskDispatcher`](https://github.com/areal-project/AReaL/blob/main/areal/core/workflow_executor.py)
 在后台线程中运行，通过 HTTP 持续向工作进程提交 rollout 请求：
 
 - 轮流向 rollout 工作进程提交任务
@@ -303,7 +303,7 @@ TrainController           训练工作进程
 因此，**在 AReaL 中 rollout 和训练同时进行**，尽管代码看起来像是同步编排。
 
 **级别 2 - 工作进程 RPC 服务器**：每个 rollout 工作进程在 **CPU** 上运行 Flask HTTP 服务器
-（[`rpc_server.py`](https://github.com/inclusionAI/AReaL/blob/main/areal/infra/rpc/rpc_server.py)）：
+（[`rpc_server.py`](https://github.com/areal-project/AReaL/blob/main/areal/infra/rpc/rpc_server.py)）：
 
 - 接受并发 HTTP 请求（多线程 Flask）
 - **引擎线程**：串行处理引擎操作（NCCL 兼容性）
@@ -349,7 +349,7 @@ return concat_padded_tensors(results)  # 形状：[batch_size, seq_len]
 ```
 
 **过期管理**：
-[`StalenessManager`](https://github.com/inclusionAI/AReaL/blob/main/areal/infra/staleness_manager.py)
+[`StalenessManager`](https://github.com/areal-project/AReaL/blob/main/areal/infra/staleness_manager.py)
 限制并发 inflight 请求：
 
 - `max_concurrent_rollouts`：最大 inflight 轨迹数
@@ -362,7 +362,7 @@ return concat_padded_tensors(results)  # 形状：[batch_size, seq_len]
 
 ### TrainController：分发机制
 
-[`TrainController`](https://github.com/inclusionAI/AReaL/blob/main/areal/infra/controller/train_controller.py)
+[`TrainController`](https://github.com/areal-project/AReaL/blob/main/areal/infra/controller/train_controller.py)
 提供核心 RPC 分发：
 
 1. `_dispatch_inputs()`：使用 FFD 负载平衡跨工作进程分割批次
@@ -400,7 +400,7 @@ return concat_padded_tensors(results)  # 形状：[batch_size, seq_len]
 ### 训练工作进程：算法实现
 
 在每个训练工作进程上，
-[`FSDPPPOActor`](https://github.com/inclusionAI/AReaL/blob/main/areal/trainer/ppo/actor.py)
+[`FSDPPPOActor`](https://github.com/areal-project/AReaL/blob/main/areal/trainer/ppo/actor.py)
 实现了 GRPO/PPO 算法：
 
 **算法方法**：
@@ -431,7 +431,7 @@ GPU 3: SGLang         GPU 7: FSDP rank 3  ─┘
 ### 训练循环
 
 `trainer.train()` 方法编排完整循环。请参阅
-[`PPOTrainer.train()`](https://github.com/inclusionAI/AReaL/blob/main/areal/trainer/rl_trainer.py)
+[`PPOTrainer.train()`](https://github.com/areal-project/AReaL/blob/main/areal/trainer/rl_trainer.py)
 获取完整实现：
 
 ```python
@@ -487,7 +487,7 @@ for global_step in range(start_step, max_steps):
 1. 使用重新计算的 KV 缓存恢复 rollout
 
 请参阅
-[`PPOTrainer.train()`](https://github.com/inclusionAI/AReaL/blob/main/areal/trainer/rl_trainer.py)
+[`PPOTrainer.train()`](https://github.com/areal-project/AReaL/blob/main/areal/trainer/rl_trainer.py)
 第 861-874 行获取完整实现。
 
 ## 监控和工具
@@ -498,10 +498,10 @@ AReaL 提供由 `PPOTrainer` 管理的工具，用于检查点保存、评估和
 
 AReaL 提供两种检查点机制：
 
-| 组件                                                                                      | 用途              | 格式        | 配置             |
-| ----------------------------------------------------------------------------------------- | ----------------- | ----------- | ---------------- |
-| [`Saver`](https://github.com/inclusionAI/AReaL/blob/main/areal/utils/saver.py)            | 导出用于评估/部署 | HuggingFace | `config.saver`   |
-| [`RecoverHandler`](https://github.com/inclusionAI/AReaL/blob/main/areal/utils/recover.py) | 故障后恢复        | DCP（分片） | `config.recover` |
+| 组件                                                                                        | 用途              | 格式        | 配置             |
+| ------------------------------------------------------------------------------------------- | ----------------- | ----------- | ---------------- |
+| [`Saver`](https://github.com/areal-project/AReaL/blob/main/areal/utils/saver.py)            | 导出用于评估/部署 | HuggingFace | `config.saver`   |
+| [`RecoverHandler`](https://github.com/areal-project/AReaL/blob/main/areal/utils/recover.py) | 故障后恢复        | DCP（分片） | `config.recover` |
 
 **Saver** 创建与 HuggingFace 兼容的检查点，可以使用 `transformers` 加载或发布到 HuggingFace Hub。每次保存创建一个新目录。
 
@@ -511,7 +511,7 @@ AReaL 提供两种检查点机制：
 
 ### 评估
 
-[`Evaluator`](https://github.com/inclusionAI/AReaL/blob/main/areal/utils/evaluator.py)
+[`Evaluator`](https://github.com/areal-project/AReaL/blob/main/areal/utils/evaluator.py)
 在验证集上运行定期评估。通过 `config.evaluation` 配置。在 `trainer.train()` 中自动调用。
 
 ### 指标跟踪
@@ -519,7 +519,7 @@ AReaL 提供两种检查点机制：
 AReaL 使用两组件指标系统：
 
 **`stats_tracker`**
-（[源码](https://github.com/inclusionAI/AReaL/blob/main/areal/utils/stats_tracker.py)）：
+（[源码](https://github.com/areal-project/AReaL/blob/main/areal/utils/stats_tracker.py)）：
 以两种针对不同用例优化的范式收集统计信息：
 
 - **流式指标**用于 rollout 工作进程：每个工作流单独记录标量（例如 `reward`），由控制器跨工作进程聚合
@@ -535,7 +535,7 @@ stats_tracker.stat(advantages=tensor, denominator="n_valid_tokens")
 ```
 
 **`StatsLogger`**
-（[源码](https://github.com/inclusionAI/AReaL/blob/main/areal/utils/stats_logger.py)）：
+（[源码](https://github.com/areal-project/AReaL/blob/main/areal/utils/stats_logger.py)）：
 将聚合指标从 rank 0 发送到日志后端（Weights & Biases、SwanLab、TensorBoard）。在每个训练步骤中，`PPOTrainer`
 从所有组件收集指标并提交：
 

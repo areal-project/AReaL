@@ -299,6 +299,38 @@ log_config = {
             "handlers": ["systemHandler"],
             "level": LOGLEVEL,
         },
+        # Suppress verbose HTTP loggers from third-party libraries.
+        "uvicorn": {"handlers": [], "level": "WARNING", "propagate": False},
+        "uvicorn.access": {
+            "handlers": [],
+            "level": "WARNING",
+            "propagate": False,
+        },
+        "uvicorn.error": {
+            "handlers": [],
+            "level": "WARNING",
+            "propagate": False,
+        },
+        "httpx": {"handlers": [], "level": "WARNING", "propagate": False},
+        "httpcore": {"handlers": [], "level": "WARNING", "propagate": False},
+        "aiohttp": {"handlers": [], "level": "WARNING", "propagate": False},
+        "aiohttp.access": {
+            "handlers": [],
+            "level": "WARNING",
+            "propagate": False,
+        },
+        "aiohttp.server": {
+            "handlers": [],
+            "level": "WARNING",
+            "propagate": False,
+        },
+        "werkzeug": {"handlers": [], "level": "WARNING", "propagate": False},
+        "urllib3": {"handlers": [], "level": "WARNING", "propagate": False},
+        "urllib3.connectionpool": {
+            "handlers": [],
+            "level": "WARNING",
+            "propagate": False,
+        },
     },
     "disable_existing_loggers": True,
 }
@@ -342,6 +374,34 @@ def getLogger(
                 logger.addHandler(handler)
 
     return logger
+
+
+_HTTP_LOGGERS = (
+    "uvicorn",
+    "uvicorn.access",
+    "uvicorn.error",
+    "httpx",
+    "httpcore",
+    "aiohttp",
+    "aiohttp.access",
+    "aiohttp.server",
+    "werkzeug",
+    "urllib3",
+    "urllib3.connectionpool",
+)
+
+
+def suppress_http_loggers() -> None:
+    """Force all HTTP-related loggers to WARNING.
+
+    Call this from service __main__.py right before uvicorn.run() or
+    app.run() to ensure third-party HTTP loggers stay quiet even after
+    uvicorn/Flask reconfigure the logging hierarchy.
+    """
+    import logging as _logging
+
+    for name in _HTTP_LOGGERS:
+        _logging.getLogger(name).setLevel(_logging.WARNING)
 
 
 def setup_file_logging(

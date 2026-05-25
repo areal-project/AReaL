@@ -286,22 +286,85 @@ class SGLangBackend:
     def build_init_weights_group_request(
         self, addr: str, server_idx: int, meta: WeightUpdateMeta
     ) -> HttpRequest:
-        """Build SGLang init weights group request."""
+        """Build SGLang init weights group request.
+
+        Supports two scenarios:
+
+        1. **PP=1** (original): Single NCCL group spanning all TP workers across
+           all DP instances. ``rank_offset`` is based on ``tp_size``.
+
+        2. **PP>1, per-PP-rank groups**: The training engine creates a separate
+           NCCL group per PP stage. The group name encodes the PP rank
+           (e.g., ``update_weight_group_0``). Only sglang workers at that PP
+           rank participate, so ``rank_offset`` is based on ``tp_size`` only,
+           ``world_size = n_servers * tp_size + 1``, and ``pp_rank`` is
+           included in the payload.
+
+        All three training engines (Megatron, FSDP, Archon) use per-PP-rank
+        group naming (``update_weight_group_{pp_rank}``) when PP>1, so the
+        per-PP-rank path is always taken for PP>1.
+        """
         assert meta.gen_allocation is not None
         gen_parallel = meta.gen_allocation.parallel
-        if gen_parallel.pp_size != 1:
-            raise NotImplementedError(
-                "NCCL weight update with PP size > 1 is not implemented yet."
-            )
-        rank_offset = 1 + server_idx * gen_parallel.tp_size
-        payload = {
-            "master_address": format_host_for_url(meta.nccl_master_address),
-            "master_port": str(meta.nccl_master_port),
-            "rank_offset": rank_offset,
-            "world_size": gen_parallel.world_size + 1,
-            "backend": current_platform.communication_backend,
-            "group_name": meta.nccl_group_name,
-        }
+        group_name = meta.nccl_group_name
+
+        # Determine if training side uses per-PP-rank groups.
+        # Per-PP-rank groups are identified by group names ending with _{digit}
+        # and pp_size > 1. All engines use this pattern when PP>1.
+        per_pp_groups = False
+        if gen_parallel.pp_size > 1:
+            try:
+                _suffix = group_name.rsplit("_", 1)[-1]
+                int(_suffix)
+                per_pp_groups = True
+            except (ValueError, IndexError):
+                per_pp_groups = False
+
+        if per_pp_groups:
+            # Scenario 2: PP>1 with per-PP-rank groups.
+            # Extract pp_rank from the group name suffix.
+            pp_rank = int(group_name.rsplit("_", 1)[-1])
+
+            tp_size = gen_parallel.tp_size
+            pp_size = gen_parallel.pp_size
+            # gen_parallel.world_size = dp_size * tp_size * pp_size on the
+            # inference side. n_servers (number of sglang server replicas)
+            # therefore equals dp_size whether or not DP-attention is
+            # configured: the AReaL allocation always materialises one server
+            # replica per DP shard, each running ``tp_size * pp_size`` workers.
+            n_servers = gen_parallel.world_size // (tp_size * pp_size)
+
+            # Each server contributes exactly ``tp_size`` workers per PP stage.
+            # Across all replicas this PP stage has ``n_servers * tp_size``
+            # inference workers (= dp_size * tp_size), all of which join the
+            # per-PP NCCL group together with the trainer.
+            rank_offset = 1 + server_idx * tp_size
+
+            # world_size for this group: TP workers across all DP replicas at
+            # this PP rank + 1 (trainer).
+            world_size = n_servers * tp_size + 1
+
+            payload = {
+                "master_address": format_host_for_url(meta.nccl_master_address),
+                "master_port": str(meta.nccl_master_port),
+                "rank_offset": rank_offset,
+                "world_size": world_size,
+                "backend": current_platform.communication_backend,
+                "group_name": group_name,
+                "pp_rank": pp_rank,
+            }
+        else:
+            instance_size = gen_parallel.tp_size * gen_parallel.pp_size
+            rank_offset = 1 + server_idx * instance_size
+            payload = {
+                "master_address": format_host_for_url(meta.nccl_master_address),
+                "master_port": str(meta.nccl_master_port),
+                "rank_offset": rank_offset,
+                "world_size": gen_parallel.world_size + 1,
+                "backend": current_platform.communication_backend,
+                "group_name": group_name,
+            }
+
         return HttpRequest(endpoint="/init_weights_update_group", payload=payload)
 
     def get_pause_request(self) -> HttpRequest:

@@ -98,7 +98,7 @@ be out of date. We recommend removing it and installing AReaL from source.
 ```bash
 rm -rf /AReaL
 
-git clone https://github.com/inclusionAI/AReaL
+git clone https://github.com/areal-project/AReaL
 cd AReaL
 
 # Checkout to ascend branch

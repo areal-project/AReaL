@@ -20,7 +20,7 @@ debugging agent behaviour.
 #### AReaL
 
 Follow the
-[AReaL installation guide](https://inclusionai.github.io/AReaL/en/tutorial/installation.html).
+[AReaL installation guide](https://areal-project.github.io/AReaL/en/tutorial/installation.html).
 
 #### Tau2
 
@@ -96,7 +96,7 @@ following procedure:
 ### Prerequisites
 
 - **AReaL installed** — follow the
-  [installation guide](https://inclusionai.github.io/AReaL/en/tutorial/installation.html).
+  [installation guide](https://areal-project.github.io/AReaL/en/tutorial/installation.html).
 - **zeroclaw installed** — any OpenAI-compatible CLI that supports
   `--session-state-file` can be substituted; the demo uses zeroclaw for convenience.
 - **A zeroclaw config at `~/.zeroclaw/config.toml`** with at least a `default_provider`

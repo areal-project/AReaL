@@ -11,6 +11,7 @@ from typing import Any
 
 import httpx
 
+from areal.infra.utils.http import async_httpx_retry, create_httpx_client
 from areal.utils import logging
 
 logger = logging.getLogger("InferenceGateway")
@@ -39,10 +40,11 @@ async def _use_client(
     if client is not None:
         yield client
     else:
-        async with httpx.AsyncClient(timeout=timeout) as c:
+        async with create_httpx_client(timeout=timeout) as c:
             yield c
 
 
+@async_httpx_retry
 async def query_router(
     router_addr: str,
     api_key: str | None = None,
@@ -116,45 +118,49 @@ async def query_router(
         raise RouterUnreachableError(f"Router unreachable: {exc}") from exc
     except httpx.TimeoutException as exc:
         raise RouterUnreachableError(f"Router timed out: {exc}") from exc
+    except httpx.TransportError as exc:
+        raise RouterUnreachableError(f"Router transport error: {exc}") from exc
     except httpx.HTTPStatusError as exc:
         raise RouterUnreachableError(
             f"Router returned HTTP {exc.response.status_code}: {exc}"
         ) from exc
 
 
+@async_httpx_retry
 async def register_session_in_router(
     router_addr: str,
-    session_api_key: str,
-    session_id: str,
+    sessions: list[dict[str, str]],
     worker_addr: str,
     timeout: float,
     admin_api_key: str | None = None,
     *,
+    group_id: str,
     client: httpx.AsyncClient | None = None,
 ) -> None:
-    """Register a session→worker mapping in the Router.
-
-    POST ``{router_addr}/register_session``.
-    Called by the gateway after intercepting ``/rl/start_session`` response.
-    """
+    """Register session(s) and their group in the Router atomically."""
     try:
         headers = {}
         if admin_api_key is not None:
             headers["Authorization"] = f"Bearer {admin_api_key}"
 
+        payload: dict[str, Any] = {
+            "sessions": sessions,
+            "worker_addr": worker_addr,
+            "group_id": group_id,
+        }
+
         async with _use_client(client, timeout) as c:
             resp = await c.post(
                 f"{router_addr}/register_session",
-                json={
-                    "session_api_key": session_api_key,
-                    "session_id": session_id,
-                    "worker_addr": worker_addr,
-                },
+                json=payload,
                 headers=headers,
                 timeout=timeout,
             )
 
         resp.raise_for_status()
+    except httpx.TransportError as exc:
+        logger.error("Failed to register session in router: %s", exc)
+        raise RouterUnreachableError(f"Failed to register session: {exc}") from exc
     except Exception as exc:
         logger.error("Failed to register session in router: %s", exc)
         raise RouterUnreachableError(f"Failed to register session: {exc}") from exc
@@ -163,23 +169,17 @@ async def register_session_in_router(
 async def revoke_session_in_router(
     router_addr: str,
     admin_api_key: str,
-    session_id: str,
-    timeout: float,
+    group_id: str,
+    timeout: float = 2.0,
     *,
     client: httpx.AsyncClient | None = None,
 ) -> None:
-    """Remove a session from the Router's session registry.
-
-    POST ``{router_addr}/remove_session`` with admin key auth and
-    JSON body ``{"session_id": ...}``.
-    Called after ``/export_trajectories`` to prevent unbounded memory growth.
-    Best-effort: logs errors but never raises.
-    """
+    """Best-effort removal of a session group from the Router's registry."""
     try:
         async with _use_client(client, timeout) as c:
             resp = await c.post(
                 f"{router_addr}/remove_session",
-                json={"session_id": session_id},
+                json={"group_id": group_id},
                 headers={"Authorization": f"Bearer {admin_api_key}"},
                 timeout=timeout,
             )
@@ -188,40 +188,10 @@ async def revoke_session_in_router(
                 "remove_session returned %d: %s", resp.status_code, resp.text
             )
     except Exception as exc:
-        logger.warning("Failed to remove session %s in router: %s", session_id, exc)
+        logger.warning("Failed to remove group %s in router: %s", group_id, exc)
 
 
-async def grant_capacity_in_router(
-    router_addr: str,
-    admin_api_key: str,
-    timeout: float,
-    *,
-    client: httpx.AsyncClient | None = None,
-) -> dict:
-    """Forward a grant_capacity request to the Router.
-
-    POST ``{router_addr}/grant_capacity`` with admin key auth.
-    Returns the JSON response body from the router.
-    """
-    try:
-        async with _use_client(client, timeout) as c:
-            resp = await c.post(
-                f"{router_addr}/grant_capacity",
-                headers={"Authorization": f"Bearer {admin_api_key}"},
-                timeout=timeout,
-            )
-        resp.raise_for_status()
-        return resp.json()
-    except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
-        raise RouterUnreachableError(
-            f"Router unreachable for grant_capacity: {exc}"
-        ) from exc
-    except Exception as exc:
-        raise RouterUnreachableError(
-            f"Failed to grant capacity in router: {exc}"
-        ) from exc
-
-
+@async_httpx_retry
 async def get_all_worker_addrs(
     router_addr: str,
     admin_api_key: str,
@@ -247,6 +217,7 @@ async def get_all_worker_addrs(
         raise RouterUnreachableError(f"Failed to get workers: {exc}") from exc
 
 
+@async_httpx_retry
 async def register_model_in_router(
     router_addr: str,
     model: str,
@@ -279,6 +250,7 @@ async def register_model_in_router(
         raise RouterUnreachableError(f"Router unreachable: {exc}") from exc
 
 
+@async_httpx_retry
 async def route_external_model(
     router_addr: str,
     name: str,
@@ -307,6 +279,7 @@ async def route_external_model(
         raise RouterUnreachableError(f"Router unreachable: {exc}") from exc
 
 
+@async_httpx_retry
 async def list_models_from_router(
     router_addr: str,
     admin_api_key: str,
@@ -327,6 +300,7 @@ async def list_models_from_router(
         raise RouterUnreachableError(f"Router unreachable: {exc}") from exc
 
 
+@async_httpx_retry
 async def remove_model_from_router(
     router_addr: str,
     name: str,
@@ -349,6 +323,7 @@ async def remove_model_from_router(
         pass  # Best-effort rollback; swallow errors
 
 
+@async_httpx_retry
 async def resolve_worker_addr(
     router_addr: str,
     admin_api_key: str,
@@ -387,6 +362,10 @@ async def resolve_worker_addr(
     except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
         raise RouterUnreachableError(
             f"Router unreachable for resolve_worker: {exc}"
+        ) from exc
+    except httpx.TransportError as exc:
+        raise RouterUnreachableError(
+            f"Router transport error for resolve_worker: {exc}"
         ) from exc
     except Exception as exc:
         raise RouterUnreachableError(
@@ -429,7 +408,7 @@ async def forward_sse_stream(
 
     fwd_headers = _forwarding_headers(headers)
     try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(timeout)) as c:
+        async with create_httpx_client(timeout=httpx.Timeout(timeout)) as c:
             async with c.stream(
                 "POST", upstream_url, content=body, headers=fwd_headers
             ) as resp:
@@ -446,12 +425,17 @@ async def forward_sse_stream(
                     return
                 async for chunk in resp.aiter_bytes():
                     yield chunk
+    except httpx.TransportError as exc:
+        logger.error("SSE transport error from %s: %s", upstream_url, exc)
+        error_event = _json.dumps({"error": str(exc)})
+        yield f"data: {error_event}\n\n".encode()
     except Exception as exc:
         logger.error("SSE stream error from %s: %s", upstream_url, exc)
         error_event = _json.dumps({"error": str(exc)})
         yield f"data: {error_event}\n\n".encode()
 
 
+@async_httpx_retry
 async def forward_request(
     upstream_url: str,
     body: bytes,

@@ -73,7 +73,7 @@ jobs:
       matrix:
         variant: ${{ fromJson(needs.determine-variants.outputs.matrix) }}
     env:
-      CONTAINER_IMAGE: ghcr.io/inclusionai/areal-runtime:${{ inputs.image_tag || 'dev' }}-${{ matrix.variant }}
+      CONTAINER_IMAGE: ghcr.io/areal-project/areal-runtime:${{ inputs.image_tag || 'dev' }}-${{ matrix.variant }}
       RUNNER_LABELS: gcp-a2-highgpu-2g,variant-${{ matrix.variant }}
     steps:
       - name: Set instance variables

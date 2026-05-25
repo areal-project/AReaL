@@ -225,4 +225,4 @@ class CustomTrajectoryMaker(Controller):
 
 - [TensorRT-LLM Scaffolding README](https://github.com/NVIDIA/TensorRT-LLM/tree/main/tensorrt_llm/scaffolding)
 - [AReaL Workflow Documentation](../../docs/customization/workflow.md)
-- [RFC: Scaffolding Integration](https://github.com/inclusionAI/AReaL/issues/818)
+- [RFC: Scaffolding Integration](https://github.com/areal-project/AReaL/issues/818)

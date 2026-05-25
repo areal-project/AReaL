@@ -32,7 +32,7 @@ strict permission rules and an isolated execution environment for your agent run
 # Install uv
 curl -LsSf https://astral.sh/uv/install.sh | sh
 # Clone and install AReaL
-git clone https://github.com/inclusionAI/AReaL.git
+git clone https://github.com/areal-project/AReaL.git
 cd AReaL
 uv sync --all-extras
 ```

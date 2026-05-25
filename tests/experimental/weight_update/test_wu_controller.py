@@ -81,6 +81,7 @@ class TestConnect:
                 "save_path": "",
                 "use_lora": False,
                 "lora_name": "",
+                "colocate": False,
             },
             timeout=10.0,
         )
@@ -110,6 +111,7 @@ class TestConnect:
                 "save_path": "/shared/weights",
                 "use_lora": True,
                 "lora_name": "my-lora",
+                "colocate": False,
             },
             timeout=10.0,
         )

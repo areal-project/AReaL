@@ -71,7 +71,7 @@ areal/                     Core Python package
 |-- utils/                 Cross-cutting helpers (logging, data, checkpoints, RL ops)
 +-- workflow/              RolloutWorkflow implementations (RLVR, multi-turn, vision)
 
-docs/                      Jupyter Book docs (https://inclusionai.github.io/AReaL/)
+docs/                      Jupyter Book docs (https://areal-project.github.io/AReaL/)
 examples/                  Training scripts and launcher recipes
 ```
 
@@ -250,7 +250,7 @@ ______________________________________________________________________
 
 ## Reference material
 
-- **Docs portal**: <https://inclusionai.github.io/AReaL/>
+- **Docs portal**: <https://areal-project.github.io/AReaL/>
 - **Quickstart**: `docs/tutorial/quickstart.md`
 - **Architecture**: `docs/tutorial/gsm8k_grpo.md`
 - **Customization**: `docs/customization/*.md`

@@ -24,7 +24,7 @@ The following hardware configuration has been extensively tested:
 | Git LFS                  | Required for downloading models, datasets, and AReaL code. See [installation guide](https://docs.github.com/en/repositories/working-with-files/managing-large-files/installing-git-large-file-storage) |
 | Docker                   |                                                                                                 27.5.1                                                                                                 |
 | NVIDIA Container Toolkit |                                         See [installation guide](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)                                          |
-| AReaL Image              |                                    `ghcr.io/inclusionai/areal-runtime:v1.0.4-sglang` (default) or `v1.0.4-vllm`. Includes runtime dependencies and Ray components.                                     |
+| AReaL Image              |                                   `ghcr.io/areal-project/areal-runtime:v1.0.4-sglang` (default) or `v1.0.4-vllm`. Includes runtime dependencies and Ray components.                                    |
 
 **Note**: This tutorial does not cover the installation of NVIDIA Drivers, CUDA, or
 shared storage mounting, as these depend on your specific node configuration and system
@@ -42,19 +42,19 @@ We recommend using Docker with our provided image. The Dockerfile is available i
 top-level directory of the AReaL repository.
 
 ```bash
-docker pull ghcr.io/inclusionai/areal-runtime:v1.0.4-sglang
+docker pull ghcr.io/areal-project/areal-runtime:v1.0.4-sglang
 docker run -it --name areal-node1 \
    --privileged --gpus all --network host \
    --shm-size 700g -v /path/to/mount:/path/to/mount \
-   ghcr.io/inclusionai/areal-runtime:v1.0.4-sglang \
+   ghcr.io/areal-project/areal-runtime:v1.0.4-sglang \
    /bin/bash
-git clone https://github.com/inclusionAI/AReaL /path/to/mount/AReaL
+git clone https://github.com/areal-project/AReaL /path/to/mount/AReaL
 cd /path/to/mount/AReaL
 uv pip install -e . --no-deps
 ```
 
 A vLLM variant of the Docker image is also available at
-`ghcr.io/inclusionai/areal-runtime:v1.0.4-vllm`. Replace the image tag in the commands
+`ghcr.io/areal-project/areal-runtime:v1.0.4-vllm`. Replace the image tag in the commands
 above if you prefer vLLM as the inference backend.
 
 ### Option 2: Custom Environment Installation
@@ -64,7 +64,7 @@ above if you prefer vLLM as the inference backend.
 1. Clone the repo:
 
 ```bash
-git clone https://github.com/inclusionAI/AReaL
+git clone https://github.com/areal-project/AReaL
 cd AReaL
 ```
 
@@ -215,7 +215,7 @@ fused Adam kernel), install them manually after running `uv sync --extra cuda`:
 | grouped_gemm      | MoE model support in Megatron            | `uv pip install --no-build-isolation git+https://github.com/fanshiqing/grouped_gemm@v1.1.4`                                                                       |
 | NVIDIA apex       | Fused Adam, etc. in Megatron             | `NVCC_APPEND_FLAGS="--threads 4" APEX_PARALLEL_BUILD=8 APEX_CPP_EXT=1 APEX_CUDA_EXT=1 uv pip install --no-build-isolation git+https://github.com/NVIDIA/apex.git` |
 | TransformerEngine | FP8 training, optimized GEMM in Megatron | `uv pip install --no-build-isolation git+https://github.com/NVIDIA/TransformerEngine.git@stable`                                                                  |
-| flash-attn-3      | Flash Attention v3 (Hopper)              | Built from source, see [Dockerfile](https://github.com/inclusionAI/AReaL/blob/main/Dockerfile)                                                                    |
+| flash-attn-3      | Flash Attention v3 (Hopper)              | Built from source, see [Dockerfile](https://github.com/areal-project/AReaL/blob/main/Dockerfile)                                                                  |
 
 **Important**: These packages require `--no-build-isolation` because they need access to
 the already-installed PyTorch for CUDA compilation. Install PyTorch first via
@@ -226,7 +226,7 @@ the already-installed PyTorch for CUDA compilation. Install PyTorch first via
 For running DeepSeek-V3 style MoE models with optimal performance, the Docker image also
 includes the following packages. These packages have complex build requirements and GPU
 architecture constraints. **Refer to the
-[Dockerfile](https://github.com/inclusionAI/AReaL/blob/main/Dockerfile) for the exact
+[Dockerfile](https://github.com/areal-project/AReaL/blob/main/Dockerfile) for the exact
 installation commands and environment variables.**
 
 | Package                | Purpose                                     | GPU Requirement |
@@ -305,7 +305,7 @@ sky check
 
 If `GCP: enabled` or `Kubernetes: enabled` are shown, you're ready to use SkyPilot with
 AReaL. See the
-[SkyPilot example](https://github.com/inclusionAI/AReaL/blob/main/examples/skypilot/README.md)
+[SkyPilot example](https://github.com/areal-project/AReaL/blob/main/examples/skypilot/README.md)
 for a detailed guide on running AReaL with SkyPilot. For more options and details, see
 the official
 [SkyPilot installation guide](https://docs.skypilot.co/en/latest/getting-started/installation.html).

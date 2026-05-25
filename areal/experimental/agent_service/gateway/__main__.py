@@ -6,6 +6,8 @@ import argparse
 
 import uvicorn
 
+from areal.infra.utils.http import validate_admin_api_key
+
 from ..auth import DEFAULT_ADMIN_API_KEY
 from .app import create_gateway_app
 from .bridge import OpenResponsesBridge, mount_bridge
@@ -25,6 +27,10 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    validate_admin_api_key(
+        args.host, args.admin_api_key, default_key=DEFAULT_ADMIN_API_KEY
+    )
+
     config = GatewayConfig(
         host=args.host,
         port=args.port,
@@ -42,7 +48,13 @@ def main() -> None:
         ),
         admin_api_key=config.admin_api_key,
     )
-    uvicorn.run(app, host=config.host, port=config.port, log_level=config.log_level)
+    uvicorn.run(
+        app,
+        host=config.host,
+        port=config.port,
+        log_level=config.log_level,
+        access_log=False,
+    )
 
 
 if __name__ == "__main__":

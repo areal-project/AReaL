@@ -128,7 +128,7 @@ dependencies = [
     "uvicorn",
     "uvloop>=0.21.0",
     "flask",
-    "tenacity",
+    "tenacity>=8.2.0",
 
     # Build and packaging tools
     "build>=1.2.1",
@@ -185,10 +185,10 @@ sandbox = [
 ]
 
 [project.urls]
-"Homepage" = "https://github.com/inclusionAI/AReaL"
-"Repository" = "https://github.com/inclusionAI/AReaL"
-"Documentation" = "https://inclusionai.github.io/AReaL/en/intro.html"
-"Bug Tracker" = "https://github.com/inclusionAI/AReaL/issues"
+"Homepage" = "https://github.com/areal-project/AReaL"
+"Repository" = "https://github.com/areal-project/AReaL"
+"Documentation" = "https://areal-project.github.io/AReaL/en/intro.html"
+"Bug Tracker" = "https://github.com/areal-project/AReaL/issues"
 
 [dependency-groups]
 dev = [

@@ -236,7 +236,7 @@ class TestSessionKeyUnchanged:
             headers=admin_headers(),
         )
         assert resp.status_code == 201
-        session_api_key = resp.json()["api_key"]
+        session_api_key = resp.json()["sessions"][0]["session_api_key"]
 
         # Now use session key for chat completions
         resp = await client.post(

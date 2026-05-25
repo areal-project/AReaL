@@ -224,8 +224,13 @@ class OpenAIProxyWorkflow(RolloutWorkflow):
             # Run the user code.
             try:
                 rewards = await self._run_agent(proxy_client.session_api_key, data)
-            except Exception:
-                logger.warning("Agent task failed. This trajectory will be rejected.")
+            except Exception as exc:
+                logger.warning(
+                    "Agent task failed (%s: %s). This trajectory will be rejected.",
+                    type(exc).__name__,
+                    exc,
+                    exc_info=True,
+                )
                 raise
 
             # Assign rewards back according to user code output

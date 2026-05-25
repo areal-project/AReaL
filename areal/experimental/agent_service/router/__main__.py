@@ -6,6 +6,8 @@ import argparse
 
 import uvicorn
 
+from areal.infra.utils.http import validate_admin_api_key
+
 from ..auth import DEFAULT_ADMIN_API_KEY
 from .app import create_router_app
 from .config import RouterConfig
@@ -23,6 +25,10 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    validate_admin_api_key(
+        args.host, args.admin_api_key, default_key=DEFAULT_ADMIN_API_KEY
+    )
+
     config = RouterConfig(
         host=args.host,
         port=args.port,
@@ -36,6 +42,7 @@ def main() -> None:
         host=config.host,
         port=config.port,
         log_level=config.log_level,
+        access_log=False,
     )
 
 

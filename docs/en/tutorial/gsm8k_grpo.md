@@ -2,9 +2,9 @@
 
 This guide walks you through how AReaL runs the GRPO algorithm on the GSM8K dataset.
 We'll use the example training script
-[`examples/math/gsm8k_rl.py`](https://github.com/inclusionAI/AReaL/blob/main/examples/math/gsm8k_rl.py)
+[`examples/math/gsm8k_rl.py`](https://github.com/areal-project/AReaL/blob/main/examples/math/gsm8k_rl.py)
 and configuration file
-[`examples/math/gsm8k_grpo.yaml`](https://github.com/inclusionAI/AReaL/blob/main/examples/math/gsm8k_grpo.yaml)
+[`examples/math/gsm8k_grpo.yaml`](https://github.com/areal-project/AReaL/blob/main/examples/math/gsm8k_grpo.yaml)
 to explain the key concepts step by step.
 
 ## Overview: How AReaL Works
@@ -142,7 +142,7 @@ that runs on the controller node.
 ### Configuration Files
 
 Configuration files are YAML files that specify options from
-[`areal/api/cli_args.py`](https://github.com/inclusionAI/AReaL/blob/main/areal/api/cli_args.py).
+[`areal/api/cli_args.py`](https://github.com/areal-project/AReaL/blob/main/areal/api/cli_args.py).
 You can override settings via CLI:
 
 ```bash
@@ -166,7 +166,7 @@ See [CLI Reference](../cli_reference.md) for all available options.
 ## The Training Script: Entry Point
 
 The training script
-([`examples/math/gsm8k_rl.py`](https://github.com/inclusionAI/AReaL/blob/main/examples/math/gsm8k_rl.py))
+([`examples/math/gsm8k_rl.py`](https://github.com/areal-project/AReaL/blob/main/examples/math/gsm8k_rl.py))
 follows this pattern:
 
 ```python
@@ -207,7 +207,7 @@ See [CLI Reference](../cli_reference.md) for configuration options, and
 ## The PPOTrainer: Controller-Based Training
 
 The
-[`PPOTrainer`](https://github.com/inclusionAI/AReaL/blob/main/areal/trainer/rl_trainer.py)
+[`PPOTrainer`](https://github.com/areal-project/AReaL/blob/main/areal/trainer/rl_trainer.py)
 orchestrates distributed training by initializing the scheduler and creating controllers
 for actors (policy/critic) and rollout workers.
 
@@ -254,7 +254,7 @@ trainer.train(
 ### RLVRWorkflow: Single-Turn Reward Learning
 
 The
-[`RLVRWorkflow`](https://github.com/inclusionAI/AReaL/blob/main/areal/workflow/rlvr.py)
+[`RLVRWorkflow`](https://github.com/areal-project/AReaL/blob/main/areal/workflow/rlvr.py)
 defines how prompts become training samples. Each trajectory goes through these steps:
 
 1. **Tokenize input**: Apply chat template to messages
@@ -268,7 +268,7 @@ defines how prompts become training samples. Each trajectory goes through these 
    - `rewards`: Scalar reward
 
 **GSM8K Reward**: Binary reward (1.0 for correct answer, 0.0 otherwise). See
-[`gsm8k_reward_fn`](https://github.com/inclusionAI/AReaL/blob/main/areal/reward/gsm8k.py).
+[`gsm8k_reward_fn`](https://github.com/areal-project/AReaL/blob/main/areal/reward/gsm8k.py).
 
 **NOTE:** This workflow adopts the low-level API of inference engines --- the
 `agenerate` API. It is preferable if you want more fine-grained control over token IDs.
@@ -313,7 +313,7 @@ Key: Generation and training happen SIMULTANEOUSLY on different GPUs
 #### Three Levels of Concurrency
 
 **Level 1 - Controller Thread**:
-[`BatchTaskDispatcher`](https://github.com/inclusionAI/AReaL/blob/main/areal/core/workflow_executor.py)
+[`BatchTaskDispatcher`](https://github.com/areal-project/AReaL/blob/main/areal/core/workflow_executor.py)
 runs in a background thread, continuously submitting rollout requests to workers via
 HTTP:
 
@@ -325,7 +325,7 @@ As such, **rollout and training happen simultaneously** in AReaL, even though th
 looks like a synchronous orchestration.
 
 **Level 2 - Worker RPC Server**: Each rollout worker runs a Flask HTTP server
-([`rpc_server.py`](https://github.com/inclusionAI/AReaL/blob/main/areal/infra/rpc/rpc_server.py))
+([`rpc_server.py`](https://github.com/areal-project/AReaL/blob/main/areal/infra/rpc/rpc_server.py))
 on **CPU**:
 
 - Accepts concurrent HTTP requests (multi-threaded Flask)
@@ -372,7 +372,7 @@ return concat_padded_tensors(results)  # Shape: [batch_size, seq_len]
 ```
 
 **Staleness Control**:
-[`StalenessManager`](https://github.com/inclusionAI/AReaL/blob/main/areal/infra/staleness_manager.py)
+[`StalenessManager`](https://github.com/areal-project/AReaL/blob/main/areal/infra/staleness_manager.py)
 limits concurrent inflight requests:
 
 - `max_concurrent_rollouts`: Maximum inflight trajectories
@@ -387,7 +387,7 @@ results are merged back.
 
 ### TrainController: Dispatch Mechanism
 
-[`TrainController`](https://github.com/inclusionAI/AReaL/blob/main/areal/infra/controller/train_controller.py)
+[`TrainController`](https://github.com/areal-project/AReaL/blob/main/areal/infra/controller/train_controller.py)
 provides the core RPC dispatch:
 
 1. `_dispatch_inputs()`: Splits batches using FFD load balancing across workers
@@ -426,7 +426,7 @@ directly from rollout workers, avoiding controller memory overhead.
 ### Training Workers: Algorithm Implementation
 
 On each training worker,
-[`FSDPPPOActor`](https://github.com/inclusionAI/AReaL/blob/main/areal/trainer/ppo/actor.py)
+[`FSDPPPOActor`](https://github.com/areal-project/AReaL/blob/main/areal/trainer/ppo/actor.py)
 implements the GRPO/PPO algorithm:
 
 **Algorithm Methods:**
@@ -458,7 +458,7 @@ Each worker processes its shard, then synchronizes gradients via NCCL.
 ### The Training Loop
 
 The `trainer.train()` method orchestrates the complete loop. See
-[`PPOTrainer.train()`](https://github.com/inclusionAI/AReaL/blob/main/areal/trainer/rl_trainer.py)
+[`PPOTrainer.train()`](https://github.com/areal-project/AReaL/blob/main/areal/trainer/rl_trainer.py)
 for the full implementation:
 
 ```python
@@ -516,7 +516,7 @@ The weight sync process in `PPOTrainer.train()` follows this pattern:
 1. Resume rollout with updated weights with re-computed KV cache
 
 See
-[`PPOTrainer.train()`](https://github.com/inclusionAI/AReaL/blob/main/areal/trainer/rl_trainer.py)
+[`PPOTrainer.train()`](https://github.com/areal-project/AReaL/blob/main/areal/trainer/rl_trainer.py)
 lines 861-874 for the full implementation.
 
 ## Monitoring and Utilities
@@ -528,10 +528,10 @@ metrics tracking. These are automatically orchestrated during training.
 
 AReaL provides two checkpointing mechanisms:
 
-| Component                                                                                 | Purpose                          | Format        | Configuration    |
-| ----------------------------------------------------------------------------------------- | -------------------------------- | ------------- | ---------------- |
-| [`Saver`](https://github.com/inclusionAI/AReaL/blob/main/areal/utils/saver.py)            | Export for evaluation/deployment | HuggingFace   | `config.saver`   |
-| [`RecoverHandler`](https://github.com/inclusionAI/AReaL/blob/main/areal/utils/recover.py) | Resume after failures            | DCP (sharded) | `config.recover` |
+| Component                                                                                   | Purpose                          | Format        | Configuration    |
+| ------------------------------------------------------------------------------------------- | -------------------------------- | ------------- | ---------------- |
+| [`Saver`](https://github.com/areal-project/AReaL/blob/main/areal/utils/saver.py)            | Export for evaluation/deployment | HuggingFace   | `config.saver`   |
+| [`RecoverHandler`](https://github.com/areal-project/AReaL/blob/main/areal/utils/recover.py) | Resume after failures            | DCP (sharded) | `config.recover` |
 
 **Saver** creates HuggingFace-compatible checkpoints that can be loaded with
 `transformers` or published to HuggingFace Hub. Each save creates a new directory.
@@ -546,7 +546,7 @@ Both are called automatically during `trainer.train()`. For details, see the
 ### Evaluation
 
 The
-[`Evaluator`](https://github.com/inclusionAI/AReaL/blob/main/areal/utils/evaluator.py)
+[`Evaluator`](https://github.com/areal-project/AReaL/blob/main/areal/utils/evaluator.py)
 runs periodic evaluations on validation sets. Configure via `config.evaluation`. Called
 automatically in `trainer.train()`.
 
@@ -555,7 +555,7 @@ automatically in `trainer.train()`.
 AReaL uses a two-component metrics system:
 
 **`stats_tracker`**
-([source](https://github.com/inclusionAI/AReaL/blob/main/areal/utils/stats_tracker.py)):
+([source](https://github.com/areal-project/AReaL/blob/main/areal/utils/stats_tracker.py)):
 Collects statistics with two paradigms optimized for different use cases:
 
 - **Streaming metrics** for rollout workers: Each workflow logs scalars individually
@@ -573,7 +573,7 @@ stats_tracker.stat(advantages=tensor, denominator="n_valid_tokens")
 ```
 
 **`StatsLogger`**
-([source](https://github.com/inclusionAI/AReaL/blob/main/areal/utils/stats_logger.py)):
+([source](https://github.com/areal-project/AReaL/blob/main/areal/utils/stats_logger.py)):
 Sends aggregated metrics to logging backends (Weights & Biases, SwanLab, TensorBoard)
 from rank 0. At each training step, `PPOTrainer` collects metrics from all components
 and commits them:

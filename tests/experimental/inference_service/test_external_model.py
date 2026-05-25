@@ -353,7 +353,7 @@ class TestGatewayExternalEndpoints:
 
         resp = await gateway_client.post(
             "/export_trajectories",
-            json={"session_id": "ext-1"},
+            json={"session_ids": ["ext-1"]},
             headers=admin_headers(),
         )
         assert resp.status_code == 200
@@ -486,10 +486,11 @@ class TestDataProxyExternalEndpoints:
 
         not_ready = await data_proxy_client.post(
             "/export_trajectories",
-            json={"session_id": "__hitl__"},
+            json={"session_ids": ["__hitl__"], "remove_session": False},
             headers={"Authorization": "Bearer areal-admin-key"},
         )
-        assert not_ready.status_code == 409
+        assert not_ready.status_code == 200
+        assert not_ready.json()["interactions"] == {}
 
         set_reward = await data_proxy_client.post(
             "/rl/set_reward",
@@ -501,7 +502,7 @@ class TestDataProxyExternalEndpoints:
 
         exported = await data_proxy_client.post(
             "/export_trajectories",
-            json={"session_id": "__hitl__"},
+            json={"session_ids": ["__hitl__"]},
             headers={"Authorization": "Bearer areal-admin-key"},
         )
         assert exported.status_code == 200
@@ -578,7 +579,7 @@ class TestDataProxyExternalEndpoints:
 
         exported = await data_proxy_client.post(
             "/export_trajectories",
-            json={"session_id": "__hitl__"},
+            json={"session_ids": ["__hitl__"]},
             headers={"Authorization": "Bearer areal-admin-key"},
         )
         assert exported.status_code == 200
@@ -587,10 +588,11 @@ class TestDataProxyExternalEndpoints:
 
         exported_again = await data_proxy_client.post(
             "/export_trajectories",
-            json={"session_id": "__hitl__"},
+            json={"session_ids": ["__hitl__"]},
             headers={"Authorization": "Bearer areal-admin-key"},
         )
-        assert exported_again.status_code == 409
+        assert exported_again.status_code == 200
+        assert exported_again.json()["interactions"] == {}
 
     @pytest.mark.asyncio
     async def test_unregistered_model_falls_through_to_internal(

@@ -908,6 +908,12 @@ class RemoteInfEngine(InferenceEngine):
         """
         assert meta.type == "xccl"
 
+        self.logger.info(
+            "Initializing weight update group: group=%s, addresses=%s",
+            meta.nccl_group_name,
+            self.addresses,
+        )
+
         fut = get_executor().submit(
             _init_weights_update_group_remote,
             self.backend,
@@ -1395,7 +1401,19 @@ def _init_weights_update_group_remote(
                         timeout=request_timeout,
                     )
                 )
-            await asyncio.gather(*jobs)
+            results = await asyncio.gather(*jobs, return_exceptions=True)
+            for _idx, _r in enumerate(results):
+                if isinstance(_r, Exception):
+                    logger.error(
+                        "init_weights_update_group request %d to %s failed: %s",
+                        _idx,
+                        addresses[_idx],
+                        _r,
+                    )
+            # Re-raise first exception if any failed
+            for _r in results:
+                if isinstance(_r, Exception):
+                    raise _r
 
     return uvloop.run(_fn())
 

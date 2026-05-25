@@ -215,15 +215,15 @@ async def online_stack(monkeypatch):
         async def _revoke_session_in_router(
             router_addr: str,
             admin_api_key: str,
-            session_id: str,
-            timeout: float,
+            group_id: str,
+            timeout: float = 2.0,
             *,
             client: httpx.AsyncClient | None = None,
         ) -> None:
             del router_addr, timeout, client
             resp = await router_client.post(
                 "/remove_session",
-                json={"session_id": session_id},
+                json={"group_id": group_id},
                 headers={"Authorization": f"Bearer {admin_api_key}"},
             )
             assert resp.status_code == 200
@@ -282,7 +282,7 @@ async def test_online_stack_latest_ready_export_keeps_session_pinned(online_stac
 
     export_resp = await gw.post(
         "/export_trajectories",
-        json={"session_id": "__hitl__", "discount": 1.0, "style": "individual"},
+        json={"session_ids": ["__hitl__"], "discount": 1.0, "style": "individual"},
         headers=_admin_headers(),
     )
     assert export_resp.status_code == 200
@@ -325,10 +325,11 @@ async def test_online_stack_explicit_then_latest_export(online_stack):
     explicit_resp = await gw.post(
         "/export_trajectories",
         json={
-            "session_id": "__hitl__",
+            "session_ids": ["__hitl__"],
             "trajectory_id": 0,
             "discount": 1.0,
             "style": "individual",
+            "remove_session": False,
         },
         headers=_admin_headers(),
     )
@@ -337,7 +338,12 @@ async def test_online_stack_explicit_then_latest_export(online_stack):
 
     latest_resp = await gw.post(
         "/export_trajectories",
-        json={"session_id": "__hitl__", "discount": 1.0, "style": "individual"},
+        json={
+            "session_ids": ["__hitl__"],
+            "discount": 1.0,
+            "style": "individual",
+            "remove_session": False,
+        },
         headers=_admin_headers(),
     )
     assert latest_resp.status_code == 200

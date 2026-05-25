@@ -1827,6 +1827,7 @@ class SGLangConfig:
         dist_init_addr: str | None = None,
         n_nodes: int = 1,
         node_rank: int = 0,
+        pp_size: int = 1,
     ):
         args = SGLangConfig.build_args(
             sglang_config=sglang_config,
@@ -1837,6 +1838,7 @@ class SGLangConfig:
             dist_init_addr=dist_init_addr,
             n_nodes=n_nodes,
             node_rank=node_rank,
+            pp_size=pp_size,
         )
 
         return SGLangConfig.build_cmd_from_args(args)
@@ -1857,6 +1859,7 @@ class SGLangConfig:
         dist_init_addr: str | None = None,
         n_nodes: int = 1,
         node_rank: int = 0,
+        pp_size: int = 1,
     ):
         # Map "all-linear" to "all"
         args: dict = conf_as_dict(sglang_config)
@@ -1886,6 +1889,8 @@ class SGLangConfig:
             dist_init_addr=dist_init_addr,
             **args,
         )
+        if pp_size > 1:
+            args["pp_size"] = pp_size
         if host is not None:
             args["host"] = host
         if port is not None:

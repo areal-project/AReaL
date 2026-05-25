@@ -44,4 +44,4 @@ Fixes #(issue)
 ______________________________________________________________________
 
 **Need help?** Check the [Contributing Guide](../CONTRIBUTING.md) or ask in
-[GitHub Discussions](https://github.com/inclusionAI/AReaL/discussions)!
+[GitHub Discussions](https://github.com/areal-project/AReaL/discussions)!

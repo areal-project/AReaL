@@ -19,6 +19,7 @@ def main():
 
     from areal.infra.data_service.gateway.app import create_gateway_app
     from areal.infra.data_service.gateway.config import GatewayConfig
+    from areal.utils.logging import suppress_http_loggers
 
     config = GatewayConfig(
         host=args.host,
@@ -31,8 +32,15 @@ def main():
 
     import uvicorn
 
+    suppress_http_loggers()
     app = create_gateway_app(config)
-    uvicorn.run(app, host=config.host, port=config.port, log_level="warning")
+    uvicorn.run(
+        app,
+        host=config.host,
+        port=config.port,
+        log_level="warning",
+        access_log=False,
+    )
 
 
 if __name__ == "__main__":
