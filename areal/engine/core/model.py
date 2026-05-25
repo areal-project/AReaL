@@ -59,6 +59,10 @@ def is_gemma3_model(model_type: str) -> bool:
     return model_type in ["gemma3"]
 
 
+def is_qwen_model(model_type: str) -> bool:
+    return model_type.startswith("qwen")
+
+
 VALID_MOE_MODELS = [
     "qwen3_moe",
     "qwen3_vl_moe",
