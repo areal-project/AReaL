@@ -501,7 +501,11 @@ class RolloutControllerV2:
             if self.external_mode:
                 dp_cmd = data_proxy_base_cmd + ["--backend-addr", ""]
             else:
-                addr = backend_addr if backend_addr is not None else self._inf_addrs[group_idx]
+                addr = (
+                    backend_addr
+                    if backend_addr is not None
+                    else self._inf_addrs[group_idx]
+                )
                 dp_cmd = data_proxy_base_cmd + [
                     "--backend-addr",
                     addr,
@@ -815,7 +819,9 @@ class RolloutControllerV2:
                 ]
             )
         else:
-            group_results = await asyncio.gather(*[_fork_group(i) for i in range(dp_size)])
+            group_results = await asyncio.gather(
+                *[_fork_group(i) for i in range(dp_size)]
+            )
 
             for host, port, forked in group_results:
                 addr = f"http://{format_hostport(host, port)}"
@@ -891,7 +897,9 @@ class RolloutControllerV2:
         worker_types = ["regular"] * dp_size
         bootstrap_ports = [None] * dp_size
 
-        if getattr(self, "_prefill_addrs", None) and getattr(self, "_decode_addrs", None):
+        if getattr(self, "_prefill_addrs", None) and getattr(
+            self, "_decode_addrs", None
+        ):
             # PD mode (DP=2): index 0 = prefill, index 1 = decode
             worker_types[0] = "prefill"
             worker_types[1] = "decode"

@@ -2209,8 +2209,7 @@ class InferenceEngineConfig:
                 )
             if self._version != "v2":
                 raise ValueError(
-                    "pd_disaggregation requires _version='v2', "
-                    f"got: {self._version}"
+                    f"pd_disaggregation requires _version='v2', got: {self._version}"
                 )
             if self.api_url is not None:
                 raise ValueError(
