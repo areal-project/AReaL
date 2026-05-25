@@ -41,7 +41,9 @@ RUN git clone --depth 1 --branch ${SGLANG_TAG} https://github.com/sgl-project/sg
     pip install -e python[srt_npu] && \
     python3 -m pip cache purge
 
-# Install AReaL dependencies
+# Install AReaL dependencies. No `--upgrade` — keep vllm-ascend's pre-installed
+# torch/torch-npu/etc. via uv's "leave-installed-if-satisfied" semantic.
+# Container `pip show` may lag uv.npu.lock; that divergence is by design.
 RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=type=bind,source=pyproject.npu.toml,target=pyproject.toml \
     UV_HTTP_TIMEOUT=300 uv pip install -r pyproject.toml --system --group dev
