@@ -316,7 +316,7 @@ def _compute_map_trace_score(
     return right_edge + (1.0 - right_edge) * (hi - ndtw) / (hi - lo), ndtw
 
 
-def _compute_repetition_penalty(text: str, num_turns: int = 2) -> float:
+def _compute_repetition_penalty(text: str, num_turns: int = 2, disable_sentence_penalty: bool = False) -> float:
     if not text or len(text) < 20:
         return 0.0
 
@@ -331,15 +331,16 @@ def _compute_repetition_penalty(text: str, num_turns: int = 2) -> float:
     if re.search(r"(\b\w+(?:\s+\w+){3,})(?:\s+\1){9,}", text):
         return -2.0
 
-    sentences = re.split(r"[.!?\n]+", text)
-    sentences = [s.strip() for s in sentences if len(s.strip()) > 10]
-    if sentences:
-        counts = Counter(sentences)
-        max_count = counts.most_common(1)[0][1] if counts else 0
-        if max_count >= 10:
-            return -1.5 * 2 / num_turns
-        if max_count >= 7:
-            return -1.0 * 2 / num_turns
+    if not disable_sentence_penalty:
+        sentences = re.split(r"[.!?\n]+", text)
+        sentences = [s.strip() for s in sentences if len(s.strip()) > 10]
+        if sentences:
+            counts = Counter(sentences)
+            max_count = counts.most_common(1)[0][1] if counts else 0
+            if max_count >= 10:
+                return -1.5 * 2 / num_turns
+            if max_count >= 7:
+                return -1.0 * 2 / num_turns
 
     if re.search(r"\b(\w+)(?:\s+\1){9,}\b", text):
         return -1.5
@@ -389,6 +390,9 @@ class GeoVisionQARewardManager:
         self.num_examine = num_examine
         self.reward_fn_key = reward_fn_key
         self.config = config
+        self.disable_sentence_rep_penalty = False
+        if config is not None:
+            self.disable_sentence_rep_penalty = getattr(config, "disable_sentence_rep_penalty", False)
 
         api_key = os.environ.get("JUDGE_API_KEY")
         if api_key:
@@ -504,7 +508,7 @@ class GeoVisionQARewardManager:
             if hasattr(num_turns, '__len__'):
                 num_turns = int(num_turns[0]) if len(num_turns) > 0 else 2
             model_only_text = re.sub(r"<\|im_start\|>user\n.*?<\|im_end\|>", "", response_str, flags=re.DOTALL)
-            r_rep = _compute_repetition_penalty(model_only_text, int(num_turns))
+            r_rep = _compute_repetition_penalty(model_only_text, int(num_turns), self.disable_sentence_rep_penalty)
 
             # R_format: format compliance
             r_format = _compute_format_reward(response_str)

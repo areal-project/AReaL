@@ -23,24 +23,24 @@ set -x
 # ============================================================
 
 WORKSPACE=${WORKSPACE:-/storage/openpsi/data/lcy_image_edit/mixed_rl_v2}
-model_name=${MODEL_PATH:-/storage/openpsi/models/lcy_image_edit/sft_workspace/qwen3vl8b-thinking-5ds-v2-0419-ct65536/checkpoint-280}
+model_name=${MODEL_PATH:-/storage/openpsi/models/lcy_image_edit/sft_workspace/qwen3vl8b-thinking-5ds-v3-0520-ct65536-lr1e5}
 
 train_data="[$WORKSPACE/train_v2_0524.parquet]"
 val_data="[$WORKSPACE/val_v2_0524.parquet]"
 run_name="mixed-gigpo-v2-0524"
 rl_alg=gigpo
-gigpo_sim_threshold=0.5
+gigpo_sim_threshold=0.9
 # ---- Cluster topology ----
 n_gpus_per_node=8
 n_nodes=4
 
 # ---- Batch sizes (scaled for 4 nodes) ----
 n=4
-batch_size=64
+batch_size=128
 ppo_mini_batch_size=256
 
 # ---- Sequence lengths ----
-max_prompt_length=16384
+max_prompt_length=20480
 max_response_length=32768
 max_action_length=4096
 max_obs_length=8192
@@ -64,7 +64,7 @@ reward_manager=geo_vision_qa
 # ---- Training ----
 strategy="fsdp2"
 lr=1e-6
-kl_loss_coef=0.0
+kl_loss_coef=0.001
 kl_coef=0.0
 entropy_coeff=0
 kl_loss_type=low_var_kl
@@ -154,13 +154,16 @@ PYTHONUNBUFFERED=1 python3 -m verl_tool.trainer.main_ppo \
     data.val_files=$val_data \
     data.train_batch_size=$batch_size \
     data.val_batch_size=256 \
-    data.dataloader_num_workers=64 \
+    +data.sampler.class_path=verl_tool/trainer/ppo/at_gigpo_sampler.py \
+    +data.sampler.class_name=ATGiGPOSampler \
+    data.dataloader_num_workers=0 \
     data.max_prompt_length=$max_prompt_length \
     data.max_response_length=$max_response_length \
     data.filter_overlong_prompts=False \
     data.truncation='right' \
     data.shuffle=True \
     reward_model.reward_manager=$reward_manager \
+    +reward_model.disable_sentence_rep_penalty=True \
     actor_rollout_ref.model.path=$model_name \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
     actor_rollout_ref.actor.optim.lr=$lr \
@@ -173,7 +176,7 @@ PYTHONUNBUFFERED=1 python3 -m verl_tool.trainer.main_ppo \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=$ppo_micro_batch_size_per_gpu \
     actor_rollout_ref.actor.use_dynamic_bsz=$use_dynamic_bsz \
     actor_rollout_ref.actor.ppo_max_token_len_per_gpu=$ppo_max_token_len_per_gpu \
-    actor_rollout_ref.actor.use_kl_loss=False \
+    actor_rollout_ref.actor.use_kl_loss=True \
     actor_rollout_ref.actor.strategy=$strategy \
     actor_rollout_ref.actor.kl_loss_coef=$kl_loss_coef \
     actor_rollout_ref.actor.kl_loss_type=$kl_loss_type \
