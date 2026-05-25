@@ -135,6 +135,11 @@ class RolloutControllerV2:
         self._data_proxy_addrs: list[str] = []
         self._gateway_addr: str = ""
 
+        # PD disaggregation addresses (populated in _async_fork_inf_servers)
+        self._prefill_addrs: list[str] = []
+        self._decode_addrs: list[str] = []
+        self._prefill_bootstrap_port: int = 8998
+
         # Worker ID mapping (data proxy addr → router-assigned worker_id)
         self._worker_ids: dict[str, str] = {}  # data_proxy_addr -> worker_id
 
@@ -480,7 +485,10 @@ class RolloutControllerV2:
                 str(agent_cfg.engine_max_tokens),
             ]
 
-        async def _fork_data_proxy(group_idx: int) -> tuple[str, int, str]:
+        async def _fork_data_proxy(
+            group_idx: int,
+            backend_addr: str | None = None,
+        ) -> tuple[str, int, str]:
             if self.external_mode:
                 head_worker = inf_workers[group_idx]
             else:
@@ -493,9 +501,10 @@ class RolloutControllerV2:
             if self.external_mode:
                 dp_cmd = data_proxy_base_cmd + ["--backend-addr", ""]
             else:
+                addr = backend_addr if backend_addr is not None else self._inf_addrs[group_idx]
                 dp_cmd = data_proxy_base_cmd + [
                     "--backend-addr",
-                    self._inf_addrs[group_idx],
+                    addr,
                     "--backend-type",
                     inf_backend or "sglang",
                 ]
@@ -520,6 +529,8 @@ class RolloutControllerV2:
             "--log-level",
             _DEFAULT_SERVICE_LOG_LEVEL,
         ]
+        if getattr(self.config, "pd_disaggregation", False):
+            gw_cmd.append("--pd-disaggregation")
 
         gw_task = asyncio.ensure_future(
             self._async_fork_on_guard(
@@ -529,14 +540,20 @@ class RolloutControllerV2:
                 raw_cmd=gw_cmd,
             )
         )
-        dp_results = await asyncio.gather(
-            *[_fork_data_proxy(i) for i in range(dp_size)]
-        )
 
-        # Track data-proxies in group order, then gateway — deterministic cleanup.
-        for group_idx, (dp_host, dp_port, dp_guard) in enumerate(dp_results):
+        # ---- Launch Data Proxies ----
+        is_pd = getattr(self.config, "pd_disaggregation", False)
+        if is_pd:
+            backend_addrs = [self._prefill_addrs[0], self._decode_addrs[0]]
+        else:
+            backend_addrs = [None] * dp_size
+
+        dp_results = await asyncio.gather(
+            *[_fork_data_proxy(i, backend_addrs[i]) for i in range(len(backend_addrs))]
+        )
+        for idx, (dp_host, dp_port, dp_guard) in enumerate(dp_results):
             self._data_proxy_addrs.append(f"http://{format_hostport(dp_host, dp_port)}")
-            self._forked_services.append((dp_guard, "data-proxy", group_idx))
+            self._forked_services.append((dp_guard, "data-proxy", idx))
         logger.info("Data proxies: %s", self._data_proxy_addrs)
 
         gw_host, gw_port = await gw_task
@@ -557,6 +574,12 @@ class RolloutControllerV2:
         """Fork inference server groups in parallel across all DP ranks."""
         tp_size = alloc.parallel.tp_size
         pp_size = alloc.parallel.pp_size
+        is_pd = getattr(self.config, "pd_disaggregation", False)
+
+        if is_pd and inf_backend != "sglang":
+            raise ValueError(
+                f"PD disaggregation only supports sglang backend, got: {inf_backend}"
+            )
 
         # Build backend-specific launch command builder
         if inf_backend == "sglang":
@@ -582,7 +605,25 @@ class RolloutControllerV2:
                 n_nodes: int = 1,
                 node_rank: int = 0,
                 dist_init_addr: str | None = None,
+                disaggregation_mode: str = "null",
+                bootstrap_port: int | None = None,
             ) -> list[str]:
+                if is_pd:
+                    args = SGLangConfig.build_args(
+                        sglang_config=sglang_config,
+                        tp_size=tp_size,
+                        pp_size=pp_size,
+                        base_gpu_id=0,
+                        host=host,
+                        port=port,
+                        dist_init_addr=dist_init_addr,
+                        n_nodes=n_nodes,
+                        node_rank=node_rank,
+                    )
+                    args["disaggregation_mode"] = disaggregation_mode
+                    if bootstrap_port is not None:
+                        args["disaggregation_bootstrap_port"] = bootstrap_port
+                    return SGLangConfig.build_cmd_from_args(args)
                 return SGLangConfig.build_cmd(
                     sglang_config=sglang_config,
                     tp_size=tp_size,
@@ -618,6 +659,8 @@ class RolloutControllerV2:
                 n_nodes: int = 1,
                 node_rank: int = 0,
                 dist_init_addr: str | None = None,
+                disaggregation_mode: str = "null",
+                bootstrap_port: int | None = None,
             ) -> list[str]:
                 return vLLMConfig.build_cmd(
                     vllm_config=vllm_config,
@@ -635,7 +678,10 @@ class RolloutControllerV2:
 
         async def _fork_group(
             group_idx: int,
-        ) -> tuple[str, int, list[tuple[str, str, int]]]:
+            *,
+            disaggregation_mode: str = "null",
+        ) -> tuple[str, int, list[tuple[str, str, int]], int | None]:
+            """Returns (host, port, forked_services, bootstrap_port_or_None)."""
             group_workers = inf_workers[
                 group_idx * nnodes_per_instance : (group_idx + 1) * nnodes_per_instance
             ]
@@ -656,7 +702,9 @@ class RolloutControllerV2:
                 rendezvous_port = rendezvous_data["ports"][0]
                 dist_init_addr = format_hostport(rendezvous_host, rendezvous_port)
 
-            async def _fork_node(node_rank: int, worker: Any) -> tuple[str, int, str]:
+            async def _fork_node(
+                node_rank: int, worker: Any
+            ) -> tuple[str, int, str, int | None]:
                 guard_addr = (
                     f"http://{format_hostport(worker.ip, int(worker.worker_ports[0]))}"
                 )
@@ -671,12 +719,18 @@ class RolloutControllerV2:
                 inf_host: str = port_data["host"]
                 inf_port: int = port_data["ports"][0]
 
+                bp: int | None = None
+                if is_pd and disaggregation_mode == "prefill":
+                    bp = inf_port + 1000
+
                 cmd = _build_launch_cmd(
                     host=inf_host,
                     port=inf_port,
                     n_nodes=nnodes_per_instance,
                     node_rank=node_rank,
                     dist_init_addr=dist_init_addr,
+                    disaggregation_mode=disaggregation_mode,
+                    bootstrap_port=bp,
                 )
 
                 fork_payload: dict[str, Any] = {
@@ -710,42 +764,80 @@ class RolloutControllerV2:
                     timeout=30.0,
                 )
                 resp.raise_for_status()
-                return inf_host, inf_port, guard_addr
+                return inf_host, inf_port, guard_addr, bp
 
             node_results = await asyncio.gather(
                 *[_fork_node(rank, w) for rank, w in enumerate(group_workers)]
             )
 
-            head_inf_host, head_inf_port, _ = node_results[0]
+            head_inf_host, head_inf_port, _, head_bp = node_results[0]
             forked: list[tuple[str, str, int]] = [
                 (guard_addr, "inf-server", group_idx * nnodes_per_instance + rank)
-                for rank, (_, _, guard_addr) in enumerate(node_results)
+                for rank, (_, _, guard_addr, _) in enumerate(node_results)
             ]
-            return (head_inf_host, head_inf_port, forked)
+            return (head_inf_host, head_inf_port, forked, head_bp)
 
-        group_results = await asyncio.gather(*[_fork_group(i) for i in range(dp_size)])
+        # Fork all inference server groups
+        if is_pd:
+            # PD mode (DP=2): group 0 = prefill, group 1 = decode
+            prefill_results, decode_results = await asyncio.gather(
+                _fork_group(0, disaggregation_mode="prefill"),
+                _fork_group(1, disaggregation_mode="decode"),
+            )
 
-        for host, port, forked in group_results:
-            addr = f"http://{format_hostport(host, port)}"
-            self._inf_addrs.append(addr)
+            host, port, forked, bp = prefill_results
+            self._prefill_addrs.append(f"http://{format_hostport(host, port)}")
             self.server_infos.append(
-                LocalInfServerInfo(
-                    host=host,
-                    port=port,
-                    process=None,  # type: ignore[arg-type]
-                )
+                LocalInfServerInfo(host=host, port=port, process=None)
             )
             self._forked_services.extend(forked)
+            self._prefill_bootstrap_port = bp or 8998
+            logger.info("Prefill inference servers: %s", self._prefill_addrs)
 
-        # Wait for all inference servers to be healthy in parallel
-        await asyncio.gather(
-            *[
-                self._async_wait_for_service(
-                    f"{addr}/health", f"InfServer-{i}", timeout=cfg.setup_timeout
+            host, port, forked, _ = decode_results
+            self._decode_addrs.append(f"http://{format_hostport(host, port)}")
+            self.server_infos.append(
+                LocalInfServerInfo(host=host, port=port, process=None)
+            )
+            self._forked_services.extend(forked)
+            logger.info("Decode inference servers: %s", self._decode_addrs)
+
+            # Also populate _inf_addrs for downstream compatibility
+            self._inf_addrs = self._prefill_addrs + self._decode_addrs
+
+            all_addrs = self._inf_addrs
+            await asyncio.gather(
+                *[
+                    self._async_wait_for_service(
+                        f"{addr}/health", f"InfServer-{i}", timeout=cfg.setup_timeout
+                    )
+                    for i, addr in enumerate(all_addrs)
+                ]
+            )
+        else:
+            group_results = await asyncio.gather(*[_fork_group(i) for i in range(dp_size)])
+
+            for host, port, forked in group_results:
+                addr = f"http://{format_hostport(host, port)}"
+                self._inf_addrs.append(addr)
+                self.server_infos.append(
+                    LocalInfServerInfo(
+                        host=host,
+                        port=port,
+                        process=None,  # type: ignore[arg-type]
+                    )
                 )
-                for i, addr in enumerate(self._inf_addrs)
-            ]
-        )
+                self._forked_services.extend(forked)
+
+            # Wait for all inference servers to be healthy in parallel
+            await asyncio.gather(
+                *[
+                    self._async_wait_for_service(
+                        f"{addr}/health", f"InfServer-{i}", timeout=cfg.setup_timeout
+                    )
+                    for i, addr in enumerate(self._inf_addrs)
+                ]
+            )
 
     # -- Service health checks & registration ------------------------------
 
@@ -793,27 +885,44 @@ class RolloutControllerV2:
         admin_key = self.config.admin_api_key
         router_addr = self._router_addr
 
-        def _register_one(data_proxy_addr: str) -> tuple[str, str | None]:
-            # Each thread gets its own httpx.Client because httpx.Client
-            # is not thread-safe and must not be shared across threads.
+        # Determine worker types for each data proxy
+        # In PD mode, first half are prefill, second half are decode
+        dp_size = len(self._data_proxy_addrs)
+        worker_types = ["regular"] * dp_size
+        bootstrap_ports = [None] * dp_size
+
+        if getattr(self, "_prefill_addrs", None) and getattr(self, "_decode_addrs", None):
+            # PD mode (DP=2): index 0 = prefill, index 1 = decode
+            worker_types[0] = "prefill"
+            worker_types[1] = "decode"
+            bootstrap_ports[0] = getattr(self, "_prefill_bootstrap_port", 8998)
+
+        def _register_one(args: tuple[int, str]) -> tuple[str, str | None]:
+            idx, data_proxy_addr = args
             with httpx.Client() as client:
+                payload: dict[str, Any] = {"worker_addr": data_proxy_addr}
+                if worker_types[idx] != "regular":
+                    payload["worker_type"] = worker_types[idx]
+                if bootstrap_ports[idx] is not None:
+                    payload["bootstrap_port"] = bootstrap_ports[idx]
                 resp = client.post(
                     f"{router_addr}/register",
-                    json={"worker_addr": data_proxy_addr},
+                    json=payload,
                     headers={"Authorization": f"Bearer {admin_key}"},
                     timeout=5,
                 )
             resp.raise_for_status()
             worker_id = resp.json().get("worker_id")
             logger.info(
-                "Registered data proxy %s in router (worker_id=%s)",
+                "Registered data proxy %s type=%s in router (worker_id=%s)",
                 data_proxy_addr,
+                worker_types[idx],
                 worker_id,
             )
             return data_proxy_addr, worker_id
 
         with ThreadPoolExecutor(max_workers=len(self._data_proxy_addrs)) as pool:
-            results = list(pool.map(_register_one, self._data_proxy_addrs))
+            results = list(pool.map(_register_one, enumerate(self._data_proxy_addrs)))
 
         for data_proxy_addr, worker_id in results:
             if worker_id:

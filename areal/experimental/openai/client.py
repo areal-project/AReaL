@@ -727,11 +727,22 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
             ),
         )
 
+        # Extract PD disaggregation bootstrap fields from kwargs
+        # (injected by Gateway in PD mode, passed through to SGLang)
+        _bootstrap_fields = {}
+        for _bk in ("bootstrap_host", "bootstrap_port", "bootstrap_room"):
+            if _bk in kwargs:
+                _bootstrap_fields[_bk] = kwargs.pop(_bk)
+
+        _meta = metadata if not is_omitted(metadata) else {}
+        if _bootstrap_fields:
+            _meta = {**_meta, "bootstrap": _bootstrap_fields}
+
         model_request = ModelRequest(
             input_ids=prompt_token_ids,
             gconfig=gconfig,
             rid=str(uuid.uuid4()),
-            metadata=metadata if not is_omitted(metadata) else {},
+            metadata=_meta,
             tokenizer=self.tokenizer,
             image_data=image_data if has_images else None,
             vision_msg_vllm=([vision_messages_for_vllm] if has_images else None),

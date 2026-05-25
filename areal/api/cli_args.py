@@ -7,7 +7,7 @@ from dataclasses import MISSING as dataclass_missing
 from dataclasses import asdict, dataclass, field, fields
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, ClassVar, TypeVar
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, TypeVar
 
 import uvloop
 import yaml
@@ -1774,6 +1774,10 @@ class SGLangConfig:
     # but we disable it to avoid precision issues
     chunked_prefill_size: int | None = -1
     max_prefill_tokens: int = 32768
+    # PD disaggregation fields (passed through to SGLang ServerArgs)
+    disaggregation_mode: Literal["null", "prefill", "decode"] = "null"
+    disaggregation_transfer_backend: str | None = None
+    disaggregation_bootstrap_port: int = 8998
     schedule_policy: str = "lpm"
     schedule_conservativeness: float = 1.0
     cpu_offload_gb: int = 0
@@ -2126,6 +2130,13 @@ class InferenceEngineConfig:
             "help": "Return routed expert indices for MoE models. Effective only when using SGLang engine with MoE models."
         },
     )
+    pd_disaggregation: bool = field(
+        default=False,
+        metadata={
+            "help": "Enable prefill-decode disaggregation for inference. "
+            "Requires sglang backend and _version='v2'."
+        },
+    )
 
     # v2 controller options
     _version: str = field(
@@ -2188,6 +2199,38 @@ class InferenceEngineConfig:
                 "rollout.agent.admin_api_key is ignored by rollout controller v2; "
                 "use rollout.admin_api_key instead."
             )
+
+        # PD disaggregation validation (v1: PP=1, DP=1, homogeneous TP)
+        if self.pd_disaggregation:
+            if not self.backend.startswith("sglang"):
+                raise ValueError(
+                    "pd_disaggregation only supported with sglang backend, "
+                    f"got: {self.backend}"
+                )
+            if self._version != "v2":
+                raise ValueError(
+                    "pd_disaggregation requires _version='v2', "
+                    f"got: {self._version}"
+                )
+            if self.api_url is not None:
+                raise ValueError(
+                    "pd_disaggregation not supported with external api_url"
+                )
+
+            from areal.api.alloc_mode import ModelAllocation
+
+            alloc = ModelAllocation.from_str(self.backend)
+            if alloc.parallel.pipeline_parallel_size != 1:
+                raise ValueError(
+                    "pd_disaggregation v1 requires PP=1, "
+                    f"got PP={alloc.parallel.pipeline_parallel_size}"
+                )
+            if alloc.parallel.data_parallel_size != 2:
+                raise ValueError(
+                    "pd_disaggregation requires DP=2 "
+                    "(group 0 = prefill, group 1 = decode), "
+                    f"got DP={alloc.parallel.data_parallel_size}"
+                )
 
 
 @dataclass

@@ -5,8 +5,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from typing import Any
 
 import httpx
@@ -495,3 +497,137 @@ async def broadcast_to_workers(
     tasks = [_call(addr) for addr in worker_addrs]
     results = await asyncio.gather(*tasks)
     return list(results)
+
+
+# =============================================================================
+# PD disaggregation utilities
+# =============================================================================
+
+
+@dataclass
+class PDPair:
+    """A matched prefill + decode worker pair with bootstrap triplet."""
+
+    prefill_addr: str
+    decode_addr: str
+    bootstrap_host: str
+    bootstrap_port: int
+    bootstrap_room: int
+
+
+@async_httpx_retry
+async def query_router_pd(
+    router_addr: str,
+    admin_api_key: str | None = None,
+    timeout: float = 2.0,
+    *,
+    model: str | None = None,
+    client: httpx.AsyncClient | None = None,
+) -> PDPair:
+    """Ask the Router for a PD pair.
+
+    POST ``{router_addr}/route_pd`` and return a :class:`PDPair`.
+
+    Raises
+    ------
+    RouterUnreachableError
+    RouterKeyRejectedError
+    """
+    try:
+        headers = {}
+        if admin_api_key is not None:
+            headers["Authorization"] = f"Bearer {admin_api_key}"
+
+        payload: dict[str, Any] = {}
+        if model is not None:
+            payload["model"] = model
+
+        async with _use_client(client, timeout) as c:
+            resp = await c.post(
+                f"{router_addr}/route_pd",
+                json=payload,
+                headers=headers,
+                timeout=timeout,
+            )
+
+        if resp.status_code == 503:
+            data = resp.json()
+            raise RouterKeyRejectedError(
+                data.get("detail", data.get("error", "No healthy PD workers")), 503
+            )
+        resp.raise_for_status()
+        data = resp.json()
+        return PDPair(
+            prefill_addr=data["prefill_addr"],
+            decode_addr=data["decode_addr"],
+            bootstrap_host=data["bootstrap_host"],
+            bootstrap_port=data["bootstrap_port"],
+            bootstrap_room=data["bootstrap_room"],
+        )
+    except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+        raise RouterUnreachableError(f"Router unreachable: {exc}") from exc
+    except httpx.TimeoutException as exc:
+        raise RouterUnreachableError(f"Router timed out: {exc}") from exc
+    except httpx.TransportError as exc:
+        raise RouterUnreachableError(f"Router transport error: {exc}") from exc
+    except httpx.HTTPStatusError as exc:
+        raise RouterUnreachableError(
+            f"Router returned HTTP {exc.response.status_code}: {exc}"
+        ) from exc
+
+
+async def pd_dual_dispatch(
+    pd_pair: PDPair,
+    body: bytes,
+    headers: dict[str, str],
+    timeout: float,
+    *,
+    client: httpx.AsyncClient | None = None,
+) -> bytes:
+    """Concurrently dispatch to prefill + decode, return decode response.
+
+    Injects ``bootstrap_host``, ``bootstrap_port``, ``bootstrap_room`` into
+    the JSON body before forwarding to both prefill and decode Data Proxies.
+
+    SGLang decode receives KV cache (and the first token) from prefill via
+    the transfer backend, so decode's response already contains the complete
+    generation result.  No merging needed — we just return decode's body.
+    """
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Invalid JSON body for PD dispatch: {exc}") from exc
+
+    payload["bootstrap_host"] = pd_pair.bootstrap_host
+    payload["bootstrap_port"] = pd_pair.bootstrap_port
+    payload["bootstrap_room"] = pd_pair.bootstrap_room
+    modified_body = json.dumps(payload).encode("utf-8")
+
+    fwd_headers = _forwarding_headers(headers)
+
+    async with _use_client(client, timeout) as c:
+        prefill_task = c.post(
+            f"{pd_pair.prefill_addr}/chat/completions",
+            content=modified_body,
+            headers=fwd_headers,
+            timeout=timeout,
+        )
+        decode_task = c.post(
+            f"{pd_pair.decode_addr}/chat/completions",
+            content=modified_body,
+            headers=fwd_headers,
+            timeout=timeout,
+        )
+        prefill_resp, decode_resp = await asyncio.gather(
+            prefill_task, decode_task, return_exceptions=True
+        )
+
+    if isinstance(decode_resp, Exception):
+        raise RouterUnreachableError(f"Decode dispatch failed: {decode_resp}")
+    if isinstance(prefill_resp, Exception):
+        raise RouterUnreachableError(f"Prefill dispatch failed: {prefill_resp}")
+
+    decode_resp.raise_for_status()
+    prefill_resp.raise_for_status()
+
+    return decode_resp.content

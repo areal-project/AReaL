@@ -22,3 +22,4 @@ class GatewayConfig:
     router_timeout: float = 2.0  # seconds for /route call
     forward_timeout: float = 120.0  # seconds for forwarding to data proxy
     log_level: str = "warning"
+    pd_disaggregation: bool = False  # Enable PD disaggregation mode

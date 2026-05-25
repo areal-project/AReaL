@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import hmac
+import random
 from contextlib import asynccontextmanager
 
 import httpx
@@ -65,6 +66,8 @@ def _require_admin_key(request: Request, admin_key: str) -> str:
 
 class RegisterWorkerRequest(BaseModel):
     worker_addr: str
+    worker_type: str = "regular"
+    bootstrap_port: int | None = None
 
 
 class UnregisterWorkerRequest(BaseModel):
@@ -135,6 +138,19 @@ class RouteResponse(BaseModel):
     worker_addr: str
     url: str | None = None
     api_key: str | None = None
+
+
+class RoutePDRequest(BaseModel):
+    session_id: str | None = None
+    model: str | None = None
+
+
+class RoutePDResponse(BaseModel):
+    prefill_addr: str
+    decode_addr: str
+    bootstrap_host: str
+    bootstrap_port: int
+    bootstrap_room: int
 
 
 class RemoveSessionResponse(BaseModel):
@@ -260,8 +276,17 @@ def create_app(config: RouterConfig) -> FastAPI:
     @app.post("/register", response_model=RegisterWorkerResponse)
     async def register(body: RegisterWorkerRequest, request: Request):
         _require_admin_key(request, config.admin_api_key)
-        worker_id = await worker_registry.register(body.worker_addr)
-        logger.info("Worker registered: %s (id=%s)", body.worker_addr, worker_id)
+        worker_id = await worker_registry.register(
+            body.worker_addr,
+            worker_type=body.worker_type,
+            bootstrap_port=body.bootstrap_port,
+        )
+        logger.info(
+            "Worker registered: %s type=%s (id=%s)",
+            body.worker_addr,
+            body.worker_type,
+            worker_id,
+        )
         return RegisterWorkerResponse(status="ok", worker_id=worker_id)
 
     @app.post("/unregister", response_model=UnregisterWorkerResponse)
@@ -383,6 +408,62 @@ def create_app(config: RouterConfig) -> FastAPI:
 
         # Step E: Unknown key
         raise HTTPException(status_code=404, detail="Unknown API key")
+
+    # =========================================================================
+    # PD disaggregation routing (admin key required)
+    # =========================================================================
+
+    @app.post("/route_pd", response_model=RoutePDResponse)
+    async def route_pd(body: RoutePDRequest, request: Request):
+        _require_admin_key(request, config.admin_api_key)
+
+        # Step A: model filtering (same as /route)
+        model_addrs: list[str] | None = None
+        if body.model is not None:
+            info = await model_registry.get(body.model)
+            if info is not None:
+                model_addrs = info.data_proxy_addrs
+
+        def _filter_by_model(workers: list, addrs: list[str] | None) -> list:
+            if addrs is None:
+                return workers
+            addr_set = set(addrs)
+            return [w for w in workers if w.worker_addr in addr_set]
+
+        # Step B: Get prefill workers
+        prefill_workers = await worker_registry.get_prefill_workers()
+        if model_addrs is not None:
+            prefill_workers = _filter_by_model(prefill_workers, model_addrs)
+        if not prefill_workers:
+            raise HTTPException(status_code=503, detail="No healthy prefill workers")
+
+        # Step C: Get decode workers
+        decode_workers = await worker_registry.get_decode_workers()
+        if model_addrs is not None:
+            decode_workers = _filter_by_model(decode_workers, model_addrs)
+        if not decode_workers:
+            raise HTTPException(status_code=503, detail="No healthy decode workers")
+
+        # Step D: Pick one of each (round-robin within type)
+        prefill = strategy.pick(prefill_workers)
+        decode = strategy.pick(decode_workers)
+        if prefill is None or decode is None:
+            raise HTTPException(status_code=503, detail="No available PD pair")
+
+        # Step E: Generate bootstrap triplet
+        bootstrap_room = random.getrandbits(64)
+        prefill_url = prefill.worker_addr
+        host_part = prefill_url.split("://", 1)[-1]
+        bootstrap_host = host_part.split(":")[0]
+        bootstrap_port = prefill.bootstrap_port or 8998
+
+        return RoutePDResponse(
+            prefill_addr=prefill.worker_addr,
+            decode_addr=decode.worker_addr,
+            bootstrap_host=bootstrap_host,
+            bootstrap_port=bootstrap_port,
+            bootstrap_room=bootstrap_room,
+        )
 
     # =========================================================================
     # Session registration (admin key required)
