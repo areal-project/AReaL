@@ -835,13 +835,13 @@ Spaces.
 See: https://github.com/gradio-app/trackio
 ```
 
-| Parameter                     | Type           | Default      | Description                                                |
-| ----------------------------- | -------------- | ------------ | ---------------------------------------------------------- |
-| `mode`                        | string         | `"disabled"` | -                                                          |
-| `project`                     | string \| None | `None`       | -                                                          |
-| `name`                        | string \| None | `None`       | -                                                          |
-| `space_id`                    | string \| None | `None`       | -                                                          |
-| `max_rollout_traces_per_step` | integer        | `32`         | Maximum rollout/eval trajectories to log as Trackio traces |
+| Parameter                     | Type           | Default      | Description |
+| ----------------------------- | -------------- | ------------ | ----------- |
+| `mode`                        | string         | `"disabled"` | -           |
+| `project`                     | string \| None | `None`       | -           |
+| `name`                        | string \| None | `None`       | -           |
+| `space_id`                    | string \| None | `None`       | -           |
+| `max_rollout_traces_per_step` | integer        | `32`         | -           |
 
 (section-wand-b)=
 

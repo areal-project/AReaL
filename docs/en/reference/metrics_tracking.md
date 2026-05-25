@@ -297,8 +297,8 @@ def commit(self, epoch, step, global_step, data):
 
 When Trackio is enabled, `PPOTrainer` also logs rollout and evaluation trajectories as
 `trackio.Trace` records. These traces decode each tensor trajectory into a user prompt
-and assistant completion, with metadata such as `global_step`, trajectory index,
-sample index, sequence length, prompt length, reward, and head/tail model versions.
+and assistant completion, with metadata such as `global_step`, trajectory index, sample
+index, sequence length, prompt length, reward, and head/tail model versions.
 
 ### Configuration
 
