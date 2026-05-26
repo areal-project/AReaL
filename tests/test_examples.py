@@ -195,6 +195,7 @@ def test_gsm8k_grpo(tmp_path_factory, _version):
         "scheduler.type=local",
         f"+actor._version={_version}",
         f"+rollout._version={_version}",
+        "+rollout.agent.admin_api_key=admin-test123",
         timeout=900,
     )
     assert success, f"GSM8K GRPO example failed (_version={_version})"
@@ -461,6 +462,12 @@ def test_gsm8k_grpo_lora(tmp_path_factory, rollout_backend, actor_backend):
         f"actor.backend={actor_backend}",
         "gconfig.n_samples=2",
         "gconfig.max_new_tokens=256",
+        # TODO: workaround for ArealOpenAI client not forwarding gconfig.lora_name
+        # into the inner GenerationHyperparameters (it falls back to the
+        # default "default_lora"), so the server-side adapter name and the
+        # request-side lora_path mismatch. Remove once the client transparently
+        # propagates gconfig.lora_name (or accepts it via extra_body).
+        "gconfig.lora_name=default_lora",
         "actor.mb_spec.max_tokens_per_mb=1024",
         "train_dataset.batch_size=16",
         "valid_dataset.batch_size=16",
@@ -472,6 +479,7 @@ def test_gsm8k_grpo_lora(tmp_path_factory, rollout_backend, actor_backend):
         f"actor.path={model_path}",
         "scheduler.type=local",
         "actor.weight_update_mode=disk",
+        "+rollout.agent.admin_api_key=admin-test123",
     )
     assert success, "GSM8K GRPO LoRA example failed"
 
