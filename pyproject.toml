@@ -128,7 +128,7 @@ dependencies = [
     "uvicorn",
     "uvloop>=0.21.0",
     "flask",
-    "tenacity",
+    "tenacity>=8.2.0",
 
     # Build and packaging tools
     "build>=1.2.1",

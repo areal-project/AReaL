@@ -474,6 +474,7 @@ class RolloutController:
                     host="0.0.0.0",
                     port=self._proxy_gateway_port,
                     log_level="warning",
+                    access_log=False,
                 )
                 server = uvicorn.Server(config)
                 self._proxy_gateway_server = server

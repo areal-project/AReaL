@@ -438,6 +438,11 @@ def create_app(config: DataProxyConfig) -> FastAPI:
         if version is None or not isinstance(version, int):
             raise HTTPException(status_code=400, detail="'version' (int) is required")
         app.state.version = version
+
+        # Propagate version to InfBridge so it stamps correct versions on generated tokens
+        if app.state.inf_bridge is not None:
+            app.state.inf_bridge.set_version(version)
+
         return SetVersionResponse(status="ok", version=version)
 
     @app.get("/get_version", response_model=GetVersionResponse)
