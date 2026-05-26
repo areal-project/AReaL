@@ -194,14 +194,18 @@ def create_awex_blueprint(
 
 def _create_training_adapter(engine):
     from areal.engine.fsdp_engine import FSDPEngine
-    from areal.engine.megatron_engine import MegatronEngine
     from areal.experimental.weight_update.awex.fsdp_adapter import AwexFSDPAdapter
-    from areal.experimental.weight_update.awex.megatron_adapter import (
-        AwexMegatronAdapter,
-    )
 
     if isinstance(engine, FSDPEngine):
         return AwexFSDPAdapter(engine)
+
+    # Lazy-import Megatron path: megatron-bridge requires transformer-engine,
+    # which pyproject.toml deliberately marks as never-install. FSDP-only
+    # users should not pay the import cost (or hit ImportError).
+    from areal.engine.megatron_engine import MegatronEngine
+    from areal.experimental.weight_update.awex.megatron_adapter import (
+        AwexMegatronAdapter,
+    )
 
     if isinstance(engine, MegatronEngine):
         return AwexMegatronAdapter(engine)
