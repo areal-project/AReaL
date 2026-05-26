@@ -602,6 +602,10 @@ class MegatronEngine(TrainEngine):
     def destroy(self):
         self._initialized = False
         self.process_group_initialized = False
+        # Drain any pending async checkpoint saves before tearing down process
+        # groups; the background save workers issue collectives during finalize.
+        if getattr(self, "checkpointer", None) is not None:
+            self.checkpointer.close()
         if hasattr(self, "optimizer"):
             del self.optimizer
         if hasattr(self, "model"):

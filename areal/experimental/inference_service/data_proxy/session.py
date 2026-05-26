@@ -80,7 +80,7 @@ class ExportTrajectoriesRequest(BaseModel):
 class ExportTrajectoriesResponse(BaseModel):
     """Response containing merged serialized interactions."""
 
-    interactions: Any
+    traj: dict[str, Any]
 
 
 @dataclass(frozen=True)

@@ -872,7 +872,18 @@ class MegatronEngineConfig:
     exp_avg_sq_dtype: str = "float32"
 
     # Checkpointing Configuration
-    async_save: bool = False
+    async_save: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "If True, Megatron checkpoint saves run in background processes and "
+                "save_checkpoint() returns immediately after weights are durably "
+                "staged off the GPU. Pending saves are drained before the next "
+                "load_checkpoint() and during engine.destroy(). Reduces per-save "
+                "sync wait on large MoE checkpoints."
+            ),
+        },
+    )
     use_checkpoint_opt_param_scheduler: bool = True
 
     # Deterministic Option
