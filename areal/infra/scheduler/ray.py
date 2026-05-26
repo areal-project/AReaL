@@ -40,6 +40,7 @@ from areal.infra.utils.ray_placement_group import (
 )
 from areal.utils import logging
 from areal.utils.offload import get_tms_env_vars
+from areal.utils.wandb_system_metrics import prepare_wandb_run_identity
 
 logger = logging.getLogger("RayScheduler")
 
@@ -63,6 +64,8 @@ class RayScheduler(Scheduler):
         exp_config: BaseExperimentConfig | None = None,
         n_gpus_per_node: int = 8,
     ):
+        prepare_wandb_run_identity(exp_config)
+
         self.exp_config = exp_config
         self._n_gpus_per_node = n_gpus_per_node
         self.startup_timeout = startup_timeout
