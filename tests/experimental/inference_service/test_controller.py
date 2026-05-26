@@ -513,9 +513,7 @@ class TestOnlineCallbackFlow:
 
 
 class TestInferenceServiceWorkflow:
-    @pytest.mark.skip(
-        reason="pending /export_trajectories traj schema migration"
-    )
+    @pytest.mark.skip(reason="pending /export_trajectories traj schema migration")
     @pytest.mark.asyncio
     async def test_online_mode_waits_on_controller(self):
         mock_interaction = MagicMock(reward=1.0)

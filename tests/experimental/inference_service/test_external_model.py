@@ -347,7 +347,9 @@ class TestGatewayExternalEndpoints:
         mock_forward.return_value = httpx.Response(
             200,
             json={
-                "interactions": {"id-1": {"messages": [], "reward": 0.0}},
+                "traj": {
+                    "interactions": [{"request": [], "response": "", "reward": 0.0}]
+                },
             },
         )
 

@@ -245,12 +245,19 @@ class InferenceServiceWorkflow(RolloutWorkflow):
         if not traj:
             return None
 
-        if "rewards" not in traj or not traj["rewards"]:
+        if "rewards" in traj and len(traj["rewards"]) > 0:
+            last_reward = float(traj["rewards"][-1])
+        elif (
+            "interactions" in traj
+            and traj["interactions"]
+            and traj["interactions"][-1].get("reward") is not None
+        ):
+            last_reward = float(traj["interactions"][-1]["reward"])
+        else:
             logger.warning(
                 "Exported trajectory is missing rewards. This trajectory will be rejected."
             )
             return None
 
-        last_reward = float(traj["rewards"][-1])
         stats_tracker.get(workflow_context.stat_scope()).scalar(reward=last_reward)
         return traj

@@ -423,28 +423,6 @@ class TestLocalLaunchPPSizeThreading:
             "found:\n" + window
         )
 
-    @pytest.mark.skip(
-        reason="Stale after controller v2 refactor (#1354): controller now uses "
-        "SGLangConfig.build_cmd_from_args and pp_size is threaded by the caller "
-        "via server_args. TODO: replace with a functional test on the new path."
-    )
-    def test_controller_sglang_branch_passes_pp_size(self):
-        """Source-level regression: the local controller's SGLang launch
-        builder must thread ``pp_size`` into ``SGLangConfig.build_cmd``.
-        """
-        import inspect
-
-        import areal.experimental.inference_service.controller.controller as mod
-
-        src = inspect.getsource(mod)
-        idx = src.find("SGLangConfig.build_cmd(")
-        assert idx >= 0, "SGLangConfig.build_cmd(...) call not found"
-        window = src[idx : idx + 800]
-        assert "pp_size=" in window, (
-            "controller.py must thread pp_size into SGLangConfig.build_cmd(); "
-            "found:\n" + window
-        )
-
 
 class TestPPDPAttentionRankMath:
     """``build_init_weights_group_request`` must produce
