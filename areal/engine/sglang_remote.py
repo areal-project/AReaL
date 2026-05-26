@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-
+import logging
 import os
 import subprocess
 import sys
@@ -35,6 +35,8 @@ from areal.infra.platforms import current_platform
 from areal.infra.utils.launcher import TRITON_CACHE_PATH
 from areal.utils import perf_tracer, stats_tracker
 from areal.utils.network import format_host_for_url
+
+logger = logging.getLogger(__name__)
 
 
 class SGLangBackend:
@@ -97,16 +99,111 @@ class SGLangBackend:
         stop_reason = finish_reason["type"]
         stop_message = finish_reason.get("message", "")
 
-        # Extract routed_experts information if available
-        routed_experts = meta_info.get("routed_experts", None)
+        # Extract routed_experts information if available.
+        routed_experts_raw = meta_info.get("routed_experts", None)
+        routed_experts = routed_experts_raw
         if routed_experts is not None:
             num_sgl_token = (
                 meta_info["prompt_tokens"] + meta_info["completion_tokens"] - 1
             )
-            # Extract expert_id and reshape to (num_sgl_token, num_layers*expert_top_k)
-            routed_experts = np.frombuffer(
-                pybase64.b64decode(routed_experts.encode("utf-8")), dtype=np.int32
-            ).reshape(num_sgl_token, -1)
+            re_type_name = type(routed_experts_raw).__name__
+            if isinstance(routed_experts, dict):
+                # Empty dict -> jsonable_encoder(tensor) failure.  Non-empty
+                # dict is not a documented SGLang wire format; surface it
+                # loudly so we can add a decoder if/when it starts
+                # happening rather than silently corrupting R3 data.
+                if not routed_experts:
+                    logger.warning(
+                        "[R3] SGLang returned routed_experts=%s (empty "
+                        "dict).  This is the fingerprint of a raw "
+                        "torch.Tensor being serialised by FastAPI's "
+                        "jsonable_encoder.  Ensure the AReaL SGLang "
+                        "server-side patch (areal.infra.launcher."
+                        "sglang_r3_patch) is installed on the inference "
+                        "server; dropping payload.",
+                        routed_experts_raw,
+                    )
+                else:
+                    logger.warning(
+                        "[R3] SGLang returned routed_experts as a "
+                        "non-empty dict (keys=%s); no decoder registered. "
+                        "Dropping payload.",
+                        sorted(routed_experts.keys()),
+                    )
+                routed_experts = None
+            elif isinstance(routed_experts, str):
+                try:
+                    flat = np.frombuffer(
+                        pybase64.b64decode(routed_experts.encode("utf-8")),
+                        dtype=np.int32,
+                    )
+                    if num_sgl_token <= 0 or flat.size % num_sgl_token != 0:
+                        # Total element count does not divide by
+                        # ``num_sgl_token``.  This usually means SGLang's
+                        # tokenizer round-trip (``skip_tokenizer_init=False``)
+                        # inserted/removed tokens between the router capture
+                        # and the returned ``output_tokens``.  Drop the
+                        # payload instead of silently reshaping into a wrong
+                        # grid that would corrupt R3 replay.
+                        logger.warning(
+                            "[R3] routed_experts size=%d does not divide "
+                            "num_sgl_token=%d (prompt=%d + completion=%d - 1). "
+                            "Likely tokenizer round-trip drift; dropping.",
+                            flat.size,
+                            num_sgl_token,
+                            meta_info.get("prompt_tokens", -1),
+                            meta_info.get("completion_tokens", -1),
+                        )
+                        routed_experts = None
+                    else:
+                        routed_experts = flat.reshape(num_sgl_token, -1)
+                        logger.debug(
+                            "[R3] SGLang decoded routed_experts: "
+                            "shape=%s, first3=%s, hash=%d",
+                            routed_experts.shape,
+                            routed_experts.flat[:3].tolist(),
+                            hash(routed_experts.tobytes()),
+                        )
+                except Exception as exc:
+                    logger.warning(
+                        "[R3] Failed to decode base64 routed_experts "
+                        "(num_sgl_token=%d): %s",
+                        num_sgl_token,
+                        exc,
+                        exc_info=True,
+                    )
+                    routed_experts = None
+            else:
+                try:
+                    raw = np.asarray(routed_experts, dtype=np.int32).reshape(-1)
+                    if num_sgl_token <= 0 or raw.size % num_sgl_token != 0:
+                        logger.warning(
+                            "[R3] routed_experts size=%d does not divide "
+                            "num_sgl_token=%d; likely tokenizer round-trip "
+                            "drift, dropping.",
+                            raw.size,
+                            num_sgl_token,
+                        )
+                        routed_experts = None
+                    else:
+                        routed_experts = raw.reshape(num_sgl_token, -1)
+                        logger.debug(
+                            "[R3] SGLang converted routed_experts: "
+                            "shape=%s, first3=%s, hash=%d",
+                            routed_experts.shape,
+                            routed_experts.flat[:3].tolist(),
+                            hash(routed_experts.tobytes()),
+                        )
+                except Exception as exc:
+                    logger.warning(
+                        "[R3] Failed to convert routed_experts from %s "
+                        "(num_sgl_token=%d): %s",
+                        re_type_name,
+                        num_sgl_token,
+                        exc,
+                        exc_info=True,
+                    )
+                    routed_experts = None
 
         if stop_reason == "abort" and stop_message.startswith("Abort before prefill"):
             return HttpGenerationResult(

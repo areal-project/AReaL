@@ -149,6 +149,9 @@ def all_gather_param(
     # Use the caller-provided duplicated_param_names set for reliable detection.
     is_duplicated = (
         duplicated_param_names is not None and name in duplicated_param_names
+    ) or (
+        ".self_attention.linear_q_down_proj." in name
+        or ".self_attention.linear_kv_down_proj." in name
     )
     if not param.tensor_model_parallel or is_duplicated:
         # NOTE: For FP8 tensors with direct conversion, return the tensor directly
@@ -1254,6 +1257,7 @@ _CONVERSION_FN_REGISTRY = {
     "qwen2": convert_qwen2_to_hf,
     "qwen3": convert_qwen2_to_hf,
     "deepseekv3": convert_deepseekv3_to_hf,
+    "deepseek_v3": convert_deepseekv3_to_hf,
     "bailing_moe_v2": convert_bailingmoe_to_hf,
     "bailing_moe_linear": convert_bailingmoe_to_hf,
     "bailing_hybrid": convert_bailingmoe_to_hf,

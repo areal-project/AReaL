@@ -59,6 +59,8 @@ class RLVRWorkflow(RolloutWorkflow):
         | str = default_get_input_ids_fn,
         data_extract_prompt_fn: Callable[[dict[str, Any]], Any]
         | str = default_data_extract_prompt_fn,
+        r3_num_moe_layers: int | None = None,
+        r3_topk: int | None = None,
     ):
         self.reward_fn = reward_fn
         self.tokenizer = tokenizer
@@ -69,6 +71,8 @@ class RLVRWorkflow(RolloutWorkflow):
             self.tokenizer = tokenizer
         self.gconfig = gconfig.new_with_stop_and_pad_token_ids(self.tokenizer)
         self.enable_thinking = enable_thinking
+        self.r3_num_moe_layers = r3_num_moe_layers
+        self.r3_topk = r3_topk
         if not isinstance(reward_fn, str):
             self.async_reward_fn = AsyncRewardWrapper(reward_fn)
         # Support string paths for get_input_ids_fn
@@ -175,4 +179,22 @@ class RLVRWorkflow(RolloutWorkflow):
             "attention_mask": torch.ones(len(seq), dtype=torch.bool),
             "rewards": torch.tensor(reward, dtype=torch.float32),
         }
-        return {k: v.unsqueeze(0) for k, v in res.items()}
+        res = {k: v.unsqueeze(0) for k, v in res.items()}
+
+        # R3: Extract and inject routed_experts from rollout response
+        if resp.routed_experts is not None:
+            from areal.workflow.rlvr_r3_patch import (
+                extract_routed_experts,
+                inject_routed_experts_into_result,
+            )
+
+            routed_experts_tensor = extract_routed_experts(
+                resp.routed_experts,
+                res["input_ids"],
+                res["attention_mask"],
+                num_moe_layers=self.r3_num_moe_layers,
+                topk=self.r3_topk,
+            )
+            res = inject_routed_experts_into_result(res, routed_experts_tensor)
+
+        return res

@@ -377,7 +377,13 @@ class SerializedTokenizer(BaseModel):
         with tempfile.TemporaryDirectory() as tmpdir:
             with zipfile.ZipFile(zip_buffer) as zf:
                 zf.extractall(tmpdir)
-            tokenizer = AutoTokenizer.from_pretrained(tmpdir)
+            # NOTE: Models such as Moonlight / DeepSeek-V3 rely on a custom
+            # tokenizer class declared via ``auto_map`` (e.g. the TikToken based
+            # ``TikTokenTokenizer``). Without ``trust_remote_code=True``
+            # ``AutoTokenizer.from_pretrained`` raises and the caller falls back
+            # to the raw dict, which then explodes inside ``_save_model_to_hf``
+            # as ``'dict' object has no attribute 'save_pretrained'``.
+            tokenizer = AutoTokenizer.from_pretrained(tmpdir, trust_remote_code=True)
 
         if hasattr(tokenizer, "name_or_path"):
             tokenizer.name_or_path = self.name_or_path
@@ -487,7 +493,7 @@ class SerializedProcessor(BaseModel):
         with tempfile.TemporaryDirectory() as tmpdir:
             with zipfile.ZipFile(zip_buffer) as zf:
                 zf.extractall(tmpdir)
-            processor = AutoProcessor.from_pretrained(tmpdir)
+            processor = AutoProcessor.from_pretrained(tmpdir, trust_remote_code=True)
 
         if hasattr(processor, "name_or_path"):
             processor.name_or_path = self.name_or_path

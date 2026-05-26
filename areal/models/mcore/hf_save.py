@@ -29,6 +29,16 @@ from areal.utils import logging
 
 logger = logging.getLogger("HFSaver")
 
+_MLA_DUPLICATED_WEIGHT_PATTERNS = (
+    "self_attention.linear_q_down_proj.",
+    "self_attention.linear_kv_down_proj.",
+)
+
+
+def _is_mla_duplicated_weight(global_name: str) -> bool:
+    return any(p in global_name for p in _MLA_DUPLICATED_WEIGHT_PATTERNS)
+
+
 HF_MODEL_CONFIG_FILES = [
     "generation_config.json",
     "tokenizer_config.json",
@@ -646,9 +656,12 @@ def save_weights_to_hf_with_mbridge_fast(
             infer_params = _maybe_convert_from_te_fp8_params(
                 infer_params, fp8_direct_convert, weight_block_size
             )
-            infer_params = bridge._weight_merge_across_tp(
-                s.global_name, infer_params, param
-            )
+            if _is_mla_duplicated_weight(s.global_name):
+                infer_params = infer_params[0].clone()
+            else:
+                infer_params = bridge._weight_merge_across_tp(
+                    s.global_name, infer_params, param
+                )
         else:
             infer_params = param
             infer_params = _maybe_convert_from_te_fp8_params(

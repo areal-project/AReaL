@@ -32,6 +32,22 @@ def areal_launch_server(server_args) -> None:
         areal_run_scheduler_process,
         create_result_ipc,
     )
+
+    # Install R3 server-side monkey patches (no-op when R3 is
+    # not used).  Must run before ``_launch_subprocesses`` so that the
+    # ``TokenizerManager._handle_batch_output`` override is visible to
+    # every subprocess imported from the upstream SGLang entrypoint.
+    try:
+        from areal.infra.launcher.sglang_r3_patch import apply_sglang_r3_patch
+
+        apply_sglang_r3_patch()
+    except Exception:  # pragma: no cover - defensive
+        import logging
+
+        logging.getLogger(__name__).exception(
+            "[R3] Failed to install AReaL SGLang patches; bridge-mode "
+            "server will start without R3 wire-format fixes."
+        )
     # ---- END AREAL ----
 
     # ---- BEGIN AREAL ----

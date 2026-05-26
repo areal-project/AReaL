@@ -933,6 +933,17 @@ class MegatronEngineConfig:
         },
     )
 
+    enable_router_replay: bool = field(
+        default=False,
+        metadata={
+            "help": "Enable Router Replay (R3) for MoE models. "
+            "When True, the training forward pass replays the expert routing "
+            "decisions from the inference engine to reduce train-inference "
+            "routing discrepancy. Automatically set by the trainer when "
+            "rollout.return_routed_experts=True."
+        },
+    )
+
     use_mbridge_save: bool = field(
         default=False,
         metadata={
@@ -2134,7 +2145,8 @@ class InferenceEngineConfig:
     return_routed_experts: bool = field(
         default=False,
         metadata={
-            "help": "Return routed expert indices for MoE models. Effective only when using SGLang engine with MoE models."
+            "help": "Return routed expert indices for MoE models. Effective only when using SGLang engine with MoE models. "
+            "num_moe_layers and topk are automatically resolved from the model config."
         },
     )
 
