@@ -140,8 +140,6 @@ actor:
         HCCL_CONNECT_TIMEOUT: "7200"
         PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
         TORCH_COMPILE_DISABLE: "1"
-        HCCL_BUFFSIZE : "512"
-        HCCL_IF_BASE_PORT: "50000"
       additional_bash_cmds:
         # install tau2-bench with async generation
         - uv pip install git+https://github.com/dhh1995/tau2-bench.git@dhh/async-and-custom-completion
