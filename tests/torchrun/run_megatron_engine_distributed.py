@@ -9,8 +9,6 @@ import torch.distributed as dist
 from megatron.core import parallel_state as mpu
 from transformers import AutoTokenizer
 
-from tests.utils import get_model_path
-
 from areal.api import FinetuneSpec, SaveLoadMeta
 from areal.api.alloc_mode import ModelAllocation
 from areal.api.cli_args import (
@@ -23,15 +21,21 @@ from areal.engine import FSDPEngine, MegatronEngine
 from areal.infra.platforms import current_platform
 from areal.utils import seeding
 from areal.utils.data import broadcast_tensor_container
+from areal.utils.testing_utils import DENSE_MODEL_PATHS, MOE_MODEL_PATHS
 
+# Re-key from testing_utils.py canonical paths so local-path overrides
+# (e.g. ``/home/nfs/models/Qwen3-0.6B``) propagate from a single source.
+# Keys here use the runner's existing convention (no underscore in ``qwen3moe``).
 MODEL_PATHS = {
-    "qwen3": get_model_path(
-        "/storage/openpsi/models/Qwen__Qwen3-0.6B/", "Qwen/Qwen3-0.6B"
-    ),
-    "qwen3moe": get_model_path(
-        "/storage/openpsi/models/Qwen__Qwen3-30B-A3B/", "Qwen/Qwen3-30B-A3B"
-    ),
+    "qwen3": DENSE_MODEL_PATHS["qwen3"],
+    "qwen3moe": MOE_MODEL_PATHS["qwen3_moe"],
+    "qwen3_5": DENSE_MODEL_PATHS["qwen3_5"],
 }
+
+# bridge_type must default to mbridge for backwards compat with existing
+# qwen3/qwen3moe tests; qwen3_5 is forced to megatron-bridge because that's
+# the only bridge that handles its GDN hybrid attention layers.
+_MODEL_BRIDGE_OVERRIDES = {"qwen3_5": "megatron-bridge"}
 
 
 def write_result(out: str, succ: bool):
@@ -73,6 +77,7 @@ def mock_input(
 
 
 def make_engine(model_type, backend, mb_spec, vpp_size=1, init_optimizer=False):
+    bridge_type = _MODEL_BRIDGE_OVERRIDES.get(model_type, "mbridge")
     config = TrainEngineConfig(
         backend=backend,
         experiment_name="test",
@@ -80,7 +85,10 @@ def make_engine(model_type, backend, mb_spec, vpp_size=1, init_optimizer=False):
         path=MODEL_PATHS[model_type],
         mb_spec=mb_spec,
         optimizer=OptimizerConfig() if init_optimizer else None,
-        megatron=MegatronEngineConfig(virtual_pipeline_parallel_size=vpp_size),
+        megatron=MegatronEngineConfig(
+            virtual_pipeline_parallel_size=vpp_size,
+            bridge_type=bridge_type,
+        ),
     )
     alloc_mode = ModelAllocation.from_str(backend)
     ft_spec = FinetuneSpec(total_train_epochs=1, dataset_size=128, train_batch_size=8)
@@ -490,7 +498,7 @@ def main():
     parser.add_argument(
         "--model_type",
         type=str,
-        choices=["qwen3", "qwen3moe"],
+        choices=["qwen3", "qwen3moe", "qwen3_5"],
         default="qwen3",
         help="Type of model to test",
     )

@@ -148,3 +148,105 @@ def test_qwen3moe_dcp_save_load(tmp_path_factory):
         test_type="simple_dcp_save_load",
         output=str(output),
     )
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Qwen3.5 dense tests. Routed through bridge_type=megatron-bridge because
+# its GDN hybrid attention is only handled by the megatron-bridge model
+# definitions (mbridge would fall back to the qwen3 substring match and
+# emit wrong shapes). The runner sets bridge_type automatically based on
+# ``_MODEL_BRIDGE_OVERRIDES``.
+# ──────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.slow
+def test_qwen3_5_single_gpu_forward(tmp_path_factory):
+    """Smoke test on a single GPU: engine init + forward pass.
+
+    Validates the megatron-bridge load path (including the AReaL-side
+    ``with torch.device("cpu"):`` fix for GDN ChunkedMapping) and basic
+    forward execution before exercising any parallelism.
+    """
+    if current_platform.device_count() < 1:
+        pytest.skip("requires 1 GPU to run")
+    output = tmp_path_factory.mktemp("test_output") / "qwen3_5_single_gpu.out"
+    _run_test_with_torchrun(
+        "qwen3_5", "megatron:d1p1t1", test_type="forward", output=str(output)
+    )
+
+
+@pytest.mark.multi_gpu
+@pytest.mark.slow
+def test_qwen3_5_tensor_parallel(tmp_path_factory):
+    if current_platform.device_count() < 2:
+        pytest.skip("tensor parallel requires 2 GPUs to run")
+    output = tmp_path_factory.mktemp("test_output") / "qwen3_5_tensor_parallel.out"
+    _run_test_with_torchrun(
+        "qwen3_5", "megatron:d1p1t2", test_type="forward", output=str(output)
+    )
+
+
+@pytest.mark.multi_gpu
+@pytest.mark.slow
+def test_qwen3_5_pipeline_parallel(tmp_path_factory):
+    if current_platform.device_count() < 2:
+        pytest.skip("pipeline parallel requires 2 GPUs to run")
+    output = tmp_path_factory.mktemp("test_output") / "qwen3_5_pipeline_parallel.out"
+    _run_test_with_torchrun(
+        "qwen3_5", "megatron:d1p2t1", test_type="forward", output=str(output)
+    )
+
+
+@pytest.mark.multi_gpu
+@pytest.mark.slow
+def test_qwen3_5_virtual_pipeline_parallel(tmp_path_factory):
+    if current_platform.device_count() < 2:
+        pytest.skip("virtual pipeline parallel requires 2 GPUs to run")
+    output = (
+        tmp_path_factory.mktemp("test_output") / "qwen3_5_virtual_pipeline_parallel.out"
+    )
+    _run_test_with_torchrun(
+        "qwen3_5",
+        "megatron:d1p2t1",
+        test_type="forward",
+        output=str(output),
+        vpp_size=2,
+    )
+
+
+@pytest.mark.multi_gpu
+@pytest.mark.slow
+def test_qwen3_5_grad_norm_mb_invariance(tmp_path_factory):
+    """Same regression guard as ``test_qwen3_grad_norm_mb_invariance`` but on
+    Qwen3.5. Exercises full backward + optimizer step under DP=2 to verify the
+    ``loss_multiplier`` fix still holds for GDN models.
+    """
+    if current_platform.device_count() < 2:
+        pytest.skip("grad_norm_mb_invariance requires 2 GPUs to run")
+    output = (
+        tmp_path_factory.mktemp("test_output") / "qwen3_5_grad_norm_mb_invariance.out"
+    )
+    _run_test_with_torchrun(
+        "qwen3_5",
+        "megatron:d2p1t1",
+        test_type="grad_norm_mb_invariance",
+        output=str(output),
+    )
+
+
+@pytest.mark.multi_gpu
+@pytest.mark.slow
+def test_qwen3_5_dcp_save_load(tmp_path_factory):
+    """DCP save/load round-trip under TP=2 (sufficient to exercise cross-rank
+    save/load; the full d2p2t2 layout used for Qwen3 dense isn't needed
+    because the bridge type, not parallelism, is what's being validated).
+    """
+    if current_platform.device_count() < 2:
+        pytest.skip("Qwen3.5 DCP save load requires 2 GPUs to run")
+    output = tmp_path_factory.mktemp("test_output") / "qwen3_5_save_load.out"
+    _run_test_with_torchrun(
+        "qwen3_5",
+        "megatron:d1p1t2",
+        test_type="train_dcp_save_load",
+        output=str(output),
+    )
