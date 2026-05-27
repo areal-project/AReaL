@@ -53,4 +53,6 @@ COPY . /AReaL
 RUN uv pip install --no-deps -e /AReaL --system
 
 # Add MindSpeed to PYTHONPATH as per official doc
-ENV PYTHONPATH="/areal-workspace/MindSpeed:$PYTHONPATH"
+ENV PYTHONPATH="/areal-workspace/MindSpeed:$PYTHONPATH" \
+    HCCL_IF_BASE_PORT=63000 \
+    HCCL_NPU_SOCKET_PORT_RANGE="62100-62350"
