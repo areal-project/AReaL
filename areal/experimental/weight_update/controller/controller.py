@@ -125,6 +125,7 @@ class WeightUpdateController:
             "save_path": save_path,
             "use_lora": use_lora,
             "lora_name": lora_name,
+            "colocate": colocate,
             "nccl_master_addr": nccl_master_addr,
             "nccl_master_port": nccl_master_port,
         }
