@@ -61,6 +61,7 @@ from areal.engine.core.model import (
     is_valid_vision_model,
     lang_config,
 )
+from areal.engine.megatron_utils import megatron_bridge_patches  # noqa: F401
 from areal.engine.megatron_utils.checkpointer import MegatronCheckpointManager
 from areal.engine.megatron_utils.deterministic import set_deterministic_algorithms
 from areal.engine.megatron_utils.fp8 import FP8BlockwiseTensorHelper
@@ -359,6 +360,17 @@ class MegatronEngine(TrainEngine):
                 self.logger.info(
                     f"VLM model detected (type={self.hf_config.model_type}). "
                     f"Loaded processor and tokenizer."
+                )
+
+            if (
+                self.mcore_config.use_padded_seq
+                and self.parallel_strategy.context_parallel_size > 1
+            ):
+                raise NotImplementedError(
+                    "Context parallel (CP > 1) is not supported with "
+                    "use_padded_seq=True (the padded BSHD path operates on "
+                    "[B, S] tensors and the CP path packs sequences). "
+                    f"Got context_parallel_size={self.parallel_strategy.context_parallel_size}."
                 )
 
             self.quantization_config = getattr(
@@ -844,6 +856,7 @@ class MegatronEngine(TrainEngine):
                 mb_input.padded_mb,
                 gather_cp_output=not cp_local,
                 is_vision_model=self.is_vision_model,
+                use_padded_seq=self.mcore_config.use_padded_seq,
             )
 
             # Release tree attention metadata after forward pass

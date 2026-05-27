@@ -950,6 +950,18 @@ class MegatronEngineConfig:
         },
     )
 
+    use_padded_seq: bool = field(
+        default=False,
+        metadata={
+            "help": "Force padded (BSHD) input layout instead of packed (THD) for "
+            "forward / train_batch. Required for architectures whose state-space "
+            "or SSM layers reject packed sequences (e.g. Qwen3.5's GDN). Less "
+            "memory-efficient because attention computes over padding, so prefer "
+            "small per-microbatch sequence counts. Incompatible with "
+            "context_parallel_size > 1 (same constraint VLM has).",
+        },
+    )
+
 
 class SchedulingStrategyType(str, Enum):
     separation = "separation"
