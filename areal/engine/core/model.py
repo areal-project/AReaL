@@ -7,6 +7,8 @@ VALID_VISION_MODELS = [
     "qwen2_5_vl",
     "qwen3_vl",
     "qwen3_vl_moe",
+    "qwen3_5",
+    "qwen3_5_moe",
     "gemma3",
 ]
 # This registry is used to check if a model is a vision model that we have checked it works with AReaL.

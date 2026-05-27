@@ -1874,7 +1874,7 @@ class MegatronEngine(TrainEngine):
             if bucket_size + size > weight_chunked_mem_size:
                 self._update_bucket_weights_from_distributed(meta, bucket)
                 bucket_size = 0
-            bucket.append((hf_name, hf_tensor))
+            bucket.append((hf_name, hf_tensor.contiguous()))
             bucket_size += size
 
         if bucket:
