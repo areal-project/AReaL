@@ -21,7 +21,7 @@ pip install nixl                         # alternative, UCX-based
 ```bash
 python3 examples/experimental/inference_service/online_rollout.py \
     --config examples/experimental/inference_service/online_rollout.yaml \
-    rollout.backend="sglang(P:d1t1p1|D:d1t1p1)" \
+    'rollout.backend="sglang(P:d1t1p1|D:d1t1p1)"' \
     cluster.n_gpus_per_node=2 \
     actor.path=Qwen/Qwen3-0.6B
 ```

@@ -1786,7 +1786,7 @@ class SGLangConfig:
     chunked_prefill_size: int | None = -1
     max_prefill_tokens: int = 32768
     # PD disaggregation fields (passed through to SGLang ServerArgs)
-    disaggregation_mode: Literal["null", "prefill", "decode"] = "null"
+    disaggregation_mode: str = "null"
     disaggregation_transfer_backend: str | None = None
     disaggregation_bootstrap_port: int = 8998
     schedule_policy: str = "lpm"
