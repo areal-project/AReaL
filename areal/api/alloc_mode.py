@@ -295,7 +295,8 @@ class ModelAllocation:
         ----------
         spec : str
             Single component spec like ``"fsdp:d4"``, ``"sglang:d4t2"``,
-            or ``"megatron:(attn:d1p12t4|ffn:d1p12e4)"``.
+            ``"megatron:(attn:d1p12t4|ffn:d1p12e4)"``,
+            or ``"sglang(P:d1t1p1|D:d1t1p1)"`` for PD disaggregation.
             An explicit backend prefix is always required.
         name : str, optional
             Role name (e.g., ``"actor"``, ``"rollout"``).

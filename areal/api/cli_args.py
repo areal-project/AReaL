@@ -2145,7 +2145,7 @@ class InferenceEngineConfig:
         default=False,
         metadata={
             "help": "Enable prefill-decode disaggregation for inference. "
-            "Requires sglang backend and _version='v2'."
+            "Auto-derived from backend string when using sglang(P:...|D:...) syntax."
         },
     )
 
@@ -2211,36 +2211,11 @@ class InferenceEngineConfig:
                 "use rollout.admin_api_key instead."
             )
 
-        # PD disaggregation validation (v1: PP=1, DP=1, homogeneous TP)
-        if self.pd_disaggregation:
-            if not self.backend.startswith("sglang"):
-                raise ValueError(
-                    "pd_disaggregation only supported with sglang backend, "
-                    f"got: {self.backend}"
-                )
-            if self._version != "v2":
-                raise ValueError(
-                    f"pd_disaggregation requires _version='v2', got: {self._version}"
-                )
-            if self.api_url is not None:
-                raise ValueError(
-                    "pd_disaggregation not supported with external api_url"
-                )
+        # Auto-derive pd_disaggregation from backend string
+        import re
 
-            from areal.api.alloc_mode import ModelAllocation
-
-            alloc = ModelAllocation.from_str(self.backend)
-            if alloc.parallel.pipeline_parallel_size != 1:
-                raise ValueError(
-                    "pd_disaggregation v1 requires PP=1, "
-                    f"got PP={alloc.parallel.pipeline_parallel_size}"
-                )
-            if alloc.parallel.data_parallel_size != 2:
-                raise ValueError(
-                    "pd_disaggregation requires DP=2 "
-                    "(group 0 = prefill, group 1 = decode), "
-                    f"got DP={alloc.parallel.data_parallel_size}"
-                )
+        if re.search(r"sglang\(P:.*\|D:.*\)", self.backend):
+            self.pd_disaggregation = True
 
 
 @dataclass

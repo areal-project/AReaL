@@ -337,6 +337,8 @@ class RolloutControllerV2:
             dp_size = alloc.parallel.dp_size
             inf_backend = alloc.backend
 
+        is_pd = getattr(self.config, "pd_disaggregation", False)
+
         # ==================================================================
         # Step 0: Create RPCGuard workers (dp_size × nnodes_per_instance)
         # ==================================================================
@@ -533,7 +535,7 @@ class RolloutControllerV2:
             "--log-level",
             _DEFAULT_SERVICE_LOG_LEVEL,
         ]
-        if getattr(self.config, "pd_disaggregation", False):
+        if is_pd:
             gw_cmd.append("--pd-disaggregation")
 
         gw_task = asyncio.ensure_future(
@@ -546,7 +548,6 @@ class RolloutControllerV2:
         )
 
         # ---- Launch Data Proxies ----
-        is_pd = getattr(self.config, "pd_disaggregation", False)
         if is_pd:
             backend_addrs = [self._prefill_addrs[0], self._decode_addrs[0]]
         else:

@@ -209,15 +209,14 @@ ______________________________________________________________________
 ## Example 3: Prefill-Decode Disaggregation Online Rollout
 
 `online_rollout.py` handles **Prefill-Decode (PD) disaggregation** when
-`rollout.pd_disaggregation=true` — each chat request runs prefill on one server and
-streams the KV cache to a decode server. Needs 2 GPUs and a KV transport engine
-(`pip install mooncake-transfer-engine` or `pip install nixl`).
+`rollout.backend` specifies two groups with `P` and `D` names — each chat request runs
+prefill on one server and streams the KV cache to a decode server. Needs 2 GPUs and a KV
+transport engine (`pip install mooncake-transfer-engine` or `pip install nixl`).
 
 ```bash
 python3 examples/experimental/inference_service/online_rollout.py \
     --config examples/experimental/inference_service/online_rollout.yaml \
-    rollout.backend="sglang:d2" \
-    rollout.pd_disaggregation=true \
+    rollout.backend="sglang(P:d1t1p1|D:d1t1p1)" \
     cluster.n_gpus_per_node=2 \
     actor.path=<MODEL_PATH>
 ```
