@@ -163,6 +163,8 @@ class WorkerInfo(BaseModel):
     addr: str
     healthy: bool
     active_requests: int
+    worker_type: str = "regular"
+    bootstrap_port: int | None = None
 
 
 class WorkersResponse(BaseModel):
@@ -451,7 +453,8 @@ def create_app(config: RouterConfig) -> FastAPI:
             raise HTTPException(status_code=503, detail="No available PD pair")
 
         # Step E: Generate bootstrap triplet
-        bootstrap_room = random.getrandbits(64)
+        # Use 63 bits to stay within signed 64-bit range (SGLang limitation)
+        bootstrap_room = random.getrandbits(63)
         prefill_url = prefill.worker_addr
         host_part = prefill_url.split("://", 1)[-1]
         bootstrap_host = host_part.split(":")[0]
@@ -516,6 +519,8 @@ def create_app(config: RouterConfig) -> FastAPI:
                     addr=w.worker_addr,
                     healthy=w.is_healthy,
                     active_requests=w.active_requests,
+                    worker_type=w.worker_type,
+                    bootstrap_port=w.bootstrap_port,
                 )
                 for w in all_workers
             ]

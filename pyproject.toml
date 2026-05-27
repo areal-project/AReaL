@@ -151,7 +151,9 @@ sglang = [
     "torch; sys_platform == 'linux' and platform_machine == 'x86_64'",
     "torchaudio; sys_platform == 'linux' and platform_machine == 'x86_64'",
     "torchvision; sys_platform == 'linux' and platform_machine == 'x86_64'",
-    "mooncake-transfer-engine; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    # Note: PD disaggregation needs a KV-cache transfer backend at runtime.
+    # Install one of `mooncake-transfer-engine` or `nixl` separately when
+    # enabling rollout.pd_disaggregation. They ship Linux-x86_64 wheels only.
 ]
 tms = [
     "torch_memory_saver==0.0.9; sys_platform == 'linux'",

@@ -203,3 +203,27 @@ first or second try, for example:
   A: There are 3 r's in the word "strawberry".
   ✔ Correct on first try.
 ```
+
+______________________________________________________________________
+
+## Example 3: Prefill-Decode Disaggregation Online Rollout
+
+`pd_online_rollout.py` is the same online rollout flow as Example 2, but with
+**Prefill-Decode (PD) disaggregation** enabled in the inference stack: each chat request
+is dispatched to a separate prefill server and decode server, with the KV cache
+transferred between them. This is the production-style topology for larger models where
+prefill and decode have very different compute profiles.
+
+### Running
+
+`pd_online_rollout.py` reuses the existing `online_rollout.yaml` and toggles PD via CLI
+overrides:
+
+```bash
+python3 examples/experimental/inference_service/pd_online_rollout.py \
+    --config examples/experimental/inference_service/online_rollout.yaml \
+    rollout.backend="sglang:d2" \
+    rollout.pd_disaggregation=true \
+    cluster.n_gpus_per_node=2 \
+    actor.path=<MODEL_PATH>
+```
