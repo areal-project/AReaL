@@ -111,6 +111,16 @@ teacher:
   distill_loss_weight: 5e-3
 ```
 
+Example command using local scheduler:
+
+```bash
+python3 examples/math/gsm8k_rl.py \
+  --config examples/distillation/gsm8k_grpo_distill_mode_rolloutEngine.yaml \
+  scheduler.type=local \
+  experiment_name=gsm8k-grpo-distillation \
+  trial_name=trial0
+```
+
 ### Mode 2: legacy train teacher (deprecated)
 
 ```yaml
@@ -136,7 +146,7 @@ Example command using local scheduler:
 
 ```bash
 python3 examples/math/gsm8k_rl.py \
-  --config examples/distillation/gsm8k_grpo_distill.yaml \
+  --config examples/distillation/gsm8k_grpo_distill_mode_trainEngine.yaml \
   scheduler.type=local \
   experiment_name=gsm8k-grpo-distillation \
   trial_name=trial0

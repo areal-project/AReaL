@@ -127,6 +127,23 @@ class VLLMBackend:
             stop_reason=stop_reason,
         )
 
+    def build_score_request(
+        self, input_ids: list[int], target_len: int, with_lora: bool, version: int
+    ) -> HttpRequest:
+        payload: dict[str, Any] = {
+            "prompt": input_ids,
+            "max_tokens": 1,
+            "temperature": 0.0,
+            "logprobs": 1,
+            "prompt_logprobs": 1,
+            "echo": True,
+        }
+        if with_lora:
+            raise NotImplementedError(
+                "LoRA scoring request is not supported in vLLM teacher compute_logp yet."
+            )
+        return HttpRequest(endpoint="/v1/completions", payload=payload)
+
     def parse_score_response(
         self, response: dict[str, Any], target_len: int
     ) -> list[float]:
