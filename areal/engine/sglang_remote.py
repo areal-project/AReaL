@@ -8,6 +8,7 @@ from collections.abc import Callable
 from concurrent.futures import Future
 from typing import Any
 
+import torch
 import numpy as np
 import pybase64
 from torchdata.stateful_dataloader import StatefulDataLoader
@@ -125,6 +126,38 @@ class SGLangBackend:
             stop_reason=stop_reason,
             routed_experts=routed_experts,
         )
+
+    def build_score_request(
+        self, input_ids: list[int], target_len: int, with_lora: bool, version: int
+    ) -> HttpRequest:
+        payload: dict[str, Any] = {
+            "input_ids": input_ids,
+            "sampling_params": {
+                "max_new_tokens": 1,
+                "temperature": 0.0,
+            },
+            "return_logprob": True,
+            "logprob_start_len": max(0, len(input_ids) - target_len - 1),
+            "top_logprobs_num": 0,
+            "stream": False,
+        }
+        if with_lora:
+            raise NotImplementedError(
+                "LoRA scoring request is not supported in SGLang teacher compute_logp yet."
+            )
+        return HttpRequest(endpoint="/generate", payload=payload)
+
+    def parse_score_response(
+        self, response: dict[str, Any], target_len: int
+    ) -> list[float]:
+        meta_info = response["meta_info"]
+        # SGLang returns [logprob, token_id, ...]
+        all_logprobs = [float(x[0]) for x in meta_info.get("input_token_logprobs", [])]
+        if len(all_logprobs) < target_len:
+            raise ValueError(
+                f"SGLang returned insufficient input_token_logprobs: {len(all_logprobs)} < {target_len}"
+            )
+        return all_logprobs[-target_len:]
 
     def build_disk_weight_update_requests(
         self, meta: WeightUpdateMeta
@@ -501,6 +534,9 @@ class RemoteSGLangEngine(InferenceEngine):
             group_size=group_size,
             dynamic_bs=dynamic_bs,
         )
+
+    def compute_logp(self, data: list[dict[str, Any]]) -> list[torch.Tensor]:
+        return self._engine.compute_logp(data)
 
     def pause(self):
         return self._engine.pause()

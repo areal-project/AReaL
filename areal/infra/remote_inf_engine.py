@@ -20,6 +20,7 @@ import aiohttp
 import numpy as np
 import ray
 import requests
+import torch
 import torch.distributed as dist
 import uvloop
 from torchdata.stateful_dataloader import StatefulDataLoader
@@ -172,6 +173,18 @@ class RemoteInfBackendProtocol(Protocol):
         HttpGenerationResult
             Parsed result with tokens, logprobs, and stop reason
         """
+        ...
+
+    def build_score_request(
+        self, input_ids: list[int], target_len: int, with_lora: bool, version: int
+    ) -> HttpRequest:
+        """Build HTTP request for token log-prob scoring."""
+        ...
+
+    def parse_score_response(
+        self, response: dict[str, Any], target_len: int
+    ) -> list[float]:
+        """Parse token log-prob scoring response."""
         ...
 
     def build_disk_weight_update_requests(
@@ -501,6 +514,55 @@ class RemoteInfEngine(InferenceEngine):
         """Get the current weight version."""
         with self.lock:
             return self._version
+
+    def compute_logp(self, data: list[dict[str, Any]]) -> list[torch.Tensor]:
+        results: list[torch.Tensor] = []
+        timeout = self.config.request_timeout
+        version = self.get_version()
+        for traj in data:
+            input_ids = traj["input_ids"]
+            loss_mask = traj["loss_mask"]
+            if input_ids.dim() != 2 or loss_mask.dim() != 2:
+                raise ValueError("input_ids and loss_mask must be 2D tensors")
+            bs = input_ids.shape[0]
+            out = torch.zeros_like(loss_mask, dtype=torch.float32)
+            for i in range(bs):
+                token_ids = input_ids[i].tolist()
+                target_len = int(loss_mask[i].sum().item())
+                if target_len <= 0:
+                    continue
+                if "attention_mask" in traj:
+                    attn_mask = traj["attention_mask"][i]
+                    active_idx = torch.nonzero(attn_mask, as_tuple=False).squeeze(-1)
+                    token_ids = input_ids[i, active_idx].tolist()
+                else:
+                    token_ids = input_ids[i].tolist()
+                server_addr = self.choose_server()
+                http_req = self.backend.build_score_request(
+                    input_ids=token_ids,
+                    target_len=target_len,
+                    with_lora=self.config.use_lora,
+                    version=version,
+                )
+                response = requests.request(
+                    http_req.method,
+                    f"http://{server_addr}{http_req.endpoint}",
+                    json=http_req.payload,
+                    timeout=timeout,
+                )
+                response.raise_for_status()
+                payload = response.json()
+                token_logps = self.backend.parse_score_response(payload, target_len)
+                if len(token_logps) != target_len:
+                    raise ValueError(
+                        f"Expected {target_len} token logprobs, got {len(token_logps)}"
+                    )
+                write_idx = torch.nonzero(loss_mask[i], as_tuple=False).squeeze(-1)
+                out[i, write_idx] = torch.tensor(
+                    token_logps, device=out.device, dtype=out.dtype
+                )
+            results.append(out)
+        return results
 
     def set_proxy_gateway_addr(self, addr: str) -> None:
         """Set the proxy gateway address.

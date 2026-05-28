@@ -717,6 +717,15 @@ class InferenceEngine(abc.ABC):
         """
         raise NotImplementedError()
 
+    def compute_logp(self, data: list[dict[str, Any]]) -> list[torch.Tensor]:
+        """Compute token log-probabilities for teacher distillation.
+
+        Implementations support this as an inference-side scoring API.
+        """
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not implement compute_logp()."
+        )
+
     def submit(
         self,
         data: dict[str, Any],
