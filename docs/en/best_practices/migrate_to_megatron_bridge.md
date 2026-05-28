@@ -116,7 +116,7 @@ class MyModelBridge(MegatronModelBridge):
         # ...
         return provider
 
-    def mapping_registry(self, hf_pretrained):
+    def mapping_registry(self):
         return MegatronMappingRegistry(
             AutoMapping(
                 hf_param="model.embed_tokens.weight",
