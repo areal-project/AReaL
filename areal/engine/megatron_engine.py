@@ -16,7 +16,10 @@ from contextlib import contextmanager
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
-import mbridge
+try:
+    import mbridge
+except ImportError:
+    mbridge = None
 import torch
 import torch.distributed as dist
 from megatron.bridge import AutoBridge as MegatronBridgeAutoBridge
@@ -35,7 +38,15 @@ from torch import nn
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import PretrainedConfig
 
-import areal.models.mcore.bailing_moe_bridge  # noqa: F401  # register bridge
+# mbridge-based bridge modules are optional; their @register_model decorators
+# only fire when mbridge is installed. Wrap each import so the engine still
+# loads in megatron-bridge-only deployments.
+try:
+    import areal.models.mcore.bailing_moe_bridge  # noqa: F401  # register bridge
+except ImportError:
+    pass
+# megatron-bridge adapters do not depend on mbridge and register on import.
+import areal.models.mcore.bailing_moe_megatron_bridge  # noqa: F401  # register bridge
 from areal.api import (
     FinetuneSpec,
     InferenceEngine,
@@ -548,6 +559,12 @@ class MegatronEngine(TrainEngine):
 
     def _build_hf_mcore_bridge(self):
         if self.bridge_cls == "mbridge":
+            if mbridge is None:
+                raise ImportError(
+                    "bridge_type='mbridge' requested but the 'mbridge' package "
+                    "is not installed. Install it or switch to "
+                    "bridge_type='megatron-bridge'."
+                )
             self.bridge = mbridge.AutoBridge.from_pretrained(
                 self.config.path, trust_remote_code=True
             )

@@ -3,7 +3,6 @@
 from contextlib import contextmanager
 
 import torch
-from mbridge.core import LLMBridge
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.attention import SelfAttention
@@ -190,6 +189,10 @@ def patch_bridge_for_tree_training(enable: bool = True):
     if not enable:
         yield
         return
+
+    # Lazy import: tree training is only used with mbridge; defer the import
+    # so deployments without mbridge can still load this module.
+    from mbridge.core import LLMBridge
 
     # Store original method
     original_layer_spec_getter = LLMBridge._get_transformer_layer_spec
