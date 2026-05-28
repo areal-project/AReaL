@@ -59,12 +59,18 @@ class AwexFSDPAdapter(AwexTrainingAdapter):
             "dp_replicated": False,
         }
 
+    @property
+    def _tie_word_embeddings(self) -> bool:
+        return getattr(self._engine.model_config, "tie_word_embeddings", False)
+
     def get_weight_metadata(self) -> list[ParameterMeta]:
         rank_info = self._build_rank_info()
         metadata: list[ParameterMeta] = []
 
         for raw_name, param in self._engine.model.named_parameters():
             name = self._to_hf_name(raw_name)
+            if self._tie_word_embeddings and name == "lm_head.weight":
+                continue
             tensor = param.data
             if isinstance(tensor, DTensor):
                 shard_meta = self._extract_dtensor_shard_meta(name, tensor, rank_info)
@@ -99,6 +105,8 @@ class AwexFSDPAdapter(AwexTrainingAdapter):
 
         for raw_name, param in self._engine.model.named_parameters():
             name = self._to_hf_name(raw_name)
+            if self._tie_word_embeddings and name == "lm_head.weight":
+                continue
             if required is not None and name not in required:
                 continue
 

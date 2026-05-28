@@ -14,6 +14,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
 import os
 import random
 
@@ -26,13 +28,17 @@ from megatron.core.dist_checkpointing.serialization import (
     get_default_load_sharded_strategy,
     get_default_save_sharded_strategy,
 )
+from megatron.core.dist_checkpointing.strategies.async_utils import (
+    AsyncCallsQueue,
+    AsyncRequest,
+)
 from megatron.core.dist_checkpointing.strategies.fully_parallel import (
     FullyParallelLoadStrategyWrapper,
     FullyParallelSaveStrategyWrapper,
 )
 
 from areal.infra.platforms import current_platform
-from areal.utils import logging
+from areal.utils import logging, stats_tracker
 
 logger = logging.getLogger("MegatronCheckpointer")
 
@@ -50,7 +56,9 @@ def get_device_name() -> str:
     return device
 
 
-def save_dist_checkpointing(sharded_state_dict, ckpt_path, async_save=False):
+def save_dist_checkpointing(
+    sharded_state_dict, ckpt_path, async_save=False
+) -> AsyncRequest | None:
     validate_sharding_integrity = True
     # Get checkpointing strategies
     save_strategy = get_default_save_sharded_strategy("torch_dist")
@@ -58,14 +66,21 @@ def save_dist_checkpointing(sharded_state_dict, ckpt_path, async_save=False):
         save_strategy, mpu.get_data_parallel_group(with_context_parallel=True)
     )
 
-    # Save model sharded state dicts
-    async_save_request = dist_checkpointing.save(
-        sharded_state_dict,
-        ckpt_path,
+    # Save model sharded state dicts. When async_save=True the actual IO is
+    # deferred; the returned AsyncRequest must be scheduled by the caller via
+    # AsyncCallsQueue.schedule_async_request(). Recent megatron-core versions
+    # require an explicit async_strategy when async_sharded_save=True; "mcore"
+    # selects the AsyncCallsQueue-backed implementation we use below.
+    save_kwargs = dict(
+        sharded_state_dict=sharded_state_dict,
+        checkpoint_dir=ckpt_path,
         sharded_strategy=save_strategy,
         async_sharded_save=async_save,
         validate_access_integrity=validate_sharding_integrity,
     )
+    if async_save:
+        save_kwargs["async_strategy"] = "mcore"
+    async_save_request = dist_checkpointing.save(**save_kwargs)
 
     return async_save_request
 
@@ -160,8 +175,11 @@ class MegatronCheckpointManager:
         self.rank = torch.distributed.get_rank()
         self.use_dist_checkpointing = use_dist_checkpointing
         self.async_save = async_save
-        if async_save:
-            raise NotImplementedError("Async save not implenmented yet!")
+        # AsyncCallsQueue manages outstanding background save processes.
+        # Created only when async_save is enabled; sync path keeps zero overhead.
+        self._async_queue: AsyncCallsQueue | None = (
+            AsyncCallsQueue() if async_save else None
+        )
 
     def get_rng_state(
         self, use_dist_ckpt: bool = True, data_parallel_random_init: bool = False
@@ -322,6 +340,11 @@ class MegatronCheckpointManager:
         with_optimizer: bool = True,
         with_rng: bool = True,
     ):
+        # If a prior save to the same directory is still flushing in the
+        # background, block until it finishes so we don't load a half-written
+        # checkpoint.
+        self.wait_async_saves()
+
         if local_path is not None:
             assert os.path.exists(local_path), (
                 f"Checkpoint path {local_path} does not exist."
@@ -403,21 +426,107 @@ class MegatronCheckpointManager:
     ):
         dist_checkpoint_path = local_path
 
-        if self.use_dist_checkpointing:
-            # Generate state dict for saving
-            state_dict = self.generate_state_dict(with_model, with_optimizer, with_rng)
-            # Start Async save if enabled
-            async_save_request = save_dist_checkpointing(
-                sharded_state_dict=state_dict,
-                ckpt_path=dist_checkpoint_path,
-                async_save=self.async_save,
+        if not self.use_dist_checkpointing:
+            raise NotImplementedError("Please use dist checkpointing!")
+
+        # Reap any previously scheduled async saves that have already finished.
+        # Non-blocking: this only finalizes completed background processes and
+        # writes their metadata.json. Pending saves remain queued.
+        self._reap_finished_async_saves()
+
+        # Generate state dict for saving
+        state_dict = self.generate_state_dict(with_model, with_optimizer, with_rng)
+        # Start Async save if enabled
+        async_save_request = save_dist_checkpointing(
+            sharded_state_dict=state_dict,
+            ckpt_path=dist_checkpoint_path,
+            async_save=self.async_save,
+        )
+
+        if self.async_save:
+            # Invariant relies on save_dist_checkpointing using "torch_dist" +
+            # FullyParallelSaveStrategyWrapper, both of which support async in
+            # current megatron-core. A different strategy could legitimately
+            # return None here; revisit if the save strategy changes.
+            assert async_save_request is not None, (
+                "Megatron returned no AsyncRequest despite async_sharded_save=True."
+            )
+            assert self._async_queue is not None
+            call_idx = self._async_queue.schedule_async_request(async_save_request)
+            # By the time schedule_async_request returns, AsyncCallsQueue has
+            # already done torch.cuda.synchronize() and forked the background
+            # save process — so weights are durably staged off the GPU. The
+            # wall-clock the trainer sees (timeperf/save) covers up to this
+            # point. Disk IO continues in the background; success is observable
+            # as ckpt/async_save_queue_depth dropping back to 0 (and a failing
+            # finalize raises from wait_async_saves -> engine.destroy()).
+            stats_tracker.scalar(
+                **{
+                    "ckpt/async_save_queue_depth": float(
+                        self._async_queue.get_num_unfinalized_calls()
+                    ),
+                }
+            )
+            log_with_rank(
+                f"Scheduled async checkpoint save #{call_idx} to {local_path} "
+                f"(queue_depth={self._async_queue.get_num_unfinalized_calls()})",
+                rank=self.rank,
+                log_only_rank_0=True,
+            )
+        else:
+            assert async_save_request is None, (
+                "Async save request should be None when not using async save."
+            )
+            torch.distributed.barrier()
+
+    def _reap_finished_async_saves(self) -> None:
+        """Non-blocking finalize of any background save processes that have finished.
+
+        Must be called collectively on all ranks: maybe_finalize_async_calls
+        runs an all_reduce internally to agree on which calls have completed.
+        Safe to call when async_save is disabled (becomes a no-op).
+        """
+        if self._async_queue is None:
+            return
+        finalized = self._async_queue.maybe_finalize_async_calls(blocking=False)
+        for call_idx in finalized:
+            log_with_rank(
+                f"Finalized async checkpoint save #{call_idx}",
+                rank=self.rank,
+                log_only_rank_0=True,
             )
 
-            # Synchronize all async save requests
-            if not self.async_save:
-                assert async_save_request is None, (
-                    "Async save request should be None when not using async save."
-                )
-                torch.distributed.barrier()
-        else:
-            raise NotImplementedError("Please use dist checkpointing!")
+    def wait_async_saves(self) -> None:
+        """Block until every previously scheduled async save has finalized.
+
+        Must be called collectively on all ranks. Call before:
+        - loading a checkpoint (so prior saves to the same dir are durable),
+        - tearing down process groups,
+        - exiting the training process.
+        """
+        if self._async_queue is None:
+            return
+        # Do NOT early-return when get_num_unfinalized_calls()==0: that count is
+        # rank-local, but a previous non-blocking reap can leave ranks skewed
+        # (process-exit timing differs). maybe_finalize_async_calls(blocking=True)
+        # is a collective; if one rank skips it while another waits inside it,
+        # the cluster deadlocks. The call is cheap when truly empty.
+        pending = self._async_queue.get_num_unfinalized_calls()
+        if pending > 0:
+            log_with_rank(
+                f"Waiting for {pending} pending async checkpoint save(s) to finalize",
+                rank=self.rank,
+                log_only_rank_0=True,
+            )
+        finalized = self._async_queue.maybe_finalize_async_calls(blocking=True)
+        for call_idx in finalized:
+            log_with_rank(
+                f"Finalized async checkpoint save #{call_idx}",
+                rank=self.rank,
+                log_only_rank_0=True,
+            )
+
+    def close(self) -> None:
+        """Drain all pending async saves. Idempotent; safe to call multiple times."""
+        self.wait_async_saves()
+        self._async_queue = None

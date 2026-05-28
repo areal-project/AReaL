@@ -973,7 +973,10 @@ class FSDPEngine(TrainEngine):
         )
 
     def _create_llm_actor_or_critic(self):
-        dtype = getattr(torch, self.config.dtype)
+        # Storage dtype = optimizer_dtype. FSDP2 MixedPrecisionPolicy
+        # (configured in parallelize_model) will cast to self.config.dtype
+        # in forward/backward.
+        dtype = getattr(torch, self.config.optimizer_dtype)
 
         if self.config.is_critic:
             model_class = AutoModelForTokenClassification
@@ -1009,7 +1012,9 @@ class FSDPEngine(TrainEngine):
         else:
             self.device = torch.device(int(os.environ["LOCAL_RANK"]))
 
-        dtype = getattr(torch, self.config.dtype)
+        # Load weights in optimizer_dtype (typically fp32) to maintain
+        # master weights. FSDP2 MP casts to compute dtype on-the-fly.
+        dtype = getattr(torch, self.config.optimizer_dtype)
 
         if self.config.fsdp.memory_efficient_load:
             # Only rank 0 loads on CPU; other ranks use meta device (zero memory)
@@ -1026,8 +1031,14 @@ class FSDPEngine(TrainEngine):
 
         self.get_device_stats().log("before model creation/loading")
 
+        # Note: VLMs often have vision_tower in fp32 already; loading whole
+        # model in optimizer_dtype (fp32 default) is consistent.
         if self.is_vision_model:
-            if dtype == torch.float16:
+            # Compute dtype (config.dtype) is what FSDP2 MP casts to in
+            # forward/backward; storage dtype (optimizer_dtype) is restricted
+            # to fp32/bf16 by config validation, so checking it would never
+            # catch a float16 misconfiguration.
+            if self._compute_dtype() == torch.float16:
                 raise ValueError(
                     "Vision models do not support float16 dtype. Please use bfloat16."
                 )
@@ -1092,6 +1103,12 @@ class FSDPEngine(TrainEngine):
             raise NotImplementedError()
 
         self.model.enable_input_require_grads()
+        # autocast_adapter_dtype=False: with optimizer_dtype=float32, LoRA
+        # adapter weights are stored in fp32 alongside the base model.
+        # FSDP2 MixedPrecisionPolicy (param_dtype=config.dtype) casts both
+        # base and adapter params to compute dtype during forward/backward.
+        # The fp32 adapter path is not exercised by tests/test_fsdp_optimizer_dtype.py
+        # (full-model only); LoRA + fp32 master is a known untested combination.
         self.model = get_peft_model(
             self.model,
             peft_config,
@@ -1112,9 +1129,33 @@ class FSDPEngine(TrainEngine):
             "adam_bf16",
             "sgd",
         ], "Only adam/adam_bf16/sgd optimizer is supported in this engine."
-        if self.optimizer_config.type in ["sgd", "adam_bf16"]:
+        if self.optimizer_config.type == "sgd":
             self.logger.warning(
-                f"Using the '{self.optimizer_config.type}' optimizer with FSDP may be less stable. Consider using the 'adam' (AdamW) optimizer for improved stability and performance."
+                "Using SGD with FSDP may be less stable. Consider using "
+                "the 'adam' (AdamW) optimizer for improved stability."
+            )
+        elif self.optimizer_config.type == "adam_bf16":
+            if self.config.optimizer_dtype != "bfloat16":
+                # __post_init__ canonicalizes bf16 → bfloat16; check canonical value only.
+                self.logger.warning(
+                    "adam_bf16 is intended to be paired with optimizer_dtype="
+                    "'bfloat16' for memory savings (m/v in bf16, Kahan summation "
+                    "for fp32-equivalent updates). Current optimizer_dtype=%s — "
+                    "you may want to use the standard 'adam' optimizer instead.",
+                    self.config.optimizer_dtype,
+                )
+        elif (
+            self.optimizer_config.type == "adam"
+            and self.config.optimizer_dtype == "bfloat16"
+        ):
+            self.logger.warning(
+                "optimizer.type='adam' with optimizer_dtype='bfloat16' is the "
+                "exact configuration that triggers issue #1292 (silent loss "
+                "plateau ~3x higher than fp32 master weights). torch.optim.AdamW "
+                "will create bf16 exp_avg/exp_avg_sq inheriting from "
+                "model.parameters(). For memory savings, switch to "
+                "optimizer.type='adam_bf16' (uses Kahan summation). "
+                "For default behavior, leave optimizer_dtype='float32'."
             )
         lr = self.optimizer_config.lr
         weight_decay = self.optimizer_config.weight_decay
@@ -1243,6 +1284,24 @@ class FSDPEngine(TrainEngine):
                 yield new_name, value
         else:
             yield from name_params_iterator
+
+    def _compute_dtype(self) -> torch.dtype:
+        """Resolve config.dtype to torch.dtype (canonicalized in TrainEngineConfig)."""
+        return getattr(torch, self.config.dtype)
+
+    def _cast_to_compute_dtype(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Cast fp32 master storage to compute dtype for export / rollout sync.
+
+        When optimizer_dtype=float32 (the fp32 master weights default), the
+        underlying storage is fp32. HF export and xccl weight sync to rollout
+        engines (SGLang/vLLM) must cast back to compute dtype (typically bf16)
+        so deployment artefacts and broadcast bandwidth stay unchanged.
+        No-op when storage already matches compute dtype.
+        """
+        compute_dtype = self._compute_dtype()
+        if tensor.is_floating_point() and tensor.dtype != compute_dtype:
+            return tensor.to(compute_dtype)
+        return tensor
 
     def _get_full_tensor(self, param: nn.Parameter) -> torch.Tensor:
         """Get full tensor from a parameter, handling DTensor and CPU offloaded tensors."""
@@ -1550,9 +1609,15 @@ class FSDPEngine(TrainEngine):
         try:
             for name, param in param_iterator:
                 # Ranks other than 0 only help to get the full tensor
+                # (DTensor.full_tensor() is a collective; all ranks must
+                # call _get_full_tensor). Only rank 0 broadcasts to the
+                # rollout engine, so casting is main-rank-only by design.
                 tensor = self._get_full_tensor(param)
                 if not main_rank:
                     continue
+                # Cast fp32 master storage to compute dtype before broadcast.
+                # Rollout engines (SGLang/vLLM) expect compute dtype (bf16).
+                tensor = self._cast_to_compute_dtype(tensor)
 
                 tensor_size = tensor.numel() * tensor.element_size()
                 bucket_overflow = (
@@ -1639,6 +1704,16 @@ class FSDPEngine(TrainEngine):
         # Get full state dict with FSDP2
         options = StateDictOptions(full_state_dict=True, cpu_offload=True)
         state_dict = get_model_state_dict(self.model, options=options)
+
+        # Cast weights to compute dtype before HF export. When
+        # optimizer_dtype=float32 (default for fp32 master weights), the
+        # underlying storage is fp32, but downstream consumers
+        # (rollout engines, HF users) expect compute dtype (bfloat16).
+        if dist.get_rank() == 0:
+            state_dict = {
+                k: self._cast_to_compute_dtype(v) if v.is_floating_point() else v
+                for k, v in state_dict.items()
+            }
 
         # save huggingface model on rank 0
         if dist.get_rank() == 0:

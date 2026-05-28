@@ -191,6 +191,7 @@ class InfBridge:
 
         accumulated_tokens: list[int] = []
         accumulated_logprobs: list[float] = []
+        accumulated_versions: list[int] = []
         stop_reason: _StopReason | None = None
         final_routed_experts: np.ndarray | None = None
 
@@ -220,6 +221,7 @@ class InfBridge:
 
             accumulated_tokens.extend(result.output_tokens)
             accumulated_logprobs.extend(result.output_logprobs)
+            accumulated_versions.extend([self._version] * len(result.output_tokens))
             stop_reason = cast(_StopReason, result.stop_reason)
 
             if result.routed_experts is not None:
@@ -254,7 +256,7 @@ class InfBridge:
             input_tokens=list(req.input_ids),
             output_tokens=accumulated_tokens,
             output_logprobs=accumulated_logprobs,
-            output_versions=[self._version] * len(accumulated_tokens),
+            output_versions=accumulated_versions,
             stop_reason=stop_reason,
             tokenizer=req.tokenizer,
             latency=latency,
