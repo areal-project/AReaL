@@ -7,7 +7,7 @@ from dataclasses import MISSING as dataclass_missing
 from dataclasses import asdict, dataclass, field, fields
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, ClassVar, Literal, TypeVar
+from typing import TYPE_CHECKING, Any, ClassVar, TypeVar
 
 import uvloop
 import yaml

@@ -193,7 +193,7 @@ class RolloutControllerV2:
 
     # -- Initialize --------------------------------------------------------
 
-    _WORKERS_READY_TIMEOUT: float = 30.0
+    _WORKERS_READY_TIMEOUT: float = 300.0
 
     def initialize(
         self,
