@@ -183,6 +183,19 @@ cuda = [
 sandbox = [
     "daytona>=0.167.0",
 ]
+# Minimal extra for the lightweight `areal` CLI (login-node install). The CLI
+# must NOT pull in torch / transformers / sglang / vllm / ray / megatron / ...;
+# the lightness guard test in `tests/experimental/test_cli_lightness.py`
+# enforces this invariant. The CLI only depends on PyYAML (to peek at config
+# files for driver / scheduler resolution) and colorlog (for the project's
+# colored loggers).
+cli = [
+    "PyYAML",
+    "colorlog",
+]
+
+[project.scripts]
+areal = "areal.experimental.cli.main:cli"
 
 [project.urls]
 "Homepage" = "https://github.com/areal-project/AReaL"
