@@ -91,7 +91,7 @@ teacher:
   engine_type: rollout
   path: Qwen/Qwen2.5-14B-Instruct
   rollout:
-    backend: "vllm:d1p1t2" 
+    backend: "vllm:d1p1t2"
     scheduling_spec:
       - task_type: worker
         port_count: 2

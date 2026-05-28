@@ -185,27 +185,6 @@ class VLLMBackend:
             requests=[HttpRequest(endpoint=endpoint, payload=payload)]
         )
 
-    def build_disk_weight_update_requests(
-        self, meta: WeightUpdateMeta
-    ) -> WeightUpdateRequests:
-        """Build vLLM disk weight update requests."""
-        if meta.use_lora:
-            if meta.version is None:
-                raise ValueError("Version is required for LoRA update.")
-            lora_name = get_versioned_lora_name(meta.lora_name, meta.version)
-            endpoint = "/v1/load_lora_adapter"
-            payload = {
-                "lora_path": str(meta.path),
-                "lora_name": lora_name,
-            }
-        else:
-            endpoint = "/areal_update_weights"
-            payload = {"model_path": str(meta.path)}
-
-        return WeightUpdateRequests(
-            requests=[HttpRequest(endpoint=endpoint, payload=payload)]
-        )
-
     def build_distributed_weight_update_requests(
         self,
         meta: WeightUpdateMeta,

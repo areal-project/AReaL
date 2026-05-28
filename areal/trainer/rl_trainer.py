@@ -197,7 +197,6 @@ class PPOTrainer:
                     "and is deprecated; please migrate to engine_type='rollout'."
                 )
 
-
         steps_per_epoch: int | None = None
         self.train_dataloader: StatefulDataLoader | _EmptyDataLoader
         if self._online_mode:
@@ -657,7 +656,6 @@ class PPOTrainer:
                         traj["distill_loss_weight"] = (
                             self.config.teacher.distill_loss_weight
                         )
-                    self.teacher.get_device_stats().log("teacher logp")
                 if self._should_offload_teacher:
                     self._offload_model(self.teacher, role="teacher")
 

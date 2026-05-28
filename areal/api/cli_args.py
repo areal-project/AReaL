@@ -2875,6 +2875,7 @@ class DPOConfig(BaseExperimentConfig):
                 "Remove 'actor.is_critic: true' from your YAML config."
             )
 
+
 @dataclass
 class TeacherConfig:
     engine_type: str = field(
@@ -2921,7 +2922,6 @@ class TeacherConfig:
             raise ValueError(
                 "teacher.train must be provided when teacher.engine_type='train'."
             )
-
 
 
 @dataclass

@@ -8,9 +8,9 @@ from collections.abc import Callable
 from concurrent.futures import Future
 from typing import Any
 
-import torch
 import numpy as np
 import pybase64
+import torch
 from torchdata.stateful_dataloader import StatefulDataLoader
 
 from areal.api import (
