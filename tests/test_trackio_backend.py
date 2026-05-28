@@ -307,3 +307,128 @@ class TestStatsLoggerTrackioIntegration:
         )
 
         assert mock_trackio.Trace.call_count == 1
+
+    @patch("areal.utils.stats_logger.trackio")
+    @patch("areal.utils.stats_logger.wandb")
+    @patch("areal.utils.stats_logger.swanlab")
+    @patch("areal.utils.stats_logger.dist")
+    def test_trackio_trace_logging_skips_none_trajectories(
+        self, mock_dist, mock_swanlab, mock_wandb, mock_trackio
+    ):
+        """Rejected rollout trajectories should be skipped."""
+        mock_dist.is_initialized.return_value = False
+        mock_trackio.Trace.side_effect = lambda messages, metadata: {
+            "messages": messages,
+            "metadata": metadata,
+        }
+
+        from areal.utils.stats_logger import StatsLogger
+
+        config = _make_test_config(TrackioConfig(mode="online"))
+        logger = StatsLogger(config, _make_ft_spec())
+        mock_trackio.log.reset_mock()
+
+        tokenizer = MagicMock()
+        tokenizer.decode.side_effect = lambda ids, skip_special_tokens=False: " ".join(
+            str(i) for i in ids
+        )
+        trajectory = {
+            "input_ids": torch.tensor([[1, 2]], dtype=torch.int64),
+            "attention_mask": torch.tensor([[1, 1]], dtype=torch.bool),
+            "loss_mask": torch.tensor([[0, 1]], dtype=torch.int64),
+        }
+
+        logger.log_rollout_traces(
+            [None, trajectory],
+            split="eval-rollout",
+            global_step=4,
+            tokenizer=tokenizer,
+        )
+
+        mock_trackio.Trace.assert_called_once()
+        assert mock_trackio.Trace.call_args.kwargs["metadata"]["trajectory_index"] == 1
+        mock_trackio.log.assert_called_once()
+
+    @patch("areal.utils.stats_logger.trackio")
+    @patch("areal.utils.stats_logger.wandb")
+    @patch("areal.utils.stats_logger.swanlab")
+    @patch("areal.utils.stats_logger.dist")
+    def test_trackio_trace_logging_reconstructs_multiturn_tool_messages(
+        self, mock_dist, mock_swanlab, mock_wandb, mock_trackio
+    ):
+        """Interleaved loss masks should become multi-message traces."""
+        mock_dist.is_initialized.return_value = False
+
+        from areal.utils.stats_logger import StatsLogger
+
+        config = _make_test_config(TrackioConfig(mode="online"))
+        logger = StatsLogger(config, _make_ft_spec())
+        mock_trackio.log.reset_mock()
+
+        tokenizer = MagicMock()
+        tokenizer.decode.side_effect = lambda ids, skip_special_tokens=False: "|".join(
+            str(i) for i in ids
+        )
+        trajectory = {
+            "input_ids": torch.tensor([[1, 2, 3, 4, 5, 6, 7]], dtype=torch.int64),
+            "attention_mask": torch.tensor([[1, 1, 1, 1, 1, 1, 1]], dtype=torch.bool),
+            "loss_mask": torch.tensor([[0, 0, 1, 1, 0, 0, 1]], dtype=torch.int64),
+        }
+
+        logger.log_rollout_traces(
+            [trajectory],
+            split="rollout",
+            global_step=5,
+            tokenizer=tokenizer,
+        )
+
+        assert mock_trackio.Trace.call_args.kwargs["messages"] == [
+            {"role": "user", "content": "1|2"},
+            {"role": "assistant", "content": "3|4"},
+            {"role": "tool", "content": "5|6"},
+            {"role": "assistant", "content": "7"},
+        ]
+
+    @patch("areal.utils.stats_logger.trackio")
+    @patch("areal.utils.stats_logger.wandb")
+    @patch("areal.utils.stats_logger.swanlab")
+    @patch("areal.utils.stats_logger.dist")
+    def test_trackio_trace_logging_prefers_structured_messages(
+        self, mock_dist, mock_swanlab, mock_wandb, mock_trackio
+    ):
+        """Structured conversation data should be logged directly when present."""
+        mock_dist.is_initialized.return_value = False
+
+        from areal.utils.stats_logger import StatsLogger
+
+        config = _make_test_config(TrackioConfig(mode="online"))
+        logger = StatsLogger(config, _make_ft_spec())
+        mock_trackio.log.reset_mock()
+
+        tokenizer = MagicMock()
+        trajectory = {
+            "input_ids": torch.tensor([[1, 2, 3]], dtype=torch.int64),
+            "attention_mask": torch.tensor([[1, 1, 1]], dtype=torch.bool),
+            "loss_mask": torch.tensor([[0, 1, 1]], dtype=torch.int64),
+            "messages": [
+                [
+                    {"role": "system", "content": "Use tools when needed."},
+                    {"role": "user", "content": "What is 2 + 2?"},
+                    {"role": "assistant", "content": "I will calculate it."},
+                    {"role": "tool", "content": "calculator: 4"},
+                    {"role": "assistant", "content": "4"},
+                ]
+            ],
+        }
+
+        logger.log_rollout_traces(
+            [trajectory],
+            split="rollout",
+            global_step=6,
+            tokenizer=tokenizer,
+        )
+
+        assert (
+            mock_trackio.Trace.call_args.kwargs["messages"] == trajectory["messages"][0]
+        )
+        tokenizer.decode.assert_not_called()
