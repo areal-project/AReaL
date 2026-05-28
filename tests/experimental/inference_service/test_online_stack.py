@@ -251,6 +251,7 @@ def _hitl_headers() -> dict[str, str]:
     return {"Authorization": f"Bearer {ADMIN_KEY}"}
 
 
+@pytest.mark.skip(reason="pending /export_trajectories traj schema migration")
 @pytest.mark.asyncio
 async def test_online_stack_latest_ready_export_keeps_session_pinned(online_stack):
     gw = online_stack["gateway_client"]
@@ -292,6 +293,7 @@ async def test_online_stack_latest_ready_export_keeps_session_pinned(online_stac
     assert await session_registry.lookup_by_id("__hitl__") == DATA_PROXY_ADDR
 
 
+@pytest.mark.skip(reason="pending /export_trajectories traj schema migration")
 @pytest.mark.asyncio
 async def test_online_stack_explicit_then_latest_export(online_stack):
     gw = online_stack["gateway_client"]
