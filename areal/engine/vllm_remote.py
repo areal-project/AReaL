@@ -147,7 +147,10 @@ class VLLMBackend:
     def parse_score_response(
         self, response: dict[str, Any], target_len: int
     ) -> list[float]:
-        prompt_logprobs = response["choices"][0].get("prompt_logprobs")
+        choices = response.get("choices")
+        if not choices:
+            raise ValueError("vLLM response missing choices for score request")
+        prompt_logprobs = choices[0].get("prompt_logprobs")
         if prompt_logprobs is None:
             raise ValueError("vLLM response missing prompt_logprobs for score request")
         if len(prompt_logprobs) < target_len + 1:

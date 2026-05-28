@@ -1088,6 +1088,7 @@ class PPOTrainer:
             server_args = SGLangConfig.build_args(
                 sglang_config=teacher_sglang_cfg,
                 tp_size=rollout_alloc.parallel.tp_size,
+                pp_size=rollout_alloc.parallel.pp_size,
                 base_gpu_id=0,
             )
         elif rollout_alloc.backend == "vllm":

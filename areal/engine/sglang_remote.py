@@ -150,7 +150,9 @@ class SGLangBackend:
     def parse_score_response(
         self, response: dict[str, Any], target_len: int
     ) -> list[float]:
-        meta_info = response["meta_info"]
+        meta_info = response.get("meta_info")
+        if meta_info is None:
+            raise ValueError("SGLang response missing meta_info for score request")
         # SGLang returns [logprob, token_id, ...]
         all_logprobs = [float(x[0]) for x in meta_info.get("input_token_logprobs", [])]
         if len(all_logprobs) < target_len:
