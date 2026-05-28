@@ -20,12 +20,13 @@ new model architecture under the `megatron-bridge` backend.
 
 ## When to use which
 
-| Need                                               | Prefer            |
-| -------------------------------------------------- | ----------------- |
-| Existing setups, disk-based HF weight load/save    | `mbridge`         |
-| Tree-attention training in `MegatronEngine`        | `mbridge`         |
-| PEFT/LoRA support                                  | `megatron-bridge` |
-| Architectures NVIDIA upstream maintains officially | `megatron-bridge` |
+| Need                                                   | Prefer            |
+| ------------------------------------------------------ | ----------------- |
+| Existing setups, disk-based HF weight load/save        | `mbridge`         |
+| Tree-attention training in `MegatronEngine`            | `mbridge`         |
+| PEFT/LoRA support                                      | `megatron-bridge` |
+| Newer model architectures (GLM-5.1 DSA, GLM-4.7-Flash) | `megatron-bridge` |
+| Architectures NVIDIA upstream maintains officially     | `megatron-bridge` |
 
 `megatron-bridge` is the long-term direction: it has PEFT support, NVIDIA upstream
 maintenance, and broader model coverage. `mbridge` is being deprecated but remains the
@@ -57,17 +58,21 @@ new model adapters.
 Architectures registered in AReaL's `mcore/registry.py` and routed through both
 backends:
 
-| HF architecture               | `mbridge` | `megatron-bridge` | Notes                                 |
-| ----------------------------- | --------- | ----------------- | ------------------------------------- |
-| `Qwen3ForCausalLM`            | ✅        | ✅ (NV upstream)  | Dense.                                |
-| `BailingMoeV2_5ForCausalLM`   | ✅        | ✅                | Heterogeneous Lightning + MLA layers. |
-| `BailingMoeLinearForCausalLM` | ✅        | ✅                | Shares `BailingMoeV25Bridge` adapter. |
-| `BailingHybridForCausalLM`    | ✅        | ✅                | Shares `BailingMoeV25Bridge` adapter. |
+| HF architecture                  | `mbridge` | `megatron-bridge` | Notes                                               |
+| -------------------------------- | --------- | ----------------- | --------------------------------------------------- |
+| `Qwen3ForCausalLM`               | ✅        | ✅ (NV upstream)  | Dense.                                              |
+| `BailingMoeV2_5ForCausalLM`      | ✅        | ✅                | Heterogeneous Lightning + MLA layers.               |
+| `BailingMoeLinearForCausalLM`    | ✅        | ✅                | Shares `BailingMoeV25Bridge` adapter.               |
+| `BailingHybridForCausalLM`       | ✅        | ✅                | Shares `BailingMoeV25Bridge` adapter.               |
+| `DeepseekV3ForCausalLM`          | ✅        | ✅ (NV upstream)  | Homogeneous MLA + MoE.                              |
+| `GlmMoeDsaForCausalLM` (GLM-5.1) | ✅        | ✅                | MLA + MoE + DSA (Dynamic Sparse Attention) indexer. |
+| `Glm4MoeForCausalLM`             | ✅        | ✅ (NV upstream)  | GLM-4.7-Flash class.                                |
 
 Custom adapters live under `areal/models/mcore/`:
 
-- mbridge subclasses: `bailing_moe_bridge.py`
-- megatron-bridge subclasses: `bailing_moe_megatron_bridge.py`
+- mbridge subclasses: `bailing_moe_bridge.py`, `deepseek_v3_bridge.py`
+- megatron-bridge subclasses: `bailing_moe_megatron_bridge.py`,
+  `glm5_megatron_bridge.py`
 
 ## How registry dispatch works
 
@@ -77,17 +82,24 @@ Custom adapters live under `areal/models/mcore/`:
 
   - With `bridge_type="mbridge"`, returns `(bridge.hf_config, bridge.config)`.
   - With `bridge_type="megatron-bridge"`, returns
-    `(bridge.hf_pretrained.config, bridge.transformer_config)`.
+    `(bridge.hf_pretrained.config, bridge.transformer_config)`. Also backfills
+    DSA-specific fields onto the transformer config via `_supplement_dsa_config()` when
+    the model is DSA-enabled.
 
 - `make_mcore_model(hf_config, tf_config, mcore_config, bridge, bridge_type, ...)`:
 
   - With `mbridge`, calls `bridge.get_model(...)`.
+
   - With `megatron-bridge`, calls `bridge.to_megatron_provider(load_weights=False)` and
     configures the provider with the current TP/PP/CP/EP context, then
     `provider.provide_distributed_model(...)`. Before configuring the provider, it
-    overrides `provider.transformer_layer_spec` for models whose layer structure
-    megatron-bridge's default spec doesn't express — currently the **Bailing-MoE V2.5
-    family**, which uses AReaL's heterogeneous Lightning + MLA layer spec.
+    overrides `provider.transformer_layer_spec` for two cases NVIDIA's default spec
+    doesn't cover:
+
+    - **DSA models** (e.g., GLM-5.1): uses AReaL's `DSAMLASelfAttention` so the indexer
+      modules (`wq_b`, `wk`, `k_norm`, `weights_proj`) are wired correctly.
+    - **Bailing-MoE V2.5 family**: uses AReaL's heterogeneous Lightning + MLA layer
+      spec.
 
 ## Adding a new model under `megatron-bridge`
 
@@ -137,7 +149,8 @@ import areal.models.mcore.my_model_megatron_bridge  # noqa: F401  # register bri
 
 If the model has custom attention modules that megatron-bridge's default
 `get_gpt_decoder_block_spec` cannot express, add a branch in
-`registry.make_mcore_model()` to inject your spec (mirror the `_is_bailing` branch).
+`registry.make_mcore_model()` to inject your spec (mirror the `_has_dsa` / `_is_bailing`
+branches).
 
 ## Common pitfalls
 

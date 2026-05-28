@@ -17,6 +17,11 @@ from areal.models.mcore.bailing_moe import (
     hf_to_mcore_config_bailing_moe,
     make_mcore_layer_specs_bailing_moe,
 )
+from areal.models.mcore.deepseek_v3 import (
+    _has_dsa,
+    hf_to_mcore_config_deepseek_v3,
+    make_mcore_layer_specs_deepseek_v3,
+)
 from areal.models.mcore.qwen3 import (
     hf_to_mcore_config_qwen3_dense,
     make_mcore_layer_specs_qwen3_dense,
@@ -119,11 +124,41 @@ _BAILING_ARCHITECTURES = {
     "BailingHybridForCausalLM",
 }
 
+_DEEPSEEK_V3_ARCHITECTURES = {
+    "DeepseekV3ForCausalLM",
+    "GlmMoeDsaForCausalLM",
+    "Glm4MoeForCausalLM",
+}
+
 
 def _is_bailing(hf_config: PretrainedConfig) -> bool:
     """Return True if hf_config belongs to the BailingMoeV2.5 family."""
     architectures = getattr(hf_config, "architectures", None) or []
     return bool(architectures) and architectures[0] in _BAILING_ARCHITECTURES
+
+
+def _supplement_dsa_config(hf_config: PretrainedConfig, tf_config) -> None:
+    """Backfill DSA-specific fields onto tf_config when applicable.
+
+    Megatron-Bridge's TransformerConfig does not natively include DSA
+    (Dynamic Sparse Attention) parameters. When the model is DSA-enabled,
+    copy the indexer settings from the HF config so DSAMLASelfAttention
+    can be constructed correctly.
+    """
+    if not _has_dsa(hf_config):
+        return
+    dsa_attrs = {
+        "dsa_indexer_n_heads": hf_config.index_n_heads,
+        "dsa_indexer_head_dim": hf_config.index_head_dim,
+        "dsa_indexer_topk": hf_config.index_topk,
+        "dsa_indexer_loss_coeff": getattr(hf_config, "dsa_indexer_loss_coeff", 0.0),
+        "dsa_indexer_use_sparse_loss": getattr(
+            hf_config, "dsa_indexer_use_sparse_loss", False
+        ),
+    }
+    for attr, val in dsa_attrs.items():
+        if getattr(tf_config, attr, None) is None:
+            setattr(tf_config, attr, val)
 
 
 # Model registry for different architectures
@@ -142,6 +177,7 @@ def make_hf_and_mcore_config(
         if hasattr(hf_config, "_name_or_path"):
             hf_config._name_or_path = hf_path
         tf_config = bridge.transformer_config
+        _supplement_dsa_config(hf_config, tf_config)
         return hf_config, tf_config
     else:
         hf_config: PretrainedConfig = AutoConfig.from_pretrained(
@@ -154,6 +190,8 @@ def make_hf_and_mcore_config(
             return hf_config, hf_to_mcore_config_qwen3_dense(hf_config, dtype)
         elif architecture in _BAILING_ARCHITECTURES:
             return hf_config, hf_to_mcore_config_bailing_moe(hf_config, dtype)
+        elif architecture in _DEEPSEEK_V3_ARCHITECTURES:
+            return hf_config, hf_to_mcore_config_deepseek_v3(hf_config, dtype)
         else:
             raise ValueError(
                 f"Architecture not registered for config conversion: {architecture}."
@@ -167,6 +205,8 @@ def make_mcore_layer_specs(hf_config: PretrainedConfig, tf_config: TransformerCo
         return make_mcore_layer_specs_qwen3_dense(tf_config, use_te=True)
     elif architecture in _BAILING_ARCHITECTURES:
         return make_mcore_layer_specs_bailing_moe(tf_config, hf_config, use_te=True)
+    elif architecture in _DEEPSEEK_V3_ARCHITECTURES:
+        return make_mcore_layer_specs_deepseek_v3(tf_config, hf_config, use_te=True)
     else:
         raise ValueError(
             f"Architecture not registered for config conversion: {architecture}."
@@ -212,8 +252,14 @@ def make_mcore_model(
         # one that megatron-bridge does not provide. The lambda matches
         # megatron-bridge's call signature
         # ``(config, vp_stage=None) -> TransformerBlockSubmodules``.
+        #   * DSA models (GLM-5.1): need DSAMLASelfAttention with indexer.
         #   * Bailing-MoE V2.5: per-layer heterogeneous Lightning + MLA.
-        if _is_bailing(hf_config):
+        if _has_dsa(hf_config):
+            _dsa_specs = make_mcore_layer_specs(hf_config, tf_config)
+            provider.transformer_layer_spec = (
+                lambda config, vp_stage=None, _s=_dsa_specs: _s
+            )
+        elif _is_bailing(hf_config):
             _bailing_specs = make_mcore_layer_specs(hf_config, tf_config)
             provider.transformer_layer_spec = (
                 lambda config, vp_stage=None, _s=_bailing_specs: _s

@@ -43,8 +43,13 @@ try:
     import areal.models.mcore.bailing_moe_bridge  # noqa: F401  # register bridge
 except ImportError:
     pass
+try:
+    import areal.models.mcore.deepseek_v3_bridge  # noqa: F401  # register bridge
+except ImportError:
+    pass
 # megatron-bridge adapters do not depend on mbridge and register on import.
 import areal.models.mcore.bailing_moe_megatron_bridge  # noqa: F401  # register bridge
+import areal.models.mcore.glm5_megatron_bridge  # noqa: F401  # register bridge
 from areal.api import (
     FinetuneSpec,
     InferenceEngine,
