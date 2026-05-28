@@ -916,21 +916,32 @@ class GatewayTrainController:
         if not self._worker_addrs:
             return
 
+        # Get backend from scheduling_spec env_vars (worker process config)
+        backend = "awex"  # default
+        if self.config.scheduling_spec:
+            env_vars = self.config.scheduling_spec[0].env_vars or {}
+            backend = env_vars.get("AREAL_WEIGHT_UPDATE_BACKEND", "awex")
+
+        teardown_endpoint = f"/{backend}/teardown"
+
         async def _shutdown_all() -> None:
             timeout = aiohttp.ClientTimeout(total=30)
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 tasks = []
                 for addr in self._worker_addrs:
-                    tasks.append(_shutdown_one(session, addr))
+                    tasks.append(_shutdown_one(session, addr, teardown_endpoint))
                 await asyncio.gather(*tasks, return_exceptions=True)
 
-        async def _shutdown_one(session: aiohttp.ClientSession, addr: str) -> None:
+        async def _shutdown_one(
+            session: aiohttp.ClientSession, addr: str, endpoint: str
+        ) -> None:
             try:
-                async with session.post(f"{addr}/awex/teardown") as resp:
+                async with session.post(f"{addr}{endpoint}") as resp:
                     resp.raise_for_status()
             except Exception as e:
                 logger.warning(
-                    "Graceful shutdown: failed to call /awex/teardown on %s: %s",
+                    "Graceful shutdown: failed to call %s on %s: %s",
+                    endpoint,
                     addr,
                     e,
                 )

@@ -6,6 +6,8 @@ from dataclasses import dataclass
 
 from pydantic import BaseModel  # pyright: ignore[reportMissingImports]
 
+from areal.experimental.weight_update import BACKEND_AWEX, BACKEND_DISK, BACKEND_RDT
+
 
 @dataclass
 class WeightUpdateConfig:
@@ -55,7 +57,7 @@ class PairInfo:
     last_version: int = 0
 
     # Disk-mode fields (used when mode="disk")
-    mode: str = "awex"  # "awex" or "disk"
+    mode: str = BACKEND_AWEX  # "awex", "disk", or "rdt"
     save_path: str = ""
     use_lora: bool = False
     lora_name: str = ""
@@ -66,5 +68,7 @@ class PairInfo:
     def __post_init__(self):
         if not self.pair_name:
             raise ValueError("pair_name must not be empty")
-        if self.mode not in ("awex", "disk"):
-            raise ValueError(f"mode must be 'awex' or 'disk', got '{self.mode}'")
+        if self.mode not in (BACKEND_AWEX, BACKEND_DISK, BACKEND_RDT):
+            raise ValueError(
+                f"mode must be '{BACKEND_AWEX}', '{BACKEND_DISK}', or '{BACKEND_RDT}', got '{self.mode}'"
+            )

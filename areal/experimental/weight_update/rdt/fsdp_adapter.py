@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
+"""RDT FSDP Adapter for training-side weight update."""
+
 from __future__ import annotations
 
-# pyright: reportMissingImports=false
 import os
 from typing import TYPE_CHECKING
 
@@ -13,39 +14,40 @@ from awex.meta.weight_meta import (
 )
 from awex.sharding.param_sharding import ShardingType
 from awex.sharding.rank_info import RankInfo
-from awex.transfer.nccl_comm import batch_send_recv, nccl_build_send_ops
 from awex.transfer.transfer_plan import TransferPlan, TransferPlanBuilder
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.placement_types import Shard
 
 from areal.engine.core.model import is_qwen_vl_model
-from areal.experimental.weight_update.awex import fetch_kv_metadata
-from areal.experimental.weight_update.nccl_group import (
-    init_weights_update_group,
-    setup_batch_isend_irecv,
-)
-from areal.experimental.weight_update.training_adapter import (
-    AwexTrainingAdapter,
-)
+from areal.experimental.weight_update.rdt import fetch_kv_metadata
 from areal.utils import logging
 
 if TYPE_CHECKING:
     from areal.engine.fsdp_engine import FSDPEngine
 
-logger = logging.getLogger("AwexFSDPAdapter")
+logger = logging.getLogger("RDTFSDPAdapter")
 
 
-class AwexFSDPAdapter(AwexTrainingAdapter):
-    """Awex training adapter wrapping FSDPEngine for shard-direct NCCL P2P updates."""
+class RDTFSDPAdapter:
+    """RDT training adapter for FSDPEngine."""
 
     def __init__(self, engine: FSDPEngine):
+        """Initialize adapter with FSDPEngine reference.
+
+        Args:
+            engine: FSDPEngine instance holding the model
+        """
         self._engine = engine
-        self._transfer_plan: TransferPlan | None = None
-        self._weights_update_group = None
-        self._transfer_rank: int | None = None
+        self._transfer_plans: dict[str, TransferPlan] = {}
+        self._transfer_ranks: dict[str, int] = {}
 
     @property
     def parallelism_strategy(self) -> dict:
+        """Parallelism strategy for TransferPlan building.
+
+        Returns:
+            dict: Contains world_size, tp_size, pp_size, dp_size, ep_size
+        """
         mesh = self._engine.world_mesh
         dim_names = tuple(mesh.mesh_dim_names or ())
         tp_size = mesh.size(dim_names.index("sp_tp")) if "sp_tp" in dim_names else 1
@@ -59,17 +61,23 @@ class AwexFSDPAdapter(AwexTrainingAdapter):
             "dp_replicated": False,
         }
 
-    @property
-    def _tie_word_embeddings(self) -> bool:
-        return getattr(self._engine.model_config, "tie_word_embeddings", False)
-
     def get_weight_metadata(self) -> list[ParameterMeta]:
+        """Extract parameter shard metadata for TransferPlan building.
+
+        Returns:
+            list[ParameterMeta]: Parameter metadata for all model parameters
+        """
         rank_info = self._build_rank_info()
         metadata: list[ParameterMeta] = []
 
+        # Skip lm_head.weight if tie_word_embeddings=True (shared with embed_tokens)
+        tie_word_embeddings = getattr(
+            self._engine.model_config, "tie_word_embeddings", False
+        )
+
         for raw_name, param in self._engine.model.named_parameters():
             name = self._to_hf_name(raw_name)
-            if self._tie_word_embeddings and name == "lm_head.weight":
+            if tie_word_embeddings and name == "lm_head.weight":
                 continue
             tensor = param.data
             if isinstance(tensor, DTensor):
@@ -100,12 +108,25 @@ class AwexFSDPAdapter(AwexTrainingAdapter):
     def get_local_shard_parameters(
         self, required_names: list[str] | None = None
     ) -> dict[str, torch.Tensor]:
+        """Return local shard tensors in HF naming.
+
+        Args:
+            required_names: Optional filter for specific parameters
+
+        Returns:
+            dict[str, torch.Tensor]: Local shard tensors by HF name
+        """
         required = set(required_names) if required_names else None
         local_params: dict[str, torch.Tensor] = {}
 
+        # Skip lm_head.weight if tie_word_embeddings=True (shared with embed_tokens)
+        tie_word_embeddings = getattr(
+            self._engine.model_config, "tie_word_embeddings", False
+        )
+
         for raw_name, param in self._engine.model.named_parameters():
             name = self._to_hf_name(raw_name)
-            if self._tie_word_embeddings and name == "lm_head.weight":
+            if tie_word_embeddings and name == "lm_head.weight":
                 continue
             if required is not None and name not in required:
                 continue
@@ -119,6 +140,12 @@ class AwexFSDPAdapter(AwexTrainingAdapter):
         return local_params
 
     def save_parameters(self, save_path: str, names: list[str] | None = None) -> None:
+        """Save local shard parameters to file for debugging.
+
+        Args:
+            save_path: File path to save parameters
+            names: Optional filter for specific parameters
+        """
         params = self.get_local_shard_parameters(names)
         cpu_params = {k: v.detach().cpu().clone() for k, v in params.items()}
         torch.save(cpu_params, save_path)
@@ -126,16 +153,23 @@ class AwexFSDPAdapter(AwexTrainingAdapter):
     def init_weight_update_group(
         self,
         pair_name: str,
-        master_addr: str,
-        master_port: int,
-        transfer_rank: int,
-        world_size: int,
         kv_store_url: str,
         infer_world_size: int,
         train_world_size: int,
         num_engines: int,
+        transfer_rank: int,
     ) -> None:
-        self._transfer_rank = transfer_rank
+        """Initialize RDT weight update group for TW.
+
+        Args:
+            pair_name: TW-IW pair identifier
+            kv_store_url: Gateway KV store URL
+            infer_world_size: Total IW world size
+            train_world_size: Total TW world size
+            num_engines: Number of IW engines
+            transfer_rank: TW's transfer rank
+        """
+        self._transfer_ranks[pair_name] = transfer_rank
 
         infer_meta, train_meta = fetch_kv_metadata(kv_store_url, pair_name)
 
@@ -144,81 +178,35 @@ class AwexFSDPAdapter(AwexTrainingAdapter):
             train_world_size=train_world_size,
             num_infer_engines=num_engines,
         )
-        self._transfer_plan = builder.build_local_transfer_plan(
+        self._transfer_plans[pair_name] = builder.build_local_transfer_plan(
             infer_meta, train_meta, global_transfer_rank=transfer_rank
         )
-
-        os.environ["TORCHELASTIC_USE_AGENT_STORE"] = str(False)
-        self._weights_update_group = init_weights_update_group(
-            master_address=master_addr,
-            master_port=master_port,
-            rank=transfer_rank,
-            world_size=world_size,
-            group_name=f"awex_{pair_name}",
-            role="training",
-        )
-
-    def execute_weight_update(self, version: int) -> None:
-        import time
-
-        del version
-        t0 = time.monotonic()
-
-        if self._transfer_plan is None:
-            raise RuntimeError("Transfer plan is not initialized")
-        if self._weights_update_group is None:
-            raise RuntimeError("Weight update group is not initialized")
-        if self._transfer_rank is None:
-            raise RuntimeError("Transfer rank is not initialized")
-
-        t1 = time.monotonic()
-
-        params = self.get_local_shard_parameters()
-        t2 = time.monotonic()
-
-        send_ops, _, _ = nccl_build_send_ops(
-            params,
-            self._transfer_plan,
-            self._weights_update_group,
-            copy_rank=self._transfer_rank,
-        )
-        t3 = time.monotonic()
-
-        batch_send_recv(send_ops=send_ops, recv_ops=[], blocking=True)
-        t4 = time.monotonic()
-
-        torch.distributed.barrier(group=self._weights_update_group)
-        t5 = time.monotonic()
-
         logger.info(
-            f"[Awex-FSDP-TW-Timing] prep={1000 * (t1 - t0):.1f}ms | "
-            f"get_params={1000 * (t2 - t1):.1f}ms | "
-            f"build_ops={1000 * (t3 - t2):.1f}ms | "
-            f"nccl_send={1000 * (t4 - t3):.1f}ms | "
-            f"barrier={1000 * (t5 - t4):.1f}ms | "
-            f"total={1000 * (t5 - t0):.1f}ms"
+            f"RDT TW init: Built TransferPlan for pair '{pair_name}' transfer_rank={transfer_rank}"
         )
 
-    def batch_isend_irecv(self, **kwargs) -> None:
-        setup_kwargs = {k: v for k, v in kwargs.items() if k != "world_size"}
-        setup_batch_isend_irecv(
-            self._weights_update_group,
-            self._transfer_rank,
-            kwargs.get("world_size", 0),
-            **setup_kwargs,
-        )
+    def teardown_weight_update_group(self, pair_name: str | None = None) -> None:
+        """Clear stored TransferPlans.
 
-    def teardown_weight_update_group(self) -> None:
-        if (
-            self._weights_update_group is not None
-            and torch.distributed.is_initialized()
-        ):
-            torch.distributed.destroy_process_group(self._weights_update_group)
-        self._weights_update_group = None
-        self._transfer_plan = None
-        self._transfer_rank = None
+        Args:
+            pair_name: Optional specific pair to teardown; clears all if None
+        """
+        if pair_name:
+            self._transfer_plans.pop(pair_name, None)
+            self._transfer_ranks.pop(pair_name, None)
+        else:
+            self._transfer_plans.clear()
+            self._transfer_ranks.clear()
 
     def _to_hf_name(self, name: str) -> str:
+        """Convert to HuggingFace canonical format for Qwen-VL.
+
+        Args:
+            name: Internal parameter name
+
+        Returns:
+            str: HF canonical name
+        """
         if self._engine.is_vision_model and is_qwen_vl_model(
             self._engine.model_config.model_type
         ):
@@ -231,6 +219,11 @@ class AwexFSDPAdapter(AwexTrainingAdapter):
         return name
 
     def _build_rank_info(self) -> RankInfo:
+        """Build RankInfo for shard metadata extraction.
+
+        Returns:
+            RankInfo: Rank information for current worker
+        """
         mesh = self._engine.world_mesh
         dim_names = tuple(mesh.mesh_dim_names or ())
 
@@ -268,6 +261,14 @@ class AwexFSDPAdapter(AwexTrainingAdapter):
 
     @staticmethod
     def _compute_dtensor_offset(dtensor: DTensor) -> tuple[int, ...]:
+        """Compute global offset for DTensor shard.
+
+        Args:
+            dtensor: Distributed tensor
+
+        Returns:
+            tuple[int, ...]: Global offset for local shard
+        """
         global_shape = tuple(dtensor.shape)
         placements = dtensor.placements
         mesh = dtensor.device_mesh
@@ -288,6 +289,14 @@ class AwexFSDPAdapter(AwexTrainingAdapter):
 
     @staticmethod
     def _extract_dtensor_sharding(dtensor: DTensor) -> tuple[int, int]:
+        """Extract sharding dimension and num_shards from DTensor.
+
+        Args:
+            dtensor: Distributed tensor
+
+        Returns:
+            tuple[int, int]: (sharding_dim, num_shards)
+        """
         shard_info: dict[int, int] = {}
         for mesh_dim, placement in enumerate(dtensor.placements):
             if isinstance(placement, Shard):
@@ -307,6 +316,16 @@ class AwexFSDPAdapter(AwexTrainingAdapter):
         dtensor: DTensor,
         rank_info: RankInfo,
     ) -> ParameterShardMeta:
+        """Extract ParameterShardMeta for DTensor.
+
+        Args:
+            name: Parameter name
+            dtensor: Distributed tensor
+            rank_info: Rank information
+
+        Returns:
+            ParameterShardMeta: Shard metadata
+        """
         local_tensor = dtensor._local_tensor
         sharding_dim, num_shards = self._extract_dtensor_sharding(dtensor)
         sharding_type = (
@@ -341,6 +360,16 @@ class AwexFSDPAdapter(AwexTrainingAdapter):
         tensor: torch.Tensor,
         rank_info: RankInfo,
     ) -> ParameterShardMeta:
+        """Extract ParameterShardMeta for plain tensor.
+
+        Args:
+            name: Parameter name
+            tensor: Plain tensor (non-DTensor)
+            rank_info: Rank information
+
+        Returns:
+            ParameterShardMeta: Shard metadata
+        """
         return ParameterShardMeta(
             tp_rank=rank_info.tp_rank,
             attn_tp_rank=rank_info.attn_tp_rank,
