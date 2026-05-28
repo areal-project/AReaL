@@ -1106,9 +1106,30 @@ class TrainEngineConfig:
     gradient_checkpointing: bool = field(
         default=False, metadata={"help": "Enable gradient checkpointing"}
     )
-    dtype: str = field(default="bfloat16", metadata={"help": "Parameter data type."})
+    dtype: str = field(
+        default="bfloat16",
+        metadata={"help": "Forward/backward compute dtype."},
+    )
     grad_reduce_dtype: str = field(
         default="float32", metadata={"help": "Gradient reduction data type."}
+    )
+    optimizer_dtype: str = field(
+        default="float32",
+        metadata={
+            "help": (
+                "Underlying parameter storage dtype, also the dtype of optimizer "
+                "states (exp_avg, exp_avg_sq) since torch.optim.AdamW inherits "
+                "dtype from model.parameters(). "
+                "Default 'float32' maintains fp32 master weights matching "
+                "DeepSpeed ZeRO-3 and Megatron precision-aware optimizer behavior. "
+                "FSDP2's MixedPrecisionPolicy(param_dtype=`dtype`) will still "
+                "cast forward/backward computation to `dtype` (e.g. bfloat16). "
+                "Set to 'bfloat16' together with optimizer.type='adam_bf16' to "
+                "reduce memory at the cost of needing Kahan summation for stability. "
+                "Currently FSDP-only; Megatron uses use_precision_aware_optimizer "
+                "instead and ignores this field."
+            )
+        },
     )
     optimizer: OptimizerConfig | None = field(
         default=None,
@@ -1228,6 +1249,27 @@ class TrainEngineConfig:
         if self._version not in ("v1", "v2"):
             raise ValueError(
                 f"_version must be either 'v1' or 'v2', got '{self._version}'"
+            )
+
+        # Canonicalize common aliases so getattr(torch, ...) works at runtime.
+        # Storage map omits fp16 since float16 is not a valid optimizer_dtype;
+        # leaving "fp16" un-canonicalized makes the validation error below
+        # echo what the user typed instead of a silently rewritten value.
+        _compute_aliases = {"fp32": "float32", "bf16": "bfloat16", "fp16": "float16"}
+        _storage_aliases = {"fp32": "float32", "bf16": "bfloat16"}
+        if self.optimizer_dtype in _storage_aliases:
+            self.optimizer_dtype = _storage_aliases[self.optimizer_dtype]
+        if self.dtype in _compute_aliases:
+            self.dtype = _compute_aliases[self.dtype]
+
+        if self.optimizer_dtype not in ("float32", "bfloat16"):
+            raise ValueError(
+                f"optimizer_dtype must be 'float32' or 'bfloat16', "
+                f"got {self.optimizer_dtype!r}"
+            )
+        if self.dtype not in ("float32", "bfloat16", "float16"):
+            raise ValueError(
+                f"dtype must be one of float32/bfloat16/float16, got {self.dtype!r}"
             )
 
 
