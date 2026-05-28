@@ -1,0 +1,63 @@
+labels: [show-and-tell]
+
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ## Show and Tell
+
+        Built something cool with AReaL? Share it with the community! We love seeing what you've created.
+
+  - type: input
+    id: project-name
+    attributes:
+      label: Project Name
+      description: What's your project called?
+      placeholder: My Awesome Agent
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: Tell us about your project
+      placeholder: |
+        What does it do?
+        What algorithms or techniques did you use?
+        What challenges did you face?
+    validations:
+      required: true
+
+  - type: textarea
+    id: results
+    attributes:
+      label: Results
+      description: Share any results, metrics, or achievements
+      placeholder: |
+        Performance metrics
+        Training curves
+        Interesting findings
+    validations:
+      required: false
+
+  - type: textarea
+    id: resources
+    attributes:
+      label: Resources
+      description: Links to your code, paper, blog post, etc.
+      placeholder: |
+        GitHub repo: https://...
+        Paper: https://...
+        Blog post: https://...
+    validations:
+      required: false
+
+  - type: textarea
+    id: screenshots
+    attributes:
+      label: Screenshots or Media
+      description: Add screenshots, videos, or visualizations
+      placeholder: Drag and drop images or paste URLs
+    validations:
+      required: false

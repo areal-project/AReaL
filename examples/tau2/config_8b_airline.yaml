@@ -1,0 +1,213 @@
+experiment_name: tau2-rl
+trial_name: 7b-airline
+
+seed: 1
+enable_offload: false
+total_train_epochs: 200
+total_train_steps: 500
+tokenizer_path: ${actor.path}
+
+cluster:
+  n_nodes: 3
+  n_gpus_per_node: 8
+  fileroot: /path/to/experiments  # Replace with your experiment directory
+  name_resolve:
+    type: nfs
+    nfs_record_root: /path/to/name_resolve  # Replace with your name resolve directory
+
+
+scheduler:
+  type: slurm
+
+gconfig:
+  n_samples: 8
+  min_new_tokens: 0
+  max_new_tokens: 8192
+  max_tokens: 32767
+  greedy: false
+  temperature: 1.0
+
+rollout:
+  backend: "sglang:d16"
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  max_concurrent_rollouts: 256
+  queue_size: null
+  consumer_batch_size: ${train_dataset.batch_size}
+  max_head_offpolicyness: 2
+  enable_rollout_tracing: false
+  scheduling_spec: ${actor.scheduling_spec}
+  fileroot: ${cluster.fileroot}
+  tokenizer_path: ${tokenizer_path}
+  dump_to_file: true
+  agent:
+    mode: inline
+    tool_call_parser: qwen25
+    reasoning_parser: qwen3
+    engine_max_tokens: ${gconfig.max_tokens}
+    export_style: individual
+    turn_discount: 1.0
+
+actor:
+  backend: "archon:d8"
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  path: Qwen/Qwen3-8B  # HuggingFace model path
+  init_from_scratch: false
+  disable_dropout: true
+  gradient_checkpointing: true
+  dtype: bfloat16
+  mb_spec:
+    max_tokens_per_mb: 32768
+  optimizer:
+    type: adam
+    lr: 1.7e-5
+    weight_decay: 0.017
+    beta1: 0.9
+    beta2: 0.999
+    eps: 1e-8
+    lr_scheduler_type: constant
+    gradient_clipping: 1.0
+    warmup_steps_proportion: 0.001
+  eps_clip: 0.4
+  temperature: ${gconfig.temperature}
+  reward_scaling: 10.0
+  reward_bias: -0.5
+  kl_ctl: 0.0
+  ppo_n_minibatches: 1
+  recompute_logprob: true
+  use_decoupled_loss: true
+  rejection_sampling:
+    metric: ratio
+    upper: 5.0
+  reward_norm: null
+  adv_norm:
+    mean_level: batch
+    std_level: batch
+  max_new_tokens: ${gconfig.max_new_tokens}
+  pad_to_maximum: true
+  enable_tree_training: true
+  scheduling_spec:
+    - task_type: worker
+      port_count: 2
+      gpu: 1
+      cpu: 4
+      mem: 32
+      cmd: python3 -m areal.infra.rpc.rpc_server
+      # image: /path/to/container.sif  # Optional: specify container image for Slurm
+      env_vars:
+        # NCCL settings - adjust based on your cluster network configuration
+        NCCL_DEBUG: "WARN"
+        TAU2_DATA_DIR: /path/to/tau2-bench/data  # Set if using tau2-bench
+        WANDB_BASE_URL: your-wandb-url  # Optional: for W&B logging
+        WANDB_API_KEY: your-wandb-api-key  # Optional: for W&B logging
+        AREAL_PROXY_WARN_ONCE: "1" # Avoid warning spamming
+      additional_bash_cmds:
+        # install tau2-bench with async generation
+        - uv pip install git+https://github.com/dhh1995/tau2-bench.git@dhh/async-and-custom-completion
+
+ref:
+  backend: ${actor.backend}
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  path: ${actor.path}
+  init_from_scratch: false
+  disable_dropout: true
+  dtype: ${actor.dtype}
+  mb_spec:
+    max_tokens_per_mb: 32768
+  optimizer: null
+
+# Tau2 environment configuration
+econfig:
+  domain: airline
+  max_steps: 50
+  add_thinking_tool: false
+  solo_mode: false
+  user_llm_base_url: http://localhost:8000/v1/  # Replace with your user LLM endpoint
+  user_llm: openai/self-hosted-Qwen2.5-72B
+  user_llm_args:
+    temperature: 0.0
+    max_completion_tokens: 512
+  turn_discount: 1.0
+  invalid_format_penalty: 0.1
+
+# SGLang inference server configuration
+sglang:
+  model_path: ${actor.path}
+  random_seed: ${seed}
+  skip_tokenizer_init: true
+  dtype: ${actor.dtype}
+  max_running_requests: null
+  context_length: 32768
+  mem_fraction_static: 0.8
+
+vllm:
+  model: ${actor.path}
+  seed: ${seed}
+  skip_tokenizer_init: false
+  dtype: ${actor.dtype}
+  max_model_len: 32768
+  gpu_memory_utilization: 0.9
+
+# Datasets
+train_dataset:
+  batch_size: 30
+  shuffle: true
+  pin_memory: true
+  num_workers: 4
+  path: tau2/train
+  type: rl
+  max_length: 1024
+
+valid_dataset:
+  batch_size: 16
+  shuffle: true
+  pin_memory: true
+  num_workers: 4
+  path: tau2/test
+  type: rl
+  drop_last: false
+
+# Utilities
+saver:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: 1
+  freq_steps: null
+  freq_secs: null
+
+recover:
+  mode: disabled
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: 1
+  freq_steps: null
+  freq_secs: 3600
+
+evaluator:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: null
+  freq_steps: null
+  freq_secs: null
+
+stats_logger:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  wandb:
+    mode: online
+
+perf_tracer:
+  enabled: false
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  save_interval: 1
+  session_tracer:
+    enabled: true
+    flush_threshold: 100

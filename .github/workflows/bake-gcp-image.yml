@@ -1,0 +1,289 @@
+name: Bake GCP CI Image
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_image:
+        description: 'Base GCP OS image to start from (empty = current default)'
+        required: false
+        type: string
+        default: ''
+      image_tag:
+        description: 'Docker image tag to pre-pull (e.g., dev)'
+        required: false
+        type: string
+        default: 'dev'
+  workflow_call:
+    inputs:
+      base_image:
+        description: 'Base GCP OS image to start from'
+        required: false
+        type: string
+        default: ''
+      image_tag:
+        description: 'Docker image tag to pre-pull'
+        required: false
+        type: string
+        default: 'dev'
+    outputs:
+      image_name:
+        description: 'Name of the newly baked GCP image'
+        value: ${{ jobs.bake.outputs.image_name }}
+
+concurrency:
+  group: bake-gcp-image
+  cancel-in-progress: false
+
+env:
+  GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+  DEFAULT_BASE_IMAGE: areal-cicd-test-20260506-432
+
+jobs:
+  bake:
+    name: Bake GCP CI image
+    runs-on: ubuntu-latest
+    outputs:
+      image_name: ${{ steps.create-image.outputs.image_name }}
+    env:
+      INSTANCE_NAME: areal-image-baker-${{ github.run_id }}
+    steps:
+      - name: Set parameters
+        id: params
+        run: |
+          BASE="${{ inputs.base_image }}"
+          TAG="${{ inputs.image_tag }}"
+          echo "base_image=${BASE:-$DEFAULT_BASE_IMAGE}" >> "$GITHUB_OUTPUT"
+          echo "image_tag=${TAG:-dev}" >> "$GITHUB_OUTPUT"
+
+          DATE=$(date -u +%Y%m%d)
+          echo "new_image=areal-cicd-test-${DATE}-${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v3
+        with:
+          credentials_json: ${{ secrets.GCP_SERVICE_ACCOUNT_KEY }}
+
+      - name: Set up Google Cloud SDK
+        uses: google-github-actions/setup-gcloud@v3
+
+      - name: Render bake script and write metadata files
+        env:
+          GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
+        run: |
+          cat > bake-script.sh << 'EOF'
+          #!/bin/bash
+          set -euo pipefail
+          exec > >(tee /var/log/image-bake.log) 2>&1
+
+          echo "=== GCP Image Bake Started at $(date -u) ==="
+
+          METADATA_URL="http://metadata.google.internal/computeMetadata/v1/instance/attributes"
+          METADATA_HEADER="Metadata-Flavor: Google"
+
+          IMAGE_TAG=$(curl -fsSL -H "$METADATA_HEADER" "$METADATA_URL/image_tag")
+          GHCR_TOKEN=$(curl -fsSL -H "$METADATA_HEADER" "$METADATA_URL/ghcr_token" 2>/dev/null || true)
+
+          IMAGE_REPO="ghcr.io/areal-project/areal-runtime"
+
+          # Wait for Docker daemon to be ready
+          echo "Waiting for Docker daemon..."
+          for i in $(seq 1 60); do
+            if docker info >/dev/null 2>&1; then
+              echo "Docker daemon is ready."
+              break
+            fi
+            if [ "$i" -eq 60 ]; then
+              echo "ERROR: Docker daemon failed to start within 5 minutes."
+              exit 1
+            fi
+            sleep 5
+          done
+
+          # Authenticate to GHCR if token is available
+          if [ -n "${GHCR_TOKEN:-}" ]; then
+            echo "$GHCR_TOKEN" | docker login ghcr.io -u areal-project --password-stdin
+            echo "Authenticated to GHCR."
+          fi
+
+          # Pull both variant images
+          echo "Pulling ${IMAGE_REPO}:${IMAGE_TAG}-sglang..."
+          docker pull "${IMAGE_REPO}:${IMAGE_TAG}-sglang"
+
+          echo "Pulling ${IMAGE_REPO}:${IMAGE_TAG}-vllm..."
+          docker pull "${IMAGE_REPO}:${IMAGE_TAG}-vllm"
+
+          # Clean up Docker credentials so they are not baked into the image
+          if [ -n "${GHCR_TOKEN:-}" ]; then
+            docker logout ghcr.io
+            rm -f /root/.docker/config.json
+          fi
+
+          echo "Pre-pulled Docker images:"
+          docker images "${IMAGE_REPO}"
+
+          echo "=== GCP Image Bake Complete at $(date -u) ==="
+
+          # Shut down so the workflow can create a GCP image from the disk
+          # The script uses set -euo pipefail, so reaching this line means
+          # all docker pulls succeeded. If any command failed, the script
+          # would have exited early and the instance stays RUNNING (caught
+          # by the wait step's 40-minute timeout).
+          shutdown -h now
+          EOF
+
+          # Write GHCR token to a file for secure metadata injection
+          printf '%s' "$GHCR_TOKEN" > ghcr-token.txt
+
+      - name: Create temporary bake instance
+        id: create-instance
+        env:
+          BASE_IMAGE: ${{ steps.params.outputs.base_image }}
+          IMAGE_TAG: ${{ steps.params.outputs.image_tag }}
+        run: |
+          set -euo pipefail
+          echo "Creating bake instance from base image: $BASE_IMAGE"
+
+          zones=$(gcloud compute zones list --project "$GCP_PROJECT_ID" --filter="status=UP" --format="value(name)")
+          if [ -z "$zones" ]; then
+            echo "No available zones found." >&2
+            exit 1
+          fi
+
+          for zone in $zones; do
+            echo "Attempting to create instance in $zone..."
+            if gcloud compute instances create "$INSTANCE_NAME" \
+              --project "$GCP_PROJECT_ID" \
+              --zone "$zone" \
+              --machine-type "a2-highgpu-2g" \
+              --image "$BASE_IMAGE" \
+              --boot-disk-size 2000GB \
+              --maintenance-policy TERMINATE \
+              --no-restart-on-failure \
+              --max-run-duration "1h" \
+              --instance-termination-action STOP \
+              --scopes "https://www.googleapis.com/auth/cloud-platform" \
+              --metadata "image_tag=${IMAGE_TAG}" \
+              --metadata-from-file startup-script=bake-script.sh,ghcr_token=ghcr-token.txt
+            then
+              echo "Successfully created instance in $zone."
+              echo "zone=$zone" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "Failed to create instance in $zone, trying next zone." >&2
+          done
+
+          echo "Unable to create instance in any available zone." >&2
+          exit 1
+
+      - name: Remove local secrets
+        if: always()
+        run: rm -f ghcr-token.txt bake-script.sh
+
+      - name: Wait for bake to complete
+        env:
+          ZONE: ${{ steps.create-instance.outputs.zone }}
+        run: |
+          echo "Waiting for bake instance to finish pulling images and shut down..."
+          TIMEOUT=2400  # 40 minutes
+          INTERVAL=30
+          ELAPSED=0
+
+          while [ $ELAPSED -lt $TIMEOUT ]; do
+            STATUS=$(gcloud compute instances describe "$INSTANCE_NAME" \
+              --project "$GCP_PROJECT_ID" \
+              --zone "$ZONE" \
+              --format="get(status)" 2>/dev/null || echo "NOT_FOUND")
+
+            case "$STATUS" in
+              TERMINATED|STOPPED)
+                echo "Instance has shut down (status: $STATUS)."
+                exit 0
+                ;;
+              NOT_FOUND)
+                echo "Instance not found — it may have been deleted externally."
+                exit 1
+                ;;
+              *)
+                echo "Instance status: $STATUS (${ELAPSED}s elapsed, timeout at ${TIMEOUT}s)"
+                ;;
+            esac
+
+            sleep $INTERVAL
+            ELAPSED=$((ELAPSED + INTERVAL))
+          done
+
+          echo "Timed out waiting for bake instance to shut down after ${TIMEOUT}s."
+          exit 1
+
+      - name: Create GCP image
+        id: create-image
+        env:
+          NEW_IMAGE: ${{ steps.params.outputs.new_image }}
+          BASE_IMAGE: ${{ steps.params.outputs.base_image }}
+          IMAGE_TAG: ${{ steps.params.outputs.image_tag }}
+          ZONE: ${{ steps.create-instance.outputs.zone }}
+        run: |
+          echo "Creating GCP image: $NEW_IMAGE"
+
+          gcloud compute images create "$NEW_IMAGE" \
+            --project "$GCP_PROJECT_ID" \
+            --source-disk "$INSTANCE_NAME" \
+            --source-disk-zone "$ZONE" \
+            --storage-location us \
+            --force \
+            --description "AReaL CI image with pre-pulled Docker images (${IMAGE_TAG}-sglang, ${IMAGE_TAG}-vllm). Base: ${BASE_IMAGE}. Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --labels "base-image=${BASE_IMAGE},image-tag=${IMAGE_TAG}"
+
+          echo "image_name=$NEW_IMAGE" >> "$GITHUB_OUTPUT"
+          echo "Created GCP image: $NEW_IMAGE"
+
+      - name: Delete temporary instance
+        if: always()
+        env:
+          ZONE: ${{ steps.create-instance.outputs.zone }}
+        run: |
+          if [ -z "${ZONE:-}" ]; then
+            echo "No zone recorded — instance may not have been created."
+            exit 0
+          fi
+
+          if gcloud compute instances describe "$INSTANCE_NAME" \
+            --project "$GCP_PROJECT_ID" \
+            --zone "$ZONE" >/dev/null 2>&1; then
+            gcloud compute instances delete "$INSTANCE_NAME" \
+              --project "$GCP_PROJECT_ID" \
+              --zone "$ZONE" \
+              --quiet
+            echo "Deleted temporary instance $INSTANCE_NAME."
+          else
+            echo "Instance $INSTANCE_NAME already removed."
+          fi
+
+      - name: Summary
+        if: always()
+        env:
+          IMAGE_NAME: ${{ steps.create-image.outputs.image_name }}
+          BASE_IMAGE: ${{ steps.params.outputs.base_image }}
+          IMAGE_TAG: ${{ steps.params.outputs.image_tag }}
+        run: |
+          if [ -n "${IMAGE_NAME:-}" ]; then
+            cat >> "$GITHUB_STEP_SUMMARY" << SUMMARY_EOF
+          ## GCP Image Bake Complete
+
+          | Property | Value |
+          |---|---|
+          | **New Image** | \`${IMAGE_NAME}\` |
+          | **Base Image** | \`${BASE_IMAGE}\` |
+          | **Pre-pulled** | \`ghcr.io/areal-project/areal-runtime:${IMAGE_TAG}-sglang\`, \`ghcr.io/areal-project/areal-runtime:${IMAGE_TAG}-vllm\` |
+
+          ### Next Steps
+          Update \`GCP_OS_IMAGE\` in \`.github/workflows/test-areal.yml\`:
+          \`\`\`yaml
+          GCP_OS_IMAGE: ${IMAGE_NAME}
+          \`\`\`
+          SUMMARY_EOF
+          else
+            echo "## GCP Image Bake Failed" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "Check the workflow logs for details." >> "$GITHUB_STEP_SUMMARY"
+          fi

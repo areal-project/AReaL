@@ -1,0 +1,10 @@
+{"messages": [{"role": "user", "content": "What is 15 + 27?"}], "answer": "42"}
+{"messages": [{"role": "user", "content": "Calculate 3 * 4 + 2 * 5"}], "answer": "22"}
+{"messages": [{"role": "user", "content": "What is the square root of 144?"}], "answer": "12"}
+{"messages": [{"role": "user", "content": "If a train travels 120 miles in 2 hours, what is its speed?"}], "answer": "60"}
+{"messages": [{"role": "user", "content": "What is 2^3 + 3^2?"}], "answer": "17"}
+{"messages": [{"role": "user", "content": "Calculate the area of a circle with radius 5"}], "answer": "78.54"}
+{"messages": [{"role": "user", "content": "What is 100 divided by 4?"}], "answer": "25"}
+{"messages": [{"role": "user", "content": "If x = 3 and y = 4, what is x^2 + y^2?"}], "answer": "25"}
+{"messages": [{"role": "user", "content": "What is the factorial of 5?"}], "answer": "120"}
+{"messages": [{"role": "user", "content": "Calculate 1/2 + 1/3 + 1/6"}], "answer": "1"}

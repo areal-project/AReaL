@@ -1,0 +1,181 @@
+name: Test Package Installation
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'pyproject.toml'
+      - 'pyproject.vllm.toml'
+      - 'uv.lock'
+      - 'uv.vllm.lock'
+      - 'areal/**'
+      - '.github/workflows/install-test.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'pyproject.toml'
+      - 'pyproject.vllm.toml'
+      - 'uv.lock'
+      - 'uv.vllm.lock'
+      - 'areal/**'
+      - '.github/workflows/install-test.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: install-test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  install-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python-version: ['3.12']
+    runs-on: ${{ matrix.os }}
+    name: Install test (${{ matrix.os }}, Python ${{ matrix.python-version }})
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          cache-dependency-glob: |
+            uv.lock
+            uv.vllm.lock
+
+      - name: Set up Python
+        run: uv python install ${{ matrix.python-version }}
+
+      - name: Install package (basic)
+        run: uv sync
+
+      - name: Verify package import
+        run: |
+          uv run python -c "import areal; print(f'areal version: {areal.__version__}')"
+
+      - name: Verify core modules are importable
+        run: |
+          uv run python -c "
+          from areal import (
+              TrainController,
+              RolloutController,
+              WorkflowExecutor,
+              StalenessManager,
+              workflow_context,
+              current_platform,
+          )
+          print('All core modules imported successfully')
+          "
+
+      - name: Build wheel
+        run: uv build --wheel
+
+      - name: Verify wheel artifact
+        run: |
+          ls -la dist/
+          python -m zipfile -l dist/*.whl | head -20
+
+  install-test-cuda-extras:
+    # Test CUDA extras installation on Linux only (CUDA packages have Linux-only wheels)
+    # Note: flash-attn is excluded because it requires CUDA compilation infrastructure
+    # which is not available on standard GitHub runners
+    # sglang and vllm are conflicting extras, so we test each separately
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [sglang, vllm]
+    name: Install test (Linux, CUDA extras, ${{ matrix.variant }})
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          cache-dependency-glob: |
+            uv.lock
+            uv.vllm.lock
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install package with CUDA extras (excluding flash-attn)
+        # flash-attn requires CUDA toolkit for compilation, skip it in CI
+        # Test individual extras that have pre-built wheels
+        run: |
+          if [ "${{ matrix.variant }}" = "vllm" ]; then
+            cp pyproject.vllm.toml pyproject.toml
+            cp uv.vllm.lock uv.lock
+          fi
+          uv sync --extra ${{ matrix.variant }} --extra megatron --extra tms
+
+      - name: Verify package import with CUDA extras
+        run: |
+          uv run python -c "import areal; print(f'areal version: {areal.__version__}')"
+
+      - name: Verify CUDA-dependent packages are installed
+        env:
+          VARIANT: ${{ matrix.variant }}
+        run: |
+          uv run python -c "
+          import os, importlib.util
+          variant = os.environ['VARIANT']
+          packages = [variant, 'megatron.core']
+          for pkg in packages:
+              spec = importlib.util.find_spec(pkg)
+              status = 'installed' if spec else 'not found'
+              print(f'{pkg}: {status}')
+          "
+
+  install-test-docker:
+    # Test editable installation in Docker runtime image
+    # This mirrors the installation method documented for Docker users
+    # Only runs on manual dispatch due to large image pull time
+    # and `no space on device left` errors on busy runners
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [sglang, vllm]
+    name: Install test (Docker ${{ matrix.variant }} image)
+    container:
+      image: ghcr.io/areal-project/areal-runtime:dev-${{ matrix.variant }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install package (editable, no deps)
+        # This is the documented Docker installation method
+        # Dependencies are pre-installed in the runtime image
+        run: uv pip install -e . --no-deps
+
+      - name: Verify package import
+        run: |
+          python -c "import areal; print(f'areal version: {areal.__version__}')"
+
+      - name: Verify core modules are importable
+        run: |
+          python -c "
+          from areal import (
+              TrainController,
+              RolloutController,
+              WorkflowExecutor,
+              StalenessManager,
+              workflow_context,
+              current_platform,
+          )
+          print('All core modules imported successfully')
+          "
+
+      - name: Run Docker installation validation
+        run: |
+          python areal/tools/validate_docker_installation.py

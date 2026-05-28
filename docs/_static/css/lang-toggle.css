@@ -1,0 +1,80 @@
+/**
+ * AReaL Documentation Language Toggle Styles
+ * Gray theme to match navigation icons
+ */
+
+/* Language toggle button - gray theme to match nav icons */
+.areal-lang-toggle-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+    margin: 0;
+    font-weight: 400;
+    font-family: inherit;
+    color: #6b7280;
+    background-color: transparent;
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+    transition: all 0.2s ease;
+    white-space: nowrap;
+    vertical-align: middle;
+    line-height: 1;
+    height: auto;
+}
+
+.areal-lang-toggle-btn svg {
+    vertical-align: middle;
+    margin-right: 4px;
+}
+
+.areal-lang-toggle-btn:hover {
+    color: #374151;
+    background-color: rgba(0, 0, 0, 0.05);
+}
+
+.areal-lang-toggle-btn:active {
+    background-color: rgba(0, 0, 0, 0.1);
+}
+
+/* Position in header-article-items__end (right side of header) */
+.header-article-items__end .areal-lang-toggle-btn,
+.header-article-items .areal-lang-toggle-btn {
+    display: inline-flex;
+    align-items: center;
+    margin-left: 8px;
+    margin-right: 0;
+    vertical-align: middle;
+}
+
+/* Make sure the button aligns with other icons in the header */
+.header-article-items__end {
+    align-items: center !important;
+}
+
+/* Dark mode support */
+@media (prefers-color-scheme: dark) {
+    .areal-lang-toggle-btn {
+        color: #9ca3af;
+        background-color: transparent;
+    }
+
+    .areal-lang-toggle-btn:hover {
+        color: #d1d5db;
+        background-color: rgba(255, 255, 255, 0.1);
+    }
+
+    .areal-lang-toggle-btn:active {
+        background-color: rgba(255, 255, 255, 0.15);
+    }
+}
+
+/* Mobile responsiveness */
+@media (max-width: 768px) {
+    .areal-lang-toggle-btn {
+        padding: 3px 6px;
+        font-size: 11px;
+        margin: 0 3px;
+    }
+}

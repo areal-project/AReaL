@@ -1,0 +1,46 @@
+name: 'Close stale issues'
+
+on:
+  schedule:
+    - cron: '0 0 * * *'  # Run daily at midnight UTC
+  workflow_dispatch:  # Allow manual triggering
+
+permissions:
+  issues: write
+  pull-requests: write
+
+jobs:
+  stale:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/stale@v10
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          stale-issue-message: |
+            This issue has been automatically marked as stale because it has not had recent activity within the last 14 days.
+
+            If this issue is still relevant, please add a comment to keep it open. Otherwise, it will be automatically closed in 16 days.
+
+            Thank you for your contribution!
+          close-issue-message: |
+            This issue has been automatically closed because it has been inactive for 30 days.
+
+            If you believe this issue is still relevant, please feel free to reopen it or create a new issue with updated information.
+
+            Thank you for your contribution!
+          days-before-stale: 14
+          days-before-close: 16  # 16 days after being marked stale = 30 days total
+          stale-issue-label: 'stale'
+          exempt-issue-labels: 'pinned,security,enhancement'
+          exempt-all-assignees: true
+          operations-per-run: 100
+          stale-pr-message: |
+            This pull request has been automatically marked as stale because it has not had recent activity within the last 14 days.
+
+            Please add a comment or push new commits to keep it active.
+
+            Thank you for your contribution!
+          days-before-pr-stale: 14
+          days-before-pr-close: -1
+          stale-pr-label: 'stale'
+          exempt-pr-labels: 'pinned,security,enhancement'

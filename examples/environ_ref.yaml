@@ -1,0 +1,34 @@
+# This is a reference yaml file for setting device-specific environment variables.
+# ***IT IS NOT INTENDED TO BE USED DIRECTLY AS AN EXPERIMENT CONFIGURATION***
+
+# To use this file, copy and paste the `env_vars` field under `actor.scheduling_spec` in
+# an actual experiment yaml configuration with proper indentation.
+
+# NVIDIA GPU
+env_vars:
+  NCCL_DEBUG: "WARN"
+  NCCL_IB_DISABLE: "0"
+  NCCL_SOCKET_IFNAME: "bond0"
+  NCCL_NET: "IB"
+  NCCL_NET_PLUGIN: ""
+  NCCL_IB_GID_INDEX: "3"
+  NCCL_IB_TIMEOUT: "22"
+  NCCL_IB_RETRY_CNT: "7"
+  NCCL_IB_SL: "5"
+  NCCL_IB_TC: "136"
+  NCCL_IB_HCA: "mlx5_bond"
+  NCCL_IB_QPS_PER_CONNECTION: "8"
+  NCCL_SET_THREAD_NAME: "1"
+  PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
+
+# NPU
+# env_vars:
+#   TASK_QUEUE_ENABLE: "2"
+#   HCCL_EXEC_TIMEOUT: "14400"
+#   HCCL_OP_EXPANSION_MODE: "HOST"
+#   ACL_DEVICE_SYNC_TIMEOUT: "14400"
+#   HCCL_EVENT_TIMEOUT: "14500"
+#   HCCL_ASYNC_ERROR_HANDLING: "0"
+#   ACL_STREAM_TIMEOUT: "14500000"
+#   HCCL_CONNECT_TIMEOUT: "7200"
+#   PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"

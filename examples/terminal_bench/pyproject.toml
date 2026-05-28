@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "areal-terminal-bench-env"
+version = "0.1.0"
+description = "Minimal dependency spec for AReaL + Camel + Terminal Bench workflow with the premise of a working AReaL environment"
+requires-python = ">=3.10"
+dependencies = [
+  "ipython",
+  "ruamel.yaml",
+  "streamlit",
+  "sqlalchemy",
+  "docker",
+  "camel-ai==0.2.85a0",
+  "terminal-bench==0.2.18",
+]
+
+[project.optional-dependencies]
+npu = [
+  "sglang[srt_npu] @ git+https://github.com/sgl-project/sglang.git@v0.5.6.post2#subdirectory=python",
+]
+
+[tool.notes]
+tiktoken_cache_dir = "/tmp/tiktoken-cache"
+tiktoken_cache_file = "o200k_base.tiktoken"
+
+[tool.install-notes]
+no_deps = [
+  "docker",
+  "camel-ai",
+  "terminal-bench",
+]
+
+commands = [
+  "export TIKTOKEN_CACHE_DIR=/tmp/tiktoken-cache",
+  "mkdir -p '$TIKTOKEN_CACHE_DIR'",
+  "curl -k -O https://openaipublic.blob.core.windows.net/encodings/o200k_base.tiktoken",
+]

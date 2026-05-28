@@ -1,0 +1,35 @@
+# Book settings
+title: AReaL Documentation
+author: AReaL Team
+copyright: "2026"
+logo: ../figures/logo.png
+
+execute:
+  execute_notebooks: force
+
+latex:
+  latex_documents:
+    targetname: book.tex
+
+repository:
+  url: https://github.com/areal-project/AReaL
+  path_to_book: docs
+  branch: main
+
+html:
+  use_issues_button: true
+  use_repository_button: true
+  extra_footerjs:
+    - _static/js/lang-toggle.js
+  extra_css:
+    - _static/css/lang-toggle.css
+
+build:
+  dir: ../_build/en
+  figureurl: /figures
+
+sphinx:
+  config:
+    html_extra_path:
+      - _static
+      - ../figures

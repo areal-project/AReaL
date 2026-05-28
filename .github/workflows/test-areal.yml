@@ -1,0 +1,372 @@
+name: AReaL CI on GCP runner
+
+on:
+  pull_request:
+    branches: [main]
+    types: [labeled]
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: 'Docker image tag to use for testing'
+        required: false
+        type: string
+        default: 'dev'
+      variant:
+        description: 'Image variant to test'
+        required: false
+        type: choice
+        options:
+          - both
+          - sglang
+          - vllm
+        default: 'both'
+  workflow_call:
+    inputs:
+      image_tag:
+        description: 'Docker image tag to use for testing'
+        required: false
+        type: string
+        default: 'dev'
+      variant:
+        description: 'Image variant (sglang or vllm)'
+        required: false
+        type: string
+        default: 'both'
+
+concurrency:
+  group: areal-unit-tests-${{ github.ref }}-${{ inputs.variant || 'both' }}
+  cancel-in-progress: true
+
+env:
+  GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+  RUNNER_VERSION: '2.332.0'
+  GCP_OS_IMAGE: areal-cicd-test-20260506-432
+
+jobs:
+  determine-variants:
+    name: Determine test variants
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - name: Set variant matrix
+        id: set-matrix
+        run: |
+          VARIANT="${{ inputs.variant || 'both' }}"
+          if [ "$VARIANT" = "both" ]; then
+            echo 'matrix=["sglang","vllm"]' >> "$GITHUB_OUTPUT"
+          else
+            echo "matrix=[\"$VARIANT\"]" >> "$GITHUB_OUTPUT"
+          fi
+
+  provision-runner:
+    if: |
+      github.event_name == 'workflow_call' ||
+      contains(github.event.pull_request.labels.*.name, 'safe-to-test') ||
+      github.event_name == 'workflow_dispatch'
+    needs:
+      - determine-variants
+    name: Provision GCP runner (${{ matrix.variant }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: ${{ fromJson(needs.determine-variants.outputs.matrix) }}
+    env:
+      CONTAINER_IMAGE: ghcr.io/areal-project/areal-runtime:${{ inputs.image_tag || 'dev' }}-${{ matrix.variant }}
+      RUNNER_LABELS: gcp-a2-highgpu-2g,variant-${{ matrix.variant }}
+    steps:
+      - name: Set instance variables
+        id: vars
+        run: |
+          echo "instance_name=gcp-runner-${{ github.run_id }}-${{ matrix.variant }}" >> "$GITHUB_OUTPUT"
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v3
+        with:
+          credentials_json: ${{ secrets.GCP_SERVICE_ACCOUNT_KEY }}
+
+      - name: Set up Google Cloud SDK
+        uses: google-github-actions/setup-gcloud@v3
+
+      - name: Fetch GitHub runner token
+        id: runner-token
+        uses: actions/github-script@v8
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+        with:
+          github-token: ${{ secrets.GH_PAT }}
+          script: |
+            const pat = process.env.GH_PAT;
+            if (!pat) {
+              core.setFailed('GH_PAT secret is not configured.');
+              return;
+            }
+
+            const tokenResponse = await github.rest.actions.createRegistrationTokenForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              request: {
+                headers: {
+                  authorization: `token ${pat}`,
+                },
+              },
+            });
+
+            core.setOutput('token', tokenResponse.data.token);
+
+      - name: Render startup script and metadata files
+        env:
+          RUNNER_VERSION: ${{ env.RUNNER_VERSION }}
+          TOKEN: ${{ steps.runner-token.outputs.token }}
+        run: |
+          cat <<'EOF' > startup-script.template
+          #!/bin/bash
+          set -euo pipefail
+
+          exec > >(tee /var/log/github-runner-startup.log) 2>&1
+
+          RUNNER_VERSION="__RUNNER_VERSION__"
+          CONTAINER_NAME="areal-cicd"
+          CONTAINER_IMAGE="__CONTAINER_IMAGE__"
+          RUNNER_DIR="/opt/actions-runner"
+
+          # apt-get update
+          # apt-get install -y curl jq
+          # systemctl enable docker
+          # systemctl start docker
+
+          if ! docker ps --format '{{.Names}}' | grep -qx "$CONTAINER_NAME"; then
+            docker run --name "$CONTAINER_NAME" -d -it \
+              -e LC_ALL=C.UTF-8 \
+              -e LANG=C.UTF-8 \
+              --ulimit nofile=1048576:1048576 \
+              --shm-size="58205394001.92b" \
+              --runtime=nvidia \
+              --gpus all \
+              --net=host \
+              --cap-add=SYS_ADMIN \
+              --device=/dev/fuse \
+              --security-opt=apparmor:unconfined \
+              -v /storage:/storage \
+              --entrypoint=/bin/bash \
+              "$CONTAINER_IMAGE" \
+              -lc "trap : TERM INT; sleep infinity & wait"
+          fi
+
+          docker exec "$CONTAINER_NAME" bash -lc "
+          set -euo pipefail
+          RUNNER_VERSION=\"__RUNNER_VERSION__\"
+          RUNNER_DIR=\"/opt/actions-runner\"
+
+          REPO=\$(curl -fsSL -H \"Metadata-Flavor: Google\" \"http://metadata.google.internal/computeMetadata/v1/instance/attributes/repo\")
+          TOKEN=\$(curl -fsSL -H \"Metadata-Flavor: Google\" \"http://metadata.google.internal/computeMetadata/v1/instance/attributes/runner_token\")
+          LABELS=\$(curl -fsSL -H \"Metadata-Flavor: Google\" \"http://metadata.google.internal/computeMetadata/v1/instance/attributes/runner_labels\")
+
+          apt-get update
+          apt-get install -y sudo
+
+          if ! id runner >/dev/null 2>&1; then
+            useradd --home-dir \"\${RUNNER_DIR}\" --create-home --shell /bin/bash runner
+          fi
+
+          cd \"\${RUNNER_DIR}\"
+
+          curl -sSLO \"https://github.com/actions/runner/releases/download/v\${RUNNER_VERSION}/actions-runner-linux-x64-\${RUNNER_VERSION}.tar.gz\"
+          tar xzf \"actions-runner-linux-x64-\${RUNNER_VERSION}.tar.gz\"
+          chown -R runner:runner \"\${RUNNER_DIR}\"
+
+          sudo -u runner ./config.sh \\
+            --url \"https://github.com/\${REPO}\" \\
+            --token \"\${TOKEN}\" \\
+            --labels \"\${LABELS}\" \\
+            --unattended \\
+            --ephemeral
+
+          sudo -u runner nohup ./run.sh >/opt/actions-runner/runner.log 2>&1 &
+          "
+          EOF
+
+          sed -e "s/__RUNNER_VERSION__/${RUNNER_VERSION}/g" -e "s#__CONTAINER_IMAGE__#${CONTAINER_IMAGE}#g" startup-script.template > startup-script.sh
+          rm startup-script.template
+
+          printf '%s' "$TOKEN" > runner-token.txt
+
+      - name: Create runner instance
+        id: create-instance
+        env:
+          INSTANCE_NAME: ${{ steps.vars.outputs.instance_name }}
+        run: |
+          set -euo pipefail
+          zones=$(gcloud compute zones list --project "$GCP_PROJECT_ID" --filter="status=UP" --format="value(name)")
+          if [ -z "$zones" ]; then
+            echo "No available zones found." >&2
+            exit 1
+          fi
+
+          for zone in $zones; do
+            echo "Attempting to create instance in $zone..."
+            if gcloud compute instances create "$INSTANCE_NAME" \
+              --project "$GCP_PROJECT_ID" \
+              --zone "$zone" \
+              --machine-type "a2-highgpu-2g" \
+              --image "$GCP_OS_IMAGE" \
+              --boot-disk-size 2000GB \
+              --maintenance-policy TERMINATE \
+              --restart-on-failure \
+              --max-run-duration "2h" \
+              --instance-termination-action DELETE \
+              --scopes "https://www.googleapis.com/auth/cloud-platform" \
+              --metadata "^::^repo=${{ github.repository }}::runner_labels=${RUNNER_LABELS}" \
+              --metadata-from-file startup-script=startup-script.sh,runner_token=runner-token.txt
+            then
+              echo "Successfully created instance in $zone."
+              echo "zone=$zone" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "Failed to create instance in $zone, trying next zone." >&2
+          done
+
+          echo "Unable to create instance in any available zone." >&2
+          exit 1
+
+      - name: Remove local runner artifacts
+        if: always()
+        run: rm -f startup-script.sh runner-token.txt
+
+      - name: Wait for runner to register
+        uses: actions/github-script@v8
+        env:
+          INSTANCE_NAME: ${{ steps.vars.outputs.instance_name }}
+          GH_PAT: ${{ secrets.GH_PAT }}
+        with:
+          github-token: ${{ secrets.GH_PAT }}
+          script: |
+            const instanceName = process.env.INSTANCE_NAME;
+            const maxAttempts = 200;
+            const delayMs = 15000;
+
+            const pat = process.env.GH_PAT;
+            if (!pat) {
+              core.setFailed('GH_PAT secret is not configured.');
+              return;
+            }
+
+            const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+            for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+              const response = await github.rest.actions.listSelfHostedRunnersForRepo({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                per_page: 100,
+                request: {
+                  headers: {
+                    authorization: `token ${pat}`,
+                  },
+                },
+              });
+
+              const found = response.data.runners.find((runner) => runner.name === instanceName);
+              if (found && found.status === 'online') {
+                core.info(`Runner ${instanceName} is online.`);
+                return;
+              }
+
+              core.info(`Runner ${instanceName} not ready yet (attempt ${attempt}/${maxAttempts}).`);
+              await wait(delayMs);
+            }
+
+            throw new Error(`Timed out waiting for runner ${instanceName} to come online.`);
+
+  unit-tests:
+    if: |
+      github.event_name == 'workflow_call' ||
+      contains(github.event.pull_request.labels.*.name, 'safe-to-test') ||
+      github.event_name == 'workflow_dispatch'
+    needs:
+      - determine-variants
+      - provision-runner
+    name: Run AReaL unit tests (${{ matrix.variant }})
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: ${{ fromJson(needs.determine-variants.outputs.matrix) }}
+    environment:
+      name: AReaL-unittests
+    permissions:
+      contents: read
+    runs-on:
+      - self-hosted
+      - gcp-a2-highgpu-2g
+      - "variant-${{ matrix.variant }}"
+    timeout-minutes: 120
+    env:
+      # Activate the venv created in the Docker image
+      VIRTUAL_ENV: /opt/.venv
+      EXCLUDE_BACKEND: ${{ matrix.variant == 'sglang' && 'vllm' || 'sglang' }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Validate Docker installation
+        run: |
+          export PATH="/opt/.venv/bin:$PATH"
+          python areal/tools/validate_docker_installation.py
+
+      - name: Run unit tests
+        env:
+          CI: true
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          PYTHONPATH: ${{ github.workspace }}
+          TOKENIZERS_PARALLELISM: false
+          AREAL_IS_IN_CI: 1
+          VIRTUAL_ENV: /opt/.venv
+        run: |
+          export PATH="/opt/.venv/bin:$PATH"
+          pytest -m "(not slow or ci) and not ${EXCLUDE_BACKEND}" --durations=20 -s -vv tests/test_*.py tests/experimental/ tests/infra/
+
+  cleanup:
+    name: Tear down GCP runner (${{ matrix.variant }})
+    needs:
+      - determine-variants
+      - unit-tests
+      - provision-runner
+    if: always() && needs.determine-variants.result != 'skipped' && needs.provision-runner.result != 'skipped'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: ${{ fromJson(needs.determine-variants.outputs.matrix) }}
+    steps:
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v3
+        with:
+          credentials_json: ${{ secrets.GCP_SERVICE_ACCOUNT_KEY }}
+
+      - name: Set up Google Cloud SDK
+        uses: google-github-actions/setup-gcloud@v3
+
+      - name: Delete runner instance
+        env:
+          INSTANCE_NAME: gcp-runner-${{ github.run_id }}-${{ matrix.variant }}
+        run: |
+          # Look up instance zone dynamically since matrix job outputs
+          # cannot be consumed per-element by downstream matrix jobs.
+          # Only suppress "not found" — propagate real errors.
+          INSTANCE_ZONE=$(gcloud compute instances list \
+            --project "$GCP_PROJECT_ID" \
+            --filter="name=$INSTANCE_NAME" \
+            --format="value(zone)") || {
+            echo "⚠️ gcloud lookup failed (exit $?), instance may need manual cleanup"
+            INSTANCE_ZONE=""
+          }
+
+          if [ -z "$INSTANCE_ZONE" ]; then
+            echo "Instance $INSTANCE_NAME not found; skipping cleanup."
+            exit 0
+          fi
+
+          if gcloud compute instances describe "$INSTANCE_NAME" --project "$GCP_PROJECT_ID" --zone "$INSTANCE_ZONE" >/dev/null 2>&1; then
+            gcloud compute instances delete "$INSTANCE_NAME" --project "$GCP_PROJECT_ID" --zone "$INSTANCE_ZONE" --quiet
+          else
+            echo "Instance $INSTANCE_NAME already removed."
+          fi

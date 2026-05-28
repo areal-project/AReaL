@@ -1,0 +1,48 @@
+labels: [discussion]
+
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ## Share Your Ideas
+
+        Have an idea for improving AReaL? We'd love to hear it! This is the place to propose new features, improvements, or discuss potential changes before creating a formal feature request.
+
+  - type: textarea
+    id: idea
+    attributes:
+      label: Your Idea
+      description: Describe your idea in detail
+      placeholder: |
+        What would you like to see in AReaL?
+        How would it benefit the community?
+        Any implementation thoughts?
+    validations:
+      required: true
+
+  - type: textarea
+    id: use-case
+    attributes:
+      label: Use Case
+      description: What problem does this solve or what would it enable?
+      placeholder: Describe the use case or scenario where this would be helpful
+    validations:
+      required: false
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives
+      description: Have you considered any alternative approaches?
+      placeholder: What alternatives have you thought about?
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: contribution
+    attributes:
+      label: Contribution
+      description: Would you be interested in implementing this?
+      options:
+        - label: I'd like to work on this if it's accepted
+          required: false

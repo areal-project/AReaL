@@ -1,0 +1,143 @@
+default_install_hook_types:
+  - pre-commit
+  - commit-msg
+
+repos:
+  - repo: https://github.com/pre-commit/mirrors-clang-format
+    rev: v19.1.7
+    hooks:
+      - id: clang-format
+        files: \.(c|cc|cxx|cpp|h|hpp|hxx|cu|cuh)$
+        args:
+          - --style=file
+          - --fallback-style=Google
+
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: check-yaml
+        files: \.(yaml|yml)$
+        exclude: \.github/workflows/
+      - id: end-of-file-fixer
+        files: \.(py|md|yaml|yml|c|cc|cxx|cpp|h|hpp|hxx|cu|cuh|ipynb)$
+      - id: trailing-whitespace
+        files: \.(py|md|yaml|yml|c|cc|cxx|cpp|h|hpp|hxx|cu|cuh|ipynb)$
+      - id: check-added-large-files
+        name: Check for large files
+        args: ['--maxkb=1000']
+        exclude: uv.lock
+      - id: check-json
+        name: Check JSON files
+
+      - id: detect-private-key
+        name: Detect private keys
+
+  - repo: https://github.com/executablebooks/mdformat
+    rev: 0.7.17
+    hooks:
+      - id: mdformat
+        args:
+          - --wrap=88
+        additional_dependencies:
+          - mdformat-gfm
+          - mdformat-tables
+          - mdformat-frontmatter
+        exclude: ^(docs/(en|zh)/algorithms/.*\.md|docs/(en|zh)/best_practices/algo_perf\.md)$
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    # Ruff version.
+    rev: v0.14.9
+    hooks:
+      - id: ruff # Run the linter.
+        name: Run Linter Check (Ruff)
+        types_or: [ python, pyi, jupyter ]
+        args: [ --fix ]
+      - id: ruff-format # Run the formatter.
+        name: Run Formatter (Ruff)
+        types_or: [ python, pyi, jupyter ]
+
+  # Clean notebook outputs and metadata
+  - repo: https://github.com/kynan/nbstripout
+    rev: 0.7.1
+    hooks:
+      - id: nbstripout
+        name: nbstripout - Strip notebook output
+        description: Strip output from Jupyter notebooks
+
+  # Check consistency between pyproject.toml variants (sglang vs vllm)
+  - repo: local
+    hooks:
+      - id: check-pyproject-consistency
+        name: Check pyproject.toml consistency
+        entry: python3 areal/tools/check_pyproject_consistency.py
+        language: system
+        files: ^pyproject(\.vllm)?\.toml$
+        pass_filenames: false
+        always_run: false
+        require_serial: true
+
+  # Regenerate uv lockfiles when pyproject files change
+  - repo: local
+    hooks:
+      - id: uv-lock
+        name: Regenerate uv lockfiles
+        entry: bash scripts/uv_lock.sh
+        language: system
+        files: ^pyproject(\.vllm)?\.toml$
+        pass_filenames: false
+        always_run: false
+        require_serial: true
+
+  # Generate CLI documentation
+  - repo: local
+    hooks:
+      - id: generate-cli-docs
+        name: Generate CLI documentation
+        entry: python docs/generate_cli_docs.py
+        language: system
+        files: ^(areal/api/cli_args\.py|docs/generate_cli_docs\.py)$
+        pass_filenames: false
+        always_run: false
+        require_serial: true
+
+  # Ensure SPDX license header in Python source files
+  - repo: local
+    hooks:
+      - id: check-license-header
+        name: Check SPDX license header
+        entry: python3 areal/tools/check_license_header.py
+        language: system
+        files: ^areal/.*\.py$
+        types: [python]
+
+  # Format and lint .github/CODEOWNERS
+  - repo: local
+    hooks:
+      - id: format-codeowners
+        name: Format CODEOWNERS
+        entry: python3 areal/tools/format_codeowners.py
+        language: system
+        files: ^\.github/CODEOWNERS$
+        pass_filenames: false
+        always_run: false
+        require_serial: true
+
+  # Conventional Commits message check
+  - repo: https://github.com/compilerla/conventional-pre-commit
+    rev: v4.4.0
+    hooks:
+      - id: conventional-pre-commit
+        stages: [commit-msg]
+        args:
+          - feat
+          - fix
+          - docs
+          - gov
+          - style
+          - refactor
+          - perf
+          - test
+          - build
+          - ci
+          - chore
+          - revert

@@ -1,0 +1,196 @@
+experiment_name: terminal_bench_npu_rl
+trial_name: trial0
+
+seed: 1
+total_train_epochs: 200
+tokenizer_path: ${actor.path}
+async_training: true
+
+n_trajs: 4
+max_tokens_per_trajectory: 40000
+
+dynamic_bs: false
+
+cluster:
+  n_nodes: 1
+  n_gpus_per_node: 16
+  fileroot: /tmp/areal/experiments
+  name_resolve:
+    type: nfs
+    nfs_record_root: /tmp/areal/name_resolve
+
+allocation_mode: vllm:d4p1t2+d4p1t1c2
+
+scheduler:
+  type: local
+
+rollout:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  max_concurrent_rollouts: 64
+  queue_size: null
+  consumer_batch_size: ${train_dataset.batch_size}
+  max_head_offpolicyness: 2
+  enable_rollout_tracing: false
+  scheduling_spec: ${actor.scheduling_spec}
+  fileroot: ${cluster.fileroot}
+  tokenizer_path: ${tokenizer_path}
+  dump_to_file: true
+  check_trajectory_format: true
+
+gconfig:
+  n_samples: 2
+  min_new_tokens: 0
+  max_new_tokens: 1024
+  greedy: false
+  temperature: 1.0
+
+actor:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  path: Qwen/Qwen3-8B
+  init_from_scratch: false
+  disable_dropout: true
+  gradient_checkpointing: true
+  dtype: bfloat16
+  mb_spec:
+    max_tokens_per_mb: 30000
+  optimizer:
+    type: adam
+    lr: 1.70e-5
+    weight_decay: 0.017
+    beta1: 0.9
+    beta2: 0.999
+    eps: 1e-8
+    lr_scheduler_type: constant
+    gradient_clipping: 1.0
+    warmup_steps_proportion: 0.001
+  eps_clip: 0.4
+  temperature: ${gconfig.temperature}
+  reward_scaling: 10.0
+  reward_bias: -0.5
+  kl_ctl: 0.0
+  ppo_n_minibatches: 1
+  recompute_logprob: true
+  use_decoupled_loss: true
+  behave_imp_weight_cap: 5.0
+  adv_norm:
+    mean_level: batch
+    std_level: batch
+  weight_update_mode: xccl
+  max_new_tokens: ${gconfig.max_new_tokens}
+  scheduling_spec:
+    - task_type: worker
+      port_count: 2
+      gpu: 1
+      cpu: 4
+      mem: 16
+      cmd: python3 -m areal.infra.rpc.rpc_server
+      env_vars:
+        VLLM_USE_V1: "1"
+        VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
+        TASK_QUEUE_ENABLE: "2"
+        HCCL_EXEC_TIMEOUT: "14400"
+        HCCL_OP_EXPANSION_MODE: "HOST"
+        ACL_DEVICE_SYNC_TIMEOUT: "14400"
+        HCCL_EVENT_TIMEOUT: "14500"
+        HCCL_ASYNC_ERROR_HANDLING: "0"
+        ACL_STREAM_TIMEOUT: "14500000"
+        HCCL_CONNECT_TIMEOUT: "7200"
+        PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
+
+ref:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  path: ${actor.path}
+  init_from_scratch: false
+  disable_dropout: true
+  dtype: ${actor.dtype}
+  mb_spec:
+    max_tokens_per_mb: 10240
+  optimizer:
+    type: adam
+    lr: 1.70e-5
+    weight_decay: 0.017
+    beta1: 0.9
+    beta2: 0.999
+    eps: 1e-8
+    lr_scheduler_type: constant
+    gradient_clipping: 1.0
+    warmup_steps_proportion: 0.001
+  scheduling_strategy:
+    type: colocation
+    target: actor
+  scheduling_spec: ${actor.scheduling_spec}
+
+# adpated for NPU
+vllm:
+  model: ${actor.path}
+  seed: ${seed}
+  skip_tokenizer_init: false
+  dtype: ${actor.dtype}
+  max_model_len: 40000
+  gpu_memory_utilization: 0.8
+  enforce_eager: true
+
+
+# datasets
+train_dataset:
+  batch_size: 16
+  shuffle: true
+  pin_memory: true
+  num_workers: 4
+  path: path/to/tbench-selected-tasks-easy.parquet
+  type: rl
+  max_length: 1024
+
+valid_dataset:
+  batch_size: 4
+  shuffle: true
+  pin_memory: true
+  num_workers: 4
+  path: path/to/val.parquet
+  type: rl
+
+# Utilities
+saver:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: 1
+  freq_steps: null
+  freq_secs: null
+
+recover:
+  mode: disabled
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: 1
+  freq_steps: null
+  freq_secs: 3600
+
+evaluator:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: null
+  freq_steps: null
+  freq_secs: null
+
+stats_logger:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  wandb:
+    mode: disabled
+
+perf_tracer:
+  enabled: true
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  save_interval: 1
+  session_tracer:
+    enabled: true
+    flush_threshold: 100

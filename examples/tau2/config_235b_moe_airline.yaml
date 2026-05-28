@@ -1,0 +1,253 @@
+experiment_name: tau2-grpo-235b
+trial_name: trial0
+
+seed: 1
+enable_offload: false
+total_train_epochs: 200
+total_train_steps: 500
+tokenizer_path: ${actor.path}
+
+cluster:
+  n_nodes: 10
+  n_gpus_per_node: 8
+  fileroot: /tmp/experiments
+  name_resolve:
+    type: nfs
+    nfs_record_root: /tmp/name_resolve
+
+
+scheduler:
+  type: slurm
+
+gconfig:
+  n_samples: 16
+  min_new_tokens: 0
+  max_new_tokens: 8192
+  max_tokens: 30000
+  greedy: false
+  temperature: 1.0
+  top_p: 1.0
+  top_k: 100000000
+
+rollout:
+  backend: "sglang:d4t8"
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  max_concurrent_rollouts: 128
+  queue_size: null
+  consumer_batch_size: ${train_dataset.batch_size}
+  max_head_offpolicyness: 2
+  enable_rollout_tracing: true
+  scheduling_spec: ${actor.scheduling_spec}
+  fileroot: ${cluster.fileroot}
+  tokenizer_path: ${tokenizer_path}
+  dump_to_file: true
+  setup_timeout: 300.0
+  request_timeout: 3600.0
+  request_retries: 3
+  agent:
+    mode: inline
+    tool_call_parser: qwen25
+    reasoning_parser: qwen3
+    chat_template_type: hf
+    engine_max_tokens: ${gconfig.max_tokens}
+    export_style: individual
+    turn_discount: 1.0
+    subproc_max_workers: 4
+    session_timeout_seconds: 3600
+
+actor:
+  backend: "megatron:(attn:d1p12t4|ffn:d1p12e4)"
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  path: Qwen/Qwen3-235B-A22B
+  init_from_scratch: false
+  disable_dropout: true
+  gradient_checkpointing: true
+  dtype: bfloat16
+  grad_reduce_dtype: float32
+  mb_spec:
+    n_mbs: 1
+    granularity: 1
+    max_tokens_per_mb: 32768
+    n_mbs_divisor: 1
+  pad_to_maximum: true
+  optimizer:
+    type: adam
+    lr: 5e-6
+    weight_decay: 0.005
+    beta1: 0.9
+    beta2: 0.999
+    eps: 1.0e-08
+    lr_scheduler_type: constant
+    gradient_clipping: 1.0
+    warmup_steps_proportion: 0.001
+    min_loss_scale: 1.0
+    loss_scale_window: 5.0
+    hysteresis: 2
+  megatron:
+    wrap_with_ddp: true
+    ddp:
+      grad_reduce_in_fp32: true
+      overlap_grad_reduce: false
+      overlap_param_gather: false
+      use_distributed_optimizer: true
+    use_deterministic_algorithms: true
+    recompute_granularity: full
+    recompute_method: uniform
+    recompute_num_layers: 1
+    moe_router_dtype: fp32
+    moe_token_dispatcher_type: alltoall
+  archon:
+    attn_type: varlen
+    offload_params: false
+    enable_compile: true
+    ac_mode: full
+    ac_preserve_rng_state: true
+  eps_clip: 0.4
+  temperature: ${gconfig.temperature}
+  reward_scaling: 10.0
+  reward_bias: -0.5
+  reward_clip: 20.0
+  kl_ctl: 0.0
+  ppo_n_minibatches: 1
+  recompute_logprob: true
+  use_decoupled_loss: true
+  rejection_sampling:
+    metric: ratio
+    upper: 5.0
+  discount: 1.0
+  gae_lambda: 1.0
+  adv_norm:
+    mean_level: batch
+    std_level: batch
+    std_unbiased: true
+    eps: 1.0e-05
+  max_new_tokens: ${gconfig.max_new_tokens}
+  enable_tree_training: false
+  scheduling_spec:
+    - task_type: worker
+      port_count: 2
+      gpu: 1
+      cpu: 4
+      mem: 32
+      cmd: python3 -m areal.infra.rpc.rpc_server
+      # image: /path/to/container.sif  # Optional: specify container image for Slurm
+      env_vars:
+        # NCCL settings - adjust based on your cluster network configuration
+        NCCL_DEBUG: "WARN"
+        AREAL_PROXY_WARN_ONCE: "1"
+        TAU2_DATA_DIR: /path/to/tau2-bench/data  # Set if using tau2-bench
+        WANDB_BASE_URL: your-wandb-url  # Optional: for W&B logging
+        WANDB_API_KEY: your-wandb-api-key  # Optional: for W&B logging
+      additional_bash_cmds:
+        # install tau2-bench with async generation
+        - uv pip install git+https://github.com/dhh1995/tau2-bench.git@dhh/async-and-custom-completion
+
+ref:
+  backend: ${actor.backend}
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  path: ${actor.path}
+  init_from_scratch: false
+  disable_dropout: true
+  dtype: ${actor.dtype}
+  mb_spec:
+    n_mbs: 1
+    granularity: 1
+    max_tokens_per_mb: 32768
+    n_mbs_divisor: 1
+  optimizer: null
+  enable_tree_training: false
+
+# Tau2 environment configuration
+econfig:
+  domain: airline
+  max_steps: 50
+  add_thinking_tool: false
+  solo_mode: false
+  user_llm_base_url: http://localhost:8000/v1/  # Replace with your user LLM endpoint
+  user_llm: openai/qwen
+  user_llm_args:
+    temperature: 0.0
+    max_completion_tokens: 2048
+  turn_discount: 1.0
+  invalid_format_penalty: 0.1
+
+# SGLang inference server configuration
+sglang:
+  model_path: ${actor.path}
+  random_seed: ${seed}
+  skip_tokenizer_init: true
+  dtype: ${actor.dtype}
+  context_length: 32768
+  mem_fraction_static: 0.8
+  max_prefill_tokens: 32768
+  schedule_policy: lpm
+  attention_backend: fa3
+  log_level: warning
+
+vllm:
+  model: ${actor.path}
+  seed: ${seed}
+  skip_tokenizer_init: false
+  dtype: ${actor.dtype}
+  max_model_len: 32768
+  gpu_memory_utilization: 0.9
+
+# Datasets
+train_dataset:
+  batch_size: 16
+  shuffle: true
+  pin_memory: true
+  num_workers: 4
+  drop_last: true
+  path: tau2/train
+  type: rl
+  max_length: 1024
+
+valid_dataset:
+  batch_size: 16
+  shuffle: true
+  pin_memory: true
+  num_workers: 4
+  drop_last: false
+  path: tau2/test
+  type: rl
+
+# Utilities
+saver:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: 1
+
+recover:
+  mode: disabled
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: 1
+  freq_secs: 3600
+
+evaluator:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+
+stats_logger:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  wandb:
+    mode: online
+
+perf_tracer:
+  enabled: false
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  save_interval: 1
+  session_tracer:
+    enabled: true
+    flush_threshold: 100
