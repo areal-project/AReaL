@@ -5,21 +5,25 @@
 from .version import __version__  # noqa
 
 
-_INFRA_NAMES = frozenset({
-    "RolloutController",
-    "StalenessManager",
-    "TrainController",
-    "WorkflowExecutor",
-    "current_platform",
-    "workflow_context",
-})
+_INFRA_NAMES = frozenset(
+    {
+        "RolloutController",
+        "StalenessManager",
+        "TrainController",
+        "WorkflowExecutor",
+        "current_platform",
+        "workflow_context",
+    }
+)
 
-_TRAINER_NAMES = frozenset({
-    "DPOTrainer",
-    "PPOTrainer",
-    "RWTrainer",
-    "SFTTrainer",
-})
+_TRAINER_NAMES = frozenset(
+    {
+        "DPOTrainer",
+        "PPOTrainer",
+        "RWTrainer",
+        "SFTTrainer",
+    }
+)
 
 
 def __getattr__(name: str):
