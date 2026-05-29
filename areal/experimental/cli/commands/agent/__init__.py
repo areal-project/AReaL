@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import argparse
 
-
 _DESCRIPTION = """\
 Operate an agent service: gateway + router + (worker, data-proxy) pairs.
 Session-centric: the primary unit of interaction is an agent session,

@@ -20,13 +20,11 @@ from __future__ import annotations
 import argparse
 import sys
 
-from areal.version import __version__
-
 from areal.experimental.cli.commands import agent as cmd_agent
 from areal.experimental.cli.commands import inf as cmd_inf
 from areal.experimental.cli.commands import train as cmd_train
 from areal.experimental.cli.commands import weight_update as cmd_weight_update
-
+from areal.version import __version__
 
 _DESCRIPTION = """\
 AReaL operator CLI for the v2 microservice architecture.

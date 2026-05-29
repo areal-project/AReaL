@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import argparse
 
-
 _DESCRIPTION = """\
 Diagnose the weight-update service that bridges training and inference.
 

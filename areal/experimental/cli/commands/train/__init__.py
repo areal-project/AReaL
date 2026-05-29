@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import argparse
 
-
 _DESCRIPTION = """\
 Submit and observe training jobs. Job-shaped (terminates), not
 service-shaped — the CLI wraps lifecycle only and does not choose the

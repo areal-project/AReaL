@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import argparse
 
-
 _DESCRIPTION = """\
 Operate an inference service: gateway + router + optional model backends.
 
