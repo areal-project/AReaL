@@ -1832,6 +1832,7 @@ class SGLangConfig:
     cpu_offload_gb: int = 0
     dtype: str = "bfloat16"
     kv_cache_dtype: str = "auto"
+    quantization: str = ""
     dp_size: int = 1  # only used for dp attention
     ep_size: int = 1
     # lora
@@ -1913,6 +1914,23 @@ class SGLangConfig:
                 model_loader_extra_config, separators=(",", ":")
             )
         args.pop("enable_multithread_load", None)
+
+        quantization = args.pop("quantization", "")
+        if quantization == "fp8":
+            args["quantization"] = "fp8"
+            fp8_quant_config = {
+                "quant_method": "fp8",
+                "activation_scheme": "dynamic",
+                "weight_block_size": [128, 128],
+            }
+            args["json_model_override_args"] = json.dumps(
+                {"quantization_config": fp8_quant_config},
+                separators=(",", ":"),
+            )
+        elif quantization:
+            raise ValueError(
+                f"SGLangConfig.quantization must be 'fp8' or empty, got {quantization!r}"
+            )
 
         args = dict(
             # Model and tokenizer

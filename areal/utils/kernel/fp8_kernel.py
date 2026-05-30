@@ -45,7 +45,6 @@ except ImportError:
     pass
 
 
-
 # ---------------------------------------------------------------------------
 # PyTorch fallback (always available)
 # ---------------------------------------------------------------------------
@@ -219,7 +218,12 @@ def scaled_fp8_blockwise(
     if weight_block_size is None:
         weight_block_size = [128, 128]
 
-    if _TRITON_AVAILABLE and os.environ.get("DISABLE_TRITON_FP8", "0") != "1":
+    use_triton = (
+        _TRITON_AVAILABLE
+        and os.environ.get("DISABLE_TRITON_FP8", "0") != "1"
+        and data_hp.device.type == "cuda"
+    )
+    if use_triton:
         # Triton path with auto-padding
         block_size0, block_size1 = weight_block_size[0], weight_block_size[1]
         original_shape = data_hp.shape
@@ -231,7 +235,9 @@ def scaled_fp8_blockwise(
                 data_hp, (0, pad_dim1, 0, pad_dim0), mode="constant", value=0
             )
 
-        fp_data, scale = _blockwise_cast_to_fp8_triton_wrapper(data_hp, weight_block_size)
+        fp_data, scale = _blockwise_cast_to_fp8_triton_wrapper(
+            data_hp, weight_block_size
+        )
 
         if pad_dim0 > 0 or pad_dim1 > 0:
             fp_data = fp_data[: original_shape[0], : original_shape[1]].contiguous()
