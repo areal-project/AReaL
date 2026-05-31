@@ -1,1 +1,0 @@
-{"task": "code", "query_id": "0001", "prompt": "", "solutions": [""], "input_output": "{\"inputs\": [\"2\", \"2\", \"2\"], \"outputs\": [\"4\\n\", \"4\\n\", \"4\\n\"], \"fn_name\": \"\", \"remote\": false}", "language": "PYTHON"}

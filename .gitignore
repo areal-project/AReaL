@@ -196,3 +196,4 @@ wandb/
 outputs/
 sympy/
 !/docs/figures/*
+.omo/
