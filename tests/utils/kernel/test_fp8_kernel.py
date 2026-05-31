@@ -8,6 +8,7 @@ import importlib.util
 import os
 import sys
 import types
+from pathlib import Path
 
 import pytest
 import torch
@@ -27,7 +28,7 @@ sys.modules["areal.utils.math"] = math_mod
 
 spec = importlib.util.spec_from_file_location(
     "fp8_kernel",
-    "/F00120250029/lixiang_share/zengziyi_share/zengziyi/Research/Areal_sub/areal/utils/kernel/fp8_kernel.py",
+    str(Path(__file__).parents[3] / "areal" / "utils" / "kernel" / "fp8_kernel.py"),
 )
 fp8_mod = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(fp8_mod)
