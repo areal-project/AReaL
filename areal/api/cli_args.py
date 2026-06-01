@@ -2165,6 +2165,15 @@ class InferenceEngineConfig:
         default=False,
         metadata={"help": "Whether to use LoRA. Should be same as actors LORA option."},
     )
+    lora_name: str = field(
+        default="",
+        metadata={
+            "help": "LoRA adapter name the rollout backend serves. Generation "
+            "requests select the adapter by this name (plus the weight version). "
+            "Usually left empty and auto-filled from gconfig.lora_name by "
+            "PPOConfig.__post_init__ so load and request sides stay in sync."
+        },
+    )
     agent: AgentConfig = field(
         default_factory=lambda: AgentConfig(
             agent_cls_path="areal.experimental.openai.proxy.online_agent._OnlineAgent"
@@ -2930,6 +2939,12 @@ class PPOConfig(BaseExperimentConfig):
         """Validate the eval generation config."""
         if self.eval_gconfig is None:
             self.eval_gconfig = self.gconfig.new()
+        # Propagate the LoRA adapter name to the rollout engine so the OpenAI-proxy
+        # generation path requests the same adapter the trainer loads. The request
+        # side (ArealOpenAI) cannot read gconfig.lora_name, so it must come from
+        # the engine config. Single source of truth: gconfig.lora_name.
+        if self.rollout.use_lora and not self.rollout.lora_name:
+            self.rollout.lora_name = self.gconfig.lora_name
         super().__post_init__()
 
 
