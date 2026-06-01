@@ -576,41 +576,6 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
             kv_store.delete(pair_info.pair_name, weight_key)
             kv_store.delete(pair_info.pair_name, done_key)
 
-    @asynccontextmanager
-    async def _inference_paused(
-        session: aiohttp.ClientSession,
-        inference_urls: list[str],
-        timeout_s: float,
-        pair_name: str,
-    ):
-        await asyncio.gather(
-            *[
-                _post(session, f"{url}/pause_generation", timeout_s, json_data={})
-                for url in inference_urls
-            ]
-        )
-        try:
-            yield
-        finally:
-            try:
-                await asyncio.gather(
-                    *[
-                        _post(
-                            session,
-                            f"{url}/continue_generation",
-                            timeout_s,
-                            json_data={},
-                        )
-                        for url in inference_urls
-                    ]
-                )
-            except Exception:
-                logger.warning(
-                    "Failed to resume inference for pair '%s'",
-                    pair_name,
-                    exc_info=True,
-                )
-
     async def _awex_transfer_weights(
         pair_info: PairInfo,
         version: int,
@@ -702,24 +667,18 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
         start = time.monotonic()
 
         try:
-            async with _inference_paused(
-                session,
-                pair_info.inference_worker_urls,
-                timeout_s,
-                pair_info.pair_name,
-            ):
-                if pair_info.colocate:
-                    await _colocate_transfer_weights(
-                        pair_info, body.version, session, timeout_s
-                    )
-                elif pair_info.mode == "disk":
-                    await _disk_transfer_weights(
-                        pair_info, body.version, session, timeout_s
-                    )
-                else:
-                    await _awex_transfer_weights(
-                        pair_info, body.version, session, timeout_s
-                    )
+            if pair_info.colocate:
+                await _colocate_transfer_weights(
+                    pair_info, body.version, session, timeout_s
+                )
+            elif pair_info.mode == "disk":
+                await _disk_transfer_weights(
+                    pair_info, body.version, session, timeout_s
+                )
+            else:
+                await _awex_transfer_weights(
+                    pair_info, body.version, session, timeout_s
+                )
         except Exception as e:
             duration_ms = (time.monotonic() - start) * 1000
             logger.error(
