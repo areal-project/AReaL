@@ -1,0 +1,174 @@
+# configs for the reward model
+
+# Whether to enable reward model. If False, we compute the reward only with the user-defined reward functions.
+# In GSM8K and Math examples, we disable reward model.
+# For RLHF alignment example using full_hh_rlhf, we utilize reward model to assess the responses.
+# If False, the following parameters are not effective
+enable: False
+
+# Whether to deploy the model to a separate resource pool.
+# If true, n_gpus_per_node & nnodes will be used to determine the resource node.
+enable_resource_pool: False
+n_gpus_per_node: 0
+nnodes: 0
+
+# FSDP strategy: "fsdp" or "fsdp2"
+strategy: ???
+
+# model config for reward scoring
+model:
+
+  # Input tokenizer. If the reward model's chat template is inconsistent with the policy,
+  # we need to first decode to plaintext, then apply the rm's chat_template.
+  # Then score with RM. If chat_templates are consistent, it can be set to null.
+  # set this to null if the chat template is identical
+  input_tokenizer: ${actor_rollout_ref.model.path}
+
+  # RM’s HDFS path or local path. Note that RM only supports AutoModelForSequenceClassification.
+  # Other model types need to define their own RewardModelWorker and pass it from the code.
+  path: ~/models/FsfairX-LLaMA3-RM-v0.1
+
+  # External model implementation (optional)
+  external_lib: ${actor_rollout_ref.model.external_lib}
+
+  # Whether to enable loading a remote code model, default to False
+  trust_remote_code: False
+
+# [Deprecated] Global micro batch size
+# will be deprecated, use micro_batch_size_per_gpu
+micro_batch_size: null
+
+# Local per-GPU micro batch size
+micro_batch_size_per_gpu: null
+
+# Maximum sequence length to process for scoring
+max_length: null
+
+# Whether to dynamically adjust batch size at runtime
+use_dynamic_bsz: ${critic.use_dynamic_bsz}
+
+# Maximum number of tokens per GPU in one forward pass
+forward_max_token_len_per_gpu: ${critic.forward_max_token_len_per_gpu}
+
+# Reward Manager. This defines the mechanism of computing rule-based reward and handling different reward sources.
+# Default is naive. If all verification functions are multiprocessing-safe,
+# the reward manager can be set to prime for parallel verification.
+reward_manager: naive
+
+# Frontend wrapper for reward computation. Supported values:
+# "reward_manager": use the POLARIS-style local wrapper.
+# "reward_manager_with_server": use the server-compatible wrapper.
+# null: fall back to the legacy load_reward_manager behaviour.
+reward_manager_type: reward_manager
+
+# Number of gunicorn workers to launch when using reward_manager_with_server. Null keeps the default.
+reward_manager_server_workers: 64
+
+# Additional configuration dictionary forwarded to the selected reward manager.
+config:
+  # Use "v1" by default
+  version: "v1"
+
+  correct_reward: 1.0
+  incorrect_reward: -1.0
+  format_error_reward: -1.0
+  unk_error_reward: -1.0
+
+  require_think_end: True
+  strip_comma_from_answer: False
+
+  parallel_reward: 0.0
+  parallel_clip_max: 100000
+
+  # only used if version is "v2"
+  parallel_rewardv2: 0.0
+
+  parallel_ratio_reward: 0.0
+  parallel_ratio_reward_factor: 1.0
+  parallel_ratio_clip_max: 1.0
+  parallel_ratio_curve: linear
+
+  acceleration_ratio_reward: 0.
+  acceleration_ratio_reward_factor: 1.0
+  acceleration_ratio_clip_max: 1.0
+  acceleration_ratio_curve: linear
+
+  # Additive grouped parallel bonus weights. The z-score statistics are
+  # computed within each GRPO group by `uid`.
+  subtask_beta: 0.0
+  trial_beta: 0.0
+  parallel_ratio_beta: 0.0
+  latency_alpha: 0.0
+  group_shaping_eps: 1.0e-8
+
+  parallel_format_error_reward_enabled: False
+  parallel_format_error_reward: -1.0
+  parallel_format_error_v2_reward_enabled: False
+  parallel_format_error_v2_reward: -1.0
+  parallel_format_error_v2_allow_nonempty_whitespace: False
+  parallel_format_error_v2_skip_conclusion_check: False
+
+  allow_immediate_stop: False
+
+  treat_no_parallel_as_format_error: null
+
+  second_reward_type: none
+
+  verbose: 0
+
+  # Length penalty (batch/group-wise) — disabled by default
+  # If enabled, for each group G in a batch, compute Acc_G (mean correctness)
+  # and activate a dynamic penalty only when Acc_G >= tau:
+  #   alpha = 0                            if Acc_G < tau
+  #           beta * (Acc_G - tau + eps) / (1 - tau + eps) otherwise
+  # For each sample i in G, with response length L_i and
+  # L_correct_shortest = min length among correct samples in G,
+  # compute overlong ratio: O_i = clip((L_i - L_correct_shortest)/L_window, 0, 1)
+  # and subtract alpha * O_i from the base reward (returned by the reward server).
+  length_penalty_enabled: False
+  length_penalty_tau: 0.8             # tau in [0,1]
+  length_penalty_beta: 0.2            # scales the maximum penalty
+  length_penalty_epsilon: 1.0e-6      # numerical stability
+  length_penalty_window: 10000.0        # L_window (tokens)
+  length_penalty_length_metric: num_tokens_in_the_longest_thread
+
+# Whether to launch custom reward function asynchronously during log_prob
+# custom reward function executed async on CPU, during log_prob
+launch_reward_fn_async: False
+
+# Cloud/local sandbox fusion configuration for custom reward logic
+sandbox_fusion:
+
+  # Cloud /local function URL for sandbox execution
+  url: null
+
+  # Max concurrent requests allowed to sandbox
+  max_concurrent: 64
+
+  # Max memory limit for each sandbox process in MB
+  memory_limit_mb: 1024
+
+# profile the reward model in `compute_reward` 
+profiler:
+
+  # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
+  _target_: verl.utils.profiler.ProfilerConfig
+
+  # profiler tool, default same as profiler.tool in global config
+  # choices: nsys, npu, torch
+  tool: ${oc.select:global_profiler.tool,null}
+
+  # whether enable profile on ref
+  enable: False
+  
+  # Whether to profile all ranks.
+  all_ranks: False
+
+  # The ranks that will be profiled. [] or [0,1,...]
+  ranks: []
+
+  # profile results saving path
+  save_path: ${oc.select:global_profiler.save_path,null}
+
+  # specific tool config
+  tool_config: ${oc.select:actor_rollout_ref.actor.profiler.tool_config,null}
