@@ -1833,8 +1833,6 @@ class SGLangConfig:
     dtype: str = "bfloat16"
     kv_cache_dtype: str = "auto"
     quantization: str = ""
-    quantization_config: dict | None = None
-    model_override: dict | None = None
     dp_size: int = 1  # only used for dp attention
     ep_size: int = 1
     # lora
@@ -1918,29 +1916,21 @@ class SGLangConfig:
         args.pop("enable_multithread_load", None)
 
         quantization = args.pop("quantization", "")
-        quant_config = args.pop("quantization_config", None)
-        model_override = args.pop("model_override", None)
         if quantization == "fp8":
             args["quantization"] = "fp8"
-            if quant_config is None:
-                quant_config = {
-                    "quant_method": "fp8",
-                    "activation_scheme": "dynamic",
-                    "weight_block_size": [128, 128],
-                }
-            if model_override is None:
-                model_override = {"quantization_config": quant_config}
-            elif "quantization_config" not in model_override:
-                model_override["quantization_config"] = quant_config
+            args["json_model_override_args"] = json.dumps(
+                {
+                    "quantization_config": {
+                        "quant_method": "fp8",
+                        "activation_scheme": "dynamic",
+                        "weight_block_size": [128, 128],
+                    }
+                },
+                separators=(",", ":"),
+            )
         elif quantization:
             raise ValueError(
                 f"SGLangConfig.quantization must be 'fp8' or empty, got {quantization!r}"
-            )
-
-        if model_override is not None:
-            args["json_model_override_args"] = json.dumps(
-                model_override,
-                separators=(",", ":"),
             )
 
         args = dict(
