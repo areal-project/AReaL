@@ -1735,6 +1735,8 @@ class vLLMConfig:
     )
     enable_sleep_mode: bool = False
     uvicorn_log_level: str = "warning"
+    # GDN prefill backend for hybrid models like Qwen3.5; "triton" or "flashinfer".
+    gdn_prefill_backend: str | None = None
     # lora
     enable_lora: bool = False
     max_lora_rank: int = 16  # vllm's default

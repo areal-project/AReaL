@@ -653,6 +653,7 @@ https://docs.vllm.ai/en/stable/api/index.html for detailed documentation.
 | `worker_extension_cls`         | string                 | `"areal.engine.vllm_ext.vllm_worker_extension.VLLMWorkerExtension"` | -           |
 | `enable_sleep_mode`            | boolean                | `False`                                                             | -           |
 | `uvicorn_log_level`            | string                 | `"warning"`                                                         | -           |
+| `gdn_prefill_backend`          | string \| None         | `None`                                                              | -           |
 | `enable_lora`                  | boolean                | `False`                                                             | -           |
 | `max_lora_rank`                | integer                | `16`                                                                | -           |
 | `max_loras`                    | integer                | `8`                                                                 | -           |
