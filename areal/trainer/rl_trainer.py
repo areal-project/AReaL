@@ -1113,10 +1113,9 @@ class PPOTrainer:
                 name="critic",
             )
         # Async mode: synchronization handled by AsyncCheckpointManager
-        if not self.saver.is_async:
+        if not self.saver.is_async and not is_single_controller():
             dist.barrier(group=self.actor.cpu_group)
-            if not is_single_controller():
-                current_platform.synchronize()
+            current_platform.synchronize()
 
     def _save_recover_checkpoint(self, epoch: int, epoch_step: int, global_step: int):
         # Save recoverable checkpoints
@@ -1140,8 +1139,8 @@ class PPOTrainer:
             processor=self.processor,
         )
 
-        dist.barrier(group=self.actor.cpu_group)
         if not is_single_controller():
+            dist.barrier(group=self.actor.cpu_group)
             current_platform.synchronize()
 
     def _evaluate_fn(
@@ -1163,8 +1162,8 @@ class PPOTrainer:
                     cnt += 1
             self.eval_rollout.wait(cnt, timeout=None)
 
-        dist.barrier(group=self.actor.cpu_group)
         if not is_single_controller():
+            dist.barrier(group=self.actor.cpu_group)
             current_platform.synchronize()
 
     def _evaluate(
@@ -1191,8 +1190,8 @@ class PPOTrainer:
             epoch_step,
             global_step,
         )
-        dist.barrier(group=self.actor.cpu_group)
         if not is_single_controller():
+            dist.barrier(group=self.actor.cpu_group)
             current_platform.synchronize()
 
     def _export_and_commit_stats(self, epoch: int, epoch_step: int, global_step: int):
@@ -1203,8 +1202,8 @@ class PPOTrainer:
             stats.update(self.eval_rollout.export_stats())
         self.stats_logger.commit(epoch, epoch_step, global_step, stats)
 
-        dist.barrier(group=self.actor.cpu_group)
         if not is_single_controller():
+            dist.barrier(group=self.actor.cpu_group)
             current_platform.synchronize()
 
     def _validate_cfg(self):
