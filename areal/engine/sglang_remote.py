@@ -143,6 +143,23 @@ class SGLangBackend:
                     payload={"lora_name": lora_name, "lora_path": str(meta.path)},
                 )
             ]
+            # Unload the version that has fallen outside the retention window so
+            # sglang does not accumulate one adapter per train step (which leaks
+            # VRAM and eventually hangs). Kept versions cover off-policy rollouts
+            # (max_head_offpolicyness). Best-effort: the stale adapter may have
+            # already been evicted or never loaded.
+            keep = meta.lora_keep_versions
+            if keep > 0 and meta.version - keep >= 0:
+                stale_name = get_versioned_lora_name(
+                    meta.lora_name, meta.version - keep
+                )
+                requests.append(
+                    HttpRequest(
+                        endpoint="/unload_lora_adapter",
+                        payload={"lora_name": stale_name},
+                        best_effort=True,
+                    )
+                )
             return WeightUpdateRequests(requests=requests)
         else:
             # Full model update
