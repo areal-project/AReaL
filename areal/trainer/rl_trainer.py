@@ -156,7 +156,7 @@ class PPOTrainer:
         if self._online_mode and config.valid_dataset is not None:
             raise ValueError(
                 "valid_dataset must not be set when using online RL mode "
-                "(openai.mode='online'). Online mode does not support "
+                "(agent.mode='online'). Online mode does not support "
                 "validation datasets."
             )
 
@@ -164,7 +164,7 @@ class PPOTrainer:
         if not self._online_mode and train_dataset is None:
             raise ValueError(
                 "train_dataset must be provided unless using online RL mode "
-                "(openai.mode='online')."
+                "(agent.mode='online')."
             )
 
         # Create models: actor, critic, ref — each with its own allocation.
@@ -324,7 +324,18 @@ class PPOTrainer:
         self._proxy_started = False
 
         # Prepare weight update meta and connect to inference engine
-        if self.config.actor.weight_update_mode == "disk":
+        if self.config.actor._version == "v2":
+            awex_kwargs: dict[str, Any] = {}
+            if config.actor.use_lora:
+                awex_kwargs.update(
+                    {
+                        "use_lora": config.actor.use_lora,
+                        "lora_name": config.gconfig.lora_name,
+                        "base_model_name": config.actor.path,
+                    }
+                )
+            self.weight_update_meta = WeightUpdateMeta.from_awex(**awex_kwargs)
+        elif self.config.actor.weight_update_mode == "disk":
             disk_kwargs = {
                 "experiment_name": config.experiment_name,
                 "trial_name": config.trial_name,
@@ -1169,7 +1180,7 @@ class PPOTrainer:
                 name="critic",
             )
         # Async mode: synchronization handled by AsyncCheckpointManager
-        if not self.saver.is_async:
+        if not self.saver.is_async and not is_single_controller():
             dist.barrier(group=self.actor.cpu_group)
             current_platform.synchronize()
 
@@ -1195,8 +1206,9 @@ class PPOTrainer:
             processor=self.processor,
         )
 
-        dist.barrier(group=self.actor.cpu_group)
-        current_platform.synchronize()
+        if not is_single_controller():
+            dist.barrier(group=self.actor.cpu_group)
+            current_platform.synchronize()
 
     def _evaluate_fn(
         self,
@@ -1217,8 +1229,9 @@ class PPOTrainer:
                     cnt += 1
             self.eval_rollout.wait(cnt, timeout=None)
 
-        dist.barrier(group=self.actor.cpu_group)
-        current_platform.synchronize()
+        if not is_single_controller():
+            dist.barrier(group=self.actor.cpu_group)
+            current_platform.synchronize()
 
     def _evaluate(
         self,
@@ -1244,8 +1257,9 @@ class PPOTrainer:
             epoch_step,
             global_step,
         )
-        dist.barrier(group=self.actor.cpu_group)
-        current_platform.synchronize()
+        if not is_single_controller():
+            dist.barrier(group=self.actor.cpu_group)
+            current_platform.synchronize()
 
     def _export_and_commit_stats(self, epoch: int, epoch_step: int, global_step: int):
         # Upload statistics to the logger (e.g., wandb)
@@ -1255,8 +1269,9 @@ class PPOTrainer:
             stats.update(self.eval_rollout.export_stats())
         self.stats_logger.commit(epoch, epoch_step, global_step, stats)
 
-        dist.barrier(group=self.actor.cpu_group)
-        current_platform.synchronize()
+        if not is_single_controller():
+            dist.barrier(group=self.actor.cpu_group)
+            current_platform.synchronize()
 
     def _validate_cfg(self):
         """validate config for incompatible settings before weight initialization, to avoid wasted resources on spawning workers and loading models."""
@@ -1301,6 +1316,15 @@ class PPOTrainer:
                 "Megatron actor with LoRA is not supported with SGLang rollout in "
                 "RL trainer. Please use vLLM rollout backend, or disable LoRA, or "
                 "switch actor backend from Megatron."
+            )
+
+        # Ensure actor and rollout controller versions match.
+        actor_version = self.config.actor._version
+        rollout_version = self.config.rollout._version
+        if actor_version != rollout_version:
+            raise ValueError(
+                f"actor._version ('{actor_version}') and rollout._version "
+                f"('{rollout_version}') must match. Both must be 'v1' or both 'v2'."
             )
 
     def _requires_proxy_workflow(self, workflow: WorkflowLike | None) -> bool:
@@ -1366,8 +1390,11 @@ class PPOTrainer:
         if self.config.scheduler.type == "ray":
             raise NotImplementedError("Proxy workers not supported with RayScheduler")
 
-        assert isinstance(self.rollout, RolloutController)
+        if not isinstance(self.rollout, RolloutController):
+            self._proxy_started = True
+            return
 
+        # v1 controller needs an explicit proxy launch call
         logger.info("Initializing proxy workers for AgentWorkflow support")
         self.rollout.start_proxy()
         if self.eval_rollout is not None:

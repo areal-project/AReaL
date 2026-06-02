@@ -537,9 +537,13 @@ class RemotevLLMEngine(InferenceEngine):
         return stats_tracker.export_all(reduce_group=None)
 
     @classmethod
-    def as_controller(
-        cls, config: InferenceEngineConfig, scheduler: Scheduler
-    ) -> RolloutController:
+    def as_controller(cls, config: InferenceEngineConfig, scheduler: Scheduler):
+        if config._version == "v2":
+            from areal.experimental.inference_service.controller.controller import (
+                RolloutControllerV2,
+            )
+
+            return RolloutControllerV2(config=config, scheduler=scheduler)
         return RolloutController(cls, config=config, scheduler=scheduler)
 
     def clear_batches(self, shard_ids: list[str]) -> None:
