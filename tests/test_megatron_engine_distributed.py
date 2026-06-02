@@ -264,3 +264,71 @@ def test_qwen3_5_hf_save_load(tmp_path_factory):
         test_type="train_hf_save_load",
         output=str(output),
     )
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Qwen3.5 MoE tests. Same GDN hybrid attention as dense Qwen3.5 (routed through
+# bridge_type=megatron-bridge + use_padded_seq via the runner's override maps),
+# plus a Mixture-of-Experts FFN exercised with expert parallelism.
+#
+# Parallelism constraints for this model:
+#   * Context parallel is unavailable for the Qwen3.5 series (GDN/SSM layers
+#     reject packed sequences; see Megatron-LM #4043 and the VLM-CP guard).
+#   * The full-attention layers have num_query_groups=2, so TP <= 2.
+#   * Ranks are therefore filled with PP (and DP, for the optimizer), at EP=2.
+#
+# The 35B-A3B forward skips the megatron-vs-FSDP comparison (a full FSDP replica
+# cannot co-reside with the megatron model, even at 8x80GB; the megatron weights
+# are not cheaply freeable mid-test) -- see _MODEL_SKIP_FSDP_COMPARE in the
+# runner. Conversion correctness is instead covered by the save/load round-trip.
+# ──────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.multi_gpu
+@pytest.mark.slow
+def test_qwen3_5_moe_expert_parallel(tmp_path_factory):
+    """Qwen3.5-MoE megatron forward under PP=2 / TP=2 / EP=2.
+
+    The MoE analog of ``test_qwen3moe_expert_parallel``. CP is unavailable for
+    the GDN layers and the full-attention layers cap TP at 2, so the 4 ranks are
+    filled with PP=2 and experts run at EP=2. The megatron-vs-FSDP cross-check is
+    skipped for this model (see ``_MODEL_SKIP_FSDP_COMPARE``) because a 35B-A3B
+    FSDP replica cannot co-reside with the megatron model. This validates engine
+    init + GDN BSHD forward + cross-rank logprob consistency; weight-conversion
+    correctness is covered by ``test_qwen3_5_moe_hf_save_load``.
+    """
+    if current_platform.device_count() < 4:
+        pytest.skip("Qwen3.5 MoE expert parallel requires 4 GPUs to run")
+    output = tmp_path_factory.mktemp("test_output") / "qwen3_5_moe_expert_parallel.out"
+    _run_test_with_torchrun(
+        "qwen3_5_moe",
+        "megatron:(attn:d1p2t2|ffn:d1p2t1e2)",
+        test_type="forward",
+        output=str(output),
+    )
+
+
+@pytest.mark.multi_gpu
+@pytest.mark.slow
+def test_qwen3_5_moe_hf_save_load(tmp_path_factory):
+    """HF save/load round-trip for Qwen3.5-MoE under PP=2 / TP=2 / EP=2.
+
+    Validates the megatron-bridge conversion of MoE expert weights
+    (TEGroupedLinear ``weight0..N`` + GLU ``linear_fc1`` stride-2 de-interleave)
+    across a save -> zero -> load -> compare cycle. Uses HF safetensors (not
+    mcore DCP) because dist_checkpointing does not support SSM/GDN
+    ``flattened_range`` tensors yet. The train step is skipped for this model
+    (see ``_MODEL_SAVELOAD_SKIP_TRAIN`` in the runner) because a 35B-A3B
+    optimizer state does not fit; the loaded HF weights are already non-trivial,
+    so the round-trip still exercises expert-weight conversion. No optimizer
+    means it fits on 4 GPUs.
+    """
+    if current_platform.device_count() < 4:
+        pytest.skip("Qwen3.5 MoE HF save load requires 4 GPUs to run")
+    output = tmp_path_factory.mktemp("test_output") / "qwen3_5_moe_hf_save_load.out"
+    _run_test_with_torchrun(
+        "qwen3_5_moe",
+        "megatron:(attn:d1p2t2|ffn:d1p2t1e2)",
+        test_type="train_hf_save_load",
+        output=str(output),
+    )

@@ -30,17 +30,40 @@ MODEL_PATHS = {
     "qwen3": DENSE_MODEL_PATHS["qwen3"],
     "qwen3moe": MOE_MODEL_PATHS["qwen3_moe"],
     "qwen3_5": DENSE_MODEL_PATHS["qwen3_5"],
+    "qwen3_5_moe": MOE_MODEL_PATHS["qwen3_5_moe"],
 }
 
 # bridge_type must default to mbridge for backwards compat with existing
-# qwen3/qwen3moe tests; qwen3_5 is forced to megatron-bridge because that's
-# the only bridge that handles its GDN hybrid attention layers.
-_MODEL_BRIDGE_OVERRIDES = {"qwen3_5": "megatron-bridge"}
+# qwen3/qwen3moe tests; the qwen3_5 family (dense + MoE) is forced to
+# megatron-bridge because that's the only bridge that handles its GDN hybrid
+# attention layers.
+_MODEL_BRIDGE_OVERRIDES = {
+    "qwen3_5": "megatron-bridge",
+    "qwen3_5_moe": "megatron-bridge",
+}
 
 # Models whose GDN/SSM kernels reject packed (THD) inputs must run forward
 # on padded [B, S] BSHD tensors. The engine reconstructs the 2D form
-# internally from cu_seqlens; no caller-side input change needed.
-_MODEL_PADDED_SEQ_OVERRIDES = {"qwen3_5": True}
+# internally from cu_seqlens; no caller-side input change needed. Both the
+# dense and MoE qwen3_5 variants share the GDN attention layers.
+_MODEL_PADDED_SEQ_OVERRIDES = {"qwen3_5": True, "qwen3_5_moe": True}
+
+# Models large enough that a full-AdamW optimizer state does not fit even when
+# sharded (Qwen3.5-35B-A3B's optimizer state is ~420GB, exceeding 8x80GB with
+# params/grads/activations) skip the train step in the HF save/load round-trip.
+# The loaded HF weights are already non-trivial, so save -> zero -> load ->
+# compare still validates bridge weight conversion (incl. MoE experts) without
+# an optimizer.
+_MODEL_SAVELOAD_SKIP_TRAIN = {"qwen3_5_moe": True}
+
+# Models whose memory footprint is too large to co-locate a full FSDP replica
+# alongside the megatron model on the same GPUs skip the megatron-vs-FSDP
+# forward comparison (the megatron forward + cross-rank logprob consistency are
+# still validated). Qwen3.5-35B-A3B cannot fit both even at 8x80GB, and the
+# megatron weights cannot be cheaply freed mid-test (held by the bridge / mpu /
+# DDP grad buffers). Bridge-conversion correctness for these is covered by the
+# hf_save_load round-trip test, which only holds one model.
+_MODEL_SKIP_FSDP_COMPARE = {"qwen3_5_moe": True}
 
 
 def write_result(out: str, succ: bool):
@@ -164,39 +187,53 @@ def test_forward(
     )
     assert is_equal, "Logprobs should be the same across all model parallel ranks."
 
-    # make FSDP engine, and check if the difference between FSDP and megatron engine
-    fsdp_engine = make_fsdp_engine(model_type, alloc_mode, mb_spec)
-    fsdp_logprobs = fsdp_engine.forward(
-        input_=input_,
-        aggregate_fn=lambda xs: torch.cat(xs, dim=0),
-    )
-    print(
-        f"rank {rank} logprobs.shape={logprobs.shape} fsdp_logprobs.shape={fsdp_logprobs.shape}"
-    )
-    # only compare results on data parallel head
     failed = False
-    if engine.is_data_parallel_head():
-        diff = torch.abs(logprobs - fsdp_logprobs)
+    if _MODEL_SKIP_FSDP_COMPARE.get(model_type, False):
+        # Models too large to co-locate a full FSDP replica (see
+        # _MODEL_SKIP_FSDP_COMPARE) skip the megatron-vs-FSDP cross-check. The
+        # megatron forward + cross-rank logprob consistency above are the
+        # validation here; bridge-conversion correctness is covered separately by
+        # the hf_save_load round-trip test.
         print(
-            f"rank {rank} diff between megatron and fsdp logprobs: {diff}, max(diff)={torch.max(diff)} avg(diff)={torch.mean(diff)}"
+            f"rank {rank} skipping megatron-vs-FSDP comparison for {model_type} "
+            "(too large to co-reside with an FSDP replica)."
         )
-
-        cosine_sim = torch.nn.functional.cosine_similarity(
-            logprobs.flatten().to(torch.float32),
-            fsdp_logprobs.flatten().to(torch.float32),
-            dim=0,
+        current_platform.synchronize()
+        dist.barrier()
+        engine.destroy()
+    else:
+        # make FSDP engine, and check the difference between FSDP and megatron engine
+        fsdp_engine = make_fsdp_engine(model_type, alloc_mode, mb_spec)
+        fsdp_logprobs = fsdp_engine.forward(
+            input_=input_,
+            aggregate_fn=lambda xs: torch.cat(xs, dim=0),
         )
-        print(f"Cosine Similarity: {cosine_sim.item()}")
-
-        if cosine_sim < 0.99:
-            raise AssertionError(
-                f"Cosine similarity {cosine_sim.item()} is less than 0.99"
+        print(
+            f"rank {rank} logprobs.shape={logprobs.shape} fsdp_logprobs.shape={fsdp_logprobs.shape}"
+        )
+        # only compare results on data parallel head
+        if engine.is_data_parallel_head():
+            diff = torch.abs(logprobs - fsdp_logprobs)
+            print(
+                f"rank {rank} diff between megatron and fsdp logprobs: {diff}, max(diff)={torch.max(diff)} avg(diff)={torch.mean(diff)}"
             )
 
-    current_platform.synchronize()
-    dist.barrier()
-    fsdp_engine.destroy()
-    engine.destroy()
+            cosine_sim = torch.nn.functional.cosine_similarity(
+                logprobs.flatten().to(torch.float32),
+                fsdp_logprobs.flatten().to(torch.float32),
+                dim=0,
+            )
+            print(f"Cosine Similarity: {cosine_sim.item()}")
+
+            if cosine_sim < 0.99:
+                raise AssertionError(
+                    f"Cosine similarity {cosine_sim.item()} is less than 0.99"
+                )
+
+        current_platform.synchronize()
+        dist.barrier()
+        fsdp_engine.destroy()
+        engine.destroy()
 
     print(f"Test: test_forward(model_type={model_type}, alloc_mode={alloc_mode}) Done.")
     if rank == 0 and output is not None:
@@ -522,30 +559,37 @@ def test_train_hf_save_load(
 
     tokenizer = AutoTokenizer.from_pretrained(MODEL_PATHS[model_type])
 
+    skip_train = _MODEL_SAVELOAD_SKIP_TRAIN.get(model_type, False)
     mb_spec = MicroBatchSpec(max_tokens_per_mb=256)
     engine = make_engine(
-        model_type, alloc_mode, mb_spec, init_optimizer=True, vpp_size=vpp_size
+        model_type,
+        alloc_mode,
+        mb_spec,
+        init_optimizer=not skip_train,
+        vpp_size=vpp_size,
     )
 
     seeding.set_random_seed(0, key=f"trainer{rank}")
 
-    input_ = mock_input(batch_size=16, max_seqlen=128, device=engine.device)
-    bcasted_input = broadcast_tensor_container(
-        input_,
-        src_rank=engine.current_data_parallel_head(),
-        group=engine.context_and_model_parallel_group,
-    )
-
-    # train step — exercises forward + backward + optimizer with BSHD
-    train_result = engine.train_batch(
-        input_=bcasted_input,
-        loss_fn=mock_loss_fn,
-        loss_weight_fn=lambda x: x["cu_seqlens"][-1],
-    )
-    print(f"rank {rank} train_result: {train_result}")
-
-    current_platform.synchronize()
-    dist.barrier()
+    if not skip_train:
+        # train step — exercises forward + backward + optimizer with BSHD so the
+        # saved weights differ from the on-disk checkpoint. Skipped for models too
+        # large to hold an optimizer (see _MODEL_SAVELOAD_SKIP_TRAIN); the loaded
+        # HF weights are already non-trivial, so the round-trip stays meaningful.
+        input_ = mock_input(batch_size=16, max_seqlen=128, device=engine.device)
+        bcasted_input = broadcast_tensor_container(
+            input_,
+            src_rank=engine.current_data_parallel_head(),
+            group=engine.context_and_model_parallel_group,
+        )
+        train_result = engine.train_batch(
+            input_=bcasted_input,
+            loss_fn=mock_loss_fn,
+            loss_weight_fn=lambda x: x["cu_seqlens"][-1],
+        )
+        print(f"rank {rank} train_result: {train_result}")
+        current_platform.synchronize()
+        dist.barrier()
 
     # snapshot post-train weights
     with torch.no_grad():
@@ -609,7 +653,7 @@ def main():
     parser.add_argument(
         "--model_type",
         type=str,
-        choices=["qwen3", "qwen3moe", "qwen3_5"],
+        choices=["qwen3", "qwen3moe", "qwen3_5", "qwen3_5_moe"],
         default="qwen3",
         help="Type of model to test",
     )
