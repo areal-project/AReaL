@@ -14,7 +14,7 @@ from areal.utils import logging
 from areal.utils.dynamic_import import import_from_string
 
 from ..protocol import QueueMode
-from ..types import AgentRequest, AgentResponse, AgentRunnable
+from ..types import AgentRequest, AgentResponse, AgentRunnable, TrainingContext
 
 logger = logging.getLogger("AgentWorker")
 
@@ -50,6 +50,44 @@ def create_worker_app(
 
     @app.get("/health")
     async def health():
+        return {"status": "ok"}
+
+    @app.post("/session/{session_key}/episode/start")
+    async def episode_start(session_key: str, body: dict[str, Any]):
+        hook = getattr(agent, "on_episode_start", None)
+        if hook is None:
+            return {"status": "noop"}
+        ctx = TrainingContext(
+            session_id=body.get("session_id", session_key),
+            llm_base_url=body.get("llm_base_url", ""),
+            llm_api_key=body.get("llm_api_key", ""),
+            llm_model=body.get("llm_model", ""),
+            extras=body.get("extras", {}),
+        )
+        try:
+            await hook(session_key, ctx)
+        except Exception as exc:
+            logger.exception("on_episode_start failed (session=%s)", session_key)
+            return JSONResponse(
+                {"error": {"message": str(exc), "type": type(exc).__name__}},
+                status_code=500,
+            )
+        return {"status": "ok"}
+
+    @app.post("/session/{session_key}/episode/end")
+    async def episode_end(session_key: str, body: dict[str, Any]):
+        hook = getattr(agent, "on_episode_end", None)
+        if hook is None:
+            return {"status": "noop"}
+        reward = body.get("reward")
+        try:
+            await hook(session_key, reward)
+        except Exception as exc:
+            logger.exception("on_episode_end failed (session=%s)", session_key)
+            return JSONResponse(
+                {"error": {"message": str(exc), "type": type(exc).__name__}},
+                status_code=500,
+            )
         return {"status": "ok"}
 
     @app.post("/session/{session_key}/close")
