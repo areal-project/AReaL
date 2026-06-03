@@ -60,6 +60,7 @@ from areal.engine.core.model import (
     disable_dropout_in_model,
     is_valid_vision_model,
     lang_config,
+    requires_padded_seq,
 )
 from areal.engine.megatron_utils import megatron_bridge_patches  # noqa: F401
 from areal.engine.megatron_utils.checkpointer import MegatronCheckpointManager
@@ -347,6 +348,10 @@ class MegatronEngine(TrainEngine):
             )
 
             self.is_vision_model = is_valid_vision_model(self.hf_config.model_type)
+            # GDN/SSM models (e.g. Qwen3.5) reject packed THD input and must run
+            # the padded BSHD forward. Derived from model type rather than a
+            # config flag so the layout can't be mis-set.
+            self.use_padded_seq = requires_padded_seq(self.hf_config.model_type)
             if self.is_vision_model:
                 if self.parallel_strategy.context_parallel_size > 1:
                     raise NotImplementedError(
@@ -362,14 +367,12 @@ class MegatronEngine(TrainEngine):
                     f"Loaded processor and tokenizer."
                 )
 
-            if (
-                self.mcore_config.use_padded_seq
-                and self.parallel_strategy.context_parallel_size > 1
-            ):
+            if self.use_padded_seq and self.parallel_strategy.context_parallel_size > 1:
                 raise NotImplementedError(
-                    "Context parallel (CP > 1) is not supported with "
-                    "use_padded_seq=True (the padded BSHD path operates on "
-                    "[B, S] tensors and the CP path packs sequences). "
+                    f"Context parallel (CP > 1) is not supported for "
+                    f"model_type={self.hf_config.model_type!r}, which requires the "
+                    "padded BSHD forward (it operates on [B, S] tensors while the "
+                    "CP path packs sequences). "
                     f"Got context_parallel_size={self.parallel_strategy.context_parallel_size}."
                 )
 
@@ -379,6 +382,24 @@ class MegatronEngine(TrainEngine):
 
             self._check_and_apply_fp8_config()
             self._validate_fp8_consistency()
+
+            # Warn once if bridge-delegated weight sync was requested but a
+            # fallback condition forces the registry conversion path (the
+            # dispatch in _update_weights_from_distributed silently falls back).
+            if self.mcore_config.use_bridge_for_update_weights:
+                fallback_reasons = []
+                if self.bridge_cls != "megatron-bridge":
+                    fallback_reasons.append(f"bridge_type={self.bridge_cls!r}")
+                if self.quantization_config:
+                    fallback_reasons.append("FP8/quantized training")
+                if self.config.use_lora:
+                    fallback_reasons.append("LoRA enabled")
+                if fallback_reasons:
+                    self.logger.warning(
+                        "use_bridge_for_update_weights=True, but live weight sync "
+                        "will use the registry conversion path instead because: "
+                        f"{', '.join(fallback_reasons)}."
+                    )
 
             with self.device:
                 models = make_mcore_model(
@@ -856,7 +877,7 @@ class MegatronEngine(TrainEngine):
                 mb_input.padded_mb,
                 gather_cp_output=not cp_local,
                 is_vision_model=self.is_vision_model,
-                use_padded_seq=self.mcore_config.use_padded_seq,
+                use_padded_seq=self.use_padded_seq,
             )
 
             # Release tree attention metadata after forward pass

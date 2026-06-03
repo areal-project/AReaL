@@ -79,7 +79,6 @@ actor:
     std_level: batch
   megatron:
     bridge_type: megatron-bridge
-    use_padded_seq: true # required for GDN forward
     use_bridge_for_update_weights: true # for live weight sync
   max_new_tokens: ${gconfig.max_new_tokens}
   scheduling_spec:

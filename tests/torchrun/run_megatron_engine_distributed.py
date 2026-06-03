@@ -42,12 +42,6 @@ _MODEL_BRIDGE_OVERRIDES = {
     "qwen3_5_moe": "megatron-bridge",
 }
 
-# Models whose GDN/SSM kernels reject packed (THD) inputs must run forward
-# on padded [B, S] BSHD tensors. The engine reconstructs the 2D form
-# internally from cu_seqlens; no caller-side input change needed. Both the
-# dense and MoE qwen3_5 variants share the GDN attention layers.
-_MODEL_PADDED_SEQ_OVERRIDES = {"qwen3_5": True, "qwen3_5_moe": True}
-
 # Models large enough that a full-AdamW optimizer state does not fit even when
 # sharded (Qwen3.5-35B-A3B's optimizer state is ~420GB, exceeding 8x80GB with
 # params/grads/activations) skip the train step in the HF save/load round-trip.
@@ -106,7 +100,6 @@ def mock_input(
 
 def make_engine(model_type, backend, mb_spec, vpp_size=1, init_optimizer=False):
     bridge_type = _MODEL_BRIDGE_OVERRIDES.get(model_type, "mbridge")
-    use_padded_seq = _MODEL_PADDED_SEQ_OVERRIDES.get(model_type, False)
     config = TrainEngineConfig(
         backend=backend,
         experiment_name="test",
@@ -117,7 +110,6 @@ def make_engine(model_type, backend, mb_spec, vpp_size=1, init_optimizer=False):
         megatron=MegatronEngineConfig(
             virtual_pipeline_parallel_size=vpp_size,
             bridge_type=bridge_type,
-            use_padded_seq=use_padded_seq,
         ),
     )
     alloc_mode = ModelAllocation.from_str(backend)

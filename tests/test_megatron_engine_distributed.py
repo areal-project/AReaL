@@ -222,7 +222,7 @@ def test_qwen3_5_virtual_pipeline_parallel(tmp_path_factory):
 @pytest.mark.multi_gpu
 @pytest.mark.slow
 @pytest.mark.skip(
-    reason="BSHD mode (use_padded_seq) lacks microbatch invariance: padding "
+    reason="BSHD mode (padded forward) lacks microbatch invariance: padding "
     "changes per MB boundary cause small grad_norm drift. verl sidesteps "
     "this by setting ppo_micro_batch_size_per_gpu=1 (1 seq/MB, no padding "
     "diff). See run_qwen3_5_35b_megatron.sh for the recommended config."
@@ -268,8 +268,9 @@ def test_qwen3_5_hf_save_load(tmp_path_factory):
 
 # ──────────────────────────────────────────────────────────────────────
 # Qwen3.5 MoE tests. Same GDN hybrid attention as dense Qwen3.5 (routed through
-# bridge_type=megatron-bridge + use_padded_seq via the runner's override maps),
-# plus a Mixture-of-Experts FFN exercised with expert parallelism.
+# bridge_type=megatron-bridge via the runner's override map; the padded BSHD
+# forward is auto-derived from model_type), plus a Mixture-of-Experts FFN
+# exercised with expert parallelism.
 #
 # Parallelism constraints for this model:
 #   * Context parallel is unavailable for the Qwen3.5 series (GDN/SSM layers
