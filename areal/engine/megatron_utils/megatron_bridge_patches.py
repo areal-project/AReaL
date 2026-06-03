@@ -2,8 +2,10 @@
 
 """Runtime patches for megatron-bridge bugs not yet in a released version.
 
-Each patch is keyed to an upstream PR and is auto-disabled once megatron-bridge
-ships a release containing the fix. Apply patches at import time via
+Each patch is keyed to an upstream PR. Patches are not version-gated; instead
+each one's hot path becomes a no-op once the upstream fix is present (the patch
+checks for the missing attribute/behavior before acting), and an idempotency
+sentinel prevents double-application. Apply patches at import time via
 ``_apply_patches_on_import()`` at module bottom.
 """
 

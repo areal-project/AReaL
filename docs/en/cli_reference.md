@@ -634,30 +634,30 @@ Configuration for vLLM runtime. Refer to:
 
 https://docs.vllm.ai/en/stable/api/index.html for detailed documentation.
 
-| Parameter                      | Type                   | Default                                                             | Description |
-| ------------------------------ | ---------------------- | ------------------------------------------------------------------- | ----------- |
-| `model`                        | string                 | `""`                                                                | -           |
-| `seed`                         | integer                | `1`                                                                 | -           |
-| `skip_tokenizer_init`          | boolean                | `False`                                                             | -           |
-| `enforce_eager`                | boolean                | `False`                                                             | -           |
-| `dtype`                        | string                 | `"bfloat16"`                                                        | -           |
-| `distributed_executor_backend` | string                 | `"mp"`                                                              | -           |
-| `max_num_seqs`                 | integer                | `256`                                                               | -           |
-| `block_size`                   | integer                | `16`                                                                | -           |
-| `cpu_offload_gb`               | float                  | `0`                                                                 | -           |
-| `disable_sliding_window`       | boolean                | `True`                                                              | -           |
-| `max_model_len`                | integer \| None        | `32768`                                                             | -           |
-| `no_enable_chunked_prefill`    | boolean                | `False`                                                             | -           |
-| `no_enable_prefix_caching`     | boolean                | `True`                                                              | -           |
-| `gpu_memory_utilization`       | float                  | `0.9`                                                               | -           |
-| `worker_extension_cls`         | string                 | `"areal.engine.vllm_ext.vllm_worker_extension.VLLMWorkerExtension"` | -           |
-| `enable_sleep_mode`            | boolean                | `False`                                                             | -           |
-| `uvicorn_log_level`            | string                 | `"warning"`                                                         | -           |
-| `gdn_prefill_backend`          | string \| None         | `None`                                                              | -           |
-| `enable_lora`                  | boolean                | `False`                                                             | -           |
-| `max_lora_rank`                | integer                | `16`                                                                | -           |
-| `max_loras`                    | integer                | `8`                                                                 | -           |
-| `lora_modules`                 | list of string \| None | `None`                                                              | -           |
+| Parameter                      | Type                   | Default                                                             | Description                                                                             |
+| ------------------------------ | ---------------------- | ------------------------------------------------------------------- | --------------------------------------------------------------------------------------- |
+| `model`                        | string                 | `""`                                                                | -                                                                                       |
+| `seed`                         | integer                | `1`                                                                 | -                                                                                       |
+| `skip_tokenizer_init`          | boolean                | `False`                                                             | -                                                                                       |
+| `enforce_eager`                | boolean                | `False`                                                             | -                                                                                       |
+| `dtype`                        | string                 | `"bfloat16"`                                                        | -                                                                                       |
+| `distributed_executor_backend` | string                 | `"mp"`                                                              | -                                                                                       |
+| `max_num_seqs`                 | integer                | `256`                                                               | -                                                                                       |
+| `block_size`                   | integer                | `16`                                                                | -                                                                                       |
+| `cpu_offload_gb`               | float                  | `0`                                                                 | -                                                                                       |
+| `disable_sliding_window`       | boolean                | `True`                                                              | -                                                                                       |
+| `max_model_len`                | integer \| None        | `32768`                                                             | -                                                                                       |
+| `no_enable_chunked_prefill`    | boolean                | `False`                                                             | -                                                                                       |
+| `no_enable_prefix_caching`     | boolean                | `True`                                                              | -                                                                                       |
+| `gpu_memory_utilization`       | float                  | `0.9`                                                               | -                                                                                       |
+| `worker_extension_cls`         | string                 | `"areal.engine.vllm_ext.vllm_worker_extension.VLLMWorkerExtension"` | -                                                                                       |
+| `enable_sleep_mode`            | boolean                | `False`                                                             | -                                                                                       |
+| `uvicorn_log_level`            | string                 | `"warning"`                                                         | -                                                                                       |
+| `gdn_prefill_backend`          | string \| None         | `None`                                                              | GDN prefill backend for hybrid models like Qwen3.5. **Choices:** `triton`, `flashinfer` |
+| `enable_lora`                  | boolean                | `False`                                                             | -                                                                                       |
+| `max_lora_rank`                | integer                | `16`                                                                | -                                                                                       |
+| `max_loras`                    | integer                | `8`                                                                 | -                                                                                       |
+| `lora_modules`                 | list of string \| None | `None`                                                              | -                                                                                       |
 
 (section-train-dataset)=
 
