@@ -38,6 +38,9 @@ parts:
     - file: algorithms/grpo_series
     - file: algorithms/m2po
     - file: algorithms/prox_approx
+  - caption: Quantization
+    chapters:
+    - file: quantization/quantization
   - caption: Reference
     chapters:
     - file: reference/checkpointing

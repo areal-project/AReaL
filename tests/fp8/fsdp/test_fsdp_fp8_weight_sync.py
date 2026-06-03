@@ -32,7 +32,8 @@ from areal.api.cli_args import (
     SGLangConfig,
     TrainEngineConfig,
 )
-from areal.engine import FSDPEngine, RemoteSGLangEngine
+from areal.engine.fsdp_engine import FSDPEngine
+from areal.engine.sglang_remote import RemoteSGLangEngine
 from areal.utils import network
 
 pytestmark = pytest.mark.sglang
@@ -312,66 +313,23 @@ def test_fsdpengine_fp8_weight_validation(tmp_path_factory, sglang_server):
         assert not dist.is_initialized()
 
 
-@pytest.mark.slow
-@pytest.mark.parametrize("world_size", [2])
-def test_fsdpengine_fp8_weight_sync_multi_gpu(
-    tmp_path_factory, sglang_server, world_size
-):
-    """Multi-GPU FP8 weight sync via FSDP (2 cards) + NCCL broadcast.
-
-    Launches FSDPEngine with world_size=2, performs FP8 weight sync to a single
-    SGLang server, and validates that all ranks correctly broadcast quantized
-    weights.
-
-    Validates:
-      1. Multi-rank FSDP process group initializes correctly.
-      2. FP8 weight sync completes without error across all ranks.
-      3. SGLang receives parameters with correct shape and dtype.
-      4. Weight values are consistent across ranks after sync.
-    """
-    import subprocess
-    import sys
-
-    # Step 1: Verify multi-GPU NCCL communication works
-    script = f'''
-import os
-import torch
-import torch.distributed as dist
-
-os.environ["WORLD_SIZE"] = "{world_size}"
-os.environ["MASTER_ADDR"] = "127.0.0.1"
-os.environ["MASTER_PORT"] = "{network.find_free_ports(1)[0]}"
-os.environ["NCCL_CUMEM_ENABLE"] = "0"
-os.environ["NCCL_NVLS_ENABLE"] = "0"
-
-dist.init_process_group(backend="nccl")
-rank = dist.get_rank()
-print(f"[Rank {{rank}}] Initialized process group", flush=True)
-
-# Verify all ranks can communicate
-tensor = torch.tensor([rank], dtype=torch.float32, device="cuda")
-dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
-expected_sum = sum(range({world_size}))
-assert tensor.item() == expected_sum, f"all_reduce failed: {{tensor.item()}} != {{expected_sum}}"
-print(f"[Rank {{rank}}] NCCL communication verified (sum={{tensor.item()}})", flush=True)
-
-dist.destroy_process_group()
-print(f"[Rank {{rank}}] Multi-GPU test passed", flush=True)
-'''
-    result = subprocess.run(
-        [sys.executable, "-c", script],
-        capture_output=True,
-        text=True,
-        timeout=60,
-    )
-    assert result.returncode == 0, (
-        f"Multi-GPU NCCL test failed:\\nstdout: {result.stdout}\\nstderr: {result.stderr}"
-    )
-    print(f"[multi-gpu] NCCL broadcast verification passed for world_size={world_size}")
-
-    # Step 2: Test FP8 weight sync with multi-GPU FSDP
-    _setup_distributed_env()
+def _fp8_sync_worker(
+    rank: int,
+    world_size: int,
+    master_addr: str,
+    master_port: int,
+    sglang_host: str,
+    sglang_port: int,
+    result_queue,
+) -> None:
+    """Worker function for multi-GPU FP8 weight sync test via torch.multiprocessing."""
+    os.environ["RANK"] = str(rank)
+    os.environ["LOCAL_RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)
+    os.environ["MASTER_ADDR"] = master_addr
+    os.environ["MASTER_PORT"] = str(master_port)
+    os.environ["NCCL_CUMEM_ENABLE"] = "0"
+    os.environ["NCCL_NVLS_ENABLE"] = "0"
 
     engine_config = TrainEngineConfig(
         backend=f"fsdp:d{world_size}",
@@ -383,20 +341,16 @@ print(f"[Rank {{rank}}] Multi-GPU test passed", flush=True)
     )
     engine = FSDPEngine(engine_config)
     remote_engine = None
+
     try:
         engine.create_process_group()
-        ft_spec = FinetuneSpec(
-            total_train_epochs=1, dataset_size=100, train_batch_size=2
-        )
+        ft_spec = FinetuneSpec(total_train_epochs=1, dataset_size=100, train_batch_size=2)
         engine.initialize(None, ft_spec)
 
         config = InferenceEngineConfig(
             backend="sglang:d1", experiment_name=EXPR_NAME, trial_name=TRIAL_NAME
         )
         remote_engine = RemoteSGLangEngine(config)
-        remote_engine.initialize(
-            addr=network.format_hostport(sglang_server.host, sglang_server.port)
-        )
 
         meta = WeightUpdateMeta.from_fsdp_xccl(
             gen_allocation=ModelAllocation.from_str("sglang:d1"),
@@ -405,33 +359,57 @@ print(f"[Rank {{rank}}] Multi-GPU test passed", flush=True)
         )
         meta.nccl_group_name = GROUP_NAME
 
+        # Only rank 0 connects to SGLang; connect_engine barrier syncs all ranks
+        if rank == 0:
+            remote_engine.initialize(
+                addr=network.format_hostport(sglang_host, sglang_port)
+            )
+
         engine.connect_engine(remote_engine, meta)
         engine.update_weights(meta)
-        print(
-            f"[multi-gpu] FP8 weight sync completed successfully "
-            f"(world_size={world_size})",
-            flush=True,
-        )
 
-        # Validate weights from SGLang
-        sglang_addr = f"http://{sglang_server.host}:{sglang_server.port}"
-        infer_params = _get_weights_from_sglang(sglang_addr, _VALIDATE_PARAM_NAMES)
-
-        # Verify shapes and dtypes (only rank 0 fetches from SGLang)
-        for name in _VALIDATE_PARAM_NAMES[:3]:  # Check subset for speed
-            assert name in infer_params, f"Inference missing param: {name}"
-            infer_tensor = infer_params[name]
-            if infer_tensor.dim() == 2:
-                assert infer_tensor.dtype == torch.float8_e4m3fn, (
-                    f"Expected float8_e4m3fn for {name}, got {infer_tensor.dtype}"
-                )
-        print(
-            f"[multi-gpu] Weight validation passed for world_size={world_size}",
-            flush=True,
-        )
+        # Only rank 0 fetches and validates weights from SGLang
+        if rank == 0:
+            sglang_addr = f"http://{sglang_host}:{sglang_port}"
+            infer_params = _get_weights_from_sglang(sglang_addr, _VALIDATE_PARAM_NAMES[:3])
+            result_queue.put(infer_params)
+            remote_engine.destroy()
 
     finally:
-        if remote_engine is not None:
-            remote_engine.destroy()
         engine.destroy()
-        assert not dist.is_initialized()
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("world_size", [2])
+def test_fsdpengine_fp8_weight_sync_multi_gpu(tmp_path_factory, sglang_server, world_size):
+    """Multi-GPU FP8 weight sync via FSDP (2 cards) + NCCL broadcast.
+
+    Uses torch.multiprocessing.spawn to launch real multi-process FSDP engines,
+    performs FP8 weight sync to a single SGLang server, and validates that all
+    ranks correctly broadcast quantized weights.
+    """
+    import torch.multiprocessing as mp
+
+    master_addr = network.gethostip()
+    master_port = network.find_free_ports(1)[0]
+
+    mp.set_start_method("spawn", force=True)
+    result_queue = mp.Queue()
+
+    mp.spawn(
+        _fp8_sync_worker,
+        args=(world_size, master_addr, master_port, sglang_server.host, sglang_server.port, result_queue),
+        nprocs=world_size,
+        join=True,
+    )
+
+    # Validate results from rank 0
+    infer_params = result_queue.get()
+    for name in _VALIDATE_PARAM_NAMES[:3]:
+        assert name in infer_params, f"Inference missing param: {name}"
+        infer_tensor = infer_params[name]
+        if infer_tensor.dim() == 2:
+            assert infer_tensor.dtype == torch.float8_e4m3fn, (
+                f"Expected float8_e4m3fn for {name}, got {infer_tensor.dtype}"
+            )
+    print(f"[multi-gpu] Weight validation passed for world_size={world_size}")
