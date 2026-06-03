@@ -58,11 +58,6 @@ Rollout 控制器配置。
 3. **广播**：`fp8_weight`（float8_e4m3fn）和 `weight_scale_inv`（float32）通过 NCCL 分别广播
 4. **推理**：SGLang 接收 FP8 权重和缩放因子，直接用于分块 FP8 GEMM
 
-## 参数过滤
-
-- **量化**: `q_proj`、`k_proj`、`v_proj`、`o_proj`、`gate_proj`、`up_proj`、`down_proj`、`fc1`、`fc2`
-- **跳过**: `embed_tokens`、`lm_head`、`layernorm`、`norm`、`ln_`、`embeddings`、`mlp.gate.weight`
-
 ## 使用方法
 
 ```bash

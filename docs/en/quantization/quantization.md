@@ -58,11 +58,6 @@ The rollout controller configuration.
 3. **Broadcast**: `fp8_weight` (float8_e4m3fn) and `weight_scale_inv` (float32) are broadcast separately via NCCL
 4. **Rollout**: SGLang receives FP8 weights and scales, uses them directly for block-wise FP8 GEMM
 
-## Parameters Filtered
-
-- **Quantized**: `q_proj`, `k_proj`, `v_proj`, `o_proj`, `gate_proj`, `up_proj`, `down_proj`, `fc1`, `fc2`
-- **Skipped**: `embed_tokens`, `lm_head`, `layernorm`, `norm`, `ln_`, `embeddings`, `mlp.gate.weight`
-
 ## Usage
 
 ```bash
