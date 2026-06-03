@@ -60,23 +60,8 @@ Rollout 控制器配置。
 
 ## 参数过滤
 
-### 量化的参数
-
-| 模式 | 原因 |
-|------|------|
-| `q_proj`、`k_proj`、`v_proj`、`o_proj` | 大尺寸 2D 矩阵；FP8 节省最大内存/带宽 |
-| `gate_proj`、`up_proj`、`down_proj` | 大尺寸 2D 矩阵 |
-| `fc1`、`fc2` | 前馈层权重 |
-
-### 跳过的参数
-
-| 模式 | 原因 |
-|------|------|
-| `embed_tokens` | 整数索引查找表；FP8 会破坏 token 嵌入 |
-| `lm_head` | 与 `embed_tokens` 共享权重；数据类型必须一致 |
-| `layernorm`、`norm`、`ln_` | 小尺寸 1D 向量；量化开销超过收益 |
-| `embeddings` | 与 `embed_tokens` 相同 |
-| `mlp.gate.weight` | MoE 路由器；FP8 会改变专家选择分布 |
+- **量化**: `q_proj`、`k_proj`、`v_proj`、`o_proj`、`gate_proj`、`up_proj`、`down_proj`、`fc1`、`fc2`
+- **跳过**: `embed_tokens`、`lm_head`、`layernorm`、`norm`、`ln_`、`embeddings`、`mlp.gate.weight`
 
 ## 使用方法
 

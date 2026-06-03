@@ -60,23 +60,8 @@ The rollout controller configuration.
 
 ## Parameters Filtered
 
-### Quantized
-
-| Pattern | Reason |
-|---------|--------|
-| `q_proj`, `k_proj`, `v_proj`, `o_proj` | Large 2D matrices; FP8 gives max memory/bandwidth savings |
-| `gate_proj`, `up_proj`, `down_proj` | Large 2D matrices |
-| `fc1`, `fc2` | Feed-forward weights |
-
-### Skipped
-
-| Pattern | Reason |
-|---------|--------|
-| `embed_tokens` | Integer-indexed lookup table; FP8 corrupts token embeddings |
-| `lm_head` | Tied to `embed_tokens`; must match dtype |
-| `layernorm`, `norm`, `ln_` | Small 1D vectors; quantization overhead exceeds savings |
-| `embeddings` | Same as `embed_tokens` |
-| `mlp.gate.weight` | MoE router; FP8 changes expert selection distribution |
+- **Quantized**: `q_proj`, `k_proj`, `v_proj`, `o_proj`, `gate_proj`, `up_proj`, `down_proj`, `fc1`, `fc2`
+- **Skipped**: `embed_tokens`, `lm_head`, `layernorm`, `norm`, `ln_`, `embeddings`, `mlp.gate.weight`
 
 ## Usage
 
