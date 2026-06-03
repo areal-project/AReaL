@@ -1,1 +1,2 @@
-The latest version of this code of conduct can be found at https://github.com/areal-project/community/blob/main/CODE_OF_CONDUCT.md
+The latest version of this code of conduct can be found at
+https://github.com/areal-project/community/blob/main/CODE_OF_CONDUCT.md

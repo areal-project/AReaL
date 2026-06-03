@@ -291,7 +291,9 @@ Check the [AI Coding Assistant Guide](docs/reference/ai_assisted_dev.md) and
 
 We warmly welcome contributions from the community! Whether you're fixing bugs, adding
 features, improving documentation, or helping others, your contribution is valued.
-Please check our **[Contributing Guide](https://github.com/areal-project/community/blob/main/CONTRIBUTING.md)** for detailed information.
+Please check our
+**[Contributing Guide](https://github.com/areal-project/community/blob/main/CONTRIBUTING.md)**
+for detailed information.
 
 ```bash
 # Fork and clone the repository

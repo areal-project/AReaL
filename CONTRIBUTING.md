@@ -1,1 +1,2 @@
-The latest version of this file can be found at https://github.com/areal-project/community/blob/main/CONTRIBUTING.md
+The latest version of this file can be found at
+https://github.com/areal-project/community/blob/main/CONTRIBUTING.md
