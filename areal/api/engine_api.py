@@ -697,6 +697,30 @@ class InferenceEngine(abc.ABC):
         """
         raise NotImplementedError()
 
+    def update_weights_from_awex(
+        self,
+        meta: WeightUpdateMeta,
+        step_id: int | None = None,
+        kwargs: dict | None = None,
+    ) -> Future[None]:
+        """Update weights in the inference engine via Awex.
+
+        Parameters
+        ----------
+        meta : WeightUpdateMeta
+            Metadata containing information about the weight update
+        step_id : int | None
+            Step id to report to Awex (defaults to engine version if None)
+        kwargs : dict | None
+            Extra kwargs forwarded to Awex update endpoint
+
+        Returns
+        -------
+        Future[None]
+            A future object representing the asynchronous weight update operation
+        """
+        raise NotImplementedError()
+
     def set_version(self, version: int) -> None:
         """Set the current weight version in the inference engine.
 

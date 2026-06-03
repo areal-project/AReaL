@@ -244,6 +244,18 @@ class RemoteInfBackendProtocol(Protocol):
         """
         ...
 
+    def build_awex_init_request(
+        self, meta: WeightUpdateMeta, engine_rank: int, num_engines: int
+    ) -> HttpRequest:
+        """Build request to initialize Awex on the inference server."""
+        ...
+
+    def build_awex_update_request(
+        self, meta: WeightUpdateMeta, step_id: int, kwargs: dict | None
+    ) -> HttpRequest:
+        """Build request to update weights via Awex."""
+        ...
+
     def get_pause_request(self) -> HttpRequest:
         """Get request to pause generation.
 
@@ -369,6 +381,12 @@ class RemoteInfEngine(InferenceEngine):
         self._version = 0
 
         self.lock = Lock()
+        # Serialize Awex init so concurrent updates do not double-init the remote engine.
+        self._awex_lock = Lock()
+        self._awex_initialized = False
+        # Optional Awex engine identity overrides (set by controller).
+        self._awex_engine_rank: int | None = None
+        self._awex_num_engines: int | None = None
 
         self._workflow_executor: WorkflowExecutor | None = None
         self._initialized = False
@@ -406,6 +424,8 @@ class RemoteInfEngine(InferenceEngine):
         engine_id: str | None = None,
         addr: str | list[str] | None = None,
         train_data_parallel_size: int | None = None,
+        engine_rank: int | None = None,
+        num_engines: int | None = None,
     ):
         """Initialize the engine by discovering and connecting to servers.
 
@@ -424,6 +444,10 @@ class RemoteInfEngine(InferenceEngine):
             else:
                 engine_id = uuid.uuid4().hex
         self.engine_id = engine_id
+        if engine_rank is not None:
+            self._awex_engine_rank = int(engine_rank)
+        if num_engines is not None:
+            self._awex_num_engines = int(num_engines)
         self.logger = logging.getLogger(f"[RemoteInfEngine Rank {engine_id}]")
 
         if addr:
@@ -1080,6 +1104,44 @@ class RemoteInfEngine(InferenceEngine):
         fut.add_done_callback(callback)
         return fut
 
+    def update_weights_from_awex(
+        self,
+        meta: WeightUpdateMeta,
+        step_id: int | None = None,
+        kwargs: dict | None = None,
+    ) -> Future[None]:
+        """Update weights in the inference engine via Awex."""
+        assert meta.type == "awex"
+        if not meta.meta_server_addr:
+            raise ValueError("meta_server_addr must be set for awex updates.")
+        if step_id is None:
+            step_id = self.get_version()
+        with self._awex_lock:
+            if not self._awex_initialized:
+                init_fut = get_executor().submit(
+                    _init_awex_remote,
+                    self.backend,
+                    meta,
+                    self.addresses,
+                    self._awex_engine_rank,
+                    self._awex_num_engines,
+                    self.config.request_timeout,
+                    self.config.request_retries,
+                )
+                init_fut.result()
+                self._awex_initialized = True
+
+        return get_executor().submit(
+            _update_weights_from_awex,
+            self.backend,
+            meta,
+            step_id,
+            kwargs,
+            self.addresses,
+            self.config.request_timeout,
+            self.config.request_retries,
+        )
+
     def submit(
         self,
         data: dict[str, Any],
@@ -1519,5 +1581,110 @@ def _update_weights_from_distributed(
                     for addr in addresses
                 ]
                 await asyncio.gather(*jobs)
+
+    return uvloop.run(_fn())
+
+
+def _init_awex_remote(
+    backend: RemoteInfBackendProtocol,
+    meta: WeightUpdateMeta,
+    addresses: list[str],
+    engine_rank_override: int | None = None,
+    num_engines_override: int | None = None,
+    request_timeout: float | None = None,
+    request_retries: int | None = None,
+):
+    """Helper to initialize Awex on remote inference servers."""
+    if request_timeout is None and request_retries is None:
+        # Backward compatibility: old signature passed (timeout, retries) in place of overrides.
+        request_timeout = (
+            float(engine_rank_override) if engine_rank_override is not None else None
+        )
+        request_retries = (
+            int(num_engines_override) if num_engines_override is not None else None
+        )
+        engine_rank_override = None
+        num_engines_override = None
+    if request_timeout is None or request_retries is None:
+        raise ValueError("request_timeout and request_retries must be provided.")
+
+    async def _fn():
+        async with aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=request_timeout),
+            read_bufsize=1024 * 1024 * 10,
+            connector=get_default_connector(),
+        ) as session:
+            jobs = []
+            if engine_rank_override is not None and num_engines_override is not None:
+                for addr in addresses:
+                    http_req = backend.build_awex_init_request(
+                        meta,
+                        engine_rank=engine_rank_override,
+                        num_engines=num_engines_override,
+                    )
+                    jobs.append(
+                        arequest_with_retry(
+                            session=session,
+                            addr=addr,
+                            endpoint=http_req.endpoint,
+                            payload=http_req.payload,
+                            method=http_req.method,
+                            max_retries=request_retries,
+                            timeout=request_timeout,
+                        )
+                    )
+            else:
+                num_engines = len(addresses)
+                for engine_rank, addr in enumerate(addresses):
+                    http_req = backend.build_awex_init_request(
+                        meta, engine_rank=engine_rank, num_engines=num_engines
+                    )
+                    jobs.append(
+                        arequest_with_retry(
+                            session=session,
+                            addr=addr,
+                            endpoint=http_req.endpoint,
+                            payload=http_req.payload,
+                            method=http_req.method,
+                            max_retries=request_retries,
+                            timeout=request_timeout,
+                        )
+                    )
+            await asyncio.gather(*jobs)
+
+    return uvloop.run(_fn())
+
+
+def _update_weights_from_awex(
+    backend: RemoteInfBackendProtocol,
+    meta: WeightUpdateMeta,
+    step_id: int,
+    kwargs: dict | None,
+    addresses: list[str],
+    request_timeout: float,
+    request_retries: int,
+):
+    """Helper to update weights via Awex in a separate process."""
+
+    async def _fn():
+        http_req = backend.build_awex_update_request(meta, step_id, kwargs)
+        async with aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=request_timeout),
+            read_bufsize=1024 * 1024 * 10,
+            connector=get_default_connector(),
+        ) as session:
+            jobs = [
+                arequest_with_retry(
+                    session=session,
+                    addr=addr,
+                    endpoint=http_req.endpoint,
+                    payload=http_req.payload,
+                    method=http_req.method,
+                    max_retries=request_retries,
+                    timeout=request_timeout,
+                )
+                for addr in addresses
+            ]
+            await asyncio.gather(*jobs)
 
     return uvloop.run(_fn())

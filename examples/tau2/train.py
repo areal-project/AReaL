@@ -1,5 +1,6 @@
 """Training script for Tau2 benchmark with AReaL proxy mode."""
 
+import os
 import sys
 import warnings
 from typing import Any
@@ -14,6 +15,20 @@ from areal.api.cli_args import load_expr_config
 from areal.utils import logging
 
 logger = logging.getLogger("Tau2Train")
+
+
+def _ensure_awex_runtime(config) -> None:
+    if config.actor.weight_update_mode != "awex":
+        return
+    meta_addr = os.environ.get("AREAL_GSM8K_AWEX_META_SERVER")
+    if not meta_addr:
+        meta_addr = config.awex.meta_server_addr
+    if not meta_addr or meta_addr.lower() == "auto":
+        from awex.meta.meta_server import start_meta_server
+
+        meta_ip, meta_port = start_meta_server()
+        meta_addr = f"{meta_ip}:{meta_port}"
+    config.awex.meta_server_addr = meta_addr
 
 
 def get_tau2_dataset(
@@ -68,6 +83,7 @@ def main(args):
     warnings.filterwarnings("ignore", category=UserWarning, module="pydantic")
 
     config, _ = load_expr_config(args, Tau2PPOConfig)
+    _ensure_awex_runtime(config)
     econfig = config.econfig
     domain = econfig.domain
 

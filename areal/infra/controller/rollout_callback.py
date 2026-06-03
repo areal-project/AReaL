@@ -167,6 +167,23 @@ class RolloutCallback:
         payload = {"meta": serialize_value(meta)}
         return self._post_nowait_void("/callback/update_weights_disk", payload)
 
+    def update_weights_from_awex(
+        self,
+        meta: WeightUpdateMeta,
+        step_id: int | None = None,
+        kwargs: dict[str, Any] | None = None,
+    ) -> Future[None]:
+        """Callback to controller to load weights via Awex on inference side.
+
+        This method is NON-BLOCKING to allow weight exchange coordination.
+        """
+        payload = {
+            "meta": serialize_value(meta),
+            "step_id": step_id,
+            "kwargs": serialize_value(kwargs),
+        }
+        return self._post_nowait_void("/callback/update_weights_awex", payload)
+
     def pause_generation(self) -> None:
         """Callback to controller to pause inference generation.
 

@@ -271,6 +271,45 @@ class VLLMBackend:
         }
         return HttpRequest(endpoint="/areal_init_weights_update_group", payload=payload)
 
+    def build_awex_init_request(
+        self, meta: WeightUpdateMeta, engine_rank: int, num_engines: int
+    ) -> HttpRequest:
+        """Build vLLM Awex init request."""
+        payload = {
+            "meta_server_addr": meta.meta_server_addr,
+            "engine_rank": engine_rank,
+            "num_engines": num_engines,
+            "comm_backend": meta.comm_backend or "file",
+            "enable_debug_mode": meta.enable_debug_mode,
+            "debug_mode_config": meta.debug_mode_config or {},
+            "disable_weights_exchange_pipeline": meta.disable_weights_exchange_pipeline,
+            "enable_colocate_mode": meta.enable_colocate_mode,
+            "weights_exchange_ipc_backend": meta.weights_exchange_ipc_backend or "cuda",
+            "weights_comm_nccl_group_size": meta.weights_comm_nccl_group_size,
+            "weights_validation_steps": meta.weights_validation_steps,
+            "validate_weights_every_n_steps": meta.validate_weights_every_n_steps,
+        }
+        if meta.dump_weights_list_for_validation:
+            payload["dump_weights_list_for_validation"] = (
+                meta.dump_weights_list_for_validation
+            )
+        if meta.dump_weights_dir_for_validation:
+            payload["dump_weights_dir_for_validation"] = (
+                meta.dump_weights_dir_for_validation
+            )
+        if meta.nnodes is not None:
+            payload["nnodes"] = meta.nnodes
+        if meta.node_rank is not None:
+            payload["node_rank"] = meta.node_rank
+        return HttpRequest(endpoint="/areal_awex_init", payload=payload)
+
+    def build_awex_update_request(
+        self, meta: WeightUpdateMeta, step_id: int, kwargs: dict | None
+    ) -> HttpRequest:
+        """Build vLLM Awex update request."""
+        payload = {"step_id": step_id, "kwargs": kwargs or {}}
+        return HttpRequest(endpoint="/areal_awex_update", payload=payload)
+
     def get_pause_request(self) -> HttpRequest:
         """Get vLLM pause request."""
         return HttpRequest(endpoint="/areal_pause_generation", payload={})
@@ -386,13 +425,21 @@ class RemotevLLMEngine(InferenceEngine):
         engine_id: str | None = None,
         addr: str | list[str] | None = None,
         train_data_parallel_size: int | None = None,
+        engine_rank: int | None = None,
+        num_engines: int | None = None,
     ):
         """Initialize the engine by discovering and connecting to servers."""
         if train_data_parallel_size is None:
             train_data_parallel_size = ModelAllocation.from_str(
                 self.config.backend, name="rollout"
             ).parallel.data_parallel_size
-        return self._engine.initialize(engine_id, addr, train_data_parallel_size)
+        return self._engine.initialize(
+            engine_id,
+            addr,
+            train_data_parallel_size,
+            engine_rank=engine_rank,
+            num_engines=num_engines,
+        )
 
     def destroy(self):
         """Destroy the engine and clean up resources."""
@@ -439,6 +486,17 @@ class RemotevLLMEngine(InferenceEngine):
     def update_weights_from_disk(self, meta: WeightUpdateMeta) -> Future[None]:
         """Update weights from disk."""
         return self._engine.update_weights_from_disk(meta)
+
+    def update_weights_from_awex(
+        self,
+        meta: WeightUpdateMeta,
+        step_id: int | None = None,
+        kwargs: dict | None = None,
+    ) -> Future[None]:
+        """Update weights via Awex."""
+        return self._engine.update_weights_from_awex(
+            meta, step_id=step_id, kwargs=kwargs
+        )
 
     def submit(
         self,

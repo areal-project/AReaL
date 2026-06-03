@@ -52,7 +52,7 @@ class Platform:
     # .e.g. CUDA_VISIBLE_DEVICES for CUDA.
     # hint: search for "get_visible_accelerator_ids_env_var" in
     # https://github.com/ray-project/ray/tree/master/python/ray/_private/accelerators # noqa
-    # Examples: "CUDA_VISIBLE_DEVICES", "ASCEND_VISIBLE_DEVICES"
+    # Examples: "CUDA_VISIBLE_DEVICES", "ASCEND_RT_VISIBLE_DEVICES"
     device_control_env_var: str
 
     # Optional Ray experimental config

@@ -205,6 +205,23 @@ class WeightUpdateMeta:
 
     version: int | None = None
 
+    # Awex-specific fields
+    meta_server_addr: str | None = None
+    comm_backend: str | None = None
+    weights_exchange_ipc_backend: str | None = None
+    weights_comm_nccl_group_size: int = 1
+    enable_debug_mode: bool = False
+    debug_mode_config: dict = field(default_factory=dict)
+    disable_weights_exchange_pipeline: bool = False
+    enable_colocate_mode: bool = False
+    weights_validation_steps: int = 0
+    validate_weights_every_n_steps: int = 1
+    dump_weights_list_for_validation: list[str] = field(default_factory=list)
+    dump_weights_dir_for_validation: str | None = None
+    nnodes: int | None = None
+    node_rank: int | None = None
+    use_mindspeed: bool = False
+
     def with_version(self, version: int) -> "WeightUpdateMeta":
         """Return a copy of this meta with versioned path.
 
@@ -295,13 +312,43 @@ class WeightUpdateMeta:
     @classmethod
     def from_awex(
         cls,
+        meta_server_addr: str,
+        comm_backend: str = "file",
+        weights_exchange_ipc_backend: str = "cuda",
+        weights_comm_nccl_group_size: int = 1,
+        enable_debug_mode: bool = False,
+        debug_mode_config: dict | None = None,
+        disable_weights_exchange_pipeline: bool = False,
+        enable_colocate_mode: bool = False,
+        weights_validation_steps: int = 0,
+        validate_weights_every_n_steps: int = 1,
+        dump_weights_list_for_validation: list[str] | None = None,
+        dump_weights_dir_for_validation: str | None = None,
+        nnodes: int | None = None,
+        node_rank: int | None = None,
+        use_mindspeed: bool = False,
         use_lora: bool = False,
         lora_name: str = "",
         lora_int_id: int = 1,
         base_model_name: str = "",
-    ):
+    ) -> "WeightUpdateMeta":
         return cls(
             type="awex",
+            meta_server_addr=meta_server_addr,
+            comm_backend=comm_backend,
+            weights_exchange_ipc_backend=weights_exchange_ipc_backend,
+            weights_comm_nccl_group_size=weights_comm_nccl_group_size,
+            enable_debug_mode=enable_debug_mode,
+            debug_mode_config=debug_mode_config or {},
+            disable_weights_exchange_pipeline=disable_weights_exchange_pipeline,
+            enable_colocate_mode=enable_colocate_mode,
+            weights_validation_steps=weights_validation_steps,
+            validate_weights_every_n_steps=validate_weights_every_n_steps,
+            dump_weights_list_for_validation=dump_weights_list_for_validation or [],
+            dump_weights_dir_for_validation=dump_weights_dir_for_validation,
+            nnodes=nnodes,
+            node_rank=node_rank,
+            use_mindspeed=use_mindspeed,
             use_lora=use_lora,
             lora_name=lora_name,
             lora_int_id=lora_int_id,

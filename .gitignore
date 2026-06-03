@@ -203,3 +203,9 @@ wandb/
 outputs/
 sympy/
 !/docs/figures/*
+
+# Awex/AReaL validation & comms debug dumps
+*communication_plan_*.json
+*_params_meta_*.json
+*_params_raw_meta_*.json
+*_params_non_converted_raw_meta_*.json
