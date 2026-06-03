@@ -58,6 +58,13 @@ Rollout 控制器配置。
 3. **广播**：`fp8_weight`（float8_e4m3fn）和 `weight_scale_inv`（float32）通过 NCCL 分别广播
 4. **推理**：SGLang 接收 FP8 权重和缩放因子，直接用于分块 FP8 GEMM
 
+## FP8 相关配置
+
+- **`actor.dtype: bfloat16`** — 训练计算数据类型。训练期间权重保持 BF16，梯度计算使用 BF16。FP8 量化仅在权重同步到推理引擎时应用。
+- **`actor.weight_update_mode: xccl`** — 权重广播路径。Legacy xccl NCCL 路径支持在广播前进行 FP8 分块量化。
+- **`sglang.quantization: fp8`** — 在 SGLang 中启用 FP8 分块量化。SGLang 直接接收 FP8 权重和缩放因子用于分块 FP8 GEMM。
+- **`sglang.dtype: ${actor.dtype}`** — SGLang 使用与训练引擎相同的数据类型（BF16）。FP8 量化由 SGLang 的量化层内部处理。
+
 ## 使用方法
 
 ```bash

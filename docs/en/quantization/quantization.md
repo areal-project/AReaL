@@ -58,6 +58,13 @@ The rollout controller configuration.
 3. **Broadcast**: `fp8_weight` (float8_e4m3fn) and `weight_scale_inv` (float32) are broadcast separately via NCCL
 4. **Rollout**: SGLang receives FP8 weights and scales, uses them directly for block-wise FP8 GEMM
 
+## FP8-Related Config
+
+- **`actor.dtype: bfloat16`** — Training compute dtype. Weights are kept in BF16 during training and gradients are computed in BF16. FP8 quantization is only applied during weight sync to the inference engine.
+- **`actor.weight_update_mode: xccl`** — Weight broadcast path. The legacy xccl NCCL path supports FP8 block-wise quantization before broadcast.
+- **`sglang.quantization: fp8`** — Enables FP8 block-wise quantization in SGLang. SGLang receives FP8 weights and scales directly for block-wise FP8 GEMM.
+- **`sglang.dtype: ${actor.dtype}``** — SGLang uses the same dtype as the training engine (BF16). The FP8 quantization is handled internally by SGLang's quantization layer.
+
 ## Usage
 
 ```bash
