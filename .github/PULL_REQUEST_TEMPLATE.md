@@ -24,7 +24,8 @@ Fixes #(issue)
 
 <!-- Mark with 'x' what you've done -->
 
-- [ ] I have read the [Contributing Guide](../CONTRIBUTING.md)
+- [ ] I have read the
+  [Contributing Guide](https://github.com/areal-project/community/blob/main/CONTRIBUTING.md)
 - [ ] Pre-commit hooks pass (`pre-commit run --all-files`)
 - [ ] Relevant tests pass; new tests added for new functionality
 - [ ] Documentation updated (if applicable; built with `./docs/build_all.sh`)
@@ -43,5 +44,6 @@ Fixes #(issue)
 
 ______________________________________________________________________
 
-**Need help?** Check the [Contributing Guide](../CONTRIBUTING.md) or ask in
-[GitHub Discussions](https://github.com/areal-project/AReaL/discussions)!
+**Need help?** Check the
+[Contributing Guide](https://github.com/areal-project/community/blob/main/CONTRIBUTING.md)
+or ask in [GitHub Discussions](https://github.com/areal-project/AReaL/discussions)!
