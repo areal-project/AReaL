@@ -33,11 +33,13 @@ class Trainer(SFTTrainer):
                 seq_token = self.tokenizer.encode(
                     sample["prompt"] + sample["answer"] + self.tokenizer.eos_token
                 )
-            prompt_token = self.tokenizer.encode(sample["prompt"])
-            loss_mask = [0] * len(prompt_token) + [1] * (
-                len(seq_token) - len(prompt_token)
-            )
-            results.append({"input_ids": seq_token, "loss_mask": loss_mask})
+                prompt_token = self.tokenizer.encode(sample["prompt"])
+                loss_mask = [0] * len(prompt_token) + [1] * (
+                    len(seq_token) - len(prompt_token)
+                )
+                if len(seq_token) > self.config.actor.mb_spec.max_tokens_per_mb:
+                    continue
+                results.append({"input_ids": seq_token, "loss_mask": loss_mask})
             return collate_samples_to_list(results)
 
         return create_dataloader(

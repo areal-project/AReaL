@@ -9,17 +9,18 @@ tokenizer_path: ${actor.path}
 cluster:
   n_nodes: 1
   n_gpus_per_node: 8
-  fileroot: /tmp/areal/experiments
+  fileroot: /storage/openpsi/experiments
   name_resolve:
     type: nfs
-    nfs_record_root: /tmp/areal/name_resolve
+    nfs_record_root: /storage/openpsi/experiments/name_resolve/whj
 
+allocation_mode: "megatron:(attn:d1p4t4|ffn:d1p4e4)"
 
 scheduler:
   type: null
 
 actor:
-  backend: "fsdp:d8p1t1"
+  # backend: "fsdp:d8p1t1"
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
   path: Qwen/Qwen3-1.7B
@@ -27,7 +28,7 @@ actor:
   gradient_checkpointing: true
   dtype: bfloat16
   mb_spec:
-    max_tokens_per_mb: 32768
+    max_tokens_per_mb: 65536
   optimizer:
     type: adam
     lr: 2e-5
@@ -43,7 +44,21 @@ actor:
       gpu: 1
       mem: 32
       cmd: python3 -m areal.infra.rpc.rpc_server
-      env_vars: {}
+      env_vars:
+        NCCL_DEBUG: "WARN"
+        NCCL_IB_DISABLE: "0"
+        NCCL_SOCKET_IFNAME: "bond0"
+        NCCL_NET: "IB"
+        NCCL_NET_PLUGIN: ""
+        NCCL_IB_GID_INDEX: "3"
+        NCCL_IB_TIMEOUT: "22"
+        NCCL_IB_RETRY_CNT: "7"
+        NCCL_IB_SL: "5"
+        NCCL_IB_TC: "136"
+        NCCL_IB_HCA: "mlx5_bond"
+        NCCL_IB_QPS_PER_CONNECTION: "8"
+        NCCL_SET_THREAD_NAME: "1"
+        PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
 
 train_dataset:
   batch_size: 128
