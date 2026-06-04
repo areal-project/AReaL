@@ -4,41 +4,28 @@
 
 from .version import __version__  # noqa
 
-
-_INFRA_NAMES = frozenset(
-    {
-        "RolloutController",
-        "StalenessManager",
-        "TrainController",
-        "WorkflowExecutor",
-        "current_platform",
-        "workflow_context",
-    }
-)
-
-_TRAINER_NAMES = frozenset(
-    {
-        "DPOTrainer",
-        "PPOTrainer",
-        "RWTrainer",
-        "SFTTrainer",
-    }
+from .infra import (
+    RolloutController,
+    StalenessManager,
+    TrainController,
+    WorkflowExecutor,
+    current_platform,
+    workflow_context,
 )
 
 
 def __getattr__(name: str):
-    if name in _INFRA_NAMES:
-        from . import infra as _infra
+    if name in ("DPOTrainer", "PPOTrainer", "RWTrainer", "SFTTrainer"):
+        from .trainer import DPOTrainer, PPOTrainer, RWTrainer, SFTTrainer
 
-        value = getattr(_infra, name)
-        globals()[name] = value
-        return value
-    if name in _TRAINER_NAMES:
-        from . import trainer as _trainer
-
-        value = getattr(_trainer, name)
-        globals()[name] = value
-        return value
+        _map = {
+            "DPOTrainer": DPOTrainer,
+            "PPOTrainer": PPOTrainer,
+            "RWTrainer": RWTrainer,
+            "SFTTrainer": SFTTrainer,
+        }
+        globals().update(_map)
+        return _map[name]
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
