@@ -82,6 +82,8 @@ class TestConnect:
                 "use_lora": False,
                 "lora_name": "",
                 "colocate": False,
+                "nccl_master_addr": "",
+                "nccl_master_port": 0,
             },
             timeout=10.0,
         )
@@ -112,6 +114,8 @@ class TestConnect:
                 "use_lora": True,
                 "lora_name": "my-lora",
                 "colocate": False,
+                "nccl_master_addr": "",
+                "nccl_master_port": 0,
             },
             timeout=10.0,
         )

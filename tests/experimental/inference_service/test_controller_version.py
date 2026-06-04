@@ -63,23 +63,25 @@ class TestControllerSetVersion:
     def test_set_version_no_gateway_skips_broadcast(self):
         """When _gateway_addr is empty, set_version updates local but makes no HTTP calls."""
         ctrl = _make_controller(gateway_addr="", worker_ids={"dp0": "w1"})
+        ctrl._data_proxy_addrs = ["http://dp0:8000"]
         with patch.object(
-            ctrl, "_async_gateway_http_post", new_callable=AsyncMock
+            ctrl, "_async_data_proxy_post", new_callable=AsyncMock
         ) as mock_post:
             ctrl.set_version(5)
             mock_post.assert_not_called()
         assert ctrl._version == 5
 
     def test_set_version_broadcasts_to_all_workers(self):
-        """When gateway_addr is set and 2 workers exist, broadcasts to both."""
+        """When gateway_addr is set and data proxies exist, broadcasts to all."""
         ctrl = _make_controller(
             gateway_addr="http://gateway:8000",
             worker_ids={"dp0": "w1", "dp1": "w2"},
         )
+        ctrl._data_proxy_addrs = ["http://dp0:8000", "http://dp1:8000"]
 
         mock_post = AsyncMock()
 
-        with patch.object(ctrl, "_async_gateway_http_post", mock_post):
+        with patch.object(ctrl, "_async_data_proxy_post", mock_post):
             loop = asyncio.new_event_loop()
             try:
                 loop.run_until_complete(ctrl._async_set_version(10))
@@ -87,9 +89,12 @@ class TestControllerSetVersion:
                 loop.close()
 
         assert mock_post.call_count == 2
-        call_endpoints = [call.args[0] for call in mock_post.call_args_list]
-        assert "/set_version/w1" in call_endpoints
-        assert "/set_version/w2" in call_endpoints
+        call_addrs = [call.args[0] for call in mock_post.call_args_list]
+        assert "http://dp0:8000" in call_addrs
+        assert "http://dp1:8000" in call_addrs
+        for call in mock_post.call_args_list:
+            assert call.args[1] == "/set_version"
+            assert call.args[2] == {"version": 10}
 
 
 # =============================================================================

@@ -383,13 +383,11 @@ async def test_external_model_flow_end_to_end_gateway_router_data_proxy(router_c
             )
             assert exported.status_code == 200
             payload = exported.json()
-            assert len(payload["interactions"]) == 1
+            assert len(payload["traj"]["interactions"]) == 1
 
-            interaction = next(iter(payload["interactions"].values()))
-            assert interaction["messages"][0]["content"] == "hello"
-            cached_response = json.loads(
-                interaction["output_message_list"][0]["content"]
-            )
+            interaction = payload["traj"]["interactions"][0]
+            assert interaction["request"][0]["content"] == "hello"
+            cached_response = json.loads(interaction["response"])
             assert (
                 cached_response["choices"][0]["message"]["content"] == "Mock response"
             )

@@ -201,18 +201,39 @@ class _FakeDataLoader:
 def _server_args_for_backend(
     backend: str, model_path: str, *, mem: float = 0.15
 ) -> dict[str, Any]:
-    """Return backend-specific ``server_args`` for full-init fixtures."""
+    """Return backend-specific ``server_args`` for full-init fixtures.
+
+    Mirrors the production path in ``rl_trainer.py``: build the backend's
+    dataclass config first, then expand it via ``build_args`` so all
+    dataclass defaults (e.g. ``max_model_len``, ``context_length``) land
+    on the launch command. RolloutControllerV2 no longer injects these
+    defaults itself, so callers must pre-expand.
+    """
     if backend == "sglang":
-        return {
-            "model_path": model_path,
-            "skip_tokenizer_init": True,
-            "mem_fraction_static": mem,
-        }
+        from areal.api.cli_args import SGLangConfig
+
+        sglang_config = SGLangConfig(
+            model_path=model_path,
+            skip_tokenizer_init=True,
+            mem_fraction_static=mem,
+        )
+        return SGLangConfig.build_args(
+            sglang_config=sglang_config,
+            tp_size=1,
+            base_gpu_id=0,
+        )
     if backend == "vllm":
-        return {
-            "model": model_path,
-            "gpu_memory_utilization": mem,
-        }
+        from areal.api.cli_args import vLLMConfig
+
+        vllm_config = vLLMConfig(
+            model=model_path,
+            gpu_memory_utilization=mem,
+        )
+        return vLLMConfig.build_args(
+            vllm_config=vllm_config,
+            tp_size=1,
+            pp_size=1,
+        )
     raise ValueError(f"Unknown backend: {backend}")
 
 
