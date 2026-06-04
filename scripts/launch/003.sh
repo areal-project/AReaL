@@ -11,8 +11,9 @@ python3 swe_opcd/jsonl_sft.py \
     train_dataset.path=/storage/openpsi/users/wanghuaijie.whj/datasets/math_chat_sft/train-qwen-distill-airline400-telecom400.jsonl \
     valid_dataset.path=/storage/openpsi/users/wanghuaijie.whj/datasets/math_chat_sft/train-qwen-distill-airline400-telecom400.jsonl \
     total_train_epochs=1 \
-    allocation_mode=megatron:d4p4 \
+    allocation_mode=megatron:d2p4t2 \
     actor.path=/storage/openpsi/models/Qwen__Qwen3-8B/ \
+    actor.mb_spec.max_tokens_per_mb=32768 \
     actor.optimizer.lr=1e-5 \
     actor.optimizer.lr_scheduler_type=constant \
     +actor.optimizer.warmup_steps_proportion=0.1 \
