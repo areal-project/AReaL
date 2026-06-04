@@ -26,9 +26,10 @@ This directory ships two complementary entry points:
 | **Agent Service** | `run_agent_service.py` | Hosts OpenClaw behind AReaL's Agent Service so external clients call it over an OpenAI-compatible HTTP API. Start here.                |
 | **RL training**   | `train.py`             | Drives end-to-end RL (PPO) where every agent LLM call flows through the training proxy gateway. Documented from *Prerequisites* below. |
 
-The two share the same building block — the `OpenClawAgent` ([`agent.py`](agent.py)) —
-and the same lifecycle hooks, so a setup that serves traffic today can be wired into RL
-training tomorrow.
+The two share the same building block — the `OpenClawAgent`
+([`areal/experimental/agent_service/runtimes/openclaw.py`](../../areal/experimental/agent_service/runtimes/openclaw.py))
+— and the same lifecycle hooks, so a setup that serves traffic today can be wired into
+RL training tomorrow.
 
 ## Serving OpenClaw via the Agent Service
 
@@ -56,7 +57,8 @@ client ──HTTP /v1/responses──▶ Gateway ──▶ Router ──▶ Data
 - **DataProxy** — keeps the conversation history for a session and replays it to the
   worker each turn.
 - **Worker** — loads the class named by `AgentConfig.agent_cls_path` (here
-  `examples.openclaw.agent.OpenClawAgent`) and exposes it as an `AgentRunnable`.
+  `areal.experimental.agent_service.runtimes.openclaw.OpenClawAgent`) and exposes it as
+  an `AgentRunnable`.
 
 **Why one OpenClaw subprocess per session?** OpenClaw's configuration (provider,
 upstream key, model) is *process-global*. RL requires each session's turns to be

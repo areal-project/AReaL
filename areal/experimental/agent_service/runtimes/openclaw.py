@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 """OpenClaw Agent for AReaL Agent Service (per-session subprocess).
 
 Implements :class:`AgentRunnable` by spawning **one OpenClaw Gateway
@@ -191,54 +193,75 @@ class OpenClawAgent:
         port = _free_port()
         token = secrets.token_hex(16)
         config_dir = tempfile.mkdtemp(prefix="openclaw-")
-        config_path = os.path.join(config_dir, "openclaw.json")
-        state_dir = os.path.join(config_dir, "state")
-        os.makedirs(state_dir, exist_ok=True)
-        with open(config_path, "w") as fh:
-            json.dump(self._render_config(port, token, upstream), fh)
-
-        env = dict(os.environ)
-        env["OPENCLAW_CONFIG_PATH"] = config_path
-        env["OPENCLAW_STATE_DIR"] = state_dir
-        if self._node_extra_ca_certs:
-            env["NODE_EXTRA_CA_CERTS"] = self._node_extra_ca_certs
-        if self._tls_insecure:
-            env["NODE_TLS_REJECT_UNAUTHORIZED"] = "0"
-
-        log_file = open(os.path.join(config_dir, "gateway.log"), "w")
-        proc = await asyncio.create_subprocess_exec(
-            self._bin,
-            "gateway",
-            "--port",
-            str(port),
-            "--auth",
-            "token",
-            "--token",
-            token,
-            "--force",
-            "--allow-unconfigured",
-            env=env,
-            stdout=log_file,
-            stderr=asyncio.subprocess.STDOUT,
-        )
-
-        client = httpx.AsyncClient(
-            base_url=f"http://127.0.0.1:{port}",
-            timeout=self._timeout,
-            headers={"Authorization": f"Bearer {token}"},
-        )
-        state = _SessionState(
-            port=port,
-            gateway_token=token,
-            config_dir=config_dir,
-            process=proc,
-            client=client,
-            log_file=log_file,
-        )
+        log_file: IO[str] | None = None
+        client: httpx.AsyncClient | None = None
+        proc: asyncio.subprocess.Process | None = None
         try:
+            config_path = os.path.join(config_dir, "openclaw.json")
+            state_dir = os.path.join(config_dir, "state")
+            os.makedirs(state_dir, exist_ok=True)
+            with open(config_path, "w") as fh:
+                json.dump(self._render_config(port, token, upstream), fh)
+
+            env = dict(os.environ)
+            env["OPENCLAW_CONFIG_PATH"] = config_path
+            env["OPENCLAW_STATE_DIR"] = state_dir
+            if self._node_extra_ca_certs:
+                env["NODE_EXTRA_CA_CERTS"] = self._node_extra_ca_certs
+            if self._tls_insecure:
+                env["NODE_TLS_REJECT_UNAUTHORIZED"] = "0"
+
+            log_file = open(os.path.join(config_dir, "gateway.log"), "w")
+            proc = await asyncio.create_subprocess_exec(
+                self._bin,
+                "gateway",
+                "--port",
+                str(port),
+                "--auth",
+                "token",
+                "--token",
+                token,
+                "--force",
+                "--allow-unconfigured",
+                env=env,
+                stdout=log_file,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+
+            client = httpx.AsyncClient(
+                base_url=f"http://127.0.0.1:{port}",
+                timeout=self._timeout,
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            state = _SessionState(
+                port=port,
+                gateway_token=token,
+                config_dir=config_dir,
+                process=proc,
+                client=client,
+                log_file=log_file,
+            )
             await self._wait_healthy(state)
         except Exception:
-            await self._teardown_state(state)
+            # Any failure before the session is fully healthy must not leak the
+            # log file descriptor, the subprocess, or the temp config dir.
+            if client is not None:
+                with contextlib.suppress(Exception):
+                    await client.aclose()
+            if proc is not None and proc.returncode is None:
+                with contextlib.suppress(ProcessLookupError):
+                    proc.terminate()
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=10)
+                except TimeoutError:
+                    with contextlib.suppress(ProcessLookupError):
+                        proc.kill()
+                    with contextlib.suppress(Exception):
+                        await proc.wait()
+            if log_file is not None:
+                with contextlib.suppress(Exception):
+                    log_file.close()
+            shutil.rmtree(config_dir, ignore_errors=True)
             raise
 
         logger.info(
@@ -340,6 +363,10 @@ class OpenClawAgent:
         state = self._sessions.pop(session_key, None)
         if state is not None:
             await self._teardown_state(state)
+        # Drop the per-session lock so ``_locks`` does not grow unbounded as
+        # sessions are created and destroyed over a long-running worker.
+        async with self._locks_guard:
+            self._locks.pop(session_key, None)
 
     async def close_all_sessions(self) -> None:
         for key in list(self._sessions.keys()):
@@ -370,7 +397,11 @@ class OpenClawAgent:
         ]
 
         text_parts: list[str] = []
-        tool_calls: list[dict[str, Any]] = []
+        # Accumulate streamed tool calls by their ``index``: OpenAI-compatible
+        # streaming sends the ``name`` only in the first chunk and streams
+        # ``arguments`` across later chunks, so we must buffer per index and
+        # emit once the stream completes.
+        active_tool_calls: dict[int, dict[str, Any]] = {}
 
         # Use a fresh OpenClaw session per turn: OpenClaw keeps its own
         # per-session-key memory, but AReaL's DataProxy already replays the
@@ -416,12 +447,26 @@ class OpenClawAgent:
                     text_parts.append(text)
 
                 for tc in delta.get("tool_calls") or []:
+                    idx = tc.get("index")
+                    if idx is None:
+                        continue
                     fn = tc.get("function") or {}
                     name = fn.get("name")
                     args = fn.get("arguments", "")
+                    slot = active_tool_calls.setdefault(
+                        idx, {"name": "", "arguments": []}
+                    )
                     if name:
-                        await emitter.emit_tool_call(name=name, args=args)
-                        tool_calls.append({"name": name, "input": args})
+                        slot["name"] = name
+                    if args:
+                        slot["arguments"].append(args)
+
+        tool_calls: list[dict[str, Any]] = []
+        for slot in active_tool_calls.values():
+            name = slot["name"]
+            full_args = "".join(slot["arguments"])
+            await emitter.emit_tool_call(name=name, args=full_args)
+            tool_calls.append({"name": name, "input": full_args})
 
         summary = "".join(text_parts)
         return AgentResponse(

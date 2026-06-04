@@ -159,7 +159,7 @@ def main() -> None:
             env_vars[passthrough] = os.environ[passthrough]
 
     ctrl_config = AgentConfig(
-        agent_cls_path="examples.openclaw.agent.OpenClawAgent",
+        agent_cls_path="areal.experimental.agent_service.runtimes.openclaw.OpenClawAgent",
         admin_api_key=admin_key,
         scheduling_spec=(SchedulingSpec(env_vars=env_vars),),
     )
