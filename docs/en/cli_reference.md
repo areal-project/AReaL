@@ -844,7 +844,7 @@ See: https://github.com/gradio-app/trackio
 | `project`                     | string \| None | `None`       | -           |
 | `name`                        | string \| None | `None`       | -           |
 | `space_id`                    | string \| None | `None`       | -           |
-| `max_rollout_traces_per_step` | integer        | `32`         | -           |
+| `max_rollout_traces_per_step` | integer        | `0`          | -           |
 
 (section-wand-b)=
 

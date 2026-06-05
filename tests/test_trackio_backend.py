@@ -25,7 +25,7 @@ class TestTrackioConfig:
         assert config.project is None
         assert config.name is None
         assert config.space_id is None
-        assert config.max_rollout_traces_per_step == 32
+        assert config.max_rollout_traces_per_step == 0
 
     def test_custom_values(self):
         """TrackioConfig should accept custom values."""
@@ -118,7 +118,9 @@ class TestStatsLoggerTrackioIntegration:
 
         from areal.utils.stats_logger import StatsLogger
 
-        config = _make_test_config(TrackioConfig(mode="online"))
+        config = _make_test_config(
+            TrackioConfig(mode="online", max_rollout_traces_per_step=32)
+        )
         logger = StatsLogger(config, _make_ft_spec())
         mock_trackio.init.assert_called_once()
         assert logger._trackio_enabled is True
@@ -152,7 +154,9 @@ class TestStatsLoggerTrackioIntegration:
 
         from areal.utils.stats_logger import StatsLogger
 
-        config = _make_test_config(TrackioConfig(mode="online"))
+        config = _make_test_config(
+            TrackioConfig(mode="online", max_rollout_traces_per_step=32)
+        )
         logger = StatsLogger(config, _make_ft_spec())
         mock_trackio.log.reset_mock()
 
@@ -172,7 +176,9 @@ class TestStatsLoggerTrackioIntegration:
 
         from areal.utils.stats_logger import StatsLogger
 
-        config = _make_test_config(TrackioConfig(mode="online"))
+        config = _make_test_config(
+            TrackioConfig(mode="online", max_rollout_traces_per_step=32)
+        )
         logger = StatsLogger(config, _make_ft_spec())
         mock_trackio.finish.reset_mock()
 
@@ -216,7 +222,9 @@ class TestStatsLoggerTrackioIntegration:
 
         from areal.utils.stats_logger import StatsLogger
 
-        config = _make_test_config(TrackioConfig(mode="online"))
+        config = _make_test_config(
+            TrackioConfig(mode="online", max_rollout_traces_per_step=32)
+        )
         logger = StatsLogger(config, _make_ft_spec())
         mock_trackio.log.reset_mock()
 
@@ -324,7 +332,9 @@ class TestStatsLoggerTrackioIntegration:
 
         from areal.utils.stats_logger import StatsLogger
 
-        config = _make_test_config(TrackioConfig(mode="online"))
+        config = _make_test_config(
+            TrackioConfig(mode="online", max_rollout_traces_per_step=32)
+        )
         logger = StatsLogger(config, _make_ft_spec())
         mock_trackio.log.reset_mock()
 
@@ -361,7 +371,9 @@ class TestStatsLoggerTrackioIntegration:
 
         from areal.utils.stats_logger import StatsLogger
 
-        config = _make_test_config(TrackioConfig(mode="online"))
+        config = _make_test_config(
+            TrackioConfig(mode="online", max_rollout_traces_per_step=32)
+        )
         logger = StatsLogger(config, _make_ft_spec())
         mock_trackio.log.reset_mock()
 
@@ -401,7 +413,9 @@ class TestStatsLoggerTrackioIntegration:
 
         from areal.utils.stats_logger import StatsLogger
 
-        config = _make_test_config(TrackioConfig(mode="online"))
+        config = _make_test_config(
+            TrackioConfig(mode="online", max_rollout_traces_per_step=32)
+        )
         logger = StatsLogger(config, _make_ft_spec())
         mock_trackio.log.reset_mock()
 
