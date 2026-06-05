@@ -1718,6 +1718,7 @@ class vLLMConfig:
     max_lora_rank: int = 16  # vllm's default
     max_loras: int = 8  # override default
     lora_modules: list[str] | None = None  # lora_modules is automatically filled
+    enable_return_routed_experts: bool = False
 
     @staticmethod
     def build_args(
@@ -2176,7 +2177,7 @@ class InferenceEngineConfig:
     return_routed_experts: bool = field(
         default=False,
         metadata={
-            "help": "Return routed expert indices for MoE models. Effective only when using SGLang engine with MoE models."
+            "help": "Return routed expert indices for MoE models."
         },
     )
 
