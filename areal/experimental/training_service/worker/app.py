@@ -15,7 +15,7 @@ from areal.experimental.training_service.worker.awex import create_awex_blueprin
 from areal.experimental.training_service.worker.config import TrainWorkerConfig
 from areal.experimental.training_service.worker.engine import create_engine_module
 from areal.experimental.training_service.worker.rdt import create_rdt_blueprint
-from areal.experimental.weight_update import get_weight_update_backend
+from areal.experimental.weight_update.constants import get_weight_update_backend
 from areal.infra.platforms import current_platform
 from areal.infra.rpc.serialization import deserialize_value, serialize_value
 from areal.utils import logging

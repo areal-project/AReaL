@@ -6,7 +6,11 @@ from dataclasses import dataclass
 
 from pydantic import BaseModel  # pyright: ignore[reportMissingImports]
 
-from areal.experimental.weight_update import BACKEND_AWEX, BACKEND_DISK, BACKEND_RDT
+from areal.experimental.weight_update.constants import (
+    BACKEND_AWEX,
+    BACKEND_DISK,
+    BACKEND_RDT,
+)
 
 
 @dataclass

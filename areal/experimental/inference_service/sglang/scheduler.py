@@ -12,7 +12,7 @@ import torch.distributed as dist
 import zmq
 from sglang.srt.server_args import PortArgs, ServerArgs
 
-from areal.experimental.weight_update import (
+from areal.experimental.weight_update.constants import (
     BACKEND_AWEX,
     BACKEND_RDT,
     WEIGHT_UPDATE_BACKEND_ENV,

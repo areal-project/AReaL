@@ -9,7 +9,7 @@ from typing import Any
 
 import httpx
 
-from areal.experimental.weight_update import BACKEND_AWEX
+from areal.experimental.weight_update.constants import BACKEND_AWEX
 from areal.experimental.weight_update.controller.config import (
     WeightUpdateControllerConfig,
 )

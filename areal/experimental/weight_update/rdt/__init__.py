@@ -91,6 +91,65 @@ def deserialize_actor_handle_bytes(actor_bytes_b64: str) -> Any:
     return ray.cloudpickle.loads(actor_bytes)
 
 
+def try_register_nixl_memory(tensor: Any) -> bool:
+    """Try to register tensor memory with NIXL for lifetime of the process.
+
+    Pre-registering avoids per-step NIXL registration overhead when the same
+    buffer is reused across multiple weight update steps. Returns True if
+    registration succeeded, False if the API is unavailable or call fails.
+
+    Args:
+        tensor: A PyTorch tensor whose memory should be registered with NIXL
+
+    Returns:
+        bool: True if registration succeeded, False otherwise
+    """
+    try:
+        from ray.experimental import (
+            register_nixl_memory,  # pyright: ignore[reportMissingImports]
+        )
+
+        register_nixl_memory(tensor)
+        return True
+    except (ImportError, AttributeError, Exception) as e:
+        logger.warning(
+            "register_nixl_memory not available or failed: %s. "
+            "NIXL buffer reuse will be disabled.",
+            e,
+        )
+        return False
+
+
+def try_set_target_for_ref(ref: Any, target: list) -> bool:
+    """Try to set target buffers for an RDT ObjectRef to receive into.
+
+    When set_target_for_ref succeeds, ray.get() writes RDMA data directly
+    into the pre-allocated target buffers, avoiding per-step GPU allocation.
+    Returns True if succeeded, False if the API is unavailable or call fails.
+
+    Args:
+        ref: A Ray ObjectRef for an RDT object
+        target: A list of tensors to be used as target receive buffers
+
+    Returns:
+        bool: True if succeeded, False otherwise
+    """
+    try:
+        from ray.experimental import (
+            set_target_for_ref,  # pyright: ignore[reportMissingImports]
+        )
+
+        set_target_for_ref(ref, target)
+        return True
+    except (ImportError, AttributeError, Exception) as e:
+        logger.warning(
+            "set_target_for_ref not available or failed: %s. "
+            "Falling back to standard ray.get().",
+            e,
+        )
+        return False
+
+
 def get_tensor_transport() -> str:
     """Get appropriate tensor transport based on device type.
 
@@ -113,6 +172,8 @@ __all__ = [
     "serialize_actor_handle_bytes",
     "deserialize_actor_handle_bytes",
     "get_tensor_transport",
+    "try_register_nixl_memory",
+    "try_set_target_for_ref",
     "WeightTransportActor",
 ]
 

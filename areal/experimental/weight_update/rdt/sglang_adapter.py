@@ -27,6 +27,8 @@ from areal.experimental.weight_update.rdt import (
     deserialize_actor_handle_bytes,
     fetch_kv_metadata,
     get_tensor_transport,
+    try_register_nixl_memory,
+    try_set_target_for_ref,
 )
 from areal.utils import logging
 
@@ -37,6 +39,11 @@ class RDTSGLangAdapter:
     """RDT inference adapter for in-process SGLang schedulers.
 
     Handles one-sided RDMA weight pull via Ray RPC from TW actors.
+
+    With NIXL buffer reuse, pre-allocates receive buffers during init and
+    registers them with register_nixl_memory. During weight update, uses
+    set_target_for_ref to direct RDMA into pre-allocated buffers, avoiding
+    per-step GPU allocation.
     """
 
     def __init__(self, scheduler: Any) -> None:
@@ -47,6 +54,14 @@ class RDTSGLangAdapter:
         self._tensor_transport: str | None = None
         self._ray_initialized: bool = False
         self._rank_info: RankInfo | None = None
+
+        # NIXL buffer reuse: pre-allocated receive buffers
+        # Key: pair_name, Value: dict mapping send_rank -> recv buffer
+        self._recv_buffers: dict[str, dict[int, torch.Tensor]] = {}
+        # Cached unpack metadata per pair_name per send_rank
+        self._recv_buffer_meta: dict[str, dict[int, dict]] = {}
+        # Whether NIXL reuse is available (None = not tested yet)
+        self._nixl_reuse_available: bool | None = None
 
     def _get_model(self) -> torch.nn.Module:
         return self._scheduler.tp_worker.model_runner.model
@@ -341,6 +356,89 @@ class RDTSGLangAdapter:
 
         self._tensor_transport = transport
 
+    def _compute_recv_buffer_sizes(
+        self, plan: TransferPlan
+    ) -> dict[int, tuple[int, torch.dtype]]:
+        """Compute per-send_rank buffer sizes from TransferPlan.
+
+        Returns:
+            dict mapping send_rank -> (total_numel, common_dtype)
+        """
+        buffer_sizes: dict[int, tuple[int, torch.dtype]] = {}
+
+        for send_rank, operations in plan.inter_operations.items():
+            total_numel = 0
+            common_dtype = None
+            for op in operations:
+                numel = math.prod(op.send_shard_meta.shape)
+                total_numel += numel
+                op_dtype = op.send_shard_meta.dtype
+                # Use torch dtype object directly (ParameterShardMeta.dtype is torch.dtype)
+                if common_dtype is None:
+                    common_dtype = op_dtype
+            buffer_sizes[send_rank] = (total_numel, common_dtype)
+
+        return buffer_sizes
+
+    def _allocate_recv_buffers(self, pair_name: str, plan: TransferPlan) -> None:
+        """Pre-allocate receive buffers for each TW send_rank and register with NIXL.
+
+        Buffer sizes are deterministic from TransferPlan — same model architecture
+        means same buffer sizes every step. Pre-registering with NIXL avoids
+        per-step registration overhead.
+        """
+        buffer_sizes = self._compute_recv_buffer_sizes(plan)
+        local_rank = self._get_model_context()["local_rank"]
+        device = torch.device(f"cuda:{local_rank}")
+
+        recv_buffers: dict[int, torch.Tensor] = {}
+        recv_meta: dict[int, dict] = {}
+
+        for send_rank, (total_numel, common_dtype) in buffer_sizes.items():
+            recv_buffer = torch.empty(total_numel, dtype=common_dtype, device=device)
+
+            # Try registering with NIXL
+            if self._nixl_reuse_available is None:
+                self._nixl_reuse_available = try_register_nixl_memory(recv_buffer)
+            elif self._nixl_reuse_available:
+                try_register_nixl_memory(recv_buffer)
+
+            recv_buffers[send_rank] = recv_buffer
+
+            # Compute unpack metadata from TransferPlan
+            # (names, offsets, shapes, dtypes) — deterministic across steps
+            operations = plan.inter_operations[send_rank]
+            names = [op.send_shard_meta.name for op in operations]
+            offsets = []
+            current_offset = 0
+            shapes = []
+            dtypes = []
+            for op in operations:
+                shape = op.send_shard_meta.shape
+                numel = math.prod(shape)
+                offsets.append(current_offset)
+                shapes.append(shape)
+                dtypes.append(str(op.send_shard_meta.dtype))
+                current_offset += numel
+
+            recv_meta[send_rank] = {
+                "names": names,
+                "offsets": offsets,
+                "shapes": shapes,
+                "dtypes": dtypes,
+            }
+
+        self._recv_buffers[pair_name] = recv_buffers
+        self._recv_buffer_meta[pair_name] = recv_meta
+
+        total_bytes = sum(b.numel() * b.element_size() for b in recv_buffers.values())
+        reuse_str = "enabled" if self._nixl_reuse_available else "disabled"
+        logger.info(
+            f"NIXL buffer reuse ({reuse_str}): pre-allocated "
+            f"{len(recv_buffers)} recv buffers for pair '{pair_name}', "
+            f"total={total_bytes / 1024 / 1024:.1f}MB"
+        )
+
     def rdt_init_weight_update_group(
         self,
         pair_name: str,
@@ -396,6 +494,9 @@ class RDTSGLangAdapter:
                 f"for {len(tw_handles)} TW handles"
             )
 
+            # Pre-allocate receive buffers for NIXL reuse
+            self._allocate_recv_buffers(pair_name, self._transfer_plans[pair_name])
+
     def rdt_execute_weight_update(self, version: int = 0) -> None:
         import time
 
@@ -436,6 +537,30 @@ class RDTSGLangAdapter:
             )
 
         t2 = time.monotonic()
+
+        # Try set_target_for_ref for NIXL buffer reuse
+        # If available, RDMA data lands directly in pre-allocated recv buffers
+        reuse = (
+            self._nixl_reuse_available
+            and pair_name in self._recv_buffers
+            and pair_name in self._recv_buffer_meta
+        )
+
+        if reuse:
+            send_ranks = list(plan.inter_operations.keys())
+            target_success = True
+            for ref, send_rank in zip(refs, send_ranks):
+                recv_buffer = self._recv_buffers[pair_name][send_rank]
+                if not try_set_target_for_ref(ref, [recv_buffer]):
+                    target_success = False
+                    break
+
+            if target_success:
+                logger.info(f"[RDT-IW] set_target_for_ref enabled for {len(refs)} refs")
+            else:
+                reuse = False
+                logger.info("[RDT-IW] set_target_for_ref failed, falling back to alloc")
+
         logger.info(f"[RDT-IW] Submitted {len(refs)} RPCs, calling ray.get...")
         raw_results = ray.get(refs)
         t3 = time.monotonic()
@@ -443,57 +568,94 @@ class RDTSGLangAdapter:
         # Unpack merged buffers back to tensor dicts
         shard_tensor_by_rank: dict[int, dict[str, torch.Tensor]] = {}
         total_bytes = 0
-        for idx, (result, send_rank) in enumerate(
-            zip(raw_results, list(plan.inter_operations.keys()))
-        ):
-            buffer = result["buffer"]
-            metadata = result["metadata"]
-            names = metadata["names"]
-            offsets = metadata["offsets"]
-            shapes = metadata["shapes"]
-            dtypes = metadata["dtypes"]
 
-            # Split buffer back into individual tensors
-            tensor_dict = {}
-            for i, name in enumerate(names):
-                offset = offsets[i]
-                shape = shapes[i]
-                dtype_str = dtypes[i]
+        # Dtype map for unpacking
+        dtype_map = {
+            "torch.bfloat16": torch.bfloat16,
+            "torch.float16": torch.float16,
+            "torch.float32": torch.float32,
+            "torch.int32": torch.int32,
+            "torch.int64": torch.int64,
+        }
 
-                # Calculate numel from shape
-                numel = 1
-                for s in shape:
-                    numel *= s
+        if reuse:
+            # Unpack from pre-allocated recv buffers (views, no new alloc)
+            recv_meta = self._recv_buffer_meta[pair_name]
+            for result, send_rank in zip(
+                raw_results, list(plan.inter_operations.keys())
+            ):
+                recv_buffer = self._recv_buffers[pair_name][send_rank]
+                cached_meta = recv_meta[send_rank]
 
-                # Extract tensor slice from buffer
-                if i + 1 < len(offsets):
-                    next_offset = offsets[i + 1]
-                else:
-                    next_offset = buffer.numel()
+                names = cached_meta["names"]
+                offsets = cached_meta["offsets"]
+                shapes = cached_meta["shapes"]
+                dtypes = cached_meta["dtypes"]
 
-                flat_slice = buffer[offset:next_offset]
-                tensor = flat_slice.reshape(shape)
+                tensor_dict = {}
+                for i, name in enumerate(names):
+                    offset = offsets[i]
+                    shape = shapes[i]
+                    dtype_str = dtypes[i]
 
-                # Cast to correct dtype if needed
-                dtype_map = {
-                    "torch.bfloat16": torch.bfloat16,
-                    "torch.float16": torch.float16,
-                    "torch.float32": torch.float32,
-                    "torch.int32": torch.int32,
-                    "torch.int64": torch.int64,
-                }
-                target_dtype = dtype_map.get(dtype_str)
-                if target_dtype and tensor.dtype != target_dtype:
-                    tensor = tensor.to(target_dtype)
+                    numel = math.prod(shape)
+                    if i + 1 < len(offsets):
+                        next_offset = offsets[i + 1]
+                    else:
+                        next_offset = recv_buffer.numel()
 
-                tensor_dict[name] = tensor
-                total_bytes += numel * tensor.element_size()
+                    flat_slice = recv_buffer[offset:next_offset]
+                    tensor = flat_slice.reshape(shape)
 
-            shard_tensor_by_rank[send_rank] = tensor_dict
+                    target_dtype = dtype_map.get(dtype_str)
+                    if target_dtype and tensor.dtype != target_dtype:
+                        tensor = tensor.to(target_dtype)
+
+                    tensor_dict[name] = tensor
+                    total_bytes += numel * tensor.element_size()
+
+                shard_tensor_by_rank[send_rank] = tensor_dict
+        else:
+            # Fallback: unpack from fresh buffers (current behavior)
+            for idx, (result, send_rank) in enumerate(
+                zip(raw_results, list(plan.inter_operations.keys()))
+            ):
+                buffer = result["buffer"]
+                metadata = result["metadata"]
+                names = metadata["names"]
+                offsets = metadata["offsets"]
+                shapes = metadata["shapes"]
+                dtypes = metadata["dtypes"]
+
+                tensor_dict = {}
+                for i, name in enumerate(names):
+                    offset = offsets[i]
+                    shape = shapes[i]
+                    dtype_str = dtypes[i]
+
+                    numel = math.prod(shape)
+
+                    if i + 1 < len(offsets):
+                        next_offset = offsets[i + 1]
+                    else:
+                        next_offset = buffer.numel()
+
+                    flat_slice = buffer[offset:next_offset]
+                    tensor = flat_slice.reshape(shape)
+
+                    target_dtype = dtype_map.get(dtype_str)
+                    if target_dtype and tensor.dtype != target_dtype:
+                        tensor = tensor.to(target_dtype)
+
+                    tensor_dict[name] = tensor
+                    total_bytes += numel * tensor.element_size()
+
+                shard_tensor_by_rank[send_rank] = tensor_dict
 
         t4 = time.monotonic()
+        reuse_str = "reuse" if reuse else "alloc"
         logger.info(
-            f"[RDT-IW] Unpacked {len(raw_results)} buffers, "
+            f"[RDT-IW] Unpacked {len(raw_results)} buffers ({reuse_str}), "
             f"total tensors={sum(len(d) for d in shard_tensor_by_rank.values())}, "
             f"total_bytes={total_bytes / 1024 / 1024:.1f}MB, "
             f"unpack_time={1000 * (t4 - t3):.1f}ms"
@@ -510,7 +672,7 @@ class RDTSGLangAdapter:
         logger.info(
             f"[RDT-IW-Timing] prep={1000 * (t1 - t0):.1f}ms | "
             f"rpc_submit={1000 * (t2 - t1):.1f}ms | ray_get={1000 * (t3 - t2):.1f}ms | "
-            f"unpack={1000 * (t4 - t3):.1f}ms | apply_model={1000 * (t5 - t4):.1f}ms | "
+            f"unpack({reuse_str})={1000 * (t4 - t3):.1f}ms | apply_model={1000 * (t5 - t4):.1f}ms | "
             f"cleanup={1000 * (t6 - t5):.1f}ms | total={1000 * (t6 - t0):.1f}ms"
         )
 
@@ -580,4 +742,6 @@ class RDTSGLangAdapter:
         self._tw_handles.clear()
         self._transfer_plans.clear()
         self._infer_world_sizes.clear()
+        self._recv_buffers.clear()
+        self._recv_buffer_meta.clear()
         self._rank_info = None
