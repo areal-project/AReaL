@@ -1044,9 +1044,7 @@ class PPOTrainer:
             )
         elif rollout_backend == "vllm":
             if self.config.rollout.return_routed_experts:
-                raise ValueError(
-                    "return_routed_experts is not supported with vLLM backend. Please disable return_routed_experts or switch to SGLang backend."
-                )
+                self.config.vllm.enable_return_routed_experts = True
             if lora_path is not None and self.config.actor.use_lora:
                 self.config.vllm.lora_modules = [
                     f"{self.config.gconfig.lora_name}-v0={lora_path}"
@@ -1308,10 +1306,13 @@ class PPOTrainer:
             )
 
         if rollout_backend == "vllm" and self.config.rollout.return_routed_experts:
-            raise ValueError(
-                "return_routed_experts is only supported with SGLang backend. "
-                "Please disable return_routed_experts or switch to SGLang backend."
-            )
+            from areal.utils import pkg_version
+
+            if not pkg_version.is_version_greater_or_equal("vllm", "0.22.0"):
+                raise ValueError(
+                    "return_routed_experts is only supported with vLLM version higher than or equal to 0.22.0. "
+                    "Please disable return_routed_experts or update the version of vLLM."
+                )
         if (
             actor_backend == "megatron"
             and self.config.actor.use_lora

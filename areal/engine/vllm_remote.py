@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import io
 import os
 import subprocess
 import sys
@@ -8,6 +9,8 @@ from collections.abc import Callable
 from concurrent.futures import Future
 from typing import Any
 
+import numpy as np
+import pybase64
 import torch
 from torchdata.stateful_dataloader import StatefulDataLoader
 
@@ -67,6 +70,10 @@ class VLLMBackend:
         if gconfig.stop:
             payload["stop"] = gconfig.stop
 
+        # Add return_routed_experts to payload if set
+        if req.metadata.get("return_routed_experts", False):
+            payload["return_routed_experts"] = True
+
         if with_lora:
             lora_name = gconfig.lora_name
             if not lora_name:
@@ -105,6 +112,13 @@ class VLLMBackend:
         """Parse vLLM generation response."""
         meta_info = response["choices"][0]
         stop_reason = meta_info["finish_reason"]
+        # Extract routed_experts information if available
+        routed_experts = meta_info.get("routed_experts")
+        if routed_experts is not None:
+            # Extract expert_id and reshape to (num_vllm_tokens, num_players * expert_top_k)
+            routed_experts = np.load(io.BytesIO(pybase64.b64decode(routed_experts)))
+            num_vllm_tokens = routed_experts.shape[0]
+            routed_experts = routed_experts.reshape(num_vllm_tokens, -1)
 
         # Parse tokens from "token:123" format
         if "tokens" in meta_info["logprobs"]:
@@ -123,11 +137,13 @@ class VLLMBackend:
                 output_tokens=[],
                 output_logprobs=[],
                 stop_reason=stop_reason,
+                routed_experts=routed_experts,
             )
         return HttpGenerationResult(
             output_tokens=output_tokens,
             output_logprobs=output_logprobs,
             stop_reason=stop_reason,
+            routed_experts=routed_experts,
         )
 
     def build_score_request(
