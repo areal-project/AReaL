@@ -1354,7 +1354,7 @@ def _update_weights_from_disk(
                     # not fail the weight update: the target may already be gone.
                     results = await asyncio.gather(*jobs, return_exceptions=True)
                     for r in results:
-                        if isinstance(r, BaseException):
+                        if isinstance(r, Exception):
                             logger.warning(
                                 f"Best-effort request to {http_req.endpoint} "
                                 f"failed (ignored): {r}"
