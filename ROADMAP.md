@@ -147,7 +147,7 @@ organized into two categories:
 **Planned but not in progress**
 
 - [ ] Support for agentic training with large VLM MoE models (Archon backend)
-- [ ] Omni model RL support with FSDP/Archon backend
+- [ ] Omini model RL support with FSDP/Archon backend
 - [ ] Decoupling agent service from the inference service
 - [ ] Online RL training with the proxy server
 - [ ] LoRA support for the Archon backend
