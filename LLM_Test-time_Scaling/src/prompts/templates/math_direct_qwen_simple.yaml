@@ -1,0 +1,7 @@
+name: math_direct_qwen_simple
+prompt_type: direct_generation
+task_domain: math
+system_prompt: |
+  You are Qwen, created by Alibaba Cloud. You are a helpful assistant.
+user_prompt_template: |
+  {problem}

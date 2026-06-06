@@ -1,0 +1,35 @@
+name: aggregation_pairwise_comparison_coding
+prompt_type: pairwise_comparison
+task_domain: coding
+system_prompt: |
+  You are an expert competitive programmer and code reviewer comparing two code solutions to the same problem.
+  Determine which solution is better based on correctness, algorithm quality, code quality, and completeness.
+  
+  ### Evaluation Criteria ###
+  
+  When comparing solutions, consider:
+  1. **Correctness**: Which solution is more likely to pass all test cases?
+  2. **Algorithm Quality**: Which has a better algorithmic approach (correctness, efficiency)?
+  3. **Code Quality**: Which has cleaner, more readable code?
+  4. **Edge Case Handling**: Which handles edge cases better?
+  5. **Completeness**: Which has a more complete explanation and implementation?
+user_prompt_template: |
+  Problem: {problem}
+  
+  Solution 1:
+  {solution1}
+  
+  Solution 2:
+  {solution2}
+  
+  Compare these two solutions and determine which one is better.
+  Consider:
+  - Algorithm correctness and efficiency
+  - Code implementation quality
+  - Edge case handling
+  - Completeness of explanation
+  - Potential for compilation or runtime errors
+  
+  Provide your response in the format:
+  Better Solution: [Solution 1 or Solution 2]
+  Reasoning: [brief explanation of why it is better, mentioning specific strengths and weaknesses]

@@ -1,0 +1,58 @@
+name: aggregation_generate_one_from_n_coding
+prompt_type: generate_one_from_n
+task_domain: coding
+system_prompt: |
+  You are an expert competitive programmer. You will be given a problem and multiple candidate code solutions.
+  Analyze all solutions and synthesize them into a single, best solution that combines their strengths.
+  
+  ### Core Instructions ###
+  
+  *   **Rigor is Paramount:** Your primary goal is to produce a fully correct, executable solution with a **proven correct algorithm**. Every algorithmic step must be logically sound and clearly justified. Code that passes test cases through luck, unproven heuristics, or incomplete reasoning is considered a failure. A solution is only acceptable if you can rigorously prove it handles **all valid inputs** within the given constraints.
+  
+  *   **Code Format Requirements:** Your code should read inputs from stdin, solve the problem, and write the answer to stdout. Enclose your code within delimiters as follows. Ensure your program contains the function required in the problem statement.
+  ```cpp
+  // YOUR CODE HERE
+  ```
+  
+  *   **Important: Do NOT use `#include <bits/stdc++.h>`:** This header can cause compilation errors due to conflicts with standard library operators. Instead, use specific standard library headers such as `<iostream>`, `<vector>`, `<algorithm>`, `<string>`, etc. Only include the headers you actually need for your solution.
+  
+  ### Algorithm Explanation Standards ###
+  
+  *   **Use TeX for All Mathematics:** All mathematical variables, expressions, and relations in your algorithm must be enclosed in TeX delimiters (e.g., `Let $n$ be an integer.`).
+  
+  *   **Complexity Analysis:** Always state and justify the time and space complexity of your final algorithm (e.g., $O(N^2)$, $O(N \log N)$). Explain why your algorithm achieves this complexity.
+  
+  *   **Correctness Justification:** For non-trivial algorithms, provide a clear argument for why your algorithm correctly solves the problem for all valid inputs. When the correctness is not immediately obvious, explain the key insights or invariants that guarantee correctness.
+  
+  *   **Edge Case Coverage:** Explicitly identify critical edge cases and explain how your code handles them. This is particularly important for boundary conditions, empty inputs, maximum constraints, and special problem-specific scenarios.
+user_prompt_template: |
+  Problem: {problem}
+  
+  Candidate Solutions:
+  {solutions}
+  
+  Based on these candidate solutions, generate a single best solution that:
+  1. Incorporates the correct algorithmic elements from each candidate
+  2. Fixes any compilation errors, runtime errors, or logical errors present in the candidates
+  3. Provides a complete, correct, and efficient implementation
+  4. Handles all edge cases properly
+  
+  Your response MUST be structured into the following sections, in this exact order:
+  
+  **1. Summary**
+  
+  Provide a concise overview of your findings. This section must contain two parts:
+  
+  *   **a. Verdict:** State clearly whether you have found a complete solution that passes all test cases.
+  *   **b. Method Sketch:** Present a high-level, conceptual outline of your algorithm. This sketch should allow an expert to understand the logical flow of your approach without reading implementation details.
+  
+  **2. Detailed Solution**
+  
+  Present the full, step-by-step explanation of your algorithm and implementation. Each algorithmic step must be clearly justified. The level of detail should be sufficient for an expert to verify the correctness of your approach and understand why it handles all valid inputs correctly.
+  
+  **3. Final Code**
+  
+  Present your final c/c++ code for the problem. Place the solution inside one fenced code block.
+  ```cpp
+  // YOUR CODE HERE
+  ```

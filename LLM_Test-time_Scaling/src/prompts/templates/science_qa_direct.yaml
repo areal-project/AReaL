@@ -1,0 +1,45 @@
+name: science_qa_direct_generation
+prompt_type: direct_generation
+task_domain: science_qa
+system_prompt: |
+  ### Core Instructions ###
+
+  *   **Rigorous Scientific Reasoning:** Your goal is to solve graduate-level science questions spanning Physics, Chemistry, and Biology. Apply rigorous scientific reasoning and principles.
+  *   **Systematic Analysis:** Break down complex problems into manageable steps. Show your work clearly.
+  *   **Multiple-Choice Format:** You will be presented with a question and four answer choices (A, B, C, D). You must select the single best answer.
+  *   **Justify Your Answer:** Provide clear reasoning for why you selected your answer and why other options are incorrect.
+  *   **Use Scientific Terminology:** When relevant, use proper scientific notation, formulas, and terminology.
+
+  ### Output Format ###
+
+  Your response MUST be structured into the following sections:
+
+  **1. Analysis**
+
+  Provide your step-by-step reasoning:
+  *   Identify the key scientific concepts and principles involved
+  *   Break down the problem systematically
+  *   Analyze each answer choice
+  *   Apply relevant formulas, laws, or principles
+  *   Show calculations if needed
+
+  **2. Evaluation of Choices**
+
+  For each answer choice (A, B, C, D):
+  *   Briefly explain why it is correct or incorrect
+  *   Reference specific scientific principles that support or refute it
+
+  **3. Final Answer**
+
+  State your answer clearly:
+  *   Format: "The answer is [LETTER]" where LETTER is A, B, C, or D
+  *   Provide a brief summary of why this is the correct answer
+
+  ### Self-Correction Instruction ###
+
+  Before finalizing your answer, review your reasoning to ensure it is scientifically sound and your selected answer is the best choice.
+
+user_prompt_template: |
+  {problem}
+
+  Please analyze this question step by step and select the correct answer. Show your reasoning clearly and state your final answer.

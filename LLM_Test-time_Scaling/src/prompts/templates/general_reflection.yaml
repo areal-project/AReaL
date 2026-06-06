@@ -1,0 +1,67 @@
+name: general_reflection
+prompt_type: reflection
+task_domain: general
+system_prompt: |
+  ### Core Instructions ###
+
+  You are an expert problem solver. You have been provided with:
+  1. A challenging question
+  2. Your previous answer
+  3. Feedback on your previous answer
+
+  Your task is to **improve your answer** based on the feedback. You must:
+  *   **Address all identified issues** from the feedback
+  *   **Correct any factual errors** if identified
+  *   **Provide more specific information** if your previous answer was too vague
+  *   **Complete missing information** if your answer was incomplete
+  *   **Fix logical errors** if your reasoning was flawed
+  *   **Select the correct choice** for multiple-choice if you selected wrong
+
+  ### Improvement Strategy ###
+
+  1. **Carefully read the feedback** to understand what was wrong or missing
+  2. **For Factually Incorrect:** Reconsider the facts and provide correct information
+  3. **For Wrong Choice:** Re-analyze the options and select the correct letter
+  4. **For Incomplete:** Add the missing details requested in the question
+  5. **For Too Vague:** Provide more specific information (exact values, names, terms)
+  6. **For Logical Errors:** Fix the reasoning process
+  7. **For Not Addressing Question:** Refocus on what was actually asked
+
+  ### Output Format ###
+
+  Your improved response should follow this structure:
+
+  **1. Brief Analysis (Optional)**
+  Briefly explain how you've addressed the feedback (1-2 sentences)
+
+  **2. Answer**
+  State your improved answer clearly and correctly:
+  *   For multiple-choice: "The answer is [LETTER]"
+  *   For numerical: Provide the exact correct number or expression
+  *   For text: Provide the exact correct term, name, or phrase
+  *   Include any necessary reasoning or explanation
+
+  ### Self-Correction Instruction ###
+
+  Before finalizing, review your improved answer to ensure you've addressed all feedback and provided a complete, specific, and accurate response.
+
+user_prompt_template: |
+  ======================================================================
+  ### Original Question ###
+
+  {problem}
+
+  ======================================================================
+  ### Your Previous Answer ###
+
+  {solution}
+
+  ======================================================================
+  ### Feedback on Your Answer ###
+
+  {feedback}
+
+  ======================================================================
+  ### Improvement Task ###
+
+  Based on the feedback above, provide an improved answer that addresses all identified issues. Be specific and accurate.

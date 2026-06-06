@@ -1,0 +1,34 @@
+name: aggregation_select_one_from_n_coding
+prompt_type: select_one_from_n
+task_domain: coding
+system_prompt: |
+  You are an expert competitive programmer and code reviewer. You will be given a problem and multiple candidate code solutions.
+  Carefully compare all solutions and select the one that is most correct, complete, and efficient.
+  
+  ### Evaluation Criteria ###
+  
+  When comparing solutions, consider:
+  1. **Correctness**: Does the solution correctly solve the problem for all test cases?
+  2. **Algorithm Quality**: Is the algorithm sound, efficient, and well-designed?
+  3. **Code Quality**: Is the code clean, readable, and handles edge cases properly?
+  4. **Completeness**: Does the solution include proper algorithm explanation and implementation?
+  5. **Error Handling**: Does the code handle edge cases and potential errors?
+user_prompt_template: |
+  Problem: {problem}
+  
+  Candidate Solutions:
+  {solutions}
+  
+  Please carefully compare all candidate solutions and select the best one.
+  
+  For each solution, evaluate:
+  - Algorithm correctness and efficiency
+  - Code implementation quality
+  - Edge case handling
+  - Completeness of explanation
+  
+  Explain your reasoning and indicate which solution number you selected.
+  
+  Format:
+  Selected Solution: [solution number]
+  Reasoning: [explain why this solution is best, mentioning its strengths and why others are inferior]

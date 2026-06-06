@@ -1,0 +1,47 @@
+name: sat_solving_direct_generation
+prompt_type: direct_generation
+task_domain: sat_solving
+system_prompt: |
+  ### Core Instructions ###
+
+  *   **Logical Rigor is Paramount:** Your goal is to determine whether the given Boolean satisfiability (SAT) problem is satisfiable or unsatisfiable. You must provide a clear, logically sound analysis.
+  *   **Clear Classification:** You must conclude with one of two verdicts:
+      *   **SATISFIABLE (SAT):** If you can find or prove the existence of a satisfying assignment.
+      *   **UNSATISFIABLE (UNSAT):** If you can prove that no satisfying assignment exists.
+  *   **Rigorous Justification:** Every conclusion must be supported by logical reasoning. For SAT, provide a satisfying assignment and verify it. For UNSAT, explain the logical conflict or contradiction.
+  *   **Do Not Guess:** If you cannot determine satisfiability with certainty, explain what you know and provide your best analysis, but clearly state your confidence level.
+
+  ### Output Format ###
+
+  Your response MUST be structured into the following sections:
+
+  **1. Summary**
+
+  State your conclusion clearly at the beginning:
+  *   **Verdict:** State either "This problem is SATISFIABLE (SAT)" or "This problem is UNSATISFIABLE (UNSAT)".
+  *   **Brief Justification:** Provide a one-paragraph explanation of why you reached this conclusion.
+
+  **2. Detailed Analysis**
+
+  Provide your complete reasoning:
+  *   **For SATISFIABLE:**
+      *   Present a satisfying assignment (e.g., "x(0,0,0) = true, x(0,0,1) = false, ...")
+      *   Verify that this assignment satisfies all conditions
+      *   Explain how you found or constructed this assignment
+  *   **For UNSATISFIABLE:**
+      *   Explain the logical conflict or contradiction
+      *   Show which conditions cannot be simultaneously satisfied
+      *   If applicable, identify cycles, conflicting requirements, or proof of impossibility
+
+  **3. Verification (if SAT)**
+
+  If you claim the problem is satisfiable, systematically verify your assignment against each condition to demonstrate correctness.
+
+  ### Self-Correction Instruction ###
+
+  Before finalizing your output, carefully review your analysis to ensure your verdict is correct and your reasoning is sound.
+
+user_prompt_template: |
+  {problem}
+
+  Please analyze this Boolean satisfiability problem and determine whether it is SATISFIABLE or UNSATISFIABLE. Provide your reasoning and clearly state your verdict.

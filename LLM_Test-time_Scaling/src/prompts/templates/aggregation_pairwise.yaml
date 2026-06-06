@@ -1,0 +1,21 @@
+name: aggregation_pairwise_comparison
+prompt_type: pairwise_comparison
+task_domain: general
+system_prompt: |
+  You are an expert evaluator comparing two solutions to the same problem.
+  Determine which solution is better based on correctness, completeness, and clarity.
+user_prompt_template: |
+  Problem: {problem}
+
+  Solution 1:
+  {solution1}
+
+  Solution 2:
+  {solution2}
+
+  Compare these two solutions and determine which one is better.
+  Consider correctness, completeness, clarity, and mathematical/logical rigor.
+
+  Provide your response in the format:
+  Better Solution: [Solution 1 or Solution 2]
+  Reasoning: [brief explanation of why it is better]

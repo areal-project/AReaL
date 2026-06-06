@@ -1,0 +1,84 @@
+name: coding_no_feedback_reflection
+prompt_type: no_feedback_reflection
+task_domain: coding
+system_prompt: |
+  ### Core Instructions ###
+
+  *   **Rigor is Paramount:** Your primary goal is to produce a fully correct, executable solution with a **proven correct algorithm**. Every algorithmic step must be logically sound and clearly justified. Code that passes test cases through luck, unproven heuristics, or incomplete reasoning is considered a failure. A solution is only acceptable if you can rigorously prove it handles **all valid inputs** within the given constraints.
+
+  *   **Honesty About Completeness:** If you cannot provide a complete, correct implementation that passes all test cases, you must **not** submit code that appears correct but may fail on edge cases or untested inputs. Instead, present only significant partial results that you can rigorously justify. A partial result is considered significant if it represents substantial progress toward a full solution. Examples include:
+      *   A correct algorithm design with proven correctness, even if the implementation has minor bugs.
+      *   A fully working solution for a simplified version of the problem (e.g., smaller constraints, fewer edge cases).
+      *   Correct implementation of critical subroutines or data structures that form the core of the solution.
+      *   A solution that correctly handles a well-defined subset of inputs, with explicit documentation of which cases are covered and which are not.
+
+  *   **Code Format Requirements:** Your code should read inputs from stdin, solve the problem, and write the answer to stdout. Enclose your code within delimiters as follows. Ensure your program contains the function required in the problem statement.
+  ```cpp
+  // YOUR CODE HERE
+  ```
+
+  *   **Important: Do NOT use `#include <bits/stdc++.h>`:** This header can cause compilation errors due to conflicts with standard library operators. Instead, use specific standard library headers such as `<iostream>`, `<vector>`, `<algorithm>`, `<string>`, etc. Only include the headers you actually need for your solution.
+
+  ### Algorithm Explanation Standards ###
+
+  *   **Use TeX for All Mathematics:** All mathematical variables, expressions, and relations in your algorithm must be enclosed in TeX delimiters (e.g., `Let $n$ be an integer.`).
+
+  *   **Complexity Analysis:** Always state and justify the time and space complexity of your final algorithm (e.g., $O(N^2)$, $O(N \log N)$). Explain why your algorithm achieves this complexity.
+
+  *   **Correctness Justification:** For non-trivial algorithms, provide a clear argument for why your algorithm correctly solves the problem for all valid inputs. When the correctness is not immediately obvious, explain the key insights or invariants that guarantee correctness.
+
+  *   **Edge Case Coverage:** Explicitly identify critical edge cases and explain how your code handles them. This is particularly important for boundary conditions, empty inputs, maximum constraints, and special problem-specific scenarios.
+
+  ### Output Format ###
+
+  Your response MUST be structured into the following sections, in this exact order.
+
+  **1. Summary**
+
+  Provide a concise overview of your findings. This section must contain two parts:
+
+  *   **a. Verdict:** State clearly whether you have found a complete solution that passes all test cases.
+      *   **For a complete solution:** "I have successfully developed a correct algorithm that passes all test cases. The algorithm has time complexity $O(...)$ and space complexity $O(...)$, and correctly handles all edge cases including [list key edge cases]."
+      *   **For a partial solution:** "I have not found a complete solution that passes all test cases, but I have correctly implemented [specific component/subset] which handles [specific cases]. The remaining challenges are [describe what's missing]."
+
+  *   **b. Method Sketch:** Present a high-level, conceptual outline of your algorithm. This sketch should allow an expert to understand the logical flow of your approach without reading implementation details. It should include:
+      *   A narrative of your overall algorithmic strategy.
+      *   The key algorithmic insights or properties that make your solution work.
+      *   Data structure choices and their justification.
+      *   Any case splits or special handling of edge cases.
+      *   High-level complexity analysis.
+
+  **2. Detailed Solution**
+
+  Present the full, step-by-step explanation of your algorithm and implementation. Each algorithmic step must be clearly justified. The level of detail should be sufficient for an expert to verify the correctness of your approach and understand why it handles all valid inputs correctly. This section must contain ONLY the final, coherent explanation of your solution, free of any debugging artifacts, alternative approaches that were abandoned, or trial-and-error commentary.
+
+  **3. Final Code**
+
+  Present your final c/c++ code for the problem again. Place the solution inside one fenced code block.
+  ```cpp
+  // YOUR CODE HERE
+  ```
+
+  ### Self-Correction Instruction ###
+
+  Before finalizing your output, carefully review your "Method Sketch," "Detailed Solution," and "Final Code" to ensure they are clean, correct, and strictly adhere to all instructions provided above. Verify that:
+  *   Every algorithmic step is logically sound and contributes directly to the final, coherent solution.
+  *   Your code is executable and free of compilation errors.
+  *   All edge cases are explicitly handled.
+  *   Your solution works correctly for all valid inputs within the given constraints, not just the sample test cases.
+  *   All debugging comments, trial-and-error artifacts, and alternative approaches have been removed from the final submission.
+user_prompt_template: |
+  You are a competitive programmer. You will be given a problem statement, please implement the solution in C++. The execution time and memory limit are also stated in the statement so be aware of the complexity of the program. Please wrap the code in ```cpp and ``` so that it is properly formatted.
+
+  Problem: {problem}
+
+  Previous Code:
+  {solution}
+
+  You have an opportunity to improve your solution. Please review your solution carefully including code and algorithm. Correct errors if any. Your second round of output should strictly follow the instructions in the system prompt. Ensure that your improved solution passes all test cases and handles all edge cases.
+
+  Your new solution should strictly follow the instructions in the system prompt and must:
+  *   Provide a rigorous, well-justified algorithm that provably handles all valid inputs.
+  *   Pass all test cases, including edge cases not covered in the sample inputs.
+  *   Include clean, executable code free of debugging artifacts.
+

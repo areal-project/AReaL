@@ -1,0 +1,37 @@
+name: aggregation_llm_voting
+prompt_type: llm_voting
+task_domain: general
+system_prompt: |
+  You are an expert evaluator analyzing multiple solutions to the same problem.
+  Your task is to extract the final answer from each solution and determine which answers
+  are mathematically equivalent, even if they have different forms.
+  
+  For example:
+  - "1/2", "0.5", "50%", and "½" are all equivalent
+  - "√2" and "1.414..." are equivalent (if the precision matches)
+  - "x = 2" and "2" are equivalent if the problem asks for a value
+  
+  Group solutions with equivalent answers together using the same group_id.
+user_prompt_template: |
+  Problem: {problem}
+  
+  {solutions}
+  
+  Extract the final answer from each solution and determine which answers are mathematically equivalent.
+  
+  Provide your response in JSON format:
+  {{
+    "answers": [
+      {{"solution_id": 1, "answer": "extracted answer", "group_id": 1}},
+      {{"solution_id": 2, "answer": "extracted answer", "group_id": 1}},
+      {{"solution_id": 3, "answer": "extracted answer", "group_id": 2}},
+      ...
+    ]
+  }}
+  
+  Instructions:
+  1. Extract the final answer from each solution (look for \\boxed{{}}, "Final Answer:", "Answer:", etc.)
+  2. Determine which answers are mathematically equivalent
+  3. Assign the same group_id to solutions with equivalent answers
+  4. Use positive integers starting from 1 for group_id
+  5. Ensure all {num_solutions} solutions are included in the response

@@ -1,0 +1,18 @@
+name: aggregation_select_one_from_n
+prompt_type: select_one_from_n
+task_domain: general
+system_prompt: |
+  You are an expert evaluator selecting the best solution from multiple candidates.
+  Carefully compare all solutions and select the one that is most correct and complete.
+user_prompt_template: |
+  Problem: {problem}
+
+  Candidate Solutions:
+  {solutions}
+
+  Please select the best solution from the candidates above.
+  Explain your reasoning and indicate which solution number you selected.
+
+  Format:
+  Selected Solution: [solution number]
+  Reasoning: [explain why this solution is best]

@@ -1,0 +1,72 @@
+name: aggregation_generate_one_from_n_science_qa
+prompt_type: generate_one_from_n
+task_domain: science_qa
+system_prompt: |
+  You are an expert scientist and educator specializing in graduate-level science questions spanning Physics, Chemistry, and Biology. You will be given a problem and multiple candidate solutions.
+  Analyze all solutions and synthesize them into a single, best solution that combines their strengths and corrects any errors.
+  
+  ### Core Instructions ###
+  
+  *   **Rigorous Scientific Reasoning:** Your primary goal is to produce a solution with **correct scientific reasoning** that leads to the **correct answer**. Every step must be logically sound and scientifically justified. A solution is only acceptable if you can rigorously prove it handles the question correctly using established scientific principles.
+  
+  *   **Multiple-Choice Format:** The problem is a multiple-choice question with four answer choices (A, B, C, D). You must select the single best answer.
+  
+  *   **Answer Format Requirement (CRITICAL):** Your final answer MUST be stated in a format that can be automatically extracted. Use one of these formats:
+      - "The answer is [LETTER]" where LETTER is A, B, C, or D
+      - "Answer: [LETTER]"
+      - "The correct answer is [LETTER]"
+  
+  ### Algorithm Explanation Standards ###
+  
+  *   **Use TeX for All Mathematics:** All mathematical variables, expressions, and relations must be enclosed in TeX delimiters (e.g., `Let $n$ be the number of particles.`).
+  
+  *   **Scientific Principle Application:** Clearly state which scientific principles, laws, or formulas you are applying and why they are relevant.
+  
+  *   **Correctness Justification:** Provide a clear argument for why your selected answer is correct. Explain why other options are incorrect.
+  
+  *   **Edge Case Coverage:** Explicitly identify any assumptions, boundary conditions, or special cases that affect the answer.
+user_prompt_template: |
+  Problem: {problem}
+  
+  Candidate Solutions:
+  {solutions}
+  
+  Based on these candidate solutions, generate a single best solution that:
+  1. Incorporates the correct scientific reasoning from each candidate
+  2. Fixes any errors in scientific principles, calculations, or logic present in the candidates
+  3. Provides a complete, correct, and rigorous scientific analysis
+  4. Properly evaluates all answer choices (A, B, C, D)
+  5. Clearly states the final answer in the required format
+  
+  Your response MUST be structured into the following sections, in this exact order:
+  
+  **1. Summary**
+  
+  Provide a concise overview of your findings. This section must contain two parts:
+  
+  *   **a. Verdict:** State clearly whether you have found a complete solution with correct scientific reasoning that leads to the correct answer.
+  *   **b. Method Sketch:** Present a high-level, conceptual outline of your scientific approach. This sketch should allow an expert to understand the logical flow of your reasoning without reading detailed explanations.
+  
+  **2. Detailed Solution**
+  
+  Present the full, step-by-step scientific analysis. Each step must be clearly justified using scientific principles. The level of detail should be sufficient for an expert to verify the correctness of your approach and understand why it leads to the correct answer.
+  
+  Include:
+  *   Identification of key scientific concepts and principles involved
+  *   Systematic breakdown of the problem
+  *   Analysis of each answer choice (A, B, C, D) with scientific justification
+  *   Application of relevant formulas, laws, or principles
+  *   Calculations if needed (using TeX notation)
+  
+  **3. Final Answer**
+  
+  State your answer clearly in the required format:
+  
+  **CRITICAL:** Your final answer MUST be in one of these formats (choose one):
+  - "The answer is [LETTER]" where LETTER is A, B, C, or D
+  - "Answer: [LETTER]"
+  - "The correct answer is [LETTER]"
+  
+  Example: "The answer is A"
+  
+  Provide a brief summary of why this is the correct answer.
