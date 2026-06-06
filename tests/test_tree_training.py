@@ -166,7 +166,7 @@ def _check_nan_params(params: dict[str, torch.Tensor], label: str) -> list[str]:
 
 def _create_engine(
     engine_type: str,
-    enable_tree_training: bool = False,
+    tree_training_mode: str = "disabled",
     port: str = "7777",
     experiment_name: str = "test",
     max_tokens_per_mb: int = 256,
@@ -194,7 +194,7 @@ def _create_engine(
         path=MODEL_PATH,
         mb_spec=MicroBatchSpec(**mb_spec_kwargs),
         optimizer=OptimizerConfig(),
-        enable_tree_training=enable_tree_training,
+        tree_training_mode=tree_training_mode,
         pad_to_maximum=True,
     )
 
@@ -245,7 +245,7 @@ def test_tree_training_forward(engine_type, tree_attn_backend):
     inputs = mock_tree_input()
     tree_engine = _create_engine(
         engine_type,
-        enable_tree_training=True,
+        tree_training_mode="sparse",
         port="7778",
     )
     tree_engine.eval()
@@ -347,7 +347,7 @@ def test_tree_training_forward_backward(engine_type, tree_attn_backend):
     inputs = mock_tree_input()
     tree_engine = _create_engine(
         engine_type,
-        enable_tree_training=True,
+        tree_training_mode="sparse",
         port="7778",
         experiment_name="test_tree",
     )

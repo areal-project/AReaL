@@ -27,11 +27,11 @@
 
 ### 启用树训练
 
-通过 `TrainEngineConfig` 中的 `enable_tree_training` 选项启用树训练：
+通过 `TrainEngineConfig` 中的 `tree_training_mode` 选项启用树训练：
 
 ```yaml
 actor:
-  enable_tree_training: true
+  tree_training_mode: sparse
   pad_to_maximum: true # 树训练必须设为 true
   mb_spec:
     max_tokens_per_mb: 8192  # 树训练必须设置
@@ -39,13 +39,34 @@ actor:
 
 ### 必需配置
 
-| 参数                        | 类型 | 必需 | 描述                              |
-| --------------------------- | ---- | ---- | --------------------------------- |
-| `enable_tree_training`      | bool | 是   | 启用基于树的序列打包              |
-| `pad_to_maximum`            | bool | 是   | 树训练必须设为 `true`             |
-| `mb_spec.max_tokens_per_mb` | int  | 是   | 每棵树的最大 token 数（必须设置） |
+| 参数                        | 类型 | 必需 | 描述                                    |
+| --------------------------- | ---- | ---- | --------------------------------------- |
+| `tree_training_mode`        | str  | 是   | `sparse` 启用稀疏树训练，`dta` 启用 DTA |
+| `pad_to_maximum`            | bool | 是   | 稀疏树训练必须设为 `true`               |
+| `mb_spec.max_tokens_per_mb` | int  | 是   | 每棵树的最大 token 数（必须设置）       |
 
 注意：启用树训练时，`max_tokens_per_mb` 必须是 `BLOCK_SIZE`（128）的倍数。
+
+### Dynamic Tree Attention
+
+Dynamic Tree Attention（DTA）通过 `tree_training_mode: dta` 启用。若需要在 rollout redistribution
+阶段按 DTA 逻辑在数据并行 rank 间重新分配轨迹，请将训练引擎的 `packing_algorithm` 设为 `dta`：
+
+```yaml
+actor:
+  tree_training_mode: dta
+  packing_algorithm: dta
+```
+
+这个选项和 `mb_spec.packing_algorithm` 不同。rollout 级别的 `packing_algorithm` 控制数据并行 rank
+间的轨迹分配，而 `mb_spec.packing_algorithm` 只控制训练 step 内的 micro-batch 构造。DTA 分配实现位于
+`areal/experimental/dta`，并通过 `areal.infra.dp_allocation` 中的 trajectory-level allocation
+wrapper 暴露， 因此核心 rollout 代码和 `ffd`、`kk` 使用同一个 allocation 接口。
+
+DTA 分配会先把 grouped rollout trajectories 展平成 sequence-level items，再进行分区。它会记录 `dta/*`
+指标，包括分配前后的 tree token 数和压缩率。sequence-level 准备、allocation validation 和指标计算都放在
+`areal.experimental.dta.allocation` 中；共享的 rollout 和 controller 代码只调用 experimental
+helper， 避免把算法专属细节放进核心数据路径。
 
 ## 实现
 

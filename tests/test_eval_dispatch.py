@@ -13,6 +13,7 @@ from areal.infra.controller.train_controller import (
     _dispatch_tensors,
     _pad_eval_batch,
 )
+from areal.infra.dp_allocation import AllocationInput, allocate_trajectories
 from areal.trainer.rw.rw_engine import (
     RWController,
     RWEngine,
@@ -274,11 +275,38 @@ class TestRWDispatchGrouping:
         with pytest.raises(ValueError, match="divisible by group_size"):
             _dispatch_tensors(items, dp_size=2, group_size=2)
 
+    def test_allocate_trajectories_ffd_equal_preserves_group_size(self):
+        items = _build_rw_batch(n_pairs=4)
+        allocation = allocate_trajectories(
+            AllocationInput(
+                items=items,
+                n_groups=2,
+                algorithm="ffd_equal",
+                group_size=2,
+            )
+        )
+
+        assert allocation.items is items
+        assert len(allocation.group_indices) == 2
+        for indices in allocation.group_indices:
+            assert len(indices) % 2 == 0
+            for idx in range(0, len(indices), 2):
+                assert indices[idx + 1] == indices[idx] + 1
+
     def test_dispatch_group_size_1_unchanged(self):
         items = [_make_item(i, seqlen=i + 1) for i in range(8)]
         _, indices_default = _dispatch_tensors(items, dp_size=4)
         _, indices_gs1 = _dispatch_tensors(items, dp_size=4, group_size=1)
         assert indices_default == indices_gs1
+
+    def test_dispatch_default_is_explicit_ffd_equal(self):
+        items = [_make_item(i, seqlen=i + 1) for i in range(8)]
+        _, indices_default = _dispatch_tensors(items, dp_size=4)
+        _, indices_equal = _dispatch_tensors(
+            items, dp_size=4, packing_algorithm="ffd_equal"
+        )
+        assert indices_default == indices_equal
+        assert [len(indices) for indices in indices_equal] == [2, 2, 2, 2]
 
     @pytest.mark.parametrize(
         "dp_size, group_size, n_items",

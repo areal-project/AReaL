@@ -124,7 +124,7 @@ actor:
     std_unbiased: true
     eps: 1.0e-05
   max_new_tokens: ${gconfig.max_new_tokens}
-  enable_tree_training: false
+  tree_training_mode: disabled
   scheduling_spec:
     - task_type: worker
       port_count: 2
@@ -158,7 +158,7 @@ ref:
     max_tokens_per_mb: 32768
     n_mbs_divisor: 1
   optimizer: null
-  enable_tree_training: false
+  tree_training_mode: disabled
 
 # Tau2 environment configuration
 econfig:
