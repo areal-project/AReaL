@@ -951,6 +951,16 @@ class MegatronEngineConfig:
         },
     )
 
+    disable_grad_buffers_cpu_backup: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "When offloading with torch_memory_saver, skip CPU backup for "
+                "Megatron gradient buffers (they are recomputed each step). "
+            )
+        },
+    )
+
 
 class SchedulingStrategyType(str, Enum):
     separation = "separation"
