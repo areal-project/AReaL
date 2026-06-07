@@ -20,12 +20,12 @@ from areal.api import (
 )
 from areal.api.alloc_mode import ModelAllocation
 from areal.api.cli_args import PerfTracerConfig, TrainEngineConfig
+from areal.infra.dp_allocation import AllocationInput, allocate_trajectories
 from areal.infra.rpc.rtensor import RTensor, flatten_shard_ids
 from areal.infra.utils.concurrent import run_async_task
 from areal.utils import logging, stats_tracker
 from areal.utils.data import make_dummy_eval_item
 from areal.utils.network import find_free_ports
-from areal.utils.seqpack import balanced_greedy_partition
 
 from .rollout_callback import RolloutCallback
 from .rollout_controller import RolloutController
@@ -58,68 +58,57 @@ def _is_tensor_like(obj: Any) -> bool:
     )
 
 
-def _item_weight(d: dict[str, Any]) -> int:
-    attn_mask = d.get("attention_mask")
-    if isinstance(attn_mask, torch.Tensor):
-        return int(attn_mask.sum().item())
-    if isinstance(attn_mask, RTensor):
-        return attn_mask.data.numel()
-    # Fallback: first tensor's numel
-    for v in d.values():
-        if isinstance(v, RTensor):
-            return v.data.numel()
-        if isinstance(v, torch.Tensor) and v.ndim >= 2:
-            return v.numel()
-    return 1
+def _controller_allocation_algorithm(packing_algorithm: str) -> str:
+    if packing_algorithm in {"dta", "ffd_equal"}:
+        return packing_algorithm
+    # TODO(agent): This preserves the controller dispatch behavior introduced by
+    # e97f2a0c (#1017), where tensor-like eval inputs were split with
+    # balanced_greedy_partition instead of actor.packing_algorithm. It does not
+    # honor actor.packing_algorithm="ffd"/"kk" literally; fix this with an
+    # explicit controller dispatch config or a safe ffd/kk controller policy.
+    return "ffd_equal"
 
 
 def _dispatch_tensors(
     item_list: list[dict[str, Any]],
     dp_size: int,
     group_size: int = 1,
+    packing_algorithm: str = "ffd_equal",
 ) -> tuple[list[list[dict[str, Any]]], list[list[int]]]:
     """Partition trajectories across DP groups by balanced token count.
 
     Args:
+        packing_algorithm: controller dispatch allocation algorithm. ``"ffd_equal"``
+            is the default because controller dispatch historically used
+            ``balanced_greedy_partition`` for tensor-like eval inputs. External
+            rollout config values ``"ffd"`` and ``"kk"`` currently keep this
+            equal-cardinality behavior; see TODO in
+            ``_controller_allocation_algorithm``.
         group_size: number of consecutive items that form an atomic dispatch
             unit (e.g. 2 for chosen/rejected RW pairs).  Groups are never
             split across DP ranks.  ``group_size=1`` degenerates to per-item
             partitioning.
     """
-    n = len(item_list)
-    if n % group_size != 0:
-        raise ValueError(
-            f"item count ({n}) must be divisible by group_size ({group_size})"
+    allocation = allocate_trajectories(
+        AllocationInput(
+            items=item_list,
+            n_groups=dp_size,
+            algorithm=_controller_allocation_algorithm(packing_algorithm),
+            group_size=group_size,
         )
-
-    token_weights = [_item_weight(d) for d in item_list]
-    n_groups = n // group_size
-
-    group_weights = [
-        sum(token_weights[g * group_size + k] for k in range(group_size))
-        for g in range(n_groups)
+    )
+    if allocation.metrics is not None:
+        stats_tracker.scalar(**allocation.metrics.to_stats())
+    splits = [
+        [allocation.items[idx] for idx in group_indices]
+        for group_indices in allocation.group_indices
     ]
-
-    gpart = balanced_greedy_partition(group_weights, K=dp_size)
-
-    group_indices: list[list[int]] = []
-    splits: list[list[dict[str, Any]]] = []
-    for gidxs in gpart:
-        item_idxs: list[int] = []
-        items: list[dict[str, Any]] = []
-        for g in gidxs:
-            for k in range(group_size):
-                idx = g * group_size + k
-                item_idxs.append(idx)
-                items.append(item_list[idx])
-        group_indices.append(item_idxs)
-        splits.append(items)
 
     assert all(len(s) % group_size == 0 for s in splits), (
         f"Post-dispatch invariant violated: shard sizes "
         f"{[len(s) for s in splits]} not all divisible by group_size={group_size}"
     )
-    return splits, group_indices
+    return splits, allocation.group_indices
 
 
 def _pad_eval_batch(
@@ -535,7 +524,10 @@ class TrainController:
             if _is_tensor_like(item):
                 if group_indices is None:
                     splits, group_indices = _dispatch_tensors(
-                        item, dp_size, group_size=group_size
+                        item,
+                        dp_size,
+                        group_size=group_size,
+                        packing_algorithm=self.config.packing_algorithm,
                     )
                     return splits
                 return [[item[i] for i in idxs] for idxs in group_indices]

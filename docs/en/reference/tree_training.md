@@ -32,11 +32,11 @@ FLOPs by up to **10x** and achieves up to **7x** acceleration.
 
 ### Enabling Tree Training
 
-Enable tree training via the `enable_tree_training` option in `TrainEngineConfig`:
+Enable tree training via the `tree_training_mode` option in `TrainEngineConfig`:
 
 ```yaml
 actor:
-  enable_tree_training: true
+  tree_training_mode: sparse
   pad_to_maximum: true # Must be set to true for tree training
   mb_spec:
     max_tokens_per_mb: 8192  # Must be set for tree training
@@ -44,14 +44,40 @@ actor:
 
 ### Required Configuration
 
-| Parameter                   | Type | Required | Description                        |
-| --------------------------- | ---- | -------- | ---------------------------------- |
-| `enable_tree_training`      | bool | Yes      | Enable tree-based sequence packing |
-| `pad_to_maximum`            | bool | Yes      | Must be `true` for tree training   |
-| `mb_spec.max_tokens_per_mb` | int  | Yes      | Max tokens per tree (must be set)  |
+| Parameter                   | Type | Required | Description                                      |
+| --------------------------- | ---- | -------- | ------------------------------------------------ |
+| `tree_training_mode`        | str  | Yes      | `sparse` for sparse tree training, `dta` for DTA |
+| `pad_to_maximum`            | bool | Yes      | Must be `true` for sparse tree training          |
+| `mb_spec.max_tokens_per_mb` | int  | Yes      | Max tokens per tree (must be set)                |
 
 NOTE: When tree training is enabled `max_tokens_per_mb` must be a multiple of
 `BLOCK_SIZE` (128).
+
+### Dynamic Tree Attention
+
+Dynamic Tree Attention (DTA) is enabled with `tree_training_mode: dta`. For rollout
+redistribution across data-parallel ranks, set the train engine `packing_algorithm` to
+`dta`:
+
+```yaml
+actor:
+  tree_training_mode: dta
+  packing_algorithm: dta
+```
+
+This option is separate from `mb_spec.packing_algorithm`. The rollout-level
+`packing_algorithm` controls trajectory allocation across data-parallel ranks, while
+`mb_spec.packing_algorithm` controls micro-batch formation inside a training step. DTA
+allocation is implemented under `areal/experimental/dta` and is exposed through the
+trajectory-level allocation wrapper in `areal.infra.dp_allocation`, so core rollout code
+uses the same allocation interface as `ffd` and `kk`.
+
+DTA allocation flattens grouped rollout trajectories to sequence-level items before
+partitioning. It reports `dta/*` metrics such as tree tokens before and after allocation
+and compression ratios. The sequence-level preparation, allocation validation, and
+metric computation live in `areal.experimental.dta.allocation`; shared rollout and
+controller code only call the experimental helper and keep algorithm-specific details
+out of the core data path.
 
 ## Implementation
 

@@ -366,6 +366,18 @@ class PPOActor:
 
 
 class PPOActorController(TrainController):
+    def _prepare_rollout_batch(
+        self, batch: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        if self.config.packing_algorithm != "dta":
+            return batch
+        from areal.experimental.dta.rollout import prepare_dta_rollout_batch
+
+        return prepare_dta_rollout_batch(batch)
+
+    def prepare_batch(self, *args, **kwargs) -> list[dict[str, Any]]:
+        return self._prepare_rollout_batch(super().prepare_batch(*args, **kwargs))
+
     def compute_logp(self, *args, **kwargs):
         return self._custom_function_call(
             "compute_logp", *args, rpc_meta={"broadcast": True}, **kwargs

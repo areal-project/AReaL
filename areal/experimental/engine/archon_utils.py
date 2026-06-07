@@ -258,11 +258,11 @@ def force_pad_to_maximum(
     config: TrainEngineConfig,
     parallel_dims: ArchonParallelDims,
     enable_compile: bool,
-    enable_tree_training: bool,
+    tree_training_mode: str,
     logger: logging.Logger,
 ) -> None:
     """Force ``config.pad_to_maximum = True`` when compile, PP, or tree training
-    requires it. Also validates tree training constraints.
+    requires it. Also validates sparse tree training constraints.
     """
     # Force pad_to_maximum when compile is enabled to avoid dynamic shape issues
     if enable_compile and not config.pad_to_maximum:
@@ -280,8 +280,8 @@ def force_pad_to_maximum(
         )
         config.pad_to_maximum = True
 
-    # Tree training constraints
-    if enable_tree_training:
+    # Sparse tree training constraints
+    if tree_training_mode == "sparse":
         if config.is_critic:
             raise NotImplementedError(
                 "Tree training with critic model is not supported yet."
@@ -309,7 +309,7 @@ def prepare_training_config(
     config: TrainEngineConfig,
     parallel_dims: ArchonParallelDims,
     model_config: PretrainedConfig,
-    enable_tree_training: bool,
+    tree_training_mode: str,
     logger: logging.Logger,
 ) -> tuple[ActivationCheckpointConfig | None, bool]:
     """Build and validate all training configs before parallelism setup.
@@ -345,7 +345,7 @@ def prepare_training_config(
         config=config,
         parallel_dims=parallel_dims,
         enable_compile=enable_compile,
-        enable_tree_training=enable_tree_training,
+        tree_training_mode=tree_training_mode,
         logger=logger,
     )
 

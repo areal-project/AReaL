@@ -158,20 +158,26 @@ def reorder_to_balanced_batches(
 # Packing Algorithm Registry
 # =============================================================================
 
-# Supported packing algorithm names (used in MicroBatchSpec.packing_algorithm)
+# Supported cost-packing algorithm names used by MicroBatchSpec.packing_algorithm.
+# This registry operates on integer costs and intentionally does not include DTA;
+# trajectory-level allocation lives in areal.infra.dp_allocation.
 PACKING_ALGORITHM_FFD = "ffd"
 PACKING_ALGORITHM_KK = "kk"
-PACKING_ALGORITHMS = {PACKING_ALGORITHM_FFD, PACKING_ALGORITHM_KK}
+PACKING_ALGORITHMS = {
+    PACKING_ALGORITHM_FFD,
+    PACKING_ALGORITHM_KK,
+}
 
 
 def get_allocate_fn(algorithm: str = PACKING_ALGORITHM_FFD):
-    """Return the allocation function for the given algorithm name.
+    """Return a cost allocator for micro-batch sequence packing.
 
     Args:
         algorithm: One of ``"ffd"`` or ``"kk"``.
 
     Returns:
-        The corresponding allocation function (``ffd_allocate`` or ``kk_allocate``).
+        A function with signature ``(values, capacity, min_groups,
+        n_groups_divisor=1) -> group_indices``.
 
     Raises:
         ValueError: If the algorithm name is not recognized.

@@ -73,3 +73,28 @@ def test_micro_batch_split(mock_padded_data, n_mbs, max_tokens_per_mb, n_mbs_div
         assert torch.allclose(x, packed_data[key])
         y = pad_and_stack_tensors_along_first_dim(xs)
         assert torch.allclose(mock_padded_data[key], y)
+
+
+def test_micro_batch_split_n_mbs_equal_batch_size_uses_allocator(
+    mock_padded_data, monkeypatch
+):
+    calls = 0
+    original_allocate = __import__(
+        "areal.utils.data", fromlist=["allocate_balanced_mbs_synced"]
+    ).allocate_balanced_mbs_synced
+
+    def track_allocate(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original_allocate(*args, **kwargs)
+
+    monkeypatch.setattr("areal.utils.data.allocate_balanced_mbs_synced", track_allocate)
+
+    bs = mock_padded_data["attention_mask"].shape[0]
+    mb_spec = MicroBatchSpec(n_mbs=bs, max_tokens_per_mb=100)
+
+    split_result = split_padded_tensor_dict_into_mb_list(mock_padded_data, mb_spec)
+
+    assert calls == 1
+    assert len(split_result.mbs) == bs
+    assert all(mb["input_ids"].shape[0] == 1 for mb in split_result.mbs)

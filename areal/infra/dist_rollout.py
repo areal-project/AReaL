@@ -8,14 +8,15 @@ import torch.distributed as dist
 from torchdata.stateful_dataloader import StatefulDataLoader
 
 from areal.api import InferenceEngine, TrainEngine, WorkflowLike
+from areal.infra.dp_allocation import AllocationInput, allocate_trajectories
 from areal.infra.platforms import current_platform
+from areal.utils import stats_tracker
 from areal.utils.data import (
     all_gather_tensor_container,
     broadcast_tensor_container,
     split_and_unpad_tensor,
     tensor_container_to,
 )
-from areal.utils.seqpack import get_allocate_fn
 
 
 @dataclass
@@ -24,6 +25,7 @@ class RedistributedData:
     data: list[dict[str, Any]]
     rank: int
     group_indices: list[list[int]]
+    dta_metrics: Any | None = None
 
 
 def redistribute_trajectories(
@@ -45,7 +47,9 @@ def redistribute_trajectories(
     group : dist.ProcessGroup, optional
         The process group for communication. If None, uses the default group.
     packing_algorithm : str, optional
-        Packing algorithm to use ("ffd" or "kk"). Default is "ffd".
+        How to pack trajectories across data-parallel ranks: ``"ffd"`` or ``"kk"``
+        balance by total sequence length; ``"dta"`` uses DTA DFS-order partitioning
+        with ``n_tree_tokens`` as cost. Default ``"ffd"``.
 
     Returns
     -------
@@ -64,9 +68,6 @@ def redistribute_trajectories(
     for traj_list in all_gathered:
         all_data.extend(traj_list)
 
-    # Compute sequence lengths for load balancing
-    seqlens = [d["attention_mask"].sum().item() for d in all_data]
-
     # Remove pad positions from each trajectory (split_and_unpad_tensor
     # auto-derives trim lengths from attention_mask when traj_seqlens=None)
     all_data = [
@@ -76,21 +77,24 @@ def redistribute_trajectories(
         for d in all_data
     ]
 
-    allocate_fn = get_allocate_fn(packing_algorithm)
-    # Allocate trajectories to ranks using the configured packing algorithm
-    # No capacity limit leads to balanced partition across this group
-    group_indices = allocate_fn(
-        seqlens, capacity=int(1e12), min_groups=dist.get_world_size(group)
+    n_groups = dist.get_world_size(group)
+    allocation = allocate_trajectories(
+        AllocationInput(
+            items=all_data,
+            n_groups=n_groups,
+            algorithm=packing_algorithm,
+        )
     )
-    local_indices = group_indices[dist.get_rank(group=group)]
 
     # Select assigned trajectories for this rank (no concatenation — deferred to train side)
-    data = [all_data[i] for i in local_indices]
+    local_indices = allocation.group_indices[dist.get_rank(group=group)]
+    data = [allocation.items[i] for i in local_indices]
     return RedistributedData(
-        all_data=all_data,
+        all_data=allocation.items,
         data=data,
         rank=dist.get_rank(group=group),
-        group_indices=group_indices,
+        group_indices=allocation.group_indices,
+        dta_metrics=allocation.metrics,
     )
 
 
@@ -122,21 +126,31 @@ class DistRolloutCoordinator:
         list[dict[str, Any]]
             Redistributed and broadcast batch available on all ranks (list of trajs)
         """
+        rollout_packing = self.train_engine.config.packing_algorithm
+
         if trajectories is not None:
-            config = getattr(self.train_engine, "config", None)
-            mb_spec = getattr(config, "mb_spec", None)
-            packing_algorithm = getattr(mb_spec, "packing_algorithm", "ffd")
             redist = redistribute_trajectories(
                 trajectories,
                 group=self.train_engine.data_parallel_group,
-                packing_algorithm=packing_algorithm,
+                packing_algorithm=rollout_packing,
             )
             batch = redist.data
+            dta_metrics_payload = [redist.dta_metrics]
         else:
             batch = None
+            dta_metrics_payload = [None]
 
         current_platform.synchronize()
         dist.barrier(group=self.train_engine.cpu_group)
+
+        dist.broadcast_object_list(
+            dta_metrics_payload,
+            src=self.train_engine.current_data_parallel_head(),
+            group=self.train_engine.context_and_model_parallel_group,
+        )
+        dta_metrics = dta_metrics_payload[0]
+        if dta_metrics is not None:
+            stats_tracker.scalar(**dta_metrics.to_stats())
 
         batch = broadcast_tensor_container(
             batch,

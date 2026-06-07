@@ -151,11 +151,22 @@ For reward curves of experiments on a larger scale, please refer to the
    `generated/` directory under `cluster.fileroot`. You can analyze these for debugging
    and evaluation.
 
-1. **Tree training**: The configs enable `enable_tree_training=true` by default, which
+1. **Tree training**: The configs use `tree_training_mode=sparse` by default, which
    optimizes training by sharing prefix computations across rollouts with the same
    prompt. This option can largely accelerate training but will possibly increase GPU
    memory usage if `actor.mb_spec.max_tokens_per_mb` is large. And this setting may
    cause instability during the training of the MoE model.
+
+   To try Dynamic Tree Attention (DTA) with the Archon Tau2 configs, keep the existing
+   config file and pass overrides instead of using a separate DTA-specific config:
+
+   ```bash
+   python3 examples/tau2/train.py \
+       --config examples/tau2/config_1.7b_airline.yaml \
+       actor.tree_training_mode=dta \
+       actor.packing_algorithm=dta \
+       actor.gradient_checkpointing=false
+   ```
 
 ## Customization
 
