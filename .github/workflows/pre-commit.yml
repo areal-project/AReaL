@@ -22,6 +22,11 @@ jobs:
           path: ~/.cache/pre-commit
           key: pre-commit-${{ hashFiles('.pre-commit-config.yaml') }}
 
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: '0.9.18'
+
       - name: Run pre-commit hooks
         run: |
           pip install pre-commit
@@ -35,7 +40,7 @@ jobs:
           FAILED=0
           for SHA in $(git log --no-merges --format=%H origin/${{ github.base_ref }}..HEAD); do
             git log --format=%B -1 "$SHA" > /tmp/commit_msg
-            if ! conventional-pre-commit feat fix docs style refactor perf test build ci chore revert /tmp/commit_msg; then
+            if ! conventional-pre-commit feat fix docs gov style refactor perf test build ci chore revert /tmp/commit_msg; then
               echo "❌ Bad commit: $(git log --format=%s -1 "$SHA")"
               FAILED=1
             fi

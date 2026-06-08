@@ -30,6 +30,20 @@ class BaseModelArgs(ABC):
     # Attention backend type: "sdpa" or "varlen"
     attn_type: str = "varlen"
 
+    @staticmethod
+    def _get_rope_theta(hf_config: PretrainedConfig, default: float = 10000.0) -> float:
+        """Extract rope_theta from HF config, compatible with transformers v4 and v5+.
+
+        In transformers v5+, rope_theta was moved from a direct config attribute
+        into the rope_parameters dict. This helper checks both locations.
+        """
+        # v5+: rope_theta lives inside rope_parameters dict
+        rope_params = getattr(hf_config, "rope_parameters", None) or {}
+        if "rope_theta" in rope_params:
+            return rope_params["rope_theta"]
+        # v4: rope_theta is a direct attribute
+        return getattr(hf_config, "rope_theta", default)
+
     @classmethod
     @abstractmethod
     def from_hf_config(
@@ -105,6 +119,15 @@ class BaseStateDictAdapter(ABC):
                 "Loading from quantized checkpoint format is not supported for this model."
             )
         return HuggingFaceStorageReader(path)
+
+    def _maybe_composite_hf_key(self, hf_key: str) -> str:
+        """Return the checkpoint key to use for HF save/load operations.
+
+        Most Archon adapters use the HuggingFace key as-is. Adapters that need to
+        remap text weights into a composite namespace, such as Qwen3.5 multimodal
+        checkpoints, can override this hook.
+        """
+        return hf_key
 
     @abstractmethod
     def from_hf(self, hf_state_dict: dict[str, Any]) -> dict[str, Any]: ...

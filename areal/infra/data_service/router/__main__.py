@@ -19,8 +19,10 @@ def main():
     router_config_module = importlib.import_module(
         "areal.infra.data_service.router.config"
     )
+    logging_module = importlib.import_module("areal.utils.logging")
     create_router_app = router_app_module.create_router_app
     RouterConfig = router_config_module.RouterConfig
+    suppress_http_loggers = logging_module.suppress_http_loggers
 
     config = RouterConfig(
         host=args.host,
@@ -32,8 +34,15 @@ def main():
 
     uvicorn = importlib.import_module("uvicorn")
 
+    suppress_http_loggers()
     app = create_router_app(config)
-    uvicorn.run(app, host=config.host, port=config.port, log_level="warning")
+    uvicorn.run(
+        app,
+        host=config.host,
+        port=config.port,
+        log_level="warning",
+        access_log=False,
+    )
 
 
 if __name__ == "__main__":

@@ -10,4 +10,4 @@ class WorkerConfig:
     host: str = "0.0.0.0"
     port: int = 9000
     agent_cls_path: str = ""
-    log_level: str = "info"
+    log_level: str = "warning"

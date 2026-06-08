@@ -113,6 +113,16 @@ def _get_custom_dataset(
             max_length=max_length,
             **kwargs,
         )
+    elif "hh-rlhf" in path and type == "dpo":
+        from .hhrlhf import get_hhrlhf_dpo_dataset
+
+        return get_hhrlhf_dpo_dataset(
+            path=path,
+            split=split,
+            tokenizer=tokenizer,
+            max_length=max_length,
+            **kwargs,
+        )
     elif "torl_data" in path and type == "rl":
         from .torl_data import get_torl_data_rl_dataset
 

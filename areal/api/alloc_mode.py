@@ -1129,7 +1129,7 @@ class _LLMParallelParser:
             err_hint = """
 Hints:
 1. The parsing logic requires colons instead of dots to separate backends from dimensions, e.g., use "sglang:d4+fsdp:d4" instead of "sglang.d4+fsdp.d4".
-2. Check https://inclusionai.github.io/AReaL/en/tutorial/megatron.html for allowed syntax and examples with complex MoE models.
+2. Check https://areal-project.github.io/AReaL/en/tutorial/megatron.html for allowed syntax and examples with complex MoE models.
 """
             raise ValueError(f"Parsing error: {e}\n{err_hint}")
 

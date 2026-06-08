@@ -11,6 +11,6 @@ class TrainDataProxyConfig:
     port: int = 9082
     worker_addrs: list[str] = field(default_factory=list)
     admin_api_key: str = "areal-admin-key"
-    log_level: str = "info"
+    log_level: str = "warning"
     request_timeout: float = 600.0
     warmup_timeout: float = 120.0

@@ -8,7 +8,7 @@ and Worker.
 
 Submodules
 ----------
-- ``controller`` — :class:`AgentServiceController` orchestrator
+- ``controller`` — :class:`AgentController` orchestrator
 - ``gateway`` — public HTTP/WebSocket entry point
 - ``router`` — session-affine routing
 - ``data_proxy`` — stateful session proxy

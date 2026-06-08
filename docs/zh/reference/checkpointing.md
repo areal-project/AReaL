@@ -58,7 +58,7 @@ PPOTrainer.train()
 
 ## Saver：HuggingFace 模型导出
 
-[`Saver`](https://github.com/inclusionAI/AReaL/blob/main/areal/utils/saver.py) 定期以
+[`Saver`](https://github.com/areal-project/AReaL/blob/main/areal/utils/saver.py) 定期以
 HuggingFace 格式导出模型权重，用于评估或部署。
 
 ### 保存模式
@@ -126,7 +126,7 @@ tokenizer = AutoTokenizer.from_pretrained(
 
 ## RecoverHandler：容错
 
-[`RecoverHandler`](https://github.com/inclusionAI/AReaL/blob/main/areal/utils/recover.py)
+[`RecoverHandler`](https://github.com/areal-project/AReaL/blob/main/areal/utils/recover.py)
 通过保存完整训练状态实现故障后恢复训练。
 
 ### 配置

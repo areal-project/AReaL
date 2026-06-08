@@ -448,16 +448,17 @@ class RolloutController:
             logger.warning("Proxy gateway already running")
             return
 
-        from areal.api.cli_args import OpenAIProxyConfig
         from areal.experimental.openai.proxy.proxy_gateway import (
             create_proxy_gateway_app,
         )
 
-        openai_cfg = self.config.openai or OpenAIProxyConfig()
+        agent_cfg = self.config.agent
 
         app = create_proxy_gateway_app(
             proxy_addrs=self.proxy_addrs,
-            admin_api_key=openai_cfg.admin_api_key,
+            admin_api_key=agent_cfg.admin_api_key
+            if agent_cfg is not None
+            else "areal-admin-key",
         )
 
         self._proxy_gateway_port = find_free_ports(1)[0]
@@ -473,6 +474,7 @@ class RolloutController:
                     host="0.0.0.0",
                     port=self._proxy_gateway_port,
                     log_level="warning",
+                    access_log=False,
                 )
                 server = uvicorn.Server(config)
                 self._proxy_gateway_server = server
@@ -980,6 +982,46 @@ class RolloutController:
         # Return list of trajectories
         trajectories = [r.trajectory if r is not None else None for r in results]
         return [t for t in trajectories if t is not None]
+
+    def compute_logp(self, data: list[dict[str, Any]]) -> list[Any]:
+        """Compute token log-probabilities for trajectories via remote workers."""
+        if len(data) == 0:
+            return []
+
+        async def _compute():
+            indexed_chunks: list[list[int]] = []
+            tasks = []
+            n_workers = len(self.workers)
+            if n_workers == 0:
+                raise RuntimeError("No workers available for compute_logp.")
+
+            for rank, worker in enumerate(self.workers):
+                idxs = list(range(rank, len(data), n_workers))
+                if not idxs:
+                    continue
+                chunk = [data[i] for i in idxs]
+                indexed_chunks.append(idxs)
+                tasks.append(
+                    self.scheduler.async_call_engine(
+                        worker_id=worker.id,
+                        method="compute_logp",
+                        engine_name=self._engine_name(rank),
+                        data=chunk,
+                        http_timeout=self.config.request_timeout,
+                    )
+                )
+            rpc_results = await asyncio.gather(*tasks)
+            merged: list[Any] = [None] * len(data)
+            for idxs, chunk_result in zip(indexed_chunks, rpc_results):
+                if len(chunk_result) != len(idxs):
+                    raise RuntimeError(
+                        f"compute_logp result length mismatch: got {len(chunk_result)}, expected {len(idxs)}"
+                    )
+                for out_idx, value in zip(idxs, chunk_result):
+                    merged[out_idx] = value
+            return merged
+
+        return run_async_task(_compute)
 
     async def agenerate(self, req: ModelRequest) -> ModelResponse:
         """Asynchronously generate a response for the given request.

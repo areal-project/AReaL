@@ -97,9 +97,10 @@ class MockScheduler:
         await asyncio.sleep(0.001)
         return None
 
-    def delete_workers(self, role):
+    def delete_workers(self, role, reverse_order: bool = False):
         """Mock worker deletion."""
         self.deleted_roles.append(role)
+        self.delete_reverse_order = reverse_order
         self.workers.clear()
 
 
@@ -259,6 +260,22 @@ class TestTrainControllerDestroy:
 
         # Workers should still be cleared
         assert len(train_controller.workers) == 0
+
+    def test_destroy_requests_reverse_order(self, train_controller, ft_spec):
+        """Workers must be torn down in reverse rank order.
+
+        This protects rank-0 (which owns the global TCPStore server) from
+        being killed before non-zero ranks finish NCCL abort, avoiding a
+        noisy ``TCPStore.recvValue failed`` warning from
+        HeartbeatMonitor.
+        """
+        train_controller.initialize(role="train_worker", ft_spec=ft_spec)
+
+        train_controller.destroy()
+
+        assert (
+            getattr(train_controller.scheduler, "delete_reverse_order", False) is True
+        )
 
 
 class TestTrainControllerMergeResults:
@@ -674,6 +691,33 @@ class TestTrainControllerDispatchInputs:
         # Should split into dp_size chunks
         assert len(split_args) == 1
         assert len(split_args[0]) == train_controller.parallel_strategy.dp_size
+
+    def test_prepare_dispatch_partitions_without_duplication(
+        self, train_controller, ft_spec
+    ):
+        """Regression for #1202: trajectories are partitioned across DP ranks,
+        never replicated. Each DP rank must see a disjoint slice so that total
+        tokens processed equal the original batch, not batch * dp_size."""
+        train_controller.initialize(
+            role="train_worker",
+            ft_spec=ft_spec,
+        )
+
+        dp_size = train_controller.parallel_strategy.dp_size
+        batch_size = 4 * dp_size
+        batch = create_mock_distributed_batch(size=batch_size)
+
+        split_args, _, group_indices = train_controller._prepare_dispatch(batch)
+
+        # Sanity: tensor-like list triggers the partition path, not replication.
+        assert group_indices is not None
+        assert len(group_indices) == dp_size
+
+        shards = split_args[0]
+        assert sum(len(shard) for shard in shards) == batch_size
+
+        flat_indices = [idx for group in group_indices for idx in group]
+        assert sorted(flat_indices) == list(range(batch_size))
 
     def test_prepare_dispatch_replicates_non_batch_args(
         self, train_controller, ft_spec

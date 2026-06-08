@@ -2,10 +2,11 @@
 
 """Agent Service Controller — orchestrator for agent micro-services."""
 
-from .config import AgentServiceControllerConfig
-from .controller import AgentServiceController
+from areal.api.cli_args import AgentConfig
+
+from .controller import AgentController
 
 __all__ = [
-    "AgentServiceController",
-    "AgentServiceControllerConfig",
+    "AgentController",
+    "AgentConfig",
 ]

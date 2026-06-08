@@ -347,13 +347,15 @@ class TestGatewayExternalEndpoints:
         mock_forward.return_value = httpx.Response(
             200,
             json={
-                "interactions": {"id-1": {"messages": [], "reward": 0.0}},
+                "traj": {
+                    "interactions": [{"request": [], "response": "", "reward": 0.0}]
+                },
             },
         )
 
         resp = await gateway_client.post(
             "/export_trajectories",
-            json={"session_id": "ext-1"},
+            json={"session_ids": ["ext-1"]},
             headers=admin_headers(),
         )
         assert resp.status_code == 200
@@ -408,12 +410,10 @@ def mock_areal_client():
 
 
 @pytest_asyncio.fixture
-async def data_proxy_client(data_proxy_config, mock_tokenizer, mock_areal_client):
-    from areal.experimental.inference_service.data_proxy.backend import (
-        SGLangBridgeBackend,
-    )
-    from areal.experimental.inference_service.data_proxy.inf_bridge import InfBridge
+async def data_proxy_app(data_proxy_config, mock_tokenizer, mock_areal_client):
     from areal.experimental.inference_service.data_proxy.pause import PauseState
+    from areal.experimental.inference_service.inf_bridge import InfBridge
+    from areal.experimental.inference_service.sglang.bridge import SGLangBridgeBackend
 
     app = create_data_proxy_app(data_proxy_config)
     pause_state = PauseState()
@@ -433,9 +433,17 @@ async def data_proxy_client(data_proxy_config, mock_tokenizer, mock_areal_client
     store = SessionStore()
     store.set_admin_key(data_proxy_config.admin_api_key)
     app.state.session_store = store
+    app.state.http_client = MagicMock()
     app.state.version = 0
+    http_client = httpx.AsyncClient(timeout=10.0)
+    app.state.http_client = http_client
+    yield app
+    await http_client.aclose()
 
-    transport = httpx.ASGITransport(app=app)
+
+@pytest_asyncio.fixture
+async def data_proxy_client(data_proxy_app):
+    transport = httpx.ASGITransport(app=data_proxy_app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
         yield c
 
@@ -454,6 +462,7 @@ class TestDataProxyExternalEndpoints:
     async def test_external_chat_completions_non_streaming(
         self,
         data_proxy_client,
+        data_proxy_app,
         monkeypatch,
     ):
         await data_proxy_client.post(
@@ -462,24 +471,12 @@ class TestDataProxyExternalEndpoints:
         )
 
         class _FakeClient:
-            def __init__(self, *args, **kwargs):
-                pass
-
-            async def __aenter__(self):
-                return self
-
-            async def __aexit__(self, exc_type, exc, tb):
-                return False
-
             async def post(self, url, json=None, headers=None):
                 assert url == "http://ext-api/chat/completions"
                 assert json["model"] == "gpt-4o"
                 return httpx.Response(200, json={"id": "ext-1-response"})
 
-        monkeypatch.setattr(
-            "areal.experimental.inference_service.data_proxy.app.httpx.AsyncClient",
-            _FakeClient,
-        )
+        data_proxy_app.state.http_client = _FakeClient()
 
         resp = await data_proxy_client.post(
             "/chat/completions",
@@ -491,10 +488,11 @@ class TestDataProxyExternalEndpoints:
 
         not_ready = await data_proxy_client.post(
             "/export_trajectories",
-            json={"session_id": "__hitl__"},
+            json={"session_ids": ["__hitl__"], "remove_session": False},
             headers={"Authorization": "Bearer areal-admin-key"},
         )
-        assert not_ready.status_code == 409
+        assert not_ready.status_code == 200
+        assert not_ready.json()["traj"] == {}
 
         set_reward = await data_proxy_client.post(
             "/rl/set_reward",
@@ -506,12 +504,12 @@ class TestDataProxyExternalEndpoints:
 
         exported = await data_proxy_client.post(
             "/export_trajectories",
-            json={"session_id": "__hitl__"},
+            json={"session_ids": ["__hitl__"]},
             headers={"Authorization": "Bearer areal-admin-key"},
         )
         assert exported.status_code == 200
         payload = exported.json()
-        assert len(payload["interactions"]) == 1
+        assert len(payload["traj"]["interactions"]) == 1
 
     @pytest.mark.asyncio
     async def test_external_chat_completions_streaming(
@@ -583,19 +581,20 @@ class TestDataProxyExternalEndpoints:
 
         exported = await data_proxy_client.post(
             "/export_trajectories",
-            json={"session_id": "__hitl__"},
+            json={"session_ids": ["__hitl__"]},
             headers={"Authorization": "Bearer areal-admin-key"},
         )
         assert exported.status_code == 200
         payload = exported.json()
-        assert len(payload["interactions"]) == 1
+        assert len(payload["traj"]["interactions"]) == 1
 
         exported_again = await data_proxy_client.post(
             "/export_trajectories",
-            json={"session_id": "__hitl__"},
+            json={"session_ids": ["__hitl__"]},
             headers={"Authorization": "Bearer areal-admin-key"},
         )
-        assert exported_again.status_code == 409
+        assert exported_again.status_code == 200
+        assert exported_again.json()["traj"] == {}
 
     @pytest.mark.asyncio
     async def test_unregistered_model_falls_through_to_internal(
@@ -614,6 +613,7 @@ class TestDataProxyExternalEndpoints:
     async def test_external_chat_uses_stored_provider_api_key(
         self,
         data_proxy_client,
+        data_proxy_app,
         monkeypatch,
     ):
         await data_proxy_client.post(
@@ -629,24 +629,12 @@ class TestDataProxyExternalEndpoints:
         captured_headers: dict[str, str] = {}
 
         class _FakeClient:
-            def __init__(self, *args, **kwargs):
-                pass
-
-            async def __aenter__(self):
-                return self
-
-            async def __aexit__(self, exc_type, exc, tb):
-                return False
-
             async def post(self, url, json=None, headers=None):
                 if headers:
                     captured_headers.update(headers)
                 return httpx.Response(200, json={"id": "ext-1-response"})
 
-        monkeypatch.setattr(
-            "areal.experimental.inference_service.data_proxy.app.httpx.AsyncClient",
-            _FakeClient,
-        )
+        data_proxy_app.state.http_client = _FakeClient()
 
         resp = await data_proxy_client.post(
             "/chat/completions",
@@ -692,7 +680,10 @@ async def test_external_model_end_to_end_register_then_chat(router_config):
             data_proxy_addrs: list[str],
             admin_api_key: str,
             timeout: float,
+            *,
+            client: httpx.AsyncClient | None = None,
         ) -> dict:
+            del router_addr, admin_api_key, timeout, client
             resp = await router_client.post(
                 "/register_model",
                 json={
@@ -715,24 +706,28 @@ async def test_external_model_end_to_end_register_then_chat(router_config):
             session_id: str | None = None,
             admin_api_key: str | None = None,
             model: str | None = None,
+            client: httpx.AsyncClient | None = None,
         ) -> str:
+            del router_addr, path, timeout, admin_api_key, client
+            payload: dict[str, str] = {}
             if model is not None:
-                resp = await router_client.post(
-                    "/route",
-                    json={"model": model},
-                    headers=admin_headers(),
-                )
+                payload["model"] = model
+            if api_key is not None:
+                payload["api_key"] = api_key
+            if session_id is not None:
+                payload["session_id"] = session_id
+            resp = await router_client.post(
+                "/route",
+                json=payload,
+                headers=admin_headers(),
+            )
+            if model is not None:
                 if resp.status_code == 404:
                     raise RouterKeyRejectedError("not found", 404)
                 if resp.status_code == 503:
                     raise RouterKeyRejectedError("no healthy workers", 503)
                 resp.raise_for_status()
                 return resp.json()["worker_addr"]
-            resp = await router_client.post(
-                "/route",
-                json={"api_key": api_key, "session_id": session_id},
-                headers=admin_headers(),
-            )
             resp.raise_for_status()
             return resp.json()["worker_addr"]
 
@@ -741,7 +736,10 @@ async def test_external_model_end_to_end_register_then_chat(router_config):
             body: bytes,
             headers: dict[str, str],
             timeout: float,
+            *,
+            client: httpx.AsyncClient | None = None,
         ) -> httpx.Response:
+            del timeout, client
             if upstream_url == f"{WORKER_ADDR}/register_model":
                 data = json.loads(body)
                 proxy_state[data["name"]] = {

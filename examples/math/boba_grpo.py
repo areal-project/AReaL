@@ -5,7 +5,7 @@ from datasets import load_dataset
 from areal import PPOTrainer
 from areal.api.cli_args import GRPOConfig, load_expr_config
 from areal.reward import get_math_verify_worker
-from areal.utils.hf_utils import load_hf_tokenizer
+from areal.utils.hf_utils import apply_chat_template, load_hf_tokenizer
 
 
 def get_input_ids_fn(data, tokenizer, enable_thinking):
@@ -18,7 +18,8 @@ def get_input_ids_fn(data, tokenizer, enable_thinking):
         .replace(assistant_token, "")
         .replace(think_token, "")
     )
-    input_ids = tokenizer.apply_chat_template(
+    input_ids = apply_chat_template(
+        tokenizer,
         [{"role": "user", "content": data}],
         tokenize=True,
         add_generation_prompt=True,

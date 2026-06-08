@@ -6,10 +6,12 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager
 from typing import Any
 
 import httpx
 
+from areal.infra.utils.http import async_httpx_retry, create_httpx_client
 from areal.utils import logging
 
 logger = logging.getLogger("InferenceGateway")
@@ -30,6 +32,19 @@ class RouterKeyRejectedError(Exception):
         self.status_code = status_code
 
 
+@asynccontextmanager
+async def _use_client(
+    client: httpx.AsyncClient | None, timeout: float
+) -> AsyncGenerator[httpx.AsyncClient, None]:
+    """Yield the shared *client* if provided, otherwise create a temporary one."""
+    if client is not None:
+        yield client
+    else:
+        async with create_httpx_client(timeout=timeout) as c:
+            yield c
+
+
+@async_httpx_retry
 async def query_router(
     router_addr: str,
     api_key: str | None = None,
@@ -39,6 +54,7 @@ async def query_router(
     session_id: str | None = None,
     admin_api_key: str | None = None,
     model: str | None = None,
+    client: httpx.AsyncClient | None = None,
 ) -> str:
     """Ask the Router for a worker address.
 
@@ -49,13 +65,20 @@ async def query_router(
     Parameters
     ----------
     admin_api_key : str | None
-        Admin API key for authenticating with the router.  Required since
-        the ``/route`` endpoint requires admin auth.
+        When set, sent as ``Authorization: Bearer <key>`` so the Router
+        can authenticate the request.
+    session_id : str | None
+        Pin routing to the session's worker.
+    model : str | None
+        Route to a specific model's data proxies.
+    client : httpx.AsyncClient | None
+        Shared HTTP client.  When ``None``, a per-request client is created
+        (backwards-compatible, but less efficient).
 
     Raises
     ------
     RouterUnreachableError
-        Router connection failed.
+        Router is unreachable or returned an unexpected HTTP error.
     RouterKeyRejectedError
         Router returned 404 (unknown key / session) or 503 (no healthy workers).
     """
@@ -73,12 +96,12 @@ async def query_router(
         headers = {}
         if admin_api_key is not None:
             headers["Authorization"] = f"Bearer {admin_api_key}"
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            resp = await client.post(
-                f"{router_addr}/route",
-                json=payload,
-                headers=headers,
+
+        async with _use_client(client, timeout) as c:
+            resp = await c.post(
+                f"{router_addr}/route", json=payload, headers=headers, timeout=timeout
             )
+
         if resp.status_code == 404:
             data = resp.json()
             raise RouterKeyRejectedError(
@@ -95,40 +118,49 @@ async def query_router(
         raise RouterUnreachableError(f"Router unreachable: {exc}") from exc
     except httpx.TimeoutException as exc:
         raise RouterUnreachableError(f"Router timed out: {exc}") from exc
+    except httpx.TransportError as exc:
+        raise RouterUnreachableError(f"Router transport error: {exc}") from exc
     except httpx.HTTPStatusError as exc:
         raise RouterUnreachableError(
             f"Router returned HTTP {exc.response.status_code}: {exc}"
         ) from exc
 
 
+@async_httpx_retry
 async def register_session_in_router(
     router_addr: str,
-    session_api_key: str,
-    session_id: str,
+    sessions: list[dict[str, str]],
     worker_addr: str,
     timeout: float,
     admin_api_key: str | None = None,
+    *,
+    group_id: str,
+    client: httpx.AsyncClient | None = None,
 ) -> None:
-    """Register a session→worker mapping in the Router.
-
-    POST ``{router_addr}/register_session``.
-    Called by the gateway after intercepting ``/rl/start_session`` response.
-    """
+    """Register session(s) and their group in the Router atomically."""
     try:
         headers = {}
         if admin_api_key is not None:
             headers["Authorization"] = f"Bearer {admin_api_key}"
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            resp = await client.post(
+
+        payload: dict[str, Any] = {
+            "sessions": sessions,
+            "worker_addr": worker_addr,
+            "group_id": group_id,
+        }
+
+        async with _use_client(client, timeout) as c:
+            resp = await c.post(
                 f"{router_addr}/register_session",
-                json={
-                    "session_api_key": session_api_key,
-                    "session_id": session_id,
-                    "worker_addr": worker_addr,
-                },
+                json=payload,
                 headers=headers,
+                timeout=timeout,
             )
+
         resp.raise_for_status()
+    except httpx.TransportError as exc:
+        logger.error("Failed to register session in router: %s", exc)
+        raise RouterUnreachableError(f"Failed to register session: {exc}") from exc
     except Exception as exc:
         logger.error("Failed to register session in router: %s", exc)
         raise RouterUnreachableError(f"Failed to register session: {exc}") from exc
@@ -137,98 +169,46 @@ async def register_session_in_router(
 async def revoke_session_in_router(
     router_addr: str,
     admin_api_key: str,
-    session_id: str,
-    timeout: float,
+    group_id: str,
+    timeout: float = 2.0,
+    *,
+    client: httpx.AsyncClient | None = None,
 ) -> None:
-    """Remove a session from the Router's session registry.
-
-    POST ``{router_addr}/remove_session`` with admin key auth and
-    JSON body ``{"session_id": ...}``.
-    Called after ``/export_trajectories`` to prevent unbounded memory growth.
-    Best-effort: logs errors but never raises.
-    """
+    """Best-effort removal of a session group from the Router's registry."""
     try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            resp = await client.post(
+        async with _use_client(client, timeout) as c:
+            resp = await c.post(
                 f"{router_addr}/remove_session",
-                json={"session_id": session_id},
+                json={"group_id": group_id},
                 headers={"Authorization": f"Bearer {admin_api_key}"},
+                timeout=timeout,
             )
         if resp.status_code != 200:
             logger.warning(
                 "remove_session returned %d: %s", resp.status_code, resp.text
             )
     except Exception as exc:
-        logger.warning("Failed to remove session %s in router: %s", session_id, exc)
+        logger.warning("Failed to remove group %s in router: %s", group_id, exc)
 
 
-async def grant_capacity_in_router(
-    router_addr: str,
-    admin_api_key: str,
-    timeout: float,
-) -> dict:
-    """Forward a grant_capacity request to the Router.
-
-    POST ``{router_addr}/grant_capacity`` with admin key auth.
-    Returns the JSON response body from the router.
-    """
-    try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            resp = await client.post(
-                f"{router_addr}/grant_capacity",
-                headers={"Authorization": f"Bearer {admin_api_key}"},
-            )
-        resp.raise_for_status()
-        return resp.json()
-    except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
-        raise RouterUnreachableError(
-            f"Router unreachable for grant_capacity: {exc}"
-        ) from exc
-    except Exception as exc:
-        raise RouterUnreachableError(
-            f"Failed to grant capacity in router: {exc}"
-        ) from exc
-
-
-async def release_capacity_in_router(
-    router_addr: str,
-    admin_api_key: str,
-    timeout: float,
-) -> None:
-    """Return one capacity permit to the Router.
-
-    POST ``{router_addr}/release_capacity`` with admin key auth.
-    Best-effort: logs errors but never raises, since the caller is
-    already handling a failure path.
-    """
-    try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            resp = await client.post(
-                f"{router_addr}/release_capacity",
-                headers={"Authorization": f"Bearer {admin_api_key}"},
-            )
-        if resp.status_code != 200:
-            logger.warning(
-                "release_capacity returned %d: %s", resp.status_code, resp.text
-            )
-    except Exception as exc:
-        logger.warning("Failed to release capacity in router: %s", exc)
-
-
+@async_httpx_retry
 async def get_all_worker_addrs(
     router_addr: str,
     admin_api_key: str,
     timeout: float,
+    *,
+    client: httpx.AsyncClient | None = None,
 ) -> list[str]:
     """Fetch all worker addresses from the Router (for broadcast).
 
     GET ``{router_addr}/workers`` with admin key auth.
     """
     try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            resp = await client.get(
+        async with _use_client(client, timeout) as c:
+            resp = await c.get(
                 f"{router_addr}/workers",
                 headers={"Authorization": f"Bearer {admin_api_key}"},
+                timeout=timeout,
             )
         resp.raise_for_status()
         data = resp.json()
@@ -237,6 +217,7 @@ async def get_all_worker_addrs(
         raise RouterUnreachableError(f"Failed to get workers: {exc}") from exc
 
 
+@async_httpx_retry
 async def register_model_in_router(
     router_addr: str,
     model: str,
@@ -245,10 +226,12 @@ async def register_model_in_router(
     data_proxy_addrs: list[str],
     admin_api_key: str,
     timeout: float,
+    *,
+    client: httpx.AsyncClient | None = None,
 ) -> dict:
     try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            resp = await client.post(
+        async with _use_client(client, timeout) as c:
+            resp = await c.post(
                 f"{router_addr}/register_model",
                 json={
                     "model": model,
@@ -257,6 +240,7 @@ async def register_model_in_router(
                     "data_proxy_addrs": data_proxy_addrs,
                 },
                 headers={"Authorization": f"Bearer {admin_api_key}"},
+                timeout=timeout,
             )
         if resp.status_code == 503:
             raise RouterKeyRejectedError("No healthy workers", 503)
@@ -266,18 +250,22 @@ async def register_model_in_router(
         raise RouterUnreachableError(f"Router unreachable: {exc}") from exc
 
 
+@async_httpx_retry
 async def route_external_model(
     router_addr: str,
     name: str,
     admin_api_key: str,
     timeout: float,
+    *,
+    client: httpx.AsyncClient | None = None,
 ) -> dict:
     try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            resp = await client.post(
+        async with _use_client(client, timeout) as c:
+            resp = await c.post(
                 f"{router_addr}/route",
                 json={"model": name},
                 headers={"Authorization": f"Bearer {admin_api_key}"},
+                timeout=timeout,
             )
         if resp.status_code == 404:
             raise RouterKeyRejectedError(f"Model '{name}' not found", 404)
@@ -291,16 +279,20 @@ async def route_external_model(
         raise RouterUnreachableError(f"Router unreachable: {exc}") from exc
 
 
+@async_httpx_retry
 async def list_models_from_router(
     router_addr: str,
     admin_api_key: str,
     timeout: float,
+    *,
+    client: httpx.AsyncClient | None = None,
 ) -> list[str]:
     try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            resp = await client.get(
+        async with _use_client(client, timeout) as c:
+            resp = await c.get(
                 f"{router_addr}/models",
                 headers={"Authorization": f"Bearer {admin_api_key}"},
+                timeout=timeout,
             )
         resp.raise_for_status()
         return resp.json().get("models", [])
@@ -308,30 +300,37 @@ async def list_models_from_router(
         raise RouterUnreachableError(f"Router unreachable: {exc}") from exc
 
 
+@async_httpx_retry
 async def remove_model_from_router(
     router_addr: str,
     name: str,
     admin_api_key: str,
     timeout: float,
+    *,
+    client: httpx.AsyncClient | None = None,
 ) -> None:
     """Remove an external model from the router registry (best-effort rollback)."""
     try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            resp = await client.post(
+        async with _use_client(client, timeout) as c:
+            resp = await c.post(
                 f"{router_addr}/remove_model",
                 json={"name": name},
                 headers={"Authorization": f"Bearer {admin_api_key}"},
+                timeout=timeout,
             )
         resp.raise_for_status()
     except Exception:
         pass  # Best-effort rollback; swallow errors
 
 
+@async_httpx_retry
 async def resolve_worker_addr(
     router_addr: str,
     admin_api_key: str,
     worker_id: str,
     timeout: float,
+    *,
+    client: httpx.AsyncClient | None = None,
 ) -> str:
     """Resolve a worker_id to its address via the Router.
 
@@ -345,10 +344,11 @@ async def resolve_worker_addr(
         Router connection failed.
     """
     try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            resp = await client.get(
+        async with _use_client(client, timeout) as c:
+            resp = await c.get(
                 f"{router_addr}/resolve_worker/{worker_id}",
                 headers={"Authorization": f"Bearer {admin_api_key}"},
+                timeout=timeout,
             )
         if resp.status_code == 404:
             data = resp.json()
@@ -362,6 +362,10 @@ async def resolve_worker_addr(
     except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
         raise RouterUnreachableError(
             f"Router unreachable for resolve_worker: {exc}"
+        ) from exc
+    except httpx.TransportError as exc:
+        raise RouterUnreachableError(
+            f"Router transport error for resolve_worker: {exc}"
         ) from exc
     except Exception as exc:
         raise RouterUnreachableError(
@@ -384,6 +388,8 @@ async def forward_sse_stream(
     body: bytes,
     headers: dict[str, str],
     timeout: float | None = None,
+    *,
+    client: httpx.AsyncClient | None = None,
 ) -> AsyncGenerator[bytes, None]:
     """True SSE streaming proxy — yields bytes as they arrive from upstream.
 
@@ -393,18 +399,20 @@ async def forward_sse_stream(
     On upstream HTTP errors or mid-stream failures, an SSE error event
     (``data: {"error": ...}``) is emitted so clients can distinguish a
     clean end-of-stream from a backend failure.
+
+    Note: streaming requires owning the client context for the duration
+    of the stream, so a per-request client is always created here.
+    The ``client`` parameter is accepted for API consistency but not used.
     """
     import json as _json
 
     fwd_headers = _forwarding_headers(headers)
     try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(timeout)) as client:
-            async with client.stream(
+        async with create_httpx_client(timeout=httpx.Timeout(timeout)) as c:
+            async with c.stream(
                 "POST", upstream_url, content=body, headers=fwd_headers
             ) as resp:
                 if resp.status_code != 200:
-                    # Upstream returned a non-200 status — read body and emit
-                    # an SSE error event so the client sees the failure.
                     error_body = await resp.aread()
                     try:
                         detail = _json.loads(error_body)
@@ -417,23 +425,31 @@ async def forward_sse_stream(
                     return
                 async for chunk in resp.aiter_bytes():
                     yield chunk
+    except httpx.TransportError as exc:
+        logger.error("SSE transport error from %s: %s", upstream_url, exc)
+        error_event = _json.dumps({"error": str(exc)})
+        yield f"data: {error_event}\n\n".encode()
     except Exception as exc:
         logger.error("SSE stream error from %s: %s", upstream_url, exc)
         error_event = _json.dumps({"error": str(exc)})
         yield f"data: {error_event}\n\n".encode()
 
 
+@async_httpx_retry
 async def forward_request(
     upstream_url: str,
     body: bytes,
     headers: dict[str, str],
     timeout: float = 120.0,
+    *,
+    client: httpx.AsyncClient | None = None,
 ) -> httpx.Response:
     """Forward a non-streaming request to upstream, return full response."""
     fwd_headers = _forwarding_headers(headers)
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        resp = await client.post(upstream_url, content=body, headers=fwd_headers)
-    return resp
+    async with _use_client(client, timeout) as c:
+        return await c.post(
+            upstream_url, content=body, headers=fwd_headers, timeout=timeout
+        )
 
 
 async def broadcast_to_workers(
@@ -442,6 +458,8 @@ async def broadcast_to_workers(
     body: bytes,
     headers: dict[str, str],
     timeout: float = 10.0,
+    *,
+    client: httpx.AsyncClient | None = None,
 ) -> list[dict[str, Any]]:
     """Broadcast a request to all workers (best-effort).
 
@@ -454,11 +472,12 @@ async def broadcast_to_workers(
 
     async def _call(addr: str) -> dict[str, Any]:
         try:
-            async with httpx.AsyncClient(timeout=timeout) as client:
-                resp = await client.post(
+            async with _use_client(client, timeout) as c:
+                resp = await c.post(
                     f"{addr}{path}",
                     content=body,
                     headers=_forwarding_headers(headers),
+                    timeout=timeout,
                 )
             return {
                 "worker_addr": addr,

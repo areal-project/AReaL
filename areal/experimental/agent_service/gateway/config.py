@@ -15,4 +15,4 @@ class GatewayConfig:
     router_addr: str = "http://localhost:8081"
     router_timeout: float = 2.0
     forward_timeout: float = 120.0
-    log_level: str = "info"
+    log_level: str = "warning"

@@ -510,6 +510,12 @@ class TrainEngine(abc.ABC):
     def get_device_stats(self) -> DeviceRuntimeInfo:
         raise NotImplementedError()
 
+    def start_memory_profile(self, max_entries: int = 100000) -> None:
+        pass
+
+    def stop_memory_profile(self, snapshot_dir: str) -> None:
+        pass
+
     def save_perf_tracer(self, step: int | None = None, force: bool = False) -> None:
         """Save performance tracer data.
 
@@ -710,6 +716,15 @@ class InferenceEngine(abc.ABC):
             The current weight version number
         """
         raise NotImplementedError()
+
+    def compute_logp(self, data: list[dict[str, Any]]) -> list[torch.Tensor]:
+        """Compute token log-probabilities for teacher distillation.
+
+        Implementations support this as an inference-side scoring API.
+        """
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not implement compute_logp()."
+        )
 
     def submit(
         self,

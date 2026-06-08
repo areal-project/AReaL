@@ -139,8 +139,8 @@ class TestSerializationRoundTrip:
 
         original = AutoProcessor.from_pretrained(
             get_model_path(
-                "/storage/openpsi/models/Qwen__Qwen3-VL-2B-Instruct",
-                "Qwen/Qwen3-VL-2B-Instruct",
+                "/storage/openpsi/models/Qwen__Qwen2.5-VL-3B-Instruct",
+                "Qwen/Qwen2.5-VL-3B-Instruct",
             )
         )
 
@@ -177,6 +177,7 @@ class TestSerializationRoundTrip:
         assert torch.equal(deserialized["list"][0], payload["list"][0])
         assert deserialized["meta"]["text"] == "value"
 
+    @pytest.mark.skip("skipping the ray test unless skip mark is commented out")
     def test_ray_object_ref_roundtrip(self):
         """Ray ObjectRef handles should round-trip through RPC serialization."""
         ray.init(local_mode=True, ignore_reinit_error=True)

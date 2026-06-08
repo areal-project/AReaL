@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from copy import deepcopy
 from dataclasses import asdict
 from pathlib import Path
 
@@ -20,11 +21,8 @@ def main(args: list[str]) -> None:
     ext_args, remaining = parser.parse_known_args(args)
 
     from areal.api.cli_args import PPOConfig, load_expr_config
-    from areal.experimental.inference_service.controller.config import (
-        GatewayControllerConfig,
-    )
     from areal.experimental.inference_service.controller.controller import (
-        GatewayInferenceController,
+        RolloutControllerV2,
     )
     from areal.utils import logging
     from areal.utils.environ import is_single_controller
@@ -32,10 +30,10 @@ def main(args: list[str]) -> None:
     logger = logging.getLogger("InferenceServiceOnlineTrain")
 
     config, _ = load_expr_config(remaining, PPOConfig)
-    openai_cfg = config.rollout.openai
-    if openai_cfg is None or openai_cfg.mode != "online":
+    agent_cfg = config.rollout.agent
+    if agent_cfg is None or agent_cfg.mode != "online":
         raise ValueError(
-            "online_rollout.py requires rollout.openai.mode='online' for inference_service online training."
+            "online_rollout.py requires rollout.agent.mode='online' for inference_service online training."
         )
     if not is_single_controller():
         raise NotImplementedError(
@@ -54,26 +52,13 @@ def main(args: list[str]) -> None:
 
     is_external = ext_args.api_url is not None
 
-    ctrl_config = GatewayControllerConfig(
-        tokenizer_path=config.tokenizer_path,
-        model_path=config.actor.path,
-        consumer_batch_size=config.rollout.consumer_batch_size,
-        max_concurrent_rollouts=config.rollout.max_concurrent_rollouts,
-        max_head_offpolicyness=config.rollout.max_head_offpolicyness,
-        queue_size=config.rollout.queue_size,
-        enable_rollout_tracing=config.rollout.enable_rollout_tracing,
-        fileroot=config.rollout.fileroot,
-        experiment_name=config.rollout.experiment_name,
-        trial_name=config.rollout.trial_name,
-        dump_to_file=False,
-        backend=config.rollout.backend,
-        scheduling_spec=config.rollout.scheduling_spec,
-        setup_timeout=config.rollout.setup_timeout,
-        request_timeout=config.rollout.request_timeout,
-        admin_api_key=openai_cfg.admin_api_key,
-        turn_discount=openai_cfg.turn_discount,
-        export_style=openai_cfg.export_style,
-    )
+    ctrl_config = deepcopy(config.rollout)
+    if ctrl_config.dump_to_file:
+        # FIXME: dump_to_file is not yet supported in inference service.
+        logger.warning(
+            "rollout.dump_to_file=true is not yet supported in inference service; forcing dump_to_file=false"
+        )
+    ctrl_config.dump_to_file = False
     if ext_args.model:
         ctrl_config.model = ext_args.model
     if is_external:
@@ -91,7 +76,7 @@ def main(args: list[str]) -> None:
         else:
             raise ValueError(f"Unsupported rollout backend: {rollout_alloc.backend}")
 
-    ctrl = GatewayInferenceController(config=ctrl_config, scheduler=scheduler)
+    ctrl = RolloutControllerV2(config=ctrl_config, scheduler=scheduler)
     try:
         ctrl.initialize(
             role="rollout",

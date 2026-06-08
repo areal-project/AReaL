@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
-"""AgentServiceController — orchestrates agent service micro-services via Guards.
+"""AgentController — orchestrates agent service micro-services via Guards.
 
 Mirrors the architecture of
-:class:`~areal.experimental.inference_service.controller.controller.GatewayInferenceController`:
+:class:`~areal.experimental.inference_service.controller.controller.RolloutControllerV2`:
 Guard workers are created via the Scheduler, then the controller forks
 Router, Worker+DataProxy pairs, and Gateway onto them via HTTP API.
 
@@ -12,7 +12,7 @@ Lifecycle::
     from areal.infra.scheduler.local import LocalScheduler
 
     scheduler = LocalScheduler(...)
-    controller = AgentServiceController(config, scheduler)
+    controller = AgentController(config, scheduler)
     controller.initialize()
     # ... run traffic ...
     controller.scale_up(2)     # add 2 Worker+DataProxy pairs
@@ -27,25 +27,28 @@ import threading
 import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import TYPE_CHECKING, Any
 
 import requests
 
-from areal.experimental.agent_service.controller.config import (
-    AgentServiceControllerConfig,
-)
+from areal.api.cli_args import AgentConfig
 from areal.utils import logging
 from areal.utils.network import format_hostport
 
 if TYPE_CHECKING:
     from areal.api.scheduler_api import Scheduler, Worker
 
-logger = logging.getLogger("AgentServiceController")
+logger = logging.getLogger("AgentController")
 
 _GUARD_ROLE = "agent-guard"
 _UNREGISTER_RETRIES = 3
 _HEALTH_CHECK_WORKERS = 4
+_DEFAULT_PAIR_COUNT = 1
+_DEFAULT_AGENT_LOG_LEVEL = "info"
+_DEFAULT_HEALTH_POLL_INTERVAL = 5.0
+_DEFAULT_DRAIN_TIMEOUT = 30.0
+_DEFAULT_SETUP_TIMEOUT = 120.0
 
 
 @dataclass
@@ -60,7 +63,7 @@ class _WorkerPair:
     worker_addr: str
 
 
-class AgentServiceController:
+class AgentController:
     """Orchestrator for the Agent Service micro-service stack.
 
     Parameters
@@ -73,7 +76,7 @@ class AgentServiceController:
 
     def __init__(
         self,
-        config: AgentServiceControllerConfig,
+        config: AgentConfig,
         scheduler: Scheduler,
     ) -> None:
         self.config = config
@@ -91,6 +94,7 @@ class AgentServiceController:
         self._next_pair_index: int = 0
 
         self._forked_services: list[tuple[str, str, int]] = []
+        self._base_env: dict[str, str] = {}
 
         self._health_stop = threading.Event()
         self._health_thread: threading.Thread | None = None
@@ -120,14 +124,15 @@ class AgentServiceController:
         cfg = self.config
 
         # Step 1: Create Guard workers via scheduler
-        guard_spec = SchedulingSpec(
-            gpu=0, cmd=f"{sys.executable} -m areal.experimental.agent_service.guard"
-        )
-        num_guards = max(cfg.num_pairs, 1)
+        guard_spec = SchedulingSpec(**asdict(cfg.scheduling_spec[0]))
+        guard_spec.gpu = 0
+        guard_spec.cmd = f"{sys.executable} -m areal.experimental.agent_service.guard"
+        self._base_env = dict(guard_spec.env_vars)
+        num_guards = _DEFAULT_PAIR_COUNT
         guard_job = Job(
             role=_GUARD_ROLE,
             replicas=num_guards,
-            tasks=[guard_spec for _ in range(num_guards)],
+            tasks=[SchedulingSpec(**asdict(guard_spec)) for _ in range(num_guards)],
             scheduling_strategy=SchedulingStrategy(),
         )
         self.scheduler.create_workers(job=guard_job)
@@ -159,7 +164,7 @@ class AgentServiceController:
         logger.info("Router: %s", self._router_addr)
 
         # Step 3: Fork Worker+DataProxy pairs
-        self.scale_up(cfg.num_pairs)
+        self.scale_up(_DEFAULT_PAIR_COUNT)
 
         # Step 4: Fork Gateway on guard[0]
         gw_cmd = [
@@ -181,7 +186,7 @@ class AgentServiceController:
         logger.info("Gateway: %s", self._gateway_addr)
 
         # Step 5: Start health monitor
-        if cfg.health_poll_interval > 0:
+        if _DEFAULT_HEALTH_POLL_INTERVAL > 0:
             self._health_stop.clear()
             self._health_thread = threading.Thread(
                 target=self._health_monitor_loop, daemon=True
@@ -217,6 +222,7 @@ class AgentServiceController:
         self._service_roles.clear()
         self._workers.clear()
         self._guard_addrs.clear()
+        self._base_env.clear()
         with self._pairs_lock:
             self._pairs.clear()
         self._router_addr = ""
@@ -244,7 +250,7 @@ class AgentServiceController:
                 "--agent",
                 cfg.agent_cls_path,
                 "--log-level",
-                cfg.log_level,
+                _DEFAULT_AGENT_LOG_LEVEL,
             ]
             worker_host, worker_port = self._fork_on_guard(
                 guard_addr=guard_addr,
@@ -396,7 +402,7 @@ class AgentServiceController:
 
         cmd = list(raw_cmd) + ["--host", host, "--port", str(port)]
 
-        merged_env = {**self.config.env, **(env or {})}
+        merged_env = {**self._base_env, **(env or {})}
 
         fork_payload: dict[str, Any] = {
             "role": role,
@@ -457,7 +463,7 @@ class AgentServiceController:
     def _wait_for_service(
         self, url: str, name: str, timeout: float | None = None
     ) -> None:
-        timeout = timeout or self.config.setup_timeout
+        timeout = timeout or _DEFAULT_SETUP_TIMEOUT
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             try:
@@ -486,7 +492,7 @@ class AgentServiceController:
         logger.info("Registered proxy %s with Router", proxy_addr)
 
     def _drain_proxy(self, proxy_addr: str) -> None:
-        timeout = self.config.drain_timeout
+        timeout = _DEFAULT_DRAIN_TIMEOUT
         if timeout <= 0:
             return
         deadline = time.monotonic() + timeout
@@ -522,7 +528,7 @@ class AgentServiceController:
             logger.warning("Pair %d proxy %s unreachable", pair_index, proxy_addr)
 
     def _health_monitor_loop(self) -> None:
-        interval = self.config.health_poll_interval
+        interval = _DEFAULT_HEALTH_POLL_INTERVAL
         while not self._health_stop.wait(timeout=interval):
             with self._pairs_lock:
                 snapshot = list(self._pairs.items())

@@ -84,8 +84,8 @@ class Qwen3_5RMSNormGated(nn.Module):
         hidden_states = hidden_states * torch.rsqrt(variance + self.eps)
         hidden_states = self.weight * hidden_states.to(input_dtype)
         if gate is not None:
-            hidden_states = hidden_states * F.silu(gate.float()).to(input_dtype)
-        return hidden_states
+            hidden_states = hidden_states * F.silu(gate.to(torch.float32))
+        return hidden_states.to(input_dtype)
 
     def reset_parameters(self):
         nn.init.ones_(self.weight)

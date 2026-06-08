@@ -4,7 +4,7 @@ The proxy rollout server's ``chat_completions`` handler must correctly return a
 ``StreamingResponse`` (SSE) when ``stream=True`` is requested, and a plain JSON
 ``ChatCompletion`` otherwise.
 
-Ref: https://github.com/inclusionAI/AReaL/issues/1046
+Ref: https://github.com/areal-project/AReaL/issues/1046
 """
 
 from __future__ import annotations

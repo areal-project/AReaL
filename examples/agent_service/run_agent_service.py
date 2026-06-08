@@ -5,7 +5,7 @@
 Usage::
 
     python examples/agent_service/run_agent_service.py
-    python examples/agent_service/run_agent_service.py --num-pairs 2
+    python examples/agent_service/run_agent_service.py
 
 Requires::
 
@@ -21,10 +21,8 @@ import time
 
 import httpx
 
-from areal.experimental.agent_service.controller import (
-    AgentServiceController,
-    AgentServiceControllerConfig,
-)
+from areal.api.cli_args import AgentConfig
+from areal.experimental.agent_service.controller import AgentController
 
 
 async def _wait_healthy(url: str, timeout: float = 60.0) -> None:
@@ -83,12 +81,6 @@ async def interactive_loop(gateway_addr: str, admin_key: str) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Agent Service — Claude Agent SDK")
     parser.add_argument(
-        "--num-pairs",
-        type=int,
-        default=1,
-        help="Number of Worker+DataProxy pairs (default: 1)",
-    )
-    parser.add_argument(
         "--admin-api-key",
         default="areal-agent-admin",
         help="Admin API key for inter-service auth",
@@ -103,15 +95,14 @@ def main() -> None:
         gpu_devices=[],
     )
 
-    ctrl_config = AgentServiceControllerConfig(
+    ctrl_config = AgentConfig(
         agent_cls_path="examples.agent_service.agent.ClaudeAgent",
         admin_api_key=args.admin_api_key,
-        num_pairs=args.num_pairs,
     )
-    ctrl = AgentServiceController(config=ctrl_config, scheduler=scheduler)
+    ctrl = AgentController(config=ctrl_config, scheduler=scheduler)
 
     try:
-        print(f"Initializing with {args.num_pairs} pair(s) ...")
+        print("Initializing with 1 pair ...")
         ctrl.initialize()
         print(f"  Router:  {ctrl.router_addr}")
         print(f"  Gateway: {ctrl.gateway_addr}")

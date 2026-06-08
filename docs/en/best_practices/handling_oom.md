@@ -254,3 +254,55 @@ WeightUpdateMeta.from_fsdp_xccl(
     weight_chunked_mem_mb = 512,  # Reduce from default (typically 1024+)
 )
 ```
+
+## Reducing optimizer state memory
+
+By default, the FSDP backend keeps fp32 master weights and fp32 AdamW optimizer states
+(`exp_avg`, `exp_avg_sq`), matching DeepSpeed ZeRO-3 and Megatron precision-aware
+optimizer behavior. For an `N`-billion parameter model, this costs roughly `12N` GB
+across all GPUs:
+
+| Component                      | Bytes/param |
+| ------------------------------ | ----------- |
+| fp32 master weights (storage)  | 4           |
+| fp32 `exp_avg` (1st moment)    | 4           |
+| fp32 `exp_avg_sq` (2nd moment) | 4           |
+
+**CPU memory note:** when `actor.fsdp.memory_efficient_load=true`, rank 0 loads the full
+model on CPU before broadcasting. fp32 storage doubles this peak — for an 8B model, rank
+0 CPU usage rises from ~16 GB to ~32 GB. Provision the head node accordingly, or set
+`memory_efficient_load=false` to spread CPU load across ranks.
+
+**DCP checkpoint note:** training checkpoints (Distributed Checkpoint) preserve storage
+dtype (fp32) — this is required for correct resume of master weights. HF export and
+rollout weight sync **always** cast back to compute dtype, so deployment artefacts stay
+bf16.
+
+If you hit OOM and cannot increase parallelism, switch to bf16 optimizer states with
+Kahan-summation updates:
+
+```yaml
+actor:
+  dtype: bfloat16
+  optimizer_dtype: bfloat16   # storage in bf16 (matches AdamW state)
+  optimizer:
+    type: adam_bf16           # uses AnyPrecisionAdamW + Kahan summation
+```
+
+This recovers approximately `8N` GB:
+
+| Component                      | Bytes/param |
+| ------------------------------ | ----------- |
+| bf16 master weights            | 2           |
+| bf16 `exp_avg`                 | 2           |
+| bf16 `exp_avg_sq`              | 2           |
+| bf16 Kahan compensation buffer | 2           |
+
+Per the AnyPrecision paper, Kahan summation recovers fp32-equivalent update precision.
+Step time is ~5-10% slower than fused fp32 AdamW; quality is comparable on dense and MoE
+models.
+
+**Do not use `optimizer.type: adam` together with `optimizer_dtype: bfloat16`** —
+`torch.optim.AdamW` will silently create bf16 optimizer states and the late-stage
+convergence will plateau ~3× higher than fp32 master weights (see issue #1292). The
+runtime emits a warning when this combination is detected.

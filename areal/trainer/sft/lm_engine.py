@@ -26,6 +26,7 @@ class LMEngine:
 
     def _train_lm(self, data: dict[str, Any]) -> None:
         self.engine.train()
+        data["loss_mask"] = torch.roll(data["loss_mask"].bool(), shifts=-1, dims=-1)
         stats = self.engine.train_batch(
             input_=data,
             loss_fn=compute_packed_sft_loss,
@@ -40,6 +41,7 @@ class LMEngine:
 
     def _evaluate_lm(self, data: dict[str, Any]) -> None:
         self.engine.eval()
+        data["loss_mask"] = torch.roll(data["loss_mask"].bool(), shifts=-1, dims=-1)
         self.engine.eval_batch(
             input_=data,
             loss_fn=compute_packed_sft_loss,
@@ -88,11 +90,10 @@ def compute_packed_sft_loss(
     cu_seqlens: torch.Tensor = input_["cu_seqlens"]
     loss_mask = input_["loss_mask"].bool()
 
-    loss_mask = torch.roll(loss_mask, shifts=-1, dims=-1)
     logprobs = torch.where(loss_mask, logprobs, 0)
 
     device = logprobs.device
-    loss = -logprobs.sum() / loss_mask.count_nonzero()
+    loss = -logprobs.sum() / (1e-5 + loss_mask.count_nonzero())
     with torch.no_grad():
         batch_size = cu_seqlens.shape[0] - 1
         seqlogp = torch.zeros(batch_size, dtype=torch.float64, device=device)
@@ -110,7 +111,7 @@ def compute_packed_sft_loss(
             n_seqs[i] = True
             seqlogp[i] = torch.where(m, logp.detach(), 0.0).sum() / valid_tokens
 
-    ## Loggin stats
+    ## Logging stats
     stats_tracker.denominator(
         n_seqs=n_seqs,
         n_tokens=torch.ones(logprobs.shape[0], dtype=torch.bool, device=device),

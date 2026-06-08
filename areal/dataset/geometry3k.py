@@ -96,6 +96,7 @@ def get_geometry3k_sft_dataset(
         )
 
         example["input_ids"] = processed_input["input_ids"].squeeze(0)
+        example["mm_token_type_ids"] = processed_input.get("token_type_ids", None)
         multi_modal_input = {}
         multi_modal_input["pixel_values"] = processed_input["pixel_values"]
         if "image_grid_thw" in processed_input:

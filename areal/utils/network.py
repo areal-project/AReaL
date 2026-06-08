@@ -112,14 +112,18 @@ def split_hostport(addr: str) -> tuple[str, int]:
 
 
 def find_free_ports(
-    count: int, port_range: tuple = (1024, 65535), exclude_ports: set[int] | None = None
+    count: int,
+    port_range: tuple = (10000, 32767),
+    exclude_ports: set[int] | None = None,
 ) -> list[int]:
     """
     Find multiple free ports within a specified range.
 
     Args:
         count: Number of free ports to find
-        port_range: Tuple of (min_port, max_port) to search within
+        port_range: Tuple of (min_port, max_port) to search within.
+            Defaults to (10000, 32767) to avoid the OS ephemeral range
+            (typically 32768-60999 on Linux) which causes TOCTOU collisions.
         exclude_ports: Set of ports to exclude from search
 
     Returns:

@@ -398,7 +398,7 @@ def local_main(config, run_id: int = 0):
         )
         launcher.submit(
             job_name="trainer",
-            cmd=f"torchrun --nnodes 1 --nproc-per-node {nprocs} --master-addr localhost --master-port {find_free_ports(1, (10000, 50000))[0]} {' '.join(sys.argv[1:])}",
+            cmd=f"torchrun --nnodes 1 --nproc-per-node {nprocs} --master-addr localhost --master-port {find_free_ports(1, (10000, 32767))[0]} {' '.join(sys.argv[1:])}",
             gpu=gpu,
             env_vars={
                 **BASE_ENVIRONS,

@@ -36,6 +36,7 @@ class DataServiceConfig:
             num_workers=max(dataset_config.num_dataset_workers, 1),
             scheduling_spec=dataset_config.scheduling_spec,
             dataloader_num_workers=max(dataset_config.num_workers, 0),
+            setup_timeout=dataset_config.setup_timeout,
             seed=seed,
         )
 

@@ -24,6 +24,7 @@ from areal.api.engine_api import InferenceEngine
 from areal.api.workflow_api import RolloutWorkflow
 from areal.utils import logging
 from areal.utils.dynamic_import import import_from_string
+from areal.utils.hf_utils import apply_chat_template
 
 from ._compat import (
     NativeGenerationController,
@@ -179,14 +180,14 @@ class ScaffoldingWorkflow(RolloutWorkflow):
             self._lazy_init_scaffolding(engine)
 
         # Tokenize prompt
-        input_ids = list(
-            self.tokenizer.apply_chat_template(
-                data["messages"],
-                tokenize=True,
-                add_generation_prompt=True,
-                enable_thinking=self.enable_thinking,
-            )
+        input_ids = apply_chat_template(
+            self.tokenizer,
+            data["messages"],
+            tokenize=True,
+            add_generation_prompt=True,
+            enable_thinking=self.enable_thinking,
         )
+        input_ids = list(input_ids)
         prompt_str = self.tokenizer.decode(input_ids)
 
         # Configure per-episode data on trajectory maker

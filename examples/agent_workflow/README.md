@@ -56,6 +56,6 @@ See `areal/workflow/openai/` for concrete examples.
    Constructing a `httpx.AsyncClient` in each workflow will increase latency by ~50ms,
    resulting in a ~10s overhead for a batch of 256.
 1. It is also valid to ignore the provided argument. You can instead start a subprocess
-   (i.e., setting `rollout.openai.mode=subproc`) to run the agent. While this provides
+   (i.e., setting `rollout.agent.mode=subproc`) to run the agent. While this provides
    more flexibility for writing the agent, using a subprocess will introduce even larger
    overhead.

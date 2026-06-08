@@ -107,7 +107,7 @@ Controller Process
 ## 实现
 
 有关完整示例，请参阅
-[`examples/math/gsm8k_eval.py`](https://github.com/inclusionAI/AReaL/blob/main/examples/math/gsm8k_eval.py)。关键模式如下：
+[`examples/math/gsm8k_eval.py`](https://github.com/areal-project/AReaL/blob/main/examples/math/gsm8k_eval.py)。关键模式如下：
 
 ```python
 from areal.api.alloc_mode import ModelAllocation

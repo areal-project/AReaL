@@ -12,7 +12,7 @@ def get_placement_group_master_ip_and_port(
 ):
     def _master_ip_and_port():
         host_ip = gethostip()
-        port = find_free_ports(1, (10000, 60000))[0]
+        port = find_free_ports(1, (10000, 32767))[0]
         return host_ip, port
 
     future = ray.remote(

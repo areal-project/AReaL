@@ -57,6 +57,7 @@ from areal.experimental.openai.cache import InteractionCache
 from areal.experimental.openai.tool_call_parser import process_tool_calls
 from areal.experimental.openai.types import InteractionWithTokenLogpReward
 from areal.utils import logging
+from areal.utils.hf_utils import apply_chat_template
 
 if TYPE_CHECKING:
     from transformers.tokenization_utils_fast import PreTrainedTokenizerFast
@@ -385,7 +386,8 @@ def concat_prompt_token_ids_with_parent(
 
     all_message_list += message_list
 
-    all_tokens = tokenizer.apply_chat_template(
+    all_tokens = apply_chat_template(
+        tokenizer,
         all_message_list,
         tools=tools,
         add_generation_prompt=True,
@@ -607,7 +609,8 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
 
         tokenizer_messages = messages_for_tokenizer if has_images else messages_list
         if self.chat_template_type == "hf":
-            prompt_token_ids = self.tokenizer.apply_chat_template(
+            prompt_token_ids = apply_chat_template(
+                self.tokenizer,
                 tokenizer_messages,
                 tools=tools_list,
                 add_generation_prompt=True,
@@ -1011,7 +1014,8 @@ class AsyncResponsesWithReward(BaseAsyncResponses):
 
         tokenizer_messages = messages_for_tokenizer if has_images else messages_list
         if self.chat_template_type == "hf":
-            prompt_token_ids = self.tokenizer.apply_chat_template(
+            prompt_token_ids = apply_chat_template(
+                self.tokenizer,
                 tokenizer_messages,
                 tools=tools_list,
                 add_generation_prompt=True,

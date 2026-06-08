@@ -14,6 +14,7 @@ Assumptions:
 """
 
 import base64
+import enum
 import importlib
 import importlib.util
 import io
@@ -635,6 +636,19 @@ def serialize_value(value: Any) -> Any:
     if isinstance(value, subprocess.Popen):
         return None
 
+    # Handle torch.dtype (e.g. torch.float32)
+    if isinstance(value, torch.dtype):
+        return {"type": "torch_dtype", "value": str(value)}
+
+    # Handle Enum values (e.g. ShardingType.TP_SHARDING)
+    if isinstance(value, enum.Enum):
+        cls = type(value)
+        return {
+            "type": "enum",
+            "class_path": f"{cls.__module__}.{cls.__qualname__}",
+            "value": value.value,
+        }
+
     # Primitives (int, float, str, bool) pass through unchanged
     return value
 
@@ -744,6 +758,14 @@ def deserialize_value(value: Any) -> Any:
                 logger.warning(
                     f"Failed to deserialize tensor, treating as regular dict: {e}"
                 )
+
+        if value.get("type") == "torch_dtype":
+            return getattr(torch, value["value"].removeprefix("torch."))
+
+        if value.get("type") == "enum":
+            module_path, class_name = value["class_path"].rsplit(".", 1)
+            enum_cls = getattr(importlib.import_module(module_path), class_name)
+            return enum_cls(value["value"])
 
         # Regular dict - recursively deserialize values
         return {key: deserialize_value(val) for key, val in value.items()}

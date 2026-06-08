@@ -4,7 +4,7 @@
 
 ## AReaL-lite（2025年7月）：让 RL 触手可及
 
-*📖 [分步教程](https://inclusionai.github.io/AReaL/zh/tutorial/gsm8k_grpo.html)*
+*📖 [分步教程](https://areal-project.github.io/AReaL/zh/tutorial/gsm8k_grpo.html)*
 
 AReaL-lite 代表了对研究人员与强化学习系统交互方式的根本性重新思考。源于认识到 AReaL 的系统优先架构为 AI
 研究人员设置了障碍，这个轻量级版本将算法开发置于基础设施复杂性之上。
@@ -19,7 +19,7 @@ PyTorch -centric API。该架构遵循熟悉的 SPMD 模式，同时为异步训
 
 ## AReaL v0.3（2025年8月）：突破速度壁垒
 
-*📖 [完整博客文章](https://github.com/inclusionAI/AReaL/blob/main/blog/AReaL_v0_3.md)*
+*📖 [完整博客文章](https://github.com/areal-project/AReaL/blob/main/blog/AReaL_v0_3.md)*
 
 0.3 版本标志着 AReaL 最大胆的架构飞跃：在不同的 GPU 集群上完全解耦生成和训练。这不仅仅是增量改进——它从根本上重新想象了 RL
 系统可以扩展的方式，实现了令人瞩目的 **2.77 倍加速**，同时保持训练稳定性。
@@ -37,7 +37,7 @@ PyTorch -centric API。该架构遵循熟悉的 SPMD 模式，同时为异步训
 
 ## AReaL v0.2（2025年3月）：工程卓越与 SOTA 性能
 
-*📖 [完整博客文章](https://github.com/inclusionAI/AReaL/blob/main/blog/AReaL_v0_2.md)*
+*📖 [完整博客文章](https://github.com/areal-project/AReaL/blob/main/blog/AReaL_v0_2.md)*
 
 第二个主要版本专注于将 AReaL 从一个有前途的研究原型转变为生产就绪的系统。v0.2 的核心是从 vLLM 过渡到 SGLang
 v0.4.0，带来了复杂的基数注意力机制，显著提高了多响应采样场景的吞吐量——这正是 RL 训练所要求的。
@@ -58,7 +58,7 @@ AReaL v0.2 产生了当时 **性能最好的 7B 数学推理模型**，在 AIME 
 
 ## AReaL v0.1（2025年2月）：奠定基石
 
-*📖 [完整博客文章](https://github.com/inclusionAI/AReaL/blob/main/blog/AReaL_v0_1.md)*
+*📖 [完整博客文章](https://github.com/areal-project/AReaL/blob/main/blog/AReaL_v0_1.md)*
 
 在最初发布时，AReaL 的 1.5B 模型在仅 40 小时的训练中就在数学推理方面超越了 o1-Preview。v0.1 还通过 R1-Zero 风格的训练在
 Qwen2.5-7B

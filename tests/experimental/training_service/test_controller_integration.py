@@ -168,6 +168,7 @@ def _build_cuda_gateway_controller(
                 dataset_size=8,
                 train_batch_size=2,
             ),
+            wait=True,
         )
     except Exception as exc:
         try:
@@ -193,6 +194,7 @@ def _make_batch(n: int = 4, seq_len: int = 16) -> list[dict[str, torch.Tensor]]:
         {
             "input_ids": torch.randint(0, 100, (1, seq_len), dtype=torch.long),
             "attention_mask": torch.ones((1, seq_len), dtype=torch.bool),
+            "loss_mask": torch.ones((1, seq_len), dtype=torch.bool),
         }
         for _ in range(n)
     ]

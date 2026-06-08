@@ -71,6 +71,14 @@ class InfBridgeBackend(Protocol):
         """Return the HTTP request that resumes generation on the backend."""
         ...
 
+    def get_offload_request(self) -> HttpRequest:
+        """Return the HTTP request that offloads model memory on the backend."""
+        ...
+
+    def get_onload_request(self, tags: list[str] | None = None) -> HttpRequest:
+        """Return the HTTP request that reloads model memory on the backend."""
+        ...
+
     def get_generation_max_new_tokens(self, http_req: HttpRequest) -> int:
         """Return the current generation budget encoded in ``http_req``."""
         ...

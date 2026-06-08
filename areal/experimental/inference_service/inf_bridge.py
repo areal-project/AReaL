@@ -75,6 +75,11 @@ class InfBridge:
         self.max_resubmit_retries = max_resubmit_retries
         self.resubmit_wait = resubmit_wait
         self._version = version
+        self._client = httpx.AsyncClient(timeout=request_timeout)
+
+    async def aclose(self) -> None:
+        """Close the underlying HTTP client."""
+        await self._client.aclose()
 
     # -- version tracking ---------------------------------------------------
 
@@ -99,6 +104,18 @@ class InfBridge:
         await self._send_request(http_req, timeout=10.0)
         await self.pause_state.set_paused(False)
         logger.info("Resume request sent to %s", self.backend_addr)
+
+    async def offload(self) -> None:
+        """Offload model memory on the backend inference server."""
+        http_req = self.backend.get_offload_request()
+        await self._send_request(http_req, timeout=30.0)
+        logger.info("Offload request sent to %s", self.backend_addr)
+
+    async def onload(self, tags: list[str] | None = None) -> None:
+        """Reload model memory on the backend inference server."""
+        http_req = self.backend.get_onload_request(tags=tags)
+        await self._send_request(http_req, timeout=30.0)
+        logger.info("Onload request sent to %s", self.backend_addr)
 
     # -- HTTP transport (shared across all backends) -------------------------
 
@@ -130,13 +147,15 @@ class InfBridge:
         """
         _timeout = timeout if timeout is not None else self.request_timeout
         url = f"{self.backend_addr}{http_req.endpoint}"
-        async with httpx.AsyncClient(timeout=_timeout) as client:
-            if http_req.method == "GET":
-                resp = await client.get(url)
-            else:
-                resp = await client.post(url, json=http_req.payload)
-            resp.raise_for_status()
-            return resp.json()
+        if http_req.method == "GET":
+            resp = await self._client.get(url, timeout=_timeout)
+        else:
+            resp = await self._client.post(url, json=http_req.payload, timeout=_timeout)
+        if resp.status_code >= 400:
+            body = resp.text[:500]
+            logger.error("Backend returned %d for %s: %s", resp.status_code, url, body)
+        resp.raise_for_status()
+        return resp.json()
 
     # -- main generation with pause/abort/resubmit --------------------------
 
@@ -172,6 +191,7 @@ class InfBridge:
 
         accumulated_tokens: list[int] = []
         accumulated_logprobs: list[float] = []
+        accumulated_versions: list[int] = []
         stop_reason: _StopReason | None = None
         final_routed_experts: np.ndarray | None = None
 
@@ -201,6 +221,7 @@ class InfBridge:
 
             accumulated_tokens.extend(result.output_tokens)
             accumulated_logprobs.extend(result.output_logprobs)
+            accumulated_versions.extend([self._version] * len(result.output_tokens))
             stop_reason = cast(_StopReason, result.stop_reason)
 
             if result.routed_experts is not None:
@@ -235,7 +256,7 @@ class InfBridge:
             input_tokens=list(req.input_ids),
             output_tokens=accumulated_tokens,
             output_logprobs=accumulated_logprobs,
-            output_versions=[self._version] * len(accumulated_tokens),
+            output_versions=accumulated_versions,
             stop_reason=stop_reason,
             tokenizer=req.tokenizer,
             latency=latency,

@@ -139,7 +139,7 @@ class MyWorkflow(RolloutWorkflow):
 
 ## Execution Modes
 
-The proxy approach supports two execution modes, configured via `rollout.openai.mode`:
+The proxy approach supports two execution modes, configured via `rollout.agent.mode`:
 
 ### Inline Mode (Default)
 
@@ -149,7 +149,7 @@ via `extra_kwargs`.
 
 ```yaml
 rollout:
-  openai:
+  agent:
     mode: inline
 ```
 
@@ -167,7 +167,7 @@ agent and data, executes in a subprocess, and deserializes the result.
 
 ```yaml
 rollout:
-  openai:
+  agent:
     mode: subproc
     subproc_max_workers: 4  # Process pool size
 ```

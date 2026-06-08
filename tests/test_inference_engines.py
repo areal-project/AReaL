@@ -34,14 +34,23 @@ def _dummy_reward_fn(*args, **kwargs):
 
 @pytest.fixture(
     params=[
-        pytest.param("vllm", marks=pytest.mark.vllm),
-        pytest.param("sglang", marks=pytest.mark.sglang),
+        pytest.param({"backend": "vllm", "method": "init"}, marks=pytest.mark.vllm),
+        pytest.param({"backend": "sglang", "method": "init"}, marks=pytest.mark.sglang),
+        pytest.param(
+            {"backend": "vllm", "method": "from_pretrained"},
+            marks=pytest.mark.vllm_from_pretrained,
+        ),
+        pytest.param(
+            {"backend": "sglang", "method": "from_pretrained"},
+            marks=pytest.mark.sglang_from_pretrained,
+        ),
     ],
     scope="module",
 )
 def inference_engine(request):
     """Fixture for remote inference engines only (vLLM and SGLang)."""
-    backend = request.param
+    backend = request.param["backend"]
+    method = request.param["method"]
 
     # Skip if vLLM is not installed
     if backend == "vllm" and not IS_VLLM_INSTALLED:
@@ -100,15 +109,23 @@ def inference_engine(request):
 
         engine_class = RemoteSGLangEngine
         server_args = sglang_args
-
-    # Create engine instance for server management
-    temp_config = InferenceEngineConfig(
-        backend="sglang:d1",
-        experiment_name=expr_name,
-        trial_name=trial_name,
-        setup_timeout=360,
-    )
-    server_manager = engine_class(temp_config)
+    if method == "init":
+        # Create engine instance for server management
+        temp_config = InferenceEngineConfig(
+            backend="sglang:d1",
+            experiment_name=expr_name,
+            trial_name=trial_name,
+            setup_timeout=360,
+        )
+        server_manager = engine_class(temp_config)
+    else:
+        server_manager = engine_class.from_pretrained(
+            tokenizer_path=MODEL_PATH,
+            dp_size=1,
+            experiment_name=expr_name,
+            trial_name=trial_name,
+            setup_timeout=360,
+        )
 
     try:
         # Launch server via engine API

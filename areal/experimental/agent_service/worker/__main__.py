@@ -23,12 +23,18 @@ def main() -> None:
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=9000)
     parser.add_argument(
-        "--log-level", choices=["debug", "info", "warning", "error"], default="info"
+        "--log-level", choices=["debug", "info", "warning", "error"], default="warning"
     )
     args = parser.parse_args()
 
     app = create_worker_app(args.agent)
-    uvicorn.run(app, host=args.host, port=args.port, log_level=args.log_level)
+    uvicorn.run(
+        app,
+        host=args.host,
+        port=args.port,
+        log_level=args.log_level,
+        access_log=False,
+    )
 
 
 if __name__ == "__main__":

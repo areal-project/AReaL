@@ -20,7 +20,7 @@ from areal.api import (
 )
 from areal.api.alloc_mode import ModelAllocation
 from areal.api.cli_args import PerfTracerConfig, TrainEngineConfig
-from areal.infra.rpc.rtensor import RTensor
+from areal.infra.rpc.rtensor import RTensor, flatten_shard_ids
 from areal.infra.utils.concurrent import run_async_task
 from areal.utils import logging, stats_tracker
 from areal.utils.data import make_dummy_eval_item
@@ -404,6 +404,19 @@ class TrainController:
         """Destroy the controller and release GPU memory of models.
 
         Cleans up all resources including workers, engines, and internal state.
+
+        The teardown order is carefully chosen to avoid a noisy
+        ``TCPStore.recvValue failed`` warning from NCCL's HeartbeatMonitor
+        on non-zero ranks:
+
+        1. Remote engines' ``destroy()`` runs first so that every rank calls
+           ``dist.destroy_process_group()`` after a CPU barrier. This
+           guarantees all ranks finish NCCL abort together before any store
+           shuts down.
+        2. Workers are killed in reverse rank order so that rank-0 (owner
+           of the global TCPStore server) receives SIGTERM last. This
+           avoids the short window where non-zero ranks' HeartbeatMonitor
+           threads poll a store whose TCP listener has already been closed.
         """
         logger.info("Destroying TrainController...")
 
@@ -421,17 +434,28 @@ class TrainController:
                         )
                         for rank, worker in enumerate(self.workers)
                     ]
-                    await asyncio.gather(*tasks, return_exceptions=True)
+                    return await asyncio.gather(*tasks, return_exceptions=True)
 
-                run_async_task(_destroy_all_engines)
+                results = run_async_task(_destroy_all_engines)
+                # Surface per-worker failures instead of silently swallowing them.
+                for rank, res in enumerate(results or []):
+                    if isinstance(res, BaseException):
+                        logger.warning(
+                            f"Engine destroy on rank {rank} raised "
+                            f"{type(res).__name__}: {res}"
+                        )
                 logger.info("Engines destroyed")
             except Exception as e:
                 logger.error(f"Error destroying engines: {e}")
 
-        # Then delete workers via scheduler
+        # Then delete workers via scheduler. Pass reverse_order=True so
+        # that rank-0 (TCPStore owner) is killed last. All in-tree
+        # Scheduler implementations (Local/Ray/Slurm) accept this kwarg;
+        # third-party subclasses that override ``delete_workers`` must
+        # adopt the same signature.
         try:
-            logger.info("Deleting all workers...")
-            self.scheduler.delete_workers(role=self._worker_role)
+            logger.info("Deleting all workers (reverse rank order)...")
+            self.scheduler.delete_workers(role=self._worker_role, reverse_order=True)
             logger.info("Workers deleted")
         except Exception as e:
             logger.error(f"Error deleting workers: {e}")
@@ -700,6 +724,12 @@ class TrainController:
     def get_device_stats(self):
         return self._custom_function_call("get_device_stats")
 
+    def start_memory_profile(self, max_entries: int = 100000):
+        return self._custom_function_call("start_memory_profile", max_entries)
+
+    def stop_memory_profile(self, snapshot_dir: str):
+        return self._custom_function_call("stop_memory_profile", snapshot_dir)
+
     def config_perf_tracer(self, config: PerfTracerConfig, role: str) -> None:
         async def _call():
             tasks = [
@@ -763,7 +793,13 @@ class TrainController:
             )
 
     async def _async_clear_batches(self, *targets: dict[str, RTensor]):
-        """Extract shard IDs and clear tensors on each worker."""
+        """Extract shard IDs and clear tensors on each worker.
+
+        HTTP DELETEs to each storage node's ``/data/clear`` — this evicts
+        ``_storage`` (mandatory, otherwise HTTP storage grows unboundedly)
+        and, via :func:`rtensor.remove`, also pops the storage owner's own
+        ``_fetch_buffer`` (covers storage-owner-as-consumer). See #1209.
+        """
         shards_by_node = RTensor.collect_shards(targets)
 
         if not shards_by_node:
@@ -775,5 +811,58 @@ class TrainController:
         )
 
     def clear_batches(self, *targets: dict[str, RTensor]):
-        """Clear distributed batch shards from workers to free memory."""
+        """Clear distributed batch shards from workers to free memory.
+
+        Two fan-outs — see areal-project/AReaL#1209:
+
+        1. ``_async_clear_batches``: HTTP DELETE to each storage node,
+           dropping ``_storage`` entries (and the owner's ``_fetch_buffer``
+           via :func:`rtensor.remove`).
+        2. Replicated RPC to every DP head so cross-node consumer workers
+           drain their local ``_fetch_buffer``. Payload is a flat
+           ``list[str]`` of shard IDs — sending IDs (not RTensors)
+           side-steps the RPC's ``localize`` pass (no RTensor → no
+           re-fetch), and ``_is_tensor_like(list[str]) == False`` routes
+           dispatch through ``_replicate_inputs`` so every head sees the
+           full sid set.
+
+        After the second fan-out, a ``fetch_buffer_stats`` RPC logs the
+        drain result — WARNING on leak, DEBUG when clean.
+        """
         run_async_task(self._async_clear_batches, *targets)
+        sids = flatten_shard_ids(targets)
+        if not sids:
+            return
+        # broadcast=False → purely local per-head op (no NCCL collective).
+        # list[str] is not tensor-like → _replicate_inputs copies the full
+        # sid set to every DP head.
+        self._custom_function_call("clear_batches", sids, rpc_meta={"broadcast": False})
+        # Always observe post-drain state. _custom_function_call returns
+        # the first DP head's stats (scalar dispatch collapses via
+        # _collect_results[0]); all heads are symmetric in steady state,
+        # so head 0 is a sufficient leak signal. Best-effort: an RPC
+        # failure here is observability-only and must not break training.
+        try:
+            stats = self._custom_function_call(
+                "fetch_buffer_stats", rpc_meta={"broadcast": False}
+            )
+        except Exception as e:
+            logger.debug(
+                "fetch_buffer_stats RPC failed (observability only, role=%s): %s",
+                self._worker_role,
+                e,
+            )
+            return
+        n_entries = stats.get("num_entries", 0) if isinstance(stats, dict) else 0
+        if n_entries > 0:
+            logger.warning(
+                "clear_batches: _fetch_buffer non-empty on DP head 0 "
+                "(role=%s, num_entries=%d) — possible leak, see #1209",
+                self._worker_role,
+                n_entries,
+            )
+        else:
+            logger.debug(
+                "clear_batches: _fetch_buffer drained on DP head 0 (role=%s)",
+                self._worker_role,
+            )

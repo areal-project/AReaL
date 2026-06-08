@@ -108,8 +108,8 @@ uv run python docs/generate_cli_docs.py
 
 ## Git Workflow
 
-- **Commits**: Conventional Commits (`feat:`, `fix:`, `docs:`), ~72 chars subject,
-  imperative voice, reasoning in body
+- **Commits**: Conventional Commits (e.g., `feat:`, `fix:`, `docs:`, `gov:`), ~72 chars
+  subject, imperative voice, reasoning in body
 - **Squash**: Squash WIP commits before opening PR
 - **PR requirements**: Run pre-commit, document test coverage, note hardware limitations
 

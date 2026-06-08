@@ -8,6 +8,11 @@ import uvicorn
 
 from areal.experimental.training_service.data_proxy.app import create_app
 from areal.experimental.training_service.data_proxy.config import TrainDataProxyConfig
+from areal.infra.utils.http import (
+    get_default_uvicorn_kwargs,
+    validate_admin_api_key,
+)
+from areal.utils.logging import suppress_http_loggers
 
 
 def main():
@@ -21,10 +26,12 @@ def main():
     parser.add_argument("--request-timeout", type=float, default=600.0)
     parser.add_argument(
         "--log-level",
-        default="info",
+        default="warning",
         choices=["debug", "info", "warning", "error"],
     )
     args, _ = parser.parse_known_args()
+
+    validate_admin_api_key(args.host, args.admin_api_key)
 
     worker_addrs = [
         addr.strip() for addr in args.worker_addrs.split(",") if addr.strip()
@@ -40,8 +47,16 @@ def main():
         warmup_timeout=args.warmup_timeout,
     )
 
+    suppress_http_loggers()
     app = create_app(config)
-    uvicorn.run(app, host=config.host, port=config.port, log_level=config.log_level)
+    uvicorn.run(
+        app,
+        host=config.host,
+        port=config.port,
+        log_level=config.log_level,
+        access_log=False,
+        **get_default_uvicorn_kwargs(),
+    )
 
 
 if __name__ == "__main__":

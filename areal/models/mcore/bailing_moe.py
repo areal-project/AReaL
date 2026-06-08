@@ -191,7 +191,9 @@ def hf_to_mcore_config_bailing_moe(
         "v_head_dim": getattr(hf_config, "v_head_dim", 128),
         # RoPE (for MLA layers; Lightning layers handle their own RoPE)
         "rope_type": "rope",
-        "rotary_base": getattr(hf_config, "rope_theta", 10000.0),
+        "rotary_base": (getattr(hf_config, "rope_parameters", None) or {}).get(
+            "rope_theta", getattr(hf_config, "rope_theta", 10000.0)
+        ),
         "rotary_percent": 1.0,
         "rotary_scaling_factor": rotary_scaling_factor,
         "apply_rope_fusion": False,

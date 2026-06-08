@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any
 from areal.api.io_struct import (
     HttpGenerationResult,
     HttpRequest,
+    detect_image_mime,
     get_versioned_lora_name,
 )
 
@@ -73,8 +74,9 @@ class VLLMBridgeBackend:
                                 raise ValueError(
                                     "Not enough images in req.image_data to match image_url entries."
                                 ) from exc
+                            mime = detect_image_mime(base64_img)
                             content["image_url"] = {
-                                "url": f"data:image/jpeg;base64,{base64_img}"
+                                "url": f"data:{mime};base64,{base64_img}"
                             }
             payload["messages"] = parsed_input.copy()
             payload["logprobs"] = True
@@ -121,6 +123,19 @@ class VLLMBridgeBackend:
 
     def get_resume_request(self) -> HttpRequest:
         return HttpRequest(endpoint="/areal_continue_generation", payload={})
+
+    def get_offload_request(self) -> HttpRequest:
+        return HttpRequest(endpoint="/sleep", payload={}, method="POST")
+
+    def get_onload_request(self, tags: list[str] | None = None) -> HttpRequest:
+        if tags is not None:
+            from urllib.parse import urlencode
+
+            tags_query = urlencode({"tags": tags}, doseq=True)
+            endpoint = f"/wake_up?{tags_query}"
+        else:
+            endpoint = "/wake_up"
+        return HttpRequest(endpoint=endpoint, payload={}, method="POST")
 
     def get_generation_max_new_tokens(self, http_req: HttpRequest) -> int:
         return int(http_req.payload["max_tokens"])

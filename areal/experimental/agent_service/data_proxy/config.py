@@ -12,4 +12,4 @@ class DataProxyConfig:
     worker_addr: str = "http://localhost:9000"
     request_timeout: float = 600.0
     session_timeout: int = 3600
-    log_level: str = "info"
+    log_level: str = "warning"

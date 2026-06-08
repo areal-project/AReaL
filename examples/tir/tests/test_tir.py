@@ -3,74 +3,104 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
+from areal.api.cli_args import GenerationHyperparameters
+
 # Add the parent directory to the path so we can import TIR modules
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from tir_workflow import TIRWorkflow
-from tool_manager import ToolManager
-from train_tir import math_reward_fn
+from tir_workflow import TIRConfig, TIRWorkflow  # noqa: E402
+from tool_manager import ToolCallStatus, ToolManager  # noqa: E402
+from train_tir import math_reward_fn  # noqa: E402
 
 
+class FakeTokenizer:
+    pad_token_id = 0
+    eos_token_id = 1
+
+    def encode(self, text: str, add_special_tokens: bool = False) -> list[int]:
+        del add_special_tokens
+        return [ord(ch) for ch in text]
+
+    def decode(self, tokens: list[int]) -> str:
+        return "".join(chr(token) for token in tokens)
+
+
+@pytest.mark.asyncio
 async def test_tool_manager():
     """Test tool manager"""
-    print("Testing ToolManager...")
+    python_manager = ToolManager(timeout=10, enabled_tools="python", debug_mode=True)
+    calc_manager = ToolManager(timeout=10, enabled_tools="calculator")
 
-    tool_manager = ToolManager(timeout=10)
+    try:
+        # Test Python execution through the normal tool-call interface.
+        python_result, python_status = await python_manager.aexecute_tool_call(
+            "```python\nprint(2 + 3)\n```"
+        )
+        assert python_status == ToolCallStatus.SUCCESS
+        assert python_result == "dummy python output"
 
-    # Test Python execution
-    python_code = "print(2 + 3)"
-    result = await tool_manager.execute_python(python_code)
-    print(f"Python execution result: {result}")
-    assert "5" in result, f"Expected '5' in result, got: {result}"
+        # Test calculator.
+        calc_result, calc_status = await calc_manager.aexecute_tool_call(
+            "<calculator>2 * 3 + 4</calculator>"
+        )
+        assert calc_status == ToolCallStatus.SUCCESS
+        assert calc_result == "10"
 
-    # Test calculator
-    calc_expr = "2 * 3 + 4"
-    result = await tool_manager.execute_calculator(calc_expr)
-    print(f"Calculator result: {result}")
-    assert result == "10", f"Expected '10', got: {result}"
-
-    # Test unsafe code
-    unsafe_code = "import os; os.system('ls')"
-    result = await tool_manager.execute_python(unsafe_code)
-    print(f"Unsafe code result: {result}")
-    assert "Error" in result, f"Expected error for unsafe code, got: {result}"
-
-    tool_manager.cleanup()
-    print("ToolManager tests passed!")
+        # Test malformed Python tool input.
+        empty_result, empty_status = await python_manager.aexecute_tool_call(
+            "```python\n\n```"
+        )
+        assert empty_status == ToolCallStatus.ERROR
+        assert "Error" in empty_result
+    finally:
+        await python_manager.acleanup()
+        await calc_manager.acleanup()
 
 
+@pytest.mark.asyncio
+async def test_tool_manager_error_handling():
+    """Test tool manager error handling with real execution"""
+    python_manager = ToolManager(timeout=10, enabled_tools="python", debug_mode=False)
+
+    try:
+        # Test ZeroDivisionError
+        zero_result, zero_status = await python_manager.aexecute_tool_call(
+            "```python\n1 / 0\n```"
+        )
+        print(f"Zero division result: {zero_result}, status: {zero_status}")
+        assert zero_status == ToolCallStatus.ERROR
+        assert (
+            "division by zero" in zero_result.lower()
+            or "zerodivisionerror" in zero_result.lower()
+        )
+
+    finally:
+        await python_manager.acleanup()
+
+
+@pytest.mark.asyncio
 async def test_tir_workflow():
-    """Test TIR workflow (requires mock engine)"""
-    print("Testing TIRWorkflow...")
+    """Test TIR workflow initialization."""
+    tokenizer = FakeTokenizer()
 
-    # Here we only test workflow initialization, actual inference requires a real engine
-    from transformers import AutoTokenizer
-
-    # Use a simple tokenizer for testing
-    tokenizer = AutoTokenizer.from_pretrained("gpt2")
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    tool_manager = ToolManager()
-
-    # Create TIR workflow
-    _ = TIRWorkflow(
+    workflow = TIRWorkflow(
         reward_fn=math_reward_fn,
-        gconfig=None,  # Simplified here, actual needs GenerationHyperparameters
+        gconfig=GenerationHyperparameters(max_new_tokens=32, max_tokens=256),
         tokenizer=tokenizer,
-        tool_manager=tool_manager,
-        max_turns=3,
-        max_length=2000,  # Use smaller length for testing
+        tir_config=TIRConfig(max_turns=3, max_length=2000),
     )
 
-    tool_manager.cleanup()
-    print("TIRWorkflow tests passed!")
+    assert workflow.tool_manager is not None
+    assert workflow.start_markers
+    assert workflow.end_markers
+
+    await workflow.tool_manager.acleanup()
 
 
 def test_data_loading():
     """Test data loading"""
-    print("Testing data loading...")
-
     data_file = Path(__file__).parent / "data" / "sample_math.jsonl"
     assert data_file.exists(), f"Data file not found: {data_file}"
 
@@ -81,23 +111,16 @@ def test_data_loading():
     assert "messages" in data[0], "Missing 'messages' field"
     assert "answer" in data[0], "Missing 'answer' field"
 
-    print(f"Loaded {len(data)} samples")
-    print("Data loading tests passed!")
-
 
 async def main():
     """Run all tests"""
-    print("Running TIR tests...")
-
     try:
         await test_tool_manager()
         await test_tir_workflow()
         test_data_loading()
-
-        print("\n All tests passed!")
-
+        print("\nAll tests passed!")
     except Exception as e:
-        print(f"\n Test failed: {e}")
+        print(f"\nTest failed: {e}")
         import traceback
 
         traceback.print_exc()

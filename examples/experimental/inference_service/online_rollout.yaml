@@ -19,6 +19,7 @@ scheduler:
   type: local
 
 rollout:
+  _version: v2
   backend: "sglang:d1"
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
@@ -33,7 +34,8 @@ rollout:
   dump_to_file: true
   request_timeout: 120.0
   setup_timeout: 300.0
-  openai:
+  admin_api_key: sk-test123456
+  agent:
     mode: online
     export_style: individual
     turn_discount: 1.0
@@ -75,7 +77,9 @@ actor:
   ppo_n_minibatches: 1
   recompute_logprob: true
   use_decoupled_loss: true
-  behave_imp_weight_cap: 5.0
+  rejection_sampling:
+    metric: ratio
+    upper: 5.0
   reward_norm:
     mean_level: group
     std_level: group

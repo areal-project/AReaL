@@ -159,9 +159,8 @@ areal/experimental/agent_service/
 ├── protocol.py          # Gateway protocol frame types
 ├── types.py             # AgentRequest, AgentResponse, EventEmitter, AgentRunnable
 ├── controller/
-│   ├── __init__.py      # AgentServiceController, AgentServiceControllerConfig
-│   ├── config.py        # AgentServiceControllerConfig dataclass
-│   └── controller.py    # AgentServiceController orchestrator
+│   ├── __init__.py      # AgentController export
+│   └── controller.py    # AgentController orchestrator
 ├── guard/
 │   ├── __init__.py      # Module docstring
 │   ├── __main__.py      # python -m areal.experimental.agent_service.guard

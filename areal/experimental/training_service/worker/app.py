@@ -11,6 +11,7 @@ from threading import Lock, Thread
 from typing import Any
 
 from areal.api import TrainEngine
+from areal.experimental.training_service.worker.awex import create_awex_blueprint
 from areal.experimental.training_service.worker.config import TrainWorkerConfig
 from areal.experimental.training_service.worker.engine import create_engine_module
 from areal.infra.platforms import current_platform
@@ -194,6 +195,15 @@ def create_app(config: TrainWorkerConfig):
             run_endpoint=_run_endpoint,
             execute_compute=_execute_compute,
             get_node_addr=_get_node_addr,
+        )
+    )
+
+    app.register_blueprint(
+        create_awex_blueprint(
+            flask_module=flask,
+            get_engine=_get_engine,
+            submit_to_engine_thread=_submit_to_engine_thread,
+            run_endpoint=_run_endpoint,
         )
     )
 

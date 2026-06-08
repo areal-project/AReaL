@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 
+from areal.utils.hf_utils import apply_chat_template as _apply_chat_template
+
 
 class TokenizerProxy:
     """Wraps HuggingFace tokenizer with async-safe methods for the data proxy."""
@@ -22,12 +24,12 @@ class TokenizerProxy:
         """Apply chat template -> token IDs. Runs in executor."""
         loop = asyncio.get_running_loop()
 
-        def apply_chat_template():
-            return self._tok.apply_chat_template(
-                messages, tokenize=True, add_generation_prompt=True, **kw
+        def _apply():
+            return _apply_chat_template(
+                self._tok, messages, tokenize=True, add_generation_prompt=True, **kw
             )
 
-        return await loop.run_in_executor(None, apply_chat_template)
+        return await loop.run_in_executor(None, _apply)
 
     def decode_token(self, token_id: int) -> str:
         """Decode single token ID -> string piece. Sync (fast dict lookup)."""

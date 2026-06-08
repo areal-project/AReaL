@@ -35,7 +35,7 @@ rollout:
   enable_rollout_tracing: false
   scheduling_spec: ${actor.scheduling_spec}
   dump_to_file: true
-  openai:
+  agent:
     mode: inline
     tool_call_parser: qwen25
     reasoning_parser: qwen3

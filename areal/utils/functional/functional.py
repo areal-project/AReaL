@@ -140,9 +140,11 @@ def _compute_sequence_level_ratio_and_advantages(
         # Average token advantages per sequence
         # This ensures gradient magnitude is independent of sequence length
         seq_lengths = loss_mask.sum(dim=-1, keepdim=True).clamp(min=1)
-        advantages = (advantages.sum(dim=-1, keepdim=True) / seq_lengths).expand_as(
-            log_ratio
-        )
+        masked_advantages = torch.where(loss_mask, advantages, 0.0)
+        advantages = (
+            masked_advantages.sum(dim=-1, keepdim=True) / seq_lengths
+        ).expand_as(log_ratio)
+        advantages = torch.where(loss_mask, advantages, 0.0)
 
     return ratio, advantages
 
@@ -686,6 +688,70 @@ def sapo_loss_fn(
     )
 
     return pg_loss, stat
+
+
+def dpo_pair_logratios(
+    logprobs: torch.Tensor,
+    ref_logprobs: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    loss_mask: torch.Tensor,
+    valid_pairs: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Aggregate per-sequence masked logprobs over a packed batch and pair them up.
+
+    Sequences are packed and interleaved as ``[chosen_0, rejected_0, chosen_1,
+    rejected_1, ...]``. ``loss_mask`` is shifted by one to align with
+    next-token logprobs, and each sequence's final position is zeroed (no next
+    token exists for it). Aggregation uses ``fp64`` scatter-add to avoid
+    precision loss on long (~2k+ tok) pairs where ``fp32`` accumulation can
+    flip the log-ratio sign.
+
+    Returns:
+        ``(policy_logps, ref_logps, completion_lens)`` each of shape ``(K, 2)``
+        where ``K = valid_pairs.sum()``, column 0 is chosen, column 1 is
+        rejected. ``completion_lens`` counts the shifted-mask response tokens
+        per sequence (needed by IPO for per-token normalization).
+    """
+    device = logprobs.device
+
+    shifted_mask = torch.zeros_like(loss_mask)
+    if loss_mask.shape[0] > 1:
+        shifted_mask[:-1] = loss_mask[1:]
+    seqlens = cu_seqlens[1:] - cu_seqlens[:-1]
+    shifted_mask.index_fill_(0, (cu_seqlens[1:] - 1)[seqlens > 0], False)
+
+    n_seqs = seqlens.shape[0]
+    seq_ids = torch.repeat_interleave(torch.arange(n_seqs, device=device), seqlens)
+    masked = shifted_mask.to(dtype=logprobs.dtype)
+    policy_logps = torch.zeros(n_seqs, dtype=torch.float64, device=device)
+    ref_logps = torch.zeros(n_seqs, dtype=torch.float64, device=device)
+    policy_logps.index_add_(0, seq_ids, (logprobs * masked).double())
+    ref_logps.index_add_(0, seq_ids, (ref_logprobs * masked).double())
+
+    completion_lens = torch.zeros(n_seqs, dtype=torch.float64, device=device)
+    completion_lens.index_add_(0, seq_ids, shifted_mask.double())
+
+    return (
+        policy_logps.view(-1, 2)[valid_pairs],
+        ref_logps.view(-1, 2)[valid_pairs],
+        completion_lens.view(-1, 2)[valid_pairs],
+    )
+
+
+def dpo_preference_loss(
+    logits: torch.Tensor, *, beta: float, loss_type: str = "sigmoid"
+) -> torch.Tensor:
+    """Per-pair preference loss from DPO log-ratio logits.
+
+    For ``"sigmoid"``, ``logits`` is the un-normalized pair delta.
+    For ``"ipo"``, ``logits`` must be **per-token averaged** (length-normalized)
+    before being passed here, matching trl's confirmed-with-authors convention.
+    """
+    if loss_type == "sigmoid":
+        return -torch.nn.functional.logsigmoid(beta * logits.float())
+    if loss_type == "ipo":
+        return (logits.float() - 1.0 / (2.0 * beta)) ** 2
+    raise ValueError(f"Unsupported DPO loss_type: {loss_type!r}")
 
 
 def _huber_loss(x: torch.Tensor, y: torch.Tensor, delta: float):

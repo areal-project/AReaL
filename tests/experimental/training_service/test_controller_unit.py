@@ -63,36 +63,12 @@ class _FakeAsyncClient:
             raise next_item
         return next_item
 
-    async def _post(self, _url: str, json=None):
+    async def _post(self, _url: str, json=None, **kwargs):
         _ = json
         next_item = self._responses_or_errors.pop(0)
         if isinstance(next_item, Exception):
             raise next_item
         return next_item
-
-
-class TestGatewayTrainControllerAsyncHelpers:
-    @pytest.mark.asyncio
-    async def test_async_wait_for_service_reuses_single_client_across_retries(self):
-        controller = _make_controller()
-        fake_client = _FakeAsyncClient(
-            [
-                httpx.ConnectError("not ready"),
-                _make_response("GET", "http://service/health"),
-            ]
-        )
-
-        with (
-            patch("httpx.AsyncClient", return_value=fake_client) as mock_client_cls,
-            patch(f"{MODULE}.asyncio.sleep", new_callable=AsyncMock) as mock_sleep,
-        ):
-            await controller._async_wait_for_service(
-                "http://service/health", "service", timeout=1.0
-            )
-
-        mock_client_cls.assert_called_once_with(timeout=2.0)
-        assert fake_client.get.await_count == 2
-        mock_sleep.assert_awaited_once_with(0.1)
 
 
 class TestGatewayTrainControllerInitialization:

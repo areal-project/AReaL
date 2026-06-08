@@ -35,6 +35,8 @@ class Qwen3_5StateDictAdapter(BaseStateDictAdapter):
         self, model_config: PretrainedConfig, hf_assets_path: str | None = None
     ):
         super().__init__(model_config, hf_assets_path)
+        self._composite_text_prefix = "model.language_model."
+        self._use_composite_text_namespace = self._detect_composite_text_namespace()
 
         # HuggingFace -> Archon key mapping
         # Use {} as placeholder for layer numbers and expert ids
@@ -169,13 +171,11 @@ class Qwen3_5StateDictAdapter(BaseStateDictAdapter):
         3. Weight tying: copy embed_tokens to lm_head if missing
         """
         # Handle weight tying
-        if (
-            self.enable_weight_tying
-            and "lm_head.weight" not in hf_state_dict
-            and "model.embed_tokens.weight" in hf_state_dict
-        ):
-            hf_state_dict = dict(hf_state_dict)
-            hf_state_dict["lm_head.weight"] = hf_state_dict["model.embed_tokens.weight"]
+        if self.enable_weight_tying and "lm_head.weight" not in hf_state_dict:
+            embed_key = self._find_hf_embed_tokens_key(hf_state_dict)
+            if embed_key is not None:
+                hf_state_dict = dict(hf_state_dict)
+                hf_state_dict["lm_head.weight"] = hf_state_dict[embed_key]
 
         state_dict = {}
         expert_weights_by_layer: dict[str, dict[str, dict[int, Any]]] = {}
@@ -255,7 +255,7 @@ class Qwen3_5StateDictAdapter(BaseStateDictAdapter):
     def _convert_key_to_hf(self, archon_key: str) -> str | None:
         """Convert an Archon key to HuggingFace key."""
         if archon_key in self.to_hf_map:
-            return self.to_hf_map[archon_key]
+            return self._maybe_composite_hf_key(self.to_hf_map[archon_key])
 
         match = re.search(r"layers\.(\d+)\.", archon_key)
         if match:
@@ -263,12 +263,15 @@ class Qwen3_5StateDictAdapter(BaseStateDictAdapter):
             abstract_key = re.sub(r"layers\.\d+\.", "layers.{}.", archon_key)
             if abstract_key in self.to_hf_map:
                 hf_abstract = self.to_hf_map[abstract_key]
-                return hf_abstract.replace("{}", layer_num, 1)
+                return self._maybe_composite_hf_key(
+                    hf_abstract.replace("{}", layer_num, 1)
+                )
 
         return None
 
     def _convert_key_from_hf(self, hf_key: str) -> str | None:
         """Convert a HuggingFace key to Archon key."""
+        hf_key = self._normalize_hf_text_key(hf_key)
         if hf_key in self.from_hf_map:
             result = self.from_hf_map[hf_key]
             return result if result is not None else None
@@ -287,6 +290,7 @@ class Qwen3_5StateDictAdapter(BaseStateDictAdapter):
 
     def _parse_expert_key(self, hf_key: str) -> tuple[str, int, str] | None:
         """Parse HF expert key into (layer_id, expert_id, archon_abstract_key)."""
+        hf_key = self._normalize_hf_text_key(hf_key)
         match = re.match(
             r"model\.layers\.(\d+)\.mlp\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight",
             hf_key,
@@ -321,10 +325,43 @@ class Qwen3_5StateDictAdapter(BaseStateDictAdapter):
             model.layers.0.mlp.experts.gate_up_proj  (fused gate+up)
             model.layers.0.mlp.experts.down_proj
         """
+        hf_key = self._normalize_hf_text_key(hf_key)
         match = self._FUSED_EXPERT_RE.match(hf_key)
         if not match:
             return None
         return match.group(1), match.group(2)
+
+    def _normalize_hf_text_key(self, hf_key: str) -> str:
+        """Normalize composite Qwen3.5 text keys to text-only namespace."""
+        if hf_key.startswith(self._composite_text_prefix):
+            return "model." + hf_key.removeprefix(self._composite_text_prefix)
+        return hf_key
+
+    def _maybe_composite_hf_key(self, hf_key: str) -> str:
+        """Map text-only HF keys into composite text namespace when needed."""
+        if self._use_composite_text_namespace and hf_key.startswith("model."):
+            return self._composite_text_prefix + hf_key.removeprefix("model.")
+        return hf_key
+
+    def _detect_composite_text_namespace(self) -> bool:
+        """Detect whether source HF assets use composite Qwen3.5 text keys."""
+        if not self.fqn_to_index_mapping:
+            return False
+        return any(
+            key.startswith(self._composite_text_prefix)
+            for key in self.fqn_to_index_mapping
+        )
+
+    def _find_hf_embed_tokens_key(self, hf_state_dict: dict[str, Any]) -> str | None:
+        """Find the embedding weight key in text-only or composite checkpoints."""
+        for key in (
+            self._maybe_composite_hf_key("model.embed_tokens.weight"),
+            "model.embed_tokens.weight",
+            "model.language_model.embed_tokens.weight",
+        ):
+            if key in hf_state_dict:
+                return key
+        return None
 
     def _handle_fused_expert_weight(
         self,

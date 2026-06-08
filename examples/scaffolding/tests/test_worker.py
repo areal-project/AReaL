@@ -20,7 +20,7 @@ from examples.scaffolding.worker import SGLangWorker
 from areal.api.cli_args import SGLangConfig
 from areal.tests.utils import get_model_path
 from areal.utils import network, seeding
-from areal.utils.hf_utils import load_hf_tokenizer
+from areal.utils.hf_utils import apply_chat_template, load_hf_tokenizer
 from areal.utils.proc import kill_process_tree
 
 # ---------------------------------------------------------------------------
@@ -160,8 +160,8 @@ async def test_generation_max_tokens(sglang_worker):
 async def test_generation_with_chat_template(sglang_worker, tokenizer):
     """Client-side chat template + completions API, matching ScaffoldingWorkflow."""
     messages = [{"role": "user", "content": "What is the capital of France?"}]
-    input_ids = tokenizer.apply_chat_template(
-        messages, tokenize=True, add_generation_prompt=True
+    input_ids = apply_chat_template(
+        tokenizer, messages, tokenize=True, add_generation_prompt=True
     )
     prompt_str = tokenizer.decode(input_ids)
 
@@ -181,8 +181,8 @@ async def test_multi_turn_generation(sglang_worker, tokenizer):
     """Multi-turn via client-side chat template + completions API."""
     # Turn 1
     messages = [{"role": "user", "content": "My name is Alice."}]
-    input_ids = tokenizer.apply_chat_template(
-        messages, tokenize=True, add_generation_prompt=True
+    input_ids = apply_chat_template(
+        tokenizer, messages, tokenize=True, add_generation_prompt=True
     )
     prompt_str = tokenizer.decode(input_ids)
 
@@ -194,8 +194,8 @@ async def test_multi_turn_generation(sglang_worker, tokenizer):
     # Turn 2 — append assistant reply and new user message
     messages.append({"role": "assistant", "content": task.output_str})
     messages.append({"role": "user", "content": "What is my name?"})
-    input_ids_2 = tokenizer.apply_chat_template(
-        messages, tokenize=True, add_generation_prompt=True
+    input_ids_2 = apply_chat_template(
+        tokenizer, messages, tokenize=True, add_generation_prompt=True
     )
     prompt_str_2 = tokenizer.decode(input_ids_2)
 

@@ -88,7 +88,7 @@ class TestGatewayUnifiedExportTrajectories:
 
         resp = await gateway_client.post(
             "/export_trajectories",
-            json={"session_id": "ext-1"},
+            json={"session_ids": ["ext-1"]},
             headers=admin_headers(),
         )
 
@@ -112,7 +112,12 @@ class TestGatewayUnifiedExportTrajectories:
 
         resp = await gateway_client.post(
             "/export_trajectories",
-            json={"session_id": "ses-1", "discount": 1.0, "style": "sft"},
+            json={
+                "session_ids": ["ses-1"],
+                "group_id": "grp-test",
+                "discount": 1.0,
+                "style": "sft",
+            },
             headers=admin_headers(),
         )
 
@@ -139,7 +144,7 @@ class TestGatewayUnifiedExportTrajectories:
         )
 
         assert resp.status_code == 400
-        assert "session_id is required" in resp.json()["error"]
+        assert "session_ids is required" in resp.json()["error"]
         mock_query_router.assert_not_called()
         mock_forward.assert_not_called()
         mock_revoke.assert_not_called()
@@ -196,6 +201,7 @@ async def test_external_model_flow_end_to_end_gateway_router_data_proxy(router_c
     store.set_admin_key(ADMIN_KEY)
     data_proxy_app.state.session_store = store
     data_proxy_app.state.version = 0
+    data_proxy_app.state.http_client = httpx.AsyncClient(timeout=10.0)
     gateway_app = create_gateway_app(
         GatewayConfig(
             host="127.0.0.1",
@@ -226,6 +232,7 @@ async def test_external_model_flow_end_to_end_gateway_router_data_proxy(router_c
             transport=external_transport, base_url="http://mock-external"
         ) as external_client,
     ):
+        data_proxy_app.state.http_client = external_client
         await router_client.post(
             "/register",
             json={"worker_addr": WORKER_ADDR},
@@ -240,7 +247,10 @@ async def test_external_model_flow_end_to_end_gateway_router_data_proxy(router_c
             data_proxy_addrs: list[str],
             admin_api_key: str,
             timeout: float,
+            *,
+            client: httpx.AsyncClient | None = None,
         ) -> dict:
+            del router_addr, admin_api_key, timeout, client
             resp = await router_client.post(
                 "/register_model",
                 json={
@@ -263,7 +273,9 @@ async def test_external_model_flow_end_to_end_gateway_router_data_proxy(router_c
             session_id: str | None = None,
             admin_api_key: str | None = None,
             model: str | None = None,
+            client: httpx.AsyncClient | None = None,
         ) -> str:
+            del router_addr, path, timeout, admin_api_key, client
             payload: dict = {}
             if model is not None:
                 payload["model"] = model
@@ -286,7 +298,10 @@ async def test_external_model_flow_end_to_end_gateway_router_data_proxy(router_c
             body: bytes,
             headers: dict[str, str],
             timeout: float,
+            *,
+            client: httpx.AsyncClient | None = None,
         ) -> httpx.Response:
+            del timeout, client
             if upstream_url.startswith(WORKER_ADDR):
                 path = upstream_url.removeprefix(WORKER_ADDR)
                 return await data_proxy_client.post(path, content=body, headers=headers)
@@ -328,6 +343,10 @@ async def test_external_model_flow_end_to_end_gateway_router_data_proxy(router_c
                 _ExternalClient,
             ),
         ):
+            # Set the shared HTTP client to the fake external client so
+            # non-streaming external model requests go through it.
+            data_proxy_app.state.http_client = _ExternalClient()
+
             reg = await gateway_client.post(
                 "/register_model",
                 json={
@@ -359,18 +378,16 @@ async def test_external_model_flow_end_to_end_gateway_router_data_proxy(router_c
 
             exported = await gateway_client.post(
                 "/export_trajectories",
-                json={"session_id": "__hitl__"},
+                json={"session_ids": ["__hitl__"]},
                 headers=admin_headers(),
             )
             assert exported.status_code == 200
             payload = exported.json()
-            assert len(payload["interactions"]) == 1
+            assert len(payload["traj"]["interactions"]) == 1
 
-            interaction = next(iter(payload["interactions"].values()))
-            assert interaction["messages"][0]["content"] == "hello"
-            cached_response = json.loads(
-                interaction["output_message_list"][0]["content"]
-            )
+            interaction = payload["traj"]["interactions"][0]
+            assert interaction["request"][0]["content"] == "hello"
+            cached_response = json.loads(interaction["response"])
             assert (
                 cached_response["choices"][0]["message"]["content"] == "Mock response"
             )

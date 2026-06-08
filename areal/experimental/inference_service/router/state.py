@@ -90,46 +90,6 @@ class WorkerRegistry:
             return list(self._workers.keys())
 
 
-class CapacityManager:
-    """Tracks available capacity for new RL sessions (staleness control).
-
-    The rollout controller calls ``grant()`` once per episode to add one
-    permit.  ``try_acquire()`` is called when ``/rl/start_session`` arrives
-    — if no permits remain, it returns *False* so the gateway can respond
-    with HTTP 429.  This prevents users from starting sessions outside
-    the allowed weight-staleness window.
-    """
-
-    def __init__(self) -> None:
-        self._capacity: int = 0
-        self._lock = asyncio.Lock()
-
-    async def grant(self) -> int:
-        """Increment capacity by 1. Returns the new capacity value."""
-        async with self._lock:
-            self._capacity += 1
-            return self._capacity
-
-    async def try_acquire(self) -> bool:
-        """Try to decrement capacity by 1. Returns True on success."""
-        async with self._lock:
-            if self._capacity <= 0:
-                return False
-            self._capacity -= 1
-            return True
-
-    async def release(self) -> int:
-        """Return one previously acquired permit. Returns the new capacity value."""
-        async with self._lock:
-            self._capacity += 1
-            return self._capacity
-
-    async def get_capacity(self) -> int:
-        """Return current capacity (for health / debug endpoints)."""
-        async with self._lock:
-            return self._capacity
-
-
 class SessionRegistry:
     """Maps session API keys and session IDs to worker addresses.
 
@@ -219,6 +179,16 @@ class ModelInfo:
     data_proxy_addrs: list[str] = field(default_factory=list)
 
 
+@dataclass
+class GroupInfo:
+    """A registered group of sessions."""
+
+    group_id: str
+    worker_addr: str
+    session_ids: list[str] = field(default_factory=list)
+    created_at: float = field(default_factory=time.time)
+
+
 class ModelRegistry:
     """Thread-safe registry for model routing."""
 
@@ -258,3 +228,37 @@ class ModelRegistry:
     async def remove(self, name: str) -> bool:
         async with self._lock:
             return self._models.pop(name, None) is not None
+
+
+class GroupRegistry:
+    """Maps group IDs to worker addresses and member session IDs."""
+
+    def __init__(self) -> None:
+        self._groups: dict[str, GroupInfo] = {}
+        self._lock = asyncio.Lock()
+
+    async def register_group(
+        self, group_id: str, worker_addr: str, session_ids: list[str]
+    ) -> None:
+        """Store a group mapping. Raises ValueError if group_id already exists."""
+        async with self._lock:
+            if group_id in self._groups:
+                raise ValueError(f"Group {group_id} already registered")
+            self._groups[group_id] = GroupInfo(
+                group_id=group_id,
+                worker_addr=worker_addr,
+                session_ids=list(session_ids),
+            )
+
+    async def lookup(self, group_id: str) -> GroupInfo | None:
+        """Return the GroupInfo for a group_id, or None."""
+        async with self._lock:
+            return self._groups.get(group_id)
+
+    async def revoke(self, group_id: str) -> list[str]:
+        """Remove a group. Returns the session_ids that were in the group."""
+        async with self._lock:
+            info = self._groups.pop(group_id, None)
+            if info is None:
+                return []
+            return info.session_ids

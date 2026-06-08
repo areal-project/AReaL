@@ -28,9 +28,10 @@ from openai.types.responses import Response
 from openai.types.responses.response_create_params import ResponseCreateParams
 from pydantic import BaseModel
 
-from areal.api.cli_args import NameResolveConfig, OpenAIProxyConfig
+from areal.api.cli_args import NameResolveConfig
 from areal.experimental.openai.client import ArealOpenAI
 from areal.infra.rpc.serialization import deserialize_value, serialize_value
+from areal.infra.utils.http import validate_admin_api_key
 from areal.utils import name_resolve, names, seeding
 from areal.utils.dynamic_import import import_from_string
 from areal.utils.hf_utils import load_hf_tokenizer
@@ -263,25 +264,32 @@ def _setup_openai_client():
     global _openai_client, _session_timeout_seconds, _admin_api_key
     config = _engine.config
     tokenizer = load_hf_tokenizer(config.tokenizer_path)
-    openai_cfg = config.openai or OpenAIProxyConfig()
+    agent_cfg = config.agent
     _openai_client = ArealOpenAI(
         engine=_engine,
         tokenizer=tokenizer,
-        tool_call_parser=openai_cfg.tool_call_parser,
-        reasoning_parser=openai_cfg.reasoning_parser,
-        engine_max_tokens=openai_cfg.engine_max_tokens,
-        chat_template_type=openai_cfg.chat_template_type,
+        tool_call_parser=agent_cfg.tool_call_parser,
+        reasoning_parser=agent_cfg.reasoning_parser,
+        engine_max_tokens=agent_cfg.engine_max_tokens,
+        chat_template_type=agent_cfg.chat_template_type,
     )
     # Set session timeout from config
-    _session_timeout_seconds = openai_cfg.session_timeout_seconds
-    # Set admin API key from config
+    _session_timeout_seconds = agent_cfg.session_timeout_seconds
+    # Validate admin API key BEFORE assigning it to the global, so a
+    # failed validation cannot leave the default key live on the server.
+    # The default admin key is publicly known; refuse to use it when the
+    # server is reachable from outside the local host (otherwise anyone
+    # who can reach this port can call admin endpoints such as
+    # grant_capacity, start_session, export_trajectories, ...).
+    validate_admin_api_key(
+        _server_host,
+        agent_cfg.admin_api_key,
+        default_key=DEFAULT_ADMIN_API_KEY,
+        config_field="AgentConfig.admin_api_key",
+    )
+    # Only commit the key to the global after validation has passed.
     with _lock:
-        _admin_api_key = openai_cfg.admin_api_key
-        if _admin_api_key == DEFAULT_ADMIN_API_KEY:
-            logger.warning(
-                "Using default admin API key. Change 'admin_api_key' in "
-                "OpenAIProxyConfig for non-local deployments."
-            )
+        _admin_api_key = agent_cfg.admin_api_key
 
 
 @app.post("/configure")
@@ -1019,10 +1027,11 @@ def main():
         # Run uvicorn directly (blocking)
         uvicorn.run(
             app,
-            host="0.0.0.0",
+            host=_server_host,
             port=_server_port,
             log_level="warning",
             timeout_keep_alive=300,
+            access_log=False,
         )
     except KeyboardInterrupt:
         logger.info("Shutting down proxy rollout server")

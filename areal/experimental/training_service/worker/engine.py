@@ -221,6 +221,31 @@ def create_engine_module(
 
         bp.add_url_rule(path, f"{method_name}_endpoint", handler, methods=http_methods)
 
+    # -- lifecycle routes --------------------------------------------------
+
+    @bp.route("/destroy_engine", methods=["POST"])
+    def destroy_engine():
+        """Gracefully destroy the engine and release distributed resources.
+
+        Calls ``engine.destroy()`` which runs
+        ``dist.destroy_process_group()`` (a local ``ncclCommAbort`` +
+        HeartbeatMonitor join).  Must be called on **all** workers before
+        any process exits so that rank-0's TCPStore server outlives every
+        other rank's HeartbeatMonitor thread.
+        """
+        engine = get_engine()
+        if engine is None:
+            return jsonify({"status": "success", "message": "No engine to destroy"})
+
+        def action():
+            engine.destroy()
+
+        return run_endpoint(
+            "destroy_engine",
+            lambda: submit_to_engine_thread("destroy_engine", action),
+            return_result=False,
+        )
+
     # -- engine routes -----------------------------------------------------
 
     _register_engine_route("/train", "train", return_result=False)

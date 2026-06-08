@@ -5,14 +5,16 @@
 Manages the full lifecycle: create RPCGuard workers → fork DataWorkers,
 Router, Gateway → register datasets → serve batches → shutdown.
 
-Follows the same patterns as ``GatewayInferenceController``.
+Follows the same patterns as ``RolloutControllerV2``.
 """
 
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import os
 import sys
+import threading
 import time
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any
@@ -33,7 +35,7 @@ logger = logging.getLogger("DataController")
 class DataController:
     """Controller for the distributed data loading service.
 
-    API follows ``TrainController`` / ``GatewayInferenceController`` patterns:
+    API follows ``TrainController`` / ``RolloutControllerV2`` patterns:
     ``__init__(config, scheduler)`` then ``initialize(role, ...)``.
     """
 
@@ -62,18 +64,80 @@ class DataController:
 
         self._datasets: dict[str, dict[str, Any]] = {}
 
+        # Pipelined initialization state
+        self._init_future: concurrent.futures.Future | None = None
+        self._init_lock = threading.Lock()
+        self._workers_ready = threading.Event()
+        self._shutdown_requested = threading.Event()
+
+    _WORKERS_READY_TIMEOUT: float = 30.0
+
     # -- Initialize --------------------------------------------------------
 
     def initialize(
         self,
         role: str,
         num_dataset_workers: int = 1,
+        *,
+        wait: bool = False,
+        **kwargs: Any,
+    ) -> concurrent.futures.Future | None:
+        from areal.infra.utils.concurrent import get_executor
+
+        if self._init_future is not None:
+            raise RuntimeError(
+                "initialize() called while a previous initialization is in progress"
+            )
+
+        self._worker_role = role
+
+        self._workers_ready.clear()
+        self._shutdown_requested.clear()
+        self._init_future = get_executor("ctrl_init").submit(
+            self._guarded_bg_initialize, num_dataset_workers, **kwargs
+        )
+
+        if not self._workers_ready.wait(timeout=self._WORKERS_READY_TIMEOUT):
+            raise TimeoutError(
+                f"Worker creation timed out after {self._WORKERS_READY_TIMEOUT}s"
+            )
+        if self._init_future.done():
+            self._init_future.result()
+
+        if wait:
+            self._ensure_initialized()
+            return None
+        return self._init_future
+
+    def _guarded_bg_initialize(self, *args: Any, **kwargs: Any) -> None:
+        """Ensure _workers_ready is signaled even if _bg_initialize fails."""
+        try:
+            self._bg_initialize(*args, **kwargs)
+        except BaseException:
+            self._workers_ready.set()
+            raise
+
+    def _bg_initialize(
+        self,
+        num_dataset_workers: int,
         **kwargs: Any,
     ) -> None:
         from areal.infra.utils.concurrent import run_async_task
 
-        self._worker_role = role
         run_async_task(self._async_initialize, num_dataset_workers, **kwargs)
+        if self._shutdown_requested.is_set():
+            return
+        logger.info("DataController initialized with %d workers", num_dataset_workers)
+
+    def _ensure_initialized(self) -> None:
+        if self._init_future is None:
+            return
+        with self._init_lock:
+            future = self._init_future
+            if future is None:
+                return
+            future.result(timeout=self.config.setup_timeout)
+            self._init_future = None
 
     async def _async_initialize(
         self,
@@ -115,6 +179,11 @@ class DataController:
         guard_workers = self.scheduler.get_workers(role=guard_role)
         self.workers = guard_workers
         logger.info("RPCGuard workers ready: %s", [w.id for w in guard_workers])
+
+        self._workers_ready.set()
+
+        if self._shutdown_requested.is_set():
+            return
 
         guard_addrs = [
             f"http://{format_hostport(w.ip, int(w.worker_ports[0]))}"
@@ -172,9 +241,12 @@ class DataController:
                 logger.info("DataWorkers: %s", self._worker_addrs)
                 logger.info("Router: %s", self._router_addr)
 
+                if self._shutdown_requested.is_set():
+                    return
+
                 # Wave 2: Fork Gateway + Register workers with Router
                 async def _register_workers() -> None:
-                    for worker_addr in self._worker_addrs:
+                    async def _register_one(worker_addr: str) -> None:
                         async with session.post(
                             f"{self._router_addr}/register",
                             json={"worker_addr": worker_addr},
@@ -183,6 +255,14 @@ class DataController:
                         ) as resp:
                             resp.raise_for_status()
                         logger.info("Registered DataWorker %s in router", worker_addr)
+
+                    results = await asyncio.gather(
+                        *[_register_one(addr) for addr in self._worker_addrs],
+                        return_exceptions=True,
+                    )
+                    errors = [r for r in results if isinstance(r, BaseException)]
+                    if errors:
+                        raise errors[0]
 
                 gw_result, _ = await asyncio.gather(
                     self._async_fork_on_guard(
@@ -199,7 +279,7 @@ class DataController:
                             "--router-addr",
                             self._router_addr,
                             "--forward-timeout",
-                            str(60.0),
+                            str(cfg.setup_timeout),
                         ],
                     ),
                     _register_workers(),
@@ -231,8 +311,6 @@ class DataController:
             self._gateway_addr = ""
             raise
 
-        logger.info("DataController initialized with %d workers", num_dataset_workers)
-
     # -- Register / Unregister Datasets ------------------------------------
 
     def register_dataset(
@@ -251,6 +329,7 @@ class DataController:
 
         POST /v1/datasets/register on Gateway.
         """
+        self._ensure_initialized()
 
         payload = {
             "dataset_id": dataset_id,
@@ -297,6 +376,7 @@ class DataController:
 
     def unregister_dataset(self, dataset_id: str) -> None:
         """Unregister a dataset from the service."""
+        self._ensure_initialized()
         from areal.infra.utils.concurrent import run_async_task
 
         run_async_task(
@@ -324,6 +404,7 @@ class DataController:
         ``actor.clear_batches()``, to free memory held by the data
         service instead of relying on TTL-based eviction.
         """
+        self._ensure_initialized()
         if not self._worker_addrs:
             return
         from areal.infra.utils.concurrent import run_async_task
@@ -351,6 +432,12 @@ class DataController:
 
     def destroy(self) -> None:
         """Shutdown service: unload all datasets, kill services, delete workers."""
+        self._shutdown_requested.set()
+        future = self._init_future
+        self._init_future = None
+        if future is not None:
+            future.cancel()
+
         from areal.infra.utils.concurrent import run_async_task
 
         if self._gateway_addr:

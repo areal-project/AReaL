@@ -32,7 +32,7 @@ strict permission rules and an isolated execution environment for your agent run
 # Install uv
 curl -LsSf https://astral.sh/uv/install.sh | sh
 # Clone and install AReaL
-git clone https://github.com/inclusionAI/AReaL.git
+git clone https://github.com/areal-project/AReaL.git
 cd AReaL
 uv sync --all-extras
 ```
@@ -46,7 +46,7 @@ uv run python3 examples/openclaw/train.py --config examples/openclaw/config.yaml
     actor.backend=fsdp:d1 \
     actor.path=Qwen/Qwen3-0.6B \
     scheduler.type=local \
-    rollout.openai.admin_api_key=<admin-api-key>
+    rollout.agent.admin_api_key=<admin-api-key>
 ```
 
 After initialization, you will see output similar to the following:

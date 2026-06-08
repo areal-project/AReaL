@@ -332,17 +332,32 @@ class DockerInstallationValidator(BaseInstallationValidator):
         return "AReaL Docker Installation Validation"
 
 
+def _detect_pyproject(project_root: Path) -> Path:
+    """Auto-detect the correct pyproject file based on installed variant."""
+    vllm_path = project_root / "pyproject.vllm.toml"
+    default_path = project_root / "pyproject.toml"
+
+    try:
+        __import__("vllm")
+        if vllm_path.exists():
+            return vllm_path
+    except (ImportError, ModuleNotFoundError):
+        pass
+
+    return default_path
+
+
 def main():
     """Main entry point."""
-    # Find pyproject.toml
     script_dir = Path(__file__).parent
     project_root = script_dir.parent.parent
-    pyproject_path = project_root / "pyproject.toml"
+    pyproject_path = _detect_pyproject(project_root)
 
     if not pyproject_path.exists():
-        print(f"Error: pyproject.toml not found at {pyproject_path}")
+        print(f"Error: pyproject not found at {pyproject_path}")
         sys.exit(1)
 
+    print(f"Using: {pyproject_path.name}")
     validator = DockerInstallationValidator(pyproject_path)
     success = validator.run()
     sys.exit(0 if success else 1)

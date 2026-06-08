@@ -76,6 +76,18 @@ repos:
         always_run: false
         require_serial: true
 
+  # Regenerate uv lockfiles when pyproject files change
+  - repo: local
+    hooks:
+      - id: uv-lock
+        name: Regenerate uv lockfiles
+        entry: bash scripts/uv_lock.sh
+        language: system
+        files: ^pyproject(\.vllm)?\.toml$
+        pass_filenames: false
+        always_run: false
+        require_serial: true
+
   # Generate CLI documentation
   - repo: local
     hooks:
@@ -98,6 +110,18 @@ repos:
         files: ^areal/.*\.py$
         types: [python]
 
+  # Format and lint .github/CODEOWNERS
+  - repo: local
+    hooks:
+      - id: format-codeowners
+        name: Format CODEOWNERS
+        entry: python3 areal/tools/format_codeowners.py
+        language: system
+        files: ^\.github/CODEOWNERS$
+        pass_filenames: false
+        always_run: false
+        require_serial: true
+
   # Conventional Commits message check
   - repo: https://github.com/compilerla/conventional-pre-commit
     rev: v4.4.0
@@ -108,6 +132,7 @@ repos:
           - feat
           - fix
           - docs
+          - gov
           - style
           - refactor
           - perf

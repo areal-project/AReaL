@@ -93,13 +93,22 @@ def _replace_output_layer_with_value_head(
 
 
 def unwrap_to_gpt_model(model: torch.nn.Module) -> GPTModel:
-    """Unwraps a model to the underlying GPTModel instance."""
+    """Unwraps a model to the underlying GPTModel instance.
+
+    Handles both plain GPTModel (possibly wrapped in DDP) and VLM models
+    (e.g., Qwen2_5VLModel) where GPTModel lives at ``model.language_model``.
+    """
     _model = model
     while not isinstance(_model, GPTModel) and hasattr(_model, "module"):
         _model = _model.module
-    if not isinstance(_model, GPTModel):
-        raise TypeError(f"Model could not be unwrapped to GPTModel. Got {type(_model)}")
-    return _model
+    if isinstance(_model, GPTModel):
+        return _model
+    # VLM models wrap GPTModel as language_model (e.g., Qwen2_5VLModel)
+    if hasattr(_model, "language_model") and isinstance(
+        _model.language_model, GPTModel
+    ):
+        return _model.language_model
+    raise TypeError(f"Model could not be unwrapped to GPTModel. Got {type(_model)}")
 
 
 # Model registry for different architectures

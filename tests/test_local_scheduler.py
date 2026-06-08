@@ -1100,6 +1100,39 @@ class TestDeleteWorkers:
         # Should not raise
         scheduler.delete_workers("nonexistent")
 
+    def test_delete_workers_reverse_order(self, scheduler, tmp_path, monkeypatch):
+        """With reverse_order=True, workers are cleaned up in reverse rank order.
+
+        This protects rank-0 (owner of the global TCPStore server) from being
+        torn down before non-zero ranks finish their final NCCL abort.
+        """
+        workers = [
+            create_worker_info(
+                worker_id=f"role1/{i}",
+                role="role1",
+                ports=[str(8000 + i)],
+                log_file=str(tmp_path / f"role1-{i}.log"),
+            )
+            for i in range(4)
+        ]
+        scheduler._workers["role1"] = workers
+        scheduler._allocated_ports = {8000, 8001, 8002, 8003}
+
+        observed_order: list[str] = []
+
+        original_cleanup = scheduler._cleanup_workers
+
+        def spy(workers_arg):
+            observed_order.extend(w.worker.id for w in workers_arg)
+            original_cleanup(workers_arg)
+
+        monkeypatch.setattr(scheduler, "_cleanup_workers", spy)
+
+        scheduler.delete_workers("role1", reverse_order=True)
+
+        assert observed_order == ["role1/3", "role1/2", "role1/1", "role1/0"]
+        assert "role1" not in scheduler._workers
+
     def test_cleanup_workers_releases_ports(self, scheduler, tmp_path):
         """Should release allocated ports when cleaning up workers."""
         worker = create_worker_info(

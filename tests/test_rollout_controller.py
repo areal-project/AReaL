@@ -161,7 +161,7 @@ class MockScheduler:
         await asyncio.sleep(0.001)
         return None
 
-    def delete_workers(self, role):
+    def delete_workers(self, role, reverse_order: bool = False):
         self.workers.clear()
         self._pending_results.clear()
         self._task_counter = 0

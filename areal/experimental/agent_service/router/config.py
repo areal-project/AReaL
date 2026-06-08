@@ -14,4 +14,4 @@ class RouterConfig:
     admin_api_key: str = DEFAULT_ADMIN_API_KEY
     poll_interval: float = 5.0
     worker_health_timeout: float = 2.0
-    log_level: str = "info"
+    log_level: str = "warning"

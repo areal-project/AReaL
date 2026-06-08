@@ -1,3 +1,6 @@
+from __future__ import annotations
+
+import asyncio
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
@@ -21,6 +24,7 @@ class ToolType(Enum):
 
     PYTHON = "python"
     CALCULATOR = "calculator"
+    DAYTONA_PYTHON = "daytona_python"
 
 
 @dataclass
@@ -79,8 +83,30 @@ class BaseTool(ABC):
 
     @abstractmethod
     def execute(self, parameters: dict[str, Any]) -> tuple[str, ToolCallStatus]:
-        """Execute tool
+        """Execute tool.
 
         Returns:
             Tuple[str, ToolCallStatus]: (result, status)
         """
+
+    async def aexecute(self, parameters: dict[str, Any]) -> tuple[str, ToolCallStatus]:
+        """Async version of execute.
+
+        Override directly for tools that are natively async. The default keeps
+        existing synchronous tools working unchanged.
+        """
+
+        return await asyncio.to_thread(self.execute, parameters)
+
+    async def aclose(self) -> None:
+        """Async cleanup hook."""
+
+        return None
+
+    def close(self) -> None:
+        """Release any tool resources.
+
+        Most tools are stateless and do not need cleanup.
+        """
+
+        return None

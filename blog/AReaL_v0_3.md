@@ -291,7 +291,7 @@ either entirely correct or entirely incorrect.
     [14B-code](https://huggingface.co/inclusionAI/AReaL-boba-2-14B),
     [8B-code-open](https://huggingface.co/inclusionAI/AReaL-boba-2-8B-subset),
     [14B-code-open](https://huggingface.co/inclusionAI/AReaL-boba-2-14B-subset)
-  - [Evaluation Guide](https://inclusionai.github.io/AReaL/en/tutorial/eval.html)
-  - [Training configs](https://github.com/inclusionAI/AReaL/tree/main/examples/configs/v0.3-qwen3-code)
+  - [Evaluation Guide](https://areal-project.github.io/AReaL/en/tutorial/eval.html)
+  - [Training configs](https://github.com/areal-project/AReaL/tree/main/examples/configs/v0.3-qwen3-code)
     and instructions (`reference/reproduce.html`, revert to a version before v0.5.1 to
     see the reproduction guide)

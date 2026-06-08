@@ -74,7 +74,7 @@ AReaL injects these arguments via `extra_kwargs`:
 
 ## Execution Modes
 
-AReaL supports two execution modes, configured via `rollout.openai.mode`:
+AReaL supports two execution modes, configured via `rollout.agent.mode`:
 
 ### Inline Mode (Default)
 
@@ -83,7 +83,7 @@ cases.
 
 ```yaml
 rollout:
-  openai:
+  agent:
     mode: inline
 ```
 
@@ -106,7 +106,7 @@ async-compatible or uses libraries that conflict with the main process.
 
 ```yaml
 rollout:
-  openai:
+  agent:
     mode: subproc
     subproc_max_workers: 4  # Process pool size
 ```
@@ -184,11 +184,11 @@ completion_id = response.id  # Use this ID for reward mapping
 
 ## Configuration
 
-Agent workflow settings are in `rollout.openai`:
+Agent workflow settings are in `rollout.agent`:
 
 ```yaml
 rollout:
-  openai:
+  agent:
     mode: inline              # "inline" or "subproc"
     turn_discount: 0.9        # Reward discount for earlier turns
     export_style: individual  # "individual" or "concat"

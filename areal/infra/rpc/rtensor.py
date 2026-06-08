@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import uuid
 from collections import defaultdict
+from collections.abc import Iterable
 from dataclasses import dataclass
 from threading import Lock
 from typing import Any, Protocol, cast
@@ -309,11 +310,62 @@ def set_backend(backend: RTensorBackend | None) -> None:
 # Caches fetched tensors by shard_id so that repeated fetch() calls for the
 # same shard (e.g. when the same rollout_batch is sent to multiple engine
 # calls across RPC boundaries) avoid redundant network transfers.
-# Entries are evicted by clear_node() when clear_batches() runs at the end
-# of each train step.
+#
+# Cleanup invariant — a single ``clear_batches`` at step end must drain the
+# buffer on every process that could have populated it (see #1209):
+#   1. controller:           ``RTensor.clear_node`` pops locally.
+#   2. storage-owner worker: ``remove()`` pops (covers storage-owner-as-consumer).
+#   3. cross-node consumer:  each engine's ``clear_batches`` RPC handler calls
+#      ``clear_fetch_buffer(sids)`` on its own process.
 
 _fetch_buffer: dict[Any, torch.Tensor] = {}
 _fetch_buffer_lock = Lock()
+
+
+def clear_fetch_buffer(shard_ids: Iterable[Any] | None = None) -> int:
+    """Evict entries from the local client-side fetch buffer.
+
+    Parameters
+    ----------
+    shard_ids
+        Iterable of shard IDs to evict. ``None`` flushes the entire buffer.
+
+    Returns
+    -------
+    int
+        Number of entries removed.
+    """
+    with _fetch_buffer_lock:
+        if shard_ids is None:
+            n = len(_fetch_buffer)
+            _fetch_buffer.clear()
+            return n
+        return sum(_fetch_buffer.pop(sid, None) is not None for sid in shard_ids)
+
+
+def fetch_buffer_stats() -> dict[str, int]:
+    """Return observability stats for the local client-side fetch buffer."""
+    with _fetch_buffer_lock:
+        return {"num_entries": len(_fetch_buffer)}
+
+
+def flatten_shard_ids(obj: Any) -> list[Any]:
+    """Collect all RTensor shard IDs from a nested structure as a flat list.
+
+    Convenience helper used by :class:`TrainController` to build the shard-id
+    payload for ``clear_batches`` RPCs. Sending a flat ``list[str]`` (rather
+    than the original nested RTensor structure) is deliberate:
+
+    - ``engine_blueprint.py`` always runs ``RTensor.localize`` on incoming
+      RPC args; passing RTensors would re-fetch the shards we're trying to
+      clear, defeating the purpose.
+    - ``_is_tensor_like(list[str])`` is False, so ``_prepare_dispatch``
+      replicates the payload to every DP head instead of partitioning it.
+      Each head's ``_fetch_buffer`` is keyed by sid without node-affinity,
+      so every head must see the full sid set to drain completely.
+    """
+    shards_by_node = RTensor.collect_shards(obj)
+    return [sid for sids in shards_by_node.values() for sid in sids]
 
 
 @dataclass
@@ -567,8 +619,18 @@ def fetch(shard_id: str) -> torch.Tensor:
 
 
 def remove(shard_id: str) -> int:
-    """Remove a tensor shard from global storage."""
+    """Remove a tensor shard from global storage.
+
+    Also evicts the shard from this process's client-side ``_fetch_buffer``.
+    This is required because ``to_local()`` on a storage-owning worker still
+    goes through the HTTP backend (even for a self-local shard) and caches
+    the fetched tensor. Without this pop, RSS grows unboundedly across steps
+    on any worker that both stores and localizes the same shard — see
+    areal-project/AReaL#1209.
+    """
     global _storage, _storage_lock, _storage_stats
+    with _fetch_buffer_lock:
+        _fetch_buffer.pop(shard_id, None)
     with _storage_lock:
         if shard_id in _storage:
             del _storage[shard_id]

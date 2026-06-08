@@ -105,7 +105,7 @@ actor:
 
 | Backend  | Supported Dimensions |
 | -------- | -------------------- |
-| `sglang` | `d`, `t`             |
+| `sglang` | `d`, `t`, `p`        |
 | `vllm`   | `d`, `t`, `p`        |
 
 For inference, `d` represents the number of independent server instances, and each

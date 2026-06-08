@@ -20,6 +20,7 @@ import asyncio
 
 import httpx
 
+from areal.infra.utils.http import create_httpx_client
 from areal.utils import logging
 
 logger = logging.getLogger("InferenceDataProxy")
@@ -41,17 +42,33 @@ class PauseState:
         return self._paused
 
 
-async def pause_backend(backend_addr: str) -> None:
+async def pause_backend(
+    backend_addr: str, *, client: httpx.AsyncClient | None = None
+) -> None:
     """Call SGLang POST /pause_generation to abort in-flight requests."""
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        resp = await client.post(f"{backend_addr}/pause_generation", json={})
+    if client is not None:
+        resp = await client.post(
+            f"{backend_addr}/pause_generation", json={}, timeout=10.0
+        )
         resp.raise_for_status()
+    else:
+        async with create_httpx_client(timeout=10.0) as c:
+            resp = await c.post(f"{backend_addr}/pause_generation", json={})
+            resp.raise_for_status()
     logger.info("SGLang pause_generation called on %s", backend_addr)
 
 
-async def resume_backend(backend_addr: str) -> None:
+async def resume_backend(
+    backend_addr: str, *, client: httpx.AsyncClient | None = None
+) -> None:
     """Call SGLang POST /continue_generation to resume inference."""
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        resp = await client.post(f"{backend_addr}/continue_generation", json={})
+    if client is not None:
+        resp = await client.post(
+            f"{backend_addr}/continue_generation", json={}, timeout=10.0
+        )
         resp.raise_for_status()
+    else:
+        async with create_httpx_client(timeout=10.0) as c:
+            resp = await c.post(f"{backend_addr}/continue_generation", json={})
+            resp.raise_for_status()
     logger.info("SGLang continue_generation called on %s", backend_addr)

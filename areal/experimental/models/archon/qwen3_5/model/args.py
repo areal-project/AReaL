@@ -113,10 +113,7 @@ class Qwen3_5ModelArgs(BaseModelArgs):
             partial_rotary_factor = rope_params.get("partial_rotary_factor", 0.25)
 
         # Extract rope_theta (may be top-level or inside rope_parameters)
-        rope_theta = getattr(hf_config, "rope_theta", None)
-        if rope_theta is None:
-            rope_params = getattr(hf_config, "rope_parameters", {}) or {}
-            rope_theta = rope_params.get("rope_theta", 1000000.0)
+        rope_theta = cls._get_rope_theta(hf_config, default=1000000.0)
 
         # Check if MoE is enabled
         num_experts = getattr(hf_config, "num_experts", None)

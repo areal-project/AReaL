@@ -31,7 +31,7 @@ from areal.api.engine_api import InferenceEngine
 from areal.dataset import get_custom_dataset
 from areal.trainer import PPOTrainer
 from areal.utils import logging
-from areal.utils.hf_utils import load_hf_tokenizer
+from areal.utils.hf_utils import apply_chat_template, load_hf_tokenizer
 
 from ._compat import (
     NativeGenerationController,
@@ -214,8 +214,9 @@ class SearchScaffoldingWorkflow(ScaffoldingWorkflow):
 
         # Tokenize the original prompt
         input_ids = list(
-            self.tokenizer.apply_chat_template(
-                messages,
+            apply_chat_template(
+                self.tokenizer,
+                data["messages"],
                 tokenize=True,
                 add_generation_prompt=True,
                 enable_thinking=self.enable_thinking,

@@ -15,6 +15,7 @@ class Evaluator:
             freq_epoch=config.freq_epochs,
             freq_step=config.freq_steps,
             freq_sec=config.freq_secs,
+            initial_epoch_value=config.eval_before_train,
         )
 
     def state_dict(self):

@@ -14,6 +14,7 @@ from megatron.core import parallel_state as mpu
 from megatron.core.fp8_utils import is_float8tensor
 from safetensors import safe_open
 
+from areal.engine.core.model import lang_config
 from areal.engine.megatron_utils.fp8 import (
     FP8BlockwiseTensorHelper,
     dequantize_params,
@@ -51,10 +52,11 @@ def _merge_qkv_weights(
 ) -> torch.Tensor | FP8BlockwiseTensorHelper:
     """Merge Q, K, V weights into a single QKV weight tensor."""
     assert len(hf_weights_safe_slice) == 3
-    num_key_value_heads = hf_config.num_key_value_heads
-    hidden_dim = hf_config.hidden_size
-    num_attention_heads = hf_config.num_attention_heads
-    head_dim = getattr(hf_config, "head_dim", hidden_dim // num_attention_heads)
+    text_cfg = lang_config(hf_config)
+    num_key_value_heads = text_cfg.num_key_value_heads
+    hidden_dim = text_cfg.hidden_size
+    num_attention_heads = text_cfg.num_attention_heads
+    head_dim = getattr(text_cfg, "head_dim", hidden_dim // num_attention_heads)
     group_dim = head_dim * num_attention_heads // num_key_value_heads
     q, k, v = hf_weights_safe_slice
     # q k v might be tp split
@@ -78,45 +80,62 @@ def _load_fused_qkv_weight(
     tp_rank: int,
     tp_size: int,
 ) -> torch.Tensor:
-    """Load fused QKV weight for Lightning Attention, with format conversion and TP slicing.
+    """Load fused QKV weight/bias with format conversion and TP slicing.
 
-    HF stores Lightning Attention QKV in concatenated format:
+    HF stores fused QKV in concatenated format:
         [Q_all, K_all, V_all] along dim 0, i.e., [q0,...,qH, k0,...,kH, v0,...,vH].
     Megatron-core expects interleaved format:
         [H, 3, D] along dim 0, i.e., [q0,k0,v0, q1,k1,v1, ...].
 
-    This function converts from HF concatenated to mcore interleaved, then TP-slices.
+    Handles both 2D weights [qkv_size, hidden] and 1D biases [qkv_size].
     """
     assert len(hf_weights_safe_slice) == 1
     x = hf_weights_safe_slice[0]
     x = x[:] if not isinstance(x, torch.Tensor) else x
 
-    num_heads = hf_config.num_attention_heads
-    num_kv_heads = getattr(hf_config, "num_key_value_heads", num_heads)
+    text_cfg = lang_config(hf_config)
+    num_heads = text_cfg.num_attention_heads
+    num_kv_heads = getattr(text_cfg, "num_key_value_heads", num_heads)
     head_dim = x.shape[0] // (num_heads + 2 * num_kv_heads)
-    hidden = x.shape[1]
+    is_bias = x.dim() == 1
 
-    # Split concatenated [Q_all(H*D), K_all(Kv*D), V_all(Kv*D)] into separate Q, K, V
-    q = x[: num_heads * head_dim].view(num_heads, head_dim, hidden)
-    k = x[num_heads * head_dim : (num_heads + num_kv_heads) * head_dim].view(
-        num_kv_heads, head_dim, hidden
-    )
-    v = x[(num_heads + num_kv_heads) * head_dim :].view(num_kv_heads, head_dim, hidden)
-
-    # For Lightning Attention, num_kv_heads == num_heads (no GQA)
+    # num_kv_heads == num_heads (no GQA) for this path
     assert num_kv_heads == num_heads, (
-        f"Lightning Attention requires num_kv_heads == num_heads (no GQA), "
+        f"_load_fused_qkv_weight requires num_kv_heads == num_heads (no GQA), "
         f"got num_kv_heads={num_kv_heads}, num_heads={num_heads}"
     )
-    # Convert to interleaved: [H, 3, D, hidden] -> [H*3*D, hidden]
-    x = torch.stack([q, k, v], dim=1)  # [H, 3, D, hidden]
-    x = x.reshape(-1, hidden)  # [H*3*D, hidden]
 
-    if tp_size > 1:
-        heads_per_tp = num_heads // tp_size
-        x = x.view(num_heads, 3 * head_dim, hidden)
-        x = x[tp_rank * heads_per_tp : (tp_rank + 1) * heads_per_tp]
-        x = x.reshape(-1, hidden)
+    if is_bias:
+        # 1D bias: [Q_all(H*D), K_all(Kv*D), V_all(Kv*D)]
+        q = x[: num_heads * head_dim].view(num_heads, head_dim)
+        k = x[num_heads * head_dim : (num_heads + num_kv_heads) * head_dim].view(
+            num_kv_heads, head_dim
+        )
+        v = x[(num_heads + num_kv_heads) * head_dim :].view(num_kv_heads, head_dim)
+        x = torch.stack([q, k, v], dim=1)  # [H, 3, D]
+        x = x.reshape(-1)  # [H*3*D]
+        if tp_size > 1:
+            heads_per_tp = num_heads // tp_size
+            x = x.view(num_heads, 3 * head_dim)
+            x = x[tp_rank * heads_per_tp : (tp_rank + 1) * heads_per_tp]
+            x = x.reshape(-1)
+    else:
+        # 2D weight: [Q_all(H*D), K_all(Kv*D), V_all(Kv*D), hidden]
+        hidden = x.shape[1]
+        q = x[: num_heads * head_dim].view(num_heads, head_dim, hidden)
+        k = x[num_heads * head_dim : (num_heads + num_kv_heads) * head_dim].view(
+            num_kv_heads, head_dim, hidden
+        )
+        v = x[(num_heads + num_kv_heads) * head_dim :].view(
+            num_kv_heads, head_dim, hidden
+        )
+        x = torch.stack([q, k, v], dim=1)  # [H, 3, D, hidden]
+        x = x.reshape(-1, hidden)  # [H*3*D, hidden]
+        if tp_size > 1:
+            heads_per_tp = num_heads // tp_size
+            x = x.view(num_heads, 3 * head_dim, hidden)
+            x = x[tp_rank * heads_per_tp : (tp_rank + 1) * heads_per_tp]
+            x = x.reshape(-1, hidden)
 
     return x.contiguous()
 
@@ -151,6 +170,80 @@ def _slice_moe_expert_weight(
     return x[_get_tp_slice(shape, dim=partition_dim, tp_rank=tp_rank, tp_size=tp_size)]
 
 
+def _parse_local_expert_idx(mcore_weights_name: str) -> int:
+    """Extract the per-rank-local expert index from an mcore expert param name.
+
+    mcore weight names for grouped MoE end with ``weight{idx}`` where ``idx`` is
+    the rank-local expert index (0..num_experts_per_rank-1). The global expert
+    index is ``idx + (num_moe_experts // ep_size) * ep_rank``.
+    """
+    return int(mcore_weights_name.split(".weight")[-1])
+
+
+def _slice_moe_expert_fc1_stacked_gate_up(
+    hf_weights_safe_slice: list,
+    mcore_weights_name: str,
+    num_moe_experts: int,
+    ep_rank: int,
+    ep_size: int,
+    tp_rank: int,
+    tp_size: int,
+) -> torch.Tensor:
+    """Slice a per-expert ``linear_fc1.weight{idx}`` shard from a 3D stacked
+    HF ``gate_up_proj`` of shape ``[E, hidden, 2*expert_dim]``.
+
+    Used for Qwen3-VL-MoE-style MoE checkpoints whose HF format keeps experts
+    grouped under one tensor (vs Qwen3-MoE which exposes per-expert flat keys).
+    Mirrors mbridge ``Qwen3VBaseBridge._weight_to_mcore_format`` MoE branch
+    (``base_bridge.py:322-331``) plus AReaL's TP slicing of the gate/up halves.
+    """
+    assert len(hf_weights_safe_slice) == 1
+    stacked = hf_weights_safe_slice[0]
+    local_idx = _parse_local_expert_idx(mcore_weights_name)
+    num_experts_per_rank = num_moe_experts // ep_size
+    global_idx = local_idx + num_experts_per_rank * ep_rank
+    expert = stacked[global_idx]  # [hidden, 2*expert_dim]
+    if not isinstance(expert, torch.Tensor):
+        expert = expert[:]
+    expert_t = expert.T.contiguous()  # [2*expert_dim, hidden]
+    gate, up = expert_t.chunk(2, dim=0)  # each [expert_dim, hidden]
+    gate = gate[
+        _get_tp_slice(_get_shape(gate), dim=0, tp_rank=tp_rank, tp_size=tp_size)
+    ]
+    up = up[_get_tp_slice(_get_shape(up), dim=0, tp_rank=tp_rank, tp_size=tp_size)]
+    return torch.cat([gate, up], dim=0)
+
+
+def _slice_moe_expert_fc2_stacked_down(
+    hf_weights_safe_slice: list,
+    mcore_weights_name: str,
+    num_moe_experts: int,
+    ep_rank: int,
+    ep_size: int,
+    tp_rank: int,
+    tp_size: int,
+) -> torch.Tensor:
+    """Slice a per-expert ``linear_fc2.weight{idx}`` shard from a 3D stacked
+    HF ``down_proj`` of shape ``[E, expert_dim, hidden]``.
+
+    After expert slice + transpose the result is ``[hidden, expert_dim]``,
+    matching mcore's per-expert ``linear_fc2`` layout. TP shards along dim 1
+    (input/expert_dim axis), the same axis ``_slice_moe_expert_weight`` uses.
+    """
+    assert len(hf_weights_safe_slice) == 1
+    stacked = hf_weights_safe_slice[0]
+    local_idx = _parse_local_expert_idx(mcore_weights_name)
+    num_experts_per_rank = num_moe_experts // ep_size
+    global_idx = local_idx + num_experts_per_rank * ep_rank
+    expert = stacked[global_idx]  # [expert_dim, hidden]
+    if not isinstance(expert, torch.Tensor):
+        expert = expert[:]
+    expert_t = expert.T.contiguous()  # [hidden, expert_dim]
+    return expert_t[
+        _get_tp_slice(_get_shape(expert_t), dim=1, tp_rank=tp_rank, tp_size=tp_size)
+    ]
+
+
 def _slice_generic_weight(
     mcore_param_shape: list,
     hf_weights_safe_slice: list,
@@ -176,6 +269,62 @@ def _slice_generic_weight(
         ]
 
 
+def _convert_vision_qkv_hf_to_mcore(
+    hf_config,
+    mcore_weights_name: str,
+    mcore_param_shape: list,
+    hf_weights_safe_slice: list,
+    tp_rank: int,
+    tp_size: int,
+) -> torch.Tensor:
+    """Convert vision encoder QKV from HF format to mcore format.
+
+    HF format: grouped [Q_all | K_all | V_all] (3 sections of num_heads*head_dim rows).
+    mcore format: per-head interleaved [head_0(q,k,v) | head_1(q,k,v) | ...].
+    Both have the same total shape but different internal ordering.
+
+    Mirrors mbridge Qwen2_5VLBridge._weight_to_mcore_format for vision QKV.
+    """
+    # If 3 separate Q, K, V tensors, concatenate first into HF grouped format
+    if len(hf_weights_safe_slice) == 3:
+        parts = [
+            w[:] if not isinstance(w, torch.Tensor) else w
+            for w in hf_weights_safe_slice
+        ]
+        x = torch.cat(parts, dim=0)
+    else:
+        x = hf_weights_safe_slice[0]
+        x = x[:] if not isinstance(x, torch.Tensor) else x
+
+    vision_config = getattr(hf_config, "vision_config", None)
+    if vision_config is None:
+        # No vision_config means no special conversion is needed
+        return _slice_generic_weight(mcore_param_shape, [x], tp_rank, tp_size)
+
+    num_heads = vision_config.num_heads
+    hidden_size = vision_config.hidden_size
+    head_dim = hidden_size // num_heads
+    is_bias = ".bias" in mcore_weights_name
+
+    # Reshape from HF grouped format to mcore per-head interleaved format.
+    # HF: [3, num_heads, head_dim, hidden_size] (weight) or [3, num_heads, head_dim] (bias)
+    # mcore: [num_heads, 3*head_dim, hidden_size] (weight) or [num_heads, 3*head_dim] (bias)
+    in_shape = (
+        [3, num_heads, -1, head_dim, hidden_size] if not is_bias else [3, num_heads, -1]
+    )
+    q, k, v = x.view(*in_shape)
+
+    head_shape = [num_heads, head_dim, -1] if not is_bias else [num_heads, head_dim]
+    q = q.view(*head_shape)
+    k = k.view(*head_shape)
+    v = v.view(*head_shape)
+
+    out_shape = [-1, hidden_size] if not is_bias else [-1]
+    fused = torch.cat([q, k, v], dim=1).view(*out_shape).contiguous()
+
+    return _slice_generic_weight(mcore_param_shape, [fused], tp_rank, tp_size)
+
+
 def _weight_to_mcore_tp(
     hf_config,
     mcore_weights_name: str,
@@ -197,23 +346,100 @@ def _weight_to_mcore_tp(
         "self_attention.linear_qkv." in mcore_weights_name
         and "layer_norm" not in mcore_weights_name
     ):
-        if len(hf_weights_safe_slice) == 3:
+        if (
+            len(hf_weights_safe_slice) == 3
+            and "vision_model." not in mcore_weights_name
+        ):
             res = _merge_qkv_weights(
                 hf_config, mcore_weights_name, hf_weights_safe_slice, tp_rank, tp_size
             )
-        else:
-            # Fused QKV weight (e.g., Lightning Attention query_key_value)
-            # Already in megatron interleaved format [H, 3, D] — just TP-slice
-            res = _load_fused_qkv_weight(
-                hf_config, hf_weights_safe_slice, tp_rank, tp_size
+        elif "vision_model." in mcore_weights_name:
+            # Vision encoder QKV: no GQA (num_heads == num_kv_heads). HF stores
+            # QKV in grouped layout [Q_all | K_all | V_all] while mcore uses
+            # per-head interleaved [head_0(q,k,v) | head_1(q,k,v) | ...].
+            # Must convert between these formats (same shape, different ordering).
+            res = _convert_vision_qkv_hf_to_mcore(
+                hf_config,
+                mcore_weights_name,
+                mcore_param_shape,
+                hf_weights_safe_slice,
+                tp_rank,
+                tp_size,
             )
+        else:
+            text_cfg = lang_config(hf_config)
+            num_kv_heads = getattr(
+                text_cfg, "num_key_value_heads", text_cfg.num_attention_heads
+            )
+            if num_kv_heads == text_cfg.num_attention_heads:
+                # Fused QKV weight (e.g., Lightning Attention query_key_value)
+                # Already in megatron interleaved format [H, 3, D] — just TP-slice
+                res = _load_fused_qkv_weight(
+                    hf_config, hf_weights_safe_slice, tp_rank, tp_size
+                )
+            else:
+                # Fused QKV with GQA (e.g., Qwen2.5-VL language model qkv_proj)
+                # Split into separate Q, K, V then merge into mcore format.
+                x = hf_weights_safe_slice[0]
+                x = x[:] if not isinstance(x, torch.Tensor) else x
+                num_heads = text_cfg.num_attention_heads
+                head_dim = x.shape[0] // (num_heads + 2 * num_kv_heads)
+                q = x[: num_heads * head_dim]
+                k = x[num_heads * head_dim : (num_heads + num_kv_heads) * head_dim]
+                v = x[(num_heads + num_kv_heads) * head_dim :]
+                res = _merge_qkv_weights(
+                    hf_config,
+                    mcore_weights_name,
+                    [q, k, v],
+                    tp_rank,
+                    tp_size,
+                )
     elif (
         "linear_fc1.weight" in mcore_weights_name
         or "linear_fc1.bias" in mcore_weights_name
     ):
-        res = _merge_gate_up_weights(hf_weights_safe_slice, tp_rank, tp_size)
+        if len(hf_weights_safe_slice) == 2:
+            # SwiGLU: merge separate gate_proj + up_proj
+            res = _merge_gate_up_weights(hf_weights_safe_slice, tp_rank, tp_size)
+        elif (
+            "mlp.experts.linear_fc1.weight" in mcore_weights_name
+            and len(hf_weights_safe_slice) == 1
+            and len(_get_shape(hf_weights_safe_slice[0])) == 3
+        ):
+            # Stacked MoE expert (e.g., Qwen3-VL-MoE ``gate_up_proj`` shape
+            # ``[E, hidden, 2*expert_dim]``). Slice per-expert + transpose +
+            # gate/up TP-split. ``num_moe_experts`` lives on the bridge config.
+            res = _slice_moe_expert_fc1_stacked_gate_up(
+                hf_weights_safe_slice,
+                mcore_weights_name,
+                num_moe_experts=lang_config(hf_config).num_experts,
+                ep_rank=mpu.get_expert_model_parallel_rank(),
+                ep_size=mpu.get_expert_model_parallel_world_size(),
+                tp_rank=tp_rank,
+                tp_size=tp_size,
+            )
+        else:
+            # Single fc1 weight (e.g., vision encoder MLP without gate/up split)
+            res = _slice_generic_weight(
+                mcore_param_shape, hf_weights_safe_slice, tp_rank, tp_size
+            )
     elif "mlp.experts.linear_fc2.weight" in mcore_weights_name:
-        res = _slice_moe_expert_weight(hf_weights_safe_slice, tp_rank, tp_size)
+        if (
+            len(hf_weights_safe_slice) == 1
+            and len(_get_shape(hf_weights_safe_slice[0])) == 3
+        ):
+            # Stacked MoE expert ``down_proj`` shape ``[E, expert_dim, hidden]``.
+            res = _slice_moe_expert_fc2_stacked_down(
+                hf_weights_safe_slice,
+                mcore_weights_name,
+                num_moe_experts=lang_config(hf_config).num_experts,
+                ep_rank=mpu.get_expert_model_parallel_rank(),
+                ep_size=mpu.get_expert_model_parallel_world_size(),
+                tp_rank=tp_rank,
+                tp_size=tp_size,
+            )
+        else:
+            res = _slice_moe_expert_weight(hf_weights_safe_slice, tp_rank, tp_size)
     else:
         res = _slice_generic_weight(
             mcore_param_shape, hf_weights_safe_slice, tp_rank, tp_size

@@ -22,13 +22,13 @@ def main(args):
     )
 
     workflow_kwargs = dict(
-        reward_fn="areal.reward.gsm8k.gsm8k_reward_fn",
-        gconfig=config.gconfig,
-        tokenizer=config.tokenizer_path,
-        enable_thinking=False,
+        temperature=config.gconfig.temperature,
+        top_p=config.gconfig.top_p,
+        max_tokens=config.gconfig.max_tokens,
+        max_completion_tokens=config.gconfig.max_new_tokens,
     )
     eval_workflow_kwargs = workflow_kwargs.copy()
-    eval_workflow_kwargs["gconfig"] = config.gconfig.new(temperature=0.6)
+    eval_workflow_kwargs["temperature"] = 0.6
 
     with PPOTrainer(
         config,
@@ -36,9 +36,9 @@ def main(args):
         valid_dataset=valid_dataset,
     ) as trainer:
         trainer.train(
-            workflow="areal.workflow.rlvr.RLVRWorkflow",
+            workflow="areal.workflow.openai.math_agent.MathAgent",
             workflow_kwargs=workflow_kwargs,
-            eval_workflow="areal.workflow.rlvr.RLVRWorkflow",
+            eval_workflow="areal.workflow.openai.math_agent.MathAgent",
             eval_workflow_kwargs=eval_workflow_kwargs,
         )
 

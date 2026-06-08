@@ -22,6 +22,7 @@ from areal.api.cli_args import (
     field,
 )
 from areal.utils import logging, stats_tracker
+from areal.utils.hf_utils import apply_chat_template
 
 from prompts import ANSWER, SYSTEM_PROMPT, TORL_PROMPT  # isort: skip
 from tool_manager import ToolCallStatus, ToolManager  # isort: skip
@@ -66,8 +67,10 @@ class TIRWorkflow(RolloutWorkflow):
         self.reward_fn = reward_fn
         self.gconfig = gconfig.new_with_stop_and_pad_token_ids(tokenizer)
         self.tokenizer = tokenizer
+        self.tool_timeout = tir_config.tool_timeout
+        self.enable_tools = tir_config.enable_tools
         self.tool_manager = ToolManager(
-            tir_config.tool_timeout, tir_config.enable_tools, debug_mode=False
+            self.tool_timeout, self.enable_tools, debug_mode=False
         )
         self.is_chat_model = tir_config.is_chat_model
         self.max_turns = tir_config.max_turns
@@ -81,6 +84,9 @@ class TIRWorkflow(RolloutWorkflow):
         logger.info(
             f"start markers: {self.start_markers}, end markers {self.end_markers}"
         )
+
+    def _build_tool_manager(self) -> ToolManager:
+        return ToolManager(self.tool_timeout, self.enable_tools, debug_mode=False)
 
     @staticmethod
     def _process_tool_result(tool_result) -> str:
@@ -100,36 +106,48 @@ class TIRWorkflow(RolloutWorkflow):
         :param data: The input data.
         :return: The output tensor dict.
         """
-        # Initialize conversation history
-        messages = data["messages"]
+        tool_manager = self._build_tool_manager()
+        # Daytona-backed tools can allocate remote sandboxes per episode, so
+        # cleanup must run even when generation or reward computation fails.
+        try:
+            # Initialize conversation history
+            messages = data["messages"]
 
-        # Add system prompt with tool usage instructions
-        system_prompt = SYSTEM_PROMPT.format(
-            tool_descriptions=self.tool_manager.get_tool_descriptions_prompt()
-        )
-        if messages[0]["role"] == "system":
-            messages[0]["content"] = system_prompt
-        else:
-            messages.insert(0, {"role": "system", "content": system_prompt})
-
-        # Prepare input
-        if self.is_chat_model:
-            input_ids = self.tokenizer.apply_chat_template(
-                messages,
-                tokenize=True,
-                add_generation_prompt=True,
-                enable_thinking=self.enable_thinking,
+            # Add system prompt with tool usage instructions
+            system_prompt = SYSTEM_PROMPT.format(
+                tool_descriptions=tool_manager.get_tool_descriptions_prompt()
             )
-        else:
-            input_ids = self.tokenizer.encode(
-                TORL_PROMPT.format(prompt=messages[1]["content"]),
-                add_special_tokens=False,
+            if messages[0]["role"] == "system":
+                messages[0]["content"] = system_prompt
+            else:
+                messages.insert(0, {"role": "system", "content": system_prompt})
+
+            # Prepare input
+            if self.is_chat_model:
+                input_ids = apply_chat_template(
+                    self.tokenizer,
+                    messages,
+                    tokenize=True,
+                    add_generation_prompt=True,
+                    enable_thinking=self.enable_thinking,
+                )
+            else:
+                input_ids = self.tokenizer.encode(
+                    TORL_PROMPT.format(prompt=messages[1]["content"]),
+                    add_special_tokens=False,
+                )
+
+            # Run single trajectory
+            return await self._multi_round_response(
+                engine, input_ids, data, tool_manager
             )
+        finally:
+            await tool_manager.acleanup()
 
-        # Run single trajectory
-        return await self._multi_round_response(engine, input_ids, data)
+    async def _multi_round_response(self, engine, prompt_ids, data, tool_manager=None):
+        if tool_manager is None:
+            tool_manager = self.tool_manager
 
-    async def _multi_round_response(self, engine, prompt_ids, data):
         prompt_str = self.tokenizer.decode(prompt_ids)
         completions_str = ""
         has_tool = False
@@ -196,8 +214,8 @@ class TIRWorkflow(RolloutWorkflow):
                 and stop_reason == "stop"
                 and tool_start_idx != -1
             ):
-                tool_results, tool_status = self._execute_tools(
-                    completions_str[tool_start_idx:]
+                tool_results, tool_status = await self._execute_tools(
+                    completions_str[tool_start_idx:], tool_manager
                 )
                 if tool_status == ToolCallStatus.NOT_FOUND:
                     # No match found, continue generating until next tool end marker
@@ -294,8 +312,10 @@ class TIRWorkflow(RolloutWorkflow):
                 return marker
         return None
 
-    def _execute_tools(self, response: str) -> tuple[str, ToolCallStatus]:
+    async def _execute_tools(
+        self, response: str, tool_manager=None
+    ) -> tuple[str, ToolCallStatus]:
         """Execute tool call"""
-        # Call execute_tool_call
-        tool_results = self.tool_manager.execute_tool_call(response)
-        return tool_results
+        if tool_manager is None:
+            tool_manager = self.tool_manager
+        return await tool_manager.aexecute_tool_call(response)

@@ -6,8 +6,6 @@ and all router endpoints.
 
 from __future__ import annotations
 
-import asyncio
-
 import httpx
 import pytest
 import pytest_asyncio
@@ -15,7 +13,6 @@ import pytest_asyncio
 from areal.experimental.inference_service.router.app import create_app
 from areal.experimental.inference_service.router.config import RouterConfig
 from areal.experimental.inference_service.router.state import (
-    CapacityManager,
     SessionRegistry,
     WorkerInfo,
     WorkerRegistry,
@@ -366,13 +363,14 @@ class TestRouterEndpoints:
             json={"worker_addr": WORKER_1},
             headers=admin_headers(),
         )
-        await client.post("/grant_capacity", headers=admin_headers())
         await client.post(
             "/register_session",
             json={
-                "session_api_key": "sess-key-1",
-                "session_id": "task-0-0",
+                "sessions": [
+                    {"session_api_key": "sess-key-1", "session_id": "task-0-0"}
+                ],
                 "worker_addr": WORKER_1,
+                "group_id": "grp-test-1",
             },
             headers=admin_headers(),
         )
@@ -437,13 +435,14 @@ class TestRouterEndpoints:
             json={"worker_addr": WORKER_1},
             headers=admin_headers(),
         )
-        await client.post("/grant_capacity", headers=admin_headers())
         await client.post(
             "/register_session",
             json={
-                "session_api_key": "sess-key-1",
-                "session_id": "task-0-0",
+                "sessions": [
+                    {"session_api_key": "sess-key-1", "session_id": "task-0-0"}
+                ],
                 "worker_addr": WORKER_1,
+                "group_id": "grp-test-2",
             },
             headers=admin_headers(),
         )
@@ -480,25 +479,26 @@ class TestRouterEndpoints:
             headers=admin_headers(),
         )
         assert resp.status_code == 503
-        assert "No healthy workers" in resp.json()["detail"]
+        assert "No registered workers" in resp.json()["detail"]
 
     # ----- /route — pinned worker unhealthy -----
 
     @pytest.mark.asyncio
-    async def test_route_pinned_worker_unhealthy_503(self, client):
+    async def test_route_pinned_worker_unhealthy_still_routes(self, client):
         # Register worker + session
         await client.post(
             "/register",
             json={"worker_addr": WORKER_1},
             headers=admin_headers(),
         )
-        await client.post("/grant_capacity", headers=admin_headers())
         await client.post(
             "/register_session",
             json={
-                "session_api_key": "sess-key-1",
-                "session_id": "task-0-0",
+                "sessions": [
+                    {"session_api_key": "sess-key-1", "session_id": "task-0-0"}
+                ],
                 "worker_addr": WORKER_1,
+                "group_id": "grp-test-4",
             },
             headers=admin_headers(),
         )
@@ -507,25 +507,27 @@ class TestRouterEndpoints:
         wr: WorkerRegistry = client._transport.app.state.worker_registry  # type: ignore[attr-defined]
         await wr.update_health(WORKER_1, False)
 
+        # Routing still returns the pinned worker even if unhealthy
         resp = await client.post(
             "/route",
             json={"api_key": "sess-key-1", "path": "/chat/completions"},
             headers=admin_headers(),
         )
-        assert resp.status_code == 503
-        assert "Pinned worker unhealthy" in resp.json()["detail"]
+        assert resp.status_code == 200
+        assert resp.json()["worker_addr"] == WORKER_1
 
     # ----- /route — session_id lookup -----
 
     @pytest.mark.asyncio
     async def test_route_by_session_id(self, client):
-        await client.post("/grant_capacity", headers=admin_headers())
         await client.post(
             "/register_session",
             json={
-                "session_api_key": "sess-key-1",
-                "session_id": "task-0-0",
+                "sessions": [
+                    {"session_api_key": "sess-key-1", "session_id": "task-0-0"}
+                ],
                 "worker_addr": WORKER_1,
+                "group_id": "grp-test-3",
             },
             headers=admin_headers(),
         )
@@ -576,9 +578,11 @@ class TestRouterEndpoints:
         resp = await client.post(
             "/register_session",
             json={
-                "session_api_key": "sess-key-1",
-                "session_id": "task-0-0",
+                "sessions": [
+                    {"session_api_key": "sess-key-1", "session_id": "task-0-0"}
+                ],
                 "worker_addr": WORKER_1,
+                "group_id": "grp-test-5",
             },
         )
         assert resp.status_code == 401
@@ -594,13 +598,14 @@ class TestRouterEndpoints:
             headers=admin_headers(),
         )
 
-        await client.post("/grant_capacity", headers=admin_headers())
         resp = await client.post(
             "/register_session",
             json={
-                "session_api_key": "sess-key-1",
-                "session_id": "task-0-0",
+                "sessions": [
+                    {"session_api_key": "sess-key-1", "session_id": "task-0-0"}
+                ],
                 "worker_addr": WORKER_1,
+                "group_id": "grp-test-6",
             },
             headers=admin_headers(),
         )
@@ -611,43 +616,6 @@ class TestRouterEndpoints:
         route_resp = await client.post(
             "/route",
             json={"api_key": "sess-key-1", "path": "/chat/completions"},
-            headers=admin_headers(),
-        )
-        assert route_resp.status_code == 200
-        assert route_resp.json()["worker_addr"] == WORKER_1
-
-    @pytest.mark.asyncio
-    async def test_remove_session_keeps_hitl_persistent_binding(self, client):
-        await client.post(
-            "/register",
-            json={"worker_addr": WORKER_1},
-            headers=admin_headers(),
-        )
-
-        await client.post(
-            "/route",
-            json={
-                "api_key": ADMIN_KEY,
-                "path": "/chat/completions",
-            },
-            headers=admin_headers(),
-        )
-
-        resp = await client.post(
-            "/remove_session",
-            json={"session_id": "__hitl__"},
-            headers=admin_headers(),
-        )
-        assert resp.status_code == 200
-        assert resp.json()["removed"] is False
-        assert resp.json()["persistent"] is True
-
-        route_resp = await client.post(
-            "/route",
-            json={
-                "api_key": ADMIN_KEY,
-                "path": "/chat/completions",
-            },
             headers=admin_headers(),
         )
         assert route_resp.status_code == 200
@@ -758,182 +726,3 @@ class TestRouterEndpoints:
             headers=admin_headers(),
         )
         assert resp.status_code == 404
-
-
-# =============================================================================
-# CapacityManager unit tests
-# =============================================================================
-
-
-class TestCapacityManager:
-    @pytest.mark.asyncio
-    async def test_initial_capacity_zero(self):
-        cm = CapacityManager()
-        assert await cm.get_capacity() == 0
-
-    @pytest.mark.asyncio
-    async def test_grant_increments(self):
-        cm = CapacityManager()
-        result = await cm.grant()
-        assert result == 1
-        assert await cm.get_capacity() == 1
-
-    @pytest.mark.asyncio
-    async def test_grant_multiple(self):
-        cm = CapacityManager()
-        await cm.grant()
-        await cm.grant()
-        result = await cm.grant()
-        assert result == 3
-        assert await cm.get_capacity() == 3
-
-    @pytest.mark.asyncio
-    async def test_try_acquire_success(self):
-        cm = CapacityManager()
-        await cm.grant()
-        assert await cm.try_acquire() is True
-        assert await cm.get_capacity() == 0
-
-    @pytest.mark.asyncio
-    async def test_try_acquire_empty_fails(self):
-        cm = CapacityManager()
-        assert await cm.try_acquire() is False
-        assert await cm.get_capacity() == 0
-
-    @pytest.mark.asyncio
-    async def test_grant_then_acquire_then_empty(self):
-        """Grant 2, acquire 2, then acquire again fails."""
-        cm = CapacityManager()
-        await cm.grant()
-        await cm.grant()
-        assert await cm.try_acquire() is True
-        assert await cm.try_acquire() is True
-        assert await cm.try_acquire() is False
-        assert await cm.get_capacity() == 0
-
-    @pytest.mark.asyncio
-    async def test_interleaved_grant_acquire(self):
-        """Interleaved grants and acquires track correctly."""
-        cm = CapacityManager()
-        await cm.grant()  # 1
-        assert await cm.try_acquire() is True  # 0
-        assert await cm.try_acquire() is False  # still 0
-        await cm.grant()  # 1
-        await cm.grant()  # 2
-        assert await cm.try_acquire() is True  # 1
-        assert await cm.get_capacity() == 1
-
-    @pytest.mark.asyncio
-    async def test_concurrent_grants(self):
-        """Multiple concurrent grants all succeed."""
-        cm = CapacityManager()
-        results = await asyncio.gather(*[cm.grant() for _ in range(10)])
-        # Results should be 1..10 in some order (each grant increments atomically)
-        assert sorted(results) == list(range(1, 11))
-        assert await cm.get_capacity() == 10
-
-    @pytest.mark.asyncio
-    async def test_concurrent_acquires(self):
-        """Grant N, then N+M concurrent acquires → exactly N succeed."""
-        cm = CapacityManager()
-        for _ in range(5):
-            await cm.grant()
-        results = await asyncio.gather(*[cm.try_acquire() for _ in range(8)])
-        assert sum(results) == 5  # exactly 5 succeed
-        assert results.count(False) == 3  # 3 fail
-        assert await cm.get_capacity() == 0
-
-
-# =============================================================================
-# Router capacity endpoint tests
-# =============================================================================
-
-
-class TestRouterCapacityEndpoints:
-    @pytest.mark.asyncio
-    async def test_health_includes_capacity(self, client):
-        """Health response includes capacity field."""
-        resp = await client.get("/health")
-        assert resp.status_code == 200
-        data = resp.json()
-        assert "capacity" in data
-        assert data["capacity"] == 0
-
-    # ----- /grant_capacity -----
-
-    @pytest.mark.asyncio
-    async def test_grant_capacity_200(self, client):
-        """Admin key → /grant_capacity → capacity incremented."""
-        resp = await client.post("/grant_capacity", headers=admin_headers())
-        assert resp.status_code == 200
-        data = resp.json()
-        assert data["status"] == "ok"
-        assert data["capacity"] == 1
-
-    @pytest.mark.asyncio
-    async def test_grant_capacity_increments(self, client):
-        """Multiple grants increment capacity."""
-        await client.post("/grant_capacity", headers=admin_headers())
-        resp = await client.post("/grant_capacity", headers=admin_headers())
-        assert resp.json()["capacity"] == 2
-
-        # Verify via /health
-        health = (await client.get("/health")).json()
-        assert health["capacity"] == 2
-
-    @pytest.mark.asyncio
-    async def test_grant_capacity_no_auth_401(self, client):
-        """/grant_capacity without auth → 401."""
-        resp = await client.post("/grant_capacity")
-        assert resp.status_code == 401
-
-    @pytest.mark.asyncio
-    async def test_grant_capacity_wrong_key_403(self, client):
-        """/grant_capacity with wrong key → 403."""
-        resp = await client.post(
-            "/grant_capacity",
-            headers={"Authorization": "Bearer wrong-key"},
-        )
-        assert resp.status_code == 403
-
-    # ----- Grant + register_session interleaved -----
-
-    @pytest.mark.asyncio
-    async def test_grant_register_session_interleaved(self, client):
-        """Grant, register_session (consumes capacity), grant again, register_session → all succeed."""
-        await client.post("/grant_capacity", headers=admin_headers())
-        resp = await client.post(
-            "/register_session",
-            json={
-                "session_api_key": "sess-key-1",
-                "session_id": "task-0-0",
-                "worker_addr": WORKER_1,
-            },
-            headers=admin_headers(),
-        )
-        assert resp.status_code == 200
-
-        # No capacity left — register_session should fail with 429
-        resp = await client.post(
-            "/register_session",
-            json={
-                "session_api_key": "sess-key-2",
-                "session_id": "task-0-1",
-                "worker_addr": WORKER_1,
-            },
-            headers=admin_headers(),
-        )
-        assert resp.status_code == 429
-
-        # Grant again
-        await client.post("/grant_capacity", headers=admin_headers())
-        resp = await client.post(
-            "/register_session",
-            json={
-                "session_api_key": "sess-key-3",
-                "session_id": "task-0-2",
-                "worker_addr": WORKER_1,
-            },
-            headers=admin_headers(),
-        )
-        assert resp.status_code == 200

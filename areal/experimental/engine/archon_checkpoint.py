@@ -390,7 +390,9 @@ def load_model_from_hf(engine: ArchonEngine, path: str) -> None:
     )
     if pp_weight_tying_fix:
         # Add a placeholder with embed_tokens key so DCP will load it
-        embed_key = "model.embed_tokens.weight"
+        embed_key = engine.state_dict_adapter._maybe_composite_hf_key(
+            "model.embed_tokens.weight"
+        )
         if embed_key not in hf_state_dict:
             hf_state_dict[embed_key] = torch.empty_like(state_dict["output.weight"])
 

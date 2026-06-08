@@ -163,9 +163,25 @@ def get_versioned_lora_name(lora_name: str, version: int) -> str:
     return f"{lora_name}-v{version}"
 
 
+def detect_image_mime(base64_data: str) -> str:
+    """Detect image MIME type from the first bytes of base64-encoded data.
+
+    Examines base64 magic byte prefixes to determine the actual image format.
+    """
+    if base64_data.startswith("iVBOR"):  # PNG: \x89PNG
+        return "image/png"
+    if base64_data.startswith("/9j/"):  # JPEG: \xff\xd8\xff
+        return "image/jpeg"
+    if base64_data.startswith("R0lGOD"):  # GIF: GIF8
+        return "image/gif"
+    if base64_data.startswith("UklGR"):  # WebP: RIFF
+        return "image/webp"
+    return "image/jpeg"
+
+
 @dataclass
 class WeightUpdateMeta:
-    type: Literal["disk", "xccl"]
+    type: Literal["disk", "xccl", "awex"]
     path: str | None = None
     gen_allocation: ModelAllocation | None = None
 
@@ -261,6 +277,22 @@ class WeightUpdateMeta:
             type="xccl",
             gen_allocation=gen_allocation,
             weight_chunked_mem_mb=weight_chunked_mem_mb,
+            use_lora=use_lora,
+            lora_name=lora_name,
+            lora_int_id=lora_int_id,
+            base_model_name=base_model_name,
+        )
+
+    @classmethod
+    def from_awex(
+        cls,
+        use_lora: bool = False,
+        lora_name: str = "",
+        lora_int_id: int = 1,
+        base_model_name: str = "",
+    ):
+        return cls(
+            type="awex",
             use_lora=use_lora,
             lora_name=lora_name,
             lora_int_id=lora_int_id,

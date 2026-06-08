@@ -25,7 +25,7 @@ class TestSGLangMultiNode:
                 "areal.api.cli_args.pkg_version.is_version_greater_or_equal",
                 return_value=True,
             ),
-            patch("areal.api.cli_args.is_version_less", return_value=False),
+            patch("areal.api.cli_args.pkg_version.is_version_less", return_value=False),
         ):
             return SGLangConfig.build_args(**defaults)
 
@@ -42,7 +42,7 @@ class TestSGLangMultiNode:
                 "areal.api.cli_args.pkg_version.is_version_greater_or_equal",
                 return_value=True,
             ),
-            patch("areal.api.cli_args.is_version_less", return_value=False),
+            patch("areal.api.cli_args.pkg_version.is_version_less", return_value=False),
         ):
             return SGLangConfig.build_cmd(**defaults)
 

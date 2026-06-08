@@ -1,4 +1,4 @@
-"""Rollout-only script for Tau2 benchmark using GatewayInferenceController.
+"""Rollout-only script for Tau2 benchmark using RolloutControllerV2.
 
 This example demonstrates how to run rollouts (data generation) without
 training, using the gateway HTTP stack to route inference requests.
@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import sys
 import warnings
+from copy import deepcopy
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
@@ -27,11 +28,8 @@ from areal.api.cli_args import (
     TrainDatasetConfig,
     load_expr_config,
 )
-from areal.experimental.inference_service.controller.config import (
-    GatewayControllerConfig,
-)
 from areal.experimental.inference_service.controller.controller import (
-    GatewayInferenceController,
+    RolloutControllerV2,
 )
 from areal.utils import logging
 
@@ -138,7 +136,7 @@ def get_tau2_dataset(
 
 @dataclass
 class Tau2GatewayRolloutConfig(BaseExperimentConfig):
-    """Configuration for Tau2 rollout-only with GatewayInferenceController."""
+    """Configuration for Tau2 rollout-only with RolloutControllerV2."""
 
     gconfig: GenerationHyperparameters = field(
         default_factory=GenerationHyperparameters
@@ -160,7 +158,8 @@ def main(argv: list[str]) -> None:
 
     config, _ = load_expr_config(argv, Tau2GatewayRolloutConfig)
     econfig = config.econfig
-    rollout_cfg = config.rollout
+    rollout_cfg = deepcopy(config.rollout)
+    rollout_cfg.model = config.model_path
 
     # --- Dataset ---
     train_dataset = get_tau2_dataset(
@@ -176,26 +175,6 @@ def main(argv: list[str]) -> None:
         batch_size=config.train_dataset.batch_size,
         shuffle=config.train_dataset.shuffle,
         num_workers=0,  # in-process; tau2 dataset is lightweight
-    )
-
-    # --- Build GatewayControllerConfig from YAML rollout section ---
-    ctrl_config = GatewayControllerConfig(
-        tokenizer_path=config.tokenizer_path,
-        model_path=config.model_path,
-        consumer_batch_size=rollout_cfg.consumer_batch_size,
-        max_concurrent_rollouts=rollout_cfg.max_concurrent_rollouts,
-        max_head_offpolicyness=rollout_cfg.max_head_offpolicyness,
-        queue_size=rollout_cfg.queue_size,
-        enable_rollout_tracing=rollout_cfg.enable_rollout_tracing,
-        fileroot=rollout_cfg.fileroot,
-        experiment_name=rollout_cfg.experiment_name,
-        trial_name=rollout_cfg.trial_name,
-        dump_to_file=rollout_cfg.dump_to_file,
-        backend=rollout_cfg.backend,
-        scheduling_spec=rollout_cfg.scheduling_spec,
-        setup_timeout=rollout_cfg.setup_timeout,
-        request_timeout=rollout_cfg.request_timeout,
-        openai=rollout_cfg.openai,
     )
 
     # --- Scheduler ---
@@ -219,7 +198,7 @@ def main(argv: list[str]) -> None:
     else:
         raise ValueError(f"Unsupported rollout backend: {rollout_alloc.backend}")
 
-    ctrl = GatewayInferenceController(config=ctrl_config, scheduler=scheduler)
+    ctrl = RolloutControllerV2(config=rollout_cfg, scheduler=scheduler)
     ctrl.initialize(
         role="rollout",
         server_args=server_args,

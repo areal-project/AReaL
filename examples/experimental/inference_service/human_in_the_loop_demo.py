@@ -283,7 +283,8 @@ def main() -> None:
             str(config_yaml),
             f"actor.path={args.actor_path}",
             f"rollout.backend={args.inference_backend}:d1",
-            f"rollout.openai.admin_api_key={args.admin_key}",
+            f"rollout.admin_api_key={args.admin_key}",
+            "rollout._version=v2",
             f"rollout.request_timeout={args.request_timeout}",
         ]
         if args.api_url:

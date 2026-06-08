@@ -89,9 +89,9 @@ class SlurmScheduler(Scheduler):
         exp_config: BaseExperimentConfig | None = None,
     ):
         # Get n_gpus_per_node from parameter or config
-        self.n_gpus_per_node = n_gpus_per_node
+        self._n_gpus_per_node = n_gpus_per_node
         if exp_config is not None:
-            self.n_gpus_per_node = exp_config.cluster.n_gpus_per_node
+            self._n_gpus_per_node = exp_config.cluster.n_gpus_per_node
 
         # Get other params from config if provided
         self.experiment_name = experiment_name
@@ -156,6 +156,10 @@ class SlurmScheduler(Scheduler):
             f"trial={self.trial_name}, fileroot={self.fileroot}, "
             f"n_gpus_per_node={self.n_gpus_per_node}"
         )
+
+    @property
+    def n_gpus_per_node(self) -> int:
+        return self._n_gpus_per_node
 
     def _slurm_name(self, job_name: str) -> str:
         return f"{self.experiment_name}_{self.trial_name}:{job_name}"
@@ -1221,14 +1225,92 @@ class SlurmScheduler(Scheduler):
 
         raise WorkerTimeoutError(role, timeout)
 
-    def delete_workers(self, role: str | None = None):
+    def _destroy_engines_on_workers(
+        self, workers: list[SlurmWorkerInfo], timeout: float = 30.0
+    ) -> None:
+        """Call ``engine.destroy()`` on every worker via HTTP before killing jobs.
+
+        All calls are dispatched concurrently so that the engine-side CPU
+        barrier (``dist.barrier`` + ``dist.destroy_process_group``) can
+        complete across all ranks.  A bounded *timeout* prevents indefinite
+        blocking when a worker is already unreachable.
+        """
+        if not workers:
+            return
+
+        async def _destroy_all():
+            destroy_timeout = aiohttp.ClientTimeout(total=timeout)
+            async with aiohttp.ClientSession(
+                timeout=destroy_timeout,
+                connector=get_default_connector(),
+            ) as session:
+                tasks = []
+                for wi in workers:
+                    port = int(wi.worker.worker_ports[0])
+                    url = f"http://{format_hostport(wi.worker.ip, port)}/call"
+                    payload = {
+                        "method": "destroy",
+                        "engine_name": wi.worker.id,
+                        "args": serialize_value([]),
+                        "kwargs": serialize_value({}),
+                        "rpc_meta": None,
+                    }
+                    tasks.append(
+                        session.post(
+                            url,
+                            data=orjson.dumps(payload),
+                            headers={"Content-Type": "application/json"},
+                        )
+                    )
+                results = await asyncio.gather(
+                    *[self._safe_destroy_request(t) for t in tasks],
+                    return_exceptions=True,
+                )
+                for wi, res in zip(workers, results):
+                    if isinstance(res, BaseException):
+                        logger.warning(
+                            f"engine.destroy() on {wi.worker.id} failed: "
+                            f"{type(res).__name__}: {res}"
+                        )
+
+        try:
+            run_async_task(_destroy_all)
+        except Exception as e:
+            logger.warning(f"Failed to destroy engines before cancel: {e}")
+
+    @staticmethod
+    async def _safe_destroy_request(coro):
+        """Await an aiohttp context-manager response, suppressing errors."""
+        try:
+            async with coro as resp:
+                await resp.read()
+        except Exception as e:
+            raise RuntimeError(str(e)) from e
+
+    def delete_workers(self, role: str | None = None, reverse_order: bool = False):
         """Delete workers and cancel Slurm jobs.
+
+        Teardown follows a two-phase protocol analogous to the Ray and Local
+        schedulers:
+
+        1. **Engine destroy** – call ``engine.destroy()`` on every worker via
+           HTTP concurrently.  This runs the engine-side CPU barrier and
+           ``dist.destroy_process_group`` so that NCCL communicators and the
+           TCPStore are shut down cleanly on all ranks.
+        2. **Job cancel** – ``scancel`` the Slurm job.  At this point process
+           groups are already torn down, so killing the processes will not
+           produce spurious ``TCPStore.recvValue failed`` warnings.
 
         Parameters
         ----------
         role : str, optional
             Role to delete. If None, deletes all roles.
+        reverse_order : bool, optional
+            Accepted for API compatibility with other schedulers but ignored
+            here: Slurm tears down the entire job step atomically via
+            ``scancel``, so per-rank ordering cannot be enforced.
         """
+        del reverse_order  # unused, see docstring
         if role is None:
             # Delete colocated/forked roles first (they don't own Slurm jobs)
             colocated_roles = list(self._colocated_roles.keys())
@@ -1261,9 +1343,17 @@ class SlurmScheduler(Scheduler):
             del self._workers[role]
             return
 
-        logger.info(f"Deleting workers for role '{role}' (job ID {job_id})")
+        workers = self._workers[role]
+        logger.info(
+            f"Deleting {len(workers)} workers for role '{role}' (job ID {job_id})"
+        )
 
-        # Cancel Slurm job
+        # Phase 1: destroy engines so that the CPU barrier and
+        # dist.destroy_process_group complete on every rank.
+        self._destroy_engines_on_workers(workers)
+
+        # Phase 2: cancel the Slurm job. Process groups are already torn
+        # down, so scancel will not cause TCPStore race conditions.
         try:
             cancel_jobs(slurm_ids=[job_id], signal="SIGTERM")
             time.sleep(2)  # Give time for graceful shutdown

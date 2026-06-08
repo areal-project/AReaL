@@ -165,8 +165,8 @@ class vLLMServerWrapper:
             server_idx_offset = 0
 
         # Separate ports used by each server in the same node
-        # ports range (10000, 50000)
-        ports_per_server = 40000 // n_servers_per_node
+        # ports range (10000, 32767)
+        ports_per_server = 22767 // n_servers_per_node
         launch_server_args = []
         server_addresses = []
         base_random_seed = self.config.seed

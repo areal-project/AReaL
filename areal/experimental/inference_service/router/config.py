@@ -21,4 +21,4 @@ class RouterConfig:
     poll_interval: float = 5.0  # seconds between health polls
     worker_health_timeout: float = 2.0  # seconds per health check
     routing_strategy: str = "round_robin"  # "round_robin" (only supported strategy)
-    log_level: str = "info"
+    log_level: str = "warning"

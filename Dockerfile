@@ -6,46 +6,31 @@
 #   docker build -t areal-runtime:dev-sglang .                          # default (sglang)
 #   docker build --build-arg VARIANT=vllm -t areal-runtime:dev-vllm .    # vllm variant
 
-FROM lmsysorg/sglang:v0.5.9-cu129-amd64-runtime
+# ============================================================
+# BUILDER STAGE: compile C++ extensions and install all deps
+# ============================================================
+FROM lmsysorg/sglang:v0.5.10.post1-runtime AS builder
 
 # Inference backend selector: sglang (default) or vllm
-# Declared early so torch version and C++ builds match the chosen backend.
 ARG VARIANT=sglang
 
 WORKDIR /
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Install system dependencies
+# Build-time system dependencies (includes compilers + dev headers)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
-    net-tools \
-    unzip \
-    kmod \
-    ccache \
     cmake \
+    ccache \
+    kmod \
     libibverbs-dev \
     librdmacm-dev \
-    ibverbs-utils \
-    rdmacm-utils \
-    python3-pyverbs \
-    opensm \
-    ibutils \
-    perftest \
-    python3-venv \
-    tmux \
-    lsof \
-    nvtop \
-    rsync \
-    dnsutils \
-    vim \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-# Update pip and install uv
+# Install pip and uv
 RUN pip install -U pip uv
-
-WORKDIR /AReaL
 
 # Enable bytecode compilation
 ENV UV_COMPILE_BYTECODE=1
@@ -56,19 +41,19 @@ ENV UV_LINK_MODE=copy
 # Ensure installed tools can be executed out of the box
 ENV UV_TOOL_BIN_DIR=/usr/local/bin
 
-# Environment variables for build configuration
+# Build-time environment variables
 ENV NVTE_WITH_USERBUFFERS=1
 ENV NVTE_FRAMEWORK=pytorch
 ENV MPI_HOME=/usr/local/mpi
 ENV TORCH_CUDA_ARCH_LIST="8.0 8.9 9.0 9.0a"
 ENV MAX_JOBS=32
 
-# Set VIRTUAL_ENV so uv pip install targets the venv created below
-ENV VIRTUAL_ENV=/AReaL/.venv
+# Set VIRTUAL_ENV so uv pip install targets the venv
+ENV VIRTUAL_ENV=/opt/.venv
+ENV CUDA_HOME=/usr/local/cuda
 
 ##############################################################
-# STAGE 1: Install base torch FIRST
-# Torch version depends on VARIANT (sglang and vllm require different versions)
+# Install base torch (version is variant-specific)
 ##############################################################
 
 # Create venv and install torch with CUDA support
@@ -78,21 +63,21 @@ RUN uv venv $VIRTUAL_ENV \
     && uv pip install --index-url https://download.pytorch.org/whl/cu129 \
     "torch==${TORCH_VER}+cu129" "torchaudio" "torchvision"
 
-RUN uv pip install "setuptools>=77.0.3,<80" pybind11 nvidia-mathdx
+RUN uv pip install "setuptools>=77.0.3,<80" pybind11 nvidia-mathdx wheel
 
 ##############################################################
-# STAGE 2: Install heavy C++ dependencies BEFORE uv sync
+# Install heavy C++ dependencies
 # These require only torch and rarely change.
 # Moving these BEFORE uv sync prevents recompilation when
 # pyproject.toml/uv.lock changes (C++ packages stay cached).
 ##############################################################
 
 # Install torch memory saver
-RUN uv pip install --no-build-isolation --no-cache-dir --force-reinstall \
+RUN TMS_CUDA_MAJOR=12 uv pip install --no-build-isolation --no-cache-dir --force-reinstall \
     git+https://github.com/fzyzcjy/torch_memory_saver.git
 
 # Install grouped_gemm (for MoE models)
-RUN uv pip install --no-build-isolation \
+RUN uv pip install --no-build-isolation --no-cache-dir \
     git+https://github.com/fanshiqing/grouped_gemm@v1.1.4
 
 # Install apex (NVIDIA apex for mixed precision training)
@@ -101,47 +86,38 @@ RUN NVCC_APPEND_FLAGS="--threads 4" APEX_PARALLEL_BUILD=8 APEX_CPP_EXT=1 APEX_CU
     git+https://github.com/NVIDIA/apex.git
 
 # Install transformer engine (for FP8 training)
-RUN uv pip -v install --no-build-isolation \
+RUN uv pip -v install --no-build-isolation --no-cache-dir \
     git+https://github.com/NVIDIA/TransformerEngine.git@stable
-
-ENV CUDA_HOME=/usr/local/cuda
 
 # FlashMLA (Multi-head Latent Attention for DeepSeek-V3)
 RUN git clone https://github.com/deepseek-ai/FlashMLA.git /flash-mla \
-    && cd /flash-mla \
+    && cd /flash-mla && git checkout 71c7379 \
     && git submodule update --init --recursive \
-    && uv pip install -v . --no-build-isolation \
+    && uv pip install -v . --no-build-isolation --no-cache-dir \
     && rm -rf /flash-mla
 
 # DeepGEMM (FP8 GEMM library for DeepSeek-V3)
 RUN git clone https://github.com/deepseek-ai/DeepGEMM /DeepGEMM \
-    && cd /DeepGEMM \
+    && cd /DeepGEMM && git checkout d30fc36 \
     && git submodule update --init --recursive \
-    && uv pip install -v . --no-build-isolation \
+    && uv pip install -v . --no-build-isolation --no-cache-dir \
     && rm -rf /DeepGEMM
 
 # DeepEP (Expert Parallelism communication library for MoE)
 # Note: TORCH_CUDA_ARCH_LIST="9.0" enables SM90 features and aggressive PTX instructions
 # The NVSHMEM path is auto-detected from nvidia.nvshmem module installed above
 RUN git clone https://github.com/deepseek-ai/DeepEP /DeepEP \
-    && cd /DeepEP \
-    && TORCH_CUDA_ARCH_LIST="9.0 9.0a" uv pip install -v . --no-build-isolation \
+    && cd /DeepEP && git checkout 567632d \
+    && TORCH_CUDA_ARCH_LIST="9.0 9.0a" uv pip install -v . --no-build-isolation --no-cache-dir \
     && rm -rf /DeepEP
 
 # conv1d, required by Qwen-3.5
 RUN git clone https://github.com/Dao-AILab/causal-conv1d -b v1.6.0 /causal-conv1d \
     && cd /causal-conv1d \
-    && uv pip install -v . --no-build-isolation \
+    && uv pip install -v . --no-build-isolation --no-cache-dir \
     && rm -rf /causal-conv1d
 
-# flash-linear-attention (pure Triton kernels, no CUDA extensions)
-RUN git clone https://github.com/fla-org/flash-linear-attention /flash-linear-attention \
-    && cd /flash-linear-attention \
-    && uv pip install -v . \
-    && rm -rf /flash-linear-attention
-
 # flash-attn 2: download pre-built wheel, strip local version, repack & install
-RUN uv pip install wheel  # ensure wheel is available for repacking
 RUN set -ex \
     && FA_VER="2.8.3" \
     && FA_RELEASE="v0.7.16" \
@@ -182,71 +158,117 @@ RUN set -ex \
     && touch "$SITE_PKG/__init__.py"
 
 ##############################################################
-# STAGE 2.5: Install Node.js and npm-based tools
+# Install project dependencies from pyproject.toml
+# --active: target the existing $VIRTUAL_ENV instead of creating a new .venv
+# --inexact: keep C++ packages (apex, flash-attn, etc.) not tracked in the lockfile
+# --no-install-project: install dependencies only, not the areal package itself
 ##############################################################
 
-# Install Node.js via fnm and Claude Code
-ENV FNM_DIR=/root/.fnm
-ENV NODE_VERSION=24.13.0
-ENV PATH="$FNM_DIR/aliases/default/bin:/root/.local/bin:$PATH"
-RUN curl -fsSL https://fnm.vercel.app/install | bash -s -- --install-dir "$FNM_DIR" --skip-shell \
-    && eval "$($FNM_DIR/fnm env --shell bash)" \
-    && $FNM_DIR/fnm install $NODE_VERSION \
-    && $FNM_DIR/fnm default $NODE_VERSION \
-    && npm install -g npm@latest \
-    && curl -fsSL https://claude.ai/install.sh | bash \
-    && curl -fsSL https://opencode.ai/install | bash \
-    && npm install -g @openai/codex \
-    && npm install -g @google/gemini-cli \
-    && npm install -g openclaw@latest
-
-ENV PATH="/root/.cargo/bin:$PATH"
-RUN curl --proto '=https' --tlsv1.2 -LsSf \
-    https://github.com/nearai/ironclaw/releases/latest/download/ironclaw-installer.sh | sh
-RUN curl -fsSL \
-    https://github.com/zeroclaw-labs/zeroclaw/releases/latest/download/install.sh \
-    | bash -s -- --prefer-prebuilt --skip-onboard
-RUN uv pip install nanobot-ai
-
-##############################################################
-# STAGE 3: Install project dependencies from pyproject.toml
-# Changes to pyproject.toml/uv.lock will invalidate from here
-# but C++ packages above remain cached.
-# Using `uv pip install` instead of `uv sync` to avoid removing
-# C++ packages that aren't in uv.lock.
-##############################################################
-
-# Install the project's dependencies (not the project itself)
-# This adds packages without removing unlisted ones (like our C++ packages)
-# VARIANT selects the inference backend (sglang or vllm) via separate pyproject files
 RUN --mount=type=cache,target=/root/.cache/uv \
-    --mount=type=bind,source=pyproject.toml,target=pyproject.toml \
-    --mount=type=bind,source=pyproject.vllm.toml,target=pyproject.vllm.toml \
+    --mount=type=bind,source=pyproject.toml,target=/tmp/sglang/pyproject.toml \
+    --mount=type=bind,source=pyproject.vllm.toml,target=/tmp/vllm/pyproject.toml \
+    --mount=type=bind,source=uv.lock,target=/tmp/sglang/uv.lock \
+    --mount=type=bind,source=uv.vllm.lock,target=/tmp/vllm/uv.lock \
     case "$VARIANT" in \
-      sglang) cp pyproject.toml /tmp/pyproject.toml ;; \
-      vllm) cp pyproject.vllm.toml /tmp/pyproject.toml ;; \
+      sglang) PROJECT_DIR=/tmp/sglang ;; \
+      vllm) PROJECT_DIR=/tmp/vllm ;; \
       *) echo "Invalid VARIANT=$VARIANT (expected: sglang|vllm)" >&2; exit 1 ;; \
     esac \
-    && uv pip install --no-build-isolation -r /tmp/pyproject.toml --extra cuda --group dev
+    && uv sync --active --inexact --no-install-project --no-build-isolation \
+       --extra cuda --extra sandbox --group dev --project "$PROJECT_DIR"
 
-##############################################################
-# STAGE 4: Misc fixes and final setup
-##############################################################
-
-# Misc fixes
+# Misc fixes (apply in builder so the venv is clean when copied)
 RUN uv pip uninstall pynvml
-# Update setuptools to fix a wandb bug
-# Install nvidia-ml-py to replace pynvml
-RUN uv pip install -U setuptools nvidia-ml-py
+# Update setuptools to fix a wandb bug; install nvidia-ml-py to replace pynvml
+RUN uv pip install --no-cache-dir -U setuptools nvidia-ml-py
+
+# ============================================================
+# RUNTIME STAGE: lean final image (no build tools, no source
+# checkouts, no intermediate compilation artifacts)
+# ============================================================
+FROM lmsysorg/sglang:v0.5.10.post1-runtime
+
+ARG VARIANT=sglang
+
+WORKDIR /
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Runtime-only system dependencies (no cmake, ccache — build tools stay in builder)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    net-tools \
+    unzip \
+    kmod \
+    libibverbs-dev \
+    librdmacm-dev \
+    ibverbs-utils \
+    rdmacm-utils \
+    python3-pyverbs \
+    opensm \
+    ibutils \
+    perftest \
+    python3-venv \
+    tmux \
+    lsof \
+    nvtop \
+    rsync \
+    dnsutils \
+    vim \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
 
 # Remove libcudnn9 to avoid conflicts with torch
 RUN apt-get --purge remove -y --allow-change-held-packages libcudnn9* \
     && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/*
 
+# Install pip and uv (needed for editable install and nanobot-ai)
+RUN pip install --no-cache-dir -U pip uv
+
+WORKDIR /AReaL
+
+# Runtime environment variables
+ENV UV_COMPILE_BYTECODE=1
+ENV UV_LINK_MODE=copy
+ENV UV_TOOL_BIN_DIR=/usr/local/bin
+ENV NVTE_WITH_USERBUFFERS=1
+ENV NVTE_FRAMEWORK=pytorch
+ENV MPI_HOME=/usr/local/mpi
+ENV VIRTUAL_ENV=/opt/.venv
+ENV CUDA_HOME=/usr/local/cuda
+
+# Copy the fully-built venv from builder (all C++ extensions included)
+COPY --from=builder /opt/.venv /opt/.venv
+
 ##############################################################
-# STAGE 5: Install AReaL from local source
-# This is last so code changes don't invalidate C++ builds
+# Install Node.js and npm-based tools
+##############################################################
+
+# Install Node.js via fnm and Claude Code
+ENV FNM_DIR=/root/.fnm
+ENV NODE_VERSION=24.13.0
+ENV PATH="$FNM_DIR/aliases/default/bin:/root/.local/bin:$PATH"
+RUN set -ex \
+    && curl -fsSL https://fnm.vercel.app/install | bash -s -- --install-dir "$FNM_DIR" --skip-shell \
+    && eval "$($FNM_DIR/fnm env --shell bash)" \
+    && $FNM_DIR/fnm install $NODE_VERSION \
+    && $FNM_DIR/fnm default $NODE_VERSION \
+    && npm install -g npm@latest \
+    && npm install -g @openai/codex @google/gemini-cli openclaw@latest \
+    && curl -fsSL https://claude.ai/install.sh | bash \
+    && curl -fsSL https://opencode.ai/install | bash \
+    && npm cache clean --force \
+    && rm -rf /root/.cache/uv /root/.cache/pip /tmp/*
+
+ENV PATH="/root/.cargo/bin:$PATH"
+RUN curl -fsSL \
+    https://github.com/zeroclaw-labs/zeroclaw/releases/latest/download/install.sh \
+    | bash -s -- --skip-onboard \
+    && rm -rf /tmp/*
+
+##############################################################
+# Install AReaL from local source (last for fast iteration)
 ##############################################################
 
 # Copy AReaL source code from build context (checked out by CI)
@@ -254,10 +276,10 @@ COPY . /AReaL
 
 # Install areal package in editable mode without dependencies
 # Using pip install instead of uv sync to avoid overwriting C++ packages
-RUN uv pip install --no-deps -e /AReaL
+RUN uv pip install --no-cache-dir --no-deps -e /AReaL
 
 # Place executables in the environment at the front of the path
-ENV PATH="/AReaL/.venv/bin:$PATH"
+ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 
 # Reset entrypoint (some base images set custom entrypoints; this ensures /bin/bash)
 ENTRYPOINT []

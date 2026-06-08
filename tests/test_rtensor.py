@@ -1024,6 +1024,68 @@ class TestFetchBuffer:
         asyncio.run(RTensor.clear_node(rpc_server, [shard_id]))
         assert shard_id not in _fetch_buffer
 
+    def test_clear_fetch_buffer_selective(self):
+        """clear_fetch_buffer(sids) pops only the listed entries, misses are no-ops."""
+        from areal.infra.rpc.rtensor import _fetch_buffer, clear_fetch_buffer
+
+        _fetch_buffer["a"] = torch.tensor([1])
+        _fetch_buffer["b"] = torch.tensor([2])
+        _fetch_buffer["c"] = torch.tensor([3])
+
+        removed = clear_fetch_buffer(["a", "missing", "c"])
+        assert removed == 2
+        assert "a" not in _fetch_buffer
+        assert "b" in _fetch_buffer
+        assert "c" not in _fetch_buffer
+
+    def test_clear_fetch_buffer_flush_all(self):
+        """clear_fetch_buffer(None) drops every entry."""
+        from areal.infra.rpc.rtensor import _fetch_buffer, clear_fetch_buffer
+
+        _fetch_buffer["a"] = torch.tensor([1])
+        _fetch_buffer["b"] = torch.tensor([2])
+
+        removed = clear_fetch_buffer(None)
+        assert removed == 2
+        assert len(_fetch_buffer) == 0
+
+    def test_fetch_buffer_stats_reports_entry_count(self):
+        """fetch_buffer_stats() returns {'num_entries': N} matching buffer size."""
+        from areal.infra.rpc.rtensor import _fetch_buffer, fetch_buffer_stats
+
+        assert fetch_buffer_stats() == {"num_entries": 0}
+        _fetch_buffer["a"] = torch.tensor([1])
+        _fetch_buffer["b"] = torch.tensor([2])
+        assert fetch_buffer_stats() == {"num_entries": 2}
+
+    def test_remove_pops_both_storage_and_fetch_buffer(self):
+        """remove() drops the shard from both _storage and _fetch_buffer.
+
+        Regression guard for areal-project/AReaL#1209: on a worker that is both
+        storage owner and consumer, ``to_local()`` caches the tensor in
+        ``_fetch_buffer``; without this pop, RSS grows unboundedly across
+        training steps.
+        """
+        from areal.infra.rpc.rtensor import (
+            _fetch_buffer,
+            _storage,
+            _store_local,
+            remove,
+        )
+
+        sid = "test-sid-1209-regression"
+        tensor = torch.arange(6).reshape(2, 3)
+        _store_local(sid, tensor)
+        _fetch_buffer[sid] = tensor  # simulate to_local() having cached it
+
+        assert sid in _storage
+        assert sid in _fetch_buffer
+
+        n = remove(sid)
+        assert n == 1
+        assert sid not in _storage
+        assert sid not in _fetch_buffer
+
     def test_buffer_thread_safety(self, rpc_server):
         """Concurrent to_local() calls with the same shard_id should not crash."""
         import threading
@@ -1055,6 +1117,55 @@ class TestFetchBuffer:
         for result in results:
             assert result is not None
             assert torch.allclose(result, tensor)
+
+
+class TestFlattenShardIds:
+    """Tests for flatten_shard_ids helper used by TrainController.clear_batches.
+
+    The helper walks a nested (dict / list / tuple) structure and returns a flat
+    list of every RTensor's shard_id. It is the payload builder for the
+    replicated ``clear_batches`` RPC fan-out — sending a flat ``list[str]``
+    rather than the original RTensor structure is required so that
+    ``engine_blueprint``'s ``RTensor.localize`` pass on the receiving end does
+    not re-fetch the shards we are trying to clear.
+    """
+
+    @staticmethod
+    def _make_rt(sid: str) -> RTensor:
+        return RTensor(
+            shard=TensorShardInfo(shard_id=sid, node_addr="127.0.0.1:0"),
+            data=torch.empty(1, device="meta"),
+        )
+
+    def test_empty_structures_return_empty_list(self):
+        from areal.infra.rpc.rtensor import flatten_shard_ids
+
+        assert flatten_shard_ids(()) == []
+        assert flatten_shard_ids({}) == []
+        assert flatten_shard_ids([]) == []
+        assert flatten_shard_ids(None) == []
+
+    def test_structure_without_rtensor_returns_empty_list(self):
+        from areal.infra.rpc.rtensor import flatten_shard_ids
+
+        assert flatten_shard_ids({"x": 1, "y": "str"}) == []
+        assert flatten_shard_ids([torch.tensor([1, 2])]) == []
+
+    def test_nested_dict_list_tuple_are_all_walked(self):
+        from areal.infra.rpc.rtensor import flatten_shard_ids
+
+        rt_a = self._make_rt("sid-a")
+        rt_b = self._make_rt("sid-b")
+        rt_c = self._make_rt("sid-c")
+
+        obj = (
+            {"x": rt_a, "nested": [rt_b, {"y": rt_c}]},
+            {"batch_id": rt_a},  # intentional repeat across top-level args
+        )
+        sids = flatten_shard_ids(obj)
+        assert set(sids) == {"sid-a", "sid-b", "sid-c"}
+        # collect_shards preserves duplicates; downstream pop handles misses.
+        assert sids.count("sid-a") == 2
 
 
 class TestTensorShardInfoDocumentation:

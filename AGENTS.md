@@ -9,6 +9,7 @@
 ```bash
 # Environment
 uv sync --extra cuda            # CUDA + SGLang inference (default); for vLLM: cp pyproject.vllm.toml pyproject.toml && cp uv.vllm.lock uv.lock && uv sync --extra cuda
+uv sync --extra sandbox         # Daytona cloud sandbox backend (optional)
 source .venv/bin/activate        # activate venv BEFORE pre-commit or git commit if venv exists
 pre-commit install --install-hooks  # hooks: Ruff, clang-format, mdformat, nbstripout, conventional-commits
 pre-commit run --all-files       # lint + format everything
@@ -70,7 +71,7 @@ areal/                     Core Python package
 |-- utils/                 Cross-cutting helpers (logging, data, checkpoints, RL ops)
 +-- workflow/              RolloutWorkflow implementations (RLVR, multi-turn, vision)
 
-docs/                      Jupyter Book docs (https://inclusionai.github.io/AReaL/)
+docs/                      Jupyter Book docs (https://areal-project.github.io/AReaL/)
 examples/                  Training scripts and launcher recipes
 ```
 
@@ -232,8 +233,8 @@ ______________________________________________________________________
 ## Collaboration & review
 
 - **Branches**: kebab-case (`feature/multi-turn-metrics`, `bugfix/fsdp-weight-sync`).
-- **Commits**: Conventional Commits (`feat:`, `fix:`, `docs:`), ~72 char subject,
-  imperative voice. Squash WIP before PR.
+- **Commits**: Conventional Commits (e.g., `feat:`, `fix:`, `docs:`, `gov:`), ~72 char
+  subject, imperative voice. Squash WIP before PR.
 - **Pre-merge**: full pre-commit stack; doc-only edits need at least `mdformat --check`.
 - **PRs**: tie to issue, highlight risk areas, list test commands executed, note skipped
   suites with reasons.
@@ -249,7 +250,7 @@ ______________________________________________________________________
 
 ## Reference material
 
-- **Docs portal**: <https://inclusionai.github.io/AReaL/>
+- **Docs portal**: <https://areal-project.github.io/AReaL/>
 - **Quickstart**: `docs/tutorial/quickstart.md`
 - **Architecture**: `docs/tutorial/gsm8k_grpo.md`
 - **Customization**: `docs/customization/*.md`

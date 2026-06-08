@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 import shutil
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -180,6 +181,32 @@ def _patch_saved_config(base_model_path, saved_path):
         logger.info(f"Patched config.json: {', '.join(patched_fields)}")
 
 
+def _bridge_uses_stacked_experts(bridge: Bridge) -> bool:
+    """Detect bridges whose HF format keeps experts grouped under a single
+    stacked tensor (e.g., Qwen3-VL-MoE ``mlp.experts.gate_up_proj`` shape
+    ``[E, hidden, 2*expert_dim]``) rather than per-expert flat keys.
+
+    Inferred from the bridge's ``_MLP_MAPPING``: per-expert-flat bridges (Qwen3-MoE,
+    BailingMoeV2, DeepSeekV3) map ``mlp.experts.linear_fc1.weight`` to HF names that
+    template ``{expert_id}``. Stacked bridges map to a single HF name without that
+    template, and their ``_weight_to_hf_format`` buffers per-expert tensors and
+    only emits the stacked output when ``num_moe_experts`` are accumulated. Under
+    EP>1 this means the caller must arrange to feed all ``num_moe_experts`` in a
+    single rank's loop — the per-EP-rank loop in the existing fast path leaves
+    the buffer permanently under-filled.
+    """
+    mapping = getattr(bridge, "_MLP_MAPPING", None)
+    if not mapping:
+        return False
+    for mcore_pat, hf_names in mapping.items():
+        if "mlp.experts.linear_fc" not in mcore_pat:
+            continue
+        for n in hf_names:
+            if "{expert_id}" not in n:
+                return True
+    return False
+
+
 def split_state_dict_into_shards(state_dict: dict, n_shards: int) -> list[dict]:
     if n_shards == 1:
         return [state_dict]
@@ -223,6 +250,196 @@ class McoreDistributedWeightSpec:
         return int(s)
 
 
+def _emit_stacked_moe_expert_sd(
+    bridge: Bridge,
+    expert_specs: list["McoreDistributedWeightSpec"],
+    *,
+    all_gather_outputs: dict,
+    etp_size: int,
+    ep_size: int,
+    ep_rank: int,
+    ep_group,
+    quantization_config,
+    fp8_direct_convert: bool,
+    weight_block_size: int,
+) -> dict:
+    """Stacked-MoE save path (e.g., Qwen3-VL-MoE).
+
+    mbridge buffers per-expert tensors and only emits the stacked HF tensor
+    once ``num_moe_experts`` have arrived. Each EP rank only owns
+    ``num_moe_experts / ep_size`` experts, so this helper EP-gathers merged
+    tensors per ``(layer, fc)`` group, feeds mbridge in global-index order so
+    its buffer fills exactly once, and consolidates writes onto ``ep_rank==0``.
+    Other EP ranks still participate in collectives but return an empty dict.
+
+    Stacked outputs are moved to CPU memory immediately to bound peak GPU
+    footprint by one stacked tensor at a time. Without this, all
+    ``num_layers × 2`` stacked tensors (~74 GB for Qwen3-VL-30B-A3B)
+    accumulate on the EP-rank-0 GPU and trigger CUDA OOM.
+    """
+    expert_sd: dict = {}
+    num_experts = bridge.config.num_moe_experts
+    num_experts_per_rank = num_experts // ep_size
+    assert num_experts_per_rank * ep_size == num_experts, (
+        f"num_moe_experts={num_experts} not divisible by ep_size={ep_size}"
+    )
+
+    # Group local specs by (layer_idx, fc_kind) and order by local-expert-id
+    # within each group. ``local_name`` carries the rank-local TEGroupedLinear
+    # suffix (``weight0..weight{num_experts_per_rank-1}``); ``global_name`` was
+    # rewritten by the caller to bake in the global expert id, but for sort
+    # order the local idx is sufficient and avoids the rank-dependent offset.
+    _expert_re = re.compile(
+        r"\.layers\.(\d+)\.mlp\.experts\.(linear_fc\d+)\.weight(\d+)$"
+    )
+    groups: dict[tuple[str, str], list[tuple[int, McoreDistributedWeightSpec]]] = {}
+    for s in expert_specs:
+        m = _expert_re.search(s.local_name)
+        if not m:
+            raise ValueError(
+                f"stacked-expert path: cannot parse layer/fc/expert "
+                f"from local_name={s.local_name!r}"
+            )
+        layer_idx, fc_kind, local_idx_str = m.groups()
+        local_id = int(local_idx_str)
+        groups.setdefault((layer_idx, fc_kind), []).append((local_id, s))
+    for k in groups:
+        groups[k].sort(key=lambda t: t[0])
+
+    # Invariant check across the EP group: every rank must see the same set of
+    # (layer, fc) groups with the same per-group expert count. Without this, a
+    # future refactor that injects a vision-tower expert spec on some ranks
+    # only — or a VPP layout where local layers differ across EP ranks — would
+    # silently mismatch the ``all_gather_into_tensor`` collective below and
+    # either hang or scramble tensors across layers. One cheap
+    # ``all_gather_object`` eliminates that class of
+    # silent-corruption-on-future-refactor failures.
+    group_keys = tuple(sorted(groups.keys()))
+    ep_keys: list[tuple | None] = [None] * ep_size
+    dist.all_gather_object(ep_keys, group_keys, group=ep_group)
+    assert all(k == group_keys for k in ep_keys), (
+        f"EP rank divergence in (layer, fc) groups: "
+        f"rank {ep_rank} sees {group_keys}, peers see {ep_keys}"
+    )
+    for k, specs_with_idx in groups.items():
+        assert len(specs_with_idx) == num_experts_per_rank, (
+            f"layer {k} has {len(specs_with_idx)} local experts on "
+            f"ep_rank {ep_rank}, expected {num_experts_per_rank}"
+        )
+
+    for (layer_idx, fc_kind), specs_with_idx in groups.items():
+        local_specs = [s for _, s in specs_with_idx]
+        # Pre-merge each spec's TP shard into a per-expert tensor.
+        merged_local: list[torch.Tensor] = []
+        for s in local_specs:
+            if etp_size > 1:
+                params = all_gather_outputs[s.global_name].chunk(etp_size, dim=0)
+            else:
+                params = [s.param]
+            params = _maybe_convert_from_te_fp8_params(
+                params, fp8_direct_convert, weight_block_size
+            )
+            merged = bridge._weight_merge_across_tp(s.global_name, params, s.param)
+            merged_local.append(merged.contiguous())
+
+        # EP all-gather: stack local-merged on dim 0, all-gather, split.
+        # All ranks contribute the same number of experts (uniform EP shard).
+        stacked_local = torch.stack(merged_local, dim=0)
+        gathered = torch.empty(
+            (ep_size,) + tuple(stacked_local.shape),
+            dtype=stacked_local.dtype,
+            device=stacked_local.device,
+        )
+        dist.all_gather_into_tensor(gathered, stacked_local, group=ep_group)
+        # gathered shape: [ep_size, num_experts_per_rank, *expert_shape].
+        # Flatten the first two dims to get global expert order:
+        # ep_rank0 [0..n-1], ep_rank1 [n..2n-1], ...
+        gathered = gathered.view(num_experts, *stacked_local.shape[1:])
+
+        # Feed mbridge in global expert order. Build the synthetic mcore name
+        # with the appropriate global index. mbridge's buffer fills after
+        # num_experts calls and emits the stacked HF tensor; intermediate
+        # calls return ``[], []``.
+        # Use the first local spec's name as the template — the prefix is
+        # rank-invariant, only the .weight{N} suffix varies per call.
+        name_prefix = local_specs[0].global_name.split(".weight")[0]
+        last_converted_names: list[str] = []
+        last_converted_params: list[torch.Tensor] = []
+        for global_idx in range(num_experts):
+            name = f"{name_prefix}.weight{global_idx}"
+            converted_names, converted_params = bridge._weight_to_hf_format(
+                name, gathered[global_idx]
+            )
+            if converted_names:
+                last_converted_names = converted_names
+                last_converted_params = converted_params
+        converted_names, converted_params = _maybe_convert_to_torch_fp8_params(
+            name_prefix,
+            last_converted_names,
+            last_converted_params,
+            quantization_config,
+            fp8_direct_convert,
+        )
+        # Only ep_rank==0 contributes to the on-disk shard; other EP ranks
+        # discard so their expert_sd stays empty (collectives have already
+        # happened above, so this is safe).
+        if ep_rank == 0:
+            for n, p in zip(converted_names, converted_params):
+                assert n not in expert_sd, n
+                if isinstance(p, torch.Tensor) and p.is_cuda:
+                    expert_sd[n] = p.detach().to(device="cpu", non_blocking=False)
+                else:
+                    expert_sd[n] = p
+        # Free the gathered buffer before the next group.
+        del gathered, stacked_local
+
+    return expert_sd
+
+
+def _emit_per_expert_flat_expert_sd(
+    bridge: Bridge,
+    expert_specs: list["McoreDistributedWeightSpec"],
+    *,
+    all_gather_outputs: dict,
+    etp_size: int,
+    quantization_config,
+    fp8_direct_convert: bool,
+    weight_block_size: int,
+) -> dict:
+    """Per-expert-flat save path (Qwen3-MoE, BailingMoeV2, DeepSeekV3).
+
+    HF format keys experts as ``mlp.experts.{idx}.{gate,up,down}_proj.weight``,
+    so each EP rank emits its local-experts subset independently and the
+    union across ranks forms the full set without any cross-EP gather.
+    """
+    expert_sd: dict = {}
+    for s in expert_specs:
+        param = s.param
+        if etp_size > 1:
+            params = all_gather_outputs[s.global_name].chunk(etp_size, dim=0)
+        else:
+            params = [param]
+
+        params = _maybe_convert_from_te_fp8_params(
+            params, fp8_direct_convert, weight_block_size
+        )
+        merge_params = bridge._weight_merge_across_tp(s.global_name, params, param)
+        converted_names, converted_params = bridge._weight_to_hf_format(
+            s.global_name, merge_params
+        )
+        converted_names, converted_params = _maybe_convert_to_torch_fp8_params(
+            s.global_name,
+            converted_names,
+            converted_params,
+            quantization_config,
+            fp8_direct_convert,
+        )
+        for n, p in zip(converted_names, converted_params):
+            assert n not in expert_sd, n
+            expert_sd[n] = p
+    return expert_sd
+
+
 def save_weights_to_hf_with_mbridge_fast(
     bridge: Bridge,
     models: list,
@@ -230,7 +447,6 @@ def save_weights_to_hf_with_mbridge_fast(
     base_model_path: str | None = None,
     max_shard_size_byte: int = int(3e9),
     max_workers: int | None = None,
-    is_critic: bool = False,
     fp8_direct_convert: bool = False,
 ):
     # 1. Prepare some global metadata required for saving the model.
@@ -329,7 +545,21 @@ def save_weights_to_hf_with_mbridge_fast(
     expert_specs = list(
         filter(lambda s: ".mlp.experts.linear_fc" in s.global_name, weight_specs)
     )
-    expert_param_size = [s.full_param_size_byte() for s in expert_specs]
+    # Stacked-experts bridges (e.g., Qwen3-VL-MoE) emit a single stacked HF
+    # tensor per (layer, fc) that requires all ``num_moe_experts`` per-expert
+    # tensors to flow through ``bridge._weight_to_hf_format`` on the SAME rank
+    # so its internal buffer fills. Under EP>1 we EP-gather and consolidate
+    # writes onto ep_rank==0, so total expert shards == per-PP-stage count
+    # (no ``* ep_size`` multiplication; one rank writes them all).
+    stacked_experts = _bridge_uses_stacked_experts(bridge)
+    if stacked_experts:
+        # Total bytes after EP consolidation = local bytes × ep_size.
+        ep_size_for_size = mpu.get_expert_model_parallel_world_size()
+        expert_param_size = [
+            s.full_param_size_byte() * ep_size_for_size for s in expert_specs
+        ]
+    else:
+        expert_param_size = [s.full_param_size_byte() for s in expert_specs]
     expert_shards_this_stage = torch.tensor(
         min(
             len(expert_param_size),
@@ -347,8 +577,13 @@ def save_weights_to_hf_with_mbridge_fast(
         group=pp_group,
     )
     ep_size = mpu.get_expert_model_parallel_world_size()
-    # EP equally partition weights, so we simply multipy ep_size
-    pp_stage_expert_shards = [int(x) for x in pp_stage_expert_shards] * ep_size
+    # Per-expert-flat bridges: each EP rank writes its own disjoint shards →
+    # total shards across the EP group is ``per_rank * ep_size``.
+    # Stacked bridges: only ep_rank==0 writes after EP-gather → no multiplication.
+    if not stacked_experts:
+        pp_stage_expert_shards = [int(x) for x in pp_stage_expert_shards] * ep_size
+    else:
+        pp_stage_expert_shards = [int(x) for x in pp_stage_expert_shards]
     if len(expert_param_size) > 0:
         assert all(x >= 1 for x in pp_stage_expert_shards)
 
@@ -474,15 +709,23 @@ def save_weights_to_hf_with_mbridge_fast(
     if len(expert_param_size) > 0:
         ep_size = mpu.get_expert_model_parallel_world_size()
         ep_rank = mpu.get_expert_model_parallel_rank()
+        ep_group = mpu.get_expert_model_parallel_group()
         edp_size = dist.get_world_size(mpu.get_expert_data_parallel_group())
         edp_rank = mpu.get_expert_data_parallel_rank()
         etp_size: int = mpu.get_expert_tensor_parallel_world_size()
         etp_rank: int = mpu.get_expert_tensor_parallel_rank()
         etp_group = mpu.get_expert_tensor_parallel_group()
 
-        shard_offset = sum(pp_stage_non_expert_shards) + sum(
-            pp_stage_expert_shards[: ep_rank * pp_size + pp_rank]
-        )
+        # Stacked bridges consolidate all expert writes onto ep_rank==0 (per-PP
+        # stage), so the shard offset must NOT include ``ep_rank * pp_size``.
+        if stacked_experts:
+            shard_offset = sum(pp_stage_non_expert_shards) + sum(
+                pp_stage_expert_shards[:pp_rank]
+            )
+        else:
+            shard_offset = sum(pp_stage_non_expert_shards) + sum(
+                pp_stage_expert_shards[: ep_rank * pp_size + pp_rank]
+            )
         mesh_size = edp_size * etp_size
         mesh_idx = edp_rank * etp_size + etp_rank
         n_shards = int(expert_shards_this_stage)
@@ -502,7 +745,6 @@ def save_weights_to_hf_with_mbridge_fast(
             global_expert_id = num_experts_per_rank * ep_rank + local_expert_id
             s.global_name = f"{name_prefix}.weight{global_expert_id}"
         # all-gather weights across the TP group and converts to HF format
-        expert_sd = {}
         _all_gather_specs = []
         all_gather_outputs = {}
         for s in expert_specs:
@@ -515,32 +757,37 @@ def save_weights_to_hf_with_mbridge_fast(
             )
             for s, gathered_param in zip(_all_gather_specs, _all_gather_outputs):
                 all_gather_outputs[s.global_name] = gathered_param
-        for s in expert_specs:
-            param = s.param
-            if etp_size > 1:
-                params = all_gather_outputs[s.global_name].chunk(etp_size, dim=0)
-            else:
-                params = [param]
-
-            params = _maybe_convert_from_te_fp8_params(
-                params, fp8_direct_convert, weight_block_size
+        if stacked_experts and ep_size > 1:
+            expert_sd = _emit_stacked_moe_expert_sd(
+                bridge,
+                expert_specs,
+                all_gather_outputs=all_gather_outputs,
+                etp_size=etp_size,
+                ep_size=ep_size,
+                ep_rank=ep_rank,
+                ep_group=ep_group,
+                quantization_config=quantization_config,
+                fp8_direct_convert=fp8_direct_convert,
+                weight_block_size=weight_block_size,
             )
-            merge_params = bridge._weight_merge_across_tp(s.global_name, params, param)
-            converted_names, converted_params = bridge._weight_to_hf_format(
-                s.global_name, merge_params
+        else:
+            expert_sd = _emit_per_expert_flat_expert_sd(
+                bridge,
+                expert_specs,
+                all_gather_outputs=all_gather_outputs,
+                etp_size=etp_size,
+                quantization_config=quantization_config,
+                fp8_direct_convert=fp8_direct_convert,
+                weight_block_size=weight_block_size,
             )
-            converted_names, converted_params = _maybe_convert_to_torch_fp8_params(
-                s.global_name,
-                converted_names,
-                converted_params,
-                quantization_config,
-                fp8_direct_convert,
-            )
-            for n, p in zip(converted_names, converted_params):
-                assert n not in expert_sd, n
-                expert_sd[n] = p
-        # Split the state dict into shards and save the process's own shard.
-        shards = split_state_dict_into_shards(expert_sd, n_shards)
+        # Stacked-MoE: only ep_rank==0 holds the consolidated expert_sd; other
+        # EP ranks have empty dicts and must skip shard split/save (they still
+        # participate in the weight_map collective below).
+        write_shards = not (stacked_experts and ep_rank > 0)
+        if write_shards:
+            shards = split_state_dict_into_shards(expert_sd, n_shards)
+        else:
+            shards = []
 
         def _save_one_shard(x):
             i, shard = x
@@ -550,18 +797,21 @@ def save_weights_to_hf_with_mbridge_fast(
                 os.path.join(weights_path, output_filename.format(shard=shard_idx + 1)),
             )
 
-        _max_workers = max_workers
-        if _max_workers is None:
-            _max_workers = min(8, max(1, os.cpu_count() // dist.get_world_size()))
-        _max_workers = min(_max_workers, n_shards_per_gpu)
-        with ThreadPoolExecutor(max_workers=_max_workers) as executor:
-            results = executor.map(
-                _save_one_shard,
-                list(enumerate(shards[local_start : local_start + n_shards_per_gpu])),
-            )
-            # consume the result
-            for _ in results:
-                pass
+        if write_shards:
+            _max_workers = max_workers
+            if _max_workers is None:
+                _max_workers = min(8, max(1, os.cpu_count() // dist.get_world_size()))
+            _max_workers = min(_max_workers, max(1, n_shards_per_gpu))
+            with ThreadPoolExecutor(max_workers=_max_workers) as executor:
+                results = executor.map(
+                    _save_one_shard,
+                    list(
+                        enumerate(shards[local_start : local_start + n_shards_per_gpu])
+                    ),
+                )
+                # consume the result
+                for _ in results:
+                    pass
         # organize metadata
         for i, shard in enumerate(shards):
             shard_idx = shard_offset + i
@@ -586,8 +836,9 @@ def save_weights_to_hf_with_mbridge_fast(
             copy_hf_configs(base_model_path, weights_path)
             _patch_saved_config(base_model_path, weights_path)
 
-    # 8. Save ValueHead weights separately for critic models.
-    if is_critic and mpu.is_pipeline_last_stage():
+
+def save_critic_value_head(models, weights_path):
+    if mpu.is_pipeline_last_stage():
         is_tp_first = mpu.get_tensor_model_parallel_rank() == 0
         is_dp_first = mpu.get_data_parallel_rank(with_context_parallel=True) == 0
         should_save_value_head = is_tp_first and is_dp_first

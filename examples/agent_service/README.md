@@ -37,10 +37,6 @@ Worker+DataProxy → Gateway. An interactive prompt lets you chat with the Claud
 
 ### Options
 
-```bash
-python examples/agent_service/run_agent_service.py --num-pairs 4
-```
-
 ### Send requests directly
 
 ```bash
@@ -85,17 +81,23 @@ Turn 2: Client → Gateway → Router (same DataProxy) → DataProxy → Worker
 ## Programmatic Usage
 
 ```python
+import os
+
+from areal.api.cli_args import AgentConfig, SchedulingSpec
 from areal.experimental.agent_service.controller import (
-    AgentServiceController,
-    AgentServiceControllerConfig,
+    AgentController,
 )
 from areal.infra.scheduler.local import LocalScheduler
 
 scheduler = LocalScheduler(experiment_name="demo", trial_name="run0", gpu_devices=[])
-ctrl = AgentServiceController(
-    config=AgentServiceControllerConfig(
+ctrl = AgentController(
+    config=AgentConfig(
         agent_cls_path="examples.agent_service.agent.ClaudeAgent",
-        num_pairs=2,
+        scheduling_spec=(
+            SchedulingSpec(
+                env_vars={"ANTHROPIC_API_KEY": os.environ["ANTHROPIC_API_KEY"]},
+            ),
+        ),
     ),
     scheduler=scheduler,
 )
@@ -105,6 +107,9 @@ ctrl.initialize()
 # ctrl.scale_down(1) → remove 1 pair (with graceful drain)
 ctrl.destroy()
 ```
+
+Use `AgentConfig.scheduling_spec[0].env_vars` to pass environment variables to all
+forked agent-service child processes.
 
 ## Files
 

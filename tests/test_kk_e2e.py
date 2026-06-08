@@ -19,6 +19,8 @@ import sys
 
 import pytest
 
+from areal.infra.platforms import current_platform
+
 # Path to the torchrun worker script
 WORKER_SCRIPT = os.path.join(os.path.dirname(__file__), "torchrun", "run_kk_vs_ffd.py")
 
@@ -33,6 +35,9 @@ WORKER_SCRIPT = os.path.join(os.path.dirname(__file__), "torchrun", "run_kk_vs_f
         (1000, 7),
     ],
     ids=["200seqs", "500seqs", "1000seqs"],
+)
+@pytest.mark.skipif(
+    current_platform.device_count() < 4, reason="This test requires 4 GPUs"
 )
 def test_kk_vs_ffd_e2e(tmp_path, world_size, n_seqs, seed):
     """End-to-end test: KK produces more balanced redistribution than FFD.
@@ -117,6 +122,9 @@ def test_kk_vs_ffd_e2e(tmp_path, world_size, n_seqs, seed):
 
 
 @pytest.mark.multi_gpu
+@pytest.mark.skipif(
+    current_platform.device_count() < 4, reason="This test requires 4 GPUs"
+)
 def test_kk_consistent_across_ranks(tmp_path):
     """Verify all ranks agree on the same KK vs FFD metrics.
 

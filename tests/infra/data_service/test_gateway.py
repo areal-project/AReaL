@@ -148,17 +148,22 @@ class TestDatasetRegistration:
         reg_payload = await _register_dataset(client, dataset_id="dataset-b")
         dataset_key = reg_payload["api_key"]
 
-        mock_client = AsyncMock()
-        mock_client.post.return_value = httpx.Response(
-            200,
-            json={"samples": [{"text": "hello"}]},
+        mock_resp = AsyncMock()
+        mock_resp.status = 200
+        mock_resp.json = AsyncMock(return_value={"samples": [{"text": "hello"}]})
+        mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
+        mock_resp.__aexit__ = AsyncMock(return_value=False)
+
+        mock_session = AsyncMock()
+        mock_session.post = lambda *args, **kwargs: (
+            setattr(mock_session, "_post_args", (args, kwargs)) or mock_resp
         )
-        mock_cm = AsyncMock()
-        mock_cm.__aenter__.return_value = mock_client
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=False)
 
         with (
             patch(f"{MODULE}._query_router", new_callable=AsyncMock) as mock_route,
-            patch(f"{MODULE}.httpx.AsyncClient", return_value=mock_cm),
+            patch(f"{MODULE}.aiohttp.ClientSession", return_value=mock_session),
         ):
             mock_route.return_value = WORKER_ADDR
             resp = await client.post(
@@ -168,9 +173,9 @@ class TestDatasetRegistration:
             )
 
         assert resp.status_code == 200
-        call_args = mock_client.post.await_args
-        assert call_args[0][0] == f"{WORKER_ADDR}/v1/samples/fetch"
-        assert call_args[1]["json"]["dataset_id"] == "dataset-b"
+        post_args, post_kwargs = mock_session._post_args
+        assert post_args[0] == f"{WORKER_ADDR}/v1/samples/fetch"
+        assert post_kwargs["json"]["dataset_id"] == "dataset-b"
 
     @pytest.mark.asyncio
     async def test_unregister_revokes_key(self, client):

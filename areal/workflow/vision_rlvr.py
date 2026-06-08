@@ -117,6 +117,7 @@ class VisionRLVRWorkflow(RLVRWorkflow):
         )
 
         input_ids: list[int] = processed_input["input_ids"].tolist()[0]
+        mm_token_type_ids: list[int] = processed_input["mm_token_type_ids"].tolist()[0]
 
         byte_images = image2base64(data["images"])
         req = ModelRequest(
@@ -138,6 +139,7 @@ class VisionRLVRWorkflow(RLVRWorkflow):
 
         # Build result tensor dict with batch dim 1
         seq = resp.input_tokens + resp.output_tokens
+        mm_token_type_ids = mm_token_type_ids + [0] * resp.output_len
         logprobs = [0.0] * resp.input_len + resp.output_logprobs
         loss_mask = [0] * resp.input_len + [1] * resp.output_len
         versions = [-1] * resp.input_len + resp.output_versions
@@ -152,7 +154,10 @@ class VisionRLVRWorkflow(RLVRWorkflow):
             multi_modal_input[0]["image_grid_thw"] = processed_input["image_grid_thw"]
 
         return {
-            "input_ids": torch.tensor(seq, dtype=torch.int32).unsqueeze(0),
+            "input_ids": torch.tensor(seq, dtype=torch.long).unsqueeze(0),
+            "mm_token_type_ids": torch.tensor(
+                mm_token_type_ids, dtype=torch.long
+            ).unsqueeze(0),
             "loss_mask": torch.tensor(loss_mask, dtype=torch.int32).unsqueeze(0),
             "logprobs": torch.tensor(logprobs, dtype=torch.float32).unsqueeze(0),
             "multi_modal_input": multi_modal_input,

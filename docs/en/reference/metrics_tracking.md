@@ -205,6 +205,9 @@ stats_tracker.get("eval-rollout").scalar(reward=0.9)
 all_stats = stats_tracker.export_all(reduce_group=group)
 ```
 
+If `evaluator.eval_before_train: true`, evaluation runs once before the first training
+step to get an estimate of the initial model's performance before finetuning.
+
 ## Data Flow
 
 The complete metrics flow from collection to logging:
@@ -240,7 +243,7 @@ RolloutController.export_stats()                 │
 ## StatsLogger: Logging Backends
 
 The
-[`StatsLogger`](https://github.com/inclusionAI/AReaL/blob/main/areal/utils/stats_logger.py)
+[`StatsLogger`](https://github.com/areal-project/AReaL/blob/main/areal/utils/stats_logger.py)
 sends aggregated metrics to external logging backends. It is automatically managed by
 `PPOTrainer` and runs only on rank 0 to avoid duplicate logging.
 

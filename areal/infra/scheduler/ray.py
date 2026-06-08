@@ -61,12 +61,15 @@ class RayScheduler(Scheduler):
         startup_timeout: float = 30.0,
         *,
         exp_config: BaseExperimentConfig | None = None,
+        n_gpus_per_node: int = 8,
     ):
         self.exp_config = exp_config
+        self._n_gpus_per_node = n_gpus_per_node
         self.startup_timeout = startup_timeout
         self.enable_tms_offload = False
         if exp_config is not None:
             self.enable_tms_offload = exp_config.enable_offload
+            self._n_gpus_per_node = exp_config.cluster.n_gpus_per_node
 
         self._workers: dict[str, list[RayWorkerInfo]] = defaultdict(list)
         self._worker_info_by_id: dict[str, RayWorkerInfo] = {}
@@ -74,6 +77,10 @@ class RayScheduler(Scheduler):
 
         # Colocation tracking: colocated roles reuse workers from target role
         self._colocated_roles: dict[str, str] = {}  # colocated_role -> target_role
+
+    @property
+    def n_gpus_per_node(self) -> int:
+        return self._n_gpus_per_node
 
     def _prepare_worker_specs(
         self, role: str, num_workers: int, schedulings: list[SchedulingSpec] | None
@@ -343,16 +350,60 @@ class RayScheduler(Scheduler):
 
         Unlike _cleanup_workers, this doesn't remove placement groups since
         forked workers share placement groups with target workers.
+
+        Teardown is done in two phases so that peer ranks can finish their
+        pre-destroy CPU barrier inside ``engine.destroy()`` before any actor
+        process is forcibly killed:
+
+        1. Dispatch ``actor.destroy.remote()`` on every actor concurrently
+           and collect the ObjectRefs (fire but *don't* forget).
+        2. ``ray.wait`` on all of them with a bounded timeout so that all
+           ranks return together. Only then do we drop references / kill
+           stragglers.
         """
+        # Phase 1: concurrently dispatch destroy on all actors.
+        destroy_refs: list[tuple[RayWorkerInfo, Any]] = []
         for wi in workers:
-            actor = wi.actor
             try:
-                actor.destroy.remote()
+                ref = wi.actor.destroy.remote()
+                destroy_refs.append((wi, ref))
             except Exception:
                 logger.warning(
-                    f"Could not destroy forked actor {actor}, force killing actor"
+                    f"Could not dispatch destroy on forked actor {wi.actor}, "
+                    f"force killing actor"
                 )
-                ray.kill(actor, no_restart=True)
+                ray.kill(wi.actor, no_restart=True)
+
+        # Phase 2: wait for all destroys to finish (bounded). This lets the
+        # engine-side pre-destroy CPU barrier complete on every rank before
+        # we release references.
+        if destroy_refs:
+            refs = [r for _, r in destroy_refs]
+            try:
+                ray.wait(refs, num_returns=len(refs), timeout=30.0)
+            except Exception as e:
+                logger.warning(f"ray.wait on forked destroy refs failed: {e}")
+
+            # Surface per-actor failures; force-kill any that did not finish.
+            for wi, ref in destroy_refs:
+                try:
+                    ray.get(ref, timeout=0)
+                except ray.exceptions.GetTimeoutError:
+                    logger.warning(
+                        f"Forked actor {wi.actor} did not finish destroy in time, "
+                        f"force killing"
+                    )
+                    try:
+                        ray.kill(wi.actor, no_restart=True)
+                    except Exception:
+                        pass
+                except Exception as e:
+                    logger.warning(
+                        f"Forked actor {wi.actor} destroy raised "
+                        f"{type(e).__name__}: {e}"
+                    )
+
+        for wi in workers:
             # Remove from worker_info_by_id
             self._worker_info_by_id.pop(wi.worker.id, None)
 
@@ -390,7 +441,7 @@ class RayScheduler(Scheduler):
         num_workers = job.replicas
         if num_workers == 0:
             raise WorkerCreationError(
-                role, "Invalud configuration", "replicas must be greater than 0"
+                role, "Invalid configuration", "replicas must be greater than 0"
             )
 
         schedulings = self._prepare_worker_specs(role, num_workers, job.tasks)
@@ -492,7 +543,7 @@ class RayScheduler(Scheduler):
 
         return [wi.worker for wi in worker_info_list]
 
-    def delete_workers(self, role: str | None = None):
+    def delete_workers(self, role: str | None = None, reverse_order: bool = False):
         """
         Delete workers and clean up resources
 
@@ -500,16 +551,20 @@ class RayScheduler(Scheduler):
         --------
         role: str, optional
             Specific worker role to delete, or None to delete all
+        reverse_order: bool, optional
+            If True, iterate workers in reverse rank order when issuing
+            ``actor.destroy.remote()`` so that rank-0 is signalled last.
+            Note: Ray kills are asynchronous, so ordering here is best-effort.
         """
         if role is None:
             # Delete colocated roles first (they're just mappings)
             colocated_roles = list(self._colocated_roles.keys())
             for r in colocated_roles:
-                self.delete_workers(r)
+                self.delete_workers(r, reverse_order=reverse_order)
             # Then delete actual worker roles
             roles = list(self._workers.keys())
             for r in roles:
-                self.delete_workers(r)
+                self.delete_workers(r, reverse_order=reverse_order)
             return
 
         # Handle colocated role
@@ -521,6 +576,8 @@ class RayScheduler(Scheduler):
                 logger.info(
                     f"Cleaning up {len(workers)} forked actors for role '{role}'"
                 )
+                if reverse_order:
+                    workers = list(reversed(workers))
                 self._cleanup_forked_workers(workers)
                 del self._workers[role]
             else:
@@ -536,6 +593,8 @@ class RayScheduler(Scheduler):
         workers = self._workers[role]
         logger.info(f"Deleting {len(workers)} workers for role '{role}'")
 
+        if reverse_order:
+            workers = list(reversed(workers))
         self._cleanup_workers(workers)
 
         del self._workers[role]
@@ -575,22 +634,72 @@ class RayScheduler(Scheduler):
         return worker_ids
 
     def _cleanup_workers(self, workers: list[RayWorkerInfo]):
-        # Kill actors first
+        """Tear down actors and their placement groups in three phases.
+
+        The ordering matters for distributed teardown correctness:
+
+        1. Dispatch ``actor.destroy.remote()`` on every actor concurrently
+           and collect the ObjectRefs. ``destroy`` on the worker side runs
+           the engine's pre-destroy CPU barrier + ``dist.destroy_process_group``,
+           which requires all peer ranks to still be alive.
+        2. ``ray.wait`` on all destroy refs with a bounded timeout so that
+           every rank finishes the barrier together. Without this, rank-0
+           (TCPStore owner) may be torn down first and cause a noisy
+           ``TCPStore.recvValue failed`` on other ranks.
+        3. Only after the barrier phase, remove the placement groups. PG
+           removal hard-kills any still-alive actor process, so it must
+           come last.
+        """
+        # Phase 1: concurrently dispatch destroy on all actors.
+        destroy_refs: list[tuple[RayWorkerInfo, Any]] = []
         for wi in workers:
-            actor = wi.actor
             try:
-                # Asynchronously destroy actor
-                actor.destroy.remote()
+                ref = wi.actor.destroy.remote()
+                destroy_refs.append((wi, ref))
             except Exception:
                 try:
-                    actor.__ray_terminate__.remote()
+                    wi.actor.__ray_terminate__.remote()
                 except Exception:
                     logger.warning(
-                        f"Could not destroy remote actor {actor}, force killing actor"
+                        f"Could not destroy remote actor {wi.actor}, "
+                        f"force killing actor"
                     )
-                    ray.kill(actor, no_restart=True)
+                    ray.kill(wi.actor, no_restart=True)
 
-        # Collect unique placement groups and remove them
+        # Phase 2: wait for destroys to finish so the engine-side CPU
+        # barrier has a chance to complete on every rank.
+        if destroy_refs:
+            ref_to_wi = {id(r): wi for wi, r in destroy_refs}
+            refs = [r for _, r in destroy_refs]
+
+            ready_refs, remaining_refs = ray.wait(
+                refs, num_returns=len(refs), timeout=30.0
+            )
+
+            # Completed: check whether destroy raised an exception.
+            for ref in ready_refs:
+                wi = ref_to_wi[id(ref)]
+                try:
+                    ray.get(ref)
+                except Exception as e:
+                    logger.warning(
+                        f"Actor {wi.actor} destroy raised {type(e).__name__}: {e}"
+                    )
+
+            # Timed-out: force kill actors that did not finish in time.
+            for ref in remaining_refs:
+                wi = ref_to_wi[id(ref)]
+                logger.warning(
+                    f"Actor {wi.actor} did not finish destroy in 30s, force killing"
+                )
+                try:
+                    ray.kill(wi.actor, no_restart=True)
+                except Exception:
+                    pass
+
+        # Phase 3: collect unique placement groups and remove them.
+        # This step hard-kills any actor still using the PG, so it MUST
+        # come after the barrier phase above.
         unique_pgs = {wi.placement_group for wi in workers}
         for pg in unique_pgs:
             try:

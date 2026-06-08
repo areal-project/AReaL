@@ -94,7 +94,7 @@ class Qwen3ModelArgs(BaseModelArgs):
             ),
             hidden_dim=hf_config.intermediate_size,
             norm_eps=hf_config.rms_norm_eps,
-            rope_theta=getattr(hf_config, "rope_theta", 1000000.0),
+            rope_theta=cls._get_rope_theta(hf_config, default=1000000.0),
             qk_norm=getattr(hf_config, "qk_norm", True),
             max_seq_len=getattr(hf_config, "max_position_embeddings", 4096),
             eos_id=getattr(hf_config, "eos_token_id", 151645),

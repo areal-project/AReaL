@@ -133,7 +133,7 @@ class TestFork:
         raw = [
             "python",
             "-m",
-            "sglang.launch_server",
+            "areal.experimental.inference_service.sglang.launch_server",
             "--model",
             "test-model",
         ]

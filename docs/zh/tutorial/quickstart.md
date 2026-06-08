@@ -8,9 +8,9 @@ GSM8K。在继续之前，请确保已完成[安装和环境设置](installation
 要运行实验，您需要：
 
 - 训练脚本：
-  [examples/math/gsm8k_rl.py](https://github.com/inclusionAI/AReaL/blob/main/examples/math/gsm8k_rl.py)
+  [examples/math/gsm8k_rl.py](https://github.com/areal-project/AReaL/blob/main/examples/math/gsm8k_rl.py)
 - 配置文件 YAML：
-  [examples/math/gsm8k_grpo.yaml](https://github.com/inclusionAI/AReaL/blob/main/examples/math/gsm8k_grpo.yaml)
+  [examples/math/gsm8k_grpo.yaml](https://github.com/areal-project/AReaL/blob/main/examples/math/gsm8k_grpo.yaml)
 
 我们的训练脚本会自动下载数据集（openai/gsm8k）和模型（Qwen/Qwen2-1.5B-Instruct）。要使用默认配置运行示例，请从仓库目录执行：
 
@@ -23,10 +23,10 @@ python3 examples/math/gsm8k_rl.py --config examples/math/gsm8k_grpo.yaml schedul
 ## 修改配置
 
 所有可用的配置选项都列在
-[areal/api/cli_args.py](https://github.com/inclusionAI/AReaL/blob/main/areal/api/cli_args.py)中。要自定义实验（模型、资源、算法选项），您可以：
+[areal/api/cli_args.py](https://github.com/areal-project/AReaL/blob/main/areal/api/cli_args.py)中。要自定义实验（模型、资源、算法选项），您可以：
 
 1. 直接编辑 YAML 文件
-   [examples/math/gsm8k_grpo.yaml](https://github.com/inclusionAI/AReaL/blob/main/examples/math/gsm8k_grpo.yaml)。
+   [examples/math/gsm8k_grpo.yaml](https://github.com/areal-project/AReaL/blob/main/examples/math/gsm8k_grpo.yaml)。
 1. 添加命令行选项：
    - 对于 YAML 文件中已存在的选项，直接添加： `actor.path=Qwen/Qwen3-1.7B`。
    - 对于 `cli_args.py` 中存在但不在 YAML 文件中的选项，使用前缀 "+" 添加：
@@ -93,7 +93,7 @@ python3 examples/math/gsm8k_rl.py \
 其他参考：
 
 - 有关调度器的更多选项，请查看
-  [areal/api/cli_args.py](https://github.com/inclusionAI/AReaL/blob/main/areal/api/cli_args.py)中的
+  [areal/api/cli_args.py](https://github.com/areal-project/AReaL/blob/main/areal/api/cli_args.py)中的
   `SchedulerConfig`。
 - 有关如何设置 Ray 集群的指南，请参阅安装文档中的分布式设置部分。
 
@@ -140,7 +140,7 @@ sky launch -c areal-test examples/skypilot/ray_cluster.sky.yaml --infra k8s
 ```
 
 查看
-[使用 SkyPilot 运行 AReaL](https://github.com/inclusionAI/AReaL/blob/main/examples/skypilot/README.md)
+[使用 SkyPilot 运行 AReaL](https://github.com/areal-project/AReaL/blob/main/examples/skypilot/README.md)
 了解更多示例详情。查看 [SkyPilot 文档](https://docs.skypilot.co/en/latest/docs/index.html) 了解更多关于
 SkyPilot 的信息。
 

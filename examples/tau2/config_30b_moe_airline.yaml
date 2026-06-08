@@ -45,7 +45,7 @@ rollout:
   setup_timeout: 300.0
   request_timeout: 3600.0
   request_retries: 3
-  openai:
+  agent:
     mode: inline
     tool_call_parser: qwen25
     reasoning_parser: qwen3
