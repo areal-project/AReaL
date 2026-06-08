@@ -33,7 +33,6 @@ def _handle(args: argparse.Namespace) -> int:
     from areal.experimental.cli.inf_state import (
         ServiceState,
         get_current_service,
-        service_logs_dir,
         supervisor_alive,
     )
 
@@ -73,6 +72,5 @@ def _handle(args: argparse.Namespace) -> int:
             print(f"  - {addr}")
     else:
         print("Servers:    (none)")
-    log_dir = service_logs_dir(state.name)
-    print(f"Logs:       {log_dir}")
+    print(f"Logs:       {state.log_dir or '-'}")
     return 0

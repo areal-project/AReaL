@@ -9,17 +9,22 @@ Lifecycle:
 
   1. parse args (--config / --service / --overrides)
   2. ``load_expr_config`` -> PPOConfig
-  3. ``SlurmScheduler`` (or Local / Ray) per ``config.scheduler.type``
-  4. ``RolloutControllerV2(config.rollout, scheduler).initialize(role="rollout")``
+  3. resolve log_dir (same v2 training layout) and rebind stdout/stderr to
+     ``{log_dir}/main.log`` so users can `tail -f` it from `areal inf logs`.
+  4. ``SlurmScheduler`` (or Local / Ray) per ``config.scheduler.type``
+  5. ``RolloutControllerV2(config.rollout, scheduler).initialize(role="rollout")``
      -- this spawns workers, router, gateway, proxies as worker sub-processes
      via the scheduler.  When ``initialize`` returns the stack is healthy.
-  5. write ``ServiceState`` + ready marker
-  6. install SIGTERM/SIGINT handler that calls ``controller.destroy()`` and
+  6. write ``ServiceState`` + ready marker
+  7. install SIGTERM/SIGINT handler that calls ``controller.destroy()`` and
      removes the state file -- this is the SAME teardown path that
      ``PPOTrainer.close()`` uses.
-  7. sleep forever; SIGTERM is the only way out.
+  8. sleep forever; SIGTERM is the only way out.
 
-``areal inf stop`` simply sends SIGTERM to ``supervisor_pid``.
+If ANY step before sleep raises, the supervisor writes a ``failed`` marker,
+attempts ``controller.destroy()`` if the controller exists, and exits 1.
+``areal inf run`` watches both markers and surfaces the failure to the user
+instead of waiting for the launch timeout.
 """
 
 from __future__ import annotations
@@ -71,10 +76,28 @@ def _build_server_args(config: Any) -> dict:
     raise SystemExit(f"Unsupported rollout backend for `areal inf`: {backend!r}")
 
 
+def _redirect_stdio(log_path: Path) -> None:
+    """Send all subsequent print / logging output to the main log file.
+
+    Uses ``os.dup2`` so any C-level / subprocess-inherited fd 1/2 also lands
+    in the same file. ``line buffering = 1`` because users will be tailing it.
+    """
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(log_path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+    os.dup2(fd, 1)
+    os.dup2(fd, 2)
+    os.close(fd)
+    # python-level streams: rebind so getLogger handlers also pick up the new fd
+    sys.stdout = os.fdopen(1, "w", buffering=1)
+    sys.stderr = os.fdopen(2, "w", buffering=1)
+
+
 def _run(name: str, config_path: Path, overrides: list[str]) -> int:
     from areal.experimental.cli.inf_config import load_inference_config
     from areal.experimental.cli.inf_state import (
         ServiceState,
+        service_failed_marker,
+        service_log_dir_for_config,
         service_ready_marker,
     )
     from areal.experimental.inference_service.controller.controller import (
@@ -82,8 +105,14 @@ def _run(name: str, config_path: Path, overrides: list[str]) -> int:
     )
     from areal.utils.logging import getLogger
 
-    logger = getLogger("InfSupervisor")
     config, resolved_name = load_inference_config(config_path, overrides)
+    log_dir = service_log_dir_for_config(config)
+    main_log = log_dir / "main.log"
+    _redirect_stdio(main_log)
+
+    logger = getLogger("InfSupervisor")
+    logger.info("=== inf supervisor starting (pid=%d) ===", os.getpid())
+    logger.info("service=%s config=%s log_dir=%s", name, config_path, log_dir)
     if name != resolved_name:
         logger.warning(
             "Service name mismatch: CLI passed %r, config resolves to %r. "
@@ -92,36 +121,56 @@ def _run(name: str, config_path: Path, overrides: list[str]) -> int:
             resolved_name,
         )
 
-    logger.info("Building scheduler (type=%s) ...", config.scheduler.type)
-    scheduler = _build_scheduler(config)
+    controller: RolloutControllerV2 | None = None
+    try:
+        logger.info("Building scheduler (type=%s) ...", config.scheduler.type)
+        scheduler = _build_scheduler(config)
 
-    logger.info("Initializing RolloutControllerV2 ...")
-    controller = RolloutControllerV2(config=config.rollout, scheduler=scheduler)
-    server_args = _build_server_args(config)
-    controller.initialize(role="rollout", server_args=server_args)
-    logger.info(
-        "RolloutControllerV2 ready (gateway=%s, router=%s, %d server(s))",
-        controller._gateway_addr,
-        controller._router_addr,
-        len(controller._server_infos),
-    )
+        logger.info("Initializing RolloutControllerV2 ...")
+        controller = RolloutControllerV2(config=config.rollout, scheduler=scheduler)
+        server_args = _build_server_args(config)
+        controller.initialize(role="rollout", server_args=server_args)
+        logger.info(
+            "RolloutControllerV2 ready (gateway=%s, router=%s, %d server(s))",
+            controller._gateway_addr,
+            controller._router_addr,
+            len(controller._server_infos),
+        )
 
-    state = ServiceState(
-        name=name,
-        supervisor_pid=os.getpid(),
-        config_path=str(config_path),
-        overrides=list(overrides),
-        gateway_addr=controller._gateway_addr or "",
-        router_addr=controller._router_addr or "",
-        server_addrs=[
-            f"http://{info.host}:{info.port}" for info in controller._server_infos
-        ],
-        created_at=time.time(),
-        ready_at=time.time(),
-    )
-    state.save()
-    service_ready_marker(name).write_text("ready\n")
-    logger.info("Service %r ready; supervisor pid=%d", name, os.getpid())
+        state = ServiceState(
+            name=name,
+            supervisor_pid=os.getpid(),
+            config_path=str(config_path),
+            log_dir=str(log_dir),
+            overrides=list(overrides),
+            gateway_addr=controller._gateway_addr or "",
+            router_addr=controller._router_addr or "",
+            server_addrs=[
+                f"http://{info.host}:{info.port}" for info in controller._server_infos
+            ],
+            created_at=time.time(),
+            ready_at=time.time(),
+        )
+        state.save()
+        service_ready_marker(name).write_text("ready\n")
+        logger.info("Service %r ready; supervisor pid=%d", name, os.getpid())
+    except BaseException as e:
+        logger.error("Supervisor init failed: %s", e)
+        logger.error(traceback.format_exc())
+        # Write failed marker so the parent CLI exits the wait loop quickly.
+        try:
+            service_failed_marker(name).write_text(f"{type(e).__name__}: {e}\n")
+        except Exception:
+            pass
+        if controller is not None:
+            try:
+                controller.destroy()
+            except Exception:
+                logger.error(
+                    "controller.destroy() during failure cleanup also failed:\n%s",
+                    traceback.format_exc(),
+                )
+        return 1
 
     stop_event = {"stop": False}
 
