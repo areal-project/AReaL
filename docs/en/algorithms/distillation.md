@@ -84,29 +84,33 @@ J_{RKL}(\theta)$.
 
 Need to add teacher configuration to your yaml.
 
-Teacher supports two modes via `teacher.engine_type`:
+Each entry in `teacher.teachers` supports two modes via `engine_type`:
 
 - `rollout` (recommended): inference-only teacher (vLLM/SGLang) with lower memory
   overhead.
 - `train` (legacy, deprecated): train-engine teacher path kept for backward
   compatibility.
 
+AReaL also supports **multi-teacher weighted mixture** distillation with `teacher.teachers`.
+
 ### Mode 1: rollout teacher (recommended)
 
 
 ```yaml
 teacher:
-  engine_type: rollout
-  path: Qwen/Qwen2.5-14B-Instruct
-  rollout:
-    backend: "vllm:d1p1t2" # or sglang:d...
-    scheduling_spec:
-      - task_type: worker
-        port_count: 2
-        gpu: 1
-        mem: 32
-        cmd: python3 -m areal.infra.rpc.rpc_server
-        env_vars: {}
+  teachers:
+    - engine_type: rollout
+      path: Qwen/Qwen2.5-14B-Instruct
+      weight: 1.0
+      rollout:
+        backend: "vllm:d1p1t2" # or sglang:d...
+        scheduling_spec:
+          - task_type: worker
+            port_count: 2
+            gpu: 1
+            mem: 32
+            cmd: python3 -m areal.infra.rpc.rpc_server
+            env_vars: {}
   rl_loss_weight: 1.0
   distill_loss_weight: 5e-3
 ```
@@ -125,22 +129,62 @@ python3 examples/math/gsm8k_rl.py \
 
 ```yaml
 teacher:
-  engine_type: train
-  train:
-    backend: fsdp:d1p1t4
-    experiment_name: ${experiment_name}
-    trial_name: ${trial_name}
-    path: Qwen/Qwen2.5-14B-Instruct
-    init_from_scratch: false
-    disable_dropout: true
-    dtype: ${actor.dtype}
-    mb_spec:
-      max_tokens_per_mb: 10240
-    optimizer: null
-    scheduling_spec: ${actor.scheduling_spec}
+  teachers:
+    - engine_type: train
+      weight: 1.0
+      train:
+        backend: fsdp:d1p1t4
+        experiment_name: ${experiment_name}
+        trial_name: ${trial_name}
+        path: Qwen/Qwen2.5-14B-Instruct
+        init_from_scratch: false
+        disable_dropout: true
+        dtype: ${actor.dtype}
+        mb_spec:
+          max_tokens_per_mb: 10240
+        optimizer: null
+        scheduling_spec: ${actor.scheduling_spec}
   rl_loss_weight: 1.0
   distill_loss_weight: 0.005
 ```
+
+### Mode 3: multi-teacher weighted mixture (rollout)
+
+```yaml
+teacher:
+  teachers:
+    - engine_type: rollout
+      path: Qwen/Qwen2.5-14B-Instruct
+      weight: 0.7
+      rollout:
+        backend: "vllm:d1p1t2"
+        scheduling_spec:
+          - task_type: worker
+            port_count: 2
+            gpu: 1
+            mem: 32
+            cmd: python3 -m areal.infra.rpc.rpc_server
+            env_vars: {}
+    - engine_type: rollout
+      path: Qwen/Qwen2.5-7B-Instruct
+      weight: 0.3
+      rollout:
+        backend: "vllm:d1p1t1"
+        scheduling_spec:
+          - task_type: worker
+            port_count: 2
+            gpu: 1
+            mem: 32
+            cmd: python3 -m areal.infra.rpc.rpc_server
+            env_vars: {}
+  rl_loss_weight: 1.0
+  distill_loss_weight: 0.005
+```
+
+At training time, token-level mixture teacher log-probability is computed as:
+`log p_mix = logsumexp(log normalized_weight_i + log p_i)`.
+The KD/KDRL objective is then unchanged and consumes this mixed `teacher_logp`.
+
 
 Example command using local scheduler:
 

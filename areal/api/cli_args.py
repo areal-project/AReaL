@@ -2922,16 +2922,12 @@ class TeacherConfig:
     )
     offload: bool = field(
         default=False,
-        metadata={"help": "Whether to offload teacher rollout model between steps"},
-    )
-    rl_loss_weight: float = field(
-        default=1.0,
-        metadata={"help": "RL loss weight"},
+        metadata={"help": "Whether to offload teacher model between steps"},
     )
 
-    distill_loss_weight: float = field(
-        default=0.005,
-        metadata={"help": "Distillation loss weight"},
+    weight: float = field(
+        default=1.0,
+        metadata={"help": "Teacher mixture weight."},
     )
 
     def __post_init__(self):
@@ -2941,14 +2937,44 @@ class TeacherConfig:
                 f"teacher.engine_type={self.engine_type!r} selects which one is used.",
                 stacklevel=2,
             )
+
         if self.engine_type == "rollout" and self.rollout is None:
             raise ValueError(
-                "teacher.rollout must be provided when teacher.engine_type='rollout'."
+                "teacher.rollout must be provided when engine_type='rollout'."
             )
+
         if self.engine_type == "train" and self.train is None:
+            raise ValueError("teacher.train must be provided when engine_type='train'.")
+
+
+@dataclass
+class DistillationConfig:
+    teachers: list[TeacherConfig] = field(default_factory=list)
+    rl_loss_weight: float = field(
+        default=1.0,
+        metadata={"help": "RL loss weight."},
+    )
+    distill_loss_weight: float = field(
+        default=5e-3,
+        metadata={"help": "Distillation loss weight."},
+    )
+
+    def __post_init__(self):
+        if len(self.teachers) == 0:
+            raise ValueError("At least one teacher must be provided.")
+
+        engine_types = {t.engine_type for t in self.teachers}
+        if len(engine_types) != 1:
             raise ValueError(
-                "teacher.train must be provided when teacher.engine_type='train'."
+                f"All teachers must have the same engine_type, got: {engine_types}"
             )
+
+        if any(t.weight < 0 for t in self.teachers):
+            raise ValueError("Teacher weights must be non-negative.")
+
+        total_w = sum(t.weight for t in self.teachers)
+        if total_w <= 0:
+            raise ValueError("Sum of teacher weights must be positive.")
 
 
 @dataclass
@@ -2968,11 +2994,11 @@ class PPOConfig(BaseExperimentConfig):
     actor: PPOActorConfig = field(default_factory=PPOActorConfig)
     ref: PPOActorConfig | None = field(default=None)
     critic: PPOCriticConfig | None = field(default=None)
-    teacher: TeacherConfig | None = field(
+    teacher: DistillationConfig | None = field(
         default=None,
         metadata={
             "help": (
-                "Optional teacher model configuration used for on-policy "
+                "Optional distillation configuration used for on-policy "
                 "distillation during PPO training. If provided, the actor "
                 "may be trained to match the teacher in addition to the "
                 "standard PPO objective."
