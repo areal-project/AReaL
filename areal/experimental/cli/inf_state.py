@@ -1,6 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 
-"""State files for ``areal inf`` services."""
+"""State files for ``areal inf`` services.
+
+A service is a long-running ``inf_supervisor`` process that holds the
+``RolloutControllerV2`` (which in turn manages sglang workers + router +
+gateway + data-proxies). State is the minimum needed to find and stop
+the supervisor and to display useful diagnostics; the supervisor itself
+is the source of truth for its children.
+"""
 
 from __future__ import annotations
 
@@ -9,7 +16,7 @@ import os
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-from areal.experimental.cli.state import areal_home, pid_alive
+from areal.experimental.cli.state import areal_home, pid_alive, sanitize_name
 
 
 def inf_dir() -> Path:
@@ -25,43 +32,30 @@ def services_dir() -> Path:
 
 
 def service_logs_dir(name: str) -> Path:
-    d = inf_dir() / "logs" / name
+    d = inf_dir() / "logs" / sanitize_name(name)
     d.mkdir(parents=True, exist_ok=True)
     return d
 
 
-def current_service_file() -> Path:
-    return inf_dir() / "current-service"
-
-
 def service_state_path(name: str) -> Path:
-    return services_dir() / f"{name}.json"
+    return services_dir() / f"{sanitize_name(name)}.json"
+
+
+def service_ready_marker(name: str) -> Path:
+    return services_dir() / f"{sanitize_name(name)}.ready"
 
 
 @dataclass
 class ServiceState:
     name: str
-    gateway_host: str
-    gateway_port: int
-    router_host: str
-    router_port: int
-    gateway_pid: int
-    router_pid: int
-    admin_api_key: str
-    log_level: str = "info"
-    routing_strategy: str = "round_robin"
+    supervisor_pid: int
+    config_path: str
+    overrides: list[str] = field(default_factory=list)
+    gateway_addr: str = ""
+    router_addr: str = ""
+    server_addrs: list[str] = field(default_factory=list)
     created_at: float = 0.0
-    extra: dict = field(default_factory=dict)
-
-    @property
-    def gateway_url(self) -> str:
-        host = "127.0.0.1" if self.gateway_host in ("0.0.0.0", "::") else self.gateway_host
-        return f"http://{host}:{self.gateway_port}"
-
-    @property
-    def router_url(self) -> str:
-        host = "127.0.0.1" if self.router_host in ("0.0.0.0", "::") else self.router_host
-        return f"http://{host}:{self.router_port}"
+    ready_at: float = 0.0
 
     def save(self) -> None:
         p = service_state_path(self.name)
@@ -83,17 +77,17 @@ class ServiceState:
         p = service_state_path(self.name)
         if p.exists():
             p.unlink()
+        ready = service_ready_marker(self.name)
+        if ready.exists():
+            ready.unlink()
 
 
-def liveness_summary(state: ServiceState) -> dict[str, bool]:
-    return {
-        "gateway_pid_alive": pid_alive(state.gateway_pid),
-        "router_pid_alive": pid_alive(state.router_pid),
-    }
+def supervisor_alive(state: ServiceState) -> bool:
+    return pid_alive(state.supervisor_pid)
 
 
 def get_current_service() -> str | None:
-    p = current_service_file()
+    p = inf_dir() / "current-service"
     if not p.exists():
         return None
     name = p.read_text().strip()
@@ -101,7 +95,7 @@ def get_current_service() -> str | None:
 
 
 def set_current_service(name: str | None) -> None:
-    p = current_service_file()
+    p = inf_dir() / "current-service"
     p.parent.mkdir(parents=True, exist_ok=True)
     if name is None:
         if p.exists():

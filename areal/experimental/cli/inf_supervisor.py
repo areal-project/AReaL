@@ -1,0 +1,171 @@
+# SPDX-License-Identifier: Apache-2.0
+
+"""Long-running supervisor for an ``areal inf`` service.
+
+Spawned (detached) by ``areal inf run``. Holds the v2 ``RolloutControllerV2``
+which itself manages the sglang workers, router, gateway, and data-proxies.
+
+Lifecycle:
+
+  1. parse args (--config / --service / --overrides)
+  2. ``load_expr_config`` -> PPOConfig
+  3. ``SlurmScheduler`` (or Local / Ray) per ``config.scheduler.type``
+  4. ``RolloutControllerV2(config.rollout, scheduler).initialize(role="rollout")``
+     -- this spawns workers, router, gateway, proxies as worker sub-processes
+     via the scheduler.  When ``initialize`` returns the stack is healthy.
+  5. write ``ServiceState`` + ready marker
+  6. install SIGTERM/SIGINT handler that calls ``controller.destroy()`` and
+     removes the state file -- this is the SAME teardown path that
+     ``PPOTrainer.close()`` uses.
+  7. sleep forever; SIGTERM is the only way out.
+
+``areal inf stop`` simply sends SIGTERM to ``supervisor_pid``.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import signal
+import sys
+import time
+import traceback
+from pathlib import Path
+from typing import Any
+
+
+def _build_scheduler(config: Any):
+    from areal.infra.scheduler.local import LocalScheduler
+    from areal.infra.scheduler.ray import RayScheduler
+    from areal.infra.scheduler.slurm import SlurmScheduler
+
+    t = config.scheduler.type
+    if t == "local":
+        return LocalScheduler(exp_config=config)
+    if t == "ray":
+        return RayScheduler(exp_config=config)
+    if t == "slurm":
+        return SlurmScheduler(exp_config=config)
+    raise SystemExit(f"Unknown scheduler type: {t!r}")
+
+
+def _build_server_args(config: Any) -> dict:
+    from areal.api.alloc_mode import ModelAllocation
+    from areal.api.cli_args import SGLangConfig, vLLMConfig
+
+    alloc = ModelAllocation.from_str(config.rollout.backend, name="rollout")
+    backend = alloc.backend
+    if backend == "sglang":
+        return SGLangConfig.build_args(
+            sglang_config=config.sglang,
+            tp_size=alloc.parallel.tp_size,
+            pp_size=alloc.parallel.pp_size,
+            base_gpu_id=0,
+        )
+    if backend == "vllm":
+        return vLLMConfig.build_args(
+            vllm_config=config.vllm,
+            tp_size=alloc.parallel.tp_size,
+            pp_size=alloc.parallel.pp_size,
+        )
+    raise SystemExit(f"Unsupported rollout backend for `areal inf`: {backend!r}")
+
+
+def _run(name: str, config_path: Path, overrides: list[str]) -> int:
+    from areal.experimental.cli.inf_config import load_inference_config
+    from areal.experimental.cli.inf_state import (
+        ServiceState,
+        service_ready_marker,
+    )
+    from areal.experimental.inference_service.controller.controller import (
+        RolloutControllerV2,
+    )
+    from areal.utils.logging import getLogger
+
+    logger = getLogger("InfSupervisor")
+    config, resolved_name = load_inference_config(config_path, overrides)
+    if name != resolved_name:
+        logger.warning(
+            "Service name mismatch: CLI passed %r, config resolves to %r. "
+            "Using CLI value.",
+            name,
+            resolved_name,
+        )
+
+    logger.info("Building scheduler (type=%s) ...", config.scheduler.type)
+    scheduler = _build_scheduler(config)
+
+    logger.info("Initializing RolloutControllerV2 ...")
+    controller = RolloutControllerV2(config=config.rollout, scheduler=scheduler)
+    server_args = _build_server_args(config)
+    controller.initialize(role="rollout", server_args=server_args)
+    logger.info(
+        "RolloutControllerV2 ready (gateway=%s, router=%s, %d server(s))",
+        controller._gateway_addr,
+        controller._router_addr,
+        len(controller._server_infos),
+    )
+
+    state = ServiceState(
+        name=name,
+        supervisor_pid=os.getpid(),
+        config_path=str(config_path),
+        overrides=list(overrides),
+        gateway_addr=controller._gateway_addr or "",
+        router_addr=controller._router_addr or "",
+        server_addrs=[
+            f"http://{info.host}:{info.port}" for info in controller._server_infos
+        ],
+        created_at=time.time(),
+        ready_at=time.time(),
+    )
+    state.save()
+    service_ready_marker(name).write_text("ready\n")
+    logger.info("Service %r ready; supervisor pid=%d", name, os.getpid())
+
+    stop_event = {"stop": False}
+
+    def _teardown(signum, _frame):
+        if stop_event["stop"]:
+            return
+        stop_event["stop"] = True
+        logger.info("Received signal %d, tearing down ...", signum)
+        try:
+            controller.destroy()
+        except Exception:
+            logger.error("controller.destroy() failed:\n%s", traceback.format_exc())
+        try:
+            state.remove()
+        except Exception:
+            pass
+        logger.info("Teardown complete; supervisor exiting.")
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, _teardown)
+    signal.signal(signal.SIGINT, _teardown)
+
+    while not stop_event["stop"]:
+        time.sleep(1.0)
+    return 0
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(prog="areal-inf-supervisor", add_help=False)
+    p.add_argument("--name", required=True)
+    p.add_argument("--config", required=True, type=Path)
+    p.add_argument("overrides", nargs=argparse.REMAINDER)
+    args = p.parse_args()
+    overrides = args.overrides or []
+    if overrides and overrides[0] == "--":
+        overrides = overrides[1:]
+    try:
+        return _run(args.name, args.config, overrides)
+    except SystemExit:
+        raise
+    except BaseException:
+        traceback.print_exc(file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
