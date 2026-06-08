@@ -113,6 +113,20 @@ def _run(name: str, config_path: Path, overrides: list[str]) -> int:
     logger = getLogger("InfSupervisor")
     logger.info("=== inf supervisor starting (pid=%d) ===", os.getpid())
     logger.info("service=%s config=%s log_dir=%s", name, config_path, log_dir)
+    logger.info(
+        "config.cluster: n_nodes=%s n_gpus_per_node=%s fileroot=%s",
+        getattr(config.cluster, "n_nodes", "?"),
+        config.cluster.n_gpus_per_node,
+        config.cluster.fileroot,
+    )
+    logger.info(
+        "config.rollout: backend=%s",
+        config.rollout.backend,
+    )
+    logger.info(
+        "config.scheduler: type=%s",
+        config.scheduler.type,
+    )
     if name != resolved_name:
         logger.warning(
             "Service name mismatch: CLI passed %r, config resolves to %r. "
