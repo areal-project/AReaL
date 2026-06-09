@@ -295,7 +295,8 @@ class ModelAllocation:
         ----------
         spec : str
             Single component spec like ``"fsdp:d4"``, ``"sglang:d4t2"``,
-            or ``"megatron:(attn:d1p12t4|ffn:d1p12e4)"``.
+            ``"megatron:(attn:d1p12t4|ffn:d1p12e4)"``,
+            or ``"sglang(P:d1t1p1|D:d1t1p1)"`` for PD disaggregation.
             An explicit backend prefix is always required.
         name : str, optional
             Role name (e.g., ``"actor"``, ``"rollout"``).
@@ -324,12 +325,27 @@ class ModelAllocation:
 
         # Extract the single ModelAllocation from the parse result
         if isinstance(result, list):
-            if len(result) != 1:
-                raise ValueError(
-                    f"Expected a single allocation from spec '{spec}', "
-                    f"got {len(result)} allocations."
+            if len(result) == 1:
+                alloc = result[0]
+            else:
+                # PD disaggregation: merge groups into a single synthetic allocation
+                # with dp_size = sum of all groups' dp_size.
+                first = result[0]
+                total_dp = sum(r.parallel.dp_size for r in result)
+                alloc = ModelAllocation(
+                    backend=first.backend,
+                    name=first.name,
+                    parallel=ParallelStrategy(
+                        data_parallel_size=total_dp,
+                        tensor_parallel_size=first.parallel.tensor_parallel_size,
+                        pipeline_parallel_size=first.parallel.pipeline_parallel_size,
+                    ),
+                    scheduling_strategy=SchedulingStrategy(
+                        type=SchedulingStrategyType.separation, target=None
+                    ),
                 )
-            alloc = result[0]
+                # Stash individual groups for callers that need them
+                alloc._pd_groups = result
         elif isinstance(result, ModelAllocation):
             alloc = result
         else:
@@ -348,6 +364,22 @@ class ModelAllocation:
             )
 
         return alloc
+
+    @classmethod
+    def from_str_multi(
+        cls,
+        spec: str,
+    ) -> list["ModelAllocation"]:
+        """Parse a backend spec that may contain multiple allocations.
+
+        Like :meth:`from_str` but allows PD-disaggregated specs such as
+        ``"sglang(P:d1t1p1|D:d1t1p1)"`` which produce two allocations.
+        """
+        parser = _LLMParallelParser()
+        result = parser.parse(spec)
+        if isinstance(result, list):
+            return result
+        return [result]
 
     @property
     def world_size(self):
@@ -601,8 +633,10 @@ ALLOCATION_GRAMMAR = """
     single_allocation: inf_para | train_para
     colocate_expr: single_allocation ("|" single_allocation)+
 
-    inf_para: modern_inf_para
+    inf_para: modern_inf_para | pd_parallel
     modern_inf_para: INFER_BACKEND ("[" NAME "]")? ":" inf_dim+
+    pd_parallel: INFER_BACKEND "(" pd_group ("|" pd_group)+ ")"
+    pd_group: NAME ":" inf_dim+
     train_para: train_backend_with_name | train_backend_hybrid | train_backend_only | train_name_only | train_dims_only | hybrid_moe_syntax
     train_backend_with_name: TRAIN_BACKEND "[" NAME "]" ":" common_dim+
     train_backend_hybrid: TRAIN_BACKEND ":" hybrid_moe_syntax
@@ -779,7 +813,12 @@ class _ParallelStrategyTransformer(Transformer):
         return allocations
 
     def inf_para(self, items):
-        return items[0]
+        result = items[0]
+        # pd_parallel returns a list; modern_inf_para returns a single ModelAllocation.
+        # Normalize to list so callers can handle uniformly.
+        if isinstance(result, list):
+            return result
+        return result
 
     def modern_inf_para(self, items):
         backend = str(items[0])
@@ -810,6 +849,41 @@ class _ParallelStrategyTransformer(Transformer):
             strategy,
             SchedulingStrategy(type=SchedulingStrategyType.separation, target=None),
         )
+
+    def pd_group(self, items):
+        """Handle: NAME ":" inf_dim+"""
+        name = str(items[0])
+        dimensions = items[1:]
+
+        strategy_kwargs = {}
+        for dim in dimensions:
+            if dim.type_ == "d":
+                strategy_kwargs["data_parallel_size"] = dim.size
+            elif dim.type_ == "t":
+                strategy_kwargs["tensor_parallel_size"] = dim.size
+            elif dim.type_ == "p":
+                strategy_kwargs["pipeline_parallel_size"] = dim.size
+
+        strategy = ParallelStrategy(**strategy_kwargs)
+        return self._build_model_allocation(
+            "sglang",
+            name,
+            strategy,
+            SchedulingStrategy(type=SchedulingStrategyType.separation, target=None),
+        )
+
+    def pd_parallel(self, items):
+        """Handle: INFER_BACKEND "(" pd_group ("|" pd_group)+ ")"
+
+        Returns a list of ModelAllocation objects (one per PD group).
+        The backend name is inherited from the outer INFER_BACKEND token
+        and overrides whatever the pd_group transformer set.
+        """
+        backend = str(items[0])
+        groups = items[1:]  # list of ModelAllocation from pd_group
+        for group in groups:
+            group.backend = backend
+        return groups
 
     def train_para(self, items):
         """Pass through result from one of the train_* alternatives."""

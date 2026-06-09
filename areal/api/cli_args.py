@@ -1848,6 +1848,10 @@ class SGLangConfig:
     # but we disable it to avoid precision issues
     chunked_prefill_size: int | None = -1
     max_prefill_tokens: int = 32768
+    # PD disaggregation fields (passed through to SGLang ServerArgs)
+    disaggregation_mode: str = "null"
+    disaggregation_transfer_backend: str | None = None
+    disaggregation_bootstrap_port: int = 8998
     schedule_policy: str = "lpm"
     schedule_conservativeness: float = 1.0
     cpu_offload_gb: int = 0
@@ -2209,6 +2213,13 @@ class InferenceEngineConfig:
             "help": "Return routed expert indices for MoE models. Effective only when using SGLang engine with MoE models."
         },
     )
+    pd_disaggregation: bool = field(
+        default=False,
+        metadata={
+            "help": "Enable prefill-decode disaggregation for inference. "
+            "Auto-derived from backend string when using sglang(P:...|D:...) syntax."
+        },
+    )
 
     # v2 controller options
     _version: str = field(
@@ -2271,6 +2282,12 @@ class InferenceEngineConfig:
                 "rollout.agent.admin_api_key is ignored by rollout controller v2; "
                 "use rollout.admin_api_key instead."
             )
+
+        # Auto-derive pd_disaggregation from backend string
+        import re
+
+        if re.search(r"sglang\(P:.*\|D:.*\)", self.backend):
+            self.pd_disaggregation = True
 
 
 @dataclass

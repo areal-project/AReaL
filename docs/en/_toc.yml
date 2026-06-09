@@ -12,6 +12,7 @@ parts:
     - file: tutorial/quickstart
     - file: tutorial/agentic_rl
     - file: tutorial/online_proxy
+    - file: tutorial/pd_disaggregation
     - file: tutorial/eval
     - file: tutorial/megatron
     - file: tutorial/archon

@@ -68,7 +68,7 @@ def main(args: list[str]) -> None:
     else:
         from areal.api.alloc_mode import ModelAllocation
 
-        rollout_alloc = ModelAllocation.from_str(config.rollout.backend, name="rollout")
+        rollout_alloc = ModelAllocation.from_str(config.rollout.backend)
         if rollout_alloc.backend == "sglang":
             server_args = asdict(config.sglang)
         elif rollout_alloc.backend == "vllm":

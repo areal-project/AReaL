@@ -39,6 +39,12 @@ def main():
         choices=["debug", "info", "warning", "error"],
         help="Log level",
     )
+    parser.add_argument(
+        "--pd-disaggregation",
+        action="store_true",
+        default=False,
+        help="Enable prefill-decode disaggregation mode",
+    )
     args, _ = parser.parse_known_args()
 
     from areal.experimental.inference_service.gateway.app import create_app
@@ -59,6 +65,7 @@ def main():
         router_timeout=args.router_timeout,
         forward_timeout=args.forward_timeout,
         log_level=args.log_level,
+        pd_disaggregation=args.pd_disaggregation,
     )
 
     import uvicorn

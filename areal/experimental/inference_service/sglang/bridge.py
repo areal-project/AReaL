@@ -80,6 +80,13 @@ class SGLangBridgeBackend:
                 )
             payload["lora_path"] = get_versioned_lora_name(lora_name, version)
 
+        # Forward PD disaggregation bootstrap fields from metadata
+        bootstrap = req.metadata.get("bootstrap", {})
+        if bootstrap:
+            payload["bootstrap_host"] = bootstrap.get("bootstrap_host")
+            payload["bootstrap_port"] = bootstrap.get("bootstrap_port")
+            payload["bootstrap_room"] = bootstrap.get("bootstrap_room")
+
         return HttpRequest(endpoint="/generate", payload=payload)
 
     # -- response parsing ---------------------------------------------------

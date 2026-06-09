@@ -22,6 +22,8 @@ class WorkerInfo:
     is_healthy: bool = True
     active_requests: int = 0
     registered_at: float = field(default_factory=time.time)
+    worker_type: str = "regular"  # "regular" | "prefill" | "decode"
+    bootstrap_port: int | None = None  # only for prefill
 
 
 class WorkerRegistry:
@@ -30,18 +32,40 @@ class WorkerRegistry:
     def __init__(self) -> None:
         self._workers: dict[str, WorkerInfo] = {}  # worker_addr -> WorkerInfo
         self._id_to_addr: dict[str, str] = {}  # worker_id -> worker_addr
+        self._type_workers: dict[str, list[str]] = {}  # worker_type -> list[worker_id]
         self._lock = asyncio.Lock()
 
-    async def register(self, worker_addr: str) -> str:
+    async def register(
+        self,
+        worker_addr: str,
+        worker_type: str = "regular",
+        bootstrap_port: int | None = None,
+    ) -> str:
         """Add a worker. Returns existing worker_id if already registered."""
         async with self._lock:
             if worker_addr in self._workers:
-                return self._workers[worker_addr].worker_id
+                existing = self._workers[worker_addr]
+                old_type = existing.worker_type
+                existing.worker_type = worker_type
+                if bootstrap_port is not None:
+                    existing.bootstrap_port = bootstrap_port
+                if old_type != worker_type:
+                    old_list = self._type_workers.get(old_type, [])
+                    if existing.worker_id in old_list:
+                        old_list.remove(existing.worker_id)
+                    self._type_workers.setdefault(worker_type, []).append(
+                        existing.worker_id
+                    )
+                return existing.worker_id
             worker_id = str(uuid.uuid4())
             self._workers[worker_addr] = WorkerInfo(
-                worker_id=worker_id, worker_addr=worker_addr
+                worker_id=worker_id,
+                worker_addr=worker_addr,
+                worker_type=worker_type,
+                bootstrap_port=bootstrap_port,
             )
             self._id_to_addr[worker_id] = worker_addr
+            self._type_workers.setdefault(worker_type, []).append(worker_id)
             return worker_id
 
     async def deregister(self, worker_addr: str) -> None:
@@ -50,6 +74,9 @@ class WorkerRegistry:
             w = self._workers.pop(worker_addr, None)
             if w is not None:
                 self._id_to_addr.pop(w.worker_id, None)
+                type_list = self._type_workers.get(w.worker_type, [])
+                if w.worker_id in type_list:
+                    type_list.remove(w.worker_id)
 
     async def deregister_by_id(self, worker_id: str) -> str | None:
         """Remove a worker by ID. Returns the worker_addr or None if not found."""
@@ -88,6 +115,26 @@ class WorkerRegistry:
         """Return all registered worker addresses."""
         async with self._lock:
             return list(self._workers.keys())
+
+    async def get_prefill_workers(self) -> list[WorkerInfo]:
+        """Return healthy workers with worker_type == 'prefill'."""
+        async with self._lock:
+            return [
+                self._workers[self._id_to_addr[wid]]
+                for wid in self._type_workers.get("prefill", [])
+                if wid in self._id_to_addr
+                and self._workers[self._id_to_addr[wid]].is_healthy
+            ]
+
+    async def get_decode_workers(self) -> list[WorkerInfo]:
+        """Return healthy workers with worker_type == 'decode'."""
+        async with self._lock:
+            return [
+                self._workers[self._id_to_addr[wid]]
+                for wid in self._type_workers.get("decode", [])
+                if wid in self._id_to_addr
+                and self._workers[self._id_to_addr[wid]].is_healthy
+            ]
 
 
 class SessionRegistry:

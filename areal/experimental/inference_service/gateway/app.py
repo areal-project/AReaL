@@ -31,7 +31,9 @@ from areal.experimental.inference_service.gateway.streaming import (
     forward_request,
     forward_sse_stream,
     list_models_from_router,
+    pd_dual_dispatch,
     query_router,
+    query_router_pd,
     register_model_in_router,
     register_session_in_router,
     remove_model_from_router,
@@ -137,6 +139,45 @@ def create_app(config: GatewayConfig) -> FastAPI:
         except (json.JSONDecodeError, AttributeError):
             pass
 
+        # PD disaggregation mode
+        if config.pd_disaggregation:
+            if is_streaming:
+                return JSONResponse(
+                    {"error": "Streaming not supported in PD disaggregation mode"},
+                    status_code=400,
+                )
+            try:
+                pd_pair = await query_router_pd(
+                    config.router_addr,
+                    admin_api_key=config.admin_api_key,
+                    timeout=config.router_timeout,
+                    model=model_name,
+                    client=_client(),
+                )
+            except (RouterUnreachableError, RouterKeyRejectedError) as exc:
+                return _router_error_response(exc)
+
+            try:
+                merged_body = await pd_dual_dispatch(
+                    pd_pair=pd_pair,
+                    body=body,
+                    headers=headers,
+                    timeout=config.forward_timeout,
+                    client=_client(),
+                )
+            except (RouterUnreachableError, ValueError) as exc:
+                return JSONResponse(
+                    {"error": str(exc)},
+                    status_code=502,
+                )
+
+            return Response(
+                content=merged_body,
+                status_code=200,
+                media_type="application/json",
+            )
+
+        # Normal mode (existing logic)
         try:
             worker_addr = await query_router(
                 config.router_addr,
