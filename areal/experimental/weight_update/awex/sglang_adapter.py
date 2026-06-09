@@ -357,7 +357,23 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
         train_world_size: int,
         num_engines: int,
     ) -> None:
-        self._transfer_rank = transfer_rank
+        per_engine_world = infer_world_size // num_engines
+        ctx = self._get_model_context()
+        tp_size = int(ctx["tp_size"])
+        tp_rank = int(ctx["tp_rank"])
+        pp_size = int(ctx["pp_size"])
+        pp_rank = int(ctx["pp_rank"])
+        if per_engine_world != tp_size * pp_size:
+            raise RuntimeError(
+                "awex per-engine world mismatch: gateway reports "
+                f"infer_world_size={infer_world_size} / num_engines={num_engines} "
+                f"= {per_engine_world}, but local engine has "
+                f"tp_size*pp_size={tp_size * pp_size}"
+            )
+
+        engine_local_rank = pp_rank * tp_size + tp_rank
+        global_rank = transfer_rank * per_engine_world + engine_local_rank
+        self._transfer_rank = global_rank
 
         infer_meta, train_meta = fetch_kv_metadata(kv_store_url, pair_name)
 
@@ -367,14 +383,14 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
             num_infer_engines=num_engines,
         )
         self._transfer_plan = builder.build_local_transfer_plan(
-            infer_meta, train_meta, global_transfer_rank=transfer_rank
+            infer_meta, train_meta, global_transfer_rank=global_rank
         )
 
         os.environ["TORCHELASTIC_USE_AGENT_STORE"] = str(False)
         self._weights_update_group = init_weights_update_group(
             master_address=master_addr,
             master_port=master_port,
-            rank=transfer_rank,
+            rank=global_rank,
             world_size=world_size,
             group_name=f"awex_{pair_name}",
             role="inference",
