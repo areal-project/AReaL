@@ -24,6 +24,9 @@ from typing import Any
 
 from areal.experimental.cli.commands.inf.launcher import _spawn_detached, kill_pids
 from areal.experimental.cli.state import pid_alive
+from areal.utils.logging import getLogger
+
+logger = getLogger("InfCli")
 
 
 # ---- backend spec parsing ------------------------------------------------
@@ -140,11 +143,6 @@ def _build_vllm_cmd(
     # vLLMConfig.build_cmd does not embed --host/--port; append.
     cmd += ["--host", host, "--port", str(port)]
     return cmd
-
-
-def _shlex_split(cmd: str) -> list[str]:
-    import shlex
-    return shlex.split(cmd)
 
 
 def _build_data_proxy_cmd(
@@ -289,16 +287,15 @@ def register_internal_model(
                     tp=spec.tp,
                     pp=spec.pp,
                 )
-            print(
-                f"  spawning {spec.engine} server "
-                f"(replica {replica}/{spec.dp}, tp={spec.tp}, port={inf_port}) ...",
-                file=sys.stderr,
+            logger.info(
+                "Spawning %s server (replica %d/%d, tp=%d, port=%d) ...",
+                spec.engine, replica, spec.dp, spec.tp, inf_port,
             )
             inf_pid = _spawn_detached(cmd, inf_log)
             spawned.append(inf_pid)
             inf_addr = f"http://127.0.0.1:{inf_port}"
             inf_addrs.append(inf_addr)
-            print(f"    pid={inf_pid}, log={inf_log}", file=sys.stderr)
+            logger.info("  -> pid=%d, log=%s", inf_pid, inf_log)
 
             # Wait for this server to come up before spawning its data-proxy.
             _wait_health(
@@ -325,16 +322,15 @@ def register_internal_model(
                 chat_template_type=args.chat_template_type,
                 engine_max_tokens=args.engine_max_tokens,
             )
-            print(
-                f"  spawning data-proxy "
-                f"(replica {replica}/{spec.dp}, port={proxy_port}) ...",
-                file=sys.stderr,
+            logger.info(
+                "Spawning data-proxy (replica %d/%d, port=%d) ...",
+                replica, spec.dp, proxy_port,
             )
             proxy_pid = _spawn_detached(proxy_cmd, proxy_log)
             spawned.append(proxy_pid)
             proxy_addr = f"http://127.0.0.1:{proxy_port}"
             proxy_addrs.append(proxy_addr)
-            print(f"    pid={proxy_pid}, log={proxy_log}", file=sys.stderr)
+            logger.info("  -> pid=%d, log=%s", proxy_pid, proxy_log)
 
             _wait_health(
                 f"{proxy_addr}/health",
@@ -368,9 +364,9 @@ def register_internal_model(
     except BaseException:
         # Roll back: kill anything we spawned.
         if spawned:
-            print(
-                "  internal registration failed -- killing spawned workers.",
-                file=sys.stderr,
+            logger.error(
+                "Internal registration failed; killing %d spawned worker(s).",
+                len(spawned),
             )
             kill_pids(spawned, grace_s=10.0)
         raise

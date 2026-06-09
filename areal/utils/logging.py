@@ -44,6 +44,9 @@ LOGGER_COLORS_EXACT = {
     "LocalLauncher": "blue",
     "RayLauncher": "blue",
     "SlurmLauncher": "blue",
+    # Operator CLI - blue (alongside Launchers/Schedulers; these spawn
+    # services on behalf of the user)
+    "InfCli": "blue",
     # Workflows - purple
     "RLVRWorkflow": "light_purple",
     "VisionRLVRWorkflow": "light_purple",

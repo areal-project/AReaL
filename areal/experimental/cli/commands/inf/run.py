@@ -36,6 +36,10 @@ import sys
 import time
 from pathlib import Path
 
+from areal.utils.logging import getLogger
+
+logger = getLogger("InfCli")
+
 
 _DESCRIPTION = __doc__
 
@@ -345,8 +349,7 @@ def _handle(args: argparse.Namespace) -> int:
     _refuse_or_replace(service, force=args.force)
 
     logs = service_logs_dir(service)
-    print(f"Starting service {service!r} ...", file=sys.stderr)
-    print(f"  logs: {logs}", file=sys.stderr)
+    logger.info("Starting service %r (logs: %s)", service, logs)
 
     router_pid = spawn_router(
         host=args.router_host,
@@ -357,7 +360,7 @@ def _handle(args: argparse.Namespace) -> int:
         log_level=args.log_level,
         log_file=logs / "router.log",
     )
-    print(f"  router pid:  {router_pid}", file=sys.stderr)
+    logger.info("Spawned router pid=%d", router_pid)
 
     time.sleep(0.3)
 
@@ -372,7 +375,7 @@ def _handle(args: argparse.Namespace) -> int:
         log_level=args.log_level,
         log_file=logs / "gateway.log",
     )
-    print(f"  gateway pid: {gateway_pid}", file=sys.stderr)
+    logger.info("Spawned gateway pid=%d", gateway_pid)
 
     state = ServiceState(
         name=service,

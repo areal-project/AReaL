@@ -17,6 +17,10 @@ import argparse
 import sys
 import time
 
+from areal.utils.logging import getLogger
+
+logger = getLogger("InfCli")
+
 
 _DESCRIPTION = __doc__
 
@@ -85,16 +89,14 @@ def _handle(args: argparse.Namespace) -> int:
 
     alive = gateway_alive(state) or router_alive(state)
     if not alive:
-        print(
-            f"Service {name!r} is already down (no live gateway/router pid). "
-            f"Cleaning up state.",
-            file=sys.stderr,
+        logger.warning(
+            "Service %r is already down (no live gateway/router pid); "
+            "cleaning up state.", name,
         )
     else:
-        print(
-            f"Stopping service {name!r}: gateway={state.gateway_pid}, "
-            f"router={state.router_pid} ...",
-            file=sys.stderr,
+        logger.info(
+            "Stopping service %r: gateway=%d, router=%d ...",
+            name, state.gateway_pid, state.router_pid,
         )
         kill_pids(pids, grace_s=args.grace_period)
 
