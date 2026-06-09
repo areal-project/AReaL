@@ -1404,6 +1404,38 @@ class Normalization:
         bs = x.size(0)
         eps = self.eps
 
+        non_finite = ~torch.isfinite(x)
+        if non_finite.any().item():
+            if loss_mask is None:
+                logger.warning(
+                    "Normalization input contains non-finite values and no "
+                    "loss_mask was provided. They will propagate through "
+                    "normalization and may indicate an upstream numerical issue."
+                )
+            else:
+                active_non_finite = loss_mask.bool().logical_and(non_finite)
+                masked_non_finite = (~loss_mask.bool()).logical_and(non_finite)
+                if active_non_finite.any().item() and masked_non_finite.any().item():
+                    logger.warning(
+                        "Normalization input contains non-finite values at both "
+                        "active and masked positions. Active non-finite values "
+                        "will propagate through normalization; masked non-finite "
+                        "values will be ignored by loss_mask. This may indicate "
+                        "an upstream numerical issue."
+                    )
+                elif active_non_finite.any().item():
+                    logger.warning(
+                        "Normalization input contains non-finite values at active "
+                        "positions. They will propagate through normalization and "
+                        "may indicate an upstream numerical issue."
+                    )
+                else:
+                    logger.warning(
+                        "Normalization input contains non-finite values at masked "
+                        "positions. They will be ignored by loss_mask, but this "
+                        "may indicate an upstream numerical issue."
+                    )
+
         # Early return if no elements are active (all masked out)
         if loss_mask is not None and loss_mask.sum().item() == 0:
             return x.float()
@@ -1446,10 +1478,10 @@ class Normalization:
             mean = torch.zeros_like(x)
 
         # Subtract mean
-        x_centered = x - mean
-        # mask unrelevant elements as 0
         if loss_mask is not None:
-            x_centered = x_centered * loss_mask
+            x_centered = torch.where(loss_mask.bool(), x - mean, 0.0)
+        else:
+            x_centered = x - mean
 
         # Step 2: Compute std
         if self.std_level == "batch":
@@ -1517,7 +1549,7 @@ class Normalization:
             x_sum = x.sum(dim=dim, keepdim=True)
         else:
             mask = mask.to(dtype)
-            x_masked = x * mask
+            x_masked = torch.where(mask.bool(), x, 0.0)
             factor = mask.sum(dim, keepdim=True)
             x_sum = x_masked.sum(dim=dim, keepdim=True)
 
@@ -1576,9 +1608,8 @@ class Normalization:
             x_sum_sq = (x_centered**2).sum(dim=dim, keepdim=True)
         else:
             mask = mask.to(dtype)
-            x_masked = x * mask
             factor = mask.sum(dim, keepdim=True)
-            x_centered = x_masked - mean * mask  # only apply mean where mask is 1
+            x_centered = torch.where(mask.bool(), x - mean, 0.0)
             x_sum_sq = (x_centered**2).sum(dim=dim, keepdim=True)
 
         if dist.is_initialized() and all_reduce:
