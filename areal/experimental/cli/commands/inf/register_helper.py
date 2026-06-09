@@ -18,7 +18,7 @@ from __future__ import annotations
 import socket
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -107,13 +107,13 @@ def _free_port() -> int:
 
 
 def _build_sglang_cmd(
-    *, model_path: str, tokenizer_path: str, host: str, port: int, tp: int
+    *, model_path: str, host: str, port: int, tp: int,
+    extra_args: list[str],
 ) -> list[str]:
     from areal.api.cli_args import SGLangConfig
 
     cfg = SGLangConfig(model_path=model_path)
-    # build_cmd already returns a fully-tokenized argv list.
-    return list(
+    cmd = list(
         SGLangConfig.build_cmd(
             sglang_config=cfg,
             tp_size=tp,
@@ -125,10 +125,13 @@ def _build_sglang_cmd(
             pp_size=1,
         )
     )
+    cmd.extend(extra_args)
+    return cmd
 
 
 def _build_vllm_cmd(
-    *, model_path: str, tokenizer_path: str, host: str, port: int, tp: int, pp: int
+    *, model_path: str, host: str, port: int, tp: int, pp: int,
+    extra_args: list[str],
 ) -> list[str]:
     from areal.api.cli_args import vLLMConfig
 
@@ -138,10 +141,11 @@ def _build_vllm_cmd(
             vllm_config=cfg,
             tp_size=tp,
             pp_size=pp,
+            host=host,
+            port=port,
         )
     )
-    # vLLMConfig.build_cmd does not embed --host/--port; append.
-    cmd += ["--host", host, "--port", str(port)]
+    cmd.extend(extra_args)
     return cmd
 
 
@@ -154,12 +158,7 @@ def _build_data_proxy_cmd(
     tokenizer_path: str,
     admin_api_key: str,
     log_level: str,
-    request_timeout: float,
-    set_reward_finish_timeout: float,
-    tool_call_parser: str,
-    reasoning_parser: str,
-    chat_template_type: str,
-    engine_max_tokens: int | None,
+    extra_args: list[str],
 ) -> list[str]:
     cmd = [
         sys.executable, "-m", "areal.experimental.inference_service.data_proxy",
@@ -170,14 +169,8 @@ def _build_data_proxy_cmd(
         "--tokenizer-path", tokenizer_path,
         "--admin-api-key", admin_api_key,
         "--log-level", log_level,
-        "--request-timeout", str(request_timeout),
-        "--set-reward-finish-timeout", str(set_reward_finish_timeout),
-        "--tool-call-parser", tool_call_parser,
-        "--reasoning-parser", reasoning_parser,
-        "--chat-template-type", chat_template_type,
     ]
-    if engine_max_tokens is not None:
-        cmd += ["--engine-max-tokens", str(engine_max_tokens)]
+    cmd.extend(extra_args)
     return cmd
 
 
@@ -221,13 +214,13 @@ class InternalRegisterArgs:
     admin_api_key: str = "areal-admin-key"
     log_level: str = "info"
     health_timeout: float = 600.0  # sglang load can be slow
-    # data-proxy knobs
-    request_timeout: float = 120.0
-    set_reward_finish_timeout: float = 0.0
-    tool_call_parser: str = "qwen"
-    reasoning_parser: str = "qwen3"
-    chat_template_type: str = "hf"
-    engine_max_tokens: int | None = None
+    # Passthrough flag strings, shlex.split into argv tokens.  See
+    # `areal inf run --help` for guidance; the engine flag set is whatever
+    # sglang / vllm accept, the proxy flag set is whatever
+    # `python -m areal.experimental.inference_service.data_proxy --help`
+    # accepts.
+    engine_extra_args: list[str] = field(default_factory=list)
+    proxy_extra_args: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -278,19 +271,19 @@ def register_internal_model(
             if spec.engine == "sglang":
                 cmd = _build_sglang_cmd(
                     model_path=args.model_path,
-                    tokenizer_path=tokenizer_path,
                     host="127.0.0.1",
                     port=inf_port,
                     tp=spec.tp,
+                    extra_args=args.engine_extra_args,
                 )
             else:
                 cmd = _build_vllm_cmd(
                     model_path=args.model_path,
-                    tokenizer_path=tokenizer_path,
                     host="127.0.0.1",
                     port=inf_port,
                     tp=spec.tp,
                     pp=spec.pp,
+                    extra_args=args.engine_extra_args,
                 )
             logger.info(
                 "Spawning %s server (replica %d/%d, tp=%d, port=%d) ...",
@@ -320,12 +313,7 @@ def register_internal_model(
                 tokenizer_path=tokenizer_path,
                 admin_api_key=args.admin_api_key,
                 log_level=args.log_level,
-                request_timeout=args.request_timeout,
-                set_reward_finish_timeout=args.set_reward_finish_timeout,
-                tool_call_parser=args.tool_call_parser,
-                reasoning_parser=args.reasoning_parser,
-                chat_template_type=args.chat_template_type,
-                engine_max_tokens=args.engine_max_tokens,
+                extra_args=args.proxy_extra_args,
             )
             logger.info(
                 "Spawning data-proxy (replica %d/%d, port=%d) ...",

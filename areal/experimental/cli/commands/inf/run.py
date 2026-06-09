@@ -119,14 +119,22 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
         "--model-health-timeout", type=float, default=600.0,
         help="Seconds to wait for an internal model server to become healthy.",
     )
-    p.add_argument("--request-timeout", type=float, default=120.0)
-    p.add_argument("--set-reward-finish-timeout", type=float, default=0.0)
-    p.add_argument("--tool-call-parser", default="qwen")
-    p.add_argument("--reasoning-parser", default="qwen3")
     p.add_argument(
-        "--chat-template-type", default="hf", choices=["hf", "concat"],
+        "--engine-args", default="",
+        help="Extra args forwarded verbatim to the sglang / vllm process. "
+             "Pass as a single shell-style string, e.g. "
+             "'--mem-fraction-static 0.85 --chunked-prefill-size 4096'. "
+             "See the sglang or vllm CLI docs for the full flag set.",
     )
-    p.add_argument("--engine-max-tokens", type=int, default=None)
+    p.add_argument(
+        "--proxy-args", default="",
+        help="Extra args forwarded verbatim to the data-proxy process. "
+             "Pass as a single shell-style string, e.g. "
+             "'--tool-call-parser qwen --reasoning-parser qwen3 "
+             "--chat-template-type hf'. See "
+             "`python -m areal.experimental.inference_service.data_proxy --help` "
+             "for the full flag set.",
+    )
 
     p.set_defaults(func=_handle)
 
@@ -297,6 +305,8 @@ def _register_internal_inline(
     )
     from areal.experimental.cli.commands.inf.state import ModelState, ServiceModels
 
+    import shlex
+
     if not args.model_path:
         raise SystemExit(
             "--model-path is required for internal model registration."
@@ -312,12 +322,8 @@ def _register_internal_inline(
             admin_api_key=args.admin_api_key,
             log_level=args.log_level,
             health_timeout=args.model_health_timeout,
-            request_timeout=args.request_timeout,
-            set_reward_finish_timeout=args.set_reward_finish_timeout,
-            tool_call_parser=args.tool_call_parser,
-            reasoning_parser=args.reasoning_parser,
-            chat_template_type=args.chat_template_type,
-            engine_max_tokens=args.engine_max_tokens,
+            engine_extra_args=shlex.split(args.engine_args) if args.engine_args else [],
+            proxy_extra_args=shlex.split(args.proxy_args) if args.proxy_args else [],
         ),
         gateway_url=gateway_url,
         router_url=router_url,
