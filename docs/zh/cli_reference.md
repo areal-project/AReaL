@@ -656,6 +656,7 @@ https://docs.vllm.ai/en/stable/api/index.html for detailed documentation.
 | `dtype`                        | string                 | `"bfloat16"`                                                        | -                                                                                       |
 | `distributed_executor_backend` | string                 | `"mp"`                                                              | -                                                                                       |
 | `load_format`                  | string                 | `"auto"`                                                            | -                                                                                       |
+| `max_num_batched_tokens`       | integer                | `2048`                                                              | -                                                                                       |
 | `max_num_seqs`                 | integer                | `256`                                                               | -                                                                                       |
 | `block_size`                   | integer                | `16`                                                                | -                                                                                       |
 | `cpu_offload_gb`               | float                  | `0`                                                                 | -                                                                                       |
@@ -676,6 +677,9 @@ https://docs.vllm.ai/en/stable/api/index.html for detailed documentation.
 | `tensor_parallel_size`         | integer \| None        | `None`                                                              | -                                                                                       |
 | `pipeline_parallel_size`       | integer \| None        | `None`                                                              | -                                                                                       |
 | `enable_expert_parallel`       | boolean                | `False`                                                             | -                                                                                       |
+| `compilation_config`           | `dict` \| None         | `None`                                                              | -                                                                                       |
+| `additional_config`            | `dict` \| None         | `None`                                                              | -                                                                                       |
+| `no_async_scheduling`          | boolean                | `False`                                                             | -                                                                                       |
 
 (section-train-dataset)=
 

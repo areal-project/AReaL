@@ -1793,6 +1793,7 @@ class vLLMConfig:
     distributed_executor_backend: str = "mp"
     load_format: str = "auto"
     # original
+    max_num_batched_tokens: int = 2048
     max_num_seqs: int = 256
     # kv_cache_type: str = "auto"
     block_size: int = 16
@@ -1839,6 +1840,18 @@ class vLLMConfig:
     tensor_parallel_size: int | None = None
     pipeline_parallel_size: int | None = None
     enable_expert_parallel: bool = False
+    compilation_config: dict | None = None
+    additional_config: dict | None = None
+    no_async_scheduling: bool = False
+
+    def __post_init__(self):
+        # convert vLLM config dictionaries to a string since we don't need to read
+        # these values and just pass directly to vLLM
+        if self.compilation_config:
+            self.compilation_config = json.dumps(self.compilation_config)
+
+        if self.additional_config:
+            self.additional_config = json.dumps(self.additional_config)
 
     @staticmethod
     def build_args(
