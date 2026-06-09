@@ -148,6 +148,9 @@ class PPOActor:
         batch_indices = torch.arange(
             bs, device=data["input_ids"].device, dtype=torch.long
         )
+        attn_mask = data["attention_mask"]
+        seqlens = attn_mask.sum(-1).long()
+        seq_no_eos_mask = seqlens == max_seqlen
 
         # Reward Penalty on length
         if self.config.overlong_reward_penalty:
@@ -170,7 +173,10 @@ class PPOActor:
             reward_score, max=self.reward_clip, min=-self.reward_clip
         )
         if self.reward_norm:
-            reward_score = self.reward_norm(reward_score)
+            reward_norm_mask = None
+            if self.mask_no_eos_with_zero:
+                reward_norm_mask = (~seq_no_eos_mask).to(dtype=reward_score.dtype)
+            reward_score = self.reward_norm(reward_score, reward_norm_mask)
 
         loss_mask = data["loss_mask"].float()
         loss_mask = torch.roll(loss_mask, shifts=-1, dims=-1)
@@ -196,9 +202,6 @@ class PPOActor:
         old_logp *= loss_mask
 
         # Compute KL-regularized rewards.
-        attn_mask = data["attention_mask"]
-        seqlens = attn_mask.sum(-1).long()
-        seq_no_eos_mask = seqlens == attn_mask.shape[1]
         rewards = -self.kl_ctl * self.kl_estimator(old_logp, ref_logp)
         kl_rewards = rewards.clone()
         # KL rewards at the next token after eos is zero.
