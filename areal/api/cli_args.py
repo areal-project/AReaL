@@ -954,8 +954,8 @@ class MegatronEngineConfig:
     enable_mtp: bool = field(
         default=False,
         metadata={
-            "help": "Build the model's Multi-Token-Prediction (MTP) head. Default "
-            "False: MTP is inference-only and unused by RL; set True for SFT.",
+            "help": "Keep the model's Multi-Token-Prediction (MTP) head "
+            "(bridge_type=megatron-bridge only). Default False drops it.",
         },
     )
 
