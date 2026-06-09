@@ -22,6 +22,7 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 
 from areal.api.cli_args import InferenceEngineConfig
 from areal.api import RolloutWorkflow
+from areal.infra.rpc.rtensor import RTensor
 from .async_task_runner import (
     AsyncTaskRunner,
     TaskQueueFullError,
@@ -839,6 +840,8 @@ class WorkflowExecutor:
     ) -> tuple[bool, str]:
         if traj is None:
             return False, "trajectory is None"
+
+        traj = RTensor.localize(traj)
 
         dump_dir = self._get_dump_dir(is_eval)
         if dump_dir is None:
