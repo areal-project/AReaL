@@ -400,7 +400,10 @@ class OpenClawAgent:
         # Accumulate streamed tool calls by their ``index``: OpenAI-compatible
         # streaming sends the ``name`` only in the first chunk and streams
         # ``arguments`` across later chunks, so we must buffer per index and
-        # emit once the stream completes.
+        # surface them once the stream completes.  These are reported in the
+        # response ``metadata`` for observability only -- see the note at the
+        # emit site below for why they are deliberately not streamed as
+        # ``tool_call`` events.
         active_tool_calls: dict[int, dict[str, Any]] = {}
 
         # Use a fresh OpenClaw session per turn: OpenClaw keeps its own
@@ -461,15 +464,26 @@ class OpenClawAgent:
                     if args:
                         slot["arguments"].append(args)
 
-        tool_calls: list[dict[str, Any]] = []
-        for slot in active_tool_calls.values():
-            name = slot["name"]
-            full_args = "".join(slot["arguments"])
-            await emitter.emit_tool_call(name=name, args=full_args)
-            tool_calls.append({"name": name, "input": full_args})
+        # Tool calls are deliberately NOT streamed as ``tool_call`` events.
+        # OpenClaw executes tools inside its own subprocess and only streams
+        # back the final assistant text, so AReaL never observes a matching
+        # tool *result*.  The DataProxy turns each ``tool_call`` event into an
+        # ``assistant``/``tool_calls`` message that requires a following
+        # ``tool`` message per ``tool_call_id``; emitting one without the
+        # result would build an invalid chat-completions history that the
+        # upstream rejects when this runtime replays it on the next turn.
+        # We therefore surface tool calls only in ``metadata`` for observability.
+        tool_calls = [
+            {"name": slot["name"], "input": "".join(slot["arguments"])}
+            for slot in active_tool_calls.values()
+        ]
 
+        # Keep the full assistant text: the DataProxy stores ``summary`` as the
+        # assistant turn and replays it verbatim on later turns (and the gateway
+        # returns it as the final output), so truncating here would corrupt both
+        # the replayed prompt and the user-visible response.
         summary = "".join(text_parts)
         return AgentResponse(
-            summary=summary[:200],
+            summary=summary,
             metadata={"tool_calls": tool_calls},
         )

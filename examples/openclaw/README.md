@@ -181,6 +181,8 @@ accepted as fallbacks for the upstream URL / key / model.
 - **`name_resolve... does not exist` / `fileroot ... is None`** — pass
   `--fileroot <dir>` (auto-created); the default temp directory normally avoids this.
 
+## Prerequisites (RL training)
+
 1. A GPU machine with at least **2 NVIDIA GPUs** (compute capability 8.0 or higher, i.e.
    Ampere / Hopper).
 1. A machine that hosts your agent runtime and can reach the GPU node over the network.

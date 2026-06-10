@@ -158,6 +158,18 @@ def create_data_proxy_app(config: DataProxyConfig) -> FastAPI:
         if session is None:
             session = _SessionData()
             sessions[session_key] = session
+
+        # Start the episode on the worker first: only once the worker has
+        # successfully (re)spawned its per-session state do we reset ours.
+        # Resetting before this call would wipe the existing history/reward
+        # even when the worker fails (500 from ``raise_for_status``), leaving
+        # the session blanked for an episode that never actually started.
+        resp = await http_client.post(
+            f"{config.worker_addr}/session/{session_key}/episode/start",
+            json=body,
+        )
+        resp.raise_for_status()
+
         # A new episode starts from a clean slate: the worker respawns a
         # fresh subprocess, so any history/reward carried over from a prior
         # episode on the same key would corrupt the new trajectory.
@@ -165,12 +177,6 @@ def create_data_proxy_app(config: DataProxyConfig) -> FastAPI:
         session.reward = None
         session.training_ctx = dict(body)
         session.last_active = time.monotonic()
-
-        resp = await http_client.post(
-            f"{config.worker_addr}/session/{session_key}/episode/start",
-            json=body,
-        )
-        resp.raise_for_status()
         return resp.json()
 
     @app.post("/session/{session_key}/episode/end")

@@ -76,7 +76,15 @@ def _attach_mock_session(agent: OpenClawAgent, session_key: str, sse: str) -> No
 
 @pytest.mark.asyncio
 async def test_run_accumulates_streamed_tool_calls():
-    """Streamed tool-call name/args are buffered by index, emitted once each."""
+    """Streamed tool-call name/args are buffered by index into metadata.
+
+    They are surfaced in ``metadata['tool_calls']`` for observability but are
+    deliberately *not* emitted as ``tool_call`` events: OpenClaw runs tools in
+    its own subprocess and never returns a matching tool result, so emitting a
+    ``tool_call`` without a paired ``tool_result`` would make the DataProxy
+    build an invalid chat-completions history that the upstream rejects on
+    replay.
+    """
     sse = (
         'data: {"choices":[{"delta":{"content":"Hel"}}]}\n'
         'data: {"choices":[{"delta":{"content":"lo"}}]}\n'
@@ -103,12 +111,37 @@ async def test_run_accumulates_streamed_tool_calls():
 
     assert resp.summary == "Hello"
     assert emitter.deltas == ["Hel", "lo"]
-    # each tool call emitted exactly once, fully accumulated
-    assert emitter.tool_calls == [("search", '{"q":"hi"}'), ("calc", "1+1")]
+    # tool calls are NOT streamed as events (no paired tool_result available)
+    assert emitter.tool_calls == []
+    # but they are fully accumulated by index into the response metadata
     assert resp.metadata["tool_calls"] == [
         {"name": "search", "input": '{"q":"hi"}'},
         {"name": "calc", "input": "1+1"},
     ]
+
+
+@pytest.mark.asyncio
+async def test_run_keeps_full_summary_for_replay():
+    """summary is returned in full, not truncated, so replay stays faithful.
+
+    The DataProxy stores ``summary`` as the assistant turn and replays it on
+    later turns; truncating it would corrupt both the replayed prompt and the
+    user-visible output.
+    """
+    long_text = "x" * 500
+    sse = (
+        f'data: {{"choices":[{{"delta":{{"content":"{long_text}"}}}}]}}\ndata: [DONE]\n'
+    )
+    agent = OpenClawAgent()
+    _attach_mock_session(agent, "s_long", sse)
+    emitter = _RecordingEmitter()
+    req = AgentRequest(message="hi", session_key="s_long", run_id="r1", history=[])
+
+    resp = await agent.run(req, emitter=emitter)
+    await agent.close_all_sessions()
+
+    assert resp.summary == long_text
+    assert len(resp.summary) == 500
 
 
 @pytest.mark.asyncio
