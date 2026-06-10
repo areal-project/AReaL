@@ -10,6 +10,7 @@ from typing import Any
 
 import numpy as np
 import pybase64
+import torch
 from torchdata.stateful_dataloader import StatefulDataLoader
 
 from areal.api import (
@@ -126,6 +127,40 @@ class SGLangBackend:
             routed_experts=routed_experts,
         )
 
+    def build_score_request(
+        self, input_ids: list[int], target_len: int, with_lora: bool, version: int
+    ) -> HttpRequest:
+        payload: dict[str, Any] = {
+            "input_ids": input_ids,
+            "sampling_params": {
+                "max_new_tokens": 1,
+                "temperature": 0.0,
+            },
+            "return_logprob": True,
+            "logprob_start_len": max(0, len(input_ids) - target_len - 1),
+            "top_logprobs_num": 0,
+            "stream": False,
+        }
+        if with_lora:
+            raise NotImplementedError(
+                "LoRA scoring request is not supported in SGLang teacher compute_logp yet."
+            )
+        return HttpRequest(endpoint="/generate", payload=payload)
+
+    def parse_score_response(
+        self, response: dict[str, Any], target_len: int
+    ) -> list[float]:
+        meta_info = response.get("meta_info")
+        if meta_info is None:
+            raise ValueError("SGLang response missing meta_info for score request")
+        # SGLang returns [logprob, token_id, ...]
+        all_logprobs = [float(x[0]) for x in meta_info.get("input_token_logprobs", [])]
+        if len(all_logprobs) < target_len:
+            raise ValueError(
+                f"SGLang returned insufficient input_token_logprobs: {len(all_logprobs)} < {target_len}"
+            )
+        return all_logprobs[-target_len:]
+
     def build_disk_weight_update_requests(
         self, meta: WeightUpdateMeta
     ) -> WeightUpdateRequests:
@@ -143,6 +178,23 @@ class SGLangBackend:
                     payload={"lora_name": lora_name, "lora_path": str(meta.path)},
                 )
             ]
+            # Unload the version that has fallen outside the retention window so
+            # sglang does not accumulate one adapter per train step (which leaks
+            # VRAM and eventually hangs). Kept versions cover off-policy rollouts
+            # (max_head_offpolicyness). Best-effort: the stale adapter may have
+            # already been evicted or never loaded.
+            keep = meta.lora_keep_versions
+            if keep > 0 and meta.version - keep >= 0:
+                stale_name = get_versioned_lora_name(
+                    meta.lora_name, meta.version - keep
+                )
+                requests.append(
+                    HttpRequest(
+                        endpoint="/unload_lora_adapter",
+                        payload={"lora_name": stale_name},
+                        best_effort=True,
+                    )
+                )
             return WeightUpdateRequests(requests=requests)
         else:
             # Full model update
@@ -502,6 +554,9 @@ class RemoteSGLangEngine(InferenceEngine):
             dynamic_bs=dynamic_bs,
         )
 
+    def compute_logp(self, data: list[dict[str, Any]]) -> list[torch.Tensor]:
+        return self._engine.compute_logp(data)
+
     def pause(self):
         return self._engine.pause()
 
@@ -530,9 +585,13 @@ class RemoteSGLangEngine(InferenceEngine):
         return stats_tracker.export_all(reduce_group=None)
 
     @classmethod
-    def as_controller(
-        cls, config: InferenceEngineConfig, scheduler: Scheduler
-    ) -> RolloutController:
+    def as_controller(cls, config: InferenceEngineConfig, scheduler: Scheduler):
+        if config._version == "v2":
+            from areal.experimental.inference_service.controller.controller import (
+                RolloutControllerV2,
+            )
+
+            return RolloutControllerV2(config=config, scheduler=scheduler)
         return RolloutController(cls, config=config, scheduler=scheduler)
 
     def clear_batches(self, shard_ids: list[str]) -> None:

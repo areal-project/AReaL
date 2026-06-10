@@ -31,12 +31,17 @@ rollout:
   fileroot: ${cluster.fileroot}
   tokenizer_path: ${tokenizer_path}
   dump_to_file: true
+  agent:
+    mode: inline
+    export_style: individual
+    turn_discount: 1.0
   use_lora: true
 
 gconfig:
   n_samples: 4
   min_new_tokens: 0
   max_new_tokens: 1024
+  max_tokens: 2048
   greedy: false
   temperature: 1.0
   lora_name: "lora-gsm8k"

@@ -81,7 +81,7 @@ NOTE: Following commands should be executed from root directory of this reposito
 
 #### Single Node (1.7B Model)
 
-On a single 8x GPU node with our offical image
+On a single 8x GPU node with our official image
 (ghcr.io/areal-project/areal-runtime:latest), run:
 
 ```bash
