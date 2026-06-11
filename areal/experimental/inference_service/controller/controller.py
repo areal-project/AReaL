@@ -188,8 +188,6 @@ class RolloutControllerV2:
 
     # -- Initialize --------------------------------------------------------
 
-    _WORKERS_READY_TIMEOUT: float = 30.0
-
     def initialize(
         self,
         role: str,
@@ -215,10 +213,9 @@ class RolloutControllerV2:
             self._guarded_bg_initialize, server_args, server_infos, *args, **kwargs
         )
 
-        if not self._workers_ready.wait(timeout=self._WORKERS_READY_TIMEOUT):
-            raise TimeoutError(
-                f"Worker creation timed out after {self._WORKERS_READY_TIMEOUT}s"
-            )
+        ready_timeout = self.config.workers_ready_timeout
+        if not self._workers_ready.wait(timeout=ready_timeout):
+            raise TimeoutError(f"Worker creation timed out after {ready_timeout}s")
         if self._init_future.done():
             self._init_future.result()
 
@@ -1482,6 +1479,14 @@ class RolloutControllerV2:
     def inference_worker_urls(self) -> list[str]:
         self._ensure_initialized()
         return list(self._inf_addrs)
+
+    @property
+    def inference_guard_addrs(self) -> list[str]:
+        self._ensure_initialized()
+        return [
+            f"http://{format_hostport(w.ip, int(w.worker_ports[0]))}"
+            for w in self.workers
+        ]
 
     @property
     def server_infos(self) -> list[LocalInfServerInfo]:

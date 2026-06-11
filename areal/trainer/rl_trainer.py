@@ -181,11 +181,21 @@ class PPOTrainer:
             self.ref = self._create_train_engine(config.ref, ref_alloc)
 
         self.teacher = None
+        self.teacher_alloc = None
         if config.teacher is not None:
-            teacher_alloc = ModelAllocation.from_str(
-                config.teacher.backend, name="teacher"
-            )
-            self.teacher = self._create_train_engine(config.teacher, teacher_alloc)
+            if config.teacher.engine_type == "rollout":
+                self.teacher_alloc = ModelAllocation.from_str(
+                    config.teacher.rollout.backend, name="teacher"
+                )
+            else:
+                assert config.teacher.train is not None
+                self.teacher_alloc = ModelAllocation.from_str(
+                    self.config.teacher.train.backend, name="teacher"
+                )
+                logger.warning(
+                    "teacher.engine_type='train' uses legacy train-engine teacher path "
+                    "and is deprecated; please migrate to engine_type='rollout'."
+                )
 
         steps_per_epoch: int | None = None
         self.train_dataloader: StatefulDataLoader | _EmptyDataLoader
@@ -281,7 +291,14 @@ class PPOTrainer:
         if self.ref is not None:
             self.ref.initialize(**engine_init_kwargs, role="ref")
 
-        if self.teacher is not None:
+        if (
+            self.config.teacher is not None
+            and self.config.teacher.engine_type == "train"
+        ):
+            assert self.config.teacher.train is not None
+            self.teacher = self._create_train_engine(
+                self.config.teacher.train, self.teacher_alloc
+            )
             self.teacher.initialize(**engine_init_kwargs, role="teacher")
 
         # Save initial LoRA weights if enabled (for inference server pre-loading)
@@ -297,6 +314,11 @@ class PPOTrainer:
             self.eval_rollout = self._init_rollout(
                 config.rollout, is_eval=True, lora_path=initial_lora_path
             )
+        if (
+            self.config.teacher is not None
+            and self.config.teacher.engine_type == "rollout"
+        ):
+            self.teacher = self._init_teacher_rollout(self.config.teacher.rollout)
 
         # Proxy worker initialization (lazy, for AgentWorkflow support)
         self._proxy_started = False
@@ -327,6 +349,11 @@ class PPOTrainer:
                         "use_lora": config.actor.use_lora,
                         "lora_name": config.gconfig.lora_name,
                         "base_model_name": config.actor.path,
+                        # Keep enough recent adapter versions for off-policy
+                        # rollouts (max_head_offpolicyness) plus a safety margin;
+                        # older versions are unloaded to bound sglang VRAM and
+                        # avoid the adapter-accumulation hang.
+                        "lora_keep_versions": config.rollout.max_head_offpolicyness + 2,
                     }
                 )
             self.weight_update_meta = WeightUpdateMeta.from_disk(**disk_kwargs)
@@ -645,7 +672,6 @@ class PPOTrainer:
                         traj["distill_loss_weight"] = (
                             self.config.teacher.distill_loss_weight
                         )
-                    self.teacher.get_device_stats().log("teacher logp")
                 if self._should_offload_teacher:
                     self._offload_model(self.teacher, role="teacher")
 
@@ -846,6 +872,8 @@ class PPOTrainer:
         if self.eval_rollout is not None:
             self.eval_rollout.destroy()
         self.rollout.destroy()
+        if self.teacher is not None:
+            self.teacher.destroy()
         if self.ref is not None:
             self.ref.destroy()
         if self.critic is not None:
@@ -1059,6 +1087,50 @@ class PPOTrainer:
             init_kwargs["server_infos"] = self.rollout.server_infos
             init_kwargs["role"] = "eval-rollout"
         controller.initialize(**init_kwargs)
+        return controller
+
+    def _init_teacher_rollout(
+        self, rollout_config: InferenceEngineConfig
+    ) -> InferenceEngine | RolloutController:
+        if self.teacher_alloc is None:
+            raise RuntimeError("teacher_alloc is not initialized")
+        rollout_alloc = self.teacher_alloc
+        config = deepcopy(rollout_config)
+        if rollout_alloc.backend == "sglang":
+            engine_cls = RemoteSGLangEngine
+            teacher_sglang_cfg = deepcopy(self.config.sglang)
+            if self.config.teacher is not None and self.config.teacher.path:
+                teacher_sglang_cfg.model_path = self.config.teacher.path
+            server_args = SGLangConfig.build_args(
+                sglang_config=teacher_sglang_cfg,
+                tp_size=rollout_alloc.parallel.tp_size,
+                pp_size=rollout_alloc.parallel.pp_size,
+                base_gpu_id=0,
+            )
+        elif rollout_alloc.backend == "vllm":
+            engine_cls = RemotevLLMEngine
+            teacher_vllm_cfg = deepcopy(self.config.vllm)
+            if self.config.teacher is not None and self.config.teacher.path:
+                teacher_vllm_cfg.model = self.config.teacher.path
+                if not rollout_config.tokenizer_path:
+                    config.tokenizer_path = self.config.teacher.path
+            server_args = vLLMConfig.build_args(
+                vllm_config=teacher_vllm_cfg,
+                tp_size=rollout_alloc.parallel.tp_size,
+                pp_size=rollout_alloc.parallel.pp_size,
+            )
+        else:
+            raise ValueError(
+                f"Invalid teacher rollout backend: {rollout_alloc.backend}, expected sglang or vllm"
+            )
+        if not is_single_controller():
+            engine = engine_cls(config)
+            engine.initialize(
+                train_data_parallel_size=self.actor_alloc.parallel.dp_size
+            )
+            return engine
+        controller = engine_cls.as_controller(config, self.scheduler)
+        controller.initialize(role="teacher", server_args=server_args)
         return controller
 
     def _save_initial_lora_weights(self) -> str | None:

@@ -288,6 +288,7 @@ def packed_context_parallel_forward(
     input_: dict[str, Any],
     gather_cp_output: bool = True,
     is_vision_model: bool = False,
+    use_padded_seq: bool = False,
 ):
     input_ids = input_["input_ids"]
     position_ids = input_.get("position_ids", None)
@@ -300,12 +301,18 @@ def packed_context_parallel_forward(
     packed_seq_params = None
 
     is_vision = is_vision_model and any(key in input_ for key in _VLM_FORWARD_KEYS)
+    # Architectures whose attention/SSM kernels reject packed sequences (e.g.
+    # Qwen3.5 GDN) must run on [B, S] padded input. The reconstruction logic
+    # below is shared with the VLM path; the difference is downstream
+    # (attention_mask and position_ids are passed through for text-only).
+    needs_padded_form = is_vision or use_padded_seq
 
-    # Track whether we reconstructed 2D batch form for vision
-    vision_repack_info = None
+    # Track shape metadata so the output can be repacked back to packed
+    # [total_len, ...] form on the last PP stage.
+    padded_repack_info = None
 
     if cu_seqlens is not None:
-        if not is_vision:
+        if not needs_padded_form:
             if attention_mask is not None or tree_triton_data is not None:
                 raise ValueError(
                     "Attention mask should be None when using packed sequences."
@@ -315,10 +322,9 @@ def packed_context_parallel_forward(
             )
             input_ids = input_ids.contiguous()
         else:
-            # VLM models expect batch-form [B, S] input_ids for mRoPE position
-            # computation and vision token embedding replacement. Reconstruct
-            # padded 2D tensors from packed 1D using cu_seqlens via boolean
-            # masking — avoids per-sample Python loop and GPU-CPU sync.
+            # VLM and BSHD-only models expect [B, S] padded input. Reconstruct
+            # padded 2D tensors from packed 1D via boolean masking — avoids
+            # per-sample Python loop and GPU-CPU sync.
             batch_size = cu_seqlens.shape[0] - 1
             seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
             max_seqlen = int(seq_lens.max().item())
@@ -337,14 +343,15 @@ def packed_context_parallel_forward(
             )
             input_ids_2d[attention_mask] = input_ids
             input_ids = input_ids_2d
-            vision_repack_info = (cu_seqlens, seq_lens, max_seqlen)
+            padded_repack_info = (cu_seqlens, seq_lens, max_seqlen)
 
-    # Pass tree_triton_data as attention_mask if present (for Triton tree attention)
-    # Otherwise use the attention_mask from input (could be dense tensor for flex attention)
-    # For VLM: pass None — the model's get_rope_index uses the 2D attention_mask
-    # internally for correct mRoPE positions. Each batch slot holds one sequence
-    # with trailing padding, so causal attention yields correct outputs at
+    # VLM path: attention_mask=None — model's get_rope_index uses the 2D mask
+    # internally for mRoPE positions. Each batch slot holds one sequence with
+    # trailing padding, so causal attention yields correct outputs at
     # non-padding positions; padding outputs are discarded during repack.
+    #
+    # BSHD text-only path (use_padded_seq): pass our built attention_mask so
+    # the model's attention layers skip padding.
     if is_vision:
         final_attention_mask = None
     else:
@@ -359,6 +366,13 @@ def packed_context_parallel_forward(
         for key in _VLM_FORWARD_KEYS:
             if key in input_:
                 vlm_kwargs[key] = input_[key]
+
+    # For BSHD text-only, drop the packed-form position_ids (a 1D tensor of
+    # length total_len) — they don't match the 2D [B, S] input. Let mcore
+    # compute the default torch.arange positions per row; padding positions
+    # are masked out by attention_mask.
+    if use_padded_seq and not is_vision:
+        position_ids = None
 
     try:
         output = model(
@@ -379,7 +393,7 @@ def packed_context_parallel_forward(
         ignore_virtual=False, vp_stage=model_vp_stage
     )
 
-    # Repack vision output to packed [total_len, ...] for the last PP stage only.
+    # Repack padded output to packed [total_len, ...] for the last PP stage only.
     # Intermediate stages must return their output unchanged so the pipeline
     # send/recv shapes match what the next stage expects (megatron-core's
     # `_communicate_shapes` negotiates based on this return value).
@@ -387,8 +401,8 @@ def packed_context_parallel_forward(
     # On the last PP stage, megatron-core GPTModel returns logits already
     # transposed to [B, S, V] (gpt_model.py: `return logits.transpose(0, 1).contiguous()`),
     # so a boolean mask of valid positions selects the packed sequence.
-    if vision_repack_info is not None and is_pipeline_last_stage:
-        _, repack_seq_lens, repack_max_seqlen = vision_repack_info
+    if padded_repack_info is not None and is_pipeline_last_stage:
+        _, repack_seq_lens, repack_max_seqlen = padded_repack_info
         mask = (
             torch.arange(repack_max_seqlen, device=output.device)[None, :]
             < repack_seq_lens[:, None]
