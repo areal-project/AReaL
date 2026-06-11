@@ -18,6 +18,9 @@ from areal.experimental.cli.commands.inf.client import (
     GatewayUnreachable,
     RouterClient,
 )
+from areal.utils.logging import getLogger
+
+logger = getLogger("InfCli")
 from areal.experimental.cli.commands.inf.launcher import (
     kill_pids,
     pick_free_port,
@@ -222,9 +225,9 @@ def _register_internal(
             spawned.append(pid)
             inf_addr = f"http://127.0.0.1:{inf_port}"
             inf_addrs.append(inf_addr)
-            click.echo(
-                f"  spawned {engine} replica {r}/{dp} pid={pid} port={inf_port}",
-                err=True,
+            logger.info(
+                "spawned %s replica %d/%d pid=%d port=%d",
+                engine, r, dp, pid, inf_port,
             )
 
             _wait_inf_health(inf_addr, deadline=time.time() + model_health_timeout,
@@ -246,9 +249,9 @@ def _register_internal(
             spawned.append(proxy_pid)
             proxy_addr = f"http://127.0.0.1:{proxy_port}"
             proxy_addrs.append(proxy_addr)
-            click.echo(
-                f"  spawned data-proxy {r}/{dp} pid={proxy_pid} port={proxy_port}",
-                err=True,
+            logger.info(
+                "spawned data-proxy %d/%d pid=%d port=%d",
+                r, dp, proxy_pid, proxy_port,
             )
 
             _wait_inf_health(proxy_addr, deadline=time.time() + 30.0,
@@ -277,9 +280,9 @@ def _register_internal(
 
     except BaseException:
         if spawned:
-            click.echo(
-                f"  internal register failed; killing {len(spawned)} spawned worker(s)",
-                err=True,
+            logger.error(
+                "internal register failed; killing %d spawned worker(s)",
+                len(spawned),
             )
             kill_pids(spawned, grace_s=10.0)
         raise
@@ -320,7 +323,7 @@ def _wait_inf_health(addr: str, *, deadline: float, pid: int, label: str) -> Non
               help="Gateway port.")
 @click.option("--host", default="127.0.0.1", show_default=True,
               help="Gateway bind host.")
-@click.option("--admin-api-key", default="areal-admin-key", show_default=True)
+@click.option("--admin-api-key", default="admin-api-key", show_default=True)
 @click.option("--routing-strategy",
               type=click.Choice(["round_robin", "least_busy"]),
               default="round_robin", show_default=True)
@@ -383,7 +386,7 @@ def _do_run(opts: dict) -> int:
     router_log = log_dir / "router.log"
     gateway_log = log_dir / "gateway.log"
 
-    click.echo(f"starting inference daemon (logs: {log_dir})", err=True)
+    logger.info("starting inference daemon (logs: %s)", log_dir)
 
     router_pid, router_port = spawn_router(
         host="127.0.0.1",
@@ -393,7 +396,7 @@ def _do_run(opts: dict) -> int:
         log_file=router_log,
     )
     router_url = f"http://127.0.0.1:{router_port}"
-    click.echo(f"  router pid={router_pid} {router_url}", err=True)
+    logger.info("router pid=%d %s", router_pid, router_url)
 
     time.sleep(0.3)
 
@@ -407,7 +410,7 @@ def _do_run(opts: dict) -> int:
     )
     host_for_url = "127.0.0.1" if opts["host"] in ("0.0.0.0", "::") else opts["host"]
     gateway_url = f"http://{host_for_url}:{opts['port']}"
-    click.echo(f"  gateway pid={gateway_pid} {gateway_url}", err=True)
+    logger.info("gateway pid=%d %s", gateway_pid, gateway_url)
 
     gateway_client = GatewayClient(gateway_url, opts["admin_api_key"])
     router_client = RouterClient(router_url, opts["admin_api_key"])
@@ -466,25 +469,27 @@ def _do_run(opts: dict) -> int:
             DaemonState.remove()
             raise
 
-    click.echo(f"daemon ready  pid={gateway_pid}  url={gateway_url}")
+    logger.info("daemon ready pid=%d url=%s", gateway_pid, gateway_url)
     if opts["model"]:
         kind = "external" if opts["api_url"] else f"internal ({opts['backend']})"
-        click.echo(f"  default model: {opts['model']} ({kind})")
+        logger.info("default model: %s (%s)", opts["model"], kind)
 
     if opts["detach"]:
         return 0
 
-    click.echo("foreground (Ctrl-C to stop) ...", err=True)
+    logger.info("foreground (Ctrl-C to stop) ...")
     try:
         while gateway_alive(state):
             time.sleep(1.0)
     except KeyboardInterrupt:
-        click.echo("\nshutting down ...", err=True)
-        kill_pids([gateway_pid, router_pid], grace_s=10.0)
+        logger.info("shutting down ...")
+        kill_pids(
+            [gateway_pid, router_pid, *state.worker_pids], grace_s=10.0
+        )
         DaemonState.remove()
         return 0
 
-    click.echo("gateway exited", err=True)
+    logger.warning("gateway exited")
     DaemonState.remove()
     return 0
 
@@ -625,7 +630,7 @@ def _do_stop(grace: float, force: bool) -> int:
     try:
         s = DaemonState.load()
     except Exception:
-        click.echo("stale state; removing", err=True)
+        logger.warning("stale state; removing")
         DaemonState.remove()
         return 0
 
