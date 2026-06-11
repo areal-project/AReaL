@@ -1317,6 +1317,7 @@ class RejectionSamplingConfig:
             For KL metrics, aggregation is arithmetic.
         upper: Upper bound for filtering.
         lower: Lower bound for filtering (optional).
+        token_action: Enables two-stage rejection sampling and importance sampling mode ('mask' or 'clamp')(optional).
     """
 
     level: str = field(
@@ -1383,6 +1384,27 @@ class RejectionSamplingConfig:
             "For 'ratio' metric: typical value is 0.5 (filter out tokens where policy "
             "probability dropped significantly). Must be > 0. "
             "For 'kl_k1' metric: can be used to filter negative KL estimates."
+        },
+    )
+    token_action: str | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Enables two-stage Geo-RS + Token-MIS/TIS mode. "
+                "Only valid when level='sequence' and metric='ratio'. "
+                "Stage 1 (Geo-RS): sequences whose geometric-mean importance ratio "
+                "exceeds `upper` are fully rejected (loss_mask zeroed for all tokens). "
+                "Stage 2: on accepted sequences, apply per-token correction using "
+                "this action — 'mask' (Token-MIS: zero tokens where per-token "
+                "ratio > upper) or 'clamp' (Token-TIS: clamp per-token ratio to "
+                "[lower, upper]). "
+                "None disables Stage 2 (pure sequence-level Geo-RS only). "
+                "Experimental results (PR #1084) show that neither Geo-RS alone "
+                "nor Token-MIS/TIS alone is stable under severe off-policy drift; "
+                "the two-stage combination is necessary for both grad_norm and "
+                "approx_kl stability."
+            ),
+            "choices": ["mask", "clamp"],
         },
     )
 
@@ -1453,6 +1475,30 @@ class RejectionSamplingConfig:
                 UserWarning,
                 stacklevel=2,
             )
+        # Validate two-stage (Geo-RS + Token-MIS/TIS) constraints.
+        if self.token_action is not None:
+            _VALID_TOKEN_ACTIONS = ("mask", "clamp")
+            if self.token_action not in _VALID_TOKEN_ACTIONS:
+                raise ValueError(
+                    f"token_action must be one of {_VALID_TOKEN_ACTIONS} or None, "
+                    f"got '{self.token_action}'"
+                )
+            if self.level != "sequence":
+                raise ValueError(
+                    "token_action (two-stage Geo-RS + Token-MIS/TIS) requires "
+                    f"level='sequence'. Got level='{self.level}'."
+                )
+            if self.metric != "ratio":
+                raise ValueError(
+                    "token_action (two-stage Geo-RS + Token-MIS/TIS) requires "
+                    f"metric='ratio'. Got metric='{self.metric}'."
+                )
+            if self.action != "mask":
+                raise ValueError(
+                    "token_action (two-stage mode) requires action='mask' for "
+                    "the sequence-level stage (hard Geo-RS rejection). "
+                    f"Got action='{self.action}'."
+                )
 
 
 @dataclass
