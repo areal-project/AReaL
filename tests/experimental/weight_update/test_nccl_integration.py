@@ -1218,3 +1218,162 @@ def test_awex_megatron_colocate_dp_multi_version_e2e(tmp_path_factory):
         train_ctrl.destroy()
         inf_ctrl.destroy()
         scheduler.delete_workers(None)
+
+
+def _run_fsdp_colocate_e2e(
+    n_gpus: int,
+    pair_name: str,
+    tag: str,
+    tmp_path_factory,
+) -> None:
+    """E2E for colocated FSDPEngine + SGLang on the same n_gpus.
+
+    Mirrors _run_megatron_colocate_e2e but uses FSDPEngine for training.
+    DP-only (FSDP TP=PP=EP=1).
+    """
+    from areal.api import FinetuneSpec
+    from areal.api.cli_args import (
+        InferenceEngineConfig,
+        OptimizerConfig,
+        SchedulingSpec,
+        TrainEngineConfig,
+    )
+    from areal.experimental.inference_service.controller.controller import (
+        RolloutControllerV2,
+    )
+    from areal.experimental.training_service.controller.controller import (
+        GatewayTrainController,
+    )
+    from areal.experimental.weight_update.controller import (
+        WeightUpdateController,
+        WeightUpdateControllerConfig,
+    )
+
+    tmp = tmp_path_factory.mktemp(tag)
+    model_path = _get_test_model_path()
+    scheduler = _make_local_scheduler(tmp, tag, gpu_devices=list(range(n_gpus)))
+
+    inf_config = InferenceEngineConfig(
+        tokenizer_path=model_path,
+        backend=f"sglang:d{n_gpus}",
+        scheduling_spec=(
+            SchedulingSpec(
+                gpu=1,
+                cmd="python -m areal.experimental.inference_service.guard",
+            ),
+        ),
+        consumer_batch_size=8,
+        max_head_offpolicyness=1024,
+        setup_timeout=300.0,
+        admin_api_key="test-admin",
+    )
+    inf_ctrl = RolloutControllerV2(config=inf_config, scheduler=scheduler)
+
+    train_config = TrainEngineConfig(
+        backend=f"fsdp:d{n_gpus}",
+        experiment_name=f"test-awex-{tag}",
+        trial_name="t0",
+        path=model_path,
+        optimizer=OptimizerConfig(),
+        _version="v2",
+        setup_timeout=300.0,
+        scheduling_spec=(
+            SchedulingSpec(
+                gpu=1,
+                cmd="python -m areal.experimental.training_service.guard",
+                env_vars=dict(NCCL_CUMEM_ENABLE="0", NCCL_NVLS_ENABLE="0"),
+            ),
+        ),
+    )
+    train_ctrl = GatewayTrainController(
+        train_engine="areal.engine.fsdp_engine.FSDPEngine",
+        config=train_config,
+        scheduler=scheduler,
+    )
+
+    wu_ctrl: WeightUpdateController | None = None
+    try:
+        inf_ctrl.initialize(
+            role="rollout",
+            server_args={"model_path": model_path, "mem_fraction_static": 0.7},
+            wait=True,
+        )
+        inf_worker_urls = list(inf_ctrl._inf_addrs)
+
+        for url in inf_worker_urls:
+            resp = httpx.post(f"{url}/awex/debug/randomize_parameters", timeout=120.0)
+            assert resp.status_code == 200, f"randomize_parameters failed: {resp.text}"
+
+        train_ctrl.initialize(
+            role="actor",
+            ft_spec=FinetuneSpec(
+                total_train_epochs=1, dataset_size=100, train_batch_size=2
+            ),
+            wait=True,
+        )
+        train_worker_urls = list(train_ctrl._worker_addrs)
+
+        wu_ctrl = WeightUpdateController(
+            config=WeightUpdateControllerConfig(host="127.0.0.1", request_timeout=300.0)
+        )
+        wu_ctrl.initialize()
+        assert wu_ctrl.health_check()
+
+        wu_ctrl.connect(
+            pair_name=pair_name,
+            train_worker_urls=train_worker_urls,
+            inference_worker_urls=inf_worker_urls,
+            colocate=True,
+        )
+
+        result = wu_ctrl.update_weights(version=1)
+        assert result.status == "ok"
+        assert result.version == 1
+
+        wu_ctrl.disconnect()
+
+        gen_resp = httpx.post(
+            f"{inf_worker_urls[0]}/generate",
+            json={
+                "text": "Hello",
+                "sampling_params": {"max_new_tokens": 5, "temperature": 0},
+            },
+            timeout=30.0,
+        )
+        assert gen_resp.status_code == 200, (
+            f"Generation failed after weight update: {gen_resp.text}"
+        )
+
+        _validate_weight_update_correctness(
+            train_worker_urls=train_worker_urls,
+            inf_worker_url=inf_worker_urls[0],
+            param_dir=tmp,
+        )
+    finally:
+        if wu_ctrl is not None:
+            wu_ctrl.destroy()
+        train_ctrl.destroy()
+        inf_ctrl.destroy()
+        scheduler.delete_workers(None)
+
+
+@pytest.mark.multi_gpu
+@pytest.mark.slow
+@pytest.mark.sglang
+@pytest.mark.parametrize("n_gpus", [2, 4, 8], ids=["2gpu", "4gpu", "8gpu"])
+def test_awex_fsdp_colocate_dp_e2e_weight_update(n_gpus, tmp_path_factory):
+    """Full round trip: colocated FSDPEngine (pure DP) + SGLang on same GPUs.
+
+    DP-only, mirrors test_awex_megatron_colocate_dp_e2e_weight_update.
+    Verifies that FSDPEngine._get_full_tensor() materialization + CUDA-IPC
+    transfer produces parameters on the inference side that match the
+    training side bit-exactly (via FSDP shard-concat validation).
+    """
+    if current_platform.device_count() < n_gpus:
+        pytest.skip(f"This test requires {n_gpus} GPUs")
+    _run_fsdp_colocate_e2e(
+        n_gpus=n_gpus,
+        pair_name=f"test_fsdp_colocate_dp{n_gpus}",
+        tag=f"fsdp_colocate_dp{n_gpus}",
+        tmp_path_factory=tmp_path_factory,
+    )
