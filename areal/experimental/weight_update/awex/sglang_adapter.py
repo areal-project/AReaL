@@ -343,7 +343,14 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
 
     def randomize_parameters(self) -> None:
         for _, param in self._get_model().named_parameters():
-            param.data.normal_()
+            if param.data.dtype == torch.float8_e4m3fn:
+                param.data.copy_(
+                    torch.randn_like(param.data, dtype=torch.bfloat16).to(
+                        param.data.dtype
+                    )
+                )
+            else:
+                param.data.normal_()
 
     def init_weight_update_group(
         self,
