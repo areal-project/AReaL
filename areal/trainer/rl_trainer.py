@@ -39,6 +39,7 @@ from areal.experimental.inference_service.controller.controller import (
     RolloutControllerV2,
 )
 from areal.infra import (
+    KubernetesScheduler,
     LocalScheduler,
     RayScheduler,
     RolloutController,
@@ -920,6 +921,8 @@ class PPOTrainer:
             return RayScheduler(exp_config=self.config)
         elif cfg.type == "slurm":
             return SlurmScheduler(exp_config=self.config)
+        elif cfg.type in {"kubernetes", "k8s"}:
+            return KubernetesScheduler(exp_config=self.config)
         raise NotImplementedError(f"Unknown scheduler type: {cfg.type}")
 
     def _create_dataloader(
