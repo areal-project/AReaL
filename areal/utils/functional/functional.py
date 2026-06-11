@@ -426,6 +426,18 @@ def apply_rejection_sampling(
     )
 
 
+def compute_binary_kl_divergence(
+    log_p: torch.Tensor, log_q: torch.Tensor, eps: float = 1e-8
+) -> torch.Tensor:
+    """KL(P||Q) for Bernoulli distributions parameterized by log-probabilities.
+    Treats each element as a Bernoulli: P = [p, 1-p], Q = [q, 1-q].
+    KL(P||Q) = p*log(p/q) + (1-p)*log((1-p)/(1-q))
+    """
+    p = torch.clamp(torch.exp(log_p), eps, 1.0 - eps)
+    q = torch.clamp(torch.exp(log_q), eps, 1.0 - eps)
+    return p * torch.log(p / q) + (1 - p) * torch.log((1 - p) / (1 - q))
+
+
 def ppo_actor_loss_fn(
     logprobs: torch.Tensor,
     proximal_logprobs: torch.Tensor,
@@ -438,6 +450,11 @@ def ppo_actor_loss_fn(
     rejection_sampling: RejectionSamplingConfig | None = None,
     importance_sampling_level: str = "token",
     cu_seqlens: torch.Tensor | None = None,
+    enable_icepop: bool = False,
+    icepop_alpha: float = 0.5,
+    icepop_beta: float = 5.0,
+    enable_kpop: bool = False,
+    kpop_phi: float = 2.0,
 ) -> tuple[torch.Tensor, dict]:
     """PPO actor loss function with optional rejection sampling.
 
@@ -531,6 +548,26 @@ def ppo_actor_loss_fn(
     else:
         dual_clip_mask = torch.zeros_like(clip_mask)
 
+    # Apply IcePop (Double-Sided Masking)
+    if enable_icepop:
+        imp_ratio = torch.exp(proximal_logprobs - old_logprobs)
+        icepop_mask = (imp_ratio >= icepop_alpha) & (imp_ratio <= icepop_beta)
+        icepop_filtered_mask = loss_mask & ~icepop_mask
+        loss_mask = loss_mask.logical_and(icepop_mask)
+        loss_mask_count = loss_mask.count_nonzero() or 1
+        pg_loss = pg_loss * imp_ratio
+
+    # Apply KPop (Bidirectional Binary KL Divergence Masking)
+    if enable_kpop:
+        kl_fwd = compute_binary_kl_divergence(proximal_logprobs, old_logprobs)
+        kl_rev = compute_binary_kl_divergence(old_logprobs, proximal_logprobs)
+        kpop_mask = (kl_fwd < kpop_phi) & (kl_rev < kpop_phi)
+        kpop_filtered_mask = loss_mask & ~kpop_mask
+        loss_mask = loss_mask.logical_and(kpop_mask)
+        loss_mask_count = loss_mask.count_nonzero() or 1
+        imp_ratio = torch.exp(proximal_logprobs - old_logprobs)
+        pg_loss = pg_loss * imp_ratio
+
     # Apply behavioural importance weight from rejection sampling
     if rejection_sampling is not None:
         behave_approx_kl = proximal_logprobs.detach() - old_logprobs.detach()
@@ -549,6 +586,13 @@ def ppo_actor_loss_fn(
         clip_mask=clip_mask,
         dual_clip_mask=dual_clip_mask,
     )
+
+    if enable_icepop:
+        stat["icepop_filtered_mask"] = icepop_filtered_mask
+
+    if enable_kpop:
+        stat["kpop_filtered_mask"] = kpop_filtered_mask
+
     if rejection_sampling is not None:
         stat.update(
             behave_approx_kl=behave_approx_kl.detach(),
