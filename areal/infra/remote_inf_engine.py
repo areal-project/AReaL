@@ -1411,7 +1411,18 @@ def _update_weights_from_disk(
                     )
                     for addr in addresses
                 ]
-                await asyncio.gather(*jobs)
+                if http_req.best_effort:
+                    # Cleanup requests (e.g. unloading a stale LoRA adapter) must
+                    # not fail the weight update: the target may already be gone.
+                    results = await asyncio.gather(*jobs, return_exceptions=True)
+                    for r in results:
+                        if isinstance(r, Exception):
+                            logger.warning(
+                                f"Best-effort request to {http_req.endpoint} "
+                                f"failed (ignored): {r}"
+                            )
+                else:
+                    await asyncio.gather(*jobs)
 
         return load_timestamp - save_timestamp
 

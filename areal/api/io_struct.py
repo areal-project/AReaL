@@ -195,6 +195,9 @@ class WeightUpdateMeta:
     lora_int_id: int = 0
     base_model_name: str = ""
     peft_config: dict = field(default_factory=dict)
+    # Number of recent LoRA adapter versions to keep loaded on the inference
+    # server. Older versions are unloaded to bound memory; 0 disables cleanup.
+    lora_keep_versions: int = 0
 
     clear_checkpoint_after_load: bool = True
 
@@ -226,6 +229,7 @@ class WeightUpdateMeta:
         lora_name: str = "",
         lora_int_id: int = 1,
         base_model_name: str = "",
+        lora_keep_versions: int = 0,
     ) -> "WeightUpdateMeta":
         from areal.utils.saver import Saver
 
@@ -241,6 +245,7 @@ class WeightUpdateMeta:
             lora_name=lora_name,
             lora_int_id=lora_int_id,
             base_model_name=base_model_name,
+            lora_keep_versions=lora_keep_versions,
         )
 
     @classmethod
@@ -307,6 +312,9 @@ class HttpRequest:
     endpoint: str
     payload: dict[str, Any]
     method: str = "POST"
+    # When True, failures are logged and ignored instead of raised. Used for
+    # cleanup requests (e.g. unloading a stale LoRA adapter that may be gone).
+    best_effort: bool = False
 
 
 @dataclass
