@@ -15,7 +15,7 @@ The mbridge backend remains the default; this module is only imported (and
 its decorators only run) when the user opts in via ``mcore.bridge_type:
 megatron-bridge``.
 
-Implementation mirrors ``glm5_megatron_bridge.py``:
+Implementation outline:
 - One ``BailingMoeV25Bridge`` class with three ``@register_bridge`` decorators
   for the three HF architectures (V2_5 / Linear / Hybrid)
 - ``provider_bridge()`` sets MLA + MoE fields and injects the heterogeneous
@@ -25,21 +25,16 @@ Implementation mirrors ``glm5_megatron_bridge.py``:
   per-layer mapping selection
 - ``LightningQKVMapping`` is an ``AutoMapping`` subclass that permutes the
   fused QKV weight between HF ``[Q|K|V]`` and mcore ``[q0,k0,v0,...]``
-  layouts. If the megatron-bridge release in use does not support
-  overriding ``hf_to_megatron`` / ``megatron_to_hf``, fall back to a hook
-  via ``maybe_modify_converted_hf_weight`` (see TODO in that method).
+  layouts before TP sharding (HF -> mcore) and after TP gathering
+  (mcore -> HF).
 """
 
 import os
-from collections.abc import Mapping
 from functools import partial
 
 import torch
 from megatron.bridge.models.conversion.mapping_registry import MegatronMappingRegistry
-from megatron.bridge.models.conversion.model_bridge import (
-    MegatronModelBridge,
-    WeightConversionTask,
-)
+from megatron.bridge.models.conversion.model_bridge import MegatronModelBridge
 from megatron.bridge.models.conversion.param_mapping import AutoMapping, GatedMLPMapping
 from megatron.bridge.models.hf_pretrained.causal_lm import PreTrainedCausalLM
 from megatron.bridge.models.mla_provider import MLAModelProvider
@@ -111,9 +106,17 @@ class LightningQKVMapping(AutoMapping):
         self._head_dim = head_dim
 
     def hf_to_megatron(self, hf_weights, *args, **kwargs):
-        """Apply [3,H,D] -> [H,3,D] permutation when converting HF -> mcore."""
+        """Apply [3,H,D] -> [H,3,D] permutation when converting HF -> mcore.
+
+        The permutation runs on the full tensor before ``super()`` shards it
+        to TP ranks (the permutation does not commute with TP splitting).
+        ``hf_weights`` is None on non-source TP ranks, which only participate
+        in the scatter.
+        """
         weight = hf_weights[0] if isinstance(hf_weights, (list, tuple)) else hf_weights
-        return _permute_qkv_hf_to_mcore(weight, self._num_heads, self._head_dim)
+        if weight is not None:
+            weight = _permute_qkv_hf_to_mcore(weight, self._num_heads, self._head_dim)
+        return super().hf_to_megatron(weight, *args, **kwargs)
 
     def megatron_to_hf(self, megatron_weight, *args, **kwargs):
         """Apply [H,3,D] -> [3,H,D] permutation when converting mcore -> HF."""
@@ -338,6 +341,10 @@ class BailingMoeV25Bridge(MegatronModelBridge):
         # Lightning Attention. The signature
         # ``(tf_config, vp_stage=None) -> TransformerBlockSubmodules``
         # matches what megatron-bridge calls.
+        # This assignment serves direct megatron-bridge usage (e.g.
+        # ``AutoBridge.to_megatron_provider()`` outside AReaL); AReaL's own
+        # flow overrides it again in ``registry.make_mcore_model()`` with a
+        # spec built in the current TP/PP/CP/EP context.
         provider.transformer_layer_spec = partial(
             make_mcore_layer_specs_bailing_moe,
             hf_config=hf_config,
@@ -351,6 +358,15 @@ class BailingMoeV25Bridge(MegatronModelBridge):
                 f"AREAL_DISABLE_MTP=1: overriding mtp_num_layers from {mtp_num_layers} to 0"
             )
             mtp_num_layers = 0
+        if mtp_num_layers:
+            # mapping_registry() has no mtp.* entries yet; megatron-bridge only
+            # warns on unmapped params, so MTP layers would stay randomly
+            # initialized instead of loading from the HF checkpoint.
+            logger.warning(
+                f"mtp_num_layers={mtp_num_layers} from HF config, but MTP weight "
+                "mappings are not implemented — MTP layers will NOT be loaded "
+                "from the checkpoint. Set AREAL_DISABLE_MTP=1 to disable MTP."
+            )
         provider.mtp_num_layers = mtp_num_layers or 0
 
         # ---------------- Architecture basics ----------------
@@ -382,9 +398,13 @@ class BailingMoeV25Bridge(MegatronModelBridge):
         if shared_expert_intermediate is None:
             num_shared = getattr(hf_config, "num_shared_experts", 0)
             inter = getattr(
-                hf_config, "moe_intermediate_size", hf_config.intermediate_size
+                hf_config,
+                "moe_intermediate_size",
+                getattr(hf_config, "intermediate_size", None),
             )
-            shared_expert_intermediate = num_shared * inter if num_shared > 0 else None
+            shared_expert_intermediate = (
+                num_shared * inter if num_shared > 0 and inter is not None else None
+            )
         provider.moe_shared_expert_intermediate_size = shared_expert_intermediate
 
         provider.num_moe_experts = getattr(hf_config, "num_experts", None)
@@ -414,7 +434,9 @@ class BailingMoeV25Bridge(MegatronModelBridge):
         # original 0.707/0.707).
         rope_scaling = getattr(hf_config, "rope_scaling", None) or {}
         provider.rope_type = "rope"
-        provider.rotary_base = getattr(hf_config, "rope_theta", 10000.0)
+        provider.rotary_base = (getattr(hf_config, "rope_parameters", None) or {}).get(
+            "rope_theta", getattr(hf_config, "rope_theta", 10000.0)
+        )
         provider.rotary_percent = 1.0
         provider.rotary_scaling_factor = rope_scaling.get("factor", 1.0)
         provider.apply_rope_fusion = False
@@ -492,39 +514,3 @@ class BailingMoeV25Bridge(MegatronModelBridge):
         )
 
         return MegatronMappingRegistry(*mappings)
-
-    def maybe_modify_converted_hf_weight(
-        self,
-        task: WeightConversionTask,
-        converted_weights_dict: dict[str, torch.Tensor],
-        hf_state_dict: Mapping[str, torch.Tensor],
-    ) -> dict[str, torch.Tensor]:
-        """Fallback QKV permute hook.
-
-        ``LightningQKVMapping`` already permutes the fused QKV via its
-        overridden ``hf_to_megatron`` / ``megatron_to_hf`` methods. If a
-        particular megatron-bridge release does not honour those overrides
-        (early versions of the conversion subsystem ignored subclasses),
-        the permutation will not run and the weights will be wrong. Detect
-        that case here and fix the output in place.
-
-        This method is a no-op when ``LightningQKVMapping`` worked
-        correctly: the converted weight is already in mcore layout
-        ``[H,3,D,hidden]``, and trying to re-detect by shape alone would
-        be unsafe — so we don't. The hook is wired up for diagnostic
-        completeness; if you observe NaN/garbage on the very first
-        forward of a Lightning layer after loading HF weights, replace
-        this stub with an explicit re-permute keyed on the global param
-        name (see commented sketch below).
-
-            # if (
-            #     global_name.startswith("decoder.layers.")
-            #     and ".self_attention.linear_qkv." in global_name
-            #     and "layer_norm" not in global_name
-            # ):
-            #     parts = global_name.split(".")
-            #     layer_idx = int(parts[2])
-            #     if is_lightning_layer(layer_idx, layer_group_size):
-            #         ...  # re-apply permute on converted_weights_dict[global_name]
-        """
-        return converted_weights_dict

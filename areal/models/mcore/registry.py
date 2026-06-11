@@ -212,7 +212,13 @@ def make_mcore_model(
         # one that megatron-bridge does not provide. The lambda matches
         # megatron-bridge's call signature
         # ``(config, vp_stage=None) -> TransformerBlockSubmodules``.
-        #   * Bailing-MoE V2.5: per-layer heterogeneous Lightning + MLA.
+        #   * Bailing-MoE V2.5: per-layer heterogeneous Lightning + MLA. The
+        #     Bailing bridge already sets transformer_layer_spec in
+        #     provider_bridge() for direct megatron-bridge usage; this
+        #     override is the one AReaL's flow uses and picks up the current
+        #     TP/PP/CP/EP context for layer slicing. Note: the captured spec
+        #     is built for the current PP rank with vp_stage=None, so VPP > 1
+        #     is not supported here.
         if _is_bailing(hf_config):
             _bailing_specs = make_mcore_layer_specs(hf_config, tf_config)
             provider.transformer_layer_spec = (

@@ -49,7 +49,7 @@ new model adapters.
 | Model creation        | `bridge.get_model(wrap_with_ddp=...)`                 | `provider = bridge.to_megatron_provider()` → set parallel sizes → `provider.provide_distributed_model(...)` |
 | Layer spec injection  | Override `bridge._get_transformer_layer_spec()`       | Set `provider.transformer_layer_spec = lambda config: spec`                                                 |
 | Runtime config tweaks | `bridge.set_extra_args(field=value, ...)`             | `provider.field = value` directly                                                                           |
-| Load HF weights       | `bridge.load_weights(model, path)`                    | `bridge.load_hf_weights(model)` / `bridge.import_hf_weights(model)`                                         |
+| Load HF weights       | `bridge.load_weights(model, path)`                    | `bridge.load_hf_weights(model)`                                                                             |
 | Save as HF            | `bridge.save_weights(model, path)`                    | `bridge.save_hf_pretrained(model, path, distributed_save=True)`                                             |
 
 ## Supported architectures
@@ -109,7 +109,7 @@ from megatron.core.models.gpt.gpt_model import GPTModel
 )
 class MyModelBridge(MegatronModelBridge):
     def provider_bridge(self, hf_pretrained):
-        provider = self._get_default_provider(hf_pretrained)
+        provider = super().provider_bridge(hf_pretrained)
         # Set MLA/MoE/RoPE fields from hf_pretrained.config here.
         # provider.num_moe_experts = hf_pretrained.config.n_routed_experts
         # provider.moe_router_topk = hf_pretrained.config.num_experts_per_tok

@@ -9,6 +9,7 @@ import json
 import math
 import os
 import re
+import shutil
 import struct
 from collections.abc import Callable, Iterator
 from concurrent.futures import Future
@@ -100,6 +101,7 @@ from areal.infra.dist_rollout import DistRolloutCoordinator
 from areal.infra.platforms import current_platform
 from areal.models.mcore.hf_load import load_weights_from_hf_with_mbridge_fast
 from areal.models.mcore.hf_save import (
+    _patch_saved_config,
     save_critic_value_head,
     save_weights_to_hf_with_mbridge_fast,
 )
@@ -2057,6 +2059,20 @@ class MegatronEngine(TrainEngine):
                     source_path=base_model_path,
                     strict=not self._mtp_head_dropped,
                 )
+                # Patch config.json and copy auxiliary files from source.
+                # PretrainedConfig.to_dict() reads model_type from the class
+                # attribute, which trust_remote_code configs may lack — without
+                # the patch the saved checkpoint cannot be loaded by inference
+                # engines (e.g. sglang).
+                if base_model_path and dist.get_rank() == 0:
+                    _patch_saved_config(base_model_path, path)
+                    src_gen_cfg = os.path.join(
+                        base_model_path, "generation_config.json"
+                    )
+                    if os.path.isfile(src_gen_cfg):
+                        shutil.copy2(
+                            src_gen_cfg, os.path.join(path, "generation_config.json")
+                        )
         else:
             if self.mcore_config.use_mbridge_save:
                 # when loading model using AreaL's fast hf load, the safetensor_io is never set
