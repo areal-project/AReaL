@@ -8,13 +8,17 @@ import gc
 import math
 import os
 import re
+import shutil
 from collections.abc import Callable, Iterator
 from concurrent.futures import Future
 from contextlib import contextmanager
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
-import mbridge
+try:
+    import mbridge
+except ImportError:
+    mbridge = None
 import torch
 import torch.distributed as dist
 from megatron.bridge import AutoBridge as MegatronBridgeAutoBridge
@@ -33,7 +37,15 @@ from torch import nn
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import PretrainedConfig
 
-import areal.models.mcore.bailing_moe_bridge  # noqa: F401  # register bridge
+# mbridge-based bridge modules are optional; their @register_model decorators
+# only fire when mbridge is installed. Wrap each import so the engine still
+# loads in megatron-bridge-only deployments.
+try:
+    import areal.models.mcore.bailing_moe_bridge  # noqa: F401  # register bridge
+except ImportError:
+    pass
+# megatron-bridge adapters do not depend on mbridge and register on import.
+import areal.models.mcore.bailing_moe_megatron_bridge  # noqa: F401  # register bridge
 from areal.api import (
     FinetuneSpec,
     InferenceEngine,
@@ -87,6 +99,7 @@ from areal.infra.dist_rollout import DistRolloutCoordinator
 from areal.infra.platforms import current_platform
 from areal.models.mcore.hf_load import load_weights_from_hf_with_mbridge_fast
 from areal.models.mcore.hf_save import (
+    _patch_saved_config,
     save_critic_value_head,
     save_weights_to_hf_with_mbridge_fast,
 )
@@ -546,6 +559,12 @@ class MegatronEngine(TrainEngine):
 
     def _build_hf_mcore_bridge(self):
         if self.bridge_cls == "mbridge":
+            if mbridge is None:
+                raise ImportError(
+                    "bridge_type='mbridge' requested but the 'mbridge' package "
+                    "is not installed. Install it or switch to "
+                    "bridge_type='megatron-bridge'."
+                )
             self.bridge = mbridge.AutoBridge.from_pretrained(
                 self.config.path, trust_remote_code=True
             )
@@ -1959,6 +1978,20 @@ class MegatronEngine(TrainEngine):
                     path,
                     source_path=base_model_path,
                 )
+                # Patch config.json and copy auxiliary files from source.
+                # PretrainedConfig.to_dict() reads model_type from the class
+                # attribute, which trust_remote_code configs may lack — without
+                # the patch the saved checkpoint cannot be loaded by inference
+                # engines (e.g. sglang).
+                if base_model_path and dist.get_rank() == 0:
+                    _patch_saved_config(base_model_path, path)
+                    src_gen_cfg = os.path.join(
+                        base_model_path, "generation_config.json"
+                    )
+                    if os.path.isfile(src_gen_cfg):
+                        shutil.copy2(
+                            src_gen_cfg, os.path.join(path, "generation_config.json")
+                        )
         else:
             if self.mcore_config.use_mbridge_save:
                 # when loading model using AreaL's fast hf load, the safetensor_io is never set
