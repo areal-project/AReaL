@@ -951,6 +951,14 @@ class MegatronEngineConfig:
         },
     )
 
+    enable_mtp: bool = field(
+        default=False,
+        metadata={
+            "help": "Keep the model's Multi-Token-Prediction (MTP) head "
+            "(bridge_type=megatron-bridge only). Default False drops it.",
+        },
+    )
+
 
 class SchedulingStrategyType(str, Enum):
     separation = "separation"
