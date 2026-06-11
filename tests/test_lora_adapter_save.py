@@ -157,7 +157,7 @@ class TestAdapterConfigJson:
         assert cfg["lora_alpha"] == 32
         assert cfg["bias"] == "none"
         assert cfg["lora_dropout"] == 0.0
-        assert cfg["inference_mode"] is True
+        assert cfg["inference_mode"] is False
         assert "target_modules" in cfg
 
     def test_target_modules_default_to_all_linear(self, tmp_path):

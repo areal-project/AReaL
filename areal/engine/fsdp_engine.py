@@ -1757,7 +1757,7 @@ class FSDPEngine(TrainEngine):
             if not any(kw in name for kw in lora_keywords):
                 continue
             stripped = name.replace(f".{adapter_name}.", ".")
-            adapter_state_dict[stripped] = tensor.contiguous().cpu()
+            adapter_state_dict[stripped] = tensor.contiguous().cpu().float()
 
         if not adapter_state_dict:
             raise RuntimeError(
@@ -1782,7 +1782,7 @@ class FSDPEngine(TrainEngine):
             "base_model_name_or_path": getattr(config, "path", "") or "",
             "bias": "none",
             "fan_in_fan_out": False,
-            "inference_mode": True,
+            "inference_mode": False,
             "init_lora_weights": True,
             "layers_to_transform": None,
             "layers_pattern": None,
