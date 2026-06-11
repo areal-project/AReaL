@@ -189,6 +189,8 @@ class WeightUpdateMeta:
     nccl_master_port: int | None = None
     nccl_group_name: str | None = None
     weight_chunked_mem_mb: int = 1024
+    colocate_stage: int = 0
+    colocate_mode: bool = False
 
     backend: str | None = None
 
@@ -236,6 +238,18 @@ class WeightUpdateMeta:
             new_meta.path = os.path.join(base_dir, f"weight_update_v{version}")
         return new_meta
 
+    def with_colocate_stage(self, stage: int) -> "WeightUpdateMeta":
+        """for update colocation,
+        stage 0 for actor save weights
+        stage 1 for rollout load weights
+        """
+        assert stage in [0, 1] and self.colocate_mode, (
+            f"colocate_mode must be True,got {self.colocate_mode}.stage must be 0 or 1, got {stage}"
+        )
+        new_meta = copy.copy(self)
+        new_meta.colocate_stage = stage
+        return new_meta
+
     @classmethod
     def from_disk(
         cls,
@@ -249,6 +263,7 @@ class WeightUpdateMeta:
         lora_int_id: int = 1,
         base_model_name: str = "",
         lora_keep_versions: int = 0,
+        colocate_mode: bool = False,
     ) -> "WeightUpdateMeta":
         from areal.utils.saver import Saver
 
@@ -265,6 +280,7 @@ class WeightUpdateMeta:
             lora_int_id=lora_int_id,
             base_model_name=base_model_name,
             lora_keep_versions=lora_keep_versions,
+            colocate_mode=colocate_mode,
         )
 
     @classmethod

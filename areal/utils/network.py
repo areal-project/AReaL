@@ -26,15 +26,18 @@ def gethostip(probe_host: str = "8.8.8.8", probe_port: int = 80) -> str:
     try:
         hostname = socket.gethostname()
         infos = socket.getaddrinfo(hostname, None, socket.AF_UNSPEC, socket.SOCK_DGRAM)
+        ipv4_list = []
+        ipv6_list = []
         for family, _, _, _, sockaddr in infos:
+            ip = sockaddr[0]
             if family == socket.AF_INET:
-                ip = sockaddr[0]
-                if ip and not ip.startswith("127."):
-                    return ip
+                if ip and not ip.startswith("127.") and not ip.startswith("172."):
+                    ipv4_list.append(ip)
             elif family == socket.AF_INET6:
-                ip = sockaddr[0]
                 if ip and ip != "::1":
-                    return ip
+                    ipv6_list.append(ip)
+        if ipv4_list or ipv6_list:
+            return ipv4_list[0] if ipv4_list else (ipv6_list[0] if ipv6_list else None)
     except socket.gaierror:
         pass
 
