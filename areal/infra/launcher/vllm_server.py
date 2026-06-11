@@ -278,6 +278,9 @@ def launch_vllm_server(argv):
     # Get CPU per GPU from rollout scheduling spec
     rollout_spec = get_scheduling_spec(config.rollout)
 
+    if config.rollout.return_routed_experts:
+        config.vllm.enable_return_routed_experts = True
+
     vllm_server = vLLMServerWrapper(
         config.experiment_name,
         config.trial_name,
