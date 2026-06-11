@@ -3088,9 +3088,58 @@ def _migrate_legacy_rejection_sampling(cfg: DictConfig) -> DictConfig:
     return cfg
 
 
+def normalize_teacher_config(cfg: DictConfig) -> DictConfig:
+    """
+    Checks if the teacher config is using the legacy flat format
+    and normalizes it to the standard nested DistillationConfig format on the fly.
+
+    This provides backward compatibility for legacy single-teacher execution configurations
+    while transitioning the pipeline to support multiple teacher mixtures.
+    """
+    # Use standard dict-like access to avoid triggering OmegaConf missing key errors
+    teacher_cfg = cfg.get("teacher")
+    if teacher_cfg is not None:
+        if (
+            "engine_type" in teacher_cfg
+            or "path" in teacher_cfg
+            or "rollout" in teacher_cfg
+        ):
+            warnings.warn(
+                "Defining a single teacher directly under the 'teacher' block is deprecated "
+                "and will be removed in a future release. Please update your config to use "
+                "the nested 'teachers' list like DistillationConfig.",
+                category=DeprecationWarning,
+                stacklevel=2,
+            )
+
+            # Extract loss weights safely (defaulting to the dataclass defaults if omitted)
+            rl_loss_weight = teacher_cfg.get("rl_loss_weight", 1.0)
+            distill_loss_weight = teacher_cfg.get("distill_loss_weight", 5e-3)
+
+            # Reconstruct the teacher inner-dictionary
+            teacher_fields = {
+                "engine_type": teacher_cfg.get("engine_type", "rollout"),
+                "path": teacher_cfg.get("path", ""),
+                "rollout": teacher_cfg.get("rollout", None),
+                "train": teacher_cfg.get("train", None),
+                "offload": teacher_cfg.get("offload", False),
+                "weight": teacher_cfg.get("weight", 1.0),
+            }
+
+            # Assign the newly structured signle teacher dict-mapping back to OmegaConf
+            cfg.teacher = {
+                "teachers": [teacher_fields],
+                "rl_loss_weight": rl_loss_weight,
+                "distill_loss_weight": distill_loss_weight,
+            }
+
+    return cfg
+
+
 def to_structured_cfg(cfg, config_cls):
     # Intercept legacy config keys before merge to give actionable error.
     _migrate_legacy_rejection_sampling(cfg)
+    cfg = normalize_teacher_config(cfg)
     # Merge with the default configuration.
     # The yaml and commandline can omit some default values defined in python dataclasses.
     default_cfg = OmegaConf.structured(config_cls)

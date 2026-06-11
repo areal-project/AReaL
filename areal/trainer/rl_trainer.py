@@ -5,6 +5,7 @@ from __future__ import annotations
 import functools
 import os
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from typing import TYPE_CHECKING, Any, cast
 
@@ -694,9 +695,12 @@ class PPOTrainer:
                         args={"global_step": global_step},
                     ),
                 ):
-                    per_teacher_logps = [
-                        teacher.compute_logp(rollout_batch) for teacher in self.teachers
-                    ]
+                    with ThreadPoolExecutor(max_workers=len(self.teachers)) as executor:
+                        futures = [
+                            executor.submit(teacher.compute_logp, rollout_batch)
+                            for teacher in self.teachers
+                        ]
+                        per_teacher_logps = [future.result() for future in futures]
                     per_teacher_logps = RTensor.localize(per_teacher_logps)
                     log_weights = torch.log(
                         torch.tensor(
