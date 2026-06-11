@@ -2477,6 +2477,9 @@ class TrackioConfig:
     space_id: str | None = None
     """HF Space ID for remote dashboard deployment (e.g. "user/my-space").
     When set, metrics are also pushed to the specified Hugging Face Space."""
+    max_rollout_traces_per_step: int = 0
+    """Maximum rollout/eval trajectories to log as Trackio traces per step.
+    Set to 0 or a negative value to disable trace logging."""
 
     def __post_init__(self):
         """Validate Trackio configuration."""
