@@ -85,3 +85,21 @@ class RouterClient:
             bearer=self.key,
             timeout=timeout,
         )
+
+    def unregister_worker(self, addr: str, *, timeout: float = 10.0) -> dict:
+        return _request(
+            f"{self.base}/unregister",
+            method="POST",
+            payload={"worker_addr": addr},
+            bearer=self.key,
+            timeout=timeout,
+        )
+
+    def remove_model(self, name: str, *, timeout: float = 10.0) -> dict:
+        return _request(
+            f"{self.base}/remove_model",
+            method="POST",
+            payload={"name": name},
+            bearer=self.key,
+            timeout=timeout,
+        )

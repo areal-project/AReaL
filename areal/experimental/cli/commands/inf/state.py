@@ -26,6 +26,12 @@ def logs_dir() -> Path:
 
 
 @dataclass
+class ModelEntry:
+    pids: list[int] = field(default_factory=list)
+    proxy_addrs: list[str] = field(default_factory=list)
+
+
+@dataclass
 class DaemonState:
     gateway_pid: int
     gateway_url: str
@@ -33,7 +39,7 @@ class DaemonState:
     router_url: str
     admin_api_key: str
     started_at: float
-    worker_pids: list[int] = field(default_factory=list)
+    models: dict[str, ModelEntry] = field(default_factory=dict)
 
     def save(self) -> None:
         atomic_write_json(state_path(), asdict(self))
@@ -44,13 +50,21 @@ class DaemonState:
         if not p.exists():
             raise FileNotFoundError(f"No daemon state at {p}")
         with open(p) as f:
-            return cls(**json.load(f))
+            raw = json.load(f)
+        models = {
+            name: ModelEntry(**entry)
+            for name, entry in (raw.pop("models", None) or {}).items()
+        }
+        return cls(models=models, **raw)
 
     @classmethod
     def remove(cls) -> None:
         p = state_path()
         if p.exists():
             p.unlink()
+
+    def all_worker_pids(self) -> list[int]:
+        return [pid for entry in self.models.values() for pid in entry.pids]
 
 
 def gateway_alive(state: DaemonState) -> bool:

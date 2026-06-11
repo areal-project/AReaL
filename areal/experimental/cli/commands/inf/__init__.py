@@ -33,6 +33,7 @@ from areal.experimental.cli.commands.inf.launcher import (
 )
 from areal.experimental.cli.commands.inf.state import (
     DaemonState,
+    ModelEntry,
     gateway_alive,
     inf_root,
     logs_dir,
@@ -146,8 +147,8 @@ def _split_args(s: str) -> list[str]:
 
 
 # =============================================================================
-# Model registration (called from `run --model ...`; phase 2 will add a
-# standalone `register` verb that reuses these helpers)
+# Model registration helpers (shared between `inf run --model ...` and
+# the standalone `inf register` verb)
 # =============================================================================
 
 
@@ -187,7 +188,7 @@ def _register_internal(
     gateway: GatewayClient,
     router: RouterClient,
     log_dir: Path,
-) -> list[int]:
+) -> tuple[list[int], list[str]]:
     engine, tp, dp, pp = _parse_backend_spec(backend)
     if pp > 1:
         raise click.ClickException(
@@ -287,7 +288,7 @@ def _register_internal(
             kill_pids(spawned, grace_s=10.0)
         raise
 
-    return spawned
+    return spawned, proxy_addrs
 
 
 def _wait_inf_health(addr: str, *, deadline: float, pid: int, label: str) -> None:
@@ -445,8 +446,10 @@ def _do_run(opts: dict) -> int:
                     provider_model=opts["provider_model"],
                     gateway=gateway_client,
                 )
+                state.models[opts["model"]] = ModelEntry(pids=[], proxy_addrs=[])
+                state.save()
             else:
-                state.worker_pids = _register_internal(
+                pids, proxy_addrs = _register_internal(
                     model=opts["model"],
                     backend=opts["backend"],
                     model_path=opts["model_path"],
@@ -460,10 +463,13 @@ def _do_run(opts: dict) -> int:
                     router=router_client,
                     log_dir=log_dir,
                 )
+                state.models[opts["model"]] = ModelEntry(
+                    pids=pids, proxy_addrs=proxy_addrs,
+                )
                 state.save()
         except BaseException:
             kill_pids(
-                [gateway_pid, router_pid, *state.worker_pids],
+                [gateway_pid, router_pid, *state.all_worker_pids()],
                 grace_s=5.0,
             )
             DaemonState.remove()
@@ -484,7 +490,7 @@ def _do_run(opts: dict) -> int:
     except KeyboardInterrupt:
         logger.info("shutting down ...")
         kill_pids(
-            [gateway_pid, router_pid, *state.worker_pids], grace_s=10.0
+            [gateway_pid, router_pid, *state.all_worker_pids()], grace_s=10.0
         )
         DaemonState.remove()
         return 0
@@ -635,7 +641,7 @@ def _do_stop(grace: float, force: bool) -> int:
         return 0
 
     pids = [
-        p for p in (s.gateway_pid, s.router_pid, *s.worker_pids) if p > 0
+        p for p in (s.gateway_pid, s.router_pid, *s.all_worker_pids()) if p > 0
     ]
 
     if force:
@@ -647,3 +653,148 @@ def _do_stop(grace: float, force: bool) -> int:
     DaemonState.remove()
     click.echo("daemon stopped")
     return 0
+
+
+# =============================================================================
+# inf register
+# =============================================================================
+
+
+@inf.command(name="register", help="Register a model against the running daemon.")
+@click.argument("name")
+@click.option("--api-url", default=None,
+              help="External provider URL (presence => external model).")
+@click.option("--provider-api-key", default=None)
+@click.option("--provider-api-key-env", default=None)
+@click.option("--provider-model", default=None)
+@click.option("--backend", default=None,
+              help="Internal backend spec, e.g. 'sglang:tp=2,dp=2'.")
+@click.option("--model-path", default=None)
+@click.option("--tokenizer-path", default=None)
+@click.option("--engine-args", default="")
+@click.option("--proxy-args", default="")
+@click.option("--model-health-timeout", type=float, default=600.0,
+              show_default=True)
+@click.option("--log-level",
+              type=click.Choice(["debug", "info", "warning", "error"]),
+              default="info", show_default=True)
+def _register_cmd(name: str, **opts) -> None:
+    raise SystemExit(_do_register(name, opts) or 0)
+
+
+def _do_register(name: str, opts: dict) -> int:
+    s = _load_running_state()
+
+    if opts["api_url"] and opts["backend"]:
+        raise click.UsageError("Use --api-url OR --backend, not both.")
+    if not opts["api_url"] and not opts["backend"]:
+        raise click.UsageError(
+            "Provide --api-url <url> (external) or --backend <spec> (internal)."
+        )
+    if opts["backend"] and not opts["model_path"]:
+        raise click.UsageError("--backend requires --model-path.")
+
+    if name in s.models:
+        raise click.ClickException(f"model {name!r} already registered")
+
+    gateway = GatewayClient(s.gateway_url, s.admin_api_key)
+    router = RouterClient(s.router_url, s.admin_api_key)
+
+    if opts["api_url"]:
+        api_key = _resolve_provider_api_key(
+            provider_api_key=opts["provider_api_key"],
+            provider_api_key_env=opts["provider_api_key_env"],
+        )
+        _register_external(
+            model=name,
+            api_url=opts["api_url"],
+            api_key=api_key,
+            provider_model=opts["provider_model"],
+            gateway=gateway,
+        )
+        s.models[name] = ModelEntry(pids=[], proxy_addrs=[])
+        s.save()
+        logger.info("registered external model %r", name)
+        return 0
+
+    pids, proxy_addrs = _register_internal(
+        model=name,
+        backend=opts["backend"],
+        model_path=opts["model_path"],
+        tokenizer_path=opts["tokenizer_path"] or opts["model_path"],
+        engine_extra=_split_args(opts["engine_args"]),
+        proxy_extra=_split_args(opts["proxy_args"]),
+        model_health_timeout=opts["model_health_timeout"],
+        log_level=opts["log_level"],
+        admin_api_key=s.admin_api_key,
+        gateway=gateway,
+        router=router,
+        log_dir=logs_dir(),
+    )
+    s.models[name] = ModelEntry(pids=pids, proxy_addrs=proxy_addrs)
+    s.save()
+    logger.info(
+        "registered internal model %r (%d worker(s))", name, len(pids)
+    )
+    return 0
+
+
+# =============================================================================
+# inf deregister
+# =============================================================================
+
+
+@inf.command(name="deregister", help="Deregister a model and tear down its workers.")
+@click.argument("name")
+@click.option("--grace", type=float, default=10.0, show_default=True,
+              help="Seconds to wait before SIGKILL on the model's workers.")
+@click.option("--force", is_flag=True, help="SIGKILL workers immediately.")
+def _deregister_cmd(name: str, grace: float, force: bool) -> None:
+    raise SystemExit(_do_deregister(name, grace, force) or 0)
+
+
+def _do_deregister(name: str, grace: float, force: bool) -> int:
+    s = _load_running_state()
+    if name not in s.models:
+        raise click.ClickException(f"model {name!r} is not registered")
+    entry = s.models[name]
+
+    router = RouterClient(s.router_url, s.admin_api_key)
+
+    try:
+        router.remove_model(name)
+    except GatewayHTTPError as e:
+        if e.status != 404:
+            logger.warning("router remove_model %s returned %d", name, e.status)
+    except GatewayUnreachable as e:
+        logger.warning("router unreachable while removing %s: %s", name, e)
+
+    for addr in entry.proxy_addrs:
+        try:
+            router.unregister_worker(addr)
+        except (GatewayHTTPError, GatewayUnreachable) as e:
+            logger.warning("router unregister %s failed: %s", addr, e)
+
+    if entry.pids:
+        if force:
+            for p in entry.pids:
+                signal_pid(p, signal.SIGKILL)
+        else:
+            kill_pids(entry.pids, grace_s=grace)
+
+    del s.models[name]
+    s.save()
+    logger.info("deregistered model %r", name)
+    return 0
+
+
+def _load_running_state() -> DaemonState:
+    if not state_path().exists():
+        raise click.ClickException("daemon not running")
+    try:
+        s = DaemonState.load()
+    except Exception as e:
+        raise click.ClickException(f"failed to load state: {e}") from e
+    if not gateway_alive(s):
+        raise click.ClickException("daemon pid not alive")
+    return s
