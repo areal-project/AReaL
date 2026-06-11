@@ -5,9 +5,11 @@ from __future__ import annotations
 import functools
 import os
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from typing import TYPE_CHECKING, Any, cast
 
+import torch
 import torch.distributed as dist
 from torchdata.stateful_dataloader import StatefulDataLoader
 
@@ -30,6 +32,7 @@ from areal.api.cli_args import (
     SchedulingStrategy,
     SchedulingStrategyType,
     SGLangConfig,
+    TeacherConfig,
     TrainDatasetConfig,
     ValidDatasetConfig,
     vLLMConfig,
@@ -48,6 +51,7 @@ from areal.infra import (
 from areal.infra.data_service import DataController
 from areal.infra.data_service.controller.config import DataServiceConfig
 from areal.infra.data_service.rdataset import RDataset
+from areal.infra.rpc.rtensor import RTensor
 from areal.infra.utils.concurrent import call_maybe_async
 from areal.utils import logging, perf_tracer, seeding, stats_tracker
 from areal.utils.dataloader import create_dataloader
@@ -141,9 +145,8 @@ class PPOTrainer:
             config.critic is not None and config.critic.offload
         )
         self._should_offload_ref = config.ref is not None and config.ref.offload
-        self._should_offload_teacher = (
-            config.teacher is not None and config.teacher.offload
-        )
+        teacher_configs = config.teacher.teachers if config.teacher is not None else []
+        self._should_offload_teacher = any(t.offload for t in teacher_configs)
 
         # Validate config before proceeding with weight initialization
         self._validate_cfg()
@@ -180,22 +183,34 @@ class PPOTrainer:
             ref_alloc = ModelAllocation.from_str(config.ref.backend, name="ref")
             self.ref = self._create_train_engine(config.ref, ref_alloc)
 
-        self.teacher = None
-        self.teacher_alloc = None
-        if config.teacher is not None:
-            if config.teacher.engine_type == "rollout":
-                self.teacher_alloc = ModelAllocation.from_str(
-                    config.teacher.rollout.backend, name="teacher"
-                )
-            else:
-                assert config.teacher.train is not None
-                self.teacher_alloc = ModelAllocation.from_str(
-                    self.config.teacher.train.backend, name="teacher"
-                )
-                logger.warning(
-                    "teacher.engine_type='train' uses legacy train-engine teacher path "
-                    "and is deprecated; please migrate to engine_type='rollout'."
-                )
+        self.teachers: list[Any] = []
+        self.teacher_configs = teacher_configs
+        self.teacher_allocs = []
+        self.teacher_mixture_weights: list[float] = []
+        if len(self.teacher_configs) > 0:
+            total_weight = sum(t.weight for t in self.teacher_configs)
+            self.teacher_mixture_weights = [
+                t.weight / total_weight for t in self.teacher_configs
+            ]
+            for idx, t_config in enumerate(self.teacher_configs):
+                if t_config.engine_type == "rollout":
+                    self.teacher_allocs.append(
+                        ModelAllocation.from_str(
+                            t_config.rollout.backend, name=f"teacher-{idx}"
+                        )
+                    )
+                else:
+                    assert t_config.train is not None
+                    self.teacher_allocs.append(
+                        ModelAllocation.from_str(
+                            t_config.train.backend,
+                            name=f"teacher-{idx}",
+                        )
+                    )
+                    logger.warning(
+                        "teacher.engine_type='train' uses legacy train-engine teacher path "
+                        "and is deprecated; please migrate to engine_type='rollout'."
+                    )
 
         steps_per_epoch: int | None = None
         self.train_dataloader: StatefulDataLoader | _EmptyDataLoader
@@ -292,14 +307,17 @@ class PPOTrainer:
             self.ref.initialize(**engine_init_kwargs, role="ref")
 
         if (
-            self.config.teacher is not None
-            and self.config.teacher.engine_type == "train"
+            len(self.teacher_configs) > 0
+            and self.teacher_configs[0].engine_type == "train"
         ):
-            assert self.config.teacher.train is not None
-            self.teacher = self._create_train_engine(
-                self.config.teacher.train, self.teacher_alloc
-            )
-            self.teacher.initialize(**engine_init_kwargs, role="teacher")
+            for idx, teacher_config in enumerate(self.teacher_configs):
+                assert teacher_config.train is not None
+                teacher = self._create_train_engine(
+                    teacher_config.train,
+                    self.teacher_allocs[idx],
+                )
+                teacher.initialize(**engine_init_kwargs, role=f"teacher-{idx}")
+                self.teachers.append(teacher)
 
         # Save initial LoRA weights if enabled (for inference server pre-loading)
         initial_lora_path = self._save_initial_lora_weights()
@@ -315,10 +333,13 @@ class PPOTrainer:
                 config.rollout, is_eval=True, lora_path=initial_lora_path
             )
         if (
-            self.config.teacher is not None
-            and self.config.teacher.engine_type == "rollout"
+            len(self.teacher_configs) > 0
+            and self.teacher_configs[0].engine_type == "rollout"
         ):
-            self.teacher = self._init_teacher_rollout(self.config.teacher.rollout)
+            self.teachers = [
+                self._init_teacher_rollout(teacher_config, idx)
+                for idx, teacher_config in enumerate(self.teacher_configs)
+            ]
 
         # Proxy worker initialization (lazy, for AgentWorkflow support)
         self._proxy_started = False
@@ -457,6 +478,20 @@ class PPOTrainer:
         ):
             engine.offload()
 
+    def _onload_teachers(self) -> None:
+        for idx, (teacher, teacher_config) in enumerate(
+            zip(self.teachers, self.teacher_configs, strict=True)
+        ):
+            if teacher_config.offload:
+                self._onload_model(teacher, role=f"teacher-{idx}")
+
+    def _offload_teachers(self) -> None:
+        for idx, (teacher, teacher_config) in enumerate(
+            zip(self.teachers, self.teacher_configs, strict=True)
+        ):
+            if teacher_config.offload:
+                self._offload_model(teacher, role=f"teacher-{idx}")
+
     def _offload_rollout(self, is_eval: bool = False):
         rollout = self.rollout if not is_eval else self.eval_rollout
         if rollout is None:
@@ -545,7 +580,7 @@ class PPOTrainer:
         if self._should_offload_critic:
             self._offload_model(self.critic, role="critic")
         if self._should_offload_teacher:
-            self._offload_model(self.teacher, role="teacher")
+            self._offload_teachers()
         if self._should_offload_actor:
             self._offload_model(self.actor, role="actor")
 
@@ -654,9 +689,9 @@ class PPOTrainer:
                 if self._should_offload_ref:
                     self._offload_model(self.ref, role="ref")
 
-            if self.teacher is not None:
+            if len(self.teachers) > 0:
                 if self._should_offload_teacher:
-                    self._onload_model(self.teacher, role="teacher")
+                    self._onload_teachers()
                 with (
                     stats_tracker.record_timing("teacher_logp"),
                     perf_tracer.trace_scope(
@@ -665,15 +700,39 @@ class PPOTrainer:
                         args={"global_step": global_step},
                     ),
                 ):
-                    teacher_logps = self.teacher.compute_logp(rollout_batch)
-                    for traj, logp in zip(rollout_batch, teacher_logps):
-                        traj["teacher_logp"] = logp
+                    with ThreadPoolExecutor(max_workers=len(self.teachers)) as executor:
+                        futures = [
+                            executor.submit(teacher.compute_logp, rollout_batch)
+                            for teacher in self.teachers
+                        ]
+                        per_teacher_logps = [future.result() for future in futures]
+                    per_teacher_logps = RTensor.localize(per_teacher_logps)
+                    log_weights = torch.log(
+                        torch.tensor(
+                            self.teacher_mixture_weights,
+                            dtype=torch.float32,
+                            device=per_teacher_logps[0][0].device,
+                        )
+                    )
+                    for traj_idx, traj in enumerate(rollout_batch):
+                        stacked = torch.stack(
+                            [
+                                teacher_logps[traj_idx]
+                                for teacher_logps in per_teacher_logps
+                            ],
+                            dim=0,
+                        )
+                        mixed_logp = torch.logsumexp(
+                            stacked + log_weights[:, None, None], dim=0
+                        )
+                        traj["teacher_logp"] = mixed_logp
                         traj["rl_loss_weight"] = self.config.teacher.rl_loss_weight
                         traj["distill_loss_weight"] = (
                             self.config.teacher.distill_loss_weight
                         )
+
                 if self._should_offload_teacher:
-                    self._offload_model(self.teacher, role="teacher")
+                    self._offload_teachers()
 
             if self._should_offload_actor:
                 self._onload_model(self.actor, role="actor")
@@ -872,8 +931,8 @@ class PPOTrainer:
         if self.eval_rollout is not None:
             self.eval_rollout.destroy()
         self.rollout.destroy()
-        if self.teacher is not None:
-            self.teacher.destroy()
+        for teacher in self.teachers:
+            teacher.destroy()
         if self.ref is not None:
             self.ref.destroy()
         if self.critic is not None:
@@ -1090,17 +1149,17 @@ class PPOTrainer:
         return controller
 
     def _init_teacher_rollout(
-        self, rollout_config: InferenceEngineConfig
+        self, teacher_config: TeacherConfig, idx: int
     ) -> InferenceEngine | RolloutController:
-        if self.teacher_alloc is None:
-            raise RuntimeError("teacher_alloc is not initialized")
-        rollout_alloc = self.teacher_alloc
+        assert teacher_config.rollout is not None
+        rollout_config = teacher_config.rollout
+        rollout_alloc = self.teacher_allocs[idx]
         config = deepcopy(rollout_config)
         if rollout_alloc.backend == "sglang":
             engine_cls = RemoteSGLangEngine
             teacher_sglang_cfg = deepcopy(self.config.sglang)
-            if self.config.teacher is not None and self.config.teacher.path:
-                teacher_sglang_cfg.model_path = self.config.teacher.path
+            if teacher_config.path:
+                teacher_sglang_cfg.model_path = teacher_config.path
             server_args = SGLangConfig.build_args(
                 sglang_config=teacher_sglang_cfg,
                 tp_size=rollout_alloc.parallel.tp_size,
@@ -1110,10 +1169,10 @@ class PPOTrainer:
         elif rollout_alloc.backend == "vllm":
             engine_cls = RemotevLLMEngine
             teacher_vllm_cfg = deepcopy(self.config.vllm)
-            if self.config.teacher is not None and self.config.teacher.path:
-                teacher_vllm_cfg.model = self.config.teacher.path
+            if teacher_config.path:
+                teacher_vllm_cfg.model = teacher_config.path
                 if not rollout_config.tokenizer_path:
-                    config.tokenizer_path = self.config.teacher.path
+                    config.tokenizer_path = teacher_config.path
             server_args = vLLMConfig.build_args(
                 vllm_config=teacher_vllm_cfg,
                 tp_size=rollout_alloc.parallel.tp_size,
@@ -1130,7 +1189,7 @@ class PPOTrainer:
             )
             return engine
         controller = engine_cls.as_controller(config, self.scheduler)
-        controller.initialize(role="teacher", server_args=server_args)
+        controller.initialize(role=f"teacher-{idx}", server_args=server_args)
         return controller
 
     def _save_initial_lora_weights(self) -> str | None:
