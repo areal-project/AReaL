@@ -2950,10 +2950,6 @@ class BaseExperimentConfig:
             "help": "Memory snapshot profiler configuration. None means disabled."
         },
     )
-    trajectory_debug: TrajectoryDebugConfig | None = field(
-        default=None,
-        metadata={"help": "Trajectory dump/replay configuration. None means disabled."},
-    )
     recover: RecoverConfig = field(default_factory=RecoverConfig)
 
     sglang: SGLangConfig = field(default_factory=SGLangConfig)
@@ -3125,6 +3121,16 @@ class PPOConfig(BaseExperimentConfig):
             "help": "Enable dynamic batch sizing in prepare_batch. When True, batch collection "
             "stops when (accepted + rejected) >= batch_size, returning only accepted results. "
             "This results in variable-sized batches of valid data."
+        },
+    )
+    trajectory_debug: TrajectoryDebugConfig | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Trajectory dump/replay configuration for offline debugging of "
+                "the PPO training loop. Only meaningful for experiments with a "
+                "rollout phase. None means disabled."
+            )
         },
     )
 
