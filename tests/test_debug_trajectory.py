@@ -259,6 +259,69 @@ class TestTrajectoryIO:
         files = os.listdir(fake_trainer._trajectory_dir)
         assert len(files) == 5
 
+    def test_rotation_skips_unparseable_filenames(self, fake_trainer, sample_batch):
+        """Malformed step_*.pt files must be skipped, not crash rotation.
+
+        The trajectory directory is user-visible, so a hand-copied or
+        half-written file like 'step_backup.pt' can appear. Rotation should
+        warn-and-skip such files and still rotate the well-formed ones.
+        """
+        fake_trainer._max_keep = 2
+
+        # Drop in a malformed file that matches the step_*.pt glob but has no
+        # numeric step component.
+        bad_path = os.path.join(fake_trainer._trajectory_dir, "step_backup.pt")
+        torch.save(sample_batch, bad_path)
+
+        with patch("areal.trainer.rl_trainer.is_single_controller", return_value=True):
+            # Saving triggers _rotate_trajectories on each write; the malformed
+            # file must never cause an exception.
+            for step in range(1, 6):
+                fake_trainer._save_trajectory(sample_batch, step)
+
+        files = sorted(os.listdir(fake_trainer._trajectory_dir))
+        # Malformed file is exempt from the budget and never deleted.
+        assert "step_backup.pt" in files
+        # Well-formed files rotate down to the 2 most recent.
+        assert "step_000004.pt" in files
+        assert "step_000005.pt" in files
+        assert "step_000003.pt" not in files
+
+    def test_rotation_tolerates_missing_file(self, fake_trainer, sample_batch):
+        """Concurrent rotation (file already gone) must not raise.
+
+        In SPMD mode multiple data-parallel ranks rotate the shared directory
+        at once, so a file we plan to delete may already be removed by a peer.
+        os.remove is wrapped in try/except FileNotFoundError; simulate the race
+        by deleting the target out from under _rotate_trajectories.
+        """
+        # Write several files with rotation effectively disabled (huge budget),
+        # so we have a real backlog to rotate in the patched call below.
+        fake_trainer._max_keep = 100
+        with patch("areal.trainer.rl_trainer.is_single_controller", return_value=True):
+            for step in range(1, 8):
+                fake_trainer._save_trajectory(sample_batch, step)
+
+        # Now tighten the budget so the explicit rotation has files to delete.
+        fake_trainer._max_keep = 2
+
+        real_remove = os.remove
+
+        def racing_remove(path):
+            # Simulate a peer rank deleting the file first, then our own call.
+            real_remove(path)
+            # A second delete of the same path raises FileNotFoundError, which
+            # _rotate_trajectories must swallow.
+            real_remove(path)
+
+        with patch("os.remove", side_effect=racing_remove):
+            # Should complete without raising despite the double-delete.
+            fake_trainer._rotate_trajectories()
+
+        # The 2 most recent files survive; the rest were rotated out.
+        files = sorted(os.listdir(fake_trainer._trajectory_dir))
+        assert files == ["step_000006.pt", "step_000007.pt"]
+
 
 # ------------------------------------------------------------------ #
 #  _NoOpRollout stub interface                                         #

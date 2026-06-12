@@ -391,6 +391,18 @@ class PPOTrainer:
                 for f in os.listdir(self._trajectory_dir)
                 if f.startswith("step_") and f.endswith(".pt")
             )
+            # Fail fast: a replay run with no dumped files on disk cannot make
+            # progress. Surfacing this at init (before the inference engine is
+            # stubbed out and cluster resources are acquired) gives a clearer
+            # diagnostic than a FileNotFoundError deep inside the train loop.
+            if not available:
+                raise FileNotFoundError(
+                    "Replay mode enabled but no trajectory files were found in "
+                    f"{self._trajectory_dir}. Run a dump pass first "
+                    "(trajectory_debug.dump_rollout_data=true) or point "
+                    "trajectory_debug.path at a directory containing "
+                    "step_*.pt files."
+                )
             logger.info(
                 "Replay mode: skipping rollout initialization. "
                 f"Loading trajectories from {self._trajectory_dir} "
@@ -1416,11 +1428,19 @@ class PPOTrainer:
         # Filename format: step_000042.pt or step_000042_dp_3.pt
         rotatable = []
         for f in all_files:
-            # Extract step number from filename
+            # Extract step number from filename.
             # Filename: step_000042.pt or step_000042_dp_3.pt
+            # The directory is user-visible, so guard against malformed names
+            # (e.g. a hand-copied "step_backup.pt" or a half-written file): skip
+            # anything we cannot parse instead of crashing the training run.
             stem = os.path.splitext(f)[0]  # "step_000042" or "step_000042_dp_3"
-            step_str = stem.split("_")[1]  # "000042"
-            step_num = int(step_str)
+            parts = stem.split("_")
+            if len(parts) < 2 or not parts[1].isdigit():
+                logger.warning(
+                    f"Skipping unparseable trajectory file during rotation: {f}"
+                )
+                continue
+            step_num = int(parts[1])
             if step_num not in self._pin_steps:
                 rotatable.append(f)
 
@@ -1428,8 +1448,16 @@ class PPOTrainer:
         if to_remove > 0:
             for f in rotatable[:to_remove]:
                 filepath = os.path.join(self._trajectory_dir, f)
-                os.remove(filepath)
-                logger.debug(f"Trajectory rotated (deleted): {filepath}")
+                # Tolerate concurrent rotation: in SPMD mode multiple
+                # data-parallel ranks may rotate the shared directory at once,
+                # so a file listed above may already be gone by the time we
+                # delete it. Deletion is best-effort cleanup; a missing file is
+                # the desired end state, not an error.
+                try:
+                    os.remove(filepath)
+                    logger.debug(f"Trajectory rotated (deleted): {filepath}")
+                except FileNotFoundError:
+                    pass
 
     def _load_trajectory(self, step: int) -> list[dict[str, torch.Tensor]]:
         """Load a previously dumped rollout batch from disk."""
