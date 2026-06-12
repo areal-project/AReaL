@@ -9,8 +9,6 @@ import torch.distributed as dist
 from megatron.core import parallel_state as mpu
 from transformers import AutoTokenizer
 
-from tests.utils import get_model_path
-
 from areal.api import FinetuneSpec, SaveLoadMeta
 from areal.api.alloc_mode import ModelAllocation
 from areal.api.cli_args import (
@@ -23,15 +21,43 @@ from areal.engine import FSDPEngine, MegatronEngine
 from areal.infra.platforms import current_platform
 from areal.utils import seeding
 from areal.utils.data import broadcast_tensor_container
+from areal.utils.testing_utils import DENSE_MODEL_PATHS, MOE_MODEL_PATHS
 
+# Re-key from testing_utils.py canonical paths so local-path overrides
+# (e.g. ``/home/nfs/models/Qwen3-0.6B``) propagate from a single source.
+# Keys here use the runner's existing convention (no underscore in ``qwen3moe``).
 MODEL_PATHS = {
-    "qwen3": get_model_path(
-        "/storage/openpsi/models/Qwen__Qwen3-0.6B/", "Qwen/Qwen3-0.6B"
-    ),
-    "qwen3moe": get_model_path(
-        "/storage/openpsi/models/Qwen__Qwen3-30B-A3B/", "Qwen/Qwen3-30B-A3B"
-    ),
+    "qwen3": DENSE_MODEL_PATHS["qwen3"],
+    "qwen3moe": MOE_MODEL_PATHS["qwen3_moe"],
+    "qwen3_5": DENSE_MODEL_PATHS["qwen3_5"],
+    "qwen3_5_moe": MOE_MODEL_PATHS["qwen3_5_moe"],
 }
+
+# bridge_type must default to mbridge for backwards compat with existing
+# qwen3/qwen3moe tests; the qwen3_5 family (dense + MoE) is forced to
+# megatron-bridge because that's the only bridge that handles its GDN hybrid
+# attention layers.
+_MODEL_BRIDGE_OVERRIDES = {
+    "qwen3_5": "megatron-bridge",
+    "qwen3_5_moe": "megatron-bridge",
+}
+
+# Models large enough that a full-AdamW optimizer state does not fit even when
+# sharded (Qwen3.5-35B-A3B's optimizer state is ~420GB, exceeding 8x80GB with
+# params/grads/activations) skip the train step in the HF save/load round-trip.
+# The loaded HF weights are already non-trivial, so save -> zero -> load ->
+# compare still validates bridge weight conversion (incl. MoE experts) without
+# an optimizer.
+_MODEL_SAVELOAD_SKIP_TRAIN = {"qwen3_5_moe": True}
+
+# Models whose memory footprint is too large to co-locate a full FSDP replica
+# alongside the megatron model on the same GPUs skip the megatron-vs-FSDP
+# forward comparison (the megatron forward + cross-rank logprob consistency are
+# still validated). Qwen3.5-35B-A3B cannot fit both even at 8x80GB, and the
+# megatron weights cannot be cheaply freed mid-test (held by the bridge / mpu /
+# DDP grad buffers). Bridge-conversion correctness for these is covered by the
+# hf_save_load round-trip test, which only holds one model.
+_MODEL_SKIP_FSDP_COMPARE = {"qwen3_5_moe": True}
 
 
 def write_result(out: str, succ: bool):
@@ -73,6 +99,7 @@ def mock_input(
 
 
 def make_engine(model_type, backend, mb_spec, vpp_size=1, init_optimizer=False):
+    bridge_type = _MODEL_BRIDGE_OVERRIDES.get(model_type, "mbridge")
     config = TrainEngineConfig(
         backend=backend,
         experiment_name="test",
@@ -80,7 +107,10 @@ def make_engine(model_type, backend, mb_spec, vpp_size=1, init_optimizer=False):
         path=MODEL_PATHS[model_type],
         mb_spec=mb_spec,
         optimizer=OptimizerConfig() if init_optimizer else None,
-        megatron=MegatronEngineConfig(virtual_pipeline_parallel_size=vpp_size),
+        megatron=MegatronEngineConfig(
+            virtual_pipeline_parallel_size=vpp_size,
+            bridge_type=bridge_type,
+        ),
     )
     alloc_mode = ModelAllocation.from_str(backend)
     ft_spec = FinetuneSpec(total_train_epochs=1, dataset_size=128, train_batch_size=8)
@@ -149,39 +179,53 @@ def test_forward(
     )
     assert is_equal, "Logprobs should be the same across all model parallel ranks."
 
-    # make FSDP engine, and check if the difference between FSDP and megatron engine
-    fsdp_engine = make_fsdp_engine("qwen3", alloc_mode, mb_spec)
-    fsdp_logprobs = fsdp_engine.forward(
-        input_=input_,
-        aggregate_fn=lambda xs: torch.cat(xs, dim=0),
-    )
-    print(
-        f"rank {rank} logprobs.shape={logprobs.shape} fsdp_logprobs.shape={fsdp_logprobs.shape}"
-    )
-    # only compare results on data parallel head
     failed = False
-    if engine.is_data_parallel_head():
-        diff = torch.abs(logprobs - fsdp_logprobs)
+    if _MODEL_SKIP_FSDP_COMPARE.get(model_type, False):
+        # Models too large to co-locate a full FSDP replica (see
+        # _MODEL_SKIP_FSDP_COMPARE) skip the megatron-vs-FSDP cross-check. The
+        # megatron forward + cross-rank logprob consistency above are the
+        # validation here; bridge-conversion correctness is covered separately by
+        # the hf_save_load round-trip test.
         print(
-            f"rank {rank} diff between megatron and fsdp logprobs: {diff}, max(diff)={torch.max(diff)} avg(diff)={torch.mean(diff)}"
+            f"rank {rank} skipping megatron-vs-FSDP comparison for {model_type} "
+            "(too large to co-reside with an FSDP replica)."
         )
-
-        cosine_sim = torch.nn.functional.cosine_similarity(
-            logprobs.flatten().to(torch.float32),
-            fsdp_logprobs.flatten().to(torch.float32),
-            dim=0,
+        current_platform.synchronize()
+        dist.barrier()
+        engine.destroy()
+    else:
+        # make FSDP engine, and check the difference between FSDP and megatron engine
+        fsdp_engine = make_fsdp_engine(model_type, alloc_mode, mb_spec)
+        fsdp_logprobs = fsdp_engine.forward(
+            input_=input_,
+            aggregate_fn=lambda xs: torch.cat(xs, dim=0),
         )
-        print(f"Cosine Similarity: {cosine_sim.item()}")
-
-        if cosine_sim < 0.99:
-            raise AssertionError(
-                f"Cosine similarity {cosine_sim.item()} is less than 0.99"
+        print(
+            f"rank {rank} logprobs.shape={logprobs.shape} fsdp_logprobs.shape={fsdp_logprobs.shape}"
+        )
+        # only compare results on data parallel head
+        if engine.is_data_parallel_head():
+            diff = torch.abs(logprobs - fsdp_logprobs)
+            print(
+                f"rank {rank} diff between megatron and fsdp logprobs: {diff}, max(diff)={torch.max(diff)} avg(diff)={torch.mean(diff)}"
             )
 
-    current_platform.synchronize()
-    dist.barrier()
-    fsdp_engine.destroy()
-    engine.destroy()
+            cosine_sim = torch.nn.functional.cosine_similarity(
+                logprobs.flatten().to(torch.float32),
+                fsdp_logprobs.flatten().to(torch.float32),
+                dim=0,
+            )
+            print(f"Cosine Similarity: {cosine_sim.item()}")
+
+            if cosine_sim < 0.99:
+                raise AssertionError(
+                    f"Cosine similarity {cosine_sim.item()} is less than 0.99"
+                )
+
+        current_platform.synchronize()
+        dist.barrier()
+        fsdp_engine.destroy()
+        engine.destroy()
 
     print(f"Test: test_forward(model_type={model_type}, alloc_mode={alloc_mode}) Done.")
     if rank == 0 and output is not None:
@@ -485,12 +529,123 @@ def test_simple_dcp_save_load(
     )
 
 
+def test_train_hf_save_load(
+    model_type: str, alloc_mode: str, output: str | None = None, vpp_size: int = 1
+):
+    """Train → HF save → zero params → HF load → retrain, verify weights match.
+
+    Same structure as test_train_dcp_save_load but uses _save_model_to_hf /
+    _load_model_from_hf (HF safetensors) instead of mcore DCP. Needed for
+    architectures whose SSM/GDN tensors are not supported by mcore's
+    dist_checkpointing (e.g. Qwen3.5).
+    """
+    print(
+        f"running test_train_hf_save_load(model_type={model_type} alloc_mode={alloc_mode})"
+    )
+    rank = int(os.environ["RANK"])
+
+    base_dir = tempfile.gettempdir()
+    save_dir = os.path.join(base_dir, "megatron_engine_hf_save_test")
+    if rank == 0:
+        os.makedirs(save_dir, exist_ok=True)
+
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_PATHS[model_type])
+
+    skip_train = _MODEL_SAVELOAD_SKIP_TRAIN.get(model_type, False)
+    mb_spec = MicroBatchSpec(max_tokens_per_mb=256)
+    engine = make_engine(
+        model_type,
+        alloc_mode,
+        mb_spec,
+        init_optimizer=not skip_train,
+        vpp_size=vpp_size,
+    )
+
+    seeding.set_random_seed(0, key=f"trainer{rank}")
+
+    if not skip_train:
+        # train step — exercises forward + backward + optimizer with BSHD so the
+        # saved weights differ from the on-disk checkpoint. Skipped for models too
+        # large to hold an optimizer (see _MODEL_SAVELOAD_SKIP_TRAIN); the loaded
+        # HF weights are already non-trivial, so the round-trip stays meaningful.
+        input_ = mock_input(batch_size=16, max_seqlen=128, device=engine.device)
+        bcasted_input = broadcast_tensor_container(
+            input_,
+            src_rank=engine.current_data_parallel_head(),
+            group=engine.context_and_model_parallel_group,
+        )
+        train_result = engine.train_batch(
+            input_=bcasted_input,
+            loss_fn=mock_loss_fn,
+            loss_weight_fn=lambda x: x["cu_seqlens"][-1],
+        )
+        print(f"rank {rank} train_result: {train_result}")
+        current_platform.synchronize()
+        dist.barrier()
+
+    # snapshot post-train weights
+    with torch.no_grad():
+        engine.eval()
+        params_before = {
+            n: p.detach().clone() for n, p in engine.model.named_parameters()
+        }
+
+    # save via HF format
+    engine._save_model_to_hf(save_dir, tokenizer)
+
+    # zero all params to prove load actually restores them
+    with torch.no_grad():
+        for p in engine.model.parameters():
+            p.data.zero_()
+
+    # recover from HF checkpoint
+    engine._load_model_from_hf(save_dir)
+
+    current_platform.synchronize()
+    dist.barrier()
+
+    # compare: loaded weights must match pre-save snapshot.
+    # bf16 norm weights may lose ~0.004 precision during the HF safetensors
+    # round-trip (bf16 mantissa is 7 bits → ~0.008 ULP near 1.0), so use a
+    # small absolute tolerance rather than exact match.
+    hf_round_trip_atol = 0.01
+    with torch.no_grad():
+        succ = True
+        for name, param in engine.model.named_parameters():
+            if name not in params_before:
+                continue
+            if not torch.allclose(
+                param, params_before[name], atol=hf_round_trip_atol, rtol=0
+            ):
+                diff = torch.abs(params_before[name] - param)
+                print(
+                    f"rank {rank} diff of {name}: "
+                    f"max(diff)={torch.max(diff)} avg(diff)={torch.mean(diff)}, "
+                    f"count(diff)={torch.count_nonzero(diff)}"
+                )
+                succ = False
+        assert succ, "Weights should be same after HF save/load round-trip"
+
+    current_platform.synchronize()
+    dist.barrier()
+
+    engine.destroy()
+
+    if output:
+        write_result(output, True)
+
+    print(
+        f"Test: test_train_hf_save_load(model_type={model_type}, "
+        f"alloc_mode={alloc_mode}) Done."
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(description="Run Megatron Engine Distributed Test")
     parser.add_argument(
         "--model_type",
         type=str,
-        choices=["qwen3", "qwen3moe"],
+        choices=["qwen3", "qwen3moe", "qwen3_5", "qwen3_5_moe"],
         default="qwen3",
         help="Type of model to test",
     )
@@ -521,6 +676,7 @@ def main():
             "grad_norm_mb_invariance",
             "simple_dcp_save_load",
             "train_dcp_save_load",
+            "train_hf_save_load",
         ],
         default="forward",
         help="Type of test to run: 'forward' or 'train'",
@@ -558,6 +714,13 @@ def main():
         )
     elif args.test_type == "train_dcp_save_load":
         test_train_dcp_save_load(
+            args.model_type,
+            args.backend,
+            output=args.output,
+            vpp_size=args.vpp_size,
+        )
+    elif args.test_type == "train_hf_save_load":
+        test_train_hf_save_load(
             args.model_type,
             args.backend,
             output=args.output,

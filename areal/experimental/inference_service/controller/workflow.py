@@ -11,6 +11,7 @@ import openai
 
 from areal.api.workflow_api import RolloutWorkflow
 from areal.infra import workflow_context
+from areal.infra.rpc.rtensor import RTensor
 from areal.infra.rpc.serialization import deserialize_value
 from areal.infra.utils.http import async_http_retry
 from areal.utils import logging, stats_tracker
@@ -245,8 +246,12 @@ class InferenceServiceWorkflow(RolloutWorkflow):
         if not traj:
             return None
 
-        if "rewards" in traj and len(traj["rewards"]) > 0:
-            last_reward = float(traj["rewards"][-1])
+        rewards_tensor = traj.get("rewards")
+        if isinstance(rewards_tensor, RTensor):
+            rewards_tensor = rewards_tensor.to_local()
+
+        if rewards_tensor is not None and len(rewards_tensor) > 0:
+            last_reward = float(rewards_tensor[-1])
         elif (
             "interactions" in traj
             and traj["interactions"]
