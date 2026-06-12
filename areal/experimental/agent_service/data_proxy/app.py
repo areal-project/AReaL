@@ -41,6 +41,43 @@ def create_data_proxy_app(config: DataProxyConfig) -> FastAPI:
         except Exception:
             logger.debug("Failed to close worker session %s", session_key)
 
+    async def _relay_reward_to_training(session: _SessionData, reward: float) -> None:
+        """Relay the episode's final reward into the training pipeline.
+
+        The agent's LLM calls flow through the inference proxy gateway under
+        a per-episode key (``sk-sess-*``), so the trajectory's tokens and
+        logprobs are already captured there.  The reward, however, only lives
+        in this DataProxy until we forward it.  We reuse the very same
+        ``llm_base_url`` / ``llm_api_key`` that were injected at episode start
+        (``training_ctx``) to POST the scalar to the proxy gateway's
+        ``/rl/set_reward``, binding the reward to that captured trajectory.
+
+        This is best-effort and never raises: a relay failure must not break
+        episode teardown, and in serving mode (no ``training_ctx``) there is
+        no training pipeline to relay to, so we simply skip.
+        """
+        ctx = session.training_ctx
+        if not ctx:
+            return
+        base_url = ctx.get("llm_base_url")
+        api_key = ctx.get("llm_api_key")
+        if not base_url or not api_key:
+            return
+        try:
+            resp = await http_client.post(
+                f"{str(base_url).rstrip('/')}/rl/set_reward",
+                json={"reward": reward},
+                headers={"Authorization": f"Bearer {api_key}"},
+                timeout=10,
+            )
+            resp.raise_for_status()
+        except Exception:
+            logger.warning(
+                "Failed to relay reward to training pipeline for an episode "
+                "(reward=%s); trajectory will train without it",
+                reward,
+            )
+
     async def _reap_idle_sessions() -> None:
         while True:
             await asyncio.sleep(60)
@@ -198,6 +235,11 @@ def create_data_proxy_app(config: DataProxyConfig) -> FastAPI:
         resp.raise_for_status()
 
         if session is not None:
+            # Relay the final reward into the training pipeline (best-effort;
+            # no-op in serving mode where no training_ctx was injected). Done
+            # only after the worker has successfully ended the episode.
+            if reward is not None:
+                await _relay_reward_to_training(session, reward)
             # The reward has been consumed by this episode; clear it so a
             # subsequent episode on the same key does not inherit a stale value.
             session.reward = None
@@ -208,9 +250,10 @@ def create_data_proxy_app(config: DataProxyConfig) -> FastAPI:
     async def set_reward(session_key: str, body: dict[str, Any]):
         """Record a scalar reward for the session.
 
-        The reward is buffered here and forwarded to the worker on the
-        next ``episode/end`` call.  Layer 2 will additionally relay it
-        to the ProxyGateway's ``/rl/set_reward`` endpoint for training.
+        The reward is buffered here and, on the next ``episode/end`` call,
+        forwarded to the worker and relayed to the training pipeline's
+        ``/rl/set_reward`` endpoint (see ``_relay_reward_to_training``).
+        In serving mode (no ``training_ctx``) the relay is skipped.
         """
         session = sessions.get(session_key)
         if session is None:

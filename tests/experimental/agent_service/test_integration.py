@@ -233,6 +233,82 @@ class TestToolCallFlow:
                 assert "tool_call_id" in tool_msgs[0]
 
 
+class TestRewardRelay:
+    """Layer 2: episode/end relays the final reward into the training pipeline.
+
+    The relay reuses the ``training_ctx`` (``llm_base_url`` / ``llm_api_key``)
+    injected at episode/start to POST the scalar to the proxy gateway's
+    ``/rl/set_reward``. In serving mode (no training_ctx) it is skipped.
+    """
+
+    @staticmethod
+    def _patched_post(relayed):
+        original_post = httpx.AsyncClient.post
+
+        async def patched_post(self, url, **kwargs):
+            request = httpx.Request("POST", url)
+            if "/rl/set_reward" in url:
+                relayed.append(
+                    {
+                        "url": url,
+                        "json": kwargs.get("json"),
+                        "headers": kwargs.get("headers"),
+                    }
+                )
+                return httpx.Response(200, json={"status": "ok"}, request=request)
+            if "worker" in url:
+                return httpx.Response(200, json={"status": "ok"}, request=request)
+            return await original_post(self, url, **kwargs)
+
+        return patched_post
+
+    @pytest.mark.asyncio
+    async def test_relay_fires_with_training_ctx(self):
+        proxy_app = create_data_proxy_app(DataProxyConfig(worker_addr="http://worker"))
+        relayed: list[dict] = []
+        proxy_transport = httpx.ASGITransport(app=proxy_app)
+
+        with patch.object(httpx.AsyncClient, "post", self._patched_post(relayed)):
+            async with httpx.AsyncClient(
+                transport=proxy_transport, base_url="http://proxy"
+            ) as client:
+                await client.post(
+                    "/session/s1/episode/start",
+                    json={
+                        "session_id": "demo-0",
+                        "llm_base_url": "http://proxy-gateway",
+                        "llm_api_key": "sk-sess-xyz",
+                        "llm_model": "Qwen",
+                    },
+                )
+                await client.post("/session/s1/reward", json={"reward": 1.0})
+                r = await client.post("/session/s1/episode/end", json={})
+                assert r.status_code == 200
+
+        assert len(relayed) == 1
+        assert relayed[0]["url"] == "http://proxy-gateway/rl/set_reward"
+        assert relayed[0]["json"] == {"reward": 1.0}
+        assert relayed[0]["headers"]["Authorization"] == "Bearer sk-sess-xyz"
+
+    @pytest.mark.asyncio
+    async def test_relay_skipped_without_training_ctx(self):
+        proxy_app = create_data_proxy_app(DataProxyConfig(worker_addr="http://worker"))
+        relayed: list[dict] = []
+        proxy_transport = httpx.ASGITransport(app=proxy_app)
+
+        with patch.object(httpx.AsyncClient, "post", self._patched_post(relayed)):
+            async with httpx.AsyncClient(
+                transport=proxy_transport, base_url="http://proxy"
+            ) as client:
+                # Serving mode: a reward is set but no episode/start ran, so the
+                # session carries no training_ctx and the relay must be skipped.
+                await client.post("/session/s2/reward", json={"reward": 0.5})
+                r = await client.post("/session/s2/episode/end", json={})
+                assert r.status_code == 200
+
+        assert relayed == []
+
+
 class TestGatewayHealth:
     @pytest.mark.asyncio
     async def test_health(self):

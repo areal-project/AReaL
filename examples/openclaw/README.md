@@ -142,15 +142,19 @@ DataProxy) and reuses the same OpenClaw subprocess.
 The same agent participates in RL through three DataProxy endpoints (the controller
 calls these once it can mint per-session keys):
 
-| Endpoint                            | Effect                                                                             |
-| ----------------------------------- | ---------------------------------------------------------------------------------- |
-| `POST /session/{key}/episode/start` | Forwards a `TrainingContext` → `on_episode_start` spawns a subprocess bound to it. |
-| `POST /session/{key}/reward`        | Buffers a scalar reward for the session.                                           |
-| `POST /session/{key}/episode/end`   | Forwards the final reward → `on_episode_end` tears the subprocess down.            |
+| Endpoint                            | Effect                                                                                                                                         |
+| ----------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
+| `POST /session/{key}/episode/start` | Forwards a `TrainingContext` → `on_episode_start` spawns a subprocess bound to it.                                                             |
+| `POST /session/{key}/reward`        | Buffers a scalar reward for the session.                                                                                                       |
+| `POST /session/{key}/episode/end`   | Forwards the final reward → `on_episode_end` tears the subprocess down, **and relays the reward to the training pipeline's `/rl/set_reward`**. |
 
 The `TrainingContext` carries `llm_base_url` / `llm_api_key` / `llm_model`, pointing
 OpenClaw's upstream at AReaL's proxy gateway so tokens and log-probabilities are
-captured for training.
+captured for training. On `episode/end` the DataProxy reuses that same `llm_base_url` /
+`llm_api_key` to POST the buffered reward to the proxy gateway's `/rl/set_reward`,
+binding the scalar reward to the captured trajectory. The relay is best-effort (a
+failure never breaks episode teardown) and is skipped automatically in serving mode,
+where no `TrainingContext` was injected.
 
 ### Environment variables
 
