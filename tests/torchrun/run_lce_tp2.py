@@ -7,7 +7,7 @@ import torch
 import torch.distributed as dist
 
 from areal.infra.platforms import current_platform
-from areal.models.kernel import linear_cross_entropy
+from areal.models.lce import linear_cross_entropy
 from areal.utils.functional import gather_logprobs_entropy
 
 

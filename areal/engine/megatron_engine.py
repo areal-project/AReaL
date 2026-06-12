@@ -90,7 +90,7 @@ from areal.engine.megatron_utils.pipeline_parallel import (
 )
 from areal.infra.dist_rollout import DistRolloutCoordinator
 from areal.infra.platforms import current_platform
-from areal.models.kernel import (
+from areal.models.lce import (
     linear_cross_entropy_logprobs,
     linear_cross_entropy_logprobs_entropy,
 )

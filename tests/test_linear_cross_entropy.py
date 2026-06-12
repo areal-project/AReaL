@@ -3,7 +3,7 @@
 Correctness + performance tests for the fused linear-cross-entropy kernel.
 
 The test suite verifies that
-:func:`areal.models.kernel.linear_cross_entropy_logprobs_entropy` produces
+:func:`areal.models.lce.linear_cross_entropy_logprobs_entropy` produces
 results numerically equivalent to the materialised ``logits @ weight`` +
 ``log_softmax`` reference, and that it provides a measurable wall-clock /
 memory benefit over the reference path on representative LLM shapes.
@@ -101,7 +101,7 @@ def test_linear_cross_entropy_correctness(
     dtype: torch.dtype,
 ) -> None:
     """Fused forward output must match the materialised reference."""
-    from areal.models.kernel import linear_cross_entropy_logprobs_entropy
+    from areal.models.lce import linear_cross_entropy_logprobs_entropy
 
     hidden, weight, labels = _make_inputs(num_tokens, hidden_size, vocab_size, dtype)
 
@@ -133,7 +133,7 @@ def test_linear_cross_entropy_correctness(
 @pytest.mark.parametrize("temperature", [0.7, 1.0, 1.5])
 def test_linear_cross_entropy_temperature(temperature: float) -> None:
     """Temperature scaling matches the reference for non-trivial values."""
-    from areal.models.kernel import linear_cross_entropy_logprobs_entropy
+    from areal.models.lce import linear_cross_entropy_logprobs_entropy
 
     hidden, weight, labels = _make_inputs(
         num_tokens=128, hidden_size=512, vocab_size=4096, dtype=torch.float32
@@ -174,7 +174,7 @@ def test_linear_cross_entropy_backward_matches_reference(
     drift in the fused d_hidden / d_weight kernels is caught at scale rather
     than only on toy inputs.
     """
-    from areal.models.kernel import linear_cross_entropy
+    from areal.models.lce import linear_cross_entropy
 
     hidden_a, weight_a, labels = _make_inputs(
         num_tokens, hidden_size, vocab_size, torch.float32
@@ -355,7 +355,7 @@ def _run_reference_forward_backward(hidden, weight, labels, temperature):
 
 
 def _run_fused_forward_backward(hidden, weight, labels, temperature):
-    from areal.models.kernel import linear_cross_entropy
+    from areal.models.lce import linear_cross_entropy
 
     h = hidden.detach().clone().requires_grad_(True)
     w = weight.detach().clone().requires_grad_(True)

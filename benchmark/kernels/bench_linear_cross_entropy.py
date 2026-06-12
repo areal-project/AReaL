@@ -124,7 +124,7 @@ def _ref_step(hidden, weight, labels, temperature=1.0, tp_group=None):
 
 
 def _fused_step(hidden, weight, labels, temperature=1.0, tp_group=None):
-    from areal.models.kernel import linear_cross_entropy
+    from areal.models.lce import linear_cross_entropy
 
     h = hidden.detach().clone().requires_grad_(True)
     w = weight.detach().clone().requires_grad_(True)

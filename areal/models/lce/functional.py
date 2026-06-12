@@ -113,7 +113,7 @@ def linear_cross_entropy_logprobs_entropy(
     leading_shape = labels.shape
 
     if _kernel_available():
-        from areal.models.kernel.linear_cross_entropy import linear_cross_entropy
+        from areal.models.lce.linear_cross_entropy import linear_cross_entropy
 
         if hidden.device.type != "cuda":
             logger.warning(
