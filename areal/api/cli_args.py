@@ -1234,6 +1234,12 @@ class TrainEngineConfig:
         default=3600.0,
         metadata={"help": "Gateway setup timeout in seconds for controller v2."},
     )
+    workers_ready_timeout: float = field(
+        default=30.0,
+        metadata={
+            "help": "Timeout (seconds) for initialize() to wait for guards to be ready."
+        },
+    )
     scheduling_strategy: SchedulingStrategy = field(
         default_factory=SchedulingStrategy,
         metadata={
@@ -2142,6 +2148,12 @@ class InferenceEngineConfig:
         default=300.0,
         metadata={
             "help": "Timeout in seconds of connecting to remote servers or launching local servers."
+        },
+    )
+    workers_ready_timeout: float = field(
+        default=30.0,
+        metadata={
+            "help": "Timeout (seconds) for initialize() to wait for guards to be ready."
         },
     )
     request_timeout: float = field(
