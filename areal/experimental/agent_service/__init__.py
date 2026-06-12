@@ -16,11 +16,18 @@ Submodules
 - ``protocol`` — WebSocket frame types and helpers
 """
 
-from .types import AgentRequest, AgentResponse, AgentRunnable, EventEmitter
+from .types import (
+    AgentRequest,
+    AgentResponse,
+    AgentRunnable,
+    EventEmitter,
+    TrainingContext,
+)
 
 __all__ = [
     "AgentRequest",
     "AgentResponse",
     "AgentRunnable",
     "EventEmitter",
+    "TrainingContext",
 ]
