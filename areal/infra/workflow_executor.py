@@ -832,6 +832,49 @@ class WorkflowExecutor:
         subdir = "eval-rollout" if is_eval else "rollout"
         return os.path.join(log_path, subdir)
 
+    @staticmethod
+    def _split_trajectory_for_dump(
+        ids: list[int], mask: list[int], tokenizer
+    ) -> dict[str, Any]:
+        assert len(ids) == len(mask)
+        prompt_end = mask.index(1) if 1 in mask else len(ids)
+        prompt_text = tokenizer.decode(ids[:prompt_end], skip_special_tokens=False)
+        completion_text = tokenizer.decode(ids[prompt_end:], skip_special_tokens=False)
+
+        raw_segments: list[dict[str, Any]] = []
+        n = len(mask)
+        idx = 0
+        seen_prompt = False
+        while idx < n:
+            j = idx + 1
+            while j < n and mask[j] == mask[idx]:
+                j += 1
+            if mask[idx] == 1:
+                role = "gen"
+            elif not seen_prompt:
+                role = "prompt"
+                seen_prompt = True
+            else:
+                role = "context"
+            raw_segments.append(
+                {
+                    "role": role,
+                    "len": j - idx,
+                    "text": tokenizer.decode(ids[idx:j], skip_special_tokens=False),
+                }
+            )
+            idx = j
+
+        gen_count = sum(1 for s in raw_segments if s["role"] == "gen")
+        segments = raw_segments if gen_count > 1 else None
+
+        return {
+            "prompt_end": prompt_end,
+            "prompt_text": prompt_text,
+            "completion_text": completion_text,
+            "segments": segments,
+        }
+
     async def _dump_trajectory(
         self,
         traj: dict[str, Any] | None,
@@ -872,14 +915,16 @@ class WorkflowExecutor:
             self.logger.warning(
                 "Trajectory missing 'versions' field, defaulting to current inference engine version."
             )
-            versions = [self.inference_engine.get_version()]
+            all_versions = None
+            default_version = self.inference_engine.get_version()
         else:
-            versions = traj["versions"].flatten().tolist()
+            all_versions = traj["versions"]
 
-        tail_version = max(versions)
-        head_version = min(versions)
+        global_tail = (
+            all_versions.max().item() if all_versions is not None else default_version
+        )
         # Create versioned directory
-        version_dir = os.path.join(dump_dir, str(tail_version))
+        version_dir = os.path.join(dump_dir, str(global_tail))
         await aiofiles.os.makedirs(version_dir, exist_ok=True)
 
         # Handle batched trajectories
@@ -897,15 +942,26 @@ class WorkflowExecutor:
                 if mask[-1] != 1:
                     continue
 
-                prompt_end = seqlen - sum(mask)
-                prompt_ids = ids[:prompt_end]
-                completion_ids = ids[prompt_end:]
+                if all_versions is not None:
+                    sample_versions = all_versions[i, :seqlen].tolist()
+                    output_versions = [
+                        v for v, m in zip(sample_versions, mask) if m == 1
+                    ]
+                else:
+                    output_versions = [default_version]
 
-                # Decode to text
-                prompt_text = tokenizer.decode(prompt_ids, skip_special_tokens=False)
-                completion_text = tokenizer.decode(
-                    completion_ids, skip_special_tokens=False
-                )
+                head_version = min(output_versions) if output_versions else -1
+                tail_version = max(output_versions) if output_versions else -1
+
+                # RLE: [[version, count], ...]
+                version_rle = []
+                for v in output_versions:
+                    if version_rle and version_rle[-1][0] == v:
+                        version_rle[-1][1] += 1
+                    else:
+                        version_rle.append([v, 1])
+
+                split = self._split_trajectory_for_dump(ids, mask, tokenizer)
 
                 reward = rewards[i].item()
 
@@ -913,13 +969,24 @@ class WorkflowExecutor:
                     "task_id": task_id,
                     "sample_idx": i,
                     "seqlen": seqlen,
-                    "prompt_len": prompt_end,
+                    "prompt_len": split["prompt_end"],
                     "head_version": head_version,
                     "tail_version": tail_version,
+                    "version_rle": version_rle,
                     "reward": reward,
-                    "prompt": prompt_text,
-                    "completion": completion_text,
+                    "prompt": split["prompt_text"],
+                    "completion": split["completion_text"],
                 }
+                if split["segments"] is not None:
+                    record["segments"] = split["segments"]
+
+                original_rewards = traj.get("original_rewards")
+                if original_rewards is not None:
+                    val = original_rewards[i]
+                    record["original_reward"] = (
+                        val.item() if hasattr(val, "item") else val
+                    )
+
                 await f.write(json.dumps(record) + "\n")
         return True, ""
 
