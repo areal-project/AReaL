@@ -359,6 +359,11 @@ class PPOActor:
                         sapo_tau_pos=self.config.sapo_tau_pos,
                         sapo_tau_neg=self.config.sapo_tau_neg,
                         use_decoupled_loss=self.config.use_decoupled_loss,
+                        enable_icepop=self.config.enable_icepop,
+                        icepop_alpha=self.config.icepop_alpha,
+                        icepop_beta=self.config.icepop_beta,
+                        enable_kpop=self.config.enable_kpop,
+                        kpop_phi=self.config.kpop_phi,
                     ),
                     loss_weight_fn=lambda x: x["loss_mask"].count_nonzero(),
                 )
@@ -421,6 +426,11 @@ def grpo_loss_fn(
     sapo_tau_pos: float = 1.0,
     sapo_tau_neg: float = 1.05,
     use_decoupled_loss: bool = False,
+    enable_icepop: bool = False,
+    icepop_alpha: float = 0.5,
+    icepop_beta: float = 5.0,
+    enable_kpop: bool = False,
+    kpop_phi: float = 2.0,
     vocab_min_logits: torch.Tensor | None = None,
     vocab_max_logits: torch.Tensor | None = None,
 ):
@@ -477,6 +487,11 @@ def grpo_loss_fn(
             rejection_sampling=rejection_sampling,
             importance_sampling_level=importance_sampling_level,
             cu_seqlens=input_data.get("cu_seqlens"),
+            enable_icepop=enable_icepop,
+            icepop_alpha=icepop_alpha,
+            icepop_beta=icepop_beta,
+            enable_kpop=enable_kpop,
+            kpop_phi=kpop_phi,
         )
 
     # Joint Distillation KL Loss
@@ -522,6 +537,18 @@ def grpo_loss_fn(
     if rkl_stat is not None:
         stats_tracker.stat(
             rkl_loss=rkl_stat,
+            denominator="n_valid_tokens",
+        )
+
+    if "icepop_filtered_mask" in stat:
+        stats_tracker.stat(
+            icepop_filtered_ratio=stat["icepop_filtered_mask"].float(),
+            denominator="n_valid_tokens",
+        )
+
+    if "kpop_filtered_mask" in stat:
+        stats_tracker.stat(
+            kpop_filtered_ratio=stat["kpop_filtered_mask"].float(),
             denominator="n_valid_tokens",
         )
 
