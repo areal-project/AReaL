@@ -983,7 +983,9 @@ class WorkflowExecutor:
                 original_rewards = traj.get("original_rewards")
                 if original_rewards is not None:
                     val = original_rewards[i]
-                    record["original_reward"] = val.item() if hasattr(val, "item") else val
+                    record["original_reward"] = (
+                        val.item() if hasattr(val, "item") else val
+                    )
 
                 await f.write(json.dumps(record) + "\n")
         return True, ""
