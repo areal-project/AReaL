@@ -550,7 +550,7 @@ def ppo_actor_loss_fn(
 
     # Apply IcePop (Double-Sided Masking)
     if enable_icepop:
-        imp_ratio = torch.exp(proximal_logprobs - old_logprobs)
+        imp_ratio = torch.exp(proximal_logprobs - old_logprobs).detach()
         icepop_mask = (imp_ratio >= icepop_alpha) & (imp_ratio <= icepop_beta)
         icepop_filtered_mask = loss_mask & ~icepop_mask
         loss_mask = loss_mask.logical_and(icepop_mask)
@@ -559,13 +559,17 @@ def ppo_actor_loss_fn(
 
     # Apply KPop (Bidirectional Binary KL Divergence Masking)
     if enable_kpop:
-        kl_fwd = compute_binary_kl_divergence(proximal_logprobs, old_logprobs)
-        kl_rev = compute_binary_kl_divergence(old_logprobs, proximal_logprobs)
+        kl_fwd = compute_binary_kl_divergence(
+            proximal_logprobs.detach(), old_logprobs.detach()
+        )
+        kl_rev = compute_binary_kl_divergence(
+            old_logprobs.detach(), proximal_logprobs.detach()
+        )
         kpop_mask = (kl_fwd < kpop_phi) & (kl_rev < kpop_phi)
         kpop_filtered_mask = loss_mask & ~kpop_mask
         loss_mask = loss_mask.logical_and(kpop_mask)
         loss_mask_count = loss_mask.count_nonzero() or 1
-        imp_ratio = torch.exp(proximal_logprobs - old_logprobs)
+        imp_ratio = torch.exp(proximal_logprobs - old_logprobs).detach()
         pg_loss = pg_loss * imp_ratio
 
     # Apply behavioural importance weight from rejection sampling
