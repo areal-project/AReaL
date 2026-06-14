@@ -1,0 +1,34 @@
+# SPDX-License-Identifier: Apache-2.0
+# Phase 1 PoC config for SD1.5 + LoRA + GRPO with an aesthetic reward.
+# This is a plain example config consumed by examples/diffusion/sd15_grpo.py;
+# it is NOT wired into areal/api/cli_args.py (Phase 1 keeps the API surface
+# untouched). Multi-GPU / FSDP2 / async rollout are out of scope for Phase 1.
+
+model:
+  # The original `runwayml/stable-diffusion-v1-5` repo was removed from the Hub;
+  # use the byte-identical community mirror (see prepare_assets.sh).
+  model_path: stable-diffusion-v1-5/stable-diffusion-v1-5
+  dtype: float16
+  device: cuda
+  lora_rank: 8
+
+reward:
+  # Path to the LAION aesthetic predictor MLP head, e.g.
+  # sac+logos+ava1-l14-linearMSE.pth. Required; no silent zero-reward fallback.
+  aesthetic_weights: null
+  clip_model: openai/clip-vit-large-patch14
+
+sampling:
+  group_size: 8
+  num_inference_steps: 20
+  guidance_scale: 7.5
+  # eta MUST be > 0 so the DDIM transition kernel is stochastic and yields
+  # per-step log-probs usable for policy gradients.
+  eta: 1.0
+  height: 512
+  width: 512
+
+train:
+  lr: 1.0e-4
+  num_iterations: 100
+  save_path: ./sd15_grpo_lora
