@@ -565,7 +565,7 @@ def ppo_actor_loss_fn(
         kl_rev = compute_binary_kl_divergence(
             old_logprobs.detach(), proximal_logprobs.detach()
         )
-        kpop_mask = (kl_fwd < kpop_phi) & (kl_rev < kpop_phi)
+        kpop_mask = (kl_fwd <= kpop_phi) & (kl_rev <= kpop_phi)
         kpop_filtered_mask = loss_mask & ~kpop_mask
         loss_mask = loss_mask.logical_and(kpop_mask)
         loss_mask_count = loss_mask.count_nonzero() or 1
