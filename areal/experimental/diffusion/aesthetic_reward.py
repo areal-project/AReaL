@@ -93,7 +93,7 @@ class AestheticScorer:
             nn.Linear(64, 16),
             nn.Linear(16, 1),
         )
-        state = torch.load(self.weights_path, map_location="cpu")
+        state = torch.load(self.weights_path, map_location="cpu", weights_only=True)
         # The official LAION checkpoint stores its head as an ``nn.Module`` whose
         # submodule is named ``layers`` (keys like ``layers.0.weight``), whereas
         # the bare ``nn.Sequential`` above expects keys like ``0.weight``. Strip

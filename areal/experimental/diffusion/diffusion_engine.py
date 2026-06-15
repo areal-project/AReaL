@@ -206,11 +206,21 @@ class DiffusionInferenceEngine:
             timestep
             - scheduler.config.num_train_timesteps // scheduler.num_inference_steps
         )
-        alpha_prod_t = scheduler.alphas_cumprod[timestep]
-        alpha_prod_t_prev = (
-            scheduler.alphas_cumprod[prev_timestep]
-            if prev_timestep >= 0
-            else scheduler.final_alpha_cumprod
+        # Keep everything on the timestep's device and branch with ``torch.where``
+        # instead of a Python ``if`` on a GPU tensor: evaluating ``prev_timestep >= 0``
+        # in a Python conditional forces a device-to-host sync on every denoising
+        # step, which is a hot-path stall during both rollout and training.
+        alphas_cumprod = scheduler.alphas_cumprod.to(device=timestep.device)
+        alpha_prod_t = alphas_cumprod[timestep]
+        prev_timestep_clipped = prev_timestep.clamp(min=0)
+        alpha_prod_t_prev = torch.where(
+            prev_timestep >= 0,
+            alphas_cumprod[prev_timestep_clipped],
+            torch.as_tensor(
+                scheduler.final_alpha_cumprod,
+                device=timestep.device,
+                dtype=alphas_cumprod.dtype,
+            ),
         )
         beta_prod_t = 1 - alpha_prod_t
         return alpha_prod_t, alpha_prod_t_prev, beta_prod_t
@@ -241,11 +251,15 @@ class DiffusionInferenceEngine:
             / (1 - alpha_prod_t)
             * (1 - alpha_prod_t / alpha_prod_t_prev)
         )
-        std_dev_t = eta * variance ** (0.5)
+        # Clamp before the square root: in float16/bfloat16, underflow or rounding
+        # can push ``variance`` (or the direction term below) slightly negative,
+        # and ``(<0) ** 0.5`` yields NaN that then propagates through the whole
+        # trajectory and destabilizes training.
+        std_dev_t = eta * variance.clamp(min=0.0) ** (0.5)
         # ---- Direction pointing to x_t (uses the std-corrected coefficient) ----
-        pred_sample_direction = (1 - alpha_prod_t_prev - std_dev_t**2) ** (
-            0.5
-        ) * noise_pred
+        pred_sample_direction = (1 - alpha_prod_t_prev - std_dev_t**2).clamp(
+            min=0.0
+        ) ** (0.5) * noise_pred
         mean = alpha_prod_t_prev ** (0.5) * pred_original + pred_sample_direction
         return mean, std_dev_t
 
@@ -257,11 +271,14 @@ class DiffusionInferenceEngine:
         Differentiable w.r.t. ``mean`` (and therefore w.r.t. ``noise_pred`` /
         the UNet params when ``mean`` carries grad).
         """
+        import torch
+
         std = std + 1e-8
+        # Use ``torch.log(std)`` rather than ``math.log(float(std))``: calling
+        # ``float()`` on a CUDA tensor forces a device-to-host sync every step
+        # (and breaks outright once ``std`` is non-scalar). Keep it on-device.
         log_prob = -0.5 * (
-            ((x - mean) ** 2) / (std**2)
-            + 2 * math.log(float(std))
-            + math.log(2 * math.pi)
+            ((x - mean) ** 2) / (std**2) + 2 * torch.log(std) + math.log(2 * math.pi)
         )
         return log_prob.sum(dim=tuple(range(1, log_prob.ndim)))
 
