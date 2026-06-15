@@ -12,9 +12,13 @@ Two pieces live here:
    LLM case (token-level ``logprob * advantage``), the diffusion trajectory is a
    sequence of *denoising steps*; each UNet prediction yields one step log-prob.
    The whole trajectory shares a single terminal advantage (the reward can only
-   be computed from the final image), so the loss is
-   ``- mean_t( logprob_t ) * advantage`` averaged over the batch. This mirrors
-   the ddpo-pytorch / TRL ``DDPOTrainer`` formulation.
+   be computed from the final image). When ``old_logprobs`` is supplied we use a
+   PPO-style clipped ratio surrogate ``min(r*A, clip(r)*A)`` with
+   ``r = exp(new_logprob - old_logprob)``; when it is ``None`` we fall back to
+   the plain REINFORCE surrogate ``- mean_t(logprob_t) * advantage``. Both
+   mirror the ddpo-pytorch / TRL ``DDPOTrainer`` formulation. The PPO form is
+   what enables off-policy reuse in Phase 2; in Phase 1 the single on-policy
+   step has ``new == old`` so the ratio is ~1 and the two forms coincide.
 
 The loss callable is shaped to be consumed by
 ``TrainEngine.train_batch(input_, loss_fn, loss_weight_fn)``: it accepts the
@@ -67,6 +71,8 @@ def diffusion_grpo_loss_fn(
     step_logprobs: torch.Tensor,
     advantages: torch.Tensor,
     loss_mask: torch.Tensor | None = None,
+    old_logprobs: torch.Tensor | None = None,
+    clip_eps: float = 0.2,
 ) -> torch.Tensor:
     """Step-level GRPO policy loss for a batch of diffusion trajectories.
 
@@ -78,6 +84,10 @@ def diffusion_grpo_loss_fn(
             across all steps of a trajectory.
         loss_mask: Optional ``[batch, num_steps]`` mask for variable-length
             trajectories. ``None`` means all steps are valid.
+        old_logprobs: Optional detached rollout-time per-step log-probs, same
+            shape as ``step_logprobs``. When provided, a PPO-style clipped ratio
+            surrogate is used; when ``None``, plain REINFORCE is used.
+        clip_eps: PPO clip range (only used when ``old_logprobs`` is provided).
 
     Returns:
         Scalar policy loss (to be minimized).
@@ -93,6 +103,11 @@ def diffusion_grpo_loss_fn(
             f"got advantages {tuple(advantages.shape)} vs "
             f"step_logprobs {tuple(step_logprobs.shape)}"
         )
+    if old_logprobs is not None and old_logprobs.shape != step_logprobs.shape:
+        raise ValueError(
+            f"old_logprobs must match step_logprobs shape; got "
+            f"{tuple(old_logprobs.shape)} vs {tuple(step_logprobs.shape)}"
+        )
 
     # Mean log-prob per trajectory over its denoising steps.
     if loss_mask is None:
@@ -101,6 +116,22 @@ def diffusion_grpo_loss_fn(
         denom = loss_mask.sum(dim=1).clamp_min(1.0)
         traj_logprob = (step_logprobs * loss_mask).sum(dim=1) / denom
 
-    # Policy gradient surrogate: maximize advantage-weighted log-prob.
-    loss = -(traj_logprob * advantages).mean()
+    if old_logprobs is None:
+        # Plain REINFORCE surrogate: maximize advantage-weighted log-prob.
+        loss = -(traj_logprob * advantages).mean()
+        return loss
+
+    # PPO-style clipped ratio surrogate. old_logprobs are the detached
+    # rollout-time values; the ratio is per-trajectory (mean over steps).
+    if loss_mask is None:
+        old_traj_logprob = old_logprobs.mean(dim=1)
+    else:
+        denom = loss_mask.sum(dim=1).clamp_min(1.0)
+        old_traj_logprob = (old_logprobs * loss_mask).sum(dim=1) / denom
+    old_traj_logprob = old_traj_logprob.detach()
+
+    ratio = torch.exp(traj_logprob - old_traj_logprob)
+    surr1 = ratio * advantages
+    surr2 = torch.clamp(ratio, 1.0 - clip_eps, 1.0 + clip_eps) * advantages
+    loss = -torch.minimum(surr1, surr2).mean()
     return loss

@@ -93,10 +93,15 @@ class DiffusionRolloutWorkflow(RolloutWorkflow):
 
         Returns:
             A dict carrying the batched trajectory:
-            ``step_logprobs`` ``[group_size, num_steps]`` (rollout-time, detached),
+            ``old_step_logprobs`` ``[group_size, num_steps]`` (rollout-time,
+            detached -- the PPO "old" policy log-probs),
             ``advantages`` ``[group_size]``, ``rewards`` ``[group_size]``,
             ``latents`` (list of per-sample latent trajectories), ``timesteps``,
-            and ``prompts``. Returns ``None`` if the prompt is missing.
+            and ``prompts``. The training step recomputes differentiable
+            log-probs from ``latents``/``timesteps`` via
+            ``engine.recompute_step_logprobs`` (the rollout-time values are
+            detached and cannot backprop). Returns ``None`` if the prompt is
+            missing.
         """
         prompt = data.get("prompt")
         if prompt is None:
@@ -138,7 +143,10 @@ class DiffusionRolloutWorkflow(RolloutWorkflow):
 
         return {
             "prompts": [prompt] * self.group_size,
-            "step_logprobs": step_logprobs,
+            # Rollout-time (detached) log-probs: the PPO "old" policy. The
+            # training step recomputes the differentiable "new" log-probs from
+            # the recorded latents/timesteps via recompute_step_logprobs.
+            "old_step_logprobs": step_logprobs,
             "advantages": advantages,
             "rewards": rewards,
             "latents": [r.latents for r in responses],

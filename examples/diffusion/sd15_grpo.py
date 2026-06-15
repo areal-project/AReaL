@@ -10,7 +10,7 @@ Run (requires a GPU, diffusers, peft, transformers, and the LAION aesthetic
 predictor weights)::
 
     python examples/diffusion/sd15_grpo.py \\
-        --model_path stable-diffusion-v1-5/stable-diffusion-v1-5 \\
+        --model_path runwayml/stable-diffusion-v1-5 \\
         --aesthetic_weights /path/to/sac+logos+ava1-l14-linearMSE.pth \\
         --num_iterations 100
 
@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from pathlib import Path
 
 from areal.experimental.diffusion.aesthetic_reward import make_aesthetic_reward_fn
 from areal.experimental.diffusion.diffusion_engine import DiffusionInferenceEngine
@@ -31,7 +32,8 @@ from areal.utils import logging
 
 logger = logging.getLogger("SD15GRPOExample")
 
-# A tiny fixed prompt set for the PoC. Replace with a real dataset loader.
+# Fallback prompt set when --prompt_file is not given. For real training pass a
+# prompt file (one prompt per line); see examples/diffusion/prompts/.
 DEFAULT_PROMPTS = [
     "a serene mountain lake at sunrise",
     "a cozy bookstore cafe in autumn",
@@ -40,22 +42,80 @@ DEFAULT_PROMPTS = [
 ]
 
 
+def load_prompts(prompt_file: str | None) -> list[str]:
+    """Load prompts from a text file (one per line), else use the fallback set.
+
+    Blank lines and lines starting with ``#`` are ignored.
+    """
+    if prompt_file is None:
+        logger.warning(
+            "No --prompt_file given; using %d built-in fallback prompts. "
+            "Pass a prompt file for real training.",
+            len(DEFAULT_PROMPTS),
+        )
+        return list(DEFAULT_PROMPTS)
+    path = Path(prompt_file)
+    if not path.is_file():
+        raise FileNotFoundError(f"--prompt_file not found: {prompt_file}")
+    prompts = [
+        line.strip()
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+    if not prompts:
+        raise ValueError(f"--prompt_file {prompt_file} contains no usable prompts")
+    logger.info("Loaded %d prompts from %s", len(prompts), prompt_file)
+    return prompts
+
+
 def parse_args():
     p = argparse.ArgumentParser(description="SD1.5 GRPO PoC")
-    # The original `runwayml/stable-diffusion-v1-5` repo was removed from the
-    # Hub; use the byte-identical community mirror (see prepare_assets.sh).
-    p.add_argument("--model_path", default="stable-diffusion-v1-5/stable-diffusion-v1-5")
+    p.add_argument("--model_path", default="runwayml/stable-diffusion-v1-5")
     p.add_argument("--aesthetic_weights", default=None)
     p.add_argument("--clip_model", default="openai/clip-vit-large-patch14")
     p.add_argument("--device", default="cuda")
-    p.add_argument("--dtype", default="float16")
+    p.add_argument(
+        "--dtype",
+        default="float32",
+        choices=["float32", "float16", "bfloat16"],
+        help=(
+            "Compute dtype for the diffusion pipeline. Default float32 is the "
+            "recommended/stable setting for REINFORCE fine-tuning: fp16 has a narrow "
+            "dynamic range and the UNet forward overflows to NaN after the first LoRA "
+            "update (rewards then collapse to the fixed aesthetic score of a NaN image). "
+            "On a 48GB GPU fp32 peaks at ~12GB, so there is no memory reason to use fp16."
+        ),
+    )
     p.add_argument("--lora_rank", type=int, default=8)
     p.add_argument("--group_size", type=int, default=8)
     p.add_argument("--num_inference_steps", type=int, default=20)
     p.add_argument("--guidance_scale", type=float, default=7.5)
     p.add_argument("--eta", type=float, default=1.0)
     p.add_argument("--lr", type=float, default=1e-4)
+    p.add_argument("--clip_eps", type=float, default=0.2)
+    p.add_argument(
+        "--max_grad_norm",
+        type=float,
+        default=1.0,
+        help="Gradient clipping max-norm for LoRA params. REINFORCE log-prob "
+        "gradients are large/high-variance; clipping is required for numerical "
+        "stability (without it the policy diverges to NaN within a few steps).",
+    )
     p.add_argument("--num_iterations", type=int, default=100)
+    p.add_argument(
+        "--reinforce_stepwise",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use memory-efficient per-step gradient accumulation (REINFORCE; "
+        "exact, ~single-step peak memory). Disable (--no-reinforce_stepwise) to "
+        "fall back to the whole-trajectory PPO-clip path (much higher memory).",
+    )
+    p.add_argument(
+        "--prompt_file",
+        default=None,
+        help="Text file with one training prompt per line (# comments allowed). "
+        "If omitted, a tiny built-in fallback prompt set is used.",
+    )
     p.add_argument("--save_path", default="./sd15_grpo_lora")
     return p.parse_args()
 
@@ -88,12 +148,15 @@ async def run(args):
         eta=args.eta,
     )
 
+    # ---- Prompts ----
+    prompts = load_prompts(args.prompt_file)
+
     # ---- Optimizer over LoRA params only ----
     trainable = [p for p in engine.unet.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(trainable, lr=args.lr)
 
     for step in range(args.num_iterations):
-        prompt = DEFAULT_PROMPTS[step % len(DEFAULT_PROMPTS)]
+        prompt = prompts[step % len(prompts)]
 
         # ---- Rollout (synchronous; engine is not an InferenceEngine) ----
         traj = await workflow.arun_episode(engine, {"prompt": prompt})
@@ -101,23 +164,91 @@ async def run(args):
             continue
 
         advantages = traj["advantages"].to(args.device)
-        # NOTE(agent): Phase 1 uses the rollout-time log-probs directly as a
-        # differentiable surrogate placeholder. A correct implementation must
-        # recompute step log-probs under grad (teacher-forcing the recorded
-        # latents through the UNet). That recompute path is tracked as a Phase 2
-        # follow-up in the execution plan; see diffusion_engine for the forward.
-        step_logprobs = traj["step_logprobs"].to(args.device).requires_grad_(True)
+        old_step_logprobs = traj["old_step_logprobs"].to(args.device)
 
-        loss = diffusion_grpo_loss_fn(step_logprobs, advantages)
-
+        # ---- Teacher-forcing recompute of differentiable step log-probs ----
+        # The rollout-time log-probs are detached and cannot backprop. We re-run
+        # each recorded latent trajectory through the (LoRA-updated) UNet UNDER
+        # grad to obtain new, differentiable per-step log-probs. This is the fix
+        # for the gradient backflow gap.
+        num_samples = len(traj["prompts"])
         optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+
+        if args.reinforce_stepwise:
+            # ---- Memory-efficient REINFORCE via per-step gradient accumulation ----
+            # The REINFORCE trajectory loss is linear in the per-step log-probs:
+            #   L = mean_s( -(1/T_s) * sum_t logprob_{s,t} * A_s )
+            #     = sum_s sum_t [ -(A_s / (G * T_s)) * logprob_{s,t} ]
+            # so we can backward each step immediately with weight
+            # -(A_s / (G * T_s)) and let autograd free that step's graph. Peak
+            # activation memory stays ~one denoising step instead of T steps,
+            # while the accumulated gradient is mathematically identical to
+            # backprop-ing the full summed loss. (PPO clip is non-linear in the
+            # step mean, so this exact-accumulation path is REINFORCE-only.)
+            total_loss_val = 0.0
+            for s in range(num_samples):
+                adv_s = float(advantages[s])
+                T_s = len(traj["timesteps"][s])
+                weight = -adv_s / (num_samples * T_s)
+                for logprob_t in engine.iter_step_logprobs(
+                    latents_traj=traj["latents"][s],
+                    timesteps=traj["timesteps"][s],
+                    prompt=traj["prompts"][s],
+                    eta=args.eta,
+                    guidance_scale=args.guidance_scale,
+                ):
+                    step_loss = weight * logprob_t
+                    step_loss.backward()
+                    total_loss_val += float(step_loss.detach())
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                trainable, max_norm=args.max_grad_norm
+            )
+            if torch.isfinite(grad_norm):
+                optimizer.step()
+            else:
+                logger.warning(
+                    f"[step {step}] non-finite grad norm ({float(grad_norm)}); "
+                    "skipping optimizer step to protect the policy."
+                )
+            loss_val = total_loss_val
+        else:
+            # ---- Original whole-trajectory path (PPO clip; high peak memory) ----
+            new_logprobs_per_sample = []
+            for s in range(num_samples):
+                lp = engine.recompute_step_logprobs(
+                    latents_traj=traj["latents"][s],
+                    timesteps=traj["timesteps"][s],
+                    prompt=traj["prompts"][s],
+                    eta=args.eta,
+                    guidance_scale=args.guidance_scale,
+                )
+                new_logprobs_per_sample.append(lp)
+            new_step_logprobs = torch.stack(new_logprobs_per_sample, dim=0)
+
+            loss = diffusion_grpo_loss_fn(
+                new_step_logprobs,
+                advantages,
+                old_logprobs=old_step_logprobs,
+                clip_eps=args.clip_eps,
+            )
+            loss.backward()
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                trainable, max_norm=args.max_grad_norm
+            )
+            if torch.isfinite(grad_norm):
+                optimizer.step()
+            else:
+                logger.warning(
+                    f"[step {step}] non-finite grad norm ({float(grad_norm)}); "
+                    "skipping optimizer step to protect the policy."
+                )
+            loss_val = float(loss)
+
         engine.set_version(engine.get_version() + 1)
 
         logger.info(
             f"[step {step}] reward_mean={float(traj['rewards'].mean()):.4f} "
-            f"loss={float(loss):.4f}"
+            f"loss={loss_val:.4f}"
         )
 
     engine.save(args.save_path)

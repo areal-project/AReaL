@@ -94,6 +94,15 @@ class AestheticScorer:
             nn.Linear(16, 1),
         )
         state = torch.load(self.weights_path, map_location="cpu")
+        # The official LAION checkpoint stores its head as an ``nn.Module`` whose
+        # submodule is named ``layers`` (keys like ``layers.0.weight``), whereas
+        # the bare ``nn.Sequential`` above expects keys like ``0.weight``. Strip
+        # the leading ``layers.`` prefix so the state dict loads cleanly.
+        if any(k.startswith("layers.") for k in state):
+            state = {
+                (k[len("layers.") :] if k.startswith("layers.") else k): v
+                for k, v in state.items()
+            }
         mlp.load_state_dict(state)
         self._mlp = mlp.to(self.device).eval()
         logger.info(

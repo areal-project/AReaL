@@ -5,9 +5,7 @@
 # untouched). Multi-GPU / FSDP2 / async rollout are out of scope for Phase 1.
 
 model:
-  # The original `runwayml/stable-diffusion-v1-5` repo was removed from the Hub;
-  # use the byte-identical community mirror (see prepare_assets.sh).
-  model_path: stable-diffusion-v1-5/stable-diffusion-v1-5
+  model_path: runwayml/stable-diffusion-v1-5
   dtype: float16
   device: cuda
   lora_rank: 8
@@ -30,5 +28,15 @@ sampling:
 
 train:
   lr: 1.0e-4
+  # PPO clip range for the GRPO ratio surrogate. In Phase 1 the single
+  # on-policy step keeps the ratio ~1, so clipping is rarely active; it matters
+  # for the off-policy reuse planned in Phase 2.
+  clip_eps: 0.2
   num_iterations: 100
   save_path: ./sd15_grpo_lora
+
+data:
+  # Text file with one training prompt per line (# comments allowed). Download
+  # nothing for this -- prompts ship in-repo. Run examples/diffusion/
+  # prepare_assets.sh to fetch the SD1.5 / CLIP / aesthetic-predictor weights.
+  prompt_file: examples/diffusion/prompts/aesthetic_prompts.txt

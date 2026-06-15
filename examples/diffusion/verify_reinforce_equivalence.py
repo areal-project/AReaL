@@ -1,4 +1,3 @@
-# SPDX-License-Identifier: Apache-2.0
 """Verify the REINFORCE per-step gradient-accumulation proposal.
 
 This script proves the two central claims of the issue's proposal:
@@ -25,20 +24,21 @@ import asyncio
 
 import torch
 
-from areal.experimental.diffusion import DiffusionInferenceEngine, DiffusionRolloutWorkflow
-from areal.utils import logging
-
 # Reuse the example's reward + prompt helpers so behaviour matches training.
 from examples.diffusion.sd15_grpo import load_prompts, make_aesthetic_reward_fn
+
+from areal.experimental.diffusion import (
+    DiffusionInferenceEngine,
+    DiffusionRolloutWorkflow,
+)
+from areal.utils import logging
 
 logger = logging.getLogger("VerifyReinforceEquiv")
 
 
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__)
-    # The original `runwayml/stable-diffusion-v1-5` repo was removed from the
-    # Hub; use the byte-identical community mirror (see prepare_assets.sh).
-    p.add_argument("--model_path", default="stable-diffusion-v1-5/stable-diffusion-v1-5")
+    p.add_argument("--model_path", default="runwayml/stable-diffusion-v1-5")
     p.add_argument("--aesthetic_weights", default=None)
     p.add_argument("--clip_model", default="openai/clip-vit-large-patch14")
     p.add_argument("--device", default="cuda")
@@ -176,7 +176,13 @@ async def run(args):
 
     # ---- Path A: whole-trajectory single backward ----
     g_whole, loss_whole, mem_whole = _grad_whole_trajectory(
-        engine, traj, advantages, num_samples, args.device, args.eta, args.guidance_scale
+        engine,
+        traj,
+        advantages,
+        num_samples,
+        args.device,
+        args.eta,
+        args.guidance_scale,
     )
     logger.info(
         f"[whole-trajectory] loss={loss_whole:.6f} "
@@ -185,7 +191,13 @@ async def run(args):
 
     # ---- Path B: per-step accumulation (the proposal) ----
     g_step, loss_step, mem_step = _grad_stepwise(
-        engine, traj, advantages, num_samples, args.device, args.eta, args.guidance_scale
+        engine,
+        traj,
+        advantages,
+        num_samples,
+        args.device,
+        args.eta,
+        args.guidance_scale,
     )
     logger.info(
         f"[stepwise-accum ] loss={loss_step:.6f} "
@@ -196,9 +208,7 @@ async def run(args):
     abs_diff = (g_whole - g_step).abs()
     max_abs = float(abs_diff.max())
     cos = float(
-        torch.nn.functional.cosine_similarity(
-            g_whole.unsqueeze(0), g_step.unsqueeze(0)
-        )
+        torch.nn.functional.cosine_similarity(g_whole.unsqueeze(0), g_step.unsqueeze(0))
     )
     # The fair equivalence metric is the *relative residual norm*:
     #   ||g_whole - g_step|| / ||g_whole||
