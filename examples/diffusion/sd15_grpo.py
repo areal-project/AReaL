@@ -9,10 +9,13 @@ contract, so we drive rollout with a plain loop here.
 Run (requires a GPU, diffusers, peft, transformers, and the LAION aesthetic
 predictor weights)::
 
+    bash examples/diffusion/prepare_assets.sh        # fetch SD1.5 + CLIP + reward
     python examples/diffusion/sd15_grpo.py \\
-        --model_path runwayml/stable-diffusion-v1-5 \\
-        --aesthetic_weights /path/to/sac+logos+ava1-l14-linearMSE.pth \\
         --num_iterations 100
+
+With no --model_path / --clip_model / --aesthetic_weights flags the script
+picks up the local copies that prepare_assets.sh writes under
+``./assets/diffusion`` (see the argparse defaults below).
 
 This is a proof of concept, not a production launcher; multi-GPU / FSDP2 / async
 rollout are explicitly out of scope for Phase 1 (see the execution plan).
@@ -70,9 +73,24 @@ def load_prompts(prompt_file: str | None) -> list[str]:
 
 def parse_args():
     p = argparse.ArgumentParser(description="SD1.5 GRPO PoC")
-    p.add_argument("--model_path", default="runwayml/stable-diffusion-v1-5")
-    p.add_argument("--aesthetic_weights", default=None)
-    p.add_argument("--clip_model", default="openai/clip-vit-large-patch14")
+    p.add_argument(
+        "--model_path",
+        default="./assets/diffusion/stable-diffusion-v1-5",
+        help="SD1.5 pipeline: local dir (default, as written by "
+        "prepare_assets.sh) or a HuggingFace/ModelScope hub id.",
+    )
+    p.add_argument(
+        "--aesthetic_weights",
+        default="./assets/diffusion/sac+logos+ava1-l14-linearMSE.pth",
+        help="LAION aesthetic MLP head (.pth). Defaults to the prepare_assets.sh "
+        "download location.",
+    )
+    p.add_argument(
+        "--clip_model",
+        default="./assets/diffusion/clip-vit-large-patch14",
+        help="CLIP ViT-L/14 backbone for the aesthetic reward: local dir "
+        "(default) or a HuggingFace hub id.",
+    )
     p.add_argument("--device", default="cuda")
     p.add_argument(
         "--dtype",

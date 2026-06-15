@@ -38,9 +38,17 @@ logger = logging.getLogger("VerifyReinforceEquiv")
 
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--model_path", default="runwayml/stable-diffusion-v1-5")
+    p.add_argument(
+        "--model_path",
+        default="./assets/diffusion/stable-diffusion-v1-5",
+        help="SD1.5 pipeline: local dir (default, from prepare_assets.sh) or a "
+        "HuggingFace/ModelScope hub id.",
+    )
     p.add_argument("--aesthetic_weights", default=None)
-    p.add_argument("--clip_model", default="openai/clip-vit-large-patch14")
+    p.add_argument(
+        "--clip_model",
+        default="./assets/diffusion/clip-vit-large-patch14",
+    )
     p.add_argument("--device", default="cuda")
     p.add_argument("--dtype", default="float32")
     p.add_argument("--lora_rank", type=int, default=8)

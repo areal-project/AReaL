@@ -5,16 +5,21 @@
 # untouched). Multi-GPU / FSDP2 / async rollout are out of scope for Phase 1.
 
 model:
-  model_path: runwayml/stable-diffusion-v1-5
-  dtype: float16
+  # Local dir written by prepare_assets.sh (default). Can also be a
+  # HuggingFace/ModelScope hub id.
+  model_path: ./assets/diffusion/stable-diffusion-v1-5
+  # float32 is the recommended/stable setting for REINFORCE fine-tuning: fp16 has
+  # a narrow dynamic range and the UNet forward overflows to NaN after the first
+  # LoRA update (rewards then collapse). On a 48GB GPU fp32 peaks at ~12GB.
+  dtype: float32
   device: cuda
   lora_rank: 8
 
 reward:
   # Path to the LAION aesthetic predictor MLP head, e.g.
   # sac+logos+ava1-l14-linearMSE.pth. Required; no silent zero-reward fallback.
-  aesthetic_weights: null
-  clip_model: openai/clip-vit-large-patch14
+  aesthetic_weights: ./assets/diffusion/sac+logos+ava1-l14-linearMSE.pth
+  clip_model: ./assets/diffusion/clip-vit-large-patch14
 
 sampling:
   group_size: 8
