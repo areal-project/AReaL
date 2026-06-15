@@ -57,6 +57,7 @@ from areal.utils.evaluator import Evaluator
 from areal.utils.hf_utils import load_hf_processor_and_tokenizer
 from areal.utils.perf_tracer import Category
 from areal.utils.recover import RecoverHandler
+from areal.utils.replay import NoOpRollout
 from areal.utils.saver import Saver
 from areal.utils.stats_logger import StatsLogger
 
@@ -100,51 +101,6 @@ class _EmptyDataLoader:
         return {}
 
     def load_state_dict(self, state_dict: dict) -> None:  # noqa: ARG002
-        pass
-
-
-class _NoOpRollout:
-    """Stub replacing the inference engine in replay mode.
-
-    Provides the same interface as a real rollout engine so that
-    ``PPOTrainer.train()`` can call pause/resume/set_version without
-    branching on replay mode at every call site.
-    """
-
-    staleness_manager = None
-    workflow_executor = None
-
-    def pause(self):
-        pass
-
-    def resume(self):
-        pass
-
-    def destroy(self):
-        pass
-
-    def set_version(self, version):  # noqa: ARG002
-        pass
-
-    def offload(self):
-        pass
-
-    def onload(self):
-        pass
-
-    def config_perf_tracer(self, *args, **kwargs):  # noqa: ARG002
-        pass
-
-    def save_perf_tracer(self, *args, **kwargs):  # noqa: ARG002
-        pass
-
-    def export_stats(self):
-        return {}
-
-    async def pause_generation(self):
-        pass
-
-    async def continue_generation(self):
         pass
 
 
@@ -404,7 +360,7 @@ class PPOTrainer:
         checkpoint recovery flow is executed.
         """
         if self._replay_mode:
-            self.rollout = _NoOpRollout()
+            self.rollout = NoOpRollout()
             self.eval_rollout = None
             self.weight_update_meta = None
             self._proxy_started = False
@@ -708,19 +664,26 @@ class PPOTrainer:
         steps_per_epoch = len(self.train_dataloader)
         max_steps = total_epochs * steps_per_epoch
 
-        # Initialize proxy workers if not using RolloutWorkflow
-        if workflow is None:
-            agent_cfg = self.config.rollout.agent
-            if agent_cfg is not None and agent_cfg.mode == "online":
+        # Initialize proxy workers if not using RolloutWorkflow.
+        #
+        # Replay mode uses a no-op stub in place of the real inference engine,
+        # so there are no proxy workers to launch and none are needed: every
+        # rollout/agent-workflow path loads trajectories from disk instead of
+        # calling the engine. Skip proxy initialization entirely so that
+        # start_proxy()/start_proxy_gateway() are never invoked on the stub.
+        if not self._replay_mode:
+            if workflow is None:
+                agent_cfg = self.config.rollout.agent
+                if agent_cfg is not None and agent_cfg.mode == "online":
+                    self._ensure_proxy_started()
+                else:
+                    raise ValueError(
+                        "workflow must be specified for train() unless "
+                        "agent.mode='online' is configured. "
+                        "Pass a RolloutWorkflow, AgentWorkflow, or callable."
+                    )
+            elif self._requires_proxy_workflow(workflow):
                 self._ensure_proxy_started()
-            else:
-                raise ValueError(
-                    "workflow must be specified for train() unless "
-                    "agent.mode='online' is configured. "
-                    "Pass a RolloutWorkflow, AgentWorkflow, or callable."
-                )
-        elif self._requires_proxy_workflow(workflow):
-            self._ensure_proxy_started()
 
         for global_step in range(start_step, max_steps):
             if (
