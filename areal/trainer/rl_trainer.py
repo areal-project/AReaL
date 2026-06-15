@@ -347,7 +347,22 @@ class PPOTrainer:
             )
             self.teacher.initialize(**engine_init_kwargs, role="teacher")
 
-        # -- Trajectory debug flags -------------------------------------------
+        # -- Trajectory debug setup -------------------------------------------
+        self._init_trajectory_debug(config)
+
+        # -- Rollout, weight-update, and recovery initialization ---------------
+        self._init_rollout_and_recovery(config, ft_spec)
+
+    # ------------------------------------------------------------------ #
+    #  Trajectory debug & rollout initialization (extracted for clarity)   #
+    # ------------------------------------------------------------------ #
+
+    def _init_trajectory_debug(self, config: PPOConfig) -> None:
+        """Parse trajectory debug config and set instance attributes.
+
+        Sets: _replay_mode, _dump_mode, _trajectory_dir, _dump_steps_set,
+              _max_keep, _pin_steps, _dump_scope.
+        """
         _traj_cfg = config.trajectory_debug
         self._replay_mode = _traj_cfg is not None and _traj_cfg.replay_rollout_data
         self._dump_mode = _traj_cfg is not None and _traj_cfg.dump_rollout_data
@@ -379,8 +394,15 @@ class PPOTrainer:
             _traj_cfg.dump_scope if _traj_cfg is not None else "rollout"
         )
 
-        # -- Rollout & weight-update initialization ----------------------------
-        # In replay mode, skip inference engine setup entirely and use a stub.
+    def _init_rollout_and_recovery(
+        self, config: PPOConfig, ft_spec: FinetuneSpec
+    ) -> None:
+        """Initialize rollout engine (or stub), weight-update meta, and recovery.
+
+        In replay mode the inference engine is replaced by a no-op stub and
+        recovery is skipped. Otherwise the full rollout + weight-update +
+        checkpoint recovery flow is executed.
+        """
         if self._replay_mode:
             self.rollout = _NoOpRollout()
             self.eval_rollout = None
@@ -391,10 +413,6 @@ class PPOTrainer:
                 for f in os.listdir(self._trajectory_dir)
                 if f.startswith("step_") and f.endswith(".pt")
             )
-            # Fail fast: a replay run with no dumped files on disk cannot make
-            # progress. Surfacing this at init (before the inference engine is
-            # stubbed out and cluster resources are acquired) gives a clearer
-            # diagnostic than a FileNotFoundError deep inside the train loop.
             if not available:
                 raise FileNotFoundError(
                     "Replay mode enabled but no trajectory files were found in "
