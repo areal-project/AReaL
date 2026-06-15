@@ -1348,8 +1348,10 @@ class RejectionSamplingConfig:
             "'ratio': direct importance ratio π_proximal/π_behave. "
             "'kl_k1': KL estimator k1 = log(r), forward KL unbiased estimator (can be negative). "
             "'kl_k2': KL estimator k2 = 0.5 * (log r)^2, non-negative quadratic approximation. "
-            "'kl_k3': KL estimator k3 = r - log(r) - 1, non-negative exact forward KL estimator.",
-            "choices": ["ratio", "kl_k1", "kl_k2", "kl_k3"],
+            "'kl_k3': KL estimator k3 = r - log(r) - 1, non-negative exact forward KL estimator. "
+            "'binary_kl': KPop (symmetric binary KL divergence) — masks tokens where either "
+            "KL(proximal||behave) or KL(behave||proximal) exceeds the upper bound.",
+            "choices": ["ratio", "kl_k1", "kl_k2", "kl_k3", "binary_kl"],
         },
     )
     agg: str = field(
@@ -1545,34 +1547,6 @@ class PPOActorConfig(TrainEngineConfig):
         metadata={"help": "SAPO temperature for negative advantages"},
     )
 
-    # IcePop (Double-Sided Masking) - https://ringtech.notion.site/icepop
-    enable_icepop: bool = field(
-        default=False,
-        metadata={"help": "Enable IcePop: masking tokens with upper and lower bounds."},
-    )
-    icepop_alpha: float = field(
-        default=0.5,
-        metadata={"help": "Lower bound on the off-policy correction ratio for IcePop."},
-    )
-    icepop_beta: float = field(
-        default=5.0,
-        metadata={"help": "Upper bound on the off-policy correction ratio for IcePop."},
-    )
-
-    # KPop (Bidirectional Binary KL Divergence Masking) - https://ringtech.notion.site/kpop
-    enable_kpop: bool = field(
-        default=False,
-        metadata={
-            "help": "Enable KPop: masking tokens with bidirectional binary KL divergence."
-        },
-    )
-    kpop_phi: float = field(
-        default=2.0,
-        metadata={
-            "help": "The bidirectional binary KL bound on the off-policy correction ratio for KPop."
-        },
-    )
-
     # Asynchronous RL
     recompute_logprob: bool = field(
         default=False,
@@ -1678,39 +1652,6 @@ class PPOActorConfig(TrainEngineConfig):
                 raise ValueError(
                     "SAPO is not compatible with `use_decoupled_loss=True`. "
                     "Please set `actor.use_decoupled_loss=false` in your configuration."
-                )
-
-        # Validate IcePop configuration
-        if self.enable_icepop:
-            if not self.use_decoupled_loss:
-                raise ValueError(
-                    "IcePop requires use_decoupled_loss=True. "
-                    "IcePop uses double-sided masking between proximal and "
-                    "rollout policies, which requires decoupled loss mode."
-                )
-            if self.icepop_alpha < 0 or self.icepop_beta <= 0:
-                raise ValueError(
-                    f"IcePop parameter icepop_alpha must be non-negative and icepop_beta must be positive. "
-                    f"Got icepop_alpha={self.icepop_alpha}, icepop_beta={self.icepop_beta}."
-                )
-            if self.icepop_alpha >= self.icepop_beta:
-                raise ValueError(
-                    f"IcePop parameter icepop_alpha must be less than icepop_beta. "
-                    f"Got icepop_alpha={self.icepop_alpha}, icepop_beta={self.icepop_beta}."
-                )
-
-        # Validate KPop configuration
-        if self.enable_kpop:
-            if not self.use_decoupled_loss:
-                raise ValueError(
-                    "KPop requires use_decoupled_loss=True. "
-                    "KPop uses bidirectional binary KL between proximal and "
-                    "rollout policies, which requires decoupled loss mode."
-                )
-            if self.kpop_phi <= 0:
-                raise ValueError(
-                    f"KPop parameter kpop_phi must be positive. "
-                    f"Got kpop_phi={self.kpop_phi}."
                 )
 
         super().__post_init__()

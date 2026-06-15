@@ -74,11 +74,10 @@ actor:
   ppo_n_minibatches: 1
   use_decoupled_loss: true
   rejection_sampling:
-    metric: ratio
-    upper: 5.0
-  # KPop: masking tokens with bidirectional binary KL divergence
-  enable_kpop: true
-  kpop_phi: 2.0
+    level: token
+    action: mask
+    metric: binary_kl
+    upper: 2.0
   reward_norm:
     mean_level: group
     std_level: group

@@ -74,12 +74,11 @@ actor:
   ppo_n_minibatches: 1
   use_decoupled_loss: true
   rejection_sampling:
+    level: token
+    action: mask
     metric: ratio
+    lower: 0.5
     upper: 5.0
-  # IcePop: masking tokens with upper and lower bounds
-  enable_icepop: true
-  icepop_alpha: 0.5
-  icepop_beta: 5.0
   reward_norm:
     mean_level: group
     std_level: group
