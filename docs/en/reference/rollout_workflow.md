@@ -140,15 +140,37 @@ Each line in the JSONL file contains:
 {
   "task_id": 42,
   "sample_idx": 0,
-  "seqlen": 256,
+  "seqlen": 512,
   "prompt_len": 128,
   "head_version": 5,
-  "tail_version": 5,
+  "tail_version": 6,
+  "version_rle": [[5, 100], [6, 200]],
   "reward": 1.0,
   "prompt": "<|im_start|>user\nWhat is 2+2?<|im_end|>\n<|im_start|>assistant\n",
   "completion": "The answer is 4.<|im_end|>"
 }
 ```
+
+**Field descriptions:**
+
+| Field             | Description                                                                                                                                                          |
+| ----------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `task_id`         | Batch task identifier                                                                                                                                                |
+| `sample_idx`      | Index of the sample within the batch                                                                                                                                 |
+| `seqlen`          | Effective sequence length                                                                                                                                            |
+| `prompt_len`      | Index of the first generated token (`mask.index(1)`). For multi-turn agent rollouts this is the position of the first assistant generation, not `seqlen - sum(mask)` |
+| `head_version`    | Per-sample minimum model version among `loss_mask==1` tokens                                                                                                         |
+| `tail_version`    | Per-sample maximum model version among `loss_mask==1` tokens                                                                                                         |
+| `version_rle`     | Run-length encoded per-token version sequence (output tokens only), e.g. `[[5, 100], [6, 200]]`                                                                      |
+| `reward`          | Reward value for this sample                                                                                                                                         |
+| `prompt`          | Decoded prompt text                                                                                                                                                  |
+| `completion`      | Decoded completion text                                                                                                                                              |
+| `segments`        | *(multi-turn only)* List of `{"role": "prompt"\|"gen"\|"context", "len": N, "text": "..."}`                                                                          |
+| `original_reward` | *(optional)* Pre-shaping reward value, if available from the workflow                                                                                                |
+
+**Directory naming:** The `{version}` directory is named by the batch-global maximum
+version (`global_tail`). Individual records within the same directory may have
+`tail_version <= global_tail`.
 
 ## Grouped Rollout
 

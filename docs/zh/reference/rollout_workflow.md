@@ -134,15 +134,36 @@ JSONL 文件的每一行包含：
 {
   "task_id": 42,
   "sample_idx": 0,
-  "seqlen": 256,
+  "seqlen": 512,
   "prompt_len": 128,
   "head_version": 5,
-  "tail_version": 5,
+  "tail_version": 6,
+  "version_rle": [[5, 100], [6, 200]],
   "reward": 1.0,
   "prompt": "<|im_start|>user\nWhat is 2+2?<|im_end|>\n<|im_start|>assistant\n",
   "completion": "The answer is 4.<|im_end|>"
 }
 ```
+
+**字段说明：**
+
+| 字段              | 说明                                                                                                                  |
+| ----------------- | --------------------------------------------------------------------------------------------------------------------- |
+| `task_id`         | Batch 任务标识符                                                                                                      |
+| `sample_idx`      | Batch 内的样本索引                                                                                                    |
+| `seqlen`          | 有效序列长度                                                                                                          |
+| `prompt_len`      | 第一个生成 token 的位置（`mask.index(1)`）。多轮 agent rollout 中为首次 assistant 生成位置，而非 `seqlen - sum(mask)` |
+| `head_version`    | Per-sample 最小模型版本，仅统计 `loss_mask==1` 的 token                                                               |
+| `tail_version`    | Per-sample 最大模型版本，仅统计 `loss_mask==1` 的 token                                                               |
+| `version_rle`     | RLE 编码的 per-token 版本序列（仅输出 token），例如 `[[5, 100], [6, 200]]`                                            |
+| `reward`          | 该样本的 reward 值                                                                                                    |
+| `prompt`          | 解码后的 prompt 文本                                                                                                  |
+| `completion`      | 解码后的 completion 文本                                                                                              |
+| `segments`        | *（仅多轮）* 分段列表 `[{"role": "prompt"\|"gen"\|"context", "len": N, "text": "..."}]`                               |
+| `original_reward` | *（可选）* reward shaping 前的原始 reward，如果 workflow 提供了该值                                                   |
+
+**目录命名：** `{version}` 目录以 batch 内的全局最大版本（`global_tail`）命名。 同一目录内的单条 record 的
+`tail_version` 可能 \<= 目录名。
 
 ## 分组 Rollout
 

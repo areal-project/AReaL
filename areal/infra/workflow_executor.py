@@ -836,37 +836,52 @@ class WorkflowExecutor:
     def _split_trajectory_for_dump(
         ids: list[int], mask: list[int], tokenizer
     ) -> dict[str, Any]:
-        assert len(ids) == len(mask)
+        if len(ids) != len(mask):
+            raise ValueError(f"ids length {len(ids)} != mask length {len(mask)}")
         prompt_end = mask.index(1) if 1 in mask else len(ids)
         prompt_text = tokenizer.decode(ids[:prompt_end], skip_special_tokens=False)
         completion_text = tokenizer.decode(ids[prompt_end:], skip_special_tokens=False)
 
-        raw_segments: list[dict[str, Any]] = []
+        # Count generation runs without decoding to avoid unnecessary work
+        # in the common single-turn case.
         n = len(mask)
+        gen_count = 0
         idx = 0
-        seen_prompt = False
         while idx < n:
             j = idx + 1
             while j < n and mask[j] == mask[idx]:
                 j += 1
             if mask[idx] == 1:
-                role = "gen"
-            elif not seen_prompt:
-                role = "prompt"
-                seen_prompt = True
-            else:
-                role = "context"
-            raw_segments.append(
-                {
-                    "role": role,
-                    "len": j - idx,
-                    "text": tokenizer.decode(ids[idx:j], skip_special_tokens=False),
-                }
-            )
+                gen_count += 1
             idx = j
 
-        gen_count = sum(1 for s in raw_segments if s["role"] == "gen")
-        segments = raw_segments if gen_count > 1 else None
+        # Only decode segments for multi-turn trajectories so single-turn
+        # keeps the same 2-decode cost as before.
+        segments: list[dict[str, Any]] | None = None
+        if gen_count > 1:
+            raw_segments: list[dict[str, Any]] = []
+            idx = 0
+            seen_prompt = False
+            while idx < n:
+                j = idx + 1
+                while j < n and mask[j] == mask[idx]:
+                    j += 1
+                if mask[idx] == 1:
+                    role = "gen"
+                elif not seen_prompt:
+                    role = "prompt"
+                    seen_prompt = True
+                else:
+                    role = "context"
+                raw_segments.append(
+                    {
+                        "role": role,
+                        "len": j - idx,
+                        "text": tokenizer.decode(ids[idx:j], skip_special_tokens=False),
+                    }
+                )
+                idx = j
+            segments = raw_segments
 
         return {
             "prompt_end": prompt_end,
@@ -884,111 +899,117 @@ class WorkflowExecutor:
         if traj is None:
             return False, "trajectory is None"
 
-        traj = RTensor.localize(traj)
+        try:
+            traj = RTensor.localize(traj)
 
-        dump_dir = self._get_dump_dir(is_eval)
-        if dump_dir is None:
-            return False, "dump dir is empty"
+            dump_dir = self._get_dump_dir(is_eval)
+            if dump_dir is None:
+                return False, "dump dir is empty"
 
-        tokenizer = self._get_tokenizer()
-        if tokenizer is None:
-            return False, "tokenizer not configured"
+            tokenizer = self._get_tokenizer()
+            if tokenizer is None:
+                return False, "tokenizer not configured"
 
-        # Extract tensors
-        input_ids = traj.get("input_ids")
-        rewards = traj.get("rewards")
-        loss_mask = traj.get("loss_mask")
-        attention_mask = traj.get("attention_mask")
+            # Extract tensors
+            input_ids = traj.get("input_ids")
+            rewards = traj.get("rewards")
+            loss_mask = traj.get("loss_mask")
+            attention_mask = traj.get("attention_mask")
 
-        if (
-            input_ids is None
-            or rewards is None
-            or loss_mask is None
-            or attention_mask is None
-        ):
-            return (
-                False,
-                "missing required tensor fields: input_ids, rewards, attention_mask, or loss_mask",
+            if (
+                input_ids is None
+                or rewards is None
+                or loss_mask is None
+                or attention_mask is None
+            ):
+                return (
+                    False,
+                    "missing required tensor fields: input_ids, rewards, attention_mask, or loss_mask",
+                )
+
+            if "versions" not in traj:
+                self.logger.warning(
+                    "Trajectory missing 'versions' field, defaulting to current inference engine version."
+                )
+                all_versions = None
+                default_version = self.inference_engine.get_version()
+            else:
+                all_versions = traj["versions"]
+
+            global_tail = (
+                all_versions.max().item()
+                if all_versions is not None
+                else default_version
             )
+            # Directory is named by batch-global max version (global_tail).
+            # Individual records may have tail_version <= global_tail.
+            version_dir = os.path.join(dump_dir, str(global_tail))
+            await aiofiles.os.makedirs(version_dir, exist_ok=True)
 
-        if "versions" not in traj:
-            self.logger.warning(
-                "Trajectory missing 'versions' field, defaulting to current inference engine version."
-            )
-            all_versions = None
-            default_version = self.inference_engine.get_version()
-        else:
-            all_versions = traj["versions"]
+            # Handle batched trajectories
+            batch_size = input_ids.shape[0]
+            original_rewards = traj.get("original_rewards")
 
-        global_tail = (
-            all_versions.max().item() if all_versions is not None else default_version
-        )
-        # Create versioned directory
-        version_dir = os.path.join(dump_dir, str(global_tail))
-        await aiofiles.os.makedirs(version_dir, exist_ok=True)
+            file_path = os.path.join(version_dir, f"{task_id}.jsonl")
+            async with aiofiles.open(file_path, "a") as f:
+                for i in range(batch_size):
+                    seqlen = attention_mask[i].sum().item()
+                    if seqlen == 0:
+                        continue
+                    ids = input_ids[i, :seqlen].tolist()
+                    mask = loss_mask[i, :seqlen].tolist()
+                    # Skip samples with empty completions
+                    if mask[-1] != 1:
+                        continue
 
-        # Handle batched trajectories
-        batch_size = input_ids.shape[0]
-
-        file_path = os.path.join(version_dir, f"{task_id}.jsonl")
-        async with aiofiles.open(file_path, "a") as f:
-            for i in range(batch_size):
-                seqlen = attention_mask[i].sum().item()
-                if seqlen == 0:
-                    continue
-                ids = input_ids[i, :seqlen].tolist()
-                mask = loss_mask[i, :seqlen].tolist()
-                # Skip samples with empty completions (all prompt, no completion tokens)
-                if mask[-1] != 1:
-                    continue
-
-                if all_versions is not None:
-                    sample_versions = all_versions[i, :seqlen].tolist()
-                    output_versions = [
-                        v for v, m in zip(sample_versions, mask) if m == 1
-                    ]
-                else:
-                    output_versions = [default_version]
-
-                head_version = min(output_versions) if output_versions else -1
-                tail_version = max(output_versions) if output_versions else -1
-
-                # RLE: [[version, count], ...]
-                version_rle = []
-                for v in output_versions:
-                    if version_rle and version_rle[-1][0] == v:
-                        version_rle[-1][1] += 1
+                    if all_versions is not None:
+                        sample_versions = all_versions[i, :seqlen].tolist()
+                        output_versions = [
+                            v for v, m in zip(sample_versions, mask) if m == 1
+                        ]
                     else:
-                        version_rle.append([v, 1])
+                        output_versions = [default_version]
 
-                split = self._split_trajectory_for_dump(ids, mask, tokenizer)
+                    head_version = min(output_versions) if output_versions else -1
+                    tail_version = max(output_versions) if output_versions else -1
 
-                reward = rewards[i].item()
+                    # RLE: [[version, count], ...]
+                    version_rle: list[list[int]] = []
+                    for v in output_versions:
+                        if version_rle and version_rle[-1][0] == v:
+                            version_rle[-1][1] += 1
+                        else:
+                            version_rle.append([v, 1])
 
-                record = {
-                    "task_id": task_id,
-                    "sample_idx": i,
-                    "seqlen": seqlen,
-                    "prompt_len": split["prompt_end"],
-                    "head_version": head_version,
-                    "tail_version": tail_version,
-                    "version_rle": version_rle,
-                    "reward": reward,
-                    "prompt": split["prompt_text"],
-                    "completion": split["completion_text"],
-                }
-                if split["segments"] is not None:
-                    record["segments"] = split["segments"]
+                    split = self._split_trajectory_for_dump(ids, mask, tokenizer)
 
-                original_rewards = traj.get("original_rewards")
-                if original_rewards is not None:
-                    val = original_rewards[i]
-                    record["original_reward"] = (
-                        val.item() if hasattr(val, "item") else val
-                    )
+                    reward = rewards[i].item()
 
-                await f.write(json.dumps(record) + "\n")
-        return True, ""
+                    record = {
+                        "task_id": task_id,
+                        "sample_idx": i,
+                        "seqlen": seqlen,
+                        "prompt_len": split["prompt_end"],
+                        "head_version": head_version,
+                        "tail_version": tail_version,
+                        "version_rle": version_rle,
+                        "reward": reward,
+                        "prompt": split["prompt_text"],
+                        "completion": split["completion_text"],
+                    }
+                    if split["segments"] is not None:
+                        record["segments"] = split["segments"]
+
+                    if original_rewards is not None:
+                        val = original_rewards[i]
+                        record["original_reward"] = (
+                            val.item() if hasattr(val, "item") else val
+                        )
+
+                    await f.write(json.dumps(record) + "\n")
+            return True, ""
+        except Exception as e:
+            return False, f"dump failed: {e}"
 
     def initialize(self, logger=None, train_data_parallel_size: int | None = None):
         """Initialize the workflow executor and start background threads.
