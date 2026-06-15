@@ -1131,7 +1131,7 @@ class MegatronEngine(TrainEngine):
         # memory left for TMS to back up.
         if self.mcore_config.disable_grad_buffers_cpu_backup:
             for m in self.model:
-                m.offload_grad_buffers()
+                m.offload_grad_buffers(synchronize=False, empty_cache=False)
 
         current_platform.clear_memory()
         torch_memory_saver.pause()
@@ -1155,7 +1155,7 @@ class MegatronEngine(TrainEngine):
         # storage and zeroes it; param.main_grad views become valid again.
         if self.mcore_config.disable_grad_buffers_cpu_backup:
             for m in self.model:
-                m.restore_grad_buffers()
+                m.restore_grad_buffers(synchronize=False)
 
         current_platform.clear_memory()
 
