@@ -332,6 +332,18 @@ monthly. We warmly welcome community engagement and contributions. We are also
 **actively hiring interns and full-time employees** with open positions in both the US
 and China.
 
+## 📢 Community
+
+<img src="./assets/figures/wechat_qrcode.png" width="200" alt="WeChat QR Code">
+
+We warmly welcome everyone to join our community! We have a _**WeChat group**_ for
+real-time discussions and a
+[GitHub discussion board](https://github.com/areal-project/AReaL/discussions) for
+asynchronous conversations.
+
+Check out our [Community Repository](https://github.com/areal-project/community) for
+more details and meeting materials.
+
 ## 🙏 Acknowledgments
 
 We gratefully acknowledge that major contributors are from the AReaL Team at the
