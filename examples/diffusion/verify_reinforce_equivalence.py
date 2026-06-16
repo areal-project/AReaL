@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Verify the REINFORCE per-step gradient-accumulation proposal.
 
 This script proves the two central claims of the issue's proposal:
