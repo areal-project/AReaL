@@ -27,8 +27,12 @@ def logs_dir() -> Path:
 
 @dataclass
 class ModelEntry:
+    kind: str = "internal"
+    backend: str = ""
+    api_url: str = ""
     pids: list[int] = field(default_factory=list)
     proxy_addrs: list[str] = field(default_factory=list)
+    inference_server_addrs: list[str] = field(default_factory=list)
 
 
 @dataclass

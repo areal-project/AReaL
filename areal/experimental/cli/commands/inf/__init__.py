@@ -8,6 +8,7 @@ import shlex
 import signal
 import sys
 import time
+from dataclasses import asdict
 from pathlib import Path
 
 import click
@@ -39,6 +40,7 @@ from areal.experimental.cli.commands.inf.state import (
     logs_dir,
     state_path,
 )
+from areal.experimental.cli.state import pid_alive
 
 
 @click.group(help="Manage the local AReaL inference service.")
@@ -188,7 +190,7 @@ def _register_internal(
     gateway: GatewayClient,
     router: RouterClient,
     log_dir: Path,
-) -> tuple[list[int], list[str]]:
+) -> tuple[list[int], list[str], list[str]]:
     engine, tp, dp, pp = _parse_backend_spec(backend)
     if pp > 1:
         raise click.ClickException(
@@ -288,14 +290,12 @@ def _register_internal(
             kill_pids(spawned, grace_s=10.0)
         raise
 
-    return spawned, proxy_addrs
+    return spawned, proxy_addrs, inf_addrs
 
 
 def _wait_inf_health(addr: str, *, deadline: float, pid: int, label: str) -> None:
     import urllib.error
     import urllib.request
-
-    from areal.experimental.cli.state import pid_alive
 
     last_err: Exception | None = None
     url = f"{addr}/health"
@@ -446,10 +446,13 @@ def _do_run(opts: dict) -> int:
                     provider_model=opts["provider_model"],
                     gateway=gateway_client,
                 )
-                state.models[opts["model"]] = ModelEntry(pids=[], proxy_addrs=[])
+                state.models[opts["model"]] = ModelEntry(
+                    kind="external",
+                    api_url=opts["api_url"],
+                )
                 state.save()
             else:
-                pids, proxy_addrs = _register_internal(
+                pids, proxy_addrs, inf_addrs = _register_internal(
                     model=opts["model"],
                     backend=opts["backend"],
                     model_path=opts["model_path"],
@@ -464,7 +467,11 @@ def _do_run(opts: dict) -> int:
                     log_dir=log_dir,
                 )
                 state.models[opts["model"]] = ModelEntry(
-                    pids=pids, proxy_addrs=proxy_addrs,
+                    kind="internal",
+                    backend=opts["backend"],
+                    pids=pids,
+                    proxy_addrs=proxy_addrs,
+                    inference_server_addrs=inf_addrs,
                 )
                 state.save()
         except BaseException:
@@ -520,28 +527,24 @@ def _do_ps(as_json: bool) -> int:
             click.echo("daemon not running")
         return 0
 
-    gateway = GatewayClient(s.gateway_url, s.admin_api_key)
-    try:
-        resp = gateway.list_models()
-    except (GatewayUnreachable, GatewayHTTPError) as e:
-        raise click.ClickException(f"list_models failed: {e}") from e
-
-    models = resp.get("data") or resp.get("models") or []
     if as_json:
-        click.echo(json.dumps(models, indent=2))
+        out = [
+            {"name": name, **asdict(entry)}
+            for name, entry in s.models.items()
+        ]
+        click.echo(json.dumps(out, indent=2))
         return 0
 
-    if not models:
+    if not s.models:
         click.echo("no models registered")
         return 0
 
     rows = []
-    for m in models:
-        if isinstance(m, str):
-            rows.append((m,))
-        elif isinstance(m, dict):
-            rows.append((m.get("id") or m.get("name") or "?",))
-    cols = ("NAME",)
+    for name, entry in s.models.items():
+        backend = entry.backend if entry.kind == "internal" else "-"
+        workers = str(len(entry.pids) // 2) if entry.kind == "internal" else "-"
+        rows.append((name, entry.kind, backend, workers))
+    cols = ("NAME", "KIND", "BACKEND", "WORKERS")
     widths = [max(len(r[i]) for r in (cols, *rows)) for i in range(len(cols))]
     fmt = "  ".join(f"{{:<{w}}}" for w in widths)
     click.echo(fmt.format(*cols))
@@ -576,42 +579,54 @@ def _do_status(as_json: bool) -> int:
         raise click.ClickException(f"failed to load state: {e}") from e
 
     pid_ok = gateway_alive(s)
-    gateway_http = "unknown"
-    n_models = -1
+    gateway_http = "down"
     if pid_ok:
-        gc = GatewayClient(s.gateway_url, s.admin_api_key)
         try:
-            gc.health(timeout=2.0)
+            GatewayClient(s.gateway_url, s.admin_api_key).health(timeout=2.0)
             gateway_http = "ok"
         except GatewayUnreachable:
             gateway_http = "unreachable"
         except GatewayHTTPError:
             gateway_http = "error"
-        if gateway_http == "ok":
-            try:
-                resp = gc.list_models(timeout=3.0)
-                items = resp.get("data") or resp.get("models") or []
-                n_models = len(items) if isinstance(items, list) else 0
-            except (GatewayUnreachable, GatewayHTTPError):
-                pass
 
-    snap = {
-        "running": pid_ok,
-        "gateway_url": s.gateway_url,
-        "gateway_pid": s.gateway_pid,
-        "gateway_http": gateway_http,
-        "models": n_models,
-        "started_at": s.started_at,
-    }
+    rows: list[tuple[str, str, str, str]] = []
+    rows.append((
+        "gateway", gateway_http, s.gateway_url, f"models={len(s.models)}",
+    ))
+    rows.append((
+        "router", "ok" if pid_alive(s.router_pid) else "down",
+        s.router_url, "",
+    ))
+    for name, entry in s.models.items():
+        if entry.kind == "internal":
+            detail = (
+                f"backend={entry.backend} workers={len(entry.pids) // 2}"
+            )
+            addr = "internal"
+        else:
+            detail = f"api_url={entry.api_url}"
+            addr = "external"
+        rows.append((name, "registered", addr, detail))
+
     if as_json:
+        snap = {
+            "running": pid_ok,
+            "gateway_url": s.gateway_url,
+            "gateway_pid": s.gateway_pid,
+            "gateway_http": gateway_http,
+            "router_url": s.router_url,
+            "started_at": s.started_at,
+            "models": {n: asdict(e) for n, e in s.models.items()},
+        }
         click.echo(json.dumps(snap, indent=2))
         return 0
 
-    click.echo(f"gateway_url:  {s.gateway_url}")
-    click.echo(f"gateway_pid:  {s.gateway_pid}  ({'alive' if pid_ok else 'dead'})")
-    click.echo(f"gateway_http: {gateway_http}")
-    click.echo(f"models:       {n_models if n_models >= 0 else 'unknown'}")
-    click.echo(f"started_at:   {s.started_at:.0f}")
+    cols = ("COMPONENT", "STATUS", "ADDR", "DETAILS")
+    widths = [max(len(r[i]) for r in (cols, *rows)) for i in range(len(cols))]
+    fmt = "  ".join(f"{{:<{w}}}" for w in widths)
+    click.echo(fmt.format(*cols))
+    for r in rows:
+        click.echo(fmt.format(*r))
     return 0
 
 
@@ -712,12 +727,15 @@ def _do_register(name: str, opts: dict) -> int:
             provider_model=opts["provider_model"],
             gateway=gateway,
         )
-        s.models[name] = ModelEntry(pids=[], proxy_addrs=[])
+        s.models[name] = ModelEntry(
+            kind="external",
+            api_url=opts["api_url"],
+        )
         s.save()
         logger.info("registered external model %r", name)
         return 0
 
-    pids, proxy_addrs = _register_internal(
+    pids, proxy_addrs, inf_addrs = _register_internal(
         model=name,
         backend=opts["backend"],
         model_path=opts["model_path"],
@@ -731,7 +749,13 @@ def _do_register(name: str, opts: dict) -> int:
         router=router,
         log_dir=logs_dir(),
     )
-    s.models[name] = ModelEntry(pids=pids, proxy_addrs=proxy_addrs)
+    s.models[name] = ModelEntry(
+        kind="internal",
+        backend=opts["backend"],
+        pids=pids,
+        proxy_addrs=proxy_addrs,
+        inference_server_addrs=inf_addrs,
+    )
     s.save()
     logger.info(
         "registered internal model %r (%d worker(s))", name, len(pids)
