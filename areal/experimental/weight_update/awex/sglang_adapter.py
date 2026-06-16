@@ -30,7 +30,10 @@ from awex.util.tensor_util import (
     reconstruct_tensors_from_groups,
 )
 
-from areal.experimental.weight_update.awex import fetch_kv_metadata
+from areal.experimental.weight_update.awex import (
+    awex_wu_use_group,
+    fetch_kv_metadata,
+)
 from areal.experimental.weight_update.inference_adapter import (
     AwexInferenceAdapter,
 )
@@ -409,7 +412,12 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
             self._transfer_plan,
             self._weights_update_group,
         )
-        batch_send_recv(send_ops=[], recv_ops=recv_ops, blocking=True)
+        batch_send_recv(
+            send_ops=[],
+            recv_ops=recv_ops,
+            blocking=True,
+            use_group=awex_wu_use_group(),
+        )
 
         for original, contiguous in non_contiguous_pairs:
             original.copy_(contiguous)
