@@ -526,21 +526,24 @@ def _do_ps(as_json: bool) -> int:
         else:
             click.echo("daemon not running")
         return 0
+    return _print_models(s, as_json)
 
+
+def _print_models(state: DaemonState, as_json: bool) -> int:
     if as_json:
         out = [
             {"name": name, **asdict(entry)}
-            for name, entry in s.models.items()
+            for name, entry in state.models.items()
         ]
         click.echo(json.dumps(out, indent=2))
         return 0
 
-    if not s.models:
+    if not state.models:
         click.echo("no models registered")
         return 0
 
     rows = []
-    for name, entry in s.models.items():
+    for name, entry in state.models.items():
         backend = entry.backend if entry.kind == "internal" else "-"
         workers = str(len(entry.pids) // 2) if entry.kind == "internal" else "-"
         rows.append((name, entry.kind, backend, workers))
@@ -551,6 +554,28 @@ def _do_ps(as_json: bool) -> int:
     for r in rows:
         click.echo(fmt.format(*r))
     return 0
+
+
+# =============================================================================
+# inf models
+# =============================================================================
+
+
+@inf.command(name="models", help="List registered models.")
+@click.option("--json", "as_json", is_flag=True, help="Emit JSON.")
+def _models_cmd(as_json: bool) -> None:
+    raise SystemExit(_do_models(as_json) or 0)
+
+
+def _do_models(as_json: bool) -> int:
+    s = _running_state()
+    if s is None:
+        if as_json:
+            click.echo("[]")
+        else:
+            click.echo("daemon not running")
+        return 0
+    return _print_models(s, as_json)
 
 
 # =============================================================================
