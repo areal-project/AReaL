@@ -33,7 +33,7 @@ class RolloutWorkflow(ABC):
     async def arun_episode(
         self, engine: InferenceEngine, data: dict[str, Any]
     ) -> dict[str, Any] | None | dict[str, InteractionWithTokenLogpReward]:
-        """Run a single episode of the workflow."""
+        """Run one rollout task with the workflow."""
         ...
 ```
 
@@ -195,7 +195,7 @@ has shape `[4, seq_len]` (4 samples concatenated).
 
 ### Implementation
 
-From `areal/infra/remote_inf_engine.py`:
+From `areal/workflow/wrappers.py`:
 
 ```python
 class GroupedRolloutWorkflow(RolloutWorkflow):
