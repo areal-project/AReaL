@@ -1,4 +1,4 @@
-"""Tests for WorkflowExecutor._split_trajectory_for_dump."""
+"""Tests for WorkflowExecutor._split_trajectory_for_dump and _compute_output_versions."""
 
 import pytest
 
@@ -75,3 +75,45 @@ class TestSplitTrajectoryForDump:
         result = WorkflowExecutor._split_trajectory_for_dump(ids, mask, tokenizer)
         assert result["prompt_end"] == 0
         assert result["segments"] is None
+
+
+class TestComputeOutputVersions:
+    def test_filters_negative_one_placeholders(self):
+        versions = [-1, -1, 5, 5, 6]
+        mask = [0, 0, 1, 1, 1]
+        head, tail, rle = WorkflowExecutor._compute_output_versions(versions, mask)
+        assert head == 5
+        assert tail == 6
+        assert rle == [[5, 2], [6, 1]]
+
+    def test_single_version(self):
+        versions = [-1, 3, 3, 3]
+        mask = [0, 1, 1, 1]
+        head, tail, rle = WorkflowExecutor._compute_output_versions(versions, mask)
+        assert head == 3
+        assert tail == 3
+        assert rle == [[3, 3]]
+
+    def test_multiple_version_transitions(self):
+        versions = [-1, 2, 2, 3, 3, 4]
+        mask = [0, 1, 1, 1, 1, 1]
+        head, tail, rle = WorkflowExecutor._compute_output_versions(versions, mask)
+        assert head == 2
+        assert tail == 4
+        assert rle == [[2, 2], [3, 2], [4, 1]]
+
+    def test_all_masked_out(self):
+        versions = [1, 2, 3]
+        mask = [0, 0, 0]
+        head, tail, rle = WorkflowExecutor._compute_output_versions(versions, mask)
+        assert head == -1
+        assert tail == -1
+        assert rle == []
+
+    def test_interleaved_multi_turn(self):
+        versions = [-1, -1, 5, 5, -1, -1, 6, 6]
+        mask = [0, 0, 1, 1, 0, 0, 1, 1]
+        head, tail, rle = WorkflowExecutor._compute_output_versions(versions, mask)
+        assert head == 5
+        assert tail == 6
+        assert rle == [[5, 2], [6, 2]]

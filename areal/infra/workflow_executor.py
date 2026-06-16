@@ -833,6 +833,22 @@ class WorkflowExecutor:
         return os.path.join(log_path, subdir)
 
     @staticmethod
+    def _compute_output_versions(
+        sample_versions: list[int], mask: list[int]
+    ) -> tuple[int, int, list[list[int]]]:
+        """Filter versions by loss_mask and compute head, tail, and RLE."""
+        output_versions = [v for v, m in zip(sample_versions, mask) if m == 1]
+        head = min(output_versions) if output_versions else -1
+        tail = max(output_versions) if output_versions else -1
+        rle: list[list[int]] = []
+        for v in output_versions:
+            if rle and rle[-1][0] == v:
+                rle[-1][1] += 1
+            else:
+                rle.append([v, 1])
+        return head, tail, rle
+
+    @staticmethod
     def _split_trajectory_for_dump(
         ids: list[int], mask: list[int], tokenizer
     ) -> dict[str, Any]:
@@ -948,7 +964,6 @@ class WorkflowExecutor:
 
             # Handle batched trajectories
             batch_size = input_ids.shape[0]
-            original_rewards = traj.get("original_rewards")
 
             file_path = os.path.join(version_dir, f"{task_id}.jsonl")
             async with aiofiles.open(file_path, "a") as f:
@@ -964,22 +979,12 @@ class WorkflowExecutor:
 
                     if all_versions is not None:
                         sample_versions = all_versions[i, :seqlen].tolist()
-                        output_versions = [
-                            v for v, m in zip(sample_versions, mask) if m == 1
-                        ]
+                        head_version, tail_version, version_rle = (
+                            self._compute_output_versions(sample_versions, mask)
+                        )
                     else:
-                        output_versions = [default_version]
-
-                    head_version = min(output_versions) if output_versions else -1
-                    tail_version = max(output_versions) if output_versions else -1
-
-                    # RLE: [[version, count], ...]
-                    version_rle: list[list[int]] = []
-                    for v in output_versions:
-                        if version_rle and version_rle[-1][0] == v:
-                            version_rle[-1][1] += 1
-                        else:
-                            version_rle.append([v, 1])
+                        head_version = tail_version = default_version
+                        version_rle = [[default_version, sum(mask)]]
 
                     split = self._split_trajectory_for_dump(ids, mask, tokenizer)
 
@@ -999,12 +1004,6 @@ class WorkflowExecutor:
                     }
                     if split["segments"] is not None:
                         record["segments"] = split["segments"]
-
-                    if original_rewards is not None:
-                        val = original_rewards[i]
-                        record["original_reward"] = (
-                            val.item() if hasattr(val, "item") else val
-                        )
 
                     await f.write(json.dumps(record) + "\n")
             return True, ""

@@ -153,20 +153,19 @@ Each line in the JSONL file contains:
 
 **Field descriptions:**
 
-| Field             | Description                                                                                                                                                          |
-| ----------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `task_id`         | Batch task identifier                                                                                                                                                |
-| `sample_idx`      | Index of the sample within the batch                                                                                                                                 |
-| `seqlen`          | Effective sequence length                                                                                                                                            |
-| `prompt_len`      | Index of the first generated token (`mask.index(1)`). For multi-turn agent rollouts this is the position of the first assistant generation, not `seqlen - sum(mask)` |
-| `head_version`    | Per-sample minimum model version among `loss_mask==1` tokens                                                                                                         |
-| `tail_version`    | Per-sample maximum model version among `loss_mask==1` tokens                                                                                                         |
-| `version_rle`     | Run-length encoded per-token version sequence (output tokens only), e.g. `[[5, 100], [6, 200]]`                                                                      |
-| `reward`          | Reward value for this sample                                                                                                                                         |
-| `prompt`          | Decoded prompt text                                                                                                                                                  |
-| `completion`      | Decoded completion text                                                                                                                                              |
-| `segments`        | *(multi-turn only)* List of `{"role": "prompt"\|"gen"\|"context", "len": N, "text": "..."}`                                                                          |
-| `original_reward` | *(optional)* Pre-shaping reward value, if available from the workflow                                                                                                |
+| Field          | Description                                                                                                                                                          |
+| -------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `task_id`      | Batch task identifier                                                                                                                                                |
+| `sample_idx`   | Index of the sample within the batch                                                                                                                                 |
+| `seqlen`       | Effective sequence length                                                                                                                                            |
+| `prompt_len`   | Index of the first generated token (`mask.index(1)`). For multi-turn agent rollouts this is the position of the first assistant generation, not `seqlen - sum(mask)` |
+| `head_version` | Per-sample minimum model version among `loss_mask==1` tokens                                                                                                         |
+| `tail_version` | Per-sample maximum model version among `loss_mask==1` tokens                                                                                                         |
+| `version_rle`  | Run-length encoded per-token version sequence (output tokens only), e.g. `[[5, 100], [6, 200]]`                                                                      |
+| `reward`       | Reward value for this sample                                                                                                                                         |
+| `prompt`       | Decoded prompt text                                                                                                                                                  |
+| `completion`   | Decoded completion text                                                                                                                                              |
+| `segments`     | *(multi-turn only)* List of `{"role": "prompt"\|"gen"\|"context", "len": N, "text": "..."}`                                                                          |
 
 **Directory naming:** The `{version}` directory is named by the batch-global maximum
 version (`global_tail`). Individual records within the same directory may have
