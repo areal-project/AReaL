@@ -2551,8 +2551,10 @@ class TrajectoryDebugConfig:
             ``<fileroot>/<experiment>/<trial>/debug_trajectories/``.
         dump_steps: Only dump at these global steps (must be non-negative).
             None means dump every step.
-        max_keep: Keep only the most recent N trajectory files on disk.
-            Older files are deleted after each dump. None means keep all.
+        max_keep: Keep only the most recent N trajectory *steps* on disk.
+            In SPMD mode each step produces one file per DP rank; all files
+            belonging to the same step are treated as a unit. Older steps are
+            deleted after each dump. None means keep all.
         pin_steps: Steps whose files are never deleted by max_keep rotation.
             Useful for preserving known-bad steps for later replay.
         dump_scope: What to dump. "rollout" saves prepare_batch output only.
@@ -2592,9 +2594,10 @@ class TrajectoryDebugConfig:
         default=None,
         metadata={
             "help": (
-                "Keep only the most recent N trajectory files on disk. "
-                "Older files are deleted automatically after each dump. "
-                "None means keep all files (no rotation)."
+                "Keep only the most recent N trajectory steps on disk. "
+                "In SPMD mode all DP-rank files for a step are treated as "
+                "one unit. Older steps are deleted after each dump. "
+                "None means keep all (no rotation)."
             )
         },
     )

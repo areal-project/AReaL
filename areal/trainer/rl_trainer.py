@@ -1393,10 +1393,17 @@ class PPOTrainer:
             self._rotate_trajectories()
 
     def _rotate_trajectories(self) -> None:
-        """Delete oldest trajectory files, keeping only the most recent N.
+        """Delete oldest trajectory steps, keeping only the most recent N steps.
 
-        Files whose step number appears in ``self._pin_steps`` are exempt
-        from deletion and do not count toward the ``max_keep`` budget.
+        Rotation operates at **step granularity**: in SPMD mode each step
+        produces one file per data-parallel rank (e.g. step_000042_dp_0.pt,
+        step_000042_dp_1.pt, ...). All files belonging to the same step are
+        treated as a single unit — either the entire step is kept or the
+        entire step is deleted. This prevents partial-step data corruption
+        when ``max_keep`` is not a multiple of the DP world size.
+
+        Steps whose number appears in ``self._pin_steps`` are exempt from
+        deletion and do not count toward the ``max_keep`` budget.
         """
         all_files = sorted(
             f
@@ -1405,12 +1412,11 @@ class PPOTrainer:
         )
         assert self._max_keep is not None
 
-        # Separate pinned files from rotatable files.
+        # Group files by step number.
         # Filename format: step_000042.pt or step_000042_dp_3.pt
-        rotatable = []
+        # step_to_files maps step_num -> list of filenames belonging to that step.
+        step_to_files: dict[int, list[str]] = {}
         for f in all_files:
-            # Extract step number from filename.
-            # Filename: step_000042.pt or step_000042_dp_3.pt
             # The directory is user-visible, so guard against malformed names
             # (e.g. a hand-copied "step_backup.pt" or a half-written file): skip
             # anything we cannot parse instead of crashing the training run.
@@ -1422,23 +1428,28 @@ class PPOTrainer:
                 )
                 continue
             step_num = int(parts[1])
-            if step_num not in self._pin_steps:
-                rotatable.append(f)
+            step_to_files.setdefault(step_num, []).append(f)
 
-        to_remove = len(rotatable) - self._max_keep
-        if to_remove > 0:
-            for f in rotatable[:to_remove]:
-                filepath = os.path.join(self._trajectory_dir, f)
-                # Tolerate concurrent rotation: in SPMD mode multiple
-                # data-parallel ranks may rotate the shared directory at once,
-                # so a file listed above may already be gone by the time we
-                # delete it. Deletion is best-effort cleanup; a missing file is
-                # the desired end state, not an error.
-                try:
-                    os.remove(filepath)
-                    logger.debug(f"Trajectory rotated (deleted): {filepath}")
-                except FileNotFoundError:
-                    pass
+        # Separate pinned steps from rotatable steps.
+        rotatable_steps = sorted(
+            s for s in step_to_files if s not in self._pin_steps
+        )
+
+        steps_to_remove = len(rotatable_steps) - self._max_keep
+        if steps_to_remove > 0:
+            for step_num in rotatable_steps[:steps_to_remove]:
+                for f in step_to_files[step_num]:
+                    filepath = os.path.join(self._trajectory_dir, f)
+                    # Tolerate concurrent rotation: in SPMD mode multiple
+                    # data-parallel ranks may rotate the shared directory at
+                    # once, so a file listed above may already be gone by the
+                    # time we delete it. Deletion is best-effort cleanup; a
+                    # missing file is the desired end state, not an error.
+                    try:
+                        os.remove(filepath)
+                        logger.debug(f"Trajectory rotated (deleted): {filepath}")
+                    except FileNotFoundError:
+                        pass
 
     def _load_trajectory(self, step: int) -> list[dict[str, torch.Tensor]]:
         """Load a previously dumped rollout batch from disk."""

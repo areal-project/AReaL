@@ -322,6 +322,94 @@ class TestTrajectoryIO:
         files = sorted(os.listdir(fake_trainer._trajectory_dir))
         assert files == ["step_000006.pt", "step_000007.pt"]
 
+    def test_rotation_step_granularity_spmd(self, fake_trainer, sample_batch):
+        """In SPMD mode, rotation must delete entire steps, not individual files.
+
+        When max_keep=2 and dp_size=4, each step has 4 files. Rotation should
+        keep the 2 most recent *steps* (all their DP-rank files), not just the
+        2 most recent *files*. This is the bug reported in PR #1407 review.
+        """
+        fake_trainer._max_keep = 2
+        dp_size = 4
+
+        # Simulate SPMD dumps: each step produces dp_size files.
+        for step in range(1, 6):
+            for dp_rank in range(dp_size):
+                filename = f"step_{step:06d}_dp_{dp_rank}.pt"
+                filepath = os.path.join(fake_trainer._trajectory_dir, filename)
+                torch.save(sample_batch, filepath)
+
+        # Trigger rotation.
+        fake_trainer._rotate_trajectories()
+
+        files = sorted(os.listdir(fake_trainer._trajectory_dir))
+        # 最近 2 个 step (4, 5) 的所有 dp rank 文件都应保留
+        expected = sorted(
+            f"step_{step:06d}_dp_{dp_rank}.pt"
+            for step in [4, 5]
+            for dp_rank in range(dp_size)
+        )
+        assert files == expected
+
+    def test_rotation_step_granularity_mixed_dp_sizes(self, fake_trainer, sample_batch):
+        """Rotation handles steps with different numbers of DP-rank files.
+
+        This can happen if dp_size changed between runs or files were manually
+        added/removed. Rotation should still group by step and keep N steps.
+        """
+        fake_trainer._max_keep = 2
+
+        # Step 1: 2 dp files; Step 2: 4 dp files; Step 3: 3 dp files
+        for dp_rank in range(2):
+            torch.save(
+                sample_batch,
+                os.path.join(fake_trainer._trajectory_dir, f"step_000001_dp_{dp_rank}.pt"),
+            )
+        for dp_rank in range(4):
+            torch.save(
+                sample_batch,
+                os.path.join(fake_trainer._trajectory_dir, f"step_000002_dp_{dp_rank}.pt"),
+            )
+        for dp_rank in range(3):
+            torch.save(
+                sample_batch,
+                os.path.join(fake_trainer._trajectory_dir, f"step_000003_dp_{dp_rank}.pt"),
+            )
+
+        fake_trainer._rotate_trajectories()
+
+        files = sorted(os.listdir(fake_trainer._trajectory_dir))
+        # 保留最近 2 个 step: step 2 (4 files) + step 3 (3 files) = 7 files
+        assert len(files) == 7
+        # Step 1 的文件全部删除
+        assert not any("step_000001" in f for f in files)
+        # Step 2 和 3 的文件全部保留
+        assert sum(1 for f in files if "step_000002" in f) == 4
+        assert sum(1 for f in files if "step_000003" in f) == 3
+
+    def test_rotation_pin_steps_spmd(self, fake_trainer, sample_batch):
+        """Pinned steps are preserved as a whole in SPMD mode."""
+        fake_trainer._max_keep = 1
+        fake_trainer._pin_steps = frozenset([2])
+        dp_size = 2
+
+        for step in range(1, 5):
+            for dp_rank in range(dp_size):
+                filename = f"step_{step:06d}_dp_{dp_rank}.pt"
+                filepath = os.path.join(fake_trainer._trajectory_dir, filename)
+                torch.save(sample_batch, filepath)
+
+        fake_trainer._rotate_trajectories()
+
+        files = sorted(os.listdir(fake_trainer._trajectory_dir))
+        # Pinned step 2: 2 files preserved
+        assert sum(1 for f in files if "step_000002" in f) == 2
+        # 最近 1 个 rotatable step = step 4: 2 files preserved
+        assert sum(1 for f in files if "step_000004" in f) == 2
+        # Steps 1, 3 全部删除
+        assert not any("step_000001" in f for f in files)
+        assert not any("step_000003" in f for f in files)
+
 
 # ------------------------------------------------------------------ #
 #  _NoOpRollout stub interface                                         #
