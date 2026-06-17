@@ -41,12 +41,10 @@ cost-effective** for a broad community of developers and researchers.
 
 ## 📰 News
 
-**\[2026/06/17\]** 🔬 Introducing **KPop** — bidirectional binary KL
-divergence token masking. Configured via
-`rejection_sampling.metric=binary_kl`. Also adding an
-[IcePop config](examples/math/gsm8k_icepop.yaml) (importance-ratio-based
-token masking). Check out
-[gsm8k_kpop.yaml](examples/math/gsm8k_kpop.yaml) and
+**\[2026/06/17\]** 🔬 Introducing **KPop** — bidirectional binary KL divergence token
+masking. Configured via `rejection_sampling.metric=binary_kl`. Also adding an
+[IcePop config](examples/math/gsm8k_icepop.yaml) (importance-ratio-based token masking).
+Check out [gsm8k_kpop.yaml](examples/math/gsm8k_kpop.yaml) and
 [gsm8k_icepop.yaml](examples/math/gsm8k_icepop.yaml) to get started!
 
 **\[2026/04/23\]** 🚀 We’re excited to release our integration with
@@ -168,8 +166,8 @@ For comprehensive setup instructions, see
 | Task                                                | Description                                                                                  | Performance                                                       |
 | --------------------------------------------------- | -------------------------------------------------------------------------------------------- | ----------------------------------------------------------------- |
 | **[Math](examples/math/)**                          | GSM8K math reasoning with GRPO, PPO, DAPO, REINFORCE, RLOO, LitePPO, DR-GRPO, GSPO, and more | -                                                                 |
-| **[IcePop](examples/math/gsm8k_icepop.yaml)**       | Importance-ratio-based token masking                   | -                                                                 |
-| **[KPop](examples/math/gsm8k_kpop.yaml)**           | Bidirectional binary KL divergence token masking       | -                                                                 |
+| **[IcePop](examples/math/gsm8k_icepop.yaml)**       | Importance-ratio-based token masking                                                         | -                                                                 |
+| **[KPop](examples/math/gsm8k_kpop.yaml)**           | Bidirectional binary KL divergence token masking                                             | -                                                                 |
 | **[Multi-Turn Math](examples/multi_turn_math/)**    | Multi-turn math agent with reward discounting across turns                                   | [Training Curve](examples/multi_turn_math/reward_curve.png)       |
 | **[LoRA Math](examples/math/gsm8k_grpo_lora.yaml)** | Parameter-efficient math training with LoRA (SGLang/vLLM backends)                           | -                                                                 |
 | **[Countdown](examples/countdown/)**                | Countdown numbers game with custom rewards                                                   | [Training Curve](examples/countdown/countdown_training_curve.png) |
