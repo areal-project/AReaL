@@ -22,36 +22,31 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from areal.experimental.cli.commands.inf.state import inf_root
-
+from areal.experimental.cli.inference.state import inf_root
 
 # Maps each section + key in config.toml to (verb_name, click_option_name).
 # This is the *whole* surface; anything not listed is silently ignored.
 _BINDINGS: dict[tuple[str, str], tuple[str, str]] = {
     # [default]
-    ("default", "admin_api_key"):     ("run",      "admin_api_key"),
-    ("default", "log_level"):         ("run",      "log_level"),
+    ("default", "admin_api_key"): ("run", "admin_api_key"),
+    ("default", "log_level"): ("run", "log_level"),
     # [launch] — applied to `run`
-    ("launch", "gateway_host"):       ("run",      "host"),
-    ("launch", "gateway_port"):       ("run",      "port"),
-    ("launch", "routing_strategy"):   ("run",      "routing_strategy"),
-    ("launch", "launch_timeout"):     ("run",      "launch_timeout"),
+    ("launch", "gateway_host"): ("run", "host"),
+    ("launch", "gateway_port"): ("run", "port"),
+    ("launch", "routing_strategy"): ("run", "routing_strategy"),
+    ("launch", "launch_timeout"): ("run", "launch_timeout"),
     # [register.internal] — applied to `register`
-    ("register.internal", "backend"):
-        ("register", "backend"),
-    ("register.internal", "model_health_timeout"):
-        ("register", "model_health_timeout"),
-    ("register.internal", "engine_args"):
-        ("register", "engine_args"),
-    ("register.internal", "proxy_args"):
-        ("register", "proxy_args"),
+    ("register.internal", "backend"): ("register", "backend"),
+    ("register.internal", "model_health_timeout"): ("register", "model_health_timeout"),
+    ("register.internal", "engine_args"): ("register", "engine_args"),
+    ("register.internal", "proxy_args"): ("register", "proxy_args"),
     # [collect]
-    ("collect", "batch_size"):        ("collect",  "batch_size"),
-    ("collect", "timeout"):           ("collect",  "timeout"),
-    ("collect", "poll_interval"):     ("collect",  "poll_interval"),
-    ("collect", "turn_discount"):     ("collect",  "turn_discount"),
-    ("collect", "export_style"):      ("collect",  "export_style"),
-    ("collect", "format"):            ("collect",  "format"),
+    ("collect", "batch_size"): ("collect", "batch_size"),
+    ("collect", "timeout"): ("collect", "timeout"),
+    ("collect", "poll_interval"): ("collect", "poll_interval"),
+    ("collect", "turn_discount"): ("collect", "turn_discount"),
+    ("collect", "export_style"): ("collect", "export_style"),
+    ("collect", "format"): ("collect", "format"),
 }
 
 

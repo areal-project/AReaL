@@ -6,7 +6,8 @@ import json
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-from areal.experimental.cli.state import areal_home, atomic_write_json, pid_alive
+from areal.experimental.cli.process import pid_alive
+from areal.experimental.cli.state import areal_home, atomic_write_json
 
 
 def inf_root() -> Path:

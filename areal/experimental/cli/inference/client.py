@@ -54,7 +54,7 @@ class GatewayClient:
 
     def list_models(self, *, timeout: float = 5.0) -> dict:
         return _request(
-            f"{self.base}/v1/models",
+            f"{self.base}/models",
             bearer=self.key,
             timeout=timeout,
         )
@@ -69,7 +69,11 @@ class GatewayClient:
         )
 
     def start_session(
-        self, *, model: str, task_id: str, group_size: int,
+        self,
+        *,
+        model: str,
+        task_id: str,
+        group_size: int,
         timeout: float = 30.0,
     ) -> dict:
         return _request(
@@ -81,7 +85,11 @@ class GatewayClient:
         )
 
     def set_reward(
-        self, *, session_api_key: str, reward: float, model: str | None = None,
+        self,
+        *,
+        session_api_key: str,
+        reward: float,
+        model: str | None = None,
         timeout: float = 10.0,
     ) -> dict:
         payload: dict = {"reward": reward}
@@ -96,9 +104,14 @@ class GatewayClient:
         )
 
     def export_trajectories(
-        self, *, session_ids: list[str], group_id: str | None = None,
-        remove_session: bool = True, discount: float = 1.0,
-        style: str = "individual", timeout: float = 30.0,
+        self,
+        *,
+        session_ids: list[str],
+        group_id: str | None = None,
+        remove_session: bool = True,
+        discount: float = 1.0,
+        style: str = "individual",
+        timeout: float = 30.0,
     ) -> dict:
         payload: dict = {
             "session_ids": session_ids,
