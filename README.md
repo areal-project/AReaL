@@ -41,6 +41,14 @@ cost-effective** for a broad community of developers and researchers.
 
 ## 📰 News
 
+**\[2026/06/17\]** 🔬 Introducing **KPop** — bidirectional binary KL
+divergence token masking. Configured via
+`rejection_sampling.metric=binary_kl`. Also adding an
+[IcePop config](examples/math/gsm8k_icepop.yaml) (importance-ratio-based
+token masking). Check out
+[gsm8k_kpop.yaml](examples/math/gsm8k_kpop.yaml) and
+[gsm8k_icepop.yaml](examples/math/gsm8k_icepop.yaml) to get started!
+
 **\[2026/04/23\]** 🚀 We’re excited to release our integration with
 [Scaffoldings](https://github.com/NVIDIA/TensorRT-LLM/tree/main/tensorrt_llm/scaffolding)
 for agentic RL training - now live in our
@@ -160,6 +168,8 @@ For comprehensive setup instructions, see
 | Task                                                | Description                                                                                  | Performance                                                       |
 | --------------------------------------------------- | -------------------------------------------------------------------------------------------- | ----------------------------------------------------------------- |
 | **[Math](examples/math/)**                          | GSM8K math reasoning with GRPO, PPO, DAPO, REINFORCE, RLOO, LitePPO, DR-GRPO, GSPO, and more | -                                                                 |
+| **[IcePop](examples/math/gsm8k_icepop.yaml)**       | Importance-ratio-based token masking                   | -                                                                 |
+| **[KPop](examples/math/gsm8k_kpop.yaml)**           | Bidirectional binary KL divergence token masking       | -                                                                 |
 | **[Multi-Turn Math](examples/multi_turn_math/)**    | Multi-turn math agent with reward discounting across turns                                   | [Training Curve](examples/multi_turn_math/reward_curve.png)       |
 | **[LoRA Math](examples/math/gsm8k_grpo_lora.yaml)** | Parameter-efficient math training with LoRA (SGLang/vLLM backends)                           | -                                                                 |
 | **[Countdown](examples/countdown/)**                | Countdown numbers game with custom rewards                                                   | [Training Curve](examples/countdown/countdown_training_curve.png) |
@@ -207,6 +217,8 @@ All RL algorithms support both asynchronous and synchronous versions by setting
 | **REINFORCE++**          | -                                             | [📄 Paper](https://arxiv.org/pdf/2501.03262)   | [🔗 GSM8K Example](examples/math/gsm8k_reinforce.yaml)            |
 | **RLOO**                 | [📖 Docs](docs/en/algorithms/grpo_series.md)  | [📄 Paper](https://arxiv.org/pdf/2402.14740v1) | [🔗 GSM8K Example](examples/math/gsm8k_rloo.yaml)                 |
 | **SAPO**                 | [📖 Docs](docs/en/algorithms/grpo_series.md)  | [📄 Paper](https://arxiv.org/abs/2511.20347)   | [🔗 GSM8K Example](examples/math/gsm8k_sapo.yaml)                 |
+| **IcePop**               | [📖 Docs](docs/en/algorithms/grpo_series.md)  | [📄 Blog](https://ringtech.notion.site/icepop) | [🔗 GSM8K Example](examples/math/gsm8k_icepop.yaml)               |
+| **KPop**                 | [📖 Docs](docs/en/algorithms/grpo_series.md)  | [📄 Blog](https://ringtech.notion.site/kpop)   | [🔗 GSM8K Example](examples/math/gsm8k_kpop.yaml)                 |
 | **M2PO**                 | [📖 Docs](docs/algorithms/m2po.md)            | [📄 Paper](https://arxiv.org/abs/2510.01161)   | [🔗 GSM8K Example](examples/math/gsm8k_m2po.yaml)                 |
 | **DPO**                  | [📖 Docs](docs/en/algorithms/dpo.md)          | [📄 Paper](https://arxiv.org/abs/2305.18290)   | [🔗 HH-RLHF Example](examples/alignment/hhrlhf_dpo.yaml)          |
 | **RLHF Reward Modeling** | -                                             | -                                              | [🔗 RLHF Example](examples/alignment/hhrlhf_rw.yaml)              |
