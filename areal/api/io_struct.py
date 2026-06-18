@@ -82,6 +82,12 @@ class ModelResponse:
     # MoE routing (only populated when return_routed_experts=True)
     routed_experts: np.ndarray | None = None
 
+    # Full stop-token id list for the source model. Needed for multi-EOS
+    # models (e.g. Gemma 4 has several EOS ids) where tokenizer.eos_token_id
+    # exposes only a single int. When None, falls back to the tokenizer's
+    # eos/pad ids. See areal.utils.hf_utils.resolve_stop_token_ids.
+    stop_token_ids: list[int] | None = None
+
     @property
     def input_len(self) -> int:
         return len(self.input_tokens)
@@ -90,44 +96,59 @@ class ModelResponse:
     def output_len(self) -> int:
         return len(self.output_tokens)
 
+    def _stop_token_set(self) -> set[int]:
+        """Full stop-token set used to recognise trailing stops in output.
+
+        Union of the explicit ``stop_token_ids`` (multi-EOS models) and the
+        tokenizer's eos/pad ids.
+        """
+        s: set[int] = set()
+        if self.stop_token_ids:
+            s.update(self.stop_token_ids)
+        if self.tokenizer is not None:
+            if self.tokenizer.eos_token_id is not None:
+                s.add(self.tokenizer.eos_token_id)
+            if self.tokenizer.pad_token_id is not None:
+                s.add(self.tokenizer.pad_token_id)
+        return s
+
     @property
     def end_with_stop(self) -> bool:
-        if self.tokenizer is None:
-            raise ValueError("tokenizer is None, cannot check end_with_stop")
-        eos_id = self.tokenizer.eos_token_id
-        pad_id = self.tokenizer.pad_token_id
-        if len(self.output_tokens) == 0:
+        if not self.output_tokens:
             return False
-        last_token = self.output_tokens[-1]
-        return (eos_id is not None and last_token == eos_id) or (
-            pad_id is not None and last_token == pad_id
-        )
+        return self.output_tokens[-1] in self._stop_token_set()
 
     @property
     def output_tokens_without_stop(self) -> list[int]:
         if self.tokenizer is None:
             raise ValueError("tokenizer is None, cannot get output_tokens_without_stop")
-        if self.stop_reason not in ["length", "abort"] and self.output_tokens:
-            if not self.end_with_stop:
-                raise ValueError(
-                    f"output_tokens does not end with eos or pad token, it ends with {self.output_tokens[-1]}, but stop_reason is {self.stop_reason}"
-                )
-            pad_or_eos_len = 0
-            eos_id = self.tokenizer.eos_token_id
-            pad_id = self.tokenizer.pad_token_id
-            stop_tokens = {eos_id, pad_id}
-            stop_tokens.discard(None)
-            for tok in reversed(self.output_tokens):
-                if tok in stop_tokens:
-                    pad_or_eos_len += 1
-                else:
-                    break
-            if pad_or_eos_len == len(self.output_tokens):
-                raise ValueError(
-                    "All output_tokens are EOS or PAD tokens; cannot strip stop tokens without removing entire output."
-                )
-            return self.output_tokens[:-pad_or_eos_len]
-        return self.output_tokens
+        if self.stop_reason in ["length", "abort"] or not self.output_tokens:
+            return self.output_tokens
+        stop_tokens = self._stop_token_set()
+        if not stop_tokens:
+            raise ValueError(
+                "Empty stop-token set: tokenizer has no eos/pad and no "
+                "stop_token_ids set on ModelResponse."
+            )
+        pad_or_eos_len = 0
+        for tok in reversed(self.output_tokens):
+            if tok in stop_tokens:
+                pad_or_eos_len += 1
+            else:
+                break
+        if pad_or_eos_len == 0:
+            raise ValueError(
+                f"output_tokens ends with {self.output_tokens[-1]} which is "
+                f"not in the stop set {sorted(stop_tokens)} but stop_reason="
+                f"{self.stop_reason!r}. Engine may be misreporting "
+                f"stop_reason, or stop_token_ids on ModelResponse is incomplete."
+            )
+        if pad_or_eos_len == len(self.output_tokens):
+            raise ValueError(
+                "All output_tokens are stop tokens; cannot strip without "
+                "removing entire output."
+            )
+        return self.output_tokens[:-pad_or_eos_len]
 
 
 @dataclass

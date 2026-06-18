@@ -50,6 +50,7 @@ from areal.infra.utils.proc import kill_process_tree
 from areal.utils import logging, name_resolve, names
 from areal.utils.data import concat_padded_tensors
 from areal.utils.dynamic_import import import_from_string
+from areal.utils.hf_utils import resolve_stop_token_ids
 from areal.utils.network import (
     find_free_ports,
     format_hostport,
@@ -942,6 +943,7 @@ class RemoteInfEngine(InferenceEngine):
             tokenizer=req.tokenizer,
             processor=req.processor,
             routed_experts=accumulated_routed_experts,
+            stop_token_ids=resolve_stop_token_ids(req.tokenizer),
         )
         return response
 

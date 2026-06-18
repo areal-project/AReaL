@@ -19,6 +19,7 @@ import numpy as np
 from areal.api.io_struct import HttpRequest
 from areal.experimental.inference_service.backend import InfBridgeBackend
 from areal.utils import logging
+from areal.utils.hf_utils import resolve_stop_token_ids
 
 if TYPE_CHECKING:
     from areal.api.io_struct import ModelRequest, ModelResponse
@@ -261,4 +262,5 @@ class InfBridge:
             tokenizer=req.tokenizer,
             latency=latency,
             routed_experts=final_routed_experts,
+            stop_token_ids=resolve_stop_token_ids(req.tokenizer),
         )
