@@ -245,6 +245,17 @@ def apply_rejection_sampling(
             kl_estimator=estimator_name,
             apply_clamp=False,  # Don't clamp; threshold check handles bounds
         )
+    elif config.metric == "binary_kl":
+        # Bidirectional binary KL divergence (KPop): mask tokens where
+        # KL(proximal || behave) > upper OR KL(behave || proximal) > upper.
+        kl_fwd = compute_binary_kl_divergence(
+            proximal_logprobs.detach(), old_logprobs.detach()
+        )
+        kl_rev = compute_binary_kl_divergence(
+            old_logprobs.detach(), proximal_logprobs.detach()
+        )
+        # Use max of forward and reverse as the metric; upper bound applies to both.
+        metric = torch.maximum(kl_fwd, kl_rev)
     else:
         raise ValueError(f"Unknown metric: {config.metric}")
 
@@ -426,6 +437,18 @@ def apply_rejection_sampling(
     )
 
 
+def compute_binary_kl_divergence(
+    log_p: torch.Tensor, log_q: torch.Tensor, eps: float = 1e-8
+) -> torch.Tensor:
+    """KL(P||Q) for Bernoulli distributions parameterized by log-probabilities.
+    Treats each element as a Bernoulli: P = [p, 1-p], Q = [q, 1-q].
+    KL(P||Q) = p*log(p/q) + (1-p)*log((1-p)/(1-q))
+    """
+    p = torch.clamp(torch.exp(log_p), eps, 1.0 - eps)
+    q = torch.clamp(torch.exp(log_q), eps, 1.0 - eps)
+    return p * torch.log(p / q) + (1 - p) * torch.log((1 - p) / (1 - q))
+
+
 def ppo_actor_loss_fn(
     logprobs: torch.Tensor,
     proximal_logprobs: torch.Tensor,
@@ -549,6 +572,7 @@ def ppo_actor_loss_fn(
         clip_mask=clip_mask,
         dual_clip_mask=dual_clip_mask,
     )
+
     if rejection_sampling is not None:
         stat.update(
             behave_approx_kl=behave_approx_kl.detach(),
