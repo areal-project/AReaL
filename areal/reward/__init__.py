@@ -71,12 +71,18 @@ class MathVerifyWorker:
         return 1.0 if result else 0.0
 
     def verify(self, response: str, ground_truth: str) -> float:
+        executor = None
         try:
             if self.timeout is None:
                 return self._verify_impl(response, ground_truth)
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-                future = executor.submit(self._verify_impl, response, ground_truth)
-                return future.result(timeout=self.timeout)
+            # Don't use ThreadPoolExecutor as a context manager: _verify_impl runs
+            # with signal-based timeouts disabled, so a runaway call never returns,
+            # and __exit__'s shutdown(wait=True) would block past self.timeout
+            # joining it. Shut down with wait=False so the wall-clock stays bounded;
+            # the orphaned worker exits on its own.
+            executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+            future = executor.submit(self._verify_impl, response, ground_truth)
+            return future.result(timeout=self.timeout)
         except concurrent.futures.TimeoutError:
             logger.warning(
                 f"Timeout ({self.timeout}s) in MathVerifyWorker.verify for "
@@ -89,6 +95,9 @@ class MathVerifyWorker:
                 exc_info=True,
             )
             return 0.0
+        finally:
+            if executor is not None:
+                executor.shutdown(wait=False, cancel_futures=True)
 
 
 _MATH_VERIFY_WORKER: MathVerifyWorker | None = None
