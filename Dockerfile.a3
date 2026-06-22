@@ -15,18 +15,47 @@
 # This file is a part of the AReaL project.
 #
 
-FROM quay.io/ascend/vllm-ascend:v0.19.1rc1-a3
+FROM quay.io/ascend/cann:9.0.0-a3-ubuntu22.04-py3.11
 
 ARG MEGATRON_TAG=core_v0.16.1
 ARG MINDSPEED_BRANCH=core_r0.16.0
-ARG MINDSPEED_COMMIT=73c6c360b3e996038e9de8942cf3c238326acfc1
+ARG MINDSPEED_COMMIT=e42335e9ff6f28ef1a60f2fb3356544790ded567
 ARG SGLANG_TAG=v0.5.7
+# Must be pinned to this specific commit: megatron-core 0.16.x compatible. The v0.4.x tags pin
+# megatron-core 0.17.1, which MindSpeed core_r0.16.0 does not support.
+ARG MEGATRON_BRIDGE_COMMIT=de93536e
+ARG VLLM_TAG=v0.18.0
+ARG VLLM_ASCEND_BRANCH=releases/v0.18.0
+ARG ASCEND_INSTALL_PATH=/usr/local/Ascend
+ARG SOC_VERSION=ascend910_9391
 
-# Update pip and install uv (bootstrap; remaining deps come from pyproject.npu.toml)
-RUN python3 -m pip install -U pip uv && \
+# System build deps (the clean CANN base ships none) + pip/uv bootstrap.
+RUN apt-get update -y && \
+    apt-get install -y --no-install-recommends \
+        gcc g++ cmake libnuma-dev wget git curl jq vim build-essential gawk && \
+    apt-get clean && rm -rf /var/lib/apt/lists/* && \
+    python3 -m pip install -U pip "setuptools==80.10.2" uv && \
     python3 -m pip cache purge
 
-# Install Megatron & MindSpeed
+# Install vLLM + vllm-ascend; requirements.txt brings the
+# matching torch-npu 2.9.0.post2 + triton-ascend 3.2.1 from the Ascend index.
+RUN export PIP_EXTRA_INDEX_URL=https://triton-ascend.osinfra.cn/pypi/simple/ && \
+    export PIP_TRUSTED_HOST=triton-ascend.osinfra.cn && \
+    export SOC_VERSION=${SOC_VERSION} && \
+    export LD_LIBRARY_PATH=${ASCEND_INSTALL_PATH}/cann-9.0.0/aarch64-linux/devlib/linux/aarch64:$LD_LIBRARY_PATH && \
+    . ${ASCEND_INSTALL_PATH}/ascend-toolkit/set_env.sh && \
+    . ${ASCEND_INSTALL_PATH}/nnal/atb/set_env.sh && \
+    git clone --depth 1 --branch ${VLLM_TAG} https://github.com/vllm-project/vllm.git /areal-workspace/vllm && \
+    git clone --branch ${VLLM_ASCEND_BRANCH} https://github.com/vllm-project/vllm-ascend.git /areal-workspace/vllm-ascend && \
+    cd /areal-workspace/vllm && \
+    pip install -r requirements/build.txt && \
+    VLLM_TARGET_DEVICE=empty pip install -v -e . && \
+    cd /areal-workspace/vllm-ascend && \
+    pip install -r requirements.txt && \
+    COMPILE_CUSTOM_KERNELS=1 pip install --no-build-isolation --no-deps -v -e . && \
+    python3 -m pip cache purge
+
+# Install Megatron & MindSpeed (megatron-core lives inside the MindSpeed tree).
 RUN git clone --depth 1 --branch ${MEGATRON_TAG} https://github.com/NVIDIA/Megatron-LM.git /areal-workspace/Megatron-LM && \
     git clone --branch ${MINDSPEED_BRANCH} https://gitcode.com/Ascend/MindSpeed.git /areal-workspace/MindSpeed && \
     git -C /areal-workspace/MindSpeed checkout ${MINDSPEED_COMMIT} && \
@@ -41,20 +70,24 @@ RUN git clone --depth 1 --branch ${SGLANG_TAG} https://github.com/sgl-project/sg
     pip install -e python[srt_npu] && \
     python3 -m pip cache purge
 
-# Install AReaL dependencies. No `--upgrade` — keep vllm-ascend's pre-installed
-# torch/torch-npu/etc. via uv's "leave-installed-if-satisfied" semantic.
-# Container `pip show` may lag uv.npu.lock; that divergence is by design.
+# Install AReaL deps. No --upgrade: keep vllm-ascend's torch/torch-npu/triton.
 RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=type=bind,source=pyproject.npu.toml,target=pyproject.toml \
     UV_HTTP_TIMEOUT=300 uv pip install -r pyproject.toml --system --group dev
 
+# Install Megatron-Bridge
+RUN git clone https://github.com/NVIDIA-NeMo/Megatron-Bridge.git /areal-workspace/Megatron-Bridge && \
+    git -C /areal-workspace/Megatron-Bridge checkout ${MEGATRON_BRIDGE_COMMIT} && \
+    python3 -m pip cache purge
+
 # Copy AReaL source code
 COPY . /AReaL
-
-# Install areal package in editable mode without dependencies
 RUN uv pip install --no-deps -e /AReaL --system
 
-# Add MindSpeed to PYTHONPATH as per official doc
-ENV PYTHONPATH="/areal-workspace/MindSpeed:$PYTHONPATH" \
-    HCCL_IF_BASE_PORT=63000 \
+ENV PYTHONPATH=/areal-workspace/MindSpeed:/areal-workspace/Megatron-Bridge/src:$PYTHONPATH
+
+ENV HCCL_IF_BASE_PORT=63000 \
     HCCL_NPU_SOCKET_PORT_RANGE="62100-62350"
+
+ENV TASK_QUEUE_ENABLE=1 \
+    OMP_NUM_THREADS=1
