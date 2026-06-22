@@ -62,22 +62,32 @@ def get_eos_token_ids(model_name_or_path: str) -> tuple[int, ...]:
         elif isinstance(value, (list, tuple)):
             eos.update(x for x in value if isinstance(x, int))
 
+    # Best effort: any failure falls back to the tokenizer's eos/pad ids.
+    # Catch-all (not just OSError) so malformed repo ids, gated/offline hub
+    # repos, or trust_remote_code errors degrade gracefully instead of
+    # crashing the generation path. The resolved set is lru_cached per path.
     try:
         _absorb(
             transformers.GenerationConfig.from_pretrained(
                 model_name_or_path
             ).eos_token_id
         )
-    except (FileNotFoundError, OSError):
-        pass
+    except Exception as e:
+        logger.debug(
+            f"Could not read eos_token_id from generation_config of "
+            f"{model_name_or_path!r}; falling back to tokenizer eos/pad. ({e!r})"
+        )
     try:
         cfg = transformers.AutoConfig.from_pretrained(
             model_name_or_path, trust_remote_code=True
         )
         _absorb(getattr(cfg, "eos_token_id", None))
         _absorb(getattr(getattr(cfg, "text_config", None), "eos_token_id", None))
-    except (FileNotFoundError, OSError):
-        pass
+    except Exception as e:
+        logger.debug(
+            f"Could not read eos_token_id from model config of "
+            f"{model_name_or_path!r}; falling back to tokenizer eos/pad. ({e!r})"
+        )
     return tuple(sorted(eos))
 
 
