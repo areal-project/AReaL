@@ -4,18 +4,15 @@ from __future__ import annotations
 
 import click
 
-from areal.experimental.cli.inference.common import print_models, running_state
+from areal.experimental.cli.inference.common import print_services
 
 
-@click.command(name="ps", help="List registered models.")
+@click.command(name="ps", help="List locally known inference services.")
 @click.option("--json", "as_json", is_flag=True, help="Emit JSON.")
-def ps_cmd(as_json: bool) -> None:
-    raise SystemExit(do_ps(as_json) or 0)
+@click.option("--all", "include_all", is_flag=True, help="Include stale services.")
+def ps_cmd(as_json: bool, include_all: bool) -> None:
+    raise SystemExit(do_ps(as_json, include_all) or 0)
 
 
-def do_ps(as_json: bool) -> int:
-    state = running_state()
-    if state is None:
-        click.echo("[]" if as_json else "daemon not running")
-        return 0
-    return print_models(state, as_json)
+def do_ps(as_json: bool, include_all: bool) -> int:
+    return print_services(as_json=as_json, include_all=include_all)

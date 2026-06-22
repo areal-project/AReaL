@@ -18,8 +18,9 @@ from areal.experimental.cli.inference.common import (
 from areal.experimental.cli.inference.state import ModelEntry, logs_dir
 
 
-@click.command(name="register", help="Register a model against the running daemon.")
+@click.command(name="register", help="Register a model against a running service.")
 @click.argument("name")
+@click.option("--service", default=None, help="Target service instance.")
 @click.option("--api-url", default=None, help="External provider URL.")
 @click.option("--provider-api-key", default=None)
 @click.option("--provider-api-key-env", default=None)
@@ -36,12 +37,12 @@ from areal.experimental.cli.inference.state import ModelEntry, logs_dir
     default="info",
     show_default=True,
 )
-def register_cmd(name: str, **opts) -> None:
-    raise SystemExit(do_register(name, opts) or 0)
+def register_cmd(name: str, service: str | None, **opts) -> None:
+    raise SystemExit(do_register(name, opts, service=service) or 0)
 
 
-def do_register(name: str, opts: dict) -> int:
-    state = load_running_state()
+def do_register(name: str, opts: dict, *, service: str | None = None) -> int:
+    state = load_running_state(service)
     if opts["api_url"] and opts["backend"]:
         raise click.UsageError("Use --api-url OR --backend, not both.")
     if not opts["api_url"] and not opts["backend"]:
@@ -49,7 +50,9 @@ def do_register(name: str, opts: dict) -> int:
     if opts["backend"] and not opts["model_path"]:
         raise click.UsageError("--backend requires --model-path.")
     if name in state.models:
-        raise click.ClickException(f"model {name!r} already registered")
+        raise click.ClickException(
+            f"model {name!r} already registered in service {state.service!r}"
+        )
 
     gateway = GatewayClient(state.gateway_url, state.admin_api_key)
     router = RouterClient(state.router_url, state.admin_api_key)
@@ -65,9 +68,12 @@ def do_register(name: str, opts: dict) -> int:
             provider_model=opts["provider_model"],
             gateway=gateway,
         )
-        state.models[name] = ModelEntry(kind="external", api_url=opts["api_url"])
-        state.save()
-        logger.info("registered external model %r", name)
+        state.model_state.models[name] = ModelEntry(
+            kind="external", api_url=opts["api_url"]
+        )
+        state.model_state.set_default_if_empty(name)
+        state.model_state.save()
+        logger.info("registered external model %r in service %r", name, state.service)
         return 0
 
     pids, proxy_addrs, inf_addrs, base_gpu, n_gpu = register_internal(
@@ -82,10 +88,10 @@ def do_register(name: str, opts: dict) -> int:
         admin_api_key=state.admin_api_key,
         gateway=gateway,
         router=router,
-        log_dir=logs_dir(),
-        base_gpu_id=state.next_gpu_id,
+        log_dir=logs_dir(state.service),
+        base_gpu_id=state.model_state.next_gpu_id,
     )
-    state.models[name] = ModelEntry(
+    state.model_state.models[name] = ModelEntry(
         kind="internal",
         backend=opts["backend"],
         base_gpu_id=base_gpu,
@@ -94,11 +100,13 @@ def do_register(name: str, opts: dict) -> int:
         proxy_addrs=proxy_addrs,
         inference_server_addrs=inf_addrs,
     )
-    state.next_gpu_id = base_gpu + n_gpu
-    state.save()
+    state.model_state.next_gpu_id = base_gpu + n_gpu
+    state.model_state.set_default_if_empty(name)
+    state.model_state.save()
     logger.info(
-        "registered internal model %r (%d worker(s), GPU %d-%d)",
+        "registered internal model %r in service %r (%d worker(s), GPU %d-%d)",
         name,
+        state.service,
         len(pids),
         base_gpu,
         base_gpu + n_gpu - 1,

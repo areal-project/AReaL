@@ -14,14 +14,19 @@ from areal.experimental.cli.inference.client import (
     GatewayHTTPError,
     GatewayUnreachable,
 )
-from areal.experimental.cli.inference.common import load_running_state, logger
+from areal.experimental.cli.inference.common import (
+    load_running_state,
+    logger,
+    resolve_model_name,
+)
 
 
 @click.command(
     name="collect",
     help="Start sessions, wait for ready trajectories, export and dump them.",
 )
-@click.argument("model")
+@click.argument("model", required=False)
+@click.option("--service", default=None, help="Target service instance.")
 @click.option(
     "--batch-size", type=int, required=True, help="Number of sessions to collect."
 )
@@ -43,7 +48,8 @@ from areal.experimental.cli.inference.common import load_running_state, logger
 )
 @click.option("--json", "json_progress", is_flag=True, help="Emit progress events.")
 def collect_cmd(
-    model: str,
+    model: str | None,
+    service: str | None,
     batch_size: int,
     output: Path | None,
     timeout: float,
@@ -56,6 +62,7 @@ def collect_cmd(
     raise SystemExit(
         do_collect(
             model=model,
+            service=service,
             batch_size=batch_size,
             output=output,
             timeout=timeout,
@@ -71,7 +78,7 @@ def collect_cmd(
 
 def do_collect(
     *,
-    model: str,
+    model: str | None,
     batch_size: int,
     output: Path | None,
     timeout: float,
@@ -80,8 +87,10 @@ def do_collect(
     export_style: str,
     format: str,
     json_progress: bool,
+    service: str | None = None,
 ) -> int:
-    state = load_running_state()
+    state = load_running_state(service)
+    model = resolve_model_name(state, model)
     gateway = GatewayClient(state.gateway_url, state.admin_api_key)
 
     event = _make_event_writer(json_progress)

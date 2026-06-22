@@ -18,7 +18,7 @@ from areal.experimental.cli.inference.commands.status import status_cmd
 from areal.experimental.cli.inference.commands.stop import stop_cmd
 
 
-@click.group(help="Manage the local AReaL inference service.")
+@click.group(help="Manage local AReaL inference services.")
 @click.option(
     "--config",
     "config_file",

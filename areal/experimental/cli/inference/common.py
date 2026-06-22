@@ -25,9 +25,14 @@ from areal.experimental.cli.inference.launcher import (
     spawn_vllm,
 )
 from areal.experimental.cli.inference.state import (
-    DaemonState,
+    DEFAULT_SERVICE,
+    ModelState,
+    RuntimeState,
     gateway_alive,
-    state_path,
+    list_service_names,
+    load_runtime_state,
+    resolve_service_name,
+    service_state_path,
 )
 from areal.experimental.cli.process import kill_pids, pick_free_port, pid_alive
 from areal.utils.logging import getLogger
@@ -50,11 +55,12 @@ PROXY_ARGS_HELP = (
 )
 
 
-def running_state() -> DaemonState | None:
-    if not state_path().exists():
+def running_state(service: str | None = None) -> RuntimeState | None:
+    service_name = resolve_service_name(service)
+    if not service_state_path(service_name).exists():
         return None
     try:
-        state = DaemonState.load()
+        state = load_runtime_state(service_name)
     except Exception:
         return None
     if not gateway_alive(state):
@@ -62,25 +68,38 @@ def running_state() -> DaemonState | None:
     return state
 
 
-def load_running_state() -> DaemonState:
-    if not state_path().exists():
-        raise click.ClickException("daemon not running")
+def load_running_state(service: str | None = None) -> RuntimeState:
+    service_name = resolve_service_name(service)
+    if not service_state_path(service_name).exists():
+        raise click.ClickException(f"service {service_name!r} is not running")
     try:
-        state = DaemonState.load()
+        state = load_runtime_state(service_name)
     except Exception as exc:
         raise click.ClickException(f"failed to load state: {exc}") from exc
     if not gateway_alive(state):
-        raise click.ClickException("daemon pid not alive")
+        raise click.ClickException(f"service {service_name!r} gateway pid not alive")
     return state
 
 
-def refuse_if_running() -> None:
-    state = running_state()
+def refuse_if_running(service: str | None = None) -> None:
+    service_name = service or DEFAULT_SERVICE
+    state = running_state(service_name)
     if state is None:
         return
     raise click.ClickException(
-        f"daemon already running (pid={state.gateway_pid}, url={state.gateway_url}). "
-        "Run `areal inf stop` first."
+        f"service {service_name!r} already running "
+        f"(pid={state.gateway_pid}, url={state.gateway_url}). "
+        f"Run `areal inf stop --service {service_name}` first."
+    )
+
+
+def resolve_model_name(state: RuntimeState, model: str | None) -> str:
+    if model:
+        return model
+    if state.model_state.default_model:
+        return state.model_state.default_model
+    raise click.ClickException(
+        f"service {state.service!r} has no default model; pass a model name"
     )
 
 
@@ -327,25 +346,82 @@ def register_internal(
     return spawned, proxy_addrs, inf_addrs, base_gpu_id, gpu_count
 
 
-def print_models(state: DaemonState, as_json: bool) -> int:
+def print_models(state: RuntimeState | ModelState, as_json: bool) -> int:
+    model_state = state.model_state if isinstance(state, RuntimeState) else state
     if as_json:
-        out = [{"name": name, **asdict(entry)} for name, entry in state.models.items()]
+        out = [
+            {
+                "name": name,
+                "default": name == model_state.default_model,
+                **asdict(entry),
+            }
+            for name, entry in model_state.models.items()
+        ]
         click.echo(json.dumps(out, indent=2))
         return 0
 
-    if not state.models:
+    if not model_state.models:
         click.echo("no models registered")
         return 0
 
     rows = []
-    for name, entry in state.models.items():
+    for name, entry in model_state.models.items():
         backend = entry.backend if entry.kind == "internal" else "-"
         workers = str(len(entry.pids) // 2) if entry.kind == "internal" else "-"
-        rows.append((name, entry.kind, backend, workers))
-    cols = ("NAME", "KIND", "BACKEND", "WORKERS")
+        default = "*" if name == model_state.default_model else ""
+        rows.append((name, default, entry.kind, backend, workers))
+    cols = ("NAME", "DEFAULT", "KIND", "BACKEND", "WORKERS")
     widths = [max(len(row[i]) for row in (cols, *rows)) for i in range(len(cols))]
     fmt = "  ".join(f"{{:<{width}}}" for width in widths)
     click.echo(fmt.format(*cols))
     for row in rows:
+        click.echo(fmt.format(*row))
+    return 0
+
+
+def print_services(*, as_json: bool, include_all: bool) -> int:
+    rows = []
+    for service in list_service_names():
+        try:
+            state = load_runtime_state(service)
+        except Exception:
+            if include_all:
+                rows.append({"service": service, "status": "stale"})
+            continue
+        running = gateway_alive(state)
+        if running or include_all:
+            rows.append(
+                {
+                    "service": service,
+                    "status": "running" if running else "stale",
+                    "gateway_url": state.gateway_url,
+                    "gateway_pid": state.gateway_pid,
+                    "router_url": state.router_url,
+                    "models": len(state.models),
+                }
+            )
+
+    if as_json:
+        click.echo(json.dumps(rows, indent=2))
+        return 0
+    if not rows:
+        click.echo("no inference services")
+        return 0
+
+    table = [
+        (
+            row["service"],
+            row["status"],
+            str(row.get("models", "")),
+            row.get("gateway_url", ""),
+            str(row.get("gateway_pid", "")),
+        )
+        for row in rows
+    ]
+    cols = ("SERVICE", "STATUS", "MODELS", "GATEWAY", "PID")
+    widths = [max(len(str(row[i])) for row in (cols, *table)) for i in range(5)]
+    fmt = "  ".join(f"{{:<{width}}}" for width in widths)
+    click.echo(fmt.format(*cols))
+    for row in table:
         click.echo(fmt.format(*row))
     return 0

@@ -13,29 +13,34 @@ from areal.experimental.cli.inference.client import (
     GatewayUnreachable,
 )
 from areal.experimental.cli.inference.state import (
-    DaemonState,
     gateway_alive,
-    state_path,
+    load_runtime_state,
+    resolve_service_name,
+    service_state_path,
 )
 from areal.experimental.cli.process import pid_alive
 
 
-@click.command(name="status", help="Show daemon status.")
+@click.command(name="status", help="Show inference service status.")
+@click.option("--service", default=None, help="Target service instance.")
 @click.option("--json", "as_json", is_flag=True, help="Emit JSON.")
-def status_cmd(as_json: bool) -> None:
-    raise SystemExit(do_status(as_json) or 0)
+def status_cmd(service: str | None, as_json: bool) -> None:
+    raise SystemExit(do_status(as_json, service=service) or 0)
 
 
-def do_status(as_json: bool) -> int:
-    if not state_path().exists():
+def do_status(as_json: bool, *, service: str | None = None) -> int:
+    service_name = resolve_service_name(service)
+    if not service_state_path(service_name).exists():
         if as_json:
-            click.echo(json.dumps({"running": False}, indent=2))
+            click.echo(
+                json.dumps({"service": service_name, "running": False}, indent=2)
+            )
         else:
-            click.echo("daemon not running")
+            click.echo(f"service {service_name!r} not running")
         return 0
 
     try:
-        state = DaemonState.load()
+        state = load_runtime_state(service_name)
     except Exception as exc:
         raise click.ClickException(f"failed to load state: {exc}") from exc
 
@@ -52,6 +57,7 @@ def do_status(as_json: bool) -> int:
 
     if as_json:
         snap = {
+            "service": state.service,
             "running": pid_ok,
             "gateway_url": state.gateway_url,
             "gateway_pid": state.gateway_pid,
@@ -64,9 +70,14 @@ def do_status(as_json: bool) -> int:
         return 0
 
     rows: list[tuple[str, str, str, str]] = [
-        ("gateway", gateway_http, state.gateway_url, f"models={len(state.models)}"),
         (
-            "router",
+            f"{state.service}/gateway",
+            gateway_http,
+            state.gateway_url,
+            f"models={len(state.models)}",
+        ),
+        (
+            f"{state.service}/router",
             "ok" if pid_alive(state.router_pid) else "down",
             state.router_url,
             "",
@@ -79,7 +90,7 @@ def do_status(as_json: bool) -> int:
         else:
             detail = f"api_url={entry.api_url}"
             addr = "external"
-        rows.append((name, "registered", addr, detail))
+        rows.append((f"{state.service}/{name}", "registered", addr, detail))
 
     cols = ("COMPONENT", "STATUS", "ADDR", "DETAILS")
     widths = [max(len(row[i]) for row in (cols, *rows)) for i in range(len(cols))]

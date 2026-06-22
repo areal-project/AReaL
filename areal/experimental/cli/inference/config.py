@@ -26,8 +26,25 @@ from areal.experimental.cli.inference.state import inf_root
 
 # Maps each section + key in config.toml to (verb_name, click_option_name).
 # This is the *whole* surface; anything not listed is silently ignored.
-_BINDINGS: dict[tuple[str, str], tuple[str, str]] = {
+_BINDINGS: dict[tuple[str, str], tuple[str | tuple[str, ...], str]] = {
     # [default]
+    (
+        "default",
+        "service",
+    ): (
+        (
+            "run",
+            "stop",
+            "status",
+            "register",
+            "deregister",
+            "models",
+            "collect",
+            "reward",
+            "logs",
+        ),
+        "service",
+    ),
     ("default", "admin_api_key"): ("run", "admin_api_key"),
     ("default", "log_level"): ("run", "log_level"),
     # [launch] — applied to `run`
@@ -101,6 +118,9 @@ def load_click_default_map(extra: Path | None = None) -> dict:
         binding = _BINDINGS.get((section, key))
         if binding is None:
             continue
-        verb, opt = binding
-        default_map.setdefault(verb, {})[opt] = value
+        verbs, opt = binding
+        if isinstance(verbs, str):
+            verbs = (verbs,)
+        for verb in verbs:
+            default_map.setdefault(verb, {})[opt] = value
     return default_map

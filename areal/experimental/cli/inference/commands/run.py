@@ -20,15 +20,19 @@ from areal.experimental.cli.inference.common import (
 )
 from areal.experimental.cli.inference.launcher import spawn_gateway, spawn_router
 from areal.experimental.cli.inference.state import (
-    DaemonState,
+    DEFAULT_SERVICE,
     ModelEntry,
+    ModelState,
+    ServiceState,
     gateway_alive,
     logs_dir,
+    service_state_path,
 )
 from areal.experimental.cli.process import kill_pids
 
 
-@click.command(name="run", help="Start the inference daemon (gateway + router).")
+@click.command(name="run", help="Start an inference service (gateway + router).")
+@click.option("--service", default=DEFAULT_SERVICE, show_default=True)
 @click.option("--port", type=int, default=8080, show_default=True, help="Gateway port.")
 @click.option(
     "--host", default="127.0.0.1", show_default=True, help="Gateway bind host."
@@ -75,12 +79,14 @@ from areal.experimental.cli.process import kill_pids
     show_default=True,
     help="Seconds to wait for the model server to come up.",
 )
+@click.option("--force", is_flag=True, help="Replace stale or running service state.")
 def run_cmd(**opts) -> None:
     raise SystemExit(do_run(opts) or 0)
 
 
 def do_run(opts: dict) -> int:
-    refuse_if_running()
+    service = opts["service"]
+    _prepare_service_slot(service=service, force=opts["force"])
 
     if opts["model"]:
         if opts["api_url"] and opts["backend"]:
@@ -96,8 +102,8 @@ def do_run(opts: dict) -> int:
     elif opts["api_url"] or opts["backend"]:
         raise click.UsageError("model registration flags require --model.")
 
-    log_dir = logs_dir()
-    logger.info("starting inference daemon (logs: %s)", log_dir)
+    log_dir = logs_dir(service)
+    logger.info("starting inference service %r (logs: %s)", service, log_dir)
 
     router_pid, router_port = spawn_router(
         host="127.0.0.1",
@@ -132,7 +138,8 @@ def do_run(opts: dict) -> int:
         kill_pids([gateway_pid, router_pid], grace_s=5.0)
         raise
 
-    state = DaemonState(
+    service_state = ServiceState(
+        service=service,
         gateway_pid=gateway_pid,
         gateway_url=gateway_url,
         router_pid=router_pid,
@@ -140,7 +147,9 @@ def do_run(opts: dict) -> int:
         admin_api_key=opts["admin_api_key"],
         started_at=time.time(),
     )
-    state.save()
+    model_state = ModelState(service=service)
+    service_state.save()
+    model_state.save()
 
     if opts["model"]:
         try:
@@ -156,9 +165,10 @@ def do_run(opts: dict) -> int:
                     provider_model=opts["provider_model"],
                     gateway=gateway_client,
                 )
-                state.models[opts["model"]] = ModelEntry(
+                model_state.models[opts["model"]] = ModelEntry(
                     kind="external", api_url=opts["api_url"]
                 )
+                model_state.set_default_if_empty(opts["model"])
             else:
                 pids, proxy_addrs, inf_addrs, base_gpu, n_gpu = register_internal(
                     model=opts["model"],
@@ -173,9 +183,9 @@ def do_run(opts: dict) -> int:
                     gateway=gateway_client,
                     router=router_client,
                     log_dir=log_dir,
-                    base_gpu_id=state.next_gpu_id,
+                    base_gpu_id=model_state.next_gpu_id,
                 )
-                state.models[opts["model"]] = ModelEntry(
+                model_state.models[opts["model"]] = ModelEntry(
                     kind="internal",
                     backend=opts["backend"],
                     base_gpu_id=base_gpu,
@@ -184,14 +194,19 @@ def do_run(opts: dict) -> int:
                     proxy_addrs=proxy_addrs,
                     inference_server_addrs=inf_addrs,
                 )
-                state.next_gpu_id = base_gpu + n_gpu
-            state.save()
+                model_state.next_gpu_id = base_gpu + n_gpu
+                model_state.set_default_if_empty(opts["model"])
+            model_state.save()
         except BaseException:
-            kill_pids([gateway_pid, router_pid, *state.all_worker_pids()], grace_s=5.0)
-            DaemonState.remove()
+            kill_pids(
+                [gateway_pid, router_pid, *model_state.all_worker_pids()],
+                grace_s=5.0,
+            )
+            ServiceState.remove(service)
+            ModelState.remove(service)
             raise
 
-    logger.info("daemon ready pid=%d url=%s", gateway_pid, gateway_url)
+    logger.info("service %r ready pid=%d url=%s", service, gateway_pid, gateway_url)
     if opts["model"]:
         kind = "external" if opts["api_url"] else f"internal ({opts['backend']})"
         logger.info("default model: %s (%s)", opts["model"], kind)
@@ -201,14 +216,40 @@ def do_run(opts: dict) -> int:
 
     logger.info("foreground (Ctrl-C to stop) ...")
     try:
-        while gateway_alive(state):
+        while gateway_alive(service_state):
             time.sleep(1.0)
     except KeyboardInterrupt:
         logger.info("shutting down ...")
-        kill_pids([gateway_pid, router_pid, *state.all_worker_pids()], grace_s=10.0)
-        DaemonState.remove()
+        kill_pids(
+            [gateway_pid, router_pid, *model_state.all_worker_pids()],
+            grace_s=10.0,
+        )
+        ServiceState.remove(service)
+        ModelState.remove(service)
         return 0
 
     logger.warning("gateway exited")
-    DaemonState.remove()
+    ServiceState.remove(service)
+    ModelState.remove(service)
     return 0
+
+
+def _prepare_service_slot(*, service: str, force: bool) -> None:
+    if not service_state_path(service).exists():
+        return
+    if force:
+        try:
+            from areal.experimental.cli.inference.state import load_runtime_state
+
+            state = load_runtime_state(service)
+            kill_pids(state.all_pids(), grace_s=5.0)
+        except Exception:
+            pass
+        ServiceState.remove(service)
+        ModelState.remove(service)
+        return
+    refuse_if_running(service)
+    raise click.ClickException(
+        f"stale state exists for service {service!r}; "
+        f"use `areal inf run --service {service} --force`"
+    )

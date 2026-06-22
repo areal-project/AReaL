@@ -17,16 +17,21 @@ from areal.experimental.cli.process import kill_pids, signal_pid
 
 @click.command(name="deregister", help="Deregister a model and tear down its workers.")
 @click.argument("name")
+@click.option("--service", default=None, help="Target service instance.")
 @click.option("--grace", type=float, default=10.0, show_default=True)
 @click.option("--force", is_flag=True, help="SIGKILL workers immediately.")
-def deregister_cmd(name: str, grace: float, force: bool) -> None:
-    raise SystemExit(do_deregister(name, grace, force) or 0)
+def deregister_cmd(name: str, service: str | None, grace: float, force: bool) -> None:
+    raise SystemExit(do_deregister(name, grace, force, service=service) or 0)
 
 
-def do_deregister(name: str, grace: float, force: bool) -> int:
-    state = load_running_state()
+def do_deregister(
+    name: str, grace: float, force: bool, *, service: str | None = None
+) -> int:
+    state = load_running_state(service)
     if name not in state.models:
-        raise click.ClickException(f"model {name!r} is not registered")
+        raise click.ClickException(
+            f"model {name!r} is not registered in service {state.service!r}"
+        )
     entry = state.models[name]
     router = RouterClient(state.router_url, state.admin_api_key)
 
@@ -51,9 +56,13 @@ def do_deregister(name: str, grace: float, force: bool) -> int:
         else:
             kill_pids(entry.pids, grace_s=grace)
 
-    if entry.gpu_count > 0 and entry.base_gpu_id + entry.gpu_count == state.next_gpu_id:
-        state.next_gpu_id = entry.base_gpu_id
-    del state.models[name]
-    state.save()
-    logger.info("deregistered model %r", name)
+    if (
+        entry.gpu_count > 0
+        and entry.base_gpu_id + entry.gpu_count == state.model_state.next_gpu_id
+    ):
+        state.model_state.next_gpu_id = entry.base_gpu_id
+    state.model_state.promote_default_after_remove(name)
+    del state.model_state.models[name]
+    state.model_state.save()
+    logger.info("deregistered model %r from service %r", name, state.service)
     return 0
