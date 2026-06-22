@@ -816,7 +816,7 @@ class PPOTrainer:
                 new_version = global_step + 1
                 versioned_meta = self.weight_update_meta.with_version(new_version)
                 self.actor.update_weights(versioned_meta)
-                if versioned_meta.colocate_stage:
+                if versioned_meta.colocate_mode:
                     self._offload_model(self.actor, role="actor")
                     self._onload_rollout()
                     stage_meta = versioned_meta.with_colocate_stage(1)
