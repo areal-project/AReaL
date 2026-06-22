@@ -16,6 +16,7 @@ from megatron.core.transformer import TransformerConfig
 from transformers import AutoConfig, PretrainedConfig
 
 from areal.api.cli_args import MegatronEngineConfig
+from areal.infra.platforms import is_npu_available
 from areal.models.mcore.bailing_moe import (
     hf_to_mcore_config_bailing_moe,
     make_mcore_layer_specs_bailing_moe,
@@ -242,9 +243,10 @@ def make_mcore_model(
             )
             provider.mtp_num_layers = None
 
-        # LoRA params are injected after model materialization and do not carry
-        # Megatron main_grad buffers required by fused grad accumulation kernels.
-        if use_lora:
+        # Disable fused weight-grad accumulation: LoRA params lack the main_grad
+        # buffers it needs; on NPU the fused wgrad op is a no-op stub that
+        # corrupts gradients (NaN).
+        if use_lora or is_npu_available:
             provider.gradient_accumulation_fusion = False
 
         # Keep these four flags aligned with mbridge base defaults.
@@ -259,6 +261,12 @@ def make_mcore_model(
         provider.overlap_p2p_comm = (
             vpp_size > 1 and provider.pipeline_model_parallel_size > 1
         )
+
+        # NPU full-attention layers hit MindSpeed's DotProductAttention, whose
+        # get_attention_mask() requires use_flash_attn (else it demands a
+        # micro_batch_size). Force it on for bridge providers.
+        if is_npu_available and hasattr(provider, "experimental_attention_variant"):
+            provider.use_flash_attn = True
 
         # Aligning tf config settings with provider for consistency.
         tf_config.variable_seq_lengths = provider.variable_seq_lengths

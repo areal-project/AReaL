@@ -4,7 +4,13 @@ import os
 import tempfile
 from typing import Any
 
-import torch
+try:
+    import areal.utils.torch_npu_compat  # noqa: F401  isort: skip  # before MindSpeed
+    import mindspeed.megatron_adaptor  # noqa: F401  isort: skip  # before megatron.core
+except ImportError:
+    pass
+
+import torch  # noqa: I001
 import torch.distributed as dist
 from megatron.core import parallel_state as mpu
 from transformers import AutoTokenizer
@@ -58,6 +64,10 @@ _MODEL_SAVELOAD_SKIP_TRAIN = {"qwen3_5_moe": True}
 # DDP grad buffers). Bridge-conversion correctness for these is covered by the
 # hf_save_load round-trip test, which only holds one model.
 _MODEL_SKIP_FSDP_COMPARE = {"qwen3_5_moe": True}
+if current_platform.device_type == "npu":
+    # HF Qwen3.5 GDN eager calls fla l2norm(dim=...), which the NPU fla build
+    # rejects -- the FSDP reference can't run.
+    _MODEL_SKIP_FSDP_COMPARE["qwen3_5"] = True
 
 
 def write_result(out: str, succ: bool):

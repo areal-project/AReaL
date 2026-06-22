@@ -8,6 +8,7 @@ import torch.distributed.nn.functional as dist_F
 from megatron.core import parallel_state as mpu
 from megatron.core.packed_seq_params import PackedSeqParams
 
+from areal.infra.platforms import is_npu_available
 from areal.utils.data import is_multi_modal_key
 
 
@@ -353,6 +354,11 @@ def packed_context_parallel_forward(
     # BSHD text-only path (use_padded_seq): pass our built attention_mask so
     # the model's attention layers skip padding.
     if is_vision:
+        final_attention_mask = None
+    elif use_padded_seq and is_npu_available and tree_triton_data is None:
+        # MindSpeed's Ascend FlashAttentionScore rejects dense [B, S] masks; it
+        # builds its own causal mask when attention_mask is None. Padding outputs
+        # are discarded during repack (same as the VLM branch).
         final_attention_mask = None
     else:
         final_attention_mask = (

@@ -7,6 +7,7 @@ from __future__ import annotations
 import dataclasses
 import functools
 import gc
+import importlib.util
 import json
 import math
 import os
@@ -362,11 +363,14 @@ class MegatronEngine(TrainEngine):
         self.quantization_config: dict[str, int | str | list[str]] | None = None
         self.bridge_cls: str = getattr(self.mcore_config, "bridge_type", "mbridge")
         if self.bridge_cls == "megatron-bridge" and is_npu_available:
-            raise ValueError(
-                "bridge_type='megatron-bridge' is not supported on NPU "
-                "(megatron-bridge has CUDA-only dependencies). "
-                "Use bridge_type='mbridge' instead."
-            )
+            # On NPU, megatron-bridge runs from source on PYTHONPATH (the wheels
+            # have CUDA-only deps), so require the package rather than block it.
+            if importlib.util.find_spec("megatron.bridge") is None:
+                raise ValueError(
+                    "bridge_type='megatron-bridge' on NPU requires the "
+                    "Megatron-Bridge source tree on PYTHONPATH. Use "
+                    "bridge_type='mbridge' instead."
+                )
         self.bridge_lora: MegatronBridgeLoRA | None = None
         self.is_vision_model: bool = False
         self.processor = None
