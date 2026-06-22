@@ -669,6 +669,9 @@ def cispo_loss_fn(
     eps_clip: float,
     loss_mask: torch.Tensor,
     eps_clip_higher: float | None = None,
+    old_logprobs: torch.Tensor | None = None,
+    rejection_sampling: RejectionSamplingConfig | None = None,
+    cu_seqlens: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict]:
     """CISPO (Clipped IS-weight Policy Optimization) loss from MiniMax-M1.
 
@@ -691,6 +694,10 @@ def cispo_loss_fn(
     wide MiniMax-M1 range. Token level only -- the geometric-mean sequence ratio
     of GSPO is not part of the MiniMax-M1 surrogate.
 
+    Decoupled loss: when ``rejection_sampling`` is set, the detached
+    ``pi_proximal/pi_behave`` weight (from ``old_logprobs``) rescales each token's
+    surrogate, mirroring :func:`ppo_actor_loss_fn`.
+
     Args:
         logprobs: Current policy log-probabilities (pi_theta), with autograd.
         proximal_logprobs: Proximal policy log-probabilities; enters only through
@@ -701,28 +708,56 @@ def cispo_loss_fn(
         eps_clip_higher: Upper clipping delta from 1 (ratio upper bound
             ``1 + eps_clip_higher``); must be positive -- the asymmetric upper
             clip is the defining knob of CISPO, so ``None`` is rejected.
+        old_logprobs: Behavior policy log-probabilities (pi_behave) from inference.
+            Required only when ``rejection_sampling`` is set (decoupled loss).
+        rejection_sampling: Staleness filtering / off-policy correction config.
+            None disables it (pure on-policy CISPO).
+        cu_seqlens: Cumulative sequence lengths for 1D packed inputs; required when
+            ``rejection_sampling.level == "sequence"``.
 
     Returns:
         ``(loss, stat)`` matching the PPO loss signature. ``stat['clip_mask']``
         flags tokens whose raw ratio left the band (CISPO never zeroes their
         loss, so band-exit -- not loss-affecting clip -- is the meaningful
-        metric); ``stat['importance_weight']`` reports the unclipped ratio.
+        metric); ``stat['importance_weight']`` reports the unclipped ratio. When
+        rejection sampling is active the ``behave_*`` keys are reported too.
     """
     if eps_clip_higher is None or eps_clip_higher <= 0:
         raise ValueError(
             "CISPO requires a positive eps_clip_higher; the asymmetric upper "
             f"clip is the defining knob (MiniMax-M1 Eq. 4-5). Got {eps_clip_higher!r}."
         )
+    # Pre-rejection token count, so the denominator matches loss_weight_fn.
     loss_mask_count = loss_mask.count_nonzero() or 1
+
+    # Decoupled off-policy correction: the pi_proximal/pi_behave weight.
+    if rejection_sampling is not None:
+        rs_result = apply_rejection_sampling(
+            proximal_logprobs=proximal_logprobs,
+            old_logprobs=old_logprobs,
+            loss_mask=loss_mask,
+            cu_seqlens=cu_seqlens,
+            config=rejection_sampling,
+        )
+        loss_mask = rs_result.loss_mask
+        behave_imp_weight = rs_result.behave_imp_weight
+        filtered_fraction = rs_result.filtered_fraction
+
     advantages = advantages.detach()
 
-    # Stop-gradient on the clipped IS weight; the gradient flows through
-    # ``logprobs`` only. The ratio path is detached explicitly so the surrogate
-    # is correct even if a caller forgot to detach ``proximal_logprobs``.
+    # Stop-gradient on the clipped IS weight; gradient flows through logprobs only.
     log_ratio = (logprobs - proximal_logprobs).detach()
     ratio = torch.exp(log_ratio)
     ratio_clipped = torch.clamp(ratio, 1.0 - eps_clip, 1.0 + eps_clip_higher).detach()
     pg_loss = -ratio_clipped * advantages * logprobs
+
+    if rejection_sampling is not None:
+        # behave_imp_weight is detached at source -> still a valid policy gradient.
+        behave_approx_kl = proximal_logprobs.detach() - old_logprobs.detach()
+        behave_mask = (behave_imp_weight > 0).logical_and(loss_mask.bool())
+        behave_approx_kl = torch.where(behave_mask, behave_approx_kl, 0.0)
+        pg_loss = pg_loss * behave_imp_weight
+
     logging_loss = pg_loss.detach()
     pg_loss = torch.where(loss_mask, pg_loss, 0).sum() / loss_mask_count
 
@@ -730,13 +765,18 @@ def cispo_loss_fn(
     stat = dict(
         loss=logging_loss,
         importance_weight=ratio.detach(),
-        # Same sign convention as ppo_actor_loss_fn / sapo_loss_fn so the logged
-        # approx_kl curve is comparable across surrogates.
         approx_kl=log_ratio,
         clip_mask=clip_mask,
-        # CISPO has no dual clip; report zeros for a stable stat schema.
+        # CISPO has no dual clip; zeros keep the stat schema stable.
         dual_clip_mask=torch.zeros_like(loss_mask, dtype=torch.bool),
     )
+    if rejection_sampling is not None:
+        stat.update(
+            behave_approx_kl=behave_approx_kl.detach(),
+            behave_imp_weight=behave_imp_weight.detach(),
+            behave_mask=behave_mask,
+            filtered_fraction=filtered_fraction,
+        )
     return pg_loss, stat
 
 

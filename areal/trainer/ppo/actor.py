@@ -469,6 +469,9 @@ def grpo_loss_fn(
             eps_clip=eps_clip,
             eps_clip_higher=eps_clip_higher,
             loss_mask=loss_mask,
+            old_logprobs=old_logp,
+            rejection_sampling=rejection_sampling,
+            cu_seqlens=input_data.get("cu_seqlens"),
         )
     elif use_sapo_loss:
         if use_decoupled_loss:
