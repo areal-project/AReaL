@@ -977,6 +977,15 @@ class MegatronEngineConfig:
         },
     )
 
+    freeze_vision_model: bool = field(
+        default=False,
+        metadata={"help": "Freeze the vision portion of a VL model (vision encoder)"},
+    )
+
+    freeze_vision_projection: bool = field(
+        default=False, metadata={"help": "Freeze the vision projection layer"}
+    )
+
 
 @dataclass
 class MindSpeedEngineConfig:

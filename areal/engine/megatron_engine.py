@@ -2128,13 +2128,16 @@ class MegatronEngine(TrainEngine):
         weight_chunked_mem_size = meta.weight_chunked_mem_mb * 1024 * 1024
         bucket: list[tuple[str, torch.Tensor]] = []
         bucket_size = 0
+        is_update_rank = (
+            self.is_pipeline_parallel_head() and self.pipeline_parallel_rank == 0
+        )
 
         for hf_name, hf_tensor in self.bridge.export_hf_weights(
             self.model,
             cpu=False,
             show_progress=False,
         ):
-            if not self.is_pipeline_parallel_head():
+            if not is_update_rank:
                 continue
             size = hf_tensor.numel() * hf_tensor.element_size()
             if bucket_size + size > weight_chunked_mem_size:

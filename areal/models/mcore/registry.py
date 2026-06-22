@@ -226,8 +226,15 @@ def make_mcore_model(
         )
         provider.recompute_modules = mcore_config.recompute_modules
 
-        provider.account_for_embedding_in_pipeline_split = False
-        provider.account_for_loss_in_pipeline_split = False
+        provider.freeze_vision_model = mcore_config.freeze_vision_model
+        provider.freeze_vision_projection = mcore_config.freeze_vision_projection
+
+        provider.account_for_embedding_in_pipeline_split = (
+            mcore_config.account_for_embedding_in_pipeline_split
+        )
+        provider.account_for_loss_in_pipeline_split = (
+            mcore_config.account_for_loss_in_pipeline_split
+        )
 
         has_mtp = bool(getattr(provider, "mtp_num_layers", None))
         if mcore_config.enable_mtp:
