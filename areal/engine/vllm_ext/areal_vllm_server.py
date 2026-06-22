@@ -365,12 +365,11 @@ if __name__ == "__main__":
     # entrypoints.
     import vllm.entrypoints.openai.api_server as _api_server_module
 
-    def _areal_build_app(args, supported_tasks=None, model_config=None):
-        """Monkey-patched build_app that replaces vLLM's /v1/completions route
-        with AReaL's wrapped version and adds AReaL custom endpoints."""
-        app = _original_build_app(
-            args, supported_tasks=supported_tasks, model_config=model_config
-        )
+    def _areal_build_app(args, supported_tasks=None, **kwargs):
+        """Monkey-patched build_app: swap in AReaL's /v1/completions route + custom
+        endpoints. ``**kwargs`` forwards version-specific params (model_config was
+        added in vLLM 0.19) so it works on both 0.18 and 0.19."""
+        app = _original_build_app(args, supported_tasks=supported_tasks, **kwargs)
         # Remove vLLM's /v1/completions POST route so AReaL's takes precedence
         app.router.routes = [
             route

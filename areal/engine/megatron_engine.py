@@ -18,6 +18,7 @@ from contextlib import contextmanager
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
+import areal.utils.torch_npu_compat  # noqa: F401 isort: skip  # before MindSpeed
 import areal.engine.megatron_utils.triton_l2norm_patch  # noqa: F401 isort: skip  # before MindSpeed: fast GDN l2norm
 import mindspeed.megatron_adaptor  # noqa: F401 isort: skip
 
