@@ -18,6 +18,11 @@ training, including:
 - **SAPO**: [Paper](https://arxiv.org/abs/2511.20347)
 - **GSPO** (Qwen3): [Paper](https://arxiv.org/abs/2507.18071),
   [Blog](https://qwenlm.github.io/blog/gspo/)
+- **IcePop**: [Blog](https://ringtech.notion.site/icepop) — Importance-ratio-based token masking (composable with other RL algorithms)
+- **KPop**: [Blog](https://ringtech.notion.site/kpop) — Bidirectional binary KL divergence token masking (composable with other RL algorithms)
+
+IcePop and KPop are token masking strategies that can be composed with any RL algorithm
+listed above.
 
 These algorithms share the same base objective but differ in their normalization
 strategies, clipping mechanisms, importance sampling levels, etc. By adjusting a few
@@ -35,7 +40,7 @@ configuration YAML file.
 | **slurm** | `python3 examples/math/gsm8k_rl.py --config examples/math/gsm8k_<algo>.yaml scheduler.type=slurm` |
 
 Replace `<algo>` with: `ppo`, `grpo`, `drgrpo`, `liteppo`, `rloo`, `gspo`,
-`dapo_dynamic_bs`, or `sapo`.
+`dapo_dynamic_bs`, `sapo`, `icepop`, or `kpop`.
 
 ### Switching Algorithms via CLI Overrides
 
@@ -148,8 +153,10 @@ parameters:
 | **LitePPO** | `group`               | `batch`              | `false`                   | `token`                     | -                                 |
 | **RLOO**    | `group`               | `null`               | `true`                    | `token`                     | -                                 |
 | **GSPO**    | `batch`               | `batch`              | `false`                   | `sequence`                  | -                                 |
-| **DAPO**    | `batch`               | `batch`              | `false`                   | `token`                     | asymmetric clip, dynamic sampling |
-| **SAPO**    | `batch`               | `batch`              | `false`                   | `token`                     | `use_sapo_loss=true`              |
+| **DAPO**    | `batch`               | `batch`              | `false`                   | `token`                     | asymmetric clip, dynamic sampling      |
+| **SAPO**    | `batch`               | `batch`              | `false`                   | `token`                     | `use_sapo_loss=true`                   |
+| **IcePop**  | `batch`               | `batch`              | `false`                   | `token`                     | `rejection_sampling.metric=ratio`      |
+| **KPop**    | `batch`               | `batch`              | `false`                   | `token`                     | `rejection_sampling.metric=binary_kl`  |
 
 **Note**: The "GRPO" row reflects the original DeepSeekMath formulation. AReaL's default
 GRPO config uses these settings but with length normalization already removed (see AReaL
@@ -297,6 +304,62 @@ and then filter them. The following option controls batch sizing behavior:
 | Parameter    | Type | Default | Description                 |
 | ------------ | ---- | ------- | --------------------------- |
 | `dynamic_bs` | bool | `false` | Enable dynamic batch sizing |
+
+### IcePop
+
+IcePop masks tokens whose importance ratio $r_{i,t} = \frac{\pi_\theta(o_{i,t} \mid q, o_{i,<t})}{\pi_{\theta_\text{old}}(o_{i,t} \mid q, o_{i,<t})}$ falls outside a configurable range $[\alpha, \beta]$ (where $\pi_\theta$ is the current training policy and $\pi_{\theta_\text{old}}$ is the behavior policy used for rollout). Tokens with too-low or too-high importance ratios are excluded from the loss.
+
+It is implemented via the `rejection_sampling` config with `metric=ratio`:
+
+```yaml
+actor:
+  use_decoupled_loss: true
+  rejection_sampling:
+    level: token
+    action: mask
+    metric: ratio
+    lower: 0.5
+    upper: 5.0
+```
+
+| Parameter                            | Type        | Default | Description                     |
+| ------------------------------------ | ----------- | ------- | ------------------------------- |
+| `actor.rejection_sampling.metric`    | str         | -       | Set to `ratio` for IcePop       |
+| `actor.rejection_sampling.lower`     | float       | `0.5`   | Lower bound of importance ratio |
+| `actor.rejection_sampling.upper`     | float       | `5.0`   | Upper bound of importance ratio |
+
+**Note:** IcePop requires `actor.use_decoupled_loss=true`, otherwise `rejection_sampling` has no effect.
+
+See `examples/math/gsm8k_icepop.yaml` for a complete configuration example.
+
+### KPop
+
+KPop masks tokens where the bidirectional binary KL divergence exceeds a threshold. For each token, it computes:
+
+$$\text{KL}_{\text{fwd}} = \text{KL}(P_\theta \| P_{\theta_\text{old}}), \quad \text{KL}_{\text{rev}} = \text{KL}(P_{\theta_\text{old}} \| P_\theta)$$
+
+where each token probability is treated as a Bernoulli parameter: $\text{KL}(P \| Q) = p \log \frac{p}{q} + (1-p) \log \frac{1-p}{1-q}$. Tokens where $\max(\text{KL}_{\text{fwd}}, \text{KL}_{\text{rev}}) > \phi$ are masked (here $\phi$ corresponds to `actor.rejection_sampling.upper`).
+
+It is implemented via the `rejection_sampling` config with `metric=binary_kl`:
+
+```yaml
+actor:
+  use_decoupled_loss: true
+  rejection_sampling:
+    level: token
+    action: mask
+    metric: binary_kl
+    upper: 2.0
+```
+
+| Parameter                            | Type        | Default | Description                          |
+| ------------------------------------ | ----------- | ------- | ------------------------------------ |
+| `actor.rejection_sampling.metric`    | str         | -       | Set to `binary_kl` for KPop          |
+| `actor.rejection_sampling.upper`     | float       | `2.0`   | KL divergence threshold ($\phi$)     |
+
+**Note:** KPop only supports `action=mask` (not `clamp`), and `lower` is not used with `binary_kl`. KPop requires `actor.use_decoupled_loss=true`, otherwise `rejection_sampling` has no effect.
+
+See `examples/math/gsm8k_kpop.yaml` for a complete configuration example.
 
 ## Core Concepts
 

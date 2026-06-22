@@ -17,6 +17,10 @@
 - **SAPO**: [论文](https://arxiv.org/abs/2511.20347)
 - **GSPO** (Qwen3): [论文](https://arxiv.org/abs/2507.18071)，
   [博客](https://qwenlm.github.io/blog/gspo/)
+- **IcePop**：[博客](https://ringtech.notion.site/icepop) — 基于重要性比率的token掩码（可与其它RL算法组合使用）
+- **KPop**：[博客](https://ringtech.notion.site/kpop) — 双向二元KL散度token掩码（可与其它RL算法组合使用）
+
+IcePop和KPop是token掩码策略，可以与上面列出的任意RL算法组合使用。
 
 这些算法共享相同的基础目标，但在归一化策略、裁剪机制、重要性采样级别等方面有所不同。通过调整AReaL中的少量配置参数，你可以在不同算法之间切换。
 
@@ -30,7 +34,7 @@
 | **ray**   | `python3 examples/math/gsm8k_rl.py --config examples/math/gsm8k_<algo>.yaml scheduler.type=ray`   |
 | **slurm** | `python3 examples/math/gsm8k_rl.py --config examples/math/gsm8k_<algo>.yaml scheduler.type=slurm` |
 
-将 `<algo>` 替换为：`ppo`、`grpo`、`drgrpo`、`liteppo`、`rloo`、`gspo`、`dapo_dynamic_bs` 或 `sapo`。
+将 `<algo>` 替换为：`ppo`、`grpo`、`drgrpo`、`liteppo`、`rloo`、`gspo`、`dapo_dynamic_bs`、`sapo`、`icepop` 或 `kpop`。
 
 ### 通过CLI覆盖切换算法
 
@@ -134,8 +138,10 @@ actor:
 | **LitePPO** | `group`               | `batch`              | `false`                   | `token`                     | -                    |
 | **RLOO**    | `group`               | `null`               | `true`                    | `token`                     | -                    |
 | **GSPO**    | `batch`               | `batch`              | `false`                   | `sequence`                  | -                    |
-| **DAPO**    | `batch`               | `batch`              | `false`                   | `token`                     | 非对称裁剪，动态采样 |
-| **SAPO**    | `batch`               | `batch`              | `false`                   | `token`                     | `use_sapo_loss=true` |
+| **DAPO**    | `batch`               | `batch`              | `false`                   | `token`                     | 非对称裁剪，动态采样              |
+| **SAPO**    | `batch`               | `batch`              | `false`                   | `token`                     | `use_sapo_loss=true`               |
+| **IcePop**  | `batch`               | `batch`              | `false`                   | `token`                     | `rejection_sampling.metric=ratio`  |
+| **KPop**    | `batch`               | `batch`              | `false`                   | `token`                     | `rejection_sampling.metric=binary_kl` |
 
 **注意**："GRPO"行反映原始DeepSeekMath公式。AReaL的默认GRPO配置使用这些设置，但已移除长度归一化（见下文AReaL实现说明）。
 
@@ -270,6 +276,62 @@ trainer.train(
 | 参数         | 类型 | 默认值  | 描述             |
 | ------------ | ---- | ------- | ---------------- |
 | `dynamic_bs` | bool | `false` | 启用动态批量大小 |
+
+### IcePop
+
+IcePop对重要性比率 $r_{i,t} = \frac{\pi_\theta(o_{i,t} \mid q, o_{i,<t})}{\pi_{\theta_\text{old}}(o_{i,t} \mid q, o_{i,<t})}$ 超出可配置范围 $[\alpha, \beta]$ 的token进行掩码（其中 $\pi_\theta$ 为当前训练策略，$\pi_{\theta_\text{old}}$ 为采样时的行为策略）。重要性比率过低或过高的token不参与损失计算。
+
+通过 `rejection_sampling` 配置的 `metric=ratio` 实现：
+
+```yaml
+actor:
+  use_decoupled_loss: true
+  rejection_sampling:
+    level: token
+    action: mask
+    metric: ratio
+    lower: 0.5
+    upper: 5.0
+```
+
+| 参数                                 | 类型        | 默认值 | 描述                       |
+| ------------------------------------ | ----------- | ------ | -------------------------- |
+| `actor.rejection_sampling.metric`    | str         | -      | 设置为 `ratio` 以启用IcePop |
+| `actor.rejection_sampling.lower`     | float       | `0.5`  | 重要性比率下界             |
+| `actor.rejection_sampling.upper`     | float       | `5.0`  | 重要性比率上界             |
+
+**注意：** IcePop需要 `actor.use_decoupled_loss=true`，否则 `rejection_sampling` 不生效。
+
+完整的配置示例见 `examples/math/gsm8k_icepop.yaml`。
+
+### KPop
+
+KPop对双向二元KL散度超过阈值的token进行掩码。对于每个token，计算：
+
+$$\text{KL}_{\text{fwd}} = \text{KL}(P_\theta \| P_{\theta_\text{old}}), \quad \text{KL}_{\text{rev}} = \text{KL}(P_{\theta_\text{old}} \| P_\theta)$$
+
+其中每个token概率被视为伯努利参数：$\text{KL}(P \| Q) = p \log \frac{p}{q} + (1-p) \log \frac{1-p}{1-q}$。$\max(\text{KL}_{\text{fwd}}, \text{KL}_{\text{rev}}) > \phi$ 的token被掩码（此处 $\phi$ 对应 `actor.rejection_sampling.upper`）。
+
+通过 `rejection_sampling` 配置的 `metric=binary_kl` 实现：
+
+```yaml
+actor:
+  use_decoupled_loss: true
+  rejection_sampling:
+    level: token
+    action: mask
+    metric: binary_kl
+    upper: 2.0
+```
+
+| 参数                                 | 类型        | 默认值 | 描述                           |
+| ------------------------------------ | ----------- | ------ | ------------------------------ |
+| `actor.rejection_sampling.metric`    | str         | -      | 设置为 `binary_kl` 以启用KPop  |
+| `actor.rejection_sampling.upper`     | float       | `2.0`  | KL散度阈值（$\phi$）          |
+
+**注意：** KPop仅支持 `action=mask`（不支持 `clamp`），且 `lower` 在 `binary_kl` 中不使用。KPop需要 `actor.use_decoupled_loss=true`，否则 `rejection_sampling` 不生效。
+
+完整的配置示例见 `examples/math/gsm8k_kpop.yaml`。
 
 ## 核心概念
 

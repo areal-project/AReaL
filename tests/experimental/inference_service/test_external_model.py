@@ -347,7 +347,9 @@ class TestGatewayExternalEndpoints:
         mock_forward.return_value = httpx.Response(
             200,
             json={
-                "interactions": {"id-1": {"messages": [], "reward": 0.0}},
+                "traj": {
+                    "interactions": [{"request": [], "response": "", "reward": 0.0}]
+                },
             },
         )
 
@@ -490,7 +492,7 @@ class TestDataProxyExternalEndpoints:
             headers={"Authorization": "Bearer areal-admin-key"},
         )
         assert not_ready.status_code == 200
-        assert not_ready.json()["interactions"] == {}
+        assert not_ready.json()["traj"] == {}
 
         set_reward = await data_proxy_client.post(
             "/rl/set_reward",
@@ -507,7 +509,7 @@ class TestDataProxyExternalEndpoints:
         )
         assert exported.status_code == 200
         payload = exported.json()
-        assert len(payload["interactions"]) == 1
+        assert len(payload["traj"]["interactions"]) == 1
 
     @pytest.mark.asyncio
     async def test_external_chat_completions_streaming(
@@ -584,7 +586,7 @@ class TestDataProxyExternalEndpoints:
         )
         assert exported.status_code == 200
         payload = exported.json()
-        assert len(payload["interactions"]) == 1
+        assert len(payload["traj"]["interactions"]) == 1
 
         exported_again = await data_proxy_client.post(
             "/export_trajectories",
@@ -592,7 +594,7 @@ class TestDataProxyExternalEndpoints:
             headers={"Authorization": "Bearer areal-admin-key"},
         )
         assert exported_again.status_code == 200
-        assert exported_again.json()["interactions"] == {}
+        assert exported_again.json()["traj"] == {}
 
     @pytest.mark.asyncio
     async def test_unregistered_model_falls_through_to_internal(

@@ -441,7 +441,7 @@ class RayScheduler(Scheduler):
         num_workers = job.replicas
         if num_workers == 0:
             raise WorkerCreationError(
-                role, "Invalud configuration", "replicas must be greater than 0"
+                role, "Invalid configuration", "replicas must be greater than 0"
             )
 
         schedulings = self._prepare_worker_specs(role, num_workers, job.tasks)

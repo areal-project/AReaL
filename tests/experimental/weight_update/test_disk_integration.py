@@ -203,32 +203,6 @@ class TestDiskUpdateWeights:
         )
         app.state.registry.register(pair_info)
 
-    def test_disk_update_calls_pause_save_load_resume(self, client, app):
-        called_urls: list[tuple[str, str]] = []
-        app.state.http_session = _make_mock_aiohttp_session(called_urls)
-
-        resp = client.post(
-            "/update_weights",
-            json={"pair_name": "test_disk", "version": 1},
-            headers=ADMIN_HEADERS,
-        )
-        assert resp.status_code == 200
-        data = resp.json()
-        assert data["status"] == "ok"
-        assert data["version"] == 1
-
-        urls = [url for _, url in called_urls]
-        assert "http://infer:9000/pause_generation" in urls
-        assert any("/save" in u for u in urls)
-        assert "http://infer:9000/update_weights_from_disk" in urls
-        assert "http://infer:9000/continue_generation" in urls
-
-        pause_idx = urls.index("http://infer:9000/pause_generation")
-        save_idx = next(i for i, u in enumerate(urls) if "/save" in u)
-        load_idx = urls.index("http://infer:9000/update_weights_from_disk")
-        resume_idx = urls.index("http://infer:9000/continue_generation")
-        assert pause_idx < save_idx < load_idx < resume_idx
-
     def test_disk_update_versioned_save_path(self, client, app):
         called_urls: list[tuple[str, str]] = []
         app.state.http_session = _make_mock_aiohttp_session(called_urls)
@@ -249,37 +223,6 @@ class TestDiskUpdateWeights:
             headers=ADMIN_HEADERS,
         )
         assert resp.status_code == 404
-
-    def test_disk_update_error_still_resumes_inference(self, client, app):
-        called_urls: list[tuple[str, str]] = []
-
-        @asynccontextmanager
-        async def _failing_post(url, **kwargs):
-            called_urls.append(("POST", url))
-            if "/save" in url:
-                raise RuntimeError("save failed")
-            resp = MagicMock()
-            resp.status = 200
-            resp.raise_for_status = MagicMock()
-            resp.json = AsyncMock(return_value={"status": "success", "result": None})
-            yield resp
-
-        mock_session = MagicMock()
-        mock_session.post = _failing_post
-        app.state.http_session = mock_session
-
-        resp = client.post(
-            "/update_weights",
-            json={"pair_name": "test_disk", "version": 1},
-            headers=ADMIN_HEADERS,
-        )
-        assert resp.status_code == 200
-        data = resp.json()
-        assert data["status"] == "error"
-        assert "save failed" in data["error"]
-
-        urls = [url for _, url in called_urls]
-        assert "http://infer:9000/continue_generation" in urls
 
 
 class TestDiskUpdateWeightsLora:

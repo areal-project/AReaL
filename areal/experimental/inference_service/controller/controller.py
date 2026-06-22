@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
-import copy
 import os
 import sys
 import threading
@@ -28,12 +27,13 @@ from typing import TYPE_CHECKING, Any, cast
 import httpx
 from openai.types.chat import ChatCompletion, ChatCompletionChunk
 
+from areal.infra.utils.http import async_http_retry, create_httpx_client
+
 if TYPE_CHECKING:
     from areal.api.scheduler_api import Scheduler, Worker
 
 from areal.api.cli_args import InferenceEngineConfig
 from areal.api.io_struct import LocalInfServerInfo
-from areal.infra.utils.http import async_http_retry, create_httpx_client
 from areal.utils import logging
 from areal.utils.network import format_hostport
 
@@ -126,7 +126,7 @@ class RolloutControllerV2:
 
         # Worker management
         self.workers: list[Worker] = []
-        self.server_infos: list[LocalInfServerInfo] = []
+        self._server_infos: list[LocalInfServerInfo] = []
         self._worker_role: str = ""
 
         # Addresses resolved after initialization
@@ -188,8 +188,6 @@ class RolloutControllerV2:
 
     # -- Initialize --------------------------------------------------------
 
-    _WORKERS_READY_TIMEOUT: float = 30.0
-
     def initialize(
         self,
         role: str,
@@ -215,10 +213,9 @@ class RolloutControllerV2:
             self._guarded_bg_initialize, server_args, server_infos, *args, **kwargs
         )
 
-        if not self._workers_ready.wait(timeout=self._WORKERS_READY_TIMEOUT):
-            raise TimeoutError(
-                f"Worker creation timed out after {self._WORKERS_READY_TIMEOUT}s"
-            )
+        ready_timeout = self.config.workers_ready_timeout
+        if not self._workers_ready.wait(timeout=ready_timeout):
+            raise TimeoutError(f"Worker creation timed out after {ready_timeout}s")
         if self._init_future.done():
             self._init_future.result()
 
@@ -257,18 +254,8 @@ class RolloutControllerV2:
             return
 
         from areal.infra.remote_inf_engine import RemoteInfEngine
-        from areal.infra.workflow_executor import WorkflowExecutor
-
-        self._workflow_executor = WorkflowExecutor(
-            config=cast(InferenceEngineConfig, self.config),
-            inference_engine=cast(RemoteInfEngine, self),
-        )
-        self._workflow_executor.initialize()
-
-        if self._shutdown_requested.is_set():
-            return
-
         from areal.infra.staleness_manager import StalenessManager
+        from areal.infra.workflow_executor import WorkflowExecutor
 
         max_concurrent = (
             self.config.max_concurrent_rollouts or self.config.consumer_batch_size
@@ -279,6 +266,16 @@ class RolloutControllerV2:
             consumer_batch_size=self.config.consumer_batch_size,
             max_staleness=self.config.max_head_offpolicyness,
         )
+
+        self._workflow_executor = WorkflowExecutor(
+            config=self.config,
+            inference_engine=cast(RemoteInfEngine, self),
+            staleness_manager=self._staleness_manager,
+        )
+        self._workflow_executor.initialize()
+
+        if self._shutdown_requested.is_set():
+            return
 
         logger.info("RolloutControllerV2 initialized (role=%s)", self._worker_role)
 
@@ -417,7 +414,7 @@ class RolloutControllerV2:
         if self.external_mode:
             logger.info("External mode — skipping inference server launch")
         elif server_infos is not None:
-            self.server_infos = server_infos
+            self._server_infos = server_infos
             self._inf_addrs = [
                 f"http://{format_hostport(info.host, info.port)}"
                 for info in server_infos
@@ -554,82 +551,14 @@ class RolloutControllerV2:
         nnodes_per_instance: int,
         server_args: dict[str, Any] | None,
     ) -> None:
-        """Fork inference server groups in parallel across all DP ranks."""
-        tp_size = alloc.parallel.tp_size
-        pp_size = alloc.parallel.pp_size
-
-        # Build backend-specific launch command builder
         if inf_backend == "sglang":
             from areal.api.cli_args import SGLangConfig
 
-            sglang_config = SGLangConfig()
-            if server_args:
-                sglang_config = copy.deepcopy(sglang_config)
-                for k, v in server_args.items():
-                    if hasattr(sglang_config, k):
-                        setattr(sglang_config, k, v)
-                    else:
-                        logger.warning(
-                            "SGLangConfig has no attribute %r, ignoring "
-                            "server_args entry (value=%r)",
-                            k,
-                            v,
-                        )
-
-            def _build_launch_cmd(
-                host: str | None,
-                port: int | None,
-                n_nodes: int = 1,
-                node_rank: int = 0,
-                dist_init_addr: str | None = None,
-            ) -> list[str]:
-                return SGLangConfig.build_cmd(
-                    sglang_config=sglang_config,
-                    tp_size=tp_size,
-                    pp_size=pp_size,
-                    base_gpu_id=0,
-                    host=host,
-                    port=port,
-                    dist_init_addr=dist_init_addr,
-                    n_nodes=n_nodes,
-                    node_rank=node_rank,
-                )
-
+            _build_launch_cmd = SGLangConfig.build_cmd_from_args
         elif inf_backend == "vllm":
             from areal.api.cli_args import vLLMConfig
 
-            vllm_config = vLLMConfig()
-            if server_args:
-                vllm_config = copy.deepcopy(vllm_config)
-                for k, v in server_args.items():
-                    if hasattr(vllm_config, k):
-                        setattr(vllm_config, k, v)
-                    else:
-                        logger.warning(
-                            "vLLMConfig has no attribute %r, ignoring "
-                            "server_args entry (value=%r)",
-                            k,
-                            v,
-                        )
-
-            def _build_launch_cmd(
-                host: str | None,
-                port: int | None,
-                n_nodes: int = 1,
-                node_rank: int = 0,
-                dist_init_addr: str | None = None,
-            ) -> list[str]:
-                return vLLMConfig.build_cmd(
-                    vllm_config=vllm_config,
-                    tp_size=tp_size,
-                    pp_size=pp_size,
-                    host=host,
-                    port=port,
-                    dist_init_addr=dist_init_addr,
-                    n_nodes=n_nodes,
-                    node_rank=node_rank,
-                )
-
+            _build_launch_cmd = vLLMConfig.build_cmd_from_args
         else:
             raise ValueError(f"Unsupported inference backend: {inf_backend!r}")
 
@@ -671,13 +600,15 @@ class RolloutControllerV2:
                 inf_host: str = port_data["host"]
                 inf_port: int = port_data["ports"][0]
 
-                cmd = _build_launch_cmd(
-                    host=inf_host,
-                    port=inf_port,
-                    n_nodes=nnodes_per_instance,
-                    node_rank=node_rank,
-                    dist_init_addr=dist_init_addr,
-                )
+                local_args = {
+                    **(server_args or {}),
+                    "host": inf_host,
+                    "port": inf_port,
+                    "nnodes": nnodes_per_instance,
+                    "node_rank": node_rank,
+                    "dist_init_addr": dist_init_addr,
+                }
+                cmd = _build_launch_cmd(local_args)
 
                 fork_payload: dict[str, Any] = {
                     "role": "inf-server",
@@ -728,7 +659,7 @@ class RolloutControllerV2:
         for host, port, forked in group_results:
             addr = f"http://{format_hostport(host, port)}"
             self._inf_addrs.append(addr)
-            self.server_infos.append(
+            self._server_infos.append(
                 LocalInfServerInfo(
                     host=host,
                     port=port,
@@ -1063,7 +994,7 @@ class RolloutControllerV2:
 
         self._service_roles.clear()
         self.workers.clear()
-        self.server_infos.clear()
+        self._server_infos.clear()
         with self._online_waiters_lock:
             for waiter in self._online_waiters:
                 if not waiter.future.done():
@@ -1097,8 +1028,8 @@ class RolloutControllerV2:
         payload = {"version": version}
         results = await asyncio.gather(
             *[
-                self._async_gateway_http_post(f"/set_version/{wid}", payload)
-                for wid in self._worker_ids.values()
+                self._async_data_proxy_post(addr, "/set_version", payload)
+                for addr in self._data_proxy_addrs
             ],
             return_exceptions=True,
         )
@@ -1134,6 +1065,7 @@ class RolloutControllerV2:
         is_eval: bool = False,
         group_size: int = 1,
     ) -> int:
+        self._ensure_initialized()
         resolved_workflow = self._resolve_workflow(
             workflow,
             workflow_kwargs,
@@ -1154,6 +1086,7 @@ class RolloutControllerV2:
         timeout: float | None = None,
         raise_timeout: bool = True,
     ) -> list[dict[str, Any] | None]:
+        self._ensure_initialized()
         return self.workflow_executor.wait(
             count, timeout=timeout, raise_timeout=raise_timeout
         )
@@ -1416,21 +1349,15 @@ class RolloutControllerV2:
 
     def pause(self) -> None:
         """Pause dispatcher + pause all workers."""
-        from areal.infra.utils.concurrent import run_async_task
-
         self._ensure_initialized()
-        if self._workflow_executor is not None:
-            self._workflow_executor.pause()
-        run_async_task(self.pause_generation)
+        assert self._workflow_executor is not None
+        self._workflow_executor.pause()
 
     def resume(self) -> None:
         """Resume all workers + resume dispatcher."""
-        from areal.infra.utils.concurrent import run_async_task
-
         self._ensure_initialized()
-        run_async_task(self.continue_generation)
-        if self._workflow_executor is not None:
-            self._workflow_executor.resume()
+        assert self._workflow_executor is not None
+        self._workflow_executor.resume()
 
     def offload(self) -> None:
         """Offload model memory on all inference workers."""
@@ -1440,12 +1367,12 @@ class RolloutControllerV2:
         run_async_task(self._async_offload)
 
     async def _async_offload(self) -> None:
-        if not self._gateway_addr:
+        if not self._data_proxy_addrs:
             return
         results = await asyncio.gather(
             *(
-                self._async_gateway_http_post(f"/release_memory_occupation/{wid}", {})
-                for wid in self._worker_ids.values()
+                self._async_data_proxy_post(addr, "/release_memory_occupation", {})
+                for addr in self._data_proxy_addrs
             ),
             return_exceptions=True,
         )
@@ -1463,15 +1390,13 @@ class RolloutControllerV2:
         run_async_task(self._async_onload, tags)
 
     async def _async_onload(self, tags: list[str] | None = None) -> None:
-        if not self._gateway_addr:
+        if not self._data_proxy_addrs:
             return
         payload: dict = {"tags": tags} if tags is not None else {}
         results = await asyncio.gather(
             *(
-                self._async_gateway_http_post(
-                    f"/resume_memory_occupation/{wid}", payload
-                )
-                for wid in self._worker_ids.values()
+                self._async_data_proxy_post(addr, "/resume_memory_occupation", payload)
+                for addr in self._data_proxy_addrs
             ),
             return_exceptions=True,
         )
@@ -1481,49 +1406,53 @@ class RolloutControllerV2:
         if failed and len(failed) == len(results):
             raise RuntimeError(f"onload failed on ALL {len(failed)} workers")
 
-    async def pause_generation(self, worker_id: str | None = None) -> None:
-        """Pause generation on a specific worker, or all workers if worker_id is None."""
-        if not self._gateway_addr:
-            return
-        if worker_id is not None:
-            await self._async_gateway_http_post(f"/pause_generation/{worker_id}", {})
-        else:
-            results = await asyncio.gather(
-                *[
-                    self._async_gateway_http_post(f"/pause_generation/{wid}", {})
-                    for wid in self._worker_ids.values()
-                ],
-                return_exceptions=True,
-            )
-            failed = [r for r in results if isinstance(r, Exception)]
-            for r in failed:
-                logger.error("Failed to pause generation on a worker: %s", r)
-            if failed and len(failed) == len(results):
-                raise RuntimeError(
-                    f"pause_generation failed on ALL {len(failed)} workers"
-                )
+    def pause_generation(self) -> None:
+        """Pause generation on all workers."""
+        from areal.infra.utils.concurrent import run_async_task
 
-    async def continue_generation(self, worker_id: str | None = None) -> None:
-        """Continue generation on a specific worker, or all workers if worker_id is None."""
-        if not self._gateway_addr:
+        self._ensure_initialized()
+        run_async_task(self._async_pause_generation)
+
+    async def _async_pause_generation(self) -> None:
+        if not self._data_proxy_addrs:
             return
-        if worker_id is not None:
-            await self._async_gateway_http_post(f"/continue_generation/{worker_id}", {})
-        else:
-            results = await asyncio.gather(
-                *[
-                    self._async_gateway_http_post(f"/continue_generation/{wid}", {})
-                    for wid in self._worker_ids.values()
-                ],
-                return_exceptions=True,
+        results = await asyncio.gather(
+            *[
+                self._async_data_proxy_post(addr, "/pause_generation", {})
+                for addr in self._data_proxy_addrs
+            ],
+            return_exceptions=True,
+        )
+        failed = [r for r in results if isinstance(r, Exception)]
+        for r in failed:
+            logger.error("Failed to pause generation on a worker: %s", r)
+        if failed and len(failed) == len(results):
+            raise RuntimeError(f"pause_generation failed on ALL {len(failed)} workers")
+
+    def continue_generation(self) -> None:
+        """Continue generation on all workers."""
+        from areal.infra.utils.concurrent import run_async_task
+
+        self._ensure_initialized()
+        run_async_task(self._async_continue_generation)
+
+    async def _async_continue_generation(self) -> None:
+        if not self._data_proxy_addrs:
+            return
+        results = await asyncio.gather(
+            *[
+                self._async_data_proxy_post(addr, "/continue_generation", {})
+                for addr in self._data_proxy_addrs
+            ],
+            return_exceptions=True,
+        )
+        failed = [r for r in results if isinstance(r, Exception)]
+        for r in failed:
+            logger.error("Failed to continue generation on a worker: %s", r)
+        if failed and len(failed) == len(results):
+            raise RuntimeError(
+                f"continue_generation failed on ALL {len(failed)} workers"
             )
-            failed = [r for r in results if isinstance(r, Exception)]
-            for r in failed:
-                logger.error("Failed to continue generation on a worker: %s", r)
-            if failed and len(failed) == len(results):
-                raise RuntimeError(
-                    f"continue_generation failed on ALL {len(failed)} workers"
-                )
 
     # -- Stats -------------------------------------------------------------
 
@@ -1539,18 +1468,30 @@ class RolloutControllerV2:
 
     # -- Proxy compatibility (gateway IS the proxy) ------------------------
 
-    def start_proxy(self) -> None:
-        """No-op — gateway already acts as the proxy."""
-
-    def start_proxy_gateway(self) -> None:
-        """No-op — gateway already acts as the proxy gateway."""
-
     @property
     def proxy_gateway_addr(self) -> str:
         self._ensure_initialized()
         return self._gateway_addr
 
     # -- Properties --------------------------------------------------------
+
+    @property
+    def inference_worker_urls(self) -> list[str]:
+        self._ensure_initialized()
+        return list(self._inf_addrs)
+
+    @property
+    def inference_guard_addrs(self) -> list[str]:
+        self._ensure_initialized()
+        return [
+            f"http://{format_hostport(w.ip, int(w.worker_ports[0]))}"
+            for w in self.workers
+        ]
+
+    @property
+    def server_infos(self) -> list[LocalInfServerInfo]:
+        self._ensure_initialized()
+        return self._server_infos
 
     @property
     def worker_ids(self) -> dict[str, str]:
@@ -1569,14 +1510,6 @@ class RolloutControllerV2:
         if self._workflow_executor is None:
             raise RuntimeError("RolloutControllerV2.initialize() must be called first")
         return self._workflow_executor
-
-    @property
-    def dispatcher(self):
-        return self.workflow_executor.dispatcher
-
-    @property
-    def runner(self):
-        return self.dispatcher.runner
 
     # -- Workflow resolution helpers ----------------------------------------
 
@@ -1834,30 +1767,6 @@ class RolloutControllerV2:
                 "Error killing forked service %s/%d: %s", role, worker_index, exc
             )
 
-    def _gateway_http_post(self, endpoint: str, payload: dict[str, Any]) -> None:
-        """Make a synchronous HTTP POST to the gateway with admin auth.
-
-        Use ``_async_gateway_http_post`` from async contexts to avoid blocking
-        the event loop.
-
-        Raises ``RuntimeError`` on HTTP errors or connection failures so that
-        callers (e.g. ``pause()`` / ``resume()``) can detect and handle them.
-        """
-        url = f"{self._gateway_addr}{endpoint}"
-        try:
-            resp = self._sync_client.post(
-                url,
-                json=payload,
-                headers={"Authorization": f"Bearer {self.config.admin_api_key}"},
-                timeout=self.config.request_timeout,
-            )
-            if resp.status_code >= 400:
-                raise RuntimeError(
-                    f"Gateway {endpoint} returned {resp.status_code}: {resp.text}"
-                )
-        except httpx.HTTPError as exc:
-            raise RuntimeError(f"Failed to POST {endpoint}: {exc}") from exc
-
     async def _get_async_client(self) -> httpx.AsyncClient:
         """Return the shared async HTTP client, recreating it when the event loop changes.
 
@@ -1880,31 +1789,6 @@ class RolloutControllerV2:
                 except Exception:
                     pass
         return self._async_client
-
-    @async_http_retry
-    async def _async_gateway_http_post(
-        self, endpoint: str, payload: dict[str, Any]
-    ) -> None:
-        """Make a non-blocking HTTP POST to the gateway with admin auth.
-
-        Raises ``RuntimeError`` on HTTP errors or connection failures so that
-        callers (e.g. ``pause_generation()`` / ``continue_generation()``) can
-        detect and handle them.
-        """
-        url = f"{self._gateway_addr}{endpoint}"
-        try:
-            client = await self._get_async_client()
-            resp = await client.post(
-                url,
-                json=payload,
-                headers={"Authorization": f"Bearer {self.config.admin_api_key}"},
-            )
-            if resp.status_code >= 400:
-                raise RuntimeError(
-                    f"Gateway {endpoint} returned {resp.status_code}: {resp.text}"
-                )
-        except httpx.HTTPError as exc:
-            raise RuntimeError(f"Failed to POST {endpoint}: {exc}") from exc
 
     @async_http_retry
     async def _async_data_proxy_post(

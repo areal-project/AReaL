@@ -223,3 +223,46 @@ WeightUpdateMeta.from_fsdp_xccl(
     weight_chunked_mem_mb = 512,  # Reduce from default (typically 1024+)
 )
 ```
+
+## 减少优化器状态显存占用
+
+FSDP 后端默认维护 fp32 主权重以及 fp32 的 AdamW 优化器状态 （`exp_avg`、`exp_avg_sq`），与 DeepSpeed ZeRO-3 和
+Megatron 的 precision-aware optimizer 行为一致。对于 `N` 十亿参数的模型， 所有 GPU 总计约占用 `12N` GB：
+
+| 组件                        | Bytes/param |
+| --------------------------- | ----------- |
+| fp32 主权重（storage）      | 4           |
+| fp32 `exp_avg`（一阶矩）    | 4           |
+| fp32 `exp_avg_sq`（二阶矩） | 4           |
+
+**CPU 内存提示**：开启 `actor.fsdp.memory_efficient_load=true` 时， rank 0 会先在 CPU
+上加载完整模型再广播。fp32 storage 让这一峰值翻倍 — 8B 模型的 rank 0 CPU 占用会从 ~16 GB 上升到 ~32 GB。请相应规划主节点
+内存，或设置 `memory_efficient_load=false` 让所有 rank 分摊 CPU 负载。
+
+**DCP checkpoint 提示**：训练 checkpoint（Distributed Checkpoint） 保留 storage
+dtype（fp32），以保证恢复时主权重精度正确。HF 导出和 rollout 权重同步**始终**会 cast 回 compute dtype，所以部署侧仍为 bf16。
+
+如果遇到 OOM 又无法增加并行度，可以切换为 bf16 优化器状态 + Kahan summation 更新：
+
+```yaml
+actor:
+  dtype: bfloat16
+  optimizer_dtype: bfloat16   # storage 使用 bf16，与 AdamW state 对齐
+  optimizer:
+    type: adam_bf16           # 使用 AnyPrecisionAdamW + Kahan summation
+```
+
+这可节省约 `8N` GB：
+
+| 组件                           | Bytes/param |
+| ------------------------------ | ----------- |
+| bf16 主权重                    | 2           |
+| bf16 `exp_avg`                 | 2           |
+| bf16 `exp_avg_sq`              | 2           |
+| bf16 Kahan compensation buffer | 2           |
+
+依据 AnyPrecision 论文，Kahan summation 能恢复 fp32 等效的更新精度。 单 step 时间相比 fused fp32 AdamW 慢约
+5-10%；在 dense 和 MoE 模型上 收敛质量相当。
+
+**不要将 `optimizer.type: adam` 与 `optimizer_dtype: bfloat16` 同时使用** — `torch.optim.AdamW`
+会静默创建 bf16 优化器状态，后期 loss 会比 fp32 主权重的方案高约 3 倍（参见 issue #1292）。运行时检测到该组合会输出 warning。
