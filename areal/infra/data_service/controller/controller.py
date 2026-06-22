@@ -70,7 +70,7 @@ class DataController:
         self._workers_ready = threading.Event()
         self._shutdown_requested = threading.Event()
 
-    _WORKERS_READY_TIMEOUT: float = 30.0
+    _WORKERS_READY_TIMEOUT: float = 300.0
 
     # -- Initialize --------------------------------------------------------
 
