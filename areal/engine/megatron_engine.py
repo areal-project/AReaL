@@ -18,6 +18,7 @@ from contextlib import contextmanager
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
+import areal.engine.megatron_utils.triton_l2norm_patch  # noqa: F401 isort: skip  # before MindSpeed: fast GDN l2norm
 import mindspeed.megatron_adaptor  # noqa: F401 isort: skip
 
 # Patch MindSpeed get_full_args to filter invalid field names.
