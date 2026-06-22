@@ -81,6 +81,17 @@ def test_without_stop_passthrough_for_length_and_abort():
         assert resp.output_tokens_without_stop == [7, 8, 9]
 
 
+def test_without_stop_passthrough_for_tool_calls():
+    """tool_calls outputs end on the tool-call structure, not a stop token.
+
+    Like length/abort, they are returned unstripped rather than raising when the
+    final token is not in the stop set. A ModelResponse with stop_reason="tool_calls"
+    is reachable directly from the inference engines' finish_reason passthrough.
+    """
+    resp = _resp([7, 8, 9], stop_token_ids=[106], stop_reason="tool_calls")
+    assert resp.output_tokens_without_stop == [7, 8, 9]
+
+
 def test_without_stop_raises_when_no_trailing_stop_but_stop_reason():
     """stop_reason=stop but output doesn't end in a stop id → diagnostic error."""
     resp = _resp([7, 8, 9], stop_token_ids=[106])

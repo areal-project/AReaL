@@ -122,7 +122,12 @@ class ModelResponse:
     def output_tokens_without_stop(self) -> list[int]:
         if self.tokenizer is None:
             raise ValueError("tokenizer is None, cannot get output_tokens_without_stop")
-        if self.stop_reason in ["length", "abort"] or not self.output_tokens:
+        # "tool_calls" outputs terminate on the tool-call structure rather than a
+        # stop token, so (like "length"/"abort") they are returned unstripped.
+        if (
+            self.stop_reason in ["length", "abort", "tool_calls"]
+            or not self.output_tokens
+        ):
             return self.output_tokens
         stop_tokens = self._stop_token_set()
         if not stop_tokens:
