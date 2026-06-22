@@ -99,7 +99,10 @@ from areal.engine.core.model import (
     lang_config,
     requires_padded_seq,
 )
-from areal.engine.megatron_utils import megatron_bridge_patches  # noqa: F401
+from areal.engine.megatron_utils import (
+    ascend_log_patches,  # noqa: F401
+    megatron_bridge_patches,  # noqa: F401
+)
 from areal.engine.megatron_utils.checkpointer import MegatronCheckpointManager
 from areal.engine.megatron_utils.deterministic import set_deterministic_algorithms
 from areal.engine.megatron_utils.fp8 import FP8BlockwiseTensorHelper
