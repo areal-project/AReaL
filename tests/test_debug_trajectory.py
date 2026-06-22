@@ -363,17 +363,23 @@ class TestTrajectoryIO:
         for dp_rank in range(2):
             torch.save(
                 sample_batch,
-                os.path.join(fake_trainer._trajectory_dir, f"step_000001_dp_{dp_rank}.pt"),
+                os.path.join(
+                    fake_trainer._trajectory_dir, f"step_000001_dp_{dp_rank}.pt"
+                ),
             )
         for dp_rank in range(4):
             torch.save(
                 sample_batch,
-                os.path.join(fake_trainer._trajectory_dir, f"step_000002_dp_{dp_rank}.pt"),
+                os.path.join(
+                    fake_trainer._trajectory_dir, f"step_000002_dp_{dp_rank}.pt"
+                ),
             )
         for dp_rank in range(3):
             torch.save(
                 sample_batch,
-                os.path.join(fake_trainer._trajectory_dir, f"step_000003_dp_{dp_rank}.pt"),
+                os.path.join(
+                    fake_trainer._trajectory_dir, f"step_000003_dp_{dp_rank}.pt"
+                ),
             )
 
         fake_trainer._rotate_trajectories()

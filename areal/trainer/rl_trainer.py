@@ -1431,9 +1431,7 @@ class PPOTrainer:
             step_to_files.setdefault(step_num, []).append(f)
 
         # Separate pinned steps from rotatable steps.
-        rotatable_steps = sorted(
-            s for s in step_to_files if s not in self._pin_steps
-        )
+        rotatable_steps = sorted(s for s in step_to_files if s not in self._pin_steps)
 
         steps_to_remove = len(rotatable_steps) - self._max_keep
         if steps_to_remove > 0:
