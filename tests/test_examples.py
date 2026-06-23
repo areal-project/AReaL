@@ -306,6 +306,7 @@ def test_vlm_grpo(tmp_path_factory, rollout_backend, actor_backend):
         "gconfig.n_samples=2",
         "gconfig.max_new_tokens=256",
         "actor.mb_spec.max_tokens_per_mb=1024",
+        "+actor.optimizer_dtype=bfloat16",
         "train_dataset.batch_size=2",
         "valid_dataset.batch_size=2",
         f"train_dataset.path={dataset_path}",
