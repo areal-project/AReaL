@@ -1,3 +1,0 @@
-jupyter-book
-matplotlib
-numpy
