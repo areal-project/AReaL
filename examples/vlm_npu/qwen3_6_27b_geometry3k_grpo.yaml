@@ -1,15 +1,14 @@
-experiment_name: gsm8k-grpo-awex-npu-sample
-trial_name: trial0
+experiment_name: geometry3k-grpo
+trial_name: trial1
 
 seed: 1
 enable_offload: false
-total_train_epochs: 1
-total_train_steps: 5
+total_train_epochs: 10
 tokenizer_path: ${actor.path}
 
 cluster:
   n_nodes: 1
-  n_gpus_per_node: 2
+  n_gpus_per_node: 16
   fileroot: /tmp/areal/experiments
   name_resolve:
     type: nfs
@@ -19,45 +18,52 @@ scheduler:
   type: local
 
 rollout:
-  backend: "vllm:d1p1t1"
+  backend: "vllm:d4p1t2"
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
   max_concurrent_rollouts: 256
-  tokenizer_path: ${actor.path}
   queue_size: null
   consumer_batch_size: ${train_dataset.batch_size}
-  max_head_offpolicyness: 2
+  max_head_offpolicyness: 4
   enable_rollout_tracing: false
   scheduling_spec: ${actor.scheduling_spec}
+  fileroot: ${cluster.fileroot}
+  tokenizer_path: ${tokenizer_path}
+  dump_to_file: true
 
 gconfig:
-  n_samples: 1
+  n_samples: 4
   min_new_tokens: 0
-  max_new_tokens: 1024
+  max_new_tokens: 2048
   greedy: false
   temperature: 1.0
 
 actor:
-  backend: "megatron:d1p1t1"
+  backend: "megatron:d1p2t4"
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
-  path: Qwen/Qwen3-0.6B
+  path: Qwen/Qwen3.6-27B
   init_from_scratch: false
   disable_dropout: true
-  gradient_checkpointing: false
+  gradient_checkpointing: true
   dtype: bfloat16
   mb_spec:
-    max_tokens_per_mb: 10240
+    max_tokens_per_mb: 4096
   optimizer:
     type: adam
-    lr: 2.0e-5
+    lr: 5e-7
     weight_decay: 0.01
     beta1: 0.9
     beta2: 0.999
     eps: 1e-8
     lr_scheduler_type: constant
     gradient_clipping: 1.0
-    warmup_steps_proportion: 0.0
+    warmup_steps_proportion: 0.001
+  mindspeed:
+    swap_optimizer: true
+    use_fused_rotary_pos_emb: true
+    use_fused_swiglu: true
+    position_embedding_type: "rope"
   eps_clip: 0.4
   temperature: ${gconfig.temperature}
   reward_scaling: 10.0
@@ -76,28 +82,28 @@ actor:
   adv_norm:
     mean_level: batch
     std_level: batch
-  weight_update_mode: awex
+  megatron:
+    bridge_type: megatron-bridge
+    use_bridge_for_update_weights: true # for live weight sync
+    enable_mtp: false
   max_new_tokens: ${gconfig.max_new_tokens}
   scheduling_spec:
     - task_type: worker
       port_count: 2
       gpu: 1
-      cpu: 4
       mem: 32
       cmd: python3 -m areal.infra.rpc.rpc_server
       env_vars:
         VLLM_USE_V1: "1"
-        VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
-        TASK_QUEUE_ENABLE: "2"
+        TASK_QUEUE_ENABLE: "1"
         HCCL_EXEC_TIMEOUT: "14400"
-        HCCL_OP_EXPANSION_MODE: "HOST"
         ACL_DEVICE_SYNC_TIMEOUT: "14400"
         HCCL_EVENT_TIMEOUT: "14500"
         HCCL_ASYNC_ERROR_HANDLING: "0"
         ACL_STREAM_TIMEOUT: "14500000"
         HCCL_CONNECT_TIMEOUT: "7200"
         PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
-        AREAL_ALLOW_DEFAULT_ADMIN_KEY: "1"
+        TORCH_COMPILE_DISABLE: "1"
 
 ref:
   backend: ${actor.backend}
@@ -108,48 +114,52 @@ ref:
   disable_dropout: true
   dtype: ${actor.dtype}
   mb_spec:
-    max_tokens_per_mb: 1024
+    max_tokens_per_mb: 4096
   optimizer: null
   scheduling_strategy:
     type: colocation
     target: actor
   scheduling_spec: ${actor.scheduling_spec}
 
+# SGLang
+sglang:
+  model_path: ${actor.path}
+  random_seed: ${seed}
+  skip_tokenizer_init: true
+  dtype: ${actor.dtype}
+  max_running_requests: 64
+  context_length: 32768
+  mem_fraction_static: 0.8
+  enable_multimodal: true
+
 vllm:
   model: ${actor.path}
   seed: ${seed}
   skip_tokenizer_init: false
   dtype: ${actor.dtype}
-  max_model_len: 2048
-  gpu_memory_utilization: 0.7
+  max_model_len: 32768
+  gpu_memory_utilization: 0.9
+  disable_sliding_window: false
   enforce_eager: true
+  gdn_prefill_backend: triton
 
-awex:
-  device_backend: npu
-  use_mindspeed: true
-  meta_server_addr: auto
-  comm_backend: hccl
-  weights_exchange_ipc_backend: cpu
-  weights_comm_nccl_group_size: 1
-  weights_validation_steps: 0
-  validate_weights_every_n_steps: 1
-
+# datasets
 train_dataset:
-  batch_size: 256
+  batch_size: 32
   shuffle: true
   pin_memory: true
   num_workers: 4
-  path: openai/gsm8k
+  path: hiyouga/geometry3k
   type: rl
-  max_length: 512
 
 valid_dataset:
-  batch_size: 256
+  batch_size: 32
   pin_memory: true
   num_workers: 4
-  path: openai/gsm8k
+  path: hiyouga/geometry3k
   type: rl
 
+# Utilities
 saver:
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
