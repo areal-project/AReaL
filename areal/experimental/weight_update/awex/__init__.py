@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from typing import Any
 
 import aiohttp  # pyright: ignore[reportMissingImports]
@@ -11,6 +12,16 @@ from areal.infra.utils.concurrent import run_async_task
 from areal.utils import logging
 
 logger = logging.getLogger("AwexHTTP")
+
+
+def awex_wu_use_group() -> bool:
+    """Resolve whether ``batch_send_recv`` should use ``use_group=True``.
+
+    Why: on some hardware/driver combinations, ``torch.distributed.batch_isend_irecv``
+    can hang during weight update. ``AWEX_WU_USE_GROUP=0`` lets the caller fall back
+    to per-op send/recv to bypass the hang. Defaults to ``1`` (True).
+    """
+    return bool(int(os.getenv("AWEX_WU_USE_GROUP", "1")))
 
 
 async def _fetch_kv_metadata(

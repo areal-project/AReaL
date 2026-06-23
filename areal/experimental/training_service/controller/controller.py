@@ -71,8 +71,6 @@ class GatewayTrainController:
         self._workers_ready = threading.Event()
         self._shutdown_requested = threading.Event()
 
-    _WORKERS_READY_TIMEOUT: float = 30.0
-
     # -- Initialize --------------------------------------------------------
 
     def initialize(
@@ -96,10 +94,9 @@ class GatewayTrainController:
             self._guarded_bg_initialize, role, ft_spec, **kwargs
         )
 
-        if not self._workers_ready.wait(timeout=self._WORKERS_READY_TIMEOUT):
-            raise TimeoutError(
-                f"Worker creation timed out after {self._WORKERS_READY_TIMEOUT}s"
-            )
+        ready_timeout = self.config.workers_ready_timeout
+        if not self._workers_ready.wait(timeout=ready_timeout):
+            raise TimeoutError(f"Worker creation timed out after {ready_timeout}s")
         if self._init_future.done():
             self._init_future.result()
 
@@ -247,6 +244,8 @@ class GatewayTrainController:
                     sys.executable,
                     "-m",
                     "areal.experimental.training_service.worker",
+                    "--admin-api-key",
+                    cfg.admin_api_key,
                     "--log-level",
                     cfg.log_level,
                 ]
@@ -971,18 +970,19 @@ class GatewayTrainController:
 
         inference_urls: list[str] = rollout.inference_worker_urls
 
-        nccl_master_addr = ""
-        nccl_master_port = 0
-        if self._guard_addrs:
-            resp = requests.post(
-                f"{self._guard_addrs[0]}/alloc_ports",
-                json={"count": 1},
-                timeout=30,
-            )
-            resp.raise_for_status()
-            port_data = resp.json()
-            nccl_master_addr = port_data["host"]
-            nccl_master_port = port_data["ports"][0]
+        # NCCL rendezvous master must live on the rank-0 process's node.
+        # awex assigns rank 0 to inference[0], so allocate on the inference
+        # rank-0 guard rather than a train guard.
+        inf_guard_addrs = rollout.inference_guard_addrs
+        resp = requests.post(
+            f"{inf_guard_addrs[0]}/alloc_ports",
+            json={"count": 1},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        port_data = resp.json()
+        nccl_master_addr = port_data["host"]
+        nccl_master_port = port_data["ports"][0]
 
         pair_name = f"{self._role}-rollout"
         ctrl.connect(

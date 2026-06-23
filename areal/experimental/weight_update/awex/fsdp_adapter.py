@@ -19,7 +19,10 @@ from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.placement_types import Shard
 
 from areal.engine.core.model import is_qwen_vl_model
-from areal.experimental.weight_update.awex import fetch_kv_metadata
+from areal.experimental.weight_update.awex import (
+    awex_wu_use_group,
+    fetch_kv_metadata,
+)
 from areal.experimental.weight_update.nccl_group import (
     init_weights_update_group,
     setup_batch_isend_irecv,
@@ -174,7 +177,12 @@ class AwexFSDPAdapter(AwexTrainingAdapter):
             self._weights_update_group,
             copy_rank=self._transfer_rank,
         )
-        batch_send_recv(send_ops=send_ops, recv_ops=[], blocking=True)
+        batch_send_recv(
+            send_ops=send_ops,
+            recv_ops=[],
+            blocking=True,
+            use_group=awex_wu_use_group(),
+        )
         torch.distributed.barrier(group=self._weights_update_group)
 
     def batch_isend_irecv(self, **kwargs) -> None:

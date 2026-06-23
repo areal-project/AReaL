@@ -7,6 +7,8 @@ VALID_VISION_MODELS = [
     "qwen2_5_vl",
     "qwen3_vl",
     "qwen3_vl_moe",
+    "qwen3_5",
+    "qwen3_5_moe",
     "gemma3",
 ]
 # This registry is used to check if a model is a vision model that we have checked it works with AReaL.
@@ -81,6 +83,16 @@ def is_qwen3_moe_model(model_type: str) -> bool:
 
 def is_qwen3_5_model(model_type: str) -> bool:
     return model_type in ["qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text"]
+
+
+def requires_padded_seq(model_type: str) -> bool:
+    """Whether the model must run the padded (BSHD) forward instead of packed (THD).
+
+    GDN/SSM models (currently the Qwen3.5 family) reject packed sequences in their
+    attention/SSM kernels, so they must run on padded ``[B, S]`` input. THD stays
+    the default for every other model.
+    """
+    return is_qwen3_5_model(model_type)
 
 
 # Copied from trl
