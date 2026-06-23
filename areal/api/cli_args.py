@@ -949,6 +949,34 @@ class MegatronEngineConfig:
         },
     )
 
+    use_bridge_for_update_weights: bool = field(
+        default=False,
+        metadata={
+            "help": "When True and bridge_type='megatron-bridge', delegate live "
+            "weight sync to bridge.export_hf_weights instead of the hand-rolled "
+            "convert_to_hf registry. Required for models without a registry entry "
+            "(e.g. Qwen3.5). FP8 paths fall back to the registry automatically.",
+        },
+    )
+
+    disable_grad_buffers_cpu_backup: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "When offloading with torch_memory_saver, skip CPU backup for "
+                "Megatron gradient buffers (they are recomputed each step). "
+            )
+        },
+    )
+
+    enable_mtp: bool = field(
+        default=False,
+        metadata={
+            "help": "Keep the model's Multi-Token-Prediction (MTP) head "
+            "(bridge_type=megatron-bridge only). Default False drops it.",
+        },
+    )
+
 
 @dataclass
 class MindSpeedEngineConfig:
@@ -1003,50 +1031,6 @@ class MindSpeedEngineConfig:
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
-
-    # Bridge backend used for HF<->Megatron conversion/model creation.
-    bridge_type: str = field(
-        default="mbridge",
-        metadata={
-            "help": "Bridge backend for MegatronEngine. Choices: 'mbridge' or 'megatron-bridge'.",
-            "choices": ["mbridge", "megatron-bridge"],
-        },
-    )
-
-    use_mbridge_save: bool = field(
-        default=False,
-        metadata={
-            "help": "Use mbridge's save method to save gpu memory when saving weights."
-        },
-    )
-
-    use_bridge_for_update_weights: bool = field(
-        default=False,
-        metadata={
-            "help": "When True and bridge_type='megatron-bridge', delegate live "
-            "weight sync to bridge.export_hf_weights instead of the hand-rolled "
-            "convert_to_hf registry. Required for models without a registry entry "
-            "(e.g. Qwen3.5). FP8 paths fall back to the registry automatically.",
-        },
-    )
-
-    disable_grad_buffers_cpu_backup: bool = field(
-        default=False,
-        metadata={
-            "help": (
-                "When offloading with torch_memory_saver, skip CPU backup for "
-                "Megatron gradient buffers (they are recomputed each step). "
-            )
-        },
-    )
-
-    enable_mtp: bool = field(
-        default=False,
-        metadata={
-            "help": "Keep the model's Multi-Token-Prediction (MTP) head "
-            "(bridge_type=megatron-bridge only). Default False drops it.",
-        },
-    )
 
 
 class SchedulingStrategyType(str, Enum):
