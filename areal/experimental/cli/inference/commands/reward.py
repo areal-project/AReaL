@@ -13,13 +13,13 @@ from areal.experimental.cli.inference.common import load_running_state
 
 
 @click.command(name="reward", help="Set reward on a session.")
-@click.argument("session_api_key")
 @click.argument("reward_value", type=float)
+@click.option("--session-api-key", required=True, help="Session API key.")
 @click.option("--service", default=None, help="Target service instance.")
 @click.option("--model", default=None, help="Model name used for routing.")
 def reward_cmd(
-    session_api_key: str,
     reward_value: float,
+    session_api_key: str,
     service: str | None,
     model: str | None,
 ) -> None:

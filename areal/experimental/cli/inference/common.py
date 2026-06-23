@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import shlex
+import signal
 import time
 import urllib.error
 import urllib.request
@@ -34,7 +35,12 @@ from areal.experimental.cli.inference.state import (
     resolve_service_name,
     service_state_path,
 )
-from areal.experimental.cli.process import kill_pids, pick_free_port, pid_alive
+from areal.experimental.cli.process import (
+    kill_pids,
+    pick_free_port,
+    pid_alive,
+    signal_pid,
+)
 from areal.utils.logging import getLogger
 
 logger = getLogger("InfCli")
@@ -193,6 +199,26 @@ def split_args(value: str) -> list[str]:
     return shlex.split(value) if value else []
 
 
+def terminate_runtime_state(
+    state: RuntimeState, *, grace_s: float, force: bool = False
+) -> None:
+    phases = (
+        state.model_state.all_engine_pids(),
+        state.model_state.all_proxy_pids(),
+        [state.gateway_pid],
+        [state.router_pid],
+    )
+    for pids in phases:
+        pids = [pid for pid in pids if pid > 0]
+        if not pids:
+            continue
+        if force:
+            for pid in pids:
+                signal_pid(pid, signal.SIGKILL)
+        else:
+            kill_pids(pids, grace_s=grace_s)
+
+
 def register_external(
     *,
     model: str,
@@ -230,7 +256,7 @@ def register_internal(
     router: RouterClient,
     log_dir: Path,
     base_gpu_id: int = 0,
-) -> tuple[list[int], list[str], list[str], int, int]:
+) -> tuple[list[int], list[int], list[int], list[str], list[str], int, int]:
     engine, tp, dp, pp = parse_backend_spec(backend)
     if pp > 1:
         raise click.ClickException(
@@ -238,6 +264,8 @@ def register_internal(
         )
 
     spawned: list[int] = []
+    engine_pids: list[int] = []
+    proxy_pids: list[int] = []
     proxy_addrs: list[str] = []
     inf_addrs: list[str] = []
     gpu_count = dp * tp
@@ -267,6 +295,7 @@ def register_internal(
                     log_file=inf_log,
                 )
             spawned.append(pid)
+            engine_pids.append(pid)
             inf_addr = f"http://127.0.0.1:{inf_port}"
             inf_addrs.append(inf_addr)
             logger.info(
@@ -298,6 +327,7 @@ def register_internal(
                 log_file=proxy_log,
             )
             spawned.append(proxy_pid)
+            proxy_pids.append(proxy_pid)
             proxy_addr = f"http://127.0.0.1:{proxy_port}"
             proxy_addrs.append(proxy_addr)
             logger.info(
@@ -343,7 +373,15 @@ def register_internal(
             kill_pids(spawned, grace_s=10.0)
         raise
 
-    return spawned, proxy_addrs, inf_addrs, base_gpu_id, gpu_count
+    return (
+        spawned,
+        engine_pids,
+        proxy_pids,
+        proxy_addrs,
+        inf_addrs,
+        base_gpu_id,
+        gpu_count,
+    )
 
 
 def print_models(state: RuntimeState | ModelState, as_json: bool) -> int:

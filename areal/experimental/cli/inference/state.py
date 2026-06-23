@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -50,6 +52,10 @@ def models_state_path(service: str = DEFAULT_SERVICE) -> Path:
     return models_dir() / f"{service}.json"
 
 
+def models_lock_path(service: str = DEFAULT_SERVICE) -> Path:
+    return models_dir() / f"{service}.lock"
+
+
 def current_service_path() -> Path:
     return inf_root() / "current-service"
 
@@ -67,8 +73,28 @@ class ModelEntry:
     base_gpu_id: int = 0
     gpu_count: int = 0
     pids: list[int] = field(default_factory=list)
+    engine_pids: list[int] = field(default_factory=list)
+    proxy_pids: list[int] = field(default_factory=list)
     proxy_addrs: list[str] = field(default_factory=list)
     inference_server_addrs: list[str] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        if self.pids and not self.engine_pids and not self.proxy_pids:
+            self.engine_pids = self.pids[0::2]
+            self.proxy_pids = self.pids[1::2]
+        elif not self.pids and (self.engine_pids or self.proxy_pids):
+            self.pids = [
+                pid for pair in zip(self.engine_pids, self.proxy_pids) for pid in pair
+            ]
+            if len(self.engine_pids) > len(self.proxy_pids):
+                self.pids.extend(self.engine_pids[len(self.proxy_pids) :])
+            elif len(self.proxy_pids) > len(self.engine_pids):
+                self.pids.extend(self.proxy_pids[len(self.engine_pids) :])
+
+    def all_pids(self) -> list[int]:
+        if self.pids:
+            return self.pids
+        return [*self.engine_pids, *self.proxy_pids]
 
 
 @dataclass
@@ -146,7 +172,13 @@ class ModelState:
             p.unlink()
 
     def all_worker_pids(self) -> list[int]:
-        return [pid for entry in self.models.values() for pid in entry.pids]
+        return [pid for entry in self.models.values() for pid in entry.all_pids()]
+
+    def all_engine_pids(self) -> list[int]:
+        return [pid for entry in self.models.values() for pid in entry.engine_pids]
+
+    def all_proxy_pids(self) -> list[int]:
+        return [pid for entry in self.models.values() for pid in entry.proxy_pids]
 
     def set_default_if_empty(self, model: str) -> None:
         if not self.default_model:
@@ -256,3 +288,60 @@ def load_runtime_state(service: str = DEFAULT_SERVICE) -> RuntimeState:
         service_state=service_state,
         model_state=ModelState.load(service_state.service),
     )
+
+
+@contextmanager
+def locked_model_state(service: str = DEFAULT_SERVICE) -> Iterator[None]:
+    import fcntl
+
+    path = models_lock_path(service)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a+") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def recover_pids_from_raw_state(service: str = DEFAULT_SERVICE) -> list[int]:
+    pids: list[int] = []
+
+    def add(value) -> None:
+        if isinstance(value, int) and value > 0:
+            pids.append(value)
+        elif isinstance(value, list):
+            for item in value:
+                add(item)
+
+    def walk(value) -> None:
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if key in {
+                    "pid",
+                    "pids",
+                    "gateway_pid",
+                    "router_pid",
+                    "engine_pids",
+                    "proxy_pids",
+                }:
+                    add(item)
+                else:
+                    walk(item)
+        elif isinstance(value, list):
+            for item in value:
+                walk(item)
+
+    for path in (service_state_path(service), models_state_path(service)):
+        if not path.exists():
+            continue
+        with open(path) as f:
+            walk(json.load(f))
+
+    seen: set[int] = set()
+    unique: list[int] = []
+    for pid in pids:
+        if pid not in seen:
+            seen.add(pid)
+            unique.append(pid)
+    return unique

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import signal
 import time
 
 import click
@@ -16,6 +17,7 @@ from areal.experimental.cli.inference.common import (
     register_internal,
     resolve_provider_api_key,
     split_args,
+    terminate_runtime_state,
     wait_client_health,
 )
 from areal.experimental.cli.inference.launcher import spawn_gateway, spawn_router
@@ -23,9 +25,12 @@ from areal.experimental.cli.inference.state import (
     DEFAULT_SERVICE,
     ModelEntry,
     ModelState,
+    RuntimeState,
     ServiceState,
     gateway_alive,
+    locked_model_state,
     logs_dir,
+    recover_pids_from_raw_state,
     service_state_path,
 )
 from areal.experimental.cli.process import kill_pids
@@ -148,63 +153,69 @@ def do_run(opts: dict) -> int:
         started_at=time.time(),
     )
     model_state = ModelState(service=service)
-    service_state.save()
-    model_state.save()
+    with locked_model_state(service):
+        service_state.save()
+        model_state.save()
 
-    if opts["model"]:
-        try:
-            if opts["api_url"]:
-                api_key = resolve_provider_api_key(
-                    provider_api_key=opts["provider_api_key"],
-                    provider_api_key_env=opts["provider_api_key_env"],
-                )
-                register_external(
-                    model=opts["model"],
-                    api_url=opts["api_url"],
-                    api_key=api_key,
-                    provider_model=opts["provider_model"],
-                    gateway=gateway_client,
-                )
-                model_state.models[opts["model"]] = ModelEntry(
-                    kind="external", api_url=opts["api_url"]
-                )
-                model_state.set_default_if_empty(opts["model"])
-            else:
-                pids, proxy_addrs, inf_addrs, base_gpu, n_gpu = register_internal(
-                    model=opts["model"],
-                    backend=opts["backend"],
-                    model_path=opts["model_path"],
-                    tokenizer_path=opts["tokenizer_path"] or opts["model_path"],
-                    engine_extra=split_args(opts["engine_args"]),
-                    proxy_extra=split_args(opts["proxy_args"]),
-                    model_health_timeout=opts["model_health_timeout"],
-                    log_level=opts["log_level"],
-                    admin_api_key=opts["admin_api_key"],
-                    gateway=gateway_client,
-                    router=router_client,
-                    log_dir=log_dir,
-                    base_gpu_id=model_state.next_gpu_id,
-                )
-                model_state.models[opts["model"]] = ModelEntry(
-                    kind="internal",
-                    backend=opts["backend"],
-                    base_gpu_id=base_gpu,
-                    gpu_count=n_gpu,
-                    pids=pids,
-                    proxy_addrs=proxy_addrs,
-                    inference_server_addrs=inf_addrs,
-                )
-                model_state.next_gpu_id = base_gpu + n_gpu
-                model_state.set_default_if_empty(opts["model"])
-            model_state.save()
-        except BaseException:
-            kill_pids(
-                [gateway_pid, router_pid, *model_state.all_worker_pids()],
-                grace_s=5.0,
-            )
-            ServiceState.remove(service)
-            ModelState.remove(service)
-            raise
+        if opts["model"]:
+            try:
+                if opts["api_url"]:
+                    api_key = resolve_provider_api_key(
+                        provider_api_key=opts["provider_api_key"],
+                        provider_api_key_env=opts["provider_api_key_env"],
+                    )
+                    register_external(
+                        model=opts["model"],
+                        api_url=opts["api_url"],
+                        api_key=api_key,
+                        provider_model=opts["provider_model"],
+                        gateway=gateway_client,
+                    )
+                    model_state.models[opts["model"]] = ModelEntry(
+                        kind="external", api_url=opts["api_url"]
+                    )
+                    model_state.set_default_if_empty(opts["model"])
+                else:
+                    (
+                        pids,
+                        engine_pids,
+                        proxy_pids,
+                        proxy_addrs,
+                        inf_addrs,
+                        base_gpu,
+                        n_gpu,
+                    ) = register_internal(
+                        model=opts["model"],
+                        backend=opts["backend"],
+                        model_path=opts["model_path"],
+                        tokenizer_path=opts["tokenizer_path"] or opts["model_path"],
+                        engine_extra=split_args(opts["engine_args"]),
+                        proxy_extra=split_args(opts["proxy_args"]),
+                        model_health_timeout=opts["model_health_timeout"],
+                        log_level=opts["log_level"],
+                        admin_api_key=opts["admin_api_key"],
+                        gateway=gateway_client,
+                        router=router_client,
+                        log_dir=log_dir,
+                        base_gpu_id=model_state.next_gpu_id,
+                    )
+                    model_state.models[opts["model"]] = ModelEntry(
+                        kind="internal",
+                        backend=opts["backend"],
+                        base_gpu_id=base_gpu,
+                        gpu_count=n_gpu,
+                        pids=pids,
+                        engine_pids=engine_pids,
+                        proxy_pids=proxy_pids,
+                        proxy_addrs=proxy_addrs,
+                        inference_server_addrs=inf_addrs,
+                    )
+                    model_state.next_gpu_id = base_gpu + n_gpu
+                    model_state.set_default_if_empty(opts["model"])
+                model_state.save()
+            except BaseException:
+                _cleanup_runtime(service, service_state, model_state, grace_s=5.0)
+                raise
 
     logger.info("service %r ready pid=%d url=%s", service, gateway_pid, gateway_url)
     if opts["model"]:
@@ -215,18 +226,19 @@ def do_run(opts: dict) -> int:
         return 0
 
     logger.info("foreground (Ctrl-C to stop) ...")
+    previous_handlers = _install_shutdown_signal_handlers()
     try:
         while gateway_alive(service_state):
             time.sleep(1.0)
     except KeyboardInterrupt:
         logger.info("shutting down ...")
-        kill_pids(
-            [gateway_pid, router_pid, *model_state.all_worker_pids()],
-            grace_s=10.0,
-        )
-        ServiceState.remove(service)
-        ModelState.remove(service)
+        _cleanup_runtime(service, service_state, model_state, grace_s=10.0)
         return 0
+    except BaseException:
+        _cleanup_runtime(service, service_state, model_state, grace_s=10.0)
+        raise
+    finally:
+        _restore_signal_handlers(previous_handlers)
 
     logger.warning("gateway exited")
     ServiceState.remove(service)
@@ -242,9 +254,21 @@ def _prepare_service_slot(*, service: str, force: bool) -> None:
             from areal.experimental.cli.inference.state import load_runtime_state
 
             state = load_runtime_state(service)
-            kill_pids(state.all_pids(), grace_s=5.0)
-        except Exception:
-            pass
+            terminate_runtime_state(state, grace_s=5.0)
+        except Exception as exc:
+            try:
+                pids = recover_pids_from_raw_state(service)
+            except Exception as recover_exc:
+                raise click.ClickException(
+                    f"failed to load state for service {service!r}: {exc}; "
+                    "refusing --force because no reliable PID list could be recovered"
+                ) from recover_exc
+            if not pids:
+                raise click.ClickException(
+                    f"failed to load state for service {service!r}: {exc}; "
+                    "refusing --force because no PIDs could be recovered"
+                ) from exc
+            kill_pids(pids, grace_s=5.0)
         ServiceState.remove(service)
         ModelState.remove(service)
         return
@@ -253,3 +277,54 @@ def _prepare_service_slot(*, service: str, force: bool) -> None:
         f"stale state exists for service {service!r}; "
         f"use `areal inf run --service {service} --force`"
     )
+
+
+def _cleanup_runtime(
+    service: str,
+    service_state: ServiceState,
+    model_state: ModelState,
+    *,
+    grace_s: float,
+) -> None:
+    model_state = _latest_model_state_for_cleanup(service, model_state)
+    try:
+        terminate_runtime_state(
+            RuntimeState(service_state=service_state, model_state=model_state),
+            grace_s=grace_s,
+        )
+    finally:
+        ServiceState.remove(service)
+        ModelState.remove(service)
+
+
+def _latest_model_state_for_cleanup(
+    service: str,
+    fallback: ModelState,
+) -> ModelState:
+    try:
+        latest = ModelState.load(service)
+    except Exception:
+        return fallback
+    latest.models.update(fallback.models)
+    return latest
+
+
+def _install_shutdown_signal_handlers():
+    def handle_shutdown(signum, frame):
+        del signum, frame
+        raise KeyboardInterrupt
+
+    signals = [signal.SIGTERM]
+    if hasattr(signal, "SIGHUP"):
+        signals.append(signal.SIGHUP)
+
+    previous = {}
+    for sig in signals:
+        previous[sig] = signal.getsignal(sig)
+        signal.signal(sig, handle_shutdown)
+    return previous
+
+
+def _restore_signal_handlers(previous_handlers) -> None:
+    for sig, handler in previous_handlers.items():
+        signal.signal(sig, handler)

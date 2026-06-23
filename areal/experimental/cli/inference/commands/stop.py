@@ -6,7 +6,7 @@ import signal
 
 import click
 
-from areal.experimental.cli.inference.common import logger
+from areal.experimental.cli.inference.common import logger, terminate_runtime_state
 from areal.experimental.cli.inference.state import (
     ModelState,
     ServiceState,
@@ -14,7 +14,7 @@ from areal.experimental.cli.inference.state import (
     resolve_service_name,
     service_state_path,
 )
-from areal.experimental.cli.process import kill_pids, signal_pid
+from areal.experimental.cli.process import signal_pid
 
 
 @click.command(name="stop", help="Stop an inference service.")
@@ -47,12 +47,17 @@ def do_stop(
             ModelState.remove(service_name)
         return 0
 
-    pids = [pid for pid in state.all_pids() if pid > 0]
     if force:
-        for pid in pids:
-            signal_pid(pid, signal.SIGKILL)
+        for pids in (
+            state.model_state.all_engine_pids(),
+            state.model_state.all_proxy_pids(),
+            [state.gateway_pid],
+            [state.router_pid],
+        ):
+            for pid in pids:
+                signal_pid(pid, signal.SIGKILL)
     else:
-        kill_pids(pids, grace_s=grace)
+        terminate_runtime_state(state, grace_s=grace)
 
     if not keep_state:
         ServiceState.remove(service_name)

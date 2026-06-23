@@ -25,7 +25,7 @@ from areal.experimental.cli.inference.common import (
     name="collect",
     help="Start sessions, wait for ready trajectories, export and dump them.",
 )
-@click.argument("model", required=False)
+@click.option("--model-name", "model", default=None, help="Model name to collect from.")
 @click.option("--service", default=None, help="Target service instance.")
 @click.option(
     "--batch-size", type=int, required=True, help="Number of sessions to collect."

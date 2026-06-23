@@ -14,6 +14,7 @@ from areal.experimental.cli.inference.state import (
     ServiceState,
     current_service_path,
     models_state_path,
+    recover_pids_from_raw_state,
     resolve_service_name,
     service_state_path,
 )
@@ -106,3 +107,34 @@ def test_default_model_resolution_uses_model_state(tmp_path, monkeypatch):
 
     assert resolve_model_name(state, None) == "m"
     assert resolve_model_name(state, "explicit") == "explicit"
+
+
+def test_model_entry_splits_legacy_interleaved_pids():
+    entry = ModelEntry(pids=[10, 20, 11, 21])
+
+    assert entry.engine_pids == [10, 11]
+    assert entry.proxy_pids == [20, 21]
+    assert entry.all_pids() == [10, 20, 11, 21]
+
+
+def test_recover_pids_from_raw_state(tmp_path, monkeypatch):
+    monkeypatch.setenv("AREAL_HOME", str(tmp_path))
+    _save_service("svc", gateway_pid=100)
+    service_payload = json.loads(service_state_path("svc").read_text())
+    service_payload["router_pid"] = 101
+    service_state_path("svc").write_text(json.dumps(service_payload))
+    models_state_path("svc").write_text(
+        json.dumps(
+            {
+                "models": {
+                    "m": {
+                        "engine_pids": [200],
+                        "proxy_pids": [300],
+                        "pids": [200, 300],
+                    }
+                }
+            }
+        )
+    )
+
+    assert recover_pids_from_raw_state("svc") == [100, 101, 200, 300]

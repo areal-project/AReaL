@@ -16,32 +16,34 @@ from areal.experimental.cli.process import kill_pids, signal_pid
 
 
 @click.command(name="deregister", help="Deregister a model and tear down its workers.")
-@click.argument("name")
+@click.option("--model-name", required=True, help="Model name to deregister.")
 @click.option("--service", default=None, help="Target service instance.")
 @click.option("--grace", type=float, default=10.0, show_default=True)
 @click.option("--force", is_flag=True, help="SIGKILL workers immediately.")
-def deregister_cmd(name: str, service: str | None, grace: float, force: bool) -> None:
-    raise SystemExit(do_deregister(name, grace, force, service=service) or 0)
+def deregister_cmd(
+    model_name: str, service: str | None, grace: float, force: bool
+) -> None:
+    raise SystemExit(do_deregister(model_name, grace, force, service=service) or 0)
 
 
 def do_deregister(
-    name: str, grace: float, force: bool, *, service: str | None = None
+    model_name: str, grace: float, force: bool, *, service: str | None = None
 ) -> int:
     state = load_running_state(service)
-    if name not in state.models:
+    if model_name not in state.models:
         raise click.ClickException(
-            f"model {name!r} is not registered in service {state.service!r}"
+            f"model {model_name!r} is not registered in service {state.service!r}"
         )
-    entry = state.models[name]
+    entry = state.models[model_name]
     router = RouterClient(state.router_url, state.admin_api_key)
 
     try:
-        router.remove_model(name)
+        router.remove_model(model_name)
     except GatewayHTTPError as exc:
         if exc.status != 404:
-            logger.warning("router remove_model %s returned %d", name, exc.status)
+            logger.warning("router remove_model %s returned %d", model_name, exc.status)
     except GatewayUnreachable as exc:
-        logger.warning("router unreachable while removing %s: %s", name, exc)
+        logger.warning("router unreachable while removing %s: %s", model_name, exc)
 
     for addr in entry.proxy_addrs:
         try:
@@ -61,8 +63,8 @@ def do_deregister(
         and entry.base_gpu_id + entry.gpu_count == state.model_state.next_gpu_id
     ):
         state.model_state.next_gpu_id = entry.base_gpu_id
-    state.model_state.promote_default_after_remove(name)
-    del state.model_state.models[name]
+    state.model_state.promote_default_after_remove(model_name)
+    del state.model_state.models[model_name]
     state.model_state.save()
-    logger.info("deregistered model %r from service %r", name, state.service)
+    logger.info("deregistered model %r from service %r", model_name, state.service)
     return 0
