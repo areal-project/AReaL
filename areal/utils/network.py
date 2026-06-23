@@ -139,8 +139,10 @@ def find_free_ports(
     free_ports = []
     attempted_ports = set()
 
-    # Calculate available port range
-    available_range = max_port - min_port + 1 - len(exclude_ports)
+    # Calculate available port range. Only excluded ports that fall within
+    # [min_port, max_port] reduce availability; out-of-range entries do not.
+    in_range_excluded = sum(min_port <= p <= max_port for p in exclude_ports)
+    available_range = max_port - min_port + 1 - in_range_excluded
 
     if count > available_range:
         raise ValueError(

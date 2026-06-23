@@ -4,7 +4,10 @@ import sys
 from areal import PPOTrainer
 from areal.api.cli_args import GRPOConfig, load_expr_config
 from areal.dataset import get_custom_dataset
+from areal.utils import logging
 from areal.utils.hf_utils import load_hf_processor_and_tokenizer
+
+logger = logging.getLogger("clevr_count_70k_grpo")
 
 
 def extract_answer(pred_str, data_name, use_last_number=True):
@@ -18,15 +21,17 @@ def extract_answer(pred_str, data_name, use_last_number=True):
 def clevr_count_70k_reward_fn(
     prompt, completions, prompt_ids, completion_ids, answer, **kwargs
 ):
-    sol = extract_answer(completions, data_name="")  # str number
-    ans = answer
+    try:
+        sol = extract_answer(str(completions), data_name="")  # str number
+        ans = str(answer)
 
-    if sol is None:
-        return 0
-    if ans is None:
-        return 0
+        if not sol or not ans:
+            return 0.0
 
-    return float(sol.strip() == ans.strip())
+        return float(sol.strip() == ans.strip())
+    except Exception:
+        logger.warning("Exception in clevr_count_70k_reward_fn", exc_info=True)
+        return 0.0
 
 
 def main(args):
