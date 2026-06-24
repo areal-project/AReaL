@@ -86,7 +86,7 @@ from areal.engine.fsdp_utils.grad import fsdp2_clip_grad_norm
 from areal.engine.fsdp_utils.optimizer import AnyPrecisionAdamW, PerLayerOptimWrapper
 from areal.engine.fsdp_utils.parallel import ParallelHelper, parallelize_model
 from areal.infra.dist_rollout import DistRolloutCoordinator
-from areal.infra.platforms import current_platform
+from areal.infra.platforms import current_platform, is_npu_available
 from areal.models.fsdp.ulysses import (
     set_ulysses_sequence_parallel_group,
     ulysses_pad,
@@ -380,6 +380,18 @@ class FSDPEngine(TrainEngine):
 
         if is_tms_enabled():
             torch_memory_saver.hook_mode = "preload"
+
+        if is_npu_available and is_qwen3_5_model(self.model_config.model_type):
+            try:
+                import areal.engine.fsdp_utils.fla_patch_npu  # noqa: F401
+
+                self.logger.info("Applied FLA patch for Qwen3.5 series on NPU")
+            except Exception as e:
+                self.logger.warning(
+                    f"Failed to apply FLA patch for Qwen3.5 series: {e}. "
+                    "Please ensure you have MindSpeed and Megatron 0.16.0 installed. "
+                    "Falling back to native transformers implementation."
+                )
 
         # Create device model
         self._create_device_model()
