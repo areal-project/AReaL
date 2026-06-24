@@ -8,11 +8,10 @@ from areal.experimental.cli.agent.state import (
     ProcessState,
     ServiceState,
     service_state_path,
-    session_state_path,
 )
 
 
-def test_run_starts_service_without_creating_session(tmp_path, monkeypatch):
+def test_run_persists_service_state(tmp_path, monkeypatch):
     monkeypatch.setenv("AREAL_HOME", str(tmp_path))
 
     def fake_launch_agent_stack(**kwargs):
@@ -71,16 +70,11 @@ def test_run_starts_service_without_creating_session(tmp_path, monkeypatch):
         drain_timeout=1.0,
         session_timeout=60.0,
         log_level="info",
-        config=None,
         force=False,
         inf_addr="http://inf",
         inf_api_key="inf-admin",
         inf_model="model",
-        interactive=False,
-        stop_on_exit=False,
-        history_file=None,
     )
 
     assert rc == 0
     assert service_state_path("svc").exists()
-    assert not session_state_path("svc").exists()

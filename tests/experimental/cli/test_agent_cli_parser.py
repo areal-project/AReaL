@@ -12,15 +12,19 @@ def test_agent_help_contains_expected_commands():
 
     assert result.exit_code == 0
     assert "run" in result.output
-    assert "switch_session" in result.output
-    assert "new_session" in result.output
+    assert "stop" in result.output
+    assert "status" in result.output
+    assert "ps" in result.output
+    assert "logs" in result.output
 
 
-def test_agent_switch_session_accepts_session_argument():
-    result = CliRunner().invoke(cli, ["agent", "switch_session", "--help"])
+def test_agent_help_does_not_register_session_commands():
+    runner = CliRunner()
 
-    assert result.exit_code == 0
-    assert "SESSION_KEY" in result.output
+    for verb in ("new_session", "switch_session", "chat", "reward"):
+        result = runner.invoke(cli, ["agent", verb])
+        assert result.exit_code != 0
+        assert "No such command" in result.output
 
 
 def test_agent_run_does_not_accept_initial_session_key():
@@ -28,15 +32,3 @@ def test_agent_run_does_not_accept_initial_session_key():
 
     assert result.exit_code == 0
     assert "--session-key" not in result.output
-
-
-def test_agent_parser_does_not_register_chat_or_reward():
-    runner = CliRunner()
-
-    chat = runner.invoke(cli, ["agent", "chat"])
-    reward = runner.invoke(cli, ["agent", "reward", "1.0"])
-
-    assert chat.exit_code != 0
-    assert reward.exit_code != 0
-    assert "No such command" in chat.output
-    assert "No such command" in reward.output

@@ -3,47 +3,17 @@
 from __future__ import annotations
 
 import sys
-import time
-import urllib.error
-import urllib.request
 from pathlib import Path
 
-from areal.experimental.cli.agent.http import AgentRouterClient
-from areal.experimental.cli.agent.process import (
-    pick_free_port,
-    pid_alive,
-    spawn_process,
-)
+from areal.experimental.cli.agent.common import wait_http_health
+from areal.experimental.cli.agent.http import RouterClient
+from areal.experimental.cli.agent.process import pick_free_port, spawn_process
 from areal.experimental.cli.agent.state import (
     PairState,
     ProcessState,
     ServiceState,
     service_logs_dir,
 )
-
-
-def wait_http_health(
-    url: str,
-    *,
-    pid: int,
-    timeout: float,
-    label: str,
-) -> None:
-    deadline = time.time() + timeout
-    last_error: Exception | None = None
-    while time.time() < deadline:
-        if not pid_alive(pid):
-            raise RuntimeError(f"{label} subprocess died during startup")
-        try:
-            with urllib.request.urlopen(
-                f"{url.rstrip('/')}/health", timeout=2.0
-            ) as resp:
-                if resp.status < 500:
-                    return
-        except (urllib.error.URLError, ConnectionError, TimeoutError, OSError) as exc:
-            last_error = exc
-            time.sleep(0.3)
-    raise RuntimeError(f"{label} did not become healthy: {last_error}")
 
 
 def launch_agent_stack(
@@ -60,7 +30,6 @@ def launch_agent_stack(
     inf_addr: str,
     inf_api_key: str,
     inf_model: str,
-    interactive: bool,
 ) -> ServiceState:
     log_dir = service_logs_dir(service)
 
@@ -77,16 +46,15 @@ def launch_agent_stack(
     wait_http_health(router_url, pid=router_pid, timeout=setup_timeout, label="router")
 
     pairs: list[PairState] = []
-    router = AgentRouterClient(router_url, admin_api_key)
+    router = RouterClient(router_url, admin_api_key)
     for idx in range(num_pairs):
         pair = _spawn_pair(
             index=idx,
             agent=agent,
-            admin_api_key=admin_api_key,
-            setup_timeout=setup_timeout,
             session_timeout=session_timeout,
             log_level=log_level,
             log_dir=log_dir,
+            setup_timeout=setup_timeout,
         )
         router.register_proxy(pair.data_proxy.url)
         pairs.append(pair)
@@ -108,7 +76,7 @@ def launch_agent_stack(
 
     return ServiceState(
         service=service,
-        launch_mode="interactive" if interactive else "detached",
+        launch_mode="detached",
         agent=agent,
         admin_api_key=admin_api_key,
         gateway=ProcessState(
@@ -192,11 +160,10 @@ def _spawn_pair(
     *,
     index: int,
     agent: str,
-    admin_api_key: str,
-    setup_timeout: float,
     session_timeout: float,
     log_level: str,
     log_dir: Path,
+    setup_timeout: float,
 ) -> PairState:
     worker_port = pick_free_port()
     worker_log = log_dir / f"worker-{index}.log"
@@ -218,10 +185,7 @@ def _spawn_pair(
     )
     worker_url = f"http://127.0.0.1:{worker_port}"
     wait_http_health(
-        worker_url,
-        pid=worker_pid,
-        timeout=setup_timeout,
-        label=f"worker-{index}",
+        worker_url, pid=worker_pid, timeout=setup_timeout, label=f"worker-{index}"
     )
 
     proxy_port = pick_free_port()
@@ -246,10 +210,7 @@ def _spawn_pair(
     )
     proxy_url = f"http://127.0.0.1:{proxy_port}"
     wait_http_health(
-        proxy_url,
-        pid=proxy_pid,
-        timeout=setup_timeout,
-        label=f"proxy-{index}",
+        proxy_url, pid=proxy_pid, timeout=setup_timeout, label=f"proxy-{index}"
     )
 
     return PairState(

@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import os
 import time
-import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -32,12 +31,6 @@ def services_dir() -> Path:
     return path
 
 
-def sessions_dir() -> Path:
-    path = agent_root() / "sessions"
-    path.mkdir(parents=True, exist_ok=True)
-    return path
-
-
 def logs_root() -> Path:
     path = agent_root() / "logs"
     path.mkdir(parents=True, exist_ok=True)
@@ -52,10 +45,6 @@ def service_logs_dir(service: str) -> Path:
 
 def service_state_path(service: str) -> Path:
     return services_dir() / f"{service}.json"
-
-
-def session_state_path(service: str) -> Path:
-    return sessions_dir() / f"{service}.json"
 
 
 def current_service_path() -> Path:
@@ -134,85 +123,6 @@ class ServiceState:
         for pair in self.pairs:
             pids.extend([pair.worker.pid, pair.data_proxy.pid])
         return pids
-
-
-@dataclass
-class SessionState:
-    key: str
-    status: str = "active"
-    created_at: float = field(default_factory=time.time)
-    last_active: float = field(default_factory=time.time)
-    expires_at: float = 0.0
-    rl_session_id: str = ""
-    rl_session_api_key: str = ""
-    last_reward: float | None = None
-    warning: str = ""
-
-    @classmethod
-    def create(cls, key: str, session_timeout: float) -> SessionState:
-        now = time.time()
-        return cls(
-            key=key,
-            created_at=now,
-            last_active=now,
-            expires_at=now + session_timeout,
-        )
-
-
-@dataclass
-class SessionsState:
-    service: str
-    current_session: str = ""
-    sessions: dict[str, SessionState] = field(default_factory=dict)
-
-    def save(self) -> None:
-        atomic_write_json(session_state_path(self.service), asdict(self))
-
-    @classmethod
-    def load(cls, service: str) -> SessionsState:
-        path = session_state_path(service)
-        if not path.exists():
-            return cls(service=service)
-        with open(path) as f:
-            raw = json.load(f)
-        sessions = {
-            key: _load_session_state(value)
-            for key, value in raw.get("sessions", {}).items()
-        }
-        return cls(
-            service=raw.get("service", service),
-            current_session=raw.get("current_session", ""),
-            sessions=sessions,
-        )
-
-    @classmethod
-    def remove(cls, service: str) -> None:
-        path = session_state_path(service)
-        if path.exists():
-            path.unlink()
-
-    def active_sessions(self) -> dict[str, SessionState]:
-        return {
-            key: session
-            for key, session in self.sessions.items()
-            if session.status == "active"
-        }
-
-    def require_active(self, key: str) -> SessionState:
-        session = self.sessions.get(key)
-        if session is None or session.status != "active":
-            raise ValueError(f"session {key!r} is not active")
-        return session
-
-
-def generate_session_key() -> str:
-    return f"session-{uuid.uuid4().hex[:8]}"
-
-
-def _load_session_state(value: dict[str, Any]) -> SessionState:
-    data = dict(value)
-    data.pop("rl_negotiated", None)
-    return SessionState(**data)
 
 
 def resolve_service_name(explicit: str | None = None) -> str:

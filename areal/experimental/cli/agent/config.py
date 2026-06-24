@@ -2,20 +2,45 @@
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
-from typing import Any
 
-from areal.experimental.cli.agent.state import DEFAULT_SERVICE, agent_root
+from areal.experimental.cli.agent.state import agent_root
 
-DEFAULT_ADMIN_API_KEY = "areal-agent-admin"
+# (section, key) -> (verb_or_verbs, click_option_name).
+# Anything not listed is silently ignored.
+_BINDINGS: dict[tuple[str, str], tuple[str | tuple[str, ...], str]] = {
+    (
+        "default",
+        "service",
+    ): (
+        (
+            "run",
+            "stop",
+            "status",
+            "ps",
+            "logs",
+        ),
+        "service",
+    ),
+    ("default", "admin_api_key"): ("run", "admin_api_key"),
+    ("default", "log_level"): ("run", "log_level"),
+    ("run", "agent"): ("run", "agent"),
+    ("run", "num_pairs"): ("run", "num_pairs"),
+    ("run", "setup_timeout"): ("run", "setup_timeout"),
+    ("run", "health_poll_interval"): ("run", "health_poll_interval"),
+    ("run", "drain_timeout"): ("run", "drain_timeout"),
+    ("run", "session_timeout"): ("run", "session_timeout"),
+    ("inference", "addr"): ("run", "inf_addr"),
+    ("inference", "api_key"): ("run", "inf_api_key"),
+    ("inference", "model"): ("run", "inf_model"),
+}
 
 
 def config_path() -> Path:
     return agent_root() / "config.toml"
 
 
-def _read_toml(path: Path) -> dict[str, Any]:
+def _read_toml(path: Path) -> dict:
     try:
         import tomllib
     except ImportError:
@@ -24,68 +49,38 @@ def _read_toml(path: Path) -> dict[str, Any]:
         return {}
     try:
         with open(path, "rb") as f:
-            data = tomllib.load(f)
+            return tomllib.load(f)
     except Exception:
         return {}
-    return data if isinstance(data, dict) else {}
 
 
-def load_config(extra: Path | None = None) -> dict[str, Any]:
-    merged: dict[str, Any] = {}
+def _flatten(toml: dict, parent: str = "") -> dict[tuple[str, str], object]:
+    out: dict[tuple[str, str], object] = {}
+    for k, v in toml.items():
+        if isinstance(v, dict):
+            sub_parent = f"{parent}.{k}" if parent else k
+            for (sec, key), val in _flatten(v, sub_parent).items():
+                out[(sec, key)] = val
+        else:
+            out[(parent, k)] = v
+    return out
+
+
+def load_click_default_map(extra: Path | None = None) -> dict:
+    merged: dict[tuple[str, str], object] = {}
     for path in (config_path(), extra):
         if path is None:
             continue
-        for section, values in _read_toml(path).items():
-            if isinstance(values, dict):
-                target = merged.setdefault(section, {})
-                if isinstance(target, dict):
-                    target.update(values)
-            else:
-                merged[section] = values
-    return merged
+        merged.update(_flatten(_read_toml(path)))
 
-
-def cfg_get(
-    config: dict[str, Any],
-    section: str,
-    key: str,
-    default: Any = None,
-) -> Any:
-    values = config.get(section)
-    if isinstance(values, dict) and key in values:
-        return values[key]
-    return default
-
-
-def resolve_default_service(config: dict[str, Any], explicit: str | None) -> str:
-    return explicit or cfg_get(config, "default", "service", DEFAULT_SERVICE)
-
-
-def resolve_admin_api_key(config: dict[str, Any], explicit: str | None) -> str:
-    return explicit or cfg_get(
-        config, "default", "admin_api_key", DEFAULT_ADMIN_API_KEY
-    )
-
-
-def resolve_inf_addr(config: dict[str, Any], explicit: str | None) -> str:
-    return (
-        explicit
-        or os.environ.get("AREAL_INF_ADDR", "")
-        or cfg_get(config, "inference", "addr", "")
-    )
-
-
-def resolve_inf_api_key(config: dict[str, Any], explicit: str | None) -> str:
-    return (
-        explicit
-        or os.environ.get("AREAL_INF_API_KEY", "")
-        or cfg_get(config, "inference", "api_key", "")
-    )
-
-
-def resolve_inf_model(config: dict[str, Any], explicit: str | None) -> str:
-    return (
-        explicit
-        or os.environ.get("AREAL_INF_MODEL", "")
-        or cfg_get(config, "inference", "model", "")
-    )
+    default_map: dict[str, dict] = {}
+    for (section, key), value in merged.items():
+        binding = _BINDINGS.get((section, key))
+        if binding is None:
+            continue
+        verbs, opt = binding
+        if isinstance(verbs, str):
+            verbs = (verbs,)
+        for verb in verbs:
+            default_map.setdefault(verb, {})[opt] = value
+    return default_map

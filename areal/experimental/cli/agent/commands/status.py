@@ -8,22 +8,18 @@ import time
 import click
 
 from areal.experimental.cli.agent.http import (
-    AgentCLIHTTPError,
-    AgentCLIUnreachable,
-    AgentGatewayClient,
-    AgentRouterClient,
+    AgentHTTPError,
+    AgentUnreachable,
     DataProxyClient,
+    GatewayClient,
+    RouterClient,
 )
 from areal.experimental.cli.agent.process import pid_alive
 from areal.experimental.cli.agent.state import (
     ServiceState,
-    SessionsState,
     resolve_service_name,
     service_state_path,
 )
-from areal.utils import logging
-
-logger = logging.getLogger("AgentCLI")
 
 
 @click.command(name="status", help="Show agent service health.")
@@ -32,53 +28,21 @@ logger = logging.getLogger("AgentCLI")
 @click.option("--interval", type=float, default=2.0, show_default=True)
 @click.option("--json", "as_json", is_flag=True)
 def status_cmd(
-    service: str | None,
-    watch: bool,
-    interval: float,
-    as_json: bool,
+    service: str | None, watch: bool, interval: float, as_json: bool
 ) -> None:
     raise SystemExit(
-        handle(service=service, watch=watch, interval=interval, as_json=as_json) or 0
+        do_status(service=service, watch=watch, interval=interval, as_json=as_json) or 0
     )
 
 
-@click.command(name="health", help="Alias for status.")
-@click.option("--service", default=None)
-@click.option("--watch", is_flag=True)
-@click.option("--interval", type=float, default=2.0, show_default=True)
-@click.option("--json", "as_json", is_flag=True)
-def health_cmd(
-    service: str | None,
-    watch: bool,
-    interval: float,
-    as_json: bool,
-) -> None:
-    raise SystemExit(
-        handle(service=service, watch=watch, interval=interval, as_json=as_json) or 0
-    )
-
-
-def handle(
-    *,
-    service: str | None,
-    watch: bool,
-    interval: float,
-    as_json: bool,
+def do_status(
+    *, service: str | None, watch: bool, interval: float, as_json: bool
 ) -> int:
-    service = resolve_service_name(service)
-    return do_status(
-        service=service,
-        as_json=as_json,
-        watch=watch,
-        interval=interval,
-    )
-
-
-def do_status(*, service: str, as_json: bool, watch: bool, interval: float) -> int:
+    name = resolve_service_name(service)
     while True:
-        snapshot = _snapshot(service)
+        snapshot = _snapshot(name)
         if as_json:
-            logger.info("%s", json.dumps(snapshot, indent=2))
+            click.echo(json.dumps(snapshot, indent=2))
         else:
             _print_table(snapshot)
         if not watch:
@@ -88,7 +52,7 @@ def do_status(*, service: str, as_json: bool, watch: bool, interval: float) -> i
 
 def _snapshot(service: str) -> dict:
     if not service_state_path(service).exists():
-        return {"service": service, "running": False, "components": [], "sessions": []}
+        return {"service": service, "running": False, "components": []}
     try:
         state = ServiceState.load(service)
     except Exception as exc:
@@ -97,7 +61,6 @@ def _snapshot(service: str) -> dict:
             "running": False,
             "error": f"failed to read state: {exc}",
             "components": [],
-            "sessions": [],
         }
 
     components = [
@@ -106,14 +69,14 @@ def _snapshot(service: str) -> dict:
             "gateway",
             state.gateway.url,
             state.gateway.pid,
-            lambda: AgentGatewayClient(state.gateway.url, state.admin_api_key).health(),
+            lambda: GatewayClient(state.gateway.url, state.admin_api_key).health(),
         ),
         _component_health(
             service,
             "router",
             state.router.url,
             state.router.pid,
-            lambda: AgentRouterClient(state.router.url, state.admin_api_key).health(),
+            lambda: RouterClient(state.router.url, state.admin_api_key).health(),
         ),
     ]
     for pair in state.pairs:
@@ -136,22 +99,12 @@ def _snapshot(service: str) -> dict:
             )
         )
 
-    sessions_state = SessionsState.load(service)
-    sessions = [
-        {
-            "key": session.key,
-            "status": session.status,
-            "current": session.key == sessions_state.current_session,
-        }
-        for session in sessions_state.sessions.values()
-    ]
     return {
         "service": service,
-        "running": any(component["pid_alive"] for component in components),
+        "running": any(c["pid_alive"] for c in components),
         "gateway_url": state.gateway.url,
         "router_url": state.router.url,
         "components": components,
-        "sessions": sessions,
     }
 
 
@@ -162,10 +115,10 @@ def _component_health(service: str, component: str, url: str, pid: int, fn) -> d
         data = fn()
         http_status = "ok"
         detail = json.dumps(data, sort_keys=True)
-    except AgentCLIHTTPError as exc:
+    except AgentHTTPError as exc:
         http_status = f"http-{exc.status}"
         detail = exc.body
-    except AgentCLIUnreachable as exc:
+    except AgentUnreachable as exc:
         detail = str(exc)
     return {
         "service": service,
@@ -181,21 +134,15 @@ def _component_health(service: str, component: str, url: str, pid: int, fn) -> d
 def _print_table(snapshot: dict) -> None:
     components = snapshot.get("components") or []
     if not components:
-        logger.info("service %r is not running", snapshot["service"])
+        click.echo(f"service {snapshot['service']!r} is not running")
         return
     rows = [
-        (
-            row["service"],
-            row["component"],
-            row["status"],
-            row["addr"],
-            row["details"],
-        )
+        (row["service"], row["component"], row["status"], row["addr"], row["details"])
         for row in components
     ]
     cols = ("SERVICE", "COMPONENT", "STATUS", "ADDR", "DETAILS")
-    widths = [max(len(str(row[i])) for row in (cols, *rows)) for i in range(len(cols))]
-    fmt = "  ".join(f"{{:<{width}}}" for width in widths)
-    logger.info("%s", fmt.format(*cols))
+    widths = [max(len(str(r[i])) for r in (cols, *rows)) for i in range(len(cols))]
+    fmt = "  ".join(f"{{:<{w}}}" for w in widths)
+    click.echo(fmt.format(*cols))
     for row in rows:
-        logger.info("%s", fmt.format(*row))
+        click.echo(fmt.format(*row))

@@ -2,28 +2,34 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import click
 
 from areal.experimental.cli.agent.commands.logs import logs_cmd
-from areal.experimental.cli.agent.commands.new_session import new_session_cmd
 from areal.experimental.cli.agent.commands.ps import ps_cmd
 from areal.experimental.cli.agent.commands.run import run_cmd
-from areal.experimental.cli.agent.commands.status import health_cmd, status_cmd
-from areal.experimental.cli.agent.commands.stop import destroy_cmd, stop_cmd
-from areal.experimental.cli.agent.commands.switch_session import switch_session_cmd
+from areal.experimental.cli.agent.commands.status import status_cmd
+from areal.experimental.cli.agent.commands.stop import stop_cmd
 
 
-@click.group(help="Manage agent services and sessions.")
-def agent() -> None:
-    pass
+@click.group(help="Manage agent services.")
+@click.option(
+    "--config",
+    "config_file",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=None,
+    help="Extra TOML file merged on top of ~/.areal/agent/config.toml.",
+)
+@click.pass_context
+def agent(ctx: click.Context, config_file: Path | None) -> None:
+    from areal.experimental.cli.agent.config import load_click_default_map
+
+    ctx.default_map = load_click_default_map(extra=config_file)
 
 
 agent.add_command(run_cmd)
 agent.add_command(stop_cmd)
-agent.add_command(destroy_cmd)
 agent.add_command(status_cmd)
-agent.add_command(health_cmd)
 agent.add_command(ps_cmd)
-agent.add_command(new_session_cmd)
-agent.add_command(switch_session_cmd)
 agent.add_command(logs_cmd)

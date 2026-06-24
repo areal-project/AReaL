@@ -28,22 +28,23 @@ def pick_free_port() -> int:
         return int(sock.getsockname()[1])
 
 
-def spawn_process(cmd: list[str], log_file: Path) -> int:
+def spawn_process(
+    cmd: list[str], log_file: Path, env: dict[str, str] | None = None
+) -> int:
     log_file.parent.mkdir(parents=True, exist_ok=True)
     log_handle = open(log_file, "ab", buffering=0)
-    env = os.environ.copy()
-    env.setdefault("PYTHONUNBUFFERED", "1")
-    try:
-        proc = subprocess.Popen(
-            cmd,
-            stdin=subprocess.DEVNULL,
-            stdout=log_handle,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-            env=env,
-        )
-    finally:
-        log_handle.close()
+    final_env = os.environ.copy()
+    final_env.setdefault("PYTHONUNBUFFERED", "1")
+    if env:
+        final_env.update(env)
+    proc = subprocess.Popen(
+        cmd,
+        stdin=subprocess.DEVNULL,
+        stdout=log_handle,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+        env=final_env,
+    )
     return proc.pid
 
 
@@ -65,17 +66,17 @@ def signal_pid(pid: int, sig: int) -> bool:
 
 
 def kill_pids(pids: list[int], grace_s: float) -> None:
-    live_pids = [pid for pid in pids if pid > 0]
-    if not live_pids:
+    pids = [p for p in pids if p > 0]
+    if not pids:
         return
-    for pid in live_pids:
+    for pid in pids:
         if pid_alive(pid):
             signal_pid(pid, signal.SIGTERM)
     deadline = time.time() + grace_s
     while time.time() < deadline:
-        if not any(pid_alive(pid) for pid in live_pids):
+        if not any(pid_alive(pid) for pid in pids):
             return
         time.sleep(0.2)
-    for pid in live_pids:
+    for pid in pids:
         if pid_alive(pid):
             signal_pid(pid, signal.SIGKILL)

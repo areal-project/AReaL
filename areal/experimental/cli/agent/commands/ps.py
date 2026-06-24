@@ -8,19 +8,16 @@ import click
 
 from areal.experimental.cli.agent.process import pid_alive
 from areal.experimental.cli.agent.state import ServiceState, list_service_names
-from areal.utils import logging
-
-logger = logging.getLogger("AgentCLI")
 
 
 @click.command(name="ps", help="List locally known agent services.")
 @click.option("--json", "as_json", is_flag=True)
-@click.option("--all", "include_all", is_flag=True)
+@click.option("--all", "include_all", is_flag=True, help="Include stale services.")
 def ps_cmd(as_json: bool, include_all: bool) -> None:
-    raise SystemExit(handle(as_json=as_json, include_all=include_all) or 0)
+    raise SystemExit(do_ps(as_json=as_json, include_all=include_all) or 0)
 
 
-def handle(*, as_json: bool, include_all: bool) -> int:
+def do_ps(*, as_json: bool, include_all: bool) -> int:
     rows = []
     for service in list_service_names():
         try:
@@ -41,10 +38,10 @@ def handle(*, as_json: bool, include_all: bool) -> int:
             )
 
     if as_json:
-        logger.info("%s", json.dumps(rows, indent=2))
+        click.echo(json.dumps(rows, indent=2))
         return 0
     if not rows:
-        logger.info("no agent services")
+        click.echo("no agent services")
         return 0
     cols = ("SERVICE", "STATUS", "GATEWAY", "AGENT")
     table = [
@@ -56,9 +53,9 @@ def handle(*, as_json: bool, include_all: bool) -> int:
         )
         for row in rows
     ]
-    widths = [max(len(str(row[i])) for row in (cols, *table)) for i in range(4)]
-    fmt = "  ".join(f"{{:<{width}}}" for width in widths)
-    logger.info("%s", fmt.format(*cols))
+    widths = [max(len(str(r[i])) for r in (cols, *table)) for i in range(4)]
+    fmt = "  ".join(f"{{:<{w}}}" for w in widths)
+    click.echo(fmt.format(*cols))
     for row in table:
-        logger.info("%s", fmt.format(*row))
+        click.echo(fmt.format(*row))
     return 0
