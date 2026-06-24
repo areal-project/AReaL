@@ -13,6 +13,18 @@ from pathlib import Path
 def pid_alive(pid: int) -> bool:
     if pid <= 0:
         return False
+    # If ``pid`` is one of our own children we may catch it mid-zombie:
+    # ``os.kill(pid, 0)`` still succeeds for zombies, so an unreaped child
+    # would look alive forever and kill_pids would burn its full grace
+    # window before sending a redundant SIGKILL. Reap it first via WNOHANG
+    # so a zombie is reported dead immediately.
+    try:
+        reaped, _ = os.waitpid(pid, os.WNOHANG)
+        if reaped == pid:
+            return False
+    except (ChildProcessError, OSError):
+        # Not our child, or already reaped — fall through to the kill probe.
+        pass
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -40,19 +52,22 @@ def spawn_process(
     """
 
     log_file.parent.mkdir(parents=True, exist_ok=True)
-    log_handle = open(log_file, "ab", buffering=0)
     final_env = os.environ.copy()
     final_env.setdefault("PYTHONUNBUFFERED", "1")
     if env:
         final_env.update(env)
-    proc = subprocess.Popen(
-        cmd,
-        stdin=subprocess.DEVNULL,
-        stdout=log_handle,
-        stderr=subprocess.STDOUT,
-        start_new_session=True,
-        env=final_env,
-    )
+    # Popen dup()s the fd for the child, so closing our copy here does not
+    # affect the child's stdout/stderr — and it stops us from leaking a fd
+    # in the parent every time spawn_process is called.
+    with open(log_file, "ab", buffering=0) as log_handle:
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+            env=final_env,
+        )
     return proc.pid
 
 
