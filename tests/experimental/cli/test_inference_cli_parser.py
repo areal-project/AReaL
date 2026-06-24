@@ -83,15 +83,18 @@ def test_inference_register_parses_model_name_option(monkeypatch):
             "svc",
             "--model-name",
             "m",
-            "--api-url",
-            "http://provider",
+            "--backend",
+            "sglang:tp=1,dp=1",
+            "--model-path",
+            "/models/m",
         ],
     )
 
     assert result.exit_code == 0
     assert captured["model_name"] == "m"
     assert captured["service"] == "svc"
-    assert captured["opts"]["api_url"] == "http://provider"
+    assert captured["opts"]["backend"] == "sglang:tp=1,dp=1"
+    assert captured["opts"]["model_path"] == "/models/m"
 
 
 def test_inference_deregister_parses_model_name_option(monkeypatch):

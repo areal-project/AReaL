@@ -7,21 +7,26 @@ from dataclasses import asdict
 
 import click
 
-from areal.experimental.cli.inference.client import (
-    GatewayClient,
-    GatewayHTTPError,
-    GatewayUnreachable,
+from areal.experimental.cli.inference.common import (
+    format_gpu_count,
+    format_placement,
+    format_ref,
+    probe_http_health,
 )
+from areal.experimental.cli.inference.scheduler import TaskHandle
 from areal.experimental.cli.inference.state import (
+    RuntimeState,
     gateway_alive,
     load_runtime_state,
     resolve_service_name,
     service_state_path,
 )
-from areal.experimental.cli.process import pid_alive
 
 
-@click.command(name="status", help="Show inference service status.")
+@click.command(
+    name="status",
+    help="Show inference service status — per-component drill-down for one service.",
+)
 @click.option("--service", default=None, help="Target service instance.")
 @click.option("--json", "as_json", is_flag=True, help="Emit JSON.")
 def status_cmd(service: str | None, as_json: bool) -> None:
@@ -44,58 +49,74 @@ def do_status(as_json: bool, *, service: str | None = None) -> int:
     except Exception as exc:
         raise click.ClickException(f"failed to load state: {exc}") from exc
 
-    pid_ok = gateway_alive(state)
-    gateway_http = "down"
-    if pid_ok:
-        try:
-            GatewayClient(state.gateway_url, state.admin_api_key).health(timeout=2.0)
-            gateway_http = "ok"
-        except GatewayUnreachable:
-            gateway_http = "unreachable"
-        except GatewayHTTPError:
-            gateway_http = "error"
+    rows = _collect_rows(state)
 
     if as_json:
-        snap = {
-            "service": state.service,
-            "running": pid_ok,
-            "gateway_url": state.gateway_url,
-            "gateway_pid": state.gateway_pid,
-            "gateway_http": gateway_http,
-            "router_url": state.router_url,
-            "started_at": state.started_at,
-            "models": {name: asdict(entry) for name, entry in state.models.items()},
-        }
-        click.echo(json.dumps(snap, indent=2))
+        click.echo(json.dumps(_json_snapshot(state, rows), indent=2))
         return 0
 
-    rows: list[tuple[str, str, str, str]] = [
-        (
-            f"{state.service}/gateway",
-            gateway_http,
-            state.gateway_url,
-            f"models={len(state.models)}",
-        ),
-        (
-            f"{state.service}/router",
-            "ok" if pid_alive(state.router_pid) else "down",
-            state.router_url,
-            "",
-        ),
-    ]
-    for name, entry in state.models.items():
-        if entry.kind == "internal":
-            detail = f"backend={entry.backend} workers={len(entry.pids) // 2}"
-            addr = "internal"
-        else:
-            detail = f"api_url={entry.api_url}"
-            addr = "external"
-        rows.append((f"{state.service}/{name}", "registered", addr, detail))
+    _print_table(state, rows)
+    return 0
 
-    cols = ("COMPONENT", "STATUS", "ADDR", "DETAILS")
-    widths = [max(len(row[i]) for row in (cols, *rows)) for i in range(len(cols))]
-    fmt = "  ".join(f"{{:<{width}}}" for width in widths)
+
+def _collect_rows(state: RuntimeState) -> list[dict]:
+    rows: list[dict] = [
+        _component_row("gateway", state.gateway_handle, state.backend),
+        _component_row("router", state.router_handle, state.backend),
+    ]
+    for name, entry in state.model_state.models.items():
+        for i, replica in enumerate(entry.replicas):
+            rows.append(
+                _component_row(
+                    f"data_proxy[{name}/{i}]", replica.data_proxy, state.backend
+                )
+            )
+            rows.append(
+                _component_row(f"worker[{name}/{i}]", replica.worker, state.backend)
+            )
+    return rows
+
+
+def _component_row(label: str, handle: TaskHandle, backend: str) -> dict:
+    addr = handle.addr or "-"
+    return {
+        "component": label,
+        "placement": format_placement(backend, handle) or "-",
+        "gpus": format_gpu_count(handle),
+        "addr": addr,
+        "ref": format_ref(backend, handle),
+        "alive": "yes" if probe_http_health(addr) else "no",
+    }
+
+
+def _print_table(state: RuntimeState, rows: list[dict]) -> None:
+    gateway_addr = state.gateway_handle.addr or "-"
+    click.echo(
+        f"service: {state.service}   "
+        f"backend: {state.backend}   "
+        f"gateway: {gateway_addr}   "
+        f"models: {len(state.models)}   "
+        f"running: {'yes' if gateway_alive(state) else 'no'}"
+    )
+    click.echo()
+
+    cols = ("COMPONENT", "PLACEMENT", "GPUS", "ADDR", "REF", "ALIVE")
+    keys = ("component", "placement", "gpus", "addr", "ref", "alive")
+    widths = [max(len(str(r[k])) for r in (dict(zip(keys, cols)), *rows)) for k in keys]
+    fmt = "  ".join(f"{{:<{w}}}" for w in widths)
     click.echo(fmt.format(*cols))
     for row in rows:
-        click.echo(fmt.format(*row))
-    return 0
+        click.echo(fmt.format(*(str(row[k]) for k in keys)))
+
+
+def _json_snapshot(state: RuntimeState, rows: list[dict]) -> dict:
+    return {
+        "service": state.service,
+        "backend": state.backend,
+        "running": gateway_alive(state),
+        "gateway_handle": asdict(state.gateway_handle),
+        "router_handle": asdict(state.router_handle),
+        "started_at": state.started_at,
+        "models": {name: asdict(entry) for name, entry in state.models.items()},
+        "components": rows,
+    }

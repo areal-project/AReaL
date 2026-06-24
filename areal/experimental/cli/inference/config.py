@@ -7,6 +7,7 @@ CLI defaults.  Per design 12, sections map to verbs:
 
   [default]              admin_api_key, log_level (applied to all verbs)
   [launch]               run-time gateway / router / strategy / timeouts
+  [scheduler]            scheduler backend selection (applied to run only)
   [register.internal]    register / inline-register defaults
   [collect]              collect verb defaults
 
@@ -52,6 +53,8 @@ _BINDINGS: dict[tuple[str, str], tuple[str | tuple[str, ...], str]] = {
     ("launch", "gateway_port"): ("run", "port"),
     ("launch", "routing_strategy"): ("run", "routing_strategy"),
     ("launch", "launch_timeout"): ("run", "launch_timeout"),
+    # [scheduler] — applied to `run` only; other verbs read from ServiceState
+    ("scheduler", "type"): ("run", "scheduler"),
     # [register.internal] — applied to `register`
     ("register.internal", "backend"): ("register", "backend"),
     ("register.internal", "model_health_timeout"): ("register", "model_health_timeout"),

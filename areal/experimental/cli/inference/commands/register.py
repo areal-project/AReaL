@@ -10,13 +10,9 @@ from areal.experimental.cli.inference.common import (
     PROXY_ARGS_HELP,
     load_running_state,
     logger,
-    register_external,
-    register_internal,
-    resolve_provider_api_key,
-    split_args,
+    register_model,
 )
 from areal.experimental.cli.inference.state import (
-    ModelEntry,
     locked_model_state,
     logs_dir,
     resolve_service_name,
@@ -26,11 +22,7 @@ from areal.experimental.cli.inference.state import (
 @click.command(name="register", help="Register a model against a running service.")
 @click.option("--model-name", required=True, help="Model name to register.")
 @click.option("--service", default=None, help="Target service instance.")
-@click.option("--api-url", default=None, help="External provider URL.")
-@click.option("--provider-api-key", default=None)
-@click.option("--provider-api-key-env", default=None)
-@click.option("--provider-model", default=None)
-@click.option("--backend", default=None, help="Internal backend spec.")
+@click.option("--backend", default=None, help="Backend spec.")
 @click.option("--model-path", default=None)
 @click.option("--tokenizer-path", default=None)
 @click.option("--engine-args", default="", help=ENGINE_ARGS_HELP)
@@ -50,78 +42,30 @@ def do_register(model_name: str, opts: dict, *, service: str | None = None) -> i
     service_name = resolve_service_name(service)
     with locked_model_state(service_name):
         state = load_running_state(service_name)
-        if opts["api_url"] and opts["backend"]:
-            raise click.UsageError("Use --api-url OR --backend, not both.")
-        if not opts["api_url"] and not opts["backend"]:
-            raise click.UsageError("Provide --api-url <url> or --backend <spec>.")
-        if opts["backend"] and not opts["model_path"]:
-            raise click.UsageError("--backend requires --model-path.")
         if model_name in state.models:
             raise click.ClickException(
                 f"model {model_name!r} already registered in service {state.service!r}"
             )
 
-        gateway = GatewayClient(state.gateway_url, state.admin_api_key)
-        router = RouterClient(state.router_url, state.admin_api_key)
-        if opts["api_url"]:
-            api_key = resolve_provider_api_key(
-                provider_api_key=opts["provider_api_key"],
-                provider_api_key_env=opts["provider_api_key_env"],
-            )
-            register_external(
-                model=model_name,
-                api_url=opts["api_url"],
-                api_key=api_key,
-                provider_model=opts["provider_model"],
-                gateway=gateway,
-            )
-            state.model_state.models[model_name] = ModelEntry(
-                kind="external", api_url=opts["api_url"]
-            )
-            state.model_state.set_default_if_empty(model_name)
-            state.model_state.save()
-            logger.info(
-                "registered external model %r in service %r", model_name, state.service
-            )
-            return 0
-
-        pids, engine_pids, proxy_pids, proxy_addrs, inf_addrs, base_gpu, n_gpu = (
-            register_internal(
-                model=model_name,
-                backend=opts["backend"],
-                model_path=opts["model_path"],
-                tokenizer_path=opts["tokenizer_path"] or opts["model_path"],
-                engine_extra=split_args(opts["engine_args"]),
-                proxy_extra=split_args(opts["proxy_args"]),
-                model_health_timeout=opts["model_health_timeout"],
-                log_level=opts["log_level"],
-                admin_api_key=state.admin_api_key,
-                gateway=gateway,
-                router=router,
-                log_dir=logs_dir(state.service),
-                base_gpu_id=state.model_state.next_gpu_id,
-            )
+        entry = register_model(
+            model_name=model_name,
+            opts=opts,
+            gateway=GatewayClient(state.gateway_url, state.admin_api_key),
+            router=RouterClient(state.router_url, state.admin_api_key),
+            log_dir=logs_dir(state.service),
+            admin_api_key=state.admin_api_key,
+            scheduler_backend=state.backend,
+            occupied_gpus=state.model_state.occupied_gpus(),
         )
-        state.model_state.models[model_name] = ModelEntry(
-            kind="internal",
-            backend=opts["backend"],
-            base_gpu_id=base_gpu,
-            gpu_count=n_gpu,
-            pids=pids,
-            engine_pids=engine_pids,
-            proxy_pids=proxy_pids,
-            proxy_addrs=proxy_addrs,
-            inference_server_addrs=inf_addrs,
-        )
-        state.model_state.next_gpu_id = base_gpu + n_gpu
+        state.model_state.models[model_name] = entry
         state.model_state.set_default_if_empty(model_name)
         state.model_state.save()
+        gpus_used = sorted({g for r in entry.replicas for g in r.worker.gpu_devices})
         logger.info(
-            "registered internal model %r in service %r (%d worker(s), GPU %d-%d)",
+            "registered model %r in service %r (%d replica(s), GPUs=%s)",
             model_name,
             state.service,
-            len(pids),
-            base_gpu,
-            base_gpu + n_gpu - 1,
+            len(entry.replicas),
+            gpus_used,
         )
     return 0

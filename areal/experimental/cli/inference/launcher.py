@@ -5,7 +5,16 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+from areal.experimental.cli.inference.scheduler import (
+    TaskAllocation,
+    TaskResources,
+    TaskSpec,
+)
 from areal.experimental.cli.process import pick_free_port, spawn_process
+
+# Gateway and router are service-level singletons spawned directly via
+# spawn_process — not submitted to a Scheduler — so their lifecycle is
+# anchored to the CLI's state files regardless of scheduler backend.
 
 
 def spawn_router(
@@ -62,65 +71,82 @@ def spawn_gateway(
     return spawn_process(cmd, log_file)
 
 
-def spawn_sglang(
+# sglang / vllm builders always pass base_gpu_id=0; the scheduler masks
+# physical GPUs via CUDA_VISIBLE_DEVICES so the launched process sees
+# its devices as 0..N-1.
+
+
+def build_sglang_task_spec(
     *,
+    name: str,
     model_path: str,
-    host: str,
-    port: int,
     tp: int,
-    base_gpu_id: int,
     extra_args: list[str],
     log_file: Path,
-) -> int:
-    from areal.api.cli_args import SGLangConfig
+) -> TaskSpec:
+    def cmd_builder(alloc: TaskAllocation) -> list[str]:
+        from areal.api.cli_args import SGLangConfig
 
-    cfg = SGLangConfig(model_path=model_path, log_requests=True)
-    cmd = list(
-        SGLangConfig.build_cmd(
-            sglang_config=cfg,
-            tp_size=tp,
-            base_gpu_id=base_gpu_id,
-            host=host,
-            port=port,
-            n_nodes=1,
-            node_rank=0,
-            pp_size=1,
+        cfg = SGLangConfig(model_path=model_path, log_requests=True)
+        cmd = list(
+            SGLangConfig.build_cmd(
+                sglang_config=cfg,
+                tp_size=tp,
+                base_gpu_id=0,
+                host=alloc.host,
+                port=alloc.ports[0],
+                n_nodes=1,
+                node_rank=0,
+                pp_size=1,
+            )
         )
+        cmd.extend(extra_args)
+        return cmd
+
+    return TaskSpec(
+        name=name,
+        cmd_builder=cmd_builder,
+        log_file=log_file,
+        resources=TaskResources(gpu=tp, ports=1),
     )
-    cmd.extend(extra_args)
-    return spawn_process(cmd, log_file)
 
 
-def spawn_vllm(
+def build_vllm_task_spec(
     *,
+    name: str,
     model_path: str,
-    host: str,
-    port: int,
     tp: int,
     pp: int,
     extra_args: list[str],
     log_file: Path,
-) -> int:
-    from areal.api.cli_args import vLLMConfig
+) -> TaskSpec:
+    def cmd_builder(alloc: TaskAllocation) -> list[str]:
+        from areal.api.cli_args import vLLMConfig
 
-    cfg = vLLMConfig(model=model_path)
-    cmd = list(
-        vLLMConfig.build_cmd(
-            vllm_config=cfg,
-            tp_size=tp,
-            pp_size=pp,
-            host=host,
-            port=port,
+        cfg = vLLMConfig(model=model_path)
+        cmd = list(
+            vLLMConfig.build_cmd(
+                vllm_config=cfg,
+                tp_size=tp,
+                pp_size=pp,
+                host=alloc.host,
+                port=alloc.ports[0],
+            )
         )
+        cmd.extend(extra_args)
+        return cmd
+
+    return TaskSpec(
+        name=name,
+        cmd_builder=cmd_builder,
+        log_file=log_file,
+        resources=TaskResources(gpu=tp * pp, ports=1),
     )
-    cmd.extend(extra_args)
-    return spawn_process(cmd, log_file)
 
 
-def spawn_data_proxy(
+def build_data_proxy_task_spec(
     *,
-    host: str,
-    port: int,
+    name: str,
     backend_addr: str,
     backend_type: str,
     tokenizer_path: str,
@@ -128,25 +154,33 @@ def spawn_data_proxy(
     log_level: str,
     extra_args: list[str],
     log_file: Path,
-) -> int:
-    cmd = [
-        sys.executable,
-        "-m",
-        "areal.experimental.inference_service.data_proxy",
-        "--host",
-        host,
-        "--port",
-        str(port),
-        "--backend-addr",
-        backend_addr,
-        "--backend-type",
-        backend_type,
-        "--tokenizer-path",
-        tokenizer_path,
-        "--admin-api-key",
-        admin_api_key,
-        "--log-level",
-        log_level,
-    ]
-    cmd.extend(extra_args)
-    return spawn_process(cmd, log_file)
+) -> TaskSpec:
+    def cmd_builder(alloc: TaskAllocation) -> list[str]:
+        cmd = [
+            sys.executable,
+            "-m",
+            "areal.experimental.inference_service.data_proxy",
+            "--host",
+            alloc.host,
+            "--port",
+            str(alloc.ports[0]),
+            "--backend-addr",
+            backend_addr,
+            "--backend-type",
+            backend_type,
+            "--tokenizer-path",
+            tokenizer_path,
+            "--admin-api-key",
+            admin_api_key,
+            "--log-level",
+            log_level,
+        ]
+        cmd.extend(extra_args)
+        return cmd
+
+    return TaskSpec(
+        name=name,
+        cmd_builder=cmd_builder,
+        log_file=log_file,
+        resources=TaskResources(gpu=0, ports=1),
+    )

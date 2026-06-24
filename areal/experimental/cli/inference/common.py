@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
 import shlex
 import signal
 import time
@@ -21,12 +20,19 @@ from areal.experimental.cli.inference.client import (
     RouterClient,
 )
 from areal.experimental.cli.inference.launcher import (
-    spawn_data_proxy,
-    spawn_sglang,
-    spawn_vllm,
+    build_data_proxy_task_spec,
+    build_sglang_task_spec,
+    build_vllm_task_spec,
+)
+from areal.experimental.cli.inference.scheduler import (
+    Scheduler,
+    TaskHandle,
+    build_scheduler,
 )
 from areal.experimental.cli.inference.state import (
     DEFAULT_SERVICE,
+    ModelEntry,
+    ModelReplica,
     ModelState,
     RuntimeState,
     gateway_alive,
@@ -37,7 +43,6 @@ from areal.experimental.cli.inference.state import (
 )
 from areal.experimental.cli.process import (
     kill_pids,
-    pick_free_port,
     pid_alive,
     signal_pid,
 )
@@ -180,36 +185,27 @@ def parse_backend_spec(spec: str) -> tuple[str, int, int, int]:
     return engine, tp, dp, pp
 
 
-def resolve_provider_api_key(
-    *, provider_api_key: str | None, provider_api_key_env: str | None
-) -> str | None:
-    if provider_api_key:
-        return provider_api_key
-    if provider_api_key_env:
-        value = os.environ.get(provider_api_key_env)
-        if not value:
-            raise click.ClickException(
-                f"env var {provider_api_key_env!r} is unset or empty"
-            )
-        return value
-    return None
-
-
 def split_args(value: str) -> list[str]:
     return shlex.split(value) if value else []
+
+
+def _pids(handles: list[TaskHandle]) -> list[int]:
+    return [h.pid for h in handles if h.pid > 0]
 
 
 def terminate_runtime_state(
     state: RuntimeState, *, grace_s: float, force: bool = False
 ) -> None:
+    # Data-flow order: kill upstream (data-proxies stop accepting requests)
+    # before the worker behind it goes away, so in-flight requests fail at
+    # the proxy boundary instead of mid-worker. Control plane last.
     phases = (
-        state.model_state.all_engine_pids(),
-        state.model_state.all_proxy_pids(),
-        [state.gateway_pid],
-        [state.router_pid],
+        _pids(state.model_state.all_data_proxies()),
+        _pids(state.model_state.all_workers()),
+        _pids([state.gateway_handle]),
+        _pids([state.router_handle]),
     )
     for pids in phases:
-        pids = [pid for pid in pids if pid > 0]
         if not pids:
             continue
         if force:
@@ -219,26 +215,45 @@ def terminate_runtime_state(
             kill_pids(pids, grace_s=grace_s)
 
 
-def register_external(
-    *,
-    model: str,
-    api_url: str,
-    api_key: str | None,
-    provider_model: str | None,
-    gateway: GatewayClient,
-) -> None:
-    payload = {
-        "model": model,
-        "url": api_url,
-        "api_key": api_key,
-        "data_proxy_addrs": [],
-    }
-    if provider_model:
-        payload["provider_model"] = provider_model
+def format_placement(backend: str, handle: TaskHandle) -> str:
+    if backend == "local":
+        import socket
+
+        return socket.gethostname()
+    if backend == "k8s":
+        node = handle.ref.get("node", "?")
+        pod = handle.ref.get("pod_name", "?")
+        return f"{node}/{pod}"
+    if backend == "slurm":
+        node = handle.ref.get("node", "?")
+        job = handle.ref.get("job_id", "?")
+        return f"{node}/job={job}"
+    return "-"
+
+
+def format_ref(backend: str, handle: TaskHandle) -> str:
+    if backend == "local":
+        return f"pid={handle.pid}" if handle.pid > 0 else "-"
+    if backend == "k8s":
+        pod = handle.ref.get("pod_name", "")
+        return f"pod={pod}" if pod else "-"
+    if backend == "slurm":
+        job = handle.ref.get("job_id", "")
+        return f"job={job}" if job else "-"
+    return "-"
+
+
+def format_gpu_count(handle: TaskHandle) -> str:
+    n = len(handle.gpu_devices)
+    return f"×{n}" if n > 0 else "-"
+
+
+def probe_http_health(addr: str, *, timeout: float = 1.0) -> bool:
     try:
-        gateway.register_model(payload)
-    except (GatewayUnreachable, GatewayHTTPError) as exc:
-        raise click.ClickException(f"register_model failed: {exc}") from exc
+        with urllib.request.urlopen(f"{addr}/health", timeout=timeout) as resp:
+            return resp.status < 500
+    except (urllib.error.URLError, ConnectionError, TimeoutError, OSError):
+        return False
 
 
 def register_internal(
@@ -255,70 +270,59 @@ def register_internal(
     gateway: GatewayClient,
     router: RouterClient,
     log_dir: Path,
-    base_gpu_id: int = 0,
-) -> tuple[list[int], list[int], list[int], list[str], list[str], int, int]:
+    scheduler: Scheduler,
+) -> list[ModelReplica]:
     engine, tp, dp, pp = parse_backend_spec(backend)
     if pp > 1:
         raise click.ClickException(
             "pp > 1 is not supported by `areal inf` (single-node only)."
         )
 
-    spawned: list[int] = []
-    engine_pids: list[int] = []
-    proxy_pids: list[int] = []
-    proxy_addrs: list[str] = []
-    inf_addrs: list[str] = []
-    gpu_count = dp * tp
+    replicas: list[ModelReplica] = []
+    spawned_handles: list[TaskHandle] = []
 
     try:
         for rank in range(dp):
-            inf_port = pick_free_port()
-            inf_log = log_dir / f"{model}-inf-{rank}.log"
+            worker_log = log_dir / f"{model}-worker-{rank}.log"
             if engine == "sglang":
-                pid = spawn_sglang(
+                worker_spec = build_sglang_task_spec(
+                    name=f"worker/{model}/{rank}",
                     model_path=model_path,
-                    host="127.0.0.1",
-                    port=inf_port,
                     tp=tp,
-                    base_gpu_id=base_gpu_id + rank * tp,
                     extra_args=engine_extra,
-                    log_file=inf_log,
+                    log_file=worker_log,
                 )
             else:
-                pid = spawn_vllm(
+                worker_spec = build_vllm_task_spec(
+                    name=f"worker/{model}/{rank}",
                     model_path=model_path,
-                    host="127.0.0.1",
-                    port=inf_port,
                     tp=tp,
                     pp=pp,
                     extra_args=engine_extra,
-                    log_file=inf_log,
+                    log_file=worker_log,
                 )
-            spawned.append(pid)
-            engine_pids.append(pid)
-            inf_addr = f"http://127.0.0.1:{inf_port}"
-            inf_addrs.append(inf_addr)
+            worker_handle = scheduler.submit(worker_spec)
+            spawned_handles.append(worker_handle)
             logger.info(
-                "spawned %s replica %d/%d pid=%d port=%d",
+                "spawned %s worker %d/%d pid=%d port=%d gpus=%s",
                 engine,
                 rank,
                 dp,
-                pid,
-                inf_port,
+                worker_handle.pid,
+                worker_handle.ports[0],
+                worker_handle.gpu_devices,
             )
             wait_http_health(
-                inf_addr,
+                worker_handle.addr,
                 deadline=time.time() + model_health_timeout,
-                pid=pid,
-                label=f"{engine} replica {rank}",
+                pid=worker_handle.pid,
+                label=f"{engine} worker {rank}",
             )
 
-            proxy_port = pick_free_port()
             proxy_log = log_dir / f"{model}-data-proxy-{rank}.log"
-            proxy_pid = spawn_data_proxy(
-                host="127.0.0.1",
-                port=proxy_port,
-                backend_addr=inf_addr,
+            proxy_spec = build_data_proxy_task_spec(
+                name=f"data_proxy/{model}/{rank}",
+                backend_addr=worker_handle.addr,
                 backend_type=engine,
                 tokenizer_path=tokenizer_path,
                 admin_api_key=admin_api_key,
@@ -326,24 +330,25 @@ def register_internal(
                 extra_args=proxy_extra,
                 log_file=proxy_log,
             )
-            spawned.append(proxy_pid)
-            proxy_pids.append(proxy_pid)
-            proxy_addr = f"http://127.0.0.1:{proxy_port}"
-            proxy_addrs.append(proxy_addr)
+            proxy_handle = scheduler.submit(proxy_spec)
+            spawned_handles.append(proxy_handle)
             logger.info(
                 "spawned data-proxy %d/%d pid=%d port=%d",
                 rank,
                 dp,
-                proxy_pid,
-                proxy_port,
+                proxy_handle.pid,
+                proxy_handle.ports[0],
             )
             wait_http_health(
-                proxy_addr,
+                proxy_handle.addr,
                 deadline=time.time() + 30.0,
-                pid=proxy_pid,
+                pid=proxy_handle.pid,
                 label=f"data-proxy {rank}",
             )
 
+            replicas.append(ModelReplica(data_proxy=proxy_handle, worker=worker_handle))
+
+        proxy_addrs = [r.data_proxy.addr for r in replicas]
         for addr in proxy_addrs:
             try:
                 router.register_worker(addr)
@@ -365,23 +370,59 @@ def register_internal(
             raise click.ClickException(f"gateway register_model failed: {exc}") from exc
 
     except BaseException:
-        if spawned:
+        if spawned_handles:
             logger.error(
                 "internal register failed; killing %d spawned worker(s)",
-                len(spawned),
+                len(spawned_handles),
             )
-            kill_pids(spawned, grace_s=10.0)
+            pids = [h.pid for h in spawned_handles if h.pid > 0]
+            kill_pids(pids, grace_s=10.0)
         raise
 
-    return (
-        spawned,
-        engine_pids,
-        proxy_pids,
-        proxy_addrs,
-        inf_addrs,
-        base_gpu_id,
-        gpu_count,
+    return replicas
+
+
+def validate_register_opts(opts: dict) -> None:
+    if not opts.get("backend"):
+        raise click.UsageError("--backend <spec> is required.")
+    if not opts.get("model_path"):
+        raise click.UsageError("--backend requires --model-path <path>.")
+
+
+def register_model(
+    *,
+    model_name: str,
+    opts: dict,
+    gateway: GatewayClient,
+    router: RouterClient,
+    log_dir: Path,
+    admin_api_key: str,
+    scheduler_backend: str,
+    occupied_gpus: set[int],
+) -> ModelEntry:
+    """Validate registration opts and spawn the model's worker + data-proxy
+    fleet. The returned ModelEntry is meant to be slotted into model_state
+    by the caller — this helper does not touch model_state itself so the
+    caller can keep the file lock scope explicit."""
+
+    validate_register_opts(opts)
+    scheduler = build_scheduler(scheduler_backend, occupied_gpus=occupied_gpus)
+    replicas = register_internal(
+        model=model_name,
+        backend=opts["backend"],
+        model_path=opts["model_path"],
+        tokenizer_path=opts.get("tokenizer_path") or opts["model_path"],
+        engine_extra=split_args(opts.get("engine_args", "")),
+        proxy_extra=split_args(opts.get("proxy_args", "")),
+        model_health_timeout=opts.get("model_health_timeout", 600.0),
+        log_level=opts.get("log_level", "info"),
+        admin_api_key=admin_api_key,
+        gateway=gateway,
+        router=router,
+        log_dir=log_dir,
+        scheduler=scheduler,
     )
+    return ModelEntry(backend=opts["backend"], replicas=replicas)
 
 
 def print_models(state: RuntimeState | ModelState, as_json: bool) -> int:
@@ -404,11 +445,9 @@ def print_models(state: RuntimeState | ModelState, as_json: bool) -> int:
 
     rows = []
     for name, entry in model_state.models.items():
-        backend = entry.backend if entry.kind == "internal" else "-"
-        workers = str(len(entry.pids) // 2) if entry.kind == "internal" else "-"
         default = "*" if name == model_state.default_model else ""
-        rows.append((name, default, entry.kind, backend, workers))
-    cols = ("NAME", "DEFAULT", "KIND", "BACKEND", "WORKERS")
+        rows.append((name, default, entry.backend, str(len(entry.replicas))))
+    cols = ("NAME", "DEFAULT", "BACKEND", "WORKERS")
     widths = [max(len(row[i]) for row in (cols, *rows)) for i in range(len(cols))]
     fmt = "  ".join(f"{{:<{width}}}" for width in widths)
     click.echo(fmt.format(*cols))
@@ -432,6 +471,7 @@ def print_services(*, as_json: bool, include_all: bool) -> int:
                 {
                     "service": service,
                     "status": "running" if running else "stale",
+                    "backend": state.backend,
                     "gateway_url": state.gateway_url,
                     "gateway_pid": state.gateway_pid,
                     "router_url": state.router_url,
@@ -446,18 +486,23 @@ def print_services(*, as_json: bool, include_all: bool) -> int:
         click.echo("no inference services")
         return 0
 
+    def _pid_cell(row: dict) -> str:
+        pid = row.get("gateway_pid", 0)
+        return str(pid) if pid else "-"
+
     table = [
         (
             row["service"],
             row["status"],
+            row.get("backend", "-"),
             str(row.get("models", "")),
             row.get("gateway_url", ""),
-            str(row.get("gateway_pid", "")),
+            _pid_cell(row),
         )
         for row in rows
     ]
-    cols = ("SERVICE", "STATUS", "MODELS", "GATEWAY", "PID")
-    widths = [max(len(str(row[i])) for row in (cols, *table)) for i in range(5)]
+    cols = ("SERVICE", "STATUS", "BACKEND", "MODELS", "GATEWAY", "PID")
+    widths = [max(len(str(row[i])) for row in (cols, *table)) for i in range(len(cols))]
     fmt = "  ".join(f"{{:<{width}}}" for width in widths)
     click.echo(fmt.format(*cols))
     for row in table:

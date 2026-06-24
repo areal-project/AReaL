@@ -13,17 +13,15 @@ from areal.experimental.cli.inference.common import (
     PROXY_ARGS_HELP,
     logger,
     refuse_if_running,
-    register_external,
-    register_internal,
-    resolve_provider_api_key,
-    split_args,
+    register_model,
     terminate_runtime_state,
+    validate_register_opts,
     wait_client_health,
 )
 from areal.experimental.cli.inference.launcher import spawn_gateway, spawn_router
+from areal.experimental.cli.inference.scheduler import TaskHandle
 from areal.experimental.cli.inference.state import (
     DEFAULT_SERVICE,
-    ModelEntry,
     ModelState,
     RuntimeState,
     ServiceState,
@@ -64,15 +62,7 @@ from areal.experimental.cli.process import kill_pids
 )
 @click.option("-d", "--detach", is_flag=True, help="Fork the daemon and exit.")
 @click.option("--model", default=None, help="Register this model at startup.")
-@click.option("--api-url", default=None, help="External provider URL.")
-@click.option("--provider-api-key", default=None)
-@click.option(
-    "--provider-api-key-env", default=None, help="Env var holding the provider API key."
-)
-@click.option("--provider-model", default=None, help="Upstream model name.")
-@click.option(
-    "--backend", default=None, help="Internal backend spec, e.g. 'sglang:tp=2,dp=2'."
-)
+@click.option("--backend", default=None, help="Backend spec, e.g. 'sglang:tp=2,dp=2'.")
 @click.option("--model-path", default=None, help="HF / local model path.")
 @click.option("--tokenizer-path", default=None, help="Tokenizer path.")
 @click.option("--engine-args", default="", show_default=False, help=ENGINE_ARGS_HELP)
@@ -84,6 +74,17 @@ from areal.experimental.cli.process import kill_pids
     show_default=True,
     help="Seconds to wait for the model server to come up.",
 )
+@click.option(
+    "--scheduler",
+    type=click.Choice(["local"]),
+    default=None,
+    help=(
+        "Scheduler backend used to place workers and data-proxies. Pinned "
+        "for the service's lifetime — register / stop / status will read it "
+        "from saved state. Defaults to [scheduler].type in config.toml, "
+        "falling back to 'local'."
+    ),
+)
 @click.option("--force", is_flag=True, help="Replace stale or running service state.")
 def run_cmd(**opts) -> None:
     raise SystemExit(do_run(opts) or 0)
@@ -94,17 +95,8 @@ def do_run(opts: dict) -> int:
     _prepare_service_slot(service=service, force=opts["force"])
 
     if opts["model"]:
-        if opts["api_url"] and opts["backend"]:
-            raise click.UsageError(
-                "Use --api-url (external) OR --backend (internal), not both."
-            )
-        if not opts["api_url"] and not opts["backend"]:
-            raise click.UsageError(
-                "--model requires --api-url <url> or --backend <spec>."
-            )
-        if opts["backend"] and not opts["model_path"]:
-            raise click.UsageError("--backend requires --model-path <path>.")
-    elif opts["api_url"] or opts["backend"]:
+        validate_register_opts(opts)
+    elif opts["backend"]:
         raise click.UsageError("model registration flags require --model.")
 
     log_dir = logs_dir(service)
@@ -143,12 +135,23 @@ def do_run(opts: dict) -> int:
         kill_pids([gateway_pid, router_pid], grace_s=5.0)
         raise
 
+    backend = opts.get("scheduler") or "local"
+
     service_state = ServiceState(
         service=service,
-        gateway_pid=gateway_pid,
-        gateway_url=gateway_url,
-        router_pid=router_pid,
-        router_url=router_url,
+        backend=backend,
+        gateway_handle=TaskHandle(
+            host=host_for_url,
+            ports=[opts["port"]],
+            gpu_devices=[],
+            ref={"pid": gateway_pid},
+        ),
+        router_handle=TaskHandle(
+            host="127.0.0.1",
+            ports=[router_port],
+            gpu_devices=[],
+            ref={"pid": router_pid},
+        ),
         admin_api_key=opts["admin_api_key"],
         started_at=time.time(),
     )
@@ -159,59 +162,18 @@ def do_run(opts: dict) -> int:
 
         if opts["model"]:
             try:
-                if opts["api_url"]:
-                    api_key = resolve_provider_api_key(
-                        provider_api_key=opts["provider_api_key"],
-                        provider_api_key_env=opts["provider_api_key_env"],
-                    )
-                    register_external(
-                        model=opts["model"],
-                        api_url=opts["api_url"],
-                        api_key=api_key,
-                        provider_model=opts["provider_model"],
-                        gateway=gateway_client,
-                    )
-                    model_state.models[opts["model"]] = ModelEntry(
-                        kind="external", api_url=opts["api_url"]
-                    )
-                    model_state.set_default_if_empty(opts["model"])
-                else:
-                    (
-                        pids,
-                        engine_pids,
-                        proxy_pids,
-                        proxy_addrs,
-                        inf_addrs,
-                        base_gpu,
-                        n_gpu,
-                    ) = register_internal(
-                        model=opts["model"],
-                        backend=opts["backend"],
-                        model_path=opts["model_path"],
-                        tokenizer_path=opts["tokenizer_path"] or opts["model_path"],
-                        engine_extra=split_args(opts["engine_args"]),
-                        proxy_extra=split_args(opts["proxy_args"]),
-                        model_health_timeout=opts["model_health_timeout"],
-                        log_level=opts["log_level"],
-                        admin_api_key=opts["admin_api_key"],
-                        gateway=gateway_client,
-                        router=router_client,
-                        log_dir=log_dir,
-                        base_gpu_id=model_state.next_gpu_id,
-                    )
-                    model_state.models[opts["model"]] = ModelEntry(
-                        kind="internal",
-                        backend=opts["backend"],
-                        base_gpu_id=base_gpu,
-                        gpu_count=n_gpu,
-                        pids=pids,
-                        engine_pids=engine_pids,
-                        proxy_pids=proxy_pids,
-                        proxy_addrs=proxy_addrs,
-                        inference_server_addrs=inf_addrs,
-                    )
-                    model_state.next_gpu_id = base_gpu + n_gpu
-                    model_state.set_default_if_empty(opts["model"])
+                entry = register_model(
+                    model_name=opts["model"],
+                    opts=opts,
+                    gateway=gateway_client,
+                    router=router_client,
+                    log_dir=log_dir,
+                    admin_api_key=opts["admin_api_key"],
+                    scheduler_backend=backend,
+                    occupied_gpus=model_state.occupied_gpus(),
+                )
+                model_state.models[opts["model"]] = entry
+                model_state.set_default_if_empty(opts["model"])
                 model_state.save()
             except BaseException:
                 _cleanup_runtime(service, service_state, model_state, grace_s=5.0)
@@ -219,13 +181,17 @@ def do_run(opts: dict) -> int:
 
     logger.info("service %r ready pid=%d url=%s", service, gateway_pid, gateway_url)
     if opts["model"]:
-        kind = "external" if opts["api_url"] else f"internal ({opts['backend']})"
-        logger.info("default model: %s (%s)", opts["model"], kind)
+        logger.info("default model: %s (%s)", opts["model"], opts["backend"])
 
     if opts["detach"]:
         return 0
 
-    logger.info("foreground (Ctrl-C to stop) ...")
+    logger.info(
+        "foreground watcher running. Ctrl+C / SIGTERM tears down the service; "
+        "closing the terminal (SIGHUP) detaches the watcher and leaves it "
+        "running — use `areal inf stop --service %s` to terminate.",
+        service,
+    )
     previous_handlers = _install_shutdown_signal_handlers()
     try:
         while gateway_alive(service_state):
@@ -233,6 +199,11 @@ def do_run(opts: dict) -> int:
     except KeyboardInterrupt:
         logger.info("shutting down ...")
         _cleanup_runtime(service, service_state, model_state, grace_s=10.0)
+        return 0
+    except SystemExit:
+        # SIGHUP path: the workers were spawned with start_new_session=True
+        # and outlive the CLI, so we exit silently without touching state.
+        logger.info("detached watcher; service %r continues running", service)
         return 0
     except BaseException:
         _cleanup_runtime(service, service_state, model_state, grace_s=10.0)
@@ -310,18 +281,24 @@ def _latest_model_state_for_cleanup(
 
 
 def _install_shutdown_signal_handlers():
-    def handle_shutdown(signum, frame):
+    # SIGINT (default Python → KeyboardInterrupt) and SIGTERM are treated as
+    # explicit "stop the service" requests and trigger teardown. SIGHUP is
+    # the terminal-disconnect path: the workers run in their own session
+    # (start_new_session=True) so they survive on their own — we just exit
+    # the watcher quietly without killing them.
+    def teardown_handler(signum, frame):
         del signum, frame
         raise KeyboardInterrupt
 
-    signals = [signal.SIGTERM]
-    if hasattr(signal, "SIGHUP"):
-        signals.append(signal.SIGHUP)
+    def detach_handler(signum, frame):
+        del signum, frame
+        raise SystemExit(0)
 
-    previous = {}
-    for sig in signals:
-        previous[sig] = signal.getsignal(sig)
-        signal.signal(sig, handle_shutdown)
+    previous = {signal.SIGTERM: signal.getsignal(signal.SIGTERM)}
+    signal.signal(signal.SIGTERM, teardown_handler)
+    if hasattr(signal, "SIGHUP"):
+        previous[signal.SIGHUP] = signal.getsignal(signal.SIGHUP)
+        signal.signal(signal.SIGHUP, detach_handler)
     return previous
 
 

@@ -8,6 +8,7 @@ from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
+from areal.experimental.cli.inference.scheduler import TaskHandle
 from areal.experimental.cli.process import pid_alive
 from areal.experimental.cli.state import areal_home, atomic_write_json
 
@@ -60,53 +61,75 @@ def current_service_path() -> Path:
     return inf_root() / "current-service"
 
 
-# Backward-compatible helper name. New code should use service_state_path().
-def state_path(service: str = DEFAULT_SERVICE) -> Path:
-    return service_state_path(service)
+def _handle_from_dict(raw: dict) -> TaskHandle:
+    return TaskHandle(
+        host=raw["host"],
+        ports=list(raw.get("ports", [])),
+        gpu_devices=list(raw.get("gpu_devices", [])),
+        ref=dict(raw.get("ref", {})),
+    )
+
+
+@dataclass
+class ModelReplica:
+    """One DP replica: data-proxy in front, worker behind. Field order
+    matches the request-flow direction used by stop / status output."""
+
+    data_proxy: TaskHandle
+    worker: TaskHandle
 
 
 @dataclass
 class ModelEntry:
-    kind: str = "internal"
     backend: str = ""
-    api_url: str = ""
-    base_gpu_id: int = 0
-    gpu_count: int = 0
-    pids: list[int] = field(default_factory=list)
-    engine_pids: list[int] = field(default_factory=list)
-    proxy_pids: list[int] = field(default_factory=list)
-    proxy_addrs: list[str] = field(default_factory=list)
-    inference_server_addrs: list[str] = field(default_factory=list)
+    replicas: list[ModelReplica] = field(default_factory=list)
 
-    def __post_init__(self) -> None:
-        if self.pids and not self.engine_pids and not self.proxy_pids:
-            self.engine_pids = self.pids[0::2]
-            self.proxy_pids = self.pids[1::2]
-        elif not self.pids and (self.engine_pids or self.proxy_pids):
-            self.pids = [
-                pid for pair in zip(self.engine_pids, self.proxy_pids) for pid in pair
-            ]
-            if len(self.engine_pids) > len(self.proxy_pids):
-                self.pids.extend(self.engine_pids[len(self.proxy_pids) :])
-            elif len(self.proxy_pids) > len(self.engine_pids):
-                self.pids.extend(self.proxy_pids[len(self.engine_pids) :])
+    def all_workers(self) -> list[TaskHandle]:
+        return [r.worker for r in self.replicas]
 
-    def all_pids(self) -> list[int]:
-        if self.pids:
-            return self.pids
-        return [*self.engine_pids, *self.proxy_pids]
+    def all_data_proxies(self) -> list[TaskHandle]:
+        return [r.data_proxy for r in self.replicas]
+
+    def gpu_devices(self) -> list[int]:
+        return [g for w in self.all_workers() for g in w.gpu_devices]
+
+    @classmethod
+    def from_dict(cls, raw: dict) -> ModelEntry:
+        replicas = [
+            ModelReplica(
+                data_proxy=_handle_from_dict(r["data_proxy"]),
+                worker=_handle_from_dict(r["worker"]),
+            )
+            for r in raw.get("replicas", [])
+        ]
+        return cls(backend=raw.get("backend", ""), replicas=replicas)
 
 
 @dataclass
 class ServiceState:
-    gateway_pid: int
-    gateway_url: str
-    router_pid: int
-    router_url: str
+    service: str
+    backend: str
+    gateway_handle: TaskHandle
+    router_handle: TaskHandle
     admin_api_key: str
     started_at: float
-    service: str = DEFAULT_SERVICE
     launch_mode: str = "detached"
+
+    @property
+    def gateway_pid(self) -> int:
+        return self.gateway_handle.pid
+
+    @property
+    def gateway_url(self) -> str:
+        return self.gateway_handle.addr
+
+    @property
+    def router_pid(self) -> int:
+        return self.router_handle.pid
+
+    @property
+    def router_url(self) -> str:
+        return self.router_handle.addr
 
     def save(self) -> None:
         atomic_write_json(service_state_path(self.service), asdict(self))
@@ -119,9 +142,15 @@ class ServiceState:
             raise FileNotFoundError(f"No service state at {p}")
         with open(p) as f:
             raw = json.load(f)
-        raw.setdefault("service", service)
-        raw.setdefault("launch_mode", "detached")
-        return cls(**raw)
+        return cls(
+            service=raw.get("service", service),
+            backend=raw["backend"],
+            gateway_handle=_handle_from_dict(raw["gateway_handle"]),
+            router_handle=_handle_from_dict(raw["router_handle"]),
+            admin_api_key=raw["admin_api_key"],
+            started_at=float(raw["started_at"]),
+            launch_mode=raw.get("launch_mode", "detached"),
+        )
 
     @classmethod
     def remove(cls, service: str = DEFAULT_SERVICE) -> None:
@@ -130,14 +159,10 @@ class ServiceState:
             p.unlink()
         clear_current_service(service)
 
-    def all_service_pids(self) -> list[int]:
-        return [self.gateway_pid, self.router_pid]
-
 
 @dataclass
 class ModelState:
     service: str = DEFAULT_SERVICE
-    next_gpu_id: int = 0
     default_model: str = ""
     models: dict[str, ModelEntry] = field(default_factory=dict)
 
@@ -154,13 +179,14 @@ class ModelState:
         with open(p) as f:
             raw = json.load(f)
         models = {
-            name: ModelEntry(**entry)
+            name: ModelEntry.from_dict(entry)
             for name, entry in (raw.pop("models", None) or {}).items()
         }
-        raw.setdefault("service", service)
-        raw.setdefault("next_gpu_id", 0)
-        raw.setdefault("default_model", "")
-        state = cls(models=models, **raw)
+        state = cls(
+            service=raw.get("service", service),
+            default_model=raw.get("default_model", ""),
+            models=models,
+        )
         if state.default_model and state.default_model not in state.models:
             state.default_model = next(iter(state.models), "")
         return state
@@ -171,14 +197,14 @@ class ModelState:
         if p.exists():
             p.unlink()
 
-    def all_worker_pids(self) -> list[int]:
-        return [pid for entry in self.models.values() for pid in entry.all_pids()]
+    def all_workers(self) -> list[TaskHandle]:
+        return [h for entry in self.models.values() for h in entry.all_workers()]
 
-    def all_engine_pids(self) -> list[int]:
-        return [pid for entry in self.models.values() for pid in entry.engine_pids]
+    def all_data_proxies(self) -> list[TaskHandle]:
+        return [h for entry in self.models.values() for h in entry.all_data_proxies()]
 
-    def all_proxy_pids(self) -> list[int]:
-        return [pid for entry in self.models.values() for pid in entry.proxy_pids]
+    def occupied_gpus(self) -> set[int]:
+        return {g for entry in self.models.values() for g in entry.gpu_devices()}
 
     def set_default_if_empty(self, model: str) -> None:
         if not self.default_model:
@@ -199,6 +225,18 @@ class RuntimeState:
     @property
     def service(self) -> str:
         return self.service_state.service
+
+    @property
+    def backend(self) -> str:
+        return self.service_state.backend
+
+    @property
+    def gateway_handle(self) -> TaskHandle:
+        return self.service_state.gateway_handle
+
+    @property
+    def router_handle(self) -> TaskHandle:
+        return self.service_state.router_handle
 
     @property
     def gateway_pid(self) -> int:
@@ -231,16 +269,6 @@ class RuntimeState:
     def save(self) -> None:
         self.service_state.save()
         self.model_state.save()
-
-    def all_worker_pids(self) -> list[int]:
-        return self.model_state.all_worker_pids()
-
-    def all_pids(self) -> list[int]:
-        return [*self.service_state.all_service_pids(), *self.all_worker_pids()]
-
-
-# Compatibility name for older inf CLI code paths.
-DaemonState = ServiceState
 
 
 def set_current_service(service: str) -> None:
@@ -279,6 +307,8 @@ def service_running(service: str) -> bool:
 
 
 def gateway_alive(state: ServiceState | RuntimeState) -> bool:
+    # Non-local backends will need their own liveness probe — PID-based
+    # check returns False for them (no pid in handle.ref).
     return pid_alive(state.gateway_pid)
 
 
@@ -305,7 +335,12 @@ def locked_model_state(service: str = DEFAULT_SERVICE) -> Iterator[None]:
 
 
 def recover_pids_from_raw_state(service: str = DEFAULT_SERVICE) -> list[int]:
+    """Best-effort PID extraction from a possibly-malformed state file —
+    walks the JSON tree for ``pid``/``pids`` keys so ``run --force`` can
+    still clean up children when the dataclass parse fails."""
+
     pids: list[int] = []
+    pid_keys = {"pid", "pids"}
 
     def add(value) -> None:
         if isinstance(value, int) and value > 0:
@@ -317,14 +352,7 @@ def recover_pids_from_raw_state(service: str = DEFAULT_SERVICE) -> list[int]:
     def walk(value) -> None:
         if isinstance(value, dict):
             for key, item in value.items():
-                if key in {
-                    "pid",
-                    "pids",
-                    "gateway_pid",
-                    "router_pid",
-                    "engine_pids",
-                    "proxy_pids",
-                }:
+                if key in pid_keys:
                     add(item)
                 else:
                     walk(item)

@@ -45,24 +45,25 @@ def do_deregister(
     except GatewayUnreachable as exc:
         logger.warning("router unreachable while removing %s: %s", model_name, exc)
 
-    for addr in entry.proxy_addrs:
+    # Router unregister → kill data-proxies → kill workers (same data-flow
+    # order as terminate_runtime_state).
+    for r in entry.replicas:
         try:
-            router.unregister_worker(addr)
+            router.unregister_worker(r.data_proxy.addr)
         except (GatewayHTTPError, GatewayUnreachable) as exc:
-            logger.warning("router unregister %s failed: %s", addr, exc)
+            logger.warning("router unregister %s failed: %s", r.data_proxy.addr, exc)
 
-    if entry.pids:
+    proxy_pids = [r.data_proxy.pid for r in entry.replicas if r.data_proxy.pid > 0]
+    worker_pids = [r.worker.pid for r in entry.replicas if r.worker.pid > 0]
+    for pids in (proxy_pids, worker_pids):
+        if not pids:
+            continue
         if force:
-            for pid in entry.pids:
+            for pid in pids:
                 signal_pid(pid, signal.SIGKILL)
         else:
-            kill_pids(entry.pids, grace_s=grace)
+            kill_pids(pids, grace_s=grace)
 
-    if (
-        entry.gpu_count > 0
-        and entry.base_gpu_id + entry.gpu_count == state.model_state.next_gpu_id
-    ):
-        state.model_state.next_gpu_id = entry.base_gpu_id
     state.model_state.promote_default_after_remove(model_name)
     del state.model_state.models[model_name]
     state.model_state.save()

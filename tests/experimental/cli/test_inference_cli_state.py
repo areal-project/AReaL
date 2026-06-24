@@ -8,6 +8,7 @@ import os
 from click.testing import CliRunner
 
 from areal.experimental.cli.inference.common import resolve_model_name
+from areal.experimental.cli.inference.scheduler import TaskHandle
 from areal.experimental.cli.inference.state import (
     ModelEntry,
     ModelState,
@@ -25,20 +26,27 @@ def _save_service(service: str, *, gateway_pid: int | None = None) -> None:
     pid = os.getpid() if gateway_pid is None else gateway_pid
     ServiceState(
         service=service,
-        gateway_pid=pid,
-        gateway_url=f"http://127.0.0.1/{service}",
-        router_pid=pid,
-        router_url=f"http://127.0.0.1/{service}-router",
+        backend="local",
+        gateway_handle=TaskHandle(
+            host="127.0.0.1", ports=[8080], gpu_devices=[], ref={"pid": pid}
+        ),
+        router_handle=TaskHandle(
+            host="127.0.0.1", ports=[9000], gpu_devices=[], ref={"pid": pid}
+        ),
         admin_api_key="admin",
         started_at=1.0,
     ).save()
+
+
+def _placeholder_model() -> ModelEntry:
+    return ModelEntry(backend="sglang:tp=1,dp=1", replicas=[])
 
 
 def test_service_and_model_state_are_per_service(tmp_path, monkeypatch):
     monkeypatch.setenv("AREAL_HOME", str(tmp_path))
     _save_service("svc-a")
     model_state = ModelState(service="svc-a")
-    model_state.models["m-a"] = ModelEntry(kind="external", api_url="http://api")
+    model_state.models["m-a"] = _placeholder_model()
     model_state.set_default_if_empty("m-a")
     model_state.save()
 
@@ -49,6 +57,7 @@ def test_service_and_model_state_are_per_service(tmp_path, monkeypatch):
     loaded_service = ServiceState.load("svc-a")
     loaded_models = ModelState.load("svc-a")
     assert loaded_service.service == "svc-a"
+    assert loaded_service.backend == "local"
     assert loaded_models.default_model == "m-a"
     assert list(loaded_models.models) == ["m-a"]
 
@@ -68,9 +77,7 @@ def test_models_command_is_service_scoped(tmp_path, monkeypatch):
     _save_service("svc-b")
     for service, model in (("svc-a", "m-a"), ("svc-b", "m-b")):
         model_state = ModelState(service=service)
-        model_state.models[model] = ModelEntry(
-            kind="external", api_url=f"http://{model}"
-        )
+        model_state.models[model] = _placeholder_model()
         model_state.set_default_if_empty(model)
         model_state.save()
 
@@ -97,7 +104,7 @@ def test_default_model_resolution_uses_model_state(tmp_path, monkeypatch):
     monkeypatch.setenv("AREAL_HOME", str(tmp_path))
     _save_service("svc")
     model_state = ModelState(service="svc")
-    model_state.models["m"] = ModelEntry(kind="external")
+    model_state.models["m"] = _placeholder_model()
     model_state.set_default_if_empty("m")
     model_state.save()
 
@@ -109,32 +116,62 @@ def test_default_model_resolution_uses_model_state(tmp_path, monkeypatch):
     assert resolve_model_name(state, "explicit") == "explicit"
 
 
-def test_model_entry_splits_legacy_interleaved_pids():
-    entry = ModelEntry(pids=[10, 20, 11, 21])
-
-    assert entry.engine_pids == [10, 11]
-    assert entry.proxy_pids == [20, 21]
-    assert entry.all_pids() == [10, 20, 11, 21]
-
-
-def test_recover_pids_from_raw_state(tmp_path, monkeypatch):
+def test_recover_pids_from_raw_state_walks_handles(tmp_path, monkeypatch):
     monkeypatch.setenv("AREAL_HOME", str(tmp_path))
-    _save_service("svc", gateway_pid=100)
-    service_payload = json.loads(service_state_path("svc").read_text())
-    service_payload["router_pid"] = 101
-    service_state_path("svc").write_text(json.dumps(service_payload))
+    # Hand-write the v1 schema so we exercise recover_pids_from_raw_state
+    # against TaskHandle.ref.pid nesting. Order of returned pids follows the
+    # JSON walk order: service file first, then models file; within each
+    # ModelReplica data_proxy is declared before worker.
+    service_state_path("svc").write_text(
+        json.dumps(
+            {
+                "service": "svc",
+                "backend": "local",
+                "gateway_handle": {
+                    "host": "127.0.0.1",
+                    "ports": [8080],
+                    "gpu_devices": [],
+                    "ref": {"pid": 100},
+                },
+                "router_handle": {
+                    "host": "127.0.0.1",
+                    "ports": [9000],
+                    "gpu_devices": [],
+                    "ref": {"pid": 101},
+                },
+                "admin_api_key": "admin",
+                "started_at": 1.0,
+            }
+        )
+    )
     models_state_path("svc").write_text(
         json.dumps(
             {
+                "service": "svc",
+                "default_model": "m",
                 "models": {
                     "m": {
-                        "engine_pids": [200],
-                        "proxy_pids": [300],
-                        "pids": [200, 300],
+                        "backend": "sglang:tp=1,dp=1",
+                        "replicas": [
+                            {
+                                "data_proxy": {
+                                    "host": "127.0.0.1",
+                                    "ports": [5001],
+                                    "gpu_devices": [],
+                                    "ref": {"pid": 300},
+                                },
+                                "worker": {
+                                    "host": "127.0.0.1",
+                                    "ports": [5000],
+                                    "gpu_devices": [0],
+                                    "ref": {"pid": 200},
+                                },
+                            }
+                        ],
                     }
-                }
+                },
             }
         )
     )
 
-    assert recover_pids_from_raw_state("svc") == [100, 101, 200, 300]
+    assert recover_pids_from_raw_state("svc") == [100, 101, 300, 200]

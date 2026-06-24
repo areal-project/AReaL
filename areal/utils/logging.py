@@ -40,6 +40,7 @@ LOGGER_COLORS_EXACT = {
     "LocalScheduler": "blue",
     "RayScheduler": "blue",
     "SlurmScheduler": "blue",
+    "InfLocalScheduler": "blue",
     # Launchers - blue
     "LocalLauncher": "blue",
     "RayLauncher": "blue",
