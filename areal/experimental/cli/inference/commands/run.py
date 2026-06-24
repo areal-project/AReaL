@@ -173,7 +173,6 @@ def do_run(opts: dict) -> int:
                     occupied_gpus=model_state.occupied_gpus(),
                 )
                 model_state.models[opts["model"]] = entry
-                model_state.set_default_if_empty(opts["model"])
                 model_state.save()
             except BaseException:
                 _cleanup_runtime(service, service_state, model_state, grace_s=5.0)

@@ -58,7 +58,6 @@ def do_register(model_name: str, opts: dict, *, service: str | None = None) -> i
             occupied_gpus=state.model_state.occupied_gpus(),
         )
         state.model_state.models[model_name] = entry
-        state.model_state.set_default_if_empty(model_name)
         state.model_state.save()
         gpus_used = sorted({g for r in entry.replicas for g in r.worker.gpu_devices})
         logger.info(

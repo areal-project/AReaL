@@ -104,16 +104,6 @@ def refuse_if_running(service: str | None = None) -> None:
     )
 
 
-def resolve_model_name(state: RuntimeState, model: str | None) -> str:
-    if model:
-        return model
-    if state.model_state.default_model:
-        return state.model_state.default_model
-    raise click.ClickException(
-        f"service {state.service!r} has no default model; pass a model name"
-    )
-
-
 def wait_client_health(client, *, timeout: float, label: str) -> None:
     deadline = time.time() + timeout
     last_err: Exception | None = None
@@ -248,7 +238,9 @@ def format_gpu_count(handle: TaskHandle) -> str:
     return f"×{n}" if n > 0 else "-"
 
 
-def probe_http_health(addr: str, *, timeout: float = 1.0) -> bool:
+def probe_http_health(addr: str, *, timeout: float = 3.0) -> bool:
+    # sglang 0.5.10 /health waits up to one scheduler tick (~1s) before
+    # responding, so the default must sit above that ceiling.
     try:
         with urllib.request.urlopen(f"{addr}/health", timeout=timeout) as resp:
             return resp.status < 500
@@ -429,11 +421,7 @@ def print_models(state: RuntimeState | ModelState, as_json: bool) -> int:
     model_state = state.model_state if isinstance(state, RuntimeState) else state
     if as_json:
         out = [
-            {
-                "name": name,
-                "default": name == model_state.default_model,
-                **asdict(entry),
-            }
+            {"name": name, **asdict(entry)}
             for name, entry in model_state.models.items()
         ]
         click.echo(json.dumps(out, indent=2))
@@ -445,9 +433,8 @@ def print_models(state: RuntimeState | ModelState, as_json: bool) -> int:
 
     rows = []
     for name, entry in model_state.models.items():
-        default = "*" if name == model_state.default_model else ""
-        rows.append((name, default, entry.backend, str(len(entry.replicas))))
-    cols = ("NAME", "DEFAULT", "BACKEND", "WORKERS")
+        rows.append((name, entry.backend, str(len(entry.replicas))))
+    cols = ("NAME", "BACKEND", "WORKERS")
     widths = [max(len(row[i]) for row in (cols, *rows)) for i in range(len(cols))]
     fmt = "  ".join(f"{{:<{width}}}" for width in widths)
     click.echo(fmt.format(*cols))

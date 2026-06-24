@@ -64,7 +64,6 @@ def do_deregister(
         else:
             kill_pids(pids, grace_s=grace)
 
-    state.model_state.promote_default_after_remove(model_name)
     del state.model_state.models[model_name]
     state.model_state.save()
     logger.info("deregistered model %r from service %r", model_name, state.service)

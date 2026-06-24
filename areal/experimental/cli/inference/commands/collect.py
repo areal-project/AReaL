@@ -17,7 +17,6 @@ from areal.experimental.cli.inference.client import (
 from areal.experimental.cli.inference.common import (
     load_running_state,
     logger,
-    resolve_model_name,
 )
 
 
@@ -25,7 +24,9 @@ from areal.experimental.cli.inference.common import (
     name="collect",
     help="Start sessions, wait for ready trajectories, export and dump them.",
 )
-@click.option("--model-name", "model", default=None, help="Model name to collect from.")
+@click.option(
+    "--model-name", "model", required=True, help="Model name to collect from."
+)
 @click.option("--service", default=None, help="Target service instance.")
 @click.option(
     "--batch-size", type=int, required=True, help="Number of sessions to collect."
@@ -48,7 +49,7 @@ from areal.experimental.cli.inference.common import (
 )
 @click.option("--json", "json_progress", is_flag=True, help="Emit progress events.")
 def collect_cmd(
-    model: str | None,
+    model: str,
     service: str | None,
     batch_size: int,
     output: Path | None,
@@ -78,7 +79,7 @@ def collect_cmd(
 
 def do_collect(
     *,
-    model: str | None,
+    model: str,
     batch_size: int,
     output: Path | None,
     timeout: float,
@@ -90,7 +91,6 @@ def do_collect(
     service: str | None = None,
 ) -> int:
     state = load_running_state(service)
-    model = resolve_model_name(state, model)
     gateway = GatewayClient(state.gateway_url, state.admin_api_key)
 
     event = _make_event_writer(json_progress)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
 
 import click
@@ -60,24 +61,33 @@ def do_status(as_json: bool, *, service: str | None = None) -> int:
 
 
 def _collect_rows(state: RuntimeState) -> list[dict]:
-    rows: list[dict] = [
-        _component_row("gateway", state.gateway_handle, state.backend),
-        _component_row("router", state.router_handle, state.backend),
+    components: list[tuple[str, TaskHandle]] = [
+        ("gateway", state.gateway_handle),
+        ("router", state.router_handle),
     ]
     for name, entry in state.model_state.models.items():
         for i, replica in enumerate(entry.replicas):
-            rows.append(
-                _component_row(
-                    f"data_proxy[{name}/{i}]", replica.data_proxy, state.backend
-                )
-            )
-            rows.append(
-                _component_row(f"worker[{name}/{i}]", replica.worker, state.backend)
-            )
-    return rows
+            components.append((f"data_proxy[{name}/{i}]", replica.data_proxy))
+            components.append((f"worker[{name}/{i}]", replica.worker))
+
+    addrs = [handle.addr or "-" for _, handle in components]
+    alive_flags = _probe_concurrently(addrs)
+    return [
+        _component_row(label, handle, state.backend, alive=alive)
+        for (label, handle), alive in zip(components, alive_flags, strict=True)
+    ]
 
 
-def _component_row(label: str, handle: TaskHandle, backend: str) -> dict:
+def _probe_concurrently(addrs: list[str]) -> list[bool]:
+    if not addrs:
+        return []
+    with ThreadPoolExecutor(max_workers=max(4, len(addrs))) as pool:
+        return list(pool.map(probe_http_health, addrs))
+
+
+def _component_row(
+    label: str, handle: TaskHandle, backend: str, *, alive: bool
+) -> dict:
     addr = handle.addr or "-"
     return {
         "component": label,
@@ -85,7 +95,7 @@ def _component_row(label: str, handle: TaskHandle, backend: str) -> dict:
         "gpus": format_gpu_count(handle),
         "addr": addr,
         "ref": format_ref(backend, handle),
-        "alive": "yes" if probe_http_health(addr) else "no",
+        "alive": "yes" if alive else "no",
     }
 
 

@@ -7,7 +7,6 @@ import os
 
 from click.testing import CliRunner
 
-from areal.experimental.cli.inference.common import resolve_model_name
 from areal.experimental.cli.inference.scheduler import TaskHandle
 from areal.experimental.cli.inference.state import (
     ModelEntry,
@@ -47,7 +46,6 @@ def test_service_and_model_state_are_per_service(tmp_path, monkeypatch):
     _save_service("svc-a")
     model_state = ModelState(service="svc-a")
     model_state.models["m-a"] = _placeholder_model()
-    model_state.set_default_if_empty("m-a")
     model_state.save()
 
     assert service_state_path("svc-a").exists()
@@ -58,7 +56,6 @@ def test_service_and_model_state_are_per_service(tmp_path, monkeypatch):
     loaded_models = ModelState.load("svc-a")
     assert loaded_service.service == "svc-a"
     assert loaded_service.backend == "local"
-    assert loaded_models.default_model == "m-a"
     assert list(loaded_models.models) == ["m-a"]
 
 
@@ -78,7 +75,6 @@ def test_models_command_is_service_scoped(tmp_path, monkeypatch):
     for service, model in (("svc-a", "m-a"), ("svc-b", "m-b")):
         model_state = ModelState(service=service)
         model_state.models[model] = _placeholder_model()
-        model_state.set_default_if_empty(model)
         model_state.save()
 
     result = CliRunner().invoke(cli, ["inf", "models", "--service", "svc-a", "--json"])
@@ -98,22 +94,6 @@ def test_ps_lists_services_and_stale_state(tmp_path, monkeypatch):
     assert result.exit_code == 0
     payload = {entry["service"]: entry["status"] for entry in json.loads(result.output)}
     assert payload == {"live": "running", "stale": "stale"}
-
-
-def test_default_model_resolution_uses_model_state(tmp_path, monkeypatch):
-    monkeypatch.setenv("AREAL_HOME", str(tmp_path))
-    _save_service("svc")
-    model_state = ModelState(service="svc")
-    model_state.models["m"] = _placeholder_model()
-    model_state.set_default_if_empty("m")
-    model_state.save()
-
-    from areal.experimental.cli.inference.common import load_running_state
-
-    state = load_running_state("svc")
-
-    assert resolve_model_name(state, None) == "m"
-    assert resolve_model_name(state, "explicit") == "explicit"
 
 
 def test_recover_pids_from_raw_state_walks_handles(tmp_path, monkeypatch):
@@ -148,7 +128,6 @@ def test_recover_pids_from_raw_state_walks_handles(tmp_path, monkeypatch):
         json.dumps(
             {
                 "service": "svc",
-                "default_model": "m",
                 "models": {
                     "m": {
                         "backend": "sglang:tp=1,dp=1",

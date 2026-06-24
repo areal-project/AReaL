@@ -104,7 +104,6 @@ def test_prepare_service_slot_force_recovers_raw_pids(tmp_path, monkeypatch):
         json.dumps(
             {
                 "service": "svc",
-                "default_model": "m",
                 "models": {
                     "m": {
                         "backend": "sglang:tp=1,dp=1",

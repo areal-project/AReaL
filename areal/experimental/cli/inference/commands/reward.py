@@ -16,12 +16,12 @@ from areal.experimental.cli.inference.common import load_running_state
 @click.argument("reward_value", type=float)
 @click.option("--session-api-key", required=True, help="Session API key.")
 @click.option("--service", default=None, help="Target service instance.")
-@click.option("--model", default=None, help="Model name used for routing.")
+@click.option("--model", required=True, help="Model name used for routing.")
 def reward_cmd(
     reward_value: float,
     session_api_key: str,
     service: str | None,
-    model: str | None,
+    model: str,
 ) -> None:
     raise SystemExit(
         do_reward(session_api_key, reward_value, model, service=service) or 0
@@ -31,7 +31,7 @@ def reward_cmd(
 def do_reward(
     session_api_key: str,
     reward: float,
-    model: str | None,
+    model: str,
     *,
     service: str | None = None,
 ) -> int:

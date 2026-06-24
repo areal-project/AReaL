@@ -163,12 +163,9 @@ class ServiceState:
 @dataclass
 class ModelState:
     service: str = DEFAULT_SERVICE
-    default_model: str = ""
     models: dict[str, ModelEntry] = field(default_factory=dict)
 
     def save(self) -> None:
-        if not self.default_model and self.models:
-            self.default_model = next(iter(self.models))
         atomic_write_json(models_state_path(self.service), asdict(self))
 
     @classmethod
@@ -182,14 +179,7 @@ class ModelState:
             name: ModelEntry.from_dict(entry)
             for name, entry in (raw.pop("models", None) or {}).items()
         }
-        state = cls(
-            service=raw.get("service", service),
-            default_model=raw.get("default_model", ""),
-            models=models,
-        )
-        if state.default_model and state.default_model not in state.models:
-            state.default_model = next(iter(state.models), "")
-        return state
+        return cls(service=raw.get("service", service), models=models)
 
     @classmethod
     def remove(cls, service: str = DEFAULT_SERVICE) -> None:
@@ -205,16 +195,6 @@ class ModelState:
 
     def occupied_gpus(self) -> set[int]:
         return {g for entry in self.models.values() for g in entry.gpu_devices()}
-
-    def set_default_if_empty(self, model: str) -> None:
-        if not self.default_model:
-            self.default_model = model
-
-    def promote_default_after_remove(self, model: str) -> None:
-        if self.default_model == model:
-            self.default_model = next(
-                (name for name in self.models if name != model), ""
-            )
 
 
 @dataclass
