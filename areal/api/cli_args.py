@@ -2552,7 +2552,7 @@ class WandBSystemMetricsConfig:
         },
     )
     roles: list[str] | None = field(
-        default=("actor", "rollout", "critic", "ref", "teacher"),
+        default_factory=lambda: ["actor", "rollout", "critic", "ref", "teacher"],
         metadata={
             "help": "Worker roles that should start W&B system metrics clients. "
             "Set to null to enable every configured worker role.",
