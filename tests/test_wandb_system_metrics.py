@@ -63,6 +63,17 @@ def test_worker_system_metrics_normalizes_iterables():
     assert cfg.gpu_device_ids == [0, 1]
 
 
+def test_worker_system_metrics_default_roles_are_independent_lists():
+    cfg = WandBSystemMetricsConfig()
+    other = WandBSystemMetricsConfig()
+
+    assert cfg.roles == ["actor", "rollout", "critic", "ref", "teacher"]
+    assert isinstance(cfg.roles, list)
+
+    cfg.roles.append("reward")
+    assert other.roles == ["actor", "rollout", "critic", "ref", "teacher"]
+
+
 def test_timestamp_run_id_is_resolved_once(monkeypatch, tmp_path):
     config = _make_config(tmp_path)
     timestamps = iter(["2026_05_14_00_00_01", "2026_05_14_00_00_02"])
