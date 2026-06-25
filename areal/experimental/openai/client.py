@@ -128,6 +128,61 @@ def _ensure_message_dict_list(
     return normalized
 
 
+def _normalize_messages_for_chat_template(messages: list[dict[str, Any]]) -> None:
+    """Normalize messages in-place to align with SGLang's preprocessing before
+    ``apply_chat_template``.
+
+    Two normalizations are applied (mirroring SGLang's ``serving_chat.py``):
+
+    1. **Content flattening**: Many chat templates (e.g. Qwen3) only accept
+       ``message.content`` as a plain string (``{%- if message.content is string %}``).
+       List-formatted content like ``[{"type": "text", "text": "..."}]`` is silently
+       discarded.  SGLang's ``process_content_for_template_format()`` detects the
+       template format and flattens content accordingly.  We flatten single-text-part
+       lists to a plain string so the template renders them correctly.
+
+    2. **tool_calls arguments parsing**: SGLang (``serving_chat.py`` L449-465) parses
+       ``tool_calls[].function.arguments`` from JSON string to dict before passing to
+       ``apply_chat_template``.  Jinja2's ``tojson`` filter uses ``sort_keys=True`` by
+       default, so a raw string vs a parsed dict produces different key ordering and
+       therefore different token sequences.
+    """
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+
+        # --- Content flattening ---
+        content = msg.get("content")
+        if content is not None and not isinstance(content, str):
+            if not isinstance(content, list):
+                content = list(content)
+            parts = []
+            for part in content:
+                if not isinstance(part, dict):
+                    part = (
+                        dict(part)
+                        if hasattr(part, "items")
+                        else {"type": "text", "text": str(part)}
+                    )
+                if "text" in part and "type" not in part:
+                    part["type"] = "text"
+                parts.append(part)
+            if len(parts) == 1 and parts[0].get("type") == "text":
+                msg["content"] = parts[0]["text"]
+            else:
+                msg["content"] = parts
+
+        # --- tool_calls arguments parsing ---
+        if msg.get("role") == "assistant" and isinstance(msg.get("tool_calls"), list):
+            for tool_call in msg["tool_calls"]:
+                func = tool_call.get("function", tool_call)
+                if isinstance(func.get("arguments"), str):
+                    try:
+                        func["arguments"] = json.loads(func["arguments"])
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+
+
 def _find_kth(lst: list, target, k: int) -> int:
     def target_indices():
         for i, char in enumerate(lst):
@@ -386,6 +441,7 @@ def concat_prompt_token_ids_with_parent(
 
     all_message_list += message_list
 
+    _normalize_messages_for_chat_template(all_message_list)
     all_tokens = apply_chat_template(
         tokenizer,
         all_message_list,
@@ -610,6 +666,7 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
         has_images = len(image_data) > 0
 
         tokenizer_messages = messages_for_tokenizer if has_images else messages_list
+        _normalize_messages_for_chat_template(tokenizer_messages)
         if self.chat_template_type == "hf":
             prompt_token_ids = apply_chat_template(
                 self.tokenizer,
@@ -1018,6 +1075,7 @@ class AsyncResponsesWithReward(BaseAsyncResponses):
         has_images = len(image_data) > 0
 
         tokenizer_messages = messages_for_tokenizer if has_images else messages_list
+        _normalize_messages_for_chat_template(tokenizer_messages)
         if self.chat_template_type == "hf":
             prompt_token_ids = apply_chat_template(
                 self.tokenizer,

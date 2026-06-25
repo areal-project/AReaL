@@ -1,9 +1,33 @@
 # AReaL Inference Service Examples
 
-This directory contains two examples that use the AReaL Inference Service
+This directory contains examples and benchmarks for the AReaL Inference Service
 (`RolloutControllerV2`) — an experimental rollout backend that exposes an
 OpenAI-compatible proxy gateway so any external agent runtime can submit chat requests
 and receive RL training data.
+
+## Directory Structure
+
+```
+inference_service/
+├── openclaw_tau2/           OpenClaw + TAU²-bench agent environment
+│   ├── openclaw/            OpenClaw agent adapter for TAU²-bench
+│   ├── tau2_env/            Socket-based environment server for cross-process tool execution
+│   ├── task_runner.py       TAU²-bench task runner (standard)
+│   └── task_runner_socket.py TAU²-bench task runner (socket variant)
+├── benchmark/               Performance benchmarking scripts
+│   ├── benchmark.py         Sweep entry point (uses RolloutControllerV2)
+│   ├── benchmark.yaml       Configuration for the benchmark
+│   ├── start_servers.py     Helper to launch SGLang servers
+│   ├── collect_metrics.py   SGLang Prometheus metrics collector
+│   ├── collect_trajectories.py  Trajectory collection (standalone mode)
+│   └── worker.py            Per-task worker subprocess
+├── online_rollout.py        Online RL demo (human-in-the-loop)
+├── online_rollout.yaml      Config for online rollout
+├── tau2_rollout.py          Offline TAU²-bench rollout demo
+├── tau2_rollout.yaml        Config for tau2 rollout
+├── human_in_the_loop_demo.py  Automated HITL demo script
+└── README.md                This file
+```
 
 ______________________________________________________________________
 
@@ -203,3 +227,140 @@ first or second try, for example:
   A: There are 3 r's in the word "strawberry".
   ✔ Correct on first try.
 ```
+
+______________________________________________________________________
+
+## OpenClaw + TAU²-Bench Agent Environment
+
+The `openclaw_tau2/` directory provides an OpenClaw agent adapter for
+[TAU²-bench](https://github.com/sierra-research/tau2-bench), enabling multi-turn
+customer service agent tasks (airline, retail, telecom) to run through the AReaL
+inference service stack.
+
+Key components:
+
+- **OpenClaw agent** (`openclaw/agent.py`) — wraps TAU²-bench agent interface for
+  OpenClaw CLI compatibility
+- **Socket environment server** (`tau2_env/environment_socket.py`) — enables
+  cross-process tool execution between the OpenClaw CLI and the TAU²-bench environment
+- **Task runners** (`task_runner.py`, `task_runner_socket.py`) — orchestrate single-task
+  execution with TAU²-bench's simulation loop
+
+### Installation
+
+```bash
+pip install git+https://github.com/dhh1995/tau2-bench.git@dhh/async-and-custom-completion
+export TAU2_DATA_DIR=/path/to/tau2-bench/data
+```
+
+______________________________________________________________________
+
+## Inference Service Benchmark
+
+The `benchmark/` directory measures AReaL inference service full-stack overhead on
+TAU²-bench agent tasks using `RolloutControllerV2` + `Tau2AgentWorkflow`.
+
+The benchmark launches the IS services (Router, DataProxy, Gateway) through the
+controller. The Agent and User SGLang servers are started separately so you can control
+GPU allocation for your hardware.
+
+### How It Works
+
+```
+benchmark.py
+  └─ RolloutControllerV2
+       ├─ Router + DataProxy + Gateway  (launched by controller, CPU-only)
+       └─ connects to Agent SGLang      (pre-existing, via --agent-endpoint)
+
+Tau2AgentWorkflow
+  └─ connects to User SGLang            (pre-existing, via --user-endpoint)
+```
+
+### Option A: Single Node, 8 GPUs, Docker (Small Model)
+
+For models that fit in 4 GPUs (e.g., Qwen3-30B-A3B or smaller). Agent and User each get
+4 GPUs on the same node.
+
+**Step 1** — Start both SGLang servers (Agent on GPUs 0-3, User on GPUs 4-7):
+
+```bash
+python3 examples/experimental/inference_service/benchmark/start_servers.py \
+    --model-path /models/Qwen3-30B-A3B-Instruct \
+    --tp 4
+```
+
+**Step 2** — Run the benchmark (controller launches IS services only, no extra GPUs
+needed):
+
+```bash
+python3 examples/experimental/inference_service/benchmark/benchmark.py \
+    --config examples/experimental/inference_service/benchmark/benchmark.yaml \
+    --model-path /models/Qwen3-30B-A3B-Instruct \
+    --agent-endpoint http://127.0.0.1:30000 \
+    --user-endpoint http://127.0.0.1:30001/v1 \
+    --concurrencies "2,5,10" \
+    --num-tasks 20 --num-trials 2
+```
+
+### Option B: Multi-Node Cluster (Large Model, e.g., Qwen3-235B)
+
+For models requiring TP=8, run Agent and User on separate 8-GPU nodes.
+
+**Step 1** — Start Agent SGLang on node A (all 8 GPUs):
+
+```bash
+python3 examples/experimental/inference_service/benchmark/start_servers.py \
+    --model-path /models/Qwen3-235B-A22B-Instruct-2507 \
+    --tp 8 --agent-only
+```
+
+**Step 2** — Start User SGLang on node B (all 8 GPUs):
+
+```bash
+python3 examples/experimental/inference_service/benchmark/start_servers.py \
+    --model-path /models/Qwen3-235B-A22B-Instruct-2507 \
+    --tp 8 --agent-only --agent-port 30001
+```
+
+**Step 3** — Run the benchmark from either node:
+
+```bash
+python3 examples/experimental/inference_service/benchmark/benchmark.py \
+    --config examples/experimental/inference_service/benchmark/benchmark.yaml \
+    --model-path /models/Qwen3-235B-A22B-Instruct-2507 \
+    --agent-endpoint http://<node-A>:30000 \
+    --user-endpoint http://<node-B>:30001/v1 \
+    --concurrencies "5,10,15,20,25,30" \
+    --num-tasks 50 --num-trials 4
+```
+
+### Configuration
+
+See [`benchmark/benchmark.yaml`](benchmark/benchmark.yaml) for full configuration. Key
+overrides can be passed as CLI arguments:
+
+| Argument           | Default            | Description                            |
+| ------------------ | ------------------ | -------------------------------------- |
+| `--model-path`     | (from YAML)        | Path to model weights                  |
+| `--agent-endpoint` | (none)             | Pre-existing Agent SGLang URL          |
+| `--user-endpoint`  | (from YAML)        | User simulator SGLang URL              |
+| `--concurrencies`  | `5,10,15,20,25,30` | Comma-separated concurrency levels     |
+| `--num-tasks`      | `50`               | Number of TAU²-bench tasks per trial   |
+| `--num-trials`     | `4`                | Number of trials per concurrency level |
+| `--output-dir`     | `./trajectories`   | Output directory for results           |
+
+### Reference Results: Qwen3-235B-A22B-Instruct-2507
+
+Tested on TAU²-bench airline domain, 50 tasks × 4 trials per concurrency, 2 nodes ×
+8×H200 GPUs (TP=8 per instance).
+
+#### Baseline (OpenClaw → SGLang direct) vs Target (OpenClaw → IS → SGLang)
+
+Each cell: `Baseline / Target (Δ)`.
+
+| Metric      | c=5                   | c=10                  | c=15                  | c=20                  | c=25                  | c=30                  |
+| ----------- | --------------------- | --------------------- | --------------------- | --------------------- | --------------------- | --------------------- |
+| Pass@1      | 38% / 30% (-8pp)      | 38% / 38% (+1pp)      | 34% / 32% (-2pp)      | 36% / 34% (-2pp)      | 34% / 34% (0pp)       | 36% / 38% (+3pp)      |
+| Avg E2E (s) | 4.82 / 4.57 (-5%)     | 8.99 / 8.57 (-5%)     | 13.05 / 12.58 (-4%)   | 17.03 / 16.33 (-4%)   | 20.73 / 20.16 (-3%)   | 24.72 / 23.41 (-5%)   |
+| Input Tok/s | 15,207 / 16,017 (+5%) | 18,204 / 19,204 (+5%) | 18,820 / 20,138 (+7%) | 19,281 / 19,388 (+1%) | 19,433 / 20,474 (+5%) | 19,480 / 20,780 (+7%) |
+| Tasks/min   | 2.5 / 2.6 (+6%)       | 3.0 / 3.2 (+5%)       | 3.1 / 3.1 (+1%)       | 3.0 / 3.0 (0%)        | 3.0 / 3.4 (+13%)      | 3.4 / 3.7 (+8%)       |
