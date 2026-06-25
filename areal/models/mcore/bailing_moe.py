@@ -200,6 +200,14 @@ def hf_to_mcore_config_bailing_moe(
         # YaRN RoPE scaling parameters (explicitly set to prevent HybridEngine default drift)
         "mscale": 0.707,
         "mscale_all_dim": 0.707,
+        # original_max_position_embeddings: YaRN nests it inside rope_scaling; non-YaRN
+        # configs may have it at the top level. Fall back to max_position_embeddings.
+        # mcore 0.16 default (4096) is wrong for long-context models.
+        "original_max_position_embeddings": (
+            rope_scaling.get("original_max_position_embeddings")
+            or getattr(hf_config, "original_max_position_embeddings", None)
+            or getattr(hf_config, "max_position_embeddings", 4096)
+        ),
     }
 
     # MoE-specific parameters
@@ -220,6 +228,8 @@ def hf_to_mcore_config_bailing_moe(
         "moe_layer_freq": moe_layer_freq,
         "moe_router_enable_expert_bias": True,
         "moe_router_load_balancing_type": "none",
+        "moe_router_bias_update_rate": 0.0,
+        "moe_z_loss_coeff": 3.5e-6,
         "moe_grouped_gemm": True,
         "moe_router_dtype": "fp32",
     }
