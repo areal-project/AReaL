@@ -9,16 +9,31 @@ from click.testing import CliRunner
 
 from areal.experimental.cli.inference.scheduler import TaskHandle
 from areal.experimental.cli.inference.state import (
+    INF_NAMESPACE,
     ModelEntry,
     ModelState,
     ServiceState,
-    current_service_path,
     models_state_path,
     recover_pids_from_raw_state,
+)
+from areal.experimental.cli.main import cli
+from areal.experimental.cli.state import (
+    current_service_path,
     resolve_service_name,
     service_state_path,
 )
-from areal.experimental.cli.main import cli
+
+
+def _service_path(service: str):
+    return service_state_path(INF_NAMESPACE, service)
+
+
+def _current_path():
+    return current_service_path(INF_NAMESPACE)
+
+
+def _resolve(name: str | None) -> str:
+    return resolve_service_name(INF_NAMESPACE, name)
 
 
 def _save_service(service: str, *, gateway_pid: int | None = None) -> None:
@@ -48,9 +63,9 @@ def test_service_and_model_state_are_per_service(tmp_path, monkeypatch):
     model_state.models["m-a"] = _placeholder_model()
     model_state.save()
 
-    assert service_state_path("svc-a").exists()
+    assert _service_path("svc-a").exists()
     assert models_state_path("svc-a").exists()
-    assert current_service_path().read_text().strip() == "svc-a"
+    assert _current_path().read_text().strip() == "svc-a"
 
     loaded_service = ServiceState.load("svc-a")
     loaded_models = ModelState.load("svc-a")
@@ -62,10 +77,10 @@ def test_service_and_model_state_are_per_service(tmp_path, monkeypatch):
 def test_resolve_service_uses_current_then_single_running(tmp_path, monkeypatch):
     monkeypatch.setenv("AREAL_HOME", str(tmp_path))
     _save_service("current")
-    assert resolve_service_name(None) == "current"
+    assert _resolve(None) == "current"
 
-    current_service_path().unlink()
-    assert resolve_service_name(None) == "current"
+    _current_path().unlink()
+    assert _resolve(None) == "current"
 
 
 def test_models_command_is_service_scoped(tmp_path, monkeypatch):
@@ -102,7 +117,7 @@ def test_recover_pids_from_raw_state_walks_handles(tmp_path, monkeypatch):
     # against TaskHandle.ref.pid nesting. Order of returned pids follows the
     # JSON walk order: service file first, then models file; within each
     # ModelReplica data_proxy is declared before worker.
-    service_state_path("svc").write_text(
+    _service_path("svc").write_text(
         json.dumps(
             {
                 "service": "svc",

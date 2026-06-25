@@ -9,15 +9,10 @@ from typing import Any
 
 import click
 
-from areal.experimental.cli.inference.client import (
-    GatewayClient,
-    GatewayHTTPError,
-    GatewayUnreachable,
-)
-from areal.experimental.cli.inference.common import (
-    load_running_state,
-    logger,
-)
+from areal.experimental.cli.client import ServiceHTTPError, ServiceUnreachable
+from areal.experimental.cli.inference.client import GatewayClient
+from areal.experimental.cli.inference.common import logger
+from areal.experimental.cli.inference.lifecycle import inf_lifecycle
 
 
 @click.command(
@@ -90,7 +85,7 @@ def do_collect(
     json_progress: bool,
     service: str | None = None,
 ) -> int:
-    state = load_running_state(service)
+    state = inf_lifecycle.load_running_state(service)
     gateway = GatewayClient(state.gateway_url, state.admin_api_key)
 
     event = _make_event_writer(json_progress)
@@ -102,7 +97,7 @@ def do_collect(
             task_id=task_id,
             group_size=batch_size,
         )
-    except (GatewayUnreachable, GatewayHTTPError) as exc:
+    except (ServiceUnreachable, ServiceHTTPError) as exc:
         raise click.ClickException(f"start_session failed: {exc}") from exc
 
     group_id = start.get("group_id", "")
@@ -128,9 +123,9 @@ def do_collect(
                 discount=turn_discount,
                 style=export_style,
             )
-        except GatewayHTTPError as exc:
+        except ServiceHTTPError as exc:
             raise click.ClickException(f"export_trajectories failed: {exc}") from exc
-        except GatewayUnreachable as exc:
+        except ServiceUnreachable as exc:
             logger.warning("gateway unreachable mid-poll: %s", exc)
             time.sleep(poll_interval)
             continue
@@ -235,7 +230,7 @@ def _cleanup_sessions(
             group_id=group_id,
             remove_session=True,
         )
-    except (GatewayHTTPError, GatewayUnreachable) as exc:
+    except (ServiceHTTPError, ServiceUnreachable) as exc:
         logger.warning("session cleanup failed: %s", exc)
 
 

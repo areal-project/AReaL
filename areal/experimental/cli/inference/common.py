@@ -1,24 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
 
+"""Domain-specific helpers for the inference CLI.
+
+Lifecycle predicates, HTTP polling, output dispatch, and logger setup
+live in the shared scaffold (`areal.experimental.cli.lifecycle`,
+`.utils`, `.client`, `.status`). This module keeps only the
+inference-specific pieces: backend spec parsing, model registration,
+and TaskHandle column formatters.
+"""
+
 from __future__ import annotations
 
-import json
-import shlex
-import signal
-import time
-import urllib.error
-import urllib.request
-from dataclasses import asdict
 from pathlib import Path
 
 import click
 
-from areal.experimental.cli.inference.client import (
-    GatewayClient,
-    GatewayHTTPError,
-    GatewayUnreachable,
-    RouterClient,
-)
+from areal.experimental.cli.client import ServiceHTTPError, ServiceUnreachable
+from areal.experimental.cli.inference.client import GatewayClient, RouterClient
 from areal.experimental.cli.inference.launcher import (
     build_data_proxy_task_spec,
     build_sglang_task_spec,
@@ -30,25 +28,15 @@ from areal.experimental.cli.inference.scheduler import (
     build_scheduler,
 )
 from areal.experimental.cli.inference.state import (
-    DEFAULT_SERVICE,
     ModelEntry,
     ModelReplica,
-    ModelState,
     RuntimeState,
-    gateway_alive,
-    list_service_names,
-    load_runtime_state,
-    resolve_service_name,
-    service_state_path,
 )
-from areal.experimental.cli.process import (
-    kill_pids,
-    pid_alive,
-    signal_pid,
-)
-from areal.utils.logging import getLogger
+from areal.experimental.cli.process import kill_pids
+from areal.experimental.cli.utils import register_cli_logger, wait_http_health
 
-logger = getLogger("InfCli")
+logger = register_cli_logger("InfCli")
+
 
 ENGINE_ARGS_HELP = (
     "Shell-style string forwarded verbatim to the sglang / vllm process. "
@@ -64,77 +52,6 @@ PROXY_ARGS_HELP = (
     "--tool-call-parser, --reasoning-parser, --engine-max-tokens, "
     "--chat-template-type {hf|concat}."
 )
-
-
-def running_state(service: str | None = None) -> RuntimeState | None:
-    service_name = resolve_service_name(service)
-    if not service_state_path(service_name).exists():
-        return None
-    try:
-        state = load_runtime_state(service_name)
-    except Exception:
-        return None
-    if not gateway_alive(state):
-        return None
-    return state
-
-
-def load_running_state(service: str | None = None) -> RuntimeState:
-    service_name = resolve_service_name(service)
-    if not service_state_path(service_name).exists():
-        raise click.ClickException(f"service {service_name!r} is not running")
-    try:
-        state = load_runtime_state(service_name)
-    except Exception as exc:
-        raise click.ClickException(f"failed to load state: {exc}") from exc
-    if not gateway_alive(state):
-        raise click.ClickException(f"service {service_name!r} gateway pid not alive")
-    return state
-
-
-def refuse_if_running(service: str | None = None) -> None:
-    service_name = service or DEFAULT_SERVICE
-    state = running_state(service_name)
-    if state is None:
-        return
-    raise click.ClickException(
-        f"service {service_name!r} already running "
-        f"(pid={state.gateway_pid}, url={state.gateway_url}). "
-        f"Run `areal inf stop --service {service_name}` first."
-    )
-
-
-def wait_client_health(client, *, timeout: float, label: str) -> None:
-    deadline = time.time() + timeout
-    last_err: Exception | None = None
-    while time.time() < deadline:
-        try:
-            client.health(timeout=1.5)
-            return
-        except (GatewayUnreachable, GatewayHTTPError) as exc:
-            last_err = exc
-            time.sleep(0.3)
-    raise click.ClickException(
-        f"{label} did not become healthy within {timeout:.0f}s (last error: {last_err})"
-    )
-
-
-def wait_http_health(addr: str, *, deadline: float, pid: int, label: str) -> None:
-    last_err: Exception | None = None
-    url = f"{addr}/health"
-    while time.time() < deadline:
-        if not pid_alive(pid):
-            raise click.ClickException(f"{label} subprocess died during startup")
-        try:
-            with urllib.request.urlopen(url, timeout=2.0) as resp:
-                if resp.status < 500:
-                    return
-        except (urllib.error.URLError, ConnectionError, TimeoutError, OSError) as exc:
-            last_err = exc
-            time.sleep(1.0)
-    raise click.ClickException(
-        f"{label} did not become healthy (last error: {last_err})"
-    )
 
 
 def parse_backend_spec(spec: str) -> tuple[str, int, int, int]:
@@ -176,33 +93,36 @@ def parse_backend_spec(spec: str) -> tuple[str, int, int, int]:
 
 
 def split_args(value: str) -> list[str]:
+    import shlex
+
     return shlex.split(value) if value else []
-
-
-def _pids(handles: list[TaskHandle]) -> list[int]:
-    return [h.pid for h in handles if h.pid > 0]
 
 
 def terminate_runtime_state(
     state: RuntimeState, *, grace_s: float, force: bool = False
 ) -> None:
-    # Data-flow order: kill upstream (data-proxies stop accepting requests)
-    # before the worker behind it goes away, so in-flight requests fail at
-    # the proxy boundary instead of mid-worker. Control plane last.
+    """Tear down the whole inference service in data-flow order: kill the
+    data-proxies first (so in-flight requests fail at the proxy boundary
+    rather than mid-worker), then workers, then gateway, then router.
+
+    ``force=True`` skips the grace period entirely — equivalent to
+    ``kill_pids(pids, grace_s=0)`` for every phase.
+    """
+
+    def _pids(handles: list[TaskHandle]) -> list[int]:
+        return [h.pid for h in handles if h.pid > 0]
+
     phases = (
         _pids(state.model_state.all_data_proxies()),
         _pids(state.model_state.all_workers()),
         _pids([state.gateway_handle]),
         _pids([state.router_handle]),
     )
+    effective_grace = 0.0 if force else grace_s
     for pids in phases:
         if not pids:
             continue
-        if force:
-            for pid in pids:
-                signal_pid(pid, signal.SIGKILL)
-        else:
-            kill_pids(pids, grace_s=grace_s)
+        kill_pids(pids, grace_s=effective_grace)
 
 
 def format_placement(backend: str, handle: TaskHandle) -> str:
@@ -236,16 +156,6 @@ def format_ref(backend: str, handle: TaskHandle) -> str:
 def format_gpu_count(handle: TaskHandle) -> str:
     n = len(handle.gpu_devices)
     return f"×{n}" if n > 0 else "-"
-
-
-def probe_http_health(addr: str, *, timeout: float = 3.0) -> bool:
-    # sglang 0.5.10 /health waits up to one scheduler tick (~1s) before
-    # responding, so the default must sit above that ceiling.
-    try:
-        with urllib.request.urlopen(f"{addr}/health", timeout=timeout) as resp:
-            return resp.status < 500
-    except (urllib.error.URLError, ConnectionError, TimeoutError, OSError):
-        return False
 
 
 def register_internal(
@@ -306,9 +216,10 @@ def register_internal(
             )
             wait_http_health(
                 worker_handle.addr,
-                deadline=time.time() + model_health_timeout,
                 pid=worker_handle.pid,
+                timeout=model_health_timeout,
                 label=f"{engine} worker {rank}",
+                poll_interval=1.0,
             )
 
             proxy_log = log_dir / f"{model}-data-proxy-{rank}.log"
@@ -333,9 +244,10 @@ def register_internal(
             )
             wait_http_health(
                 proxy_handle.addr,
-                deadline=time.time() + 30.0,
                 pid=proxy_handle.pid,
+                timeout=30.0,
                 label=f"data-proxy {rank}",
+                poll_interval=1.0,
             )
 
             replicas.append(ModelReplica(data_proxy=proxy_handle, worker=worker_handle))
@@ -344,7 +256,7 @@ def register_internal(
         for addr in proxy_addrs:
             try:
                 router.register_worker(addr)
-            except (GatewayUnreachable, GatewayHTTPError) as exc:
+            except (ServiceUnreachable, ServiceHTTPError) as exc:
                 raise click.ClickException(
                     f"router register_worker {addr} failed: {exc}"
                 ) from exc
@@ -358,7 +270,7 @@ def register_internal(
                     "data_proxy_addrs": proxy_addrs,
                 }
             )
-        except (GatewayUnreachable, GatewayHTTPError) as exc:
+        except (ServiceUnreachable, ServiceHTTPError) as exc:
             raise click.ClickException(f"gateway register_model failed: {exc}") from exc
 
     except BaseException:
@@ -417,81 +329,19 @@ def register_model(
     return ModelEntry(backend=opts["backend"], replicas=replicas)
 
 
-def print_models(state: RuntimeState | ModelState, as_json: bool) -> int:
-    model_state = state.model_state if isinstance(state, RuntimeState) else state
-    if as_json:
-        out = [
-            {"name": name, **asdict(entry)}
-            for name, entry in model_state.models.items()
-        ]
-        click.echo(json.dumps(out, indent=2))
-        return 0
-
-    if not model_state.models:
-        click.echo("no models registered")
-        return 0
-
-    rows = []
-    for name, entry in model_state.models.items():
-        rows.append((name, entry.backend, str(len(entry.replicas))))
-    cols = ("NAME", "BACKEND", "WORKERS")
-    widths = [max(len(row[i]) for row in (cols, *rows)) for i in range(len(cols))]
-    fmt = "  ".join(f"{{:<{width}}}" for width in widths)
-    click.echo(fmt.format(*cols))
-    for row in rows:
-        click.echo(fmt.format(*row))
-    return 0
-
-
-def print_services(*, as_json: bool, include_all: bool) -> int:
-    rows = []
-    for service in list_service_names():
-        try:
-            state = load_runtime_state(service)
-        except Exception:
-            if include_all:
-                rows.append({"service": service, "status": "stale"})
-            continue
-        running = gateway_alive(state)
-        if running or include_all:
-            rows.append(
-                {
-                    "service": service,
-                    "status": "running" if running else "stale",
-                    "backend": state.backend,
-                    "gateway_url": state.gateway_url,
-                    "gateway_pid": state.gateway_pid,
-                    "router_url": state.router_url,
-                    "models": len(state.models),
-                }
-            )
-
-    if as_json:
-        click.echo(json.dumps(rows, indent=2))
-        return 0
-    if not rows:
-        click.echo("no inference services")
-        return 0
-
-    def _pid_cell(row: dict) -> str:
-        pid = row.get("gateway_pid", 0)
-        return str(pid) if pid else "-"
-
-    table = [
-        (
-            row["service"],
-            row["status"],
-            row.get("backend", "-"),
-            str(row.get("models", "")),
-            row.get("gateway_url", ""),
-            _pid_cell(row),
-        )
-        for row in rows
-    ]
-    cols = ("SERVICE", "STATUS", "BACKEND", "MODELS", "GATEWAY", "PID")
-    widths = [max(len(str(row[i])) for row in (cols, *table)) for i in range(len(cols))]
-    fmt = "  ".join(f"{{:<{width}}}" for width in widths)
-    click.echo(fmt.format(*cols))
-    for row in table:
-        click.echo(fmt.format(*row))
-    return 0
+# Imports kept at bottom: these are stdlib re-exports preserved for
+# downstream callers that still import them via this module.
+__all__ = [
+    "ENGINE_ARGS_HELP",
+    "PROXY_ARGS_HELP",
+    "format_gpu_count",
+    "format_placement",
+    "format_ref",
+    "logger",
+    "parse_backend_spec",
+    "register_internal",
+    "register_model",
+    "split_args",
+    "terminate_runtime_state",
+    "validate_register_opts",
+]

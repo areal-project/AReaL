@@ -5,13 +5,8 @@ from __future__ import annotations
 import click
 
 from areal.experimental.cli.inference.common import logger, terminate_runtime_state
-from areal.experimental.cli.inference.state import (
-    ModelState,
-    ServiceState,
-    load_runtime_state,
-    resolve_service_name,
-    service_state_path,
-)
+from areal.experimental.cli.inference.lifecycle import inf_lifecycle
+from areal.experimental.cli.inference.state import ModelState, ServiceState
 
 
 @click.command(name="stop", help="Stop an inference service.")
@@ -30,13 +25,13 @@ def do_stop(
     service: str | None = None,
     keep_state: bool = False,
 ) -> int:
-    service_name = resolve_service_name(service)
-    if not service_state_path(service_name).exists():
+    service_name = inf_lifecycle.resolve_service_name(service)
+    if not inf_lifecycle.state_path(service_name).exists():
         click.echo(f"service {service_name!r} not running")
         return 0
 
     try:
-        state = load_runtime_state(service_name)
+        state = inf_lifecycle.load_state(service_name)
     except Exception:
         logger.warning("stale state; removing")
         if not keep_state:

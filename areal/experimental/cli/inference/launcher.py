@@ -10,7 +10,8 @@ from areal.experimental.cli.inference.scheduler import (
     TaskResources,
     TaskSpec,
 )
-from areal.experimental.cli.process import pick_free_port, spawn_process
+from areal.experimental.cli.process import spawn_process
+from areal.utils.network import find_free_ports
 
 # Gateway and router are service-level singletons spawned directly via
 # spawn_process — not submitted to a Scheduler — so their lifecycle is
@@ -25,7 +26,7 @@ def spawn_router(
     log_level: str,
     log_file: Path,
 ) -> tuple[int, int]:
-    port = pick_free_port()
+    port = find_free_ports(1)[0]
     cmd = [
         sys.executable,
         "-m",

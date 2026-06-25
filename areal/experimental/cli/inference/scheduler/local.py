@@ -11,8 +11,9 @@ from areal.experimental.cli.inference.scheduler.base import (
     TaskHandle,
     TaskSpec,
 )
-from areal.experimental.cli.process import pick_free_port, spawn_process
+from areal.experimental.cli.process import spawn_process
 from areal.utils.logging import getLogger
+from areal.utils.network import find_free_ports
 
 logger = getLogger("InfLocalScheduler")
 
@@ -57,6 +58,10 @@ class LocalScheduler(Scheduler):
         self.all_gpus = list(all_gpus) if all_gpus is not None else _detect_gpus()
         self.occupied_gpus: set[int] = set(occupied_gpus or ())
         self.host = host
+        # Ports already handed out by this scheduler instance — passed as
+        # exclude_ports so the next find_free_ports call cannot return the
+        # same port between subsequent submits within one CLI command.
+        self._allocated_ports: set[int] = set()
 
     def submit(self, spec: TaskSpec) -> TaskHandle:
         gpus = self._allocate_gpus(spec.resources.gpu)
@@ -101,4 +106,6 @@ class LocalScheduler(Scheduler):
         return free[:n]
 
     def _allocate_ports(self, n: int) -> list[int]:
-        return [pick_free_port() for _ in range(n)]
+        ports = find_free_ports(n, exclude_ports=self._allocated_ports)
+        self._allocated_ports.update(ports)
+        return ports

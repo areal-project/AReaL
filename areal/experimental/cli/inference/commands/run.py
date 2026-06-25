@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import signal
 import time
 
 import click
@@ -12,26 +11,25 @@ from areal.experimental.cli.inference.common import (
     ENGINE_ARGS_HELP,
     PROXY_ARGS_HELP,
     logger,
-    refuse_if_running,
     register_model,
     terminate_runtime_state,
     validate_register_opts,
-    wait_client_health,
 )
 from areal.experimental.cli.inference.launcher import spawn_gateway, spawn_router
+from areal.experimental.cli.inference.lifecycle import inf_lifecycle
 from areal.experimental.cli.inference.scheduler import TaskHandle
 from areal.experimental.cli.inference.state import (
     DEFAULT_SERVICE,
+    INF_NAMESPACE,
     ModelState,
     RuntimeState,
     ServiceState,
-    gateway_alive,
     locked_model_state,
-    logs_dir,
-    recover_pids_from_raw_state,
-    service_state_path,
 )
 from areal.experimental.cli.process import kill_pids
+from areal.experimental.cli.state import logs_dir
+from areal.experimental.cli.utils import wait_client_health
+from areal.experimental.cli.watcher import ForegroundWatcher
 
 
 @click.command(name="run", help="Start an inference service (gateway + router).")
@@ -63,8 +61,8 @@ from areal.experimental.cli.process import kill_pids
 @click.option("-d", "--detach", is_flag=True, help="Fork the daemon and exit.")
 @click.option("--model", default=None, help="Register this model at startup.")
 @click.option("--backend", default=None, help="Backend spec, e.g. 'sglang:tp=2,dp=2'.")
-@click.option("--model-path", default=None, help="HF / local model path.")
-@click.option("--tokenizer-path", default=None, help="Tokenizer path.")
+@click.option("--model-path", default=None)
+@click.option("--tokenizer-path", default=None)
 @click.option("--engine-args", default="", show_default=False, help=ENGINE_ARGS_HELP)
 @click.option("--proxy-args", default="", show_default=False, help=PROXY_ARGS_HELP)
 @click.option(
@@ -92,14 +90,17 @@ def run_cmd(**opts) -> None:
 
 def do_run(opts: dict) -> int:
     service = opts["service"]
-    _prepare_service_slot(service=service, force=opts["force"])
+    if opts["force"]:
+        inf_lifecycle.force_replace_slot(service, grace_s=5.0)
+    else:
+        inf_lifecycle.refuse_if_running(service)
 
     if opts["model"]:
         validate_register_opts(opts)
     elif opts["backend"]:
         raise click.UsageError("model registration flags require --model.")
 
-    log_dir = logs_dir(service)
+    log_dir = logs_dir(INF_NAMESPACE, service)
     logger.info("starting inference service %r (logs: %s)", service, log_dir)
 
     router_pid, router_port = spawn_router(
@@ -191,62 +192,24 @@ def do_run(opts: dict) -> int:
         "running — use `areal inf stop --service %s` to terminate.",
         service,
     )
-    previous_handlers = _install_shutdown_signal_handlers()
-    try:
-        while gateway_alive(service_state):
-            time.sleep(1.0)
-    except KeyboardInterrupt:
-        logger.info("shutting down ...")
-        _cleanup_runtime(service, service_state, model_state, grace_s=10.0)
-        return 0
-    except SystemExit:
-        # SIGHUP path: the workers were spawned with start_new_session=True
-        # and outlive the CLI, so we exit silently without touching state.
-        logger.info("detached watcher; service %r continues running", service)
-        return 0
-    except BaseException:
-        _cleanup_runtime(service, service_state, model_state, grace_s=10.0)
-        raise
-    finally:
-        _restore_signal_handlers(previous_handlers)
-
-    logger.warning("gateway exited")
-    ServiceState.remove(service)
-    ModelState.remove(service)
-    return 0
-
-
-def _prepare_service_slot(*, service: str, force: bool) -> None:
-    if not service_state_path(service).exists():
-        return
-    if force:
-        try:
-            from areal.experimental.cli.inference.state import load_runtime_state
-
-            state = load_runtime_state(service)
-            terminate_runtime_state(state, grace_s=5.0)
-        except Exception as exc:
-            try:
-                pids = recover_pids_from_raw_state(service)
-            except Exception as recover_exc:
-                raise click.ClickException(
-                    f"failed to load state for service {service!r}: {exc}; "
-                    "refusing --force because no reliable PID list could be recovered"
-                ) from recover_exc
-            if not pids:
-                raise click.ClickException(
-                    f"failed to load state for service {service!r}: {exc}; "
-                    "refusing --force because no PIDs could be recovered"
-                ) from exc
-            kill_pids(pids, grace_s=5.0)
+    watcher = ForegroundWatcher(
+        is_alive=lambda: inf_lifecycle.gateway_alive(
+            RuntimeState(service_state=service_state, model_state=model_state)
+        ),
+        teardown=lambda: _cleanup_runtime(
+            service, service_state, model_state, grace_s=10.0
+        ),
+        service_name=service,
+    )
+    rc = watcher.watch()
+    # gateway died externally (is_alive flipped to False on its own) — the
+    # children are gone, just clean the state files.
+    if rc == 0 and not inf_lifecycle.gateway_alive(
+        RuntimeState(service_state=service_state, model_state=model_state)
+    ):
         ServiceState.remove(service)
         ModelState.remove(service)
-        return
-    refuse_if_running(service)
-    raise click.ClickException(
-        f"stale state exists for service {service!r}; "
-        f"use `areal inf run --service {service} --force`"
-    )
+    return rc
 
 
 def _cleanup_runtime(
@@ -277,30 +240,3 @@ def _latest_model_state_for_cleanup(
         return fallback
     latest.models.update(fallback.models)
     return latest
-
-
-def _install_shutdown_signal_handlers():
-    # SIGINT (default Python → KeyboardInterrupt) and SIGTERM are treated as
-    # explicit "stop the service" requests and trigger teardown. SIGHUP is
-    # the terminal-disconnect path: the workers run in their own session
-    # (start_new_session=True) so they survive on their own — we just exit
-    # the watcher quietly without killing them.
-    def teardown_handler(signum, frame):
-        del signum, frame
-        raise KeyboardInterrupt
-
-    def detach_handler(signum, frame):
-        del signum, frame
-        raise SystemExit(0)
-
-    previous = {signal.SIGTERM: signal.getsignal(signal.SIGTERM)}
-    signal.signal(signal.SIGTERM, teardown_handler)
-    if hasattr(signal, "SIGHUP"):
-        previous[signal.SIGHUP] = signal.getsignal(signal.SIGHUP)
-        signal.signal(signal.SIGHUP, detach_handler)
-    return previous
-
-
-def _restore_signal_handlers(previous_handlers) -> None:
-    for sig, handler in previous_handlers.items():
-        signal.signal(sig, handler)

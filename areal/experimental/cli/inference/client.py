@@ -2,71 +2,27 @@
 
 from __future__ import annotations
 
-import json
-import urllib.error
-import urllib.request
+from typing import Any
+
+from areal.experimental.cli.client import (
+    BaseHTTPClient,
+    ServiceHTTPError,
+    ServiceUnreachable,
+)
+
+# Legacy aliases — preserve the old names imported by inference subcommands
+# (and downstream callers) so this swap is mechanical. New code should use
+# the scaffold names directly.
+GatewayHTTPError = ServiceHTTPError
+GatewayUnreachable = ServiceUnreachable
 
 
-class GatewayUnreachable(Exception):
-    pass
+class GatewayClient(BaseHTTPClient):
+    def list_models(self, *, timeout: float = 5.0) -> dict[str, Any]:
+        return self._get("/models", timeout=timeout)
 
-
-class GatewayHTTPError(Exception):
-    def __init__(self, status: int, body: str) -> None:
-        super().__init__(f"HTTP {status}: {body}")
-        self.status = status
-        self.body = body
-
-
-def _request(
-    url: str,
-    *,
-    method: str = "GET",
-    payload: dict | None = None,
-    bearer: str | None = None,
-    timeout: float = 5.0,
-) -> dict:
-    data = None
-    headers = {"Accept": "application/json"}
-    if payload is not None:
-        data = json.dumps(payload).encode()
-        headers["Content-Type"] = "application/json"
-    if bearer:
-        headers["Authorization"] = f"Bearer {bearer}"
-    req = urllib.request.Request(url, data=data, method=method, headers=headers)
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            body = resp.read().decode()
-            return json.loads(body) if body else {}
-    except urllib.error.HTTPError as e:
-        raise GatewayHTTPError(e.code, e.read().decode(errors="replace")) from e
-    except (urllib.error.URLError, ConnectionError, TimeoutError, OSError) as e:
-        raise GatewayUnreachable(str(e)) from e
-
-
-class GatewayClient:
-    def __init__(self, base_url: str, admin_api_key: str) -> None:
-        self.base = base_url.rstrip("/")
-        self.key = admin_api_key
-
-    def health(self, *, timeout: float = 2.0) -> dict:
-        return _request(f"{self.base}/health", timeout=timeout)
-
-    def list_models(self, *, timeout: float = 5.0) -> dict:
-        return _request(
-            f"{self.base}/models",
-            bearer=self.key,
-            timeout=timeout,
-        )
-
-    def register_model(self, payload: dict, *, timeout: float = 30.0) -> dict:
-        return _request(
-            f"{self.base}/register_model",
-            method="POST",
-            payload=payload,
-            bearer=self.key,
-            timeout=timeout,
-        )
+    def register_model(self, payload: dict, *, timeout: float = 30.0) -> dict[str, Any]:
+        return self._post("/register_model", payload=payload, timeout=timeout)
 
     def start_session(
         self,
@@ -75,12 +31,10 @@ class GatewayClient:
         task_id: str,
         group_size: int,
         timeout: float = 30.0,
-    ) -> dict:
-        return _request(
-            f"{self.base}/rl/start_session",
-            method="POST",
+    ) -> dict[str, Any]:
+        return self._post(
+            "/rl/start_session",
             payload={"model": model, "task_id": task_id, "group_size": group_size},
-            bearer=self.key,
             timeout=timeout,
         )
 
@@ -91,11 +45,15 @@ class GatewayClient:
         reward: float,
         model: str | None = None,
         timeout: float = 10.0,
-    ) -> dict:
+    ) -> dict[str, Any]:
         payload: dict = {"reward": reward}
         if model:
             payload["model"] = model
-        return _request(
+        # Per-session bearer token, not the gateway admin key — bypass the
+        # base client's auth and pass session_api_key explicitly.
+        from areal.experimental.cli.client import request_json
+
+        return request_json(
             f"{self.base}/rl/set_reward",
             method="POST",
             payload=payload,
@@ -112,7 +70,7 @@ class GatewayClient:
         discount: float = 1.0,
         style: str = "individual",
         timeout: float = 30.0,
-    ) -> dict:
+    ) -> dict[str, Any]:
         payload: dict = {
             "session_ids": session_ids,
             "remove_session": remove_session,
@@ -121,46 +79,15 @@ class GatewayClient:
         }
         if group_id:
             payload["group_id"] = group_id
-        return _request(
-            f"{self.base}/export_trajectories",
-            method="POST",
-            payload=payload,
-            bearer=self.key,
-            timeout=timeout,
-        )
+        return self._post("/export_trajectories", payload=payload, timeout=timeout)
 
 
-class RouterClient:
-    def __init__(self, base_url: str, admin_api_key: str) -> None:
-        self.base = base_url.rstrip("/")
-        self.key = admin_api_key
+class RouterClient(BaseHTTPClient):
+    def register_worker(self, addr: str, *, timeout: float = 10.0) -> dict[str, Any]:
+        return self._post("/register", payload={"worker_addr": addr}, timeout=timeout)
 
-    def health(self, *, timeout: float = 2.0) -> dict:
-        return _request(f"{self.base}/health", timeout=timeout)
+    def unregister_worker(self, addr: str, *, timeout: float = 10.0) -> dict[str, Any]:
+        return self._post("/unregister", payload={"worker_addr": addr}, timeout=timeout)
 
-    def register_worker(self, addr: str, *, timeout: float = 10.0) -> dict:
-        return _request(
-            f"{self.base}/register",
-            method="POST",
-            payload={"worker_addr": addr},
-            bearer=self.key,
-            timeout=timeout,
-        )
-
-    def unregister_worker(self, addr: str, *, timeout: float = 10.0) -> dict:
-        return _request(
-            f"{self.base}/unregister",
-            method="POST",
-            payload={"worker_addr": addr},
-            bearer=self.key,
-            timeout=timeout,
-        )
-
-    def remove_model(self, name: str, *, timeout: float = 10.0) -> dict:
-        return _request(
-            f"{self.base}/remove_model",
-            method="POST",
-            payload={"name": name},
-            bearer=self.key,
-            timeout=timeout,
-        )
+    def remove_model(self, name: str, *, timeout: float = 10.0) -> dict[str, Any]:
+        return self._post("/remove_model", payload={"name": name}, timeout=timeout)

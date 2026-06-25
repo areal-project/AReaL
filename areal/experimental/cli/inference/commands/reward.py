@@ -4,12 +4,9 @@ from __future__ import annotations
 
 import click
 
-from areal.experimental.cli.inference.client import (
-    GatewayClient,
-    GatewayHTTPError,
-    GatewayUnreachable,
-)
-from areal.experimental.cli.inference.common import load_running_state
+from areal.experimental.cli.client import ServiceHTTPError, ServiceUnreachable
+from areal.experimental.cli.inference.client import GatewayClient
+from areal.experimental.cli.inference.lifecycle import inf_lifecycle
 
 
 @click.command(name="reward", help="Set reward on a session.")
@@ -35,10 +32,10 @@ def do_reward(
     *,
     service: str | None = None,
 ) -> int:
-    state = load_running_state(service)
+    state = inf_lifecycle.load_running_state(service)
     gateway = GatewayClient(state.gateway_url, state.admin_api_key)
     try:
         gateway.set_reward(session_api_key=session_api_key, reward=reward, model=model)
-    except (GatewayUnreachable, GatewayHTTPError) as exc:
+    except (ServiceUnreachable, ServiceHTTPError) as exc:
         raise click.ClickException(f"set_reward failed: {exc}") from exc
     return 0

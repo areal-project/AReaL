@@ -3,62 +3,61 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from areal.experimental.cli.inference.scheduler import TaskHandle
 from areal.experimental.cli.process import pid_alive
-from areal.experimental.cli.state import areal_home, atomic_write_json
+from areal.experimental.cli.state import (
+    DEFAULT_SERVICE,
+    ServiceStateBase,
+    SupportsComponentProbe,
+    atomic_write_json,
+    clear_current_service,
+    namespace_root,
+    service_state_path,
+    set_current_service,
+)
+from areal.experimental.cli.utils import file_lock
 
-DEFAULT_SERVICE = "default"
+INF_NAMESPACE = "inf"
 
-
-def inf_root() -> Path:
-    d = areal_home() / "inf"
-    d.mkdir(parents=True, exist_ok=True)
-    return d
-
-
-def services_dir() -> Path:
-    d = inf_root() / "services"
-    d.mkdir(parents=True, exist_ok=True)
-    return d
+# ``DEFAULT_SERVICE`` is re-exported above so existing subcommand imports
+# (`from ...inference.state import DEFAULT_SERVICE`) keep working.
+__all__ = [
+    "DEFAULT_SERVICE",
+    "INF_NAMESPACE",
+    "ModelEntry",
+    "ModelReplica",
+    "ModelState",
+    "RuntimeState",
+    "ServiceState",
+    "locked_model_state",
+    "models_dir",
+    "models_lock_path",
+    "models_state_path",
+    "recover_pids_from_raw_state",
+]
 
 
 def models_dir() -> Path:
-    d = inf_root() / "models"
+    """``$AREAL_HOME/inf/models`` — separate file per service holds the
+    model registry, so we can lock and rewrite it independently of the
+    service state file."""
+
+    d = namespace_root(INF_NAMESPACE) / "models"
     d.mkdir(parents=True, exist_ok=True)
     return d
 
 
-def logs_root() -> Path:
-    d = inf_root() / "logs"
-    d.mkdir(parents=True, exist_ok=True)
-    return d
-
-
-def logs_dir(service: str = DEFAULT_SERVICE) -> Path:
-    d = logs_root() / service
-    d.mkdir(parents=True, exist_ok=True)
-    return d
-
-
-def service_state_path(service: str = DEFAULT_SERVICE) -> Path:
-    return services_dir() / f"{service}.json"
-
-
-def models_state_path(service: str = DEFAULT_SERVICE) -> Path:
+def models_state_path(service: str) -> Path:
     return models_dir() / f"{service}.json"
 
 
-def models_lock_path(service: str = DEFAULT_SERVICE) -> Path:
+def models_lock_path(service: str) -> Path:
     return models_dir() / f"{service}.lock"
-
-
-def current_service_path() -> Path:
-    return inf_root() / "current-service"
 
 
 def _handle_from_dict(raw: dict) -> TaskHandle:
@@ -132,12 +131,12 @@ class ServiceState:
         return self.router_handle.addr
 
     def save(self) -> None:
-        atomic_write_json(service_state_path(self.service), asdict(self))
-        set_current_service(self.service)
+        atomic_write_json(service_state_path(INF_NAMESPACE, self.service), asdict(self))
+        set_current_service(INF_NAMESPACE, self.service)
 
     @classmethod
-    def load(cls, service: str = DEFAULT_SERVICE) -> ServiceState:
-        p = service_state_path(service)
+    def load(cls, service: str) -> ServiceState:
+        p = service_state_path(INF_NAMESPACE, service)
         if not p.exists():
             raise FileNotFoundError(f"No service state at {p}")
         with open(p) as f:
@@ -153,23 +152,23 @@ class ServiceState:
         )
 
     @classmethod
-    def remove(cls, service: str = DEFAULT_SERVICE) -> None:
-        p = service_state_path(service)
+    def remove(cls, service: str) -> None:
+        p = service_state_path(INF_NAMESPACE, service)
         if p.exists():
             p.unlink()
-        clear_current_service(service)
+        clear_current_service(INF_NAMESPACE, service)
 
 
 @dataclass
 class ModelState:
-    service: str = DEFAULT_SERVICE
+    service: str
     models: dict[str, ModelEntry] = field(default_factory=dict)
 
     def save(self) -> None:
         atomic_write_json(models_state_path(self.service), asdict(self))
 
     @classmethod
-    def load(cls, service: str = DEFAULT_SERVICE) -> ModelState:
+    def load(cls, service: str) -> ModelState:
         p = models_state_path(service)
         if not p.exists():
             return cls(service=service)
@@ -182,7 +181,7 @@ class ModelState:
         return cls(service=raw.get("service", service), models=models)
 
     @classmethod
-    def remove(cls, service: str = DEFAULT_SERVICE) -> None:
+    def remove(cls, service: str) -> None:
         p = models_state_path(service)
         if p.exists():
             p.unlink()
@@ -198,7 +197,12 @@ class ModelState:
 
 
 @dataclass
-class RuntimeState:
+class RuntimeState(ServiceStateBase):
+    """Composite of ServiceState (gateway/router) and ModelState (model
+    registry). The single object the CLI verbs operate on; the lifecycle
+    contract is implemented against ``RuntimeState`` so scaffold helpers
+    enumerate every component in one pass."""
+
     service_state: ServiceState
     model_state: ModelState
 
@@ -243,6 +247,10 @@ class RuntimeState:
         return self.service_state.started_at
 
     @property
+    def launch_mode(self) -> str:
+        return self.service_state.launch_mode
+
+    @property
     def models(self) -> dict[str, ModelEntry]:
         return self.model_state.models
 
@@ -250,74 +258,46 @@ class RuntimeState:
         self.service_state.save()
         self.model_state.save()
 
+    @classmethod
+    def load(cls, service: str) -> RuntimeState:
+        service_state = ServiceState.load(service)
+        return cls(
+            service_state=service_state,
+            model_state=ModelState.load(service_state.service),
+        )
 
-def set_current_service(service: str) -> None:
-    current_service_path().write_text(service + "\n")
+    # --- ServiceStateBase contract ----------------------------------------
 
+    def gateway_alive(self) -> bool:
+        # Non-local backends will need their own liveness probe — PID-based
+        # check returns False for them (no pid in handle.ref).
+        return pid_alive(self.gateway_pid)
 
-def clear_current_service(service: str) -> None:
-    path = current_service_path()
-    if path.exists() and path.read_text().strip() == service:
-        path.unlink()
-
-
-def resolve_service_name(explicit: str | None = None) -> str:
-    if explicit:
-        return explicit
-    current = current_service_path()
-    if current.exists():
-        value = current.read_text().strip()
-        if value:
-            return value
-    running = [name for name in list_service_names() if service_running(name)]
-    if len(running) == 1:
-        return running[0]
-    return DEFAULT_SERVICE
-
-
-def list_service_names() -> list[str]:
-    return sorted(path.stem for path in services_dir().glob("*.json"))
-
-
-def service_running(service: str) -> bool:
-    try:
-        return gateway_alive(ServiceState.load(service))
-    except Exception:
-        return False
-
-
-def gateway_alive(state: ServiceState | RuntimeState) -> bool:
-    # Non-local backends will need their own liveness probe — PID-based
-    # check returns False for them (no pid in handle.ref).
-    return pid_alive(state.gateway_pid)
-
-
-def load_runtime_state(service: str = DEFAULT_SERVICE) -> RuntimeState:
-    service_state = ServiceState.load(service)
-    return RuntimeState(
-        service_state=service_state,
-        model_state=ModelState.load(service_state.service),
-    )
+    def components(self) -> Iterable[tuple[str, SupportsComponentProbe]]:
+        yield "gateway", self.gateway_handle
+        yield "router", self.router_handle
+        for name, entry in self.model_state.models.items():
+            for i, replica in enumerate(entry.replicas):
+                yield f"data_proxy[{name}/{i}]", replica.data_proxy
+                yield f"worker[{name}/{i}]", replica.worker
 
 
 @contextmanager
-def locked_model_state(service: str = DEFAULT_SERVICE) -> Iterator[None]:
-    import fcntl
+def locked_model_state(service: str) -> Iterator[None]:
+    """Per-service flock on the model-registry file. Held across
+    register / deregister so concurrent CLI calls cannot race the
+    JSON read-modify-write."""
 
-    path = models_lock_path(service)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "a+") as lock_file:
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+    with file_lock(models_lock_path(service)):
+        yield
 
 
-def recover_pids_from_raw_state(service: str = DEFAULT_SERVICE) -> list[int]:
-    """Best-effort PID extraction from a possibly-malformed state file —
-    walks the JSON tree for ``pid``/``pids`` keys so ``run --force`` can
-    still clean up children when the dataclass parse fails."""
+def recover_pids_from_raw_state(service: str) -> list[int]:
+    """Best-effort PID extraction from possibly-malformed state files —
+    walks BOTH service-state and model-state JSON for ``pid`` / ``pids``
+    keys so ``run --force`` cleans up children when the dataclass parse
+    fails. Inference owns its own walker because it has the second
+    (model-state) file scaffold's default helper doesn't know about."""
 
     pids: list[int] = []
     pid_keys = {"pid", "pids"}
@@ -340,7 +320,10 @@ def recover_pids_from_raw_state(service: str = DEFAULT_SERVICE) -> list[int]:
             for item in value:
                 walk(item)
 
-    for path in (service_state_path(service), models_state_path(service)):
+    for path in (
+        service_state_path(INF_NAMESPACE, service),
+        models_state_path(service),
+    ):
         if not path.exists():
             continue
         with open(path) as f:

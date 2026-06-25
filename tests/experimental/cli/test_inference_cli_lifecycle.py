@@ -70,16 +70,18 @@ def test_terminate_runtime_state_kills_in_order(monkeypatch):
 
 
 def test_prepare_service_slot_force_recovers_raw_pids(tmp_path, monkeypatch):
-    from areal.experimental.cli.inference.commands import run
+    from areal.experimental.cli.inference import lifecycle as inf_lifecycle_mod
+    from areal.experimental.cli.inference.lifecycle import inf_lifecycle
     from areal.experimental.cli.inference.state import (
+        INF_NAMESPACE,
         models_state_path,
-        service_state_path,
     )
+    from areal.experimental.cli.state import service_state_path
 
     monkeypatch.setenv("AREAL_HOME", str(tmp_path))
     # Omit the ``backend`` field so ServiceState.load raises KeyError and
-    # _prepare_service_slot falls back to recover_pids_from_raw_state.
-    service_state_path("svc").write_text(
+    # force_replace_slot falls back to recover_pids_from_raw_state.
+    service_state_path(INF_NAMESPACE, "svc").write_text(
         json.dumps(
             {
                 "service": "svc",
@@ -133,12 +135,12 @@ def test_prepare_service_slot_force_recovers_raw_pids(tmp_path, monkeypatch):
     def fake_kill_pids(pids, grace_s):
         calls.append((list(pids), grace_s))
 
-    monkeypatch.setattr(run, "kill_pids", fake_kill_pids)
+    monkeypatch.setattr(inf_lifecycle_mod, "kill_pids", fake_kill_pids)
 
-    run._prepare_service_slot(service="svc", force=True)
+    inf_lifecycle.force_replace_slot("svc", grace_s=5.0)
 
     assert calls == [([100, 101, 300, 200], 5.0)]
-    assert not service_state_path("svc").exists()
+    assert not service_state_path(INF_NAMESPACE, "svc").exists()
     assert not models_state_path("svc").exists()
 
 

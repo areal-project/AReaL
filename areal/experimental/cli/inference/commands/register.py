@@ -8,15 +8,12 @@ from areal.experimental.cli.inference.client import GatewayClient, RouterClient
 from areal.experimental.cli.inference.common import (
     ENGINE_ARGS_HELP,
     PROXY_ARGS_HELP,
-    load_running_state,
     logger,
     register_model,
 )
-from areal.experimental.cli.inference.state import (
-    locked_model_state,
-    logs_dir,
-    resolve_service_name,
-)
+from areal.experimental.cli.inference.lifecycle import inf_lifecycle
+from areal.experimental.cli.inference.state import INF_NAMESPACE, locked_model_state
+from areal.experimental.cli.state import logs_dir
 
 
 @click.command(name="register", help="Register a model against a running service.")
@@ -39,9 +36,9 @@ def register_cmd(model_name: str, service: str | None, **opts) -> None:
 
 
 def do_register(model_name: str, opts: dict, *, service: str | None = None) -> int:
-    service_name = resolve_service_name(service)
+    service_name = inf_lifecycle.resolve_service_name(service)
     with locked_model_state(service_name):
-        state = load_running_state(service_name)
+        state = inf_lifecycle.load_running_state(service_name)
         if model_name in state.models:
             raise click.ClickException(
                 f"model {model_name!r} already registered in service {state.service!r}"
@@ -52,7 +49,7 @@ def do_register(model_name: str, opts: dict, *, service: str | None = None) -> i
             opts=opts,
             gateway=GatewayClient(state.gateway_url, state.admin_api_key),
             router=RouterClient(state.router_url, state.admin_api_key),
-            log_dir=logs_dir(state.service),
+            log_dir=logs_dir(INF_NAMESPACE, state.service),
             admin_api_key=state.admin_api_key,
             scheduler_backend=state.backend,
             occupied_gpus=state.model_state.occupied_gpus(),

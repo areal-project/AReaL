@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
 
 import click
@@ -12,16 +11,12 @@ from areal.experimental.cli.inference.common import (
     format_gpu_count,
     format_placement,
     format_ref,
-    probe_http_health,
 )
+from areal.experimental.cli.inference.lifecycle import inf_lifecycle
 from areal.experimental.cli.inference.scheduler import TaskHandle
-from areal.experimental.cli.inference.state import (
-    RuntimeState,
-    gateway_alive,
-    load_runtime_state,
-    resolve_service_name,
-    service_state_path,
-)
+from areal.experimental.cli.inference.state import RuntimeState
+from areal.experimental.cli.state import SupportsComponentProbe
+from areal.experimental.cli.status import ColumnSpec, StatusReporter
 
 
 @click.command(
@@ -35,8 +30,8 @@ def status_cmd(service: str | None, as_json: bool) -> None:
 
 
 def do_status(as_json: bool, *, service: str | None = None) -> int:
-    service_name = resolve_service_name(service)
-    if not service_state_path(service_name).exists():
+    service_name = inf_lifecycle.resolve_service_name(service)
+    if not inf_lifecycle.state_path(service_name).exists():
         if as_json:
             click.echo(
                 json.dumps({"service": service_name, "running": False}, indent=2)
@@ -46,84 +41,77 @@ def do_status(as_json: bool, *, service: str | None = None) -> int:
         return 0
 
     try:
-        state = load_runtime_state(service_name)
+        state = inf_lifecycle.load_state(service_name)
     except Exception as exc:
         raise click.ClickException(f"failed to load state: {exc}") from exc
 
-    rows = _collect_rows(state)
+    components = list(state.components())
+    reporter = StatusReporter(components, _columns(state.backend))
+    alive = reporter.probe_all()
 
     if as_json:
-        click.echo(json.dumps(_json_snapshot(state, rows), indent=2))
+        click.echo(json.dumps(_json_snapshot(state, reporter, alive), indent=2))
         return 0
 
-    _print_table(state, rows)
+    gateway_addr = state.gateway_handle.addr or "-"
+    reporter.print_table(
+        reporter.render_rows(alive),
+        header_line=(
+            f"service: {state.service}   "
+            f"backend: {state.backend}   "
+            f"gateway: {gateway_addr}   "
+            f"models: {len(state.models)}   "
+            f"running: {'yes' if state.gateway_alive() else 'no'}"
+        ),
+    )
     return 0
 
 
-def _collect_rows(state: RuntimeState) -> list[dict]:
-    components: list[tuple[str, TaskHandle]] = [
-        ("gateway", state.gateway_handle),
-        ("router", state.router_handle),
-    ]
-    for name, entry in state.model_state.models.items():
-        for i, replica in enumerate(entry.replicas):
-            components.append((f"data_proxy[{name}/{i}]", replica.data_proxy))
-            components.append((f"worker[{name}/{i}]", replica.worker))
+def _columns(backend: str) -> list[ColumnSpec]:
+    def _component(label: str, _: SupportsComponentProbe, __: bool) -> str:
+        return label
 
-    addrs = [handle.addr or "-" for _, handle in components]
-    alive_flags = _probe_concurrently(addrs)
+    def _placement(_: str, handle: SupportsComponentProbe, __: bool) -> str:
+        # SupportsComponentProbe doesn't promise the TaskHandle surface,
+        # but in practice every inf component handle IS a TaskHandle.
+        return format_placement(backend, handle) or "-"  # type: ignore[arg-type]
+
+    def _gpus(_: str, handle: SupportsComponentProbe, __: bool) -> str:
+        return format_gpu_count(handle)  # type: ignore[arg-type]
+
+    def _addr(_: str, handle: SupportsComponentProbe, __: bool) -> str:
+        return handle.addr or "-"
+
+    def _ref(_: str, handle: SupportsComponentProbe, __: bool) -> str:
+        return format_ref(backend, handle)  # type: ignore[arg-type]
+
+    def _alive(_: str, __: SupportsComponentProbe, alive: bool) -> str:
+        return "yes" if alive else "no"
+
     return [
-        _component_row(label, handle, state.backend, alive=alive)
-        for (label, handle), alive in zip(components, alive_flags, strict=True)
+        ColumnSpec("COMPONENT", _component),
+        ColumnSpec("PLACEMENT", _placement),
+        ColumnSpec("GPUS", _gpus),
+        ColumnSpec("ADDR", _addr),
+        ColumnSpec("REF", _ref),
+        ColumnSpec("ALIVE", _alive),
     ]
 
 
-def _probe_concurrently(addrs: list[str]) -> list[bool]:
-    if not addrs:
-        return []
-    with ThreadPoolExecutor(max_workers=max(4, len(addrs))) as pool:
-        return list(pool.map(probe_http_health, addrs))
-
-
-def _component_row(
-    label: str, handle: TaskHandle, backend: str, *, alive: bool
+def _json_snapshot(
+    state: RuntimeState, reporter: StatusReporter, alive: list[bool]
 ) -> dict:
-    addr = handle.addr or "-"
-    return {
-        "component": label,
-        "placement": format_placement(backend, handle) or "-",
-        "gpus": format_gpu_count(handle),
-        "addr": addr,
-        "ref": format_ref(backend, handle),
-        "alive": "yes" if alive else "no",
-    }
-
-
-def _print_table(state: RuntimeState, rows: list[dict]) -> None:
-    gateway_addr = state.gateway_handle.addr or "-"
-    click.echo(
-        f"service: {state.service}   "
-        f"backend: {state.backend}   "
-        f"gateway: {gateway_addr}   "
-        f"models: {len(state.models)}   "
-        f"running: {'yes' if gateway_alive(state) else 'no'}"
-    )
-    click.echo()
-
-    cols = ("COMPONENT", "PLACEMENT", "GPUS", "ADDR", "REF", "ALIVE")
-    keys = ("component", "placement", "gpus", "addr", "ref", "alive")
-    widths = [max(len(str(r[k])) for r in (dict(zip(keys, cols)), *rows)) for k in keys]
-    fmt = "  ".join(f"{{:<{w}}}" for w in widths)
-    click.echo(fmt.format(*cols))
-    for row in rows:
-        click.echo(fmt.format(*(str(row[k]) for k in keys)))
-
-
-def _json_snapshot(state: RuntimeState, rows: list[dict]) -> dict:
+    handle_pairs: list[tuple[str, TaskHandle]] = list(state.components())  # type: ignore[arg-type]
+    rows = [
+        {**snap, "label": label}
+        for snap, (label, _) in zip(
+            reporter.json_snapshot(alive), handle_pairs, strict=True
+        )
+    ]
     return {
         "service": state.service,
         "backend": state.backend,
-        "running": gateway_alive(state),
+        "running": state.gateway_alive(),
         "gateway_handle": asdict(state.gateway_handle),
         "router_handle": asdict(state.router_handle),
         "started_at": state.started_at,
