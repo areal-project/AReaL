@@ -1,11 +1,4 @@
 # SPDX-License-Identifier: Apache-2.0
-"""CPU unit tests for the GSM8K SFT loss-mask boundary.
-
-Byte-level/BPE tokenizers can merge a token across the question/answer join when
-the question has no trailing whitespace, so the naive ``len(encode(question))``
-boundary is wrong. A deterministic stub tokenizer reproduces that merge without
-any downloads.
-"""
 
 from datasets import Dataset
 
@@ -14,9 +7,6 @@ from areal.dataset.gsm8k import get_gsm8k_sft_dataset
 
 
 class _ByteMergeTokenizer:
-    """Stub tokenizer that greedily merges the pair ``"ow"`` into one token, so
-    ``encode("...o" + "w...")`` differs from ``encode("...o")`` at the boundary."""
-
     eos_token = "<eos>"
 
     def __init__(self):
@@ -45,23 +35,19 @@ def _loss_mask(tokenizer, question: str, answer: str):
 
 
 def test_boundary_merge_token_is_supervised():
-    """A token spanning the question/answer join is attributed to the answer."""
     tok = _ByteMergeTokenizer()
-    question, answer = "abco", "wxyz"  # 'o' + 'w' merge into 'ow' across the join
+    question, answer = "abco", "wxyz"
 
     prompt_ids = tok.encode(question)
     full_ids = tok.encode(question + answer + tok.eos_token)
-    assert full_ids[: len(prompt_ids)] != prompt_ids  # the merge actually happens
+    assert full_ids[: len(prompt_ids)] != prompt_ids
 
     input_ids, loss_mask = _loss_mask(tok, question, answer)
-    # Only the 3 clean prompt tokens ('a','b','c') are masked; the merged 'ow'
-    # token is supervised, and the masked span is a true prefix of input_ids.
     assert loss_mask == [0] * 3 + [1] * (len(input_ids) - 3)
     assert input_ids[:3] == prompt_ids[:3]
 
 
 def test_no_merge_boundary_unchanged():
-    """With a clean boundary the mask still ends at len(encode(question))."""
     tok = _ByteMergeTokenizer()
     question, answer = "abc", "xyz"
 
