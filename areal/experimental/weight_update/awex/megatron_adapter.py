@@ -24,7 +24,10 @@ from awex.util.tensor_util import (
     group_tensors_by_shape_and_dtype,
 )
 
-from areal.experimental.weight_update.awex import fetch_kv_metadata
+from areal.experimental.weight_update.awex import (
+    awex_wu_use_group,
+    fetch_kv_metadata,
+)
 from areal.experimental.weight_update.nccl_group import (
     init_weights_update_group,
     setup_batch_isend_irecv,
@@ -198,7 +201,12 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
             self._weights_update_group,
             copy_rank=self._transfer_rank,
         )
-        batch_send_recv(send_ops=send_ops, recv_ops=[], blocking=True)
+        batch_send_recv(
+            send_ops=send_ops,
+            recv_ops=[],
+            blocking=True,
+            use_group=awex_wu_use_group(),
+        )
         dist.barrier(group=self._weights_update_group)
 
     def batch_isend_irecv(self, **kwargs) -> None:

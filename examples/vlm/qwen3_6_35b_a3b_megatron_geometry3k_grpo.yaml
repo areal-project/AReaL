@@ -1,5 +1,5 @@
-experiment_name: gsm8k-grpo
-trial_name: trial0
+experiment_name: geometry3k-grpo
+trial_name: trial1
 
 seed: 1
 enable_offload: false
@@ -7,58 +7,52 @@ total_train_epochs: 10
 tokenizer_path: ${actor.path}
 
 cluster:
-  n_nodes: 1
+  n_nodes: 6
   n_gpus_per_node: 8
   fileroot: /tmp/areal/experiments
   name_resolve:
     type: nfs
     nfs_record_root: /tmp/areal/name_resolve
 
-
 scheduler:
-  type: null
+  type: slurm
 
 rollout:
-  backend: "sglang:d4p1t1"
+  backend: "vllm:d8p1t2"
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
   max_concurrent_rollouts: 256
   queue_size: null
   consumer_batch_size: ${train_dataset.batch_size}
-  max_head_offpolicyness: 2
+  max_head_offpolicyness: 4
   enable_rollout_tracing: false
   scheduling_spec: ${actor.scheduling_spec}
   fileroot: ${cluster.fileroot}
   tokenizer_path: ${tokenizer_path}
   dump_to_file: true
-  agent:
-    mode: inline
-    export_style: individual
-    turn_discount: 1.0
 
 gconfig:
   n_samples: 4
   min_new_tokens: 0
-  max_new_tokens: 1024
-  max_tokens: 2048
+  max_new_tokens: 2048
   greedy: false
   temperature: 1.0
 
 actor:
-  backend: "fsdp:d4p1t1"
+  backend: "megatron:(attn:d8p2t2|ffn:d4p2t1e4)"
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
-  path: Qwen/Qwen2.5-1.5B-Instruct
+  path: Qwen/Qwen3.6-35B-A3B
   init_from_scratch: false
   disable_dropout: true
   gradient_checkpointing: true
   dtype: bfloat16
   mb_spec:
-    max_tokens_per_mb: 10240
+    max_tokens_per_mb: 8192
   optimizer:
     type: adam
-    lr: 1.70e-5
-    weight_decay: 0.017
+    lr: 1e-6
+    weight_decay: 0.01
     beta1: 0.9
     beta2: 0.999
     eps: 1e-8
@@ -78,18 +72,23 @@ actor:
     upper: 5.0
   reward_norm:
     mean_level: group
-    std_level: null
+    std_level: group
     group_size: ${gconfig.n_samples}
   adv_norm:
     mean_level: batch
     std_level: batch
+  megatron:
+    bridge_type: megatron-bridge
+    use_bridge_for_update_weights: true
+    enable_mtp: false
+  max_new_tokens: ${gconfig.max_new_tokens}
   scheduling_spec:
     - task_type: worker
       port_count: 2
       gpu: 1
       mem: 32
       cmd: python3 -m areal.infra.rpc.rpc_server
-      env_vars: {}
+      env_vars: { PYTORCH_ALLOC_CONF: "expandable_segments:True" }
 
 ref:
   backend: ${actor.backend}
@@ -100,7 +99,7 @@ ref:
   disable_dropout: true
   dtype: ${actor.dtype}
   mb_spec:
-    max_tokens_per_mb: 10240
+    max_tokens_per_mb: 4096
   optimizer: null
   scheduling_strategy:
     type: colocation
@@ -113,9 +112,10 @@ sglang:
   random_seed: ${seed}
   skip_tokenizer_init: true
   dtype: ${actor.dtype}
-  max_running_requests: null
+  max_running_requests: 64
   context_length: 32768
   mem_fraction_static: 0.8
+  enable_multimodal: true
 
 vllm:
   model: ${actor.path}
@@ -124,22 +124,24 @@ vllm:
   dtype: ${actor.dtype}
   max_model_len: 32768
   gpu_memory_utilization: 0.9
+  disable_sliding_window: false
+  enforce_eager: true
+  gdn_prefill_backend: triton
 
 # datasets
 train_dataset:
-  batch_size: 256
+  batch_size: 128
   shuffle: true
   pin_memory: true
   num_workers: 4
-  path: openai/gsm8k
+  path: hiyouga/geometry3k
   type: rl
-  max_length: 1024
 
 valid_dataset:
-  batch_size: 256
+  batch_size: 128
   pin_memory: true
   num_workers: 4
-  path: openai/gsm8k
+  path: hiyouga/geometry3k
   type: rl
 
 # Utilities

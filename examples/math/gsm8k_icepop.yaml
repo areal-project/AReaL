@@ -1,4 +1,4 @@
-experiment_name: gsm8k-grpo
+experiment_name: gsm8k-icepop
 trial_name: trial0
 
 seed: 1
@@ -30,7 +30,7 @@ rollout:
   scheduling_spec: ${actor.scheduling_spec}
   fileroot: ${cluster.fileroot}
   tokenizer_path: ${tokenizer_path}
-  dump_to_file: true
+  dump_to_file: false
   agent:
     mode: inline
     export_style: individual
@@ -55,6 +55,7 @@ actor:
   dtype: bfloat16
   mb_spec:
     max_tokens_per_mb: 10240
+    packing_algorithm: ffd
   optimizer:
     type: adam
     lr: 1.70e-5
@@ -71,18 +72,22 @@ actor:
   reward_bias: -0.5
   kl_ctl: 0.0
   ppo_n_minibatches: 1
-  recompute_logprob: true
   use_decoupled_loss: true
   rejection_sampling:
+    level: token
+    action: mask
     metric: ratio
+    lower: 0.5
     upper: 5.0
   reward_norm:
     mean_level: group
-    std_level: null
+    std_level: group
     group_size: ${gconfig.n_samples}
   adv_norm:
     mean_level: batch
     std_level: batch
+  weight_update_mode: xccl
+  max_new_tokens: ${gconfig.max_new_tokens}
   scheduling_spec:
     - task_type: worker
       port_count: 2
@@ -101,6 +106,7 @@ ref:
   dtype: ${actor.dtype}
   mb_spec:
     max_tokens_per_mb: 10240
+    packing_algorithm: ffd
   optimizer: null
   scheduling_strategy:
     type: colocation
@@ -123,7 +129,7 @@ vllm:
   skip_tokenizer_init: false
   dtype: ${actor.dtype}
   max_model_len: 32768
-  gpu_memory_utilization: 0.9
+  gpu_memory_utilization: 0.8
 
 # datasets
 train_dataset:

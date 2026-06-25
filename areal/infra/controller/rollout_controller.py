@@ -983,6 +983,46 @@ class RolloutController:
         trajectories = [r.trajectory if r is not None else None for r in results]
         return [t for t in trajectories if t is not None]
 
+    def compute_logp(self, data: list[dict[str, Any]]) -> list[Any]:
+        """Compute token log-probabilities for trajectories via remote workers."""
+        if len(data) == 0:
+            return []
+
+        async def _compute():
+            indexed_chunks: list[list[int]] = []
+            tasks = []
+            n_workers = len(self.workers)
+            if n_workers == 0:
+                raise RuntimeError("No workers available for compute_logp.")
+
+            for rank, worker in enumerate(self.workers):
+                idxs = list(range(rank, len(data), n_workers))
+                if not idxs:
+                    continue
+                chunk = [data[i] for i in idxs]
+                indexed_chunks.append(idxs)
+                tasks.append(
+                    self.scheduler.async_call_engine(
+                        worker_id=worker.id,
+                        method="compute_logp",
+                        engine_name=self._engine_name(rank),
+                        data=chunk,
+                        http_timeout=self.config.request_timeout,
+                    )
+                )
+            rpc_results = await asyncio.gather(*tasks)
+            merged: list[Any] = [None] * len(data)
+            for idxs, chunk_result in zip(indexed_chunks, rpc_results):
+                if len(chunk_result) != len(idxs):
+                    raise RuntimeError(
+                        f"compute_logp result length mismatch: got {len(chunk_result)}, expected {len(idxs)}"
+                    )
+                for out_idx, value in zip(idxs, chunk_result):
+                    merged[out_idx] = value
+            return merged
+
+        return run_async_task(_compute)
+
     async def agenerate(self, req: ModelRequest) -> ModelResponse:
         """Asynchronously generate a response for the given request.
 

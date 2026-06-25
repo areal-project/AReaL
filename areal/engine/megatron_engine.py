@@ -5,9 +5,11 @@ from __future__ import annotations
 import dataclasses
 import functools
 import gc
+import json
 import math
 import os
 import re
+import struct
 from collections.abc import Callable, Iterator
 from concurrent.futures import Future
 from contextlib import contextmanager
@@ -60,7 +62,9 @@ from areal.engine.core.model import (
     disable_dropout_in_model,
     is_valid_vision_model,
     lang_config,
+    requires_padded_seq,
 )
+from areal.engine.megatron_utils import megatron_bridge_patches  # noqa: F401
 from areal.engine.megatron_utils.checkpointer import MegatronCheckpointManager
 from areal.engine.megatron_utils.deterministic import set_deterministic_algorithms
 from areal.engine.megatron_utils.fp8 import FP8BlockwiseTensorHelper
@@ -346,6 +350,10 @@ class MegatronEngine(TrainEngine):
             )
 
             self.is_vision_model = is_valid_vision_model(self.hf_config.model_type)
+            # GDN/SSM models (e.g. Qwen3.5) reject packed THD input and must run
+            # the padded BSHD forward. Derived from model type rather than a
+            # config flag so the layout can't be mis-set.
+            self.use_padded_seq = requires_padded_seq(self.hf_config.model_type)
             if self.is_vision_model:
                 if self.parallel_strategy.context_parallel_size > 1:
                     raise NotImplementedError(
@@ -361,12 +369,39 @@ class MegatronEngine(TrainEngine):
                     f"Loaded processor and tokenizer."
                 )
 
+            if self.use_padded_seq and self.parallel_strategy.context_parallel_size > 1:
+                raise NotImplementedError(
+                    f"Context parallel (CP > 1) is not supported for "
+                    f"model_type={self.hf_config.model_type!r}, which requires the "
+                    "padded BSHD forward (it operates on [B, S] tensors while the "
+                    "CP path packs sequences). "
+                    f"Got context_parallel_size={self.parallel_strategy.context_parallel_size}."
+                )
+
             self.quantization_config = getattr(
                 self.hf_config, "quantization_config", None
             )
 
             self._check_and_apply_fp8_config()
             self._validate_fp8_consistency()
+
+            # Warn once if bridge-delegated weight sync was requested but a
+            # fallback condition forces the registry conversion path (the
+            # dispatch in _update_weights_from_distributed silently falls back).
+            if self.mcore_config.use_bridge_for_update_weights:
+                fallback_reasons = []
+                if self.bridge_cls != "megatron-bridge":
+                    fallback_reasons.append(f"bridge_type={self.bridge_cls!r}")
+                if self.quantization_config:
+                    fallback_reasons.append("FP8/quantized training")
+                if self.config.use_lora:
+                    fallback_reasons.append("LoRA enabled")
+                if fallback_reasons:
+                    self.logger.warning(
+                        "use_bridge_for_update_weights=True, but live weight sync "
+                        "will use the registry conversion path instead because: "
+                        f"{', '.join(fallback_reasons)}."
+                    )
 
             with self.device:
                 models = make_mcore_model(
@@ -844,6 +879,7 @@ class MegatronEngine(TrainEngine):
                 mb_input.padded_mb,
                 gather_cp_output=not cp_local,
                 is_vision_model=self.is_vision_model,
+                use_padded_seq=self.use_padded_seq,
             )
 
             # Release tree attention metadata after forward pass
@@ -1088,6 +1124,17 @@ class MegatronEngine(TrainEngine):
             )
 
         self.get_device_stats().log("before offload model")
+
+        # Discard gradient buffers via Megatron's native API *before* TMS pause.
+        # `DDP.offload_grad_buffers()` releases grad storage in-place
+        # (storage().resize_(0)); views like param.main_grad recover automatically
+        # on restore. Since grads are recomputed every step, they need no CPU
+        # backup. Doing this before pause() means the grad region has no physical
+        # memory left for TMS to back up.
+        if self.mcore_config.disable_grad_buffers_cpu_backup:
+            for m in self.model:
+                m.offload_grad_buffers(synchronize=False, empty_cache=False)
+
         current_platform.clear_memory()
         torch_memory_saver.pause()
 
@@ -1105,6 +1152,13 @@ class MegatronEngine(TrainEngine):
         """
 
         torch_memory_saver.resume()
+
+        # Reallocate gradient buffers released in offload(). resize_() restores
+        # storage and zeroes it; param.main_grad views become valid again.
+        if self.mcore_config.disable_grad_buffers_cpu_backup:
+            for m in self.model:
+                m.restore_grad_buffers(synchronize=False)
+
         current_platform.clear_memory()
 
         # TODO: NCCL onload
@@ -1114,17 +1168,19 @@ class MegatronEngine(TrainEngine):
 
         self.is_offload = False
 
-    def clear_batches(self, shard_ids: list[str]) -> None:
+    def clear_batches(self, shard_ids: list[str] | None = None) -> None:
         """Drain this worker's client-side RTensor fetch buffer.
 
         Called via RPC by ``TrainController.clear_batches`` at step end so
         cross-node consumer DP heads release cached tensors. See #1209.
-        Upstream ``TrainController.clear_batches`` guards against empty
-        input, so ``shard_ids`` is always a non-empty ``list[str]``.
+        Non-DP-head ranks receive no positional args via
+        ``_call_workers`` (see train_controller.py:575-577) — accept the
+        no-args call and noop, since their ``_fetch_buffer`` is empty.
         """
         from areal.infra.rpc.rtensor import clear_fetch_buffer
 
-        clear_fetch_buffer(shard_ids)
+        if shard_ids:
+            clear_fetch_buffer(shard_ids)
 
     def fetch_buffer_stats(self) -> dict[str, int]:
         """Expose local fetch-buffer stats for post-step drain verification."""
@@ -1753,6 +1809,35 @@ class MegatronEngine(TrainEngine):
 
         dist.barrier(group=self.cpu_group)
 
+        # Bridge delegation: when bridge_type=megatron-bridge and the user opts in,
+        # stream HF tensors directly from bridge.export_hf_weights. Falls back to
+        # the hand-rolled registry path for FP8 (quant_mapping in megatron-bridge
+        # is amax-style, not TE blockwise) and for LoRA (separate adapter export
+        # path not yet wired here).
+        use_bridge = (
+            self.bridge_cls == "megatron-bridge"
+            and self.mcore_config.use_bridge_for_update_weights
+            and not self.quantization_config
+            and not self.config.use_lora
+        )
+        if use_bridge:
+            self._update_weights_via_bridge(meta)
+        else:
+            self._update_weights_via_registry(meta)
+
+        if dist.get_rank() == 0:
+            self.rollout_engine.continue_generation()
+
+        current_platform.synchronize()
+        dist.barrier(group=self.cpu_group)
+
+    def _update_weights_via_registry(self, meta: WeightUpdateMeta) -> None:
+        """Hand-rolled conversion path via convert_to_hf registry.
+
+        Used for FP8, LoRA, and models with a converter entry. Iterates this PP
+        rank's local params, TP-gathers per param, converts to HF layout, and
+        bucket-broadcasts to the rollout engine.
+        """
         num_moe_experts = self.tf_config.num_moe_experts
         weight_chunked_mem_size = meta.weight_chunked_mem_mb * 1024 * 1024
 
@@ -1807,10 +1892,37 @@ class MegatronEngine(TrainEngine):
 
         dist.barrier(group=self.cpu_group)
 
-        if dist.get_rank() == 0:
-            self.rollout_engine.continue_generation()
+    def _update_weights_via_bridge(self, meta: WeightUpdateMeta) -> None:
+        """Delegate live weight sync to megatron-bridge.export_hf_weights.
 
-        current_platform.synchronize()
+        Streams (hf_name, hf_tensor) directly from the bridge, which handles
+        TP/EP/PP gather and layout transformation internally. Each PP rank
+        iterates the global parameter set (vs registry path which iterates only
+        local layers); non-PP-heads participate in collectives but do not bucket.
+        MoE expert weights are yielded inline by the bridge's grouped-export
+        path, so no separate second pass is needed.
+        """
+        weight_chunked_mem_size = meta.weight_chunked_mem_mb * 1024 * 1024
+        bucket: list[tuple[str, torch.Tensor]] = []
+        bucket_size = 0
+
+        for hf_name, hf_tensor in self.bridge.export_hf_weights(
+            self.model,
+            cpu=False,
+            show_progress=False,
+        ):
+            if not self.is_pipeline_parallel_head():
+                continue
+            size = hf_tensor.numel() * hf_tensor.element_size()
+            if bucket_size + size > weight_chunked_mem_size:
+                self._update_bucket_weights_from_distributed(meta, bucket)
+                bucket_size = 0
+            bucket.append((hf_name, hf_tensor.contiguous()))
+            bucket_size += size
+
+        if bucket:
+            self._update_bucket_weights_from_distributed(meta, bucket)
+
         dist.barrier(group=self.cpu_group)
 
     @trace_perf("megatron_engine.update_weights_from_disk", category="io")
@@ -1862,10 +1974,17 @@ class MegatronEngine(TrainEngine):
                     base_model_name_or_path=base_model_path or self.config.path,
                 )
             else:
+                # When the MTP head was dropped (enable_mtp=False), the export
+                # yields no mtp.* tensors and strict=True would silently skip
+                # every source shard containing an MTP key -- discarding the
+                # non-MTP weights packed in those shards (e.g. lm_head).
+                # strict=False writes such shards with all present keys, so the
+                # export loses only the intentionally dropped MTP weights.
                 self.bridge.save_hf_pretrained(
                     self.model,
                     path,
                     source_path=base_model_path,
+                    strict=not self._mtp_head_dropped,
                 )
         else:
             if self.mcore_config.use_mbridge_save:
@@ -1897,9 +2016,95 @@ class MegatronEngine(TrainEngine):
                 tokenizer.save_pretrained(path)
             if processor is not None:
                 processor.save_pretrained(path)
+            if self._mtp_head_dropped:
+                self._scrub_mtp_from_saved_config(path)
+                self._rebuild_index_from_saved_shards(path)
 
         current_platform.synchronize()
         dist.barrier(group=self.cpu_group)
+
+    @property
+    def _mtp_head_dropped(self) -> bool:
+        """True when the model declares an MTP head but enable_mtp left it unbuilt."""
+        if self.bridge_cls != "megatron-bridge" or self.mcore_config.enable_mtp:
+            return False
+        text_config = getattr(self.hf_config, "text_config", self.hf_config)
+        return any(
+            bool(getattr(text_config, key, 0))
+            for key in ("mtp_num_hidden_layers", "num_nextn_predict_layers")
+        )
+
+    def _scrub_mtp_from_saved_config(self, path: str) -> None:
+        """Zero MTP layer counts in an exported config.json so it matches the
+        MTP-stripped weights (the head is dropped when enable_mtp=False)."""
+        cfg_path = os.path.join(path, "config.json")
+        if not os.path.exists(cfg_path):
+            return
+        with open(cfg_path) as f:
+            cfg = json.load(f)
+
+        def _walk(node: Any) -> bool:
+            changed = False
+            if isinstance(node, dict):
+                for key, value in node.items():
+                    if (
+                        key in ("mtp_num_hidden_layers", "num_nextn_predict_layers")
+                        and value
+                    ):
+                        node[key] = 0
+                        changed = True
+                    else:
+                        changed |= _walk(value)
+            elif isinstance(node, list):
+                for item in node:
+                    changed |= _walk(item)
+            return changed
+
+        if _walk(cfg):
+            with open(cfg_path, "w") as f:
+                json.dump(cfg, f, indent=2, sort_keys=True)
+            self.logger.info(
+                "Exported checkpoint is MTP-stripped (enable_mtp=False); "
+                "zeroed MTP layer counts in %s.",
+                cfg_path,
+            )
+
+    def _rebuild_index_from_saved_shards(self, path: str) -> None:
+        """Rewrite model.safetensors.index.json from the shard files' actual
+        contents. megatron-bridge's strict=False save marks each shard's full
+        expected key set as saved, leaving ghost entries for the dropped mtp.*
+        tensors and a stale metadata.total_size."""
+        index_path = os.path.join(path, "model.safetensors.index.json")
+        if not os.path.exists(index_path):
+            return
+        weight_map: dict[str, str] = {}
+        total_size = 0
+        for filename in sorted(os.listdir(path)):
+            if not filename.endswith(".safetensors"):
+                continue
+            with open(os.path.join(path, filename), "rb") as f:
+                header_len = struct.unpack("<Q", f.read(8))[0]
+                header = json.loads(f.read(header_len))
+            for key, meta in header.items():
+                if key == "__metadata__":
+                    continue
+                weight_map[key] = filename
+                begin, end = meta["data_offsets"]
+                total_size += end - begin
+        with open(index_path) as f:
+            index = json.load(f)
+        ghosts = set(index.get("weight_map", {})) - set(weight_map)
+        index["weight_map"] = weight_map
+        index.setdefault("metadata", {})["total_size"] = total_size
+        with open(index_path, "w") as f:
+            json.dump(index, f, indent=2, sort_keys=True)
+        if ghosts:
+            self.logger.info(
+                "Rebuilt safetensors index from shard contents; removed %d ghost "
+                "entries (e.g. %s).",
+                len(ghosts),
+                sorted(ghosts)[:3],
+            )
 
     def _load_model_from_hf(self, path: str) -> None:
         assert self.model is not None, "Model is not initialized."
@@ -1909,7 +2114,17 @@ class MegatronEngine(TrainEngine):
                 raise ValueError(
                     "Loading critic model is not supported with megatron-bridge."
                 )
-            self.bridge.load_hf_weights(self.model, hf_path=path)
+            # megatron-bridge's load path builds shard-index tensors via
+            # ``torch.arange(...)`` to index HF weights that live on CPU. Under
+            # the caller's ``with self.device:`` (CUDA) context, those indices
+            # become CUDA tensors and the CPU-tensor indexing raises
+            # ``RuntimeError: indices should be either on cpu or on the same
+            # device as the indexed tensor (cpu)`` — triggered by ChunkedMapping
+            # for any model with GDN/Mamba-style conv1d weights (e.g. Qwen3.5).
+            # Force CPU as the factory-op default here; tensor data assignment
+            # to GPU model params is unaffected (handled by .copy_()).
+            with torch.device("cpu"):
+                self.bridge.load_hf_weights(self.model, hf_path=path)
         else:
             load_weights_from_hf_with_mbridge_fast(
                 bridge=self.bridge,

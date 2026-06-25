@@ -3,6 +3,7 @@
 import argparse
 import json
 import os
+import warnings
 from dataclasses import MISSING as dataclass_missing
 from dataclasses import asdict, dataclass, field, fields
 from enum import Enum
@@ -940,6 +941,34 @@ class MegatronEngineConfig:
         },
     )
 
+    use_bridge_for_update_weights: bool = field(
+        default=False,
+        metadata={
+            "help": "When True and bridge_type='megatron-bridge', delegate live "
+            "weight sync to bridge.export_hf_weights instead of the hand-rolled "
+            "convert_to_hf registry. Required for models without a registry entry "
+            "(e.g. Qwen3.5). FP8 paths fall back to the registry automatically.",
+        },
+    )
+
+    disable_grad_buffers_cpu_backup: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "When offloading with torch_memory_saver, skip CPU backup for "
+                "Megatron gradient buffers (they are recomputed each step). "
+            )
+        },
+    )
+
+    enable_mtp: bool = field(
+        default=False,
+        metadata={
+            "help": "Keep the model's Multi-Token-Prediction (MTP) head "
+            "(bridge_type=megatron-bridge only). Default False drops it.",
+        },
+    )
+
 
 class SchedulingStrategyType(str, Enum):
     separation = "separation"
@@ -1223,6 +1252,12 @@ class TrainEngineConfig:
         default=3600.0,
         metadata={"help": "Gateway setup timeout in seconds for controller v2."},
     )
+    workers_ready_timeout: float = field(
+        default=30.0,
+        metadata={
+            "help": "Timeout (seconds) for initialize() to wait for guards to be ready."
+        },
+    )
     scheduling_strategy: SchedulingStrategy = field(
         default_factory=SchedulingStrategy,
         metadata={
@@ -1331,8 +1366,10 @@ class RejectionSamplingConfig:
             "'ratio': direct importance ratio π_proximal/π_behave. "
             "'kl_k1': KL estimator k1 = log(r), forward KL unbiased estimator (can be negative). "
             "'kl_k2': KL estimator k2 = 0.5 * (log r)^2, non-negative quadratic approximation. "
-            "'kl_k3': KL estimator k3 = r - log(r) - 1, non-negative exact forward KL estimator.",
-            "choices": ["ratio", "kl_k1", "kl_k2", "kl_k3"],
+            "'kl_k3': KL estimator k3 = r - log(r) - 1, non-negative exact forward KL estimator. "
+            "'binary_kl': KPop (symmetric binary KL divergence) — masks tokens where either "
+            "KL(proximal||behave) or KL(behave||proximal) exceeds the upper bound.",
+            "choices": ["ratio", "kl_k1", "kl_k2", "kl_k3", "binary_kl"],
         },
     )
     agg: str = field(
@@ -1528,6 +1565,18 @@ class PPOActorConfig(TrainEngineConfig):
         metadata={"help": "SAPO temperature for negative advantages"},
     )
 
+    # CISPO (Clipped IS-weight Policy Optimization) - MiniMax-M1 https://arxiv.org/abs/2506.13585
+    use_cispo_loss: bool = field(
+        default=False,
+        metadata={
+            "help": "Use CISPO loss: clip the importance-sampling weight under "
+            "stop-gradient and keep gradient on every token's log pi (MiniMax-M1 "
+            "Eq. 4-5). Mutually exclusive with SAPO. Token-level only. Requires "
+            "eps_clip_higher > 0; recommended eps_clip=1.0 (single-sided, lower "
+            "bound 0) with eps_clip_higher=4.0."
+        },
+    )
+
     # Asynchronous RL
     recompute_logprob: bool = field(
         default=False,
@@ -1635,6 +1684,25 @@ class PPOActorConfig(TrainEngineConfig):
                     "Please set `actor.use_decoupled_loss=false` in your configuration."
                 )
 
+        # Validate CISPO configuration
+        if self.use_cispo_loss:
+            if self.use_sapo_loss:
+                raise ValueError(
+                    "CISPO and SAPO are mutually exclusive surrogates. "
+                    "Set at most one of use_cispo_loss / use_sapo_loss."
+                )
+            if self.eps_clip_higher is None or self.eps_clip_higher <= 0:
+                raise ValueError(
+                    "CISPO requires a positive eps_clip_higher (the asymmetric "
+                    "upper clip is its defining knob, MiniMax-M1 Eq. 4-5). Got "
+                    f"eps_clip_higher={self.eps_clip_higher}."
+                )
+            if self.importance_sampling_level != "token":
+                raise ValueError(
+                    "CISPO only supports importance_sampling_level='token'. "
+                    "Sequence-level (GSPO-style) CISPO has no published surrogate."
+                )
+
         super().__post_init__()
 
 
@@ -1713,6 +1781,16 @@ class vLLMConfig:
     )
     enable_sleep_mode: bool = False
     uvicorn_log_level: str = "warning"
+    # GDN prefill backend for hybrid models like Qwen3.5; "triton" avoids the
+    # FlashInfer GDN-kernel hang (vLLM #38916). None leaves vLLM's default, so
+    # no flag is emitted and non-GDN models are unaffected.
+    gdn_prefill_backend: str | None = field(
+        default=None,
+        metadata={
+            "help": "GDN prefill backend for hybrid models like Qwen3.5.",
+            "choices": ["triton", "flashinfer"],
+        },
+    )
     # lora
     enable_lora: bool = False
     max_lora_rank: int = 16  # vllm's default
@@ -2127,6 +2205,12 @@ class InferenceEngineConfig:
             "help": "Timeout in seconds of connecting to remote servers or launching local servers."
         },
     )
+    workers_ready_timeout: float = field(
+        default=30.0,
+        metadata={
+            "help": "Timeout (seconds) for initialize() to wait for guards to be ready."
+        },
+    )
     request_timeout: float = field(
         default=3600, metadata={"help": "Timeout for HTTP requests."}
     )
@@ -2168,6 +2252,15 @@ class InferenceEngineConfig:
     use_lora: bool = field(
         default=False,
         metadata={"help": "Whether to use LoRA. Should be same as actors LORA option."},
+    )
+    lora_name: str = field(
+        default="",
+        metadata={
+            "help": "LoRA adapter name the rollout backend serves. Generation "
+            "requests select the adapter by this name (plus the weight version). "
+            "Usually left empty and auto-filled from gconfig.lora_name by "
+            "PPOConfig.__post_init__ so load and request sides stay in sync."
+        },
     )
     agent: AgentConfig = field(
         default_factory=lambda: AgentConfig(
@@ -2894,7 +2987,32 @@ class DPOConfig(BaseExperimentConfig):
 
 
 @dataclass
-class TeacherConfig(PPOActorConfig):
+class TeacherConfig:
+    engine_type: str = field(
+        default="rollout",
+        metadata={
+            "help": "Teacher engine type. 'rollout' uses inference engine scoring; "
+            "'train' uses the legacy train-engine teacher path.",
+            "choices": ["rollout", "train"],
+        },
+    )
+    rollout: InferenceEngineConfig | None = field(default=None)
+    train: PPOActorConfig | None = field(
+        default=None,
+        metadata={
+            "help": "Legacy train-engine teacher config. Required when engine_type='train'."
+        },
+    )
+    path: str = field(
+        default="",
+        metadata={
+            "help": "Teacher model path. If set, overrides shared rollout backend model path."
+        },
+    )
+    offload: bool = field(
+        default=False,
+        metadata={"help": "Whether to offload teacher rollout model between steps"},
+    )
     rl_loss_weight: float = field(
         default=1.0,
         metadata={"help": "RL loss weight"},
@@ -2904,6 +3022,22 @@ class TeacherConfig(PPOActorConfig):
         default=0.005,
         metadata={"help": "Distillation loss weight"},
     )
+
+    def __post_init__(self):
+        if self.rollout is not None and self.train is not None:
+            warnings.warn(
+                "Both teacher.rollout and teacher.train are configured; "
+                f"teacher.engine_type={self.engine_type!r} selects which one is used.",
+                stacklevel=2,
+            )
+        if self.engine_type == "rollout" and self.rollout is None:
+            raise ValueError(
+                "teacher.rollout must be provided when teacher.engine_type='rollout'."
+            )
+        if self.engine_type == "train" and self.train is None:
+            raise ValueError(
+                "teacher.train must be provided when teacher.engine_type='train'."
+            )
 
 
 @dataclass
@@ -2947,6 +3081,12 @@ class PPOConfig(BaseExperimentConfig):
         """Validate the eval generation config."""
         if self.eval_gconfig is None:
             self.eval_gconfig = self.gconfig.new()
+        # Propagate the LoRA adapter name to the rollout engine so the OpenAI-proxy
+        # generation path requests the same adapter the trainer loads. The request
+        # side (ArealOpenAI) cannot read gconfig.lora_name, so it must come from
+        # the engine config. Single source of truth: gconfig.lora_name.
+        if self.rollout.use_lora and not self.rollout.lora_name:
+            self.rollout.lora_name = self.gconfig.lora_name
         super().__post_init__()
 
 

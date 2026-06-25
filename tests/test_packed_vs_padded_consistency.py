@@ -69,6 +69,7 @@ def test_llm_consistency(model_path, mock_padded_llm_data):
         backend="fsdp:d1",
         path=model_path,
         dtype="bfloat16",
+        optimizer_dtype="bfloat16",
         attn_impl="flash_attention_2",
         gradient_checkpointing=False,
         disable_dropout=True,
