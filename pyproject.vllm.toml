@@ -202,9 +202,6 @@ cli = [
 [project.scripts]
 areal = "areal.experimental.cli.main:cli"
 
-[project.scripts]
-areal = "areal.experimental.cli.main:cli"
-
 [project.urls]
 "Homepage" = "https://github.com/areal-project/AReaL"
 "Repository" = "https://github.com/areal-project/AReaL"

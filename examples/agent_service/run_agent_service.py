@@ -23,9 +23,6 @@ import httpx
 
 from areal.api.cli_args import AgentConfig
 from areal.experimental.agent_service.controller import AgentController
-from areal.utils import logging
-
-logger = logging.getLogger("AgentServiceDemo")
 
 
 async def _wait_healthy(url: str, timeout: float = 60.0) -> None:
@@ -44,7 +41,7 @@ async def _wait_healthy(url: str, timeout: float = 60.0) -> None:
 
 async def interactive_loop(gateway_addr: str, admin_key: str) -> None:
     session_key = f"session-{int(time.time())}"
-    logger.info("Type your message (or 'quit' to exit):")
+    print("Type your message (or 'quit' to exit):\n")
 
     async with httpx.AsyncClient(timeout=120.0) as client:
         while True:
@@ -73,12 +70,12 @@ async def interactive_loop(gateway_addr: str, admin_key: str) -> None:
                     if item.get("type") == "message":
                         for block in item.get("content", []):
                             if block.get("type") == "output_text":
-                                logger.info("Agent: %s", block["text"])
+                                print(f"Agent: {block['text']}")
                     elif item.get("type") == "function_call":
-                        logger.info("[tool] %s", item.get("name", ""))
-                logger.info("")
+                        print(f"[tool] {item.get('name', '')}")
+                print()
             elif data.get("error"):
-                logger.error("%s", data["error"].get("message", "")[:200])
+                print(f"Error: {data['error'].get('message', '')[:200]}\n")
 
 
 def main() -> None:
@@ -105,20 +102,20 @@ def main() -> None:
     ctrl = AgentController(config=ctrl_config, scheduler=scheduler)
 
     try:
-        logger.info("Initializing with 1 pair ...")
+        print("Initializing with 1 pair ...")
         ctrl.initialize()
-        logger.info("  Router:  %s", ctrl.router_addr)
-        logger.info("  Gateway: %s", ctrl.gateway_addr)
-        logger.info("  Pairs:   %d", len(ctrl.pairs))
+        print(f"  Router:  {ctrl.router_addr}")
+        print(f"  Gateway: {ctrl.gateway_addr}")
+        print(f"  Pairs:   {len(ctrl.pairs)}")
 
         asyncio.run(_wait_healthy(f"{ctrl.gateway_addr}/health"))
-        logger.info("All services ready.")
+        print("All services ready.\n")
 
         asyncio.run(interactive_loop(ctrl.gateway_addr, admin_key=args.admin_api_key))
     finally:
-        logger.info("Shutting down ...")
+        print("\nShutting down ...")
         ctrl.destroy()
-        logger.info("Done.")
+        print("Done.")
 
 
 if __name__ == "__main__":
