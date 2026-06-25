@@ -34,3 +34,18 @@ def create_resource_spec(device, cpu: int, gpu: int, mem_in_bytes: int):
     elif device != "CPU":
         res["resources"] = {device: float(gpu)}
     return res
+
+
+def ray_resource_type():
+    # npu before cuda because mindspeed patches cuda.is_available
+    import torch
+
+    from areal.infra.platforms import is_npu_available
+
+    if is_npu_available:
+        return "NPU"
+
+    if torch.cuda.is_available():
+        return "GPU"
+
+    return "CPU"

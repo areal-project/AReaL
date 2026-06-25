@@ -114,7 +114,7 @@ from areal.api.alloc_mode import ModelAllocation
 from areal.api.cli_args import GRPOConfig, SGLangConfig, load_expr_config, vLLMConfig
 from areal.engine.sglang_remote import RemoteSGLangEngine
 from areal.engine.vllm_remote import RemotevLLMEngine
-from areal.infra import LocalScheduler, SlurmScheduler
+from areal.infra import LocalScheduler, RayScheduler, SlurmScheduler
 
 # 加载配置并解析 rollout 后端
 config, _ = load_expr_config(args, GRPOConfig)
@@ -123,6 +123,8 @@ rollout_alloc = ModelAllocation.from_str(config.rollout.backend, name="rollout")
 # 根据配置初始化调度器
 if config.scheduler.type == "local":
     scheduler = LocalScheduler(exp_config=config)
+elif config.scheduler.type == "ray":
+    scheduler = RayScheduler(exp_config=config)
 elif config.scheduler.type == "slurm":
     scheduler = SlurmScheduler(exp_config=config)
 

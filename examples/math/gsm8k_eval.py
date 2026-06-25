@@ -4,7 +4,7 @@ from areal.api.alloc_mode import ModelAllocation
 from areal.api.cli_args import GRPOConfig, SGLangConfig, load_expr_config, vLLMConfig
 from areal.dataset import get_custom_dataset
 from areal.engine import RemoteSGLangEngine, RemotevLLMEngine
-from areal.infra import LocalScheduler, SlurmScheduler
+from areal.infra import LocalScheduler, RayScheduler, SlurmScheduler
 from areal.utils import logging, seeding
 from areal.utils.dataloader import create_dataloader
 from areal.utils.hf_utils import load_hf_tokenizer
@@ -26,6 +26,8 @@ def main(args):
     cfg = config.scheduler
     if cfg.type == "local":
         scheduler = LocalScheduler(exp_config=config)
+    elif cfg.type == "ray":
+        scheduler = RayScheduler(exp_config=config)
     elif cfg.type == "slurm":
         scheduler = SlurmScheduler(exp_config=config)
     else:
