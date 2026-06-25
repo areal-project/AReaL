@@ -1,4 +1,3 @@
-import threading
 import time
 
 from areal.reward import (
@@ -771,20 +770,11 @@ class TestMathVerifyWorkerTextWrappedAnswers:
 
 
 class TestMathVerifyWorkerTimeout:
-    """Regression tests: a hung ``_verify_impl`` must not block past ``timeout``.
-
-    ``_verify_impl`` runs with signal-based timeouts disabled, so a runaway
-    call never returns on its own. ``verify`` must still bound the wall-clock
-    by ``self.timeout`` instead of blocking on the worker thread's join.
-    """
-
     def test_verify_returns_within_timeout_on_hang(self, monkeypatch):
         worker = MathVerifyWorker(timeout=0.1)
-        release = threading.Event()
 
         def hung_impl(response, ground_truth):
-            # Simulate a runaway call; the cap lets a regressed run fail fast.
-            release.wait(timeout=2.0)
+            time.sleep(2.0)
             return 1.0
 
         monkeypatch.setattr(worker, "_verify_impl", hung_impl)
@@ -792,7 +782,6 @@ class TestMathVerifyWorkerTimeout:
         start = time.monotonic()
         result = worker.verify("anything", "anything")
         elapsed = time.monotonic() - start
-        release.set()  # with the fix, verify already returned; let the worker exit now
 
-        assert result == 0.0  # the 0.0 default, not the worker's 1.0
-        assert elapsed < 1.0  # bounded by the 0.1s timeout, not the worker join
+        assert result == 0.0
+        assert elapsed < 1.0
