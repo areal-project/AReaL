@@ -691,8 +691,14 @@ def deserialize_value(value: Any) -> Any:
                 deserialized_data = {
                     key: deserialize_value(val) for key, val in data.items()
                 }
-                # Reconstruct the dataclass instance
-                return dataclass_type(**deserialized_data)
+                # Restore serialized field state instead of treating the payload as
+                # fresh constructor input. RPC deserialization should not re-run
+                # __init__/__post_init__ for objects that were already constructed
+                # before serialization.
+                instance = object.__new__(dataclass_type)
+                for key, val in deserialized_data.items():
+                    object.__setattr__(instance, key, val)
+                return instance
             except Exception as e:
                 # If parsing fails, treat as regular dict
                 logger.warning(
