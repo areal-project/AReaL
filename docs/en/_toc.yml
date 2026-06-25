@@ -9,6 +9,7 @@ parts:
     chapters:
     - file: tutorial/installation
     - file: tutorial/installation_npu
+    - file: tutorial/kubernetes
     - file: tutorial/quickstart
     - file: tutorial/agentic_rl
     - file: tutorial/online_proxy
