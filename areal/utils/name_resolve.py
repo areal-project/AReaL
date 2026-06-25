@@ -26,6 +26,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("NameResolve")
 
+RAY_NAME_RESOLVE_NAMESPACE = "areal_name_resolve"
+
 
 class ArgumentError(Exception):
     pass
@@ -907,18 +909,18 @@ class RayNameResolveRepository:
         if not ray.is_initialized():
             ray.init(ignore_reinit_error=True)
 
-        # Try to get existing actor or create new one
-        try:
-            self._kv_store = ray.get_actor(self._actor_name)
-            logger.debug(
-                f"Connected to existing Ray KV store actor: {self._actor_name}"
-            )
-        except ValueError:
-            # Actor doesn't exist, create it
-            self._kv_store = DistributedKVStore.options(
-                name=self._actor_name, lifetime="detached"
-            ).remote()
-            logger.debug(f"Created new Ray KV store actor: {self._actor_name}")
+        # Use a fixed namespace so processes with different default Ray namespaces
+        # resolve the same detached actor
+        self._kv_store = DistributedKVStore.options(
+            name=self._actor_name,
+            namespace=RAY_NAME_RESOLVE_NAMESPACE,
+            lifetime="detached",
+            get_if_exists=True,
+        ).remote()
+        logger.debug(
+            "Connected to Ray KV store actor: "
+            f"{RAY_NAME_RESOLVE_NAMESPACE}/{self._actor_name}"
+        )
 
         # Track entries for cleanup and keepalive
         self._entries = {}
