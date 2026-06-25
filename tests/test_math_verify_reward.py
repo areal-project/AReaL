@@ -1,3 +1,5 @@
+import queue
+import threading
 import time
 
 from areal.reward import (
@@ -6,6 +8,13 @@ from areal.reward import (
     get_math_verify_worker,
     gsm8k_reward_fn,
 )
+
+
+class _HangingMathVerifyWorker(MathVerifyWorker):
+    def _verify_impl(self, response: str, ground_truth: str) -> float:
+        del response, ground_truth
+        time.sleep(2.0)
+        return 1.0
 
 
 class TestGSM8KRewardFn:
@@ -770,18 +779,29 @@ class TestMathVerifyWorkerTextWrappedAnswers:
 
 
 class TestMathVerifyWorkerTimeout:
-    def test_verify_returns_within_timeout_on_hang(self, monkeypatch):
-        worker = MathVerifyWorker(timeout=0.1)
-
-        def hung_impl(response, ground_truth):
-            time.sleep(2.0)
-            return 1.0
-
-        monkeypatch.setattr(worker, "_verify_impl", hung_impl)
-
+    def test_verify_returns_within_timeout_on_main_thread_hang(self):
+        worker = _HangingMathVerifyWorker(timeout=0.1)
         start = time.monotonic()
         result = worker.verify("anything", "anything")
         elapsed = time.monotonic() - start
 
+        assert result == 0.0
+        assert elapsed < 1.0
+
+    def test_verify_returns_within_timeout_on_worker_thread_hang(self):
+        worker = _HangingMathVerifyWorker(timeout=0.1)
+        results: queue.Queue[tuple[float, float]] = queue.Queue()
+
+        def run_verify():
+            start = time.monotonic()
+            result = worker.verify("anything", "anything")
+            results.put((result, time.monotonic() - start))
+
+        thread = threading.Thread(target=run_verify)
+        thread.start()
+        thread.join(timeout=3.0)
+
+        assert not thread.is_alive()
+        result, elapsed = results.get_nowait()
         assert result == 0.0
         assert elapsed < 1.0

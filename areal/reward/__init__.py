@@ -38,10 +38,9 @@ def _verify_in_subprocess(
 class MathVerifyWorker:
     """Thin wrapper over math_verify with configurable extraction/precision.
 
-    Uses ``parse()`` + ``verify()`` directly instead of ``math_metric()``
-    so that signal-based timeouts can be disabled (``parsing_timeout=None``,
-    ``timeout_seconds=None``). ``verify()`` owns the timeout around the whole
-    operation.
+    ``math_verify`` timeouts use ``SIGALRM``, which is invalid in reward
+    worker threads. This wrapper disables those nested timeouts and owns one
+    wall-clock bound around parsing + comparison.
 
     Args:
         try_extract_without_anchor: When False, only answers with explicit anchors
