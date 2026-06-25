@@ -14,6 +14,7 @@ logger = logging.getLogger("WandBSystemMetrics", "system")
 
 _worker_wandb_run: Any | None = None
 _worker_wandb_lock = threading.Lock()
+_SERVICE_ROLE_SUFFIXES = ("-data", "-guard")
 
 
 def prepare_wandb_run_identity(config: BaseExperimentConfig | None) -> None:
@@ -42,6 +43,8 @@ def worker_system_metrics_enabled(
             "stats_logger.wandb.system_metrics.enabled requires "
             "stats_logger.wandb.mode='shared'."
         )
+    if role is None or role.endswith(_SERVICE_ROLE_SUFFIXES):
+        return False
     roles = system_metrics_config.roles
     return roles is None or role in roles
 
