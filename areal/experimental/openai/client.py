@@ -131,16 +131,7 @@ def _ensure_message_dict_list(
 def _messages_for_hf_chat_template(
     messages: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Return a tokenizer-only copy of OpenAI messages.
-
-    OpenAI chat completions represent function-call arguments as a JSON string.
-    Some HuggingFace chat templates, including Qwen3 Coder's, render prior tool
-    calls by iterating over ``tool_call.function.arguments`` as a mapping; given
-    a string they raise ``AttributeError`` (or iterate it character-by-character)
-    and the rendered prompt diverges from the tokens the policy sampled. Keep the
-    public/cache representation OpenAI-compatible (wire strings), but decode the
-    arguments to a mapping for tokenizer rendering only.
-    """
+    """Return tokenizer-only messages with tool-call arguments as mappings."""
 
     rendered = deepcopy(messages)
     for message in rendered:
@@ -161,13 +152,8 @@ def _messages_for_hf_chat_template(
             try:
                 decoded = json.loads(arguments)
             except json.JSONDecodeError:
-                # A non-JSON argument string is not valid OpenAI function-call
-                # output; wrapping it under a single key is more useful than a
-                # template crash when replaying a trajectory.
                 decoded = {"arguments": arguments}
             if not isinstance(decoded, Mapping):
-                # Valid JSON that is not an object (e.g. a list) still has to
-                # satisfy the template's ``.items()`` contract.
                 decoded = {"arguments": decoded}
             if isinstance(function, dict):
                 function["arguments"] = dict(decoded)

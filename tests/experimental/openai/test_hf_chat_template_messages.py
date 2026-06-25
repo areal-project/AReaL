@@ -83,7 +83,6 @@ def test_messages_for_hf_chat_template_decodes_tool_call_arguments_copy():
         "query": "AReaL",
         "limit": 2,
     }
-    # The wire/cache representation must stay a JSON string (unchanged).
     assert messages == original
 
 
