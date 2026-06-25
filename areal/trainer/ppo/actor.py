@@ -51,19 +51,10 @@ def _ppo_loss_weight(data: dict[str, Any]) -> torch.Tensor:
 def _make_loss_weight_fn(
     loss_aggregation: str, group_size: int
 ) -> Callable[[dict[str, Any]], torch.Tensor]:
-    """Return the per-microbatch loss weight paired with ``aggregate_pg_loss``.
-
-    The weight is the number of averaging *units* in the microbatch, so the
-    engine's ``Σ_mb loss_mb·w_mb / Σ_mb w_mb`` realizes the global mean over
-    that unit. ``token_mean`` -> valid token count; ``seq_mean`` -> sequence
-    count; ``prompt_mean`` -> prompt-group count (``n_seqs // group_size``). The
-    sequence count is inferred from the packed layout (``cu_seqlens``) or the
-    padded layout (``loss_mask.shape[0]``) -- a single source of truth.
-    """
+    """Return the microbatch weight paired with ``aggregate_pg_loss``."""
     if loss_aggregation == "token_mean":
         return _ppo_loss_weight
 
-    # seq_mean's unit is one sequence (unit=1); prompt_mean groups group_size.
     unit = group_size if loss_aggregation == "prompt_mean" else 1
 
     def unit_mean_weight(x: dict[str, Any]) -> torch.Tensor:
@@ -178,10 +169,6 @@ class PPOActor:
 
     @trace_perf("ppo_actor.compute_advantages", category="compute")
     def compute_advantages(self, data: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        # Concat here (rather than via batched_call) to recover traj_group_sizes:
-        # each trajectory is one prompt group, so it gives the actual per-group
-        # row counts that group-level normalization needs, including partial
-        # groups where some episodes returned None.
         batched, meta = concat_batch(data)
         result = self._compute_advantages(batched, group_sizes=meta.traj_group_sizes)
         return split_batch(result, meta)
@@ -379,11 +366,6 @@ class PPOActor:
             data.pop(key, None)
         # NOTE: calling engine.train() is critical to enabling gradient checkpointing
         self.engine.train()
-        # With prompt_mean, the outer PPO-minibatch split must keep each
-        # prompt-group (group_size consecutive sequences) intact within one
-        # minibatch, so pin granularity to group_size; the inner token-microbatch
-        # granularity is validated in PPOActorConfig.__post_init__. token_mean
-        # uses granularity 1 (no constraint).
         outer_granularity = (
             self.config.group_size
             if self.config.loss_aggregation == "prompt_mean"

@@ -169,7 +169,6 @@ def test_cispo_config_validation():
             eps_clip_higher=4.0,
             importance_sampling_level="sequence",
         )
-    # Token-mean loss aggregation only.
     with pytest.raises(ValueError, match="loss_aggregation"):
         PPOActorConfig(
             use_cispo_loss=True,

@@ -469,51 +469,11 @@ def aggregate_pg_loss(
 ) -> torch.Tensor:
     """Reduce per-token policy-gradient loss to a microbatch scalar.
 
-    Both modes return a per-microbatch **mean** (divided by the microbatch's own
-    denominator), matching AReaL's engine loss-weight contract: the engine
-    scales the returned loss by ``loss_weight_fn(mb) / W_total`` (see
-    ``compute_total_loss_weight`` and ``fsdp_engine`` ``loss_scale``), so the
-    global result is the weighted mean over the chosen unit. ``loss_fn`` and
-    ``loss_weight_fn`` MUST agree on the denominator (see ``_make_loss_weight_fn``
-    in ``areal/trainer/ppo/actor.py``).
-
-    ``token_mean`` (default; standard PPO/GRPO/DAPO):
-
-        sum(pg_loss * mask) / sum(mask)
-
-    Denominator = number of valid tokens, paired with
-    ``loss_weight_fn = loss_mask.count_nonzero()`` so the global gradient is the
-    mean over all valid tokens in the batch.
-
-    ``prompt_mean`` (MiniMax-M1 Eq. 4 / ScaleRL §3.2 "prompt average"):
-
-        (1 / G) * sum_{g in microbatch} (
-            sum_{seq in g, t} pg_loss[seq, t] * mask[seq, t]
-            / sum_{seq in g, t} mask[seq, t]
-        )
-
-    The microbatch is partitioned into ``G`` prompt-groups of ``group_size``
-    consecutive sequences; each group's token-weighted mean contributes equally
-    (mean over groups). Denominator = ``G``, paired with ``loss_weight_fn = G``,
-    so the global gradient is the mean over all prompt-groups -- every group
-    weighted equally regardless of trajectory length. Returning the mean (not
-    the sum) of per-group ratios keeps the loss magnitude comparable to
-    ``token_mean`` so switching aggregation does not silently rescale the
-    effective learning rate by a factor of ``G``.
-
-    ``denom_mask``: the numerator always uses ``loss_mask``; the denominator
-    uses ``denom_mask`` if given, else ``loss_mask``. They differ only for
-    rejection-sampling ``action='mask'``, where ``ppo_actor_loss_fn`` rejects
-    tokens from the numerator but keeps the ORIGINAL (pre-rejection) token count
-    in the denominator -- so the per-token gradient is not inflated by
-    ``N_original / N_kept`` and the denominator stays consistent with
-    ``loss_weight_fn`` (which reads the untouched mask).
-
-    Constraints (raise ValueError): ``group_size >= 1`` (``== 1`` collapses to
-    ``token_mean``); for 2D ``[N, T]`` ``pg_loss``, ``N % group_size == 0``; for
-    1D packed ``pg_loss`` (``cu_seqlens`` given),
-    ``(cu_seqlens.numel() - 1) % group_size == 0``. A group with no valid tokens
-    contributes 0 to the numerator with the denominator floored at 1.
+    ``token_mean`` averages valid tokens. ``seq_mean`` averages per-sequence
+    token means. ``prompt_mean`` averages means over ``group_size`` consecutive
+    sequences. The returned microbatch mean must be paired with
+    ``_make_loss_weight_fn`` so distributed reduction computes the matching
+    global mean. ``denom_mask`` overrides only the denominator.
     """
     if loss_aggregation not in LOSS_AGGREGATIONS_ALL:
         raise ValueError(
@@ -528,16 +488,7 @@ def aggregate_pg_loss(
         denom = den_mask.count_nonzero().clamp_min(1)
         return torch.where(num_mask, pg_loss, 0).sum() / denom
 
-    # seq_mean and prompt_mean both compute a per-UNIT token-weighted mean and
-    # then average over the units in the microbatch; paired with
-    # loss_weight_fn = number-of-units, the engine's
-    # Sum(loss_mb*weight_mb)/Sum(weight_mb) yields the global mean over that
-    # unit (see _make_loss_weight_fn in actor.py). seq_mean's unit is a single
-    # sequence (unit=1, never raises -- 1 divides any batch); prompt_mean groups
-    # `group_size` consecutive sequences (validated group_size>=2).
     unit = group_size if loss_aggregation == LOSS_AGGREGATION_PROMPT_MEAN else 1
-    # Accumulate num/den in fp32 so a bf16 caller does not lose precision on
-    # long groups (production pg_loss is already fp32, so this is a no-op there).
     masked_pg = torch.where(num_mask, pg_loss, 0).to(torch.float32)
     den_f = den_mask.to(torch.float32)
 
@@ -562,7 +513,6 @@ def aggregate_pg_loss(
         den = den_f.view(g, unit, t).sum(dim=(1, 2)).clamp_min(1)
         return (num / den).mean()
 
-    # 1D packed path. cu_seqlens has shape [n_seqs + 1].
     if pg_loss.ndim != 1:
         raise ValueError(
             f"{loss_aggregation} expects 1D pg_loss when cu_seqlens is "
@@ -642,12 +592,7 @@ def ppo_actor_loss_fn(
             Shape: [batch_size + 1], where cu_seqlens[i] marks the start of sequence i.
             Not needed for 2D padded inputs (sequences identified by batch dimension).
     """
-    # Snapshot the ORIGINAL (pre-rejection) mask. rejection_sampling
-    # action='mask' narrows loss_mask below, but the loss DENOMINATOR must stay
-    # the original token count to match loss_weight_fn in actor.py (which reads
-    # the untouched input_data mask); otherwise mask mode inflates per-token
-    # gradients by N_original / N_kept. For token_mean this reproduces the old
-    # ``loss_mask.count_nonzero()`` denominator exactly.
+    # Rejection masking narrows the numerator but keeps the original denominator.
     orig_loss_mask = loss_mask
 
     # === Apply rejection sampling (replaces old compute_behave_imp_weight) ===

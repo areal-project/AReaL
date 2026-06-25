@@ -1,5 +1,3 @@
-"""GroupedRolloutWorkflow.min_valid_group_size drop policy."""
-
 import asyncio
 import logging
 
@@ -10,8 +8,6 @@ from areal.infra.remote_inf_engine import GroupedRolloutWorkflow
 
 
 class _FakeWorkflow:
-    """Inner workflow whose first ``n_none`` of ``arun_episode`` calls return None."""
-
     def __init__(self, n_none: int):
         self._n_none = n_none
         self._calls = 0
@@ -39,10 +35,10 @@ def _run(group_size, n_none, min_valid_group_size):
 @pytest.mark.parametrize(
     "min_valid, n_none, kept",
     [
-        (1, 1, True),  # default keeps a partial group
-        (2, 2, True),  # survivors exactly at threshold
-        (2, 3, False),  # survivors below threshold
-        (4, 1, False),  # threshold == group_size requires a full group
+        (1, 1, True),
+        (2, 2, True),
+        (2, 3, False),
+        (4, 1, False),
     ],
 )
 def test_min_valid_group_size_threshold(min_valid, n_none, kept):
@@ -58,7 +54,6 @@ def test_all_none_returns_none():
 
 @pytest.mark.parametrize("bad", [0, 5])
 def test_threshold_outside_valid_range_raises(bad):
-    """Outside [1, group_size] is an impossible config and is rejected."""
     with pytest.raises(ValueError, match="min_valid_group_size must be in"):
         GroupedRolloutWorkflow(
             _FakeWorkflow(0),

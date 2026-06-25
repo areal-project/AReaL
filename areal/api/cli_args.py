@@ -1577,28 +1577,20 @@ class PPOActorConfig(TrainEngineConfig):
         },
     )
 
-    # Loss aggregation level (the ScaleRL §3.2 axis): token / sequence / prompt.
     loss_aggregation: str = field(
         default="token_mean",
         metadata={
-            "help": "How to reduce the per-token policy-gradient loss (ScaleRL "
-            "§3.2). 'token_mean' (default): mean over all valid tokens in the "
-            "batch -- every token weighted equally (DAPO). 'seq_mean': per-"
-            "sequence token-weighted mean, then mean over sequences -- every "
-            "response weighted equally (GRPO). 'prompt_mean': per-prompt-group "
-            "token-weighted mean, then mean over groups -- every prompt weighted "
-            "equally regardless of trajectory length (MiniMax-M1 / ScaleRL). "
-            "prompt_mean requires gconfig.n_samples >= 2; mb_spec.granularity is "
-            "auto-bumped to a multiple of n_samples.",
+            "help": "Policy-gradient loss reduction. 'token_mean' averages valid "
+            "tokens, 'seq_mean' averages sequence means, and 'prompt_mean' averages "
+            "prompt-group means over gconfig.n_samples responses.",
             "choices": ["token_mean", "seq_mean", "prompt_mean"],
         },
     )
     group_size: int = field(
         default=1,
         metadata={
-            "help": "Prompt-group size for loss_aggregation='prompt_mean'. "
-            "Auto-derived from gconfig.n_samples by PPOConfig.__post_init__ -- "
-            "do not set manually (a hand-set value is overwritten)."
+            "help": "Internal prompt-group size for prompt_mean; derived from "
+            "gconfig.n_samples by PPOConfig.__post_init__."
         },
     )
 
@@ -1709,9 +1701,6 @@ class PPOActorConfig(TrainEngineConfig):
                     "Please set `actor.use_decoupled_loss=false` in your configuration."
                 )
 
-        # Validate the loss_aggregation choice. The group_size-dependent checks
-        # for prompt_mean live in PPOConfig.__post_init__, where gconfig.n_samples
-        # (the single source of truth for the prompt-group size) is in scope.
         if self.loss_aggregation not in ("token_mean", "seq_mean", "prompt_mean"):
             raise ValueError(
                 "loss_aggregation must be 'token_mean', 'seq_mean', or "
@@ -2209,12 +2198,9 @@ class InferenceEngineConfig:
     min_valid_group_size: int = field(
         default=1,
         metadata={
-            "help": "Minimum number of non-None trajectories required to keep a "
-            "rollout group. With group_size>1, a group whose successful episodes "
-            "fall below this threshold is dropped entirely (the workflow returns "
-            "None) instead of forming a partial group. Default 1 keeps every "
-            "non-empty group; set equal to gconfig.n_samples to require full "
-            "groups only. Must be between 1 and group_size inclusive."
+            "help": "Minimum non-None trajectories required to keep a rollout "
+            "group. Default 1 keeps non-empty partial groups; set to "
+            "gconfig.n_samples to require full groups. Must be in [1, group_size]."
         },
     )
     max_head_offpolicyness: int = field(
@@ -3125,10 +3111,6 @@ class PPOConfig(BaseExperimentConfig):
         if self.rollout.use_lora and not self.rollout.lora_name:
             self.rollout.lora_name = self.gconfig.lora_name
 
-        # prompt_mean's prompt-group is, by definition, the rollout's
-        # samples-per-prompt. Single source of truth: gconfig.n_samples -- the
-        # actor never asks the user to repeat it (a hand-set actor.group_size is
-        # overwritten here so it can never silently disagree with n_samples).
         if self.actor.loss_aggregation == "prompt_mean":
             self.actor.group_size = self.gconfig.n_samples
             if self.actor.group_size < 2:
@@ -3137,11 +3119,6 @@ class PPOConfig(BaseExperimentConfig):
                     ">= 2 (a single sample per prompt collapses to seq_mean), "
                     f"got n_samples={self.gconfig.n_samples}."
                 )
-            # The microbatch split must keep each prompt-group (group_size
-            # consecutive sequences) contiguous, i.e. granularity must be a
-            # multiple of group_size. Auto-bump rather than ask the user to
-            # repeat n_samples here -- granularity is not a knob most users tune
-            # for prompt_mean, and the constraint is mandatory for correctness.
             g = self.actor.mb_spec.granularity
             if g % self.actor.group_size != 0:
                 new_g = -(-g // self.actor.group_size) * self.actor.group_size
@@ -3155,13 +3132,6 @@ class PPOConfig(BaseExperimentConfig):
                     self.actor.group_size,
                 )
                 self.actor.mb_spec.granularity = new_g
-            # prompt_mean groups group_size consecutive sequences positionally,
-            # so it needs WHOLE groups: an under-filled rollout group (some
-            # episodes returned None) would mis-group the loss. Drop under-filled
-            # groups at the source by requiring min_valid_group_size == n_samples
-            # (group-by-actual-size in Normalization fixes the reward/advantage
-            # baseline, but the positional loss reduction still needs whole
-            # groups).
             if (
                 self.rollout is not None
                 and self.rollout.min_valid_group_size < self.actor.group_size
@@ -3175,9 +3145,6 @@ class PPOConfig(BaseExperimentConfig):
                 )
                 self.rollout.min_valid_group_size = self.actor.group_size
 
-        # A group can have at most gconfig.n_samples successful trajectories, so
-        # requiring more than that makes every group unsatisfiable. Fail fast at
-        # config time rather than at the first GroupedRolloutWorkflow call.
         if (
             self.rollout is not None
             and self.rollout.min_valid_group_size > self.gconfig.n_samples

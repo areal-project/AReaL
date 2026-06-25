@@ -78,8 +78,6 @@ class GroupedRolloutWorkflow(RolloutWorkflow):
     ):
         if group_size < 1:
             raise ValueError(f"group_size must be >= 1, got {group_size}")
-        # A group needs at least this many survivors to be kept; more than
-        # group_size is impossible (it would drop every group).
         if not 1 <= min_valid_group_size <= group_size:
             raise ValueError(
                 f"min_valid_group_size must be in [1, group_size={group_size}], "
@@ -101,13 +99,9 @@ class GroupedRolloutWorkflow(RolloutWorkflow):
 
         valid_results = [r for r in results if r is not None]
 
-        # All results None -> return None
         if not valid_results:
             return None
 
-        # Too few survivors to form an acceptable group -> drop the whole group.
-        # min_valid_group_size=1 (default) never triggers here; set it equal to
-        # group_size to require full groups only.
         if len(valid_results) < self.min_valid_group_size:
             self.logger.warning(
                 f"GroupedRolloutWorkflow: only {len(valid_results)}/{len(results)} "
@@ -116,7 +110,6 @@ class GroupedRolloutWorkflow(RolloutWorkflow):
             )
             return None
 
-        # Some results None -> warn and continue with valid ones
         if len(valid_results) < len(results):
             self.logger.warning(
                 f"GroupedRolloutWorkflow: {len(results) - len(valid_results)}/{len(results)} "
