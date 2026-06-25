@@ -7,7 +7,7 @@ import time
 
 import click
 
-from areal.experimental.cli.agent.http import (
+from areal.experimental.cli.agent.client import (
     AgentHTTPError,
     AgentUnreachable,
     DataProxyClient,

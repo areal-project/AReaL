@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import click
 
+from areal.experimental.cli.agent.client import AgentHTTPError, AgentUnreachable
 from areal.experimental.cli.agent.common import logger
-from areal.experimental.cli.agent.http import AgentHTTPError, AgentUnreachable
 from areal.experimental.cli.agent.launcher import launch_agent_stack
 from areal.experimental.cli.agent.process import kill_pids, pid_alive
 from areal.experimental.cli.agent.state import (

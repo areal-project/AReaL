@@ -5,8 +5,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+from areal.experimental.cli.agent.client import RouterClient
 from areal.experimental.cli.agent.common import wait_http_health
-from areal.experimental.cli.agent.http import RouterClient
 from areal.experimental.cli.agent.process import pick_free_port, spawn_process
 from areal.experimental.cli.agent.state import (
     PairState,
