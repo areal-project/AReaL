@@ -229,12 +229,21 @@ def make_mcore_model(
         provider.freeze_vision_model = mcore_config.freeze_vision_model
         provider.freeze_vision_projection = mcore_config.freeze_vision_projection
 
-        provider.account_for_embedding_in_pipeline_split = (
-            mcore_config.account_for_embedding_in_pipeline_split
-        )
-        provider.account_for_loss_in_pipeline_split = (
-            mcore_config.account_for_loss_in_pipeline_split
-        )
+        if hasattr(tf_config, "pipeline_model_parallel_layout"):
+            provider.pipeline_model_parallel_layout = (
+                tf_config.pipeline_model_parallel_layout
+            )
+        else:
+            pipeline_split_attrs = (
+                "num_layers_in_first_pipeline_stage",
+                "num_layers_in_last_pipeline_stage",
+                "account_for_embedding_in_pipeline_split",
+                "account_for_loss_in_pipeline_split",
+            )
+
+            for attr in pipeline_split_attrs:
+                if hasattr(tf_config, attr):
+                    setattr(provider, attr, getattr(tf_config, attr))
 
         has_mtp = bool(getattr(provider, "mtp_num_layers", None))
         if mcore_config.enable_mtp:
