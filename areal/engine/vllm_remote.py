@@ -4,7 +4,7 @@ import os
 import subprocess
 import sys
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from concurrent.futures import Future
 from typing import Any
 
@@ -41,6 +41,18 @@ logger = logging.getLogger("vLLMEngine")
 
 class VLLMBackend:
     """vLLM-specific backend implementation for remote inference."""
+
+    @staticmethod
+    def build_server_env(env: Mapping[str, str]) -> dict[str, str]:
+        _env = dict(env)
+        triton_cache_path = _env.get("TRITON_CACHE_PATH", TRITON_CACHE_PATH)
+        _env["TRITON_CACHE_PATH"] = os.path.join(triton_cache_path, str(uuid.uuid4()))
+
+        vllm_cache_path = _env.get("VLLM_CACHE_ROOT")
+        if vllm_cache_path:
+            _env["VLLM_CACHE_ROOT"] = os.path.join(vllm_cache_path, str(uuid.uuid4()))
+        _env["VLLM_ALLOW_RUNTIME_LORA_UPDATING"] = "True"
+        return _env
 
     def build_generation_request(
         self, req: ModelRequest, with_lora: bool, version: int
@@ -299,15 +311,7 @@ class VLLMBackend:
     def launch_server(self, server_args: dict[str, Any]) -> subprocess.Popen:
         """Launch vLLM server subprocess."""
         cmd = vLLMConfig.build_cmd_from_args(server_args)
-
-        _env = os.environ.copy()
-        triton_cache_path = _env.get("TRITON_CACHE_PATH", TRITON_CACHE_PATH)
-        _env["TRITON_CACHE_PATH"] = os.path.join(triton_cache_path, str(uuid.uuid4()))
-
-        vllm_cache_path = _env.get("VLLM_CACHE_ROOT")
-        if vllm_cache_path:
-            _env["VLLM_CACHE_ROOT"] = os.path.join(vllm_cache_path, str(uuid.uuid4()))
-        _env["VLLM_ALLOW_RUNTIME_LORA_UPDATING"] = "True"
+        _env = self.build_server_env(os.environ)
 
         logger.info(f"Launching vLLM server with command: {' '.join(cmd)}")
         return subprocess.Popen(
