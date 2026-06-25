@@ -34,6 +34,7 @@ from areal.utils.data import (
     split_padded_tensor_dict_into_mb_list,
 )
 from areal.utils.functional import (
+    cispo_loss_fn,
     ppo_actor_loss_fn,
     reward_overlong_penalty,
     sapo_loss_fn,
@@ -416,6 +417,7 @@ class PPOActor:
                         use_sapo_loss=self.config.use_sapo_loss,
                         sapo_tau_pos=self.config.sapo_tau_pos,
                         sapo_tau_neg=self.config.sapo_tau_neg,
+                        use_cispo_loss=self.config.use_cispo_loss,
                         use_decoupled_loss=self.config.use_decoupled_loss,
                         loss_aggregation=self.config.loss_aggregation,
                         group_size=self.config.group_size,
@@ -482,6 +484,7 @@ def grpo_loss_fn(
     use_sapo_loss: bool = False,
     sapo_tau_pos: float = 1.0,
     sapo_tau_neg: float = 1.05,
+    use_cispo_loss: bool = False,
     use_decoupled_loss: bool = False,
     loss_aggregation: str = "token_mean",
     group_size: int = 1,
@@ -511,8 +514,30 @@ def grpo_loss_fn(
     if m2_threshold is not None:
         loss_mask = _apply_m2po_masking(old_logp, prox_logp, loss_mask, m2_threshold)
 
-    # Use SAPO or PPO loss
-    if use_sapo_loss:
+    # Use CISPO, SAPO, or PPO loss
+    if use_cispo_loss:
+        if use_sapo_loss:
+            raise ValueError(
+                "CISPO and SAPO are mutually exclusive surrogates. "
+                "Set at most one of use_cispo_loss / use_sapo_loss."
+            )
+        if importance_sampling_level != "token":
+            raise ValueError(
+                "CISPO only supports importance_sampling_level='token'. "
+                "Sequence-level (GSPO-style) CISPO has no published surrogate."
+            )
+        loss, stat = cispo_loss_fn(
+            logprobs=logprobs,
+            proximal_logprobs=prox_logp,
+            advantages=advantages,
+            eps_clip=eps_clip,
+            eps_clip_higher=eps_clip_higher,
+            loss_mask=loss_mask,
+            old_logprobs=old_logp,
+            rejection_sampling=rejection_sampling,
+            cu_seqlens=input_data.get("cu_seqlens"),
+        )
+    elif use_sapo_loss:
         if use_decoupled_loss:
             raise ValueError(
                 "SAPO is not compatible with `use_decoupled_loss=True`. "

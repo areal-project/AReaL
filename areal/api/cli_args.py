@@ -951,6 +951,24 @@ class MegatronEngineConfig:
         },
     )
 
+    disable_grad_buffers_cpu_backup: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "When offloading with torch_memory_saver, skip CPU backup for "
+                "Megatron gradient buffers (they are recomputed each step). "
+            )
+        },
+    )
+
+    enable_mtp: bool = field(
+        default=False,
+        metadata={
+            "help": "Keep the model's Multi-Token-Prediction (MTP) head "
+            "(bridge_type=megatron-bridge only). Default False drops it.",
+        },
+    )
+
 
 class SchedulingStrategyType(str, Enum):
     separation = "separation"
@@ -1547,6 +1565,18 @@ class PPOActorConfig(TrainEngineConfig):
         metadata={"help": "SAPO temperature for negative advantages"},
     )
 
+    # CISPO (Clipped IS-weight Policy Optimization) - MiniMax-M1 https://arxiv.org/abs/2506.13585
+    use_cispo_loss: bool = field(
+        default=False,
+        metadata={
+            "help": "Use CISPO loss: clip the importance-sampling weight under "
+            "stop-gradient and keep gradient on every token's log pi (MiniMax-M1 "
+            "Eq. 4-5). Mutually exclusive with SAPO. Token-level only. Requires "
+            "eps_clip_higher > 0; recommended eps_clip=1.0 (single-sided, lower "
+            "bound 0) with eps_clip_higher=4.0."
+        },
+    )
+
     # Loss aggregation level (the ScaleRL §3.2 axis): token / sequence / prompt.
     loss_aggregation: str = field(
         default="token_mean",
@@ -1687,6 +1717,30 @@ class PPOActorConfig(TrainEngineConfig):
                 "loss_aggregation must be 'token_mean', 'seq_mean', or "
                 f"'prompt_mean', got {self.loss_aggregation!r}."
             )
+
+        # Validate CISPO configuration
+        if self.use_cispo_loss:
+            if self.use_sapo_loss:
+                raise ValueError(
+                    "CISPO and SAPO are mutually exclusive surrogates. "
+                    "Set at most one of use_cispo_loss / use_sapo_loss."
+                )
+            if self.eps_clip_higher is None or self.eps_clip_higher <= 0:
+                raise ValueError(
+                    "CISPO requires a positive eps_clip_higher (the asymmetric "
+                    "upper clip is its defining knob, MiniMax-M1 Eq. 4-5). Got "
+                    f"eps_clip_higher={self.eps_clip_higher}."
+                )
+            if self.importance_sampling_level != "token":
+                raise ValueError(
+                    "CISPO only supports importance_sampling_level='token'. "
+                    "Sequence-level (GSPO-style) CISPO has no published surrogate."
+                )
+            if self.loss_aggregation != "token_mean":
+                raise ValueError(
+                    "CISPO only supports loss_aggregation='token_mean'. "
+                    "Sequence/prompt-level CISPO has no published surrogate."
+                )
 
         super().__post_init__()
 

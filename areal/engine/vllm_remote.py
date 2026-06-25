@@ -58,11 +58,14 @@ class VLLMBackend:
             "stop_token_ids": stop_token_ids,
             "ignore_eos": gconfig.ignore_eos,
             "skip_special_tokens": gconfig.skip_special_tokens,
+            "frequency_penalty": gconfig.frequency_penalty,
             "return_tokens_as_token_ids": True,
             "logprobs": 0,
             "use_beam_search": gconfig.use_beam_search,
             "stream": False,
         }
+        if gconfig.stop:
+            payload["stop"] = gconfig.stop
 
         if with_lora:
             lora_name = gconfig.lora_name

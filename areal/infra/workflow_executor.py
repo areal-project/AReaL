@@ -832,6 +832,80 @@ class WorkflowExecutor:
         subdir = "eval-rollout" if is_eval else "rollout"
         return os.path.join(log_path, subdir)
 
+    @staticmethod
+    def _compute_output_versions(
+        sample_versions: list[int], mask: list[int]
+    ) -> tuple[int, int, list[list[int]]]:
+        """Filter versions by loss_mask and compute head, tail, and RLE."""
+        output_versions = [v for v, m in zip(sample_versions, mask) if m == 1]
+        head = min(output_versions) if output_versions else -1
+        tail = max(output_versions) if output_versions else -1
+        rle: list[list[int]] = []
+        for v in output_versions:
+            if rle and rle[-1][0] == v:
+                rle[-1][1] += 1
+            else:
+                rle.append([v, 1])
+        return head, tail, rle
+
+    @staticmethod
+    def _split_trajectory_for_dump(
+        ids: list[int], mask: list[int], tokenizer
+    ) -> dict[str, Any]:
+        if len(ids) != len(mask):
+            raise ValueError(f"ids length {len(ids)} != mask length {len(mask)}")
+        prompt_end = mask.index(1) if 1 in mask else len(ids)
+        prompt_text = tokenizer.decode(ids[:prompt_end], skip_special_tokens=False)
+        completion_text = tokenizer.decode(ids[prompt_end:], skip_special_tokens=False)
+
+        # Count generation runs without decoding to avoid unnecessary work
+        # in the common single-turn case.
+        n = len(mask)
+        gen_count = 0
+        idx = 0
+        while idx < n:
+            j = idx + 1
+            while j < n and mask[j] == mask[idx]:
+                j += 1
+            if mask[idx] == 1:
+                gen_count += 1
+            idx = j
+
+        # Only decode segments for multi-turn trajectories so single-turn
+        # keeps the same 2-decode cost as before.
+        segments: list[dict[str, Any]] | None = None
+        if gen_count > 1:
+            raw_segments: list[dict[str, Any]] = []
+            idx = 0
+            seen_prompt = False
+            while idx < n:
+                j = idx + 1
+                while j < n and mask[j] == mask[idx]:
+                    j += 1
+                if mask[idx] == 1:
+                    role = "gen"
+                elif not seen_prompt:
+                    role = "prompt"
+                    seen_prompt = True
+                else:
+                    role = "context"
+                raw_segments.append(
+                    {
+                        "role": role,
+                        "len": j - idx,
+                        "text": tokenizer.decode(ids[idx:j], skip_special_tokens=False),
+                    }
+                )
+                idx = j
+            segments = raw_segments
+
+        return {
+            "prompt_end": prompt_end,
+            "prompt_text": prompt_text,
+            "completion_text": completion_text,
+            "segments": segments,
+        }
+
     async def _dump_trajectory(
         self,
         traj: dict[str, Any] | None,
@@ -841,87 +915,100 @@ class WorkflowExecutor:
         if traj is None:
             return False, "trajectory is None"
 
-        traj = RTensor.localize(traj)
+        try:
+            traj = RTensor.localize(traj)
 
-        dump_dir = self._get_dump_dir(is_eval)
-        if dump_dir is None:
-            return False, "dump dir is empty"
+            dump_dir = self._get_dump_dir(is_eval)
+            if dump_dir is None:
+                return False, "dump dir is empty"
 
-        tokenizer = self._get_tokenizer()
-        if tokenizer is None:
-            return False, "tokenizer not configured"
+            tokenizer = self._get_tokenizer()
+            if tokenizer is None:
+                return False, "tokenizer not configured"
 
-        # Extract tensors
-        input_ids = traj.get("input_ids")
-        rewards = traj.get("rewards")
-        loss_mask = traj.get("loss_mask")
-        attention_mask = traj.get("attention_mask")
+            # Extract tensors
+            input_ids = traj.get("input_ids")
+            rewards = traj.get("rewards")
+            loss_mask = traj.get("loss_mask")
+            attention_mask = traj.get("attention_mask")
 
-        if (
-            input_ids is None
-            or rewards is None
-            or loss_mask is None
-            or attention_mask is None
-        ):
-            return (
-                False,
-                "missing required tensor fields: input_ids, rewards, attention_mask, or loss_mask",
-            )
-
-        if "versions" not in traj:
-            self.logger.warning(
-                "Trajectory missing 'versions' field, defaulting to current inference engine version."
-            )
-            versions = [self.inference_engine.get_version()]
-        else:
-            versions = traj["versions"].flatten().tolist()
-
-        tail_version = max(versions)
-        head_version = min(versions)
-        # Create versioned directory
-        version_dir = os.path.join(dump_dir, str(tail_version))
-        await aiofiles.os.makedirs(version_dir, exist_ok=True)
-
-        # Handle batched trajectories
-        batch_size = input_ids.shape[0]
-
-        file_path = os.path.join(version_dir, f"{task_id}.jsonl")
-        async with aiofiles.open(file_path, "a") as f:
-            for i in range(batch_size):
-                seqlen = attention_mask[i].sum().item()
-                if seqlen == 0:
-                    continue
-                ids = input_ids[i, :seqlen].tolist()
-                mask = loss_mask[i, :seqlen].tolist()
-                # Skip samples with empty completions (all prompt, no completion tokens)
-                if mask[-1] != 1:
-                    continue
-
-                prompt_end = seqlen - sum(mask)
-                prompt_ids = ids[:prompt_end]
-                completion_ids = ids[prompt_end:]
-
-                # Decode to text
-                prompt_text = tokenizer.decode(prompt_ids, skip_special_tokens=False)
-                completion_text = tokenizer.decode(
-                    completion_ids, skip_special_tokens=False
+            if (
+                input_ids is None
+                or rewards is None
+                or loss_mask is None
+                or attention_mask is None
+            ):
+                return (
+                    False,
+                    "missing required tensor fields: input_ids, rewards, attention_mask, or loss_mask",
                 )
 
-                reward = rewards[i].item()
+            if "versions" not in traj:
+                self.logger.warning(
+                    "Trajectory missing 'versions' field, defaulting to current inference engine version."
+                )
+                all_versions = None
+                default_version = self.inference_engine.get_version()
+            else:
+                all_versions = traj["versions"]
 
-                record = {
-                    "task_id": task_id,
-                    "sample_idx": i,
-                    "seqlen": seqlen,
-                    "prompt_len": prompt_end,
-                    "head_version": head_version,
-                    "tail_version": tail_version,
-                    "reward": reward,
-                    "prompt": prompt_text,
-                    "completion": completion_text,
-                }
-                await f.write(json.dumps(record) + "\n")
-        return True, ""
+            global_tail = (
+                all_versions.max().item()
+                if all_versions is not None
+                else default_version
+            )
+            # Directory is named by batch-global max version (global_tail).
+            # Individual records may have tail_version <= global_tail.
+            version_dir = os.path.join(dump_dir, str(global_tail))
+            await aiofiles.os.makedirs(version_dir, exist_ok=True)
+
+            # Handle batched trajectories
+            batch_size = input_ids.shape[0]
+
+            file_path = os.path.join(version_dir, f"{task_id}.jsonl")
+            async with aiofiles.open(file_path, "a") as f:
+                for i in range(batch_size):
+                    seqlen = attention_mask[i].sum().item()
+                    if seqlen == 0:
+                        continue
+                    ids = input_ids[i, :seqlen].tolist()
+                    mask = loss_mask[i, :seqlen].tolist()
+                    # Skip samples with empty completions
+                    if mask[-1] != 1:
+                        continue
+
+                    if all_versions is not None:
+                        sample_versions = all_versions[i, :seqlen].tolist()
+                        head_version, tail_version, version_rle = (
+                            self._compute_output_versions(sample_versions, mask)
+                        )
+                    else:
+                        head_version = tail_version = default_version
+                        version_rle = [[default_version, sum(mask)]]
+
+                    split = self._split_trajectory_for_dump(ids, mask, tokenizer)
+
+                    reward = rewards[i].item()
+
+                    record = {
+                        "task_id": task_id,
+                        "sample_idx": i,
+                        "seqlen": seqlen,
+                        "prompt_len": split["prompt_end"],
+                        "head_version": head_version,
+                        "tail_version": tail_version,
+                        "version_rle": version_rle,
+                        "reward": reward,
+                        "prompt": split["prompt_text"],
+                        "completion": split["completion_text"],
+                    }
+                    if split["segments"] is not None:
+                        record["segments"] = split["segments"]
+
+                    await f.write(json.dumps(record) + "\n")
+            return True, ""
+        except Exception as e:
+            return False, f"dump failed: {e}"
 
     def initialize(self, logger=None, train_data_parallel_size: int | None = None):
         """Initialize the workflow executor and start background threads.
