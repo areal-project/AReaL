@@ -1,6 +1,8 @@
 # AReaL Inference Service CLI
 
-`areal inf` launches and manages an AReaL inference service on the local machine. It starts the gateway/router, registers models, inspects service state, manages logs, and provides the session / reward / collect flow used for RL data collection.
+`areal inf` launches and manages an AReaL inference service on the local machine. It
+starts the gateway/router, registers models, inspects service state, manages logs, and
+provides the session / reward / collect flow used for RL data collection.
 
 ## Basic concepts
 
@@ -11,7 +13,8 @@ An inference service typically contains the following components:
 - `model worker`: the actual inference backend, e.g. SGLang.
 - `data proxy`: records interactions and rewards, and supports trajectory export.
 
-The CLI's local state is stored under `~/.areal/inf/` by default. The root directory can be overridden via `AREAL_HOME`:
+The CLI's local state is stored under `~/.areal/inf/` by default. The root directory can
+be overridden via `AREAL_HOME`:
 
 ```bash
 export AREAL_HOME=/path/to/areal-home
@@ -31,7 +34,10 @@ areal inf run \
   --detach
 ```
 
-`--scheduler` selects the scheduling backend for workers / data-proxies. Only `local` is supported today (and is the default). Once the service starts, this value is pinned into the service state, so subsequent `register` / `stop` / `status` calls read it from state and do not need `--scheduler` again.
+`--scheduler` selects the scheduling backend for workers / data-proxies. Only `local` is
+supported today (and is the default). Once the service starts, this value is pinned into
+the service state, so subsequent `register` / `stop` / `status` calls read it from state
+and do not need `--scheduler` again.
 
 List services known to the local machine:
 
@@ -40,7 +46,8 @@ areal inf ps
 areal inf status --service default
 ```
 
-`ps` shows the service list; `status` drills into the state of the gateway, router, data-proxy, workers, etc.
+`ps` shows the service list; `status` drills into the state of the gateway, router,
+data-proxy, workers, etc.
 
 List registered models:
 
@@ -63,10 +70,9 @@ areal inf register \
   --proxy-args "--request-timeout 120 --chat-template-type hf"
 ```
 
-`--engine-args` is a shell-style string forwarded verbatim to the sglang /
-vllm worker process; `--proxy-args` is the analogous flag for the
-data-proxy process. Available data-proxy flags include
-`--request-timeout`, `--set-reward-finish-timeout`,
+`--engine-args` is a shell-style string forwarded verbatim to the sglang / vllm worker
+process; `--proxy-args` is the analogous flag for the data-proxy process. Available
+data-proxy flags include `--request-timeout`, `--set-reward-finish-timeout`,
 `--tool-call-parser`, `--reasoning-parser`, `--engine-max-tokens`, and
 `--chat-template-type {hf|concat}`.
 
@@ -87,7 +93,8 @@ areal inf run \
 
 ## Plain inference requests
 
-Once a model is registered, the gateway's OpenAI-compatible endpoint can be called directly:
+Once a model is registered, the gateway's OpenAI-compatible endpoint can be called
+directly:
 
 ```bash
 curl -sS http://127.0.0.1:8080/v1/chat/completions \
@@ -106,7 +113,8 @@ For plain inference there is no need to call `/rl/start_session`.
 
 ## RL session flow
 
-To record trajectories, an RL session must be created first. `collect` does this automatically; for manual debugging the gateway can be called directly:
+To record trajectories, an RL session must be created first. `collect` does this
+automatically; for manual debugging the gateway can be called directly:
 
 ```bash
 curl -sS http://127.0.0.1:8080/rl/start_session \
@@ -119,7 +127,9 @@ curl -sS http://127.0.0.1:8080/rl/start_session \
   }'
 ```
 
-The response contains a `session_api_key`. Subsequent conversation turns must authenticate with this session key so the data-proxy can attribute requests, responses, and rewards to the same session/trajectory.
+The response contains a `session_api_key`. Subsequent conversation turns must
+authenticate with this session key so the data-proxy can attribute requests, responses,
+and rewards to the same session/trajectory.
 
 ```bash
 SESSION_API_KEY=...
@@ -151,7 +161,8 @@ A trajectory usually only enters the ready/export flow after a reward has been s
 
 ## Collecting trajectories
 
-`collect` launches a batch of sessions, polls for ready trajectories, and writes the exported results to a file:
+`collect` launches a batch of sessions, polls for ready trajectories, and writes the
+exported results to a file:
 
 ```bash
 areal inf collect \
@@ -164,9 +175,12 @@ areal inf collect \
   --poll-interval 2
 ```
 
-`--batch-size` corresponds to the session/group size created in one collection. For group-based algorithms such as GRPO, it usually represents how many sessions are collected per group.
+`--batch-size` corresponds to the session/group size created in one collection. For
+group-based algorithms such as GRPO, it usually represents how many sessions are
+collected per group.
 
-`--turn-discount` is the reward discount applied when exporting multi-turn trajectories; the default is `1.0`.
+`--turn-discount` is the reward discount applied when exporting multi-turn trajectories;
+the default is `1.0`.
 
 ## Logs and cleanup
 
@@ -179,7 +193,9 @@ areal inf logs --service default --component qwen-local-worker-0 -f
 areal inf logs --service default --component qwen-local-data-proxy-0 -f
 ```
 
-Each model's worker / data-proxy log file is named `<model-name>-worker-<rank>` and `<model-name>-data-proxy-<rank>`. If `--component` is wrong or the file does not exist, the CLI prints the available names.
+Each model's worker / data-proxy log file is named `<model-name>-worker-<rank>` and
+`<model-name>-data-proxy-<rank>`. If `--component` is wrong or the file does not exist,
+the CLI prints the available names.
 
 Deregister a model:
 
