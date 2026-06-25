@@ -1,12 +1,4 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Group-level reward/advantage normalization derives group_size from n_samples.
-
-The prompt-group that group-level reward_norm/adv_norm centers over *is* the
-rollout's n_samples responses, so PPOConfig.__post_init__ makes gconfig.n_samples
-the runtime source of truth even when YAML keeps `group_size: ${gconfig.n_samples}`
-as a visible reference for users.
-"""
-
 from areal.api.cli_args import (
     GenerationHyperparameters,
     GRPOConfig,
@@ -26,8 +18,6 @@ def test_group_norm_group_size_derived_from_n_samples():
 
 
 def test_mismatched_group_size_is_overridden():
-    # A hand-set group_size out of sync with n_samples cannot silently take
-    # effect: it is overridden with n_samples (the prompt-group size).
     cfg = GRPOConfig(
         gconfig=GenerationHyperparameters(n_samples=4),
         actor=PPOActorConfig(
@@ -38,7 +28,6 @@ def test_mismatched_group_size_is_overridden():
 
 
 def test_batch_level_norm_group_size_untouched():
-    # A norm that does not use group level never has its group_size rewritten.
     cfg = GRPOConfig(
         gconfig=GenerationHyperparameters(n_samples=4),
         actor=PPOActorConfig(

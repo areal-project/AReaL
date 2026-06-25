@@ -3179,11 +3179,7 @@ class PPOConfig(BaseExperimentConfig):
         if self.rollout.use_lora and not self.rollout.lora_name:
             self.rollout.lora_name = self.gconfig.lora_name
 
-        # Group-level reward/advantage normalization groups the n_samples
-        # responses of one prompt, so its group_size is, by definition,
-        # gconfig.n_samples. YAML may keep `group_size: ${gconfig.n_samples}` as
-        # a visible reference, but runtime still enforces n_samples as the source
-        # of truth so mismatched literals cannot silently take effect.
+        # Runtime source of truth for prompt-group normalization.
         for _name, _norm in (
             ("reward_norm", self.actor.reward_norm),
             ("adv_norm", self.actor.adv_norm),
@@ -3192,8 +3188,6 @@ class PPOConfig(BaseExperimentConfig):
                 continue
             if _norm.mean_level != "group" and _norm.std_level != "group":
                 continue
-            # group_size=1 is the field default (unset), so deriving it silently is
-            # expected; only warn when a user set a different value out of sync.
             if _norm.group_size not in (1, self.gconfig.n_samples):
                 logger.warning(
                     "actor.%s.group_size=%d disagrees with gconfig.n_samples=%d; "
