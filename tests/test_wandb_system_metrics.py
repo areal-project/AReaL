@@ -158,7 +158,5 @@ def test_worker_wandb_init_failure_does_not_crash(monkeypatch, tmp_path):
     fake_wandb = SimpleNamespace(Settings=FakeSettings, init=boom, finish=lambda: None)
     monkeypatch.setitem(sys.modules, "wandb", fake_wandb)
 
-    # Worker telemetry must not propagate exceptions from wandb.init().
     assert not init_worker_wandb_system_metrics(config, role="actor", rank=0)
-    # finish() should be a no-op when init failed (no run was created).
     finish_worker_wandb_system_metrics()
