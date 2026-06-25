@@ -38,7 +38,6 @@ LOG_PREFIX_WIDTH = 10  # Fixed width for alignment in merged.log
 LOGGER_COLORS_EXACT = {
     # Schedulers - blue
     "LocalScheduler": "blue",
-    "RayScheduler": "blue",
     "SlurmScheduler": "blue",
     # Launchers - blue
     "LocalLauncher": "blue",
@@ -59,7 +58,6 @@ LOGGER_COLORS_EXACT = {
     "PerfTracer": "light_green",
     # RPC servers - white
     "SyncRPCServer": "white",
-    "RayRPCServer": "white",
     "RPCSerialization": "white",
     "HttpRTensor": "white",
     # Inference wrappers - white

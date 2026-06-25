@@ -16,7 +16,7 @@ from .remote_inf_engine import (
     RemoteInfBackendProtocol,
     RemoteInfEngine,
 )
-from .scheduler import LocalScheduler, RayScheduler, SlurmScheduler
+from .scheduler import LocalScheduler, SlurmScheduler
 from .staleness_manager import StalenessManager
 from .workflow_executor import (
     WorkflowExecutor,
@@ -36,7 +36,6 @@ __all__ = [
     "current_platform",
     "is_npu_available",
     "LocalScheduler",
-    "RayScheduler",
     "SlurmScheduler",
     "LocalLauncher",
     "RayLauncher",

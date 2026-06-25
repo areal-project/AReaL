@@ -19,7 +19,6 @@ from areal.api.cli_args import (
 )
 from areal.infra import (
     LocalScheduler,
-    RayScheduler,
     SlurmScheduler,
     current_platform,
 )
@@ -352,8 +351,6 @@ class DPOTrainer:
         cfg = self.config.scheduler
         if cfg.type == "local":
             return LocalScheduler(exp_config=self.config)
-        elif cfg.type == "ray":
-            return RayScheduler(exp_config=self.config)
         elif cfg.type == "slurm":
             return SlurmScheduler(exp_config=self.config)
         raise NotImplementedError(f"Unknown scheduler type: {cfg.type}")
