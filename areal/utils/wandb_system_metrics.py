@@ -104,7 +104,7 @@ def init_worker_wandb_system_metrics(
                 resume="allow",
                 settings=wandb.Settings(**settings_kwargs),
             )
-        except Exception as exc:  # noqa: BLE001 — worker telemetry must not crash training
+        except Exception as exc:  # noqa: BLE001
             _worker_wandb_run = None
             logger.warning(
                 "Failed to start worker W&B system metrics client "
