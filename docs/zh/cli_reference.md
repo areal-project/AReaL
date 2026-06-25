@@ -66,6 +66,7 @@ python3 train.py --config path/to/config.yaml actor.lr=1e-4 seed=42
 - [TensorBoard Configuration](section-tensor-board)
 - [Trackio Configuration](section-trackio)
 - [WandB Configuration](section-wand-b)
+- [WandBSystemMetrics Configuration](section-wand-b-system-metrics)
 
 ### Others
 
@@ -85,7 +86,6 @@ python3 train.py --config path/to/config.yaml actor.lr=1e-4 seed=42
 - [SchedulingStrategy](section-scheduling-strategy)
 - [SessionTracer Configuration](section-session-tracer)
 - [Teacher Configuration](section-teacher)
-- [WandBSystemMetrics Configuration](section-wand-b-system-metrics)
 
 ______________________________________________________________________
 
@@ -878,6 +878,22 @@ Configuration for Weights & Biases experiment tracking.
 | `id_suffix`      | string \| None                                              | `"train"`    | -                                                                                                                          |
 | `system_metrics` | [`WandBSystemMetricsConfig`](section-wand-b-system-metrics) | **Required** | Worker-side W&B system metrics configuration.                                                                              |
 
+(section-wand-b-system-metrics)=
+
+## WandBSystemMetrics Configuration
+
+Worker-side W&B system metrics collection.
+
+The controller W&B client already records system metrics for the controller process.
+Enable this config to attach GPU worker processes to the same W&B run so W&B can sample
+system metrics from the GPU nodes too.
+
+| Parameter        | Type                    | Default                                            | Description                                                                                                                |
+| ---------------- | ----------------------- | -------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| `enabled`        | boolean                 | `False`                                            | Start non-primary W&B clients in worker processes to collect worker system metrics. Requires wandb.mode='shared'.          |
+| `roles`          | list of string \| None  | `['actor', 'rollout', 'critic', 'ref', 'teacher']` | Worker roles that should start W&B system metrics clients. Set to null to enable every non-service worker role.            |
+| `gpu_device_ids` | list of integer \| None | `None`                                             | Optional GPU device ids passed to W&B's system metrics collector. Leave unset to let W&B use the worker's visible devices. |
+
 (section-agent)=
 
 ## Agent Configuration
@@ -1266,19 +1282,3 @@ Configuration class: TeacherConfig
 | `offload`             | boolean                                                     | `False`     | Whether to offload teacher rollout model between steps                                                                                           |
 | `rl_loss_weight`      | float                                                       | `1.0`       | RL loss weight                                                                                                                                   |
 | `distill_loss_weight` | float                                                       | `0.005`     | Distillation loss weight                                                                                                                         |
-
-(section-wand-b-system-metrics)=
-
-## WandBSystemMetrics Configuration
-
-Worker-side W&B system metrics collection.
-
-The controller W&B client already records system metrics for the controller process.
-Enable this config to attach GPU worker processes to the same W&B run so W&B can sample
-system metrics from the GPU nodes too.
-
-| Parameter        | Type                    | Default                                            | Description                                                                                                                |
-| ---------------- | ----------------------- | -------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
-| `enabled`        | boolean                 | `False`                                            | Start non-primary W&B clients in worker processes to collect worker system metrics. Requires wandb.mode='shared'.          |
-| `roles`          | list of string \| None  | `['actor', 'rollout', 'critic', 'ref', 'teacher']` | Worker roles that should start W&B system metrics clients. Set to null to enable every configured worker role.             |
-| `gpu_device_ids` | list of integer \| None | `None`                                             | Optional GPU device ids passed to W&B's system metrics collector. Leave unset to let W&B use the worker's visible devices. |

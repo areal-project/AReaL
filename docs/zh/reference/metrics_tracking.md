@@ -322,7 +322,7 @@ stats_logger:
     entity: "my-team"
     system_metrics:
       enabled: true
-      roles: ["actor", "rollout"]  # null 表示启用所有 worker role
+      roles: ["actor", "rollout"]  # null 表示启用所有非服务类 worker role
       gpu_device_ids: null         # 让 W&B 使用 worker 可见的 GPU
 ```
 

@@ -2555,7 +2555,7 @@ class WandBSystemMetricsConfig:
         default_factory=lambda: ["actor", "rollout", "critic", "ref", "teacher"],
         metadata={
             "help": "Worker roles that should start W&B system metrics clients. "
-            "Set to null to enable every configured worker role.",
+            "Set to null to enable every non-service worker role.",
         },
     )
     gpu_device_ids: list[int] | None = field(

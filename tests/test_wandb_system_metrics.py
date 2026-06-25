@@ -94,6 +94,14 @@ def test_worker_system_metrics_respects_role_filter(tmp_path):
     assert not worker_system_metrics_enabled(config, "rollout")
 
 
+def test_worker_system_metrics_roles_none_skips_service_roles(tmp_path):
+    config = _make_config(tmp_path, roles=None)
+
+    assert worker_system_metrics_enabled(config, "actor")
+    assert not worker_system_metrics_enabled(config, "data-data")
+    assert not worker_system_metrics_enabled(config, "actor-guard")
+
+
 def test_worker_wandb_init_uses_non_primary_shared_settings(monkeypatch, tmp_path):
     config = _make_config(tmp_path, roles=["actor"], gpu_device_ids=[0, 1])
     config.stats_logger.wandb.id_suffix = "fixed"

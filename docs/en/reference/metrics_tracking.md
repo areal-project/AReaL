@@ -334,7 +334,7 @@ stats_logger:
     entity: "my-team"
     system_metrics:
       enabled: true
-      roles: ["actor", "rollout"]  # null enables every worker role
+      roles: ["actor", "rollout"]  # null enables every non-service worker role
       gpu_device_ids: null         # let W&B use the worker's visible GPUs
 ```
 

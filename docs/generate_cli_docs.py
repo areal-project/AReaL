@@ -83,6 +83,7 @@ def categorize_dataclasses(
     logging_configs = [
         "StatsLoggerConfig",
         "WandBConfig",
+        "WandBSystemMetricsConfig",
         "SwanlabConfig",
         "TensorBoardConfig",
         "TrackioConfig",
