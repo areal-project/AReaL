@@ -21,20 +21,15 @@ class _ByteMergeTokenizer:
         return ids
 
 
-def _loss_mask(tokenizer, question: str, answer: str):
+def _loss_mask(monkeypatch, tokenizer, question: str, answer: str):
     sample = Dataset.from_dict({"question": [question], "answer": [answer]})
-    orig, gsm8k_mod.load_dataset = gsm8k_mod.load_dataset, lambda *a, **k: sample
-    try:
-        dataset = get_gsm8k_sft_dataset(
-            path="ignored", split="train", tokenizer=tokenizer
-        )
-    finally:
-        gsm8k_mod.load_dataset = orig
+    monkeypatch.setattr(gsm8k_mod, "load_dataset", lambda *args, **kwargs: sample)
+    dataset = get_gsm8k_sft_dataset(path="ignored", split="train", tokenizer=tokenizer)
     row = dataset[0]
     return row["input_ids"], row["loss_mask"]
 
 
-def test_boundary_merge_token_is_supervised():
+def test_boundary_merge_token_is_supervised(monkeypatch):
     tok = _ByteMergeTokenizer()
     question, answer = "abco", "wxyz"
 
@@ -42,12 +37,12 @@ def test_boundary_merge_token_is_supervised():
     full_ids = tok.encode(question + answer + tok.eos_token)
     assert full_ids[: len(prompt_ids)] != prompt_ids
 
-    input_ids, loss_mask = _loss_mask(tok, question, answer)
+    input_ids, loss_mask = _loss_mask(monkeypatch, tok, question, answer)
     assert loss_mask == [0] * 3 + [1] * (len(input_ids) - 3)
     assert input_ids[:3] == prompt_ids[:3]
 
 
-def test_no_merge_boundary_unchanged():
+def test_no_merge_boundary_unchanged(monkeypatch):
     tok = _ByteMergeTokenizer()
     question, answer = "abc", "xyz"
 
@@ -55,5 +50,5 @@ def test_no_merge_boundary_unchanged():
     full_ids = tok.encode(question + answer + tok.eos_token)
     assert full_ids[: len(prompt_ids)] == prompt_ids
 
-    _, loss_mask = _loss_mask(tok, question, answer)
+    _, loss_mask = _loss_mask(monkeypatch, tok, question, answer)
     assert loss_mask.count(0) == len(prompt_ids)

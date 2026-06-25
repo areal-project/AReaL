@@ -29,6 +29,13 @@ sequences and append the "attention_mask":
 
 ```python
 # areal/dataset/gsm8k.py
+def _common_prefix_len(left: list[int], right: list[int]) -> int:
+    for i, (left_id, right_id) in enumerate(zip(left, right)):
+        if left_id != right_id:
+            return i
+    return min(len(left), len(right))
+
+
 def get_gsm8k_sft_dataset(
     path: str,
     split: str,
@@ -45,11 +52,7 @@ def get_gsm8k_sft_dataset(
         # `prompt_token` is not always a token-level prefix of `seq_token`: BPE
         # tokenizers may merge a token across the question/answer join. Use the
         # common-prefix length so a boundary-spanning token is supervised.
-        prompt_len = 0
-        for p, s in zip(prompt_token, seq_token):
-            if p != s:
-                break
-            prompt_len += 1
+        prompt_len = _common_prefix_len(prompt_token, seq_token)
         loss_mask = [0] * prompt_len + [1] * (len(seq_token) - prompt_len)
         return {"input_ids": seq_token, "loss_mask": loss_mask}
 
