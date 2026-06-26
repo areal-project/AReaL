@@ -69,15 +69,6 @@ areal train run \
   cluster.n_gpus_per_node=8
 ```
 
-Run an evaluation:
-
-```bash
-areal train run \
-  --config examples/math/gsm8k_grpo.yaml \
-  --driver examples.math.gsm8k_eval:main \
-  experiment_name=gsm8k_eval
-```
-
 ## Driver function conventions
 
 The CLI calls the driver with a single argument `argv: list[str]`, so the driver must
