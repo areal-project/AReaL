@@ -59,16 +59,6 @@ areal train run \
   --driver examples.math.gsm8k_sft:main
 ```
 
-Run BOBA-GRPO:
-
-```bash
-areal train run \
-  --config examples/math/boba_grpo.yaml \
-  --driver examples.math.boba_grpo:main \
-  cluster.n_nodes=2 \
-  cluster.n_gpus_per_node=8
-```
-
 ## Driver function conventions
 
 The CLI calls the driver with a single argument `argv: list[str]`, so the driver must
