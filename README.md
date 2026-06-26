@@ -41,6 +41,12 @@ cost-effective** for a broad community of developers and researchers.
 
 ## 📰 News
 
+**\[2026/06/17\]** 🔬 Introducing **KPop** — bidirectional binary KL divergence token
+masking. Configured via `rejection_sampling.metric=binary_kl`. Also adding an
+[IcePop config](examples/math/gsm8k_icepop.yaml) (importance-ratio-based token masking).
+Check out [gsm8k_kpop.yaml](examples/math/gsm8k_kpop.yaml) and
+[gsm8k_icepop.yaml](examples/math/gsm8k_icepop.yaml) to get started!
+
 **\[2026/04/23\]** 🚀 We’re excited to release our integration with
 [Scaffoldings](https://github.com/NVIDIA/TensorRT-LLM/tree/main/tensorrt_llm/scaffolding)
 for agentic RL training - now live in our
@@ -207,6 +213,8 @@ All RL algorithms support both asynchronous and synchronous versions by setting
 | **REINFORCE++**          | -                                             | [📄 Paper](https://arxiv.org/pdf/2501.03262)   | [🔗 GSM8K Example](examples/math/gsm8k_reinforce.yaml)            |
 | **RLOO**                 | [📖 Docs](docs/en/algorithms/grpo_series.md)  | [📄 Paper](https://arxiv.org/pdf/2402.14740v1) | [🔗 GSM8K Example](examples/math/gsm8k_rloo.yaml)                 |
 | **SAPO**                 | [📖 Docs](docs/en/algorithms/grpo_series.md)  | [📄 Paper](https://arxiv.org/abs/2511.20347)   | [🔗 GSM8K Example](examples/math/gsm8k_sapo.yaml)                 |
+| **IcePop**               | [📖 Docs](docs/en/algorithms/grpo_series.md)  | [📄 Blog](https://ringtech.notion.site/icepop) | [🔗 GSM8K Example](examples/math/gsm8k_icepop.yaml)               |
+| **KPop**                 | [📖 Docs](docs/en/algorithms/grpo_series.md)  | [📄 Blog](https://ringtech.notion.site/kpop)   | [🔗 GSM8K Example](examples/math/gsm8k_kpop.yaml)                 |
 | **M2PO**                 | [📖 Docs](docs/algorithms/m2po.md)            | [📄 Paper](https://arxiv.org/abs/2510.01161)   | [🔗 GSM8K Example](examples/math/gsm8k_m2po.yaml)                 |
 | **DPO**                  | [📖 Docs](docs/en/algorithms/dpo.md)          | [📄 Paper](https://arxiv.org/abs/2305.18290)   | [🔗 HH-RLHF Example](examples/alignment/hhrlhf_dpo.yaml)          |
 | **RLHF Reward Modeling** | -                                             | -                                              | [🔗 RLHF Example](examples/alignment/hhrlhf_rw.yaml)              |
@@ -331,6 +339,18 @@ AReaL is under active development with planned minor releases weekly and major r
 monthly. We warmly welcome community engagement and contributions. We are also
 **actively hiring interns and full-time employees** with open positions in both the US
 and China.
+
+## 📢 Community
+
+<img src="./assets/figures/wechat_qrcode.png" width="200" alt="WeChat QR Code">
+
+We warmly welcome everyone to join our community! We have a _**WeChat group**_ for
+real-time discussions and a
+[GitHub discussion board](https://github.com/areal-project/AReaL/discussions) for
+asynchronous conversations.
+
+Check out our [Community Repository](https://github.com/areal-project/community) for
+more details and meeting materials.
 
 ## 🙏 Acknowledgments
 

@@ -325,6 +325,7 @@ def test_create_llm_actor_or_critic_forwards_attn_impl(
         trial_name="trial0",
         path="test-model",
         attn_impl="kernels-community/flash-attn",
+        optimizer_dtype="bfloat16",
         fsdp=FSDPEngineConfig(memory_efficient_load=memory_efficient_load),
     )
     engine = fsdp_module.FSDPEngine(config)

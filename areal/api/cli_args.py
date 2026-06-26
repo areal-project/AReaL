@@ -951,6 +951,24 @@ class MegatronEngineConfig:
         },
     )
 
+    disable_grad_buffers_cpu_backup: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "When offloading with torch_memory_saver, skip CPU backup for "
+                "Megatron gradient buffers (they are recomputed each step). "
+            )
+        },
+    )
+
+    enable_mtp: bool = field(
+        default=False,
+        metadata={
+            "help": "Keep the model's Multi-Token-Prediction (MTP) head "
+            "(bridge_type=megatron-bridge only). Default False drops it.",
+        },
+    )
+
 
 class SchedulingStrategyType(str, Enum):
     separation = "separation"
@@ -1348,8 +1366,10 @@ class RejectionSamplingConfig:
             "'ratio': direct importance ratio π_proximal/π_behave. "
             "'kl_k1': KL estimator k1 = log(r), forward KL unbiased estimator (can be negative). "
             "'kl_k2': KL estimator k2 = 0.5 * (log r)^2, non-negative quadratic approximation. "
-            "'kl_k3': KL estimator k3 = r - log(r) - 1, non-negative exact forward KL estimator.",
-            "choices": ["ratio", "kl_k1", "kl_k2", "kl_k3"],
+            "'kl_k3': KL estimator k3 = r - log(r) - 1, non-negative exact forward KL estimator. "
+            "'binary_kl': KPop (symmetric binary KL divergence) — masks tokens where either "
+            "KL(proximal||behave) or KL(behave||proximal) exceeds the upper bound.",
+            "choices": ["ratio", "kl_k1", "kl_k2", "kl_k3", "binary_kl"],
         },
     )
     agg: str = field(
@@ -1545,6 +1565,18 @@ class PPOActorConfig(TrainEngineConfig):
         metadata={"help": "SAPO temperature for negative advantages"},
     )
 
+    # CISPO (Clipped IS-weight Policy Optimization) - MiniMax-M1 https://arxiv.org/abs/2506.13585
+    use_cispo_loss: bool = field(
+        default=False,
+        metadata={
+            "help": "Use CISPO loss: clip the importance-sampling weight under "
+            "stop-gradient and keep gradient on every token's log pi (MiniMax-M1 "
+            "Eq. 4-5). Mutually exclusive with SAPO. Token-level only. Requires "
+            "eps_clip_higher > 0; recommended eps_clip=1.0 (single-sided, lower "
+            "bound 0) with eps_clip_higher=4.0."
+        },
+    )
+
     # Asynchronous RL
     recompute_logprob: bool = field(
         default=False,
@@ -1650,6 +1682,25 @@ class PPOActorConfig(TrainEngineConfig):
                 raise ValueError(
                     "SAPO is not compatible with `use_decoupled_loss=True`. "
                     "Please set `actor.use_decoupled_loss=false` in your configuration."
+                )
+
+        # Validate CISPO configuration
+        if self.use_cispo_loss:
+            if self.use_sapo_loss:
+                raise ValueError(
+                    "CISPO and SAPO are mutually exclusive surrogates. "
+                    "Set at most one of use_cispo_loss / use_sapo_loss."
+                )
+            if self.eps_clip_higher is None or self.eps_clip_higher <= 0:
+                raise ValueError(
+                    "CISPO requires a positive eps_clip_higher (the asymmetric "
+                    "upper clip is its defining knob, MiniMax-M1 Eq. 4-5). Got "
+                    f"eps_clip_higher={self.eps_clip_higher}."
+                )
+            if self.importance_sampling_level != "token":
+                raise ValueError(
+                    "CISPO only supports importance_sampling_level='token'. "
+                    "Sequence-level (GSPO-style) CISPO has no published surrogate."
                 )
 
         super().__post_init__()

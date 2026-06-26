@@ -86,3 +86,13 @@ def test_get_loopback_ip_returns_bindable_address():
     network = _load_network_module()
     ip = network.get_loopback_ip()
     assert ip in {"127.0.0.1", "::1"}
+
+
+def test_find_free_ports_ignores_out_of_range_excludes():
+    # Excluded ports outside [min_port, max_port] must not deflate the
+    # availability check; all in-range ports here are free.
+    network = _load_network_module()
+    ports = network.find_free_ports(
+        count=6, port_range=(10000, 10005), exclude_ports={50000}
+    )
+    assert len(ports) == 6
