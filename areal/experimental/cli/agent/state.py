@@ -9,15 +9,18 @@ from dataclasses import asdict, dataclass, field
 
 from areal.experimental.cli.process import pid_alive
 from areal.experimental.cli.state import (
+    NamespacedStateStore,
     ServiceStateBase,
     SupportsComponentProbe,
     atomic_write_json,
-    clear_current_service,
-    service_state_path,
-    set_current_service,
 )
 
 AGENT_NAMESPACE = "agent"
+
+# Module-level store — every save/load/remove routes paths through it,
+# tests with ``AREAL_HOME`` work because the store re-resolves on each
+# call.
+store = NamespacedStateStore(AGENT_NAMESPACE)
 
 
 @dataclass
@@ -57,14 +60,12 @@ class ServiceState(ServiceStateBase):
     started_at: float = field(default_factory=time.time)
 
     def save(self) -> None:
-        atomic_write_json(
-            service_state_path(AGENT_NAMESPACE, self.service), asdict(self)
-        )
-        set_current_service(AGENT_NAMESPACE, self.service)
+        atomic_write_json(store.service_state_path(self.service), asdict(self))
+        store.set_current_service(self.service)
 
     @classmethod
     def load(cls, service: str) -> ServiceState:
-        with open(service_state_path(AGENT_NAMESPACE, service)) as f:
+        with open(store.service_state_path(service)) as f:
             raw = json.load(f)
         raw["gateway"] = ProcessState(**raw["gateway"])
         raw["router"] = ProcessState(**raw["router"])
@@ -85,10 +86,10 @@ class ServiceState(ServiceStateBase):
 
     @classmethod
     def remove(cls, service: str) -> None:
-        path = service_state_path(AGENT_NAMESPACE, service)
+        path = store.service_state_path(service)
         if path.exists():
             path.unlink()
-        clear_current_service(AGENT_NAMESPACE, service)
+        store.clear_current_service(service)
 
     def gateway_alive(self) -> bool:
         # The CLI treats "running" as "gateway process still alive". The

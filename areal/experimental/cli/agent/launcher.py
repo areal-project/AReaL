@@ -7,13 +7,12 @@ from pathlib import Path
 
 from areal.experimental.cli.agent.client import RouterClient
 from areal.experimental.cli.agent.state import (
-    AGENT_NAMESPACE,
     PairState,
     ProcessState,
     ServiceState,
+    store,
 )
 from areal.experimental.cli.process import spawn_process
-from areal.experimental.cli.state import logs_dir
 from areal.experimental.cli.utils import wait_http_health
 from areal.utils.network import find_free_ports
 
@@ -33,7 +32,7 @@ def launch_agent_stack(
     inf_api_key: str,
     inf_model: str,
 ) -> ServiceState:
-    log_dir = logs_dir(AGENT_NAMESPACE, service)
+    log_dir = store.logs_dir(service)
 
     # Reserve every port we need up front from the non-ephemeral pool to
     # avoid TOCTOU collisions between successive bind(0) calls.

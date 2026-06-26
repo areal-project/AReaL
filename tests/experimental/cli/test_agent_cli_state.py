@@ -4,11 +4,10 @@ from __future__ import annotations
 
 from areal.experimental.cli.agent.config import load_click_default_map
 from areal.experimental.cli.agent.state import (
-    AGENT_NAMESPACE,
     ProcessState,
     ServiceState,
+    store,
 )
-from areal.experimental.cli.state import service_state_path
 
 
 def test_service_state_round_trip(tmp_path, monkeypatch):
@@ -39,7 +38,7 @@ def test_service_state_round_trip(tmp_path, monkeypatch):
     assert loaded.service == "svc"
     assert loaded.gateway.pid == 11
     assert [pid for _, h in loaded.components() if (pid := h.pid) > 0] == [11, 12]
-    assert service_state_path(AGENT_NAMESPACE, "svc").exists()
+    assert store.service_state_path("svc").exists()
 
 
 def test_config_maps_toml_sections_to_click_defaults(tmp_path, monkeypatch):
