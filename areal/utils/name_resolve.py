@@ -905,9 +905,9 @@ class RayNameResolveRepository:
         self._lock = threading.Lock()
         self._actor_name = actor_name
 
-        # Initialize Ray if not already done
-        if not ray.is_initialized():
-            ray.init(ignore_reinit_error=True)
+        from areal.infra.utils.ray import initialize_ray
+
+        initialize_ray()
 
         # Use a fixed namespace so processes with different default Ray namespaces
         # resolve the same detached actor

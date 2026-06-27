@@ -48,7 +48,11 @@ from areal.infra.utils.launcher import (
     get_thread_env_vars,
 )
 from areal.infra.utils.proc import kill_process_tree, run_with_streaming_logs
-from areal.infra.utils.ray import create_resource_spec, ray_resource_type
+from areal.infra.utils.ray import (
+    create_resource_spec,
+    initialize_ray,
+    ray_resource_type,
+)
 from areal.utils import logging, name_resolve, names
 from areal.utils.fs import validate_shared_path
 from areal.utils.network import (
@@ -559,8 +563,7 @@ class RayScheduler(Scheduler):
         etcd3_addr: str = "localhost:2379",
         exp_config: BaseExperimentConfig | None = None,
     ):
-        if not ray.is_initialized():
-            ray.init(ignore_reinit_error=True)
+        initialize_ray()
 
         # Get n_gpus_per_node from parameter or config
         self._n_gpus_per_node = n_gpus_per_node

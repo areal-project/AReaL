@@ -7,6 +7,17 @@ from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 from areal.utils.network import find_free_ports, gethostip
 
 
+def initialize_ray() -> None:
+    """Connect to an existing Ray cluster, or start a local one."""
+    if ray.is_initialized():
+        return
+
+    try:
+        ray.init(address="auto", ignore_reinit_error=True)
+    except ConnectionError:
+        ray.init(ignore_reinit_error=True)
+
+
 def get_placement_group_master_ip_and_port(
     placement_group: PlacementGroup, placement_group_bundle_index: int = 0
 ):
