@@ -5,9 +5,7 @@ from __future__ import annotations
 from unittest.mock import patch
 
 import pytest
-import torch
 
-from areal.api import LossReduction
 from areal.infra.rpc.serialization import deserialize_value, serialize_value
 from areal.v2.training_service.worker.config import TrainWorkerConfig
 
@@ -108,36 +106,6 @@ class TestWorkerEndpoints:
         result = deserialize_value(train_resp.get_json()["result"])
         assert isinstance(result, dict)
         assert "total" in result
-
-    def test_train_batch_accepts_serialized_loss_reduction(self, client):
-        create_resp = client.post(
-            "/create_engine",
-            json={
-                "engine_class": "tests.v2.training_service.fake_train_engine.FakeTrainEngine",
-                "init_args": serialize_value([]),
-                "init_kwargs": serialize_value({"world_size": 1}),
-            },
-        )
-        assert create_resp.status_code == 200
-
-        loss_reduction = LossReduction.mean(
-            loss_fn=lambda **_: torch.tensor(0.0),
-            normalizer_fn=lambda data: torch.tensor(data["metadata"]["weight"]),
-        )
-        train_resp = client.post(
-            "/train_batch",
-            json={
-                "args": serialize_value(
-                    [{"token_ids": [1, 2, 3], "metadata": {"weight": 2.0}}]
-                ),
-                "kwargs": serialize_value({"loss_reduction": loss_reduction}),
-            },
-        )
-
-        assert train_resp.status_code == 200
-        result = deserialize_value(train_resp.get_json()["result"])
-        assert result["loss_terms"] == 1.0
-        assert result["normalizer"] == 2.0
 
     def test_topology_after_create_engine(self, client):
         create_resp = client.post(

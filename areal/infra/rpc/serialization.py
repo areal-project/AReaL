@@ -269,26 +269,6 @@ class SerializedRayObjectRef(BaseModel):
         return ray.cloudpickle.loads(payload)
 
 
-class SerializedCallable(BaseModel):
-    """Pydantic model for serialized Python callables."""
-
-    type: Literal["callable"] = Field(default="callable")
-    data: str
-
-    @classmethod
-    def from_callable(cls, fn: Any) -> "SerializedCallable":
-        import ray.cloudpickle
-
-        payload = ray.cloudpickle.dumps(fn)
-        return cls(data=base64.b64encode(payload).decode("utf-8"))
-
-    def to_callable(self) -> Any:
-        import ray.cloudpickle
-
-        payload = base64.b64decode(self.data.encode("utf-8"))
-        return ray.cloudpickle.loads(payload)
-
-
 class SerializedDataclass(BaseModel):
     """Pydantic model for serialized dataclass with metadata.
 
@@ -578,7 +558,6 @@ def serialize_value(value: Any) -> Any:
     - torch.Tensor -> SerializedTensor dict (CPU only, no gradient tracking)
     - numpy.ndarray -> SerializedNDArray dict
     - dataclass instances -> SerializedDataclass dict (preserves type information)
-    - callables -> SerializedCallable dict
     - Hugging Face tokenizers -> SerializedTokenizer dict
     - Hugging Face processors -> SerializedProcessor dict
     - dict -> recursively serialize values
@@ -671,7 +650,7 @@ def serialize_value(value: Any) -> Any:
         }
 
     if callable(value) and not isinstance(value, type):
-        return SerializedCallable.from_callable(value).model_dump()
+        raise ValueError("RPC serialization does not support callable values.")
 
     # Primitives (int, float, str, bool) pass through unchanged
     return value
@@ -684,7 +663,6 @@ def deserialize_value(value: Any) -> Any:
     - SerializedTensor dict -> torch.Tensor (CPU, no gradient tracking)
     - SerializedNDArray dict -> numpy.ndarray
     - SerializedDataclass dict -> dataclass instance (reconstructed with original type)
-    - SerializedCallable dict -> Python callable
     - SerializedTokenizer dict -> Hugging Face tokenizer
     - SerializedProcessor dict -> Hugging Face processor
     - dict -> recursively deserialize values
@@ -775,13 +753,7 @@ def deserialize_value(value: Any) -> Any:
                 )
 
         if value.get("type") == "callable":
-            try:
-                serialized_callable = SerializedCallable.model_validate(value)
-                return serialized_callable.to_callable()
-            except Exception as e:
-                logger.warning(
-                    f"Failed to deserialize callable, treating as regular dict: {e}"
-                )
+            raise ValueError("RPC deserialization does not support callable values.")
 
         # Check for SerializedTensor marker
         if value.get("type") == "tensor":

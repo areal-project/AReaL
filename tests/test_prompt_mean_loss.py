@@ -403,6 +403,29 @@ def test_denom_mask_keeps_empty_numerator_units_in_denominator(aggregation, grou
     torch.testing.assert_close(without, torch.tensor(4.0))
 
 
+def test_pg_loss_rejects_broadcastable_loss_mask_shape():
+    pg = torch.ones(2, 3)
+    loss_mask = torch.ones(2, 1)
+
+    with pytest.raises(ValueError, match="loss_mask shape"):
+        aggregate_pg_loss(pg, loss_mask, loss_aggregation="token_mean")
+
+
+def test_pg_loss_sum_rejects_broadcastable_denom_mask_shape():
+    pg = torch.ones(2, 3)
+    loss_mask = torch.ones_like(pg)
+    denom_mask = torch.ones(1, 3)
+
+    with pytest.raises(ValueError, match="denom_mask shape"):
+        aggregate_pg_loss_sum(
+            pg,
+            loss_mask,
+            loss_aggregation="prompt_mean",
+            group_size=2,
+            denom_mask=denom_mask,
+        )
+
+
 def test_loss_normalizer_counts_active_units():
     seq_normalizer = make_pg_loss_normalizer_fn("seq_mean", 1)
     prompt_normalizer = make_pg_loss_normalizer_fn("prompt_mean", 2)
@@ -573,7 +596,7 @@ def test_prompt_mean_keeps_partial_group_filtering_threshold():
 
 
 def test_min_valid_group_size_cannot_exceed_n_samples():
-    with pytest.raises(ValueError, match="cannot exceed gconfig.n_samples"):
+    with pytest.raises(ValueError, match=r"cannot exceed gconfig\.n_samples"):
         GRPOConfig(
             gconfig=GenerationHyperparameters(n_samples=4),
             rollout=InferenceEngineConfig(min_valid_group_size=5),

@@ -461,6 +461,26 @@ def _masked_pg_loss(pg_loss: torch.Tensor, num_mask: torch.Tensor) -> torch.Tens
     return torch.where(num_mask, pg_loss, 0).to(torch.float32)
 
 
+def _resolve_pg_masks(
+    pg_loss: torch.Tensor,
+    loss_mask: torch.Tensor,
+    denom_mask: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if loss_mask.shape != pg_loss.shape:
+        raise ValueError(
+            f"loss_mask shape {tuple(loss_mask.shape)} must match "
+            f"pg_loss shape {tuple(pg_loss.shape)}."
+        )
+    if denom_mask is not None and denom_mask.shape != pg_loss.shape:
+        raise ValueError(
+            f"denom_mask shape {tuple(denom_mask.shape)} must match "
+            f"pg_loss shape {tuple(pg_loss.shape)}."
+        )
+    num_mask = loss_mask.bool()
+    den_mask = num_mask if denom_mask is None else denom_mask.bool()
+    return num_mask, den_mask
+
+
 def _sum_active_unit_means(num: torch.Tensor, den: torch.Tensor) -> torch.Tensor:
     active = den > 0
     return torch.where(active, num / den.clamp_min(1), torch.zeros_like(num)).sum()
@@ -1021,8 +1041,7 @@ def aggregate_pg_loss(
     """
     _validate_pg_loss_aggregation_config(loss_aggregation, loss_aggregation_divisor)
 
-    num_mask = loss_mask.bool()
-    den_mask = num_mask if denom_mask is None else denom_mask.bool()
+    num_mask, den_mask = _resolve_pg_masks(pg_loss, loss_mask, denom_mask)
 
     return _PG_LOSS_REDUCERS[loss_aggregation](
         pg_loss,
@@ -1049,8 +1068,7 @@ def aggregate_pg_loss_sum(
     """Reduce per-token policy-gradient loss to a local sum term."""
     _validate_pg_loss_aggregation_config(loss_aggregation, loss_aggregation_divisor)
 
-    num_mask = loss_mask.bool()
-    den_mask = num_mask if denom_mask is None else denom_mask.bool()
+    num_mask, den_mask = _resolve_pg_masks(pg_loss, loss_mask, denom_mask)
 
     return _PG_LOSS_SUM_REDUCERS[loss_aggregation](
         pg_loss,
