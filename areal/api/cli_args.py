@@ -1008,6 +1008,27 @@ class MegatronEngineConfig:
         },
     )
 
+    enable_mtp_training: bool = field(
+        default=False,
+        metadata={
+            "help": "Train the Multi-Token-Prediction (MTP) head as an auxiliary "
+            "objective (SFT/RL). Implies enable_mtp=True. The MTP loss is fed an "
+            "independent label channel (mtp_kwargs) so the main forward keeps "
+            "labels=None and returns logits; MTP gradients are isolated from the "
+            "backbone (output weight detached, backbone hidden states cut from the "
+            "MTP graph). bridge_type=megatron-bridge only; context parallel > 1 is "
+            "not supported yet.",
+        },
+    )
+
+    mtp_loss_scaling_factor: float = field(
+        default=0.1,
+        metadata={
+            "help": "Weight of the auxiliary MTP loss relative to the main loss "
+            "when enable_mtp_training=True (DeepSeek-V3 default: 0.1).",
+        },
+    )
+
 
 class SchedulingStrategyType(str, Enum):
     separation = "separation"
