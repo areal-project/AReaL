@@ -680,6 +680,13 @@ class TrainController:
         """
         return self._custom_function_call("get_version")
 
+    def get_lora_adapter_info(self) -> dict[str, list[int]]:
+        """Get LoRA adapter parameter names and shapes from worker rank 0."""
+        results = self._custom_function_call("get_lora_adapter_info")
+        if results:
+            return results[0]
+        return {}
+
     def save(self, meta: SaveLoadMeta):
         """Save model weights and optimizer states for later use.
 

@@ -60,7 +60,7 @@ def load_hf_tokenizer(
         model_name_or_path,
         fast_tokenizer=fast_tokenizer,
         trust_remote_code=True,
-        force_download=True,
+        force_download=False,
         **kwargs,
     )
     if tokenizer.pad_token_id is None:
@@ -81,7 +81,7 @@ def load_hf_processor_and_tokenizer(
         processor = transformers.AutoProcessor.from_pretrained(
             model_name_or_path,
             trust_remote_code=True,
-            force_download=True,
+            force_download=False,
             use_fast=True,
         )
     except Exception:
