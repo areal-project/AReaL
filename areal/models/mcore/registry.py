@@ -227,11 +227,18 @@ def make_mcore_model(
         provider.account_for_loss_in_pipeline_split = False
 
         has_mtp = bool(getattr(provider, "mtp_num_layers", None))
-        if mcore_config.enable_mtp:
+        # enable_mtp_training implies keeping the MTP head (enable_mtp).
+        keep_mtp = mcore_config.enable_mtp or mcore_config.enable_mtp_training
+        if keep_mtp:
             if not has_mtp:
                 raise ValueError(
-                    "megatron.enable_mtp=True but the model has no MTP layers."
+                    "megatron.enable_mtp/enable_mtp_training=True but the model "
+                    "has no MTP layers."
                 )
+            if mcore_config.enable_mtp_training:
+                # Weight of the auxiliary MTP loss; consumed by Megatron-Core's
+                # process_mtp_loss via config.mtp_loss_scaling_factor.
+                provider.mtp_loss_scaling_factor = mcore_config.mtp_loss_scaling_factor
         elif has_mtp:
             logger.warning(
                 "Dropping MTP head (mtp_num_layers=%s -> None); not used in RL and not "
