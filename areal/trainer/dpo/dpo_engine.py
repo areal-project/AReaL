@@ -6,15 +6,15 @@ from typing import Any
 import torch
 
 from areal.api import TrainEngine
-from areal.experimental.training_service.controller.controller import (
-    GatewayTrainController,
-)
 from areal.infra import TrainController
 from areal.infra.rpc.serialization import serialize_value
 from areal.utils import logging, stats_tracker
 from areal.utils.data import batched_call
 from areal.utils.functional import dpo_pair_logratios, dpo_preference_loss
 from areal.utils.perf_tracer import trace_perf
+from areal.v2.training_service.controller.controller import (
+    GatewayTrainController,
+)
 
 logger = logging.getLogger("DPOEngine")
 

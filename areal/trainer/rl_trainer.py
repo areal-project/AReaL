@@ -35,9 +35,6 @@ from areal.api.cli_args import (
     vLLMConfig,
 )
 from areal.engine import RemoteSGLangEngine, RemotevLLMEngine
-from areal.experimental.inference_service.controller.controller import (
-    RolloutControllerV2,
-)
 from areal.infra import (
     LocalScheduler,
     RayScheduler,
@@ -58,6 +55,9 @@ from areal.utils.perf_tracer import Category
 from areal.utils.recover import RecoverHandler
 from areal.utils.saver import Saver
 from areal.utils.stats_logger import StatsLogger
+from areal.v2.inference_service.controller.controller import (
+    RolloutControllerV2,
+)
 
 if TYPE_CHECKING:
     from datasets import Dataset

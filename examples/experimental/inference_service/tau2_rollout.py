@@ -28,10 +28,10 @@ from areal.api.cli_args import (
     TrainDatasetConfig,
     load_expr_config,
 )
-from areal.experimental.inference_service.controller.controller import (
+from areal.utils import logging
+from areal.v2.inference_service.controller.controller import (
     RolloutControllerV2,
 )
-from areal.utils import logging
 
 logger = logging.getLogger("Tau2GatewayRollout")
 

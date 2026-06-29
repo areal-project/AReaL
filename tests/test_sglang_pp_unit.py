@@ -313,14 +313,14 @@ class TestPPBridgeModule:
     """Test the pp_bridge module can be imported and has expected symbols."""
 
     def test_pp_bridge_class_exists(self):
-        from areal.experimental.inference_service.sglang.pp_bridge import (
+        from areal.v2.inference_service.sglang.pp_bridge import (
             PPSchedulerBridge,
         )
 
         assert PPSchedulerBridge is not None
 
     def test_extract_pp_rank_from_group_name(self):
-        from areal.experimental.inference_service.sglang.pp_bridge import (
+        from areal.v2.inference_service.sglang.pp_bridge import (
             _extract_pp_rank_from_group_name,
         )
 
@@ -331,7 +331,7 @@ class TestPPBridgeModule:
         assert _extract_pp_rank_from_group_name("update_weight_group") is None
 
     def test_pp_bridge_bind_is_callable(self):
-        from areal.experimental.inference_service.sglang.pp_bridge import (
+        from areal.v2.inference_service.sglang.pp_bridge import (
             PPSchedulerBridge,
         )
 
@@ -339,7 +339,7 @@ class TestPPBridgeModule:
 
     def test_pp_bridge_noop_when_pp1(self):
         """PPSchedulerBridge.bind() should be a no-op when pp_size <= 1."""
-        from areal.experimental.inference_service.sglang.pp_bridge import (
+        from areal.v2.inference_service.sglang.pp_bridge import (
             PPSchedulerBridge,
         )
 
