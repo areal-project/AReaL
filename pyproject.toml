@@ -183,6 +183,13 @@ cuda = [
 sandbox = [
     "daytona>=0.167.0",
 ]
+cli = [
+    "click>=8.1",
+    "colorlog",
+]
+
+[project.scripts]
+areal = "areal.experimental.cli.main:cli"
 
 [project.urls]
 "Homepage" = "https://github.com/areal-project/AReaL"
