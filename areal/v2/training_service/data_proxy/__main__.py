@@ -6,13 +6,13 @@ import argparse
 
 import uvicorn
 
-from areal.v2.training_service.data_proxy.app import create_app
-from areal.v2.training_service.data_proxy.config import TrainDataProxyConfig
 from areal.infra.utils.http import (
     get_default_uvicorn_kwargs,
     validate_admin_api_key,
 )
 from areal.utils.logging import suppress_http_loggers
+from areal.v2.training_service.data_proxy.app import create_app
+from areal.v2.training_service.data_proxy.config import TrainDataProxyConfig
 
 
 def main():

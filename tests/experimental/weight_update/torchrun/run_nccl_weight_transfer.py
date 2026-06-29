@@ -12,11 +12,11 @@ from tests.experimental.weight_update.torchrun.dist_utils import (
     write_result,
 )
 
+from areal.infra.platforms import current_platform
 from areal.v2.weight_update.nccl_group import (
     init_weights_update_group,
     setup_batch_isend_irecv,
 )
-from areal.infra.platforms import current_platform
 
 
 def run_nccl_group_init(output=None):

@@ -24,6 +24,7 @@ from awex.util.tensor_util import (
     group_tensors_by_shape_and_dtype,
 )
 
+from areal.utils import logging
 from areal.v2.weight_update.awex import (
     awex_wu_use_group,
     fetch_kv_metadata,
@@ -35,7 +36,6 @@ from areal.v2.weight_update.nccl_group import (
 from areal.v2.weight_update.training_adapter import (
     AwexTrainingAdapter,
 )
-from areal.utils import logging
 
 if TYPE_CHECKING:
     from areal.engine.megatron_engine import MegatronEngine

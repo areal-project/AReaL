@@ -8,11 +8,11 @@ import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
 
+from areal.utils import logging
 from areal.v2.training_service.gateway import streaming
 from areal.v2.training_service.gateway.auth import extract_bearer_token
 from areal.v2.training_service.gateway.config import GatewayConfig
 from areal.v2.training_service.gateway.engine import register_engine_routes
-from areal.utils import logging
 
 logger = logging.getLogger("TrainGateway")
 

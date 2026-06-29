@@ -9,13 +9,13 @@ from typing import Any
 
 import httpx
 
+from areal.infra.utils.proc import kill_process_tree
+from areal.utils import logging
+from areal.utils.network import find_free_ports
 from areal.v2.weight_update.controller.config import (
     WeightUpdateControllerConfig,
 )
 from areal.v2.weight_update.gateway.config import WeightUpdateResult
-from areal.infra.utils.proc import kill_process_tree
-from areal.utils import logging
-from areal.utils.network import find_free_ports
 
 logger = logging.getLogger("WeightUpdateController")
 

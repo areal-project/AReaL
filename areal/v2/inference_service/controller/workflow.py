@@ -18,10 +18,10 @@ from areal.utils import logging, stats_tracker
 
 if TYPE_CHECKING:
     from areal.api.engine_api import InferenceEngine
+    from areal.experimental.openai.types import InteractionWithTokenLogpReward
     from areal.v2.inference_service.controller.controller import (
         RolloutControllerV2,
     )
-    from areal.experimental.openai.types import InteractionWithTokenLogpReward
 
 logger = logging.getLogger("InferenceServiceWorkflow")
 

@@ -17,8 +17,8 @@ import httpx
 import numpy as np
 
 from areal.api.io_struct import HttpRequest
-from areal.v2.inference_service.backend import InfBridgeBackend
 from areal.utils import logging
+from areal.v2.inference_service.backend import InfBridgeBackend
 
 if TYPE_CHECKING:
     from areal.api.io_struct import ModelRequest, ModelResponse

@@ -419,9 +419,7 @@ def gateway_controller_full_init(request, model_path, tmp_path_factory):
         model=model_path,
         backend=f"{backend}:d1",
         scheduling_spec=(
-            SchedulingSpec(
-                gpu=1, cmd="python -m areal.v2.inference_service.guard"
-            ),
+            SchedulingSpec(gpu=1, cmd="python -m areal.v2.inference_service.guard"),
         ),
         consumer_batch_size=8,
         max_head_offpolicyness=1024,
@@ -475,9 +473,7 @@ def gateway_controller_full_init_online(request, model_path, tmp_path_factory):
             mode="online",
         ),
         scheduling_spec=(
-            SchedulingSpec(
-                gpu=1, cmd="python -m areal.v2.inference_service.guard"
-            ),
+            SchedulingSpec(gpu=1, cmd="python -m areal.v2.inference_service.guard"),
         ),
         consumer_batch_size=8,
         max_head_offpolicyness=1024,
@@ -534,9 +530,7 @@ def gateway_controller_full_init_with_reward_timeout(
             set_reward_finish_timeout=3.0,
         ),
         scheduling_spec=(
-            SchedulingSpec(
-                gpu=1, cmd="python -m areal.v2.inference_service.guard"
-            ),
+            SchedulingSpec(gpu=1, cmd="python -m areal.v2.inference_service.guard"),
         ),
         consumer_batch_size=8,
         max_head_offpolicyness=1024,
@@ -588,9 +582,7 @@ def gateway_controller_full_init_vlm(request, vlm_model_path, tmp_path_factory):
         model=vlm_model_path,
         backend=f"{backend}:d1",
         scheduling_spec=(
-            SchedulingSpec(
-                gpu=1, cmd="python -m areal.v2.inference_service.guard"
-            ),
+            SchedulingSpec(gpu=1, cmd="python -m areal.v2.inference_service.guard"),
         ),
         consumer_batch_size=8,
         max_head_offpolicyness=1024,

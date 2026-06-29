@@ -18,6 +18,8 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
+from areal.infra.utils.http import create_httpx_client
+from areal.utils import logging
 from areal.v2.inference_service.gateway.auth import (
     extract_bearer_token,
     require_admin_key,
@@ -38,8 +40,6 @@ from areal.v2.inference_service.gateway.streaming import (
     resolve_worker_addr,
     revoke_session_in_router,
 )
-from areal.infra.utils.http import create_httpx_client
-from areal.utils import logging
 
 logger = logging.getLogger("InferenceGateway")
 

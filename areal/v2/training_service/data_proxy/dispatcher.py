@@ -34,7 +34,6 @@ from typing import Any
 import aiohttp
 import orjson
 
-from areal.v2.training_service.data_proxy.topology import WorkerTopology
 from areal.infra.controller.train_controller import (
     _dispatch_tensors,
     _is_tensor_like,
@@ -43,6 +42,7 @@ from areal.infra.controller.train_controller import (
 )
 from areal.infra.rpc.serialization import deserialize_value, serialize_value
 from areal.utils import logging
+from areal.v2.training_service.data_proxy.topology import WorkerTopology
 
 logger = logging.getLogger("TrainDataProxy")
 

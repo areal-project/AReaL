@@ -18,11 +18,11 @@ import pytest
 import pytest_asyncio
 import torch
 
+from areal.infra.rpc import rtensor as rtensor_storage
+from areal.infra.rpc.serialization import deserialize_value, serialize_value
 from areal.v2.inference_service.data_proxy.app import create_app
 from areal.v2.inference_service.data_proxy.config import DataProxyConfig
 from areal.v2.inference_service.data_proxy.session import SessionStore
-from areal.infra.rpc import rtensor as rtensor_storage
-from areal.infra.rpc.serialization import deserialize_value, serialize_value
 
 # =============================================================================
 # Fixtures

@@ -11,13 +11,13 @@ from threading import Lock, Thread
 from typing import Any
 
 from areal.api import TrainEngine
-from areal.v2.training_service.worker.awex import create_awex_blueprint
-from areal.v2.training_service.worker.config import TrainWorkerConfig
-from areal.v2.training_service.worker.engine import create_engine_module
 from areal.infra.platforms import current_platform
 from areal.infra.rpc.serialization import deserialize_value, serialize_value
 from areal.utils import logging
 from areal.utils.data import broadcast_tensor_container, tensor_container_to
+from areal.v2.training_service.worker.awex import create_awex_blueprint
+from areal.v2.training_service.worker.config import TrainWorkerConfig
+from areal.v2.training_service.worker.engine import create_engine_module
 
 logger = logging.getLogger("TrainWorker")
 

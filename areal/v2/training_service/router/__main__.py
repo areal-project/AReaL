@@ -35,13 +35,13 @@ def main():
     )
     args, _ = parser.parse_known_args()
 
-    from areal.v2.training_service.router.app import create_app
-    from areal.v2.training_service.router.config import RouterConfig
     from areal.infra.utils.http import (
         get_default_uvicorn_kwargs,
         validate_admin_api_key,
     )
     from areal.utils.logging import suppress_http_loggers
+    from areal.v2.training_service.router.app import create_app
+    from areal.v2.training_service.router.config import RouterConfig
 
     validate_admin_api_key(args.host, args.admin_api_key)
 

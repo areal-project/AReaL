@@ -24,9 +24,9 @@ def main():
     )
     args, _ = parser.parse_known_args()
 
+    from areal.infra.utils.http import validate_admin_api_key
     from areal.v2.training_service.worker.app import create_app
     from areal.v2.training_service.worker.config import TrainWorkerConfig
-    from areal.infra.utils.http import validate_admin_api_key
 
     validate_admin_api_key(args.host, args.admin_api_key)
 

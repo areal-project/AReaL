@@ -39,13 +39,13 @@ def main():
     )
     args, _ = parser.parse_known_args()
 
-    from areal.v2.training_service.gateway.app import create_app
-    from areal.v2.training_service.gateway.config import GatewayConfig
     from areal.infra.utils.http import (
         get_default_uvicorn_kwargs,
         validate_admin_api_key,
     )
     from areal.utils.logging import suppress_http_loggers
+    from areal.v2.training_service.gateway.app import create_app
+    from areal.v2.training_service.gateway.config import GatewayConfig
 
     validate_admin_api_key(args.host, args.admin_api_key)
 

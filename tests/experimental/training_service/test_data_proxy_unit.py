@@ -10,6 +10,8 @@ import pytest
 import pytest_asyncio
 import torch
 
+from areal.infra.controller.train_controller import _dispatch_tensors
+from areal.infra.rpc.serialization import deserialize_value, serialize_value
 from areal.v2.training_service.data_proxy.app import create_app
 from areal.v2.training_service.data_proxy.config import TrainDataProxyConfig
 from areal.v2.training_service.data_proxy.dispatcher import Dispatcher
@@ -17,8 +19,6 @@ from areal.v2.training_service.data_proxy.topology import (
     WorkerInfo,
     WorkerTopology,
 )
-from areal.infra.controller.train_controller import _dispatch_tensors
-from areal.infra.rpc.serialization import deserialize_value, serialize_value
 
 ADMIN_KEY = "dp-admin-key"
 

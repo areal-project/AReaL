@@ -8,9 +8,9 @@ import importlib
 from contextlib import asynccontextmanager
 from typing import Any
 
+from areal.utils import logging
 from areal.v2.training_service.router.config import RouterConfig
 from areal.v2.training_service.router.state import ModelRegistry
-from areal.utils import logging
 
 httpx = importlib.import_module("httpx")
 fastapi = importlib.import_module("fastapi")

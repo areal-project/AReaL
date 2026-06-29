@@ -19,6 +19,7 @@ from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.placement_types import Shard
 
 from areal.engine.core.model import is_qwen_vl_model
+from areal.utils import logging
 from areal.v2.weight_update.awex import (
     awex_wu_use_group,
     fetch_kv_metadata,
@@ -30,7 +31,6 @@ from areal.v2.weight_update.nccl_group import (
 from areal.v2.weight_update.training_adapter import (
     AwexTrainingAdapter,
 )
-from areal.utils import logging
 
 if TYPE_CHECKING:
     from areal.engine.fsdp_engine import FSDPEngine

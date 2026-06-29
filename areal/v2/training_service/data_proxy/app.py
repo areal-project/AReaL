@@ -7,11 +7,11 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.responses import Response as RawResponse
 
+from areal.utils import logging
 from areal.v2.training_service.data_proxy.config import TrainDataProxyConfig
 from areal.v2.training_service.data_proxy.dispatcher import Dispatcher
 from areal.v2.training_service.data_proxy.engine import register_engine_routes
 from areal.v2.training_service.data_proxy.topology import discover_topology
-from areal.utils import logging
 
 logger = logging.getLogger("TrainDataProxy")
 

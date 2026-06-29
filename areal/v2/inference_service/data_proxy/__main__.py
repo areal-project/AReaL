@@ -8,14 +8,14 @@ import argparse
 
 import uvicorn
 
-from areal.v2.inference_service.data_proxy.app import create_app
-from areal.v2.inference_service.data_proxy.config import DataProxyConfig
 from areal.infra.utils.http import (
     get_default_uvicorn_kwargs,
     validate_admin_api_key,
 )
 from areal.utils.logging import suppress_http_loggers
 from areal.utils.network import format_hostport
+from areal.v2.inference_service.data_proxy.app import create_app
+from areal.v2.inference_service.data_proxy.config import DataProxyConfig
 
 
 def main():

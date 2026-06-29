@@ -16,11 +16,11 @@ from areal.api.cli_args import (
     TrainEngineConfig,
 )
 from areal.api.io_struct import FinetuneSpec, SaveLoadMeta
+from areal.infra.platforms import current_platform
+from areal.infra.scheduler.local import LocalScheduler
 from areal.v2.training_service.controller.controller import (
     GatewayTrainController,
 )
-from areal.infra.platforms import current_platform
-from areal.infra.scheduler.local import LocalScheduler
 
 LOCAL_MODEL_PATH = "/storage/openpsi/models/Qwen__Qwen3-0.6B/"
 LOCAL_MOE_MODEL_PATH = "/storage/openpsi/models/Qwen__Qwen3-30B-A3B/"

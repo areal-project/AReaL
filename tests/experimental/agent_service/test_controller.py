@@ -170,10 +170,7 @@ class TestInitialize:
         create_call = scheduler.create_workers.call_args
         job = create_call.kwargs.get("job") or create_call.args[0]
         assert job.tasks[0].env_vars == {"ANTHROPIC_API_KEY": "test-anthropic-key"}
-        assert (
-            job.tasks[0].cmd
-            == f"{sys.executable} -m areal.v2.agent_service.guard"
-        )
+        assert job.tasks[0].cmd == f"{sys.executable} -m areal.v2.agent_service.guard"
         assert all(
             payload.get("env") == {"ANTHROPIC_API_KEY": "test-anthropic-key"}
             for payload in fork_payloads

@@ -13,6 +13,9 @@ from fastapi import FastAPI, Request  # pyright: ignore[reportMissingImports]
 from fastapi.responses import JSONResponse  # pyright: ignore[reportMissingImports]
 from pydantic import BaseModel  # pyright: ignore[reportMissingImports]
 
+from areal.infra.utils.http import async_http_retry
+from areal.utils import logging
+from areal.utils.network import find_free_ports
 from areal.v2.weight_update.gateway.auth import require_admin_key
 from areal.v2.weight_update.gateway.config import (
     PairInfo,
@@ -21,9 +24,6 @@ from areal.v2.weight_update.gateway.config import (
 )
 from areal.v2.weight_update.gateway.kv_store import WeightMetaStore
 from areal.v2.weight_update.gateway.pair_registry import PairRegistry
-from areal.infra.utils.http import async_http_retry
-from areal.utils import logging
-from areal.utils.network import find_free_ports
 
 logger = logging.getLogger("WeightUpdateGateway")
 

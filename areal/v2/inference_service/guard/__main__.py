@@ -4,14 +4,14 @@
 
 from __future__ import annotations
 
-from areal.v2.inference_service.guard.app import (
-    _state,
-    app,
-)
 from areal.infra.rpc.guard.app import (
     configure_state_from_args,
     make_base_parser,
     run_server,
+)
+from areal.v2.inference_service.guard.app import (
+    _state,
+    app,
 )
 
 

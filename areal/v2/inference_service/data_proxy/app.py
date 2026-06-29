@@ -17,6 +17,19 @@ from fastapi.responses import StreamingResponse
 from flask import Flask
 from pydantic import BaseModel
 
+from areal.experimental.openai.client import ArealOpenAI
+from areal.experimental.openai.types import (
+    InteractionWithTokenLogpReward,
+    concat_string_interactions,
+)
+from areal.infra.rpc.guard.data_blueprint import (
+    data_bp,
+)
+from areal.infra.rpc.rtensor import RTensor
+from areal.infra.rpc.serialization import serialize_value
+from areal.infra.utils.http import create_httpx_client
+from areal.utils import logging
+from areal.utils.data import concat_padded_tensors
 from areal.v2.inference_service.data_proxy.config import DataProxyConfig
 from areal.v2.inference_service.data_proxy.pause import PauseState
 from areal.v2.inference_service.data_proxy.session import (
@@ -36,19 +49,6 @@ from areal.v2.inference_service.data_proxy.tokenizer_proxy import (
 from areal.v2.inference_service.inf_bridge import InfBridge
 from areal.v2.inference_service.sglang.bridge import SGLangBridgeBackend
 from areal.v2.inference_service.vllm.bridge import VLLMBridgeBackend
-from areal.experimental.openai.client import ArealOpenAI
-from areal.experimental.openai.types import (
-    InteractionWithTokenLogpReward,
-    concat_string_interactions,
-)
-from areal.infra.rpc.guard.data_blueprint import (
-    data_bp,
-)
-from areal.infra.rpc.rtensor import RTensor
-from areal.infra.rpc.serialization import serialize_value
-from areal.infra.utils.http import create_httpx_client
-from areal.utils import logging
-from areal.utils.data import concat_padded_tensors
 
 logger = logging.getLogger("InferenceDataProxy")
 

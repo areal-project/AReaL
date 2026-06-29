@@ -15,12 +15,12 @@ from tests.experimental.weight_update.test_nccl_integration import (
     _validate_weight_update_correctness,
 )
 
+from areal.infra.platforms import current_platform
 from areal.v2.weight_update.gateway.app import create_app
 from areal.v2.weight_update.gateway.config import (
     PairInfo,
     WeightUpdateConfig,
 )
-from areal.infra.platforms import current_platform
 
 
 @pytest.fixture()

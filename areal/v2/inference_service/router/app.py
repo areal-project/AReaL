@@ -21,6 +21,7 @@ import httpx
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 
+from areal.utils import logging
 from areal.v2.inference_service.router.config import RouterConfig
 from areal.v2.inference_service.router.state import (
     GroupRegistry,
@@ -29,7 +30,6 @@ from areal.v2.inference_service.router.state import (
     WorkerRegistry,
 )
 from areal.v2.inference_service.router.strategies import get_strategy
-from areal.utils import logging
 
 logger = logging.getLogger("InferenceRouter")
 

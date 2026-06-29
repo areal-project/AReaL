@@ -30,6 +30,7 @@ from awex.util.tensor_util import (
     reconstruct_tensors_from_groups,
 )
 
+from areal.utils import logging
 from areal.v2.weight_update.awex import (
     awex_wu_use_group,
     fetch_kv_metadata,
@@ -41,7 +42,6 @@ from areal.v2.weight_update.nccl_group import (
     init_weights_update_group,
     setup_batch_isend_irecv,
 )
-from areal.utils import logging
 
 logger = logging.getLogger("AwexSGLangAdapter")
 

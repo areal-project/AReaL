@@ -6,8 +6,8 @@ from unittest.mock import patch
 
 import pytest
 
-from areal.v2.training_service.worker.config import TrainWorkerConfig
 from areal.infra.rpc.serialization import deserialize_value, serialize_value
+from areal.v2.training_service.worker.config import TrainWorkerConfig
 
 MODULE = "areal.v2.training_service.worker.app"
 

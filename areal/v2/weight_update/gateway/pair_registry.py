@@ -3,8 +3,8 @@ from __future__ import annotations
 
 import threading
 
-from areal.v2.weight_update.gateway.config import PairInfo
 from areal.utils import logging
+from areal.v2.weight_update.gateway.config import PairInfo
 
 logger = logging.getLogger("PairRegistry")
 

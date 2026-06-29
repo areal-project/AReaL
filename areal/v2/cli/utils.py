@@ -27,8 +27,8 @@ from typing import Any, Protocol
 
 import click
 
-from areal.v2.cli.process import pid_alive
 from areal.utils.logging import LOGGER_COLORS_EXACT, getLogger
+from areal.v2.cli.process import pid_alive
 
 # ---------------------------------------------------------------------------
 # File locking
