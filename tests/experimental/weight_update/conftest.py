@@ -18,9 +18,10 @@ _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..",
 _STUB_PACKAGES = [
     ("areal", os.path.join(_REPO_ROOT, "areal")),
     ("areal.experimental", os.path.join(_REPO_ROOT, "areal", "experimental")),
+    ("areal.v2", os.path.join(_REPO_ROOT, "areal", "v2")),
     (
         "areal.v2.weight_update",
-        os.path.join(_REPO_ROOT, "areal", "experimental", "weight_update"),
+        os.path.join(_REPO_ROOT, "areal", "v2", "weight_update"),
     ),
 ]
 
