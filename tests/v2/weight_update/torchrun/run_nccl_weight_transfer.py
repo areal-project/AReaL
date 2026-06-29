@@ -7,7 +7,7 @@ import os
 import torch
 import torch.distributed as dist
 
-from tests.experimental.weight_update.torchrun.dist_utils import (
+from tests.v2.weight_update.torchrun.dist_utils import (
     print_rank0,
     write_result,
 )

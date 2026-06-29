@@ -4,7 +4,7 @@ Tests that the base guard routes are available on the agent guard app.
 The agent_blueprint has been removed in v2 — all orchestration logic
 now lives in AgentController.
 
-Test structure mirrors ``tests/experimental/inference_service/test_guard.py``.
+Test structure mirrors ``tests/v2/inference_service/test_guard.py``.
 """
 
 from __future__ import annotations

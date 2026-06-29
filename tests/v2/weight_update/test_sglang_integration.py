@@ -4,7 +4,7 @@
 
 Requires GPU. Marked @pytest.mark.slow and @pytest.mark.sglang to exclude
 from default CI. Run manually:
-    uv run pytest tests/experimental/weight_update/test_sglang_server_integration.py -v -s
+    uv run pytest tests/v2/weight_update/test_sglang_server_integration.py -v -s
 """
 
 from __future__ import annotations

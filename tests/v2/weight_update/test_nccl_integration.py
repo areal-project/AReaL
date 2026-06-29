@@ -34,7 +34,7 @@ def _run_weight_update_test(n_gpus: int, test_type: str, output: str):
             "--nnodes=1",
             "--master-addr=localhost",
             f"--master_port={port}",
-            "tests/experimental/weight_update/torchrun/run_nccl_weight_transfer.py",
+            "tests/v2/weight_update/torchrun/run_nccl_weight_transfer.py",
             f"--test_type={test_type}",
             f"--output={output}",
         ],

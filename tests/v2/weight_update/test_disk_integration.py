@@ -9,7 +9,7 @@ import httpx
 import pytest
 import torch
 
-from tests.experimental.weight_update.test_nccl_integration import (
+from tests.v2.weight_update.test_nccl_integration import (
     _get_test_model_path,
     _make_local_scheduler,
     _validate_weight_update_correctness,

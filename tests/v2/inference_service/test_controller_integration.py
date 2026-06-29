@@ -2,7 +2,7 @@
 
 Requires GPU and a model. Marked @pytest.mark.slow to exclude from default CI.
 Run manually:
-    uv run pytest tests/experimental/inference_service/test_controller_integration.py -v -s
+    uv run pytest tests/v2/inference_service/test_controller_integration.py -v -s
 
 Backend filtering:
     pytest -m "not vllm"    # skip vLLM tests (run SGLang only)
@@ -29,7 +29,7 @@ import pytest
 import torch
 from PIL import Image
 
-from tests.experimental.inference_service.integration_utils import (
+from tests.v2.inference_service.integration_utils import (
     EXPR_NAME,
     TRIAL_NAME,
     check_server_health,

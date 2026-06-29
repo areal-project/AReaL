@@ -1,7 +1,7 @@
 """Integration tests for data proxy with a real SGLang server.
 
 Requires GPU and a model. Run with:
-    uv run pytest tests/experimental/inference_service/test_data_proxy_integration.py -v -s
+    uv run pytest tests/v2/inference_service/test_data_proxy_integration.py -v -s
 
 The test launches an SGLang server subprocess, starts the data proxy FastAPI app,
 and exercises the /chat/completions endpoint (full session lifecycle) and
@@ -103,7 +103,7 @@ def vllm_server():
     if not _has_gpu():
         pytest.skip("GPU required for vLLM server")
 
-    from tests.experimental.inference_service.integration_utils import (
+    from tests.v2.inference_service.integration_utils import (
         launch_vllm_server,
     )
 

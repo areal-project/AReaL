@@ -66,7 +66,7 @@ class TestWorkerEngineCreation:
         resp = client.post(
             "/create_engine",
             json={
-                "engine_class": "tests.experimental.training_service.fake_train_engine.FakeTrainEngine",
+                "engine_class": "tests.v2.training_service.fake_train_engine.FakeTrainEngine",
                 "init_args": serialize_value([]),
                 "init_kwargs": serialize_value({"world_size": 1}),
             },
@@ -86,7 +86,7 @@ class TestWorkerEndpoints:
         create_resp = client.post(
             "/create_engine",
             json={
-                "engine_class": "tests.experimental.training_service.fake_train_engine.FakeTrainEngine",
+                "engine_class": "tests.v2.training_service.fake_train_engine.FakeTrainEngine",
                 "init_args": serialize_value([]),
                 "init_kwargs": serialize_value({"world_size": 1}),
             },
@@ -111,7 +111,7 @@ class TestWorkerEndpoints:
         create_resp = client.post(
             "/create_engine",
             json={
-                "engine_class": "tests.experimental.training_service.fake_train_engine.FakeTrainEngine",
+                "engine_class": "tests.v2.training_service.fake_train_engine.FakeTrainEngine",
                 "init_args": serialize_value([]),
                 "init_kwargs": serialize_value({"world_size": 1}),
             },
@@ -134,7 +134,7 @@ class TestWorkerEndpoints:
         create_resp = client.post(
             "/create_engine",
             json={
-                "engine_class": "tests.experimental.training_service.fake_train_engine.FakeTrainEngine",
+                "engine_class": "tests.v2.training_service.fake_train_engine.FakeTrainEngine",
                 "init_args": serialize_value([]),
                 "init_kwargs": serialize_value({"world_size": 1}),
             },
@@ -162,7 +162,7 @@ class TestWorkerEndpoints:
         create_resp = client.post(
             "/create_engine",
             json={
-                "engine_class": "tests.experimental.training_service.fake_train_engine.FakeTrainEngine",
+                "engine_class": "tests.v2.training_service.fake_train_engine.FakeTrainEngine",
                 "init_args": serialize_value([]),
                 "init_kwargs": serialize_value({"world_size": 1}),
             },
@@ -198,7 +198,7 @@ class TestWorkerEndpoints:
         create_resp = client.post(
             "/create_engine",
             json={
-                "engine_class": "tests.experimental.training_service.fake_train_engine.FakeTrainEngine",
+                "engine_class": "tests.v2.training_service.fake_train_engine.FakeTrainEngine",
                 "init_args": serialize_value([]),
                 "init_kwargs": serialize_value({"world_size": 1}),
             },
@@ -221,7 +221,7 @@ class TestWorkerEndpoints:
         create_resp = client.post(
             "/create_engine",
             json={
-                "engine_class": "tests.experimental.training_service.fake_train_engine.FakeTrainEngine",
+                "engine_class": "tests.v2.training_service.fake_train_engine.FakeTrainEngine",
                 "init_args": serialize_value([]),
                 "init_kwargs": serialize_value({"world_size": 1}),
             },
