@@ -85,6 +85,7 @@ python3 train.py --config path/to/config.yaml actor.lr=1e-4 seed=42
 - [SchedulingStrategy](section-scheduling-strategy)
 - [SessionTracer Configuration](section-session-tracer)
 - [Teacher Configuration](section-teacher)
+- [TrajectoryDebug Configuration](section-trajectory-debug)
 
 ______________________________________________________________________
 
@@ -155,6 +156,7 @@ A dummy place holder of GRPO config for backward compatibility.
 | `critic`             | [`PPOCriticConfig`](section-ppo-critic) \| None                           | `None`       | -                                                                                                                                                                                                                                                                   |
 | `teacher`            | [`TeacherConfig`](section-teacher) \| None                                | `None`       | Optional teacher model configuration used for on-policy distillation during PPO training. If provided, the actor may be trained to match the teacher in addition to the standard PPO objective.                                                                     |
 | `dynamic_bs`         | boolean                                                                   | `False`      | Enable dynamic batch sizing in prepare_batch. When True, batch collection stops when (accepted + rejected) >= batch_size, returning only accepted results. This results in variable-sized batches of valid data.                                                    |
+| `trajectory_debug`   | [`TrajectoryDebugConfig`](section-trajectory-debug) \| None               | `None`       | Trajectory dump/replay configuration for offline debugging of the PPO training loop. Only meaningful for experiments with a rollout phase. None means disabled.                                                                                                     |
 
 (section-ppo)=
 
@@ -193,6 +195,7 @@ Configuration for Proximal Policy Optimization (PPO) reinforcement learning expe
 | `critic`             | [`PPOCriticConfig`](section-ppo-critic) \| None                           | `None`       | -                                                                                                                                                                                                                                                                   |
 | `teacher`            | [`TeacherConfig`](section-teacher) \| None                                | `None`       | Optional teacher model configuration used for on-policy distillation during PPO training. If provided, the actor may be trained to match the teacher in addition to the standard PPO objective.                                                                     |
 | `dynamic_bs`         | boolean                                                                   | `False`      | Enable dynamic batch sizing in prepare_batch. When True, batch collection stops when (accepted + rejected) >= batch_size, returning only accepted results. This results in variable-sized batches of valid data.                                                    |
+| `trajectory_debug`   | [`TrajectoryDebugConfig`](section-trajectory-debug) \| None               | `None`       | Trajectory dump/replay configuration for offline debugging of the PPO training loop. Only meaningful for experiments with a rollout phase. None means disabled.                                                                                                     |
 
 (section-rw)=
 
@@ -1251,3 +1254,39 @@ Configuration class: TeacherConfig
 | `offload`             | boolean                                                     | `False`     | Whether to offload teacher rollout model between steps                                                                                           |
 | `rl_loss_weight`      | float                                                       | `1.0`       | RL loss weight                                                                                                                                   |
 | `distill_loss_weight` | float                                                       | `0.005`     | Distillation loss weight                                                                                                                         |
+
+(section-trajectory-debug)=
+
+## TrajectoryDebug Configuration
+
+Configuration for trajectory dump/replay debugging.
+
+Enables dumping rollout data to disk during training and replaying from disk without
+running inference, useful for deterministic reproduction of training-side bugs.
+
+```
+Attributes:
+    dump_rollout_data: Enable dumping rollout batch to disk each step.
+    replay_rollout_data: Enable replaying from dumped files (skips inference).
+    path: Custom directory for trajectory files. If None, uses default
+        ``<fileroot>/<experiment>/<trial>/debug_trajectories/``.
+    dump_steps: Only dump at these global steps (must be non-negative).
+        None means dump every step.
+    max_keep: Keep only the most recent N trajectory files on disk.
+        Older files are deleted after each dump. None means keep all.
+    pin_steps: Steps whose files are never deleted by max_keep rotation.
+        Useful for preserving known-bad steps for later replay.
+    dump_scope: What to dump. "rollout" saves prepare_batch output only.
+        "full" saves the batch after critic/ref/teacher enrichment, enabling
+        replay that skips all model forward passes except the actor PPO update.
+```
+
+| Parameter             | Type                    | Default     | Description                                                                                                                                                                                |
+| --------------------- | ----------------------- | ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `dump_rollout_data`   | boolean                 | `False`     | Enable dumping rollout batch to disk each step.                                                                                                                                            |
+| `replay_rollout_data` | boolean                 | `False`     | Enable replaying from dumped trajectory files (skips inference).                                                                                                                           |
+| `path`                | string \| None          | `None`      | Custom directory for trajectory files. If None, uses <fileroot>/<experiment>/<trial>/debug_trajectories/.                                                                                  |
+| `dump_steps`          | list of integer \| None | `None`      | Only dump at these global steps. None means dump every step. Example: \[95, 96, 97, 98, 99, 100\]                                                                                          |
+| `max_keep`            | integer \| None         | `None`      | Keep only the most recent N trajectory files on disk. Older files are deleted automatically after each dump. None means keep all files (no rotation).                                      |
+| `pin_steps`           | list of integer \| None | `None`      | Steps whose trajectory files are pinned and never deleted by max_keep rotation. Useful for preserving known-bad steps while still using sliding-window cleanup. Example: \[100, 200, 500\] |
+| `dump_scope`          | string                  | `"rollout"` | What data to dump. 'rollout' saves prepare_batch output only. 'full' saves batch after critic/ref/teacher, so replay skips all forward passes except the actor PPO update.                 |

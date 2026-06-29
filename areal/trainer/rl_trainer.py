@@ -8,6 +8,7 @@ from collections.abc import Callable
 from copy import deepcopy
 from typing import TYPE_CHECKING, Any, cast
 
+import torch
 import torch.distributed as dist
 from torchdata.stateful_dataloader import StatefulDataLoader
 
@@ -53,6 +54,7 @@ from areal.utils.evaluator import Evaluator
 from areal.utils.hf_utils import load_hf_processor_and_tokenizer
 from areal.utils.perf_tracer import Category
 from areal.utils.recover import RecoverHandler
+from areal.utils.replay import NoOpRollout
 from areal.utils.saver import Saver
 from areal.utils.stats_logger import StatsLogger
 from areal.v2.inference_service.controller.controller import (
@@ -301,89 +303,174 @@ class PPOTrainer:
             )
             self.teacher.initialize(**engine_init_kwargs, role="teacher")
 
-        # Save initial LoRA weights if enabled (for inference server pre-loading)
-        initial_lora_path = self._save_initial_lora_weights()
+        # -- Trajectory debug setup -------------------------------------------
+        self._init_trajectory_debug(config)
 
-        # Initialize inference with LoRA path
-        self.rollout = self._init_rollout(
-            config.rollout, is_eval=False, lora_path=initial_lora_path
+        # -- Rollout, weight-update, and recovery initialization ---------------
+        self._init_rollout_and_recovery(config, ft_spec)
+
+    # ------------------------------------------------------------------ #
+    #  Trajectory debug & rollout initialization (extracted for clarity)   #
+    # ------------------------------------------------------------------ #
+
+    def _init_trajectory_debug(self, config: PPOConfig) -> None:
+        """Parse trajectory debug config and set instance attributes.
+
+        Sets: _replay_mode, _dump_mode, _trajectory_dir, _dump_steps_set,
+              _max_keep, _pin_steps, _dump_scope.
+        """
+        _traj_cfg = config.trajectory_debug
+        self._replay_mode = _traj_cfg is not None and _traj_cfg.replay_rollout_data
+        self._dump_mode = _traj_cfg is not None and _traj_cfg.dump_rollout_data
+        if self._dump_mode or self._replay_mode:
+            assert _traj_cfg is not None
+            self._trajectory_dir = _traj_cfg.path or os.path.join(
+                config.cluster.fileroot,
+                config.experiment_name,
+                config.trial_name,
+                "debug_trajectories",
+            )
+            os.makedirs(self._trajectory_dir, exist_ok=True)
+        else:
+            self._trajectory_dir = ""
+        self._dump_steps_set: frozenset[int] | None = (
+            frozenset(_traj_cfg.dump_steps)
+            if _traj_cfg is not None and _traj_cfg.dump_steps is not None
+            else None
+        )
+        self._max_keep: int | None = (
+            _traj_cfg.max_keep if _traj_cfg is not None else None
+        )
+        self._pin_steps: frozenset[int] = (
+            frozenset(_traj_cfg.pin_steps)
+            if _traj_cfg is not None and _traj_cfg.pin_steps is not None
+            else frozenset()
+        )
+        self._dump_scope: str = (
+            _traj_cfg.dump_scope if _traj_cfg is not None else "rollout"
         )
 
-        self.eval_rollout = None
-        if not self._online_mode:
-            self.eval_rollout = self._init_rollout(
-                config.rollout, is_eval=True, lora_path=initial_lora_path
+    def _init_rollout_and_recovery(
+        self, config: PPOConfig, ft_spec: FinetuneSpec
+    ) -> None:
+        """Initialize rollout engine (or stub), weight-update meta, and recovery.
+
+        In replay mode the inference engine is replaced by a no-op stub and
+        recovery is skipped. Otherwise the full rollout + weight-update +
+        checkpoint recovery flow is executed.
+        """
+        if self._replay_mode:
+            self.rollout = NoOpRollout()
+            self.eval_rollout = None
+            self.weight_update_meta = None
+            self._proxy_started = False
+            available = sorted(
+                f
+                for f in os.listdir(self._trajectory_dir)
+                if f.startswith("step_") and f.endswith(".pt")
             )
-        if (
-            self.config.teacher is not None
-            and self.config.teacher.engine_type == "rollout"
-        ):
-            self.teacher = self._init_teacher_rollout(self.config.teacher.rollout)
-
-        # Proxy worker initialization (lazy, for AgentWorkflow support)
-        self._proxy_started = False
-
-        # Prepare weight update meta and connect to inference engine
-        if self.config.actor._version == "v2":
-            awex_kwargs: dict[str, Any] = {}
-            if config.actor.use_lora:
-                awex_kwargs.update(
-                    {
-                        "use_lora": config.actor.use_lora,
-                        "lora_name": config.gconfig.lora_name,
-                        "base_model_name": config.actor.path,
-                    }
+            if not available:
+                raise FileNotFoundError(
+                    "Replay mode enabled but no trajectory files were found in "
+                    f"{self._trajectory_dir}. Run a dump pass first "
+                    "(trajectory_debug.dump_rollout_data=true) or point "
+                    "trajectory_debug.path at a directory containing "
+                    "step_*.pt files."
                 )
-            self.weight_update_meta = WeightUpdateMeta.from_awex(**awex_kwargs)
-        elif self.config.actor.weight_update_mode == "disk":
-            disk_kwargs = {
-                "experiment_name": config.experiment_name,
-                "trial_name": config.trial_name,
-                "file_root": config.cluster.fileroot,
-                "name": "default",
-                "clear_checkpoint_after_load": True,
-            }
-            if config.actor.use_lora:
-                disk_kwargs.update(
-                    {
-                        "use_lora": config.actor.use_lora,
-                        "lora_name": config.gconfig.lora_name,
-                        "base_model_name": config.actor.path,
-                        # Keep enough recent adapter versions for off-policy
-                        # rollouts (max_head_offpolicyness) plus a safety margin;
-                        # older versions are unloaded to bound sglang VRAM and
-                        # avoid the adapter-accumulation hang.
-                        "lora_keep_versions": config.rollout.max_head_offpolicyness + 2,
-                    }
-                )
-            self.weight_update_meta = WeightUpdateMeta.from_disk(**disk_kwargs)
-        elif self.config.actor.weight_update_mode == "xccl":
-            # NCCL/XCCL weight update
-            xccl_kwargs: dict[str, Any] = {
-                "gen_allocation": self.rollout_alloc,
-            }
-
-            if config.actor.use_lora:
-                xccl_kwargs.update(
-                    {
-                        "use_lora": config.actor.use_lora,
-                        "lora_name": config.gconfig.lora_name,
-                        "base_model_name": config.actor.path,
-                    }
-                )
-
-            if self.actor_alloc.backend == "megatron":
-                self.weight_update_meta = WeightUpdateMeta.from_megatron_xccl(
-                    **xccl_kwargs
-                )
-            else:
-                self.weight_update_meta = WeightUpdateMeta.from_fsdp_xccl(**xccl_kwargs)
+            logger.info(
+                "Replay mode: skipping rollout initialization. "
+                f"Loading trajectories from {self._trajectory_dir} "
+                f"({len(available)} files available)"
+            )
         else:
-            raise ValueError(
-                f"Invalid weight update mode: {self.config.actor.weight_update_mode}"
+            # Save initial LoRA weights if enabled (for inference server pre-loading)
+            initial_lora_path = self._save_initial_lora_weights()
+
+            # Initialize inference with LoRA path
+            self.rollout = self._init_rollout(
+                config.rollout, is_eval=False, lora_path=initial_lora_path
             )
 
-        self.actor.connect_engine(self.rollout, self.weight_update_meta)
+            self.eval_rollout = None
+            if not self._online_mode:
+                self.eval_rollout = self._init_rollout(
+                    config.rollout, is_eval=True, lora_path=initial_lora_path
+                )
+
+            if (
+                self.config.teacher is not None
+                and self.config.teacher.engine_type == "rollout"
+            ):
+                self.teacher = self._init_teacher_rollout(self.config.teacher.rollout)
+
+            # Proxy worker initialization (lazy, for AgentWorkflow support)
+            self._proxy_started = False
+
+            # Prepare weight update meta and connect to inference engine
+            if self.config.actor._version == "v2":
+                awex_kwargs: dict[str, Any] = {}
+                if config.actor.use_lora:
+                    awex_kwargs.update(
+                        {
+                            "use_lora": config.actor.use_lora,
+                            "lora_name": config.gconfig.lora_name,
+                            "base_model_name": config.actor.path,
+                        }
+                    )
+                self.weight_update_meta = WeightUpdateMeta.from_awex(**awex_kwargs)
+            elif self.config.actor.weight_update_mode == "disk":
+                disk_kwargs = {
+                    "experiment_name": config.experiment_name,
+                    "trial_name": config.trial_name,
+                    "file_root": config.cluster.fileroot,
+                    "name": "default",
+                    "clear_checkpoint_after_load": True,
+                }
+                if config.actor.use_lora:
+                    disk_kwargs.update(
+                        {
+                            "use_lora": config.actor.use_lora,
+                            "lora_name": config.gconfig.lora_name,
+                            "base_model_name": config.actor.path,
+                            # Keep enough recent adapter versions for off-policy
+                            # rollouts (max_head_offpolicyness) plus a safety margin;
+                            # older versions are unloaded to bound sglang VRAM and
+                            # avoid the adapter-accumulation hang.
+                            "lora_keep_versions": config.rollout.max_head_offpolicyness
+                            + 2,
+                        }
+                    )
+                self.weight_update_meta = WeightUpdateMeta.from_disk(**disk_kwargs)
+            elif self.config.actor.weight_update_mode == "xccl":
+                # NCCL/XCCL weight update
+                xccl_kwargs: dict[str, Any] = {
+                    "gen_allocation": self.rollout_alloc,
+                }
+
+                if config.actor.use_lora:
+                    xccl_kwargs.update(
+                        {
+                            "use_lora": config.actor.use_lora,
+                            "lora_name": config.gconfig.lora_name,
+                            "base_model_name": config.actor.path,
+                        }
+                    )
+
+                if self.actor_alloc.backend == "megatron":
+                    self.weight_update_meta = WeightUpdateMeta.from_megatron_xccl(
+                        **xccl_kwargs
+                    )
+                else:
+                    self.weight_update_meta = WeightUpdateMeta.from_fsdp_xccl(
+                        **xccl_kwargs
+                    )
+            else:
+                raise ValueError(
+                    f"Invalid weight update mode: "
+                    f"{self.config.actor.weight_update_mode}"
+                )
+
+            self.actor.connect_engine(self.rollout, self.weight_update_meta)
 
         # Set up evaluation (skip in online mode)
         self.evaluator = Evaluator(config.evaluator, ft_spec)
@@ -396,15 +483,20 @@ class PPOTrainer:
         self.stats_logger = StatsLogger(config, ft_spec)
 
         # Set up checkpointing for recover
-        self.recover_info = self.recover_handler.load(
-            self.actor,
-            self.saver,
-            self.evaluator,
-            self.stats_logger,
-            self.train_dataloader,
-            inference_engine=self.rollout,
-            weight_update_meta=self.weight_update_meta,
-        )
+        if self._replay_mode:
+            # In replay mode there is no inference engine to recover, so skip
+            # the full recovery flow. We still need recover_info for start_step.
+            self.recover_info = None
+        else:
+            self.recover_info = self.recover_handler.load(
+                self.actor,
+                self.saver,
+                self.evaluator,
+                self.stats_logger,
+                self.train_dataloader,
+                inference_engine=self.rollout,
+                weight_update_meta=self.weight_update_meta,
+            )
 
         # After recovery, sync the staleness manager so its capacity formula
         # stays bounded despite the version jumping from 0 to recovery_version.
@@ -572,19 +664,26 @@ class PPOTrainer:
         steps_per_epoch = len(self.train_dataloader)
         max_steps = total_epochs * steps_per_epoch
 
-        # Initialize proxy workers if not using RolloutWorkflow
-        if workflow is None:
-            agent_cfg = self.config.rollout.agent
-            if agent_cfg is not None and agent_cfg.mode == "online":
+        # Initialize proxy workers if not using RolloutWorkflow.
+        #
+        # Replay mode uses a no-op stub in place of the real inference engine,
+        # so there are no proxy workers to launch and none are needed: every
+        # rollout/agent-workflow path loads trajectories from disk instead of
+        # calling the engine. Skip proxy initialization entirely so that
+        # start_proxy()/start_proxy_gateway() are never invoked on the stub.
+        if not self._replay_mode:
+            if workflow is None:
+                agent_cfg = self.config.rollout.agent
+                if agent_cfg is not None and agent_cfg.mode == "online":
+                    self._ensure_proxy_started()
+                else:
+                    raise ValueError(
+                        "workflow must be specified for train() unless "
+                        "agent.mode='online' is configured. "
+                        "Pass a RolloutWorkflow, AgentWorkflow, or callable."
+                    )
+            elif self._requires_proxy_workflow(workflow):
                 self._ensure_proxy_started()
-            else:
-                raise ValueError(
-                    "workflow must be specified for train() unless "
-                    "agent.mode='online' is configured. "
-                    "Pass a RolloutWorkflow, AgentWorkflow, or callable."
-                )
-        elif self._requires_proxy_workflow(workflow):
-            self._ensure_proxy_started()
 
         for global_step in range(start_step, max_steps):
             if (
@@ -595,85 +694,121 @@ class PPOTrainer:
             epoch = global_step // steps_per_epoch
             step = global_step % steps_per_epoch
 
-            if self._should_offload_rollout:
-                self._onload_rollout()
-            with (
-                stats_tracker.record_timing("rollout"),
-                perf_tracer.trace_scope(
-                    "train.rollout",
-                    category=Category.COMPUTE,
-                    args={
-                        "global_step": global_step,
-                        "epoch_step": step,
-                    },
-                ),
-            ):
-                rollout_batch = self.actor.prepare_batch(
-                    self.train_dataloader,
-                    workflow=workflow,
-                    workflow_kwargs=workflow_kwargs,
-                    should_accept_fn=dynamic_filter_fn,
-                    group_size=config.gconfig.n_samples,
-                    dynamic_bs=self.config.dynamic_bs,
-                )
-            if self._should_offload_rollout:
-                self._offload_rollout()
-
-            if self.critic is not None:
-                if self._should_offload_critic:
-                    self._onload_model(self.critic, role="critic")
-                with (
-                    stats_tracker.record_timing("critic_values"),
-                    perf_tracer.trace_scope(
-                        "train.compute_values",
-                        category=Category.COMPUTE,
-                        args={"global_step": global_step},
-                    ),
-                ):
-                    values = self.critic.compute_values(rollout_batch)
-                    for traj, v in zip(rollout_batch, values):
-                        traj["values"] = v
-                    self.critic.get_device_stats().log("critic values")
-                # Critic stays onloaded — offloaded after ppo_update below
-
-            if self.ref is not None:
-                if self._should_offload_ref:
-                    self._onload_model(self.ref, role="ref")
-                with (
-                    stats_tracker.record_timing("ref_logp"),
-                    perf_tracer.trace_scope(
-                        "train.ref_logp",
-                        category=Category.COMPUTE,
-                        args={"global_step": global_step},
-                    ),
-                ):
-                    ref_logps = self.ref.compute_logp(rollout_batch)
-                    for traj, logp in zip(rollout_batch, ref_logps):
-                        traj["ref_logp"] = logp
-                    self.ref.get_device_stats().log("ref logp")
-                if self._should_offload_ref:
-                    self._offload_model(self.ref, role="ref")
-
-            if self.teacher is not None:
-                if self._should_offload_teacher:
-                    self._onload_model(self.teacher, role="teacher")
-                with (
-                    stats_tracker.record_timing("teacher_logp"),
-                    perf_tracer.trace_scope(
-                        "train.teacher_logp",
-                        category=Category.COMPUTE,
-                        args={"global_step": global_step},
-                    ),
-                ):
-                    teacher_logps = self.teacher.compute_logp(rollout_batch)
-                    for traj, logp in zip(rollout_batch, teacher_logps):
-                        traj["teacher_logp"] = logp
-                        traj["rl_loss_weight"] = self.config.teacher.rl_loss_weight
-                        traj["distill_loss_weight"] = (
-                            self.config.teacher.distill_loss_weight
+            # -- Replay with scope="full": load the enriched batch directly --
+            if self._replay_mode and self._dump_scope == "full":
+                rollout_batch = self._load_trajectory(global_step)
+            else:
+                # -- Rollout phase (skipped only in replay+rollout scope) --
+                if self._replay_mode:
+                    # replay with scope="rollout": load raw rollout batch
+                    rollout_batch = self._load_trajectory(global_step)
+                else:
+                    # -- Normal: run inference --
+                    if self._should_offload_rollout:
+                        self._onload_rollout()
+                    with (
+                        stats_tracker.record_timing("rollout"),
+                        perf_tracer.trace_scope(
+                            "train.rollout",
+                            category=Category.COMPUTE,
+                            args={
+                                "global_step": global_step,
+                                "epoch_step": step,
+                            },
+                        ),
+                    ):
+                        rollout_batch = self.actor.prepare_batch(
+                            self.train_dataloader,
+                            workflow=workflow,
+                            workflow_kwargs=workflow_kwargs,
+                            should_accept_fn=dynamic_filter_fn,
+                            group_size=config.gconfig.n_samples,
+                            dynamic_bs=self.config.dynamic_bs,
                         )
-                if self._should_offload_teacher:
-                    self._offload_model(self.teacher, role="teacher")
+                    if self._should_offload_rollout:
+                        self._offload_rollout()
+
+                    # -- Dump (rollout scope): save right after prepare_batch --
+                    if self._dump_mode and self._dump_scope == "rollout":
+                        if (
+                            self._dump_steps_set is None
+                            or global_step in self._dump_steps_set
+                        ):
+                            should_dump = (
+                                is_single_controller()
+                                or self.actor.is_data_parallel_head()
+                            )
+                            if should_dump:
+                                self._save_trajectory(rollout_batch, global_step)
+
+                # -- Critic / Ref / Teacher enrichment --
+                if self.critic is not None:
+                    if self._should_offload_critic:
+                        self._onload_model(self.critic, role="critic")
+                    with (
+                        stats_tracker.record_timing("critic_values"),
+                        perf_tracer.trace_scope(
+                            "train.compute_values",
+                            category=Category.COMPUTE,
+                            args={"global_step": global_step},
+                        ),
+                    ):
+                        values = self.critic.compute_values(rollout_batch)
+                        for traj, v in zip(rollout_batch, values):
+                            traj["values"] = v
+                        self.critic.get_device_stats().log("critic values")
+                    # Critic stays onloaded — offloaded after ppo_update below
+
+                if self.ref is not None:
+                    if self._should_offload_ref:
+                        self._onload_model(self.ref, role="ref")
+                    with (
+                        stats_tracker.record_timing("ref_logp"),
+                        perf_tracer.trace_scope(
+                            "train.ref_logp",
+                            category=Category.COMPUTE,
+                            args={"global_step": global_step},
+                        ),
+                    ):
+                        ref_logps = self.ref.compute_logp(rollout_batch)
+                        for traj, logp in zip(rollout_batch, ref_logps):
+                            traj["ref_logp"] = logp
+                        self.ref.get_device_stats().log("ref logp")
+                    if self._should_offload_ref:
+                        self._offload_model(self.ref, role="ref")
+
+                if self.teacher is not None:
+                    if self._should_offload_teacher:
+                        self._onload_model(self.teacher, role="teacher")
+                    with (
+                        stats_tracker.record_timing("teacher_logp"),
+                        perf_tracer.trace_scope(
+                            "train.teacher_logp",
+                            category=Category.COMPUTE,
+                            args={"global_step": global_step},
+                        ),
+                    ):
+                        teacher_logps = self.teacher.compute_logp(rollout_batch)
+                        for traj, logp in zip(rollout_batch, teacher_logps):
+                            traj["teacher_logp"] = logp
+                            traj["rl_loss_weight"] = self.config.teacher.rl_loss_weight
+                            traj["distill_loss_weight"] = (
+                                self.config.teacher.distill_loss_weight
+                            )
+                    if self._should_offload_teacher:
+                        self._offload_model(self.teacher, role="teacher")
+
+                # -- Dump (full scope): save after all enrichment --
+                if self._dump_mode and self._dump_scope == "full":
+                    if (
+                        self._dump_steps_set is None
+                        or global_step in self._dump_steps_set
+                    ):
+                        should_dump = (
+                            is_single_controller() or self.actor.is_data_parallel_head()
+                        )
+                        if should_dump:
+                            self._save_trajectory(rollout_batch, global_step)
 
             if self._should_offload_actor:
                 self._onload_model(self.actor, role="actor")
@@ -756,25 +891,26 @@ class PPOTrainer:
             # Actor already onloaded; engine-internal _offload_aware_context
             # calls in update_weights/save are no-ops.
 
-            with (
-                stats_tracker.record_timing("update_weights"),
-                perf_tracer.trace_scope(
-                    "train.update_weights",
-                    category=Category.COMM,
-                    args={"global_step": global_step},
-                ),
-            ):
-                # Use versioned path for weight updates
-                new_version = global_step + 1
-                versioned_meta = self.weight_update_meta.with_version(new_version)
-                self.actor.update_weights(versioned_meta)
+            if not self._replay_mode:
+                with (
+                    stats_tracker.record_timing("update_weights"),
+                    perf_tracer.trace_scope(
+                        "train.update_weights",
+                        category=Category.COMM,
+                        args={"global_step": global_step},
+                    ),
+                ):
+                    # Use versioned path for weight updates
+                    new_version = global_step + 1
+                    versioned_meta = self.weight_update_meta.with_version(new_version)
+                    self.actor.update_weights(versioned_meta)
 
-                self.actor.set_version(new_version)
-                if self.critic is not None:
-                    self.critic.set_version(new_version)
-                self.rollout.set_version(new_version)
-                if self.eval_rollout is not None:
-                    self.eval_rollout.set_version(new_version)
+                    self.actor.set_version(new_version)
+                    if self.critic is not None:
+                        self.critic.set_version(new_version)
+                    self.rollout.set_version(new_version)
+                    if self.eval_rollout is not None:
+                        self.eval_rollout.set_version(new_version)
 
             with (
                 stats_tracker.record_timing("save"),
@@ -802,25 +938,26 @@ class PPOTrainer:
             if self._should_offload_actor:
                 self._offload_model(self.actor, role="actor")
 
-            if self._should_offload_rollout:
-                self._onload_rollout(is_eval=True)
-            with (
-                stats_tracker.record_timing("eval"),
-                perf_tracer.trace_scope(
-                    "train.eval",
-                    category=Category.COMPUTE,
-                    args={"global_step": global_step},
-                ),
-            ):
-                self._evaluate(
-                    eval_workflow=eval_workflow,
-                    eval_workflow_kwargs=eval_workflow_kwargs,
-                    epoch=epoch,
-                    epoch_step=step,
-                    global_step=global_step,
-                )
-            if self._should_offload_rollout:
-                self._offload_rollout(is_eval=True)
+            if not self._replay_mode:
+                if self._should_offload_rollout:
+                    self._onload_rollout(is_eval=True)
+                with (
+                    stats_tracker.record_timing("eval"),
+                    perf_tracer.trace_scope(
+                        "train.eval",
+                        category=Category.COMPUTE,
+                        args={"global_step": global_step},
+                    ),
+                ):
+                    self._evaluate(
+                        eval_workflow=eval_workflow,
+                        eval_workflow_kwargs=eval_workflow_kwargs,
+                        epoch=epoch,
+                        epoch_step=step,
+                        global_step=global_step,
+                    )
+                if self._should_offload_rollout:
+                    self._offload_rollout(is_eval=True)
 
             with (
                 stats_tracker.record_timing("clear_batches"),
@@ -1214,6 +1351,134 @@ class PPOTrainer:
         if not is_single_controller():
             dist.barrier(group=self.actor.cpu_group)
             current_platform.synchronize()
+
+    # ------------------------------------------------------------------ #
+    #  Trajectory dump / replay helpers                                    #
+    # ------------------------------------------------------------------ #
+
+    def _trajectory_path(self, step: int) -> str:
+        """Return the file path for a trajectory at the given global step.
+
+        In single-controller mode, only the master saves/loads, so no rank
+        suffix is needed. In SPMD mode, files are keyed by data-parallel rank
+        (not global rank) since rollout batches are sharded by DP dimension.
+        """
+        if is_single_controller():
+            filename = f"step_{step:06d}.pt"
+        else:
+            dp_rank = self.actor.data_parallel_rank
+            filename = f"step_{step:06d}_dp_{dp_rank}.pt"
+        return os.path.join(self._trajectory_dir, filename)
+
+    def _save_trajectory(self, batch: list[dict[str, torch.Tensor]], step: int) -> None:
+        """Persist a rollout batch to disk for later replay."""
+        path = self._trajectory_path(step)
+        torch.save(batch, path)
+        # Log file size on first dump to help users estimate disk usage.
+        if not hasattr(self, "_first_dump_logged"):
+            size_mb = os.path.getsize(path) / (1024 * 1024)
+            logger.info(
+                f"Trajectory dumped: step={step}, path={path}, "
+                f"size={size_mb:.1f}MB per file"
+                + (
+                    f" (max_keep={self._max_keep}, disk cap ~{size_mb * self._max_keep:.0f}MB)"
+                    if self._max_keep
+                    else " (no max_keep set — files will accumulate)"
+                )
+            )
+            self._first_dump_logged = True
+        else:
+            logger.debug(f"Trajectory dumped: step={step}, path={path}")
+        if self._max_keep is not None:
+            self._rotate_trajectories()
+
+    def _rotate_trajectories(self) -> None:
+        """Delete oldest trajectory steps, keeping only the most recent N steps.
+
+        Rotation operates at **step granularity**: in SPMD mode each step
+        produces one file per data-parallel rank (e.g. step_000042_dp_0.pt,
+        step_000042_dp_1.pt, ...). All files belonging to the same step are
+        treated as a single unit — either the entire step is kept or the
+        entire step is deleted. This prevents partial-step data corruption
+        when ``max_keep`` is not a multiple of the DP world size.
+
+        Steps whose number appears in ``self._pin_steps`` are exempt from
+        deletion and do not count toward the ``max_keep`` budget.
+        """
+        all_files = sorted(
+            f
+            for f in os.listdir(self._trajectory_dir)
+            if f.startswith("step_") and f.endswith(".pt")
+        )
+        assert self._max_keep is not None
+
+        # Group files by step number.
+        # Filename format: step_000042.pt or step_000042_dp_3.pt
+        # step_to_files maps step_num -> list of filenames belonging to that step.
+        step_to_files: dict[int, list[str]] = {}
+        for f in all_files:
+            # The directory is user-visible, so guard against malformed names
+            # (e.g. a hand-copied "step_backup.pt" or a half-written file): skip
+            # anything we cannot parse instead of crashing the training run.
+            stem = os.path.splitext(f)[0]  # "step_000042" or "step_000042_dp_3"
+            parts = stem.split("_")
+            if len(parts) < 2 or not parts[1].isdigit():
+                logger.warning(
+                    f"Skipping unparseable trajectory file during rotation: {f}"
+                )
+                continue
+            step_num = int(parts[1])
+            step_to_files.setdefault(step_num, []).append(f)
+
+        # Separate pinned steps from rotatable steps.
+        rotatable_steps = sorted(s for s in step_to_files if s not in self._pin_steps)
+
+        steps_to_remove = len(rotatable_steps) - self._max_keep
+        if steps_to_remove > 0:
+            for step_num in rotatable_steps[:steps_to_remove]:
+                for f in step_to_files[step_num]:
+                    filepath = os.path.join(self._trajectory_dir, f)
+                    # Tolerate concurrent rotation: in SPMD mode multiple
+                    # data-parallel ranks may rotate the shared directory at
+                    # once, so a file listed above may already be gone by the
+                    # time we delete it. Deletion is best-effort cleanup; a
+                    # missing file is the desired end state, not an error.
+                    try:
+                        os.remove(filepath)
+                        logger.debug(f"Trajectory rotated (deleted): {filepath}")
+                    except FileNotFoundError:
+                        pass
+
+    def _load_trajectory(self, step: int) -> list[dict[str, torch.Tensor]]:
+        """Load a previously dumped rollout batch from disk."""
+        path = self._trajectory_path(step)
+        if not os.path.isfile(path):
+            # List available steps to help user diagnose the mismatch.
+            available = sorted(
+                f
+                for f in os.listdir(self._trajectory_dir)
+                if f.startswith("step_") and f.endswith(".pt")
+            )
+            hint = (
+                f" Available files ({len(available)}): "
+                + ", ".join(available[:10])
+                + ("..." if len(available) > 10 else "")
+                if available
+                else " Directory is empty."
+            )
+            raise FileNotFoundError(
+                f"Trajectory file not found for step {step}: {path}. "
+                "Ensure dump was run with matching mode (single-controller vs "
+                "SPMD) and identical data-parallel topology (same DP world size)."
+                + hint
+            )
+        # weights_only=False is safe here: files are self-produced by _save_trajectory.
+        # map_location="cpu" ensures replay works even if GPU topology differs from dump.
+        batch: list[dict[str, torch.Tensor]] = torch.load(
+            path, map_location="cpu", weights_only=False
+        )
+        logger.info(f"Trajectory loaded: step={step}, path={path}")
+        return batch
 
     def _evaluate_fn(
         self,
