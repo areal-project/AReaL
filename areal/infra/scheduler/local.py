@@ -101,7 +101,7 @@ class LocalScheduler(Scheduler):
         self,
         gpu_devices: list[int] | None = None,
         log_dir: str | None = None,
-        startup_timeout: float = 30.0,
+        startup_timeout: float = 300.0,
         health_check_interval: float = 1.0,
         *,
         experiment_name: str | None = None,
