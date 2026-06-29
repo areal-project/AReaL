@@ -7,13 +7,13 @@ import httpx
 import pytest
 import requests
 
-from areal.experimental.weight_update.controller.config import (
+from areal.v2.weight_update.controller.config import (
     WeightUpdateControllerConfig,
 )
-from areal.experimental.weight_update.controller.controller import (
+from areal.v2.weight_update.controller.controller import (
     WeightUpdateController,
 )
-from areal.experimental.weight_update.gateway.config import WeightUpdateResult
+from areal.v2.weight_update.gateway.config import WeightUpdateResult
 
 GATEWAY_URL = "http://localhost:7080"
 

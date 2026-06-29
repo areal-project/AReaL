@@ -8,28 +8,28 @@ import httpx
 import pytest
 import pytest_asyncio
 
-from areal.experimental.inference_service.data_proxy.app import (
+from areal.v2.inference_service.data_proxy.app import (
     create_app as create_data_proxy_app,
 )
-from areal.experimental.inference_service.data_proxy.config import DataProxyConfig
-from areal.experimental.inference_service.data_proxy.session import SessionStore
-from areal.experimental.inference_service.gateway.app import (
+from areal.v2.inference_service.data_proxy.config import DataProxyConfig
+from areal.v2.inference_service.data_proxy.session import SessionStore
+from areal.v2.inference_service.gateway.app import (
     create_app as create_gateway_app,
 )
-from areal.experimental.inference_service.gateway.config import GatewayConfig
-from areal.experimental.inference_service.gateway.streaming import (
+from areal.v2.inference_service.gateway.config import GatewayConfig
+from areal.v2.inference_service.gateway.streaming import (
     RouterKeyRejectedError,
 )
-from areal.experimental.inference_service.router.app import (
+from areal.v2.inference_service.router.app import (
     create_app as create_router_app,
 )
-from areal.experimental.inference_service.router.config import RouterConfig
-from areal.experimental.inference_service.router.state import ModelRegistry
+from areal.v2.inference_service.router.config import RouterConfig
+from areal.v2.inference_service.router.state import ModelRegistry
 
 ADMIN_KEY = "test-admin-key"
 SESSION_KEY = "session-key-abc123"
 WORKER_ADDR = "http://worker-1:18082"
-ROUTER_MODULE = "areal.experimental.inference_service.gateway.app"
+ROUTER_MODULE = "areal.v2.inference_service.gateway.app"
 
 
 def admin_headers() -> dict[str, str]:
@@ -411,9 +411,9 @@ def mock_areal_client():
 
 @pytest_asyncio.fixture
 async def data_proxy_app(data_proxy_config, mock_tokenizer, mock_areal_client):
-    from areal.experimental.inference_service.data_proxy.pause import PauseState
-    from areal.experimental.inference_service.inf_bridge import InfBridge
-    from areal.experimental.inference_service.sglang.bridge import SGLangBridgeBackend
+    from areal.v2.inference_service.data_proxy.pause import PauseState
+    from areal.v2.inference_service.inf_bridge import InfBridge
+    from areal.v2.inference_service.sglang.bridge import SGLangBridgeBackend
 
     app = create_data_proxy_app(data_proxy_config)
     pause_state = PauseState()
@@ -555,7 +555,7 @@ class TestDataProxyExternalEndpoints:
                 return _FakeStreamResponse()
 
         monkeypatch.setattr(
-            "areal.experimental.inference_service.data_proxy.app.httpx.AsyncClient",
+            "areal.v2.inference_service.data_proxy.app.httpx.AsyncClient",
             _FakeClient,
         )
 

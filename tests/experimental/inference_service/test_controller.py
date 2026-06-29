@@ -9,10 +9,10 @@ import httpx
 import pytest
 
 from areal.api.cli_args import AgentConfig, InferenceEngineConfig
-from areal.experimental.inference_service.controller.controller import (
+from areal.v2.inference_service.controller.controller import (
     RolloutControllerV2,
 )
-from areal.experimental.inference_service.controller.workflow import (
+from areal.v2.inference_service.controller.workflow import (
     InferenceServiceWorkflow,
 )
 
@@ -200,7 +200,7 @@ class TestControllerWorkflowResolution:
             match="direct RolloutWorkflow classes are not supported",
         ):
             controller._resolve_workflow(
-                "areal.experimental.inference_service.controller.workflow.InferenceServiceWorkflow"
+                "areal.v2.inference_service.controller.workflow.InferenceServiceWorkflow"
             )
 
 
@@ -364,7 +364,7 @@ class TestRolloutControllerV2Construction:
                     gpu=0,
                     cpu=1,
                     mem=1,
-                    cmd="python -m areal.experimental.inference_service.guard",
+                    cmd="python -m areal.v2.inference_service.guard",
                 ),
             ),
             admin_api_key="test-admin-key",
@@ -532,13 +532,13 @@ class TestInferenceServiceWorkflow:
 
         with (
             patch(
-                "areal.experimental.inference_service.controller.workflow.workflow_context"
+                "areal.v2.inference_service.controller.workflow.workflow_context"
             ) as mock_wf_ctx,
             patch(
-                "areal.experimental.inference_service.controller.workflow.stats_tracker"
+                "areal.v2.inference_service.controller.workflow.stats_tracker"
             ) as mock_st,
             patch(
-                "areal.experimental.inference_service.controller.workflow.deserialize_interactions"
+                "areal.v2.inference_service.controller.workflow.deserialize_interactions"
             ) as mock_deserialize,
         ):
             mock_deserialize.return_value = {"chatcmpl-1": mock_interaction}
@@ -595,10 +595,10 @@ class TestInferenceServiceWorkflow:
 
         with (
             patch(
-                "areal.experimental.inference_service.controller.workflow.workflow_context"
+                "areal.v2.inference_service.controller.workflow.workflow_context"
             ) as mock_wf_ctx,
             patch(
-                "areal.experimental.inference_service.controller.workflow.stats_tracker"
+                "areal.v2.inference_service.controller.workflow.stats_tracker"
             ) as mock_st,
         ):
             mock_http_session = AsyncMock()

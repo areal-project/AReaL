@@ -12,9 +12,9 @@ import httpx
 import pytest
 import pytest_asyncio
 
-from areal.experimental.inference_service.gateway.app import create_app
-from areal.experimental.inference_service.gateway.config import GatewayConfig
-from areal.experimental.inference_service.gateway.streaming import (
+from areal.v2.inference_service.gateway.app import create_app
+from areal.v2.inference_service.gateway.config import GatewayConfig
+from areal.v2.inference_service.gateway.streaming import (
     RouterKeyRejectedError,
     RouterUnreachableError,
 )
@@ -29,7 +29,7 @@ WORKER_ADDR = "http://worker-1:18082"
 WORKER_ADDR_2 = "http://worker-2:18082"
 WORKER_ADDR_3 = "http://worker-3:18082"
 
-MODULE = "areal.experimental.inference_service.gateway.app"
+MODULE = "areal.v2.inference_service.gateway.app"
 
 
 @pytest.fixture

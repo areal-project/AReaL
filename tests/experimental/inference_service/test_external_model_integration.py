@@ -9,26 +9,26 @@ import pytest_asyncio
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from areal.experimental.inference_service.data_proxy.app import (
+from areal.v2.inference_service.data_proxy.app import (
     create_app as create_data_proxy_app,
 )
-from areal.experimental.inference_service.data_proxy.config import DataProxyConfig
-from areal.experimental.inference_service.data_proxy.session import SessionStore
-from areal.experimental.inference_service.gateway.app import (
+from areal.v2.inference_service.data_proxy.config import DataProxyConfig
+from areal.v2.inference_service.data_proxy.session import SessionStore
+from areal.v2.inference_service.gateway.app import (
     create_app as create_gateway_app,
 )
-from areal.experimental.inference_service.gateway.config import GatewayConfig
-from areal.experimental.inference_service.gateway.streaming import (
+from areal.v2.inference_service.gateway.config import GatewayConfig
+from areal.v2.inference_service.gateway.streaming import (
     RouterKeyRejectedError,
 )
-from areal.experimental.inference_service.router.app import (
+from areal.v2.inference_service.router.app import (
     create_app as create_router_app,
 )
-from areal.experimental.inference_service.router.config import RouterConfig
+from areal.v2.inference_service.router.config import RouterConfig
 
 ADMIN_KEY = "test-admin-key"
 WORKER_ADDR = "http://worker-1:18082"
-ROUTER_MODULE = "areal.experimental.inference_service.gateway.app"
+ROUTER_MODULE = "areal.v2.inference_service.gateway.app"
 
 
 def admin_headers() -> dict[str, str]:
@@ -339,7 +339,7 @@ async def test_external_model_flow_end_to_end_gateway_router_data_proxy(router_c
                 new=AsyncMock(side_effect=_forward_request),
             ),
             patch(
-                "areal.experimental.inference_service.data_proxy.app.httpx.AsyncClient",
+                "areal.v2.inference_service.data_proxy.app.httpx.AsyncClient",
                 _ExternalClient,
             ),
         ):

@@ -10,10 +10,10 @@ import pytest
 import pytest_asyncio
 import torch
 
-from areal.experimental.training_service.data_proxy.app import create_app
-from areal.experimental.training_service.data_proxy.config import TrainDataProxyConfig
-from areal.experimental.training_service.data_proxy.dispatcher import Dispatcher
-from areal.experimental.training_service.data_proxy.topology import (
+from areal.v2.training_service.data_proxy.app import create_app
+from areal.v2.training_service.data_proxy.config import TrainDataProxyConfig
+from areal.v2.training_service.data_proxy.dispatcher import Dispatcher
+from areal.v2.training_service.data_proxy.topology import (
     WorkerInfo,
     WorkerTopology,
 )

@@ -6,10 +6,10 @@
 # Core package
 /areal/api/                             @garrett4wade @rchardx @sitabulaixizawaluduo
 /areal/engine/                          @rchardx @nuzant @garrett4wade @geshi001
-/areal/experimental/inference_service/  @nuzant @guozhihao-224 @TaoZex
-/areal/experimental/agent_service/      @CormickKneey @nuzant
-/areal/experimental/training_service/   @sitabulaixizawaluduo @garrett4wade
-/areal/experimental/weight_update/      @TaoZex @garrett4wade @sitabulaixizawaluduo
+/areal/v2/inference_service/  @nuzant @guozhihao-224 @TaoZex
+/areal/v2/agent_service/      @CormickKneey @nuzant
+/areal/v2/training_service/   @sitabulaixizawaluduo @garrett4wade
+/areal/v2/weight_update/      @TaoZex @garrett4wade @sitabulaixizawaluduo
 /areal/infra/                           @HwVanICI @garrett4wade @guozhihao-224
 /areal/models/                          @rchardx @nuzant @geshi001 @PrometheusComing
 /areal/trainer/                         @garrett4wade @rchardx @fishcrap

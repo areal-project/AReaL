@@ -30,7 +30,7 @@ from claude_agent_sdk import (
     ToolUseBlock,
 )
 
-from areal.experimental.agent_service.types import (
+from areal.v2.agent_service.types import (
     AgentRequest,
     AgentResponse,
     EventEmitter,

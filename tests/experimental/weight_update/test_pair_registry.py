@@ -3,8 +3,8 @@ from __future__ import annotations
 
 import pytest
 
-from areal.experimental.weight_update.gateway.config import PairInfo
-from areal.experimental.weight_update.gateway.pair_registry import PairRegistry
+from areal.v2.weight_update.gateway.config import PairInfo
+from areal.v2.weight_update.gateway.pair_registry import PairRegistry
 
 
 @pytest.fixture

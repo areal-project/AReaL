@@ -374,13 +374,13 @@ def test_awex_fsdp_e2e_weight_update(n_gpus, tmp_path_factory):
         SchedulingSpec,
         TrainEngineConfig,
     )
-    from areal.experimental.inference_service.controller.controller import (
+    from areal.v2.inference_service.controller.controller import (
         RolloutControllerV2,
     )
-    from areal.experimental.training_service.controller.controller import (
+    from areal.v2.training_service.controller.controller import (
         GatewayTrainController,
     )
-    from areal.experimental.weight_update.controller import (
+    from areal.v2.weight_update.controller import (
         WeightUpdateController,
         WeightUpdateControllerConfig,
     )
@@ -397,7 +397,7 @@ def test_awex_fsdp_e2e_weight_update(n_gpus, tmp_path_factory):
         scheduling_spec=(
             SchedulingSpec(
                 gpu=1,
-                cmd="python -m areal.experimental.inference_service.guard",
+                cmd="python -m areal.v2.inference_service.guard",
             ),
         ),
         consumer_batch_size=8,
@@ -418,7 +418,7 @@ def test_awex_fsdp_e2e_weight_update(n_gpus, tmp_path_factory):
         scheduling_spec=(
             SchedulingSpec(
                 gpu=1,
-                cmd="python -m areal.experimental.training_service.guard",
+                cmd="python -m areal.v2.training_service.guard",
                 env_vars=dict(NCCL_CUMEM_ENABLE="0", NCCL_NVLS_ENABLE="0"),
             ),
         ),
@@ -577,13 +577,13 @@ def _run_megatron_awex_e2e(
         SchedulingSpec,
         TrainEngineConfig,
     )
-    from areal.experimental.inference_service.controller.controller import (
+    from areal.v2.inference_service.controller.controller import (
         RolloutControllerV2,
     )
-    from areal.experimental.training_service.controller.controller import (
+    from areal.v2.training_service.controller.controller import (
         GatewayTrainController,
     )
-    from areal.experimental.weight_update.controller import (
+    from areal.v2.weight_update.controller import (
         WeightUpdateController,
         WeightUpdateControllerConfig,
     )
@@ -599,7 +599,7 @@ def _run_megatron_awex_e2e(
         scheduling_spec=(
             SchedulingSpec(
                 gpu=1,
-                cmd="python -m areal.experimental.inference_service.guard",
+                cmd="python -m areal.v2.inference_service.guard",
             ),
         ),
         consumer_batch_size=8,
@@ -621,7 +621,7 @@ def _run_megatron_awex_e2e(
         scheduling_spec=(
             SchedulingSpec(
                 gpu=1,
-                cmd="python -m areal.experimental.training_service.guard",
+                cmd="python -m areal.v2.training_service.guard",
                 env_vars=dict(NCCL_CUMEM_ENABLE="0", NCCL_NVLS_ENABLE="0"),
             ),
         ),
@@ -923,13 +923,13 @@ def _run_megatron_colocate_e2e(
         SchedulingSpec,
         TrainEngineConfig,
     )
-    from areal.experimental.inference_service.controller.controller import (
+    from areal.v2.inference_service.controller.controller import (
         RolloutControllerV2,
     )
-    from areal.experimental.training_service.controller.controller import (
+    from areal.v2.training_service.controller.controller import (
         GatewayTrainController,
     )
-    from areal.experimental.weight_update.controller import (
+    from areal.v2.weight_update.controller import (
         WeightUpdateController,
         WeightUpdateControllerConfig,
     )
@@ -945,7 +945,7 @@ def _run_megatron_colocate_e2e(
         scheduling_spec=(
             SchedulingSpec(
                 gpu=1,
-                cmd="python -m areal.experimental.inference_service.guard",
+                cmd="python -m areal.v2.inference_service.guard",
             ),
         ),
         consumer_batch_size=8,
@@ -966,7 +966,7 @@ def _run_megatron_colocate_e2e(
         scheduling_spec=(
             SchedulingSpec(
                 gpu=1,
-                cmd="python -m areal.experimental.training_service.guard",
+                cmd="python -m areal.v2.training_service.guard",
                 env_vars=dict(NCCL_CUMEM_ENABLE="0", NCCL_NVLS_ENABLE="0"),
             ),
         ),
@@ -1093,13 +1093,13 @@ def test_awex_megatron_colocate_dp_multi_version_e2e(tmp_path_factory):
         SchedulingSpec,
         TrainEngineConfig,
     )
-    from areal.experimental.inference_service.controller.controller import (
+    from areal.v2.inference_service.controller.controller import (
         RolloutControllerV2,
     )
-    from areal.experimental.training_service.controller.controller import (
+    from areal.v2.training_service.controller.controller import (
         GatewayTrainController,
     )
-    from areal.experimental.weight_update.controller import (
+    from areal.v2.weight_update.controller import (
         WeightUpdateController,
         WeightUpdateControllerConfig,
     )
@@ -1115,7 +1115,7 @@ def test_awex_megatron_colocate_dp_multi_version_e2e(tmp_path_factory):
         scheduling_spec=(
             SchedulingSpec(
                 gpu=1,
-                cmd="python -m areal.experimental.inference_service.guard",
+                cmd="python -m areal.v2.inference_service.guard",
             ),
         ),
         consumer_batch_size=8,
@@ -1136,7 +1136,7 @@ def test_awex_megatron_colocate_dp_multi_version_e2e(tmp_path_factory):
         scheduling_spec=(
             SchedulingSpec(
                 gpu=1,
-                cmd="python -m areal.experimental.training_service.guard",
+                cmd="python -m areal.v2.training_service.guard",
                 env_vars=dict(NCCL_CUMEM_ENABLE="0", NCCL_NVLS_ENABLE="0"),
             ),
         ),

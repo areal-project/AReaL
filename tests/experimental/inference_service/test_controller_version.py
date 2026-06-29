@@ -9,7 +9,7 @@ import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from areal.api.cli_args import InferenceEngineConfig, SchedulingSpec
-from areal.experimental.inference_service.controller.controller import (
+from areal.v2.inference_service.controller.controller import (
     RolloutControllerV2,
 )
 

@@ -6,7 +6,7 @@ import json
 
 import pytest
 
-from areal.experimental.agent_service.protocol import (
+from areal.v2.agent_service.protocol import (
     EventFrame,
     FrameType,
     RequestFrame,

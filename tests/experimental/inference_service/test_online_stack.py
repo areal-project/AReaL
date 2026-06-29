@@ -13,21 +13,21 @@ import httpx
 import pytest
 import pytest_asyncio
 
-from areal.experimental.inference_service.data_proxy.app import (
+from areal.v2.inference_service.data_proxy.app import (
     create_app as create_dp_app,
 )
-from areal.experimental.inference_service.data_proxy.config import DataProxyConfig
-from areal.experimental.inference_service.data_proxy.session import SessionStore
-from areal.experimental.inference_service.gateway.app import create_app as create_gw_app
-from areal.experimental.inference_service.gateway.config import GatewayConfig
-from areal.experimental.inference_service.gateway.streaming import (
+from areal.v2.inference_service.data_proxy.config import DataProxyConfig
+from areal.v2.inference_service.data_proxy.session import SessionStore
+from areal.v2.inference_service.gateway.app import create_app as create_gw_app
+from areal.v2.inference_service.gateway.config import GatewayConfig
+from areal.v2.inference_service.gateway.streaming import (
     RouterKeyRejectedError,
     RouterUnreachableError,
 )
-from areal.experimental.inference_service.router.app import (
+from areal.v2.inference_service.router.app import (
     create_app as create_router_app,
 )
-from areal.experimental.inference_service.router.config import RouterConfig
+from areal.v2.inference_service.router.config import RouterConfig
 
 ADMIN_KEY = "areal-admin-key"
 DATA_PROXY_ADDR = "http://data-proxy"
@@ -88,10 +88,10 @@ def _make_mock_areal_client():
 
 @pytest_asyncio.fixture
 async def online_stack(monkeypatch):
-    import areal.experimental.inference_service.gateway.app as gateway_app_module
-    from areal.experimental.inference_service.data_proxy.pause import PauseState
-    from areal.experimental.inference_service.inf_bridge import InfBridge
-    from areal.experimental.inference_service.sglang.bridge import SGLangBridgeBackend
+    import areal.v2.inference_service.gateway.app as gateway_app_module
+    from areal.v2.inference_service.data_proxy.pause import PauseState
+    from areal.v2.inference_service.inf_bridge import InfBridge
+    from areal.v2.inference_service.sglang.bridge import SGLangBridgeBackend
 
     dp_config = DataProxyConfig(
         host="127.0.0.1",

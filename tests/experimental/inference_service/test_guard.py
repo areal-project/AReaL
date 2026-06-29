@@ -1,4 +1,4 @@
-"""Unit tests for RPCGuard Flask app (areal.experimental.inference_service.guard.app).
+"""Unit tests for RPCGuard Flask app (areal.v2.inference_service.guard.app).
 
 Tests all 4 endpoints (/health, /alloc_ports, /fork, /kill_forked_worker)
 and the cleanup_forked_children() function using Flask test client with
@@ -12,8 +12,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from areal.experimental.inference_service.guard import app as guard_module
-from areal.experimental.inference_service.guard.app import app, cleanup_forked_children
+from areal.v2.inference_service.guard import app as guard_module
+from areal.v2.inference_service.guard.app import app, cleanup_forked_children
 
 GUARD_APP = "areal.infra.rpc.guard.app"
 
@@ -133,7 +133,7 @@ class TestFork:
         raw = [
             "python",
             "-m",
-            "areal.experimental.inference_service.sglang.launch_server",
+            "areal.v2.inference_service.sglang.launch_server",
             "--model",
             "test-model",
         ]

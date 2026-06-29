@@ -169,10 +169,10 @@ def gateway_stack(sglang_server, model_path):
     gateway_addr = f"http://{bind_host}:{gateway_port}"
 
     # --- Create Data Proxy app ---
-    from areal.experimental.inference_service.data_proxy.app import (
+    from areal.v2.inference_service.data_proxy.app import (
         create_app as create_dp_app,
     )
-    from areal.experimental.inference_service.data_proxy.config import DataProxyConfig
+    from areal.v2.inference_service.data_proxy.config import DataProxyConfig
 
     dp_config = DataProxyConfig(
         host=bind_host,
@@ -185,10 +185,10 @@ def gateway_stack(sglang_server, model_path):
     dp_app = create_dp_app(dp_config)
 
     # --- Create Router app ---
-    from areal.experimental.inference_service.router.app import (
+    from areal.v2.inference_service.router.app import (
         create_app as create_router_app,
     )
-    from areal.experimental.inference_service.router.config import RouterConfig
+    from areal.v2.inference_service.router.config import RouterConfig
 
     router_config = RouterConfig(
         host=bind_host,
@@ -201,10 +201,10 @@ def gateway_stack(sglang_server, model_path):
     router_app = create_router_app(router_config)
 
     # --- Create Gateway app ---
-    from areal.experimental.inference_service.gateway.app import (
+    from areal.v2.inference_service.gateway.app import (
         create_app as create_gw_app,
     )
-    from areal.experimental.inference_service.gateway.config import GatewayConfig
+    from areal.v2.inference_service.gateway.config import GatewayConfig
 
     gw_config = GatewayConfig(
         host=bind_host,
@@ -798,18 +798,18 @@ class TestGatewayPauseContinue:
 @pytest.fixture(scope="module")
 def gateway_stack_vllm(vllm_server, model_path):
     """Launch the full gateway stack backed by vLLM on free ports."""
-    from areal.experimental.inference_service.data_proxy.app import (
+    from areal.v2.inference_service.data_proxy.app import (
         create_app as create_dp_app,
     )
-    from areal.experimental.inference_service.data_proxy.config import DataProxyConfig
-    from areal.experimental.inference_service.gateway.app import (
+    from areal.v2.inference_service.data_proxy.config import DataProxyConfig
+    from areal.v2.inference_service.gateway.app import (
         create_app as create_gw_app,
     )
-    from areal.experimental.inference_service.gateway.config import GatewayConfig
-    from areal.experimental.inference_service.router.app import (
+    from areal.v2.inference_service.gateway.config import GatewayConfig
+    from areal.v2.inference_service.router.app import (
         create_app as create_router_app,
     )
-    from areal.experimental.inference_service.router.config import RouterConfig
+    from areal.v2.inference_service.router.config import RouterConfig
 
     bind_host = "127.0.0.1"
     data_proxy_port = _find_free_port()

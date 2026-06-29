@@ -10,10 +10,10 @@ import pytest
 
 from areal.api.cli_args import GenerationHyperparameters
 from areal.api.io_struct import ModelRequest, ModelResponse, get_versioned_lora_name
-from areal.experimental.inference_service.data_proxy.pause import PauseState
-from areal.experimental.inference_service.inf_bridge import InfBridge
-from areal.experimental.inference_service.sglang.bridge import SGLangBridgeBackend
-from areal.experimental.inference_service.vllm.bridge import VLLMBridgeBackend
+from areal.v2.inference_service.data_proxy.pause import PauseState
+from areal.v2.inference_service.inf_bridge import InfBridge
+from areal.v2.inference_service.sglang.bridge import SGLangBridgeBackend
+from areal.v2.inference_service.vllm.bridge import VLLMBridgeBackend
 
 # =============================================================================
 # Helpers

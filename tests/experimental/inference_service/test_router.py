@@ -10,14 +10,14 @@ import httpx
 import pytest
 import pytest_asyncio
 
-from areal.experimental.inference_service.router.app import create_app
-from areal.experimental.inference_service.router.config import RouterConfig
-from areal.experimental.inference_service.router.state import (
+from areal.v2.inference_service.router.app import create_app
+from areal.v2.inference_service.router.config import RouterConfig
+from areal.v2.inference_service.router.state import (
     SessionRegistry,
     WorkerInfo,
     WorkerRegistry,
 )
-from areal.experimental.inference_service.router.strategies import (
+from areal.v2.inference_service.router.strategies import (
     RoundRobinStrategy,
     get_strategy,
 )

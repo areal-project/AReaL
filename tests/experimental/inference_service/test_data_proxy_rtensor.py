@@ -18,9 +18,9 @@ import pytest
 import pytest_asyncio
 import torch
 
-from areal.experimental.inference_service.data_proxy.app import create_app
-from areal.experimental.inference_service.data_proxy.config import DataProxyConfig
-from areal.experimental.inference_service.data_proxy.session import SessionStore
+from areal.v2.inference_service.data_proxy.app import create_app
+from areal.v2.inference_service.data_proxy.config import DataProxyConfig
+from areal.v2.inference_service.data_proxy.session import SessionStore
 from areal.infra.rpc import rtensor as rtensor_storage
 from areal.infra.rpc.serialization import deserialize_value, serialize_value
 
@@ -51,7 +51,7 @@ def config():
 
 @pytest_asyncio.fixture
 async def client(config):
-    from areal.experimental.inference_service.data_proxy.pause import PauseState
+    from areal.v2.inference_service.data_proxy.pause import PauseState
 
     app = create_app(config)
     pause_state = PauseState()

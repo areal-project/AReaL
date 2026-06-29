@@ -52,7 +52,7 @@ def sglang_server():
         [
             "python",
             "-m",
-            "areal.experimental.inference_service.sglang.launch_server",
+            "areal.v2.inference_service.sglang.launch_server",
             "--model-path",
             model_path,
             "--port",

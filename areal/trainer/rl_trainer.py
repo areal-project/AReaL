@@ -35,7 +35,7 @@ from areal.api.cli_args import (
     vLLMConfig,
 )
 from areal.engine import RemoteSGLangEngine, RemotevLLMEngine
-from areal.experimental.inference_service.controller.controller import (
+from areal.v2.inference_service.controller.controller import (
     RolloutControllerV2,
 )
 from areal.infra import (

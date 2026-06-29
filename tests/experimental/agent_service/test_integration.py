@@ -10,20 +10,20 @@ from unittest.mock import patch
 
 import pytest
 
-from areal.experimental.agent_service.auth import DEFAULT_ADMIN_API_KEY, admin_headers
-from areal.experimental.agent_service.data_proxy.app import create_data_proxy_app
-from areal.experimental.agent_service.data_proxy.config import DataProxyConfig
-from areal.experimental.agent_service.gateway.app import create_gateway_app
-from areal.experimental.agent_service.gateway.bridge import OpenResponsesBridge
-from areal.experimental.agent_service.gateway.config import GatewayConfig
-from areal.experimental.agent_service.router.app import create_router_app
-from areal.experimental.agent_service.router.config import RouterConfig
-from areal.experimental.agent_service.types import (
+from areal.v2.agent_service.auth import DEFAULT_ADMIN_API_KEY, admin_headers
+from areal.v2.agent_service.data_proxy.app import create_data_proxy_app
+from areal.v2.agent_service.data_proxy.config import DataProxyConfig
+from areal.v2.agent_service.gateway.app import create_gateway_app
+from areal.v2.agent_service.gateway.bridge import OpenResponsesBridge
+from areal.v2.agent_service.gateway.config import GatewayConfig
+from areal.v2.agent_service.router.app import create_router_app
+from areal.v2.agent_service.router.config import RouterConfig
+from areal.v2.agent_service.types import (
     AgentRequest,
     AgentResponse,
     EventEmitter,
 )
-from areal.experimental.agent_service.worker.app import create_worker_app
+from areal.v2.agent_service.worker.app import create_worker_app
 
 httpx = pytest.importorskip("httpx")
 
@@ -54,7 +54,7 @@ class _ToolAgent:
 
 def _make_worker_app(agent_cls):
     with patch(
-        "areal.experimental.agent_service.worker.app.import_from_string",
+        "areal.v2.agent_service.worker.app.import_from_string",
         return_value=agent_cls,
     ):
         return create_worker_app("mock.path")

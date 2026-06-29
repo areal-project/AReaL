@@ -5,7 +5,7 @@ import threading
 
 import pytest
 
-from areal.experimental.weight_update.gateway.kv_store import WeightMetaStore
+from areal.v2.weight_update.gateway.kv_store import WeightMetaStore
 
 
 @pytest.fixture()

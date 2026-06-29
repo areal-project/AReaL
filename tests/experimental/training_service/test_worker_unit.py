@@ -6,15 +6,15 @@ from unittest.mock import patch
 
 import pytest
 
-from areal.experimental.training_service.worker.config import TrainWorkerConfig
+from areal.v2.training_service.worker.config import TrainWorkerConfig
 from areal.infra.rpc.serialization import deserialize_value, serialize_value
 
-MODULE = "areal.experimental.training_service.worker.app"
+MODULE = "areal.v2.training_service.worker.app"
 
 
 @pytest.fixture(autouse=True)
 def reset_worker_state():
-    import areal.experimental.training_service.worker.app as worker_app
+    import areal.v2.training_service.worker.app as worker_app
 
     if worker_app._engine_work_queue is not None:
         worker_app._engine_work_queue.put(None)
@@ -41,7 +41,7 @@ def reset_worker_state():
 
 @pytest.fixture
 def client():
-    from areal.experimental.training_service.worker.app import create_app
+    from areal.v2.training_service.worker.app import create_app
 
     app = create_app(
         TrainWorkerConfig(

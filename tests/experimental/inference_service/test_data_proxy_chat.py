@@ -9,12 +9,12 @@ import httpx
 import pytest
 import pytest_asyncio
 
-from areal.experimental.inference_service.data_proxy.app import (
+from areal.v2.inference_service.data_proxy.app import (
     _flush_ready_trajectories,
     create_app,
 )
-from areal.experimental.inference_service.data_proxy.config import DataProxyConfig
-from areal.experimental.inference_service.data_proxy.session import (
+from areal.v2.inference_service.data_proxy.config import DataProxyConfig
+from areal.v2.inference_service.data_proxy.session import (
     SessionData,
     SessionStore,
 )
@@ -121,9 +121,9 @@ def mock_areal_client():
 @pytest_asyncio.fixture
 async def client(config, mock_tokenizer, mock_areal_client):
     """Create app with mocked deps and yield an httpx async client."""
-    from areal.experimental.inference_service.data_proxy.pause import PauseState
-    from areal.experimental.inference_service.inf_bridge import InfBridge
-    from areal.experimental.inference_service.sglang.bridge import SGLangBridgeBackend
+    from areal.v2.inference_service.data_proxy.pause import PauseState
+    from areal.v2.inference_service.inf_bridge import InfBridge
+    from areal.v2.inference_service.sglang.bridge import SGLangBridgeBackend
 
     app = create_app(config)
     # Bypass lifespan — inject mocks directly into app.state
@@ -608,7 +608,7 @@ async def test_set_reward_timeout_delays_readiness_and_direct_callback(
         return True
 
     monkeypatch.setattr(
-        "areal.experimental.inference_service.data_proxy.app._post_online_ready_callback",
+        "areal.v2.inference_service.data_proxy.app._post_online_ready_callback",
         _mock_post_callback,
     )
 

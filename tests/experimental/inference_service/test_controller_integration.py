@@ -341,7 +341,7 @@ def _make_gateway_controller_config(
                 gpu=0,
                 cpu=1,
                 mem=4,
-                cmd="python -m areal.experimental.inference_service.guard",
+                cmd="python -m areal.v2.inference_service.guard",
             ),
         ),
         consumer_batch_size=8,
@@ -367,7 +367,7 @@ def gateway_controller(sglang_server, model_path, tmp_path_factory):
     if not has_gpu():
         pytest.skip("GPU required")
 
-    from areal.experimental.inference_service.controller.controller import (
+    from areal.v2.inference_service.controller.controller import (
         RolloutControllerV2,
     )
 
@@ -410,7 +410,7 @@ def gateway_controller_full_init(request, model_path, tmp_path_factory):
     backend = request.param
 
     from areal.api.cli_args import InferenceEngineConfig, SchedulingSpec
-    from areal.experimental.inference_service.controller.controller import (
+    from areal.v2.inference_service.controller.controller import (
         RolloutControllerV2,
     )
 
@@ -420,7 +420,7 @@ def gateway_controller_full_init(request, model_path, tmp_path_factory):
         backend=f"{backend}:d1",
         scheduling_spec=(
             SchedulingSpec(
-                gpu=1, cmd="python -m areal.experimental.inference_service.guard"
+                gpu=1, cmd="python -m areal.v2.inference_service.guard"
             ),
         ),
         consumer_batch_size=8,
@@ -462,7 +462,7 @@ def gateway_controller_full_init_online(request, model_path, tmp_path_factory):
         InferenceEngineConfig,
         SchedulingSpec,
     )
-    from areal.experimental.inference_service.controller.controller import (
+    from areal.v2.inference_service.controller.controller import (
         RolloutControllerV2,
     )
 
@@ -476,7 +476,7 @@ def gateway_controller_full_init_online(request, model_path, tmp_path_factory):
         ),
         scheduling_spec=(
             SchedulingSpec(
-                gpu=1, cmd="python -m areal.experimental.inference_service.guard"
+                gpu=1, cmd="python -m areal.v2.inference_service.guard"
             ),
         ),
         consumer_batch_size=8,
@@ -520,7 +520,7 @@ def gateway_controller_full_init_with_reward_timeout(
         InferenceEngineConfig,
         SchedulingSpec,
     )
-    from areal.experimental.inference_service.controller.controller import (
+    from areal.v2.inference_service.controller.controller import (
         RolloutControllerV2,
     )
 
@@ -535,7 +535,7 @@ def gateway_controller_full_init_with_reward_timeout(
         ),
         scheduling_spec=(
             SchedulingSpec(
-                gpu=1, cmd="python -m areal.experimental.inference_service.guard"
+                gpu=1, cmd="python -m areal.v2.inference_service.guard"
             ),
         ),
         consumer_batch_size=8,
@@ -579,7 +579,7 @@ def gateway_controller_full_init_vlm(request, vlm_model_path, tmp_path_factory):
     backend = request.param
 
     from areal.api.cli_args import InferenceEngineConfig, SchedulingSpec
-    from areal.experimental.inference_service.controller.controller import (
+    from areal.v2.inference_service.controller.controller import (
         RolloutControllerV2,
     )
 
@@ -589,7 +589,7 @@ def gateway_controller_full_init_vlm(request, vlm_model_path, tmp_path_factory):
         backend=f"{backend}:d1",
         scheduling_spec=(
             SchedulingSpec(
-                gpu=1, cmd="python -m areal.experimental.inference_service.guard"
+                gpu=1, cmd="python -m areal.v2.inference_service.guard"
             ),
         ),
         consumer_batch_size=8,

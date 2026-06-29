@@ -6,11 +6,11 @@ import httpx
 import pytest
 
 from areal.api.cli_args import SchedulingSpec, TrainEngineConfig
-from areal.experimental.training_service.controller.controller import (
+from areal.v2.training_service.controller.controller import (
     GatewayTrainController,
 )
 
-MODULE = "areal.experimental.training_service.controller.controller"
+MODULE = "areal.v2.training_service.controller.controller"
 
 
 def _make_response(method: str, url: str, *, json=None) -> httpx.Response:

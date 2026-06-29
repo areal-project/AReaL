@@ -8,10 +8,10 @@ import httpx
 import pytest
 import pytest_asyncio
 
-from areal.experimental.inference_service.data_proxy.app import create_app
-from areal.experimental.inference_service.data_proxy.config import DataProxyConfig
-from areal.experimental.inference_service.data_proxy.pause import PauseState
-from areal.experimental.inference_service.data_proxy.session import SessionStore
+from areal.v2.inference_service.data_proxy.app import create_app
+from areal.v2.inference_service.data_proxy.config import DataProxyConfig
+from areal.v2.inference_service.data_proxy.pause import PauseState
+from areal.v2.inference_service.data_proxy.session import SessionStore
 
 # =============================================================================
 # Fixtures
@@ -99,8 +99,8 @@ def mock_areal_client():
 @pytest_asyncio.fixture
 async def app_client(config, mock_tokenizer, mock_areal_client):
     """Create an ASGI test client with all app.state attributes injected."""
-    from areal.experimental.inference_service.inf_bridge import InfBridge
-    from areal.experimental.inference_service.sglang.bridge import SGLangBridgeBackend
+    from areal.v2.inference_service.inf_bridge import InfBridge
+    from areal.v2.inference_service.sglang.bridge import SGLangBridgeBackend
 
     app = create_app(config)
 

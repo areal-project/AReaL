@@ -7,7 +7,7 @@ import torch
 
 from areal.api import TrainEngine
 from areal.api.cli_args import MicroBatchSpec, PPOActorConfig, RejectionSamplingConfig
-from areal.experimental.training_service.controller.controller import (
+from areal.v2.training_service.controller.controller import (
     GatewayTrainController,
 )
 from areal.infra import TrainController

@@ -8,11 +8,11 @@ import httpx
 import pytest
 import pytest_asyncio
 
-from areal.experimental.training_service.router.app import (
+from areal.v2.training_service.router.app import (
     _probe_model_health,
     create_app,
 )
-from areal.experimental.training_service.router.config import RouterConfig
+from areal.v2.training_service.router.config import RouterConfig
 
 ADMIN_KEY = "router-admin-key"
 

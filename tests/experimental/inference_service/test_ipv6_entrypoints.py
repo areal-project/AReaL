@@ -5,7 +5,7 @@ from unittest.mock import MagicMock, patch
 
 
 def test_data_proxy_main_formats_ipv6_serving_addr():
-    from areal.experimental.inference_service.data_proxy import (
+    from areal.v2.inference_service.data_proxy import (
         __main__ as data_proxy_main,
     )
 
@@ -45,7 +45,7 @@ def test_data_proxy_main_formats_ipv6_serving_addr():
 
 
 def test_guard_main_registers_ipv6_worker_addr():
-    from areal.experimental.inference_service.guard import __main__ as guard_main
+    from areal.v2.inference_service.guard import __main__ as guard_main
 
     args = argparse.Namespace(
         port=0,

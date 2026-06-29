@@ -27,10 +27,10 @@ upstream_paths:
 | -------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `areal/engine/sglang_remote.py`                                | HTTP-only (no Python imports). Sends requests to `/generate`, `/load_lora_adapter`, `/update_weights_from_disk`, `/update_weights_from_distributed`, `/init_weights_update_group`, `/pause_generation`, `/continue_generation`, `/health`, `/release_memory_occupation`, `/resume_memory_occupation`. Parses `meta_info`, `finish_reason`, `output_token_logprobs`, `routed_experts` from JSON responses.                                                                                                                   |
 | `areal/experimental/openai/tool_call_parser.py`                | `sglang.srt.entrypoints.openai.protocol.Function`, `sglang.srt.entrypoints.openai.protocol.Tool`, `sglang.srt.function_call.function_call_parser.FunctionCallParser`, `sglang.srt.parser.reasoning_parser.ReasoningParser`                                                                                                                                                                                                                                                                                                  |
-| `areal/experimental/inference_service/sglang/launch_server.py` | `sglang.srt.entrypoints.engine.Engine`, `sglang.srt.entrypoints.engine.init_tokenizer_manager`, `sglang.srt.entrypoints.http_server._execute_server_warmup`, `sglang.srt.entrypoints.http_server._setup_and_run_http_server`, `sglang.srt.entrypoints.http_server.app`, `sglang.srt.managers.detokenizer_manager.run_detokenizer_process`                                                                                                                                                                                   |
-| `areal/experimental/inference_service/sglang/scheduler.py`     | `sglang.srt.managers.scheduler.Scheduler`, `sglang.srt.managers.scheduler.configure_scheduler`, `sglang.srt.observability.trace.process_tracing_init`, `sglang.srt.observability.trace.trace_set_thread_info`, `sglang.srt.utils.get_bool_env_var`, `sglang.srt.utils.kill_itself_when_parent_died`, `sglang.srt.utils.set_gpu_proc_affinity`, `sglang.srt.utils.numa_utils.get_numa_node_if_available`, `sglang.srt.utils.numa_utils.numa_bind_to_node`, `sglang.srt.environ.envs`, `sglang.utils.get_exception_traceback` |
-| `areal/experimental/inference_service/sglang/rpc_proxy.py`     | `sglang.srt.managers.io_struct.RpcReqInput`, `sglang.srt.managers.io_struct.RpcReqOutput`, `sglang.srt.server_args.PortArgs`, `sglang.srt.utils.network.get_zmq_socket`                                                                                                                                                                                                                                                                                                                                                     |
-| `areal/experimental/inference_service/sglang/bridge.py`        | HTTP-only (same protocol as `sglang_remote.py`). `/generate` request/response, `/pause_generation`, `/continue_generation`, `/release_memory_occupation`, `/resume_memory_occupation`.                                                                                                                                                                                                                                                                                                                                      |
+| `areal/v2/inference_service/sglang/launch_server.py` | `sglang.srt.entrypoints.engine.Engine`, `sglang.srt.entrypoints.engine.init_tokenizer_manager`, `sglang.srt.entrypoints.http_server._execute_server_warmup`, `sglang.srt.entrypoints.http_server._setup_and_run_http_server`, `sglang.srt.entrypoints.http_server.app`, `sglang.srt.managers.detokenizer_manager.run_detokenizer_process`                                                                                                                                                                                   |
+| `areal/v2/inference_service/sglang/scheduler.py`     | `sglang.srt.managers.scheduler.Scheduler`, `sglang.srt.managers.scheduler.configure_scheduler`, `sglang.srt.observability.trace.process_tracing_init`, `sglang.srt.observability.trace.trace_set_thread_info`, `sglang.srt.utils.get_bool_env_var`, `sglang.srt.utils.kill_itself_when_parent_died`, `sglang.srt.utils.set_gpu_proc_affinity`, `sglang.srt.utils.numa_utils.get_numa_node_if_available`, `sglang.srt.utils.numa_utils.numa_bind_to_node`, `sglang.srt.environ.envs`, `sglang.utils.get_exception_traceback` |
+| `areal/v2/inference_service/sglang/rpc_proxy.py`     | `sglang.srt.managers.io_struct.RpcReqInput`, `sglang.srt.managers.io_struct.RpcReqOutput`, `sglang.srt.server_args.PortArgs`, `sglang.srt.utils.network.get_zmq_socket`                                                                                                                                                                                                                                                                                                                                                     |
+| `areal/v2/inference_service/sglang/bridge.py`        | HTTP-only (same protocol as `sglang_remote.py`). `/generate` request/response, `/pause_generation`, `/continue_generation`, `/release_memory_occupation`, `/resume_memory_occupation`.                                                                                                                                                                                                                                                                                                                                      |
 
 ### Secondary (model / infra layer)
 
@@ -42,8 +42,8 @@ upstream_paths:
 | `areal/infra/launcher/ray.py`                                   | `SGLangConfig` import + `to_structured_cfg`.                                                                                         |
 | `areal/infra/launcher/local.py`                                 | `SGLangConfig` import + `to_structured_cfg`.                                                                                         |
 | `areal/infra/launcher/slurm.py`                                 | `SGLangConfig` import + `to_structured_cfg`.                                                                                         |
-| `areal/experimental/inference_service/controller/controller.py` | `SGLangConfig` in gateway controller.                                                                                                |
-| `areal/experimental/inference_service/data_proxy/backend.py`    | HTTP protocol implementation for inference service proxy (SGLangBridgeBackend).                                                      |
+| `areal/v2/inference_service/controller/controller.py` | `SGLangConfig` in gateway controller.                                                                                                |
+| `areal/v2/inference_service/data_proxy/backend.py`    | HTTP protocol implementation for inference service proxy (SGLangBridgeBackend).                                                      |
 
 ### Tertiary (tests, config)
 
@@ -415,7 +415,7 @@ ______________________________________________________________________
 
 **Source:** `python/sglang/srt/entrypoints/engine.py`
 
-Called in `areal/experimental/inference_service/sglang/launch_server.py`
+Called in `areal/v2/inference_service/sglang/launch_server.py`
 (`areal_launch_server`):
 
 ```python
@@ -447,7 +447,7 @@ ______________________________________________________________________
 
 **Source:** `python/sglang/srt/entrypoints/http_server.py`
 
-Called in `areal/experimental/inference_service/sglang/launch_server.py`
+Called in `areal/v2/inference_service/sglang/launch_server.py`
 (`areal_launch_server`):
 
 ```python
@@ -478,7 +478,7 @@ ______________________________________________________________________
 
 **Source:** `python/sglang/srt/managers/scheduler.py`
 
-Called in `areal/experimental/inference_service/sglang/scheduler.py`
+Called in `areal/v2/inference_service/sglang/scheduler.py`
 (`areal_run_scheduler_process`):
 
 ```python
@@ -510,7 +510,7 @@ ______________________________________________________________________
 
 **Source:** `python/sglang/srt/managers/io_struct.py`
 
-Used in `areal/experimental/inference_service/sglang/rpc_proxy.py`:
+Used in `areal/v2/inference_service/sglang/rpc_proxy.py`:
 
 ```python
 from sglang.srt.managers.io_struct import RpcReqInput, RpcReqOutput

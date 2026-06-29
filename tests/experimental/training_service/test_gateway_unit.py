@@ -8,16 +8,16 @@ import httpx
 import pytest
 import pytest_asyncio
 
-from areal.experimental.training_service.gateway.app import create_app
-from areal.experimental.training_service.gateway.config import GatewayConfig
-from areal.experimental.training_service.gateway.streaming import (
+from areal.v2.training_service.gateway.app import create_app
+from areal.v2.training_service.gateway.config import GatewayConfig
+from areal.v2.training_service.gateway.streaming import (
     RouterKeyRejectedError,
     RouterUnreachableError,
     forward_request,
     query_router,
 )
 
-MODULE = "areal.experimental.training_service.gateway.app"
+MODULE = "areal.v2.training_service.gateway.app"
 ADMIN_KEY = "test-admin-key"
 SESSION_KEY = "session-key"
 WORKER_ADDR = "http://mock-worker:18082"

@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import pytest
 
-from areal.experimental.agent_service.auth import DEFAULT_ADMIN_API_KEY, admin_headers
-from areal.experimental.agent_service.router.app import create_router_app
-from areal.experimental.agent_service.router.config import RouterConfig
+from areal.v2.agent_service.auth import DEFAULT_ADMIN_API_KEY, admin_headers
+from areal.v2.agent_service.router.app import create_router_app
+from areal.v2.agent_service.router.config import RouterConfig
 
 httpx = pytest.importorskip("httpx")
 

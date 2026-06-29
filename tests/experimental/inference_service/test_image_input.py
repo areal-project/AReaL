@@ -19,10 +19,10 @@ from PIL import Image
 
 from areal.api.cli_args import GenerationHyperparameters
 from areal.api.io_struct import ModelRequest
-from areal.experimental.inference_service.data_proxy.pause import PauseState
-from areal.experimental.inference_service.inf_bridge import InfBridge
-from areal.experimental.inference_service.sglang.bridge import SGLangBridgeBackend
-from areal.experimental.inference_service.vllm.bridge import VLLMBridgeBackend
+from areal.v2.inference_service.data_proxy.pause import PauseState
+from areal.v2.inference_service.inf_bridge import InfBridge
+from areal.v2.inference_service.sglang.bridge import SGLangBridgeBackend
+from areal.v2.inference_service.vllm.bridge import VLLMBridgeBackend
 from areal.experimental.openai.client import (
     _build_messages_list,
     _extract_images_from_messages,
@@ -663,9 +663,9 @@ def _make_mock_areal_client_for_images():
 @pytest_asyncio.fixture
 async def image_test_client():
     """Data proxy test client wired with an image-capturing mock."""
-    from areal.experimental.inference_service.data_proxy.app import create_app
-    from areal.experimental.inference_service.data_proxy.config import DataProxyConfig
-    from areal.experimental.inference_service.data_proxy.session import SessionStore
+    from areal.v2.inference_service.data_proxy.app import create_app
+    from areal.v2.inference_service.data_proxy.config import DataProxyConfig
+    from areal.v2.inference_service.data_proxy.session import SessionStore
 
     config = DataProxyConfig(
         host="127.0.0.1",

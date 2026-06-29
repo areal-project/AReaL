@@ -5,7 +5,7 @@ from typing import Any
 import torch
 
 from areal.api import TrainEngine
-from areal.experimental.training_service.controller.controller import (
+from areal.v2.training_service.controller.controller import (
     GatewayTrainController,
 )
 from areal.infra import TrainController

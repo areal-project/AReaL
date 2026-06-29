@@ -56,7 +56,7 @@ rollout:
       gpu: 1
       cpu: 2
       mem: 16
-      cmd: python3 -m areal.experimental.inference_service.guard
+      cmd: python3 -m areal.v2.inference_service.guard
       env_vars:
         AREAL_PROXY_WARN_ONCE: "1"
 

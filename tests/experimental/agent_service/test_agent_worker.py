@@ -6,13 +6,13 @@ from unittest.mock import patch
 
 import pytest
 
-from areal.experimental.agent_service.types import (
+from areal.v2.agent_service.types import (
     AgentRequest,
     AgentResponse,
     AgentRunnable,
     EventEmitter,
 )
-from areal.experimental.agent_service.worker.app import (
+from areal.v2.agent_service.worker.app import (
     _CollectingEmitter,
     create_worker_app,
 )
@@ -50,7 +50,7 @@ class _FailAgent:
 
 def _make_client(agent_cls):
     with patch(
-        "areal.experimental.agent_service.worker.app.import_from_string",
+        "areal.v2.agent_service.worker.app.import_from_string",
         return_value=agent_cls,
     ):
         app = create_worker_app("mock.path")

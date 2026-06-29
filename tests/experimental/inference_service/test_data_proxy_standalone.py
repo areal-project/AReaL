@@ -13,9 +13,9 @@ import httpx
 import pytest
 import pytest_asyncio
 
-from areal.experimental.inference_service.data_proxy.app import create_app
-from areal.experimental.inference_service.data_proxy.config import DataProxyConfig
-from areal.experimental.inference_service.data_proxy.session import SessionStore
+from areal.v2.inference_service.data_proxy.app import create_app
+from areal.v2.inference_service.data_proxy.config import DataProxyConfig
+from areal.v2.inference_service.data_proxy.session import SessionStore
 
 # =============================================================================
 # Fixtures
@@ -85,9 +85,9 @@ def mock_areal_client():
 @pytest_asyncio.fixture
 async def client(config, mock_tokenizer, mock_areal_client):
     """Create app with mocked deps and yield an httpx async client (no auth header)."""
-    from areal.experimental.inference_service.data_proxy.pause import PauseState
-    from areal.experimental.inference_service.inf_bridge import InfBridge
-    from areal.experimental.inference_service.sglang.bridge import SGLangBridgeBackend
+    from areal.v2.inference_service.data_proxy.pause import PauseState
+    from areal.v2.inference_service.inf_bridge import InfBridge
+    from areal.v2.inference_service.sglang.bridge import SGLangBridgeBackend
 
     app = create_app(config)
     pause_state = PauseState()
@@ -123,11 +123,11 @@ def admin_headers():
 class TestStandaloneChat:
     def test_config_can_select_vllm_backend(self):
         """backend_type=vllm creates a vLLM-backed InfBridge."""
-        from areal.experimental.inference_service.data_proxy.app import (
+        from areal.v2.inference_service.data_proxy.app import (
             _create_inf_bridge,
         )
-        from areal.experimental.inference_service.data_proxy.pause import PauseState
-        from areal.experimental.inference_service.vllm.bridge import VLLMBridgeBackend
+        from areal.v2.inference_service.data_proxy.pause import PauseState
+        from areal.v2.inference_service.vllm.bridge import VLLMBridgeBackend
 
         config = DataProxyConfig(
             host="127.0.0.1",

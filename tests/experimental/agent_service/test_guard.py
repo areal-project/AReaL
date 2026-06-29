@@ -13,8 +13,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from areal.experimental.agent_service.guard import app as guard_module
-from areal.experimental.agent_service.guard.app import app
+from areal.v2.agent_service.guard import app as guard_module
+from areal.v2.agent_service.guard.app import app
 
 GUARD_APP = "areal.infra.rpc.guard.app"
 

@@ -16,9 +16,9 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from areal.api.cli_args import AgentConfig, SchedulingSpec
-from areal.experimental.agent_service.controller.controller import AgentController
+from areal.v2.agent_service.controller.controller import AgentController
 
-CTRL = "areal.experimental.agent_service.controller.controller"
+CTRL = "areal.v2.agent_service.controller.controller"
 
 
 @dataclass
@@ -172,7 +172,7 @@ class TestInitialize:
         assert job.tasks[0].env_vars == {"ANTHROPIC_API_KEY": "test-anthropic-key"}
         assert (
             job.tasks[0].cmd
-            == f"{sys.executable} -m areal.experimental.agent_service.guard"
+            == f"{sys.executable} -m areal.v2.agent_service.guard"
         )
         assert all(
             payload.get("env") == {"ANTHROPIC_API_KEY": "test-anthropic-key"}

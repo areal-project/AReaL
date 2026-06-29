@@ -12,7 +12,7 @@ from tests.experimental.weight_update.torchrun.dist_utils import (
     write_result,
 )
 
-from areal.experimental.weight_update.nccl_group import (
+from areal.v2.weight_update.nccl_group import (
     init_weights_update_group,
     setup_batch_isend_irecv,
 )

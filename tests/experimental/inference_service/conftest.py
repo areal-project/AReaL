@@ -3,7 +3,7 @@
 The top-level ``areal/__init__.py`` imports from modules that use PEP 695 syntax
 (``def func[T](...)``) which is only valid on Python 3.12+. When running tests on
 Python 3.10/3.11 we register lightweight stubs for the ``areal`` namespace packages
-so that importing ``areal.experimental.inference_service.data_proxy.*`` never triggers the
+so that importing ``areal.v2.inference_service.data_proxy.*`` never triggers the
 problematic top-level init.
 """
 
@@ -21,7 +21,7 @@ _STUB_PACKAGES = [
     ("areal", os.path.join(_REPO_ROOT, "areal")),
     ("areal.experimental", os.path.join(_REPO_ROOT, "areal", "experimental")),
     (
-        "areal.experimental.inference_service",
+        "areal.v2.inference_service",
         os.path.join(_REPO_ROOT, "areal", "experimental", "inference_service"),
     ),
 ]

@@ -7,7 +7,7 @@ import pytest
 
 from areal.api.cli_args import RecoverConfig
 from areal.api.io_struct import FinetuneSpec, StepInfo
-from areal.experimental.training_service.controller.controller import (
+from areal.v2.training_service.controller.controller import (
     GatewayTrainController,
 )
 from areal.utils.recover import RecoverHandler, check_if_auto_recover, check_if_recover
