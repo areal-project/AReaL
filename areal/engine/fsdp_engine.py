@@ -83,7 +83,11 @@ from areal.engine.fsdp_utils import (
 )
 from areal.engine.fsdp_utils.checkpoint import DCPState
 from areal.engine.fsdp_utils.grad import fsdp2_clip_grad_norm
-from areal.engine.fsdp_utils.optimizer import AnyPrecisionAdamW, PerLayerOptimWrapper
+from areal.engine.fsdp_utils.muon import Muon as MuonOptimizer
+from areal.engine.fsdp_utils.optimizer import (
+    AnyPrecisionAdamW,
+    PerLayerOptimWrapper,
+)
 from areal.engine.fsdp_utils.parallel import ParallelHelper, parallelize_model
 from areal.infra.dist_rollout import DistRolloutCoordinator
 from areal.infra.platforms import current_platform
@@ -470,7 +474,7 @@ class FSDPEngine(TrainEngine):
         self._create_optimizer(ft_spec)
 
         if self.config.fsdp.per_layer_optim_step:
-            if self.optimizer_config.type != "adam":
+            if self.optimizer_config.type not in ("adam",):
                 raise ValueError(
                     f"per_layer_optim_step only supports 'adam' optimizer, got '{self.optimizer_config.type}'."
                 )
@@ -1130,7 +1134,8 @@ class FSDPEngine(TrainEngine):
             "adam",
             "adam_bf16",
             "sgd",
-        ], "Only adam/adam_bf16/sgd optimizer is supported in this engine."
+            "muon",
+        ], "Only adam/adam_bf16/sgd/muon optimizer is supported in this engine."
         if self.optimizer_config.type == "sgd":
             self.logger.warning(
                 "Using SGD with FSDP may be less stable. Consider using "
@@ -1164,7 +1169,44 @@ class FSDPEngine(TrainEngine):
         beta1 = self.optimizer_config.beta1
         beta2 = self.optimizer_config.beta2
         eps = self.optimizer_config.eps
-        if self.optimizer_config.type == "adam":
+        if self.optimizer_config.type == "muon":
+            muon_params: list[torch.nn.Parameter] = []
+            backend_params: list[torch.nn.Parameter] = []
+            for p in self.model.parameters():
+                if not p.requires_grad:
+                    continue
+                if p.ndim >= 2:
+                    muon_params.append(p)
+                else:
+                    backend_params.append(p)
+            self.optimizer = MuonOptimizer(
+                [
+                    dict(
+                        params=muon_params,
+                        lr=lr,
+                        momentum=self.optimizer_config.muon_momentum,
+                        weight_decay=weight_decay,
+                        scale_mode=self.optimizer_config.muon_scale_mode,
+                        extra_scale_factor=self.optimizer_config.muon_extra_scale_factor,
+                        nesterov=self.optimizer_config.muon_use_nesterov,
+                        ns_steps=self.optimizer_config.muon_num_ns_steps,
+                        use_muon=True,
+                    ),
+                    dict(
+                        params=backend_params,
+                        lr=lr,
+                        betas=(beta1, beta2),
+                        eps=eps,
+                        weight_decay=weight_decay,
+                        use_muon=False,
+                    ),
+                ]
+            )
+            self.logger.info(
+                f"Muon optimizer: {len(muon_params)} params (>=2D), "
+                f"AdamW backend: {len(backend_params)} params (<2D)"
+            )
+        elif self.optimizer_config.type == "adam":
             self.optimizer = torch.optim.AdamW(
                 self.model.parameters(),
                 lr=lr,
