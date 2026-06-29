@@ -48,6 +48,63 @@ def apply_chat_template(
 
 
 @lru_cache(maxsize=8)
+def get_eos_token_ids(model_name_or_path: str) -> tuple[int, ...]:
+    """Union of EOS ids from model config and generation_config.
+
+    Multi-EOS models (e.g. Gemma 4 [1, 106, 50]) need this because
+    tokenizer.eos_token_id only exposes a single int.
+    """
+    eos: set[int] = set()
+
+    def _absorb(value: Any) -> None:
+        if isinstance(value, int):
+            eos.add(value)
+        elif isinstance(value, (list, tuple)):
+            eos.update(x for x in value if isinstance(x, int))
+
+    # Best effort: any failure falls back to the tokenizer's eos/pad ids.
+    # Catch-all (not just OSError) so malformed repo ids, gated/offline hub
+    # repos, or trust_remote_code errors degrade gracefully instead of
+    # crashing the generation path. The resolved set is lru_cached per path.
+    try:
+        _absorb(
+            transformers.GenerationConfig.from_pretrained(
+                model_name_or_path
+            ).eos_token_id
+        )
+    except Exception as e:
+        logger.debug(
+            f"Could not read eos_token_id from generation_config of "
+            f"{model_name_or_path!r}; falling back to tokenizer eos/pad. ({e!r})"
+        )
+    try:
+        cfg = transformers.AutoConfig.from_pretrained(
+            model_name_or_path, trust_remote_code=True
+        )
+        _absorb(getattr(cfg, "eos_token_id", None))
+        _absorb(getattr(getattr(cfg, "text_config", None), "eos_token_id", None))
+    except Exception as e:
+        logger.debug(
+            f"Could not read eos_token_id from model config of "
+            f"{model_name_or_path!r}; falling back to tokenizer eos/pad. ({e!r})"
+        )
+    return tuple(sorted(eos))
+
+
+def resolve_stop_token_ids(
+    tokenizer: transformers.PreTrainedTokenizerBase | None,
+) -> list[int] | None:
+    """Full EOS list for a tokenizer's source model, or None if unresolvable."""
+    if tokenizer is None:
+        return None
+    path = getattr(tokenizer, "name_or_path", None)
+    if not path:
+        return None
+    ids = get_eos_token_ids(path)
+    return list(ids) if ids else None
+
+
+@lru_cache(maxsize=8)
 def load_hf_tokenizer(
     model_name_or_path: str,
     fast_tokenizer=True,
