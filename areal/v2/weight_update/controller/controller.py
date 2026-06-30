@@ -112,6 +112,7 @@ class WeightUpdateController:
         save_path: str = "",
         use_lora: bool = False,
         lora_name: str = "",
+        lora_keep_versions: int = 0,
         colocate: bool = False,
         nccl_master_addr: str = "",
         nccl_master_port: int = 0,
@@ -125,6 +126,7 @@ class WeightUpdateController:
             "save_path": save_path,
             "use_lora": use_lora,
             "lora_name": lora_name,
+            "lora_keep_versions": lora_keep_versions,
             "colocate": colocate,
             "nccl_master_addr": nccl_master_addr,
             "nccl_master_port": nccl_master_port,
@@ -136,7 +138,11 @@ class WeightUpdateController:
         )
         resp.raise_for_status()
         logger.info(
-            "Connected pair '%s' (mode=%s, colocate=%s)", pair_name, mode, colocate
+            "Connected pair '%s' (mode=%s, colocate=%s, use_lora=%s)",
+            pair_name,
+            mode,
+            colocate,
+            use_lora,
         )
 
     def update_weights(self, version: int) -> WeightUpdateResult:

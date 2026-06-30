@@ -323,18 +323,30 @@ class PPOTrainer:
         # Proxy worker initialization (lazy, for AgentWorkflow support)
         self._proxy_started = False
 
-        # Prepare weight update meta and connect to inference engine
+        # Prepare weight update meta and connect to inference engine.
+        # v2 controllers pick transport from use_lora: LoRA must go through
+        # disk (P2P transports cannot carry PEFT-wrapped tensors); non-LoRA
+        # uses awex. v1 keeps the legacy weight_update_mode dispatch.
         if self.config.actor._version == "v2":
-            awex_kwargs: dict[str, Any] = {}
             if config.actor.use_lora:
-                awex_kwargs.update(
-                    {
-                        "use_lora": config.actor.use_lora,
-                        "lora_name": config.gconfig.lora_name,
-                        "base_model_name": config.actor.path,
-                    }
-                )
-            self.weight_update_meta = WeightUpdateMeta.from_awex(**awex_kwargs)
+                disk_kwargs: dict[str, Any] = {
+                    "experiment_name": config.experiment_name,
+                    "trial_name": config.trial_name,
+                    "file_root": config.cluster.fileroot,
+                    "name": "default",
+                    "clear_checkpoint_after_load": True,
+                    "use_lora": config.actor.use_lora,
+                    "lora_name": config.gconfig.lora_name,
+                    "base_model_name": config.actor.path,
+                    # Keep enough recent adapter versions for off-policy
+                    # rollouts (max_head_offpolicyness) plus a safety margin;
+                    # older versions are unloaded to bound sglang VRAM and
+                    # avoid the adapter-accumulation hang.
+                    "lora_keep_versions": config.rollout.max_head_offpolicyness + 2,
+                }
+                self.weight_update_meta = WeightUpdateMeta.from_disk(**disk_kwargs)
+            else:
+                self.weight_update_meta = WeightUpdateMeta.from_awex()
         elif self.config.actor.weight_update_mode == "disk":
             disk_kwargs = {
                 "experiment_name": config.experiment_name,
@@ -358,7 +370,7 @@ class PPOTrainer:
                 )
             self.weight_update_meta = WeightUpdateMeta.from_disk(**disk_kwargs)
         elif self.config.actor.weight_update_mode == "xccl":
-            # NCCL/XCCL weight update
+            # NCCL/XCCL weight update (v1 only)
             xccl_kwargs: dict[str, Any] = {
                 "gen_allocation": self.rollout_alloc,
             }
