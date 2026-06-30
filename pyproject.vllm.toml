@@ -200,7 +200,7 @@ cli = [
 ]
 
 [project.scripts]
-areal = "areal.experimental.cli.cli:cli"
+areal = "areal.v2.cli.main:cli"
 
 [project.urls]
 "Homepage" = "https://github.com/areal-project/AReaL"

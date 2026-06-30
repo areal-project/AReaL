@@ -181,7 +181,7 @@ class RecoverHandler:
         | TrainController
         | dict[str, TrainEngine | TrainController],
     ) -> bool:
-        from areal.experimental.training_service.controller.controller import (
+        from areal.v2.training_service.controller.controller import (
             GatewayTrainController,
         )
 
