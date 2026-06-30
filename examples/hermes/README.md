@@ -100,17 +100,10 @@ keys); CLI flags override it. The explicit form below just documents those defau
 ```bash
 uv run python3 examples/hermes/train.py \
     --config examples/hermes/config.yaml \
-    actor.backend=megatron:d1 \
     actor.path=/path/to/your_model \
     actor.admin_api_key=sk-123456 \
     rollout.admin_api_key=sk-123456
 ```
-
-> Since these are defaults, the minimal command is just:
->
-> ```bash
-> uv run python3 examples/hermes/train.py --config examples/hermes/config.yaml
-> ```
 
 Note this address from the logs — it is your `<inf-gateway>` below:
 
@@ -134,10 +127,6 @@ self-evolution fields are supplied per turn (Step 4), the inference gateway upst
 takes over.
 
 ```bash
-export HERMES_UPSTREAM_BASE_URL="https://your-llm/v1"
-export HERMES_UPSTREAM_API_KEY="sk-..."
-export HERMES_UPSTREAM_MODEL="your-model"
-
 areal agent run \
     --service default \
     --agent examples.hermes.hermes.HermesAgent \
@@ -149,10 +138,6 @@ Note the printed `<agent-gateway>` address.
 
 ### Step 3 — Start a session on the inference gateway
 
-```bash
-python examples/hermes/start_session.py http://<inf-gateway> --admin-key sk-123456
-```
-
 Copy the printed `sk-sess-*` key — forward it to the agent (Step 4) and score the
 episode with it (Step 5). To reuse the key for the next episode (auto-ends and exports
 the previous one):
@@ -161,24 +146,36 @@ the previous one):
 python examples/hermes/start_session.py http://<inf-gateway> --admin-key sk-123456
 ```
 
+These are **your own upstream LLM credentials** (the agent's fallback chat backend),
+**not** the `sk-sess-*` key returned above — fill in your provider's values:
+
+```bash
+export HERMES_UPSTREAM_BASE_URL="https://your-llm/v1"
+export HERMES_UPSTREAM_API_KEY="your-upstream-api-key"
+export HERMES_UPSTREAM_MODEL="your-model"
+```
+
 ### Step 4 — Interact (produces a trajectory)
 
 Forward the inference-routing flags so the agent's LLM calls flow through the inference
 gateway under your session key and get captured. You **must** actually interact, or the
-episode has no data.
+episode has no data. `<your session-api-key>` is the `sk-sess-*` key returned by
+`start_session.py` in Step 3.
 
 ```bash
 python examples/hermes/hermes_loop.py http://<agent-gateway> \
     --admin-api-key sk-123456 \
     --inf-base-url http://<inf-gateway> \
-    --session-api-key sk-sess-123456
+    --session-api-key <your session-api-key>
 ```
 
 ### Step 5 — Score the episode
 
+Use the same `sk-sess-*` key from Step 3 as `--api-key`:
+
 ```bash
 python examples/hermes/set_reward.py http://<inf-gateway> \
-    --api-key sk-sess-123456 --reward 1.0
+    --api-key <your session-api-key> --reward 1.0
 ```
 
 Keep the reward in **\[-1, 1\]** for training stability.
