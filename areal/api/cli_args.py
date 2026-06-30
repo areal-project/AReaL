@@ -3006,6 +3006,13 @@ class TeacherConfig:
         metadata={"help": "Distillation loss weight"},
     )
 
+    cross_tokenizer: bool = field(
+        default=False,
+        metadata={
+            "help": "Enable cross-tokenizer distillation by retokenizing student rollouts with the teacher tokenizer and aligning teacher log-probs back to student tokens."
+        },
+    )
+
     def __post_init__(self):
         if self.rollout is not None and self.train is not None:
             warnings.warn(
@@ -3021,6 +3028,11 @@ class TeacherConfig:
             raise ValueError(
                 "teacher.train must be provided when teacher.engine_type='train'."
             )
+        if self.cross_tokenizer:
+            if self.engine_type == "train":
+                raise ValueError(
+                    "cross_tokenizer distillation is only supported with engine_type='rollout'."
+                )
 
 
 @dataclass

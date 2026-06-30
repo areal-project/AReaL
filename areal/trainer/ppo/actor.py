@@ -24,6 +24,7 @@ from areal.utils.constants import (
     PROX_LOGP_METHOD_RECOMPUTE,
     ProxLogpMethod,
 )
+from areal.utils.cross_tokenizer_distill import replace_unaligned_teacher_logps
 from areal.utils.data import (
     KLEstimator,
     Normalization,
@@ -515,6 +516,7 @@ def grpo_loss_fn(
         teacher_logp = (
             teacher_logp.detach()
         )  # detach to prevent gradient backprop to teacher
+        teacher_logp = replace_unaligned_teacher_logps(teacher_logp, logprobs)
 
         if rl_loss_weight == 0:
             # Pure KD using reverse KL (importance-sampling)

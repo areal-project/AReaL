@@ -665,6 +665,9 @@ class PPOTrainer:
                         args={"global_step": global_step},
                     ),
                 ):
+                    if self.config.teacher.cross_tokenizer:
+                        for traj in rollout_batch:
+                            traj["student_tokenizer_path"] = self.config.tokenizer_path
                     teacher_logps = self.teacher.compute_logp(rollout_batch)
                     for traj, logp in zip(rollout_batch, teacher_logps):
                         traj["teacher_logp"] = logp
