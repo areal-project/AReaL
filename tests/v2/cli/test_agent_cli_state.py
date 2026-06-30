@@ -46,9 +46,7 @@ def test_config_maps_toml_sections_to_click_defaults(tmp_path, monkeypatch):
     config_dir = tmp_path / "home" / "agent"
     config_dir.mkdir(parents=True)
     (config_dir / "config.toml").write_text(
-        "[default]\nadmin_api_key = 'base'\n"
-        "[inference]\naddr = 'http://base'\n"
-        "[run]\nagent = 'pkg.Agent'\n"
+        "[default]\nadmin_api_key = 'base'\n[run]\nagent = 'pkg.Agent'\nnum_pairs = 4\n"
     )
     extra = tmp_path / "extra.toml"
     extra.write_text("[default]\nadmin_api_key = 'override'\n")
@@ -56,5 +54,5 @@ def test_config_maps_toml_sections_to_click_defaults(tmp_path, monkeypatch):
     default_map = load_click_default_map(extra=extra)
 
     assert default_map["run"]["admin_api_key"] == "override"
-    assert default_map["run"]["inf_addr"] == "http://base"
     assert default_map["run"]["agent"] == "pkg.Agent"
+    assert default_map["run"]["num_pairs"] == 4

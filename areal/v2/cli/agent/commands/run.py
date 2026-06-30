@@ -30,9 +30,6 @@ logger = register_cli_logger("AgentCli")
     default="info",
     show_default=True,
 )
-@click.option("--inf-addr", default="", help="Optional inference service base URL.")
-@click.option("--inf-api-key", default="", help="Inference admin API key.")
-@click.option("--inf-model", default="", help="Inference model name.")
 @click.option("--force", is_flag=True, help="Replace stale or running service state.")
 def run_cmd(**opts) -> None:
     raise SystemExit(do_run(**opts) or 0)
@@ -49,9 +46,6 @@ def do_run(
     drain_timeout: float,
     session_timeout: float,
     log_level: str,
-    inf_addr: str,
-    inf_api_key: str,
-    inf_model: str,
     force: bool,
 ) -> int:
     if not agent:
@@ -74,9 +68,6 @@ def do_run(
             health_poll_interval=health_poll_interval,
             drain_timeout=drain_timeout,
             log_level=log_level,
-            inf_addr=inf_addr,
-            inf_api_key=inf_api_key,
-            inf_model=inf_model,
         )
         launched.save()
     except (ServiceHTTPError, ServiceUnreachable, RuntimeError, ValueError) as exc:

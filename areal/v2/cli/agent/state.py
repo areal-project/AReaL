@@ -51,9 +51,6 @@ class ServiceState(ServiceStateBase):
     gateway: ProcessState
     router: ProcessState
     pairs: list[PairState]
-    inf_addr: str = ""
-    inf_api_key: str = ""
-    inf_model: str = ""
     session_timeout: float = 1800.0
     health_poll_interval: float = 5.0
     drain_timeout: float = 30.0
@@ -82,6 +79,8 @@ class ServiceState(ServiceStateBase):
         if "created_at" in raw and "started_at" not in raw:
             raw["started_at"] = raw.pop("created_at")
         raw.pop("created_at", None)
+        for legacy in ("inf_addr", "inf_api_key", "inf_model"):
+            raw.pop(legacy, None)
         return cls(**raw)
 
     @classmethod

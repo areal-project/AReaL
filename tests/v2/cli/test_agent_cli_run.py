@@ -50,9 +50,6 @@ def test_run_persists_service_state(tmp_path, monkeypatch):
                     ),
                 )
             ],
-            inf_addr=kwargs["inf_addr"],
-            inf_api_key=kwargs["inf_api_key"],
-            inf_model=kwargs["inf_model"],
             session_timeout=kwargs["session_timeout"],
             health_poll_interval=kwargs["health_poll_interval"],
             drain_timeout=kwargs["drain_timeout"],
@@ -71,9 +68,6 @@ def test_run_persists_service_state(tmp_path, monkeypatch):
         session_timeout=60.0,
         log_level="info",
         force=False,
-        inf_addr="http://inf",
-        inf_api_key="inf-admin",
-        inf_model="model",
     )
 
     assert rc == 0

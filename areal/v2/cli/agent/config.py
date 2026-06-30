@@ -19,9 +19,6 @@ AGENT_BINDINGS: BindingMap = {
     ("run", "health_poll_interval"): ("run", "health_poll_interval"),
     ("run", "drain_timeout"): ("run", "drain_timeout"),
     ("run", "session_timeout"): ("run", "session_timeout"),
-    ("inference", "addr"): ("run", "inf_addr"),
-    ("inference", "api_key"): ("run", "inf_api_key"),
-    ("inference", "model"): ("run", "inf_model"),
 }
 
 

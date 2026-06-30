@@ -28,9 +28,6 @@ def launch_agent_stack(
     health_poll_interval: float,
     drain_timeout: float,
     log_level: str,
-    inf_addr: str,
-    inf_api_key: str,
-    inf_model: str,
 ) -> ServiceState:
     log_dir = store.logs_dir(service)
 
@@ -100,9 +97,6 @@ def launch_agent_stack(
             log_file=str(router_log),
         ),
         pairs=pairs,
-        inf_addr=inf_addr,
-        inf_api_key=inf_api_key,
-        inf_model=inf_model,
         session_timeout=session_timeout,
         health_poll_interval=health_poll_interval,
         drain_timeout=drain_timeout,

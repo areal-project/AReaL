@@ -39,38 +39,13 @@ Minimum launch — a single (worker, proxy) pair:
 ```bash
 areal agent run \
   --service default \
-  --agent my_package.my_agent:MyAgent \
+  --agent my_package.my_agent.MyAgent \
   --num-pairs 1 \
   --admin-api-key areal-agent-admin
 ```
 
 `--agent` is required; it is the import path the worker process uses to load the agent
 class.
-
-Multiple pairs (scale throughput horizontally):
-
-```bash
-areal agent run \
-  --service default \
-  --agent my_package.my_agent:MyAgent \
-  --num-pairs 4
-```
-
-Wire the agent to an inference service so that the agent's internal LLM calls go to a
-gateway launched by `areal inf`:
-
-```bash
-areal agent run \
-  --service default \
-  --agent my_package.my_agent:MyAgent \
-  --num-pairs 2 \
-  --inf-addr http://127.0.0.1:8080 \
-  --inf-api-key areal-admin-key \
-  --inf-model qwen-local
-```
-
-The `--inf-*` group is **optional**: if the agent uses a different LLM interface
-internally (direct OpenAI, local vLLM, etc.), these flags are not needed.
 
 Force-start by clearing stale state:
 
@@ -179,31 +154,17 @@ admin_api_key = "areal-agent-admin"
 log_level = "info"
 
 [run]
-agent = "my_package.my_agent:MyAgent"
+agent = "my_package.my_agent.MyAgent"
 num_pairs = 2
 setup_timeout = 120
 health_poll_interval = 5
 drain_timeout = 30
 session_timeout = 1800
-
-[inference]
-addr = "http://127.0.0.1:8080"
-api_key = "areal-admin-key"
-model = "qwen-local"
 ```
 
 Precedence: \*\*CLI flag > TOML passed via `--config` > `~/.areal/agent/config.toml`
 
 > hardcoded defaults\*\*.
-
-## Relationship with `areal inf`
-
-- `areal inf` launches a **stateless inference service**: given a prompt,it returns a
-  completion.
-- `areal agent` launches an **agent service with session state**: the agent class may
-  need multi-turn interaction, state, and context memory.
-- They are **independent**: you can run only `areal inf`, only `areal agent`, or both —
-  in the latter case, use `--inf-*` to route the agent's LLM calls to the inf gateway.
 
 ## Not implemented yet
 
