@@ -1400,6 +1400,7 @@ class Normalization:
         loss_mask: torch.Tensor | None = None,
         high_precision: bool = True,
         reduce_group=None,
+        group_sizes: list[int] | None = None,
     ) -> torch.Tensor:
         bs = x.size(0)
         eps = self.eps
@@ -1407,6 +1408,11 @@ class Normalization:
         # Early return if no elements are active (all masked out)
         if loss_mask is not None and loss_mask.sum().item() == 0:
             return x.float()
+
+        # Per-group row boundaries, only needed for group-level normalization.
+        group_bounds = None
+        if self.mean_level == "group" or self.std_level == "group":
+            group_bounds = self._resolve_group_bounds(bs, group_sizes)
 
         # Step 1: Compute mean
         if self.mean_level == "batch":
@@ -1421,13 +1427,12 @@ class Normalization:
             mean = mean.expand_as(x)
         elif self.mean_level == "group":
             mean = torch.zeros_like(x)
-            for i in range(0, bs // self.group_size):
-                s = slice(i * self.group_size, (i + 1) * self.group_size)
+            for s in group_bounds:
                 xx = x[s]
                 m = loss_mask[s] if loss_mask is not None else None
 
-                # Special case: with group_size=1 and leave_one_out=True, mean should be 0
-                if self.group_size == 1 and self.mean_leave1out:
+                # A group of one has no leave-one-out baseline -> mean 0.
+                if xx.size(0) == 1 and self.mean_leave1out:
                     dtype = torch.float64 if high_precision else torch.float32
                     group_mean = torch.zeros(
                         (1, *xx.shape[1:]), dtype=dtype, device=xx.device
@@ -1465,14 +1470,13 @@ class Normalization:
             std = std.expand_as(x)
         elif self.std_level == "group":
             std = torch.zeros_like(x)
-            for i in range(0, bs // self.group_size):
-                s = slice(i * self.group_size, (i + 1) * self.group_size)
+            for s in group_bounds:
                 xx = x[s]
                 m = loss_mask[s] if loss_mask is not None else None
                 group_mean_slice = mean[s]  # already computed and expanded
 
-                # Special case: with group_size=1 and std_unbiased=True, std should be 1 for numerical stability
-                if self.group_size == 1 and self.std_unbiased:
+                # A group of one has zero variance -> std 1 for stability.
+                if xx.size(0) == 1 and self.std_unbiased:
                     dtype = torch.float64 if high_precision else torch.float32
                     group_std = torch.ones(
                         (1, *xx.shape[1:]), dtype=dtype, device=xx.device
@@ -1494,6 +1498,37 @@ class Normalization:
 
         # Normalize
         return (x_centered / (std + eps)).float()
+
+    def _resolve_group_bounds(
+        self, bs: int, group_sizes: list[int] | None
+    ) -> list[slice]:
+        """Partition rows ``[0, bs)`` into per-group slices for group-level norm.
+
+        ``group_sizes`` gives the actual per-group row counts, which may be
+        unequal (e.g. partial groups). When omitted, fall back to fixed-size
+        positional groups of ``self.group_size`` and require exact divisibility.
+        """
+        if group_sizes is not None:
+            if any(k < 1 for k in group_sizes):
+                raise ValueError(f"group_sizes must be positive, got {group_sizes}")
+            total = sum(group_sizes)
+            if total != bs:
+                raise ValueError(f"group_sizes sum to {total} but batch size is {bs}")
+            bounds: list[slice] = []
+            offset = 0
+            for k in group_sizes:
+                bounds.append(slice(offset, offset + k))
+                offset += k
+            return bounds
+        if bs % self.group_size != 0:
+            raise ValueError(
+                f"batch size {bs} is not divisible by group_size "
+                f"{self.group_size}; pass group_sizes for partial/unequal groups"
+            )
+        return [
+            slice(i * self.group_size, (i + 1) * self.group_size)
+            for i in range(bs // self.group_size)
+        ]
 
     @staticmethod
     def _compute_mean(

@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import math
 import os
 import warnings
 from dataclasses import MISSING as dataclass_missing
@@ -1577,6 +1578,41 @@ class PPOActorConfig(TrainEngineConfig):
         },
     )
 
+    loss_aggregation: str = field(
+        default="token_mean",
+        metadata={
+            "help": "Policy-gradient loss reduction. 'token_mean' averages valid "
+            "tokens, 'seq_mean' averages sequence means, and 'prompt_mean' averages "
+            "prompt-group means over gconfig.n_samples responses. 'constant' "
+            "averages each response's masked token sum divided by "
+            "loss_aggregation_divisor.",
+            "help_zh": "Policy-gradient loss 的归约方式。'token_mean' 对有效 token "
+            "求平均，'seq_mean' 对每条序列的均值求平均，'prompt_mean' 对 "
+            "gconfig.n_samples 个 response 组成的 prompt group 均值求平均。"
+            "'constant' 将每条 response 的 masked token loss 之和除以 "
+            "loss_aggregation_divisor 后再求平均。",
+            "choices": ["token_mean", "seq_mean", "prompt_mean", "constant"],
+        },
+    )
+    loss_aggregation_divisor: float | None = field(
+        default=None,
+        metadata={
+            "help": "Positive fixed denominator L for loss_aggregation='constant'. "
+            "Unused by other loss aggregation modes.",
+            "help_zh": "loss_aggregation='constant' 使用的正数固定分母 L。其他 "
+            "loss aggregation 模式不使用。",
+        },
+    )
+    group_size: int = field(
+        default=1,
+        metadata={
+            "help": "Internal prompt-group size for prompt_mean; derived from "
+            "gconfig.n_samples by PPOConfig.__post_init__.",
+            "help_zh": "prompt_mean 使用的内部 prompt group 大小；由 "
+            "PPOConfig.__post_init__ 根据 gconfig.n_samples 推导。",
+        },
+    )
+
     # Asynchronous RL
     recompute_logprob: bool = field(
         default=False,
@@ -1684,6 +1720,32 @@ class PPOActorConfig(TrainEngineConfig):
                     "Please set `actor.use_decoupled_loss=false` in your configuration."
                 )
 
+        if self.loss_aggregation not in (
+            "token_mean",
+            "seq_mean",
+            "prompt_mean",
+            "constant",
+        ):
+            raise ValueError(
+                "loss_aggregation must be 'token_mean', 'seq_mean', "
+                f"'prompt_mean', or 'constant', got {self.loss_aggregation!r}."
+            )
+        if self.loss_aggregation == "constant":
+            if (
+                self.loss_aggregation_divisor is None
+                or not math.isfinite(self.loss_aggregation_divisor)
+                or self.loss_aggregation_divisor <= 0
+            ):
+                raise ValueError(
+                    "loss_aggregation_divisor must be a positive finite value "
+                    "when loss_aggregation='constant'."
+                )
+        elif self.loss_aggregation_divisor is not None:
+            raise ValueError(
+                "loss_aggregation_divisor is only used when "
+                "loss_aggregation='constant'."
+            )
+
         # Validate CISPO configuration
         if self.use_cispo_loss:
             if self.use_sapo_loss:
@@ -1701,6 +1763,11 @@ class PPOActorConfig(TrainEngineConfig):
                 raise ValueError(
                     "CISPO only supports importance_sampling_level='token'. "
                     "Sequence-level (GSPO-style) CISPO has no published surrogate."
+                )
+            if self.loss_aggregation != "token_mean":
+                raise ValueError(
+                    "CISPO only supports loss_aggregation='token_mean'. "
+                    "Non-token-mean CISPO has no published surrogate."
                 )
 
         super().__post_init__()
@@ -2165,6 +2232,17 @@ class InferenceEngineConfig:
         default=1,
         metadata={"help": "Batch size for consuming rollouts from the queue."},
     )
+    min_valid_group_size: int = field(
+        default=1,
+        metadata={
+            "help": "Minimum non-None trajectories required to keep a rollout "
+            "group. Default 1 keeps non-empty partial groups; set to "
+            "gconfig.n_samples to require full groups. Must be in [1, group_size].",
+            "help_zh": "保留一个 rollout group 所需的最小非 None trajectory 数。"
+            "默认值 1 会保留非空的 partial group；设为 gconfig.n_samples "
+            "则要求完整 group。必须在 [1, group_size] 范围内。",
+        },
+    )
     max_head_offpolicyness: int = field(
         default=0,
         metadata={
@@ -2323,6 +2401,10 @@ class InferenceEngineConfig:
             )
         if not self.admin_api_key or not self.admin_api_key.strip():
             raise ValueError("admin_api_key must not be empty or whitespace-only")
+        if self.min_valid_group_size < 1:
+            raise ValueError(
+                f"min_valid_group_size must be >= 1, got {self.min_valid_group_size}"
+            )
         if (
             self._version == "v2"
             and self.agent is not None
@@ -3068,6 +3150,50 @@ class PPOConfig(BaseExperimentConfig):
         # the engine config. Single source of truth: gconfig.lora_name.
         if self.rollout.use_lora and not self.rollout.lora_name:
             self.rollout.lora_name = self.gconfig.lora_name
+
+        if self.actor.loss_aggregation == "prompt_mean":
+            self.actor.group_size = self.gconfig.n_samples
+            if self.actor.group_size < 2:
+                raise ValueError(
+                    "loss_aggregation='prompt_mean' requires gconfig.n_samples "
+                    ">= 2 (a single sample per prompt collapses to seq_mean), "
+                    f"got n_samples={self.gconfig.n_samples}."
+                )
+            g = self.actor.mb_spec.granularity
+            if g % self.actor.group_size != 0:
+                new_g = -(-g // self.actor.group_size) * self.actor.group_size
+                logger.warning(
+                    "loss_aggregation='prompt_mean': bumping "
+                    "actor.mb_spec.granularity %d -> %d (a multiple of "
+                    "gconfig.n_samples=%d) so each microbatch holds whole "
+                    "prompt-groups.",
+                    g,
+                    new_g,
+                    self.actor.group_size,
+                )
+                self.actor.mb_spec.granularity = new_g
+            if (
+                self.rollout is not None
+                and self.rollout.min_valid_group_size < self.actor.group_size
+            ):
+                logger.warning(
+                    "loss_aggregation='prompt_mean' needs whole prompt-groups; "
+                    "raising rollout.min_valid_group_size %d -> %d so "
+                    "under-filled rollout groups are dropped, not mis-grouped.",
+                    self.rollout.min_valid_group_size,
+                    self.actor.group_size,
+                )
+                self.rollout.min_valid_group_size = self.actor.group_size
+
+        if (
+            self.rollout is not None
+            and self.rollout.min_valid_group_size > self.gconfig.n_samples
+        ):
+            raise ValueError(
+                f"rollout.min_valid_group_size ({self.rollout.min_valid_group_size}) "
+                f"cannot exceed gconfig.n_samples ({self.gconfig.n_samples}); no "
+                "group could ever reach the threshold."
+            )
         super().__post_init__()
 
 

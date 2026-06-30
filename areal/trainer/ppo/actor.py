@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import functools
+from collections.abc import Callable
 from typing import Any
 
 import torch
@@ -25,9 +26,16 @@ from areal.utils.data import (
     KLEstimator,
     Normalization,
     batched_call,
+    concat_batch,
+    split_batch,
     split_padded_tensor_dict_into_mb_list,
 )
 from areal.utils.functional import (
+    LOSS_AGGREGATION_CONSTANT,
+    LOSS_AGGREGATION_PROMPT_MEAN,
+    LOSS_AGGREGATION_SEQ_MEAN,
+    LOSS_AGGREGATION_TOKEN_MEAN,
+    LOSS_AGGREGATIONS_ALL,
     cispo_loss_fn,
     ppo_actor_loss_fn,
     reward_overlong_penalty,
@@ -39,6 +47,61 @@ from areal.v2.training_service.controller.controller import (
 )
 
 logger = logging.getLogger("PPOActor")
+
+_LossWeightFn = Callable[[dict[str, Any]], torch.Tensor]
+_LossWeightFactory = Callable[[int], _LossWeightFn]
+
+
+def _ppo_loss_weight(data: dict[str, Any]) -> torch.Tensor:
+    return data["loss_mask"].count_nonzero()
+
+
+def _unit_count_weight(data: dict[str, Any], unit: int) -> torch.Tensor:
+    cu_seqlens = data.get("cu_seqlens")
+    if cu_seqlens is not None:
+        n_seqs = cu_seqlens.numel() - 1
+    else:
+        n_seqs = data["loss_mask"].shape[0]
+    n_units = n_seqs // unit
+    return torch.tensor(n_units, dtype=torch.float32, device=data["loss_mask"].device)
+
+
+def _make_unit_count_weight_fn(unit: int) -> _LossWeightFn:
+    def unit_count_weight(data: dict[str, Any]) -> torch.Tensor:
+        return _unit_count_weight(data, unit)
+
+    return unit_count_weight
+
+
+def _token_loss_weight_fn(_group_size: int) -> _LossWeightFn:
+    return _ppo_loss_weight
+
+
+def _sequence_loss_weight_fn(_group_size: int) -> _LossWeightFn:
+    return _make_unit_count_weight_fn(unit=1)
+
+
+def _prompt_loss_weight_fn(group_size: int) -> _LossWeightFn:
+    return _make_unit_count_weight_fn(unit=group_size)
+
+
+_LOSS_WEIGHT_FACTORIES: dict[str, _LossWeightFactory] = {
+    LOSS_AGGREGATION_TOKEN_MEAN: _token_loss_weight_fn,
+    LOSS_AGGREGATION_SEQ_MEAN: _sequence_loss_weight_fn,
+    LOSS_AGGREGATION_PROMPT_MEAN: _prompt_loss_weight_fn,
+    LOSS_AGGREGATION_CONSTANT: _sequence_loss_weight_fn,
+}
+
+
+def _make_loss_weight_fn(loss_aggregation: str, group_size: int) -> _LossWeightFn:
+    """Return the microbatch weight paired with ``aggregate_pg_loss``."""
+    try:
+        return _LOSS_WEIGHT_FACTORIES[loss_aggregation](group_size)
+    except KeyError as e:
+        raise ValueError(
+            f"loss_aggregation must be one of {LOSS_AGGREGATIONS_ALL}, "
+            f"got {loss_aggregation!r}."
+        ) from e
 
 
 class PPOActor:
@@ -141,9 +204,13 @@ class PPOActor:
 
     @trace_perf("ppo_actor.compute_advantages", category="compute")
     def compute_advantages(self, data: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        return batched_call(self._compute_advantages, data)
+        batched, meta = concat_batch(data)
+        result = self._compute_advantages(batched, group_sizes=meta.traj_group_sizes)
+        return split_batch(result, meta)
 
-    def _compute_advantages(self, data: dict[str, Any]) -> dict[str, Any]:
+    def _compute_advantages(
+        self, data: dict[str, Any], group_sizes: list[int] | None = None
+    ) -> dict[str, Any]:
         bs = data["input_ids"].shape[0]
         max_seqlen = data["input_ids"].shape[1]
         batch_indices = torch.arange(
@@ -171,7 +238,7 @@ class PPOActor:
             reward_score, max=self.reward_clip, min=-self.reward_clip
         )
         if self.reward_norm:
-            reward_score = self.reward_norm(reward_score)
+            reward_score = self.reward_norm(reward_score, group_sizes=group_sizes)
 
         loss_mask = data["loss_mask"].float()
         loss_mask = torch.roll(loss_mask, shifts=-1, dims=-1)
@@ -237,7 +304,7 @@ class PPOActor:
 
         # Optionally perform advantage normalization.
         if self.adv_norm is not None:
-            advantages = self.adv_norm(advantages, loss_mask)
+            advantages = self.adv_norm(advantages, loss_mask, group_sizes=group_sizes)
 
         # Store data in the dict.
         data["advantages"] = advantages
@@ -334,9 +401,17 @@ class PPOActor:
             data.pop(key, None)
         # NOTE: calling engine.train() is critical to enabling gradient checkpointing
         self.engine.train()
+        outer_granularity = (
+            self.config.group_size
+            if self.config.loss_aggregation == "prompt_mean"
+            else 1
+        )
         mb_inputs = split_padded_tensor_dict_into_mb_list(
             data,
-            mb_spec=MicroBatchSpec(n_mbs=self.config.ppo_n_minibatches),
+            mb_spec=MicroBatchSpec(
+                n_mbs=self.config.ppo_n_minibatches,
+                granularity=outer_granularity,
+            ),
         )
 
         with stats_tracker.scope("update"):
@@ -361,8 +436,13 @@ class PPOActor:
                         sapo_tau_neg=self.config.sapo_tau_neg,
                         use_cispo_loss=self.config.use_cispo_loss,
                         use_decoupled_loss=self.config.use_decoupled_loss,
+                        loss_aggregation=self.config.loss_aggregation,
+                        group_size=self.config.group_size,
+                        loss_aggregation_divisor=self.config.loss_aggregation_divisor,
                     ),
-                    loss_weight_fn=lambda x: x["loss_mask"].count_nonzero(),
+                    loss_weight_fn=_make_loss_weight_fn(
+                        self.config.loss_aggregation, self.config.group_size
+                    ),
                 )
                 stats_tracker.scalar(**train_stat)
 
@@ -424,6 +504,9 @@ def grpo_loss_fn(
     sapo_tau_neg: float = 1.05,
     use_cispo_loss: bool = False,
     use_decoupled_loss: bool = False,
+    loss_aggregation: str = "token_mean",
+    group_size: int = 1,
+    loss_aggregation_divisor: float | None = None,
     vocab_min_logits: torch.Tensor | None = None,
     vocab_max_logits: torch.Tensor | None = None,
 ):
@@ -488,6 +571,9 @@ def grpo_loss_fn(
             loss_mask=loss_mask,
             importance_sampling_level=importance_sampling_level,
             cu_seqlens=input_data.get("cu_seqlens"),
+            loss_aggregation=loss_aggregation,
+            group_size=group_size,
+            loss_aggregation_divisor=loss_aggregation_divisor,
         )
     else:
         loss, stat = ppo_actor_loss_fn(
@@ -502,6 +588,9 @@ def grpo_loss_fn(
             rejection_sampling=rejection_sampling,
             importance_sampling_level=importance_sampling_level,
             cu_seqlens=input_data.get("cu_seqlens"),
+            loss_aggregation=loss_aggregation,
+            group_size=group_size,
+            loss_aggregation_divisor=loss_aggregation_divisor,
         )
 
     # Joint Distillation KL Loss

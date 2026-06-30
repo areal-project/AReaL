@@ -1,7 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from areal.utils.functional.functional import (
+    LOSS_AGGREGATION_CONSTANT,
+    LOSS_AGGREGATION_PROMPT_MEAN,
+    LOSS_AGGREGATION_SEQ_MEAN,
+    LOSS_AGGREGATION_TOKEN_MEAN,
+    LOSS_AGGREGATIONS_ALL,
     RejectionSamplingResult,
+    aggregate_pg_loss,
     apply_rejection_sampling,
     cispo_loss_fn,
     dpo_pair_logratios,
@@ -19,7 +25,13 @@ from areal.utils.functional.vocab_parallel import (
 
 __all__ = [
     # functional.py
+    "LOSS_AGGREGATION_CONSTANT",
+    "LOSS_AGGREGATION_PROMPT_MEAN",
+    "LOSS_AGGREGATION_SEQ_MEAN",
+    "LOSS_AGGREGATION_TOKEN_MEAN",
+    "LOSS_AGGREGATIONS_ALL",
     "RejectionSamplingResult",
+    "aggregate_pg_loss",
     "apply_rejection_sampling",
     "cispo_loss_fn",
     "dpo_pair_logratios",
