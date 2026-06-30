@@ -88,118 +88,31 @@ packages are added.
 > - **Do not run `uv sync`** while you need Hermes — it removes `hermes-agent` (it is
 >   not in `uv.lock`). Re-add with `uv pip install hermes-agent`.
 
-## Quick start — plain chat (no GPU, no training)
-
-This is the fastest way to see Hermes working: start the service against an
-OpenAI-compatible upstream and chat. No GPU and no training pipeline involved.
-
-### 1. Configure the upstream LLM
-
-The upstream the Hermes agent routes to is set via environment variables:
-
-| Variable                   | Default    | Description                           |
-| -------------------------- | ---------- | ------------------------------------- |
-| `HERMES_UPSTREAM_BASE_URL` | (required) | OpenAI-compatible base URL (`.../v1`) |
-| `HERMES_UPSTREAM_API_KEY`  | (required) | API key for the upstream              |
-| `HERMES_UPSTREAM_MODEL`    | `default`  | Upstream model id                     |
-| `HERMES_MAX_TURNS`         | `10`       | Max agentic iterations per turn       |
-| `HERMES_ENABLED_TOOLSETS`  | (all)      | Comma-separated toolset allowlist     |
-| `HERMES_DISABLED_TOOLSETS` | (none)     | Comma-separated toolset denylist      |
-
-```bash
-export HERMES_UPSTREAM_BASE_URL="https://your-llm/v1"
-export HERMES_UPSTREAM_API_KEY="sk-..."
-export HERMES_UPSTREAM_MODEL="your-model"
-```
-
-### 2. Start the Agent Service
-
-```bash
-areal agent run \
-    --service default \
-    --agent examples.hermes.hermes.HermesAgent \
-    --num-pairs 1 \
-    --admin-api-key sk-xxx
-```
-
-> If the `areal` console script is not on your `PATH`, use
-> `python -m areal.v2.cli.main agent run ...` instead.
-
-The CLI boots one Worker+DataProxy pair behind a Router and Gateway, then prints the
-gateway address and returns (the stack runs in the background). Look for:
-
-```
-service=default gateway=http://127.0.0.1:PORT
-```
-
-That `http://127.0.0.1:PORT` is your `<agent-gateway>`. You can re-query it any time:
-
-```bash
-areal agent status --service default
-```
-
-### 3. Chat
-
-```bash
-python examples/hermes/hermes_loop.py http://<agent-gateway> --admin-api-key sk-xxx
-```
-
-Type at the `You:` prompt; `quit` exits. To verify multi-turn history replay, send a
-fact then a recall — a correct second answer proves the DataProxy replayed turn-1 into
-turn-2 (the `AIAgent` is stateless across turns):
-
-```
-You: Remember my favorite number is 4242. Acknowledge in one sentence.
-You: What is my favorite number? Answer with just the number.
-```
-
-Run it non-interactively by piping the turns in:
-
-```bash
-printf 'Remember my favorite number is 4242. Acknowledge in one sentence.\nWhat is my favorite number? Answer with just the number.\nquit\n' \
-  | python examples/hermes/hermes_loop.py http://<agent-gateway> --admin-api-key sk-xxx
-```
-
-### 4. Stop the service
-
-```bash
-areal agent stop --service default
-```
-
-## RL training (self-evolution)
-
-RL training requires *(input, output, reward)* tuples. In self-evolution mode every LLM
-call the in-process Hermes agent makes flows through AReaL's inference gateway, which
-records tokens and log-probabilities; you then assign a scalar reward per episode.
+## Quick start — plain chat
 
 The five steps below are run from the repo root.
 
 ### Step 1 — Start the training service (embeds the inference gateway)
 
-The training defaults already live in `config.yaml` (v2 controllers, 1 node × 2 GPUs,
-`batch_size=1`, admin keys). The command line still wins over the file, so you can
-override any of them; the explicit form below documents what the defaults are:
+`config.yaml` holds the defaults (v2 controllers, 1 node × 2 GPUs, `batch_size=1`, admin
+keys); CLI flags override it. The explicit form below just documents those defaults:
 
 ```bash
 uv run python3 examples/hermes/train.py \
     --config examples/hermes/config.yaml \
-    actor.backend=fsdp:d1 \
-    rollout.backend=sglang:d1 \
-    cluster.n_nodes=1 \
-    cluster.n_gpus_per_node=2 \
-    actor.admin_api_key=gsm8k-123 \
-    rollout.admin_api_key=sk-xxx \
-    actor._version=v2 \
-    rollout._version=v2
+    actor.backend=megatron:d1 \
+    actor.path=/path/to/your_model \
+    actor.admin_api_key=sk-123456 \
+    rollout.admin_api_key=sk-123456
 ```
 
-> Because these are now defaults in `config.yaml`, the minimal command is just:
+> Since these are defaults, the minimal command is just:
 >
 > ```bash
 > uv run python3 examples/hermes/train.py --config examples/hermes/config.yaml
 > ```
 
-Find this line in the logs and note the address — it is your `<inf-gateway>` below:
+Note this address from the logs — it is your `<inf-gateway>` below:
 
 ```
 Proxy gateway available at http://X.X.X.X:PORT
@@ -207,25 +120,29 @@ Proxy gateway available at http://X.X.X.X:PORT
 
 > **Key wiring**
 >
-> `rollout.admin_api_key` (`sk-xxx`) is the **inference gateway** admin key — pass the
-> same value to `start_session.py --admin-key` and `set_reward.py` (Steps 3 and 5).
-> `actor.admin_api_key` (`gsm8k-123`) is the trainer/actor admin key and is not used by
-> the interaction scripts. See the [CLI reference](../../docs/en/cli_reference.md) for
-> every field and the [allocation mode reference](../../docs/en/reference/alloc_mode.md)
-> for GPU layout.
+> `rollout.admin_api_key` is the **inference gateway** admin key — reuse it for
+> `start_session.py --admin-key` and `set_reward.py` (Steps 3 and 5).
+> `actor.admin_api_key` is the trainer/actor key, unused by the interaction scripts. See
+> the [CLI reference](../../docs/en/cli_reference.md) and
+> [allocation mode reference](../../docs/en/reference/alloc_mode.md) for fields and GPU
+> layout.
 
 ### Step 2 — Start the Hermes Agent Service
 
-Same command as the quick start. The agent's env upstream is optional here — when
+Same command as the quick start. The agent's env upstream is optional here — once
 self-evolution fields are supplied per turn (Step 4), the inference gateway upstream
 takes over.
 
 ```bash
+export HERMES_UPSTREAM_BASE_URL="https://your-llm/v1"
+export HERMES_UPSTREAM_API_KEY="sk-..."
+export HERMES_UPSTREAM_MODEL="your-model"
+
 areal agent run \
     --service default \
     --agent examples.hermes.hermes.HermesAgent \
     --num-pairs 1 \
-    --admin-api-key sk-xxx
+    --admin-api-key sk-123456
 ```
 
 Note the printed `<agent-gateway>` address.
@@ -233,66 +150,38 @@ Note the printed `<agent-gateway>` address.
 ### Step 3 — Start a session on the inference gateway
 
 ```bash
-python examples/hermes/start_session.py http://<inf-gateway> --admin-key sk-xxx
+python examples/hermes/start_session.py http://<inf-gateway> --admin-key sk-123456
 ```
 
-Copy the printed `sk-sess-*` key — you forward it to the agent (Step 4) and use it to
-score the episode (Step 5). To reuse the same key for the next episode (auto-ends the
-previous one, exports its trajectory):
+Copy the printed `sk-sess-*` key — forward it to the agent (Step 4) and score the
+episode with it (Step 5). To reuse the key for the next episode (auto-ends and exports
+the previous one):
 
 ```bash
-python examples/hermes/start_session.py http://<inf-gateway> --admin-key sk-xxx --api-key sk-sess-xxxx
+python examples/hermes/start_session.py http://<inf-gateway> --admin-key sk-123456
 ```
 
 ### Step 4 — Interact (produces a trajectory)
 
-Chat as in the quick start, but forward the inference-routing flags so the agent's LLM
-calls flow through the inference gateway under your session key and get captured. You
-**must** actually interact, otherwise the episode has no data.
+Forward the inference-routing flags so the agent's LLM calls flow through the inference
+gateway under your session key and get captured. You **must** actually interact, or the
+episode has no data.
 
 ```bash
 python examples/hermes/hermes_loop.py http://<agent-gateway> \
-    --admin-api-key sk-xxx \
+    --admin-api-key sk-123456 \
     --inf-base-url http://<inf-gateway> \
-    --session-api-key sk-sess-xxxx
+    --session-api-key sk-sess-123456
 ```
 
 ### Step 5 — Score the episode
 
 ```bash
 python examples/hermes/set_reward.py http://<inf-gateway> \
-    --api-key sk-sess-xxxx --reward 1.0
+    --api-key sk-sess-123456 --reward 1.0
 ```
 
 Keep the reward in **\[-1, 1\]** for training stability.
-
-### How training works
-
-Training runs **asynchronously** under the hood. Once enough trajectories have been
-collected (controlled by `train_dataset.batch_size` in the config — `1` by default here,
-so every scored episode triggers a step), AReaL automatically performs a training step
-and updates the model weights. The updated weights are transparently served to
-subsequent sessions — the agent does not need to restart or reload. For details on
-asynchronous training and staleness control, see our
-[code walkthrough](../../docs/en/tutorial/gsm8k_grpo.md) and
-[paper](https://arxiv.org/abs/2505.24298).
-
-## Send requests directly
-
-The interactive loop drives the **Responses** API (`/v1/responses`):
-
-```bash
-curl -X POST http://<agent-gateway>/v1/responses \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer sk-xxx" \
-  -d '{
-    "input": [{"type": "message", "content": "Explain RLHF in simple terms"}],
-    "model": "hermes-agent",
-    "user": "my-session"
-  }'
-```
-
-The admin key is the `--admin-api-key` you passed to `areal agent run`.
 
 ## Files
 
@@ -304,4 +193,3 @@ The admin key is the `--admin-api-key` you passed to `areal agent run`.
 | `set_reward.py`    | Assign a scalar reward to a session's trajectory                 |
 | `train.py`         | RL trainer entry point (embeds the inference gateway)            |
 | `config.yaml`      | Training configuration (v2 controllers, 2-GPU defaults)          |
-| `_fmt.py`          | Shared CLI formatting helpers                                    |

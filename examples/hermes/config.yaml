@@ -48,7 +48,7 @@ gconfig:
   temperature: 1.0
 
 actor:
-  backend: "fsdp:d1"
+  backend: "megatron:d1"
   _version: v2
   admin_api_key: gsm8k-123
   experiment_name: ${experiment_name}
