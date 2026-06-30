@@ -343,6 +343,43 @@ def _build_messages_list(item: dict) -> list[dict]:
     return messages_list
 
 
+def _parse_tool_call_arguments(messages: list[dict]) -> list[dict]:
+    """Return a new message list with tool_call arguments parsed from JSON strings
+    to dicts. Some chat templates (e.g. GLM-5.1) iterate over arguments with
+    .items(), which fails when arguments is a JSON string per OpenAI API convention.
+
+    Only creates new dicts where modifications are needed; unaffected messages
+    are shared with the input list to avoid expensive deep copies.
+    """
+    result = []
+    for msg in messages:
+        tool_calls = msg.get("tool_calls") if isinstance(msg, dict) else None
+        if not tool_calls:
+            result.append(msg)
+            continue
+        new_tool_calls = []
+        modified = False
+        for tc in tool_calls:
+            fn = tc.get("function") if isinstance(tc, dict) else None
+            if fn is None:
+                new_tool_calls.append(tc)
+                continue
+            args = fn.get("arguments")
+            if isinstance(args, str):
+                try:
+                    parsed = json.loads(args)
+                    tc = {**tc, "function": {**fn, "arguments": parsed}}
+                    modified = True
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            new_tool_calls.append(tc)
+        if modified:
+            result.append({**msg, "tool_calls": new_tool_calls})
+        else:
+            result.append(msg)
+    return result
+
+
 def concat_prompt_token_ids_with_parent(
     message_list: list[dict],
     parent: InteractionWithTokenLogpReward | None,
@@ -385,6 +422,7 @@ def concat_prompt_token_ids_with_parent(
         parent_tokens += [eos_token_id]
 
     all_message_list += message_list
+    all_message_list = _parse_tool_call_arguments(all_message_list)
 
     all_tokens = apply_chat_template(
         tokenizer,
@@ -610,6 +648,7 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
         has_images = len(image_data) > 0
 
         tokenizer_messages = messages_for_tokenizer if has_images else messages_list
+        tokenizer_messages = _parse_tool_call_arguments(tokenizer_messages)
         if self.chat_template_type == "hf":
             prompt_token_ids = apply_chat_template(
                 self.tokenizer,
@@ -1018,6 +1057,7 @@ class AsyncResponsesWithReward(BaseAsyncResponses):
         has_images = len(image_data) > 0
 
         tokenizer_messages = messages_for_tokenizer if has_images else messages_list
+        tokenizer_messages = _parse_tool_call_arguments(tokenizer_messages)
         if self.chat_template_type == "hf":
             prompt_token_ids = apply_chat_template(
                 self.tokenizer,
