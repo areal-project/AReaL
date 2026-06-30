@@ -5,6 +5,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+from areal.utils.network import find_free_ports
 from areal.v2.cli.agent.client import RouterClient
 from areal.v2.cli.agent.state import (
     PairState,
@@ -14,7 +15,6 @@ from areal.v2.cli.agent.state import (
 )
 from areal.v2.cli.process import spawn_process
 from areal.v2.cli.utils import wait_http_health
-from areal.utils.network import find_free_ports
 
 
 def launch_agent_stack(
