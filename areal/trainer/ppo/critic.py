@@ -7,9 +7,6 @@ import torch
 
 from areal.api import TrainEngine
 from areal.api.cli_args import MicroBatchSpec, PPOCriticConfig
-from areal.experimental.training_service.controller.controller import (
-    GatewayTrainController,
-)
 from areal.infra import TrainController
 from areal.infra.rpc.serialization import serialize_value
 from areal.trainer.ppo.stats import infer_token_denominator
@@ -20,6 +17,9 @@ from areal.utils.data import (
 )
 from areal.utils.functional import ppo_critic_loss_fn
 from areal.utils.perf_tracer import trace_perf
+from areal.v2.training_service.controller.controller import (
+    GatewayTrainController,
+)
 
 
 class PPOCritic:

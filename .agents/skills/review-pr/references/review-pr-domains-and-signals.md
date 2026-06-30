@@ -52,19 +52,19 @@ ______________________________________________________________________
 
 ## Domain 4: Service Orchestration (HIGH)
 
-| L2 Signal                  | File Path Pattern                                                                                                                                                                               | Code Pattern                                                     |
-| -------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------- |
-| `service_routing_dataflow` | `areal/experimental/agent_service/gateway/`, `areal/experimental/agent_service/router/`, `areal/experimental/inference_service/data_proxy/`, `areal/experimental/inference_service/controller/` | `route`, `gateway`, `router`, `DataProxy`, `controller`, `batch` |
-| `session_consistency`      | `areal/experimental/agent_service/`, `areal/experimental/inference_service/`                                                                                                                    | `session`, `affinity`, `history`, `state`                        |
+| L2 Signal                  | File Path Pattern                                                                                                                                       | Code Pattern                                                     |
+| -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------- |
+| `service_routing_dataflow` | `areal/v2/agent_service/gateway/`, `areal/v2/agent_service/router/`, `areal/v2/inference_service/data_proxy/`, `areal/v2/inference_service/controller/` | `route`, `gateway`, `router`, `DataProxy`, `controller`, `batch` |
+| `session_consistency`      | `areal/v2/agent_service/`, `areal/v2/inference_service/`                                                                                                | `session`, `affinity`, `history`, `state`                        |
 
 ## Domain 5: Workflow & Trainer Contract (HIGH/MEDIUM)
 
-| L2 Signal                  | File Path Pattern                                                                               | Code Pattern                                        |
-| -------------------------- | ----------------------------------------------------------------------------------------------- | --------------------------------------------------- |
-| `workflow_engine_boundary` | `areal/workflow/`, `areal/trainer/`, `areal/engine/`                                            | `RolloutWorkflow`, `arun_episode`, `agenerate`      |
-| `dataset_surface`          | `areal/dataset/`                                                                                | `DataLoader`, `IterableDataset`, `get_*_dataset`    |
-| `async_contract`           | `areal/workflow/`, `areal/experimental/agent_service/`, `areal/experimental/inference_service/` | `async def`, `await`, `aiofiles`, `asyncio`         |
-| `weight_version_contract`  | `areal/api/engine_api.py`, `areal/workflow/`, `areal/trainer/`                                  | `WeightUpdateMeta`, `set_version`, `weight version` |
+| L2 Signal                  | File Path Pattern                                                           | Code Pattern                                        |
+| -------------------------- | --------------------------------------------------------------------------- | --------------------------------------------------- |
+| `workflow_engine_boundary` | `areal/workflow/`, `areal/trainer/`, `areal/engine/`                        | `RolloutWorkflow`, `arun_episode`, `agenerate`      |
+| `dataset_surface`          | `areal/dataset/`                                                            | `DataLoader`, `IterableDataset`, `get_*_dataset`    |
+| `async_contract`           | `areal/workflow/`, `areal/v2/agent_service/`, `areal/v2/inference_service/` | `async def`, `await`, `aiofiles`, `asyncio`         |
+| `weight_version_contract`  | `areal/api/engine_api.py`, `areal/workflow/`, `areal/trainer/`              | `WeightUpdateMeta`, `set_version`, `weight version` |
 
 ## Domain 6: API & Config Compatibility (MEDIUM)
 
@@ -95,12 +95,12 @@ ______________________________________________________________________
 
 ## Domain 9: Launcher & Infrastructure (HIGH/MEDIUM)
 
-| L2 Signal                 | File Path Pattern                                                      | Code Pattern                                              |
-| ------------------------- | ---------------------------------------------------------------------- | --------------------------------------------------------- |
-| `launcher_resource_match` | `areal/infra/launcher/`                                                | `LaunchConfig`, `RayLauncher`, `SlurmLauncher`            |
-| `scheduler_contract`      | `areal/infra/scheduler/`, `areal/scheduler/`                           | `Scheduler`, `placement`, `resource`                      |
-| `rpc_transport`           | `areal/infra/rpc/`, `areal/experimental/inference_service/data_proxy/` | `RTensor`, `serialize`, `rpc`, `fetch`                    |
-| `runtime_image_config`    | `Dockerfile`, `.dockerignore`                                          | `FROM`, `ARG`, `RUN`, `ENV`, `COPY`, `uv sync`, `VARIANT` |
+| L2 Signal                 | File Path Pattern                                            | Code Pattern                                              |
+| ------------------------- | ------------------------------------------------------------ | --------------------------------------------------------- |
+| `launcher_resource_match` | `areal/infra/launcher/`                                      | `LaunchConfig`, `RayLauncher`, `SlurmLauncher`            |
+| `scheduler_contract`      | `areal/infra/scheduler/`, `areal/scheduler/`                 | `Scheduler`, `placement`, `resource`                      |
+| `rpc_transport`           | `areal/infra/rpc/`, `areal/v2/inference_service/data_proxy/` | `RTensor`, `serialize`, `rpc`, `fetch`                    |
+| `runtime_image_config`    | `Dockerfile`, `.dockerignore`                                | `FROM`, `ARG`, `RUN`, `ENV`, `COPY`, `uv sync`, `VARIANT` |
 
 ## Domain 10: Low-Risk Hygiene (LOW)
 

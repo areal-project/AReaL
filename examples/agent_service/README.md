@@ -84,7 +84,7 @@ Turn 2: Client → Gateway → Router (same DataProxy) → DataProxy → Worker
 import os
 
 from areal.api.cli_args import AgentConfig, SchedulingSpec
-from areal.experimental.agent_service.controller import (
+from areal.v2.agent_service.controller import (
     AgentController,
 )
 from areal.infra.scheduler.local import LocalScheduler
