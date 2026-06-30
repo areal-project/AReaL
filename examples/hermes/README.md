@@ -116,7 +116,7 @@ upstream becomes optional (see [RL training](#rl-training-self-evolution) below)
 ### 2. Start the service
 
 ```bash
-python examples/agent_service/hermes/run_agent_service.py
+python examples/hermes/run_agent_service.py
 ```
 
 The launcher boots one Worker+DataProxy pair behind a Gateway, prints the Router/Gateway
@@ -132,8 +132,8 @@ records tokens and log-probabilities; you then assign a scalar reward per episod
 ### Step 1 — Start the training service (embeds the inference gateway)
 
 ```bash
-uv run python3 examples/agent_service/hermes/train.py \
-    --config examples/agent_service/hermes/config.yaml \
+uv run python3 examples/hermes/train.py \
+    --config examples/hermes/config.yaml \
     experiment_name=my-exp trial_name=trial-0 \
     rollout.backend=sglang:d1 actor.backend=fsdp:d1 \
     actor.path=Qwen/Qwen3-0.6B scheduler.type=local \
@@ -148,7 +148,7 @@ Proxy gateway available at http://X.X.X.X:PORT
 
 > **Configuration**
 >
-> You can modify `examples/agent_service/hermes/config.yaml` to suit your setup.
+> You can modify `examples/hermes/config.yaml` to suit your setup.
 > Command-line arguments override values in the YAML file, and all options are parsed
 > into the dataclasses defined in `areal/api/cli_args.py`. See the
 > [CLI reference](../../../docs/en/cli_reference.md) for a full description of each
@@ -158,7 +158,7 @@ Proxy gateway available at http://X.X.X.X:PORT
 ### Step 2 — Launch the Hermes Agent Service against the gateway
 
 ```bash
-python examples/agent_service/hermes/run_agent_service.py \
+python examples/hermes/run_agent_service.py \
     --use-areal-inference --inf-base-url http://<gateway> \
     --inf-admin-key sk-test123456
 ```
@@ -181,7 +181,7 @@ data.
 ### Step 4 — Score the episode
 
 ```bash
-python examples/agent_service/hermes/set_reward.py http://<gateway> \
+python examples/hermes/set_reward.py http://<gateway> \
     --api-key sk-sess-xxxxxxxxxxxx --reward 1.0
 ```
 
@@ -212,7 +212,7 @@ pipe the turns in:
 
 ```bash
 printf 'Remember my favorite number is 4242. Acknowledge in one sentence.\nWhat is my favorite number? Answer with just the number.\nquit\n' \
-  | python examples/agent_service/hermes/run_agent_service.py
+  | python examples/hermes/run_agent_service.py
 ```
 
 ## Send requests directly

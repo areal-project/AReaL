@@ -12,7 +12,7 @@ Usage::
     HERMES_UPSTREAM_BASE_URL=https://your-llm/v1 \\
     HERMES_UPSTREAM_API_KEY=sk-... \\
     HERMES_UPSTREAM_MODEL=anthropic/claude-sonnet-4.6 \\
-        python examples/agent_service/hermes/run_agent_service.py
+        python examples/hermes/run_agent_service.py
 
 The launcher boots one Worker+DataProxy pair behind a Gateway, then drops
 into an interactive prompt.  Each user message becomes one turn of the Hermes
@@ -237,7 +237,7 @@ def main() -> None:
             env_vars[passthrough] = os.environ[passthrough]
 
     ctrl_config = AgentConfig(
-        agent_cls_path="examples.agent_service.hermes.hermes.HermesAgent",
+        agent_cls_path="examples.hermes.hermes.HermesAgent",
         admin_api_key=admin_key,
         scheduling_spec=(SchedulingSpec(env_vars=env_vars),),
     )
