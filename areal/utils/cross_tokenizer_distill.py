@@ -209,4 +209,4 @@ def replace_unaligned_teacher_logps(
 ) -> torch.Tensor:
     """Replace ``inf`` sentinel positions with student log-probs for zero KL."""
 
-    return torch.where(torch.isinf(teacher_logp), student_logp.detach(), teacher_logp)
+    return torch.where(torch.isposinf(teacher_logp), student_logp.detach(), teacher_logp)

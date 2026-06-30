@@ -382,6 +382,7 @@ class RemoteInfEngine(InferenceEngine):
         self._proxy_gateway_addr: str | None = None
         self.local_server_processes: list[LocalInfServerInfo] = []
         self._teacher_tokenizer = None
+        self._student_tokenizers = {}
 
     def _wait_for_server(self, address: str, process: subprocess.Popen | None = None):
         """Wait for a server to become healthy."""
@@ -535,9 +536,11 @@ class RemoteInfEngine(InferenceEngine):
         )
 
         cross_tokenizer = student_tokenizer_path is not None
-        student_tokenizer = (
-            load_hf_tokenizer(student_tokenizer_path) if cross_tokenizer else None
-        )
+        student_tokenizer = None
+        if cross_tokenizer:
+            if student_tokenizer_path not in self._student_tokenizers:
+                self._student_tokenizers[student_tokenizer_path] = load_hf_tokenizer(student_tokenizer_path)
+            student_tokenizer = self._student_tokenizers[student_tokenizer_path]
         if cross_tokenizer and self._teacher_tokenizer is None:
             self._teacher_tokenizer = load_hf_tokenizer(self.config.tokenizer_path)
         for traj in data:
