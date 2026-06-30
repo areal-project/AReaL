@@ -4,7 +4,7 @@ import pytest
 import torch
 
 from areal.trainer.dpo.dpo_engine import (
-    _dpo_loss_weight,
+    _dpo_loss_normalizer,
     _dpo_valid_pairs,
     compute_dpo_loss,
 )
@@ -219,11 +219,11 @@ class TestDPOValidPairs:
         assert valid[0].item() is True
         assert valid[1].item() is False
 
-    def test_loss_weight(self):
+    def test_loss_normalizer(self):
         cu_seqlens = torch.tensor([0, 5, 10, 15, 20], dtype=torch.int32)
         input_ = {"cu_seqlens": cu_seqlens}
-        weight = _dpo_loss_weight(input_)
-        assert weight.item() == 2.0
+        normalizer = _dpo_loss_normalizer(input_)
+        assert normalizer.item() == 2.0
 
 
 class TestDPOLossIntraSequenceShift:

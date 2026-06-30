@@ -7,7 +7,7 @@ import torch.distributed as dist
 
 from tests.utils import get_model_path
 
-from areal.api import FinetuneSpec, ParallelStrategy
+from areal.api import FinetuneSpec, LossReduction, ParallelStrategy
 from areal.api.cli_args import (
     MicroBatchSpec,
     OptimizerConfig,
@@ -149,8 +149,10 @@ def test_ulysses(model_type: str):
         engine.train()
         engine.train_batch(
             input_=input,
-            loss_fn=mock_loss_fn,
-            loss_weight_fn=lambda x: x["cu_seqlens"][-1],
+            loss_reduction=LossReduction.mean(
+                loss_fn=mock_loss_fn,
+                normalizer_fn=lambda x: x["cu_seqlens"][-1],
+            ),
         )
         engine.destroy()
     else:
@@ -159,8 +161,10 @@ def test_ulysses(model_type: str):
         for input in input_chunks:
             engine_golden.train_batch(
                 input_=input,
-                loss_fn=mock_loss_fn,
-                loss_weight_fn=lambda x: x["cu_seqlens"][-1],
+                loss_reduction=LossReduction.mean(
+                    loss_fn=mock_loss_fn,
+                    normalizer_fn=lambda x: x["cu_seqlens"][-1],
+                ),
             )
         engine_golden.destroy()
 

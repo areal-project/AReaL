@@ -5,7 +5,7 @@ from typing import Any
 
 import torch
 
-from areal.api import TrainEngine
+from areal.api import LossReduction, TrainEngine
 from areal.api.cli_args import MicroBatchSpec, PPOCriticConfig
 from areal.infra import TrainController
 from areal.infra.rpc.serialization import serialize_value
@@ -65,11 +65,13 @@ class PPOCritic:
         for mb in mb_inputs.mbs:
             train_stat = self.engine.train_batch(
                 mb,
-                loss_fn=functools.partial(
-                    ppo_loss_fn,
-                    eps_clip=self.config.eps_clip,
+                loss_reduction=LossReduction.mean(
+                    loss_fn=functools.partial(
+                        ppo_loss_fn,
+                        eps_clip=self.config.eps_clip,
+                    ),
+                    normalizer_fn=lambda x: x["loss_mask"].count_nonzero(),
                 ),
-                loss_weight_fn=lambda x: x["loss_mask"].count_nonzero(),
             )
             stats_tracker.scalar(**train_stat)
 

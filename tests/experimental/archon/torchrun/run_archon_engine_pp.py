@@ -31,7 +31,7 @@ from tests.experimental.archon.torchrun.dist_utils import (
 )
 from tests.utils import get_model_path
 
-from areal.api import FinetuneSpec, ParallelStrategy
+from areal.api import FinetuneSpec, LossReduction, ParallelStrategy
 from areal.api.cli_args import MicroBatchSpec, OptimizerConfig, TrainEngineConfig
 from areal.experimental.engine.archon_engine import ArchonEngine
 
@@ -95,8 +95,7 @@ def mock_loss_fn(
     return torch.mean(logprobs)
 
 
-def mock_loss_weight_fn(input_data: dict) -> torch.Tensor:
-    """Mock loss weight function for testing."""
+def mock_normalizer_fn(input_data: dict) -> torch.Tensor:
     return input_data["cu_seqlens"][-1].float()
 
 
@@ -181,8 +180,10 @@ def test_eval_batch(engine: ArchonEngine, mock_input: dict) -> bool:
     try:
         loss = engine.eval_batch(
             mock_input,
-            loss_fn=mock_loss_fn,
-            loss_weight_fn=mock_loss_weight_fn,
+            loss_reduction=LossReduction.mean(
+                loss_fn=mock_loss_fn,
+                normalizer_fn=mock_normalizer_fn,
+            ),
         )
 
         # In PP mode, eval_batch may return None (TODO in ArchonEngine)
@@ -211,8 +212,10 @@ def test_train_batch(engine: ArchonEngine, mock_input: dict) -> bool:
     try:
         result = engine.train_batch(
             mock_input,
-            loss_fn=mock_loss_fn,
-            loss_weight_fn=mock_loss_weight_fn,
+            loss_reduction=LossReduction.mean(
+                loss_fn=mock_loss_fn,
+                normalizer_fn=mock_normalizer_fn,
+            ),
         )
 
         print_rank0("  train_batch result:")

@@ -4,7 +4,7 @@ from typing import Any
 
 import torch
 
-from areal.api import TrainEngine
+from areal.api import LossReduction, TrainEngine
 from areal.infra import TrainController
 from areal.infra.rpc.serialization import serialize_value
 from areal.utils import stats_tracker
@@ -29,8 +29,10 @@ class LMEngine:
         data["loss_mask"] = torch.roll(data["loss_mask"].bool(), shifts=-1, dims=-1)
         stats = self.engine.train_batch(
             input_=data,
-            loss_fn=compute_packed_sft_loss,
-            loss_weight_fn=lambda x: x["loss_mask"].count_nonzero(),
+            loss_reduction=LossReduction.mean(
+                loss_fn=compute_packed_sft_loss,
+                normalizer_fn=lambda x: x["loss_mask"].count_nonzero(),
+            ),
         )
         stats_tracker.scalar(**stats)
 
@@ -44,8 +46,10 @@ class LMEngine:
         data["loss_mask"] = torch.roll(data["loss_mask"].bool(), shifts=-1, dims=-1)
         self.engine.eval_batch(
             input_=data,
-            loss_fn=compute_packed_sft_loss,
-            loss_weight_fn=lambda x: x["loss_mask"].count_nonzero(),
+            loss_reduction=LossReduction.mean(
+                loss_fn=compute_packed_sft_loss,
+                normalizer_fn=lambda x: x["loss_mask"].count_nonzero(),
+            ),
         )
 
 

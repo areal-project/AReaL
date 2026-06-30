@@ -5,7 +5,7 @@ from typing import Any
 
 import torch
 
-from areal.api import TrainEngine
+from areal.api import LossReduction, TrainEngine
 from areal.infra import TrainController
 from areal.infra.rpc.serialization import serialize_value
 from areal.utils import logging, stats_tracker
@@ -24,7 +24,7 @@ def _dpo_valid_pairs(x: dict[str, Any]) -> torch.Tensor:
     return seqlens.view(-1, 2).ne(0).all(dim=1)
 
 
-def _dpo_loss_weight(x: dict[str, Any]) -> torch.Tensor:
+def _dpo_loss_normalizer(x: dict[str, Any]) -> torch.Tensor:
     return _dpo_valid_pairs(x).count_nonzero().float()
 
 
@@ -56,10 +56,12 @@ class DPOEngine:
         self.engine.train()
         stats = self.engine.train_batch(
             input_=data,
-            loss_fn=functools.partial(
-                compute_dpo_loss, beta=self.beta, loss_type=self.loss_type
+            loss_reduction=LossReduction.mean(
+                loss_fn=functools.partial(
+                    compute_dpo_loss, beta=self.beta, loss_type=self.loss_type
+                ),
+                normalizer_fn=_dpo_loss_normalizer,
             ),
-            loss_weight_fn=_dpo_loss_weight,
         )
         stats_tracker.scalar(**stats)
 
@@ -72,10 +74,12 @@ class DPOEngine:
         self.engine.eval()
         self.engine.eval_batch(
             input_=data,
-            loss_fn=functools.partial(
-                compute_dpo_loss, beta=self.beta, loss_type=self.loss_type
+            loss_reduction=LossReduction.mean(
+                loss_fn=functools.partial(
+                    compute_dpo_loss, beta=self.beta, loss_type=self.loss_type
+                ),
+                normalizer_fn=_dpo_loss_normalizer,
             ),
-            loss_weight_fn=_dpo_loss_weight,
         )
 
     @trace_perf("dpo_engine.compute_logp", category="compute")

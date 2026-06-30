@@ -6,7 +6,7 @@ import torch
 from tests.utils import get_model_path
 
 import areal
-from areal.api import FinetuneSpec
+from areal.api import FinetuneSpec, LossReduction
 from areal.api.alloc_mode import ModelAllocation
 from areal.api.cli_args import (
     MicroBatchSpec,
@@ -313,10 +313,17 @@ def test_tree_training_forward_backward(engine_type, tree_attn_backend):
     use_triton = tree_attn_backend == "triton"
 
     def loss_fn(logprobs, entropy, input_data, **kwargs):
-        return logprobs.mean()
+        loss_mask = input_data["loss_mask"].to(dtype=logprobs.dtype)
+        denom = loss_mask.count_nonzero().clamp_min(1)
+        return (logprobs * loss_mask).sum() / denom
 
-    def loss_weight_fn(input_data):
+    def normalizer_fn(input_data):
         return input_data["loss_mask"].count_nonzero()
+
+    loss_reduction = LossReduction.mean(
+        loss_fn=loss_fn,
+        normalizer_fn=normalizer_fn,
+    )
 
     areal.models.tree_attn.tree.USE_TRITON_TREE_ATTN = use_triton
     areal.models.tree_attn.module_fsdp.USE_TRITON_TREE_ATTN = use_triton
@@ -328,8 +335,7 @@ def test_tree_training_forward_backward(engine_type, tree_attn_backend):
     baseline_engine.train()
     _ = baseline_engine.train_batch(
         inputs,
-        loss_fn=loss_fn,
-        loss_weight_fn=loss_weight_fn,
+        loss_reduction=loss_reduction,
     )
 
     # Collect baseline gradients and parameters
@@ -354,8 +360,7 @@ def test_tree_training_forward_backward(engine_type, tree_attn_backend):
     tree_engine.train()
     _ = tree_engine.train_batch(
         inputs,
-        loss_fn=loss_fn,
-        loss_weight_fn=loss_weight_fn,
+        loss_reduction=loss_reduction,
     )
 
     if engine_type == "fsdp":

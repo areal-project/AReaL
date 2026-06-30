@@ -85,11 +85,11 @@ ppo_update, etc.).
 **Example** (from `areal/engine/fsdp_engine.py`):
 
 ```python
+from areal.api import LossReduction
 from areal.utils.perf_tracer import trace_perf
 
 @trace_perf("fsdp_engine.train_batch")
-def train_batch(self, input_: dict[str, Any], loss_fn, loss_weight_fn):
-    # Training logic here
+def train_batch(self, input_: dict[str, Any], loss_reduction: LossReduction):
     ...
 ```
 

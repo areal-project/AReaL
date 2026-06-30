@@ -48,6 +48,7 @@ from areal.api import (
     FinetuneSpec,
     FSDPParallelStrategy,
     InferenceEngine,
+    LossReduction,
     ModelAllocation,
     ParallelStrategy,
     ParamSpec,
@@ -60,8 +61,10 @@ from areal.api.cli_args import OptimizerConfig, PerfTracerConfig, TrainEngineCon
 from areal.api.io_struct import DeviceRuntimeInfo
 from areal.engine.core import (
     aggregate_eval_losses,
-    compute_total_loss_weight,
+    compute_global_normalizers,
+    compute_local_normalizers,
     reorder_and_pad_outputs,
+    scale_loss_for_reduction,
 )
 from areal.engine.core.distributed import (
     init_custom_process_group,
@@ -760,23 +763,19 @@ class FSDPEngine(TrainEngine):
     def train_batch(
         self,
         input_: list[dict[str, Any]] | dict[str, Any],
-        loss_fn: Callable[..., torch.Tensor],
-        loss_weight_fn: Callable[[dict[str, Any]], torch.Tensor],
+        loss_reduction: LossReduction,
     ) -> dict[str, float]:
         self._ensure_ready()
         self.optimizer_zero_grad()
 
         input_batched, _ = self._normalize_batch_input(input_)
 
-        # Step 1: Prepare micro-batches
         mb_list = self._prepare_mb_list(input_batched).to(self.device)
 
-        # Step 2: Compute total loss weight
-        total_loss_weight = compute_total_loss_weight(
-            mb_list, loss_weight_fn, self.dp_group
+        global_normalizers = compute_global_normalizers(
+            mb_list, loss_reduction, self.dp_group
         )
 
-        # Step 3: Forward-backward using process_output_fn callback
         def process_output(
             logits: torch.Tensor, ctx_dict: dict[str, Any]
         ) -> torch.Tensor:
@@ -784,15 +783,13 @@ class FSDPEngine(TrainEngine):
             return self._compute_logprobs_and_loss(
                 logits,
                 ctx,
-                loss_fn,
-                loss_weight_fn,
-                total_loss_weight,
+                loss_reduction,
+                global_normalizers,
                 loss_multiplier=self.parallel_helper.dp_size,
             )
 
         self.forward_backward_batch(mb_list, process_output, forward_only=False)
 
-        # Step 4: Optimizer step
         stats = self.optimizer_step()
         stats["num_micro_batches"] = len(mb_list.mbs)
         return stats
@@ -801,22 +798,18 @@ class FSDPEngine(TrainEngine):
     def eval_batch(
         self,
         input_: list[dict[str, Any]] | dict[str, Any],
-        loss_fn: Callable[..., torch.Tensor],
-        loss_weight_fn: Callable[[dict[str, Any]], torch.Tensor],
+        loss_reduction: LossReduction,
     ) -> torch.Tensor | None:
         self._ensure_ready()
 
         input_batched, _ = self._normalize_batch_input(input_)
 
-        # Step 1: Prepare micro-batches
         mb_list = self._prepare_mb_list(input_batched).to(self.device)
 
-        # Step 2: Compute total loss weight
-        total_loss_weight = compute_total_loss_weight(
-            mb_list, loss_weight_fn, self.dp_group
+        global_normalizers = compute_global_normalizers(
+            mb_list, loss_reduction, self.dp_group
         )
 
-        # Step 3: Forward using process_output_fn callback, collecting losses
         losses: list[torch.Tensor] = []
 
         def process_output(
@@ -826,16 +819,14 @@ class FSDPEngine(TrainEngine):
             loss = self._compute_logprobs_and_loss(
                 logits,
                 ctx,
-                loss_fn,
-                loss_weight_fn,
-                total_loss_weight,
+                loss_reduction,
+                global_normalizers,
             )
             losses.append(loss.detach())
             return loss
 
         self.forward_backward_batch(mb_list, process_output, forward_only=True)
 
-        # Step 4: Aggregate losses
         return aggregate_eval_losses(losses, self.dp_group)
 
     @torch.no_grad()
@@ -849,7 +840,6 @@ class FSDPEngine(TrainEngine):
 
         input_batched, meta = self._normalize_batch_input(input_)
 
-        # Step 1: Prepare sequence lengths
         if meta is not None:
             assert isinstance(input_, list)
             inferred_seqlens = [d["attention_mask"].shape[-1] for d in input_]
@@ -866,10 +856,8 @@ class FSDPEngine(TrainEngine):
         assert output_seqlens is not None
         batch_size = len(output_seqlens)
 
-        # Step 2: Prepare micro-batches
         mb_list = self._prepare_mb_list(input_batched).to(self.device)
 
-        # Step 3: Forward using process_output_fn callback, collecting results
         outputs: list[torch.Tensor] = []
 
         def process_output(logits: torch.Tensor, ctx_dict: dict[str, Any]) -> None:
@@ -880,7 +868,6 @@ class FSDPEngine(TrainEngine):
 
         self.forward_backward_batch(mb_list, process_output, forward_only=True)
 
-        # Step 4: Aggregate and reorder outputs
         if self.enable_tree_training:
             result = merge_packed_tree_results(outputs, batch_size)
         else:
@@ -2055,14 +2042,13 @@ class FSDPEngine(TrainEngine):
         self,
         logits: torch.Tensor,
         ctx: FSDPTrainContext,
-        loss_fn: Callable[..., torch.Tensor],
-        loss_weight_fn: Callable[[dict[str, Any]], torch.Tensor],
-        total_loss_weight: torch.Tensor,
+        loss_reduction: LossReduction,
+        global_normalizers: dict[str, torch.Tensor],
         loss_multiplier: float = 1.0,
     ) -> torch.Tensor:
         """Compute logprobs/entropy and return scaled loss."""
-        local_weight = loss_weight_fn(ctx.mb_input)
-        if local_weight == 0:
+        local_normalizers = compute_local_normalizers(ctx.mb_input, loss_reduction)
+        if all(normalizer == 0 for normalizer in local_normalizers.values()):
             return logits.mean() * 0.0
 
         if self.config.is_critic and self.enable_tree_training:
@@ -2106,7 +2092,7 @@ class FSDPEngine(TrainEngine):
                     entropy = entropy[: -ctx.pad_length]
                     vocab_min_logits = vocab_min_logits[: -ctx.pad_length]
                     vocab_max_logits = vocab_max_logits[: -ctx.pad_length]
-            loss = loss_fn(
+            loss = loss_reduction.loss_fn(
                 logprobs,
                 entropy,
                 ctx.mb_input,
@@ -2117,10 +2103,15 @@ class FSDPEngine(TrainEngine):
             values = self._compute_values(logits.squeeze(-1), ctx.ulysses_pad_size)
             if ctx.pad_length > 0:
                 values = values[: -ctx.pad_length]
-            loss = loss_fn(values, ctx.mb_input)
+            loss = loss_reduction.loss_fn(values, ctx.mb_input)
 
-        loss_scale = local_weight / total_loss_weight * loss_multiplier
-        return loss * loss_scale
+        return scale_loss_for_reduction(
+            loss,
+            loss_reduction,
+            local_normalizers,
+            global_normalizers,
+            loss_multiplier,
+        )
 
     def _compute_forward_result(
         self,

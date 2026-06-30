@@ -22,7 +22,7 @@ from typing import Any
 import torch
 import torch.distributed as dist
 
-from areal.api import FinetuneSpec, SaveLoadMeta
+from areal.api import FinetuneSpec, LossReduction, SaveLoadMeta
 from areal.api.alloc_mode import ModelAllocation
 from areal.api.cli_args import (
     MegatronEngineConfig,
@@ -280,10 +280,16 @@ def test_vlm_train(backend: str, output: str | None = None):
         engine.train()
         train_result = engine.train_batch(
             input_=bcasted_input,
-            loss_fn=lambda logprobs, entropy, input_data, **kwargs: torch.mean(
-                logprobs
+            loss_reduction=LossReduction.mean(
+                loss_fn=lambda logprobs, entropy, input_data, **kwargs: (
+                    logprobs
+                    * input_data["loss_mask"].to(
+                        dtype=logprobs.dtype, device=logprobs.device
+                    )
+                ).sum()
+                / input_data["loss_mask"].count_nonzero().clamp_min(1),
+                normalizer_fn=lambda x: x["loss_mask"].count_nonzero(),
             ),
-            loss_weight_fn=lambda x: torch.tensor(1.0, device=engine.device),
         )
 
         assert "grad_norm" in train_result, f"Missing grad_norm: {train_result}"

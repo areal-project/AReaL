@@ -11,7 +11,7 @@ from transformers import AutoTokenizer
 
 from tests.utils import get_model_path
 
-from areal.api import FinetuneSpec, SaveLoadMeta
+from areal.api import FinetuneSpec, LossReduction, SaveLoadMeta
 from areal.api.alloc_mode import ModelAllocation
 from areal.api.cli_args import MicroBatchSpec, OptimizerConfig, TrainEngineConfig
 from areal.engine import FSDPEngine
@@ -186,8 +186,13 @@ def test_train_dcp_save_load(alloc_mode: str, output: str | None = None):
 
     # Train step 1
     engine.train()
+    loss_reduction = LossReduction.mean(
+        loss_fn=mock_loss_fn,
+        normalizer_fn=lambda x: x["cu_seqlens"][-1],
+    )
     train_result = engine.train_batch(
-        input_data, loss_fn=mock_loss_fn, loss_weight_fn=lambda x: x["cu_seqlens"][-1]
+        input_data,
+        loss_reduction=loss_reduction,
     )
     print(f"Rank {rank} train step 1 result: {train_result}")
 
@@ -197,7 +202,8 @@ def test_train_dcp_save_load(alloc_mode: str, output: str | None = None):
 
     # Train step 2
     train_result = engine.train_batch(
-        input_data, loss_fn=mock_loss_fn, loss_weight_fn=lambda x: x["cu_seqlens"][-1]
+        input_data,
+        loss_reduction=loss_reduction,
     )
     print(f"Rank {rank} train step 2 result: {train_result}")
 
@@ -215,7 +221,8 @@ def test_train_dcp_save_load(alloc_mode: str, output: str | None = None):
     # Train step 2 again after load
     engine.train()
     train_result = engine.train_batch(
-        input_data, loss_fn=mock_loss_fn, loss_weight_fn=lambda x: x["cu_seqlens"][-1]
+        input_data,
+        loss_reduction=loss_reduction,
     )
     print(f"Rank {rank} train step 2 after load result: {train_result}")
 

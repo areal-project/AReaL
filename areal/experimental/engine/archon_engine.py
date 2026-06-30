@@ -28,6 +28,7 @@ from transformers import (
 
 from areal.api import (
     FinetuneSpec,
+    LossReduction,
     ParallelStrategy,
     SaveLoadMeta,
     TrainEngine,
@@ -41,8 +42,10 @@ from areal.engine.core.distributed import (
 )
 from areal.engine.core.train_engine import (
     aggregate_eval_losses,
-    compute_total_loss_weight,
+    compute_global_normalizers,
+    compute_local_normalizers,
     reorder_and_pad_outputs,
+    scale_loss_for_reduction,
 )
 from areal.engine.fsdp_utils.grad import fsdp2_clip_grad_norm
 from areal.experimental.engine.archon_checkpoint import (
@@ -394,6 +397,12 @@ class ArchonEngine(TrainEngine):
         return self.parallel_dims.world_mesh["dp"].get_group()
 
     @property
+    def loss_normalizer_group(self) -> dist.ProcessGroup:
+        group = self.parallel_dims.get_group("dp_cp")
+        assert group is not None
+        return group
+
+    @property
     def data_parallel_rank(self) -> int:
         return self._dp_rank
 
@@ -525,8 +534,7 @@ class ArchonEngine(TrainEngine):
     def train_batch(
         self,
         input_: list[dict[str, Any]] | dict[str, Any],
-        loss_fn: Callable[..., torch.Tensor],
-        loss_weight_fn: Callable[[dict[str, Any]], torch.Tensor],
+        loss_reduction: LossReduction,
     ) -> dict[str, float]:
         """Train on a batch of data."""
         assert self._initialized
@@ -536,8 +544,8 @@ class ArchonEngine(TrainEngine):
 
         mb_list = self._prepare_mb_list(input_batched).to(self.device)
 
-        total_loss_weight = compute_total_loss_weight(
-            mb_list, loss_weight_fn, self.data_parallel_group
+        global_normalizers = compute_global_normalizers(
+            mb_list, loss_reduction, self.loss_normalizer_group
         )
 
         def process_output(
@@ -547,9 +555,8 @@ class ArchonEngine(TrainEngine):
             return self._compute_logprobs_and_loss(
                 logits,
                 ctx,
-                loss_fn,
-                loss_weight_fn,
-                total_loss_weight,
+                loss_reduction,
+                global_normalizers,
                 loss_multiplier=self.data_parallel_world_size,
             )
 
@@ -563,8 +570,7 @@ class ArchonEngine(TrainEngine):
     def eval_batch(
         self,
         input_: list[dict[str, Any]] | dict[str, Any],
-        loss_fn: Callable[..., torch.Tensor],
-        loss_weight_fn: Callable[[dict[str, Any]], torch.Tensor],
+        loss_reduction: LossReduction,
     ) -> torch.Tensor | None:
         """Evaluate on a batch of data."""
         assert self._initialized
@@ -573,8 +579,8 @@ class ArchonEngine(TrainEngine):
 
         mb_list = self._prepare_mb_list(input_batched).to(self.device)
 
-        total_loss_weight = compute_total_loss_weight(
-            mb_list, loss_weight_fn, self.data_parallel_group
+        global_normalizers = compute_global_normalizers(
+            mb_list, loss_reduction, self.loss_normalizer_group
         )
 
         def process_output(
@@ -584,9 +590,8 @@ class ArchonEngine(TrainEngine):
             return self._compute_logprobs_and_loss(
                 logits,
                 ctx,
-                loss_fn,
-                loss_weight_fn,
-                total_loss_weight,
+                loss_reduction,
+                global_normalizers,
             )
 
         losses = self.forward_backward_batch(mb_list, process_output, forward_only=True)
@@ -1261,14 +1266,13 @@ class ArchonEngine(TrainEngine):
         self,
         logits: torch.Tensor,
         ctx: ArchonTrainContext,
-        loss_fn: Callable[..., torch.Tensor],
-        loss_weight_fn: Callable[[dict[str, Any]], torch.Tensor],
-        total_loss_weight: torch.Tensor,
+        loss_reduction: LossReduction,
+        global_normalizers: dict[str, torch.Tensor],
         loss_multiplier: float = 1.0,
     ) -> torch.Tensor:
         """Compute logprobs/entropy and return scaled loss."""
-        local_weight = loss_weight_fn(ctx.mb_input)
-        if local_weight == 0:
+        local_normalizers = compute_local_normalizers(ctx.mb_input, loss_reduction)
+        if all(normalizer == 0 for normalizer in local_normalizers.values()):
             return logits.mean() * 0.0
 
         if not self.config.is_critic:
@@ -1276,7 +1280,7 @@ class ArchonEngine(TrainEngine):
             if result is None:
                 return logits.mean() * 0.0
             logprobs, entropy, vocab_min_logits, vocab_max_logits = result
-            loss = loss_fn(
+            loss = loss_reduction.loss_fn(
                 logprobs,
                 entropy,
                 ctx.mb_input,
@@ -1285,10 +1289,15 @@ class ArchonEngine(TrainEngine):
             )
         else:
             values = self._gather_critic_output(logits, ctx)
-            loss = loss_fn(values, ctx.mb_input)
+            loss = loss_reduction.loss_fn(values, ctx.mb_input)
 
-        loss_scale = local_weight / total_loss_weight * loss_multiplier
-        return loss * loss_scale
+        return scale_loss_for_reduction(
+            loss,
+            loss_reduction,
+            local_normalizers,
+            global_normalizers,
+            loss_multiplier,
+        )
 
     def _compute_forward_result(
         self,

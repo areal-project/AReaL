@@ -140,21 +140,27 @@ class FakeTrainEngine(TrainEngine):
     def train_batch(
         self,
         input_: dict[str, Any],
-        loss_fn=None,
-        loss_weight_fn=None,
+        loss_reduction: Any,
     ) -> dict[str, float]:
-        return {
+        result = {
             "total": _sum_numbers(input_),
             "version": float(self._version),
             "train_mode": float(self._train_mode),
         }
+        if loss_reduction is not None:
+            normalizer = loss_reduction.terms[0].normalizer_fn(input_)
+            if hasattr(normalizer, "item"):
+                normalizer = normalizer.item()
+            result["loss_terms"] = float(len(loss_reduction.terms))
+            result["normalizer"] = float(normalizer)
+        return result
 
     def eval_batch(
         self,
         input_: dict[str, Any],
-        loss_fn=None,
-        loss_weight_fn=None,
+        loss_reduction: Any,
     ) -> float:
+        _ = loss_reduction
         return _sum_numbers(input_) + self._version
 
     def forward_batch(
@@ -172,11 +178,11 @@ class FakeTrainEngine(TrainEngine):
 
     def train_lm(self, input_, **kwargs):
         _ = kwargs
-        return self.train_batch(input_)
+        return self.train_batch(input_, loss_reduction=None)
 
     def evaluate_lm(self, input_, **kwargs):
         _ = kwargs
-        return self.eval_batch(input_)
+        return self.eval_batch(input_, loss_reduction=None)
 
     def export_stats(self) -> dict[str, float]:
         return {

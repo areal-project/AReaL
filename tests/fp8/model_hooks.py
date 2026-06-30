@@ -14,8 +14,9 @@ from tests.fp8.engine_utils import (
     print_gemm_profile,
 )
 
+from areal.api import LossReduction
 from areal.engine import MegatronEngine
-from areal.engine.core.train_engine import compute_total_loss_weight
+from areal.engine.core.train_engine import compute_global_normalizers
 from areal.engine.megatron_utils.megatron import get_named_parameters
 from areal.utils import logging
 
@@ -120,10 +121,8 @@ def collect_gradients_after_train_batch(
     for model in engine.model:
         model.zero_grad_buffer()
 
-    # Step 1: Prepare micro-batches
     mb_list = engine._prepare_mb_list(input_).to(engine.device)
 
-    # Step 2: Define loss functions
     def sft_loss_fn(logprobs, entropy, input_):
         """SFT loss function based on compute_packed_sft_loss."""
         del entropy  # SFT does not use entropy
@@ -146,16 +145,21 @@ def collect_gradients_after_train_batch(
         loss = -logprobs.sum() / num_valid
         return loss
 
-    def loss_weight_fn(mb):
-        """Loss weight function based on number of valid tokens."""
+    def normalizer_fn(mb):
+        """Loss normalizer based on number of valid tokens."""
         return mb["loss_mask"].count_nonzero()
 
-    # Step 3: Compute total loss weight
-    total_loss_weight = compute_total_loss_weight(
-        mb_list, loss_weight_fn, mpu.get_data_parallel_group()
+    loss_reduction = LossReduction.mean(
+        loss_fn=sft_loss_fn,
+        normalizer_fn=normalizer_fn,
     )
 
-    # Step 4: Forward-backward using Megatron's pipeline function
+    global_normalizers = compute_global_normalizers(
+        mb_list,
+        loss_reduction,
+        mpu.get_data_parallel_group(with_context_parallel=True),
+    )
+
     loss_multiplier = (
         mpu.get_data_parallel_world_size() * engine.optimizer.get_loss_scale().item()
     )
@@ -164,9 +168,8 @@ def collect_gradients_after_train_batch(
         return engine._compute_logprobs_and_loss(
             output,
             inputs,
-            loss_fn=sft_loss_fn,
-            loss_weight_fn=loss_weight_fn,
-            total_loss_weight=total_loss_weight,
+            loss_reduction=loss_reduction,
+            global_normalizers=global_normalizers,
             loss_multiplier=loss_multiplier,
         )
 
@@ -190,7 +193,6 @@ def collect_gradients_after_train_batch(
     else:
         engine.forward_backward_batch(mb_list, process_output, forward_only=False)
 
-    # Step 5: Collect gradients before optimizer.step()
     gradients = {}
     for name, param in get_named_parameters(engine.model, num_experts=None):
         if param.requires_grad:
@@ -545,8 +547,13 @@ def forward_backward_model_with_hooks(
         loss = -logprobs.sum() / num_valid
         return loss
 
-    def loss_weight_fn(mb):
+    def normalizer_fn(mb):
         return mb["loss_mask"].count_nonzero()
+
+    loss_reduction = LossReduction.mean(
+        loss_fn=sft_loss_fn,
+        normalizer_fn=normalizer_fn,
+    )
 
     # Use engine's train_batch but collect gradients before optimizer step
     engine.optimizer.zero_grad()
@@ -554,7 +561,7 @@ def forward_backward_model_with_hooks(
         model_chunk.zero_grad_buffer()
 
     # Forward and backward
-    engine.train_batch(input_, sft_loss_fn, loss_weight_fn)
+    engine.train_batch(input_, loss_reduction=loss_reduction)
 
     # Collect gradients from all components (focusing on the selected layers)
     model = get_model_from_engine(engine)

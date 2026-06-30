@@ -39,6 +39,7 @@ import areal.models.mcore.bailing_moe_bridge  # noqa: F401  # register bridge
 from areal.api import (
     FinetuneSpec,
     InferenceEngine,
+    LossReduction,
     MegatronParallelStrategy,
     ParallelStrategy,
     ParamSpec,
@@ -51,8 +52,10 @@ from areal.api.cli_args import MicroBatchSpec, PerfTracerConfig, TrainEngineConf
 from areal.api.io_struct import DeviceRuntimeInfo
 from areal.engine.core import (
     aggregate_eval_losses,
-    compute_total_loss_weight,
+    compute_global_normalizers,
+    compute_local_normalizers,
     reorder_and_pad_outputs,
+    scale_loss_for_reduction,
 )
 from areal.engine.core.distributed import (
     init_custom_process_group,
@@ -938,29 +941,25 @@ class MegatronEngine(TrainEngine):
     def train_batch(
         self,
         input_: list[dict[str, Any]] | dict[str, Any],
-        loss_fn: Callable[..., torch.Tensor],
-        loss_weight_fn: Callable[[dict[str, Any]], torch.Tensor],
+        loss_reduction: LossReduction,
     ) -> dict[str, float]:
         self._ensure_ready()
         self.optimizer_zero_grad()
 
         input_batched, _ = self._normalize_batch_input(input_)
 
-        # Step 1: Prepare micro-batches
         mb_list = self._prepare_mb_list(input_batched).to(self.device)
 
-        # Step 2: Compute total loss weight.
         # Use DP+CP group: after CP all-gather each rank computes the full-sequence
         # loss, so all_gather's backward (reduce_scatter) sums cp_size identical
-        # gradients, amplifying by cp_size. Including CP in the weight all-reduce
+        # gradients, amplifying by cp_size. Including CP in the normalizer all-reduce
         # introduces a matching cp_size factor in the denominator, cancelling out.
-        total_loss_weight = compute_total_loss_weight(
+        global_normalizers = compute_global_normalizers(
             mb_list,
-            loss_weight_fn,
+            loss_reduction,
             mpu.get_data_parallel_group(with_context_parallel=True),
         )
 
-        # Step 3: Forward-backward using Megatron's pipeline function.
         # `len(mb_list)` compensates Megatron Core's `output_tensor /= num_microbatches`
         # applied in the 2-tuple `(loss, {})` branch of
         # `megatron.core.pipeline_parallel.schedules._forward_step_helper`. Our
@@ -979,9 +978,8 @@ class MegatronEngine(TrainEngine):
             return self._compute_logprobs_and_loss(
                 output,
                 inputs,
-                loss_fn,
-                loss_weight_fn,
-                total_loss_weight,
+                loss_reduction,
+                global_normalizers,
                 loss_multiplier=loss_multiplier,
             )
 
@@ -991,7 +989,6 @@ class MegatronEngine(TrainEngine):
             forward_only=False,
         )
 
-        # Step 4: Optimizer step
         stats = self.optimizer_step()
         stats["num_micro_batches"] = len(mb_list.mbs)
         return stats
@@ -1000,38 +997,33 @@ class MegatronEngine(TrainEngine):
     def eval_batch(
         self,
         input_: list[dict[str, Any]] | dict[str, Any],
-        loss_fn: Callable[..., torch.Tensor],
-        loss_weight_fn: Callable[[dict[str, Any]], torch.Tensor],
+        loss_reduction: LossReduction,
     ) -> torch.Tensor | None:
         self._ensure_ready()
 
         input_batched, _ = self._normalize_batch_input(input_)
 
-        # Step 1: Prepare micro-batches
         mb_list = self._prepare_mb_list(input_batched).to(self.device)
 
-        # Step 2: Compute total loss weight (DP+CP, see train_batch comment).
-        total_loss_weight = compute_total_loss_weight(
+        global_normalizers = compute_global_normalizers(
             mb_list,
-            loss_weight_fn,
+            loss_reduction,
             mpu.get_data_parallel_group(with_context_parallel=True),
         )
 
-        # Step 3: Forward using Megatron's pipeline function, collecting losses
         losses: list[torch.Tensor] = []
 
         def process_output(
             output: torch.Tensor, inputs: dict[str, Any]
         ) -> torch.Tensor:
             loss = self._compute_logprobs_and_loss(
-                output, inputs, loss_fn, loss_weight_fn, total_loss_weight
+                output, inputs, loss_reduction, global_normalizers
             )
             losses.append(loss.detach())
             return loss
 
         self.forward_backward_batch(mb_list, process_output, forward_only=True)
 
-        # Step 4: Aggregate losses
         if mpu.is_pipeline_last_stage():
             return aggregate_eval_losses(
                 losses, mpu.get_data_parallel_group(with_context_parallel=True)
@@ -1049,7 +1041,6 @@ class MegatronEngine(TrainEngine):
 
         input_batched, meta = self._normalize_batch_input(input_)
 
-        # Step 1: Prepare sequence lengths
         if meta is not None:
             assert isinstance(input_, list)
             inferred_seqlens = [d["attention_mask"].shape[-1] for d in input_]
@@ -1066,10 +1057,8 @@ class MegatronEngine(TrainEngine):
         assert output_seqlens is not None
         batch_size = len(output_seqlens)
 
-        # Step 2: Prepare micro-batches
         mb_list = self._prepare_mb_list(input_batched).to(self.device)
 
-        # Step 3: Forward using Megatron's pipeline function, collecting results
         outputs: list[torch.Tensor] = []
 
         def process_output(output: torch.Tensor, inputs: dict[str, Any]) -> None:
@@ -1079,7 +1068,6 @@ class MegatronEngine(TrainEngine):
 
         self.forward_backward_batch(mb_list, process_output, forward_only=True)
 
-        # Step 4: Aggregate, reorder, and broadcast outputs
         res = None
         if mpu.is_pipeline_last_stage():
             if self.enable_tree_training:
@@ -2242,13 +2230,12 @@ class MegatronEngine(TrainEngine):
         self,
         output: torch.Tensor,
         inputs: dict[str, Any],
-        loss_fn: Callable[..., torch.Tensor],
-        loss_weight_fn: Callable[[dict[str, Any]], torch.Tensor],
-        total_loss_weight: torch.Tensor,
+        loss_reduction: LossReduction,
+        global_normalizers: dict[str, torch.Tensor],
         loss_multiplier: float = 1.0,
     ) -> torch.Tensor:
-        local_weight = loss_weight_fn(inputs)
-        if local_weight == 0:
+        local_normalizers = compute_local_normalizers(inputs, loss_reduction)
+        if all(normalizer == 0 for normalizer in local_normalizers.values()):
             return output.mean() * 0.0
 
         if self.config.is_critic and self.enable_tree_training:
@@ -2340,7 +2327,7 @@ class MegatronEngine(TrainEngine):
                     inputs = {
                         k: v for k, v in inputs.items() if not k.startswith("_cp_")
                     }
-            loss = loss_fn(
+            loss = loss_reduction.loss_fn(
                 logprobs,
                 entropy,
                 inputs,
@@ -2349,10 +2336,15 @@ class MegatronEngine(TrainEngine):
             )
         else:
             values = output.squeeze(-1)
-            loss = loss_fn(values, inputs)
+            loss = loss_reduction.loss_fn(values, inputs)
 
-        loss_scale = local_weight / total_loss_weight * loss_multiplier
-        return loss * loss_scale
+        return scale_loss_for_reduction(
+            loss,
+            loss_reduction,
+            local_normalizers,
+            global_normalizers,
+            loss_multiplier,
+        )
 
     def _compute_forward_result(
         self,

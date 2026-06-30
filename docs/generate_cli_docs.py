@@ -219,6 +219,7 @@ def format_default_value(field_obj) -> str:
 def generate_config_section(
     config_class,
     all_dataclasses: dict[str, Any],
+    lang: str = "en",
     title: str = "",
     description: str = "",
     anchor: str = "",
@@ -269,10 +270,9 @@ def generate_config_section(
         default_value = format_default_value(field)
 
         # Get help text from metadata
-        help_text = field.metadata.get(
-            "help",
-            "-",
-        )
+        help_text = field.metadata.get(f"help_{lang}")
+        if help_text is None:
+            help_text = field.metadata.get("help", "-")
 
         # Get choices if available
         choices = field.metadata.get("choices")
@@ -364,7 +364,7 @@ python3 train.py --config path/to/config.yaml actor.lr=1e-4 seed=42
     # Generate documentation sections automatically
     for category_name, class_list in categories.items():
         for class_name, cls in class_list:
-            doc += generate_config_section(cls, all_dataclasses)
+            doc += generate_config_section(cls, all_dataclasses, lang=lang)
 
     return doc
 

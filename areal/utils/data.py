@@ -587,7 +587,7 @@ class MicroBatchItem(NamedTuple):
     """A single micro-batch item from MicroBatchList iteration.
 
     Attributes:
-        orig_mb: Original micro-batch dict (for loss_weight_fn, context)
+        orig_mb: Original micro-batch dict (for normalizer_fn, context)
         padded_mb: Padded micro-batch dict (for model forward)
         padding_length: Batch-level padding added to this micro-batch
         old_cu_seqlens: Original cu_seqlens before sequence alignment (or None)
@@ -638,7 +638,7 @@ class MicroBatchList:
 
         Yields:
             MicroBatchItem containing:
-                - orig_mb: Original micro-batch dict (for loss_weight_fn, context)
+                - orig_mb: Original micro-batch dict (for normalizer_fn, context)
                 - padded_mb: Padded micro-batch dict (for model forward)
                 - padding_length: Batch-level padding added to this micro-batch
                 - old_cu_seqlens: Original cu_seqlens before sequence alignment (or None)
@@ -693,6 +693,36 @@ class MicroBatchList:
 DEFAULT_MAX_TOKENS_PER_MB = int(1e12)
 
 
+def _resolve_microbatch_sequence_groups(
+    bs: int, granularity: int, group_sizes: Any | None
+) -> tuple[list[list[int]], list[int] | None]:
+    if group_sizes is None:
+        if bs % granularity != 0:
+            raise RuntimeError(
+                f"Batch size {bs} cannot divide granularity {granularity}."
+            )
+        return [
+            list(range(i * granularity, (i + 1) * granularity))
+            for i in range(bs // granularity)
+        ], None
+
+    if torch.is_tensor(group_sizes):
+        group_sizes = group_sizes.detach().cpu().tolist()
+    sizes = [int(size) for size in group_sizes]
+    if any(size <= 0 for size in sizes):
+        raise ValueError(f"group_sizes must be positive, got {sizes}.")
+    total = sum(sizes)
+    if total != bs:
+        raise ValueError(f"group_sizes sum to {total} but batch size is {bs}.")
+
+    groups = []
+    offset = 0
+    for size in sizes:
+        groups.append(list(range(offset, offset + size)))
+        offset += size
+    return groups, sizes
+
+
 def split_padded_tensor_dict_into_mb_list(
     data: dict[str, Any],
     mb_spec: MicroBatchSpec,
@@ -717,18 +747,12 @@ def split_padded_tensor_dict_into_mb_list(
         )
     granularity = mb_spec.granularity
     bs = data["attention_mask"].shape[0]
-    if bs % granularity != 0:
-        raise RuntimeError(f"Batch size {bs} cannot divide granularity {granularity}.")
+    seq_groups, explicit_group_sizes = _resolve_microbatch_sequence_groups(
+        bs, granularity, data.get("group_sizes")
+    )
     max_seqlen = data["attention_mask"].shape[1]
     seq_lens = data["attention_mask"].sum(1).long().cpu().numpy().tolist()
-    input_lens = (
-        data["attention_mask"]
-        .view(bs // granularity, granularity, -1)
-        .sum(dim=(1, 2))
-        .long()
-        .cpu()
-        .numpy()
-    )
+    input_lens = [sum(seq_lens[i] for i in group) for group in seq_groups]
 
     # check for multimodal input data
     multimodal_keys = {key for key in data if is_multi_modal_key(key)}
@@ -737,6 +761,8 @@ def split_padded_tensor_dict_into_mb_list(
     to_split = {}
     not_to_split = {}
     for key, value in data.items():
+        if key == "group_sizes":
+            continue
         if key in multimodal_keys:
             continue
         if key == "position_ids" or (
@@ -749,10 +775,13 @@ def split_padded_tensor_dict_into_mb_list(
 
     # split
     group_indices = allocate_balanced_mbs_synced(mb_spec, input_lens, group=group)
+    mb_group_sizes = (
+        [[len(seq_groups[i]) for i in group_index] for group_index in group_indices]
+        if explicit_group_sizes is not None
+        else None
+    )
     group_indices = [
-        seqpack.flat2d(
-            [list(range(i * granularity, (i + 1) * granularity)) for i in group_index]
-        )
+        seqpack.flat2d([seq_groups[i] for i in group_index])
         for group_index in group_indices
     ]
     splitted_lens = [
@@ -800,6 +829,8 @@ def split_padded_tensor_dict_into_mb_list(
     # organize splitted micro batches
     assert len(mbs) == len(splitted_lens), (len(mbs), len(splitted_lens))
     for i, (mb, lens) in enumerate(zip(mbs, splitted_lens)):
+        if mb_group_sizes is not None:
+            mb["group_sizes"] = mb_group_sizes[i]
         results.append({**mb, **not_to_split})
 
     return MicroBatchList(
@@ -1400,6 +1431,7 @@ class Normalization:
         loss_mask: torch.Tensor | None = None,
         high_precision: bool = True,
         reduce_group=None,
+        group_sizes: list[int] | None = None,
     ) -> torch.Tensor:
         bs = x.size(0)
         eps = self.eps
@@ -1407,6 +1439,11 @@ class Normalization:
         # Early return if no elements are active (all masked out)
         if loss_mask is not None and loss_mask.sum().item() == 0:
             return x.float()
+
+        # Per-group row boundaries, only needed for group-level normalization.
+        group_bounds = None
+        if self.mean_level == "group" or self.std_level == "group":
+            group_bounds = self._resolve_group_bounds(bs, group_sizes)
 
         # Step 1: Compute mean
         if self.mean_level == "batch":
@@ -1421,13 +1458,12 @@ class Normalization:
             mean = mean.expand_as(x)
         elif self.mean_level == "group":
             mean = torch.zeros_like(x)
-            for i in range(0, bs // self.group_size):
-                s = slice(i * self.group_size, (i + 1) * self.group_size)
+            for s in group_bounds:
                 xx = x[s]
                 m = loss_mask[s] if loss_mask is not None else None
 
-                # Special case: with group_size=1 and leave_one_out=True, mean should be 0
-                if self.group_size == 1 and self.mean_leave1out:
+                # A group of one has no leave-one-out baseline -> mean 0.
+                if xx.size(0) == 1 and self.mean_leave1out:
                     dtype = torch.float64 if high_precision else torch.float32
                     group_mean = torch.zeros(
                         (1, *xx.shape[1:]), dtype=dtype, device=xx.device
@@ -1465,14 +1501,13 @@ class Normalization:
             std = std.expand_as(x)
         elif self.std_level == "group":
             std = torch.zeros_like(x)
-            for i in range(0, bs // self.group_size):
-                s = slice(i * self.group_size, (i + 1) * self.group_size)
+            for s in group_bounds:
                 xx = x[s]
                 m = loss_mask[s] if loss_mask is not None else None
                 group_mean_slice = mean[s]  # already computed and expanded
 
-                # Special case: with group_size=1 and std_unbiased=True, std should be 1 for numerical stability
-                if self.group_size == 1 and self.std_unbiased:
+                # A group of one has zero variance -> std 1 for stability.
+                if xx.size(0) == 1 and self.std_unbiased:
                     dtype = torch.float64 if high_precision else torch.float32
                     group_std = torch.ones(
                         (1, *xx.shape[1:]), dtype=dtype, device=xx.device
@@ -1494,6 +1529,37 @@ class Normalization:
 
         # Normalize
         return (x_centered / (std + eps)).float()
+
+    def _resolve_group_bounds(
+        self, bs: int, group_sizes: list[int] | None
+    ) -> list[slice]:
+        """Partition rows ``[0, bs)`` into per-group slices for group-level norm.
+
+        ``group_sizes`` gives the actual per-group row counts, which may be
+        unequal (e.g. partial groups). When omitted, fall back to fixed-size
+        positional groups of ``self.group_size`` and require exact divisibility.
+        """
+        if group_sizes is not None:
+            if any(k < 1 for k in group_sizes):
+                raise ValueError(f"group_sizes must be positive, got {group_sizes}")
+            total = sum(group_sizes)
+            if total != bs:
+                raise ValueError(f"group_sizes sum to {total} but batch size is {bs}")
+            bounds: list[slice] = []
+            offset = 0
+            for k in group_sizes:
+                bounds.append(slice(offset, offset + k))
+                offset += k
+            return bounds
+        if bs % self.group_size != 0:
+            raise ValueError(
+                f"batch size {bs} is not divisible by group_size "
+                f"{self.group_size}; pass group_sizes for partial/unequal groups"
+            )
+        return [
+            slice(i * self.group_size, (i + 1) * self.group_size)
+            for i in range(bs // self.group_size)
+        ]
 
     @staticmethod
     def _compute_mean(

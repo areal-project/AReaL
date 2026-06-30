@@ -7,8 +7,9 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
+from areal.api import LossReduction
 from areal.api.cli_args import MicroBatchSpec
-from areal.engine.core.train_engine import compute_total_loss_weight
+from areal.engine.core.train_engine import compute_global_normalizers
 from areal.infra.controller.train_controller import (
     _dispatch_tensors,
     _pad_eval_batch,
@@ -16,7 +17,7 @@ from areal.infra.controller.train_controller import (
 from areal.trainer.rw.rw_engine import (
     RWController,
     RWEngine,
-    _rw_loss_weight,
+    _rw_loss_normalizer,
     compute_rw_loss,
 )
 from areal.trainer.sft.lm_engine import LMController
@@ -203,7 +204,7 @@ class TestEvalBatchPadding:
         assert len(padded) == 8
         assert _count_dummies(padded) == 1
 
-    def test_compute_total_loss_weight_allows_local_zero(
+    def test_compute_global_normalizers_allows_local_zero(
         self, monkeypatch: pytest.MonkeyPatch
     ):
         mb_list = MicroBatchList(
@@ -221,13 +222,48 @@ class TestEvalBatchPadding:
 
         monkeypatch.setattr(dist, "all_reduce", _mock_all_reduce)
 
-        total_weight = compute_total_loss_weight(
+        global_normalizers = compute_global_normalizers(
             mb_list=mb_list,
-            loss_weight_fn=lambda _mb: torch.tensor(0.0),
+            loss_reduction=LossReduction.mean(
+                loss_fn=lambda: torch.tensor(0.0),
+                normalizer_fn=lambda _mb: torch.tensor(0.0),
+            ),
             dp_group=cast(dist.ProcessGroup, object()),
         )
 
-        torch.testing.assert_close(total_weight, torch.tensor(3.0), rtol=0.0, atol=0.0)
+        torch.testing.assert_close(
+            global_normalizers["loss"], torch.tensor(3.0), rtol=0.0, atol=0.0
+        )
+
+    def test_compute_global_normalizers_allows_global_zero(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        mb_list = MicroBatchList(
+            data={},
+            mb_spec=MicroBatchSpec(),
+            mbs=[{"attention_mask": torch.zeros((1, 1), dtype=torch.bool)}],
+            group_lens=[1],
+        )
+
+        def _mock_all_reduce(
+            tensor: torch.Tensor, group: dist.ProcessGroup | None = None
+        ):
+            del tensor, group
+
+        monkeypatch.setattr(dist, "all_reduce", _mock_all_reduce)
+
+        global_normalizers = compute_global_normalizers(
+            mb_list=mb_list,
+            loss_reduction=LossReduction.mean(
+                loss_fn=lambda: torch.tensor(0.0),
+                normalizer_fn=lambda _mb: torch.tensor(0.0),
+            ),
+            dp_group=cast(dist.ProcessGroup, object()),
+        )
+
+        torch.testing.assert_close(
+            global_normalizers["loss"], torch.tensor(0.0), rtol=0.0, atol=0.0
+        )
 
 
 class TestRWDispatchGrouping:
@@ -323,12 +359,12 @@ class TestRWDispatchGrouping:
 
 
 class TestRWDummyPairSemantics:
-    def test_rw_loss_weight_counts_only_valid_pairs(self):
+    def test_rw_loss_normalizer_counts_only_valid_pairs(self):
         input_data = _make_rw_input([5, 4, 0, 0])
 
-        loss_weight = _rw_loss_weight(input_data)
+        normalizer = _rw_loss_normalizer(input_data)
 
-        torch.testing.assert_close(loss_weight, torch.tensor(1.0), rtol=0.0, atol=0.0)
+        torch.testing.assert_close(normalizer, torch.tensor(1.0), rtol=0.0, atol=0.0)
 
     def test_compute_rw_loss_ignores_dummy_pairs_in_loss_and_metrics(self):
         tracker = DistributedStatsTracker()

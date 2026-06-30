@@ -703,8 +703,8 @@ class GatewayTrainController:
     def train_batch(
         self,
         input_: list[dict[str, Any]] | None = None,
-        loss_fn: Any = None,
-        loss_weight_fn: Any = None,
+        *,
+        loss_reduction: Any,
     ) -> Any:
         from areal.infra.rpc.serialization import serialize_value
 
@@ -714,9 +714,7 @@ class GatewayTrainController:
 
         payload = {
             "args": serialize_value([batch]),
-            "kwargs": serialize_value(
-                {"loss_fn": loss_fn, "loss_weight_fn": loss_weight_fn}
-            ),
+            "kwargs": serialize_value({"loss_reduction": loss_reduction}),
         }
         return self._gateway_post_result("/train_batch", payload)
 
@@ -740,8 +738,8 @@ class GatewayTrainController:
     def eval_batch(
         self,
         input_: list[dict[str, Any]] | None = None,
-        loss_fn: Any = None,
-        loss_weight_fn: Any = None,
+        *,
+        loss_reduction: Any,
     ) -> Any:
         from areal.infra.rpc.serialization import serialize_value
 
@@ -751,9 +749,7 @@ class GatewayTrainController:
 
         payload = {
             "args": serialize_value([batch]),
-            "kwargs": serialize_value(
-                {"loss_fn": loss_fn, "loss_weight_fn": loss_weight_fn}
-            ),
+            "kwargs": serialize_value({"loss_reduction": loss_reduction}),
         }
         return self._gateway_post_result("/eval_batch", payload)
 

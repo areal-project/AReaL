@@ -12,7 +12,7 @@ from transformers import AutoTokenizer
 
 from tests.utils import get_model_path
 
-from areal.api import FinetuneSpec, SaveLoadMeta
+from areal.api import FinetuneSpec, LossReduction, SaveLoadMeta
 from areal.api.cli_args import (
     FSDPEngineConfig,
     MicroBatchSpec,
@@ -177,8 +177,10 @@ def test_eval_batch(engine, mock_input):
     engine.config.mb_spec = MicroBatchSpec(n_mbs=2, max_tokens_per_mb=100)
     eval_result = engine.eval_batch(
         input_=mock_input,
-        loss_fn=mock_loss_fn,
-        loss_weight_fn=lambda x: x["cu_seqlens"][-1],
+        loss_reduction=LossReduction.mean(
+            loss_fn=mock_loss_fn,
+            normalizer_fn=lambda x: x["cu_seqlens"][-1],
+        ),
     )
     assert isinstance(eval_result, torch.Tensor), "Evaluation should return a tensor"
     assert eval_result.is_cuda, "Evaluation tensor should be on CUDA device"
@@ -191,8 +193,10 @@ def test_train_batch(engine, mock_input):
     engine.config.mb_spec = MicroBatchSpec(n_mbs=2, max_tokens_per_mb=100)
     train_result = engine.train_batch(
         input_=mock_input,
-        loss_fn=mock_loss_fn,
-        loss_weight_fn=lambda x: x["cu_seqlens"][-1],
+        loss_reduction=LossReduction.mean(
+            loss_fn=mock_loss_fn,
+            normalizer_fn=lambda x: x["cu_seqlens"][-1],
+        ),
     )
     assert isinstance(train_result, dict), "Training should return a dictionary"
     assert train_result["grad_norm"] is not None

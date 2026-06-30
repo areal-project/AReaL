@@ -6,12 +6,18 @@ This module provides stateless utility functions that are shared across
 different training engine implementations (FSDP, Megatron, etc.).
 """
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from typing import Any
 
 import torch
 import torch.distributed as dist
 
+from areal.api.engine_api import (
+    LOSS_TERM_REDUCTION_MEAN,
+    LossFnOutput,
+    LossReduction,
+    LossTerm,
+)
 from areal.infra.platforms import current_platform
 from areal.utils.data import (
     MicroBatchList,
@@ -21,48 +27,159 @@ from areal.utils.data import (
 )
 
 __all__ = [
-    "compute_total_loss_weight",
+    "compute_global_normalizers",
+    "compute_local_normalizers",
+    "scale_loss_for_reduction",
     "aggregate_eval_losses",
     "reorder_and_pad_outputs",
 ]
 
 
-def compute_total_loss_weight(
-    mb_list: MicroBatchList,
-    loss_weight_fn: Callable[[dict[str, Any]], torch.Tensor],
-    dp_group: dist.ProcessGroup,
-) -> torch.Tensor:
-    """Compute total loss weight and all_reduce across data parallel group.
+def compute_local_normalizers(
+    input_: dict[str, Any], loss_reduction: LossReduction
+) -> dict[str, torch.Tensor]:
+    return {term.name: term.normalizer_fn(input_) for term in loss_reduction.terms}
 
-    This aggregates the loss weights from all micro-batches and reduces
-    them across the data parallel group to get a global normalization factor.
 
-    Parameters
-    ----------
-    mb_list : MicroBatchList
-        The list of micro-batches.
-    loss_weight_fn : Callable[[dict[str, Any]], torch.Tensor]
-        Function to compute loss weight for each micro-batch.
-    dp_group : dist.ProcessGroup
-        The data parallel process group for all_reduce.
-
-    Returns
-    -------
-    torch.Tensor
-        The total loss weight (scalar tensor) after all_reduce.
-    """
-    total_weight = (
-        torch.stack([loss_weight_fn(mb) for mb in mb_list.mbs])
+def _sum_term_normalizer(mb_list: MicroBatchList, term: LossTerm) -> torch.Tensor:
+    return (
+        torch.stack([term.normalizer_fn(mb) for mb in mb_list.mbs])
         .sum()
         .detach()
         .clone()
         .to(dtype=torch.float32)
     )
-    dist.all_reduce(total_weight, group=dp_group)
-    assert total_weight > 0, (
-        "Global total loss weight must be positive after all_reduce"
+
+
+def compute_global_normalizers(
+    mb_list: MicroBatchList,
+    loss_reduction: LossReduction,
+    dp_group: dist.ProcessGroup,
+) -> dict[str, torch.Tensor]:
+    normalizers = torch.stack(
+        [_sum_term_normalizer(mb_list, term) for term in loss_reduction.terms]
     )
-    return total_weight
+    dist.all_reduce(normalizers, group=dp_group)
+    return {
+        term.name: normalizer
+        for term, normalizer in zip(
+            loss_reduction.terms, normalizers.unbind(), strict=True
+        )
+    }
+
+
+def _get_loss_term_value(
+    loss: LossFnOutput, loss_reduction: LossReduction, term: LossTerm
+) -> torch.Tensor:
+    if isinstance(loss, Mapping):
+        try:
+            return loss[term.name]
+        except KeyError as e:
+            raise KeyError(
+                f"loss output is missing term {term.name!r}; "
+                f"available terms are {tuple(loss)}."
+            ) from e
+    if len(loss_reduction.terms) == 1:
+        return loss
+    raise TypeError("loss_fn must return a mapping for multi-term LossReduction.")
+
+
+def _zero_like_loss(loss: LossFnOutput) -> torch.Tensor:
+    if isinstance(loss, Mapping):
+        first = next(iter(loss.values()))
+        return first * 0.0
+    return loss * 0.0
+
+
+def _apply_local_reduction(
+    term_loss: torch.Tensor,
+    term: LossTerm,
+    local_normalizer: torch.Tensor,
+) -> torch.Tensor:
+    if term.reduction == LOSS_TERM_REDUCTION_MEAN:
+        return term_loss * local_normalizer
+    return term_loss
+
+
+def _safe_global_normalizer(global_normalizer: torch.Tensor) -> torch.Tensor:
+    return torch.where(
+        global_normalizer == 0,
+        torch.ones_like(global_normalizer),
+        global_normalizer,
+    )
+
+
+def _scale_loss_term(
+    loss: LossFnOutput,
+    loss_reduction: LossReduction,
+    term: LossTerm,
+    local_normalizers: dict[str, torch.Tensor],
+    global_normalizers: dict[str, torch.Tensor],
+    loss_multiplier: float,
+) -> torch.Tensor:
+    global_normalizer = global_normalizers[term.name]
+    term_loss = _get_loss_term_value(loss, loss_reduction, term)
+    term_loss = _apply_local_reduction(term_loss, term, local_normalizers[term.name])
+    active = (global_normalizer != 0).to(dtype=term_loss.dtype)
+    return (
+        term_loss
+        / _safe_global_normalizer(global_normalizer)
+        * active
+        * loss_multiplier
+    )
+
+
+def _iter_scaled_terms(
+    loss: LossFnOutput,
+    loss_reduction: LossReduction,
+    local_normalizers: dict[str, torch.Tensor],
+    global_normalizers: dict[str, torch.Tensor],
+    loss_multiplier: float,
+) -> Iterator[torch.Tensor]:
+    for term in loss_reduction.terms:
+        yield _scale_loss_term(
+            loss,
+            loss_reduction,
+            term,
+            local_normalizers,
+            global_normalizers,
+            loss_multiplier,
+        )
+
+
+def _sum_scaled_terms(
+    terms: Iterable[torch.Tensor],
+    loss: LossFnOutput,
+) -> torch.Tensor:
+    iterator = iter(terms)
+    try:
+        total = next(iterator)
+    except StopIteration:
+        return _zero_like_loss(loss)
+
+    for term in iterator:
+        total = total + term
+    return total
+
+
+def scale_loss_for_reduction(
+    loss: LossFnOutput,
+    loss_reduction: LossReduction,
+    local_normalizers: dict[str, torch.Tensor],
+    global_normalizers: dict[str, torch.Tensor],
+    loss_multiplier: float,
+) -> torch.Tensor:
+    """Scale local loss terms into a globally normalized engine loss."""
+    return _sum_scaled_terms(
+        _iter_scaled_terms(
+            loss,
+            loss_reduction,
+            local_normalizers,
+            global_normalizers,
+            loss_multiplier,
+        ),
+        loss,
+    )
 
 
 def aggregate_eval_losses(

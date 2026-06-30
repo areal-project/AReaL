@@ -99,7 +99,7 @@ class TestWorkerEndpoints:
                 "args": serialize_value(
                     [{"token_ids": [1, 2, 3], "metadata": {"weight": 2.0}}]
                 ),
-                "kwargs": serialize_value({}),
+                "kwargs": serialize_value({"loss_reduction": None}),
             },
         )
         assert train_resp.status_code == 200

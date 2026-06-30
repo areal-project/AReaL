@@ -4,7 +4,7 @@ from typing import Any
 
 import torch
 
-from areal.api import TrainEngine
+from areal.api import LossReduction, TrainEngine
 from areal.infra import TrainController
 from areal.infra.rpc.serialization import serialize_value
 from areal.utils import logging, stats_tracker
@@ -22,7 +22,7 @@ def _rw_valid_pairs(x: dict[str, Any]) -> torch.Tensor:
     return seqlens.view(-1, 2).ne(0).all(dim=1)
 
 
-def _rw_loss_weight(x: dict[str, Any]) -> torch.Tensor:
+def _rw_loss_normalizer(x: dict[str, Any]) -> torch.Tensor:
     return _rw_valid_pairs(x).count_nonzero().float()
 
 
@@ -49,13 +49,15 @@ class RWEngine:
 
     def _train_rw(self, data: dict[str, Any]) -> None:
         """Train on a batch (reward model)."""
-        if _rw_loss_weight(data) == 0:
+        if _rw_loss_normalizer(data) == 0:
             _log_empty_rw_stats(data["cu_seqlens"].device)
         self.engine.train()
         stats = self.engine.train_batch(
             input_=data,
-            loss_fn=compute_rw_loss,
-            loss_weight_fn=_rw_loss_weight,
+            loss_reduction=LossReduction.mean(
+                loss_fn=compute_rw_loss,
+                normalizer_fn=_rw_loss_normalizer,
+            ),
         )
         stats_tracker.scalar(**stats)
 
@@ -65,13 +67,15 @@ class RWEngine:
         batched_call(self._evaluate_rw, data, unpack=False)
 
     def _evaluate_rw(self, data: dict[str, Any]) -> None:
-        if _rw_loss_weight(data) == 0:
+        if _rw_loss_normalizer(data) == 0:
             _log_empty_rw_stats(data["cu_seqlens"].device)
         self.engine.eval()
         self.engine.eval_batch(
             input_=data,
-            loss_fn=compute_rw_loss,
-            loss_weight_fn=_rw_loss_weight,
+            loss_reduction=LossReduction.mean(
+                loss_fn=compute_rw_loss,
+                normalizer_fn=_rw_loss_normalizer,
+            ),
         )
 
 
