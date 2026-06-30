@@ -59,6 +59,10 @@ class PairInfo:
     save_path: str = ""
     use_lora: bool = False
     lora_name: str = ""
+    # Number of recent LoRA adapter versions to keep loaded on each inference
+    # worker. Older versions are unloaded after a successful load_lora_adapter
+    # to bound VRAM and avoid the adapter-accumulation hang. 0 disables cleanup.
+    lora_keep_versions: int = 0
 
     # Colocated mode (training and inference share GPUs)
     colocate: bool = False

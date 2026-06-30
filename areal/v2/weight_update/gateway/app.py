@@ -38,6 +38,7 @@ class ConnectRequest(BaseModel):
     save_path: str = ""
     use_lora: bool = False
     lora_name: str = ""
+    lora_keep_versions: int = 0
     colocate: bool = False
 
 
@@ -229,12 +230,34 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
                 save_path=body.save_path,
                 use_lora=body.use_lora,
                 lora_name=body.lora_name,
+                lora_keep_versions=body.lora_keep_versions,
             )
             registry.register(pair_info)
             logger.info(
-                "Connected disk pair '%s' (save_path=%s)", pair_name, body.save_path
+                "Connected disk pair '%s' (save_path=%s, use_lora=%s, "
+                "lora_keep_versions=%d)",
+                pair_name,
+                body.save_path,
+                body.use_lora,
+                body.lora_keep_versions,
             )
             return ConnectResponse(pair_name=pair_name)
+
+        # awex mode -- LoRA is unsupported because the NCCL P2P transfer plan
+        # assumes train/infer parameter names match the HF layout, but PEFT
+        # exposes ``base_model.model.*.{base_layer,lora_A,lora_B}.weight`` on
+        # the train side. Fail fast with an actionable error rather than
+        # bubbling up a cryptic TransferPlanBuilder key-mismatch at init.
+        if body.use_lora:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": (
+                        "awex weight update does not support LoRA; set "
+                        "actor.weight_update_mode=disk in your config."
+                    )
+                },
+            )
 
         session = request.app.state.http_session
         init_timeout_s = config.init_timeout_s
@@ -633,6 +656,35 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
                     for url in pair_info.inference_worker_urls
                 ]
             )
+            # Unload the version that fell outside the retention window so
+            # sglang does not accumulate one adapter per train step (leaks
+            # VRAM and eventually hangs). Best-effort: the stale adapter may
+            # already have been evicted or never loaded on this worker.
+            keep = pair_info.lora_keep_versions
+            if keep > 0 and version - keep >= 0:
+                stale_name = get_versioned_lora_name(
+                    pair_info.lora_name, version - keep
+                )
+
+                async def _unload(url: str) -> None:
+                    try:
+                        await _post_json(
+                            session,
+                            f"{url}/unload_lora_adapter",
+                            timeout_s,
+                            json_data={"lora_name": stale_name},
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            "unload_lora_adapter(%s) on %s failed (best-effort): %s",
+                            stale_name,
+                            url,
+                            e,
+                        )
+
+                await asyncio.gather(
+                    *[_unload(url) for url in pair_info.inference_worker_urls]
+                )
         else:
             await asyncio.gather(
                 *[

@@ -17,7 +17,7 @@ import aiohttp
 from areal.infra.utils.concurrent import get_executor, run_async_task
 from areal.infra.utils.http import create_httpx_client
 from areal.utils import logging
-from areal.utils.network import format_hostport
+from areal.utils.network import format_hostport, gethostip
 
 if TYPE_CHECKING:
     from areal.api import ParallelStrategy, TrainEngine
@@ -955,13 +955,18 @@ class GatewayTrainController:
 
         self.rollout = rollout
 
-        if meta.type != "awex":
+        if meta.type not in ("awex", "disk"):
             raise ValueError(
-                f"GatewayTrainController only supports 'awex' weight updates, got '{meta.type}'"
+                f"GatewayTrainController supports 'awex' or 'disk' weight "
+                f"updates, got '{meta.type}'"
             )
 
         ctrl = WeightUpdateController(
             WeightUpdateControllerConfig(
+                # Bind gateway to this node's outbound IP so cross-host
+                # train/inf workers can reach the kv_store_url the gateway
+                # publishes. Default "127.0.0.1" only works single-machine.
+                host=gethostip(),
                 admin_api_key=self.config.admin_api_key,
                 log_level=self.config.log_level,
             )
@@ -969,29 +974,39 @@ class GatewayTrainController:
         ctrl.initialize()
 
         inference_urls: list[str] = rollout.inference_worker_urls
-
-        # NCCL rendezvous master must live on the rank-0 process's node.
-        # awex assigns rank 0 to inference[0], so allocate on the inference
-        # rank-0 guard rather than a train guard.
-        inf_guard_addrs = rollout.inference_guard_addrs
-        resp = requests.post(
-            f"{inf_guard_addrs[0]}/alloc_ports",
-            json={"count": 1},
-            timeout=30,
-        )
-        resp.raise_for_status()
-        port_data = resp.json()
-        nccl_master_addr = port_data["host"]
-        nccl_master_port = port_data["ports"][0]
-
         pair_name = f"{self._role}-rollout"
-        ctrl.connect(
-            pair_name=pair_name,
-            train_worker_urls=self._worker_addrs,
-            inference_worker_urls=inference_urls,
-            nccl_master_addr=nccl_master_addr,
-            nccl_master_port=nccl_master_port,
-        )
+
+        if meta.type == "awex":
+            # NCCL rendezvous master must live on the rank-0 process's node.
+            # awex assigns rank 0 to inference[0], so allocate on the inference
+            # rank-0 guard rather than a train guard.
+            inf_guard_addrs = rollout.inference_guard_addrs
+            resp = requests.post(
+                f"{inf_guard_addrs[0]}/alloc_ports",
+                json={"count": 1},
+                timeout=30,
+            )
+            resp.raise_for_status()
+            port_data = resp.json()
+            ctrl.connect(
+                pair_name=pair_name,
+                train_worker_urls=self._worker_addrs,
+                inference_worker_urls=inference_urls,
+                mode="awex",
+                nccl_master_addr=port_data["host"],
+                nccl_master_port=port_data["ports"][0],
+            )
+        else:  # disk
+            ctrl.connect(
+                pair_name=pair_name,
+                train_worker_urls=self._worker_addrs,
+                inference_worker_urls=inference_urls,
+                mode="disk",
+                save_path=meta.path or "",
+                use_lora=meta.use_lora,
+                lora_name=meta.lora_name,
+                lora_keep_versions=meta.lora_keep_versions,
+            )
         self._weight_update_ctrl = ctrl
         logger.info(
             "WeightUpdateController connected (pair=%s, train=%d, inf=%d)",
