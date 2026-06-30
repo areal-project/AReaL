@@ -91,9 +91,9 @@ in contributing, please reach out to discuss implementation details.
 - [ ] Migrate primary Megatron integration lib from `mbridge` to `megatron-bridge`
   ([#1260](https://github.com/areal-project/AReaL/issues/1260)) `[CC]`
 - [ ] Full support for colocation/separation weight transfer with `awex` as the backend
-  (`areal/experimental/weight_update/`) `[CC]`
+  (`areal/v2/weight_update/`) `[CC]`
 - [ ] Migrate legacy NCCL broadcast weight transfer approach from `areal/engine` into
-  `areal/experimental/weight_update/` `[CC]`
+  `areal/v2/weight_update/` `[CC]`
 - [ ] Omini model RL support with FSDP backend
   ([#879](https://github.com/areal-project/AReaL/issues/879)) `[CC]`
 - [ ] Support training the latest large MoE models with the Megatron backend, including
