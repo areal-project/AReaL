@@ -278,6 +278,7 @@ class MegatronCheckpointManager:
         with_model: bool = True,
         with_optimizer: bool = True,
         with_rng: bool = True,
+        is_loading: bool = False,
     ):
         # For save dist checkpointing
         state_dict = {}
@@ -298,7 +299,24 @@ class MegatronCheckpointManager:
         # Optimizer State Dict
         if with_optimizer:
             torch.distributed.barrier()
-            optimizer_sharded_states = self.optimizer.sharded_state_dict(state_dict)
+            # megatron-core v0.14+ removed flattened_range support (Megatron-LM
+            # PR #2126), but the sharded_state_dict default
+            # (fully_sharded_model_space) still emits it, so saving optimizer
+            # state fails on the pinned 0.17.0. dp_reshardable is upstream's
+            # current default. Trade-off: the optimizer state (not the model
+            # weights) becomes reshardable only along DP -- load hard-asserts
+            # the same bucket layout (per_bucket_numel_unpadded), so save and
+            # load must use identical TP/PP. Fine today since recover enforces
+            # the same topology; switch to fully_reshardable if cross-topology
+            # resume is ever needed (also flattened_range-free, at the cost of
+            # gathering optimizer state). is_loading=True pre-allocates
+            # exp_avg/exp_avg_sq so the load template requests them --
+            # otherwise DCP silently drops the moments on resume.
+            optimizer_sharded_states = self.optimizer.sharded_state_dict(
+                state_dict,
+                is_loading=is_loading,
+                metadata={"distrib_optim_sharding_type": "dp_reshardable"},
+            )
             state_dict["optimizer"] = optimizer_sharded_states
 
             if self.lr_scheduler is not None:
@@ -353,7 +371,7 @@ class MegatronCheckpointManager:
 
         # Get State Dict for loading
         sharded_state_dict = self.generate_state_dict(
-            with_model, with_optimizer, with_rng
+            with_model, with_optimizer, with_rng, is_loading=True
         )
         # Load Dist Checkpointing
         state_dict = load_dist_checkpointing(
