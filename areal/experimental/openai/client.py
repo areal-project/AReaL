@@ -76,6 +76,8 @@ os.environ["OPENAI_BASE_URL"] = os.environ.get("OPENAI_BASE_URL", "none")
 
 logger = logging.getLogger("OpenAIClient")
 
+_DEFAULT_MAX_TOTAL_TOKENS = 32768
+
 
 def _ensure_message_dict_list(
     name: str,
@@ -341,6 +343,18 @@ def _build_messages_list(item: dict) -> list[dict]:
         converted = _convert_tool_output_format(item)
         messages_list.append(deepcopy(converted))
     return messages_list
+
+
+def _resolve_max_total_tokens(
+    prompt_len: int,
+    max_new_tokens: int,
+    engine_max_tokens: int | None,
+) -> int:
+    # Fall back to a fixed context-length ceiling when the deployment does not
+    # configure engine_max_tokens, so a large client max_tokens cannot push
+    # prompt + generation past the backend model's context window.
+    cap = engine_max_tokens or _DEFAULT_MAX_TOTAL_TOKENS
+    return min(prompt_len + max_new_tokens, cap)
 
 
 def _parse_tool_call_arguments(messages: list[dict]) -> list[dict]:
@@ -759,6 +773,11 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
             n_samples=n,
             temperature=temp,
             max_new_tokens=max_new_tokens,
+            max_tokens=_resolve_max_total_tokens(
+                prompt_len=len(prompt_token_ids),
+                max_new_tokens=max_new_tokens,
+                engine_max_tokens=self.engine_max_tokens,
+            ),
             top_p=top_p_val,
             stop=stop_tokens,
             greedy=temp == 0,
@@ -898,9 +917,17 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
                 )
 
             # Tool calls chunks (if any)
+            # Split each tool call into two chunks (name then arguments) to
+            # match standard OpenAI streaming behavior. LiteLLM's Anthropic
+            # streaming adapter treats the first chunk with a function name as
+            # a content_block_start trigger and discards the processed delta
+            # from that same chunk. If name and arguments are combined in a
+            # single chunk, the arguments are lost and Anthropic clients see
+            # input={}.
             if tool_calls:
                 for idx, tool_call in enumerate(tool_calls):
                     tool_call = cast(ChatCompletionMessageFunctionToolCall, tool_call)
+                    # Chunk 1: name + id, with empty arguments.
                     yield ChatCompletionChunk(
                         id=completion_id,
                         choices=[
@@ -913,6 +940,30 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
                                             type="function",
                                             function=ChoiceDeltaToolCallFunction(
                                                 name=tool_call.function.name,
+                                                arguments="",
+                                            ),
+                                        )
+                                    ]
+                                ),
+                                index=0,
+                                finish_reason=None,
+                            )
+                        ],
+                        created=current_time,
+                        model="None",
+                        object="chat.completion.chunk",
+                    )
+                    # Chunk 2: arguments only, emitted as input_json_delta by
+                    # Anthropic adapters after the tool_use block has started.
+                    yield ChatCompletionChunk(
+                        id=completion_id,
+                        choices=[
+                            ChunkChoice(
+                                delta=ChoiceDelta(
+                                    tool_calls=[
+                                        ChoiceDeltaToolCall(
+                                            index=idx,
+                                            function=ChoiceDeltaToolCallFunction(
                                                 arguments=tool_call.function.arguments,
                                             ),
                                         )
@@ -1121,6 +1172,11 @@ class AsyncResponsesWithReward(BaseAsyncResponses):
             n_samples=1,
             temperature=temp,
             max_new_tokens=max_new_tokens,
+            max_tokens=_resolve_max_total_tokens(
+                prompt_len=len(prompt_token_ids),
+                max_new_tokens=max_new_tokens,
+                engine_max_tokens=self.engine_max_tokens,
+            ),
             top_p=top_p_val,
             stop=stop,
             greedy=temp == 0,
