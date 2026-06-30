@@ -91,7 +91,7 @@ def _patch_qwen3vl_pr3143_word_embeddings() -> None:
 def _patch_gpt_model_mtp_training() -> None:
     """Enable training the Multi-Token-Prediction (MTP) head as an auxiliary loss.
 
-    AReaL (like slime) computes the *main* loss outside Megatron from logits, so
+    AReaL computes the *main* loss outside Megatron from logits, so
     ``GPTModel.forward`` is always called with ``labels=None`` and must keep
     returning logits. Megatron-Core 0.17.0's ``process_mtp_loss`` instead derives
     the MTP labels from the main ``labels`` and early-returns when it is None, so
@@ -113,7 +113,7 @@ def _patch_gpt_model_mtp_training() -> None:
          - detaches the shared ``output_weight`` to isolate backbone gradients.
     3. ``MultiTokenPredictionLayer._get_embeddings`` is wrapped to detach the
        backbone hidden states and the MTP embedding input, so the MTP loss only
-       updates MTP parameters (matches slime's ``test_mimo_7B_mtp_only_grad``).
+       updates MTP parameters.
     """
     try:
         from megatron.core.models.gpt import gpt_model
