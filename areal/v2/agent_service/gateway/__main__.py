@@ -10,7 +10,12 @@ from areal.infra.utils.http import validate_admin_api_key
 
 from ..auth import DEFAULT_ADMIN_API_KEY
 from .app import create_gateway_app
-from .bridge import OpenResponsesBridge, mount_bridge
+from .bridge import (
+    ChatCompletionsBridge,
+    OpenResponsesBridge,
+    mount_bridge,
+    mount_chat_bridge,
+)
 from .config import GatewayConfig
 
 
@@ -47,6 +52,12 @@ def main() -> None:
             router_addr=config.router_addr, admin_api_key=config.admin_api_key
         ),
         admin_api_key=config.admin_api_key,
+    )
+    mount_chat_bridge(
+        app,
+        ChatCompletionsBridge(
+            router_addr=config.router_addr, admin_api_key=config.admin_api_key
+        ),
     )
     uvicorn.run(
         app,

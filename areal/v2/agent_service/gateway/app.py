@@ -7,13 +7,21 @@ from __future__ import annotations
 import hmac
 import json
 import traceback
+from typing import Any
 
 import httpx
-from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect
+from fastapi import (
+    Depends,
+    FastAPI,
+    HTTPException,
+    Query,
+    WebSocket,
+    WebSocketDisconnect,
+)
 
 from areal.utils import logging
 
-from ..auth import admin_headers
+from ..auth import admin_headers, make_admin_dependency
 from ..protocol import (
     FrameType,
     RequestFrame,
@@ -47,6 +55,7 @@ def create_gateway_app(config: GatewayConfig) -> FastAPI:
     app = FastAPI(title="AReaL Agent Gateway")
     http_client = httpx.AsyncClient(timeout=config.forward_timeout)
     _auth_headers = admin_headers(config.admin_api_key)
+    _admin = make_admin_dependency(config.admin_api_key)
 
     async def _route(session_key: str) -> str:
         resp = await http_client.post(
@@ -80,6 +89,26 @@ def create_gateway_app(config: GatewayConfig) -> FastAPI:
 
     @app.get("/health")
     async def health():
+        return {"status": "ok"}
+
+    @app.post("/sessions/close", dependencies=[Depends(_admin)])
+    async def close_session(body: dict[str, Any]):
+        """Close a session, forwarding to the DataProxy that owns it.
+
+        The ``session_key`` is supplied in the request body.  Session lifecycle
+        is keyed solely by ``session_key`` and is identical across every gateway
+        surface (WebSocket, ``/v1/responses``, ``/v1/chat/completions``): the
+        Router pins a key to one DataProxy via route affinity, so resolving the
+        key here lands on the DataProxy holding that session's state.  The
+        DataProxy close is idempotent and propagates down to the Worker, so an
+        unknown key is a no-op success.
+        """
+        session_key = body.get("session_key", "")
+        if not session_key:
+            raise HTTPException(status_code=400, detail="'session_key' is required")
+        data_proxy_addr = await _route(session_key)
+        resp = await http_client.post(f"{data_proxy_addr}/session/{session_key}/close")
+        resp.raise_for_status()
         return {"status": "ok"}
 
     @app.websocket("/ws")

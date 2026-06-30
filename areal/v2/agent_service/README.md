@@ -32,7 +32,8 @@ Client (HTTP/WS)
 ### Components
 
 **Gateway** — Public entry point. Accepts WebSocket connections (Gateway protocol) and
-HTTP requests (OpenResponses bridge at `POST /v1/responses`). Routes to the appropriate
+HTTP requests via two bridges: the OpenResponses bridge (`POST /v1/responses`) and the
+OpenAI chat-completions bridge (`POST /v1/chat/completions`). Routes to the appropriate
 DataProxy via the Router.
 
 **Router** — Session-affine routing service. DataProxy instances register at startup.
@@ -123,11 +124,12 @@ class EventEmitter(Protocol):
 
 ### Gateway
 
-| Endpoint        | Method | Description                |
-| --------------- | ------ | -------------------------- |
-| `/health`       | GET    | Health check               |
-| `/ws`           | WS     | Gateway WebSocket protocol |
-| `/v1/responses` | POST   | OpenResponses HTTP bridge  |
+| Endpoint               | Method | Description                    |
+| ---------------------- | ------ | ------------------------------ |
+| `/health`              | GET    | Health check                   |
+| `/ws`                  | WS     | Gateway WebSocket protocol     |
+| `/v1/responses`        | POST   | OpenResponses HTTP bridge      |
+| `/v1/chat/completions` | POST   | OpenAI chat-completions bridge |
 
 ## Multi-turn Conversation Flow
 

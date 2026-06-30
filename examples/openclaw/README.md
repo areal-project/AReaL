@@ -1,4 +1,4 @@
-# Agentic RL with ZeroClaw
+o# Agentic RL with ZeroClaw
 
 [ZeroClaw](https://github.com/zeroclaw-labs/zeroclaw) is a lightweight, drop-in
 replacement for [OpenClaw](https://github.com/openclaw/openclaw) written in Rust. We use
@@ -17,7 +17,185 @@ the OpenAI chat-completions protocol.
 **Disclaimer**: RL-finetuned models may exhibit unexpected behaviors. Please ensure
 strict permission rules and an isolated execution environment for your agent runtime.
 
-## Prerequisites
+## Two ways to use this example
+
+This directory ships two complementary entry points:
+
+| Mode              | Entry point            | What it does                                                                                                                           |
+| ----------------- | ---------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
+| **Agent Service** | `run_agent_service.py` | Hosts OpenClaw behind AReaL's Agent Service so external clients call it over an OpenAI-compatible HTTP API. Start here.                |
+| **RL training**   | `train.py`             | Drives end-to-end RL (PPO) where every agent LLM call flows through the training proxy gateway. Documented from *Prerequisites* below. |
+
+The two share the same building block — the `OpenClawAgent`
+([`examples/agent_service/openclaw/openclaw.py`](../agent_service/openclaw/openclaw.py))
+— and the same lifecycle hooks, so a setup that serves traffic today can be wired into
+RL training tomorrow.
+
+## Serving OpenClaw via the Agent Service
+
+### Design
+
+AReaL's Agent Service is a small fleet of cooperating processes; OpenClaw plugs in as
+the per-worker *agent runtime*:
+
+```
+client ──HTTP /v1/responses──▶ Gateway ──▶ Router ──▶ DataProxy ──▶ Worker
+                                  (auth)    (session    (per-session   (hosts OpenClawAgent)
+                                            routing)    history)             │
+                                                                             │ spawns + drives
+                                                                             ▼
+                                                              OpenClaw gateway subprocess
+                                                                (one per session)
+                                                                             │
+                                                                             ▼
+                                                                   upstream LLM (your model)
+```
+
+- **Gateway** — public OpenAI-compatible surface (`/v1/responses`); enforces the admin
+  API key.
+- **Router** — maps each `session_key` to a worker; owns health state.
+- **DataProxy** — keeps the conversation history for a session and replays it to the
+  worker each turn.
+- **Worker** — loads the class named by `AgentConfig.agent_cls_path` (here
+  `examples.agent_service.openclaw.openclaw.OpenClawAgent`) and exposes it as an
+  `AgentRunnable`.
+
+**Why one OpenClaw subprocess per session?** OpenClaw's configuration (provider,
+upstream key, model) is *process-global*. RL requires each session's turns to be
+attributable to a distinct per-session upstream key (`sk-sess-*`), so logical isolation
+inside a single process is not enough — each session gets its own OpenClaw process bound
+to its own upstream. `OpenClawAgent` manages this:
+
+- `run(request)` — one turn = one `POST /v1/chat/completions` to the session's own
+  subprocess, with `model: "openclaw/default"` and header `x-openclaw-session-key`; the
+  SSE stream is forwarded as deltas / tool calls. The upstream is taken from the
+  per-turn `metadata["areal_inference"]` the DataProxy injects when the turn opts into
+  AReaL's inference service (self-evolution), else from the `OPENCLAW_UPSTREAM_*`
+  environment (serving). The subprocess is spawned lazily on the first turn, and
+  respawned if a later turn switches the upstream.
+- `close_session` / `close_all_sessions` — terminate the subprocess (SIGTERM → SIGKILL
+  fallback), close clients, and remove the temp config directory.
+
+### Prerequisites (Agent Service)
+
+1. **AReaL** installed (see *Install AReaL* below).
+1. **OpenClaw CLI** on `PATH`:
+   ```bash
+   npm install -g openclaw
+   openclaw --version
+   ```
+1. An **upstream LLM** reachable over an OpenAI-compatible (or Anthropic) API, with a
+   base URL, API key, and model id.
+
+### Launch the service
+
+```bash
+export OPENCLAW_UPSTREAM_BASE_URL="https://your-llm/v1"   # OpenAI-compatible endpoint
+export OPENCLAW_UPSTREAM_API_KEY="sk-..."                 # upstream model key
+export OPENCLAW_UPSTREAM_MODEL="claude-sonnet-4-6"        # upstream model id
+
+python examples/agent_service/openclaw/run_agent_service.py
+```
+
+This boots one Worker + DataProxy pair behind a Router and Gateway, then drops into an
+interactive prompt. Expected output:
+
+```
+Initializing with 1 pair ...
+  Router:  http://x.x.x.x:xxxxx
+  Gateway: http://x.x.x.x:xxxxx
+  Pairs:   1
+All services ready.
+
+You: Reply with exactly: hello
+Agent: hello
+```
+
+The launcher generates a random admin API key by default (a fixed unique key is required
+when the Gateway binds to a non-loopback interface). Pass `--admin-api-key <secret>` to
+set your own, `--upstream-url` / `--upstream-model` to override the env, and
+`--fileroot <dir>` to relocate logs and name-resolve records (defaults to a temp
+directory, created automatically).
+
+### Provide the agent service (call it from a client)
+
+Once running, any OpenAI-`/v1/responses`-style client can talk to the Gateway. Use the
+admin API key as the bearer token and a stable `user` to pin a session:
+
+```bash
+curl -s http://<gateway>/v1/responses \
+  -H "Authorization: Bearer <admin-api-key>" \
+  -H "Content-Type: application/json" \
+  -d '{
+        "model": "openclaw-agent",
+        "user": "session-123",
+        "input": [{"type": "message", "content": "Hello!"}]
+      }'
+```
+
+Reusing the same `user` across calls keeps the conversation history (held by the
+DataProxy) and reuses the same OpenClaw subprocess.
+
+### Wiring into RL training (self-evolution)
+
+To route the agent's LLM calls through AReaL's own inference service so the trajectory
+is captured for training, send each turn with the inference routing fields. The Agent
+Service is **decoupled from the training side** — it never calls the inference/training
+service itself. Instead, **you** mint a per-session `sk-sess-*` (via the inference
+gateway's `/rl/start_session`, e.g. with `start_session.py`) and pass it on the turn as
+`session_api_key`:
+
+| Field             | Purpose                                                         |
+| ----------------- | --------------------------------------------------------------- |
+| `inf_base_url`    | AReaL inference gateway base URL the agent's LLM calls go to.   |
+| `session_api_key` | The per-session `sk-sess-*` you minted via `/rl/start_session`. |
+| `inf_model`       | Model id the agent requests from the inference service.         |
+
+The turn opts into self-evolution **by the presence of these fields** — there is no
+separate flag. `inf_base_url` and `session_api_key` are both required (`inf_model` is
+optional and never triggers self-evolution on its own). On the **first** turn that
+carries them, the DataProxy caches the routing handle on the session and injects
+`metadata["areal_inference"]` (`base_url` / `api_key` / `model`) into the worker
+request. The OpenClaw subprocess is (re)spawned bound to that upstream, so all of the
+session's LLM calls flow through AReaL's inference service under one trajectory.
+Subsequent turns of the same session may omit the fields and reuse the cached key.
+
+Reward write-back is the caller's responsibility: since you minted the `sk-sess-*`
+yourself, POST it to the inference service's `/rl/set_reward` once the episode is
+scored. The `run_agent_service.py` launcher wires this end-to-end via
+`--use-areal-inference --inf-base-url http://<inf-gateway>` (it calls
+`/rl/start_session` for you using `--inf-admin-key`).
+
+### Environment variables
+
+| Variable                       | Purpose                                              | Default               |
+| ------------------------------ | ---------------------------------------------------- | --------------------- |
+| `OPENCLAW_UPSTREAM_BASE_URL`   | Upstream LLM base URL (serving fallback)             | — (required to serve) |
+| `OPENCLAW_UPSTREAM_API_KEY`    | Upstream LLM API key                                 | — (required to serve) |
+| `OPENCLAW_UPSTREAM_MODEL`      | Upstream model id                                    | `default`             |
+| `OPENCLAW_UPSTREAM_API`        | `openai-completions` or `anthropic-messages`         | `openai-completions`  |
+| `OPENCLAW_BIN`                 | OpenClaw executable                                  | `openclaw`            |
+| `OPENCLAW_TIMEOUT`             | Per-request timeout (seconds)                        | `120`                 |
+| `OPENCLAW_STARTUP_TIMEOUT`     | Subprocess health-wait (seconds)                     | `60`                  |
+| `OPENCLAW_NODE_EXTRA_CA_CERTS` | CA bundle for the upstream TLS cert (preferred)      | unset                 |
+| `OPENCLAW_TLS_INSECURE`        | `1` sets `NODE_TLS_REJECT_UNAUTHORIZED=0` (dev only) | unset                 |
+
+Legacy `OPENCLAW_GATEWAY_URL` / `OPENCLAW_GATEWAY_TOKEN` / `OPENCLAW_MODEL` are still
+accepted as fallbacks for the upstream URL / key / model.
+
+### Troubleshooting
+
+- **`upstream provider timeout` / `UNABLE_TO_GET_ISSUER_CERT_LOCALLY`** — Node cannot
+  verify the upstream's TLS certificate (common with corporate CAs). Point
+  `OPENCLAW_NODE_EXTRA_CA_CERTS` at the CA bundle, or, for local dev only, set
+  `OPENCLAW_TLS_INSECURE=1`.
+- **`Refusing to start server ... default admin API key`** — the Gateway binds to a
+  routable interface. Pass a unique `--admin-api-key` (the launcher already generates
+  one by default).
+- **`name_resolve... does not exist` / `fileroot ... is None`** — pass
+  `--fileroot <dir>` (auto-created); the default temp directory normally avoids this.
+
+## Prerequisites (RL training)
 
 1. A GPU machine with at least **2 NVIDIA GPUs** (compute capability 8.0 or higher, i.e.
    Ampere / Hopper).
