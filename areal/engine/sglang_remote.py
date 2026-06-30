@@ -587,7 +587,7 @@ class RemoteSGLangEngine(InferenceEngine):
     @classmethod
     def as_controller(cls, config: InferenceEngineConfig, scheduler: Scheduler):
         if config._version == "v2":
-            from areal.experimental.inference_service.controller.controller import (
+            from areal.v2.inference_service.controller.controller import (
                 RolloutControllerV2,
             )
 

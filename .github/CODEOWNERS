@@ -1,34 +1,34 @@
 # Default: catch-all (lead + two active maintainers as backups).
 # Last matching rule wins, so this is the fallback for any path
 # not covered by a more specific rule below.
-*                                       @garrett4wade @sitabulaixizawaluduo @fishcrap
+*                               @garrett4wade @sitabulaixizawaluduo @fishcrap
 
 # Core package
-/areal/api/                             @garrett4wade @rchardx @sitabulaixizawaluduo
-/areal/engine/                          @rchardx @nuzant @garrett4wade @geshi001
-/areal/experimental/inference_service/  @nuzant @guozhihao-224 @TaoZex
-/areal/experimental/agent_service/      @CormickKneey @nuzant
-/areal/experimental/training_service/   @sitabulaixizawaluduo @garrett4wade
-/areal/experimental/weight_update/      @TaoZex @garrett4wade @sitabulaixizawaluduo
-/areal/infra/                           @HwVanICI @garrett4wade @guozhihao-224
-/areal/models/                          @rchardx @nuzant @geshi001 @PrometheusComing
-/areal/trainer/                         @garrett4wade @rchardx @fishcrap
+/areal/api/                     @garrett4wade @rchardx @sitabulaixizawaluduo
+/areal/engine/                  @rchardx @nuzant @garrett4wade @geshi001
+/areal/v2/inference_service/    @nuzant @guozhihao-224 @TaoZex
+/areal/v2/agent_service/        @CormickKneey @nuzant
+/areal/v2/training_service/     @sitabulaixizawaluduo @garrett4wade
+/areal/v2/weight_update/        @TaoZex @garrett4wade @sitabulaixizawaluduo
+/areal/infra/                   @HwVanICI @garrett4wade @guozhihao-224
+/areal/models/                  @rchardx @nuzant @geshi001 @PrometheusComing
+/areal/trainer/                 @garrett4wade @rchardx @fishcrap
 
 # Tests & Examples
-/tests/                                 @garrett4wade @sitabulaixizawaluduo
-/examples/                              @zhenanf @HwVanICI @CormickKneey @PrometheusComing
+/tests/                         @garrett4wade @sitabulaixizawaluduo
+/examples/                      @zhenanf @HwVanICI @CormickKneey @PrometheusComing
 
 # Documentation
-/docs/                                  @garrett4wade @nuzant
+/docs/                          @garrett4wade @nuzant
 
 # CI/CD & infrastructure
-/.github/                               @garrett4wade @nuzant @sitabulaixizawaluduo
-/Dockerfile                             @garrett4wade @fishcrap @sitabulaixizawaluduo
-pyproject.toml                          @garrett4wade @fishcrap @sitabulaixizawaluduo
-pyproject.vllm.toml                     @garrett4wade @fishcrap @sitabulaixizawaluduo
-uv.lock                                 @garrett4wade @fishcrap @sitabulaixizawaluduo
-uv.vllm.lock                            @garrett4wade @fishcrap @sitabulaixizawaluduo
+/.github/                       @garrett4wade @nuzant @sitabulaixizawaluduo
+/Dockerfile                     @garrett4wade @fishcrap @sitabulaixizawaluduo
+pyproject.toml                  @garrett4wade @fishcrap @sitabulaixizawaluduo
+pyproject.vllm.toml             @garrett4wade @fishcrap @sitabulaixizawaluduo
+uv.lock                         @garrett4wade @fishcrap @sitabulaixizawaluduo
+uv.vllm.lock                    @garrett4wade @fishcrap @sitabulaixizawaluduo
 
 # Governance & community
-GOVERNANCE.md                           @garrett4wade @sitabulaixizawaluduo
-CONTRIBUTING.md                         @garrett4wade @sitabulaixizawaluduo
+GOVERNANCE.md                   @garrett4wade @sitabulaixizawaluduo
+CONTRIBUTING.md                 @garrett4wade @sitabulaixizawaluduo

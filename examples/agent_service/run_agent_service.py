@@ -22,7 +22,7 @@ import time
 import httpx
 
 from areal.api.cli_args import AgentConfig
-from areal.experimental.agent_service.controller import AgentController
+from areal.v2.agent_service.controller import AgentController
 
 
 async def _wait_healthy(url: str, timeout: float = 60.0) -> None:

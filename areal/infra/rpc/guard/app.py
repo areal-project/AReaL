@@ -5,7 +5,7 @@
 This module provides the base Guard functionality shared between:
 
 - ``areal.infra.rpc.rpc_server`` (RPC server = guard + data + engine)
-- ``areal.experimental.inference_service.guard`` (inference service guard)
+- ``areal.v2.inference_service.guard`` (inference service guard)
 
 Key components:
 
