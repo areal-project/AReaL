@@ -11,7 +11,6 @@ from __future__ import annotations
 import json
 
 import pytest
-
 from examples.agent_service.hermes.hermes import (
     HermesAgent,
     _SessionState,

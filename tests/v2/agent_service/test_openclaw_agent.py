@@ -13,7 +13,6 @@ import os
 import tempfile
 
 import pytest
-
 from examples.agent_service.openclaw.openclaw import (
     OpenClawAgent,
     _SessionState,
