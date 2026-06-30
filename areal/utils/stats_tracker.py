@@ -36,6 +36,11 @@ class DistributedStatsTracker:
             self.scope_stack.append(name.strip("/"))
         self.denominators = {}  # key -> denominator key
         self.reduce_types = {}  # key -> ReduceType
+        # Per-key override of the reduce_group. If set, its value takes
+        # precedence over the `reduce_group` passed to `export`. This is used,
+        # e.g., to make CP-local SFT stats (loss/entropy/vocab_*) reduce across
+        # DP + CP so the reported numbers are CP-invariant (#1242 follow-up).
+        self.reduce_groups = {}  # key -> dist.ProcessGroup
 
         self.stats = defaultdict(list)
 
@@ -93,7 +98,7 @@ class DistributedStatsTracker:
                 self._set_reduce_type(full_key, ReduceType.SCALAR)
                 self.stats[full_key].append(time.perf_counter() - start_time)
 
-    def denominator(self, **kwargs):
+    def denominator(self, *, reduce_group=None, **kwargs):
         with self.lock:
             for key, value in kwargs.items():
                 if not isinstance(value, torch.Tensor) or value.dtype != torch.bool:
@@ -105,21 +110,34 @@ class DistributedStatsTracker:
                 full_key = self._get_full_key(key)
                 self._set_reduce_type(full_key, ReduceType.SUM)
                 self.stats[full_key].append(value.detach().clone())
+                if reduce_group is not None:
+                    self.reduce_groups[full_key] = reduce_group
 
-    def scalar(self, **kwargs):
+    def scalar(self, *, reduce_group=None, **kwargs):
         with self.lock:
             for key, value in kwargs.items():
                 full_key = self._get_full_key(key)
                 self._set_reduce_type(full_key, ReduceType.SCALAR)
                 self.stats[full_key].append(float(value))
+                if reduce_group is not None:
+                    self.reduce_groups[full_key] = reduce_group
 
     def stat(
         self,
         denominator: str,
         reduce_type: ReduceType | None = None,
+        *,
+        reduce_group=None,
         **kwargs,
     ):
-        """Record multiple values from a dictionary"""
+        """Record multiple values from a dictionary.
+
+        If `reduce_group` is provided, it overrides the `reduce_group` passed
+        to `export` for these specific keys. This enables recording stats that
+        must be reduced across a different topology than the default (e.g.,
+        loss/vocab_* under CP-local loss need DP+CP reduce while n_seqs stays
+        DP-only).
+        """
         with self.lock:
             for key, value in kwargs.items():
                 if not isinstance(value, torch.Tensor) or value.dtype != torch.float:
@@ -143,11 +161,17 @@ class DistributedStatsTracker:
                     reduce_type = ReduceType.AVG_MIN_MAX
                 self._set_reduce_type(full_key, reduce_type)
                 self.stats[full_key].append(value.detach().clone())
+                if reduce_group is not None:
+                    self.reduce_groups[full_key] = reduce_group
 
     def _set_reduce_type(self, key, reduce_type):
         if not isinstance(reduce_type, ReduceType):
             raise ValueError("reduce_type must be a ReduceType enum")
         self.reduce_types[key] = reduce_type
+
+    def _effective_reduce_group(self, key, default_reduce_group):
+        """Return the per-key reduce_group override if any, else the default."""
+        return self.reduce_groups.get(key, default_reduce_group)
 
     def export(self, key=None, reduce_group=None, reset=True) -> dict[str, float]:
         """Get aggregated statistics"""
@@ -159,7 +183,9 @@ class DistributedStatsTracker:
                     if full_key in self.denominators:
                         self.denominators.pop(full_key)
                     if full_key in self.reduce_types:
-                        self.denominators.pop(full_key)
+                        self.reduce_types.pop(full_key)
+                    if full_key in self.reduce_groups:
+                        self.reduce_groups.pop(full_key)
                     self.stats.pop(full_key)
                 return result
 
@@ -176,6 +202,7 @@ class DistributedStatsTracker:
             if reset:
                 self.denominators = {}
                 self.reduce_types = {}
+                self.reduce_groups = {}
                 self.stats = defaultdict(list)
             results = {
                 k: v.cpu().item() if torch.is_tensor(v) else v
@@ -208,9 +235,10 @@ class DistributedStatsTracker:
                 sum(self.stats[key]), dtype=torch.float32, device=device
             )
             cnt = torch.tensor(len(self.stats[key]), dtype=torch.float32, device=device)
-            if reduce_group is not None:
-                dist.all_reduce(value, group=reduce_group)
-                dist.all_reduce(cnt, group=reduce_group)
+            effective_group = self._effective_reduce_group(key, reduce_group)
+            if effective_group is not None:
+                dist.all_reduce(value, group=effective_group)
+                dist.all_reduce(cnt, group=effective_group)
             result[key] = float(value / cnt)
             result[key + "__count"] = int(cnt)
         else:
@@ -223,10 +251,11 @@ class DistributedStatsTracker:
 
     def _sum_of(self, key, reduce_group):
         values = self.stats[key]
+        effective_group = self._effective_reduce_group(key, reduce_group)
         if key not in self.denominators:
             x = sum([x.sum() for x in values])
-            if reduce_group is not None:
-                dist.all_reduce(x, group=reduce_group)
+            if effective_group is not None:
+                dist.all_reduce(x, group=effective_group)
         else:
             denominator = self.denominators[key]
             if denominator not in self.stats:
@@ -237,8 +266,8 @@ class DistributedStatsTracker:
             for v, d in zip(values, self.stats[denominator]):
                 xs.append(torch.where(d, v, 0.0).sum())
             x = sum(xs)
-            if reduce_group is not None:
-                dist.all_reduce(x, group=reduce_group)
+            if effective_group is not None:
+                dist.all_reduce(x, group=effective_group)
         return float(x)
 
     def _avg_of(self, key, reduce_group):
@@ -253,9 +282,10 @@ class DistributedStatsTracker:
             ds.append(d.sum())
         x = sum(xs)
         d = sum(ds)
-        if reduce_group is not None:
-            dist.all_reduce(x, group=reduce_group)
-            dist.all_reduce(d, group=reduce_group)
+        effective_group = self._effective_reduce_group(key, reduce_group)
+        if effective_group is not None:
+            dist.all_reduce(x, group=effective_group)
+            dist.all_reduce(d, group=effective_group)
         if d == 0:
             return None
         return x / d
@@ -269,8 +299,9 @@ class DistributedStatsTracker:
         for v, d in zip(values, self.stats[denominator]):
             xs.append(torch.where(d, v, float("inf")).min())
         x = min(xs)
-        if reduce_group is not None:
-            dist.all_reduce(x, group=reduce_group, op=dist.ReduceOp.MIN)
+        effective_group = self._effective_reduce_group(key, reduce_group)
+        if effective_group is not None:
+            dist.all_reduce(x, group=effective_group, op=dist.ReduceOp.MIN)
         if torch.isinf(x):
             return None
         return float(x)
@@ -284,8 +315,9 @@ class DistributedStatsTracker:
         for v, d in zip(values, self.stats[denominator]):
             xs.append(torch.where(d, v, -float("inf")).max())
         x = max(xs)
-        if reduce_group is not None:
-            dist.all_reduce(x, group=reduce_group, op=dist.ReduceOp.MAX)
+        effective_group = self._effective_reduce_group(key, reduce_group)
+        if effective_group is not None:
+            dist.all_reduce(x, group=effective_group, op=dist.ReduceOp.MAX)
         if torch.isinf(x):
             return None
         return float(x)

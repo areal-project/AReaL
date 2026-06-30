@@ -560,6 +560,51 @@ class MegatronEngine(TrainEngine):
                     distribute_saved_activations=self.mcore_config.distribute_saved_activations,
                     recompute_modules=self.mcore_config.recompute_modules,
                 )
+
+            # Set MoE configuration overrides (aux-loss-free balancing, z-loss).
+            moe_extra_args: dict = {
+                "moe_token_dispatcher_type": self.mcore_config.moe_token_dispatcher_type,
+                "moe_permute_fusion": self.mcore_config.moe_permute_fusion,
+                "moe_router_fusion": self.mcore_config.moe_router_fusion,
+                "moe_shared_expert_overlap": self.mcore_config.moe_shared_expert_overlap,
+                "moe_router_bias_update_rate": self.mcore_config.moe_router_bias_update_rate,
+            }
+            if self.mcore_config.moe_router_dtype is not None:
+                moe_extra_args["moe_router_dtype"] = self.mcore_config.moe_router_dtype
+            if self.mcore_config.moe_z_loss_coeff is not None:
+                moe_extra_args["moe_z_loss_coeff"] = self.mcore_config.moe_z_loss_coeff
+            if self.mcore_config.moe_enable_deepep:
+                moe_extra_args["moe_enable_deepep"] = True
+            # Filter out args not accepted by the target TransformerConfig class.
+            accepted = {
+                f.name for f in dataclasses.fields(self.bridge.TransformerConfigClass)
+            }
+            moe_extra_args = {k: v for k, v in moe_extra_args.items() if k in accepted}
+            self.bridge.set_extra_args(**moe_extra_args)
+
+            # Set precision and loss configuration (may not be supported by all
+            # model configs, e.g. MLATransformerConfig rejects enable_fp32_lm_head).
+            precision_args = {}
+            if self.mcore_config.enable_fp32_lm_head:
+                precision_args["enable_fp32_lm_head"] = True
+            if self.mcore_config.cross_entropy_loss_fusion:
+                precision_args["cross_entropy_loss_fusion"] = True
+            if precision_args:
+                skipped_precision_args = [
+                    k for k in precision_args if k not in accepted
+                ]
+                precision_args = {
+                    k: v for k, v in precision_args.items() if k in accepted
+                }
+                if skipped_precision_args:
+                    self.logger.warning(
+                        "Some precision/loss args are not supported by this model "
+                        f"config ({self.bridge.TransformerConfigClass.__name__}); "
+                        f"skipping: {skipped_precision_args}"
+                    )
+                if precision_args:
+                    self.bridge.set_extra_args(**precision_args)
+
             self.logger.info(
                 "Using mbridge to create models and hf model save/load in MegatronEngine."
             )
@@ -841,6 +886,7 @@ class MegatronEngine(TrainEngine):
             [torch.Tensor, dict[str, Any]], torch.Tensor | None
         ],
         forward_only: bool = False,
+        gather_cp_output: bool = False,
     ) -> None:
         self._ensure_ready()
 
@@ -872,7 +918,13 @@ class MegatronEngine(TrainEngine):
                     tree_attn_keys = list(tree_kwargs.keys())
 
             cp_size = mpu.get_context_parallel_world_size()
-            cp_local = cp_size > 1
+            # forward_batch (compute_logp / compute_values) passes
+            # gather_cp_output=True so CP-local outputs are gathered back to the
+            # full sequence length inside forward. This matches downstream
+            # labels / output_seqlens and fixes split_with_sizes mismatches when
+            # compute_logp runs with CP > 1. Train/eval keeps the default False
+            # value, so the CP-local loss path (_cp_local_labels) is unchanged.
+            cp_local = cp_size > 1 and not gather_cp_output
 
             output = packed_context_parallel_forward(
                 model,
@@ -1077,7 +1129,9 @@ class MegatronEngine(TrainEngine):
             outputs.append(result)
             return None
 
-        self.forward_backward_batch(mb_list, process_output, forward_only=True)
+        self.forward_backward_batch(
+            mb_list, process_output, forward_only=True, gather_cp_output=True
+        )
 
         # Step 4: Aggregate, reorder, and broadcast outputs
         res = None
@@ -2272,6 +2326,10 @@ class MegatronEngine(TrainEngine):
                 vocab_min_logits, vocab_max_logits = gather_packed_tree_vocab_stats(
                     output, trie_node
                 )
+                # Tree training only supports packed min/max vocab stats; mean/norm
+                # would need per-sequence unpacking, so leave them unset.
+                vocab_mean_logits = None
+                vocab_norm_logits = None
                 logprobs, entropy = gather_packed_tree_logprobs_entropy(
                     output,
                     trie_node,
@@ -2298,6 +2356,8 @@ class MegatronEngine(TrainEngine):
                 )
                 vocab_min_logits = output.detach().min(-1).values.float()
                 vocab_max_logits = output.detach().max(-1).values.float()
+                vocab_mean_logits = output.detach().float().mean(-1)
+                vocab_norm_logits = output.detach().float().norm(dim=-1)
                 if cp_padded_cu_seqlens is not None:
                     logprobs = reassemble_cp_packed_logprobs(
                         logprobs, cp_padded_cu_seqlens
@@ -2310,6 +2370,12 @@ class MegatronEngine(TrainEngine):
                     )
                     vocab_max_logits = reassemble_cp_packed_logprobs(
                         vocab_max_logits, cp_padded_cu_seqlens
+                    )
+                    vocab_mean_logits = reassemble_cp_packed_logprobs(
+                        vocab_mean_logits, cp_padded_cu_seqlens
+                    )
+                    vocab_norm_logits = reassemble_cp_packed_logprobs(
+                        vocab_norm_logits, cp_padded_cu_seqlens
                     )
                     cp_padding_length = inputs.get("_cp_padding_length", 0)
                     cp_old_cu_seqlens = inputs.get("_cp_old_cu_seqlens")
@@ -2337,6 +2403,18 @@ class MegatronEngine(TrainEngine):
                         cp_padded_cu_seqlens,
                         cp_old_cu_seqlens,
                     )
+                    vocab_mean_logits = unpad_logits(
+                        vocab_mean_logits,
+                        cp_padding_length,
+                        cp_padded_cu_seqlens,
+                        cp_old_cu_seqlens,
+                    )
+                    vocab_norm_logits = unpad_logits(
+                        vocab_norm_logits,
+                        cp_padding_length,
+                        cp_padded_cu_seqlens,
+                        cp_old_cu_seqlens,
+                    )
                     inputs = {
                         k: v for k, v in inputs.items() if not k.startswith("_cp_")
                     }
@@ -2346,6 +2424,8 @@ class MegatronEngine(TrainEngine):
                 inputs,
                 vocab_min_logits=vocab_min_logits,
                 vocab_max_logits=vocab_max_logits,
+                vocab_mean_logits=vocab_mean_logits,
+                vocab_norm_logits=vocab_norm_logits,
             )
         else:
             values = output.squeeze(-1)
