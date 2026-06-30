@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Set reward for the last interaction in an active session.
 
-Requires the session API key obtained from ``start_session.py``.
+Requires the per-session ``sk-sess-*`` key printed by ``run_agent_service.py
+--use-areal-inference``.
 
 Usage:
     python set_reward.py http://host:port --api-key <KEY> --reward 1.0
@@ -26,7 +27,7 @@ def main() -> None:
     parser.add_argument(
         "--api-key",
         required=True,
-        help="Session API key from start_session.py",
+        help="Per-session sk-sess-* key from run_agent_service.py",
     )
     parser.add_argument(
         "--reward",

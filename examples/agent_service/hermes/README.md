@@ -232,23 +232,6 @@ curl -X POST http://localhost:<gateway-port>/v1/responses \
 
 The admin key is printed on startup (or pass `--admin-api-key`).
 
-## Connectivity self-checks (no agent)
-
-Verify the inference gateway and the session lifecycle **without** the agent. These
-scripts talk to the gateway's control plane directly:
-
-```bash
-# Full lifecycle: start_session → chat/completions → set_reward → refresh
-python examples/agent_service/hermes/demo_lifecycle.py http://<gateway> --admin-key sk-test123456
-
-# Just mint / refresh a session key
-python examples/agent_service/hermes/start_session.py http://<gateway> --admin-key sk-test123456
-```
-
-`start_session.py` mints a session key (or, with `--api-key <key>`, refreshes an
-existing one: end old session → export trajectory → start a fresh session bound to the
-same key). `demo_lifecycle.py` exercises the whole control plane with a built-in prompt.
-
 ## Files
 
 | File                   | Description                                                      |
@@ -258,6 +241,4 @@ same key). `demo_lifecycle.py` exercises the whole control plane with a built-in
 | `train.py`             | RL trainer entry point (embeds the inference gateway)            |
 | `config.yaml`          | Training configuration                                           |
 | `set_reward.py`        | Assign a scalar reward to a session's trajectory                 |
-| `start_session.py`     | Mint / refresh a session key on the inference gateway            |
-| `demo_lifecycle.py`    | Control-plane connectivity self-check (no agent)                 |
 | `_fmt.py`              | Shared CLI formatting helpers                                    |
