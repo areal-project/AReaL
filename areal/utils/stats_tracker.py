@@ -159,7 +159,7 @@ class DistributedStatsTracker:
                     if full_key in self.denominators:
                         self.denominators.pop(full_key)
                     if full_key in self.reduce_types:
-                        self.denominators.pop(full_key)
+                        self.reduce_types.pop(full_key)
                     self.stats.pop(full_key)
                 return result
 
