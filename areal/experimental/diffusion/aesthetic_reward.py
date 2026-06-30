@@ -110,6 +110,24 @@ class AestheticScorer:
             f"weights={self.weights_path}"
         )
 
+    def _extract_image_embedding(self, pixel_values):
+        """Return the projected CLIP image embedding across transformers versions."""
+        import torch
+
+        vision_outputs = self._clip.vision_model(pixel_values=pixel_values)
+        pooled_output = getattr(vision_outputs, "pooler_output", None)
+        if pooled_output is None and isinstance(vision_outputs, tuple):
+            if len(vision_outputs) < 2:
+                raise TypeError(
+                    "CLIP vision_model returned a tuple without pooler_output."
+                )
+            pooled_output = vision_outputs[1]
+        if not isinstance(pooled_output, torch.Tensor):
+            raise TypeError(
+                "CLIP vision_model did not expose a tensor pooler_output."
+            )
+        return self._clip.visual_projection(pooled_output)
+
     def score(self, image: Image) -> float:
         """Return the aesthetic score (typically 1-10) for a single image."""
         self._lazy_init()
@@ -119,7 +137,7 @@ class AestheticScorer:
 
         inputs = self._processor(images=image, return_tensors="pt").to(self.device)
         with torch.no_grad():
-            embed = self._clip.get_image_features(**inputs)
+            embed = self._extract_image_embedding(inputs["pixel_values"])
             # LAION head expects L2-normalized embeddings.
             embed = F.normalize(embed, dim=-1)
             score = self._mlp(embed.float())

@@ -201,6 +201,8 @@ class DiffusionInferenceEngine:
         recompute path use *exactly* the same scheduler math (no divergence).
         Returns ``(alpha_prod_t, alpha_prod_t_prev, beta_prod_t)``.
         """
+        import torch
+
         scheduler = self.scheduler
         prev_timestep = (
             timestep
@@ -265,7 +267,7 @@ class DiffusionInferenceEngine:
 
     @staticmethod
     def _gaussian_logprob(x: torch.Tensor, mean: torch.Tensor, std) -> torch.Tensor:
-        """Per-sample Gaussian log-density, summed over channel/spatial dims.
+        """Per-sample Gaussian log-density, averaged over channel/spatial dims.
 
         ``log N(x; mu, sigma^2) = -0.5*((x-mu)^2/sigma^2 + log(2*pi*sigma^2))``.
         Differentiable w.r.t. ``mean`` (and therefore w.r.t. ``noise_pred`` /
@@ -280,7 +282,7 @@ class DiffusionInferenceEngine:
         log_prob = -0.5 * (
             ((x - mean) ** 2) / (std**2) + 2 * torch.log(std) + math.log(2 * math.pi)
         )
-        return log_prob.sum(dim=tuple(range(1, log_prob.ndim)))
+        return log_prob.mean(dim=tuple(range(1, log_prob.ndim)))
 
     def _ddim_step_with_logprob(
         self,

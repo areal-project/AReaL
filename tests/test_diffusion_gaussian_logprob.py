@@ -20,14 +20,18 @@ import math
 import pytest
 import torch
 
-from areal.experimental.diffusion.diffusion_engine import DiffusionInferenceEngine
+from tests.diffusion_test_utils import assert_tensors_close, load_diffusion_module
+
+DiffusionInferenceEngine = load_diffusion_module(
+    "diffusion_engine"
+).DiffusionInferenceEngine
 
 # Bind the staticmethod once for readability.
 _gaussian_logprob = DiffusionInferenceEngine._gaussian_logprob
 
 
 def _reference_logprob(x: torch.Tensor, mean: torch.Tensor, std) -> torch.Tensor:
-    """Independent reference: per-sample Gaussian log-density summed over all
+    """Independent reference: per-sample Gaussian log-density averaged over all
     dims except the leading batch dim.
 
     Intentionally written with ``torch.distributions.Normal`` so it does not
@@ -35,7 +39,7 @@ def _reference_logprob(x: torch.Tensor, mean: torch.Tensor, std) -> torch.Tensor
     """
     std_t = torch.as_tensor(std, dtype=x.dtype) + 1e-8
     logp = torch.distributions.Normal(mean, std_t).log_prob(x)
-    return logp.sum(dim=tuple(range(1, logp.ndim)))
+    return logp.mean(dim=tuple(range(1, logp.ndim)))
 
 
 class TestGaussianLogprob:
@@ -52,7 +56,7 @@ class TestGaussianLogprob:
         expected = _reference_logprob(x, mean, std)
 
         assert out.shape == (2,)
-        torch.testing.assert_close(out, expected, rtol=1e-5, atol=1e-5)
+        assert_tensors_close(out, expected, rtol=1e-5, atol=1e-5)
 
     def test_per_element_std_does_not_crash(self):
         """REGRESSION: a per-element std tensor must not raise.
@@ -82,7 +86,7 @@ class TestGaussianLogprob:
         expected = _reference_logprob(x, mean, std)
 
         assert out.shape == (3,)
-        torch.testing.assert_close(out, expected, rtol=1e-5, atol=1e-5)
+        assert_tensors_close(out, expected, rtol=1e-5, atol=1e-5)
 
     def test_scalar_and_broadcast_std_agree(self):
         """A scalar std and a full tensor filled with that same value agree."""
@@ -96,7 +100,7 @@ class TestGaussianLogprob:
         out_scalar = _gaussian_logprob(x, mean, scalar_std)
         out_tensor = _gaussian_logprob(x, mean, tensor_std)
 
-        torch.testing.assert_close(out_scalar, out_tensor, rtol=1e-5, atol=1e-5)
+        assert_tensors_close(out_scalar, out_tensor, rtol=1e-5, atol=1e-5)
 
     def test_known_closed_form_value(self):
         """Check one hand-computed value end to end (no reliance on Normal)."""
@@ -110,7 +114,7 @@ class TestGaussianLogprob:
         expected_val = -0.5 * (2 * math.log(std_eff) + math.log(2 * math.pi))
 
         out = _gaussian_logprob(x, mean, std)
-        torch.testing.assert_close(
+        assert_tensors_close(
             out, torch.tensor([expected_val], dtype=out.dtype), rtol=1e-6, atol=1e-6
         )
 
