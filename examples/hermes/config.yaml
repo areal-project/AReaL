@@ -9,7 +9,7 @@ tokenizer_path: ${actor.path}
 
 cluster:
   n_nodes: 1
-  n_gpus_per_node: 8
+  n_gpus_per_node: 2
   fileroot: /tmp/areal/experiments
   name_resolve:
     type: nfs
@@ -20,6 +20,7 @@ scheduler:
 
 rollout:
   backend: "sglang:d1"
+  _version: v2
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
   max_concurrent_rollouts: 256
@@ -37,8 +38,7 @@ rollout:
     reasoning_parser: qwen3
     export_style: individual
     turn_discount: 1.0
-    admin_api_key: sk-test123456
-  admin_api_key: sk-test123456
+  admin_api_key: sk-xxx
 
 gconfig:
   n_samples: 1
@@ -49,6 +49,8 @@ gconfig:
 
 actor:
   backend: "fsdp:d1"
+  _version: v2
+  admin_api_key: gsm8k-123
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
   path: Qwen/Qwen2.5-1.5B-Instruct
@@ -116,7 +118,7 @@ vllm:
 
 # datasets
 train_dataset:
-  batch_size: 4
+  batch_size: 1
   path: "null"
   type: rl
 
