@@ -1697,7 +1697,12 @@ class FSDPEngine(TrainEngine):
         tokenizer: PreTrainedTokenizerFast | None,
         processor: ProcessorMixin | None,
     ):
-        """Save model in HuggingFace format."""
+        """Save model in HuggingFace format.
+
+        LoRA mode writes adapter-only PEFT files for SGLang's
+        ``/load_lora_adapter`` endpoint; non-LoRA mode writes a full HF
+        model directory.
+        """
         if self.model is None:
             raise RuntimeError("Model not initialized")
         os.makedirs(path, exist_ok=True)
@@ -1720,13 +1725,79 @@ class FSDPEngine(TrainEngine):
         # save huggingface model on rank 0
         if dist.get_rank() == 0:
             os.makedirs(path, exist_ok=True)
-            self.model.save_pretrained(path, state_dict=state_dict)
-            self.model_config.save_pretrained(path)
-            if tokenizer is not None and not self.config.use_lora:
-                tokenizer.save_pretrained(path)
-            if processor is not None and not self.config.use_lora:
-                processor.save_pretrained(path)
+            if self.config.use_lora:
+                self._save_lora_adapter_to_hf(path, state_dict)
+            else:
+                self.model.save_pretrained(path, state_dict=state_dict)
+                self.model_config.save_pretrained(path)
+                if tokenizer is not None:
+                    tokenizer.save_pretrained(path)
+                if processor is not None:
+                    processor.save_pretrained(path)
         dist.barrier(group=self.cpu_group)
+
+    def _save_lora_adapter_to_hf(
+        self,
+        path: str,
+        state_dict: dict[str, torch.Tensor],
+    ):
+        """Save only LoRA adapter weights in standard PEFT format.
+
+        The saved layout matches what SGLang's ``/load_lora_adapter``
+        endpoint expects.
+        """
+        import json
+
+        from safetensors.torch import save_file as safetensors_save_file
+
+        # PEFT adapter files omit the active adapter segment, e.g. ".default.".
+        adapter_name = "default"  # PEFT default adapter name
+        lora_keywords = ("lora_A", "lora_B", "lora_embedding_A", "lora_embedding_B")
+
+        adapter_state_dict: dict[str, torch.Tensor] = {}
+        for name, tensor in state_dict.items():
+            if not any(kw in name for kw in lora_keywords):
+                continue
+            stripped = name.replace(f".{adapter_name}.", ".")
+            adapter_state_dict[stripped] = tensor.contiguous().cpu().float()
+
+        if not adapter_state_dict:
+            raise RuntimeError(
+                "use_lora=True but no LoRA adapter parameters were found in "
+                "the model state_dict; check that PEFT wrapping was applied."
+            )
+
+        safetensors_save_file(
+            adapter_state_dict, os.path.join(path, "adapter_model.safetensors")
+        )
+
+        # Build a PEFT-compatible adapter_config.json
+        config = self.config
+        if not config.target_modules or config.target_modules == ["all-linear"]:
+            target_modules_val = "all-linear"
+        else:
+            target_modules_val = config.target_modules
+
+        adapter_config = {
+            "peft_type": "LORA",
+            "auto_mapping": None,
+            "base_model_name_or_path": getattr(config, "path", "") or "",
+            "bias": "none",
+            "fan_in_fan_out": False,
+            "inference_mode": False,
+            "init_lora_weights": True,
+            "layers_to_transform": None,
+            "layers_pattern": None,
+            "lora_alpha": config.lora_alpha,
+            "lora_dropout": 0.0,
+            "modules_to_save": None,
+            "r": config.lora_rank,
+            "revision": None,
+            "target_modules": target_modules_val,
+            "task_type": "CAUSAL_LM",
+        }
+        with open(os.path.join(path, "adapter_config.json"), "w") as f:
+            json.dump(adapter_config, f, indent=2)
 
     def _load_model_from_hf(self, path: str):
         """Load model from HuggingFace format."""
