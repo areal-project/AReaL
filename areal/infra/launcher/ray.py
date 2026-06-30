@@ -34,6 +34,7 @@ from areal.infra.utils.launcher import (
     JobState,
     get_scheduling_spec,
     get_thread_env_vars,
+    run_post_exit_hook,
     validate_config_for_distributed_launcher,
     wait_llm_server_addrs,
 )
@@ -490,6 +491,7 @@ def ray_main(config, run_id: int = 0):
             launcher.stop_all(
                 force=False
             )  # force=False will send KeyboardInterrupt to sglang_server.main() to further clean all sglang-related processes
+            run_post_exit_hook(config)
             raise e
     elif allocation_mode.gen_backend == "vllm":
         config.vllm = to_structured_cfg(config.vllm, vLLMConfig)
@@ -532,6 +534,7 @@ def ray_main(config, run_id: int = 0):
             )
         except (TimeoutError, KeyboardInterrupt) as e:
             launcher.stop_all(force=True)
+            run_post_exit_hook(config)
             raise e
 
     if config.get("enable_offload", False):
@@ -626,6 +629,7 @@ def ray_main(config, run_id: int = 0):
         # Note: For trainer processes, we use force=True because the trainer doesn't
         # handle KeyboardInterrupt properly when force=False.
         launcher.stop_all(force=True, pattern="trainer")
+        run_post_exit_hook(config)
         recover_states = [JobState.FAILED]
         if isinstance(e, JobException):
             recover_this = (

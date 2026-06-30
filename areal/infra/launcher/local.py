@@ -31,6 +31,7 @@ from areal.infra.utils.launcher import (
     JobState,
     get_scheduling_spec,
     get_thread_env_vars,
+    run_post_exit_hook,
     validate_config_for_launcher,
     wait_llm_server_addrs,
 )
@@ -372,6 +373,7 @@ def local_main(config, run_id: int = 0):
             )
         except (TimeoutError, KeyboardInterrupt) as e:
             launcher.stop_all(signal="SIGINT")
+            run_post_exit_hook(config)
             raise e
 
     if config.get("enable_offload", False):
@@ -422,6 +424,7 @@ def local_main(config, run_id: int = 0):
         )
     except (KeyboardInterrupt, JobException, TimeoutError) as e:
         launcher.stop_all("SIGTERM")
+        run_post_exit_hook(config)
         # NOTE: For local launcher, We cannot distinguish between a completed job and a failed job.
         # So we will always try to recover the job if it is finished or failed.
         recover_states = [JobState.FAILED, JobState.NOT_FOUND, JobState.COMPLETED]
