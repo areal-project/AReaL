@@ -539,7 +539,9 @@ class RemoteInfEngine(InferenceEngine):
         student_tokenizer = None
         if cross_tokenizer:
             if student_tokenizer_path not in self._student_tokenizers:
-                self._student_tokenizers[student_tokenizer_path] = load_hf_tokenizer(student_tokenizer_path)
+                self._student_tokenizers[student_tokenizer_path] = load_hf_tokenizer(
+                    student_tokenizer_path
+                )
             student_tokenizer = self._student_tokenizers[student_tokenizer_path]
         if cross_tokenizer and self._teacher_tokenizer is None:
             self._teacher_tokenizer = load_hf_tokenizer(self.config.tokenizer_path)
