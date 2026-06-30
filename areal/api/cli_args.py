@@ -921,6 +921,44 @@ class MegatronEngineConfig:
         default=False,
         metadata={"help": "Fuse token rearrangement ops during token dispatching."},
     )
+    moe_router_fusion: bool = field(
+        default=False,
+        metadata={
+            "help": "Enable fusion for MoE TopK routing and aux-loss computation. "
+            "Requires TransformerEngine >= 2.7.0.",
+        },
+    )
+    moe_router_bias_update_rate: float = field(
+        default=1e-3,
+        metadata={
+            "help": "Update rate for auxiliary-loss-free MoE load balancing "
+            "(DeepSeek V3 style). Controls how fast expert_bias adjusts. "
+            "Default 1e-3 matches DeepSeek V3. Set 0.0 to disable.",
+        },
+    )
+    moe_z_loss_coeff: float | None = field(
+        default=None,
+        metadata={
+            "help": "Scaling coefficient for router z-loss. Complements "
+            "auxiliary-loss-free load balancing for router stability. A starting "
+            "value of 1e-3 is recommended. None disables z-loss.",
+        },
+    )
+
+    # Precision & Loss
+    enable_fp32_lm_head: bool = field(
+        default=False,
+        metadata={
+            "help": "Cast lm_head output to FP32 before loss computation for "
+            "numerical stability."
+        },
+    )
+    cross_entropy_loss_fusion: bool = field(
+        default=False,
+        metadata={
+            "help": "Enable fused cross-entropy loss kernel for better performance."
+        },
+    )
 
     # FP8 Training Configuration
     fp8_config: FP8EngineConfig | None = None
@@ -2105,6 +2143,27 @@ class AgentConfig:
             "choices": ["individual", "concat"],
         },
     )
+    message_preprocessors: list[str] = field(
+        default_factory=list,
+        metadata={
+            "help": (
+                "List of message preprocessor class paths applied in order before "
+                "forwarding requests to the inference engine. Each entry is a dotted "
+                "import path to a callable class."
+            ),
+        },
+    )
+    prefix_matcher: str | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Dotted import path to a custom prefix matcher function for "
+                "InteractionCache parent-child matching. The function must accept "
+                "two list[dict] arguments (candidate prefix, full messages) and "
+                "return bool. When None, exact element-wise equality is used."
+            ),
+        },
+    )
     subproc_max_workers: int = field(
         default=4,
         metadata={
@@ -2890,6 +2949,17 @@ class BaseExperimentConfig:
     vllm: vLLMConfig = field(default_factory=vLLMConfig)
 
     scheduler: SchedulerConfig = field(default_factory=SchedulerConfig)
+
+    post_exit_hook: str = field(
+        default="",
+        metadata={
+            "help": "Shell command to run after the experiment exits (normal or abnormal). "
+            "Useful for cleaning up external resources (e.g., sandbox instances). "
+            "Runs after all jobs are stopped but before recovery. "
+            "The LOG_DIR environment variable is injected automatically. "
+            "Timeout: 600 seconds. Failures are logged but do not interrupt shutdown."
+        },
+    )
 
     def __post_init__(self):
         """Validate training configuration."""
