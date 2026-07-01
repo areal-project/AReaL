@@ -53,6 +53,7 @@ from areal.utils.network import (
     gethostip,
 )
 from areal.utils.offload import get_tms_env_vars
+from areal.utils.wandb_system_metrics import prepare_wandb_run_identity
 
 logger = logging.getLogger("LocalScheduler")
 
@@ -114,6 +115,7 @@ class LocalScheduler(Scheduler):
         exp_config: BaseExperimentConfig | None = None,
     ):
         self.gpu_devices = gpu_devices or self._detect_gpus()
+        prepare_wandb_run_identity(exp_config)
 
         # Resolve experiment/trial names (exp_config overwrites direct params)
         self.experiment_name = experiment_name
