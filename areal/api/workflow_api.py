@@ -16,7 +16,10 @@ class RolloutWorkflow(ABC):
     async def arun_episode(
         self, engine: InferenceEngine, data: dict[str, Any]
     ) -> dict[str, Any] | None | dict[str, InteractionWithTokenLogpReward]:
-        """Run a single episode of the workflow.
+        """Run one rollout task with the workflow.
+
+        Most workflows return one trajectory. Wrapper workflows may return multiple
+        trajectories batched along the first dimension.
 
         Note
         ----
