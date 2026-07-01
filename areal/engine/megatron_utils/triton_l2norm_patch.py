@@ -8,6 +8,10 @@ per shape, the dominant cost of the GDN first-step compile. Monkeypatches
 ``mindspeed.ops.triton.l2norm`` in place, so it MUST be imported BEFORE
 ``mindspeed.megatron_adaptor`` (which binds ``l2norm`` into ``fla.modules``). No-op
 without MindSpeed; tracked in-repo so it survives image rebuilds.
+
+Also despecializes ``NT`` in the GDN chunk kernels (``_despecialize_chunk_nt``) so
+they compile once across sequence lengths instead of recompiling per seqlen -- the
+dominant per-new-seqlen chunk cost. All three are runtime-free compile-once wins.
 """
 # Copyright c) 2023-2025 Songlin Yang Yu Zhang
 # Copyright (c) 2024, Huawei Technologies Co., Ltd.  All rights reserved.
@@ -318,6 +322,65 @@ def _reduce_chunk_autotune() -> bool:
     return True
 
 
+# GDN chunk kernels that take ``NT`` (= cdiv(T, BT), number of chunks) as a
+# ``tl.constexpr``: since ``NT`` changes with sequence length, they recompile per
+# seqlen (the dominant chunk first-step cost after the l2norm swap). ``T`` is
+# already ``do_not_specialize``; these just miss ``NT``.
+_CHUNK_NT_KERNELS = (
+    (
+        "mindspeed.ops.triton.chunk_delta_h",
+        "chunk_gated_delta_rule_fwd_kernel_h_blockdim64",
+    ),
+    ("mindspeed.ops.triton.wy_fast", "recompute_w_u_fwd_kernel"),
+    ("mindspeed.ops.triton.wy_fast", "prepare_wy_repr_bwd_kernel"),
+)
+
+
+def _despecialize_chunk_nt() -> bool:
+    """Make ``NT`` a runtime arg in the GDN chunk kernels so they compile once.
+
+    Reuses MindSpeed's own kernel body: walks the ``Heuristics[/Autotuner]/
+    JITFunction`` wrapper chain to the ``JITFunction``, drops ``NT`` from the
+    python fn's ``__annotations__``, re-``jit``s it with ``do_not_specialize=
+    ['T','NT']``, and splices the new jit back under the original wrapper (so the
+    heuristics/autotune config is preserved exactly). Must run before the chunk
+    modules are first used. Idempotent; no-op without MindSpeed. Runtime-free
+    (the ``for i_t in range(NT)`` loop goes static-unroll -> dynamic, which the
+    varlen branch already exercises; measured warm runtime unchanged).
+    """
+    import importlib
+
+    import triton
+
+    patched = False
+    for mod_name, kern_name in _CHUNK_NT_KERNELS:
+        try:
+            mod = importlib.import_module(mod_name)
+        except Exception:
+            continue
+        wrapper = getattr(mod, kern_name, None)
+        if wrapper is None:
+            continue
+        parent, node = None, wrapper
+        while node is not None and type(node).__name__ != "JITFunction":
+            parent, node = node, getattr(node, "fn", None)
+        if node is None:
+            continue
+        pyfn = node.fn
+        ann = getattr(pyfn, "__annotations__", {})
+        if "NT" not in ann:
+            patched = True  # already despecialized
+            continue
+        del ann["NT"]
+        new_jit = triton.jit(do_not_specialize=["T", "NT"])(pyfn)
+        if parent is None:
+            setattr(mod, kern_name, new_jit)
+        else:
+            parent.fn = new_jit
+        patched = True
+    return patched
+
+
 def apply() -> bool:
     """Swap in the fast l2norm + collapse chunk autotune to one config.
 
@@ -345,6 +408,10 @@ def apply() -> bool:
     # can be skipped independently while keeping the safe l2norm swap.
     if os.environ.get("AREAL_DISABLE_TRITON_CHUNK_AUTOTUNE") != "1":
         _reduce_chunk_autotune()
+    # Despecialize NT in the GDN chunk kernels (compile-once across seqlens).
+    # Runtime-free; separate flag for A/B.
+    if os.environ.get("AREAL_DISABLE_TRITON_CHUNK_NT") != "1":
+        _despecialize_chunk_nt()
     return True
 
 
