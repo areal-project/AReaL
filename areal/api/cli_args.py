@@ -1656,12 +1656,15 @@ class PPOActorConfig(TrainEngineConfig):
             ProxLogpMethod(self.prox_logp_method) == ProxLogpMethod.REUSE_TRAIN_LOGP
             and self.ppo_n_minibatches > 1
         ):
-            raise ValueError(
-                "prox_logp_method='reuse_train_logp' requires ppo_n_minibatches=1. "
-                f"Got ppo_n_minibatches={self.ppo_n_minibatches}. "
-                "With multiple minibatches, weights change between steps, "
-                "so training forward logprobs differ from the original policy."
+            logger.warning(
+                "prox_logp_method='reuse_train_logp' requires ppo_n_minibatches=1, "
+                f"but got ppo_n_minibatches={self.ppo_n_minibatches}. "
+                "With multiple minibatches, weights change between steps, so the "
+                "training forward logprobs would differ from the original policy. "
+                "Forcing ppo_n_minibatches=1; note this changes training dynamics "
+                "to a single optimizer step per PPO update."
             )
+            self.ppo_n_minibatches = 1
         # Warn if rejection_sampling is configured but use_decoupled_loss is False
         if not self.use_decoupled_loss and self.rejection_sampling is not None:
             logger.warning(
