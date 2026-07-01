@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Release tag to build (e.g., v1.0.4-sglang)'
+        description: 'Release tag to build (e.g., v2.0.0-sglang)'
         required: true
         type: string
 
