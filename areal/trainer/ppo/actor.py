@@ -616,6 +616,8 @@ def grpo_loss_fn(
     pg_reduction: PolicyGradientReduction | None = None,
     vocab_min_logits: torch.Tensor | None = None,
     vocab_max_logits: torch.Tensor | None = None,
+    vocab_mean_logits: torch.Tensor | None = None,
+    vocab_norm_logits: torch.Tensor | None = None,
 ):
     """Loss function for actor step, all inputs should be splitted into
     pipeline micro batches, returns loss and logging stats."""
