@@ -76,6 +76,7 @@ For detailed examples, see the experiment configurations in the `examples/` dire
 - [ArchonFP8 Configuration](section-archon-fp8)
 - [DPO Configuration](section-dpo)
 - [DPOEngine Configuration](section-dpo-engine)
+- [Distillation Configuration](section-distillation)
 - [DistributedDataParallel Configuration](section-distributed-data-parallel)
 - [FP8Engine Configuration](section-fp8-engine)
 - [MegatronEngine Configuration](section-megatron-engine)
@@ -155,7 +156,7 @@ A dummy place holder of GRPO config for backward compatibility.
 | `actor`              | [`PPOActorConfig`](section-ppo-actor)                                     | **Required** | -                                                                                                                                                                                                                                                                   |
 | `ref`                | [`PPOActorConfig`](section-ppo-actor) \| None                             | `None`       | -                                                                                                                                                                                                                                                                   |
 | `critic`             | [`PPOCriticConfig`](section-ppo-critic) \| None                           | `None`       | -                                                                                                                                                                                                                                                                   |
-| `teacher`            | [`TeacherConfig`](section-teacher) \| None                                | `None`       | Optional teacher model configuration used for on-policy distillation during PPO training. If provided, the actor may be trained to match the teacher in addition to the standard PPO objective.                                                                     |
+| `teacher`            | [`DistillationConfig`](section-distillation) \| None                      | `None`       | Optional distillation configuration used for on-policy distillation during PPO training. If provided, the actor may be trained to match the teacher in addition to the standard PPO objective.                                                                      |
 | `dynamic_bs`         | boolean                                                                   | `False`      | Enable dynamic batch sizing in prepare_batch. When True, batch collection stops when (accepted + rejected) >= batch_size, returning only accepted results. This results in variable-sized batches of valid data.                                                    |
 
 (section-ppo)=
@@ -193,7 +194,7 @@ Configuration for Proximal Policy Optimization (PPO) reinforcement learning expe
 | `actor`              | [`PPOActorConfig`](section-ppo-actor)                                     | **Required** | -                                                                                                                                                                                                                                                                   |
 | `ref`                | [`PPOActorConfig`](section-ppo-actor) \| None                             | `None`       | -                                                                                                                                                                                                                                                                   |
 | `critic`             | [`PPOCriticConfig`](section-ppo-critic) \| None                           | `None`       | -                                                                                                                                                                                                                                                                   |
-| `teacher`            | [`TeacherConfig`](section-teacher) \| None                                | `None`       | Optional teacher model configuration used for on-policy distillation during PPO training. If provided, the actor may be trained to match the teacher in addition to the standard PPO objective.                                                                     |
+| `teacher`            | [`DistillationConfig`](section-distillation) \| None                      | `None`       | Optional distillation configuration used for on-policy distillation during PPO training. If provided, the actor may be trained to match the teacher in addition to the standard PPO objective.                                                                      |
 | `dynamic_bs`         | boolean                                                                   | `False`      | Enable dynamic batch sizing in prepare_batch. When True, batch collection stops when (accepted + rejected) >= batch_size, returning only accepted results. This results in variable-sized batches of valid data.                                                    |
 
 (section-rw)=
@@ -1016,6 +1017,18 @@ fields.
 | `beta`                   | float                                               | `0.1`                 | KL penalty coefficient for DPO loss.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
 | `loss_type`              | string                                              | `"sigmoid"`           | DPO loss variant. 'sigmoid': original DPO loss (Rafailov et al. 2023). 'ipo': Identity Preference Optimization with per-token length normalization (Azar et al. 2023). **Choices:** `sigmoid`, `ipo`                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
 
+(section-distillation)=
+
+## Distillation Configuration
+
+Configuration class: DistillationConfig
+
+| Parameter             | Type                                       | Default      | Description               |
+| --------------------- | ------------------------------------------ | ------------ | ------------------------- |
+| `teachers`            | list of [`TeacherConfig`](section-teacher) | **Required** | -                         |
+| `rl_loss_weight`      | float                                      | `1.0`        | RL loss weight.           |
+| `distill_loss_weight` | float                                      | `0.005`      | Distillation loss weight. |
+
 (section-distributed-data-parallel)=
 
 ## DistributedDataParallel Configuration
@@ -1244,12 +1257,11 @@ Configuration for per-session lifecycle tracing.
 
 Configuration class: TeacherConfig
 
-| Parameter             | Type                                                        | Default     | Description                                                                                                                                      |
-| --------------------- | ----------------------------------------------------------- | ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `engine_type`         | string                                                      | `"rollout"` | Teacher engine type. 'rollout' uses inference engine scoring; 'train' uses the legacy train-engine teacher path. **Choices:** `rollout`, `train` |
-| `rollout`             | [`InferenceEngineConfig`](section-inference-engine) \| None | `None`      | -                                                                                                                                                |
-| `train`               | [`PPOActorConfig`](section-ppo-actor) \| None               | `None`      | Legacy train-engine teacher config. Required when engine_type='train'.                                                                           |
-| `path`                | string                                                      | `""`        | Teacher model path. If set, overrides shared rollout backend model path.                                                                         |
-| `offload`             | boolean                                                     | `False`     | Whether to offload teacher rollout model between steps                                                                                           |
-| `rl_loss_weight`      | float                                                       | `1.0`       | RL loss weight                                                                                                                                   |
-| `distill_loss_weight` | float                                                       | `0.005`     | Distillation loss weight                                                                                                                         |
+| Parameter     | Type                                                        | Default     | Description                                                                                                                                      |
+| ------------- | ----------------------------------------------------------- | ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `engine_type` | string                                                      | `"rollout"` | Teacher engine type. 'rollout' uses inference engine scoring; 'train' uses the legacy train-engine teacher path. **Choices:** `rollout`, `train` |
+| `rollout`     | [`InferenceEngineConfig`](section-inference-engine) \| None | `None`      | -                                                                                                                                                |
+| `train`       | [`PPOActorConfig`](section-ppo-actor) \| None               | `None`      | Legacy train-engine teacher config. Required when engine_type='train'.                                                                           |
+| `path`        | string                                                      | `""`        | Teacher model path. If set, overrides shared rollout backend model path.                                                                         |
+| `offload`     | boolean                                                     | `False`     | Whether to offload teacher model between steps                                                                                                   |
+| `weight`      | float                                                       | `1.0`       | Teacher mixture weight.                                                                                                                          |
