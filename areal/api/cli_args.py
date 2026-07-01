@@ -1008,6 +1008,27 @@ class MegatronEngineConfig:
         },
     )
 
+    enable_mtp_training: bool = field(
+        default=False,
+        metadata={
+            "help": "Train the Multi-Token-Prediction (MTP) head as an auxiliary "
+            "objective (SFT/RL). Implies enable_mtp=True. The MTP loss is fed an "
+            "independent label channel (mtp_kwargs) so the main forward keeps "
+            "labels=None and returns logits; MTP gradients are isolated from the "
+            "backbone (output weight detached, backbone hidden states cut from the "
+            "MTP graph). bridge_type=megatron-bridge only; context parallel > 1 is "
+            "not supported yet.",
+        },
+    )
+
+    mtp_loss_scaling_factor: float = field(
+        default=0.1,
+        metadata={
+            "help": "Weight of the auxiliary MTP loss relative to the main loss "
+            "when enable_mtp_training=True (DeepSeek-V3 default: 0.1).",
+        },
+    )
+
 
 class SchedulingStrategyType(str, Enum):
     separation = "separation"
@@ -1974,6 +1995,33 @@ class SGLangConfig:
     max_loaded_loras: int = 8  # override default
     lora_paths: list[str] | None = None  # lora_paths is automatically filled
     lora_backend: str = "triton"
+    # Speculative decoding (MTP / EAGLE / EAGLE3 / NEXTN).
+    # All None by default so get_py_cmd() emits no flag and SGLang runs standard
+    # decoding. Field names mirror SGLang ServerArgs; underscores -> CLI hyphens.
+    speculative_algorithm: str | None = field(
+        default=None,
+        metadata={
+            "help": "Speculative decoding algorithm passed to SGLang. None disables "
+            "spec decode. Use the target model's built-in MTP head via 'NEXTN'/'EAGLE', "
+            "or an external draft model with 'EAGLE'/'EAGLE3' + "
+            "speculative_draft_model_path.",
+            "choices": ["EAGLE", "EAGLE3", "NEXTN", "STANDALONE"],
+        },
+    )
+    speculative_num_steps: int | None = None
+    speculative_eagle_topk: int | None = None
+    speculative_num_draft_tokens: int | None = None
+    speculative_draft_model_path: str | None = field(
+        default=None,
+        metadata={
+            "help": "Path to an external draft model. Leave None to use the target "
+            "model's own MTP head (training side must set megatron.enable_mtp=True).",
+        },
+    )
+    # Keep a CPU backup of draft weights so the server can start/run before the
+    # MTP/draft weights are synced from training. Required for online MTP training
+    # where draft weights arrive via weight-sync after the server launches.
+    enable_draft_weights_cpu_backup: bool = False
     # logging
     log_level: str = "warning"
     log_level_http: str | None = "warning"
