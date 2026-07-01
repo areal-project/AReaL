@@ -74,7 +74,12 @@ class NormConfig:
         },
     )
     group_size: int = field(
-        default=1, metadata={"help": "Group size for group-level normalization"}
+        default=1,
+        metadata={
+            "help": "Group size for group-level normalization. For the actor's "
+            "reward_norm/adv_norm this is derived from gconfig.n_samples; "
+            "mismatched values are overridden."
+        },
     )
 
     def __post_init__(self):
@@ -3156,6 +3161,26 @@ class PPOConfig(BaseExperimentConfig):
         # the engine config. Single source of truth: gconfig.lora_name.
         if self.rollout.use_lora and not self.rollout.lora_name:
             self.rollout.lora_name = self.gconfig.lora_name
+
+        # Runtime source of truth for prompt-group normalization.
+        for _name, _norm in (
+            ("reward_norm", self.actor.reward_norm),
+            ("adv_norm", self.actor.adv_norm),
+        ):
+            if _norm is None:
+                continue
+            if _norm.mean_level != "group" and _norm.std_level != "group":
+                continue
+            if _norm.group_size not in (1, self.gconfig.n_samples):
+                logger.warning(
+                    "actor.%s.group_size=%d disagrees with gconfig.n_samples=%d; "
+                    "overriding with n_samples (the prompt-group size).",
+                    _name,
+                    _norm.group_size,
+                    self.gconfig.n_samples,
+                )
+            _norm.group_size = self.gconfig.n_samples
+
         super().__post_init__()
 
 

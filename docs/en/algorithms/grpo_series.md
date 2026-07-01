@@ -88,13 +88,15 @@ The `NormConfig` dataclass controls how rewards and advantages are normalized:
 | `mean_leave1out` | bool        | `true`, `false`              | Use leave-one-out average (exclude current sample)         |
 | `std_unbiased`   | bool        | `true`, `false`              | Use unbiased std computation (default: `true`)             |
 | `eps`            | float       | -                            | Small constant to avoid division by zero (default: `1e-5`) |
-| `group_size`     | int         | -                            | Group size for group-level normalization                   |
+| `group_size`     | int         | -                            | Prompt-group size for group-level normalization            |
 
 "Batch" level computes the mean/std across the global batch, while "group" level
-computes them within groups (e.g., trajectories sharing the same prompt). For
-group-level normalization, `group_size` must be specified. Setting `mean_level` or
-`std_level` to `None` skips mean subtraction or standard deviation scaling,
-respectively.
+computes them within groups (e.g., trajectories sharing the same prompt). In PPO/GRPO
+actor reward/advantage normalization, `group_size` is derived from
+`gconfig.n_samples`, because that is the number of sampled responses for one prompt.
+YAML examples keep `group_size: ${gconfig.n_samples}` as a visible reference; a
+mismatched literal is overridden with a warning. Setting `mean_level` or `std_level` to
+`None` skips mean subtraction or standard deviation scaling, respectively.
 
 If the entire field is omitted (e.g., `adv_norm: null` in YAML), no normalization is
 performed.
