@@ -153,6 +153,8 @@ def compute_dpo_loss(
     loss_type: str = "sigmoid",
     vocab_min_logits: torch.Tensor | None = None,
     vocab_max_logits: torch.Tensor | None = None,
+    vocab_mean_logits: torch.Tensor | None = None,
+    vocab_norm_logits: torch.Tensor | None = None,
 ) -> torch.Tensor:
     device = logprobs.device
     cu_seqlens = input_["cu_seqlens"].to(device=device, dtype=torch.long)
