@@ -2908,6 +2908,14 @@ class BaseExperimentConfig:
 
     scheduler: SchedulerConfig = field(default_factory=SchedulerConfig)
 
+    post_exit_hook: str = field(
+        default="",
+        metadata={
+            "help": "Shell command run after launcher shutdown. "
+            "LOG_DIR is injected; failures are logged and ignored."
+        },
+    )
+
     def __post_init__(self):
         """Validate training configuration."""
         if self.total_train_epochs <= 0:

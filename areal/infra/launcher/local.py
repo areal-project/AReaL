@@ -31,6 +31,7 @@ from areal.infra.utils.launcher import (
     JobState,
     get_scheduling_spec,
     get_thread_env_vars,
+    run_post_exit_hook,
     validate_config_for_launcher,
     wait_llm_server_addrs,
 )
@@ -371,7 +372,10 @@ def local_main(config, run_id: int = 0):
                 f"LLM inference server launched at: AREAL_LLM_SERVER_ADDRS={','.join(server_addrs)}"
             )
         except (TimeoutError, KeyboardInterrupt) as e:
-            launcher.stop_all(signal="SIGINT")
+            try:
+                launcher.stop_all(signal="SIGINT")
+            finally:
+                run_post_exit_hook(config)
             raise e
 
     if config.get("enable_offload", False):
@@ -421,7 +425,10 @@ def local_main(config, run_id: int = 0):
             remove_status=(),
         )
     except (KeyboardInterrupt, JobException, TimeoutError) as e:
-        launcher.stop_all("SIGTERM")
+        try:
+            launcher.stop_all("SIGTERM")
+        finally:
+            run_post_exit_hook(config)
         # NOTE: For local launcher, We cannot distinguish between a completed job and a failed job.
         # So we will always try to recover the job if it is finished or failed.
         recover_states = [JobState.FAILED, JobState.NOT_FOUND, JobState.COMPLETED]
