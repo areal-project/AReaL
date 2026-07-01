@@ -29,6 +29,7 @@ from areal.infra.utils.launcher import (
     JobState,
     get_scheduling_spec,
     get_thread_env_vars,
+    run_post_exit_hook,
     validate_config_for_distributed_launcher,
     wait_llm_server_addrs,
 )
@@ -571,7 +572,10 @@ def slurm_main(config, run_id: int = 0):
                 n_backend_servers,
             )
         except (TimeoutError, KeyboardInterrupt) as e:
-            launcher.stop_all(force=True)
+            try:
+                launcher.stop_all(force=True)
+            finally:
+                run_post_exit_hook(config)
             raise e
 
     trainer_n_nodes = n_nodes - n_backend_nodes
@@ -675,6 +679,7 @@ def slurm_main(config, run_id: int = 0):
         )
     except (KeyboardInterrupt, JobException, TimeoutError) as e:
         launcher.stop_all(force=True)
+        run_post_exit_hook(config)
         recover_states = [JobState.FAILED, JobState.NOT_FOUND]
         if isinstance(e, JobException):
             recover_this = (
