@@ -436,6 +436,9 @@ def grpo_loss_fn(
 
     entropy = entropy.detach()
 
+    if ProxLogpMethod(prox_logp_method) == ProxLogpMethod.REUSE_TRAIN_LOGP:
+        prox_logp_gt = logprobs.detach()
+
     # Resolve proximal log-probabilities based on method
     prox_logp = _resolve_proximal_logp(
         prox_logp_gt=prox_logp_gt,
