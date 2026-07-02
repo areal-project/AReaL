@@ -148,6 +148,22 @@ def _find_kth(lst: list, target, k: int) -> int:
 _DATA_URI_RE = re.compile(r"^data:image/[a-zA-Z0-9.+-]+;base64,(.+)$", re.DOTALL)
 
 
+def _postprocess_tool_call_arguments_for_template(
+    messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    messages = deepcopy(messages)
+    for message in messages:
+        if message.get("role") == "assistant" and message.get("tool_calls"):
+            for tool_call in message["tool_calls"]:
+                function = tool_call.get("function") or {}
+                arguments = function.get("arguments")
+                if isinstance(arguments, str):
+                    function["arguments"] = json.loads(arguments) if arguments else {}
+                elif arguments is None:
+                    function["arguments"] = {}
+    return messages
+
+
 def _extract_images_from_messages(
     messages: list[dict[str, Any]],
 ) -> tuple[list[str], list[dict[str, Any]], list[dict[str, Any]]]:
@@ -386,6 +402,8 @@ def concat_prompt_token_ids_with_parent(
 
     all_message_list += message_list
 
+    all_message_list = _postprocess_tool_call_arguments_for_template(all_message_list)
+
     all_tokens = apply_chat_template(
         tokenizer,
         all_message_list,
@@ -610,6 +628,9 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
         has_images = len(image_data) > 0
 
         tokenizer_messages = messages_for_tokenizer if has_images else messages_list
+        tokenizer_messages = _postprocess_tool_call_arguments_for_template(
+            tokenizer_messages
+        )
         if self.chat_template_type == "hf":
             prompt_token_ids = apply_chat_template(
                 self.tokenizer,
@@ -631,6 +652,9 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
                 )
             else:
                 concat_tok_messages = concat_messages
+            concat_tok_messages = _postprocess_tool_call_arguments_for_template(
+                concat_tok_messages
+            )
             prompt_token_ids = concat_prompt_token_ids_with_parent(
                 concat_tok_messages,
                 interaction.parent if interaction is not None else None,
@@ -1018,6 +1042,9 @@ class AsyncResponsesWithReward(BaseAsyncResponses):
         has_images = len(image_data) > 0
 
         tokenizer_messages = messages_for_tokenizer if has_images else messages_list
+        tokenizer_messages = _postprocess_tool_call_arguments_for_template(
+            tokenizer_messages
+        )
         if self.chat_template_type == "hf":
             prompt_token_ids = apply_chat_template(
                 self.tokenizer,
