@@ -34,6 +34,7 @@ from areal.api.cli_args import (
     InferenceEngineConfig,
     PerfTracerConfig,
     SchedulingSpec,
+    SchedulingStrategyType,
 )
 from areal.infra.rpc.serialization import deserialize_value
 from areal.infra.utils.concurrent import run_async_task
@@ -87,6 +88,7 @@ class RolloutController:
         self.workers: list[Worker] = []  # List of Worker objects from scheduler
         self.server_infos: list[LocalInfServerInfo] = []
         self._worker_role: str
+        self._gpus_per_server: int = 1
 
         # Round-robin scheduling
         self._current_worker_idx = 0
@@ -167,6 +169,7 @@ class RolloutController:
         # Schedule inference engines in the granularity of instance sizes,
         # usually TP x PP.
         self._worker_role = role
+        self._gpus_per_server = alloc_mode.gen_instance_size
 
         instance_size = (
             self.rollout_alloc.parallel.tp_size * self.rollout_alloc.parallel.pp_size
@@ -183,6 +186,12 @@ class RolloutController:
         sch_spec.mem *= instance_size
         if sch_spec.gpu > 0:
             sch_spec.gpu = instance_size
+
+        if (
+            self.config.scheduling_strategy.type
+            == SchedulingStrategyType.colocation.value
+        ):
+            sch_spec.gpu_cleanup = False
 
         if sch_spec.ray_placement_strategy == "shared":
             # do not support shared placement for rollout
@@ -297,7 +306,61 @@ class RolloutController:
                 )
             ]
             await asyncio.gather(*tasks)
+        elif (
+            self.config.scheduling_strategy.type
+            == SchedulingStrategyType.colocation.value
+        ):
+            # Colocation (AWEX) path: multiple servers share a node, so SLURM does
+            # NOT isolate GPUs per worker. We must compute base_gpu_id explicitly and
+            # inject `_awex_gpus_per_server` so the worker recomputes base_gpu_id from
+            # its own SLURM_LOCALID at runtime (the only value guaranteed unique per
+            # node-slot). See SGLangBackend.launch_server.
+            #
+            # NOTE: this assumes a server fits within one node
+            # (gpus_per_server <= n_gpus_per_node). Cross-node TP servers would
+            # collapse slots_per_node to 1 and collide; only the SLURM_LOCALID
+            # path is collision-safe in that case.
+            slots_per_node = max(
+                1,
+                getattr(self.scheduler, "n_gpus_per_node", 8) // self._gpus_per_server,
+            )
+            launch_tasks = []
+            for rank, worker in enumerate(self.workers):
+                per_worker_args = {
+                    **server_args,
+                    "base_gpu_id": (rank % slots_per_node) * self._gpus_per_server,
+                    "_awex_gpus_per_server": self._gpus_per_server,
+                }
+                launch_tasks.append(
+                    self.scheduler.async_call_engine(
+                        worker_id=worker.id,
+                        method="launch_server",
+                        engine_name=self._engine_name(rank),
+                        server_args=per_worker_args,
+                    )
+                )
+            self.server_infos = await asyncio.gather(*launch_tasks)
+            tasks = [
+                self.scheduler.async_call_engine(
+                    worker_id=worker.id,
+                    method="initialize",
+                    engine_name=self._engine_name(rank),
+                    engine_id=str(rank),
+                    addr=f"{info.host}:{info.port}",
+                    *args,
+                    **kwargs,
+                )
+                for rank, (worker, info) in enumerate(
+                    zip(self.workers, self.server_infos)
+                )
+            ]
+            await asyncio.gather(*tasks)
         else:
+            # Separation path: each rollout server gets its own SLURM-isolated GPUs,
+            # so we must NOT override base_gpu_id (SLURM already sets
+            # CUDA_VISIBLE_DEVICES per worker). Use the collective launch + addr-less
+            # initialize that the verified disaggregated baseline relies on; the
+            # worker discovers its server address via name_resolve.
             self.server_infos = await self._collective_rpc_async(
                 "launch_server", server_args=server_args
             )
@@ -306,7 +369,6 @@ class RolloutController:
                     worker_id=worker.id,
                     method="initialize",
                     engine_name=self._engine_name(rank),
-                    # args in `engine_api`
                     engine_id=str(rank),
                     *args,
                     **kwargs,
@@ -591,6 +653,20 @@ class RolloutController:
         @app.route("/callback/continue_generation", methods=["POST"])
         def continue_generation():
             self._callback_loop.run_until_complete(self.continue_generation())
+            return jsonify({"status": "ok"})
+
+        @app.route("/callback/onload", methods=["POST"])
+        def onload():
+            payload = request.get_json() or {}
+            tags = payload.get("tags")
+            self.onload(tags=tags)
+            return jsonify({"status": "ok"})
+
+        @app.route("/callback/offload", methods=["POST"])
+        def offload():
+            payload = request.get_json() or {}
+            tags = payload.get("tags")
+            self.offload(tags=tags)
             return jsonify({"status": "ok"})
 
         @app.route("/callback/rollout_complete", methods=["POST"])
@@ -1085,6 +1161,9 @@ class RolloutController:
     async def pause_generation(self):
         await self._collective_rpc_async("pause_generation")
 
+    def pause_generation_sync(self):
+        self._collective_rpc("pause_generation", http_timeout=120.0)
+
     async def continue_generation(self):
         await self._collective_rpc_async("continue_generation")
 
@@ -1116,6 +1195,19 @@ class RolloutController:
     def resume(self):
         self._collective_rpc("resume", http_timeout=60.0)
         self.dispatcher.resume()
+
+    def offload(self, tags: list[str] | None = None):
+        logger.info(
+            f"[AWEX] RolloutController.offload(tags={tags}) dispatching to workers"
+        )
+        self._collective_rpc("offload", tags=tags, http_timeout=120.0)
+        logger.info(f"[AWEX] RolloutController.offload(tags={tags}) completed")
+
+    def abort_all_requests(self):
+        self._collective_rpc("abort_all_requests", http_timeout=60.0)
+
+    def onload(self, tags: list[str] | None = None):
+        self._collective_rpc("onload", tags=tags, http_timeout=120.0)
 
     def export_stats(self) -> dict[str, float]:
         all_raw_stats = self._collective_rpc(method="export_stats", http_timeout=60.0)

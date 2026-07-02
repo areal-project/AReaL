@@ -109,6 +109,27 @@ class PPOTrainer:
         train_dataset: Dataset | None = None,
         valid_dataset: Dataset | None = None,
     ):
+        # A failure inside construction (e.g. the recover-checkpoint load)
+        # escapes before `with PPOTrainer(...)` can bind the instance, so
+        # __exit__/close() would never run and the live worker jobs would leak,
+        # blocking the next attempt's resource request.
+        try:
+            self._init_impl(config, train_dataset, valid_dataset)
+        except Exception:
+            logger.error(
+                "PPOTrainer construction failed; tearing down partially "
+                "created workers",
+                exc_info=True,
+            )
+            self.close()
+            raise
+
+    def _init_impl(
+        self,
+        config: PPOConfig,
+        train_dataset: Dataset | None = None,
+        valid_dataset: Dataset | None = None,
+    ):
         rank = int(os.getenv("RANK", "0"))
         if is_single_controller():
             # Set up file logging for controller process
@@ -304,6 +325,25 @@ class PPOTrainer:
         # Save initial LoRA weights if enabled (for inference server pre-loading)
         initial_lora_path = self._save_initial_lora_weights()
 
+        # In colocate (awex) mode, offload training weights before SGLang
+        # starts so GPU memory is available for inference engine allocation.
+        # The adapter-based offload does not require TMS/enable_offload.
+        self._awex_meta_server_addr: str | None = None
+        if config.actor.weight_update_mode == "awex":
+            from awex.meta.meta_server import start_meta_server
+
+            from areal.utils.network import gethostip
+
+            host, port = start_meta_server()
+            if host in ("0.0.0.0", ""):
+                host = gethostip()
+            self._awex_meta_server_addr = f"{host}:{port}"
+            logger.info(
+                "Started MetaServer on controller at %s", self._awex_meta_server_addr
+            )
+            self.actor.init_awex_adapter(meta_server_addr=self._awex_meta_server_addr)
+            self.actor.offload()
+
         # Initialize inference with LoRA path
         self.rollout = self._init_rollout(
             config.rollout, is_eval=False, lora_path=initial_lora_path
@@ -346,7 +386,9 @@ class PPOTrainer:
                 }
                 self.weight_update_meta = WeightUpdateMeta.from_disk(**disk_kwargs)
             else:
-                self.weight_update_meta = WeightUpdateMeta.from_awex()
+                self.weight_update_meta = WeightUpdateMeta.from_awex(
+                    meta_server_addr=self._awex_meta_server_addr
+                )
         elif self.config.actor.weight_update_mode == "disk":
             disk_kwargs = {
                 "experiment_name": config.experiment_name,
@@ -762,6 +804,17 @@ class PPOTrainer:
                 if self._should_offload_critic:
                     self._offload_model(self.critic, role="critic")
 
+            # AWEX colocate saves BEFORE update_weights: the transfer ends
+            # with actor weights offloaded, so saving afterwards must resume
+            # them onto a card already crowded by the fully-resumed rollout
+            # and the saver's all-gather transient can OOM. Weights are
+            # identical on both sides of the transfer, so the checkpoint
+            # content is unchanged. Other modes keep the original
+            # save-after-update ordering.
+            is_awex = self.config.actor.weight_update_mode == "awex"
+            if is_awex:
+                self._save_and_checkpoint(epoch, step, global_step)
+
             # pause inference for updating weights, save, and evaluation
             self.rollout.pause()
 
@@ -788,27 +841,8 @@ class PPOTrainer:
                 if self.eval_rollout is not None:
                     self.eval_rollout.set_version(new_version)
 
-            with (
-                stats_tracker.record_timing("save"),
-                perf_tracer.trace_scope(
-                    "train.save",
-                    category=Category.IO,
-                    args={"global_step": global_step},
-                ),
-            ):
-                self._save_hf(epoch=epoch, epoch_step=step, global_step=global_step)
-
-            with (
-                stats_tracker.record_timing("checkpoint_for_recover"),
-                perf_tracer.trace_scope(
-                    "train.checkpoint",
-                    category=Category.IO,
-                    args={"global_step": global_step},
-                ),
-            ):
-                self._save_recover_checkpoint(
-                    epoch=epoch, epoch_step=step, global_step=global_step
-                )
+            if not is_awex:
+                self._save_and_checkpoint(epoch, step, global_step)
 
             # Offload actor before eval
             if self._should_offload_actor:
@@ -872,25 +906,56 @@ class PPOTrainer:
 
             self._save_perf_tracer(step=global_step)
 
+    def _save_and_checkpoint(self, epoch: int, step: int, global_step: int) -> None:
+        with (
+            stats_tracker.record_timing("save"),
+            perf_tracer.trace_scope(
+                "train.save",
+                category=Category.IO,
+                args={"global_step": global_step},
+            ),
+        ):
+            self._save_hf(epoch=epoch, epoch_step=step, global_step=global_step)
+
+        with (
+            stats_tracker.record_timing("checkpoint_for_recover"),
+            perf_tracer.trace_scope(
+                "train.checkpoint",
+                category=Category.IO,
+                args={"global_step": global_step},
+            ),
+        ):
+            self._save_recover_checkpoint(
+                epoch=epoch, epoch_step=step, global_step=global_step
+            )
+
     def close(self):
-        self.saver.finalize()
-        if hasattr(self, "_train_rdataset") and self._train_rdataset is not None:
-            self._train_rdataset.close()
-        if hasattr(self, "_valid_rdataset") and self._valid_rdataset is not None:
-            self._valid_rdataset.close()
-        if hasattr(self, "data_controller") and self.data_controller is not None:
-            self.data_controller.destroy()
-        self.stats_logger.close()
-        if self.eval_rollout is not None:
-            self.eval_rollout.destroy()
-        self.rollout.destroy()
-        if self.teacher is not None:
-            self.teacher.destroy()
-        if self.ref is not None:
-            self.ref.destroy()
-        if self.critic is not None:
-            self.critic.destroy()
-        self.actor.destroy()
+        # Must tolerate a partially-constructed trainer (called from
+        # __init__'s failure path), and one member's cleanup failure must
+        # not keep the remaining workers alive.
+        def _safe(name, fn):
+            try:
+                fn()
+            except Exception:
+                logger.warning(f"{name} cleanup failed during close", exc_info=True)
+
+        saver = getattr(self, "saver", None)
+        if saver is not None:
+            _safe("saver.finalize", saver.finalize)
+        for attr in ("_train_rdataset", "_valid_rdataset"):
+            member = getattr(self, attr, None)
+            if member is not None:
+                _safe(f"{attr}.close", member.close)
+        data_controller = getattr(self, "data_controller", None)
+        if data_controller is not None:
+            _safe("data_controller.destroy", data_controller.destroy)
+        stats_logger = getattr(self, "stats_logger", None)
+        if stats_logger is not None:
+            _safe("stats_logger.close", stats_logger.close)
+        for attr in ("eval_rollout", "rollout", "teacher", "ref", "critic", "actor"):
+            engine = getattr(self, attr, None)
+            if engine is not None:
+                _safe(f"{attr}.destroy", engine.destroy)
         perf_tracer.save(force=True)
 
     def _config_perf_tracer(self):
@@ -1054,6 +1119,9 @@ class PPOTrainer:
                 pp_size=self.rollout_alloc.parallel.pp_size,
                 base_gpu_id=0,
             )
+            if self.config.actor.weight_update_mode == "awex":
+                server_args["awex_colocate_mode"] = True
+                server_args["awex_meta_server_addr"] = self._awex_meta_server_addr
         elif rollout_backend == "vllm":
             if self.config.rollout.return_routed_experts:
                 raise ValueError(
@@ -1304,19 +1372,23 @@ class PPOTrainer:
             )
         )
 
-        if requires_train_engine_offload and not self.config.enable_offload:
+        is_awex = self.config.actor.weight_update_mode == "awex"
+        if (
+            requires_train_engine_offload
+            and not self.config.enable_offload
+            and not is_awex
+        ):
             raise ValueError(
                 "enable_offload must be True when colocation scheduling or train-engine "
                 "offload is enabled. Please set enable_offload=True."
             )
 
-        if (
-            self._is_actor_rollout_colocated(self.config)
-            and self.config.actor.weight_update_mode != "disk"
-        ):
+        if self._is_actor_rollout_colocated(
+            self.config
+        ) and self.config.actor.weight_update_mode not in ("disk", "awex"):
             raise ValueError(
-                "weight_update_mode must be 'disk' when colocation scheduling is enabled. "
-                "Please set actor.weight_update_mode=disk."
+                "weight_update_mode must be 'disk' or 'awex' when colocation "
+                "scheduling is enabled."
             )
 
         if rollout_backend == "vllm" and self.config.rollout.return_routed_experts:

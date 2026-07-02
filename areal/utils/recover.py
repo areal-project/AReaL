@@ -23,6 +23,7 @@ from areal.api import (
 )
 from areal.api.cli_args import RecoverConfig
 from areal.infra import TrainController
+from areal.infra.utils.concurrent import call_maybe_async
 from areal.utils import logging, timeutil
 from areal.utils.evaluator import Evaluator
 from areal.utils.saver import Saver
@@ -320,6 +321,19 @@ class RecoverHandler:
                 versioned_meta = weight_update_meta.with_version(recovery_version)
                 update_engine.connect_engine(inference_engine, versioned_meta)
                 inference_engine.pause()
+                # AWEX colocate transfer requires the full engine-level
+                # pause/offload protocol, not just the controller pause: the
+                # plugin's event loop only drains the weight-update queue while
+                # generation is paused, and the reader expects kv/weights
+                # released before the writer publishes; otherwise the
+                # recover-path transfer deadlocks. Mirrors the trainer's
+                # pre-update sequence; kv_cache onload happens inside
+                # update_weights.
+                is_awex = getattr(weight_update_meta, "type", None) == "awex"
+                if is_awex:
+                    call_maybe_async(inference_engine.pause_generation)
+                    inference_engine.offload(tags=["kv_cache"])
+                    inference_engine.offload(tags=["weights"])
                 update_engine.update_weights(versioned_meta)
                 inference_engine.resume()
                 update_engine.set_version(recovery_version)

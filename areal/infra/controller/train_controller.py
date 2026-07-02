@@ -565,6 +565,13 @@ class TrainController:
         """Send dispatched inputs to workers. DP heads get slices, others empty."""
         tasks = []
         dp_idx = 0
+        # save/load are long blocking ops: the HF saver's all-gather can occupy
+        # a worker for tens of seconds, during which its RPC server may briefly
+        # refuse connections. Widen the connection-retry budget so a
+        # busy-but-alive worker is not misjudged as dead mid-save; a genuinely
+        # dead worker still fails once the budget is exhausted.
+        long_op = method in ("save", "load")
+        retry_kw = dict(max_retries=8, retry_delay=2.0) if long_op else {}
         for idx, worker in enumerate(self.workers):
             if self.workers_is_dp_head[idx]:
                 worker_args = [splits[dp_idx] for splits in dp_split_args]
@@ -583,6 +590,7 @@ class TrainController:
                     self._engine_name(idx),
                     *worker_args,
                     rpc_meta=rpc_meta,
+                    **retry_kw,
                     **worker_kwargs,
                 )
             )
@@ -699,6 +707,20 @@ class TrainController:
             Metadata containing information about where and how to load
         """
         self._custom_function_call("load", meta)
+
+    def offload(self):
+        """Offload model weights to CPU to free GPU memory for colocated engines."""
+        self._custom_function_call("offload")
+
+    def onload(self):
+        """Reload model weights from CPU back to GPU."""
+        self._custom_function_call("onload")
+
+    def init_awex_adapter(self, meta_server_addr: str | None = None):
+        """Create awex adapter early for selective memory management."""
+        self._custom_function_call(
+            "init_awex_adapter", meta_server_addr=meta_server_addr
+        )
 
     def step_lr_scheduler(self):
         """Step the learning rate scheduler.
