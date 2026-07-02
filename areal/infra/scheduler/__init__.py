@@ -6,6 +6,6 @@ from .slurm import SlurmScheduler
 
 __all__ = [
     "LocalScheduler",
-    "SlurmScheduler",
     "RayScheduler",
+    "SlurmScheduler",
 ]

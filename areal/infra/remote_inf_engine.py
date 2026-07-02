@@ -18,7 +18,6 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 import aiohttp
 import numpy as np
-import ray
 import requests
 import torch
 import torch.distributed as dist
@@ -1337,13 +1336,6 @@ class RemoteInfEngine(InferenceEngine):
         try:
             self._wait_for_server(address, process=process)
             self.local_server_processes.append(server_info)
-            if ray.is_initialized():
-                # do not return with process for ray as it is not picklable
-                return LocalInfServerInfo(
-                    host=server_args["host"],
-                    port=server_args["port"],
-                    process=None,
-                )
             return server_info
         except TimeoutError:
             logger.warning(
