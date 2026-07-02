@@ -264,7 +264,7 @@ RUN set -ex \
 ENV PATH="/root/.cargo/bin:$PATH"
 RUN curl -fsSL \
     https://github.com/zeroclaw-labs/zeroclaw/releases/latest/download/install.sh \
-    | bash -s -- --skip-onboard \
+    | bash -s -- --skip-quickstart \
     && rm -rf /tmp/*
 
 ##############################################################
