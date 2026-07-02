@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import os
+import shutil
 import sys
 import threading
 import time
@@ -22,10 +24,31 @@ from areal.utils.network import format_hostport, gethostip
 if TYPE_CHECKING:
     from areal.api import ParallelStrategy, TrainEngine
     from areal.api.cli_args import TrainEngineConfig
-    from areal.api.io_struct import FinetuneSpec
+    from areal.api.io_struct import FinetuneSpec, WeightUpdateMeta
     from areal.api.scheduler_api import Scheduler, Worker
 
 logger = logging.getLogger("GatewayTrainController")
+
+
+def _disk_gateway_save_root(meta: WeightUpdateMeta) -> str:
+    """Return the root whose versioned child matches ``meta.with_version``."""
+    if meta.path is None:
+        raise ValueError("Disk weight update requires a checkpoint path")
+    return os.path.dirname(meta.path)
+
+
+def _validate_disk_rollout(rollout: Any) -> None:
+    """Reject disk updates that the v2 gateway cannot deliver safely."""
+    rollout_alloc = rollout.rollout_alloc
+    if (
+        rollout.external_mode
+        or rollout_alloc is None
+        or rollout_alloc.backend != "sglang"
+    ):
+        raise ValueError(
+            "v2 disk weight updates currently only support a local SGLang "
+            "rollout backend"
+        )
 
 
 class GatewayTrainController:
@@ -56,6 +79,7 @@ class GatewayTrainController:
         self._own_process_group = False
         self.rollout: Any | None = None
         self._weight_update_ctrl: Any | None = None
+        self._disk_weight_update_root: str | None = None
 
         # Version management
         self._version_lock = Lock()
@@ -953,13 +977,21 @@ class GatewayTrainController:
                 f"Ensure _version='v2' is set on InferenceEngineConfig."
             )
 
-        self.rollout = rollout
-
         if meta.type not in ("awex", "disk"):
             raise ValueError(
                 f"GatewayTrainController supports 'awex' or 'disk' weight "
                 f"updates, got '{meta.type}'"
             )
+        if meta.type == "disk":
+            _validate_disk_rollout(rollout)
+
+        inference_urls: list[str] = rollout.inference_worker_urls
+        if meta.type == "disk" and not inference_urls:
+            raise RuntimeError(
+                "v2 disk weight updates require at least one local inference worker"
+            )
+
+        self.rollout = rollout
 
         ctrl = WeightUpdateController(
             WeightUpdateControllerConfig(
@@ -973,8 +1005,8 @@ class GatewayTrainController:
         )
         ctrl.initialize()
 
-        inference_urls: list[str] = rollout.inference_worker_urls
         pair_name = f"{self._role}-rollout"
+        self._disk_weight_update_root = None
 
         if meta.type == "awex":
             # NCCL rendezvous master must live on the rank-0 process's node.
@@ -997,16 +1029,18 @@ class GatewayTrainController:
                 nccl_master_port=port_data["ports"][0],
             )
         else:  # disk
+            save_root = _disk_gateway_save_root(meta)
             ctrl.connect(
                 pair_name=pair_name,
                 train_worker_urls=self._worker_addrs,
                 inference_worker_urls=inference_urls,
                 mode="disk",
-                save_path=meta.path or "",
+                save_path=save_root,
                 use_lora=meta.use_lora,
                 lora_name=meta.lora_name,
                 lora_keep_versions=meta.lora_keep_versions,
             )
+            self._disk_weight_update_root = save_root
         self._weight_update_ctrl = ctrl
         logger.info(
             "WeightUpdateController connected (pair=%s, train=%d, inf=%d)",
@@ -1020,18 +1054,72 @@ class GatewayTrainController:
             raise RuntimeError(
                 "connect_engine() must be called before update_weights()"
             )
-        self.rollout.pause_generation()
         assert meta.version is not None and meta.version > 0, (
             f"meta.version must be a positive integer, got {meta.version}"
         )
-        result = self._weight_update_ctrl.update_weights(version=meta.version)
-        self.rollout.continue_generation()
-        logger.info(
-            "Weight update v%d completed (%s, %.0fms)",
-            meta.version,
-            result.status,
-            result.duration_ms,
-        )
+        if (
+            meta.type == "disk"
+            and meta.clear_checkpoint_after_load
+            and self._disk_weight_update_root is None
+        ):
+            raise RuntimeError(
+                "Disk weight-update root is unavailable; connect_engine() "
+                "must complete before updating weights"
+            )
+        primary_error: BaseException | None = None
+        pause_completed = False
+        update_succeeded = False
+        try:
+            self.rollout.pause_generation()
+            pause_completed = True
+            result = self._weight_update_ctrl.update_weights(version=meta.version)
+            if result.status != "ok":
+                raise RuntimeError(
+                    f"Weight update v{meta.version} failed: "
+                    f"{result.error or 'unknown gateway error'}"
+                )
+            update_succeeded = True
+            if meta.type == "disk" and meta.clear_checkpoint_after_load:
+                assert self._disk_weight_update_root is not None
+                checkpoint_path = os.path.join(
+                    self._disk_weight_update_root,
+                    f"weight_update_v{meta.version}",
+                )
+                try:
+                    shutil.rmtree(checkpoint_path)
+                except FileNotFoundError:
+                    pass
+                except OSError as exc:
+                    logger.warning(
+                        "Failed to remove disk weight-update checkpoint %s: %s",
+                        checkpoint_path,
+                        exc,
+                    )
+            logger.info(
+                "Weight update v%d completed (%s, %.0fms)",
+                meta.version,
+                result.status,
+                result.duration_ms,
+            )
+        except BaseException as exc:
+            primary_error = exc
+            raise
+        finally:
+            if not pause_completed or update_succeeded:
+                try:
+                    self.rollout.continue_generation()
+                except BaseException:
+                    if primary_error is None:
+                        raise
+                    logger.exception(
+                        "Failed to resume generation while propagating %s",
+                        type(primary_error).__name__,
+                    )
+            else:
+                logger.error(
+                    "Weight update did not complete; leaving rollout generation "
+                    "paused to avoid serving mixed model versions"
+                )
 
     def prepare_batch(
         self,

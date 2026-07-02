@@ -1,14 +1,20 @@
 from __future__ import annotations
 
+import os
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
 
 from areal.api.cli_args import SchedulingSpec, TrainEngineConfig
+from areal.api.io_struct import WeightUpdateMeta
+from areal.v2.inference_service.controller.controller import RolloutControllerV2
 from areal.v2.training_service.controller.controller import (
     GatewayTrainController,
+    _disk_gateway_save_root,
 )
+from areal.v2.weight_update.gateway.config import WeightUpdateResult
 
 MODULE = "areal.v2.training_service.controller.controller"
 
@@ -162,3 +168,197 @@ class TestGatewayTrainControllerInitialization:
         assert controller._gateway_addr == "http://127.0.0.1:18080"
         assert controller.api_key is not None
         assert controller.api_key.startswith("ak-train-role-")
+
+
+class TestGatewayTrainControllerWeightUpdate:
+    @staticmethod
+    def _prepare_controller(result=None, error=None):
+        controller = _make_controller()
+        controller.rollout = MagicMock()
+        controller._weight_update_ctrl = MagicMock()
+        controller._weight_update_ctrl.update_weights.side_effect = error
+        if error is None:
+            controller._weight_update_ctrl.update_weights.return_value = result
+        return controller
+
+    def test_failed_result_raises_and_keeps_generation_paused(self):
+        result = WeightUpdateResult(
+            status="error",
+            version=1,
+            duration_ms=10,
+            error="inference load failed",
+        )
+        controller = self._prepare_controller(result=result)
+        meta = WeightUpdateMeta(
+            type="disk",
+            path="/tmp/weights",
+            version=1,
+            clear_checkpoint_after_load=False,
+        )
+
+        with pytest.raises(RuntimeError, match="inference load failed"):
+            controller.update_weights(meta)
+
+        controller.rollout.pause_generation.assert_called_once_with()
+        controller.rollout.continue_generation.assert_not_called()
+
+    def test_gateway_exception_keeps_generation_paused(self):
+        controller = self._prepare_controller(error=TimeoutError("gateway timeout"))
+        meta = WeightUpdateMeta(
+            type="disk",
+            path="/tmp/weights",
+            version=1,
+            clear_checkpoint_after_load=False,
+        )
+
+        with pytest.raises(TimeoutError, match="gateway timeout"):
+            controller.update_weights(meta)
+
+        controller.rollout.pause_generation.assert_called_once_with()
+        controller.rollout.continue_generation.assert_not_called()
+
+    def test_pause_exception_attempts_resume(self):
+        controller = self._prepare_controller()
+        controller.rollout.pause_generation.side_effect = RuntimeError("pause failed")
+        meta = WeightUpdateMeta(
+            type="disk",
+            path="/tmp/weights",
+            version=1,
+            clear_checkpoint_after_load=False,
+        )
+
+        with pytest.raises(RuntimeError, match="pause failed"):
+            controller.update_weights(meta)
+
+        controller.rollout.continue_generation.assert_called_once_with()
+
+    def test_resume_exception_does_not_mask_pause_exception(self):
+        controller = self._prepare_controller()
+        controller.rollout.pause_generation.side_effect = RuntimeError("pause failed")
+        controller.rollout.continue_generation.side_effect = RuntimeError(
+            "resume failed"
+        )
+        meta = WeightUpdateMeta(
+            type="disk",
+            path="/tmp/weights",
+            version=1,
+            clear_checkpoint_after_load=False,
+        )
+
+        with pytest.raises(RuntimeError, match="pause failed"):
+            controller.update_weights(meta)
+
+    def test_successful_disk_update_removes_versioned_checkpoint(self, tmp_path):
+        checkpoint_path = tmp_path / "weight_update_v1"
+        checkpoint_path.mkdir()
+        result = WeightUpdateResult(
+            status="ok",
+            version=1,
+            duration_ms=10,
+        )
+        controller = self._prepare_controller(result=result)
+        controller._disk_weight_update_root = str(tmp_path)
+        meta = WeightUpdateMeta(
+            type="disk",
+            path=str(checkpoint_path),
+            version=1,
+            clear_checkpoint_after_load=True,
+        )
+
+        controller.update_weights(meta)
+
+        assert not checkpoint_path.exists()
+        controller.rollout.continue_generation.assert_called_once_with()
+
+    def test_disk_cleanup_uses_connected_root_not_update_meta_path(self, tmp_path):
+        checkpoint_path = tmp_path / "weight_update_v1"
+        checkpoint_path.mkdir()
+        unrelated_path = tmp_path / "unrelated"
+        unrelated_path.mkdir()
+        result = WeightUpdateResult(
+            status="ok",
+            version=1,
+            duration_ms=10,
+        )
+        controller = self._prepare_controller(result=result)
+        controller._disk_weight_update_root = str(tmp_path)
+        meta = WeightUpdateMeta(
+            type="disk",
+            path=str(unrelated_path),
+            version=1,
+            clear_checkpoint_after_load=True,
+        )
+
+        controller.update_weights(meta)
+
+        assert not checkpoint_path.exists()
+        assert unrelated_path.exists()
+
+    def test_disk_gateway_save_root_matches_versioned_meta_path(self, tmp_path):
+        meta = WeightUpdateMeta.from_disk(
+            experiment_name="test-exp",
+            trial_name="trial-0",
+            file_root=str(tmp_path),
+        )
+
+        save_root = _disk_gateway_save_root(meta)
+
+        assert os.path.join(save_root, "weight_update_v3") == meta.with_version(3).path
+
+    def test_connect_engine_uses_canonical_disk_save_root(self, tmp_path):
+        controller = _make_controller()
+        controller._worker_addrs = ["http://train:8000"]
+        rollout = RolloutControllerV2.__new__(RolloutControllerV2)
+        rollout.config = SimpleNamespace(api_url=None)
+        rollout.rollout_alloc = SimpleNamespace(backend="sglang")
+        rollout._init_future = None
+        rollout._inf_addrs = ["http://infer:9000"]
+        meta = WeightUpdateMeta.from_disk(
+            experiment_name="test-exp",
+            trial_name="trial-0",
+            file_root=str(tmp_path),
+        )
+
+        with (
+            patch(
+                "areal.v2.weight_update.controller.controller."
+                "WeightUpdateController.initialize"
+            ),
+            patch(
+                "areal.v2.weight_update.controller.controller."
+                "WeightUpdateController.connect"
+            ) as mock_connect,
+        ):
+            controller.connect_engine(rollout, meta)
+
+        expected_root = os.path.dirname(meta.path)
+        assert controller._disk_weight_update_root == expected_root
+        assert mock_connect.call_args.kwargs["save_path"] == expected_root
+
+    @pytest.mark.parametrize(
+        ("backend", "api_url"),
+        [("vllm", None), (None, "https://example.com/v1")],
+    )
+    def test_connect_engine_rejects_unsupported_disk_rollout(self, backend, api_url):
+        controller = _make_controller()
+        rollout = RolloutControllerV2.__new__(RolloutControllerV2)
+        rollout.config = SimpleNamespace(api_url=api_url)
+        rollout.rollout_alloc = (
+            SimpleNamespace(backend=backend) if backend is not None else None
+        )
+        rollout._init_future = None
+        rollout._inf_addrs = []
+        meta = WeightUpdateMeta(type="disk", path="/tmp/weight_update")
+
+        with (
+            patch(
+                "areal.v2.weight_update.controller.controller."
+                "WeightUpdateController.initialize"
+            ),
+            patch(
+                "areal.v2.weight_update.controller.controller."
+                "WeightUpdateController.connect"
+            ),
+            pytest.raises(ValueError, match="local SGLang"),
+        ):
+            controller.connect_engine(rollout, meta)

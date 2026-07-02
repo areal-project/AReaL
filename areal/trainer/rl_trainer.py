@@ -75,6 +75,54 @@ if TYPE_CHECKING:
 logger = logging.getLogger("RLTrainer")
 
 
+def _validate_v2_disk_weight_update(config: PPOConfig) -> None:
+    """Validate backends used by the v2 disk weight-update gateway."""
+    uses_disk = config.actor.use_lora or config.actor.weight_update_mode == "disk"
+    if (
+        config.actor._version != "v2"
+        or config.rollout._version != "v2"
+        or not uses_disk
+    ):
+        return
+
+    rollout_backend = config.rollout.backend.partition(":")[0]
+    if rollout_backend != "sglang" or config.rollout.api_url is not None:
+        raise ValueError(
+            "v2 disk weight updates currently only support a local SGLang "
+            "rollout backend. Use local SGLang or use AWEX for full-parameter "
+            "updates."
+        )
+
+
+def _build_v2_weight_update_meta(config: PPOConfig) -> WeightUpdateMeta:
+    """Build weight-update metadata for v2 train and rollout controllers."""
+    _validate_v2_disk_weight_update(config)
+    if not config.actor.use_lora and config.actor.weight_update_mode != "disk":
+        return WeightUpdateMeta.from_awex()
+
+    disk_kwargs: dict[str, Any] = {
+        "experiment_name": config.experiment_name,
+        "trial_name": config.trial_name,
+        "file_root": config.cluster.fileroot,
+        "name": "default",
+        "clear_checkpoint_after_load": True,
+    }
+    if config.actor.use_lora:
+        disk_kwargs.update(
+            {
+                "use_lora": config.actor.use_lora,
+                "lora_name": config.gconfig.lora_name,
+                "base_model_name": config.actor.path,
+                # Keep enough recent adapter versions for off-policy
+                # rollouts (max_head_offpolicyness) plus a safety margin;
+                # older versions are unloaded to bound sglang VRAM and
+                # avoid the adapter-accumulation hang.
+                "lora_keep_versions": config.rollout.max_head_offpolicyness + 2,
+            }
+        )
+    return WeightUpdateMeta.from_disk(**disk_kwargs)
+
+
 class _EmptyDataLoader:
     """Minimal dataloader for online mode that yields empty dicts.
 
@@ -324,29 +372,11 @@ class PPOTrainer:
         self._proxy_started = False
 
         # Prepare weight update meta and connect to inference engine.
-        # v2 controllers pick transport from use_lora: LoRA must go through
-        # disk (P2P transports cannot carry PEFT-wrapped tensors); non-LoRA
-        # uses awex. v1 keeps the legacy weight_update_mode dispatch.
+        # In v2, LoRA must go through disk because P2P transports cannot carry
+        # PEFT-wrapped tensors. Full-parameter updates use disk when explicitly
+        # requested and AWEX otherwise. v1 keeps the legacy dispatch below.
         if self.config.actor._version == "v2":
-            if config.actor.use_lora:
-                disk_kwargs: dict[str, Any] = {
-                    "experiment_name": config.experiment_name,
-                    "trial_name": config.trial_name,
-                    "file_root": config.cluster.fileroot,
-                    "name": "default",
-                    "clear_checkpoint_after_load": True,
-                    "use_lora": config.actor.use_lora,
-                    "lora_name": config.gconfig.lora_name,
-                    "base_model_name": config.actor.path,
-                    # Keep enough recent adapter versions for off-policy
-                    # rollouts (max_head_offpolicyness) plus a safety margin;
-                    # older versions are unloaded to bound sglang VRAM and
-                    # avoid the adapter-accumulation hang.
-                    "lora_keep_versions": config.rollout.max_head_offpolicyness + 2,
-                }
-                self.weight_update_meta = WeightUpdateMeta.from_disk(**disk_kwargs)
-            else:
-                self.weight_update_meta = WeightUpdateMeta.from_awex()
+            self.weight_update_meta = _build_v2_weight_update_meta(config)
         elif self.config.actor.weight_update_mode == "disk":
             disk_kwargs = {
                 "experiment_name": config.experiment_name,
@@ -1294,6 +1324,9 @@ class PPOTrainer:
         """validate config for incompatible settings before weight initialization, to avoid wasted resources on spawning workers and loading models."""
         rollout_backend = self.rollout_alloc.backend
         actor_backend = self.actor_alloc.backend
+
+        _validate_v2_disk_weight_update(self.config)
+
         requires_train_engine_offload = any(
             (
                 self._should_offload_rollout,
@@ -1329,6 +1362,12 @@ class PPOTrainer:
             and self.config.actor.use_lora
             and rollout_backend == "sglang"
         ):
+            if self.config.actor._version == "v2":
+                raise ValueError(
+                    "Megatron actor with LoRA is not supported with SGLang rollout "
+                    "in RL trainer v2. Use an FSDP actor with local SGLang, or "
+                    "disable LoRA."
+                )
             raise ValueError(
                 "Megatron actor with LoRA is not supported with SGLang rollout in "
                 "RL trainer. Please use vLLM rollout backend, or disable LoRA, or "
