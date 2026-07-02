@@ -8,13 +8,18 @@ from dataclasses import asdict
 from typing import Any
 
 from fastapi import FastAPI
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from areal.utils import logging
 from areal.utils.dynamic_import import import_from_string
 
-from ..protocol import QueueMode
-from ..types import AgentRequest, AgentResponse, AgentRunnable
+from ..protocol import PASSTHROUGH_HEADER, QueueMode
+from ..types import (
+    AgentRequest,
+    AgentResponse,
+    AgentRunnable,
+    StreamResponse,
+)
 
 logger = logging.getLogger("AgentWorker")
 
@@ -67,6 +72,20 @@ def create_worker_app(
 
     @app.post("/run")
     async def run(body: dict[str, Any]):
+        """Single agent entry point for every protocol and streaming mode.
+
+        Calls the agent's ``run`` and relays whichever shape it returns:
+
+        - :class:`StreamResponse` — raw passthrough; ``status_code`` /
+          ``headers`` / ``body`` are forwarded untouched so the caller gets the
+          upstream's exact wire format (e.g. SSE chat completions).  The
+          response carries the :data:`PASSTHROUGH_HEADER` marker so the
+          DataProxy relays it verbatim instead of parsing it — this works even
+          for a *non-streaming* passthrough whose body is ``application/json``.
+        - :class:`AgentResponse` — structured JSON ``{summary, metadata,
+          events}`` (``application/json``); the DataProxy rebuilds history from
+          ``events``.
+        """
         request = AgentRequest(
             message=body.get("message", ""),
             session_key=body.get("session_key", ""),
@@ -79,12 +98,33 @@ def create_worker_app(
         emitter = _CollectingEmitter()
 
         try:
-            response: AgentResponse = await agent.run(request, emitter=emitter)
+            response: AgentResponse | StreamResponse = await agent.run(
+                request, emitter=emitter
+            )
         except Exception as exc:
             logger.exception("Agent run failed (session=%s)", request.session_key)
             return JSONResponse(
                 {"error": {"message": str(exc), "type": type(exc).__name__}},
                 status_code=500,
+            )
+
+        if isinstance(response, StreamResponse):
+            # Drop hop-by-hop / length headers that would conflict with chunked
+            # relaying; FastAPI/uvicorn set framing headers themselves.
+            headers = {
+                k: v
+                for k, v in response.headers.items()
+                if k.lower()
+                not in ("content-length", "transfer-encoding", "connection")
+            }
+            # Mark the turn as raw-passthrough so the DataProxy relays it
+            # verbatim regardless of its Content-Type.
+            headers[PASSTHROUGH_HEADER] = "1"
+            return StreamingResponse(
+                response.body,
+                status_code=response.status_code,
+                headers=headers,
+                media_type=response.headers.get("content-type"),
             )
 
         return {**asdict(response), "events": emitter.events}

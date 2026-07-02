@@ -66,11 +66,14 @@ class ExportTrajectoriesResponse(BaseModel):
 class SessionData:
     """Data associated with a single RL session."""
 
-    def __init__(self, session_id: str):
+    def __init__(self, session_id: str, prefix_matcher=None):
         self.session_id = session_id
 
         self._completed = False
-        self._completions = InteractionCache()
+        self._completions = InteractionCache(
+            session_id=session_id,
+            prefix_matcher=prefix_matcher,
+        )
         self._completed_event = threading.Event()
         self._start_time = time.time()
         self._last_access_time = time.time()

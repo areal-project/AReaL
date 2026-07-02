@@ -19,6 +19,7 @@ VALID_DATASETS = [
     "virl39k",
     "hh-rlhf",
     "torl_data",
+    "swe_sft",
 ]
 
 logger = logging.getLogger("Dataset")
@@ -127,6 +128,16 @@ def _get_custom_dataset(
         from .torl_data import get_torl_data_rl_dataset
 
         return get_torl_data_rl_dataset(
+            path=path,
+            split=split,
+            tokenizer=tokenizer,
+            max_length=max_length,
+            **kwargs,
+        )
+    elif "swe" in path.lower() and type == "sft":
+        from .swe_sft import get_swe_sft_dataset
+
+        return get_swe_sft_dataset(
             path=path,
             split=split,
             tokenizer=tokenizer,

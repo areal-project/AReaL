@@ -874,11 +874,15 @@ def test_group_size_edge_cases():
     adv_norm = Normalization(config)
 
     normalized = adv_norm(advantages, loss_mask)
-    # With group size 1 and leave-one-out, each element should remain approximately unchanged
-    # because mean=0 (no other elements) and std=1 (for stability), so result ≈ (x-0)/1 = x
+
+    # With singleton leave-one-out groups, there is no peer baseline.
+    # We use the sample itself as the baseline, so each singleton group
+    # normalizes to zero instead of passing through the raw advantage.
     assert torch.allclose(
-        normalized, advantages, atol=1e-3
-    )  # Should remain approximately unchanged
+        normalized,
+        torch.zeros_like(advantages),
+        atol=1e-6,
+    )
 
 
 def test_precision_and_numerical_stability():

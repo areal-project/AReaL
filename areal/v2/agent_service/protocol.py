@@ -18,6 +18,13 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
+# HTTP response header the Worker sets on a raw-passthrough turn (an agent that
+# returns a :class:`~areal.v2.agent_service.types.StreamResponse`).
+# The DataProxy keys its relay-vs-parse decision on this marker rather than on
+# ``Content-Type`` — a *non-streaming* passthrough body is itself
+# ``application/json`` and would otherwise be mistaken for a structured turn.
+PASSTHROUGH_HEADER = "x-areal-passthrough"
+
 
 class FrameType(str, Enum):
     """WebSocket frame type discriminator."""

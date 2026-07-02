@@ -174,6 +174,16 @@ class BailingMoeBridge(LLMBridge):
                 "factor", 1.0
             ),
             apply_rope_fusion=False,
+            # original_max_position_embeddings: YaRN nests it in rope_scaling; fall back
+            # to the top-level field / max_position_embeddings. mcore 0.16 default (4096)
+            # is wrong for long-context models.
+            original_max_position_embeddings=(
+                (getattr(hf_config, "rope_scaling", None) or {}).get(
+                    "original_max_position_embeddings"
+                )
+                or getattr(hf_config, "original_max_position_embeddings", None)
+                or getattr(hf_config, "max_position_embeddings", 4096)
+            ),
             # MoE parameters
             moe_ffn_hidden_size=getattr(hf_config, "moe_intermediate_size", None),
             moe_token_dispatcher_type="alltoall",
@@ -192,6 +202,9 @@ class BailingMoeBridge(LLMBridge):
             moe_layer_freq=moe_layer_freq,
             # Other
             moe_router_dtype="fp32",
+            # Auxiliary-loss-free load balancing (DeepSeek V3 style) + router z-loss.
+            moe_router_bias_update_rate=0.0,
+            moe_z_loss_coeff=3.5e-6,
             persist_layer_norm=True,
             bias_activation_fusion=True,
             bias_dropout_fusion=True,

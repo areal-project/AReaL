@@ -322,7 +322,7 @@ jobs:
           VIRTUAL_ENV: /opt/.venv
         run: |
           export PATH="/opt/.venv/bin:$PATH"
-          pytest -m "(not slow or ci) and not ${EXCLUDE_BACKEND}" --durations=20 -s -vv tests/test_*.py tests/experimental/ tests/infra/
+          pytest -m "(not slow or ci) and not ${EXCLUDE_BACKEND}" --durations=20 -s -vv tests/test_*.py tests/experimental/ tests/infra/ tests/v2/
 
   cleanup:
     name: Tear down GCP runner (${{ matrix.variant }})

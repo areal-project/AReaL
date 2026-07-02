@@ -5,6 +5,7 @@ import enum
 import getpass
 import os
 import pathlib
+import subprocess
 import sys
 import time
 
@@ -274,3 +275,58 @@ def validate_config_for_distributed_launcher(config):
             )
         if allocation_mode.gen.tp_size > config.cluster.n_gpus_per_node:
             raise ValueError("Currently only support vLLM TP size <= #GPUs per node.")
+
+
+def run_post_exit_hook(config) -> None:
+    """Run the post-exit hook command if configured.
+
+    Executes ``config.post_exit_hook`` as a shell command with a 600-second
+    timeout. The ``LOG_DIR`` environment variable is injected so the hook
+    can locate experiment logs. Failures (timeout, non-zero exit, exceptions)
+    are logged as warnings but never propagate — they must not block recovery.
+
+    Args:
+        config: Experiment configuration with ``post_exit_hook``,
+            ``experiment_name``, ``trial_name``, and ``cluster.fileroot``.
+    """
+    hook_cmd = getattr(config, "post_exit_hook", "")
+    if not hook_cmd or not hook_cmd.strip():
+        return
+
+    hook_cmd = hook_cmd.strip()
+    logger.info(f"Running post-exit hook: {hook_cmd}")
+
+    env = os.environ.copy()
+    try:
+        log_dir = os.path.join(
+            config.cluster.fileroot,
+            "logs",
+            getpass.getuser(),
+            config.experiment_name,
+            config.trial_name,
+        )
+        env["LOG_DIR"] = log_dir
+    except Exception:
+        pass
+
+    try:
+        result = subprocess.run(
+            hook_cmd,
+            shell=True,
+            timeout=600,
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        if result.stdout:
+            logger.info(f"Post-exit hook stdout: {result.stdout.strip()}")
+        if result.stderr:
+            logger.warning(f"Post-exit hook stderr: {result.stderr.strip()}")
+        if result.returncode != 0:
+            logger.warning(f"Post-exit hook exited with code {result.returncode}")
+        else:
+            logger.info("Post-exit hook completed successfully")
+    except subprocess.TimeoutExpired:
+        logger.warning(f"Post-exit hook timed out after 600s: {hook_cmd}")
+    except Exception as e:
+        logger.warning(f"Post-exit hook failed: {e}")

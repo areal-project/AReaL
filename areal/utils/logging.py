@@ -111,6 +111,8 @@ LOGGER_COLORS_EXACT = {
     "ToolCallParser": "light_purple",
     "TokenLogpReward": "light_purple",
     "ProxyUtils": "light_purple",
+    "AReaL-SWEAgent": "light_purple",
+    "SWETrain": "light_green",
     # Agent Service - purple
     "AgentGateway": "light_purple",
     "AgentBridge": "light_purple",

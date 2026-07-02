@@ -232,16 +232,23 @@ async def test_streaming_with_tool_calling(openai_client):
         and len(chunk.choices[0].delta.tool_calls) > 0
     ]
 
-    # Verify tool calls are present and properly structured
+    # Verify tool calls are present and split into name/id and arguments chunks.
     if tool_call_chunks:
-        for chunk in tool_call_chunks:
-            for tool_call in chunk.choices[0].delta.tool_calls:
-                # Verify tool_call has required fields (simplified access after our fix)
-                assert tool_call.id is not None
-                assert tool_call.type == "function"
-                assert tool_call.function is not None
-                assert tool_call.function.name is not None
-                assert tool_call.function.arguments is not None
+        assert len(tool_call_chunks) % 2 == 0
+        for first_chunk, second_chunk in zip(
+            tool_call_chunks[::2], tool_call_chunks[1::2], strict=True
+        ):
+            first_tool_call = first_chunk.choices[0].delta.tool_calls[0]
+            second_tool_call = second_chunk.choices[0].delta.tool_calls[0]
+            assert first_tool_call.id is not None
+            assert first_tool_call.type == "function"
+            assert first_tool_call.function is not None
+            assert first_tool_call.function.name is not None
+            assert first_tool_call.function.arguments == ""
+            assert second_tool_call.index == first_tool_call.index
+            assert second_tool_call.function is not None
+            assert second_tool_call.function.arguments is not None
+            assert len(second_tool_call.function.arguments) > 0
 
     # Find the final chunk with finish_reason
     final_chunks = [
