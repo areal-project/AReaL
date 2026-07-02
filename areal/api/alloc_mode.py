@@ -587,6 +587,19 @@ class _AllocationMode:
             )
         return inf_allocs[0].parallel.tp_size * inf_allocs[0].parallel.pp_size
 
+    @property
+    def gen_scheduling_strategy(self) -> SchedulingStrategy:
+        inf_allocs = self._get_inference_allocations()
+        if len(inf_allocs) == 0:
+            return SchedulingStrategy(
+                type=SchedulingStrategyType.separation, target=None
+            )
+        if len(inf_allocs) > 1:
+            raise AttributeError(
+                f"Ambiguous 'gen_scheduling_strategy' property: found {len(inf_allocs)} inference allocations."
+            )
+        return inf_allocs[0].scheduling_strategy
+
 
 # Grammar-based parser using Lark
 # Operator precedence: | (colocation) binds tighter than + (disaggregation)
@@ -603,7 +616,8 @@ ALLOCATION_GRAMMAR = """
 
     inf_para: modern_inf_para
     modern_inf_para: INFER_BACKEND ("[" NAME "]")? ":" inf_dim+
-    train_para: train_backend_with_name | train_backend_hybrid | train_backend_only | train_name_only | train_dims_only | hybrid_moe_syntax
+    train_para: train_backend_name_hybrid | train_backend_with_name | train_backend_hybrid | train_backend_only | train_name_only | train_dims_only | hybrid_moe_syntax
+    train_backend_name_hybrid: TRAIN_BACKEND "[" NAME "]" ":" hybrid_moe_syntax
     train_backend_with_name: TRAIN_BACKEND "[" NAME "]" ":" common_dim+
     train_backend_hybrid: TRAIN_BACKEND ":" hybrid_moe_syntax
     train_backend_only: TRAIN_BACKEND ":" common_dim+
@@ -846,6 +860,19 @@ class _ParallelStrategyTransformer(Transformer):
                 strategy_kwargs["expert_parallel_size"] = dim.size
 
         strategy = ParallelStrategy(**strategy_kwargs)
+        return self._build_model_allocation(
+            backend,
+            name,
+            strategy,
+            SchedulingStrategy(type=SchedulingStrategyType.separation, target=None),
+        )
+
+    def train_backend_name_hybrid(self, items):
+        """Handle: TRAIN_BACKEND [ NAME ] : hybrid_moe_syntax"""
+        backend = str(items[0])
+        name = str(items[1])
+        strategy = items[2]  # ParallelStrategy from hybrid_moe_syntax
+
         return self._build_model_allocation(
             backend,
             name,

@@ -186,6 +186,7 @@ class WeightUpdateMeta:
     gen_allocation: ModelAllocation | None = None
 
     nccl_master_address: str | None = None
+    meta_server_addr: str | None = None
     nccl_master_port: int | None = None
     nccl_group_name: str | None = None
     weight_chunked_mem_mb: int = 1024
@@ -291,6 +292,7 @@ class WeightUpdateMeta:
     @classmethod
     def from_awex(
         cls,
+        meta_server_addr: str | None = None,
         use_lora: bool = False,
         lora_name: str = "",
         lora_int_id: int = 1,
@@ -298,6 +300,7 @@ class WeightUpdateMeta:
     ):
         return cls(
             type="awex",
+            meta_server_addr=meta_server_addr,
             use_lora=use_lora,
             lora_name=lora_name,
             lora_int_id=lora_int_id,
