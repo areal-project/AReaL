@@ -2210,6 +2210,16 @@ class AgentConfig:
             "choices": ["hf", "concat"],
         },
     )
+    chat_template_kwargs: dict[str, Any] = field(
+        default_factory=dict,
+        metadata={
+            "help": (
+                "Default keyword arguments passed to tokenizer.apply_chat_template "
+                "for agent requests. Per-request extra_body.chat_template_kwargs "
+                "override these defaults."
+            )
+        },
+    )
     engine_max_tokens: int | None = field(
         default=None,
         metadata={"help": "Maximum total tokens for the engine (prompt + completion)."},

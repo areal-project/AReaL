@@ -184,6 +184,18 @@ def _resolve_request_max_tokens(
     return prompt_len + max_new_tokens
 
 
+def _merge_chat_template_kwargs(
+    default_kwargs: Mapping[str, Any],
+    extra_body: Body,
+) -> dict[str, Any]:
+    request_kwargs = extra_body.get("chat_template_kwargs", {})
+    if request_kwargs is None:
+        request_kwargs = {}
+    if not isinstance(request_kwargs, Mapping):
+        raise TypeError("extra_body.chat_template_kwargs must be a mapping")
+    return {**default_kwargs, **request_kwargs}
+
+
 def _extract_images_from_messages(
     messages: list[dict[str, Any]],
 ) -> tuple[list[str], list[dict[str, Any]], list[dict[str, Any]]]:
@@ -385,6 +397,7 @@ def concat_prompt_token_ids_with_parent(
     tokenizer: "PreTrainedTokenizerFast",
     tools: Iterable[ChatCompletionToolParam] | None = None,
     extra_body: Body = {},
+    chat_template_kwargs: Mapping[str, Any] | None = None,
 ) -> list[int]:
     """
     Concatenate prompt token IDs with parent interaction's tokens.
@@ -430,7 +443,11 @@ def concat_prompt_token_ids_with_parent(
         tools=tools,
         add_generation_prompt=True,
         tokenize=True,
-        **extra_body.get("chat_template_kwargs", {}),
+        **(
+            dict(chat_template_kwargs)
+            if chat_template_kwargs is not None
+            else extra_body.get("chat_template_kwargs", {})
+        ),
     )
     parent_eos_num = parent_tokens.count(eos_token_id)
     if parent_eos_num > 0:
@@ -468,6 +485,7 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
         reasoning_parser: str,
         engine_max_tokens: int | None = None,
         chat_template_type: str = "hf",
+        chat_template_kwargs: Mapping[str, Any] | None = None,
         lora_name: str = "",
     ):
         super().__init__(client)
@@ -478,6 +496,7 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
         self._cache = cache
         self.engine_max_tokens = engine_max_tokens
         self.chat_template_type = chat_template_type
+        self.chat_template_kwargs = dict(chat_template_kwargs or {})
         self.lora_name = lora_name
 
     def _build_chat_completion(
@@ -620,6 +639,9 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
         )
         if extra_body is None:
             extra_body = {}
+        chat_template_kwargs = _merge_chat_template_kwargs(
+            self.chat_template_kwargs, extra_body
+        )
 
         # Convert response to OpenAI format
         current_time = int(datetime.datetime.now().timestamp())
@@ -658,7 +680,7 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
                 tools=tools_list,
                 add_generation_prompt=True,
                 tokenize=True,
-                **extra_body.get("chat_template_kwargs", {}),
+                **chat_template_kwargs,
             )
         elif self.chat_template_type == "concat":
             concat_messages = (
@@ -681,6 +703,7 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
                 self.tokenizer,
                 tools=tools_list,
                 extra_body=extra_body,
+                chat_template_kwargs=chat_template_kwargs,
             )
         else:
             raise RuntimeError(
@@ -977,6 +1000,7 @@ class AsyncResponsesWithReward(BaseAsyncResponses):
         reasoning_parser: str,
         engine_max_tokens: int | None = None,
         chat_template_type: str = "hf",
+        chat_template_kwargs: Mapping[str, Any] | None = None,
         lora_name: str = "",
     ):
         super().__init__(client)
@@ -987,6 +1011,7 @@ class AsyncResponsesWithReward(BaseAsyncResponses):
         self._cache = cache
         self.engine_max_tokens = engine_max_tokens
         self.chat_template_type = chat_template_type
+        self.chat_template_kwargs = dict(chat_template_kwargs or {})
         self.lora_name = lora_name
 
     async def create(
@@ -1020,6 +1045,9 @@ class AsyncResponsesWithReward(BaseAsyncResponses):
             raise ValueError(f"Response {resp_id} already exists in cache")
         if extra_body is None:
             extra_body = {}
+        chat_template_kwargs = _merge_chat_template_kwargs(
+            self.chat_template_kwargs, extra_body
+        )
 
         # Build a simple messages list compatible with tokenizer chat template
         messages_list: list[dict] = []
@@ -1079,7 +1107,7 @@ class AsyncResponsesWithReward(BaseAsyncResponses):
                 tools=tools_list,
                 add_generation_prompt=True,
                 tokenize=True,
-                **extra_body.get("chat_template_kwargs", {}),
+                **chat_template_kwargs,
             )
         elif self.chat_template_type == "concat":
             remaining = interaction.remaining_messages
@@ -1093,6 +1121,7 @@ class AsyncResponsesWithReward(BaseAsyncResponses):
                 self.tokenizer,
                 tools=tools_list,
                 extra_body=extra_body,
+                chat_template_kwargs=chat_template_kwargs,
             )
         else:
             raise RuntimeError(
@@ -1290,6 +1319,7 @@ class ArealOpenAI(AsyncOpenAI):
         reasoning_parser: str = "qwen3",
         engine_max_tokens: int | None = None,
         chat_template_type: str = "hf",
+        chat_template_kwargs: Mapping[str, Any] | None = None,
         lora_name: str = "",
         **kwargs,
     ):
@@ -1313,6 +1343,7 @@ class ArealOpenAI(AsyncOpenAI):
             reasoning_parser=self.reasoning_parser,
             engine_max_tokens=engine_max_tokens,
             chat_template_type=chat_template_type,
+            chat_template_kwargs=chat_template_kwargs,
             lora_name=lora_name,
         )
 
@@ -1326,6 +1357,7 @@ class ArealOpenAI(AsyncOpenAI):
             reasoning_parser=self.reasoning_parser,
             engine_max_tokens=engine_max_tokens,
             chat_template_type=chat_template_type,
+            chat_template_kwargs=chat_template_kwargs,
             lora_name=lora_name,
         )
 
