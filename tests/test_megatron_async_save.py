@@ -260,3 +260,42 @@ def test_sync_save_emits_no_async_metrics(patched_checkpointer, tmp_path):
         manager.save_checkpoint(str(tmp_path / "step0"))
 
     stats_scalar.assert_not_called()
+
+
+def test_generate_state_dict_requests_dp_reshardable_sharding(patched_checkpointer):
+    _, manager, _ = patched_checkpointer
+
+    with patch("torch.distributed.barrier"):
+        state_dict = manager.generate_state_dict(
+            with_model=False, with_optimizer=True, with_rng=False
+        )
+
+    kwargs = manager.optimizer.sharded_state_dict.call_args.kwargs
+    assert kwargs["metadata"] == {"distrib_optim_sharding_type": "dp_reshardable"}
+    assert kwargs["is_loading"] is False
+    assert "optimizer" in state_dict
+
+
+def test_load_checkpoint_builds_optimizer_template_with_is_loading(
+    patched_checkpointer, tmp_path
+):
+    mod, manager, _ = patched_checkpointer
+
+    with (
+        patch("os.path.exists", return_value=True),
+        patch("torch.distributed.barrier"),
+        patch.object(
+            mod, "load_dist_checkpointing", return_value={"optimizer": {"step": 1}}
+        ),
+    ):
+        manager.load_checkpoint(
+            str(tmp_path / "step0"),
+            with_model=False,
+            with_optimizer=True,
+            with_rng=False,
+        )
+
+    kwargs = manager.optimizer.sharded_state_dict.call_args.kwargs
+    assert kwargs["is_loading"] is True
+    assert kwargs["metadata"] == {"distrib_optim_sharding_type": "dp_reshardable"}
+    manager.optimizer.load_state_dict.assert_called_once_with({"step": 1})
