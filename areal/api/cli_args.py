@@ -2220,6 +2220,15 @@ class AgentConfig:
             )
         },
     )
+    keep_all_reasoning: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Retain reasoning content from all assistant turns when the model "
+                "chat template supports it."
+            )
+        },
+    )
     engine_max_tokens: int | None = field(
         default=None,
         metadata={"help": "Maximum total tokens for the engine (prompt + completion)."},

@@ -29,6 +29,9 @@ from openai.types.responses.response_create_params import ResponseCreateParams
 from pydantic import BaseModel
 
 from areal.api.cli_args import NameResolveConfig
+from areal.experimental.openai.chat_template_patches import (
+    apply_keep_all_reasoning_patches,
+)
 from areal.experimental.openai.client import ArealOpenAI
 from areal.infra.rpc.serialization import deserialize_value, serialize_value
 from areal.infra.utils.http import validate_admin_api_key
@@ -127,6 +130,21 @@ _etcd3_addr: str = "localhost:2379"
 
 # Adapter to convert Anthropic request to OpenAI format
 _adapter = AnthropicAdapter()
+
+
+def _chat_template_supports_kwarg(tokenizer: Any, name: str) -> bool:
+    chat_template = getattr(tokenizer, "chat_template", None)
+    return isinstance(chat_template, str) and name in chat_template
+
+
+def _build_chat_template_kwargs(agent_cfg: Any, tokenizer: Any) -> dict[str, Any]:
+    chat_template_kwargs = dict(agent_cfg.chat_template_kwargs)
+    if agent_cfg.keep_all_reasoning and _chat_template_supports_kwarg(
+        tokenizer, "preserve_thinking"
+    ):
+        chat_template_kwargs.setdefault("preserve_thinking", True)
+    return chat_template_kwargs
+
 
 # =============================================================================
 # Request Validation
@@ -265,6 +283,13 @@ def _setup_openai_client():
     config = _engine.config
     tokenizer = load_hf_tokenizer(config.tokenizer_path)
     agent_cfg = config.agent
+    chat_template_kwargs = _build_chat_template_kwargs(agent_cfg, tokenizer)
+    supports_preserve_thinking = _chat_template_supports_kwarg(
+        tokenizer, "preserve_thinking"
+    )
+    if agent_cfg.keep_all_reasoning and not supports_preserve_thinking:
+        for patch_name in apply_keep_all_reasoning_patches(tokenizer):
+            logger.info("Applied chat template patch: %s", patch_name)
     _openai_client = ArealOpenAI(
         engine=_engine,
         tokenizer=tokenizer,
@@ -272,7 +297,7 @@ def _setup_openai_client():
         reasoning_parser=agent_cfg.reasoning_parser,
         engine_max_tokens=agent_cfg.engine_max_tokens,
         chat_template_type=agent_cfg.chat_template_type,
-        chat_template_kwargs=agent_cfg.chat_template_kwargs,
+        chat_template_kwargs=chat_template_kwargs,
         lora_name=config.lora_name,
     )
     # Set session timeout from config
