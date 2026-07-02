@@ -304,6 +304,10 @@ class PPOTrainer:
         # Save initial LoRA weights if enabled (for inference server pre-loading)
         initial_lora_path = self._save_initial_lora_weights()
 
+        # Offload actor before rollout init so sglang can use the GPU memory
+        if self._should_offload_actor:
+            self._offload_model(self.actor, role="actor")
+
         # Initialize inference with LoRA path
         self.rollout = self._init_rollout(
             config.rollout, is_eval=False, lora_path=initial_lora_path
@@ -1163,6 +1167,12 @@ class PPOTrainer:
             "initial_lora",
         )
 
+        if os.path.exists(path) and os.path.isfile(
+            os.path.join(path, "adapter_config.json")
+        ):
+            logger.info(f"Initial LoRA already exists at {path}, skipping save.")
+            return path
+
         meta = SaveLoadMeta(
             path=path,
             weight_format="hf",
@@ -1171,8 +1181,9 @@ class PPOTrainer:
             processor=self.processor,
             base_model_path=self.config.actor.path,
         )
-        # Save LoRA weights using engine's HuggingFace save
+        logger.info(f"Saving initial LoRA weights to {path}...")
         self.actor.save(meta=meta)
+        logger.info(f"Initial LoRA saved: {os.listdir(path)}")
 
         return path
 

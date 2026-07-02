@@ -171,12 +171,14 @@ class SGLangBackend:
             if meta.version is None:
                 raise ValueError("Version is required for LoRA update.")
             lora_name = get_versioned_lora_name(meta.lora_name, meta.version)
-            # Load new LoRA
+            # Load new LoRA (best_effort: if already registered, SGLang
+            # returns 400 which is silently ignored).
             requests = [
                 HttpRequest(
                     endpoint="/load_lora_adapter",
                     payload={"lora_name": lora_name, "lora_path": str(meta.path)},
-                )
+                    best_effort=True,
+                ),
             ]
             # Unload the version that has fallen outside the retention window so
             # sglang does not accumulate one adapter per train step (which leaks
