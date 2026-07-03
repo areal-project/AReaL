@@ -119,8 +119,12 @@ class ReadyTrajectory:
     interaction_id: str
     completions: InteractionCache
     created_at: float
-    needs_online_callback: bool = False
+    delivery_mode: TrajectoryDeliveryMode = TrajectoryDeliveryMode.CALLBACK
     callback_delivered: bool = False
+
+    @property
+    def needs_online_callback(self) -> bool:
+        return self.delivery_mode is TrajectoryDeliveryMode.CALLBACK
 
 
 # =============================================================================
@@ -145,8 +149,10 @@ class SessionData:
         self,
         session_id: str,
         set_reward_finish_timeout: float = 0.0,
+        delivery_mode: TrajectoryDeliveryMode = TrajectoryDeliveryMode.CALLBACK,
     ):
         self.session_id = session_id
+        self.delivery_mode = delivery_mode
         self._set_reward_finish_timeout = set_reward_finish_timeout
         self._last_access_time = time.time()
         self._lock = threading.Lock()
@@ -214,7 +220,7 @@ class SessionData:
             interaction_id=resolved_interaction_id,
             completions=completions,
             created_at=now,
-            needs_online_callback=True,
+            delivery_mode=self.delivery_mode,
         )
         self._ready_trajectories[trajectory_id] = ready
         self._active_completions = InteractionCache()
@@ -400,7 +406,10 @@ class SessionStore:
         return self._admin_api_key
 
     def start_session(
-        self, task_id: str, api_key: str | None = None
+        self,
+        task_id: str,
+        api_key: str | None = None,
+        delivery_mode: TrajectoryDeliveryMode = TrajectoryDeliveryMode.CALLBACK,
     ) -> tuple[str, str]:
         """Start a new session, returning (session_id, session_api_key).
 
@@ -437,6 +446,7 @@ class SessionStore:
             self._sessions[session_id] = SessionData(
                 session_id=session_id,
                 set_reward_finish_timeout=self._set_reward_finish_timeout,
+                delivery_mode=delivery_mode,
             )
             self._api_key_to_session[session_api_key] = session_id
             self._session_to_api_key[session_id] = session_api_key

@@ -16,6 +16,7 @@ from areal.v2.inference_service.data_proxy.app import (
 )
 from areal.v2.inference_service.data_proxy.config import DataProxyConfig
 from areal.v2.inference_service.data_proxy.session import (
+    ReadyNotification,
     SessionData,
     SessionStore,
     StartSessionRequest,
@@ -161,6 +162,19 @@ def session_headers(api_key: str):
     return {"Authorization": f"Bearer {api_key}"}
 
 
+def _add_fake_interaction(
+    session: SessionData, interaction_id: str = "fake-id"
+) -> None:
+    from areal.experimental.openai.types import InteractionWithTokenLogpReward
+
+    interaction = InteractionWithTokenLogpReward(
+        messages=[{"role": "user", "content": "hi"}]
+    )
+    interaction.interaction_id = interaction_id
+    interaction.output_message_list = [{"role": "assistant", "content": "hello"}]
+    session.active_completions[interaction_id] = interaction
+
+
 # =============================================================================
 # SessionStore unit tests
 # =============================================================================
@@ -192,6 +206,58 @@ def test_start_session_request_rejects_unknown_delivery_mode():
 
 
 class TestSessionStore:
+    def test_default_delivery_remains_callback(self):
+        store = SessionStore()
+        session_id, _ = store.start_session("callback-task")
+        session = store.get_session(session_id)
+        assert isinstance(session, SessionData)
+        _add_fake_interaction(session)
+
+        session.set_reward(interaction_id="fake-id", reward=1.0)
+
+        assert store.pending_online_callbacks() == [
+            ReadyNotification(session_id=session_id, trajectory_id=0)
+        ]
+
+    def test_pull_delivery_exports_without_callback(self):
+        store = SessionStore()
+        session_id, _ = store.start_session(
+            "pull-task", delivery_mode=TrajectoryDeliveryMode.PULL
+        )
+        session = store.get_session(session_id)
+        assert isinstance(session, SessionData)
+        _add_fake_interaction(session)
+
+        result = session.set_reward(interaction_id="fake-id", reward=1.0)
+
+        assert result.ready_transition is True
+        assert store.pending_online_callbacks() == []
+        trajectory_id, interactions = session.export_trajectory(
+            discount=1.0, style="individual"
+        )
+        assert trajectory_id == 0
+        assert list(interactions) == ["fake-id"]
+
+    def test_cross_delivery_modes_only_callback_session_enqueues_notification(self):
+        store = SessionStore()
+        callback_session_id, _ = store.start_session("callback-task")
+        pull_session_id, _ = store.start_session(
+            "pull-task", delivery_mode=TrajectoryDeliveryMode.PULL
+        )
+        callback_session = store.get_session(callback_session_id)
+        pull_session = store.get_session(pull_session_id)
+        assert isinstance(callback_session, SessionData)
+        assert isinstance(pull_session, SessionData)
+        _add_fake_interaction(callback_session)
+        _add_fake_interaction(pull_session)
+
+        pull_session.set_reward(interaction_id="fake-id", reward=1.0)
+        callback_session.set_reward(interaction_id="fake-id", reward=1.0)
+
+        assert store.pending_online_callbacks() == [
+            ReadyNotification(session_id=callback_session_id, trajectory_id=0)
+        ]
+
     def test_start_session_returns_ids(self):
         store = SessionStore()
         session_id, api_key = store.start_session("task-1")
