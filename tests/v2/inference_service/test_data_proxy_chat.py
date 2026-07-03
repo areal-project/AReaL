@@ -17,6 +17,8 @@ from areal.v2.inference_service.data_proxy.config import DataProxyConfig
 from areal.v2.inference_service.data_proxy.session import (
     SessionData,
     SessionStore,
+    StartSessionRequest,
+    TrajectoryDeliveryMode,
 )
 
 # =============================================================================
@@ -161,6 +163,23 @@ def session_headers(api_key: str):
 # =============================================================================
 # SessionStore unit tests
 # =============================================================================
+
+
+def test_start_session_request_defaults_delivery_mode_to_callback():
+    request = StartSessionRequest(task_id="task-1")
+
+    assert request.delivery_mode is TrajectoryDeliveryMode.CALLBACK
+
+
+def test_start_session_request_parses_pull_delivery_mode():
+    request = StartSessionRequest(task_id="task-1", delivery_mode="pull")
+
+    assert request.delivery_mode is TrajectoryDeliveryMode.PULL
+
+
+def test_start_session_request_rejects_unknown_delivery_mode():
+    with pytest.raises(ValueError, match="delivery_mode"):
+        StartSessionRequest(task_id="task-1", delivery_mode="broadcast")
 
 
 class TestSessionStore:

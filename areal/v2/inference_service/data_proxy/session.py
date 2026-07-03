@@ -10,6 +10,7 @@ import time
 import uuid
 from collections import OrderedDict
 from dataclasses import dataclass
+from enum import Enum
 from typing import Any
 
 from pydantic import BaseModel
@@ -26,17 +27,28 @@ SESSION_TIMEOUT_SECONDS = 3600
 # =============================================================================
 
 
+class TrajectoryDeliveryMode(str, Enum):
+    """How completed trajectories are delivered to the session consumer."""
+
+    CALLBACK = "callback"
+    PULL = "pull"
+
+
 class StartSessionRequest(BaseModel):
     """Request to start one or more offline RL sessions.
 
     When ``group_size`` is greater than 1, the data proxy creates multiple
     sessions atomically. The response always contains a flat ``sessions``
     list — single-session is just ``group_size=1``.
+
+    Completed trajectories use callback delivery by default. Set
+    ``delivery_mode`` to ``pull`` when the client will explicitly export them.
     """
 
     task_id: str
     api_key: str | None = None  # Reuse a previously-issued key (refresh)
     group_size: int = 1
+    delivery_mode: TrajectoryDeliveryMode = TrajectoryDeliveryMode.CALLBACK
 
 
 class SessionCredentials(BaseModel):
