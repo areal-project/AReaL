@@ -1407,6 +1407,19 @@ class PPOTrainer:
         if self.config.scheduler.type == "ray":
             raise NotImplementedError("Proxy workers not supported with RayScheduler")
 
+        agent_cfg = self.config.rollout.agent
+        if isinstance(self.rollout, RolloutControllerV2):
+            # The V2 gateway is also the proxy and is started during controller
+            # initialization. Publish the primary rollout address here so online
+            # clients do not have to infer it from rollout/eval startup order.
+            if agent_cfg is not None and agent_cfg.mode == "online":
+                logger.info(
+                    "Proxy gateway available at %s (role=rollout)",
+                    self.rollout.proxy_gateway_addr,
+                )
+            self._proxy_started = True
+            return
+
         if not isinstance(self.rollout, RolloutController):
             self._proxy_started = True
             return
@@ -1418,7 +1431,6 @@ class PPOTrainer:
             self.eval_rollout.start_proxy()
 
         # Start proxy gateway for online mode.
-        agent_cfg = self.config.rollout.agent
         if agent_cfg is not None and agent_cfg.mode == "online":
             self.rollout.start_proxy_gateway()
             logger.info(
