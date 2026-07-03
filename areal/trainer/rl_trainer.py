@@ -153,13 +153,6 @@ class PPOTrainer:
         agent_cfg = config.rollout.agent
         self._online_mode = agent_cfg is not None and agent_cfg.mode == "online"
 
-        if self._online_mode and config.valid_dataset is not None:
-            raise ValueError(
-                "valid_dataset must not be set when using online RL mode "
-                "(agent.mode='online'). Online mode does not support "
-                "validation datasets."
-            )
-
         # -- Dataset loading --------------------------------------------------
         if not self._online_mode and train_dataset is None:
             raise ValueError(
@@ -220,23 +213,11 @@ class PPOTrainer:
         else:
             assert train_dataset is not None
             if is_single_controller() and isinstance(train_dataset, RDataset):
-                ds_cfg = DataServiceConfig.from_dataset_config(
-                    config.train_dataset, seed=config.seed
+                self._connect_rdataset(
+                    train_dataset,
+                    config.train_dataset,
+                    split="train",
                 )
-                assert self.scheduler is not None
-                controller = DataController(ds_cfg, self.scheduler)
-                controller.initialize(
-                    role="data", num_dataset_workers=ds_cfg.num_workers
-                )
-                self.data_controller = controller
-                train_dataset.connect(
-                    controller,
-                    dataset_id=f"{config.experiment_name}_{config.trial_name}_train",
-                    tokenizer_or_processor_path=config.tokenizer_path,
-                    shuffle=config.train_dataset.shuffle,
-                    drop_last=config.train_dataset.drop_last,
-                )
-                self._train_rdataset = train_dataset
 
             self.train_dataloader = self._create_dataloader(
                 train_dataset,
@@ -249,15 +230,11 @@ class PPOTrainer:
         if self.config.valid_dataset is not None and valid_dataset is not None:
             assert self.config.valid_dataset is not None
             if is_single_controller() and isinstance(valid_dataset, RDataset):
-                assert self.data_controller is not None
-                valid_dataset.connect(
-                    self.data_controller,
-                    dataset_id=f"{config.experiment_name}_{config.trial_name}_valid",
-                    tokenizer_or_processor_path=config.tokenizer_path,
-                    shuffle=self.config.valid_dataset.shuffle,
-                    drop_last=self.config.valid_dataset.drop_last,
+                self._connect_rdataset(
+                    valid_dataset,
+                    self.config.valid_dataset,
+                    split="valid",
                 )
-                self._valid_rdataset = valid_dataset
 
             self.valid_dataloader = self._create_dataloader(
                 valid_dataset,
@@ -431,6 +408,37 @@ class PPOTrainer:
 
         self._config_perf_tracer()
         self._apply_initial_offload_policy()
+
+    def _connect_rdataset(
+        self,
+        dataset: RDataset,
+        dataset_config: TrainDatasetConfig | ValidDatasetConfig,
+        *,
+        split: str,
+    ) -> None:
+        if self.data_controller is None:
+            ds_cfg = DataServiceConfig.from_dataset_config(
+                dataset_config, seed=self.config.seed
+            )
+            assert self.scheduler is not None
+            controller = DataController(ds_cfg, self.scheduler)
+            controller.initialize(role="data", num_dataset_workers=ds_cfg.num_workers)
+            self.data_controller = controller
+
+        dataset.connect(
+            self.data_controller,
+            dataset_id=(
+                f"{self.config.experiment_name}_{self.config.trial_name}_{split}"
+            ),
+            tokenizer_or_processor_path=self.config.tokenizer_path,
+            shuffle=dataset_config.shuffle,
+            drop_last=dataset_config.drop_last,
+        )
+        if split == "train":
+            self._train_rdataset = dataset
+        else:
+            assert split == "valid"
+            self._valid_rdataset = dataset
 
     @staticmethod
     def _is_colocation(strategy: SchedulingStrategy | None) -> bool:
