@@ -67,6 +67,8 @@ def validate_trajectory_policy_version(
         loss_mask, torch.Tensor
     ):
         raise ValueError("trajectory versions and loss_mask must be PyTorch tensors")
+    if versions.dtype not in (torch.int8, torch.int16, torch.int32, torch.int64):
+        raise ValueError("trajectory versions must use a signed integer dtype")
     if versions.shape != loss_mask.shape:
         raise ValueError("trajectory versions and loss_mask must have the same shape")
 
@@ -81,6 +83,28 @@ def validate_trajectory_policy_version(
             f"expected policy version {expected_policy_version}, "
             f"observed {observed_versions} on loss-bearing tokens"
         )
+
+
+async def _clear_trajectory_rtensors(traj: dict[str, Any]) -> None:
+    """Best-effort cleanup for an exported trajectory that will be discarded."""
+    shards_by_node = RTensor.collect_shards(traj)
+    if not shards_by_node:
+        return
+
+    results = await asyncio.gather(
+        *(
+            RTensor.clear_node(node_addr, shard_ids)
+            for node_addr, shard_ids in shards_by_node.items()
+        ),
+        return_exceptions=True,
+    )
+    for node_addr, result in zip(shards_by_node, results, strict=True):
+        if isinstance(result, BaseException):
+            logger.warning(
+                "Failed to clear rejected trajectory shards on %s: %s",
+                node_addr,
+                result,
+            )
 
 
 class InferenceServiceWorkflow(RolloutWorkflow):
@@ -259,30 +283,40 @@ class InferenceServiceWorkflow(RolloutWorkflow):
             session_ids,
             group_id=group_id,
         )
-        if not traj:
-            return None
+        keep_trajectory = False
+        try:
+            if not traj:
+                return None
 
-        n_failed = sum(r is None for r in results)
-        if n_failed > 0:
-            logger.warning(
-                "Abandoning group %s: %d/%d sessions failed",
-                group_id,
-                n_failed,
-                len(sessions),
-            )
-            return None
+            n_failed = sum(r is None for r in results)
+            if n_failed > 0:
+                logger.warning(
+                    "Abandoning group %s: %d/%d sessions failed",
+                    group_id,
+                    n_failed,
+                    len(sessions),
+                )
+                return None
 
-        if self.expected_policy_version is not None:
-            validate_trajectory_policy_version(traj, self.expected_policy_version)
-
-        tracker = stats_tracker.get(workflow_context.stat_scope())
-        for r in results:
-            metrics: dict[str, float | int | None] = {"reward": r}
             if self.expected_policy_version is not None:
-                metrics["policy_version"] = self.expected_policy_version
-            tracker.scalar(**metrics)
+                await asyncio.to_thread(
+                    validate_trajectory_policy_version,
+                    traj,
+                    self.expected_policy_version,
+                )
 
-        return traj
+            tracker = stats_tracker.get(workflow_context.stat_scope())
+            for r in results:
+                metrics: dict[str, float | int | None] = {"reward": r}
+                if self.expected_policy_version is not None:
+                    metrics["policy_version"] = self.expected_policy_version
+                tracker.scalar(**metrics)
+
+            keep_trajectory = True
+            return traj
+        finally:
+            if not keep_trajectory:
+                await _clear_trajectory_rtensors(traj)
 
     async def _run_online(
         self,
@@ -300,32 +334,43 @@ class InferenceServiceWorkflow(RolloutWorkflow):
             [export_request["session_id"]],
             trajectory_id=export_request["trajectory_id"],
         )
-        if not traj:
-            return None
+        keep_trajectory = False
+        try:
+            if not traj:
+                return None
 
-        rewards_tensor = traj.get("rewards")
-        if isinstance(rewards_tensor, RTensor):
-            rewards_tensor = rewards_tensor.to_local()
+            rewards_tensor = traj.get("rewards")
+            if isinstance(rewards_tensor, RTensor):
+                rewards_tensor = rewards_tensor.to_local()
 
-        if rewards_tensor is not None and len(rewards_tensor) > 0:
-            last_reward = float(rewards_tensor[-1])
-        elif (
-            "interactions" in traj
-            and traj["interactions"]
-            and traj["interactions"][-1].get("reward") is not None
-        ):
-            last_reward = float(traj["interactions"][-1]["reward"])
-        else:
-            logger.warning(
-                "Exported trajectory is missing rewards. This trajectory will be rejected."
-            )
-            return None
+            if rewards_tensor is not None and len(rewards_tensor) > 0:
+                last_reward = float(rewards_tensor[-1])
+            elif (
+                "interactions" in traj
+                and traj["interactions"]
+                and traj["interactions"][-1].get("reward") is not None
+            ):
+                last_reward = float(traj["interactions"][-1]["reward"])
+            else:
+                logger.warning(
+                    "Exported trajectory is missing rewards. "
+                    "This trajectory will be rejected."
+                )
+                return None
 
-        if self.expected_policy_version is not None:
-            validate_trajectory_policy_version(traj, self.expected_policy_version)
+            if self.expected_policy_version is not None:
+                await asyncio.to_thread(
+                    validate_trajectory_policy_version,
+                    traj,
+                    self.expected_policy_version,
+                )
 
-        metrics: dict[str, float | int] = {"reward": last_reward}
-        if self.expected_policy_version is not None:
-            metrics["policy_version"] = self.expected_policy_version
-        stats_tracker.get(workflow_context.stat_scope()).scalar(**metrics)
-        return traj
+            metrics: dict[str, float | int] = {"reward": last_reward}
+            if self.expected_policy_version is not None:
+                metrics["policy_version"] = self.expected_policy_version
+            stats_tracker.get(workflow_context.stat_scope()).scalar(**metrics)
+            keep_trajectory = True
+            return traj
+        finally:
+            if not keep_trajectory:
+                await _clear_trajectory_rtensors(traj)

@@ -421,9 +421,10 @@ class TestRolloutControllerV2Construction:
         controller = RolloutControllerV2(config=cfg, scheduler=scheduler)
         controller._callback_host = "127.0.0.1"
         controller._callback_port = 19000
-        server_infos = [
-            LocalInfServerInfo(host="127.0.0.1", port=30000, process=MagicMock())
-        ]
+        borrowed_server_info = LocalInfServerInfo(
+            host="127.0.0.1", port=30000, process=MagicMock()
+        )
+        server_infos = [borrowed_server_info]
 
         with patch.object(controller, "_async_fork_on_guard") as mock_fork:
             mock_fork.side_effect = [
@@ -439,6 +440,8 @@ class TestRolloutControllerV2Construction:
 
         assert controller.server_infos == server_infos
         assert controller.server_infos is not server_infos
+        controller.server_infos.clear()
+        assert server_infos == [borrowed_server_info]
 
         data_proxy_calls = [
             c for c in mock_fork.call_args_list if c.kwargs.get("role") == "data-proxy"
@@ -572,6 +575,26 @@ class TestInferenceServiceWorkflow:
             "rewards": torch.tensor([0.0, reward]),
             "versions": torch.tensor([-1, policy_version], dtype=torch.int32),
             "loss_mask": torch.tensor([0, 1], dtype=torch.int32),
+        }
+
+    @staticmethod
+    def _versioned_rtensor_trajectory(
+        policy_version: int, reward: float = 1.25
+    ) -> dict[str, RTensor]:
+        node_addr = "storage.test:9999"
+        return {
+            "rewards": RTensor(
+                shard=TensorShardInfo(shard_id="rewards", node_addr=node_addr),
+                data=torch.tensor([0.0, reward]),
+            ),
+            "versions": RTensor(
+                shard=TensorShardInfo(shard_id="versions", node_addr=node_addr),
+                data=torch.tensor([-1, policy_version], dtype=torch.int32),
+            ),
+            "loss_mask": RTensor(
+                shard=TensorShardInfo(shard_id="loss-mask", node_addr=node_addr),
+                data=torch.tensor([0, 1], dtype=torch.int32),
+            ),
         }
 
     @pytest.mark.asyncio
@@ -735,10 +758,11 @@ class TestInferenceServiceWorkflow:
             return_value=("group-1", [("session-1", "key-1")])
         )
         workflow._set_last_reward = AsyncMock(return_value=None)
-        workflow._export_interactions = AsyncMock(
-            return_value=self._versioned_trajectory(7)
-        )
+        traj = self._versioned_rtensor_trajectory(7)
+        workflow._export_interactions = AsyncMock(return_value=traj)
         tracker = MagicMock()
+        to_thread = AsyncMock(side_effect=lambda fn, *args: fn(*args))
+        clear_node = AsyncMock()
 
         with (
             patch(
@@ -747,6 +771,8 @@ class TestInferenceServiceWorkflow:
             patch(
                 "areal.v2.inference_service.controller.workflow.stats_tracker"
             ) as mock_st,
+            patch.object(workflow_module.asyncio, "to_thread", to_thread),
+            patch.object(RTensor, "clear_node", clear_node),
         ):
             mock_wf_ctx.get.return_value = MagicMock(task_id=42)
             mock_wf_ctx.get_httpx_client = AsyncMock(return_value=MagicMock())
@@ -756,6 +782,12 @@ class TestInferenceServiceWorkflow:
             result = await workflow._run_offline(MagicMock(), {})
 
         assert result is not None
+        to_thread.assert_awaited_once_with(
+            workflow_module.validate_trajectory_policy_version,
+            traj,
+            7,
+        )
+        clear_node.assert_not_awaited()
         tracker.scalar.assert_called_once_with(reward=1.25, policy_version=7)
 
     @pytest.mark.asyncio
@@ -774,10 +806,10 @@ class TestInferenceServiceWorkflow:
             return_value=("group-1", [("session-1", "key-1")])
         )
         workflow._set_last_reward = AsyncMock(return_value=None)
-        workflow._export_interactions = AsyncMock(
-            return_value=self._versioned_trajectory(6)
-        )
+        traj = self._versioned_rtensor_trajectory(6)
+        workflow._export_interactions = AsyncMock(return_value=traj)
         tracker = MagicMock()
+        clear_node = AsyncMock()
 
         with (
             patch(
@@ -786,6 +818,7 @@ class TestInferenceServiceWorkflow:
             patch(
                 "areal.v2.inference_service.controller.workflow.stats_tracker"
             ) as mock_st,
+            patch.object(RTensor, "clear_node", clear_node),
         ):
             mock_wf_ctx.get.return_value = MagicMock(task_id=42)
             mock_wf_ctx.get_httpx_client = AsyncMock(return_value=MagicMock())
@@ -796,6 +829,46 @@ class TestInferenceServiceWorkflow:
                 await workflow._run_offline(MagicMock(), {})
 
         tracker.scalar.assert_not_called()
+        clear_node.assert_awaited_once_with(
+            "storage.test:9999",
+            ["rewards", "versions", "loss-mask"],
+        )
+
+    @pytest.mark.asyncio
+    async def test_offline_mode_clears_exported_trajectory_when_group_fails(self):
+        class FailingAgent:
+            async def run(self, data, **kwargs):
+                raise RuntimeError("agent failed")
+
+        workflow = InferenceServiceWorkflow(
+            controller=MagicMock(),
+            agent=FailingAgent(),
+            gateway_addr="http://test:8080",
+        )
+        workflow._start_session = AsyncMock(
+            return_value=("group-1", [("session-1", "key-1")])
+        )
+        workflow._set_last_reward = AsyncMock(return_value=None)
+        traj = self._versioned_rtensor_trajectory(7)
+        workflow._export_interactions = AsyncMock(return_value=traj)
+        clear_node = AsyncMock()
+
+        with (
+            patch(
+                "areal.v2.inference_service.controller.workflow.workflow_context"
+            ) as mock_wf_ctx,
+            patch.object(RTensor, "clear_node", clear_node),
+        ):
+            mock_wf_ctx.get.return_value = MagicMock(task_id=42)
+            mock_wf_ctx.get_httpx_client = AsyncMock(return_value=MagicMock())
+
+            result = await workflow._run_offline(MagicMock(), {})
+
+        assert result is None
+        clear_node.assert_awaited_once_with(
+            "storage.test:9999",
+            ["rewards", "versions", "loss-mask"],
+        )
 
     @pytest.mark.asyncio
     async def test_offline_mode_without_expectation_accepts_missing_versions(self):
@@ -845,10 +918,11 @@ class TestInferenceServiceWorkflow:
             gateway_addr="http://test:8080",
             expected_policy_version=7,
         )
-        workflow._export_interactions = AsyncMock(
-            return_value=self._versioned_trajectory(7)
-        )
+        traj = self._versioned_rtensor_trajectory(7)
+        workflow._export_interactions = AsyncMock(return_value=traj)
         tracker = MagicMock()
+        to_thread = AsyncMock(side_effect=lambda fn, *args: fn(*args))
+        clear_node = AsyncMock()
 
         with (
             patch(
@@ -857,6 +931,8 @@ class TestInferenceServiceWorkflow:
             patch(
                 "areal.v2.inference_service.controller.workflow.stats_tracker"
             ) as mock_st,
+            patch.object(workflow_module.asyncio, "to_thread", to_thread),
+            patch.object(RTensor, "clear_node", clear_node),
         ):
             mock_wf_ctx.stat_scope.return_value = "eval-rollout"
             mock_st.get.return_value = tracker
@@ -864,6 +940,12 @@ class TestInferenceServiceWorkflow:
             result = await workflow._run_online(MagicMock())
 
         assert result is not None
+        to_thread.assert_awaited_once_with(
+            workflow_module.validate_trajectory_policy_version,
+            traj,
+            7,
+        )
+        clear_node.assert_not_awaited()
         tracker.scalar.assert_called_once_with(reward=1.25, policy_version=7)
 
     @pytest.mark.asyncio
@@ -877,10 +959,10 @@ class TestInferenceServiceWorkflow:
             gateway_addr="http://test:8080",
             expected_policy_version=7,
         )
-        workflow._export_interactions = AsyncMock(
-            return_value=self._versioned_trajectory(6)
-        )
+        traj = self._versioned_rtensor_trajectory(6)
+        workflow._export_interactions = AsyncMock(return_value=traj)
         tracker = MagicMock()
+        clear_node = AsyncMock()
 
         with (
             patch(
@@ -889,6 +971,7 @@ class TestInferenceServiceWorkflow:
             patch(
                 "areal.v2.inference_service.controller.workflow.stats_tracker"
             ) as mock_st,
+            patch.object(RTensor, "clear_node", clear_node),
         ):
             mock_wf_ctx.stat_scope.return_value = "eval-rollout"
             mock_st.get.return_value = tracker
@@ -897,6 +980,40 @@ class TestInferenceServiceWorkflow:
                 await workflow._run_online(MagicMock())
 
         tracker.scalar.assert_not_called()
+        clear_node.assert_awaited_once_with(
+            "storage.test:9999",
+            ["rewards", "versions", "loss-mask"],
+        )
+
+    @pytest.mark.asyncio
+    async def test_online_mode_clears_exported_trajectory_when_reward_is_missing(self):
+        controller = MagicMock()
+        controller.wait_for_online_trajectory = AsyncMock(
+            return_value={"session_id": "session-1", "trajectory_id": 3}
+        )
+        workflow = InferenceServiceWorkflow(
+            controller=controller,
+            gateway_addr="http://test:8080",
+        )
+        traj = {
+            "input_ids": RTensor(
+                shard=TensorShardInfo(
+                    shard_id="input-ids", node_addr="storage.test:9999"
+                ),
+                data=torch.tensor([1, 2], dtype=torch.int64),
+            )
+        }
+        workflow._export_interactions = AsyncMock(return_value=traj)
+        clear_node = AsyncMock()
+
+        with patch.object(RTensor, "clear_node", clear_node):
+            result = await workflow._run_online(MagicMock())
+
+        assert result is None
+        clear_node.assert_awaited_once_with(
+            "storage.test:9999",
+            ["input-ids"],
+        )
 
     @pytest.mark.asyncio
     async def test_online_mode_without_expectation_accepts_missing_versions(self):
@@ -990,6 +1107,15 @@ class TestValidateTrajectoryPolicyVersion:
         traj = self._trajectory(versions=[-1, 7, 7], loss_mask=[0, 1])
 
         with pytest.raises(ValueError, match="same shape"):
+            workflow_module.validate_trajectory_policy_version(traj, 7)
+
+    def test_validate_trajectory_policy_version_rejects_floating_versions(self):
+        traj = {
+            "versions": torch.tensor([-1.0, 7.0], dtype=torch.float32),
+            "loss_mask": torch.tensor([0, 1], dtype=torch.int32),
+        }
+
+        with pytest.raises(ValueError, match="signed integer dtype"):
             workflow_module.validate_trajectory_policy_version(traj, 7)
 
     def test_validate_trajectory_policy_version_rejects_no_loss_tokens(self):
