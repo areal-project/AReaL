@@ -64,3 +64,13 @@ def test_local_launcher_explicit_ld_preload_skips_stdbuf_and_quotes_value(launch
         "WORKER_LABEL='actor one' python train.py 2>&1 | tee -a "
     )
     assert "stdbuf" not in command.split(" 2>&1", maxsplit=1)[0]
+
+
+def test_local_launcher_inherited_ld_preload_skips_stdbuf(launcher, monkeypatch):
+    """A preload inherited by Popen is not extended by stdbuf."""
+    monkeypatch.setenv("LD_PRELOAD", "/opt/tms/torch_memory_saver.so")
+
+    command = _submitted_command(launcher, {"WORKER_LABEL": "actor"})
+
+    assert command.startswith("WORKER_LABEL=actor python train.py 2>&1 | tee -a ")
+    assert "stdbuf" not in command.split(" 2>&1", maxsplit=1)[0]

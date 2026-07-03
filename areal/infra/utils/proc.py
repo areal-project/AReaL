@@ -28,12 +28,14 @@ def build_target_cmd(
     *,
     env_vars: dict[str, str] | None = None,
     use_stdbuf: bool = False,
+    target_env: dict[str, str] | None = None,
 ) -> str:
     """Build a shell command with optional environment and line buffering.
 
     GNU ``stdbuf`` injects ``libstdbuf`` through ``LD_PRELOAD``. Avoid wrapping a
     target whose environment already specifies ``LD_PRELOAD`` so the target sees
-    the caller-provided value unchanged.
+    the caller-provided value unchanged. A ``None`` target environment follows
+    ``subprocess.Popen`` semantics and inherits ``os.environ``.
     """
     if isinstance(cmd, list):
         cmd_str = " ".join(shlex.quote(str(c)) for c in cmd)
@@ -47,7 +49,11 @@ def build_target_cmd(
                 f"{key}={shlex.quote(str(value))}" for key, value in env_vars.items()
             )
         )
-    if use_stdbuf and "LD_PRELOAD" not in (env_vars or {}):
+    inherited_env = os.environ if target_env is None else target_env
+    target_has_preload = (
+        "LD_PRELOAD" in (env_vars or {}) or "LD_PRELOAD" in inherited_env
+    )
+    if use_stdbuf and not target_has_preload:
         command_parts.append("stdbuf -oL")
     command_parts.append(cmd_str)
     return " ".join(command_parts)
@@ -94,11 +100,11 @@ def build_streaming_log_cmd(
     # Check if stdbuf is available (not present on macOS by default)
     _has_stdbuf = shutil.which("stdbuf") is not None
 
-    target_has_preload = "LD_PRELOAD" in (target_env or {})
     full_cmd = build_target_cmd(
         cmd,
         env_vars=env_vars,
-        use_stdbuf=_has_stdbuf and not target_has_preload,
+        use_stdbuf=_has_stdbuf,
+        target_env=target_env,
     )
 
     # Build log prefix for merged log

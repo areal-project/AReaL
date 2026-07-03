@@ -77,3 +77,54 @@ def test_run_with_streaming_logs_inherited_ld_preload_skips_target_stdbuf(
     assert "stdbuf -oL sed" in command
     assert mock_popen.call_args.kwargs["env"] is child_env
     mock_which.assert_called_once_with("stdbuf")
+
+
+@patch("areal.infra.utils.proc.subprocess.Popen")
+@patch("areal.infra.utils.proc.shutil.which", return_value="/usr/bin/stdbuf")
+def test_run_with_streaming_logs_parent_ld_preload_skips_target_stdbuf(
+    mock_which,
+    mock_popen,
+    monkeypatch,
+):
+    """Popen's default inherited environment is considered before wrapping."""
+    mock_popen.return_value = Mock()
+    monkeypatch.setenv("LD_PRELOAD", "/opt/tms/torch_memory_saver.so")
+
+    run_with_streaming_logs(
+        ["python", "worker.py"],
+        "/tmp/worker.log",
+        "/tmp/merged.log",
+        "actor",
+    )
+
+    command = mock_popen.call_args.args[0]
+    assert _target_command(command) == "python worker.py"
+    assert "stdbuf -oL sed" in command
+    assert mock_popen.call_args.kwargs["env"] is None
+    mock_which.assert_called_once_with("stdbuf")
+
+
+@patch("areal.infra.utils.proc.subprocess.Popen")
+@patch("areal.infra.utils.proc.shutil.which", return_value="/usr/bin/stdbuf")
+def test_run_with_streaming_logs_explicit_empty_env_uses_target_stdbuf(
+    mock_which,
+    mock_popen,
+    monkeypatch,
+):
+    """An explicit empty Popen environment does not inherit the parent's preload."""
+    mock_popen.return_value = Mock()
+    monkeypatch.setenv("LD_PRELOAD", "/opt/tms/torch_memory_saver.so")
+    child_env = {}
+
+    run_with_streaming_logs(
+        ["python", "worker.py"],
+        "/tmp/worker.log",
+        "/tmp/merged.log",
+        "actor",
+        env=child_env,
+    )
+
+    command = mock_popen.call_args.args[0]
+    assert _target_command(command) == "stdbuf -oL python worker.py"
+    assert mock_popen.call_args.kwargs["env"] is child_env
+    mock_which.assert_called_once_with("stdbuf")
