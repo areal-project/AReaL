@@ -60,6 +60,7 @@ def build_streaming_log_cmd(
     role: str,
     *,
     env_vars: dict[str, str] | None = None,
+    target_env: dict[str, str] | None = None,
 ) -> str:
     """Build a shell command that streams output to stdout and log files.
 
@@ -80,6 +81,10 @@ def build_streaming_log_cmd(
         Role name for log prefix (e.g., "actor", "master")
     env_vars : dict[str, str] | None
         Optional environment variables to prefix the command with KEY=VALUE
+    target_env : dict[str, str] | None
+        Optional environment passed directly to the target process. This is used
+        to preserve an inherited ``LD_PRELOAD`` when deciding whether ``stdbuf``
+        may safely wrap the target.
 
     Returns
     -------
@@ -89,7 +94,12 @@ def build_streaming_log_cmd(
     # Check if stdbuf is available (not present on macOS by default)
     _has_stdbuf = shutil.which("stdbuf") is not None
 
-    full_cmd = build_target_cmd(cmd, env_vars=env_vars, use_stdbuf=_has_stdbuf)
+    target_has_preload = "LD_PRELOAD" in (target_env or {})
+    full_cmd = build_target_cmd(
+        cmd,
+        env_vars=env_vars,
+        use_stdbuf=_has_stdbuf and not target_has_preload,
+    )
 
     # Build log prefix for merged log
     log_prefix = f"[{role}]".ljust(LOG_PREFIX_WIDTH)
@@ -138,7 +148,12 @@ def run_with_streaming_logs(
         The spawned process
     """
     shell_cmd = build_streaming_log_cmd(
-        cmd, str(log_file), str(merged_log), role, env_vars=env_vars_in_cmd
+        cmd,
+        str(log_file),
+        str(merged_log),
+        role,
+        env_vars=env_vars_in_cmd,
+        target_env=env,
     )
 
     return subprocess.Popen(

@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
-from areal.infra.utils.proc import build_streaming_log_cmd
+from areal.infra.utils.proc import build_streaming_log_cmd, run_with_streaming_logs
 
 
 def _target_command(shell_command: str) -> str:
@@ -48,4 +48,32 @@ def test_build_streaming_log_cmd_explicit_ld_preload_skips_target_stdbuf(
         "WORKER_LABEL='actor one' python worker.py"
     )
     assert "stdbuf -oL sed" in command
+    mock_which.assert_called_once_with("stdbuf")
+
+
+@patch("areal.infra.utils.proc.subprocess.Popen")
+@patch("areal.infra.utils.proc.shutil.which", return_value="/usr/bin/stdbuf")
+def test_run_with_streaming_logs_inherited_ld_preload_skips_target_stdbuf(
+    mock_which,
+    mock_popen,
+):
+    """A preload supplied through Popen's environment is not changed by stdbuf."""
+    mock_popen.return_value = Mock()
+    child_env = {
+        "LD_PRELOAD": "/opt/tms/torch_memory_saver.so",
+        "WORKER_LABEL": "actor",
+    }
+
+    run_with_streaming_logs(
+        ["python", "worker.py"],
+        "/tmp/worker.log",
+        "/tmp/merged.log",
+        "actor",
+        env=child_env,
+    )
+
+    command = mock_popen.call_args.args[0]
+    assert _target_command(command) == "python worker.py"
+    assert "stdbuf -oL sed" in command
+    assert mock_popen.call_args.kwargs["env"] is child_env
     mock_which.assert_called_once_with("stdbuf")
