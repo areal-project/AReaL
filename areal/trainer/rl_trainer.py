@@ -152,6 +152,13 @@ class PPOTrainer:
 
         agent_cfg = config.rollout.agent
         self._online_mode = agent_cfg is not None and agent_cfg.mode == "online"
+        self._validate_online_eval_controller_version(
+            online_mode=self._online_mode,
+            has_valid_dataset=(
+                config.valid_dataset is not None and valid_dataset is not None
+            ),
+            rollout_version=config.rollout._version,
+        )
 
         # -- Dataset loading --------------------------------------------------
         if not self._online_mode and train_dataset is None:
@@ -444,6 +451,15 @@ class PPOTrainer:
             self._valid_rdataset = dataset
 
     @staticmethod
+    def _validate_online_eval_controller_version(
+        *, online_mode: bool, has_valid_dataset: bool, rollout_version: str
+    ) -> None:
+        if online_mode and has_valid_dataset and rollout_version != "v2":
+            raise ValueError(
+                "Online held-out evaluation requires rollout._version='v2'."
+            )
+
+    @staticmethod
     def _should_initialize_eval_rollout(
         *, online_mode: bool, has_valid_dataloader: bool
     ) -> bool:
@@ -588,6 +604,12 @@ class PPOTrainer:
         total_epochs: int | None = None,
     ):
         config = self.config
+        if (
+            self._online_mode
+            and self.valid_dataloader is not None
+            and len(self.valid_dataloader) == 0
+        ):
+            raise ValueError("Online validation dataloader is empty.")
         if (
             self._online_mode
             and self.valid_dataloader is not None
@@ -1260,25 +1282,35 @@ class PPOTrainer:
         eval_workflow_kwargs,
     ):
         if self.actor.is_data_parallel_head():
-            cnt = 0
-            for data in self.valid_dataloader:
-                for item in data:
-                    self.eval_rollout.submit(
-                        item,
-                        eval_workflow,
-                        eval_workflow_kwargs,
-                        group_size=self.config.eval_gconfig.n_samples,
-                        is_eval=True,
-                    )
-                    cnt += 1
-            results = self.eval_rollout.wait(cnt, timeout=None)
-            if self._online_mode:
-                rejected = sum(result is None for result in results)
-                if rejected:
+            results = []
+            try:
+                cnt = 0
+                for data in self.valid_dataloader:
+                    for item in data:
+                        self.eval_rollout.submit(
+                            item,
+                            eval_workflow,
+                            eval_workflow_kwargs,
+                            group_size=self.config.eval_gconfig.n_samples,
+                            is_eval=True,
+                        )
+                        cnt += 1
+                if self._online_mode and cnt == 0:
                     raise RuntimeError(
-                        "Online evaluation incomplete: "
-                        f"rejected={rejected}, expected={cnt}"
+                        "Online evaluation is empty: no validation items were submitted."
                     )
+                results = self.eval_rollout.wait(cnt, timeout=None)
+                if self._online_mode:
+                    rejected = sum(result is None for result in results)
+                    if rejected:
+                        raise RuntimeError(
+                            "Online evaluation incomplete: "
+                            f"rejected={rejected}, expected={cnt}"
+                        )
+            finally:
+                accepted = [result for result in results if result is not None]
+                if accepted and is_single_controller():
+                    self.actor.clear_batches(*accepted)
 
         if not is_single_controller():
             dist.barrier(group=self.actor.cpu_group)

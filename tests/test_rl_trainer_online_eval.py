@@ -99,6 +99,14 @@ class TestOnlineEvalDataController:
 
 
 class TestEvalRolloutTopology:
+    def test_online_validation_requires_v2_rollout(self):
+        with pytest.raises(ValueError, match=r"rollout\._version.*v2"):
+            PPOTrainer._validate_online_eval_controller_version(
+                online_mode=True,
+                has_valid_dataset=True,
+                rollout_version="v1",
+            )
+
     def test_eval_rollout_topology_online_without_valid_data_is_disabled(self):
         assert not PPOTrainer._should_initialize_eval_rollout(
             online_mode=True,
@@ -119,6 +127,34 @@ class TestEvalRolloutTopology:
 
 
 class TestOnlineEvalIntegrity:
+    def test_online_empty_validation_fails_before_training_side_effects(self):
+        trainer = PPOTrainer.__new__(PPOTrainer)
+        trainer.config = SimpleNamespace(
+            total_train_epochs=1,
+            total_train_steps=1,
+            rollout=SimpleNamespace(agent=SimpleNamespace(mode="online")),
+            gconfig=SimpleNamespace(n_samples=1),
+            dynamic_bs=False,
+        )
+        trainer._online_mode = True
+        trainer.valid_dataloader = []
+        trainer.train_dataloader = [[{}]]
+        trainer.recover_info = None
+        trainer._should_offload_rollout = False
+        trainer._ensure_proxy_started = MagicMock(
+            side_effect=AssertionError("proxy must not start before eval preflight")
+        )
+        trainer.actor = MagicMock()
+        trainer.actor.prepare_batch.side_effect = AssertionError(
+            "training batch must not be consumed before eval preflight"
+        )
+
+        with pytest.raises(ValueError, match=r"validation.*empty"):
+            trainer.train(workflow=None, eval_workflow=sentinel.workflow)
+
+        trainer._ensure_proxy_started.assert_not_called()
+        trainer.actor.prepare_batch.assert_not_called()
+
     def test_online_validation_requires_eval_workflow_before_training_side_effects(
         self,
     ):
@@ -161,6 +197,9 @@ class TestOnlineEvalIntegrity:
             trainer._evaluate_fn(
                 eval_workflow=sentinel.workflow, eval_workflow_kwargs={}
             )
+        trainer.actor.clear_batches.assert_called_once_with(
+            sentinel.accepted_trajectory
+        )
 
     def test_all_valid_online_eval_results_complete_normally(self, monkeypatch):
         monkeypatch.setattr(rl_trainer, "is_single_controller", lambda: True)
@@ -175,6 +214,24 @@ class TestOnlineEvalIntegrity:
         )
 
         assert result is None
+        trainer.actor.clear_batches.assert_called_once_with(
+            sentinel.trajectory_one,
+            sentinel.trajectory_two,
+        )
+
+    def test_online_empty_eval_fails_closed_inside_evaluate_fn(self, monkeypatch):
+        monkeypatch.setattr(rl_trainer, "is_single_controller", lambda: True)
+        trainer = _eval_trainer(online_mode=True, wait_results=[])
+        trainer.valid_dataloader = []
+
+        with pytest.raises(RuntimeError, match=r"Online evaluation.*empty"):
+            trainer._evaluate_fn(
+                eval_workflow=sentinel.workflow,
+                eval_workflow_kwargs={},
+            )
+
+        trainer.eval_rollout.wait.assert_not_called()
+        trainer.actor.clear_batches.assert_not_called()
 
     def test_offline_incomplete_eval_preserves_current_behavior(self, monkeypatch):
         monkeypatch.setattr(rl_trainer, "is_single_controller", lambda: True)
@@ -189,3 +246,26 @@ class TestOnlineEvalIntegrity:
         )
 
         assert result is None
+        trainer.actor.clear_batches.assert_called_once_with(
+            sentinel.accepted_trajectory
+        )
+
+    def test_spmd_eval_does_not_clear_controller_rtensors(self, monkeypatch):
+        monkeypatch.setattr(rl_trainer, "is_single_controller", lambda: False)
+        barrier = MagicMock()
+        synchronize = MagicMock()
+        monkeypatch.setattr(rl_trainer.dist, "barrier", barrier)
+        monkeypatch.setattr(rl_trainer.current_platform, "synchronize", synchronize)
+        trainer = _eval_trainer(
+            online_mode=False,
+            wait_results=[sentinel.accepted_trajectory, None],
+        )
+
+        trainer._evaluate_fn(
+            eval_workflow=sentinel.workflow,
+            eval_workflow_kwargs={},
+        )
+
+        trainer.actor.clear_batches.assert_not_called()
+        barrier.assert_called_once_with(group=trainer.actor.cpu_group)
+        synchronize.assert_called_once_with()
