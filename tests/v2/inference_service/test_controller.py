@@ -746,11 +746,13 @@ class TestInferenceServiceWorkflow:
     async def test_offline_mode_records_reward_with_expected_policy_version(self):
         class MockAgent:
             async def run(self, data, **kwargs):
+                self.observed_policy_version = kwargs.get("policy_version")
                 return 1.25
 
+        agent = MockAgent()
         workflow = InferenceServiceWorkflow(
             controller=MagicMock(),
-            agent=MockAgent(),
+            agent=agent,
             gateway_addr="http://test:8080",
             expected_policy_version=7,
         )
@@ -782,6 +784,7 @@ class TestInferenceServiceWorkflow:
             result = await workflow._run_offline(MagicMock(), {})
 
         assert result is not None
+        assert agent.observed_policy_version == 7
         to_thread.assert_awaited_once_with(
             workflow_module.validate_trajectory_policy_version,
             traj,

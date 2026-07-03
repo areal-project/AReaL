@@ -231,6 +231,7 @@ class InferenceServiceWorkflow(RolloutWorkflow):
                     base_url=self.gateway_addr,
                     http_client=http_client,
                     api_key=session_api_key,
+                    policy_version=self.expected_policy_version,
                 )
                 if isinstance(rewards, dict):
                     final_reward = float(
