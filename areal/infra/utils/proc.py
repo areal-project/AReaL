@@ -23,6 +23,36 @@ if TYPE_CHECKING:
     from typing import IO
 
 
+def build_target_cmd(
+    cmd: str | list[str],
+    *,
+    env_vars: dict[str, str] | None = None,
+    use_stdbuf: bool = False,
+) -> str:
+    """Build a shell command with optional environment and line buffering.
+
+    GNU ``stdbuf`` injects ``libstdbuf`` through ``LD_PRELOAD``. Avoid wrapping a
+    target whose environment already specifies ``LD_PRELOAD`` so the target sees
+    the caller-provided value unchanged.
+    """
+    if isinstance(cmd, list):
+        cmd_str = " ".join(shlex.quote(str(c)) for c in cmd)
+    else:
+        cmd_str = cmd
+
+    command_parts = []
+    if env_vars:
+        command_parts.append(
+            " ".join(
+                f"{key}={shlex.quote(str(value))}" for key, value in env_vars.items()
+            )
+        )
+    if use_stdbuf and "LD_PRELOAD" not in (env_vars or {}):
+        command_parts.append("stdbuf -oL")
+    command_parts.append(cmd_str)
+    return " ".join(command_parts)
+
+
 def build_streaming_log_cmd(
     cmd: str | list[str],
     log_file: str | Path,
@@ -56,26 +86,10 @@ def build_streaming_log_cmd(
     str
         Shell command string ready for execution with bash
     """
-    # Escape command if it's a list
-    if isinstance(cmd, list):
-        cmd_str = " ".join(shlex.quote(str(c)) for c in cmd)
-    else:
-        cmd_str = cmd
-
     # Check if stdbuf is available (not present on macOS by default)
     _has_stdbuf = shutil.which("stdbuf") is not None
 
-    # Build prefix with env vars if provided
-    prefix_parts = []
-    if env_vars:
-        prefix_parts.append(
-            " ".join(f"{k}={shlex.quote(str(v))}" for k, v in env_vars.items())
-        )
-    if _has_stdbuf:
-        prefix_parts.append(f"stdbuf -oL {cmd_str}")
-    else:
-        prefix_parts.append(cmd_str)
-    full_cmd = " ".join(prefix_parts)
+    full_cmd = build_target_cmd(cmd, env_vars=env_vars, use_stdbuf=_has_stdbuf)
 
     # Build log prefix for merged log
     log_prefix = f"[{role}]".ljust(LOG_PREFIX_WIDTH)
