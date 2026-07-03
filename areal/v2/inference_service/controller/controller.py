@@ -414,7 +414,7 @@ class RolloutControllerV2:
         if self.external_mode:
             logger.info("External mode — skipping inference server launch")
         elif server_infos is not None:
-            self._server_infos = server_infos
+            self._server_infos = list(server_infos)
             self._inf_addrs = [
                 f"http://{format_hostport(info.host, info.port)}"
                 for info in server_infos

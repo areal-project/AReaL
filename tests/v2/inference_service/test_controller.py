@@ -373,6 +373,11 @@ class TestRolloutControllerV2Construction:
         controller = RolloutControllerV2(config=cfg, scheduler=scheduler)
         controller._callback_host = "127.0.0.1"
         controller._callback_port = 19000
+        server_infos = [
+            LocalInfServerInfo(
+                host="127.0.0.1", port=30000, process=MagicMock()
+            )
+        ]
 
         with patch.object(controller, "_async_fork_on_guard") as mock_fork:
             mock_fork.side_effect = [
@@ -383,12 +388,11 @@ class TestRolloutControllerV2Construction:
 
             await controller._async_initialize(
                 server_args=None,
-                server_infos=[
-                    LocalInfServerInfo(
-                        host="127.0.0.1", port=30000, process=MagicMock()
-                    )
-                ],
+                server_infos=server_infos,
             )
+
+        assert controller.server_infos == server_infos
+        assert controller.server_infos is not server_infos
 
         data_proxy_calls = [
             c for c in mock_fork.call_args_list if c.kwargs.get("role") == "data-proxy"
