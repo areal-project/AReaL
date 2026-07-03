@@ -418,6 +418,35 @@ async def test_start_session_with_admin_key(client):
 
 
 @pytest.mark.asyncio
+async def test_start_session_endpoint_persists_pull_delivery_mode(client):
+    response = await client.post(
+        "/rl/start_session",
+        json={"task_id": "pull-task", "delivery_mode": "pull", "group_size": 2},
+        headers=admin_headers(),
+    )
+
+    assert response.status_code == 201
+    session_ids = [item["session_id"] for item in response.json()["sessions"]]
+    assert len(session_ids) == 2
+    store: SessionStore = client._transport.app.state.session_store
+    for session_id in session_ids:
+        session = store.get_session(session_id)
+        assert isinstance(session, SessionData)
+        assert session.delivery_mode is TrajectoryDeliveryMode.PULL
+
+
+@pytest.mark.asyncio
+async def test_start_session_endpoint_rejects_unknown_delivery_mode(client):
+    response = await client.post(
+        "/rl/start_session",
+        json={"task_id": "invalid-task", "delivery_mode": "broadcast"},
+        headers=admin_headers(),
+    )
+
+    assert response.status_code == 422
+
+
+@pytest.mark.asyncio
 async def test_start_session_without_admin_key(client):
     resp = await client.post(
         "/rl/start_session",

@@ -472,7 +472,9 @@ def create_app(config: DataProxyConfig) -> FastAPI:
         for i in range(group_size):
             try:
                 session_id, session_api_key = store.start_session(
-                    body.task_id, body.api_key if i == 0 else None
+                    body.task_id,
+                    body.api_key if i == 0 else None,
+                    delivery_mode=body.delivery_mode,
                 )
             except ValueError as e:
                 raise HTTPException(status_code=409, detail=str(e))
