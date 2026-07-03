@@ -1283,6 +1283,7 @@ class PPOTrainer:
     ):
         if self.actor.is_data_parallel_head():
             results = []
+            evaluation_error: BaseException | None = None
             try:
                 cnt = 0
                 for data in self.valid_dataloader:
@@ -1307,10 +1308,21 @@ class PPOTrainer:
                             "Online evaluation incomplete: "
                             f"rejected={rejected}, expected={cnt}"
                         )
+            except BaseException as exc:
+                evaluation_error = exc
+                raise
             finally:
                 accepted = [result for result in results if result is not None]
                 if accepted and is_single_controller():
-                    self.actor.clear_batches(*accepted)
+                    try:
+                        self.actor.clear_batches(*accepted)
+                    except Exception:
+                        if evaluation_error is None:
+                            raise
+                        logger.exception(
+                            "Failed to clear evaluation trajectory shards while "
+                            "preserving the original evaluation error"
+                        )
 
         if not is_single_controller():
             dist.barrier(group=self.actor.cpu_group)

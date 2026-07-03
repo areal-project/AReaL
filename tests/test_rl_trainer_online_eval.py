@@ -201,6 +201,23 @@ class TestOnlineEvalIntegrity:
             sentinel.accepted_trajectory
         )
 
+    def test_incomplete_eval_error_survives_cleanup_failure(self, monkeypatch):
+        monkeypatch.setattr(rl_trainer, "is_single_controller", lambda: True)
+        trainer = _eval_trainer(
+            online_mode=True,
+            wait_results=[sentinel.accepted_trajectory, None],
+        )
+        trainer.actor.clear_batches.side_effect = RuntimeError("cleanup failed")
+
+        with pytest.raises(
+            RuntimeError,
+            match=r"Online evaluation incomplete: rejected=1, expected=2",
+        ):
+            trainer._evaluate_fn(
+                eval_workflow=sentinel.workflow,
+                eval_workflow_kwargs={},
+            )
+
     def test_all_valid_online_eval_results_complete_normally(self, monkeypatch):
         monkeypatch.setattr(rl_trainer, "is_single_controller", lambda: True)
         trainer = _eval_trainer(
