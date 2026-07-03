@@ -18,9 +18,7 @@ def test_ppo_actor_warns_when_reward_group_centering_is_singleton():
         UserWarning, match="singleton group centering erases the task reward"
     ):
         PPOActorConfig(
-            reward_norm=NormConfig(
-                mean_level="group", std_level="group", group_size=1
-            )
+            reward_norm=NormConfig(mean_level="group", std_level="group", group_size=1)
         )
 
 
