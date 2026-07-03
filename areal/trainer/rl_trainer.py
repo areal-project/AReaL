@@ -287,7 +287,10 @@ class PPOTrainer:
         )
 
         self.eval_rollout = None
-        if not self._online_mode:
+        if self._should_initialize_eval_rollout(
+            online_mode=self._online_mode,
+            has_valid_dataloader=self.valid_dataloader is not None,
+        ):
             self.eval_rollout = self._init_rollout(
                 config.rollout, is_eval=True, lora_path=initial_lora_path
             )
@@ -439,6 +442,12 @@ class PPOTrainer:
         else:
             assert split == "valid"
             self._valid_rdataset = dataset
+
+    @staticmethod
+    def _should_initialize_eval_rollout(
+        *, online_mode: bool, has_valid_dataloader: bool
+    ) -> bool:
+        return not online_mode or has_valid_dataloader
 
     @staticmethod
     def _is_colocation(strategy: SchedulingStrategy | None) -> bool:

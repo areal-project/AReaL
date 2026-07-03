@@ -82,3 +82,23 @@ class TestOnlineEvalDataController:
         )
         assert trainer.data_controller is existing_controller
         assert trainer._train_rdataset is dataset
+
+
+class TestEvalRolloutTopology:
+    def test_eval_rollout_topology_online_without_valid_data_is_disabled(self):
+        assert not PPOTrainer._should_initialize_eval_rollout(
+            online_mode=True,
+            has_valid_dataloader=False,
+        )
+
+    def test_eval_rollout_topology_online_with_valid_data_is_enabled(self):
+        assert PPOTrainer._should_initialize_eval_rollout(
+            online_mode=True,
+            has_valid_dataloader=True,
+        )
+
+    def test_eval_rollout_topology_offline_remains_enabled(self):
+        assert PPOTrainer._should_initialize_eval_rollout(
+            online_mode=False,
+            has_valid_dataloader=False,
+        )
