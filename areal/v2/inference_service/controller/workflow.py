@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any
 import aiohttp
 import httpx
 import openai
+import torch
 
 from areal.api.workflow_api import RolloutWorkflow
 from areal.infra import workflow_context
@@ -41,6 +42,45 @@ _CONNECTION_ERROR_TYPES: tuple[type[BaseException], ...] = (
     OSError,
     openai.APIConnectionError,
 )
+
+
+def validate_trajectory_policy_version(
+    traj: dict[str, Any], expected_policy_version: int
+) -> None:
+    """Require every loss-bearing token to come from the expected policy."""
+    for field in ("versions", "loss_mask"):
+        if field not in traj:
+            raise ValueError(
+                f"trajectory is missing required provenance field '{field}'"
+            )
+
+    provenance = RTensor.localize(
+        {
+            "versions": traj["versions"],
+            "loss_mask": traj["loss_mask"],
+        }
+    )
+    versions = provenance["versions"]
+    loss_mask = provenance["loss_mask"]
+
+    if not isinstance(versions, torch.Tensor) or not isinstance(
+        loss_mask, torch.Tensor
+    ):
+        raise ValueError("trajectory versions and loss_mask must be PyTorch tensors")
+    if versions.shape != loss_mask.shape:
+        raise ValueError("trajectory versions and loss_mask must have the same shape")
+
+    selected_versions = versions[loss_mask == 1]
+    if selected_versions.numel() == 0:
+        raise ValueError("trajectory has no loss-bearing tokens")
+
+    observed_versions = sorted(torch.unique(selected_versions.detach().cpu()).tolist())
+    if not torch.all(selected_versions == expected_policy_version).item():
+        raise ValueError(
+            "trajectory policy provenance mismatch: "
+            f"expected policy version {expected_policy_version}, "
+            f"observed {observed_versions} on loss-bearing tokens"
+        )
 
 
 class InferenceServiceWorkflow(RolloutWorkflow):
@@ -232,9 +272,15 @@ class InferenceServiceWorkflow(RolloutWorkflow):
             )
             return None
 
+        if self.expected_policy_version is not None:
+            validate_trajectory_policy_version(traj, self.expected_policy_version)
+
         tracker = stats_tracker.get(workflow_context.stat_scope())
         for r in results:
-            tracker.scalar(reward=r)
+            metrics: dict[str, float | int | None] = {"reward": r}
+            if self.expected_policy_version is not None:
+                metrics["policy_version"] = self.expected_policy_version
+            tracker.scalar(**metrics)
 
         return traj
 
@@ -275,5 +321,11 @@ class InferenceServiceWorkflow(RolloutWorkflow):
             )
             return None
 
-        stats_tracker.get(workflow_context.stat_scope()).scalar(reward=last_reward)
+        if self.expected_policy_version is not None:
+            validate_trajectory_policy_version(traj, self.expected_policy_version)
+
+        metrics: dict[str, float | int] = {"reward": last_reward}
+        if self.expected_policy_version is not None:
+            metrics["policy_version"] = self.expected_policy_version
+        stats_tracker.get(workflow_context.stat_scope()).scalar(**metrics)
         return traj

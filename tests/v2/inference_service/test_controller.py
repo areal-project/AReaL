@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
+import torch
 
 from areal.api.cli_args import AgentConfig, InferenceEngineConfig
+from areal.infra.rpc.rtensor import RTensor, TensorShardInfo
+from areal.v2.inference_service.controller import workflow as workflow_module
 from areal.v2.inference_service.controller.controller import (
     RolloutControllerV2,
 )
@@ -560,6 +564,16 @@ class TestOnlineCallbackFlow:
 
 
 class TestInferenceServiceWorkflow:
+    @staticmethod
+    def _versioned_trajectory(
+        policy_version: int, reward: float = 1.25
+    ) -> dict[str, torch.Tensor]:
+        return {
+            "rewards": torch.tensor([0.0, reward]),
+            "versions": torch.tensor([-1, policy_version], dtype=torch.int32),
+            "loss_mask": torch.tensor([0, 1], dtype=torch.int32),
+        }
+
     @pytest.mark.asyncio
     async def test_start_session_serializes_pull_delivery(self):
         workflow = InferenceServiceWorkflow(
@@ -704,6 +718,303 @@ class TestInferenceServiceWorkflow:
         workflow._export_interactions.assert_awaited_once_with(
             mock_http_session, ["sess-1"], group_id="grp-test-1"
         )
+
+    @pytest.mark.asyncio
+    async def test_offline_mode_records_reward_with_expected_policy_version(self):
+        class MockAgent:
+            async def run(self, data, **kwargs):
+                return 1.25
+
+        workflow = InferenceServiceWorkflow(
+            controller=MagicMock(),
+            agent=MockAgent(),
+            gateway_addr="http://test:8080",
+            expected_policy_version=7,
+        )
+        workflow._start_session = AsyncMock(
+            return_value=("group-1", [("session-1", "key-1")])
+        )
+        workflow._set_last_reward = AsyncMock(return_value=None)
+        workflow._export_interactions = AsyncMock(
+            return_value=self._versioned_trajectory(7)
+        )
+        tracker = MagicMock()
+
+        with (
+            patch(
+                "areal.v2.inference_service.controller.workflow.workflow_context"
+            ) as mock_wf_ctx,
+            patch(
+                "areal.v2.inference_service.controller.workflow.stats_tracker"
+            ) as mock_st,
+        ):
+            mock_wf_ctx.get.return_value = MagicMock(task_id=42)
+            mock_wf_ctx.get_httpx_client = AsyncMock(return_value=MagicMock())
+            mock_wf_ctx.stat_scope.return_value = "eval-rollout"
+            mock_st.get.return_value = tracker
+
+            result = await workflow._run_offline(MagicMock(), {})
+
+        assert result is not None
+        tracker.scalar.assert_called_once_with(reward=1.25, policy_version=7)
+
+    @pytest.mark.asyncio
+    async def test_offline_mode_rejects_version_before_recording_metrics(self):
+        class MockAgent:
+            async def run(self, data, **kwargs):
+                return 1.25
+
+        workflow = InferenceServiceWorkflow(
+            controller=MagicMock(),
+            agent=MockAgent(),
+            gateway_addr="http://test:8080",
+            expected_policy_version=7,
+        )
+        workflow._start_session = AsyncMock(
+            return_value=("group-1", [("session-1", "key-1")])
+        )
+        workflow._set_last_reward = AsyncMock(return_value=None)
+        workflow._export_interactions = AsyncMock(
+            return_value=self._versioned_trajectory(6)
+        )
+        tracker = MagicMock()
+
+        with (
+            patch(
+                "areal.v2.inference_service.controller.workflow.workflow_context"
+            ) as mock_wf_ctx,
+            patch(
+                "areal.v2.inference_service.controller.workflow.stats_tracker"
+            ) as mock_st,
+        ):
+            mock_wf_ctx.get.return_value = MagicMock(task_id=42)
+            mock_wf_ctx.get_httpx_client = AsyncMock(return_value=MagicMock())
+            mock_wf_ctx.stat_scope.return_value = "eval-rollout"
+            mock_st.get.return_value = tracker
+
+            with pytest.raises(ValueError, match="expected policy version 7"):
+                await workflow._run_offline(MagicMock(), {})
+
+        tracker.scalar.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_offline_mode_without_expectation_accepts_missing_versions(self):
+        class MockAgent:
+            async def run(self, data, **kwargs):
+                return 1.25
+
+        workflow = InferenceServiceWorkflow(
+            controller=MagicMock(),
+            agent=MockAgent(),
+            gateway_addr="http://test:8080",
+            expected_policy_version=None,
+        )
+        workflow._start_session = AsyncMock(
+            return_value=("group-1", [("session-1", "key-1")])
+        )
+        workflow._set_last_reward = AsyncMock(return_value=None)
+        workflow._export_interactions = AsyncMock(return_value={"input_ids": []})
+        tracker = MagicMock()
+
+        with (
+            patch(
+                "areal.v2.inference_service.controller.workflow.workflow_context"
+            ) as mock_wf_ctx,
+            patch(
+                "areal.v2.inference_service.controller.workflow.stats_tracker"
+            ) as mock_st,
+        ):
+            mock_wf_ctx.get.return_value = MagicMock(task_id=42)
+            mock_wf_ctx.get_httpx_client = AsyncMock(return_value=MagicMock())
+            mock_wf_ctx.stat_scope.return_value = "rollout"
+            mock_st.get.return_value = tracker
+
+            result = await workflow._run_offline(MagicMock(), {})
+
+        assert result is not None
+        tracker.scalar.assert_called_once_with(reward=1.25)
+
+    @pytest.mark.asyncio
+    async def test_online_mode_records_reward_with_expected_policy_version(self):
+        controller = MagicMock()
+        controller.wait_for_online_trajectory = AsyncMock(
+            return_value={"session_id": "session-1", "trajectory_id": 3}
+        )
+        workflow = InferenceServiceWorkflow(
+            controller=controller,
+            gateway_addr="http://test:8080",
+            expected_policy_version=7,
+        )
+        workflow._export_interactions = AsyncMock(
+            return_value=self._versioned_trajectory(7)
+        )
+        tracker = MagicMock()
+
+        with (
+            patch(
+                "areal.v2.inference_service.controller.workflow.workflow_context"
+            ) as mock_wf_ctx,
+            patch(
+                "areal.v2.inference_service.controller.workflow.stats_tracker"
+            ) as mock_st,
+        ):
+            mock_wf_ctx.stat_scope.return_value = "eval-rollout"
+            mock_st.get.return_value = tracker
+
+            result = await workflow._run_online(MagicMock())
+
+        assert result is not None
+        tracker.scalar.assert_called_once_with(reward=1.25, policy_version=7)
+
+    @pytest.mark.asyncio
+    async def test_online_mode_rejects_version_before_recording_metrics(self):
+        controller = MagicMock()
+        controller.wait_for_online_trajectory = AsyncMock(
+            return_value={"session_id": "session-1", "trajectory_id": 3}
+        )
+        workflow = InferenceServiceWorkflow(
+            controller=controller,
+            gateway_addr="http://test:8080",
+            expected_policy_version=7,
+        )
+        workflow._export_interactions = AsyncMock(
+            return_value=self._versioned_trajectory(6)
+        )
+        tracker = MagicMock()
+
+        with (
+            patch(
+                "areal.v2.inference_service.controller.workflow.workflow_context"
+            ) as mock_wf_ctx,
+            patch(
+                "areal.v2.inference_service.controller.workflow.stats_tracker"
+            ) as mock_st,
+        ):
+            mock_wf_ctx.stat_scope.return_value = "eval-rollout"
+            mock_st.get.return_value = tracker
+
+            with pytest.raises(ValueError, match="expected policy version 7"):
+                await workflow._run_online(MagicMock())
+
+        tracker.scalar.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_online_mode_without_expectation_accepts_missing_versions(self):
+        controller = MagicMock()
+        controller.wait_for_online_trajectory = AsyncMock(
+            return_value={"session_id": "session-1", "trajectory_id": 3}
+        )
+        workflow = InferenceServiceWorkflow(
+            controller=controller,
+            gateway_addr="http://test:8080",
+            expected_policy_version=None,
+        )
+        workflow._export_interactions = AsyncMock(
+            return_value={"rewards": torch.tensor([0.0, 1.25])}
+        )
+        tracker = MagicMock()
+
+        with (
+            patch(
+                "areal.v2.inference_service.controller.workflow.workflow_context"
+            ) as mock_wf_ctx,
+            patch(
+                "areal.v2.inference_service.controller.workflow.stats_tracker"
+            ) as mock_st,
+        ):
+            mock_wf_ctx.stat_scope.return_value = "rollout"
+            mock_st.get.return_value = tracker
+
+            result = await workflow._run_online(MagicMock())
+
+        assert result is not None
+        tracker.scalar.assert_called_once_with(reward=1.25)
+
+
+class TestValidateTrajectoryPolicyVersion:
+    @staticmethod
+    def _trajectory(
+        versions: list[int], loss_mask: list[int]
+    ) -> dict[str, torch.Tensor]:
+        return {
+            "versions": torch.tensor(versions, dtype=torch.int32),
+            "loss_mask": torch.tensor(loss_mask, dtype=torch.int32),
+        }
+
+    def test_validate_trajectory_policy_version_accepts_expected_loss_tokens(self):
+        traj = self._trajectory(
+            versions=[-1, -1, 7, 7],
+            loss_mask=[0, 0, 1, 1],
+        )
+
+        workflow_module.validate_trajectory_policy_version(traj, 7)
+
+    def test_validate_trajectory_policy_version_ignores_untrained_positions(self):
+        traj = self._trajectory(
+            versions=[999, -1, 7, 123],
+            loss_mask=[0, 0, 1, 0],
+        )
+
+        workflow_module.validate_trajectory_policy_version(traj, 7)
+
+    @pytest.mark.parametrize(
+        "versions, observed",
+        [
+            ([-1, 7, 6], "[6, 7]"),
+            ([-1, 6, 6], "[6]"),
+        ],
+        ids=["mixed", "all-stale"],
+    )
+    def test_validate_trajectory_policy_version_rejects_mixed_or_stale_versions(
+        self, versions: list[int], observed: str
+    ):
+        traj = self._trajectory(versions=versions, loss_mask=[0, 1, 1])
+
+        with pytest.raises(
+            ValueError,
+            match=rf"expected policy version 7.*observed {re.escape(observed)}",
+        ):
+            workflow_module.validate_trajectory_policy_version(traj, 7)
+
+    @pytest.mark.parametrize("missing_key", ["versions", "loss_mask"])
+    def test_validate_trajectory_policy_version_rejects_missing_field(
+        self, missing_key: str
+    ):
+        traj = self._trajectory(versions=[-1, 7], loss_mask=[0, 1])
+        del traj[missing_key]
+
+        with pytest.raises(ValueError, match=rf"missing.*{missing_key}"):
+            workflow_module.validate_trajectory_policy_version(traj, 7)
+
+    def test_validate_trajectory_policy_version_rejects_shape_mismatch(self):
+        traj = self._trajectory(versions=[-1, 7, 7], loss_mask=[0, 1])
+
+        with pytest.raises(ValueError, match="same shape"):
+            workflow_module.validate_trajectory_policy_version(traj, 7)
+
+    def test_validate_trajectory_policy_version_rejects_no_loss_tokens(self):
+        traj = self._trajectory(versions=[-1, 7], loss_mask=[0, 0])
+
+        with pytest.raises(ValueError, match="no loss-bearing tokens"):
+            workflow_module.validate_trajectory_policy_version(traj, 7)
+
+    def test_validate_trajectory_policy_version_accepts_local_rtensors(self):
+        traj = {
+            "versions": RTensor(
+                shard=TensorShardInfo(shard_id="versions", node_addr="unused"),
+                data=torch.tensor([-1, 7, 7], dtype=torch.int32),
+            ),
+            "loss_mask": RTensor(
+                shard=TensorShardInfo(shard_id="loss-mask", node_addr="unused"),
+                data=torch.tensor([0, 1, 1], dtype=torch.int32),
+            ),
+        }
+
+        with patch(
+            "areal.infra.rpc.rtensor.get_backend",
+            side_effect=AssertionError("local RTensor must not fetch"),
+        ):
+            workflow_module.validate_trajectory_policy_version(traj, 7)
 
 
 # =============================================================================
