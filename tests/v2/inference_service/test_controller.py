@@ -205,6 +205,50 @@ class TestControllerWorkflowResolution:
             )
 
 
+class TestSubmitPolicyVersionSnapshot:
+    @staticmethod
+    def _make_controller(version: int = 7) -> RolloutControllerV2:
+        controller = RolloutControllerV2(
+            config=InferenceEngineConfig(backend="sglang:d1", admin_api_key="test-key"),
+            scheduler=MagicMock(n_gpus_per_node=8),
+        )
+        controller._gateway_addr = "http://test:8080"
+        controller._workflow_executor = MagicMock()
+        controller._version = version
+        return controller
+
+    def test_eval_submit_snapshots_current_policy_version(self):
+        controller = self._make_controller(version=7)
+
+        controller.submit(data={}, workflow=None, is_eval=True)
+
+        resolved = controller.workflow_executor.submit.call_args.kwargs["workflow"]
+        controller._version = 8
+        assert isinstance(resolved, InferenceServiceWorkflow)
+        assert resolved.expected_policy_version == 7
+
+    def test_training_submit_has_no_expected_policy_version(self):
+        controller = self._make_controller(version=7)
+
+        controller.submit(data={}, workflow=None, is_eval=False)
+
+        resolved = controller.workflow_executor.submit.call_args.kwargs["workflow"]
+        assert resolved.expected_policy_version is None
+
+    def test_workflow_kwargs_cannot_spoof_expected_policy_version(self):
+        controller = self._make_controller(version=7)
+
+        controller.submit(
+            data={},
+            workflow=None,
+            workflow_kwargs={"expected_policy_version": 999},
+            is_eval=True,
+        )
+
+        resolved = controller.workflow_executor.submit.call_args.kwargs["workflow"]
+        assert resolved.expected_policy_version == 7
+
+
 # =============================================================================
 # RolloutControllerV2 — API surface
 # =============================================================================
@@ -374,9 +418,7 @@ class TestRolloutControllerV2Construction:
         controller._callback_host = "127.0.0.1"
         controller._callback_port = 19000
         server_infos = [
-            LocalInfServerInfo(
-                host="127.0.0.1", port=30000, process=MagicMock()
-            )
+            LocalInfServerInfo(host="127.0.0.1", port=30000, process=MagicMock())
         ]
 
         with patch.object(controller, "_async_fork_on_guard") as mock_fork:

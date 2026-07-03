@@ -54,6 +54,7 @@ class InferenceServiceWorkflow(RolloutWorkflow):
         export_style: str = "individual",
         timeout: float | None = None,
         group_size: int = 1,
+        expected_policy_version: int | None = None,
     ):
         self.controller = controller
         self.agent = agent
@@ -63,6 +64,7 @@ class InferenceServiceWorkflow(RolloutWorkflow):
         self.export_style = export_style
         self.timeout = timeout
         self.group_size = group_size
+        self.expected_policy_version = expected_policy_version
 
     @async_http_retry
     async def _start_session(

@@ -1066,11 +1066,13 @@ class RolloutControllerV2:
         group_size: int = 1,
     ) -> int:
         self._ensure_initialized()
+        expected_policy_version = self.get_version() if is_eval else None
         resolved_workflow = self._resolve_workflow(
             workflow,
             workflow_kwargs,
             group_size,
         )
+        resolved_workflow.expected_policy_version = expected_policy_version
         resolved_accept_fn = self._resolve_should_accept_fn(should_accept_fn)
         return self.workflow_executor.submit(
             data,
