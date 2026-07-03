@@ -85,7 +85,9 @@ def _validate_v2_disk_weight_update(config: PPOConfig) -> None:
     ):
         return
 
-    rollout_backend = config.rollout.backend.partition(":")[0]
+    rollout_backend = (
+        config.rollout.backend.partition(":")[0] if config.rollout.backend else ""
+    )
     if rollout_backend != "sglang" or config.rollout.api_url is not None:
         raise ValueError(
             "v2 disk weight updates currently only support a local SGLang "

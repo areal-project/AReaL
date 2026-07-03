@@ -70,6 +70,7 @@ def test_v2_disk_mode_rejects_vllm_backend():
 
 def test_v2_disk_mode_rejects_external_model():
     config = _make_config(use_lora=False, weight_update_mode="disk")
+    config.rollout.backend = None
     config.rollout.api_url = "https://example.com/v1"
 
     with pytest.raises(ValueError, match="local SGLang"):
