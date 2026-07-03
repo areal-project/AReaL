@@ -1,6 +1,8 @@
 from types import SimpleNamespace
 from unittest.mock import MagicMock, sentinel
 
+import pytest
+
 from areal.trainer import rl_trainer
 from areal.trainer.rl_trainer import PPOTrainer
 
@@ -17,6 +19,18 @@ def _bare_trainer() -> PPOTrainer:
     trainer.data_controller = None
     trainer._train_rdataset = None
     trainer._valid_rdataset = None
+    return trainer
+
+
+def _eval_trainer(*, online_mode: bool, wait_results: list[object]) -> PPOTrainer:
+    trainer = PPOTrainer.__new__(PPOTrainer)
+    trainer._online_mode = online_mode
+    trainer.config = SimpleNamespace(eval_gconfig=SimpleNamespace(n_samples=1))
+    trainer.actor = MagicMock()
+    trainer.actor.is_data_parallel_head.return_value = True
+    trainer.valid_dataloader = [[{"question": "one"}, {"question": "two"}]]
+    trainer.eval_rollout = MagicMock()
+    trainer.eval_rollout.wait.return_value = wait_results
     return trainer
 
 
@@ -102,3 +116,76 @@ class TestEvalRolloutTopology:
             online_mode=False,
             has_valid_dataloader=False,
         )
+
+
+class TestOnlineEvalIntegrity:
+    def test_online_validation_requires_eval_workflow_before_training_side_effects(
+        self,
+    ):
+        trainer = PPOTrainer.__new__(PPOTrainer)
+        trainer.config = SimpleNamespace(
+            total_train_epochs=1,
+            total_train_steps=1,
+            rollout=SimpleNamespace(agent=SimpleNamespace(mode="online")),
+            gconfig=SimpleNamespace(n_samples=1),
+            dynamic_bs=False,
+        )
+        trainer._online_mode = True
+        trainer.valid_dataloader = [[{"question": "held-out"}]]
+        trainer.train_dataloader = [[{}]]
+        trainer.recover_info = None
+        trainer._should_offload_rollout = False
+        trainer._ensure_proxy_started = MagicMock()
+        trainer.actor = MagicMock()
+        trainer.actor.prepare_batch.side_effect = AssertionError(
+            "training batch must not be consumed before eval preflight"
+        )
+
+        with pytest.raises(ValueError, match="eval_workflow"):
+            trainer.train(workflow=None, eval_workflow=None)
+
+        trainer._ensure_proxy_started.assert_not_called()
+        trainer.actor.prepare_batch.assert_not_called()
+
+    def test_incomplete_eval_reports_rejected_and_expected_counts(self, monkeypatch):
+        monkeypatch.setattr(rl_trainer, "is_single_controller", lambda: True)
+        trainer = _eval_trainer(
+            online_mode=True,
+            wait_results=[sentinel.accepted_trajectory, None],
+        )
+
+        with pytest.raises(
+            RuntimeError,
+            match=r"rejected=1, expected=2",
+        ):
+            trainer._evaluate_fn(
+                eval_workflow=sentinel.workflow, eval_workflow_kwargs={}
+            )
+
+    def test_all_valid_online_eval_results_complete_normally(self, monkeypatch):
+        monkeypatch.setattr(rl_trainer, "is_single_controller", lambda: True)
+        trainer = _eval_trainer(
+            online_mode=True,
+            wait_results=[sentinel.trajectory_one, sentinel.trajectory_two],
+        )
+
+        result = trainer._evaluate_fn(
+            eval_workflow=sentinel.workflow,
+            eval_workflow_kwargs={},
+        )
+
+        assert result is None
+
+    def test_offline_incomplete_eval_preserves_current_behavior(self, monkeypatch):
+        monkeypatch.setattr(rl_trainer, "is_single_controller", lambda: True)
+        trainer = _eval_trainer(
+            online_mode=False,
+            wait_results=[sentinel.accepted_trajectory, None],
+        )
+
+        result = trainer._evaluate_fn(
+            eval_workflow=sentinel.workflow,
+            eval_workflow_kwargs={},
+        )
+
+        assert result is None

@@ -588,6 +588,16 @@ class PPOTrainer:
         total_epochs: int | None = None,
     ):
         config = self.config
+        if (
+            self._online_mode
+            and self.valid_dataloader is not None
+            and eval_workflow is None
+        ):
+            raise ValueError(
+                "eval_workflow must be specified for online training when "
+                "validation data is configured."
+            )
+
         start_step = (
             self.recover_info.last_step_info.next().global_step
             if self.recover_info is not None
@@ -1261,7 +1271,14 @@ class PPOTrainer:
                         is_eval=True,
                     )
                     cnt += 1
-            self.eval_rollout.wait(cnt, timeout=None)
+            results = self.eval_rollout.wait(cnt, timeout=None)
+            if self._online_mode:
+                rejected = sum(result is None for result in results)
+                if rejected:
+                    raise RuntimeError(
+                        "Online evaluation incomplete: "
+                        f"rejected={rejected}, expected={cnt}"
+                    )
 
         if not is_single_controller():
             dist.barrier(group=self.actor.cpu_group)
