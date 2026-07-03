@@ -27,7 +27,14 @@ from typing import TYPE_CHECKING, Any, cast
 import httpx
 from openai.types.chat import ChatCompletion, ChatCompletionChunk
 
-from areal.infra.utils.http import async_http_retry, create_httpx_client
+from areal.infra.utils.http import (
+    HttpxAsyncClientCleanup,
+    HttpxAsyncClientCleanupState,
+    async_http_retry,
+    close_httpx_client_from_sync,
+    create_httpx_client,
+    register_httpx_client_loop_cleanup,
+)
 
 if TYPE_CHECKING:
     from areal.api.scheduler_api import Scheduler, Worker
@@ -173,6 +180,8 @@ class RolloutControllerV2:
         self._sync_client = httpx.Client(timeout=30.0)
         self._async_client: httpx.AsyncClient | None = None
         self._async_client_loop: asyncio.AbstractEventLoop | None = None
+        self._async_client_cleanup: HttpxAsyncClientCleanup | None = None
+        self._async_client_lock = Lock()
         self._destroyed = False
 
         # Proxy compatibility (no-ops — gateway IS the proxy)
@@ -968,15 +977,33 @@ class RolloutControllerV2:
 
         # Close shared HTTP clients after all kill requests have been sent
         self._sync_client.close()
-        if self._async_client is not None:
+        async_client_cleanup_error: BaseException | None = None
+        with self._async_client_lock:
+            async_client = self._async_client
+            async_client_loop = self._async_client_loop
+            async_client_cleanup = self._async_client_cleanup
+        if async_client is not None and async_client_cleanup is None:
+            async_client_cleanup_error = RuntimeError(
+                "async HTTP client cleanup state is missing"
+            )
+        elif async_client is None and (
+            async_client_loop is not None or async_client_cleanup is not None
+        ):
+            async_client_cleanup_error = RuntimeError(
+                "async HTTP client cleanup state is inconsistent"
+            )
+        elif async_client_cleanup is not None:
             try:
-                from areal.infra.utils.concurrent import run_async_task
-
-                run_async_task(self._async_client.aclose)
-            except Exception:
-                pass
-            self._async_client = None
-            self._async_client_loop = None
+                close_httpx_client_from_sync(async_client_cleanup)
+            except BaseException as exc:
+                logger.error("Failed to close async HTTP client", exc_info=True)
+                async_client_cleanup_error = exc
+            else:
+                with self._async_client_lock:
+                    if self._async_client_cleanup is async_client_cleanup:
+                        self._async_client = None
+                        self._async_client_loop = None
+                        self._async_client_cleanup = None
 
         # RPCGuard's shutdown `finally` block automatically kills all
         # forked children, so explicit teardown above is best-effort.
@@ -1007,6 +1034,12 @@ class RolloutControllerV2:
         self._router_addr = ""
         self._gateway_addr = ""
         self._staleness_manager = None
+
+        if async_client_cleanup_error is not None:
+            # Keep the client and its explicit cleanup outcome for diagnosis and
+            # allow a caller to retry teardown instead of reporting false success.
+            self._destroyed = False
+            raise async_client_cleanup_error
 
     # -- Version management ------------------------------------------------
 
@@ -1777,18 +1810,60 @@ class RolloutControllerV2:
         calls) share one client and its connection pool.
         """
         current_loop = asyncio.get_running_loop()
-        if self._async_client is None or self._async_client_loop is not current_loop:
-            old = self._async_client
-            self._async_client = create_httpx_client(
-                timeout=self.config.request_timeout
-            )
+        with self._async_client_lock:
+            client = self._async_client
+            cleanup = self._async_client_cleanup
+            owner_loop = self._async_client_loop
+            if client is not None:
+                if cleanup is None or owner_loop is not cleanup.owner_loop:
+                    raise RuntimeError(
+                        "async HTTP client cleanup state is inconsistent"
+                    )
+                state, error = cleanup.snapshot()
+                if state is HttpxAsyncClientCleanupState.FAILED:
+                    assert error is not None
+                    raise error
+                if state is HttpxAsyncClientCleanupState.SUCCEEDED:
+                    self._async_client = None
+                    self._async_client_loop = None
+                    self._async_client_cleanup = None
+                elif cleanup.owner_loop is current_loop:
+                    if state is HttpxAsyncClientCleanupState.CLOSING:
+                        raise RuntimeError(
+                            "async HTTP client cleanup is already in progress"
+                        )
+                    return client
+                elif cleanup.owner_loop.is_running():
+                    raise RuntimeError(
+                        "async HTTP client is active on another event loop"
+                    )
+                elif cleanup.owner_loop.is_closed():
+                    raise RuntimeError(
+                        "async HTTP client owner event loop closed before cleanup "
+                        "succeeded"
+                    )
+                else:
+                    raise RuntimeError(
+                        "async HTTP client owner event loop is not running"
+                    )
+            elif cleanup is not None or owner_loop is not None:
+                raise RuntimeError("async HTTP client cleanup state is inconsistent")
+
+            client = create_httpx_client(timeout=self.config.request_timeout)
+            cleanup = HttpxAsyncClientCleanup(client, current_loop)
+
+            def clear_client() -> None:
+                with self._async_client_lock:
+                    if self._async_client_cleanup is cleanup:
+                        self._async_client = None
+                        self._async_client_loop = None
+                        self._async_client_cleanup = None
+
+            register_httpx_client_loop_cleanup(cleanup, on_closed=clear_client)
+            self._async_client = client
             self._async_client_loop = current_loop
-            if old is not None:
-                try:
-                    await old.aclose()
-                except Exception:
-                    pass
-        return self._async_client
+            self._async_client_cleanup = cleanup
+            return client
 
     @async_http_retry
     async def _async_data_proxy_post(

@@ -15,7 +15,13 @@ from uuid import uuid4
 import aiohttp
 
 from areal.infra.utils.concurrent import get_executor, run_async_task
-from areal.infra.utils.http import create_httpx_client
+from areal.infra.utils.http import (
+    HttpxAsyncClientCleanup,
+    HttpxAsyncClientCleanupState,
+    close_httpx_client_from_sync,
+    create_httpx_client,
+    register_httpx_client_loop_cleanup,
+)
 from areal.utils import logging
 from areal.utils.network import format_hostport, gethostip
 
@@ -64,6 +70,8 @@ class GatewayTrainController:
         # Shared HTTP client (lazy, per-event-loop)
         self._async_client: Any | None = None
         self._async_client_loop: asyncio.AbstractEventLoop | None = None
+        self._async_client_cleanup: HttpxAsyncClientCleanup | None = None
+        self._async_client_lock = Lock()
 
         # Pipelined initialization state
         self._init_future: concurrent.futures.Future | None = None
@@ -138,16 +146,60 @@ class GatewayTrainController:
 
     async def _get_async_client(self):
         current_loop = asyncio.get_running_loop()
-        if self._async_client is None or self._async_client_loop is not current_loop:
-            old = self._async_client
-            self._async_client = create_httpx_client(timeout=self.config.setup_timeout)
+        with self._async_client_lock:
+            client = self._async_client
+            cleanup = self._async_client_cleanup
+            owner_loop = self._async_client_loop
+            if client is not None:
+                if cleanup is None or owner_loop is not cleanup.owner_loop:
+                    raise RuntimeError(
+                        "async HTTP client cleanup state is inconsistent"
+                    )
+                state, error = cleanup.snapshot()
+                if state is HttpxAsyncClientCleanupState.FAILED:
+                    assert error is not None
+                    raise error
+                if state is HttpxAsyncClientCleanupState.SUCCEEDED:
+                    self._async_client = None
+                    self._async_client_loop = None
+                    self._async_client_cleanup = None
+                elif cleanup.owner_loop is current_loop:
+                    if state is HttpxAsyncClientCleanupState.CLOSING:
+                        raise RuntimeError(
+                            "async HTTP client cleanup is already in progress"
+                        )
+                    return client
+                elif cleanup.owner_loop.is_running():
+                    raise RuntimeError(
+                        "async HTTP client is active on another event loop"
+                    )
+                elif cleanup.owner_loop.is_closed():
+                    raise RuntimeError(
+                        "async HTTP client owner event loop closed before cleanup "
+                        "succeeded"
+                    )
+                else:
+                    raise RuntimeError(
+                        "async HTTP client owner event loop is not running"
+                    )
+            elif cleanup is not None or owner_loop is not None:
+                raise RuntimeError("async HTTP client cleanup state is inconsistent")
+
+            client = create_httpx_client(timeout=self.config.setup_timeout)
+            cleanup = HttpxAsyncClientCleanup(client, current_loop)
+
+            def clear_client() -> None:
+                with self._async_client_lock:
+                    if self._async_client_cleanup is cleanup:
+                        self._async_client = None
+                        self._async_client_loop = None
+                        self._async_client_cleanup = None
+
+            register_httpx_client_loop_cleanup(cleanup, on_closed=clear_client)
+            self._async_client = client
             self._async_client_loop = current_loop
-            if old is not None:
-                try:
-                    await old.aclose()
-                except Exception:
-                    pass
-        return self._async_client
+            self._async_client_cleanup = cleanup
+            return client
 
     async def _async_initialize(
         self,
@@ -404,12 +456,33 @@ class GatewayTrainController:
                 self._router_addr, self._model_addr, self.api_key
             )
             logger.info("Model registered with api_key=%s", self.api_key)
-        except Exception:
+        except Exception as exc:
             logger.error(
                 "GatewayTrainController initialization failed, rolling back",
                 exc_info=True,
             )
-            self._cleanup_runtime_state()
+            # Initialization and its HTTP client share this running event loop.
+            # Close the client here before entering the synchronous cleanup path,
+            # which deliberately rejects owner-loop reentrancy to avoid deadlock.
+            with self._async_client_lock:
+                async_client_cleanup = self._async_client_cleanup
+            if (
+                async_client_cleanup is not None
+                and async_client_cleanup.owner_loop is asyncio.get_running_loop()
+            ):
+                try:
+                    await async_client_cleanup.close()
+                except BaseException:
+                    # The cleanup token retains the stable failure.  The complete
+                    # runtime cleanup below will re-raise it as secondary context.
+                    pass
+            try:
+                self._cleanup_runtime_state()
+            except BaseException as cleanup_error:
+                exc.add_note(
+                    "Local startup rollback failed: "
+                    f"{type(cleanup_error).__name__}: {cleanup_error}"
+                )
             raise
 
     # -- Engine creation ---------------------------------------------------
@@ -1178,13 +1251,33 @@ class GatewayTrainController:
         self._model_addr = ""
         self.api_key = None
 
-        if self._async_client is not None:
+        async_client_cleanup_error: BaseException | None = None
+        with self._async_client_lock:
+            async_client = self._async_client
+            async_client_loop = self._async_client_loop
+            async_client_cleanup = self._async_client_cleanup
+        if async_client is not None and async_client_cleanup is None:
+            async_client_cleanup_error = RuntimeError(
+                "async HTTP client cleanup state is missing"
+            )
+        elif async_client is None and (
+            async_client_loop is not None or async_client_cleanup is not None
+        ):
+            async_client_cleanup_error = RuntimeError(
+                "async HTTP client cleanup state is inconsistent"
+            )
+        elif async_client_cleanup is not None:
             try:
-                run_async_task(self._async_client.aclose)
-            except Exception:
-                pass
-            self._async_client = None
-            self._async_client_loop = None
+                close_httpx_client_from_sync(async_client_cleanup)
+            except BaseException as exc:
+                logger.error("Failed to close async HTTP client", exc_info=True)
+                async_client_cleanup_error = exc
+            else:
+                with self._async_client_lock:
+                    if self._async_client_cleanup is async_client_cleanup:
+                        self._async_client = None
+                        self._async_client_loop = None
+                        self._async_client_cleanup = None
 
         import torch.distributed as dist
 
@@ -1198,6 +1291,9 @@ class GatewayTrainController:
                 )
             finally:
                 self._own_process_group = False
+
+        if async_client_cleanup_error is not None:
+            raise async_client_cleanup_error
 
     def destroy(self) -> None:
         self._shutdown_requested.set()

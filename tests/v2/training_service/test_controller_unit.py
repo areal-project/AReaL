@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
 
 from areal.api.cli_args import SchedulingSpec, TrainEngineConfig
+from areal.infra.utils.http import HttpxAsyncClientCleanup
 from areal.v2.training_service.controller.controller import (
     GatewayTrainController,
 )
@@ -72,6 +74,80 @@ class _FakeAsyncClient:
 
 
 class TestGatewayTrainControllerInitialization:
+    def test_async_client_closes_on_owner_loop_shutdown(self):
+        controller = _make_controller()
+        client = MagicMock()
+        client.is_closed = False
+        close_loops: list[asyncio.AbstractEventLoop] = []
+
+        async def close_client() -> None:
+            close_loops.append(asyncio.get_running_loop())
+            client.is_closed = True
+
+        client.aclose = AsyncMock(side_effect=close_client)
+        loop = asyncio.new_event_loop()
+        try:
+            with patch(f"{MODULE}.create_httpx_client", return_value=client):
+                assert loop.run_until_complete(controller._get_async_client()) is client
+        finally:
+            loop.close()
+
+        client.aclose.assert_awaited_once_with()
+        assert close_loops == [loop]
+        assert controller._async_client is None
+        assert controller._async_client_loop is None
+        assert controller._async_client_cleanup is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("close_fails", [False, True])
+    async def test_async_startup_rollback_preserves_primary_on_owner_loop(
+        self, close_fails: bool
+    ):
+        worker0 = MagicMock(ip="127.0.0.1", worker_ports=[18000], id="guard-0")
+        worker1 = MagicMock(ip="127.0.0.1", worker_ports=[18001], id="guard-1")
+        scheduler = MagicMock()
+        scheduler.create_workers.return_value = ["guard-0", "guard-1"]
+        scheduler.get_workers.return_value = [worker0, worker1]
+        controller = _make_controller(scheduler)
+        primary = RuntimeError("guard setup failed")
+        cleanup_error = RuntimeError("transport close failed")
+        close_loops: list[asyncio.AbstractEventLoop] = []
+        client = MagicMock()
+
+        async def close_client() -> None:
+            close_loops.append(asyncio.get_running_loop())
+            if close_fails:
+                raise cleanup_error
+
+        client.aclose = AsyncMock(side_effect=close_client)
+        client.post = AsyncMock(side_effect=primary)
+
+        async def _run_in_thread(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        with (
+            patch(f"{MODULE}.asyncio.to_thread", side_effect=_run_in_thread),
+            patch(f"{MODULE}.create_httpx_client", return_value=client),
+            patch(f"{MODULE}.register_httpx_client_loop_cleanup"),
+            pytest.raises(RuntimeError) as exc_info,
+        ):
+            await controller._async_initialize(role="train-role")
+
+        assert exc_info.value is primary
+        client.aclose.assert_awaited_once_with()
+        assert close_loops == [asyncio.get_running_loop()]
+        if close_fails:
+            assert controller._async_client is client
+            assert controller._async_client_cleanup is not None
+            assert any(
+                "transport close failed" in note
+                for note in getattr(primary, "__notes__", [])
+            )
+        else:
+            assert controller._async_client is None
+            assert controller._async_client_loop is None
+            assert controller._async_client_cleanup is None
+
     @pytest.mark.asyncio
     async def test_async_initialize_offloads_scheduler_and_uses_async_helpers(self):
         worker0 = MagicMock(ip="127.0.0.1", worker_ports=[18000], id="guard-0")
@@ -162,3 +238,34 @@ class TestGatewayTrainControllerInitialization:
         assert controller._gateway_addr == "http://127.0.0.1:18080"
         assert controller.api_key is not None
         assert controller.api_key.startswith("ak-train-role-")
+
+
+class TestGatewayTrainControllerLifecycle:
+    def test_destroy_retains_async_client_when_close_fails(self):
+        controller = _make_controller()
+        client = MagicMock()
+        owner_loop = MagicMock()
+        primary = RuntimeError("async transport close failed")
+        cleanup = HttpxAsyncClientCleanup(client, owner_loop)
+        controller._async_client = client
+        controller._async_client_loop = owner_loop
+        controller._async_client_cleanup = cleanup
+
+        with (
+            patch(f"{MODULE}.close_httpx_client_from_sync", side_effect=primary),
+            pytest.raises(RuntimeError) as exc_info,
+        ):
+            controller.destroy()
+
+        assert exc_info.value is primary
+        assert controller._async_client is client
+        assert controller._async_client_loop is owner_loop
+        assert controller._async_client_cleanup is cleanup
+
+        with patch(f"{MODULE}.close_httpx_client_from_sync") as close_client:
+            controller.destroy()
+
+        close_client.assert_called_once_with(cleanup)
+        assert controller._async_client is None
+        assert controller._async_client_loop is None
+        assert controller._async_client_cleanup is None

@@ -1,7 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import asyncio
+import concurrent.futures
 import os
+import threading
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from enum import Enum, auto
 from http import HTTPStatus
 from typing import Any
 
@@ -51,6 +56,171 @@ def create_httpx_client(timeout: float | None = 120.0, **kwargs) -> httpx.AsyncC
         limits=get_default_httpx_limits(),
     )
     return httpx.AsyncClient(timeout=timeout, transport=transport, **kwargs)
+
+
+class HttpxAsyncClientCleanupState(Enum):
+    OPEN = auto()
+    CLOSING = auto()
+    SUCCEEDED = auto()
+    FAILED = auto()
+
+
+@dataclass
+class HttpxAsyncClientCleanup:
+    """Single-flight cleanup state for one loop-owned async client.
+
+    ``httpx.AsyncClient.is_closed`` only describes HTTPX's logical state.  It can
+    become true before the transport's ``aclose()`` has completed (or even when
+    transport cleanup subsequently fails), so it cannot acknowledge resource
+    cleanup.  This state object records the outcome of the one real close call
+    and lets concurrent callers await that same outcome.
+    """
+
+    client: httpx.AsyncClient
+    owner_loop: asyncio.AbstractEventLoop
+    _state: HttpxAsyncClientCleanupState = field(
+        default=HttpxAsyncClientCleanupState.OPEN, init=False
+    )
+    _error: BaseException | None = field(default=None, init=False)
+    _completion: concurrent.futures.Future[None] | None = field(
+        default=None, init=False
+    )
+    _lock: threading.Lock = field(default_factory=threading.Lock, init=False)
+
+    @property
+    def succeeded(self) -> bool:
+        with self._lock:
+            return self._state is HttpxAsyncClientCleanupState.SUCCEEDED
+
+    @property
+    def error(self) -> BaseException | None:
+        with self._lock:
+            return self._error
+
+    def snapshot(
+        self,
+    ) -> tuple[HttpxAsyncClientCleanupState, BaseException | None]:
+        with self._lock:
+            return self._state, self._error
+
+    def terminal_result(self) -> bool:
+        """Return whether cleanup succeeded, or re-raise its stable failure."""
+        state, error = self.snapshot()
+        if state is HttpxAsyncClientCleanupState.FAILED:
+            assert error is not None
+            raise error
+        return state is HttpxAsyncClientCleanupState.SUCCEEDED
+
+    async def close(self) -> None:
+        current_loop = asyncio.get_running_loop()
+        with self._lock:
+            state = self._state
+            error = self._error
+            if state is HttpxAsyncClientCleanupState.SUCCEEDED:
+                return
+            if state is HttpxAsyncClientCleanupState.FAILED:
+                assert error is not None
+                raise error
+            if current_loop is not self.owner_loop:
+                raise RuntimeError(
+                    "httpx.AsyncClient cleanup must run on its owner event loop"
+                )
+            if state is HttpxAsyncClientCleanupState.OPEN:
+                completion: concurrent.futures.Future[None] = (
+                    concurrent.futures.Future()
+                )
+                # ``asyncio.wrap_future`` propagates waiter cancellation to its
+                # source future.  Mark this shared acknowledgement as running so
+                # one cancelled follower cannot cancel the leader's completion.
+                if not completion.set_running_or_notify_cancel():
+                    raise RuntimeError(
+                        "new async-client cleanup completion was unexpectedly cancelled"
+                    )
+                self._completion = completion
+                self._state = HttpxAsyncClientCleanupState.CLOSING
+                leader = True
+            else:
+                assert state is HttpxAsyncClientCleanupState.CLOSING
+                assert self._completion is not None
+                completion = self._completion
+                leader = False
+
+        if not leader:
+            await asyncio.wrap_future(completion)
+            return
+
+        try:
+            await self.client.aclose()
+        except BaseException as exc:
+            with self._lock:
+                self._error = exc
+                self._state = HttpxAsyncClientCleanupState.FAILED
+            completion.set_exception(exc)
+            raise
+        else:
+            with self._lock:
+                self._state = HttpxAsyncClientCleanupState.SUCCEEDED
+            completion.set_result(None)
+
+
+async def close_httpx_client_on_owner_loop(
+    cleanup: HttpxAsyncClientCleanup,
+) -> None:
+    """Close an async client without driving loop-bound transports elsewhere."""
+    if cleanup.terminal_result():
+        return
+
+    owner_loop = cleanup.owner_loop
+    current_loop = asyncio.get_running_loop()
+    if owner_loop is current_loop:
+        await cleanup.close()
+        return
+    if owner_loop.is_closed():
+        raise RuntimeError(
+            "httpx.AsyncClient owner event loop closed before cleanup succeeded"
+        )
+    if owner_loop.is_running():
+        close_future = asyncio.run_coroutine_threadsafe(cleanup.close(), owner_loop)
+        await asyncio.wrap_future(close_future)
+        return
+    raise RuntimeError("httpx.AsyncClient owner event loop is not running")
+
+
+def register_httpx_client_loop_cleanup(
+    cleanup: HttpxAsyncClientCleanup,
+    *,
+    on_closed: Callable[[], None] | None = None,
+) -> None:
+    """Close a client on its owner loop immediately before loop shutdown."""
+    from areal.infra.utils.concurrent import register_loop_cleanup
+
+    async def close_client() -> None:
+        await cleanup.close()
+        if on_closed is not None:
+            on_closed()
+
+    register_loop_cleanup(close_client, loop=cleanup.owner_loop)
+
+
+def close_httpx_client_from_sync(
+    cleanup: HttpxAsyncClientCleanup,
+) -> None:
+    """Synchronously close a client without deadlocking its running owner loop."""
+    if cleanup.terminal_result():
+        return
+    owner_loop = cleanup.owner_loop
+    try:
+        current_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        current_loop = None
+    if current_loop is owner_loop:
+        raise RuntimeError(
+            "cannot synchronously close httpx.AsyncClient from its owner event loop"
+        )
+
+    from areal.infra.utils.concurrent import run_async_task
+
+    run_async_task(close_httpx_client_on_owner_loop, cleanup)
 
 
 def get_default_uvicorn_kwargs() -> dict[str, Any]:
