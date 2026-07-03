@@ -195,7 +195,18 @@ def register_httpx_client_loop_cleanup(
     from areal.infra.utils.concurrent import register_loop_cleanup
 
     async def close_client() -> None:
-        await cleanup.close()
+        try:
+            await cleanup.close()
+        except BaseException:
+            # Event-loop shutdown must continue through the remaining cleanup
+            # callbacks and reach the real loop.close().  The cleanup object
+            # retains the exact failure so a later explicit destroy can report
+            # it; do not acknowledge closure or clear the owner's references.
+            logger.error(
+                "Failed to close async HTTP client during loop cleanup",
+                exc_info=True,
+            )
+            return
         if on_closed is not None:
             on_closed()
 

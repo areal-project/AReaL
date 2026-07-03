@@ -241,6 +241,27 @@ class TestGatewayTrainControllerInitialization:
 
 
 class TestGatewayTrainControllerLifecycle:
+    @pytest.mark.asyncio
+    async def test_get_async_client_rejects_access_during_shutdown(self):
+        controller = _make_controller()
+        controller.destroy()
+        client = MagicMock()
+        client.aclose = AsyncMock()
+
+        with (
+            patch(
+                f"{MODULE}.create_httpx_client", return_value=client
+            ) as create_client,
+            pytest.raises(RuntimeError, match="is shutting down"),
+        ):
+            await controller._get_async_client()
+
+        create_client.assert_not_called()
+        client.aclose.assert_not_awaited()
+        assert controller._async_client is None
+        assert controller._async_client_loop is None
+        assert controller._async_client_cleanup is None
+
     def test_destroy_retains_async_client_when_close_fails(self):
         controller = _make_controller()
         client = MagicMock()

@@ -9,11 +9,12 @@ import httpx
 import pytest
 
 from areal.api.cli_args import InferenceEngineConfig
-from areal.infra.utils.concurrent import run_async_task
+from areal.infra.utils.concurrent import register_loop_cleanup, run_async_task
 from areal.infra.utils.http import (
     HttpxAsyncClientCleanup,
     close_httpx_client_from_sync,
     close_httpx_client_on_owner_loop,
+    register_httpx_client_loop_cleanup,
 )
 from areal.v2.inference_service.controller.controller import RolloutControllerV2
 
@@ -52,6 +53,31 @@ def test_destroy_rejects_open_async_client_after_owner_loop_closed() -> None:
     assert controller._destroyed is False
 
 
+def test_get_async_client_rejects_access_after_destroy() -> None:
+    controller = _controller()
+    controller.destroy()
+    client = MagicMock()
+    client.aclose = AsyncMock()
+    loop = asyncio.new_event_loop()
+    try:
+        with (
+            patch(
+                "areal.v2.inference_service.controller.controller.create_httpx_client",
+                return_value=client,
+            ) as create_client,
+            pytest.raises(RuntimeError, match="has been destroyed"),
+        ):
+            loop.run_until_complete(controller._get_async_client())
+    finally:
+        loop.close()
+
+    create_client.assert_not_called()
+    client.aclose.assert_not_awaited()
+    assert controller._async_client is None
+    assert controller._async_client_loop is None
+    assert controller._async_client_cleanup is None
+
+
 def test_async_client_closes_on_owner_loop_shutdown_before_destroy() -> None:
     controller = _controller()
     client = MagicMock()
@@ -84,6 +110,35 @@ def test_async_client_closes_on_owner_loop_shutdown_before_destroy() -> None:
 
     client.aclose.assert_awaited_once_with()
     assert controller._destroyed is True
+
+
+def test_cancelled_loop_cleanup_preserves_failure_and_runs_later_callbacks() -> None:
+    loop = asyncio.new_event_loop()
+    cancelled = asyncio.CancelledError("transport close cancelled")
+    client = MagicMock()
+    client.aclose = AsyncMock(side_effect=cancelled)
+    cleanup = HttpxAsyncClientCleanup(client, loop)
+    later_callbacks: list[str] = []
+    cleared: list[bool] = []
+
+    # Callbacks run LIFO, so register the observer first and the failing HTTP
+    # cleanup second.  The observer proves that cancellation did not abort the
+    # rest of loop teardown.
+    register_loop_cleanup(lambda: later_callbacks.append("ran"), loop=loop)
+    register_httpx_client_loop_cleanup(cleanup, on_closed=lambda: cleared.append(True))
+    try:
+        loop.close()
+    finally:
+        # Keep the test from leaking an open loop if teardown raises.
+        if not loop.is_closed():
+            loop._cleanup_orig_close()
+
+    assert loop.is_closed()
+    assert later_callbacks == ["ran"]
+    assert cleared == []
+    assert cleanup.succeeded is False
+    assert cleanup.error is cancelled
+    client.aclose.assert_awaited_once_with()
 
 
 def test_sequential_run_async_task_clients_close_on_their_own_loops() -> None:

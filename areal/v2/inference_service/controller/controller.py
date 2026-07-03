@@ -1811,6 +1811,8 @@ class RolloutControllerV2:
         """
         current_loop = asyncio.get_running_loop()
         with self._async_client_lock:
+            if self._destroyed:
+                raise RuntimeError("RolloutControllerV2 has been destroyed")
             client = self._async_client
             cleanup = self._async_client_cleanup
             owner_loop = self._async_client_loop
