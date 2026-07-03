@@ -49,6 +49,7 @@ LOGGER_COLORS_EXACT = {
     "VisionRLVRWorkflow": "light_purple",
     "MultiTurnWorkflow": "light_purple",
     "MultiTurnV2Workflow": "light_purple",
+    "VisionMultiTurnWorkflow": "light_purple",
     # Controllers - white
     "TrainController": "white",
     "RolloutController": "white",
