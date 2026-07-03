@@ -4,6 +4,7 @@ from unittest.mock import patch
 
 import pytest
 import torch
+from omegaconf import OmegaConf
 
 from areal.api.cli_args import NormConfig, PPOActorConfig
 from areal.utils.data import Normalization
@@ -13,13 +14,24 @@ from areal.utils.data import Normalization
 # =============================================================================
 
 
-def test_ppo_actor_warns_when_reward_group_centering_is_singleton():
+@pytest.mark.parametrize(
+    "reward_norm",
+    [
+        NormConfig(mean_level="group", std_level="group", group_size=1),
+        {"mean_level": "group", "std_level": "group", "group_size": 1},
+        OmegaConf.create(
+            {"mean_level": "group", "std_level": "group", "group_size": 1}
+        ),
+    ],
+    ids=["norm-config", "dict", "dict-config"],
+)
+def test_ppo_actor_warns_for_all_supported_singleton_reward_config_shapes(
+    reward_norm,
+):
     with pytest.warns(
         UserWarning, match="singleton group centering erases the task reward"
     ):
-        PPOActorConfig(
-            reward_norm=NormConfig(mean_level="group", std_level="group", group_size=1)
-        )
+        PPOActorConfig(reward_norm=reward_norm)
 
 
 @pytest.mark.parametrize(

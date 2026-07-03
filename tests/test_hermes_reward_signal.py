@@ -3,6 +3,8 @@ from pathlib import Path
 import torch
 import yaml
 
+from areal.api.cli_args import PPOActorConfig
+
 _CONFIG_PATH = Path(__file__).resolve().parents[1] / "examples/hermes/config.yaml"
 
 
@@ -20,9 +22,10 @@ def test_hermes_singleton_online_config_preserves_each_outcome_signal():
     assert actor.get("adv_norm") is None
 
     counterfactual_outcomes = torch.tensor([0.0, 1.0])
-    signed_rewards = (counterfactual_outcomes + actor["reward_bias"]) * actor[
-        "reward_scaling"
-    ]
+    actor_defaults = PPOActorConfig()
+    reward_bias = actor.get("reward_bias", actor_defaults.reward_bias)
+    reward_scaling = actor.get("reward_scaling", actor_defaults.reward_scaling)
+    signed_rewards = (counterfactual_outcomes + reward_bias) * reward_scaling
 
     for signed_reward in signed_rewards:
         single_trajectory_token_advantages = signed_reward.expand(3)

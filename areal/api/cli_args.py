@@ -1689,11 +1689,15 @@ class PPOActorConfig(TrainEngineConfig):
 
     def __post_init__(self):
         """Validate PPO actor configuration."""
-        if (
-            self.reward_norm is not None
-            and self.reward_norm.mean_level == "group"
-            and self.reward_norm.group_size == 1
-        ):
+        reward_norm = self.reward_norm
+        if isinstance(reward_norm, (dict, DictConfig)):
+            reward_mean_level = reward_norm.get("mean_level")
+            reward_group_size = reward_norm.get("group_size")
+        else:
+            reward_mean_level = getattr(reward_norm, "mean_level", None)
+            reward_group_size = getattr(reward_norm, "group_size", None)
+
+        if reward_mean_level == "group" and reward_group_size == 1:
             warnings.warn(
                 "PPO reward_norm uses mean_level='group' with group_size=1: "
                 "singleton group centering erases the task reward. Disable reward "
