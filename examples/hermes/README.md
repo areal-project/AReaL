@@ -102,9 +102,11 @@ keys); CLI flags override it. The explicit form below just documents those defau
 > Online mode currently trains on one independently rewarded trajectory per group.
 > Centering that singleton group reward subtracts the reward from itself, while
 > centering the flat token advantages from a one-trajectory batch likewise makes every
-> advantage zero. Either operation erases the task-conditioned learning signal. To use
-> GRPO-style group centering instead, sample at least two trajectories from the same
-> task and preserve their shared group identity through training.
+> advantage zero. Either operation erases the task-conditioned learning signal. Using
+> GRPO-style group centering instead requires at least two trajectories from the same
+> task and a workflow that supports grouped rollouts/session grouping and preserves
+> their shared group identity through training. Changing `n_samples` alone is
+> insufficient; the current online one-sample path does not support this directly.
 
 ```bash
 uv run python3 examples/hermes/train.py \
