@@ -15,6 +15,7 @@ from areal.v2.inference_service.controller.controller import (
 from areal.v2.inference_service.controller.workflow import (
     InferenceServiceWorkflow,
 )
+from areal.v2.inference_service.data_proxy.session import TrajectoryDeliveryMode
 
 
 def _make_scheduler(n_gpus_per_node: int = 8) -> MagicMock:
@@ -513,6 +514,41 @@ class TestOnlineCallbackFlow:
 
 
 class TestInferenceServiceWorkflow:
+    @pytest.mark.asyncio
+    async def test_start_session_serializes_pull_delivery(self):
+        workflow = InferenceServiceWorkflow(
+            controller=MagicMock(),
+            gateway_addr="http://test:8080",
+            admin_api_key="test-key",
+        )
+        mock_response = MagicMock()
+        mock_response.raise_for_status = MagicMock()
+        mock_response.json = AsyncMock(
+            return_value={
+                "group_id": "grp",
+                "sessions": [{"session_id": "s", "session_api_key": "k"}],
+            }
+        )
+        mock_cm = MagicMock()
+        mock_cm.__aenter__ = AsyncMock(return_value=mock_response)
+        mock_cm.__aexit__ = AsyncMock(return_value=False)
+        mock_http_session = MagicMock()
+        mock_http_session.post = MagicMock(return_value=mock_cm)
+
+        result = await workflow._start_session(
+            mock_http_session,
+            "42",
+            group_size=1,
+            delivery_mode=TrajectoryDeliveryMode.PULL,
+        )
+
+        assert result == ("grp", [("s", "k")])
+        mock_http_session.post.assert_called_once_with(
+            "http://test:8080/rl/start_session",
+            json={"task_id": "42", "group_size": 1, "delivery_mode": "pull"},
+            headers={"Authorization": "Bearer test-key"},
+        )
+
     @pytest.mark.skip(reason="pending /export_trajectories traj schema migration")
     @pytest.mark.asyncio
     async def test_online_mode_waits_on_controller(self):
@@ -612,7 +648,12 @@ class TestInferenceServiceWorkflow:
 
         assert result is not None
         assert "chatcmpl-1" in result
-        workflow._start_session.assert_awaited_once()
+        workflow._start_session.assert_awaited_once_with(
+            mock_http_session,
+            "42",
+            group_size=1,
+            delivery_mode=TrajectoryDeliveryMode.PULL,
+        )
         workflow._set_last_reward.assert_awaited_once()
         workflow._export_interactions.assert_awaited_once_with(
             mock_http_session, ["sess-1"], group_id="grp-test-1"

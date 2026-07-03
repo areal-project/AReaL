@@ -15,6 +15,7 @@ from areal.infra.rpc.rtensor import RTensor
 from areal.infra.rpc.serialization import deserialize_value
 from areal.infra.utils.http import async_http_retry
 from areal.utils import logging, stats_tracker
+from areal.v2.inference_service.data_proxy.session import TrajectoryDeliveryMode
 
 if TYPE_CHECKING:
     from areal.api.engine_api import InferenceEngine
@@ -69,11 +70,16 @@ class InferenceServiceWorkflow(RolloutWorkflow):
         session: aiohttp.ClientSession,
         task_id: str,
         group_size: int = 1,
+        delivery_mode: TrajectoryDeliveryMode = TrajectoryDeliveryMode.CALLBACK,
     ) -> tuple[str | None, list[tuple[str, str]]]:
         """Start one or more sessions. Returns (group_id, [(session_id, api_key), ...])."""
         url = f"{self.gateway_addr}/{_RL_START_SESSION_PATHNAME}"
         headers = {"Authorization": f"Bearer {self._admin_api_key}"}
-        payload: dict[str, Any] = {"task_id": task_id, "group_size": group_size}
+        payload: dict[str, Any] = {
+            "task_id": task_id,
+            "group_size": group_size,
+            "delivery_mode": delivery_mode.value,
+        }
         async with session.post(url, json=payload, headers=headers) as resp:
             resp.raise_for_status()
             data = await resp.json()
@@ -142,7 +148,10 @@ class InferenceServiceWorkflow(RolloutWorkflow):
     ) -> dict[str, InteractionWithTokenLogpReward] | None:
         task_id = workflow_context.get().task_id
         group_id, sessions = await self._start_session(
-            http_session, str(task_id), group_size=self.group_size
+            http_session,
+            str(task_id),
+            group_size=self.group_size,
+            delivery_mode=TrajectoryDeliveryMode.PULL,
         )
 
         assert self.agent is not None
