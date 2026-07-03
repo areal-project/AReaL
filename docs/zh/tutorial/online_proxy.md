@@ -175,6 +175,39 @@ curl http://<gateway>/rl/end_session \
 
 当 AReaL 缓冲区中积累了足够的数据后，AReaL 将自动进入训练阶段。
 
+## 固定留出集评测
+
+在线训练数据由外部应用驱动，但评测应使用固定数据集，并且这些样本绝不能进入 PPO 训练 FIFO。将该数据集传给
+`PPOTrainer`，同时提供一个独立的进程内评测智能体：
+
+```python
+valid_dataset = get_custom_dataset(
+    split="test",
+    dataset_config=config.valid_dataset,
+)
+
+with PPOTrainer(
+    config,
+    train_dataset=None,
+    valid_dataset=valid_dataset,
+) as trainer:
+    trainer.train(
+        workflow=None,
+        eval_workflow=MyEvaluationAgent,
+        eval_workflow_kwargs={"temperature": 0.0},
+    )
+```
+
+在线训练主控制器仍通过 callback 接收外部完成的轨迹。评测使用单独的控制器，拥有独立的 Router、Data Proxy、Gateway
+和会话状态；两者只共享推理服务器。评测工作流会主动 pull 自己的会话轨迹，因此评测样本不会满足在线训练的等待队列。
+
+评测指标会经过策略版本校验。提交留出集任务时，AReaL 会捕获控制器当时的策略版本。只有导出轨迹中所有被 `loss_mask` 选中的生成 token
+都携带这个精确版本时，reward 才会被记录。缺失、混合或过期的 token
+版本都会使该轨迹被拒绝；只要有一个样本被拒绝，整个在线评测轮次都会失败，而不会在一个更小、经过选择的子集上发布指标。
+
+> **版本 0 基线：** `eval_before_train` 会让 PPO 循环第一次到达评测点时执行评测，但这个评测点位于第一次优化器更新和权重更新之后。
+> 如果实验需要未训练的版本 0 基线，应在在线训练开始前单独运行一个冻结评测组，并保持验证集、解码设置和奖励函数完全一致。
+
 ## FAQ
 
 > Q: 更新后的模型何时会被加载用于推理？

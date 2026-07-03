@@ -189,6 +189,49 @@ for each agent session.**
 After enough data has been accumulated in AReaL's buffer, AReaL will automatically enter
 the training stage.
 
+## Fixed Held-Out Evaluation
+
+Online training data is driven by external applications, but evaluation should use a
+fixed dataset that is never admitted to the PPO training FIFO. Pass that dataset to
+`PPOTrainer` and provide a separate inline evaluation agent:
+
+```python
+valid_dataset = get_custom_dataset(
+    split="test",
+    dataset_config=config.valid_dataset,
+)
+
+with PPOTrainer(
+    config,
+    train_dataset=None,
+    valid_dataset=valid_dataset,
+) as trainer:
+    trainer.train(
+        workflow=None,
+        eval_workflow=MyEvaluationAgent,
+        eval_workflow_kwargs={"temperature": 0.0},
+    )
+```
+
+The main online controller continues to receive externally completed trajectories by
+callback. Evaluation uses a separate controller with its own Router, Data Proxy,
+Gateway, and session state; only the inference servers are shared. Evaluation sessions
+are explicitly pulled by the evaluation workflow, so their trajectories cannot satisfy
+an online training waiter.
+
+Evaluation metrics are version checked. When a held-out task is submitted, AReaL
+captures the controller's current policy version. A reward is recorded only if every
+generated token selected by `loss_mask` carries that exact version in the exported
+trajectory. Missing, mixed, or stale token versions reject the trajectory, and any
+rejected item aborts the complete online evaluation round instead of publishing a metric
+over a smaller, selected subset.
+
+> **Version-0 baseline:** `eval_before_train` schedules the first evaluation when the
+> PPO loop first reaches its evaluation point, which is after the first optimizer and
+> weight-update step. If an experiment needs an untrained version-0 baseline, run a
+> separate frozen evaluation arm with the same validation split, decoding settings, and
+> reward function before starting online training.
+
 ## FAQ
 
 > Q: When will the updated model be loaded for inference?
