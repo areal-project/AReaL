@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, MagicMock
 import httpx
 import pytest
 import pytest_asyncio
+from pydantic import ValidationError
 
 from areal.v2.inference_service.data_proxy.app import (
     _flush_ready_trajectories,
@@ -177,8 +178,16 @@ def test_start_session_request_parses_pull_delivery_mode():
     assert request.delivery_mode is TrajectoryDeliveryMode.PULL
 
 
+def test_start_session_request_serializes_pull_delivery_mode_as_string():
+    request = StartSessionRequest(
+        task_id="task-1", delivery_mode=TrajectoryDeliveryMode.PULL
+    )
+
+    assert request.model_dump(mode="json")["delivery_mode"] == "pull"
+
+
 def test_start_session_request_rejects_unknown_delivery_mode():
-    with pytest.raises(ValueError, match="delivery_mode"):
+    with pytest.raises(ValidationError, match="delivery_mode"):
         StartSessionRequest(task_id="task-1", delivery_mode="broadcast")
 
 
