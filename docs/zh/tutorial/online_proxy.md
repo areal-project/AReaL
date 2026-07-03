@@ -175,10 +175,23 @@ curl http://<gateway>/rl/end_session \
 
 当 AReaL 缓冲区中积累了足够的数据后，AReaL 将自动进入训练阶段。
 
-## 固定留出集评测
+## 固定留出集评测（仅限 V2）
 
 在线训练数据由外部应用驱动，但评测应使用固定数据集，并且这些样本绝不能进入 PPO 训练 FIFO。将该数据集传给
 `PPOTrainer`，同时提供一个独立的进程内评测智能体：
+
+这条带完整性校验的评测链路要求 actor 与 rollout 同时使用 V2 控制器：
+
+```yaml
+actor:
+  _version: v2
+rollout:
+  _version: v2
+  agent:
+    mode: online
+```
+
+验证数据集必须至少包含一个 batch。未启用 V2 或已配置的验证 dataloader 为空时，AReaL 会在启动在线代理前直接失败。
 
 ```python
 valid_dataset = get_custom_dataset(

@@ -189,11 +189,25 @@ for each agent session.**
 After enough data has been accumulated in AReaL's buffer, AReaL will automatically enter
 the training stage.
 
-## Fixed Held-Out Evaluation
+## Fixed Held-Out Evaluation (V2 Only)
 
 Online training data is driven by external applications, but evaluation should use a
 fixed dataset that is never admitted to the PPO training FIFO. Pass that dataset to
 `PPOTrainer` and provide a separate inline evaluation agent:
+
+This integrity-checked path requires both the actor and rollout V2 controllers:
+
+```yaml
+actor:
+  _version: v2
+rollout:
+  _version: v2
+  agent:
+    mode: online
+```
+
+The validation dataset must contain at least one batch. AReaL fails before starting the
+online proxy when V2 is not enabled or the configured validation dataloader is empty.
 
 ```python
 valid_dataset = get_custom_dataset(
