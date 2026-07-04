@@ -217,8 +217,12 @@ class PPOActor:
                 raise ValueError(
                     "step_reward_mask is required when step_rewards is provided"
                 )
-            rewards = rewards + step_rewards.to(rewards.dtype) * step_reward_mask.to(
-                rewards.dtype
+            rewards = rewards + step_rewards.to(
+                device=rewards.device,
+                dtype=rewards.dtype,
+            ) * step_reward_mask.to(
+                device=rewards.device,
+                dtype=rewards.dtype,
             )
         # KL rewards at the next token after eos is zero.
         rewards[batch_indices, seqlens - 1] = 0
@@ -316,6 +320,8 @@ class PPOActor:
             final_reward=data["tot_rewards"],
         )
         stats_tracker.stat(**stats, denominator="n_valid_tokens")
+        step_rewards = data.get("step_rewards")
+        step_reward_mask = data.get("step_reward_mask")
         if step_rewards is not None and step_reward_mask is not None:
             step_reward_values = step_rewards.float() * step_reward_mask.float()
             stats_tracker.stat(

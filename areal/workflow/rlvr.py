@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Callable
-from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -12,10 +11,12 @@ from transformers import PreTrainedTokenizerFast
 
 from areal.api import (
     AsyncRewardWrapper,
+    ModelRequest,
     RewardResult,
     RolloutWorkflow,
     normalize_reward_result,
 )
+from areal.api.cli_args import GenerationHyperparameters
 from areal.utils import logging
 from areal.utils.dynamic_import import import_from_string
 from areal.utils.hf_utils import apply_chat_template
@@ -30,15 +31,6 @@ if TYPE_CHECKING:
     from areal.api.io_struct import ModelResponse
 
 logger = logging.getLogger("RLVRWorkflow")
-
-
-@dataclass
-class _WorkflowModelRequest:
-    rid: str
-    input_ids: list[int]
-    gconfig: Any
-    tokenizer: PreTrainedTokenizerFast | None = None
-    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 def default_get_input_ids_fn(
@@ -65,7 +57,7 @@ class RLVRWorkflow(RolloutWorkflow):
     def __init__(
         self,
         reward_fn: Callable[..., Any] | str,
-        gconfig: Any,
+        gconfig: GenerationHyperparameters,
         tokenizer: PreTrainedTokenizerFast | str,
         enable_thinking: bool = False,
         get_input_ids_fn: Callable[[Any, PreTrainedTokenizerFast, bool], list[int]]
@@ -125,7 +117,7 @@ class RLVRWorkflow(RolloutWorkflow):
     async def _collect_samples(
         self,
         engine: "InferenceEngine",
-        req: _WorkflowModelRequest,
+        req: ModelRequest,
         prompt_str: str,
         task_data: dict[str, Any],
     ) -> tuple["ModelResponse", RewardResult]:
@@ -166,8 +158,9 @@ class RLVRWorkflow(RolloutWorkflow):
         """Convert stepwise rewards into completion-aligned tensors.
 
         Returns tensors of shape ``[seqlen]`` aligned to the full prompt +
-        completion sequence. Reward values are injected at the completion token
-        positions indicated by ``reward.step_ends``.
+        completion sequence. Reward values are injected at the PPO reward
+        timesteps that correspond to predicting the completion token indicated
+        by ``reward.step_ends``.
         """
 
         seq_len = resp.input_len + resp.output_len
@@ -192,7 +185,12 @@ class RLVRWorkflow(RolloutWorkflow):
                 raise ValueError(
                     f"Invalid step_end={step_end}; expected 1 <= step_end <= {completion_len}"
                 )
-            seq_index = resp.input_len + step_end - 1
+            seq_index = resp.input_len + step_end - 2
+            if seq_index < 0:
+                raise ValueError(
+                    f"Invalid aligned step index for step_end={step_end}; "
+                    "reward injection requires at least one conditioning token"
+                )
             step_rewards[seq_index] += float(step_reward)
             step_reward_mask[seq_index] = True
 
@@ -211,7 +209,7 @@ class RLVRWorkflow(RolloutWorkflow):
             self.tokenizer,
             self.enable_thinking,
         )
-        req = _WorkflowModelRequest(
+        req = ModelRequest(
             rid=uuid.uuid4().hex,
             input_ids=input_ids,
             gconfig=self.gconfig.new(n_samples=1),

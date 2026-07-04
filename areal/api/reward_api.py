@@ -9,7 +9,7 @@ from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass, field
 from functools import partial
-from typing import Any
+from typing import Any, TypeAlias
 
 from areal.utils import logging
 
@@ -74,8 +74,8 @@ class RewardResult:
         Optional reward value for each process step.
     step_ends:
         Optional 1-based completion-token end offsets for each step. Each entry
-        points to the completion token position where the corresponding
-        ``step_rewards`` value should be injected.
+        points to the completion token whose prediction timestep should receive
+        the corresponding ``step_rewards`` value.
     metadata:
         Optional debug-only payload for logging or inspection. This field is
         not consumed by the trainer in Stage 1.
@@ -87,7 +87,10 @@ class RewardResult:
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
-def normalize_reward_result(value: float | RewardResult) -> RewardResult:
+RewardValue: TypeAlias = float | RewardResult
+
+
+def normalize_reward_result(value: RewardValue) -> RewardResult:
     """Normalize legacy scalar rewards into ``RewardResult``.
 
     This keeps existing reward functions working unchanged while allowing new
@@ -178,7 +181,7 @@ class AsyncRewardWrapper:
             logger.info(f"Recreated ProcessPoolExecutor with {max_workers} workers")
             return new_executor
 
-    async def __call__(self, *args, **kwargs) -> float:
+    async def __call__(self, *args, **kwargs) -> RewardValue:
         for attempt in range(self.max_retries + 1):
             executor = self._executors.get(self._executor_key)
             if executor is None:
