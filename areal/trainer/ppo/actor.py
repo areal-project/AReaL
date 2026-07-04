@@ -210,6 +210,16 @@ class PPOActor:
         seq_no_eos_mask = seqlens == attn_mask.shape[1]
         rewards = -self.kl_ctl * self.kl_estimator(old_logp, ref_logp)
         kl_rewards = rewards.clone()
+        step_rewards = data.get("step_rewards")
+        step_reward_mask = data.get("step_reward_mask")
+        if step_rewards is not None:
+            if step_reward_mask is None:
+                raise ValueError(
+                    "step_reward_mask is required when step_rewards is provided"
+                )
+            rewards = rewards + step_rewards.to(rewards.dtype) * step_reward_mask.to(
+                rewards.dtype
+            )
         # KL rewards at the next token after eos is zero.
         rewards[batch_indices, seqlens - 1] = 0
         indices = torch.clip(seqlens - 2, min=0)
@@ -306,6 +316,15 @@ class PPOActor:
             final_reward=data["tot_rewards"],
         )
         stats_tracker.stat(**stats, denominator="n_valid_tokens")
+        if step_rewards is not None and step_reward_mask is not None:
+            step_reward_values = step_rewards.float() * step_reward_mask.float()
+            stats_tracker.stat(
+                step_reward=step_reward_values,
+                denominator="n_valid_tokens",
+            )
+            stats_tracker.scalar(
+                step_reward_events=float(step_reward_mask.sum().item()),
+            )
 
         prompt_lens = data["attention_mask"].sum(-1) - data["loss_mask"].sum(-1)
         seq_stats = dict(
