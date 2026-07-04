@@ -81,13 +81,11 @@ actor:
   rejection_sampling:
     metric: ratio
     upper: 5.0
-  reward_norm:
-    mean_level: group
-    std_level: group
-    group_size: ${gconfig.n_samples}
-  adv_norm:
-    mean_level: batch
-    std_level: batch
+  # Online mode currently consumes one independently rewarded trajectory per
+  # group. Centering a singleton reward or flat singleton advantage would erase
+  # the task-conditioned learning signal.
+  reward_norm: null
+  adv_norm: null
   weight_update_mode: xccl
   max_new_tokens: ${gconfig.max_new_tokens}
   scheduling_spec:

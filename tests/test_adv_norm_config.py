@@ -1,15 +1,59 @@
+import warnings
 from dataclasses import asdict
 from unittest.mock import patch
 
 import pytest
 import torch
+from omegaconf import OmegaConf
 
-from areal.api.cli_args import NormConfig
+from areal.api.cli_args import NormConfig, PPOActorConfig
 from areal.utils.data import Normalization
 
 # =============================================================================
 # NormConfig Tests
 # =============================================================================
+
+
+@pytest.mark.parametrize(
+    "reward_norm",
+    [
+        NormConfig(mean_level="group", std_level="group", group_size=1),
+        {"mean_level": "group", "std_level": "group", "group_size": 1},
+        OmegaConf.create(
+            {"mean_level": "group", "std_level": "group", "group_size": 1}
+        ),
+    ],
+    ids=["norm-config", "dict", "dict-config"],
+)
+def test_ppo_actor_warns_for_all_supported_singleton_reward_config_shapes(
+    reward_norm,
+):
+    with pytest.warns(
+        UserWarning, match="singleton group centering erases the task reward"
+    ):
+        PPOActorConfig(reward_norm=reward_norm)
+
+
+@pytest.mark.parametrize(
+    "reward_norm",
+    [
+        None,
+        NormConfig(mean_level=None, std_level="group", group_size=1),
+        NormConfig(mean_level="group", std_level="group", group_size=2),
+        NormConfig(mean_level="batch", std_level="batch", group_size=1),
+    ],
+)
+def test_ppo_actor_does_not_warn_without_singleton_reward_group_centering(
+    reward_norm,
+):
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        PPOActorConfig(reward_norm=reward_norm)
+
+    assert not any(
+        "singleton group centering erases the task reward" in str(warning.message)
+        for warning in caught
+    )
 
 
 def test_adv_norm_config_inheritance():
