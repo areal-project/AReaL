@@ -1,0 +1,251 @@
+experiment_name: zjw-flash-moe-colocate
+trial_name: trial0
+
+seed: 42
+enable_offload: true
+total_train_epochs: 100
+total_train_steps: 200
+tokenizer_path: ${actor.path}
+
+cluster:
+  n_nodes: 4
+  n_gpus_per_node: 8
+  fileroot: /path/to/experiments/flash-moe-colocate
+  name_resolve:
+    type: nfs
+    nfs_record_root: /path/to/experiments/flash-moe-colocate/name_resolve
+
+# Colocation: 4 nodes x 8 GPUs = 32 GPUs
+# BailingMoeV2.5 Flash: 32 layers, 256 experts, hidden=4096
+# Actor (Megatron): DP=1, PP=4, TP=4, CP=2 (attn) / EP=8 (ffn)
+# Rollout (SGLang):  DP=8, TP=4
+allocation_mode: "megatron[actor]:(attn:d1p4c8|ffn:d1p4e8)|sglang[rollout]:d8t4p1"
+
+scheduler:
+  type: slurm
+
+rollout:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  # SlurmScheduler uses this as the worker startup timeout (covers slurm queue
+  # wait). Default 300s killed controller 930543 while the actor job was still
+  # PENDING for nodes; 1800s rides out node cleanup from a previous teardown.
+  setup_timeout: 1800
+  max_concurrent_rollouts: 128
+  queue_size: null
+  consumer_batch_size: ${train_dataset.batch_size}
+  max_head_offpolicyness: 1
+  enable_rollout_tracing: false
+  scheduling_spec: ${actor.scheduling_spec}
+  scheduling_strategy: {type: colocation, target: actor}
+  fileroot: ${cluster.fileroot}
+  tokenizer_path: ${tokenizer_path}
+  dump_to_file: true
+
+gconfig:
+  n_samples: 8
+  min_new_tokens: 0
+  max_new_tokens: 131071
+  max_tokens: 131071
+  greedy: false
+  temperature: 1.0
+
+actor:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  path: /path/to/models/your-moe-base-model
+  init_from_scratch: false
+  disable_dropout: true
+  gradient_checkpointing: true
+  dtype: bfloat16
+  grad_reduce_dtype: float32
+  mb_spec:
+    n_mbs: 1
+    max_tokens_per_mb: 131072
+  pad_to_maximum: false
+  optimizer:
+    type: adam
+    lr: 3e-6
+    weight_decay: 0.003
+    beta1: 0.9
+    beta2: 0.999
+    eps: 1e-8
+    lr_scheduler_type: constant
+    gradient_clipping: 1.0
+    warmup_steps_proportion: 0.001
+  megatron:
+    wrap_with_ddp: true
+    ddp:
+      grad_reduce_in_fp32: true
+      overlap_grad_reduce: false
+      overlap_param_gather: false
+      use_distributed_optimizer: true
+    use_deterministic_algorithms: false
+    recompute_granularity: full
+    recompute_method: uniform
+    recompute_num_layers: 1
+    moe_router_dtype: fp32
+    moe_token_dispatcher_type: alltoall
+  eps_clip: 0.4
+  temperature: ${gconfig.temperature}
+  reward_scaling: 10.0
+  reward_bias: -0.5
+  kl_ctl: 0.0
+  ppo_n_minibatches: 1
+  recompute_logprob: false
+  # Reuse training logprobs as proximal logprobs to skip the extra
+  # actor.compute_logp forward pass. Requires ppo_n_minibatches=1.
+  prox_logp_method: reuse_train_logp
+  use_decoupled_loss: true
+  rejection_sampling:
+    level: token
+    action: mask
+    metric: ratio
+    upper: 5.0
+    lower: 0.5
+  reward_norm:
+    mean_level: group
+    std_level: group
+    group_size: ${gconfig.n_samples}
+  adv_norm:
+    mean_level: batch
+    std_level: batch
+  weight_update_mode: awex
+  max_new_tokens: ${gconfig.max_new_tokens}
+  scheduling_spec:
+    - task_type: worker
+      port_count: 2
+      gpu: 1
+      cpu: 4
+      mem: 32
+      image: /path/to/areal.sif
+      cmd: python3 -m areal.infra.rpc.rpc_server
+      env_vars:
+        # NCCL accepts WARN/INFO/TRACE/VERSION; "DEBUG" is INVALID (yields zero
+        # NCCL logs). TRACE-level diagnostics slow the transfer ~10x and can
+        # blow the train-side wait budget; run clean.
+        NCCL_DEBUG: "WARN"
+        # Cross-node P2P routed through a PXN staging rank can wedge the
+        # transfer: the staging rank's send kernel spins waiting for its peer
+        # while other ranks wait on the same intermediary. Disable PXN so
+        # cross-node P2P goes straight out the local NIC.
+        NCCL_P2P_PXN_LEVEL: "0"
+        # Train-side budget waiting for infer's weights_update_finished; the
+        # 300s default is too tight for large healthy transfers.
+        AWEX_COLOCATE_TIMEOUT_S: "1800"
+        # Synchronous kernel launches for debugging: IMAs throw at the exact
+        # offending kernel instead of an async watchdog report. Off by default
+        # (10x slowdown).
+        CUDA_LAUNCH_BLOCKING: ${oc.env:CUDA_LAUNCH_BLOCKING,"0"}
+        PYTORCH_CUDA_ALLOC_CONF: ""
+        SGLANG_WAIT_WEIGHTS_READY_TIMEOUT: "600"
+        SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK: "0"
+        # Colocate transport chunking. Controller --env is NOT inherited by the
+        # rollout job, so forward here with the known-good defaults; otherwise
+        # the reverted clone-per-chunk path sees chunk_mb=0 and falls into the
+        # one-shot legacy path (clones all shards at once -> OOM).
+        AWEX_CHUNK_MB: ${oc.env:AWEX_CHUNK_MB,"2048"}
+        AWEX_CHUNK_OPS: ${oc.env:AWEX_CHUNK_OPS,"128"}
+        # AWEX colocate needs raw CUDA allocation for IPC; the old TMS in the image
+        # asserts region() starts with interesting_region=False. enable_offload injects
+        # LD_PRELOAD + TMS_INIT_ENABLE=1, so clear them to match the working config.
+        LD_PRELOAD: ""
+        TMS_INIT_ENABLE: "0"
+        TMS_INIT_ENABLE_CPU_BACKUP: "0"
+      additional_bash_cmds:
+        - "pkill -9 -f 'awex_sglang_[p]lugin' 2>/dev/null || true; pkill -9 -f 'sglang_awex_[l]auncher' 2>/dev/null || true; pkill -9 -f 'sglang[.]launch_server' 2>/dev/null || true; sleep 2"
+        - "export PYTHONPATH=/path/to/awex:/path/to/flash-linear-attention:/path/to/AReaL:$PYTHONPATH"
+        - "cd /path/to/AReaL"
+
+# ref is disabled: with kl_ctl=0 no reference forward is needed, and a third
+# full-size engine does not fit on the colocated GPUs.
+ref: null
+
+sglang:
+  model_path: ${actor.path}
+  random_seed: ${seed}
+  skip_tokenizer_init: true
+  dtype: ${actor.dtype}
+  # AReaL's RLTrainer only calls update_weights at the END of each
+  # train step (first sync = version 1), so with load_format=dummy the entire
+  # first batch is generated by RANDOM weights: old_logp == -ln(157184) =
+  # -11.965 exactly (uniform logits), gibberish rollouts, task_reward 0, and
+  # grad_norm 1.3e7 on step 1. An initial pre-training transfer is required
+  # before dummy load can be used; until then, load real weights from disk.
+  load_format: "auto"
+  ep_size: 1
+  context_length: 131072
+  # 0.42 was the P71-era budget for RESIDENT optimizer state; with optimizer
+  # offload verified the KV pool can take most of the card. The post-transfer
+  # prefill needs a chunk_tokens x vocab x fp32 logits all-gather transient
+  # (16384 -> 9.6 GiB); 0.7 hit it on cycle 1 and 0.65 still hit it on cycle
+  # 9 (fragmentation + multi-batch stacking make it probabilistic), so the
+  # real fix is halving the prefill chunk below, not shaving mem_fraction.
+  mem_fraction_static: 0.65
+  # Halved from 16384: bounds the logits all-gather transient to ~4.8 GiB
+  # (chunk x 157184 vocab x fp32), the root fix for the post-transfer
+  # prefill OOM (trials 0612-0016 / 0612-0043).
+  max_prefill_tokens: 8192
+  schedule_policy: lpm
+  log_level: info
+  disable_radix_cache: true
+  disable_custom_all_reduce: true
+  enable_memory_saver: true
+  disable_cuda_graph: false
+  chunked_prefill_size: 8192
+
+train_dataset:
+  batch_size: 16
+  shuffle: true
+  pin_memory: true
+  num_workers: 4
+  path: /path/to/data/gsm8k
+  type: rl
+  max_length: 32768
+  drop_last: true
+
+valid_dataset:
+  batch_size: 4
+  pin_memory: true
+  num_workers: 4
+  path: /path/to/data/gsm8k
+  type: rl
+
+saver:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: null
+  freq_steps: 40
+  freq_secs: null
+
+recover:
+  mode: disabled
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+
+evaluator:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: null
+  freq_steps: null
+  freq_secs: null
+
+stats_logger:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  wandb:
+    mode: online
+    wandb_base_url: http://your-wandb-host:8080
+    wandb_api_key: local-3bca3d5f00a980f3075b3e8ff2e16adc4ef43ffe
+
+perf_tracer:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  enabled: false
+  session_tracer:
+    enabled: false

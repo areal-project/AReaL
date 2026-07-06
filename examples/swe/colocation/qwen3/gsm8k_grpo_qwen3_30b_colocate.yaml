@@ -1,0 +1,239 @@
+experiment_name: zjw-qwen3-30b-moe-colocate
+trial_name: trial0
+
+seed: 42
+enable_offload: false
+total_train_epochs: 100
+total_train_steps: 5
+tokenizer_path: ${actor.path}
+
+cluster:
+  n_nodes: 1
+  n_gpus_per_node: 8
+  fileroot: /path/to/experiments/qwen3-moe-colocate
+  name_resolve:
+    type: nfs
+    nfs_record_root: /path/to/experiments/qwen3-moe-colocate/name_resolve
+
+# Colocation: actor and rollout share the same GPUs
+allocation_mode: "megatron[actor]:(attn:d2p1t4|ffn:d2p1e4)|sglang[rollout]:d2t4p1"
+
+scheduler:
+  type: slurm
+
+rollout:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  setup_timeout: 3600.0
+  max_concurrent_rollouts: 128
+  queue_size: null
+  consumer_batch_size: ${train_dataset.batch_size}
+  max_head_offpolicyness: 2
+  enable_rollout_tracing: false
+  scheduling_spec:
+    - task_type: worker
+      port_count: 2
+      gpu: 1
+      cpu: 4
+      mem: 32
+      image: /path/to/areal.sif
+      cmd: python3 -m areal.infra.rpc.rpc_server
+      env_vars:
+        NCCL_TIMEOUT: "1800"
+        NCCL_DEBUG: "WARN"
+        CUDA_DEVICE_MAX_CONNECTIONS: "1"
+        SGLANG_WAIT_WEIGHTS_READY_TIMEOUT: "600"
+        SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK: "0"
+        COLOCATION_USE_SGLANG_MEMORY_SAVER_KV: "0"
+        COLOCATION_KV_RELEASE_MODE: "storage"
+        COLOCATION_BOOTSTRAP_RELEASE_KV_BEFORE_AWEX: "1"
+        COLOCATION_DROP_STATIC_POOL: "1"
+        COLOCATION_CLEAR_AWEX_PARAM_CACHE: "1"
+        AWEX_META_SERVER_ADDR: "localhost:29700"
+      additional_bash_cmds:
+        - "pkill -9 -f 'sglang_awex_[l]auncher' 2>/dev/null || true; pkill -9 -f 'sglang[.]launch_server' 2>/dev/null || true; sleep 2"
+        - "export PYTHONPATH=/path/to/awex:/path/to/AReaL:$PYTHONPATH"
+        - "cd /path/to/AReaL"
+  fileroot: ${cluster.fileroot}
+  tokenizer_path: ${tokenizer_path}
+  dump_to_file: true
+
+gconfig:
+  n_samples: 4
+  min_new_tokens: 0
+  max_new_tokens: 1024
+  greedy: false
+  temperature: 1.0
+
+actor:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  path: /path/to/models/Qwen3-30B-A3B
+  init_from_scratch: false
+  disable_dropout: true
+  gradient_checkpointing: true
+  dtype: bfloat16
+  grad_reduce_dtype: float32
+  mb_spec:
+    n_mbs: 1
+    max_tokens_per_mb: 8192
+  pad_to_maximum: false
+  optimizer:
+    type: adam
+    lr: 3e-6
+    weight_decay: 0.003
+    beta1: 0.9
+    beta2: 0.999
+    eps: 1e-8
+    lr_scheduler_type: constant
+    gradient_clipping: 1.0
+    warmup_steps_proportion: 0.001
+  megatron:
+    wrap_with_ddp: true
+    ddp:
+      grad_reduce_in_fp32: true
+      overlap_grad_reduce: false
+      overlap_param_gather: false
+      use_distributed_optimizer: true
+    use_deterministic_algorithms: false
+    recompute_granularity: full
+    recompute_method: uniform
+    recompute_num_layers: 1
+    moe_router_dtype: bf16
+    moe_token_dispatcher_type: alltoall
+  eps_clip: 0.4
+  temperature: ${gconfig.temperature}
+  reward_scaling: 10.0
+  reward_bias: -0.5
+  kl_ctl: 0.0
+  ppo_n_minibatches: 1
+  recompute_logprob: true
+  use_decoupled_loss: true
+  rejection_sampling:
+    level: token
+    action: mask
+    metric: ratio
+    upper: 5.0
+    lower: 0.5
+  reward_norm:
+    mean_level: group
+    std_level: group
+    group_size: ${gconfig.n_samples}
+  adv_norm:
+    mean_level: batch
+    std_level: batch
+  weight_update_mode: awex
+  max_new_tokens: ${gconfig.max_new_tokens}
+  scheduling_spec:
+    - task_type: worker
+      port_count: 2
+      gpu: 1
+      cpu: 4
+      mem: 32
+      image: /path/to/areal.sif
+      cmd: python3 -m areal.infra.rpc.rpc_server
+      env_vars:
+        NCCL_TIMEOUT: "1800"
+        NCCL_DEBUG: "WARN"
+        CUDA_DEVICE_MAX_CONNECTIONS: "1"
+        PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+        SGLANG_WAIT_WEIGHTS_READY_TIMEOUT: "600"
+        SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK: "0"
+        COLOCATION_USE_SGLANG_MEMORY_SAVER_KV: "0"
+        COLOCATION_KV_RELEASE_MODE: "storage"
+        COLOCATION_BOOTSTRAP_RELEASE_KV_BEFORE_AWEX: "1"
+        COLOCATION_DROP_STATIC_POOL: "1"
+        COLOCATION_CLEAR_AWEX_PARAM_CACHE: "1"
+        AWEX_CHUNK_OPS: "128"
+        AWEX_CHUNK_MB: "2048"
+        AWEX_META_SERVER_ADDR: "localhost:29700"
+      additional_bash_cmds:
+        - "pkill -9 -f 'sglang_awex_[l]auncher' 2>/dev/null || true; pkill -9 -f 'sglang[.]launch_server' 2>/dev/null || true; sleep 2"
+        - "export PYTHONPATH=/path/to/awex:/path/to/AReaL:$PYTHONPATH"
+        - "cd /path/to/AReaL"
+
+ref:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  path: ${actor.path}
+  init_from_scratch: false
+  disable_dropout: true
+  dtype: ${actor.dtype}
+  mb_spec:
+    max_tokens_per_mb: 8192
+  optimizer: null
+  scheduling_strategy:
+    type: colocation
+    target: actor
+  scheduling_spec: ${actor.scheduling_spec}
+
+sglang:
+  model_path: ${actor.path}
+  random_seed: ${seed}
+  skip_tokenizer_init: true
+  dtype: ${actor.dtype}
+  ep_size: 4
+  context_length: 32768
+  mem_fraction_static: 0.70
+  max_prefill_tokens: 8192
+  schedule_policy: lpm
+  log_level: info
+  disable_radix_cache: true
+  disable_custom_all_reduce: true
+  enable_memory_saver: true
+  disable_cuda_graph: false
+  chunked_prefill_size: 8192
+
+train_dataset:
+  batch_size: 32
+  shuffle: true
+  pin_memory: true
+  num_workers: 4
+  path: /path/to/data/gsm8k
+  type: rl
+  max_length: 1024
+  drop_last: true
+
+valid_dataset:
+  batch_size: 4
+  pin_memory: true
+  num_workers: 4
+  path: /path/to/data/gsm8k
+  type: rl
+
+saver:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: null
+  freq_steps: null
+  freq_secs: null
+
+recover:
+  mode: disabled
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+
+evaluator:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: null
+  freq_steps: null
+  freq_secs: null
+
+stats_logger:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  wandb:
+    mode: offline
+
+perf_tracer:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  enabled: false
+  session_tracer:
+    enabled: false
