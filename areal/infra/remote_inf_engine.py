@@ -611,12 +611,19 @@ class RemoteInfEngine(InferenceEngine):
                     assert self._teacher_tokenizer is not None
                     assert student_response_ids is not None
                     assert teacher_response_ids is not None
+                    student_logps = None
+                    if "logprobs" in traj:
+                        student_logps = traj["logprobs"][i, write_idx].to(
+                            device=token_logps_tensor.device,
+                            dtype=token_logps_tensor.dtype,
+                        )
                     token_logps_tensor = align_teacher_logps_to_student(
                         student_response_ids,
                         teacher_response_ids,
                         token_logps_tensor,
                         student_tokenizer,
                         self._teacher_tokenizer,
+                        student_logps,
                     )
                 out[i, write_idx] = token_logps_tensor
             results.append(out)

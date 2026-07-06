@@ -76,6 +76,38 @@ def build_chat_template_mapping(student_tokenizer: Any, teacher_tokenizer: Any):
             ("<|im_end|>", "<｜end▁of▁sentence｜>"),
             ("<|endoftext|>", "<｜end▁of▁sentence｜>"),
         ]
+    if student_family == "qwen" and teacher_family == "llama":
+        return [
+            (
+                "<|im_start|>system\n",
+                "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n",
+            ),
+            (
+                "<|im_start|>user\n",
+                "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n",
+            ),
+            (
+                "<|im_start|>assistant\n",
+                "<|begin_of_text|><|start_header_id|>assistant<|end_header_id|>\n\n",
+            ),
+            ("<|im_end|>\n", "<|eot_id|>"),
+            ("<|im_end|>", "<|eot_id|>"),
+            ("<|endoftext|>", "<|end_of_text|>"),
+        ]
+    if student_family == "deepseek" and teacher_family == "llama":
+        return [
+            ("<｜begin▁of▁sentence｜>", "<|begin_of_text|>"),
+            ("<｜User｜>", "<|start_header_id|>user<|end_header_id|>\n\n"),
+            ("<｜Assistant｜>", "<|start_header_id|>assistant<|end_header_id|>\n\n"),
+            ("<｜end▁of▁sentence｜>", "<|eot_id|>"),
+        ]
+    if student_family == "deepseek" and teacher_family == "qwen":
+        return [
+            ("<｜begin▁of▁sentence｜><｜User｜>", "<|im_start|>user\n"),
+            ("<｜User｜>", "<|im_start|>user\n"),
+            ("<｜Assistant｜>", "<|im_start|>assistant\n"),
+            ("<｜end▁of▁sentence｜>", "<|im_end|>\n"),
+        ]
     raise NotImplementedError(
         "Unsupported cross-tokenizer distillation pair: "
         f"{student_family!r} student to {teacher_family!r} teacher."
@@ -142,15 +174,24 @@ def align_teacher_logps_to_student(
     teacher_logps: torch.Tensor,
     student_tokenizer: Any,
     teacher_tokenizer: Any,
+    student_logps: torch.Tensor | None = None,
     *,
     large_chunk_threshold: int = 6,
 ) -> torch.Tensor:
     """Project teacher response log-probs to student-token granularity.
 
     Greedily forms chunks whose decoded Unicode-normalized text is identical on
-    both tokenizers. The teacher chunk log-probability is summed and evenly
-    assigned to all student tokens in that chunk. Unaligned or suspiciously large
-    chunks are set to ``inf`` so the actor loss can turn them into no-op tokens.
+    both tokenizers. If ``student_logps`` is provided, each teacher chunk
+    likelihood is distributed by the semantic-prior rule from cross-tokenizer
+    OPD:
+
+    ``log q_i = (L_T_chunk / L_S_chunk) * log p_i``.
+
+    This preserves the student's within-chunk likelihood shape while matching
+    the teacher's chunk-level likelihood. If no student prior is provided, the
+    function falls back to uniform chunk assignment. Unaligned or suspiciously
+    large chunks are set to ``inf`` so the actor loss can turn them into no-op
+    tokens.
     """
 
     aligned = torch.full(
@@ -185,7 +226,23 @@ def align_teacher_logps_to_student(
                     n_student <= large_chunk_threshold
                     and n_teacher <= large_chunk_threshold
                 ):
-                    aligned[s_ptr:s_end] = teacher_logps[t_ptr:t_end].sum() / n_student
+                    teacher_chunk_logp = teacher_logps[t_ptr:t_end].sum()
+                    if student_logps is None:
+                        aligned[s_ptr:s_end] = teacher_chunk_logp / n_student
+                    else:
+                        student_chunk_logps = student_logps[s_ptr:s_end]
+                        student_chunk_logp = student_chunk_logps.sum()
+                        if torch.isclose(
+                            student_chunk_logp,
+                            torch.zeros_like(student_chunk_logp),
+                        ):
+                            aligned[s_ptr:s_end] = teacher_chunk_logp / n_student
+                        else:
+                            aligned[s_ptr:s_end] = (
+                                teacher_chunk_logp
+                                / student_chunk_logp
+                                * student_chunk_logps
+                            )
                 s_ptr = s_end
                 t_ptr = t_end
                 matched = True
