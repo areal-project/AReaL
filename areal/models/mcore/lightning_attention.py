@@ -39,6 +39,7 @@ from megatron.core.models.common.embeddings.rotary_pos_embedding import (
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
+from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint
 from torch.distributed._functional_collectives import all_to_all_single_autograd
 
 from areal.utils import logging
@@ -382,6 +383,29 @@ class GroupRMSNorm(nn.Module):
         x = x.view(*original_shape)
         weight = self.weight.view(self.num_heads, self.head_dim)
         return x * weight
+
+    def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
+        """TP-shard the gate-norm weight for distributed checkpointing.
+
+        ``weight`` holds the LOCAL slice (``num_heads_local * head_dim``) and is
+        split across TP ranks along dim 0 (see ``LightningSelfAttention``, which
+        sets ``tensor_model_parallel=True`` / ``partition_dim=0`` on it).
+
+        Megatron's default ``sharded_state_dict`` only consults a module's own
+        ``sharded_state_dict``; since ``GroupRMSNorm`` is a plain ``nn.Module``
+        without one, ``sharded_state_dict_default`` falls back to treating the
+        weight as REPLICATED (empty TP axis map). Under TP>1 that stores the
+        global shape equal to the local shape and silently keeps only one rank's
+        shard on save — corrupting DCP recover and DCP->HF conversion (only 1/TP
+        of the gate norm survives). Declaring axis 0 here records the true global
+        tensor (``num_heads_global * head_dim``) as TP shards so save/load
+        round-trips correctly. (Param attributes alone are not enough — the
+        generic checkpoint path does not read them.)
+        """
+        state_dict = self.state_dict(prefix="", keep_vars=True)
+        return make_sharded_tensors_for_checkpoint(
+            state_dict, prefix, {"weight": 0}, sharded_offsets
+        )
 
 
 class LightningSelfAttention(MegatronModule):
