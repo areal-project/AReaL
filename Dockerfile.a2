@@ -19,8 +19,7 @@ FROM quay.io/ascend/cann:9.0.0-910b-ubuntu22.04-py3.11
 
 ARG MEGATRON_TAG=core_v0.16.1
 ARG MINDSPEED_BRANCH=core_r0.16.0
-ARG MINDSPEED_COMMIT=e42335e9ff6f28ef1a60f2fb3356544790ded567
-ARG SGLANG_TAG=v0.5.7
+ARG MINDSPEED_COMMIT=edd30e450dd64fe2d00fa5b963ab868a94b174f6
 # Must be pinned to this specific commit: megatron-core 0.16.x compatible. The v0.4.x tags pin
 # megatron-core 0.17.1, which MindSpeed core_r0.16.0 does not support.
 ARG MEGATRON_BRIDGE_COMMIT=de93536e
@@ -61,13 +60,6 @@ RUN git clone --depth 1 --branch ${MEGATRON_TAG} https://github.com/NVIDIA/Megat
     git -C /areal-workspace/MindSpeed checkout ${MINDSPEED_COMMIT} && \
     cp -r /areal-workspace/Megatron-LM/megatron /areal-workspace/MindSpeed/megatron && \
     python3 -m pip install -e /areal-workspace/MindSpeed --no-deps && \
-    python3 -m pip cache purge
-
-# Install SGLang
-RUN git clone --depth 1 --branch ${SGLANG_TAG} https://github.com/sgl-project/sglang.git /areal-workspace/sglang && \
-    cd /areal-workspace/sglang && \
-    mv python/pyproject_other.toml python/pyproject.toml && \
-    pip install -e python[srt_npu] && \
     python3 -m pip cache purge
 
 # Install AReaL deps. No --upgrade: keep vllm-ascend's torch/torch-npu/triton.
