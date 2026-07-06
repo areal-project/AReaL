@@ -325,6 +325,10 @@ class HttpGenerationResult:
     output_logprobs: list[float]
     stop_reason: str
     routed_experts: np.ndarray | None = None
+    # Speculative-decoding acceptance metrics (only populated by SGLang when
+    # speculative_algorithm is enabled; read from response meta_info).
+    spec_accept_rate: float | None = None
+    spec_accept_length: float | None = None
 
 
 @dataclass

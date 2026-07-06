@@ -109,12 +109,19 @@ class SGLangBackend:
                 pybase64.b64decode(routed_experts.encode("utf-8")), dtype=np.int32
             ).reshape(num_sgl_token, -1)
 
+        # Speculative-decoding acceptance metrics (present only when SGLang is
+        # launched with a speculative_algorithm; None otherwise).
+        spec_accept_rate = meta_info.get("spec_accept_rate")
+        spec_accept_length = meta_info.get("spec_accept_length")
+
         if stop_reason == "abort" and stop_message.startswith("Abort before prefill"):
             return HttpGenerationResult(
                 output_tokens=[],
                 output_logprobs=[],
                 stop_reason=stop_reason,
                 routed_experts=routed_experts,
+                spec_accept_rate=spec_accept_rate,
+                spec_accept_length=spec_accept_length,
             )
 
         output_tokens = [x[1] for x in meta_info["output_token_logprobs"]]
@@ -125,6 +132,8 @@ class SGLangBackend:
             output_logprobs=output_logprobs,
             stop_reason=stop_reason,
             routed_experts=routed_experts,
+            spec_accept_rate=spec_accept_rate,
+            spec_accept_length=spec_accept_length,
         )
 
     def build_score_request(
