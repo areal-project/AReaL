@@ -27,6 +27,29 @@ _MTP_TRAIN_LABELS: contextvars.ContextVar = contextvars.ContextVar(
 )
 
 
+def _wrap_forward_for_mtp_kwargs(model_cls) -> None:
+    """Patch ``model_cls.forward`` to pop/consume ``mtp_kwargs``.
+
+    Stashes ``mtp_kwargs["mtp_labels"]`` into the ``_MTP_TRAIN_LABELS``
+    ContextVar for the duration of the call so the (separately patched)
+    module-level ``process_mtp_loss`` can pick it up inside ``_postprocess``,
+    then calls the original ``forward`` with ``mtp_kwargs`` stripped out
+    (the original signature never declares it).
+    """
+    _orig_forward = model_cls.forward
+
+    def _patched_forward(self, *args, **kwargs):
+        mtp_kwargs = kwargs.pop("mtp_kwargs", None)
+        mtp_labels = mtp_kwargs.get("mtp_labels") if mtp_kwargs else None
+        token = _MTP_TRAIN_LABELS.set(mtp_labels)
+        try:
+            return _orig_forward(self, *args, **kwargs)
+        finally:
+            _MTP_TRAIN_LABELS.reset(token)
+
+    model_cls.forward = _patched_forward
+
+
 def _patch_qwen3vl_pr3143_word_embeddings() -> None:
     """megatron-bridge PR #3143: expose word_embeddings on MTP shadow embedding.
 
@@ -129,18 +152,7 @@ def _patch_gpt_model_mtp_training() -> None:
     MultiTokenPredictionLayer = mtp_mod.MultiTokenPredictionLayer
 
     # --- 1. GPTModel.forward: capture mtp_kwargs into the ContextVar ---
-    _orig_forward = GPTModel.forward
-
-    def _patched_forward(self, *args, **kwargs):
-        mtp_kwargs = kwargs.pop("mtp_kwargs", None)
-        mtp_labels = mtp_kwargs.get("mtp_labels") if mtp_kwargs else None
-        token = _MTP_TRAIN_LABELS.set(mtp_labels)
-        try:
-            return _orig_forward(self, *args, **kwargs)
-        finally:
-            _MTP_TRAIN_LABELS.reset(token)
-
-    GPTModel.forward = _patched_forward
+    _wrap_forward_for_mtp_kwargs(GPTModel)
 
     # --- 2. process_mtp_loss: inject mtp_labels (pre-rolled) + detach weight ---
     _orig_process_mtp_loss = gpt_model.process_mtp_loss
@@ -189,9 +201,50 @@ def _patch_gpt_model_mtp_training() -> None:
     )
 
 
+def _patch_qwen3vl_mtp_training() -> None:
+    """Extend the MTP training kwarg patch to megatron-bridge's Qwen3-VL decoder.
+
+    ``Qwen3VLGPTModel`` is the decoder class megatron-bridge uses for the whole
+    Qwen3.5 family (dense/MoE, text-only or multimodal ``model_type`` variants
+    such as ``qwen3_5_text``). It subclasses mcore's ``GPTModel`` but *overrides*
+    ``forward`` with its own explicit signature (deepstack visual kwargs, no
+    ``**kwargs`` catch-all), while leaving ``_postprocess`` inherited from
+    ``GPTModel``. Because Python resolves ``forward`` on the subclass first,
+    ``_patch_gpt_model_mtp_training``'s patch on ``GPTModel.forward`` never fires
+    here, so ``packed_context_parallel_forward`` passing ``mtp_kwargs=...`` raises:
+
+        TypeError: Qwen3VLGPTModel.forward() got an unexpected keyword
+        argument 'mtp_kwargs'
+
+    This mirrors step 1 of ``_patch_gpt_model_mtp_training`` for
+    ``Qwen3VLGPTModel`` specifically. Steps 2/3 of that patch
+    (``process_mtp_loss`` label injection, MTP embedding detach) already apply
+    transparently here since they patch module-level/shared code that
+    ``Qwen3VLGPTModel`` reuses via its inherited ``_postprocess``.
+    """
+    try:
+        from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.text_model import (
+            Qwen3VLGPTModel,
+        )
+    except ImportError:
+        return
+
+    if getattr(Qwen3VLGPTModel, "_areal_mtp_training_applied", False):
+        return
+
+    _wrap_forward_for_mtp_kwargs(Qwen3VLGPTModel)
+    Qwen3VLGPTModel._areal_mtp_training_applied = True
+    logger.info(
+        "Applied MTP training patch to Qwen3VLGPTModel.forward: "
+        "mtp_kwargs passthrough enabled for Qwen3.5-family models "
+        "(including text-only model_type variants)."
+    )
+
+
 def _apply_patches_on_import() -> None:
     _patch_qwen3vl_pr3143_word_embeddings()
     _patch_gpt_model_mtp_training()
+    _patch_qwen3vl_mtp_training()
 
 
 _apply_patches_on_import()
