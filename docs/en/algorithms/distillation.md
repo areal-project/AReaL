@@ -152,7 +152,7 @@ python3 examples/math/gsm8k_rl.py \
   trial_name=trial0
 ```
 
-## Result
+## KDRL Result
 
 On-policy knowledge distillation + RL reward plot for Qwen2.5-14B-Instruct (teacher) and
 Qwen3-0.6B (student), trained using FSDP and vLLM.
@@ -244,6 +244,25 @@ $\log \pi_T(x_j^s) \leftarrow \frac{R_i}{|C_i^s|}$
 #### 6. On-policy distillation objective
 
 The student is trained using the standard reverse-KL OPD objective, but with aligned teacher signals instead of token-aligned supervision.
+
+## Cross-tokenizer KDRL Result
+
+Results on the [Knight and Knave dataset](https://huggingface.co/datasets/K-and-K/knights-and-knaves), using the first 200 examples from both the train and test splits.
+
+The following plots show the reward curves for on-policy knowledge distillation + RL with Qwen3-0.6B as the student, trained with FSDP and vLLM.
+
+
+**Teacher**: Qwen3.6-27B, **Student**: Qwen3-0.6B
+
+![alt text](kk_curve.png)
+
+
+
+**Teacher**: Llama-3.1-8B-Instruct, **Student**: Qwen3-0.6B
+
+![alt text](kk_curve_llama.png)
+
+
 
 ## References
 
