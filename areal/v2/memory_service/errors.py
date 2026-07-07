@@ -23,3 +23,11 @@ class CandidateNotFoundError(MemoryServiceError):
 
 class CandidateConflictError(MemoryServiceError):
     """Raised when a candidate write conflicts with immutable history."""
+
+
+class RevisionNotFoundError(MemoryServiceError):
+    """Raised when a revision is unavailable in the requested scope."""
+
+
+class RevisionConflictError(MemoryServiceError):
+    """Raised when a revision write conflicts with immutable history."""
