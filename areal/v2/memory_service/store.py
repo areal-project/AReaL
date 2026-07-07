@@ -13,7 +13,12 @@ from areal.v2.memory_service.errors import (
     EvidenceConflictError,
     EvidenceNotFoundError,
 )
-from areal.v2.memory_service.types import EvidenceEvent, EvidenceRecord, MemoryScope
+from areal.v2.memory_service.types import (
+    EvidenceEvent,
+    EvidenceRecord,
+    MemoryScope,
+    _validate_string,
+)
 
 
 class EvidenceStore(Protocol):
@@ -94,6 +99,7 @@ class InMemoryEvidenceStore:
 
         if type(scope) is not MemoryScope:
             raise TypeError("scope must be a MemoryScope")
+        evidence_id = _validate_string(evidence_id, "evidence_id", allow_blank=True)
         with self._lock:
             record = self._by_evidence_id.get((scope, evidence_id))
             if record is None:
@@ -111,6 +117,10 @@ class InMemoryEvidenceStore:
 
         if type(scope) is not MemoryScope:
             raise TypeError("scope must be a MemoryScope")
+        if session_id is not None:
+            session_id = _validate_string(session_id, "session_id", allow_blank=True)
+        if run_id is not None:
+            run_id = _validate_string(run_id, "run_id", allow_blank=True)
         with self._lock:
             matches = (
                 record

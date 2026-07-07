@@ -65,6 +65,36 @@ class EvidenceEventSubclass(EvidenceEvent):
         return b"overridden"
 
 
+class MutableHashStr(str):
+    hash_calls: int
+    hash_salt: int
+
+    def __new__(cls, value: str) -> MutableHashStr:
+        instance = str.__new__(cls, value)
+        instance.hash_calls = 0
+        instance.hash_salt = 0
+        return instance
+
+    def __hash__(self) -> int:
+        self.hash_calls += 1
+        return str.__hash__(self) + self.hash_salt
+
+
+class AlwaysEqualStr(str):
+    equality_calls: int
+
+    def __new__(cls, value: str) -> AlwaysEqualStr:
+        instance = str.__new__(cls, value)
+        instance.equality_calls = 0
+        return instance
+
+    def __eq__(self, other: object) -> bool:
+        self.equality_calls += 1
+        return True
+
+    __hash__ = str.__hash__
+
+
 def make_scope(**overrides: str) -> MemoryScope:
     values = {
         "tenant_id": "tenant-1",
@@ -305,6 +335,26 @@ def test_get_missing_evidence_raises_not_found() -> None:
     assert type(error.value) is EvidenceNotFoundError
 
 
+def test_get_snapshots_evidence_id_before_lookup() -> None:
+    store = InMemoryEvidenceStore()
+    record = store.append(make_event())
+    query_id = MutableHashStr(record.evidence_id)
+    query_id.hash_salt = 1_000_003
+
+    assert store.get(record.event.scope, query_id) is record
+    assert query_id.hash_calls == 0
+
+
+def test_blank_query_values_remain_no_match() -> None:
+    store = InMemoryEvidenceStore()
+    record = store.append(make_event())
+
+    with pytest.raises(EvidenceNotFoundError):
+        store.get(record.event.scope, "")
+    assert store.list(record.event.scope, session_id="") == ()
+    assert store.list(record.event.scope, run_id="") == ()
+
+
 def test_get_hides_record_that_belongs_to_another_scope() -> None:
     store = InMemoryEvidenceStore()
     record = store.append(make_event())
@@ -375,6 +425,16 @@ def test_list_filters_by_scope_session_and_run() -> None:
         session_one_run_two,
     )
     assert store.list(scope, session_id="missing") == ()
+
+
+@pytest.mark.parametrize("field", ["session_id", "run_id"])
+def test_list_snapshots_filter_before_comparison(field: str) -> None:
+    store = InMemoryEvidenceStore()
+    record = store.append(make_event())
+    query = AlwaysEqualStr(f"missing-{field}")
+
+    assert store.list(record.event.scope, **{field: query}) == ()
+    assert query.equality_calls == 0
 
 
 def test_list_returns_deterministic_order_using_normalized_instants() -> None:
