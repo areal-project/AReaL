@@ -97,6 +97,17 @@ The five steps below are run from the repo root.
 `config.yaml` holds the defaults (v2 controllers, 1 node × 2 GPUs, `batch_size=1`, admin
 keys); CLI flags override it. The explicit form below just documents those defaults:
 
+> **Why reward/advantage normalization is disabled here**
+>
+> Online mode currently trains on one independently rewarded trajectory per group.
+> Centering that singleton group reward subtracts the reward from itself, while
+> centering the flat token advantages from a one-trajectory batch likewise makes every
+> advantage zero. Either operation erases the task-conditioned learning signal. Using
+> GRPO-style group centering instead requires at least two trajectories from the same
+> task and a workflow that supports grouped rollouts/session grouping and preserves
+> their shared group identity through training. Changing `n_samples` alone is
+> insufficient; the current online one-sample path does not support this directly.
+
 ```bash
 uv run python3 examples/hermes/train.py \
     --config examples/hermes/config.yaml \

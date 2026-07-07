@@ -24,7 +24,7 @@ The following hardware configuration has been extensively tested:
 | Git LFS                  | Required for downloading models, datasets, and AReaL code. See [installation guide](https://docs.github.com/en/repositories/working-with-files/managing-large-files/installing-git-large-file-storage) |
 | Docker                   |                                                                                                 27.5.1                                                                                                 |
 | NVIDIA Container Toolkit |                                         See [installation guide](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)                                          |
-| AReaL Image              |                                   `ghcr.io/areal-project/areal-runtime:v1.0.4-sglang` (default) or `v1.0.4-vllm`. Includes runtime dependencies and Ray components.                                    |
+| AReaL Image              |                                   `ghcr.io/areal-project/areal-runtime:v2.0.0-sglang` (default) or `v2.0.0-vllm`. Includes runtime dependencies and Ray components.                                    |
 
 **Note**: This tutorial does not cover the installation of NVIDIA Drivers, CUDA, or
 shared storage mounting, as these depend on your specific node configuration and system
@@ -42,11 +42,11 @@ We recommend using Docker with our provided image. The Dockerfile is available i
 top-level directory of the AReaL repository.
 
 ```bash
-docker pull ghcr.io/areal-project/areal-runtime:v1.0.4-sglang
+docker pull ghcr.io/areal-project/areal-runtime:v2.0.0-sglang
 docker run -it --name areal-node1 \
    --privileged --gpus all --network host \
    --shm-size 700g -v /path/to/mount:/path/to/mount \
-   ghcr.io/areal-project/areal-runtime:v1.0.4-sglang \
+   ghcr.io/areal-project/areal-runtime:v2.0.0-sglang \
    /bin/bash
 git clone https://github.com/areal-project/AReaL /path/to/mount/AReaL
 cd /path/to/mount/AReaL
@@ -54,7 +54,7 @@ uv pip install -e . --no-deps
 ```
 
 A vLLM variant of the Docker image is also available at
-`ghcr.io/areal-project/areal-runtime:v1.0.4-vllm`. Replace the image tag in the commands
+`ghcr.io/areal-project/areal-runtime:v2.0.0-vllm`. Replace the image tag in the commands
 above if you prefer vLLM as the inference backend.
 
 ### Option 2: Custom Environment Installation

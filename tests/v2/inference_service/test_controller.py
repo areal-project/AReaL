@@ -9,6 +9,7 @@ import httpx
 import pytest
 
 from areal.api.cli_args import AgentConfig, InferenceEngineConfig
+from areal.utils import stats_tracker
 from areal.v2.inference_service.controller.controller import (
     RolloutControllerV2,
 )
@@ -305,6 +306,25 @@ class TestRolloutControllerV2Construction:
         controller = RolloutControllerV2(config=cfg, scheduler=scheduler)
         stats = controller.export_stats()
         assert isinstance(stats, dict)
+
+    def test_export_stats_drains_local_workflow_metrics(self):
+        stats_tracker.export_all(reset=True)
+        try:
+            stats_tracker.get("rollout").scalar(reward=0.75)
+            controller = RolloutControllerV2(
+                config=InferenceEngineConfig(
+                    backend="sglang:d1", admin_api_key="test-key"
+                ),
+                scheduler=MagicMock(n_gpus_per_node=8),
+            )
+
+            assert controller.export_stats() == {
+                "rollout/reward": 0.75,
+                "rollout/reward__count": 1,
+            }
+            assert controller.export_stats() == {}
+        finally:
+            stats_tracker.export_all(reset=True)
 
     def test_proxy_gateway_addr(self):
         cfg = InferenceEngineConfig(backend="sglang:d1", admin_api_key="test-key")

@@ -25,6 +25,7 @@ from areal.utils.cross_tokenizer_distill import replace_unaligned_teacher_logps
 from areal.utils.data import (
     KLEstimator,
     Normalization,
+    TrajBatchMeta,
     batched_call,
     split_padded_tensor_dict_into_mb_list,
 )
@@ -142,9 +143,11 @@ class PPOActor:
 
     @trace_perf("ppo_actor.compute_advantages", category="compute")
     def compute_advantages(self, data: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        return batched_call(self._compute_advantages, data)
+        return batched_call(self._compute_advantages, data, pass_meta=True)
 
-    def _compute_advantages(self, data: dict[str, Any]) -> dict[str, Any]:
+    def _compute_advantages(
+        self, data: dict[str, Any], meta: TrajBatchMeta | None = None
+    ) -> dict[str, Any]:
         bs = data["input_ids"].shape[0]
         max_seqlen = data["input_ids"].shape[1]
         batch_indices = torch.arange(
@@ -171,8 +174,13 @@ class PPOActor:
         reward_score = torch.clip(
             reward_score, max=self.reward_clip, min=-self.reward_clip
         )
+        # Use actual trajectory group sizes when available so group-level
+        # normalization handles failed/filtered rollout samples without slicing
+        # across prompts. Direct calls without batched metadata keep the legacy
+        # fixed-group-size behavior.
+        group_sizes = meta.traj_group_sizes if meta is not None else None
         if self.reward_norm:
-            reward_score = self.reward_norm(reward_score)
+            reward_score = self.reward_norm(reward_score, group_sizes=group_sizes)
 
         loss_mask = data["loss_mask"].float()
         loss_mask = torch.roll(loss_mask, shifts=-1, dims=-1)
@@ -238,7 +246,9 @@ class PPOActor:
 
         # Optionally perform advantage normalization.
         if self.adv_norm is not None:
-            advantages = self.adv_norm(advantages, loss_mask)
+            # Use the same actual trajectory group sizes as reward normalization;
+            # ignored when adv_norm is batch-level.
+            advantages = self.adv_norm(advantages, loss_mask, group_sizes=group_sizes)
 
         # Store data in the dict.
         data["advantages"] = advantages
@@ -427,6 +437,8 @@ def grpo_loss_fn(
     use_decoupled_loss: bool = False,
     vocab_min_logits: torch.Tensor | None = None,
     vocab_max_logits: torch.Tensor | None = None,
+    vocab_mean_logits: torch.Tensor | None = None,
+    vocab_norm_logits: torch.Tensor | None = None,
 ):
     """Loss function for actor step, all inputs should be splitted into
     pipeline micro batches, returns loss and logging stats."""
@@ -436,6 +448,9 @@ def grpo_loss_fn(
     prox_logp_gt = input_data.get("prox_logp")  # Could be None if skipped
 
     entropy = entropy.detach()
+
+    if ProxLogpMethod(prox_logp_method) == ProxLogpMethod.REUSE_TRAIN_LOGP:
+        prox_logp_gt = logprobs.detach()
 
     # Resolve proximal log-probabilities based on method
     prox_logp = _resolve_proximal_logp(

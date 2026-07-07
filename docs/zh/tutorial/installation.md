@@ -24,7 +24,7 @@
 | Git LFS                  | 用于下载模型、数据集和 AReaL 代码。请参阅[安装指南](https://docs.github.com/en/repositories/working-with-files/managing-large-files/installing-git-large-file-storage) |
 | Docker                   |                                                                                 27.5.1                                                                                 |
 | NVIDIA Container Toolkit |                             请参阅[安装指南](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)                              |
-| AReaL 镜像               |                                `ghcr.io/areal-project/areal-runtime:v1.0.4-sglang`（默认）或 `v1.0.4-vllm`。包含运行时依赖和 Ray 组件。                                |
+| AReaL 镜像               |                                `ghcr.io/areal-project/areal-runtime:v2.0.0-sglang`（默认）或 `v2.0.0-vllm`。包含运行时依赖和 Ray 组件。                                |
 
 **注意**：本教程不涵盖 NVIDIA 驱动、CUDA 或共享存储挂载的安装，因为这些取决于您具体的节点配置和系统版本。请独立完成这些安装。
 
@@ -37,18 +37,18 @@
 我们推荐使用 Docker 和提供的镜像。Dockerfile 位于 AReaL 仓库的顶级目录。
 
 ```bash
-docker pull ghcr.io/areal-project/areal-runtime:v1.0.4-sglang
+docker pull ghcr.io/areal-project/areal-runtime:v2.0.0-sglang
 docker run -it --name areal-node1 \
    --privileged --gpus all --network host \
    --shm-size 700g -v /path/to/mount:/path/to/mount \
-   ghcr.io/areal-project/areal-runtime:v1.0.4-sglang \
+   ghcr.io/areal-project/areal-runtime:v2.0.0-sglang \
    /bin/bash
 git clone https://github.com/areal-project/AReaL /path/to/mount/AReaL
 cd /path/to/mount/AReaL
 uv pip install -e . --no-deps
 ```
 
-vLLM 变体的 Docker 镜像也可使用： `ghcr.io/areal-project/areal-runtime:v1.0.4-vllm`。如果您偏好使用 vLLM
+vLLM 变体的 Docker 镜像也可使用： `ghcr.io/areal-project/areal-runtime:v2.0.0-vllm`。如果您偏好使用 vLLM
 作为推理后端，请将上述命令中的镜像标签替换为该变体。
 
 ### 方式 2：自定义环境安装

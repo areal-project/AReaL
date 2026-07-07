@@ -921,6 +921,45 @@ class MegatronEngineConfig:
         default=False,
         metadata={"help": "Fuse token rearrangement ops during token dispatching."},
     )
+    moe_router_fusion: bool = field(
+        default=False,
+        metadata={
+            "help": "Enable fusion for MoE TopK routing and aux-loss computation. "
+            "Requires TransformerEngine >= 2.7.0.",
+        },
+    )
+    moe_router_bias_update_rate: float = field(
+        default=0.0,
+        metadata={
+            "help": "Update rate for auxiliary-loss-free MoE load balancing "
+            "(DeepSeek V3 style). Controls how fast expert_bias adjusts. "
+            "Default 0.0 disables bias updates; set a positive value such as "
+            "1e-3 to enable.",
+        },
+    )
+    moe_z_loss_coeff: float | None = field(
+        default=None,
+        metadata={
+            "help": "Scaling coefficient for router z-loss. Complements "
+            "auxiliary-loss-free load balancing for router stability. A starting "
+            "value of 1e-3 is recommended. None disables z-loss.",
+        },
+    )
+
+    # Precision & Loss
+    enable_fp32_lm_head: bool = field(
+        default=False,
+        metadata={
+            "help": "Cast lm_head output to FP32 before loss computation for "
+            "numerical stability."
+        },
+    )
+    cross_entropy_loss_fusion: bool = field(
+        default=False,
+        metadata={
+            "help": "Enable fused cross-entropy loss kernel for better performance."
+        },
+    )
 
     # FP8 Training Configuration
     fp8_config: FP8EngineConfig | None = None
@@ -1613,7 +1652,9 @@ class PPOActorConfig(TrainEngineConfig):
             "Only effective when use_decoupled_loss=True. Options: "
             "'recompute' (default): Standard decoupled PPO, recompute proximal policy via forward pass. "
             "'loglinear': Use log-linear interpolation to approximate proximal policy (skip forward pass). "
-            "'metrics': Like 'recompute', but also compute approximation metrics for evaluation.",
+            "'metrics': Like 'recompute', but also compute approximation metrics for evaluation. "
+            "'reuse_train_logp': Reuse training forward-pass logprobs as the proximal "
+            "logp (skip the extra forward; requires ppo_n_minibatches=1).",
             "choices": PROX_LOGP_METHODS_ALL,
         },
     )
@@ -1648,6 +1689,38 @@ class PPOActorConfig(TrainEngineConfig):
 
     def __post_init__(self):
         """Validate PPO actor configuration."""
+        reward_norm = self.reward_norm
+        if isinstance(reward_norm, (dict, DictConfig)):
+            reward_mean_level = reward_norm.get("mean_level")
+            reward_group_size = reward_norm.get("group_size")
+        else:
+            reward_mean_level = getattr(reward_norm, "mean_level", None)
+            reward_group_size = getattr(reward_norm, "group_size", None)
+
+        if reward_mean_level == "group" and reward_group_size == 1:
+            warnings.warn(
+                "PPO reward_norm uses mean_level='group' with group_size=1: "
+                "singleton group centering erases the task reward. Disable reward "
+                "centering (mean_level=None) or use group_size >= 2.",
+                UserWarning,
+                stacklevel=2,
+            )
+
+        from areal.utils.constants import ProxLogpMethod
+
+        if (
+            ProxLogpMethod(self.prox_logp_method) == ProxLogpMethod.REUSE_TRAIN_LOGP
+            and self.ppo_n_minibatches > 1
+        ):
+            logger.warning(
+                "prox_logp_method='reuse_train_logp' requires ppo_n_minibatches=1, "
+                f"but got ppo_n_minibatches={self.ppo_n_minibatches}. "
+                "With multiple minibatches, weights change between steps, so the "
+                "training forward logprobs would differ from the original policy. "
+                "Forcing ppo_n_minibatches=1; note this changes training dynamics "
+                "to a single optimizer step per PPO update."
+            )
+            self.ppo_n_minibatches = 1
         # Warn if rejection_sampling is configured but use_decoupled_loss is False
         if not self.use_decoupled_loss and self.rejection_sampling is not None:
             logger.warning(
@@ -2103,6 +2176,30 @@ class AgentConfig:
             "The 'concat' style exports only the final concatenated trajectory from the root. "
             "It is only suitable for linear conversation histories without token mismatching (whether valid depends on the tokenizer).",
             "choices": ["individual", "concat"],
+        },
+    )
+    message_preprocessors: list[str] = field(
+        default_factory=list,
+        metadata={
+            "help": (
+                "List of message preprocessor class paths applied, in order, to "
+                "Anthropic-compatible `/v1/messages` requests after translating "
+                "them to OpenAI-compatible requests. Native OpenAI "
+                "`/chat/completions` and `/responses` requests are not "
+                "preprocessed. Each entry is a dotted import path to a callable "
+                "class."
+            ),
+        },
+    )
+    prefix_matcher: str | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Dotted import path to a custom prefix matcher function for "
+                "InteractionCache parent-child matching. The function must accept "
+                "two list[dict] arguments (candidate prefix, full messages) and "
+                "return bool. When None, exact element-wise equality is used."
+            ),
         },
     )
     subproc_max_workers: int = field(
@@ -2890,6 +2987,14 @@ class BaseExperimentConfig:
     vllm: vLLMConfig = field(default_factory=vLLMConfig)
 
     scheduler: SchedulerConfig = field(default_factory=SchedulerConfig)
+
+    post_exit_hook: str = field(
+        default="",
+        metadata={
+            "help": "Shell command run after launcher shutdown. "
+            "LOG_DIR is injected; failures are logged and ignored."
+        },
+    )
 
     def __post_init__(self):
         """Validate training configuration."""

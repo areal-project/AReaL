@@ -1,3 +1,4 @@
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -69,6 +70,52 @@ TEXT_WITH_TOOL_CALL_IN_THINKING = (
     '<tool_call>\n{"name": "search", "arguments": {"query": "director of The Preacher\'s Wife country"}}\n</tool_call><|im_end|>'
 )
 
+QWEN3_CODER_TOOLS: list[ChatCompletionToolParam] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "Bash",
+            "description": "Run a shell command.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string"},
+                    "timeout": {"type": "integer"},
+                },
+                "required": ["command"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "Write",
+            "description": "Write a file.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file_path": {"type": "string"},
+                    "content": {"type": "string"},
+                },
+                "required": ["file_path", "content"],
+            },
+        },
+    },
+]
+
+QWEN3_CODER_TEXT = """I'll inspect the repository.
+
+<tool_call>
+<function=Bash>
+<parameter=command>
+ls -la
+</parameter>
+<parameter=timeout>
+120
+</parameter>
+</function>
+</tool_call><|im_end|>"""
+
 
 def _assert_tool_calls(tool_calls, new_text: str, new_finish_reason: str) -> None:
     assert new_finish_reason == "tool_calls"
@@ -99,6 +146,67 @@ def _run_process_tool_calls(text: str):
         use_responses=False,
         tokenizer=object(),
     )
+
+
+def test_process_tool_calls_qwen3_coder_xml_parameters_without_sglang():
+    tool_calls, new_text, new_finish_reason = parser_module.process_tool_calls(
+        text=QWEN3_CODER_TEXT,
+        tools=QWEN3_CODER_TOOLS,
+        tool_call_parser="qwen3_coder",
+        reasoning_parser="qwen3",
+        finish_reason="stop",
+        use_responses=False,
+        tokenizer=object(),
+    )
+
+    assert new_finish_reason == "tool_calls"
+    assert tool_calls is not None
+    assert len(tool_calls) == 1
+    assert tool_calls[0].function.name == "Bash"
+    assert json.loads(tool_calls[0].function.arguments) == {
+        "command": "ls -la",
+        "timeout": 120,
+    }
+    assert "<tool_call>" not in new_text
+    assert "<|im_end|>" not in new_text
+    assert "I'll inspect the repository." in new_text
+
+
+def test_qwen3_coder_xml_empty_args_returns_no_parse():
+    text = "<tool_call>\n<function=Bash>\n</function>\n</tool_call>"
+
+    tool_calls, new_text, finish_reason = (
+        parser_module._process_tool_calls_qwen3_coder_xml(
+            text=text,
+            tools=QWEN3_CODER_TOOLS,
+            finish_reason="stop",
+        )
+    )
+
+    assert tool_calls is None
+    assert new_text == text
+    assert finish_reason == "stop"
+
+
+def test_qwen3_coder_xml_literal_closing_tag_is_not_silently_truncated():
+    text = (
+        "<tool_call>\n<function=Write>\n"
+        "<parameter=file_path>\na.xml\n</parameter>\n"
+        "<parameter=content>\nsome XML text: </parameter> more content\n</parameter>\n"
+        "</function>\n</tool_call>"
+    )
+
+    tool_calls, new_text, finish_reason = (
+        parser_module._process_tool_calls_qwen3_coder_xml(
+            text=text,
+            tools=QWEN3_CODER_TOOLS,
+            finish_reason="stop",
+        )
+    )
+
+    assert tool_calls is None
+    assert new_text == text
+    assert finish_reason == "stop"
 
 
 @pytest.mark.sglang
