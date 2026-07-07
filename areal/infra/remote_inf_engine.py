@@ -1289,10 +1289,18 @@ class RemoteInfEngine(InferenceEngine):
         """Resume request submission for async rollout."""
         return self.workflow_executor.resume()
 
-    def offload(self) -> None:
+    def offload(self, tags: list[str] | None = None) -> None:
         """Offload model memory on all servers."""
-        offload_req = self.backend.get_offload_request()
+        if tags is None:
+            offload_req = self.backend.get_offload_request()
+        else:
+            offload_req = self.backend.get_offload_request(tags=tags)
         self._run_request_on_all_servers(offload_req)
+
+    def abort_all_requests(self) -> None:
+        """Abort all in-flight requests on all servers (SGLang backend only)."""
+        abort_req = self.backend.get_abort_all_request()
+        self._run_request_on_all_servers(abort_req)
 
     def onload(self, tags: list[str] | None = None) -> None:
         """Onload model memory on all servers."""

@@ -330,13 +330,18 @@ class SGLangBackend:
         """Get SGLang resume request."""
         return HttpRequest(endpoint="/continue_generation", payload={})
 
+    def get_abort_all_request(self) -> HttpRequest:
+        """Get SGLang abort-all request."""
+        return HttpRequest(endpoint="/abort_request", payload={"abort_all": True})
+
     def get_health_check_request(self) -> HttpRequest:
         """Get SGLang health check request."""
         return HttpRequest(endpoint="/health", payload={}, method="GET")
 
-    def get_offload_request(self) -> HttpRequest:
+    def get_offload_request(self, tags: list[str] | None = None) -> HttpRequest:
         """Get SGLang offload request."""
-        return HttpRequest(endpoint="/release_memory_occupation", payload={})
+        payload = {"tags": tags} if tags is not None else {}
+        return HttpRequest(endpoint="/release_memory_occupation", payload=payload)
 
     def get_onload_request(self, tags: list[str] | None = None) -> HttpRequest:
         """Get SGLang onload request.
@@ -575,8 +580,11 @@ class RemoteSGLangEngine(InferenceEngine):
     def teardown_server(self):
         return self._engine.teardown_server()
 
-    def offload(self):
-        return self._engine.offload()
+    def offload(self, tags: list[str] | None = None):
+        return self._engine.offload(tags=tags)
+
+    def abort_all_requests(self):
+        return self._engine.abort_all_requests()
 
     def onload(self, tags: list[str] | None = None):
         return self._engine.onload(tags=tags)
