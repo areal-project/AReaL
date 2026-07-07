@@ -20,9 +20,24 @@ import areal.v2.memory_service as memory_service
 from areal.v2.memory_service import store as store_module
 from areal.v2.memory_service._atomic import _atomic_publish
 from areal.v2.memory_service.errors import (
+    CandidateConflictError,
+    CandidateNotFoundError,
     EvidenceConflictError,
     EvidenceNotFoundError,
     MemoryServiceError,
+    RevisionConflictError,
+    RevisionNotFoundError,
+)
+from areal.v2.memory_service.history_store import (
+    InMemoryMemoryHistoryStore,
+    MemoryHistoryStore,
+)
+from areal.v2.memory_service.history_types import (
+    CandidateProposal,
+    MemoryCandidate,
+    MemoryRevision,
+    RevisionOperation,
+    RevisionProposal,
 )
 from areal.v2.memory_service.store import EvidenceStore, InMemoryEvidenceStore
 from areal.v2.memory_service.types import (
@@ -284,8 +299,41 @@ def test_error_types_share_memory_service_base_error() -> None:
     assert issubclass(EvidenceConflictError, MemoryServiceError)
 
 
-def test_public_module_exports_only_stable_evidence_contract() -> None:
-    """Expose only the intended immutable evidence API at package level."""
+def test_public_module_exports_stable_memory_contracts() -> None:
+    """Expose only the intended immutable evidence and history contracts."""
+    assert memory_service.__doc__ == (
+        "Public contracts for immutable Memory Service evidence and history."
+    )
+    assert memory_service.__all__ == [
+        "CandidateConflictError",
+        "CandidateNotFoundError",
+        "CandidateProposal",
+        "EvidenceConflictError",
+        "EvidenceEvent",
+        "EvidenceKind",
+        "EvidenceNotFoundError",
+        "EvidenceRecord",
+        "EvidenceStore",
+        "InMemoryEvidenceStore",
+        "InMemoryMemoryHistoryStore",
+        "MemoryCandidate",
+        "MemoryHistoryStore",
+        "MemoryRevision",
+        "MemoryScope",
+        "MemoryServiceError",
+        "RevisionConflictError",
+        "RevisionNotFoundError",
+        "RevisionOperation",
+        "RevisionProposal",
+    ]
+
+    from areal.v2.memory_service import (
+        CandidateConflictError as PublicCandidateConflictError,
+    )
+    from areal.v2.memory_service import (
+        CandidateNotFoundError as PublicCandidateNotFoundError,
+    )
+    from areal.v2.memory_service import CandidateProposal as PublicCandidateProposal
     from areal.v2.memory_service import (
         EvidenceConflictError as PublicEvidenceConflictError,
     )
@@ -299,21 +347,27 @@ def test_public_module_exports_only_stable_evidence_contract() -> None:
     from areal.v2.memory_service import (
         InMemoryEvidenceStore as PublicInMemoryEvidenceStore,
     )
+    from areal.v2.memory_service import (
+        InMemoryMemoryHistoryStore as PublicInMemoryMemoryHistoryStore,
+    )
+    from areal.v2.memory_service import MemoryCandidate as PublicMemoryCandidate
+    from areal.v2.memory_service import MemoryHistoryStore as PublicMemoryHistoryStore
+    from areal.v2.memory_service import MemoryRevision as PublicMemoryRevision
     from areal.v2.memory_service import MemoryScope as PublicMemoryScope
     from areal.v2.memory_service import MemoryServiceError as PublicMemoryServiceError
+    from areal.v2.memory_service import (
+        RevisionConflictError as PublicRevisionConflictError,
+    )
+    from areal.v2.memory_service import (
+        RevisionNotFoundError as PublicRevisionNotFoundError,
+    )
+    from areal.v2.memory_service import RevisionOperation as PublicRevisionOperation
+    from areal.v2.memory_service import RevisionProposal as PublicRevisionProposal
 
-    assert memory_service.__all__ == [
-        "EvidenceConflictError",
-        "EvidenceEvent",
-        "EvidenceKind",
-        "EvidenceNotFoundError",
-        "EvidenceRecord",
-        "EvidenceStore",
-        "InMemoryEvidenceStore",
-        "MemoryScope",
-        "MemoryServiceError",
-    ]
-    assert (
+    public_symbols = (
+        PublicCandidateConflictError,
+        PublicCandidateNotFoundError,
+        PublicCandidateProposal,
         PublicEvidenceConflictError,
         PublicEvidenceEvent,
         PublicEvidenceKind,
@@ -321,9 +375,21 @@ def test_public_module_exports_only_stable_evidence_contract() -> None:
         PublicEvidenceRecord,
         PublicEvidenceStore,
         PublicInMemoryEvidenceStore,
+        PublicInMemoryMemoryHistoryStore,
+        PublicMemoryCandidate,
+        PublicMemoryHistoryStore,
+        PublicMemoryRevision,
         PublicMemoryScope,
         PublicMemoryServiceError,
-    ) == (
+        PublicRevisionConflictError,
+        PublicRevisionNotFoundError,
+        PublicRevisionOperation,
+        PublicRevisionProposal,
+    )
+    defining_symbols = (
+        CandidateConflictError,
+        CandidateNotFoundError,
+        CandidateProposal,
         EvidenceConflictError,
         EvidenceEvent,
         EvidenceKind,
@@ -331,9 +397,23 @@ def test_public_module_exports_only_stable_evidence_contract() -> None:
         EvidenceRecord,
         EvidenceStore,
         InMemoryEvidenceStore,
+        InMemoryMemoryHistoryStore,
+        MemoryCandidate,
+        MemoryHistoryStore,
+        MemoryRevision,
         MemoryScope,
         MemoryServiceError,
+        RevisionConflictError,
+        RevisionNotFoundError,
+        RevisionOperation,
+        RevisionProposal,
     )
+    for public_symbol, defining_symbol in zip(
+        public_symbols,
+        defining_symbols,
+        strict=True,
+    ):
+        assert public_symbol is defining_symbol
 
 
 def test_evidence_store_contract_exposes_no_update_or_delete() -> None:

@@ -4,10 +4,16 @@
 
 from __future__ import annotations
 
+import faulthandler
+import inspect
 import re
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor, wait
 from datetime import UTC, datetime
 from hashlib import sha256
-from threading import RLock
+from threading import Barrier, RLock
+from time import monotonic, sleep
+from typing import TypeVar
 
 import pytest
 
@@ -89,6 +95,134 @@ class RevisionProposalSubclass(RevisionProposal):
 
 
 UTC_INSTANT = datetime(2026, 7, 7, 4, 5, 6, tzinfo=UTC)
+RACE_SIZE = 16
+RACE_TIMEOUT_SECONDS = 10.0
+HARD_RACE_TIMEOUT_SECONDS = 15.0
+T = TypeVar("T")
+
+
+class YieldingMissingDict(dict[object, object]):
+    """Yield after a missing lookup to expose an unprotected check/write race."""
+
+    def get(self, key: object, default: object = None) -> object:
+        value = super().get(key, default)
+        if value is default:
+            sleep(0.02)
+        return value
+
+
+class YieldingMissingContainsDict(dict[object, object]):
+    """Yield after a missing membership test to expose an unprotected race."""
+
+    def __contains__(self, key: object) -> bool:
+        exists = super().__contains__(key)
+        if not exists:
+            sleep(0.02)
+        return exists
+
+
+class StubHash:
+    """Return one test-controlled hexadecimal digest."""
+
+    def __init__(self, digest: str) -> None:
+        self._digest = digest
+
+    def hexdigest(self) -> str:
+        return self._digest
+
+
+def run_race(
+    items: tuple[T, ...], operation: Callable[[T], object]
+) -> tuple[object, ...]:
+    """Release callers together and apply one deadline to result collection."""
+
+    barrier = Barrier(len(items), timeout=RACE_TIMEOUT_SECONDS)
+
+    def worker(item: T) -> object:
+        barrier.wait()
+        try:
+            return operation(item)
+        except MemoryServiceError as error:
+            return error
+
+    executor = ThreadPoolExecutor(max_workers=len(items))
+    futures = ()
+    completed = False
+    faulthandler.dump_traceback_later(HARD_RACE_TIMEOUT_SECONDS, exit=True)
+    try:
+        futures = tuple(executor.submit(worker, item) for item in items)
+        deadline = monotonic() + RACE_TIMEOUT_SECONDS
+        results = tuple(
+            future.result(timeout=max(0.0, deadline - monotonic()))
+            for future in futures
+        )
+        completed = True
+        return results
+    finally:
+        executor.shutdown(wait=completed, cancel_futures=not completed)
+        if completed:
+            faulthandler.cancel_dump_traceback_later()
+        else:
+            _, unfinished = wait(futures, timeout=1.0)
+            if not unfinished:
+                faulthandler.cancel_dump_traceback_later()
+
+
+def install_digest_map(
+    monkeypatch: pytest.MonkeyPatch,
+    digest_by_bytes: dict[bytes, str],
+) -> None:
+    """Install deterministic SHA-256 results for pre-seeded canonical bytes."""
+
+    def fake_sha256(canonical_bytes: bytes) -> StubHash:
+        return StubHash(digest_by_bytes[canonical_bytes])
+
+    monkeypatch.setattr(history_store_module.hashlib, "sha256", fake_sha256)
+
+
+def test_run_race_cancels_watchdog_only_after_workers_finish(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[tuple[object, ...]] = []
+
+    def record_arm(timeout: float, *, exit: bool) -> None:
+        events.append(("arm", timeout, exit))
+
+    def record_cancel() -> None:
+        events.append(("cancel",))
+
+    monkeypatch.setattr(faulthandler, "dump_traceback_later", record_arm)
+    monkeypatch.setattr(faulthandler, "cancel_dump_traceback_later", record_cancel)
+
+    assert run_race(tuple(range(RACE_SIZE)), lambda item: item) == tuple(
+        range(RACE_SIZE)
+    )
+    assert events == [
+        ("arm", HARD_RACE_TIMEOUT_SECONDS, True),
+        ("cancel",),
+    ]
+
+    def fail(_: int) -> object:
+        raise RuntimeError("worker failed")
+
+    events.clear()
+    with pytest.raises(RuntimeError, match="worker failed"):
+        run_race(tuple(range(RACE_SIZE)), fail)
+    assert events == [
+        ("arm", HARD_RACE_TIMEOUT_SECONDS, True),
+        ("cancel",),
+    ]
+
+    events.clear()
+    monkeypatch.setitem(
+        run_race.__globals__,
+        "wait",
+        lambda futures, timeout: (set(), set(futures)),
+    )
+
+    with pytest.raises(RuntimeError, match="worker failed"):
+        run_race(tuple(range(RACE_SIZE)), fail)
+    assert events == [("arm", HARD_RACE_TIMEOUT_SECONDS, True)]
 
 
 def make_scope(**overrides: str) -> MemoryScope:
@@ -145,26 +279,59 @@ def seeded_evidence_store() -> tuple[InMemoryEvidenceStore, EvidenceRecord]:
     return evidence_store, evidence
 
 
+def seed_candidates(
+    count: int,
+) -> tuple[
+    InMemoryMemoryHistoryStore,
+    InMemoryEvidenceStore,
+    tuple[MemoryCandidate, ...],
+]:
+    """Create candidates before any test replaces the shared hashlib function."""
+
+    evidence_store, evidence = seeded_evidence_store()
+    history = InMemoryMemoryHistoryStore(evidence_store)
+    candidates = tuple(
+        history.append_candidate(
+            make_candidate_proposal(
+                content=f"candidate-{index}",
+                evidence_ids=(evidence.evidence_id,),
+                idempotency_key=f"candidate-{index}",
+            )
+        )
+        for index in range(count)
+    )
+    return history, evidence_store, candidates
+
+
 def assert_candidate_indexes_empty(history: InMemoryMemoryHistoryStore) -> None:
     assert history._candidate_by_id == {}
     assert history._candidate_by_idempotency == {}
     assert history._candidates_by_scope == {}
 
 
-def test_history_store_contract_exposes_only_candidate_and_revision_surface() -> None:
-    public_members = {
-        name for name in MemoryHistoryStore.__dict__ if not name.startswith("_")
-    }
-
-    assert public_members == {
+def test_history_contract_exposes_no_mutation_or_activation_api() -> None:
+    expected = {
         "append_candidate",
+        "append_revision",
         "get_candidate",
         "get_candidate_evidence",
-        "list_candidates",
-        "append_revision",
         "get_revision",
+        "list_candidates",
         "list_revisions",
     }
+    protocol_methods = {
+        name
+        for name, value in inspect.getmembers(MemoryHistoryStore)
+        if not name.startswith("_") and callable(value)
+    }
+    implementation_methods = {
+        name
+        for name, value in inspect.getmembers(InMemoryMemoryHistoryStore)
+        if not name.startswith("_") and callable(value)
+    }
+
+    assert protocol_methods == expected
+    assert implementation_methods == expected
 
 
 def test_history_errors_share_memory_service_base() -> None:
@@ -1263,3 +1430,427 @@ def test_generation_overflow_leaves_all_revision_indexes_unchanged() -> None:
         history._revisions_by_scope,
     )
     assert after == before
+
+
+def test_concurrent_identical_candidate_and_revision_requests_converge() -> None:
+    evidence_store, evidence = seeded_evidence_store()
+    history = InMemoryMemoryHistoryStore(evidence_store)
+    history._candidate_by_id = YieldingMissingDict()  # type: ignore[assignment]
+    history._candidate_by_idempotency = YieldingMissingDict()  # type: ignore[assignment]
+    candidate_proposal = make_candidate_proposal(evidence_ids=(evidence.evidence_id,))
+
+    candidate_results = run_race(
+        (candidate_proposal,) * RACE_SIZE,
+        history.append_candidate,
+    )
+
+    candidate = candidate_results[0]
+    assert isinstance(candidate, MemoryCandidate)
+    assert all(item is candidate for item in candidate_results)
+
+    history._revision_by_id = YieldingMissingDict()  # type: ignore[assignment]
+    history._revision_by_idempotency = YieldingMissingDict()  # type: ignore[assignment]
+    revision_proposal = make_revision_proposal(candidate_id=candidate.candidate_id)
+
+    revision_results = run_race(
+        (revision_proposal,) * RACE_SIZE,
+        history.append_revision,
+    )
+
+    revision = revision_results[0]
+    assert isinstance(revision, MemoryRevision)
+    assert all(item is revision for item in revision_results)
+    assert history.list_candidates(make_scope()) == (candidate,)
+    assert history.list_revisions(make_scope()) == (revision,)
+
+
+def test_concurrent_candidate_idempotency_conflicts_have_one_winner() -> None:
+    evidence_store, evidence = seeded_evidence_store()
+    history = InMemoryMemoryHistoryStore(evidence_store)
+    history._candidate_by_id = YieldingMissingDict()  # type: ignore[assignment]
+    history._candidate_by_idempotency = YieldingMissingDict()  # type: ignore[assignment]
+    proposals = tuple(
+        make_candidate_proposal(
+            content=f"candidate-{index}",
+            evidence_ids=(evidence.evidence_id,),
+            idempotency_key="shared-candidate-key",
+        )
+        for index in range(RACE_SIZE)
+    )
+
+    outcomes = run_race(proposals, history.append_candidate)
+
+    winners = tuple(item for item in outcomes if isinstance(item, MemoryCandidate))
+    conflicts = tuple(
+        item for item in outcomes if isinstance(item, CandidateConflictError)
+    )
+    assert len(winners) == 1
+    assert len(conflicts) == RACE_SIZE - 1
+    winner = winners[0]
+    assert history._candidate_by_id == {(make_scope(), winner.candidate_id): winner}
+    assert history._candidate_by_idempotency == {
+        (make_scope(), winner.proposal.idempotency_key): winner
+    }
+    assert history._candidates_by_scope == {make_scope(): [winner]}
+    assert history.list_candidates(make_scope()) == (winner,)
+
+
+def test_concurrent_revision_idempotency_conflicts_leave_loser_candidates_usable() -> (
+    None
+):
+    history, _, candidates = seed_candidates(RACE_SIZE)
+    history._revision_by_id = YieldingMissingDict()  # type: ignore[assignment]
+    history._revision_by_idempotency = YieldingMissingDict()  # type: ignore[assignment]
+    proposals = tuple(
+        make_revision_proposal(
+            candidate_id=candidate.candidate_id,
+            idempotency_key="shared-revision-key",
+        )
+        for candidate in candidates
+    )
+
+    outcomes = run_race(proposals, history.append_revision)
+
+    winners = tuple(item for item in outcomes if isinstance(item, MemoryRevision))
+    conflicts = tuple(
+        item for item in outcomes if isinstance(item, RevisionConflictError)
+    )
+    assert len(winners) == 1
+    assert len(conflicts) == RACE_SIZE - 1
+    winner = winners[0]
+    assert history._revision_by_id == {(make_scope(), winner.revision_id): winner}
+    assert history._revision_by_idempotency == {
+        (make_scope(), winner.proposal.idempotency_key): winner
+    }
+    assert history._revision_by_candidate == {
+        (make_scope(), winner.proposal.candidate_id): winner
+    }
+    assert history._revisions_by_scope == {make_scope(): [winner]}
+    assert history.list_revisions(make_scope()) == (winner,)
+
+    winner_candidate_id = winner.proposal.candidate_id
+    loser = next(
+        item for item in candidates if item.candidate_id != winner_candidate_id
+    )
+    recovered = history.append_revision(
+        make_revision_proposal(
+            candidate_id=loser.candidate_id,
+            idempotency_key="recovered-revision-key",
+        )
+    )
+    assert recovered.proposal.candidate_id == loser.candidate_id
+
+
+def test_concurrent_different_transitions_using_one_candidate_have_one_winner() -> None:
+    history, candidate, _ = seeded_history_candidate()
+    history._revision_by_candidate = YieldingMissingContainsDict()  # type: ignore[assignment]
+    proposals = tuple(
+        make_revision_proposal(
+            candidate_id=candidate.candidate_id,
+            idempotency_key=f"revision-{index}",
+        )
+        for index in range(RACE_SIZE)
+    )
+
+    outcomes = run_race(proposals, history.append_revision)
+
+    winners = tuple(item for item in outcomes if isinstance(item, MemoryRevision))
+    conflicts = tuple(
+        item for item in outcomes if isinstance(item, RevisionConflictError)
+    )
+    assert len(winners) == 1
+    assert len(conflicts) == RACE_SIZE - 1
+    winner = winners[0]
+    assert history._revision_by_id == {(make_scope(), winner.revision_id): winner}
+    assert history._revision_by_idempotency == {
+        (make_scope(), winner.proposal.idempotency_key): winner
+    }
+    assert history._revision_by_candidate == {
+        (make_scope(), candidate.candidate_id): winner
+    }
+    assert history._revisions_by_scope == {make_scope(): [winner]}
+    assert history.list_revisions(make_scope()) == (winner,)
+
+
+def test_concurrent_sibling_revisions_all_survive() -> None:
+    history, _, candidates = seed_candidates(RACE_SIZE + 1)
+    parent = history.append_revision(
+        make_revision_proposal(candidate_id=candidates[0].candidate_id)
+    )
+    proposals = tuple(
+        make_revision_proposal(
+            candidate_id=candidate.candidate_id,
+            operation=RevisionOperation.REFINE,
+            parent_revision_id=parent.revision_id,
+            idempotency_key=f"sibling-{index}",
+        )
+        for index, candidate in enumerate(candidates[1:])
+    )
+
+    outcomes = run_race(proposals, history.append_revision)
+
+    siblings = tuple(item for item in outcomes if isinstance(item, MemoryRevision))
+    assert len(siblings) == RACE_SIZE
+    assert len({item.revision_id for item in siblings}) == RACE_SIZE
+    assert {item.proposal.candidate_id for item in siblings} == {
+        candidate.candidate_id for candidate in candidates[1:]
+    }
+    assert {item.proposal.parent_revision_id for item in siblings} == {
+        parent.revision_id
+    }
+    assert {item.memory_id for item in siblings} == {parent.memory_id}
+    assert {item.generation for item in siblings} == {parent.generation + 1}
+    stored = history.list_revisions(make_scope())
+    expected_revision_ids = {parent.revision_id} | {
+        item.revision_id for item in siblings
+    }
+    assert len(stored) == RACE_SIZE + 1
+    assert {item.revision_id for item in stored} == expected_revision_ids
+    assert len(history._revision_by_id) == RACE_SIZE + 1
+    assert len(history._revision_by_idempotency) == RACE_SIZE + 1
+    assert len(history._revision_by_candidate) == RACE_SIZE + 1
+    assert set(history._revisions_by_scope) == {make_scope()}
+    assert {
+        item.revision_id for item in history._revisions_by_scope[make_scope()]
+    } == expected_revision_ids
+
+
+@pytest.mark.parametrize("same_full_hash", [True, False], ids=["full", "prefix"])
+def test_concurrent_candidate_collision_is_atomic_and_loser_key_is_reusable(
+    monkeypatch: pytest.MonkeyPatch,
+    same_full_hash: bool,
+) -> None:
+    evidence_store, evidence = seeded_evidence_store()
+    history = InMemoryMemoryHistoryStore(evidence_store)
+    history._candidate_by_id = YieldingMissingDict()  # type: ignore[assignment]
+    proposals = tuple(
+        make_candidate_proposal(
+            content=f"collision-{index}",
+            evidence_ids=(evidence.evidence_id,),
+            idempotency_key=f"collision-{index}",
+        )
+        for index in range(RACE_SIZE)
+    )
+    prefix = "a" * 24
+    digest_by_bytes = {
+        proposal.canonical_bytes(): (
+            prefix + ("b" * 40 if same_full_hash else f"{index:040x}")
+        )
+        for index, proposal in enumerate(proposals)
+    }
+    assert {digest[:24] for digest in digest_by_bytes.values()} == {prefix}
+    assert len(set(digest_by_bytes.values())) == (1 if same_full_hash else RACE_SIZE)
+    install_digest_map(monkeypatch, digest_by_bytes)
+
+    outcomes = run_race(proposals, history.append_candidate)
+
+    winners = tuple(item for item in outcomes if isinstance(item, MemoryCandidate))
+    conflicts = tuple(
+        item for item in outcomes if isinstance(item, CandidateConflictError)
+    )
+    assert len(winners) == 1
+    assert len(conflicts) == RACE_SIZE - 1
+    assert len(history._candidate_by_id) == 1
+    assert len(history._candidate_by_idempotency) == 1
+    assert history._candidates_by_scope == {make_scope(): [winners[0]]}
+    assert history.list_candidates(make_scope()) == winners
+    assert set(history._candidate_by_id) == {(make_scope(), winners[0].candidate_id)}
+    assert set(history._candidate_by_idempotency) == {
+        (make_scope(), winners[0].proposal.idempotency_key)
+    }
+
+    winner_key = winners[0].proposal.idempotency_key
+    loser_proposal = next(
+        proposal for proposal in proposals if proposal.idempotency_key != winner_key
+    )
+    monkeypatch.undo()
+    recovered = history.append_candidate(loser_proposal)
+    assert recovered.proposal.idempotency_key == loser_proposal.idempotency_key
+
+
+@pytest.mark.parametrize("same_full_hash", [True, False], ids=["full", "prefix"])
+def test_concurrent_revision_collision_is_atomic_and_loser_candidate_is_reusable(
+    monkeypatch: pytest.MonkeyPatch,
+    same_full_hash: bool,
+) -> None:
+    history, _, candidates = seed_candidates(RACE_SIZE)
+    history._revision_by_id = YieldingMissingDict()  # type: ignore[assignment]
+    proposals = tuple(
+        make_revision_proposal(
+            candidate_id=candidate.candidate_id,
+            idempotency_key=f"collision-revision-{index}",
+        )
+        for index, candidate in enumerate(candidates)
+    )
+    prefix = "c" * 24
+    digest_by_bytes = {
+        proposal.canonical_bytes(): (
+            prefix + ("d" * 40 if same_full_hash else f"{index:040x}")
+        )
+        for index, proposal in enumerate(proposals)
+    }
+    assert {digest[:24] for digest in digest_by_bytes.values()} == {prefix}
+    assert len(set(digest_by_bytes.values())) == (1 if same_full_hash else RACE_SIZE)
+    install_digest_map(monkeypatch, digest_by_bytes)
+
+    outcomes = run_race(proposals, history.append_revision)
+
+    winners = tuple(item for item in outcomes if isinstance(item, MemoryRevision))
+    conflicts = tuple(
+        item for item in outcomes if isinstance(item, RevisionConflictError)
+    )
+    assert len(winners) == 1
+    assert len(conflicts) == RACE_SIZE - 1
+    assert len(history._revision_by_id) == 1
+    assert len(history._revision_by_idempotency) == 1
+    assert len(history._revision_by_candidate) == 1
+    assert history._revisions_by_scope == {make_scope(): [winners[0]]}
+    assert history.list_revisions(make_scope()) == winners
+    assert set(history._revision_by_id) == {(make_scope(), winners[0].revision_id)}
+    assert set(history._revision_by_idempotency) == {
+        (make_scope(), winners[0].proposal.idempotency_key)
+    }
+    assert set(history._revision_by_candidate) == {
+        (make_scope(), winners[0].proposal.candidate_id)
+    }
+
+    winner_candidate_id = winners[0].proposal.candidate_id
+    loser_proposal = next(
+        proposal
+        for proposal in proposals
+        if proposal.candidate_id != winner_candidate_id
+    )
+    monkeypatch.undo()
+    recovered = history.append_revision(loser_proposal)
+    assert recovered.proposal.candidate_id == loser_proposal.candidate_id
+
+
+@pytest.mark.parametrize("same_full_hash", [True, False], ids=["full", "prefix"])
+def test_forced_cross_scope_collisions_coexist_for_candidates_and_revisions(
+    monkeypatch: pytest.MonkeyPatch,
+    same_full_hash: bool,
+) -> None:
+    first_scope = make_scope(subject_id="user-1")
+    second_scope = make_scope(subject_id="user-2")
+    evidence_store = InMemoryEvidenceStore()
+    first_evidence = evidence_store.append(make_evidence_event(scope=first_scope))
+    second_evidence = evidence_store.append(
+        make_evidence_event(
+            scope=second_scope,
+            idempotency_key="second-evidence",
+        )
+    )
+    history = InMemoryMemoryHistoryStore(evidence_store)
+    candidate_proposals = (
+        make_candidate_proposal(
+            scope=first_scope,
+            content="first",
+            evidence_ids=(first_evidence.evidence_id,),
+            idempotency_key="shared-candidate-key",
+        ),
+        make_candidate_proposal(
+            scope=second_scope,
+            content="second",
+            evidence_ids=(second_evidence.evidence_id,),
+            idempotency_key="shared-candidate-key",
+        ),
+    )
+    candidate_prefix = "e" * 24
+    candidate_digests = tuple(
+        candidate_prefix + ("a" * 40 if same_full_hash else f"{index:040x}")
+        for index in range(2)
+    )
+    install_digest_map(
+        monkeypatch,
+        {
+            proposal.canonical_bytes(): digest
+            for proposal, digest in zip(
+                candidate_proposals,
+                candidate_digests,
+                strict=True,
+            )
+        },
+    )
+
+    candidates = tuple(history.append_candidate(item) for item in candidate_proposals)
+
+    assert candidates[0].candidate_id == candidates[1].candidate_id
+    assert (candidates[0].content_hash == candidates[1].content_hash) is same_full_hash
+    assert (
+        history.get_candidate(first_scope, candidates[0].candidate_id) is candidates[0]
+    )
+    assert (
+        history.get_candidate(second_scope, candidates[1].candidate_id) is candidates[1]
+    )
+    assert history.list_candidates(first_scope) == (candidates[0],)
+    assert history.list_candidates(second_scope) == (candidates[1],)
+    assert history.append_candidate(candidate_proposals[0]) is candidates[0]
+    assert history.append_candidate(candidate_proposals[1]) is candidates[1]
+    assert history._candidate_by_id == {
+        (first_scope, candidates[0].candidate_id): candidates[0],
+        (second_scope, candidates[1].candidate_id): candidates[1],
+    }
+    assert history._candidate_by_idempotency == {
+        (first_scope, "shared-candidate-key"): candidates[0],
+        (second_scope, "shared-candidate-key"): candidates[1],
+    }
+    assert history._candidates_by_scope == {
+        first_scope: [candidates[0]],
+        second_scope: [candidates[1]],
+    }
+
+    revision_proposals = (
+        make_revision_proposal(
+            scope=first_scope,
+            candidate_id=candidates[0].candidate_id,
+            idempotency_key="shared-revision-key",
+        ),
+        make_revision_proposal(
+            scope=second_scope,
+            candidate_id=candidates[1].candidate_id,
+            idempotency_key="shared-revision-key",
+        ),
+    )
+    revision_prefix = "f" * 24
+    revision_digests = tuple(
+        revision_prefix + ("b" * 40 if same_full_hash else f"{index + 2:040x}")
+        for index in range(2)
+    )
+    install_digest_map(
+        monkeypatch,
+        {
+            proposal.canonical_bytes(): digest
+            for proposal, digest in zip(
+                revision_proposals,
+                revision_digests,
+                strict=True,
+            )
+        },
+    )
+
+    revisions = tuple(history.append_revision(item) for item in revision_proposals)
+
+    assert revisions[0].revision_id == revisions[1].revision_id
+    assert (revisions[0].content_hash == revisions[1].content_hash) is same_full_hash
+    assert history.get_revision(first_scope, revisions[0].revision_id) is revisions[0]
+    assert history.get_revision(second_scope, revisions[1].revision_id) is revisions[1]
+    assert history.list_revisions(first_scope) == (revisions[0],)
+    assert history.list_revisions(second_scope) == (revisions[1],)
+    assert history.append_revision(revision_proposals[0]) is revisions[0]
+    assert history.append_revision(revision_proposals[1]) is revisions[1]
+    assert history._revision_by_id == {
+        (first_scope, revisions[0].revision_id): revisions[0],
+        (second_scope, revisions[1].revision_id): revisions[1],
+    }
+    assert history._revision_by_idempotency == {
+        (first_scope, "shared-revision-key"): revisions[0],
+        (second_scope, "shared-revision-key"): revisions[1],
+    }
+    assert history._revision_by_candidate == {
+        (first_scope, candidates[0].candidate_id): revisions[0],
+        (second_scope, candidates[1].candidate_id): revisions[1],
+    }
+    assert history._revisions_by_scope == {
+        first_scope: [revisions[0]],
+        second_scope: [revisions[1]],
+    }
