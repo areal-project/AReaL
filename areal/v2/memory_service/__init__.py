@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
-"""Public contracts for immutable Memory Service evidence and history."""
+"""Public contracts for immutable Memory Service evidence, history, and releases."""
 
 from areal.v2.memory_service.errors import (
     CandidateConflictError,
@@ -8,6 +8,8 @@ from areal.v2.memory_service.errors import (
     EvidenceConflictError,
     EvidenceNotFoundError,
     MemoryServiceError,
+    ReleaseConflictError,
+    ReleaseNotFoundError,
     RevisionConflictError,
     RevisionNotFoundError,
 )
@@ -22,6 +24,11 @@ from areal.v2.memory_service.history_types import (
     RevisionOperation,
     RevisionProposal,
 )
+from areal.v2.memory_service.release_store import (
+    InMemoryMemoryReleaseStore,
+    MemoryReleaseStore,
+)
+from areal.v2.memory_service.release_types import MemoryRelease, ReleaseManifest
 from areal.v2.memory_service.store import EvidenceStore, InMemoryEvidenceStore
 from areal.v2.memory_service.types import (
     EvidenceEvent,
@@ -42,11 +49,17 @@ __all__ = [
     "EvidenceStore",
     "InMemoryEvidenceStore",
     "InMemoryMemoryHistoryStore",
+    "InMemoryMemoryReleaseStore",
     "MemoryCandidate",
     "MemoryHistoryStore",
+    "MemoryRelease",
+    "MemoryReleaseStore",
     "MemoryRevision",
     "MemoryScope",
     "MemoryServiceError",
+    "ReleaseConflictError",
+    "ReleaseManifest",
+    "ReleaseNotFoundError",
     "RevisionConflictError",
     "RevisionNotFoundError",
     "RevisionOperation",

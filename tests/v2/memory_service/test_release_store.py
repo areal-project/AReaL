@@ -4,14 +4,20 @@
 
 from __future__ import annotations
 
+import faulthandler
 import inspect
 import re
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from hashlib import sha256
+from threading import Barrier, Event, RLock
+from time import monotonic, sleep
+from typing import TypeVar
 
 import pytest
 
-from areal.v2.memory_service import release_store as release_store_module
+import areal.v2.memory_service.release_store as release_store_module
 from areal.v2.memory_service.errors import (
     MemoryServiceError,
     ReleaseConflictError,
@@ -29,7 +35,7 @@ from areal.v2.memory_service.release_store import (
     InMemoryMemoryReleaseStore,
     MemoryReleaseStore,
 )
-from areal.v2.memory_service.release_types import ReleaseManifest
+from areal.v2.memory_service.release_types import MemoryRelease, ReleaseManifest
 from areal.v2.memory_service.store import InMemoryEvidenceStore
 from areal.v2.memory_service.types import (
     EvidenceEvent,
@@ -73,6 +79,16 @@ class NoLookupHistory:
         raise AssertionError("release unexpectedly looked up a revision")
 
 
+class YieldingMissingDict(dict[object, object]):
+    """Yield after a missing lookup to expose an unprotected check/write race."""
+
+    def get(self, key: object, default: object = None) -> object:
+        value = super().get(key, default)
+        if value is default:
+            sleep(0.02)
+        return value
+
+
 class StubHash:
     """Return one test-controlled hexadecimal digest."""
 
@@ -85,6 +101,151 @@ class StubHash:
 
 UTC_INSTANT = datetime(2026, 7, 7, 4, 5, 6, tzinfo=UTC)
 LONE_SURROGATE = "\ud800"
+RACE_SIZE = 16
+RACE_TIMEOUT_SECONDS = 10.0
+HARD_RACE_TIMEOUT_SECONDS = 15.0
+T = TypeVar("T")
+
+
+def run_race(
+    items: tuple[T, ...], operation: Callable[[T], object]
+) -> tuple[object, ...]:
+    """Release callers together and apply one deadline to result collection."""
+
+    barrier = Barrier(len(items), timeout=RACE_TIMEOUT_SECONDS)
+
+    def worker(item: T) -> object:
+        barrier.wait()
+        try:
+            return operation(item)
+        except MemoryServiceError as error:
+            return error
+
+    faulthandler.dump_traceback_later(HARD_RACE_TIMEOUT_SECONDS, exit=True)
+    try:
+        with ThreadPoolExecutor(max_workers=len(items)) as executor:
+            futures = tuple(executor.submit(worker, item) for item in items)
+            deadline = monotonic() + RACE_TIMEOUT_SECONDS
+            return tuple(
+                future.result(timeout=max(0.0, deadline - monotonic()))
+                for future in futures
+            )
+    finally:
+        faulthandler.cancel_dump_traceback_later()
+
+
+def install_digest_map(
+    monkeypatch: pytest.MonkeyPatch,
+    digest_by_bytes: dict[bytes, str],
+) -> None:
+    """Install deterministic release digests for pre-seeded manifests."""
+
+    def fake_sha256(canonical_bytes: bytes) -> StubHash:
+        return StubHash(digest_by_bytes[canonical_bytes])
+
+    monkeypatch.setattr(release_store_module, "sha256", fake_sha256)
+
+
+def test_run_race_waits_for_workers_before_cancelling_watchdog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[tuple[object, ...]] = []
+
+    def record_arm(timeout: float, *, exit: bool) -> None:
+        events.append(("arm", timeout, exit))
+
+    def record_cancel() -> None:
+        events.append(("cancel",))
+
+    monkeypatch.setattr(faulthandler, "dump_traceback_later", record_arm)
+    monkeypatch.setattr(faulthandler, "cancel_dump_traceback_later", record_cancel)
+
+    assert run_race(tuple(range(RACE_SIZE)), lambda item: item) == tuple(
+        range(RACE_SIZE)
+    )
+    assert events == [
+        ("arm", HARD_RACE_TIMEOUT_SECONDS, True),
+        ("cancel",),
+    ]
+
+    finished: set[int] = set()
+    finished_lock = RLock()
+
+    def fail_or_finish(item: int) -> object:
+        if item == 0:
+            raise RuntimeError("worker failed")
+        sleep(0.15)
+        with finished_lock:
+            finished.add(item)
+        return item
+
+    events.clear()
+    started_at = monotonic()
+    with pytest.raises(RuntimeError, match="worker failed"):
+        run_race(tuple(range(RACE_SIZE)), fail_or_finish)
+    assert monotonic() - started_at >= 0.1
+    assert finished == set(range(1, RACE_SIZE))
+    assert events == [
+        ("arm", HARD_RACE_TIMEOUT_SECONDS, True),
+        ("cancel",),
+    ]
+
+
+def test_run_race_watchdog_wraps_executor_lifecycle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[tuple[object, ...]] = []
+
+    def record_arm(timeout: float, *, exit: bool) -> None:
+        events.append(("arm", timeout, exit))
+
+    def record_cancel() -> None:
+        events.append(("cancel",))
+
+    class FailingFuture:
+        def result(self, timeout: float) -> object:
+            events.append(("result",))
+            raise RuntimeError("worker failed")
+
+    class StubExecutor:
+        def __init__(self, *, max_workers: int) -> None:
+            events.append(("executor:init", max_workers))
+
+        def __enter__(self) -> StubExecutor:
+            events.append(("executor:enter",))
+            return self
+
+        def __exit__(
+            self,
+            exc_type: type[BaseException] | None,
+            exc_value: BaseException | None,
+            traceback: object,
+        ) -> None:
+            events.append(("executor:exit", exc_type))
+
+        def submit(
+            self,
+            operation: Callable[[int], object],
+            item: int,
+        ) -> FailingFuture:
+            events.append(("submit", item))
+            return FailingFuture()
+
+    monkeypatch.setattr(faulthandler, "dump_traceback_later", record_arm)
+    monkeypatch.setattr(faulthandler, "cancel_dump_traceback_later", record_cancel)
+    monkeypatch.setitem(run_race.__globals__, "ThreadPoolExecutor", StubExecutor)
+
+    with pytest.raises(RuntimeError, match="worker failed"):
+        run_race((0,), lambda item: item)
+    assert events == [
+        ("arm", HARD_RACE_TIMEOUT_SECONDS, True),
+        ("executor:init", 1),
+        ("executor:enter",),
+        ("submit", 0),
+        ("result",),
+        ("executor:exit", RuntimeError),
+        ("cancel",),
+    ]
 
 
 def make_scope(**overrides: str) -> MemoryScope:
@@ -227,6 +388,52 @@ def seeded_history(
         idempotency_key="revision-other",
     )
     return history, (first_evidence, second_evidence), (root, child, other)
+
+
+def seed_revisions(
+    count: int = RACE_SIZE,
+    *,
+    siblings: bool = False,
+    scope: MemoryScope | None = None,
+) -> tuple[InMemoryMemoryHistoryStore, tuple[MemoryRevision, ...]]:
+    """Seed independent roots or same-memory siblings for release races."""
+
+    scope = scope or make_scope()
+    evidence_store = InMemoryEvidenceStore()
+    evidence = evidence_store.append(
+        make_event(
+            scope=scope,
+            sequence_no=0,
+            payload="race evidence",
+            idempotency_key="race-evidence",
+        )
+    )
+    history = InMemoryMemoryHistoryStore(evidence_store)
+
+    def make_revision(index: int, parent: MemoryRevision | None) -> MemoryRevision:
+        candidate = append_candidate(
+            history,
+            scope=scope,
+            evidence_ids=(evidence.evidence_id,),
+            content=f"race memory {index}",
+            idempotency_key=f"race-candidate-{index}",
+        )
+        return append_revision(
+            history,
+            scope=scope,
+            candidate_id=candidate.candidate_id,
+            operation=(
+                RevisionOperation.ADD if parent is None else RevisionOperation.REFINE
+            ),
+            parent_revision_id=None if parent is None else parent.revision_id,
+            idempotency_key=f"race-revision-{index}",
+        )
+
+    if not siblings:
+        return history, tuple(make_revision(index, None) for index in range(count))
+
+    parent = make_revision(-1, None)
+    return history, tuple(make_revision(index, parent) for index in range(count))
 
 
 def seeded_sibling_revisions() -> tuple[
@@ -571,6 +778,137 @@ def test_append_release_uses_module_level_sha256(
     assert release.release_id == f"rel_{digest[:24]}"
 
 
+def test_release_validation_and_commit_obey_exact_lock_epochs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    history, _, (root, _, _) = seeded_history()
+    records: list[tuple[str, int]] = []
+
+    class EpochLock:
+        def __init__(self) -> None:
+            self._lock = RLock()
+            self.held = False
+            self.epoch = 0
+            self.enter_count = 0
+
+        def __enter__(self) -> EpochLock:
+            self._lock.acquire()
+            assert not self.held
+            self.held = True
+            self.epoch += 1
+            self.enter_count += 1
+            records.append(("lock:enter", self.epoch))
+            return self
+
+        def __exit__(
+            self,
+            exc_type: object,
+            exc_value: object,
+            traceback: object,
+        ) -> None:
+            records.append(("lock:exit", self.epoch))
+            self.held = False
+            self._lock.release()
+
+        def record_locked(self, event: str) -> None:
+            assert self.held, f"{event} accessed outside release lock"
+            records.append((event, self.epoch))
+
+        def record_unlocked(self, event: str) -> None:
+            assert not self.held, f"{event} ran inside release lock"
+            records.append((event, self.epoch))
+
+    epoch_lock = EpochLock()
+
+    class RecordingList(list[object]):
+        def append(self, item: object) -> None:
+            epoch_lock.record_locked("scope:append")
+            super().append(item)
+
+    class RecordingDict(dict[object, object]):
+        def __init__(self, name: str) -> None:
+            super().__init__()
+            self._name = name
+
+        def get(self, key: object, default: object = None) -> object:
+            epoch_lock.record_locked(f"{self._name}:get")
+            return super().get(key, default)
+
+        def __setitem__(self, key: object, value: object) -> None:
+            epoch_lock.record_locked(f"{self._name}:set")
+            super().__setitem__(key, value)
+
+        def setdefault(self, key: object, default: object = None) -> object:
+            epoch_lock.record_locked(f"{self._name}:setdefault")
+            if not dict.__contains__(self, key):
+                default = RecordingList(default or ())
+            return super().setdefault(key, default)
+
+    class ObservedHistory:
+        def get_revision(
+            self,
+            scope: MemoryScope,
+            revision_id: str,
+        ) -> MemoryRevision:
+            epoch_lock.record_unlocked("history:get")
+            return history.get_revision(scope, revision_id)
+
+    original_sha256 = release_store_module.sha256
+
+    def observed_sha256(canonical_bytes: bytes) -> object:
+        epoch_lock.record_unlocked("sha256")
+        return original_sha256(canonical_bytes)
+
+    monkeypatch.setattr(release_store_module, "sha256", observed_sha256)
+    store = InMemoryMemoryReleaseStore(ObservedHistory())  # type: ignore[arg-type]
+    store._lock = epoch_lock  # type: ignore[assignment]
+    store._release_by_id = RecordingDict("release")  # type: ignore[assignment]
+    store._release_by_idempotency = RecordingDict(  # type: ignore[assignment]
+        "idempotency"
+    )
+    store._releases_by_scope = RecordingDict("scope")  # type: ignore[assignment]
+    manifest = ReleaseManifest(make_scope(), (root.revision_id,))
+
+    release = store.append_release(manifest, idempotency_key="release-1")
+
+    assert epoch_lock.enter_count == 2
+    assert records == [
+        ("sha256", 0),
+        ("lock:enter", 1),
+        ("idempotency:get", 1),
+        ("lock:exit", 1),
+        ("history:get", 1),
+        ("lock:enter", 2),
+        ("idempotency:get", 2),
+        ("release:get", 2),
+        ("release:set", 2),
+        ("idempotency:set", 2),
+        ("scope:setdefault", 2),
+        ("scope:append", 2),
+        ("lock:exit", 2),
+    ]
+
+    records.clear()
+    epoch_lock.epoch = 0
+    epoch_lock.enter_count = 0
+    alias = store.append_release(manifest, idempotency_key="release-alias")
+
+    assert alias is release
+    assert epoch_lock.enter_count == 2
+    assert records == [
+        ("sha256", 0),
+        ("lock:enter", 1),
+        ("idempotency:get", 1),
+        ("lock:exit", 1),
+        ("history:get", 1),
+        ("lock:enter", 2),
+        ("idempotency:get", 2),
+        ("release:get", 2),
+        ("idempotency:set", 2),
+        ("lock:exit", 2),
+    ]
+
+
 def test_get_release_snapshots_identifier_subclass_before_lookup() -> None:
     history = NoLookupHistory()
     store = InMemoryMemoryReleaseStore(history)  # type: ignore[arg-type]
@@ -643,3 +981,328 @@ def test_list_releases_is_sorted_and_previous_tuple_stays_stable() -> None:
     assert store.list_releases(scope) == tuple(
         sorted((first, second, third), key=lambda item: item.release_id)
     )
+
+
+def test_missing_member_error_is_not_rewritten_by_same_key_winner() -> None:
+    history, revisions = seed_revisions(1)
+    scope = make_scope()
+    missing_lookup_started = Event()
+    allow_missing_lookup = Event()
+
+    class BlockingMissingHistory:
+        def get_revision(
+            self,
+            requested_scope: MemoryScope,
+            revision_id: str,
+        ) -> MemoryRevision:
+            if revision_id == "rev_missing":
+                missing_lookup_started.set()
+                assert allow_missing_lookup.wait(timeout=RACE_TIMEOUT_SECONDS)
+            return history.get_revision(requested_scope, revision_id)
+
+    store = InMemoryMemoryReleaseStore(BlockingMissingHistory())  # type: ignore[arg-type]
+    invalid_manifest = ReleaseManifest(scope, ("rev_missing",))
+    valid_manifest = ReleaseManifest(scope, (revisions[0].revision_id,))
+    winner: MemoryRelease | None = None
+    invalid_error: RevisionNotFoundError | None = None
+
+    faulthandler.dump_traceback_later(HARD_RACE_TIMEOUT_SECONDS, exit=True)
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            invalid_future = executor.submit(
+                store.append_release,
+                invalid_manifest,
+                idempotency_key="shared-release-key",
+            )
+            try:
+                assert missing_lookup_started.wait(timeout=RACE_TIMEOUT_SECONDS)
+                valid_future = executor.submit(
+                    store.append_release,
+                    valid_manifest,
+                    idempotency_key="shared-release-key",
+                )
+                winner = valid_future.result(timeout=RACE_TIMEOUT_SECONDS)
+            finally:
+                allow_missing_lookup.set()
+
+            with pytest.raises(RevisionNotFoundError, match="rev_missing") as raised:
+                invalid_future.result(timeout=RACE_TIMEOUT_SECONDS)
+            invalid_error = raised.value
+    finally:
+        faulthandler.cancel_dump_traceback_later()
+
+    assert type(invalid_error) is RevisionNotFoundError
+    assert winner is not None
+    assert winner.manifest is valid_manifest
+    assert store._release_by_id == {(scope, winner.release_id): winner}
+    assert store._release_by_idempotency == {(scope, "shared-release-key"): winner}
+    assert store._releases_by_scope == {scope: [winner]}
+
+
+def test_concurrent_same_key_and_manifest_converge_to_one_release() -> None:
+    history, revisions = seed_revisions(1)
+    store = InMemoryMemoryReleaseStore(history)
+    store._release_by_id = YieldingMissingDict()  # type: ignore[assignment]
+    store._release_by_idempotency = YieldingMissingDict()  # type: ignore[assignment]
+    manifest = ReleaseManifest(make_scope(), (revisions[0].revision_id,))
+
+    outcomes = run_race(
+        (manifest,) * RACE_SIZE,
+        lambda item: store.append_release(item, idempotency_key="shared-key"),
+    )
+
+    release = outcomes[0]
+    assert isinstance(release, MemoryRelease)
+    assert all(item is release for item in outcomes)
+    assert store._release_by_id == {(manifest.scope, release.release_id): release}
+    assert store._release_by_idempotency == {(manifest.scope, "shared-key"): release}
+    assert store._releases_by_scope == {manifest.scope: [release]}
+
+
+def test_concurrent_keys_for_same_manifest_all_alias_one_release() -> None:
+    history, revisions = seed_revisions(1)
+    store = InMemoryMemoryReleaseStore(history)
+    store._release_by_id = YieldingMissingDict()  # type: ignore[assignment]
+    store._release_by_idempotency = YieldingMissingDict()  # type: ignore[assignment]
+    manifest = ReleaseManifest(make_scope(), (revisions[0].revision_id,))
+    keys = tuple(f"release-key-{index}" for index in range(RACE_SIZE))
+
+    outcomes = run_race(
+        keys,
+        lambda key: store.append_release(manifest, idempotency_key=key),
+    )
+
+    release = outcomes[0]
+    assert isinstance(release, MemoryRelease)
+    assert all(item is release for item in outcomes)
+    assert store._release_by_id == {(manifest.scope, release.release_id): release}
+    assert store._release_by_idempotency == {
+        (manifest.scope, key): release for key in keys
+    }
+    assert store._releases_by_scope == {manifest.scope: [release]}
+
+
+def test_concurrent_manifests_for_shared_key_leave_losers_recoverable() -> None:
+    history, revisions = seed_revisions()
+    store = InMemoryMemoryReleaseStore(history)
+    store._release_by_id = YieldingMissingDict()  # type: ignore[assignment]
+    store._release_by_idempotency = YieldingMissingDict()  # type: ignore[assignment]
+    manifests = tuple(
+        ReleaseManifest(make_scope(), (revision.revision_id,)) for revision in revisions
+    )
+
+    outcomes = run_race(
+        manifests,
+        lambda manifest: store.append_release(
+            manifest,
+            idempotency_key="shared-release-key",
+        ),
+    )
+
+    winners = tuple(item for item in outcomes if isinstance(item, MemoryRelease))
+    conflicts = tuple(
+        item for item in outcomes if isinstance(item, ReleaseConflictError)
+    )
+    assert len(winners) == 1
+    assert len(conflicts) == RACE_SIZE - 1
+    winner = winners[0]
+    assert store._release_by_id == {(winner.manifest.scope, winner.release_id): winner}
+    assert store._release_by_idempotency == {
+        (winner.manifest.scope, "shared-release-key"): winner
+    }
+    assert store._releases_by_scope == {winner.manifest.scope: [winner]}
+
+    loser_manifests = tuple(
+        manifest for manifest in manifests if manifest is not winner.manifest
+    )
+    recovered = tuple(
+        store.append_release(
+            manifest,
+            idempotency_key=f"recovered-release-{index}",
+        )
+        for index, manifest in enumerate(loser_manifests)
+    )
+    releases = store.list_releases(make_scope())
+    assert len(recovered) == RACE_SIZE - 1
+    assert len(releases) == RACE_SIZE
+    assert len(store._release_by_id) == RACE_SIZE
+    assert len(store._release_by_idempotency) == RACE_SIZE
+    assert len(store._releases_by_scope[make_scope()]) == RACE_SIZE
+    assert set(store._release_by_id.values()) == set(releases)
+    assert set(store._release_by_idempotency.values()) == set(releases)
+    assert set(store._releases_by_scope[make_scope()]) == set(releases)
+
+
+def test_same_memory_siblings_survive_in_separate_concurrent_releases() -> None:
+    history, siblings = seed_revisions(siblings=True)
+    assert len({revision.memory_id for revision in siblings}) == 1
+    store = InMemoryMemoryReleaseStore(history)
+    store._release_by_id = YieldingMissingDict()  # type: ignore[assignment]
+    store._release_by_idempotency = YieldingMissingDict()  # type: ignore[assignment]
+    requests = tuple(
+        (
+            ReleaseManifest(make_scope(), (revision.revision_id,)),
+            f"sibling-release-{index}",
+        )
+        for index, revision in enumerate(siblings)
+    )
+
+    outcomes = run_race(
+        requests,
+        lambda item: store.append_release(item[0], idempotency_key=item[1]),
+    )
+
+    releases = tuple(item for item in outcomes if isinstance(item, MemoryRelease))
+    assert len(releases) == RACE_SIZE
+    assert len({release.release_id for release in releases}) == RACE_SIZE
+    assert {release.manifest.revision_ids[0] for release in releases} == {
+        revision.revision_id for revision in siblings
+    }
+    assert set(store.list_releases(make_scope())) == set(releases)
+    assert len(store._release_by_id) == RACE_SIZE
+    assert len(store._release_by_idempotency) == RACE_SIZE
+    assert len(store._releases_by_scope[make_scope()]) == RACE_SIZE
+
+
+@pytest.mark.parametrize("same_full_hash", [True, False], ids=["full", "prefix"])
+def test_concurrent_release_collision_is_atomic_and_all_losers_recover(
+    monkeypatch: pytest.MonkeyPatch,
+    same_full_hash: bool,
+) -> None:
+    history, revisions = seed_revisions()
+    scope = make_scope()
+    store = InMemoryMemoryReleaseStore(history)
+    store._release_by_id = YieldingMissingDict()  # type: ignore[assignment]
+    store._release_by_idempotency = YieldingMissingDict()  # type: ignore[assignment]
+    manifests = tuple(
+        ReleaseManifest(scope, (revision.revision_id,)) for revision in revisions
+    )
+    keys = tuple(f"collision-release-{index}" for index in range(RACE_SIZE))
+    prefix = "a" * 24
+    digest_by_bytes = {
+        manifest.canonical_bytes(): (
+            prefix + ("b" * 40 if same_full_hash else f"{index:040x}")
+        )
+        for index, manifest in enumerate(manifests)
+    }
+    assert {digest[:24] for digest in digest_by_bytes.values()} == {prefix}
+    assert len(set(digest_by_bytes.values())) == (1 if same_full_hash else RACE_SIZE)
+    install_digest_map(monkeypatch, digest_by_bytes)
+
+    outcomes = run_race(
+        tuple(zip(manifests, keys, strict=True)),
+        lambda item: store.append_release(item[0], idempotency_key=item[1]),
+    )
+
+    winners = tuple(item for item in outcomes if isinstance(item, MemoryRelease))
+    conflicts = tuple(
+        item for item in outcomes if isinstance(item, ReleaseConflictError)
+    )
+    assert len(winners) == 1
+    assert len(conflicts) == RACE_SIZE - 1
+    winner = winners[0]
+    winner_index = next(
+        index
+        for index, outcome in enumerate(outcomes)
+        if isinstance(outcome, MemoryRelease)
+    )
+    winner_key = keys[winner_index]
+    loser_indexes = tuple(index for index in range(RACE_SIZE) if index != winner_index)
+    assert store._release_by_id == {(scope, winner.release_id): winner}
+    assert store._release_by_idempotency == {(scope, winner_key): winner}
+    assert store._releases_by_scope == {scope: [winner]}
+    assert all(
+        (scope, keys[index]) not in store._release_by_idempotency
+        for index in loser_indexes
+    )
+
+    monkeypatch.undo()
+    recovered = tuple(
+        store.append_release(
+            manifests[index],
+            idempotency_key=keys[index],
+        )
+        for index in loser_indexes
+    )
+
+    releases = store.list_releases(scope)
+    assert len(recovered) == RACE_SIZE - 1
+    assert len(releases) == RACE_SIZE
+    assert len(store._release_by_id) == RACE_SIZE
+    assert len(store._release_by_idempotency) == RACE_SIZE
+    assert len(store._releases_by_scope[scope]) == RACE_SIZE
+    assert set(store._release_by_id.values()) == set(releases)
+    assert set(store._release_by_idempotency.values()) == set(releases)
+    assert set(store._releases_by_scope[scope]) == set(releases)
+    assert {release.manifest for release in releases} == set(manifests)
+
+
+@pytest.mark.parametrize("same_full_hash", [True, False], ids=["full", "prefix"])
+def test_forced_release_id_collision_is_isolated_across_scopes(
+    monkeypatch: pytest.MonkeyPatch,
+    same_full_hash: bool,
+) -> None:
+    first_scope = make_scope(subject_id="user-1")
+    second_scope = make_scope(subject_id="user-2")
+    manifests = (
+        ReleaseManifest(first_scope, ()),
+        ReleaseManifest(second_scope, ()),
+    )
+    prefix = "c" * 24
+    digests = tuple(
+        prefix + ("d" * 40 if same_full_hash else f"{index:040x}") for index in range(2)
+    )
+    install_digest_map(
+        monkeypatch,
+        {
+            manifest.canonical_bytes(): digest
+            for manifest, digest in zip(manifests, digests, strict=True)
+        },
+    )
+    history = NoLookupHistory()
+    store = InMemoryMemoryReleaseStore(history)  # type: ignore[arg-type]
+    store._release_by_id = YieldingMissingDict()  # type: ignore[assignment]
+    store._release_by_idempotency = YieldingMissingDict()  # type: ignore[assignment]
+
+    outcomes = run_race(
+        manifests,
+        lambda manifest: store.append_release(
+            manifest,
+            idempotency_key="shared-scoped-key",
+        ),
+    )
+    aliases = run_race(
+        manifests,
+        lambda manifest: store.append_release(
+            manifest,
+            idempotency_key="shared-scoped-alias",
+        ),
+    )
+
+    first, second = outcomes
+    assert isinstance(first, MemoryRelease)
+    assert isinstance(second, MemoryRelease)
+    assert first is not second
+    assert first.release_id == second.release_id == f"rel_{prefix}"
+    assert (first.content_hash == second.content_hash) is same_full_hash
+    assert aliases[0] is first
+    assert aliases[1] is second
+    assert store.get_release(first_scope, first.release_id) is first
+    assert store.get_release(second_scope, second.release_id) is second
+    assert store.list_releases(first_scope) == (first,)
+    assert store.list_releases(second_scope) == (second,)
+    assert store._release_by_id == {
+        (first_scope, first.release_id): first,
+        (second_scope, second.release_id): second,
+    }
+    assert store._release_by_idempotency == {
+        (first_scope, "shared-scoped-key"): first,
+        (second_scope, "shared-scoped-key"): second,
+        (first_scope, "shared-scoped-alias"): first,
+        (second_scope, "shared-scoped-alias"): second,
+    }
+    assert store._releases_by_scope == {
+        first_scope: [first],
+        second_scope: [second],
+    }
+    assert history.lookup_count == 0

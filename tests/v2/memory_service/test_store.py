@@ -25,6 +25,8 @@ from areal.v2.memory_service.errors import (
     EvidenceConflictError,
     EvidenceNotFoundError,
     MemoryServiceError,
+    ReleaseConflictError,
+    ReleaseNotFoundError,
     RevisionConflictError,
     RevisionNotFoundError,
 )
@@ -39,6 +41,11 @@ from areal.v2.memory_service.history_types import (
     RevisionOperation,
     RevisionProposal,
 )
+from areal.v2.memory_service.release_store import (
+    InMemoryMemoryReleaseStore,
+    MemoryReleaseStore,
+)
+from areal.v2.memory_service.release_types import MemoryRelease, ReleaseManifest
 from areal.v2.memory_service.store import EvidenceStore, InMemoryEvidenceStore
 from areal.v2.memory_service.types import (
     EvidenceEvent,
@@ -300,9 +307,22 @@ def test_error_types_share_memory_service_base_error() -> None:
 
 
 def test_public_module_exports_stable_memory_contracts() -> None:
-    """Expose only the intended immutable evidence and history contracts."""
+    """Expose only the intended immutable evidence, history, and release contracts."""
+    from areal.v2.memory_service import (
+        InMemoryMemoryReleaseStore as PublicInMemoryMemoryReleaseStore,
+    )
+    from areal.v2.memory_service import MemoryRelease as PublicMemoryRelease
+    from areal.v2.memory_service import MemoryReleaseStore as PublicMemoryReleaseStore
+    from areal.v2.memory_service import (
+        ReleaseConflictError as PublicReleaseConflictError,
+    )
+    from areal.v2.memory_service import ReleaseManifest as PublicReleaseManifest
+    from areal.v2.memory_service import (
+        ReleaseNotFoundError as PublicReleaseNotFoundError,
+    )
+
     assert memory_service.__doc__ == (
-        "Public contracts for immutable Memory Service evidence and history."
+        "Public contracts for immutable Memory Service evidence, history, and releases."
     )
     assert memory_service.__all__ == [
         "CandidateConflictError",
@@ -316,11 +336,17 @@ def test_public_module_exports_stable_memory_contracts() -> None:
         "EvidenceStore",
         "InMemoryEvidenceStore",
         "InMemoryMemoryHistoryStore",
+        "InMemoryMemoryReleaseStore",
         "MemoryCandidate",
         "MemoryHistoryStore",
+        "MemoryRelease",
+        "MemoryReleaseStore",
         "MemoryRevision",
         "MemoryScope",
         "MemoryServiceError",
+        "ReleaseConflictError",
+        "ReleaseManifest",
+        "ReleaseNotFoundError",
         "RevisionConflictError",
         "RevisionNotFoundError",
         "RevisionOperation",
@@ -414,6 +440,12 @@ def test_public_module_exports_stable_memory_contracts() -> None:
         strict=True,
     ):
         assert public_symbol is defining_symbol
+    assert PublicInMemoryMemoryReleaseStore is InMemoryMemoryReleaseStore
+    assert PublicMemoryRelease is MemoryRelease
+    assert PublicMemoryReleaseStore is MemoryReleaseStore
+    assert PublicReleaseConflictError is ReleaseConflictError
+    assert PublicReleaseManifest is ReleaseManifest
+    assert PublicReleaseNotFoundError is ReleaseNotFoundError
 
 
 def test_evidence_store_contract_exposes_no_update_or_delete() -> None:
