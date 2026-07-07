@@ -53,6 +53,8 @@ class InMemoryEvidenceStore:
     def append(self, event: EvidenceEvent) -> EvidenceRecord:
         """Persist an event, enforcing scoped idempotency and collision safety."""
 
+        if type(event) is not EvidenceEvent:
+            raise TypeError("event must be an EvidenceEvent")
         canonical_bytes = event.canonical_bytes()
         content_hash = hashlib.sha256(canonical_bytes).hexdigest()
         evidence_id = f"evd_{content_hash[:24]}"
@@ -90,6 +92,8 @@ class InMemoryEvidenceStore:
     def get(self, scope: MemoryScope, evidence_id: str) -> EvidenceRecord:
         """Return evidence only when it belongs to the requested scope."""
 
+        if type(scope) is not MemoryScope:
+            raise TypeError("scope must be a MemoryScope")
         with self._lock:
             record = self._by_evidence_id.get((scope, evidence_id))
             if record is None:
@@ -105,6 +109,8 @@ class InMemoryEvidenceStore:
     ) -> tuple[EvidenceRecord, ...]:
         """Return a stable snapshot of records belonging to the requested scope."""
 
+        if type(scope) is not MemoryScope:
+            raise TypeError("scope must be a MemoryScope")
         with self._lock:
             matches = (
                 record

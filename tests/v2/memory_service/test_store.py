@@ -55,6 +55,16 @@ class FoldAwareTimezone(tzinfo):
         return "FOLD-DST" if value is not None and value.fold == 0 else "FOLD-STD"
 
 
+class MemoryScopeSubclass(MemoryScope):
+    def __hash__(self) -> int:
+        return 0
+
+
+class EvidenceEventSubclass(EvidenceEvent):
+    def canonical_bytes(self) -> bytes:
+        return b"overridden"
+
+
 def make_scope(**overrides: str) -> MemoryScope:
     values = {
         "tenant_id": "tenant-1",
@@ -145,6 +155,37 @@ def test_evidence_store_contract_exposes_no_update_or_delete() -> None:
     assert not hasattr(EvidenceStore, "delete")
     assert not hasattr(store, "update")
     assert not hasattr(store, "delete")
+
+
+def test_append_rejects_evidence_event_subclass() -> None:
+    event = make_event()
+    event_subclass = EvidenceEventSubclass(
+        scope=event.scope,
+        session_id=event.session_id,
+        run_id=event.run_id,
+        sequence_no=event.sequence_no,
+        kind=event.kind,
+        payload=event.payload,
+        observed_at=event.observed_at,
+        idempotency_key=event.idempotency_key,
+    )
+
+    with pytest.raises(TypeError, match="event must be an EvidenceEvent"):
+        InMemoryEvidenceStore().append(event_subclass)
+
+
+def test_get_rejects_memory_scope_subclass() -> None:
+    scope = MemoryScopeSubclass("tenant-1", "assistant-memory", "user-1")
+
+    with pytest.raises(TypeError, match="scope must be a MemoryScope"):
+        InMemoryEvidenceStore().get(scope, "evd_missing")
+
+
+def test_list_rejects_memory_scope_subclass() -> None:
+    scope = MemoryScopeSubclass("tenant-1", "assistant-memory", "user-1")
+
+    with pytest.raises(TypeError, match="scope must be a MemoryScope"):
+        InMemoryEvidenceStore().list(scope)
 
 
 def test_append_and_get_round_trip_returns_persisted_record() -> None:

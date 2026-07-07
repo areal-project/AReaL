@@ -10,6 +10,7 @@ from datetime import UTC, datetime, timedelta, timezone, tzinfo
 
 import pytest
 
+from areal.v2.memory_service.store import InMemoryEvidenceStore
 from areal.v2.memory_service.types import (
     EvidenceEvent,
     EvidenceKind,
@@ -63,6 +64,51 @@ class StatefulDatetime(datetime):
 
     def isoformat(self, sep: str = "T", timespec: str = "auto") -> str:
         return f"{datetime.isoformat(self, sep, timespec)}{self.suffix}"
+
+
+class MutableHashStr(str):
+    """String subclass whose hash can change after construction."""
+
+    hash_salt: int
+
+    def __new__(cls, value: str) -> MutableHashStr:
+        instance = str.__new__(cls, value)
+        instance.hash_salt = 0
+        return instance
+
+    def __hash__(self) -> int:
+        return str.__hash__(self) + self.hash_salt
+
+    def __str__(self) -> str:
+        return "overridden"
+
+
+class AdversarialStr(str):
+    """String subclass overriding validation and conversion operations."""
+
+    def __str__(self) -> str:
+        return "overridden"
+
+    def strip(self, chars: str | None = None) -> str:
+        return "overridden"
+
+    def encode(self, encoding: str = "utf-8", errors: str = "strict") -> bytes:
+        return b"overridden"
+
+
+class MemoryScopeSubclass(MemoryScope):
+    def __hash__(self) -> int:
+        return 0
+
+
+class EvidenceEventSubclass(EvidenceEvent):
+    def canonical_bytes(self) -> bytes:
+        return b"overridden"
+
+
+class OverriddenInt(int):
+    def __int__(self) -> int:
+        return 999
 
 
 def make_scope(**overrides: object) -> MemoryScope:
@@ -139,10 +185,52 @@ def test_memory_scope_preserves_identifier_whitespace() -> None:
     assert scope.subject_id == " user-1 "
 
 
+def test_memory_scope_snapshots_mutable_hash_strings_for_store_indexes() -> None:
+    tenant_id = MutableHashStr("tenant-1")
+    namespace = MutableHashStr("assistant-memory")
+    subject_id = MutableHashStr("user-1")
+    scope = MemoryScope(
+        tenant_id=tenant_id,
+        namespace=namespace,
+        subject_id=subject_id,
+    )
+    event = make_event(scope=scope)
+    store = InMemoryEvidenceStore()
+    scope_hash = hash(scope)
+    original = store.append(event)
+
+    tenant_id.hash_salt = 1_000_003
+    namespace.hash_salt = 1_000_003
+    subject_id.hash_salt = 1_000_003
+    retry = store.append(event)
+
+    assert retry is original
+    assert hash(scope) == scope_hash
+    assert type(scope.tenant_id) is str
+    assert type(scope.namespace) is str
+    assert type(scope.subject_id) is str
+    assert scope == make_scope()
+    assert store.get(scope, original.evidence_id) is original
+    assert store.list(scope) == (original,)
+    assert len(store._by_evidence_id) == 1
+    assert len(store._by_idempotency_key) == 1
+    assert len(store._by_scope) == 1
+
+
 @pytest.mark.parametrize("field", ["tenant_id", "namespace", "subject_id"])
 def test_memory_scope_rejects_invalid_unicode_identifier(field: str) -> None:
     with pytest.raises(ValueError, match=field):
         make_scope(**{field: LONE_SURROGATE})
+
+
+def test_string_snapshot_uses_base_blank_validation() -> None:
+    with pytest.raises(ValueError, match="session_id"):
+        make_event(session_id=AdversarialStr(" \t\n"))
+
+
+def test_string_snapshot_uses_base_utf8_validation() -> None:
+    with pytest.raises(ValueError, match="payload"):
+        make_event(payload=AdversarialStr(LONE_SURROGATE))
 
 
 @pytest.mark.parametrize("field", ["session_id", "run_id", "idempotency_key"])
@@ -198,8 +286,32 @@ def test_evidence_event_requires_memory_scope(scope: object) -> None:
         make_event(scope=scope)
 
 
+def test_evidence_event_rejects_memory_scope_subclass() -> None:
+    scope = MemoryScopeSubclass("tenant-1", "assistant-memory", "user-1")
+
+    with pytest.raises(TypeError, match="scope must be a MemoryScope"):
+        make_event(scope=scope)
+
+
 def test_evidence_event_accepts_empty_string_payload() -> None:
     assert make_event(payload="").payload == ""
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("session_id", " session-1 "),
+        ("run_id", " run-1 "),
+        ("payload", " payload "),
+        ("idempotency_key", " idempotency-1 "),
+    ],
+)
+def test_evidence_event_snapshots_string_subclasses(field: str, value: str) -> None:
+    event = make_event(**{field: AdversarialStr(value)})
+    stored = getattr(event, field)
+
+    assert type(stored) is str
+    assert stored == value
 
 
 @pytest.mark.parametrize("payload", [None, b"hello", 7])
@@ -208,7 +320,7 @@ def test_evidence_event_rejects_non_string_payload(payload: object) -> None:
         make_event(payload=payload)
 
 
-@pytest.mark.parametrize("sequence_no", [True, False, 1.0, "1", None])
+@pytest.mark.parametrize("sequence_no", [True, False, OverriddenInt(1), 1.0, "1", None])
 def test_evidence_event_rejects_non_integer_sequence_numbers(
     sequence_no: object,
 ) -> None:
@@ -374,6 +486,23 @@ def test_evidence_record_requires_evidence_event(event: object) -> None:
         make_record(event=event)
 
 
+def test_evidence_record_rejects_evidence_event_subclass() -> None:
+    event = make_event()
+    event_subclass = EvidenceEventSubclass(
+        scope=event.scope,
+        session_id=event.session_id,
+        run_id=event.run_id,
+        sequence_no=event.sequence_no,
+        kind=event.kind,
+        payload=event.payload,
+        observed_at=event.observed_at,
+        idempotency_key=event.idempotency_key,
+    )
+
+    with pytest.raises(TypeError, match="event must be an EvidenceEvent"):
+        make_record(event=event_subclass)
+
+
 @pytest.mark.parametrize("field", ["evidence_id", "content_hash"])
 @pytest.mark.parametrize("value", ["", " \t\n"])
 def test_evidence_record_rejects_blank_identifiers_and_hash(
@@ -397,6 +526,21 @@ def test_evidence_record_preserves_identifier_and_hash_whitespace() -> None:
 
     assert record.evidence_id == " evidence-1 "
     assert record.content_hash == " sha256:abc123 "
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("evidence_id", " evidence-1 "),
+        ("content_hash", " sha256:abc123 "),
+    ],
+)
+def test_evidence_record_snapshots_string_subclasses(field: str, value: str) -> None:
+    record = make_record(**{field: AdversarialStr(value)})
+    stored = getattr(record, field)
+
+    assert type(stored) is str
+    assert stored == value
 
 
 @pytest.mark.parametrize("field", ["evidence_id", "content_hash"])
