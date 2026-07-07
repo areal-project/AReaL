@@ -14,9 +14,10 @@ from PIL.Image import Image as ImageObject
 from transformers import PreTrainedTokenizerFast
 
 from areal.api.alloc_mode import ModelAllocation
-from areal.api.cli_args import GenerationHyperparameters, tokenizer_stop_token_ids
+from areal.api.cli_args import GenerationHyperparameters
 from areal.infra.platforms import current_platform
 from areal.utils import logging
+from areal.utils.hf_utils import tokenizer_stop_token_ids
 
 if TYPE_CHECKING:
     from transformers import AutoProcessor
