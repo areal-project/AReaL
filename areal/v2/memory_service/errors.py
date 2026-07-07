@@ -31,3 +31,11 @@ class RevisionNotFoundError(MemoryServiceError):
 
 class RevisionConflictError(MemoryServiceError):
     """Raised when a revision write conflicts with immutable history."""
+
+
+class ReleaseNotFoundError(MemoryServiceError):
+    """Raised when a release is unavailable in the requested scope."""
+
+
+class ReleaseConflictError(MemoryServiceError):
+    """Raised when a release write conflicts with immutable history."""
