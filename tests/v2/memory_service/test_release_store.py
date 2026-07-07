@@ -168,25 +168,70 @@ def test_run_race_waits_for_workers_before_cancelling_watchdog(
         ("cancel",),
     ]
 
+    real_executor = ThreadPoolExecutor
+    slow_workers_ready = Event()
+    ready_count = 0
+    ready_lock = RLock()
+    shutdown_started = Event()
+    shutdown_finished = Event()
     finished: set[int] = set()
     finished_lock = RLock()
 
+    class ObservedExecutor(real_executor):
+        def shutdown(
+            self,
+            wait: bool = True,
+            *,
+            cancel_futures: bool = False,
+        ) -> None:
+            assert wait is True
+            shutdown_started.set()
+            events.append(("shutdown:start", wait, cancel_futures))
+            super().shutdown(wait=True, cancel_futures=cancel_futures)
+            shutdown_finished.set()
+            events.append(("shutdown:finish",))
+
+    def record_cancel_after_shutdown() -> None:
+        with finished_lock:
+            assert finished == set(range(1, RACE_SIZE))
+        assert shutdown_finished.is_set()
+        events.append(("cancel",))
+
     def fail_or_finish(item: int) -> object:
         if item == 0:
+            assert slow_workers_ready.wait(timeout=RACE_TIMEOUT_SECONDS)
             raise RuntimeError("worker failed")
-        sleep(0.15)
+        nonlocal ready_count
+        with ready_lock:
+            ready_count += 1
+            if ready_count == RACE_SIZE - 1:
+                slow_workers_ready.set()
+        assert shutdown_started.wait(timeout=RACE_TIMEOUT_SECONDS)
         with finished_lock:
             finished.add(item)
         return item
 
     events.clear()
-    started_at = monotonic()
+    monkeypatch.setattr(
+        faulthandler,
+        "cancel_dump_traceback_later",
+        record_cancel_after_shutdown,
+    )
+    monkeypatch.setitem(
+        run_race.__globals__,
+        "ThreadPoolExecutor",
+        ObservedExecutor,
+    )
     with pytest.raises(RuntimeError, match="worker failed"):
         run_race(tuple(range(RACE_SIZE)), fail_or_finish)
-    assert monotonic() - started_at >= 0.1
+    assert slow_workers_ready.is_set()
+    assert shutdown_started.is_set()
+    assert shutdown_finished.is_set()
     assert finished == set(range(1, RACE_SIZE))
     assert events == [
         ("arm", HARD_RACE_TIMEOUT_SECONDS, True),
+        ("shutdown:start", True, False),
+        ("shutdown:finish",),
         ("cancel",),
     ]
 
