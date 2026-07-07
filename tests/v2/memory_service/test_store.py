@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import re
 from concurrent.futures import ThreadPoolExecutor
-from datetime import UTC, datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone, tzinfo
 from hashlib import sha256 as calculate_sha256
 from threading import Barrier
 from time import sleep
@@ -40,6 +40,19 @@ class YieldingMissingDict(dict[object, object]):
         if value is default:
             sleep(0.05)
         return value
+
+
+class FoldAwareTimezone(tzinfo):
+    """Minimal repeated-hour timezone independent of the system tz database."""
+
+    def utcoffset(self, value: datetime | None) -> timedelta:
+        return timedelta(hours=-4 if value is not None and value.fold == 0 else -5)
+
+    def dst(self, value: datetime | None) -> timedelta:
+        return timedelta(hours=1 if value is not None and value.fold == 0 else 0)
+
+    def tzname(self, value: datetime | None) -> str:
+        return "FOLD-DST" if value is not None and value.fold == 0 else "FOLD-STD"
 
 
 def make_scope(**overrides: str) -> MemoryScope:
@@ -406,6 +419,39 @@ def test_list_returns_deterministic_order_using_normalized_instants() -> None:
         later_run,
         later_session,
     )
+
+
+def test_list_orders_folded_datetimes_by_absolute_instant() -> None:
+    """Normalize before sorting when one repeated wall-clock hour folds backward."""
+    store = InMemoryEvidenceStore()
+    scope = make_scope()
+    fold_timezone = FoldAwareTimezone()
+    earlier_instant = store.append(
+        make_event(
+            scope=scope,
+            session_id="session-a",
+            run_id="run-a",
+            sequence_no=1,
+            observed_at=datetime(2026, 11, 1, 1, 45, tzinfo=fold_timezone, fold=0),
+            idempotency_key="earlier-fold-instant",
+        )
+    )
+    later_instant = store.append(
+        make_event(
+            scope=scope,
+            session_id="session-a",
+            run_id="run-a",
+            sequence_no=1,
+            observed_at=datetime(2026, 11, 1, 1, 15, tzinfo=fold_timezone, fold=1),
+            idempotency_key="later-fold-instant",
+        )
+    )
+
+    assert later_instant.event.observed_at < earlier_instant.event.observed_at
+    assert earlier_instant.event.observed_at.astimezone(
+        UTC
+    ) < later_instant.event.observed_at.astimezone(UTC)
+    assert store.list(scope) == (earlier_instant, later_instant)
 
 
 def test_append_sets_aware_utc_created_at() -> None:

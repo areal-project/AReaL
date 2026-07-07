@@ -46,10 +46,8 @@ class InMemoryEvidenceStore:
 
     def __init__(self) -> None:
         self._lock = RLock()
-        self._by_evidence_id: dict[str, tuple[EvidenceRecord, bytes]] = {}
-        self._by_idempotency_key: dict[
-            tuple[MemoryScope, str], tuple[EvidenceRecord, bytes]
-        ] = {}
+        self._by_evidence_id: dict[str, EvidenceRecord] = {}
+        self._by_idempotency_key: dict[tuple[MemoryScope, str], EvidenceRecord] = {}
         self._by_scope: dict[MemoryScope, list[EvidenceRecord]] = {}
 
     def append(self, event: EvidenceEvent) -> EvidenceRecord:
@@ -61,19 +59,17 @@ class InMemoryEvidenceStore:
         idempotency_index = (event.scope, event.idempotency_key)
 
         with self._lock:
-            existing_idempotency = self._by_idempotency_key.get(idempotency_index)
-            if existing_idempotency is not None:
-                existing_record, existing_bytes = existing_idempotency
-                if existing_bytes == canonical_bytes:
+            existing_record = self._by_idempotency_key.get(idempotency_index)
+            if existing_record is not None:
+                if existing_record.event.canonical_bytes() == canonical_bytes:
                     return existing_record
                 raise EvidenceConflictError(
                     "scoped idempotency key already refers to different evidence"
                 )
 
-            existing_id = self._by_evidence_id.get(evidence_id)
-            if existing_id is not None:
-                existing_record, existing_bytes = existing_id
-                if existing_bytes == canonical_bytes:
+            existing_record = self._by_evidence_id.get(evidence_id)
+            if existing_record is not None:
+                if existing_record.event.canonical_bytes() == canonical_bytes:
                     return existing_record
                 raise EvidenceConflictError(
                     f"evidence ID collision for {evidence_id!r}"
@@ -85,9 +81,8 @@ class InMemoryEvidenceStore:
                 content_hash=content_hash,
                 created_at=datetime.now(UTC),
             )
-            indexed_record = (record, canonical_bytes)
-            self._by_evidence_id[evidence_id] = indexed_record
-            self._by_idempotency_key[idempotency_index] = indexed_record
+            self._by_evidence_id[evidence_id] = record
+            self._by_idempotency_key[idempotency_index] = record
             self._by_scope.setdefault(event.scope, []).append(record)
             return record
 
@@ -95,10 +90,10 @@ class InMemoryEvidenceStore:
         """Return evidence only when it belongs to the requested scope."""
 
         with self._lock:
-            indexed_record = self._by_evidence_id.get(evidence_id)
-            if indexed_record is None or indexed_record[0].event.scope != scope:
+            record = self._by_evidence_id.get(evidence_id)
+            if record is None or record.event.scope != scope:
                 raise EvidenceNotFoundError(f"evidence {evidence_id!r} was not found")
-            return indexed_record[0]
+            return record
 
     def list(
         self,
