@@ -120,6 +120,6 @@ def _record_sort_key(record: EvidenceRecord) -> tuple[str, str, int, datetime, s
         event.session_id,
         event.run_id,
         event.sequence_no,
-        event.observed_at.astimezone(UTC),
+        event.observed_at,
         record.evidence_id,
     )

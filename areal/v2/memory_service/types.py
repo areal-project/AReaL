@@ -25,7 +25,7 @@ def _validate_string(
         raise ValueError(f"{field_name} must be valid UTF-8") from exc
 
 
-def _validate_aware_datetime(value: object, field_name: str) -> None:
+def _validate_aware_datetime(value: object, field_name: str) -> datetime:
     if not isinstance(value, datetime):
         raise TypeError(f"{field_name} must be a datetime")
     if value.tzinfo is None:
@@ -37,9 +37,19 @@ def _validate_aware_datetime(value: object, field_name: str) -> None:
     if offset is None:
         raise ValueError(f"{field_name} must be timezone-aware")
     try:
-        value.astimezone(UTC)
+        normalized = datetime.astimezone(value, UTC)
     except (OverflowError, ValueError) as exc:
         raise ValueError(f"{field_name} must be normalizable to UTC") from exc
+    return datetime(
+        normalized.year,
+        normalized.month,
+        normalized.day,
+        normalized.hour,
+        normalized.minute,
+        normalized.second,
+        normalized.microsecond,
+        tzinfo=UTC,
+    )
 
 
 class EvidenceKind(StrEnum):
@@ -96,7 +106,8 @@ class EvidenceEvent:
         if not isinstance(self.kind, EvidenceKind):
             raise TypeError("kind must be an EvidenceKind")
         _validate_string(self.payload, "payload", allow_blank=True)
-        _validate_aware_datetime(self.observed_at, "observed_at")
+        observed_at = _validate_aware_datetime(self.observed_at, "observed_at")
+        object.__setattr__(self, "observed_at", observed_at)
 
     def canonical_bytes(self) -> bytes:
         """Serialize the event as deterministic, compact UTF-8 JSON."""
@@ -137,4 +148,5 @@ class EvidenceRecord:
             raise TypeError("event must be an EvidenceEvent")
         _validate_string(self.evidence_id, "evidence_id")
         _validate_string(self.content_hash, "content_hash")
-        _validate_aware_datetime(self.created_at, "created_at")
+        created_at = _validate_aware_datetime(self.created_at, "created_at")
+        object.__setattr__(self, "created_at", created_at)

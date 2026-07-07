@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import FrozenInstanceError
-from datetime import UTC, datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone, tzinfo
 
 import pytest
 
@@ -35,6 +35,34 @@ VALID_UTC_BOUNDARIES = (
         datetime.max.replace(tzinfo=UTC),
     ),
 )
+
+
+class MutableTimezone(tzinfo):
+    """Timezone whose offset can change after a datetime is constructed."""
+
+    def __init__(self, offset: timedelta) -> None:
+        self.offset = offset
+
+    def utcoffset(self, value: datetime | None) -> timedelta:
+        return self.offset
+
+    def dst(self, value: datetime | None) -> timedelta:
+        return timedelta(0)
+
+    def tzname(self, value: datetime | None) -> str:
+        return "MUTABLE"
+
+
+class StatefulDatetime(datetime):
+    """Datetime subclass with unsafe conversion and serialization overrides."""
+
+    suffix: str = ""
+
+    def astimezone(self, timezone: tzinfo | None = None) -> StatefulDatetime:
+        return self
+
+    def isoformat(self, sep: str = "T", timespec: str = "auto") -> str:
+        return f"{datetime.isoformat(self, sep, timespec)}{self.suffix}"
 
 
 def make_scope(**overrides: object) -> MemoryScope:
@@ -248,6 +276,42 @@ def test_evidence_event_rejects_datetime_that_cannot_normalize_to_utc(
         make_event(observed_at=observed_at)
 
 
+def test_evidence_event_snapshots_mutable_observed_at_as_utc() -> None:
+    source_timezone = MutableTimezone(timedelta(hours=1))
+    source = datetime(2026, 7, 7, 5, 5, 6, 789000, tzinfo=source_timezone)
+    event = make_event(observed_at=source)
+    canonical_bytes = event.canonical_bytes()
+
+    source_timezone.offset = timedelta(hours=2)
+
+    assert event.canonical_bytes() == canonical_bytes
+    assert event.observed_at == UTC_INSTANT
+    assert event.observed_at.tzinfo is UTC
+
+
+def test_evidence_event_snapshots_datetime_subclass_as_plain_utc() -> None:
+    source = StatefulDatetime(
+        2026,
+        7,
+        7,
+        5,
+        5,
+        6,
+        789000,
+        tzinfo=timezone(timedelta(hours=1)),
+    )
+    source.suffix = "-before"
+    event = make_event(observed_at=source)
+    canonical_bytes = event.canonical_bytes()
+
+    source.suffix = "-after"
+
+    assert type(event.observed_at) is datetime
+    assert event.observed_at == UTC_INSTANT
+    assert event.canonical_bytes() == canonical_bytes
+    assert b"-before" not in canonical_bytes
+
+
 def test_canonical_bytes_are_sorted_compact_and_deterministic() -> None:
     event = make_event()
 
@@ -281,7 +345,8 @@ def test_canonical_bytes_support_valid_utc_datetime_boundaries(
 ) -> None:
     event = make_event(observed_at=observed_at)
 
-    assert event.observed_at is observed_at
+    assert event.observed_at == expected_utc
+    assert event.observed_at.tzinfo is UTC
     assert (
         json.loads(event.canonical_bytes())["observed_at"] == expected_utc.isoformat()
     )
@@ -293,9 +358,9 @@ def test_canonical_bytes_normalize_semantically_equal_instants_to_utc() -> None:
         observed_at=UTC_INSTANT.astimezone(timezone(timedelta(hours=8)))
     )
 
-    assert utc_event.observed_at != utc_plus_eight_event.observed_at or (
-        utc_event.observed_at.tzinfo != utc_plus_eight_event.observed_at.tzinfo
-    )
+    assert utc_event.observed_at == utc_plus_eight_event.observed_at == UTC_INSTANT
+    assert utc_event.observed_at.tzinfo is UTC
+    assert utc_plus_eight_event.observed_at.tzinfo is UTC
     assert utc_event.canonical_bytes() == utc_plus_eight_event.canonical_bytes()
 
 
@@ -363,15 +428,29 @@ def test_evidence_record_rejects_datetime_that_cannot_normalize_to_utc(
         make_record(created_at=created_at)
 
 
+def test_evidence_record_snapshots_mutable_created_at_as_utc() -> None:
+    source_timezone = MutableTimezone(timedelta(hours=1))
+    source = datetime(2026, 7, 7, 5, 5, 6, 789000, tzinfo=source_timezone)
+    record = make_record(created_at=source)
+
+    source_timezone.offset = timedelta(hours=2)
+
+    assert record.created_at == UTC_INSTANT
+    assert record.created_at.tzinfo is UTC
+
+
 @pytest.mark.parametrize(
-    "created_at",
-    [value for value, _ in VALID_UTC_BOUNDARIES],
+    ("created_at", "expected_utc"),
+    VALID_UTC_BOUNDARIES,
     ids=["minimum", "maximum"],
 )
 def test_evidence_record_accepts_valid_utc_datetime_boundaries(
-    created_at: datetime,
+    created_at: datetime, expected_utc: datetime
 ) -> None:
-    assert make_record(created_at=created_at).created_at is created_at
+    record = make_record(created_at=created_at)
+
+    assert record.created_at == expected_utc
+    assert record.created_at.tzinfo is UTC
 
 
 @pytest.mark.parametrize(
