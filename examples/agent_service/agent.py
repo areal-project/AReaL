@@ -30,12 +30,12 @@ from claude_agent_sdk import (
     ToolUseBlock,
 )
 
-from areal.experimental.agent_service.types import (
+from areal.utils import logging
+from areal.v2.agent_service.types import (
     AgentRequest,
     AgentResponse,
     EventEmitter,
 )
-from areal.utils import logging
 
 logger = logging.getLogger("ClaudeAgent")
 

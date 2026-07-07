@@ -401,10 +401,11 @@ def split_batch(
 
 
 def batched_call(
-    fn: Callable[[dict[str, Any]], Any],
+    fn: Callable[..., Any],
     data: list[dict[str, Any]],
     *,
     unpack: bool = True,
+    pass_meta: bool = False,
 ) -> Any:
     """Concatenate per-trajectory dicts into one batch, call *fn*, optionally unpack.
 
@@ -421,9 +422,12 @@ def batched_call(
     unpack : bool
         If True (default), split the result back into a per-trajectory list
         via :func:`split_batch`.
+    pass_meta : bool
+        If True, call ``fn(batched, meta)`` so functions that need trajectory
+        metadata can consume it without injecting sentinel keys into the batch.
     """
     batched, meta = concat_batch(data)
-    result = fn(batched)
+    result = fn(batched, meta) if pass_meta else fn(batched)
     if unpack:
         return split_batch(result, meta)
     return result
@@ -1393,6 +1397,37 @@ class Normalization:
         self.group_size = config.group_size
         self.eps = config.eps
 
+    def _build_group_slices(
+        self, bs: int, group_sizes: list[int] | None
+    ) -> list[slice]:
+        """Build slices for group-level normalization.
+
+        When ``group_sizes`` (e.g. ``[8, 7, 8, ...]``) is provided it gives
+        the actual sample count of each trajectory group, handling variable-size
+        groups that arise when some rollout samples fail / are filtered. A fixed
+        ``group_size`` slice would otherwise straddle two groups, or leave a tail
+        of sequences whose std stays 0 → advantage blows up to (reward-mean)/eps.
+        When *None*, fall back to fixed-``group_size`` slicing.
+        """
+        if group_sizes is not None:
+            if any(sz <= 0 for sz in group_sizes):
+                raise ValueError(f"group_sizes must be all positive, got {group_sizes}")
+            if sum(group_sizes) != bs:
+                raise ValueError(
+                    f"group_sizes sum ({sum(group_sizes)}) must equal "
+                    f"batch size ({bs}), got {group_sizes}"
+                )
+            slices: list[slice] = []
+            offset = 0
+            for sz in group_sizes:
+                slices.append(slice(offset, offset + sz))
+                offset += sz
+            return slices
+        return [
+            slice(i * self.group_size, (i + 1) * self.group_size)
+            for i in range(bs // self.group_size)
+        ]
+
     @torch.no_grad()
     def __call__(
         self,
@@ -1400,6 +1435,7 @@ class Normalization:
         loss_mask: torch.Tensor | None = None,
         high_precision: bool = True,
         reduce_group=None,
+        group_sizes: list[int] | None = None,
     ) -> torch.Tensor:
         bs = x.size(0)
         eps = self.eps
@@ -1407,6 +1443,11 @@ class Normalization:
         # Early return if no elements are active (all masked out)
         if loss_mask is not None and loss_mask.sum().item() == 0:
             return x.float()
+
+        # Pre-compute group slices once (variable-size groups via group_sizes).
+        group_slices = None
+        if self.mean_level == "group" or self.std_level == "group":
+            group_slices = self._build_group_slices(bs, group_sizes)
 
         # Step 1: Compute mean
         if self.mean_level == "batch":
@@ -1421,16 +1462,17 @@ class Normalization:
             mean = mean.expand_as(x)
         elif self.mean_level == "group":
             mean = torch.zeros_like(x)
-            for i in range(0, bs // self.group_size):
-                s = slice(i * self.group_size, (i + 1) * self.group_size)
+            for s in group_slices:
                 xx = x[s]
                 m = loss_mask[s] if loss_mask is not None else None
+                group_sz = s.stop - s.start
 
-                # Special case: with group_size=1 and leave_one_out=True, mean should be 0
-                if self.group_size == 1 and self.mean_leave1out:
-                    dtype = torch.float64 if high_precision else torch.float32
-                    group_mean = torch.zeros(
-                        (1, *xx.shape[1:]), dtype=dtype, device=xx.device
+                # A singleton group has no peer to leave out. Use itself as the
+                # baseline so leave-one-out normalization outputs zero instead
+                # of passing the raw reward/advantage through.
+                if group_sz == 1 and self.mean_leave1out:
+                    group_mean = xx.to(
+                        torch.float64 if high_precision else torch.float32
                     )
                 else:
                     group_mean = self._compute_mean(
@@ -1465,14 +1507,14 @@ class Normalization:
             std = std.expand_as(x)
         elif self.std_level == "group":
             std = torch.zeros_like(x)
-            for i in range(0, bs // self.group_size):
-                s = slice(i * self.group_size, (i + 1) * self.group_size)
+            for s in group_slices:
                 xx = x[s]
                 m = loss_mask[s] if loss_mask is not None else None
                 group_mean_slice = mean[s]  # already computed and expanded
+                group_sz = s.stop - s.start
 
                 # Special case: with group_size=1 and std_unbiased=True, std should be 1 for numerical stability
-                if self.group_size == 1 and self.std_unbiased:
+                if group_sz == 1 and self.std_unbiased:
                     dtype = torch.float64 if high_precision else torch.float32
                     group_std = torch.ones(
                         (1, *xx.shape[1:]), dtype=dtype, device=xx.device

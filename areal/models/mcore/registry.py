@@ -226,6 +226,20 @@ def make_mcore_model(
         provider.account_for_embedding_in_pipeline_split = False
         provider.account_for_loss_in_pipeline_split = False
 
+        has_mtp = bool(getattr(provider, "mtp_num_layers", None))
+        if mcore_config.enable_mtp:
+            if not has_mtp:
+                raise ValueError(
+                    "megatron.enable_mtp=True but the model has no MTP layers."
+                )
+        elif has_mtp:
+            logger.warning(
+                "Dropping MTP head (mtp_num_layers=%s -> None); not used in RL and not "
+                "exportable for Qwen3.6. Set megatron.enable_mtp=True to keep it.",
+                provider.mtp_num_layers,
+            )
+            provider.mtp_num_layers = None
+
         # LoRA params are injected after model materialization and do not carry
         # Megatron main_grad buffers required by fused grad accumulation kernels.
         if use_lora:

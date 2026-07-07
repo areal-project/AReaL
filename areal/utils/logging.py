@@ -40,10 +40,12 @@ LOGGER_COLORS_EXACT = {
     "LocalScheduler": "blue",
     "RayScheduler": "blue",
     "SlurmScheduler": "blue",
+    "InfLocalScheduler": "blue",
     # Launchers - blue
     "LocalLauncher": "blue",
     "RayLauncher": "blue",
     "SlurmLauncher": "blue",
+    "InfCli": "blue",
     # Workflows - purple
     "RLVRWorkflow": "light_purple",
     "VisionRLVRWorkflow": "light_purple",
@@ -53,6 +55,7 @@ LOGGER_COLORS_EXACT = {
     "TrainController": "white",
     "RolloutController": "white",
     "WorkflowExecutor": "white",
+    "AgentCli": "white",
     # Stats/Perf - green
     "StatsLogger": "light_green",
     "StatsTracker": "light_green",
@@ -108,6 +111,8 @@ LOGGER_COLORS_EXACT = {
     "ToolCallParser": "light_purple",
     "TokenLogpReward": "light_purple",
     "ProxyUtils": "light_purple",
+    "AReaL-SWEAgent": "light_purple",
+    "SWETrain": "light_green",
     # Agent Service - purple
     "AgentGateway": "light_purple",
     "AgentBridge": "light_purple",

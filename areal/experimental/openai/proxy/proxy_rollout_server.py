@@ -110,6 +110,14 @@ _admin_api_key: str = secrets.token_urlsafe(32)
 _api_key_to_session: dict[str, str] = {}
 _session_to_api_key: dict[str, str] = {}  # Reverse mapping for O(1) cleanup
 
+# Pluggable message preprocessors loaded from config at setup time.
+# Applied in order after Anthropic-to-OpenAI translation, before content
+# reaches the ArealOpenAI client.
+_message_preprocessors: list = []
+
+# Pluggable prefix matcher for InteractionCache parent-child matching.
+_prefix_matcher = None
+
 # Server address (set at startup)
 _server_host: str = "0.0.0.0"
 _server_port: int = 8000
@@ -262,6 +270,7 @@ async def alloc_ports(raw_request: Request):
 
 def _setup_openai_client():
     global _openai_client, _session_timeout_seconds, _admin_api_key
+    global _message_preprocessors, _prefix_matcher
     config = _engine.config
     tokenizer = load_hf_tokenizer(config.tokenizer_path)
     agent_cfg = config.agent
@@ -291,6 +300,18 @@ def _setup_openai_client():
     # Only commit the key to the global after validation has passed.
     with _lock:
         _admin_api_key = agent_cfg.admin_api_key
+
+    _message_preprocessors = []
+    for path in agent_cfg.message_preprocessors:
+        cls = import_from_string(path)
+        _message_preprocessors.append(cls())
+        logger.info("Loaded message preprocessor: %s", path)
+
+    if agent_cfg.prefix_matcher:
+        _prefix_matcher = import_from_string(agent_cfg.prefix_matcher)
+        logger.info("Loaded prefix matcher: %s", agent_cfg.prefix_matcher)
+    else:
+        _prefix_matcher = None
 
 
 @app.post("/configure")
@@ -464,7 +485,10 @@ def start_session(request: StartSessionRequest) -> StartSessionResponse:
                 session_api_key = secrets.token_urlsafe(32)
 
         _capacity -= 1
-        _session_cache[session_id] = SessionData(session_id=session_id)
+        _session_cache[session_id] = SessionData(
+            session_id=session_id,
+            prefix_matcher=_prefix_matcher,
+        )
         _api_key_to_session[session_api_key] = session_id
         _session_to_api_key[session_id] = session_api_key
 
@@ -698,6 +722,19 @@ async def responses(
     )
 
 
+def _flatten_content_lists(messages: list[dict]) -> None:
+    """Flatten Anthropic content block lists to strings in-place."""
+    for msg in messages:
+        if isinstance(msg.get("content"), list):
+            text_parts = []
+            for block in msg["content"]:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    text_parts.append(block.get("text", ""))
+                elif isinstance(block, str):
+                    text_parts.append(block)
+            msg["content"] = "\n".join(text_parts)
+
+
 def _translate_anthropic_to_openai_request(anthropic_request: dict[str, Any]) -> dict:
     """Translate an Anthropic Messages API request to OpenAI format."""
     openai_request = _adapter.translate_completion_input_params(
@@ -707,20 +744,10 @@ def _translate_anthropic_to_openai_request(anthropic_request: dict[str, Any]) ->
         raise ValueError("Failed to translate request")
     openai_request = dict(openai_request)
 
-    # Fix message content if it's a list (Anthropic format with content blocks)
-    # LiteLLM's adapter may not properly convert content from list to string
-    # Claude Code CLI sends content as: [{"type":"text","text":"...","cache_control":{...}}, ...]
     if "messages" in openai_request:
-        for msg in openai_request["messages"]:
-            if isinstance(msg.get("content"), list):
-                # Convert list of content blocks to string
-                text_parts = []
-                for block in msg["content"]:
-                    if isinstance(block, dict) and block.get("type") == "text":
-                        text_parts.append(block.get("text", ""))
-                    elif isinstance(block, str):
-                        text_parts.append(block)
-                msg["content"] = "\n".join(text_parts)
+        _flatten_content_lists(openai_request["messages"])
+        for preprocessor in _message_preprocessors:
+            openai_request["messages"] = preprocessor(openai_request["messages"])
 
     return openai_request
 

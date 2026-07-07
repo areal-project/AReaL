@@ -40,15 +40,19 @@ class ProxLogpMethod(str, Enum):
         RECOMPUTE: Standard decoupled PPO - recompute via forward pass.
         LOGLINEAR: Use log-linear approximation (skip forward pass).
         METRICS: Recompute + compute approximation metrics for evaluation.
+        REUSE_TRAIN_LOGP: Reuse training forward-pass logprobs as the proximal
+            logp. Requires ppo_n_minibatches == 1 so the training forward sees
+            the unchanged policy.
     """
 
     RECOMPUTE = "recompute"
     LOGLINEAR = "loglinear"
     METRICS = "metrics"
+    REUSE_TRAIN_LOGP = "reuse_train_logp"
 
     def skips_forward_pass(self) -> bool:
         """Return True if this method skips the forward pass (optimization enabled)."""
-        return self == ProxLogpMethod.LOGLINEAR
+        return self in (ProxLogpMethod.LOGLINEAR, ProxLogpMethod.REUSE_TRAIN_LOGP)
 
 
 class ProxApproxMethod(str, Enum):
@@ -74,6 +78,7 @@ class ProxApproxMethod(str, Enum):
 PROX_LOGP_METHOD_RECOMPUTE = ProxLogpMethod.RECOMPUTE.value
 PROX_LOGP_METHOD_LOGLINEAR = ProxLogpMethod.LOGLINEAR.value
 PROX_LOGP_METHOD_METRICS = ProxLogpMethod.METRICS.value
+PROX_LOGP_METHOD_REUSE_TRAIN_LOGP = ProxLogpMethod.REUSE_TRAIN_LOGP.value
 
 # List of all valid prox_logp_method values for configuration
 PROX_LOGP_METHODS_ALL = [m.value for m in ProxLogpMethod]

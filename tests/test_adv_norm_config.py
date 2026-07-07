@@ -1,15 +1,59 @@
+import warnings
 from dataclasses import asdict
 from unittest.mock import patch
 
 import pytest
 import torch
+from omegaconf import OmegaConf
 
-from areal.api.cli_args import NormConfig
+from areal.api.cli_args import NormConfig, PPOActorConfig
 from areal.utils.data import Normalization
 
 # =============================================================================
 # NormConfig Tests
 # =============================================================================
+
+
+@pytest.mark.parametrize(
+    "reward_norm",
+    [
+        NormConfig(mean_level="group", std_level="group", group_size=1),
+        {"mean_level": "group", "std_level": "group", "group_size": 1},
+        OmegaConf.create(
+            {"mean_level": "group", "std_level": "group", "group_size": 1}
+        ),
+    ],
+    ids=["norm-config", "dict", "dict-config"],
+)
+def test_ppo_actor_warns_for_all_supported_singleton_reward_config_shapes(
+    reward_norm,
+):
+    with pytest.warns(
+        UserWarning, match="singleton group centering erases the task reward"
+    ):
+        PPOActorConfig(reward_norm=reward_norm)
+
+
+@pytest.mark.parametrize(
+    "reward_norm",
+    [
+        None,
+        NormConfig(mean_level=None, std_level="group", group_size=1),
+        NormConfig(mean_level="group", std_level="group", group_size=2),
+        NormConfig(mean_level="batch", std_level="batch", group_size=1),
+    ],
+)
+def test_ppo_actor_does_not_warn_without_singleton_reward_group_centering(
+    reward_norm,
+):
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        PPOActorConfig(reward_norm=reward_norm)
+
+    assert not any(
+        "singleton group centering erases the task reward" in str(warning.message)
+        for warning in caught
+    )
 
 
 def test_adv_norm_config_inheritance():
@@ -874,11 +918,15 @@ def test_group_size_edge_cases():
     adv_norm = Normalization(config)
 
     normalized = adv_norm(advantages, loss_mask)
-    # With group size 1 and leave-one-out, each element should remain approximately unchanged
-    # because mean=0 (no other elements) and std=1 (for stability), so result ≈ (x-0)/1 = x
+
+    # With singleton leave-one-out groups, there is no peer baseline.
+    # We use the sample itself as the baseline, so each singleton group
+    # normalizes to zero instead of passing through the raw advantage.
     assert torch.allclose(
-        normalized, advantages, atol=1e-3
-    )  # Should remain approximately unchanged
+        normalized,
+        torch.zeros_like(advantages),
+        atol=1e-6,
+    )
 
 
 def test_precision_and_numerical_stability():

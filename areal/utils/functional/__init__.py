@@ -3,6 +3,7 @@
 from areal.utils.functional.functional import (
     RejectionSamplingResult,
     apply_rejection_sampling,
+    cispo_loss_fn,
     dpo_pair_logratios,
     dpo_preference_loss,
     masked_normalization,
@@ -20,6 +21,7 @@ __all__ = [
     # functional.py
     "RejectionSamplingResult",
     "apply_rejection_sampling",
+    "cispo_loss_fn",
     "dpo_pair_logratios",
     "dpo_preference_loss",
     "masked_normalization",

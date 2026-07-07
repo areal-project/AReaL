@@ -7,9 +7,6 @@ import torch
 
 from areal.api import TrainEngine
 from areal.api.cli_args import MicroBatchSpec, PPOActorConfig, RejectionSamplingConfig
-from areal.experimental.training_service.controller.controller import (
-    GatewayTrainController,
-)
 from areal.infra import TrainController
 from areal.infra.rpc.serialization import serialize_value
 from areal.trainer.ppo.stats import infer_token_denominator
@@ -27,15 +24,20 @@ from areal.utils.constants import (
 from areal.utils.data import (
     KLEstimator,
     Normalization,
+    TrajBatchMeta,
     batched_call,
     split_padded_tensor_dict_into_mb_list,
 )
 from areal.utils.functional import (
+    cispo_loss_fn,
     ppo_actor_loss_fn,
     reward_overlong_penalty,
     sapo_loss_fn,
 )
 from areal.utils.perf_tracer import trace_perf
+from areal.v2.training_service.controller.controller import (
+    GatewayTrainController,
+)
 
 logger = logging.getLogger("PPOActor")
 
@@ -140,9 +142,11 @@ class PPOActor:
 
     @trace_perf("ppo_actor.compute_advantages", category="compute")
     def compute_advantages(self, data: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        return batched_call(self._compute_advantages, data)
+        return batched_call(self._compute_advantages, data, pass_meta=True)
 
-    def _compute_advantages(self, data: dict[str, Any]) -> dict[str, Any]:
+    def _compute_advantages(
+        self, data: dict[str, Any], meta: TrajBatchMeta | None = None
+    ) -> dict[str, Any]:
         bs = data["input_ids"].shape[0]
         max_seqlen = data["input_ids"].shape[1]
         batch_indices = torch.arange(
@@ -169,8 +173,13 @@ class PPOActor:
         reward_score = torch.clip(
             reward_score, max=self.reward_clip, min=-self.reward_clip
         )
+        # Use actual trajectory group sizes when available so group-level
+        # normalization handles failed/filtered rollout samples without slicing
+        # across prompts. Direct calls without batched metadata keep the legacy
+        # fixed-group-size behavior.
+        group_sizes = meta.traj_group_sizes if meta is not None else None
         if self.reward_norm:
-            reward_score = self.reward_norm(reward_score)
+            reward_score = self.reward_norm(reward_score, group_sizes=group_sizes)
 
         loss_mask = data["loss_mask"].float()
         loss_mask = torch.roll(loss_mask, shifts=-1, dims=-1)
@@ -236,7 +245,9 @@ class PPOActor:
 
         # Optionally perform advantage normalization.
         if self.adv_norm is not None:
-            advantages = self.adv_norm(advantages, loss_mask)
+            # Use the same actual trajectory group sizes as reward normalization;
+            # ignored when adv_norm is batch-level.
+            advantages = self.adv_norm(advantages, loss_mask, group_sizes=group_sizes)
 
         # Store data in the dict.
         data["advantages"] = advantages
@@ -358,6 +369,7 @@ class PPOActor:
                         use_sapo_loss=self.config.use_sapo_loss,
                         sapo_tau_pos=self.config.sapo_tau_pos,
                         sapo_tau_neg=self.config.sapo_tau_neg,
+                        use_cispo_loss=self.config.use_cispo_loss,
                         use_decoupled_loss=self.config.use_decoupled_loss,
                     ),
                     loss_weight_fn=lambda x: x["loss_mask"].count_nonzero(),
@@ -420,9 +432,12 @@ def grpo_loss_fn(
     use_sapo_loss: bool = False,
     sapo_tau_pos: float = 1.0,
     sapo_tau_neg: float = 1.05,
+    use_cispo_loss: bool = False,
     use_decoupled_loss: bool = False,
     vocab_min_logits: torch.Tensor | None = None,
     vocab_max_logits: torch.Tensor | None = None,
+    vocab_mean_logits: torch.Tensor | None = None,
+    vocab_norm_logits: torch.Tensor | None = None,
 ):
     """Loss function for actor step, all inputs should be splitted into
     pipeline micro batches, returns loss and logging stats."""
@@ -432,6 +447,9 @@ def grpo_loss_fn(
     prox_logp_gt = input_data.get("prox_logp")  # Could be None if skipped
 
     entropy = entropy.detach()
+
+    if ProxLogpMethod(prox_logp_method) == ProxLogpMethod.REUSE_TRAIN_LOGP:
+        prox_logp_gt = logprobs.detach()
 
     # Resolve proximal log-probabilities based on method
     prox_logp = _resolve_proximal_logp(
@@ -447,8 +465,30 @@ def grpo_loss_fn(
     if m2_threshold is not None:
         loss_mask = _apply_m2po_masking(old_logp, prox_logp, loss_mask, m2_threshold)
 
-    # Use SAPO or PPO loss
-    if use_sapo_loss:
+    # Use CISPO, SAPO, or PPO loss
+    if use_cispo_loss:
+        if use_sapo_loss:
+            raise ValueError(
+                "CISPO and SAPO are mutually exclusive surrogates. "
+                "Set at most one of use_cispo_loss / use_sapo_loss."
+            )
+        if importance_sampling_level != "token":
+            raise ValueError(
+                "CISPO only supports importance_sampling_level='token'. "
+                "Sequence-level (GSPO-style) CISPO has no published surrogate."
+            )
+        loss, stat = cispo_loss_fn(
+            logprobs=logprobs,
+            proximal_logprobs=prox_logp,
+            advantages=advantages,
+            eps_clip=eps_clip,
+            eps_clip_higher=eps_clip_higher,
+            loss_mask=loss_mask,
+            old_logprobs=old_logp,
+            rejection_sampling=rejection_sampling,
+            cu_seqlens=input_data.get("cu_seqlens"),
+        )
+    elif use_sapo_loss:
         if use_decoupled_loss:
             raise ValueError(
                 "SAPO is not compatible with `use_decoupled_loss=True`. "

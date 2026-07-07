@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import json
+import re
 import traceback
 import uuid
 from types import SimpleNamespace
@@ -14,6 +16,19 @@ from openai.types.responses.response_function_tool_call import ResponseFunctionT
 from areal.utils import logging
 
 logger = logging.getLogger("ToolCallParser")
+
+_QWEN3_CODER_TOOL_CALL_RE = re.compile(
+    r"<tool_call>\s*(?P<body>.*?)\s*</tool_call>",
+    re.DOTALL,
+)
+_QWEN3_CODER_FUNCTION_RE = re.compile(
+    r"<function=(?P<name>[^>\s]+)>\s*(?P<body>.*?)\s*</function>",
+    re.DOTALL,
+)
+_QWEN3_CODER_PARAMETER_RE = re.compile(
+    r"<parameter=(?P<name>[^>\s]+)>(?P<value>.*?)</parameter>",
+    re.DOTALL,
+)
 
 _SGLANG_TO_VLLM_TOOL_PARSER: dict[str, str] = {
     "qwen": "qwen3_xml",
@@ -56,6 +71,187 @@ def _detect_think_and_return_ori_think(
     normal_text = splits[1]
 
     return think_start_token + reasoning_text + think_end_token, normal_text
+
+
+def _iter_tool_definitions(tools: list[Any]) -> list[dict[str, Any]]:
+    """Return OpenAI chat/responses tool definitions in a common shape."""
+    tool_defs: list[dict[str, Any]] = []
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        if isinstance(tool.get("function"), dict):
+            tool_defs.append(tool["function"])
+        elif tool.get("type") == "function":
+            tool_defs.append(tool)
+    return tool_defs
+
+
+def _tool_argument_schemas(tools: list[Any]) -> dict[str, dict[str, dict[str, Any]]]:
+    schemas: dict[str, dict[str, dict[str, Any]]] = {}
+    for tool_def in _iter_tool_definitions(tools):
+        name = tool_def.get("name")
+        parameters = tool_def.get("parameters")
+        if not isinstance(name, str) or not isinstance(parameters, dict):
+            continue
+        properties = parameters.get("properties")
+        if isinstance(properties, dict):
+            schemas[name] = {
+                key: value
+                for key, value in properties.items()
+                if isinstance(value, dict)
+            }
+    return schemas
+
+
+def _clean_qwen3_coder_parameter(raw_value: str) -> str:
+    if raw_value.startswith("\n"):
+        raw_value = raw_value[1:]
+    if raw_value.endswith("\n"):
+        raw_value = raw_value[:-1]
+    return raw_value
+
+
+def _coerce_qwen3_coder_parameter(
+    value: str,
+    schema: dict[str, Any] | None,
+) -> Any:
+    if not schema:
+        return value
+
+    typ = schema.get("type")
+    if isinstance(typ, list):
+        typ = next((t for t in typ if t != "null"), None)
+    stripped = value.strip()
+
+    try:
+        if typ == "boolean":
+            lowered = stripped.lower()
+            if lowered == "true":
+                return True
+            if lowered == "false":
+                return False
+        if typ == "integer":
+            return int(stripped)
+        if typ == "number":
+            return float(stripped)
+        if typ in {"array", "object"}:
+            return json.loads(stripped)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return value
+
+    return value
+
+
+def _build_tool_call(
+    name: str,
+    arguments: str,
+    use_responses: bool,
+) -> ChatCompletionMessageFunctionToolCall | ResponseFunctionToolCall:
+    if use_responses:
+        return ResponseFunctionToolCall(
+            type="function_call",
+            id=f"fc-{uuid.uuid4().hex[:24]}",
+            call_id=f"call_{uuid.uuid4().hex[:24]}",
+            name=name,
+            arguments=arguments,
+            status="completed",
+        )
+    return ChatCompletionMessageFunctionToolCall(
+        type="function",
+        id=f"call_{uuid.uuid4().hex[:24]}",
+        function=Function(name=name, arguments=arguments),
+    )
+
+
+def _process_tool_calls_qwen3_coder_xml(
+    text: str,
+    tools: list[Any],
+    finish_reason: str,
+    use_responses: bool = False,
+) -> tuple[
+    list[ChatCompletionMessageFunctionToolCall | ResponseFunctionToolCall] | None,
+    str,
+    str,
+]:
+    """Parse Qwen3-Coder XML tool calls with ``<parameter=...>`` tags.
+
+    SGLang's qwen3_coder parser recognizes the tool name in this format but
+    can return empty arguments for Claude Code style parameters.  That makes
+    Anthropic tool_use.input become ``{}``, so Claude Code rejects calls like
+    Bash/Read/Write as missing required parameters.
+    """
+
+    reasoning_text, content_text = _detect_think_and_return_ori_think(
+        text, "<think>", "</think>"
+    )
+    arg_schemas = _tool_argument_schemas(tools)
+
+    tool_calls: list[ChatCompletionMessageFunctionToolCall | ResponseFunctionToolCall]
+    tool_calls = []
+    remove_spans: list[tuple[int, int]] = []
+
+    for tool_match in _QWEN3_CODER_TOOL_CALL_RE.finditer(content_text):
+        block_calls: list[
+            ChatCompletionMessageFunctionToolCall | ResponseFunctionToolCall
+        ] = []
+        body = tool_match.group("body")
+        for fn_match in _QWEN3_CODER_FUNCTION_RE.finditer(body):
+            tool_name = fn_match.group("name")
+            fn_body = fn_match.group("body")
+            # A parameter value that itself contains a literal "</parameter>"
+            # makes the non-greedy regex truncate at the wrong tag, silently
+            # producing wrong arguments. When opening/closing tags are unbalanced
+            # the block is ambiguous, so bail out and let the fallback parser run.
+            if fn_body.count("<parameter=") != fn_body.count("</parameter>"):
+                return None, text, finish_reason
+            args: dict[str, Any] = {}
+            for param_match in _QWEN3_CODER_PARAMETER_RE.finditer(fn_body):
+                param_name = param_match.group("name")
+                raw_param_value = param_match.group("value")
+                # A balanced count of tags still hides nested pairs, e.g. a
+                # value that contains its own "<parameter=...>...</parameter>".
+                # The non-greedy regex truncates the outer value at the inner
+                # closing tag, so treat any parameter marker inside the value as
+                # ambiguous and fall back to the backend parser.
+                if (
+                    "<parameter=" in raw_param_value
+                    or "</parameter>" in raw_param_value
+                ):
+                    return None, text, finish_reason
+                param_value = _clean_qwen3_coder_parameter(raw_param_value)
+                args[param_name] = _coerce_qwen3_coder_parameter(
+                    param_value,
+                    arg_schemas.get(tool_name, {}).get(param_name),
+                )
+
+            # No parsed arguments means either a genuinely empty block or a
+            # truncated/malformed one. Skip it so process_tool_calls falls back
+            # to the sglang parser instead of committing empty arguments.
+            if not args:
+                continue
+
+            arguments = json.dumps(args, ensure_ascii=False)
+            block_calls.append(_build_tool_call(tool_name, arguments, use_responses))
+
+        if block_calls:
+            tool_calls.extend(block_calls)
+            remove_spans.append(tool_match.span())
+
+    if not tool_calls:
+        return None, text, finish_reason
+
+    if finish_reason == "stop":
+        finish_reason = "tool_calls"
+
+    chunks: list[str] = []
+    last = 0
+    for start, end in remove_spans:
+        chunks.append(content_text[last:start])
+        last = end
+    chunks.append(content_text[last:])
+    cleaned_text = "".join(chunks).replace("<|im_end|>", "")
+
+    return tool_calls, reasoning_text + cleaned_text, finish_reason
 
 
 def _process_tool_calls_sglang(
@@ -267,6 +463,16 @@ def process_tool_calls(
     str,
 ]:
     """Process tool calls in the response"""
+    if tool_call_parser == "qwen3_coder":
+        tool_calls, output_text, finish_reason = _process_tool_calls_qwen3_coder_xml(
+            text,
+            tools,
+            finish_reason,
+            use_responses,
+        )
+        if tool_calls is not None:
+            return tool_calls, output_text, finish_reason
+
     try:
         return _process_tool_calls_sglang(
             text,
