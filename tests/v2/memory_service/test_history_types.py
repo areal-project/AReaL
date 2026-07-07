@@ -254,6 +254,13 @@ def test_proposals_require_exact_scope_and_revision_operation() -> None:
         make_revision_proposal(operation="add")
 
 
+def test_revision_proposal_requires_exact_scope() -> None:
+    scope = MemoryScopeSubclass("tenant-1", "assistant-memory", "user-1")
+
+    with pytest.raises(TypeError, match="scope"):
+        make_revision_proposal(scope=scope)
+
+
 def test_persisted_records_reject_proposal_subclasses() -> None:
     candidate_proposal = CandidateProposalSubclass(
         make_scope(), "remember this", ("evd_a",), "candidate-1"

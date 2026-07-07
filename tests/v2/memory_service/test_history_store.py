@@ -8,7 +8,7 @@ import faulthandler
 import inspect
 import re
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor, wait
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from hashlib import sha256
 from threading import Barrier, RLock
@@ -145,27 +145,17 @@ def run_race(
         except MemoryServiceError as error:
             return error
 
-    executor = ThreadPoolExecutor(max_workers=len(items))
-    futures = ()
-    completed = False
     faulthandler.dump_traceback_later(HARD_RACE_TIMEOUT_SECONDS, exit=True)
     try:
-        futures = tuple(executor.submit(worker, item) for item in items)
-        deadline = monotonic() + RACE_TIMEOUT_SECONDS
-        results = tuple(
-            future.result(timeout=max(0.0, deadline - monotonic()))
-            for future in futures
-        )
-        completed = True
-        return results
+        with ThreadPoolExecutor(max_workers=len(items)) as executor:
+            futures = tuple(executor.submit(worker, item) for item in items)
+            deadline = monotonic() + RACE_TIMEOUT_SECONDS
+            return tuple(
+                future.result(timeout=max(0.0, deadline - monotonic()))
+                for future in futures
+            )
     finally:
-        executor.shutdown(wait=completed, cancel_futures=not completed)
-        if completed:
-            faulthandler.cancel_dump_traceback_later()
-        else:
-            _, unfinished = wait(futures, timeout=1.0)
-            if not unfinished:
-                faulthandler.cancel_dump_traceback_later()
+        faulthandler.cancel_dump_traceback_later()
 
 
 def install_digest_map(
@@ -180,7 +170,7 @@ def install_digest_map(
     monkeypatch.setattr(history_store_module.hashlib, "sha256", fake_sha256)
 
 
-def test_run_race_cancels_watchdog_only_after_workers_finish(
+def test_run_race_waits_for_workers_before_cancelling_watchdog(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     events: list[tuple[object, ...]] = []
@@ -202,27 +192,91 @@ def test_run_race_cancels_watchdog_only_after_workers_finish(
         ("cancel",),
     ]
 
-    def fail(_: int) -> object:
-        raise RuntimeError("worker failed")
+    finished: set[int] = set()
+    finished_lock = RLock()
+
+    def fail_or_finish(item: int) -> object:
+        if item == 0:
+            raise RuntimeError("worker failed")
+        sleep(0.15)
+        with finished_lock:
+            finished.add(item)
+        return item
 
     events.clear()
+    started_at = monotonic()
     with pytest.raises(RuntimeError, match="worker failed"):
-        run_race(tuple(range(RACE_SIZE)), fail)
+        run_race(tuple(range(RACE_SIZE)), fail_or_finish)
+    assert monotonic() - started_at >= 0.1
+    assert finished == set(range(1, RACE_SIZE))
     assert events == [
         ("arm", HARD_RACE_TIMEOUT_SECONDS, True),
         ("cancel",),
     ]
 
-    events.clear()
+
+def test_run_race_watchdog_wraps_executor_lifecycle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[tuple[object, ...]] = []
+
+    def record_arm(timeout: float, *, exit: bool) -> None:
+        events.append(("arm", timeout, exit))
+
+    def record_cancel() -> None:
+        events.append(("cancel",))
+
+    class FailingFuture:
+        def result(self, timeout: float) -> object:
+            events.append(("result",))
+            raise RuntimeError("worker failed")
+
+    class StubExecutor:
+        def __init__(self, *, max_workers: int) -> None:
+            events.append(("executor:init", max_workers))
+
+        def __enter__(self) -> StubExecutor:
+            events.append(("executor:enter",))
+            return self
+
+        def __exit__(
+            self,
+            exc_type: type[BaseException] | None,
+            exc_value: BaseException | None,
+            traceback: object,
+        ) -> None:
+            events.append(("executor:exit", exc_type))
+
+        def submit(
+            self,
+            operation: Callable[[int], object],
+            item: int,
+        ) -> FailingFuture:
+            events.append(("submit", item))
+            return FailingFuture()
+
+        def shutdown(self, *, wait: bool, cancel_futures: bool) -> None:
+            events.append(("executor:shutdown", wait, cancel_futures))
+
+    monkeypatch.setattr(faulthandler, "dump_traceback_later", record_arm)
+    monkeypatch.setattr(faulthandler, "cancel_dump_traceback_later", record_cancel)
     monkeypatch.setitem(
         run_race.__globals__,
-        "wait",
-        lambda futures, timeout: (set(), set(futures)),
+        "ThreadPoolExecutor",
+        StubExecutor,
     )
 
     with pytest.raises(RuntimeError, match="worker failed"):
-        run_race(tuple(range(RACE_SIZE)), fail)
-    assert events == [("arm", HARD_RACE_TIMEOUT_SECONDS, True)]
+        run_race((0,), lambda item: item)
+    assert events == [
+        ("arm", HARD_RACE_TIMEOUT_SECONDS, True),
+        ("executor:init", 1),
+        ("executor:enter",),
+        ("submit", 0),
+        ("result",),
+        ("executor:exit", RuntimeError),
+        ("cancel",),
+    ]
 
 
 def make_scope(**overrides: str) -> MemoryScope:
