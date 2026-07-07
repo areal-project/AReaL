@@ -11,6 +11,7 @@ from hashlib import sha256
 
 import pytest
 
+from areal.v2.memory_service import release_store as release_store_module
 from areal.v2.memory_service.errors import (
     MemoryServiceError,
     ReleaseConflictError,
@@ -70,6 +71,16 @@ class NoLookupHistory:
     def get_revision(self, scope: MemoryScope, revision_id: str) -> MemoryRevision:
         self.lookup_count += 1
         raise AssertionError("release unexpectedly looked up a revision")
+
+
+class StubHash:
+    """Return one test-controlled hexadecimal digest."""
+
+    def __init__(self, digest: str) -> None:
+        self._digest = digest
+
+    def hexdigest(self) -> str:
+        return self._digest
 
 
 UTC_INSTANT = datetime(2026, 7, 7, 4, 5, 6, tzinfo=UTC)
@@ -521,6 +532,27 @@ def test_release_hash_and_identifier_depend_only_on_manifest() -> None:
     assert first.content_hash == second.content_hash == expected_hash
     assert first.release_id == second.release_id == f"rel_{expected_hash[:24]}"
     assert re.fullmatch(r"rel_[0-9a-f]{24}", first.release_id)
+
+
+def test_append_release_uses_module_level_sha256(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest = ReleaseManifest(make_scope(), ())
+    digest = "a" * 64
+    observed_bytes: list[bytes] = []
+
+    def fake_sha256(canonical_bytes: bytes) -> StubHash:
+        observed_bytes.append(canonical_bytes)
+        return StubHash(digest)
+
+    monkeypatch.setattr(release_store_module, "sha256", fake_sha256)
+    store = InMemoryMemoryReleaseStore(NoLookupHistory())  # type: ignore[arg-type]
+
+    release = store.append_release(manifest, idempotency_key="release-1")
+
+    assert observed_bytes == [manifest.canonical_bytes()]
+    assert release.content_hash == digest
+    assert release.release_id == f"rel_{digest[:24]}"
 
 
 def test_get_release_snapshots_identifier_subclass_before_lookup() -> None:

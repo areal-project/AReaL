@@ -4,8 +4,8 @@
 
 from __future__ import annotations
 
-import hashlib
 from datetime import UTC, datetime
+from hashlib import sha256
 from threading import RLock
 from typing import Protocol
 
@@ -66,7 +66,7 @@ class InMemoryMemoryReleaseStore:
             raise TypeError("manifest must be a ReleaseManifest")
         idempotency_key = _validate_string(idempotency_key, "idempotency_key")
         canonical_bytes = manifest.canonical_bytes()
-        content_hash = hashlib.sha256(canonical_bytes).hexdigest()
+        content_hash = sha256(canonical_bytes).hexdigest()
         release_id = f"rel_{content_hash[:24]}"
         release_index = (manifest.scope, release_id)
         idempotency_index = (manifest.scope, idempotency_key)
