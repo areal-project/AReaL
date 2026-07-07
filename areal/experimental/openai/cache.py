@@ -1,17 +1,55 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import json
+import os
 import threading
+import time
 from collections import OrderedDict
-from typing import Any
+from collections.abc import Callable
+from pathlib import Path
+from typing import Any, Protocol, runtime_checkable
 
 from areal.experimental.openai.types import InteractionWithTokenLogpReward
 from areal.utils import logging
 
 logger = logging.getLogger("OpenAICache")
 
+# Debug-only: dumping mismatched parent/child messages is OFF by default because
+# the payloads can contain full conversations. Set the dump dir env var to opt in.
+_MISMATCH_DUMP_DIR_ENV = "AREAL_OPENAI_CACHE_MISMATCH_DUMP_DIR"
+_MISMATCH_DUMP_LIMIT_ENV = "AREAL_OPENAI_CACHE_MISMATCH_DUMP_LIMIT"
+_DEFAULT_MISMATCH_DUMP_LIMIT = 20
+
+
+@runtime_checkable
+class PrefixMatcher(Protocol):
+    """Protocol for custom message prefix matching functions."""
+
+    def __call__(self, a: list[dict], b: list[dict]) -> bool: ...
+
+
+def default_prefix_matcher(a: list[dict], b: list[dict]) -> bool:
+    """Default exact prefix matcher: ``b[:len(a)] == a``."""
+    if len(a) > len(b):
+        return False
+    return b[: len(a)] == a
+
 
 class InteractionCache(OrderedDict[str, InteractionWithTokenLogpReward]):
-    def __init__(self, *args, **kwargs):
+    def __init__(
+        self,
+        *args,
+        session_id: str = "unknown",
+        prefix_matcher: PrefixMatcher
+        | Callable[[list[dict], list[dict]], bool]
+        | None = None,
+        **kwargs,
+    ):
+        self._match_fail_count = 0
+        self._session_id = session_id
+        self._prefix_matcher: Callable[[list[dict], list[dict]], bool] = (
+            prefix_matcher if prefix_matcher is not None else default_prefix_matcher
+        )
         super().__init__(*args, **kwargs)
         self._apply_reward_discount_called = False
         self._total_reward = 0.0
@@ -29,7 +67,10 @@ class InteractionCache(OrderedDict[str, InteractionWithTokenLogpReward]):
         assert len(self) == 0, (
             f"InteractionCache must be empty when deep-copied, but has {len(self)} items"
         )
-        new = InteractionCache()
+        new = InteractionCache(
+            session_id=self._session_id,
+            prefix_matcher=self._prefix_matcher,
+        )
         memo[id(self)] = new
         return new
 
@@ -115,12 +156,6 @@ class InteractionCache(OrderedDict[str, InteractionWithTokenLogpReward]):
                 "Interaction messages must be set to find parent relationship."
             )
 
-        def _is_prefix(a: list[dict], b: list[dict]) -> bool:
-            # True if a is a prefix of b
-            if len(a) > len(b):
-                return False
-            return b[: len(a)] == a
-
         def _is_similar_on_last_message(
             a: list[dict], b: list[dict]
         ) -> tuple[bool, dict[str, Any] | None, dict[str, Any] | None]:
@@ -143,13 +178,12 @@ class InteractionCache(OrderedDict[str, InteractionWithTokenLogpReward]):
             }
             return True, diff_a_message, diff_b_message
 
-        # Construct parent-child relationships using longest prefix rule
-        # Sort potential parents by message length to find the longest prefix match first.
+        # Construct parent-child relationships using longest prefix rule.
         interactions = sorted(
             self.values(), key=lambda x: len(x.messages), reverse=True
         )
+        child_msgs = value.messages
 
-        # Find parent for the new interaction
         for parent in interactions:
             # Skip interactions that are still being processed (output_message_list not set yet)
             # This can happen with concurrent requests where a streaming request hasn't
@@ -157,23 +191,102 @@ class InteractionCache(OrderedDict[str, InteractionWithTokenLogpReward]):
             if parent.output_message_list is None or parent.messages is None:
                 continue
             parent_data = parent.messages + parent.output_message_list
-            if _is_prefix(parent_data, value.messages):
+            if self._prefix_matcher(parent_data, child_msgs):
                 value.parent = parent
                 break
-            elif _is_prefix(parent.messages, value.messages):
+            elif self._prefix_matcher(parent.messages, child_msgs):
+                self._match_fail_count += 1
+
+                logger.warning(
+                    "Prefix mismatch (occurrence %d, session=%s): "
+                    "parent.messages (len=%d) is a prefix of child (len=%d), "
+                    "but parent_data (messages+output, len=%d) is not.",
+                    self._match_fail_count,
+                    self._session_id,
+                    len(parent.messages),
+                    len(child_msgs),
+                    len(parent_data),
+                )
+                self._dump_mismatch(
+                    parent_data=parent_data,
+                    child_msgs=child_msgs,
+                    parent_id=parent.interaction_id,
+                    child_key=key,
+                )
+
                 is_similar, diff_a, diff_b = _is_similar_on_last_message(
-                    parent_data, value.messages
+                    parent_data, child_msgs
                 )
                 if is_similar:
                     logger.warning(
                         "Found a parent interaction with similar last message content, "
-                        "but not a strict prefix match. If you wish to use concat mode and build a conversation tree:\n"
+                        "but not a strict prefix match (occurrence %d, "
+                        "session=%s, parent_len=%d, child_len=%d). "
+                        "If you wish to use concat mode and build a conversation tree:\n"
                         "1. For completion, append `chat_completion.choices[0].message.model_dump()` to your messages.\n"
                         "2. For response, extend `[o.model_dump() for o in response.output]` to your messages.\n"
-                        f"Different keys in parent last message: {diff_a}\n"
-                        f"Different keys in child last message: {diff_b}\n"
+                        "Different keys in parent last message: %s\n"
+                        "Different keys in child last message: %s",
+                        self._match_fail_count,
+                        self._session_id,
+                        len(parent_data),
+                        len(child_msgs),
+                        diff_a,
+                        diff_b,
                     )
         super().__setitem__(key, value)
+
+    def _dump_mismatch(
+        self,
+        parent_data: list[dict],
+        child_msgs: list[dict],
+        parent_id: str | None,
+        child_key: str,
+    ) -> None:
+        """Dump mismatched parent/child messages to a JSON file for debugging."""
+        dump_dir_env = os.environ.get(_MISMATCH_DUMP_DIR_ENV)
+        if not dump_dir_env:
+            return
+        try:
+            dump_limit = int(
+                os.environ.get(
+                    _MISMATCH_DUMP_LIMIT_ENV, str(_DEFAULT_MISMATCH_DUMP_LIMIT)
+                )
+            )
+            if dump_limit > 0 and self._match_fail_count > dump_limit:
+                return
+
+            dump_dir = Path(dump_dir_env)
+            dump_dir.mkdir(parents=True, exist_ok=True)
+
+            ts = time.strftime("%Y%m%d_%H%M%S")
+            filename = f"mismatch_{self._session_id}_{self._match_fail_count}_{ts}.json"
+            dump_path = dump_dir / filename
+
+            first_diff_idx = None
+            for i, (pm, cm) in enumerate(zip(parent_data, child_msgs)):
+                if pm != cm:
+                    first_diff_idx = i
+                    break
+
+            dump = {
+                "session_id": self._session_id,
+                "occurrence": self._match_fail_count,
+                "parent_id": parent_id,
+                "child_key": child_key,
+                "parent_len": len(parent_data),
+                "child_len": len(child_msgs),
+                "first_diff_idx": first_diff_idx,
+                "parent_data": parent_data,
+                "child_msgs": child_msgs,
+            }
+
+            with open(dump_path, "w", encoding="utf-8") as f:
+                json.dump(dump, f, indent=2, ensure_ascii=False, default=str)
+
+            logger.info("Mismatch dump saved to %s", dump_path)
+        except Exception as e:
+            logger.warning("Failed to dump mismatch: %s", e)
 
     def export_interactions(
         self, style: str, reward_discount: float | None = None

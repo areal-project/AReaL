@@ -8,7 +8,7 @@ description = "AReaL: A Large-Scale Asynchronous Reinforcement Learning System"
 readme = "README.md"
 license = {text = "Apache-2.0"}
 requires-python = ">=3.11,<3.13"
-version = "1.0.4"
+version = "2.0.0"
 authors = [
     {name = "AReaL Team"},
 ]
@@ -183,6 +183,13 @@ cuda = [
 sandbox = [
     "daytona>=0.167.0",
 ]
+cli = [
+    "click>=8.1",
+    "colorlog",
+]
+
+[project.scripts]
+areal = "areal.v2.cli.main:cli"
 
 [project.urls]
 "Homepage" = "https://github.com/areal-project/AReaL"

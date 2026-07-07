@@ -267,6 +267,13 @@ class RolloutController:
         logger.info("Engine created on all workers!")
 
         logger.info("Calling engine initialization...")
+        # Workers are controller-managed: the controller handles staleness
+        # globally, so workers must NOT apply their own dp-scaled staleness
+        # constraints. Force train_data_parallel_size=1 unless explicitly
+        # configured; an explicit None must not survive, or workers fall back
+        # to dividing capacity by dist.get_world_size().
+        if kwargs.get("train_data_parallel_size") is None:
+            kwargs["train_data_parallel_size"] = 1
         if server_infos is not None:
             # Connecting to existing local servers for evaluation
             self.server_infos = server_infos

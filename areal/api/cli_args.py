@@ -921,6 +921,45 @@ class MegatronEngineConfig:
         default=False,
         metadata={"help": "Fuse token rearrangement ops during token dispatching."},
     )
+    moe_router_fusion: bool = field(
+        default=False,
+        metadata={
+            "help": "Enable fusion for MoE TopK routing and aux-loss computation. "
+            "Requires TransformerEngine >= 2.7.0.",
+        },
+    )
+    moe_router_bias_update_rate: float = field(
+        default=0.0,
+        metadata={
+            "help": "Update rate for auxiliary-loss-free MoE load balancing "
+            "(DeepSeek V3 style). Controls how fast expert_bias adjusts. "
+            "Default 0.0 disables bias updates; set a positive value such as "
+            "1e-3 to enable.",
+        },
+    )
+    moe_z_loss_coeff: float | None = field(
+        default=None,
+        metadata={
+            "help": "Scaling coefficient for router z-loss. Complements "
+            "auxiliary-loss-free load balancing for router stability. A starting "
+            "value of 1e-3 is recommended. None disables z-loss.",
+        },
+    )
+
+    # Precision & Loss
+    enable_fp32_lm_head: bool = field(
+        default=False,
+        metadata={
+            "help": "Cast lm_head output to FP32 before loss computation for "
+            "numerical stability."
+        },
+    )
+    cross_entropy_loss_fusion: bool = field(
+        default=False,
+        metadata={
+            "help": "Enable fused cross-entropy loss kernel for better performance."
+        },
+    )
 
     # FP8 Training Configuration
     fp8_config: FP8EngineConfig | None = None
@@ -948,6 +987,24 @@ class MegatronEngineConfig:
             "weight sync to bridge.export_hf_weights instead of the hand-rolled "
             "convert_to_hf registry. Required for models without a registry entry "
             "(e.g. Qwen3.5). FP8 paths fall back to the registry automatically.",
+        },
+    )
+
+    disable_grad_buffers_cpu_backup: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "When offloading with torch_memory_saver, skip CPU backup for "
+                "Megatron gradient buffers (they are recomputed each step). "
+            )
+        },
+    )
+
+    enable_mtp: bool = field(
+        default=False,
+        metadata={
+            "help": "Keep the model's Multi-Token-Prediction (MTP) head "
+            "(bridge_type=megatron-bridge only). Default False drops it.",
         },
     )
 
@@ -1234,6 +1291,12 @@ class TrainEngineConfig:
         default=3600.0,
         metadata={"help": "Gateway setup timeout in seconds for controller v2."},
     )
+    workers_ready_timeout: float = field(
+        default=30.0,
+        metadata={
+            "help": "Timeout (seconds) for initialize() to wait for guards to be ready."
+        },
+    )
     scheduling_strategy: SchedulingStrategy = field(
         default_factory=SchedulingStrategy,
         metadata={
@@ -1342,8 +1405,10 @@ class RejectionSamplingConfig:
             "'ratio': direct importance ratio π_proximal/π_behave. "
             "'kl_k1': KL estimator k1 = log(r), forward KL unbiased estimator (can be negative). "
             "'kl_k2': KL estimator k2 = 0.5 * (log r)^2, non-negative quadratic approximation. "
-            "'kl_k3': KL estimator k3 = r - log(r) - 1, non-negative exact forward KL estimator.",
-            "choices": ["ratio", "kl_k1", "kl_k2", "kl_k3"],
+            "'kl_k3': KL estimator k3 = r - log(r) - 1, non-negative exact forward KL estimator. "
+            "'binary_kl': KPop (symmetric binary KL divergence) — masks tokens where either "
+            "KL(proximal||behave) or KL(behave||proximal) exceeds the upper bound.",
+            "choices": ["ratio", "kl_k1", "kl_k2", "kl_k3", "binary_kl"],
         },
     )
     agg: str = field(
@@ -1539,6 +1604,18 @@ class PPOActorConfig(TrainEngineConfig):
         metadata={"help": "SAPO temperature for negative advantages"},
     )
 
+    # CISPO (Clipped IS-weight Policy Optimization) - MiniMax-M1 https://arxiv.org/abs/2506.13585
+    use_cispo_loss: bool = field(
+        default=False,
+        metadata={
+            "help": "Use CISPO loss: clip the importance-sampling weight under "
+            "stop-gradient and keep gradient on every token's log pi (MiniMax-M1 "
+            "Eq. 4-5). Mutually exclusive with SAPO. Token-level only. Requires "
+            "eps_clip_higher > 0; recommended eps_clip=1.0 (single-sided, lower "
+            "bound 0) with eps_clip_higher=4.0."
+        },
+    )
+
     # Asynchronous RL
     recompute_logprob: bool = field(
         default=False,
@@ -1575,7 +1652,9 @@ class PPOActorConfig(TrainEngineConfig):
             "Only effective when use_decoupled_loss=True. Options: "
             "'recompute' (default): Standard decoupled PPO, recompute proximal policy via forward pass. "
             "'loglinear': Use log-linear interpolation to approximate proximal policy (skip forward pass). "
-            "'metrics': Like 'recompute', but also compute approximation metrics for evaluation.",
+            "'metrics': Like 'recompute', but also compute approximation metrics for evaluation. "
+            "'reuse_train_logp': Reuse training forward-pass logprobs as the proximal "
+            "logp (skip the extra forward; requires ppo_n_minibatches=1).",
             "choices": PROX_LOGP_METHODS_ALL,
         },
     )
@@ -1610,6 +1689,38 @@ class PPOActorConfig(TrainEngineConfig):
 
     def __post_init__(self):
         """Validate PPO actor configuration."""
+        reward_norm = self.reward_norm
+        if isinstance(reward_norm, (dict, DictConfig)):
+            reward_mean_level = reward_norm.get("mean_level")
+            reward_group_size = reward_norm.get("group_size")
+        else:
+            reward_mean_level = getattr(reward_norm, "mean_level", None)
+            reward_group_size = getattr(reward_norm, "group_size", None)
+
+        if reward_mean_level == "group" and reward_group_size == 1:
+            warnings.warn(
+                "PPO reward_norm uses mean_level='group' with group_size=1: "
+                "singleton group centering erases the task reward. Disable reward "
+                "centering (mean_level=None) or use group_size >= 2.",
+                UserWarning,
+                stacklevel=2,
+            )
+
+        from areal.utils.constants import ProxLogpMethod
+
+        if (
+            ProxLogpMethod(self.prox_logp_method) == ProxLogpMethod.REUSE_TRAIN_LOGP
+            and self.ppo_n_minibatches > 1
+        ):
+            logger.warning(
+                "prox_logp_method='reuse_train_logp' requires ppo_n_minibatches=1, "
+                f"but got ppo_n_minibatches={self.ppo_n_minibatches}. "
+                "With multiple minibatches, weights change between steps, so the "
+                "training forward logprobs would differ from the original policy. "
+                "Forcing ppo_n_minibatches=1; note this changes training dynamics "
+                "to a single optimizer step per PPO update."
+            )
+            self.ppo_n_minibatches = 1
         # Warn if rejection_sampling is configured but use_decoupled_loss is False
         if not self.use_decoupled_loss and self.rejection_sampling is not None:
             logger.warning(
@@ -1644,6 +1755,25 @@ class PPOActorConfig(TrainEngineConfig):
                 raise ValueError(
                     "SAPO is not compatible with `use_decoupled_loss=True`. "
                     "Please set `actor.use_decoupled_loss=false` in your configuration."
+                )
+
+        # Validate CISPO configuration
+        if self.use_cispo_loss:
+            if self.use_sapo_loss:
+                raise ValueError(
+                    "CISPO and SAPO are mutually exclusive surrogates. "
+                    "Set at most one of use_cispo_loss / use_sapo_loss."
+                )
+            if self.eps_clip_higher is None or self.eps_clip_higher <= 0:
+                raise ValueError(
+                    "CISPO requires a positive eps_clip_higher (the asymmetric "
+                    "upper clip is its defining knob, MiniMax-M1 Eq. 4-5). Got "
+                    f"eps_clip_higher={self.eps_clip_higher}."
+                )
+            if self.importance_sampling_level != "token":
+                raise ValueError(
+                    "CISPO only supports importance_sampling_level='token'. "
+                    "Sequence-level (GSPO-style) CISPO has no published surrogate."
                 )
 
         super().__post_init__()
@@ -1908,9 +2038,7 @@ class SGLangConfig:
 
     @staticmethod
     def build_cmd_from_args(args: dict[str, Any]):
-        return get_py_cmd(
-            "areal.experimental.inference_service.sglang.launch_server", args
-        )
+        return get_py_cmd("areal.v2.inference_service.sglang.launch_server", args)
 
     @staticmethod
     def build_args(
@@ -1993,7 +2121,7 @@ class AgentConfig:
         default_factory=lambda: (
             SchedulingSpec(
                 gpu=0,
-                cmd="python -m areal.experimental.agent_service.guard",
+                cmd="python -m areal.v2.agent_service.guard",
             ),
         ),
         metadata={
@@ -2048,6 +2176,30 @@ class AgentConfig:
             "The 'concat' style exports only the final concatenated trajectory from the root. "
             "It is only suitable for linear conversation histories without token mismatching (whether valid depends on the tokenizer).",
             "choices": ["individual", "concat"],
+        },
+    )
+    message_preprocessors: list[str] = field(
+        default_factory=list,
+        metadata={
+            "help": (
+                "List of message preprocessor class paths applied, in order, to "
+                "Anthropic-compatible `/v1/messages` requests after translating "
+                "them to OpenAI-compatible requests. Native OpenAI "
+                "`/chat/completions` and `/responses` requests are not "
+                "preprocessed. Each entry is a dotted import path to a callable "
+                "class."
+            ),
+        },
+    )
+    prefix_matcher: str | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Dotted import path to a custom prefix matcher function for "
+                "InteractionCache parent-child matching. The function must accept "
+                "two list[dict] arguments (candidate prefix, full messages) and "
+                "return bool. When None, exact element-wise equality is used."
+            ),
         },
     )
     subproc_max_workers: int = field(
@@ -2142,6 +2294,12 @@ class InferenceEngineConfig:
         default=300.0,
         metadata={
             "help": "Timeout in seconds of connecting to remote servers or launching local servers."
+        },
+    )
+    workers_ready_timeout: float = field(
+        default=30.0,
+        metadata={
+            "help": "Timeout (seconds) for initialize() to wait for guards to be ready."
         },
     )
     request_timeout: float = field(
@@ -2829,6 +2987,14 @@ class BaseExperimentConfig:
     vllm: vLLMConfig = field(default_factory=vLLMConfig)
 
     scheduler: SchedulerConfig = field(default_factory=SchedulerConfig)
+
+    post_exit_hook: str = field(
+        default="",
+        metadata={
+            "help": "Shell command run after launcher shutdown. "
+            "LOG_DIR is injected; failures are logged and ignored."
+        },
+    )
 
     def __post_init__(self):
         """Validate training configuration."""

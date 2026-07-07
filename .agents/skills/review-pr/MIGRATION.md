@@ -104,8 +104,8 @@ ______________________________________________________________________
 1. `areal/experimental/models/archon/**` + `areal/experimental/engine/archon_engine.py`
    \+ `areal/experimental/engine/archon_checkpoint.py` -> Distributed Runtime + Model
    Compute & Attention (CRITICAL/HIGH)
-1. `areal/experimental/agent_service/**` -> Service Orchestration (HIGH)
-1. `areal/experimental/inference_service/**` -> Service Orchestration (HIGH)
+1. `areal/v2/agent_service/**` -> Service Orchestration (HIGH)
+1. `areal/v2/inference_service/**` -> Service Orchestration (HIGH)
 1. `areal/experimental/engine/archon_weight_sync.py` -> Distributed Runtime (CRITICAL)
 1. `areal/infra/rpc/**` -> Launcher & Infrastructure + Distributed Runtime (HIGH)
 1. `areal/workflow/**`, `areal/trainer/**` -> Workflow & Trainer Contract (HIGH/MEDIUM)

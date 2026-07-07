@@ -292,7 +292,7 @@ wheels = [
 
 [[package]]
 name = "areal"
-version = "1.0.4"
+version = "2.0.0"
 source = { editable = "." }
 dependencies = [
     { name = "aiofiles", marker = "(platform_machine == 'arm64' and sys_platform == 'darwin') or (platform_machine == 'x86_64' and sys_platform == 'darwin') or (platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
@@ -386,6 +386,10 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
+cli = [
+    { name = "click", marker = "(platform_machine == 'arm64' and sys_platform == 'darwin') or (platform_machine == 'x86_64' and sys_platform == 'darwin') or (platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
+    { name = "colorlog", marker = "(platform_machine == 'arm64' and sys_platform == 'darwin') or (platform_machine == 'x86_64' and sys_platform == 'darwin') or (platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
+]
 cuda = [
     { name = "flash-linear-attention", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "kernels", marker = "(platform_machine == 'arm64' and sys_platform == 'darwin') or (platform_machine == 'x86_64' and sys_platform == 'darwin') or (platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
@@ -466,8 +470,10 @@ requires-dist = [
     { name = "blosc" },
     { name = "build", specifier = ">=1.2.1" },
     { name = "claude-agent-sdk" },
+    { name = "click", marker = "extra == 'cli'", specifier = ">=8.1" },
     { name = "colorama" },
     { name = "colorlog" },
+    { name = "colorlog", marker = "extra == 'cli'" },
     { name = "cookiecutter", specifier = ">2.1.1" },
     { name = "datasets", specifier = ">=3.0.0" },
     { name = "daytona", marker = "extra == 'sandbox'", specifier = ">=0.167.0" },
@@ -559,7 +565,7 @@ requires-dist = [
     { name = "word2number" },
     { name = "zstandard" },
 ]
-provides-extras = ["sglang", "tms", "kernels", "megatron", "cuda-train", "cuda", "sandbox"]
+provides-extras = ["sglang", "tms", "kernels", "megatron", "cuda-train", "cuda", "sandbox", "cli"]
 
 [package.metadata.requires-dev]
 dev = [

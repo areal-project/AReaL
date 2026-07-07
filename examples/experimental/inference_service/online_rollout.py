@@ -21,11 +21,11 @@ def main(args: list[str]) -> None:
     ext_args, remaining = parser.parse_known_args(args)
 
     from areal.api.cli_args import PPOConfig, load_expr_config
-    from areal.experimental.inference_service.controller.controller import (
-        RolloutControllerV2,
-    )
     from areal.utils import logging
     from areal.utils.environ import is_single_controller
+    from areal.v2.inference_service.controller.controller import (
+        RolloutControllerV2,
+    )
 
     logger = logging.getLogger("InferenceServiceOnlineTrain")
 
