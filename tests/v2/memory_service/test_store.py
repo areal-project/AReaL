@@ -546,3 +546,56 @@ def test_hash_prefix_collision_fails_without_overwriting(
     assert original.evidence_id == f"evd_{shared_prefix}"
     assert store.get(original.event.scope, original.evidence_id) is original
     assert store.list(original.event.scope) == (original,)
+
+
+def test_hash_prefix_collision_is_isolated_across_scopes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    shared_prefix = "a" * 24
+    first_digest = shared_prefix + "b" * 40
+    second_digest = shared_prefix + "c" * 40
+    first_scope = make_scope(subject_id="user-1")
+    second_scope = make_scope(subject_id="user-2")
+    missing_scope = make_scope(subject_id="user-3")
+    first_event = make_event(
+        scope=first_scope,
+        payload="first",
+        idempotency_key="shared-key",
+    )
+    second_event = make_event(
+        scope=second_scope,
+        payload="second",
+        idempotency_key="shared-key",
+    )
+    digest_by_canonical_bytes = {
+        first_event.canonical_bytes(): first_digest,
+        second_event.canonical_bytes(): second_digest,
+    }
+
+    class StubHash:
+        def __init__(self, digest: str) -> None:
+            self._digest = digest
+
+        def hexdigest(self) -> str:
+            return self._digest
+
+    def prefix_colliding_sha256(canonical_bytes: bytes) -> StubHash:
+        return StubHash(digest_by_canonical_bytes[canonical_bytes])
+
+    monkeypatch.setattr(store_module.hashlib, "sha256", prefix_colliding_sha256)
+    store = InMemoryEvidenceStore()
+
+    first = store.append(first_event)
+    second = store.append(second_event)
+
+    assert first is not second
+    assert first.evidence_id == second.evidence_id == f"evd_{shared_prefix}"
+    assert first.content_hash == first_digest
+    assert second.content_hash == second_digest
+    assert store.get(first_scope, first.evidence_id) is first
+    assert store.get(second_scope, second.evidence_id) is second
+    with pytest.raises(EvidenceNotFoundError):
+        store.get(missing_scope, first.evidence_id)
+    assert store.list(first_scope) == (first,)
+    assert store.list(second_scope) == (second,)
+    assert store.list(missing_scope) == ()

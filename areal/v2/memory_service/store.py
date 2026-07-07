@@ -46,7 +46,7 @@ class InMemoryEvidenceStore:
 
     def __init__(self) -> None:
         self._lock = RLock()
-        self._by_evidence_id: dict[str, EvidenceRecord] = {}
+        self._by_evidence_id: dict[tuple[MemoryScope, str], EvidenceRecord] = {}
         self._by_idempotency_key: dict[tuple[MemoryScope, str], EvidenceRecord] = {}
         self._by_scope: dict[MemoryScope, list[EvidenceRecord]] = {}
 
@@ -56,6 +56,7 @@ class InMemoryEvidenceStore:
         canonical_bytes = event.canonical_bytes()
         content_hash = hashlib.sha256(canonical_bytes).hexdigest()
         evidence_id = f"evd_{content_hash[:24]}"
+        evidence_index = (event.scope, evidence_id)
         idempotency_index = (event.scope, event.idempotency_key)
 
         with self._lock:
@@ -67,7 +68,7 @@ class InMemoryEvidenceStore:
                     "scoped idempotency key already refers to different evidence"
                 )
 
-            existing_record = self._by_evidence_id.get(evidence_id)
+            existing_record = self._by_evidence_id.get(evidence_index)
             if existing_record is not None:
                 if existing_record.event.canonical_bytes() == canonical_bytes:
                     return existing_record
@@ -81,7 +82,7 @@ class InMemoryEvidenceStore:
                 content_hash=content_hash,
                 created_at=datetime.now(UTC),
             )
-            self._by_evidence_id[evidence_id] = record
+            self._by_evidence_id[evidence_index] = record
             self._by_idempotency_key[idempotency_index] = record
             self._by_scope.setdefault(event.scope, []).append(record)
             return record
@@ -90,8 +91,8 @@ class InMemoryEvidenceStore:
         """Return evidence only when it belongs to the requested scope."""
 
         with self._lock:
-            record = self._by_evidence_id.get(evidence_id)
-            if record is None or record.event.scope != scope:
+            record = self._by_evidence_id.get((scope, evidence_id))
+            if record is None:
                 raise EvidenceNotFoundError(f"evidence {evidence_id!r} was not found")
             return record
 
