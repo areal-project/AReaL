@@ -4,11 +4,14 @@
 
 from __future__ import annotations
 
+import faulthandler
 import re
+from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta, timezone, tzinfo
 from hashlib import sha256 as calculate_sha256
-from threading import Barrier
+from threading import Barrier, Event
 from time import sleep
 
 import pytest
@@ -30,6 +33,84 @@ from areal.v2.memory_service.types import (
 
 UTC_INSTANT = datetime(2026, 7, 7, 4, 5, 6, 789000, tzinfo=UTC)
 CONCURRENCY_TIMEOUT_SECONDS = 10.0
+HARD_CONCURRENCY_TIMEOUT_SECONDS = CONCURRENCY_TIMEOUT_SECONDS + 5.0
+
+
+@contextmanager
+def _hard_bounded_executor(*, max_workers: int) -> Iterator[ThreadPoolExecutor]:
+    faulthandler.dump_traceback_later(
+        HARD_CONCURRENCY_TIMEOUT_SECONDS,
+        exit=True,
+    )
+    try:
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            yield executor
+    finally:
+        faulthandler.cancel_dump_traceback_later()
+
+
+def test_hard_bounded_executor_waits_for_workers_before_cancel_on_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bounded_executor = _hard_bounded_executor
+    watchdog_events: list[object] = []
+    worker_started = Event()
+    shutdown_started = Event()
+    shutdown_finished = Event()
+    worker_finished = Event()
+    shutdown_wait_values: list[bool] = []
+    original_shutdown = ThreadPoolExecutor.shutdown
+    original_error = RuntimeError("body failed")
+
+    def arm_watchdog(timeout: float, *, exit: bool) -> None:
+        watchdog_events.append(("arm", timeout, exit))
+
+    def cancel_watchdog() -> None:
+        watchdog_events.append(
+            (
+                "cancel",
+                worker_finished.is_set(),
+                shutdown_finished.is_set(),
+            )
+        )
+
+    def observe_shutdown(
+        executor: ThreadPoolExecutor,
+        wait: bool = True,
+        *,
+        cancel_futures: bool = False,
+    ) -> None:
+        shutdown_wait_values.append(wait)
+        shutdown_started.set()
+        original_shutdown(
+            executor,
+            wait=wait,
+            cancel_futures=cancel_futures,
+        )
+        shutdown_finished.set()
+
+    def slow_worker() -> None:
+        worker_started.set()
+        assert shutdown_started.wait(timeout=CONCURRENCY_TIMEOUT_SECONDS)
+        worker_finished.set()
+
+    monkeypatch.setattr(faulthandler, "dump_traceback_later", arm_watchdog)
+    monkeypatch.setattr(faulthandler, "cancel_dump_traceback_later", cancel_watchdog)
+    monkeypatch.setattr(ThreadPoolExecutor, "shutdown", observe_shutdown)
+
+    with pytest.raises(RuntimeError) as raised:
+        with bounded_executor(max_workers=1) as executor:
+            future = executor.submit(slow_worker)
+            assert worker_started.wait(timeout=CONCURRENCY_TIMEOUT_SECONDS)
+            raise original_error
+
+    assert raised.value is original_error
+    assert future.result(timeout=CONCURRENCY_TIMEOUT_SECONDS) is None
+    assert watchdog_events == [
+        ("arm", CONCURRENCY_TIMEOUT_SECONDS + 5.0, True),
+        ("cancel", True, True),
+    ]
+    assert shutdown_wait_values == [True]
 
 
 class YieldingMissingDict(dict[object, object]):
@@ -256,7 +337,7 @@ def test_concurrent_identical_appends_return_exact_original_record() -> None:
         start.wait()
         return store.append(event)
 
-    with ThreadPoolExecutor(max_workers=caller_count) as executor:
+    with _hard_bounded_executor(max_workers=caller_count) as executor:
         futures = [executor.submit(append_after_start) for _ in range(caller_count)]
         records = tuple(
             future.result(timeout=CONCURRENCY_TIMEOUT_SECONDS) for future in futures
@@ -295,7 +376,7 @@ def test_concurrent_scoped_idempotency_conflicts_leave_only_winner_indexed() -> 
         start.wait()
         return store.append(event)
 
-    with ThreadPoolExecutor(max_workers=len(events)) as executor:
+    with _hard_bounded_executor(max_workers=len(events)) as executor:
         futures = [executor.submit(append_after_start, event) for event in events]
         winners: list[EvidenceRecord] = []
         conflicts: list[EvidenceConflictError] = []
