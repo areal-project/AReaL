@@ -80,9 +80,12 @@ class InMemoryMemoryReleaseStore:
                     "scoped release idempotency key already refers to different content"
                 )
 
+        revisions = tuple(
+            self._history_store.get_revision(manifest.scope, revision_id)
+            for revision_id in manifest.revision_ids
+        )
         memory_ids: set[str] = set()
-        for revision_id in manifest.revision_ids:
-            revision = self._history_store.get_revision(manifest.scope, revision_id)
+        for revision in revisions:
             if revision.memory_id in memory_ids:
                 raise ReleaseConflictError(
                     f"release contains more than one revision for memory_id "

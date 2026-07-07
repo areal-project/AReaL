@@ -229,6 +229,43 @@ def seeded_history(
     return history, (first_evidence, second_evidence), (root, child, other)
 
 
+def seeded_sibling_revisions() -> tuple[
+    InMemoryMemoryHistoryStore,
+    MemoryRevision,
+    MemoryRevision,
+]:
+    history, _, (root, _, _) = seeded_history()
+    scope = root.proposal.scope
+    root_evidence_id = history.get_candidate(
+        scope, root.proposal.candidate_id
+    ).proposal.evidence_ids[0]
+    siblings = []
+    for side, operation in (
+        ("left", RevisionOperation.REFINE),
+        ("right", RevisionOperation.CONTRADICT),
+    ):
+        candidate = append_candidate(
+            history,
+            scope=scope,
+            evidence_ids=(root_evidence_id,),
+            content=f"{side} sibling",
+            idempotency_key=f"candidate-{side}",
+        )
+        siblings.append(
+            append_revision(
+                history,
+                scope=scope,
+                candidate_id=candidate.candidate_id,
+                operation=operation,
+                parent_revision_id=root.revision_id,
+                idempotency_key=f"revision-{side}",
+            )
+        )
+    left, right = siblings
+    assert left.memory_id == right.memory_id == root.memory_id
+    return history, left, right
+
+
 def assert_release_indexes_empty(store: InMemoryMemoryReleaseStore) -> None:
     assert store._release_by_id == {}
     assert store._release_by_idempotency == {}
@@ -399,43 +436,8 @@ def test_foreign_revision_is_indistinguishable_from_missing() -> None:
 
 
 def test_sibling_revisions_conflict_in_one_manifest_but_release_separately() -> None:
-    history, _, (root, _, _) = seeded_history()
-    scope = make_scope()
-    # Reuse a real evidence identifier from the existing root candidate.
-    root_evidence_id = history.get_candidate(
-        scope, root.proposal.candidate_id
-    ).proposal.evidence_ids[0]
-    left_candidate = append_candidate(
-        history,
-        scope=scope,
-        evidence_ids=(root_evidence_id,),
-        content="left sibling",
-        idempotency_key="candidate-left",
-    )
-    right_candidate = append_candidate(
-        history,
-        scope=scope,
-        evidence_ids=(root_evidence_id,),
-        content="right sibling",
-        idempotency_key="candidate-right",
-    )
-    left = append_revision(
-        history,
-        scope=scope,
-        candidate_id=left_candidate.candidate_id,
-        operation=RevisionOperation.REFINE,
-        parent_revision_id=root.revision_id,
-        idempotency_key="revision-left",
-    )
-    right = append_revision(
-        history,
-        scope=scope,
-        candidate_id=right_candidate.candidate_id,
-        operation=RevisionOperation.CONTRADICT,
-        parent_revision_id=root.revision_id,
-        idempotency_key="revision-right",
-    )
-    assert left.memory_id == right.memory_id
+    history, left, right = seeded_sibling_revisions()
+    scope = left.proposal.scope
     store = InMemoryMemoryReleaseStore(history)
 
     with pytest.raises(ReleaseConflictError, match="memory_id"):
@@ -452,6 +454,20 @@ def test_sibling_revisions_conflict_in_one_manifest_but_release_separately() -> 
         ReleaseManifest(scope, (right.revision_id,)), idempotency_key="release-right"
     )
     assert set(store.list_releases(scope)) == {left_release, right_release}
+
+
+def test_missing_member_precedes_duplicate_memory_conflict() -> None:
+    history, left, right = seeded_sibling_revisions()
+    store = InMemoryMemoryReleaseStore(history)
+    manifest = ReleaseManifest(
+        left.proposal.scope,
+        (left.revision_id, right.revision_id, "rev_missing"),
+    )
+
+    with pytest.raises(RevisionNotFoundError, match="rev_missing"):
+        store.append_release(manifest, idempotency_key="release-invalid")
+
+    assert_release_indexes_empty(store)
 
 
 def test_same_key_retry_returns_original_release() -> None:
