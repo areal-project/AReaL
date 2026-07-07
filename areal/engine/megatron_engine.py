@@ -512,29 +512,34 @@ class MegatronEngine(TrainEngine):
                 bridge_type=self.bridge_cls,
             )
 
-            if (
-                self.mcore_config.num_layers_in_first_pipeline_stage
-                or self.mcore_config.num_layers_in_last_pipeline_stage
-                or self.mcore_config.account_for_embedding_in_pipeline_split
-                or self.mcore_config.account_for_loss_in_pipeline_split
-            ):
-                self.bridge.config.num_layers_in_first_pipeline_stage = (
-                    self.mcore_config.num_layers_in_first_pipeline_stage
-                )
-                self.bridge.config.num_layers_in_last_pipeline_stage = (
-                    self.mcore_config.num_layers_in_last_pipeline_stage
-                )
-                self.bridge.config.account_for_embedding_in_pipeline_split = (
-                    self.mcore_config.account_for_embedding_in_pipeline_split
-                )
-                self.bridge.config.account_for_loss_in_pipeline_split = (
-                    self.mcore_config.account_for_loss_in_pipeline_split
-                )
+            PIPELINE_SPLIT_FIELDS = (
+                "num_layers_in_first_pipeline_stage",
+                "num_layers_in_last_pipeline_stage",
+                "account_for_embedding_in_pipeline_split",
+                "account_for_loss_in_pipeline_split",
+            )
 
-            else:
+            has_pipeline_split_override = any(
+                getattr(self.mcore_config, field, None)
+                for field in PIPELINE_SPLIT_FIELDS
+            )
+
+            if not has_pipeline_split_override:
                 self.tf_config = configure_pipeline_layer_splits(
-                    self.parallel_strategy, self.hf_config, self.tf_config
+                    self.parallel_strategy,
+                    self.hf_config,
+                    self.tf_config,
                 )
+            else:
+                if self.bridge_cls == "mbridge":
+                    target_config = self.bridge.config
+                elif self.bridge_cls == "megatron-bridge":
+                    target_config = self.tf_config
+                else:
+                    raise ValueError(f"Unsupported bridge_cls: {self.bridge_cls}")
+
+                for field in PIPELINE_SPLIT_FIELDS:
+                    setattr(target_config, field, getattr(self.mcore_config, field))
 
             self.is_vision_model = is_valid_vision_model(self.hf_config.model_type)
             # GDN/SSM models (e.g. Qwen3.5) reject packed THD input and must run

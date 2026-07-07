@@ -229,7 +229,10 @@ def make_mcore_model(
         provider.freeze_vision_model = mcore_config.freeze_vision_model
         provider.freeze_vision_projection = mcore_config.freeze_vision_projection
 
-        if hasattr(tf_config, "pipeline_model_parallel_layout"):
+        if (
+            hasattr(tf_config, "pipeline_model_parallel_layout")
+            and tf_config.pipeline_model_parallel_layout is not None
+        ):
             provider.pipeline_model_parallel_layout = (
                 tf_config.pipeline_model_parallel_layout
             )
