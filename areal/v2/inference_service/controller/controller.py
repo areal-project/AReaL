@@ -34,7 +34,7 @@ if TYPE_CHECKING:
 
 from areal.api.cli_args import InferenceEngineConfig
 from areal.api.io_struct import LocalInfServerInfo
-from areal.utils import logging
+from areal.utils import logging, stats_tracker
 from areal.utils.network import format_hostport
 
 logger = logging.getLogger("RolloutControllerV2")
@@ -1457,8 +1457,8 @@ class RolloutControllerV2:
     # -- Stats -------------------------------------------------------------
 
     def export_stats(self) -> dict[str, float]:
-        """Return local WorkflowExecutor stats."""
-        return {}
+        """Export and reset statistics recorded by the local workflow executor."""
+        return stats_tracker.export_all()
 
     def config_perf_tracer(self, config: Any = None, role: str = "") -> None:
         """No-op — gateway does not have per-worker perf tracing."""
