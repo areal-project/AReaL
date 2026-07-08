@@ -69,11 +69,27 @@ class InferenceServiceWorkflow(RolloutWorkflow):
         session: aiohttp.ClientSession,
         task_id: str,
         group_size: int = 1,
+        group_id: str | None = None,
     ) -> tuple[str | None, list[tuple[str, str]]]:
-        """Start one or more sessions. Returns (group_id, [(session_id, api_key), ...])."""
+        """Start one or more sessions. Returns (group_id, [(session_id, api_key), ...]).
+
+        Args:
+            session: The aiohttp session.
+            task_id: Task identifier.
+            group_size: Number of sessions in the GRPO group.
+            group_id: Pre-declared group id. When provided, the data proxy
+                reuses it so that multiple concurrent requests with the same
+                ``group_id`` are routed to distinct workers, ensuring GRPO
+                advantage normalization is computed over related sessions.
+        """
         url = f"{self.gateway_addr}/{_RL_START_SESSION_PATHNAME}"
         headers = {"Authorization": f"Bearer {self._admin_api_key}"}
-        payload: dict[str, Any] = {"task_id": task_id, "group_size": group_size}
+        payload: dict[str, Any] = {
+            "task_id": task_id,
+            "group_size": group_size,
+        }
+        if group_id is not None:
+            payload["group_id"] = group_id
         async with session.post(url, json=payload, headers=headers) as resp:
             resp.raise_for_status()
             data = await resp.json()

@@ -466,7 +466,12 @@ def create_app(config: DataProxyConfig) -> FastAPI:
         store: SessionStore = app.state.session_store
         _require_admin_key(request, store)
 
-        group_id = f"grp-{uuid.uuid4()}"
+        # If the caller provided a group_id, reuse it so that multiple
+        # concurrent requests can declare they belong to the same GRPO group.
+        # This is critical for online mode: without this, N unrelated user
+        # conversations get merged into one GRPO group, making advantage
+        # normalization mathematically meaningless.
+        group_id = body.group_id or f"grp-{uuid.uuid4()}"
         group_size = max(body.group_size, 1)
         credentials: list[SessionCredentials] = []
         for i in range(group_size):
