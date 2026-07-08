@@ -10,58 +10,9 @@ ______________________________________________________________________
 
 ## 1.1 Create the Container
 
-Create a container using the following image:
-
-`swr.cn-north-9.myhuaweicloud.com/areal/areal_npu:v1.0.1-a3`
-
-You can use the following commands to create the container:
-
-```bash
-WORK_DIR=<your_workspace>
-CONTAINER_WORK_DIR=<your_container_workspace>
-
-IMAGE=swr.cn-north-9.myhuaweicloud.com/areal/areal_npu:v1.0.1-a3
-CONTAINER_NAME=areal_npu
-
-cd "${WORK_DIR}"
-
-docker pull "${IMAGE}"
-
-docker run -itd \
-  --cap-add=SYS_PTRACE \
-  --net=host \
-  --device=/dev/davinci0 \
-  --device=/dev/davinci1 \
-  --device=/dev/davinci2 \
-  --device=/dev/davinci3 \
-  --device=/dev/davinci4 \
-  --device=/dev/davinci5 \
-  --device=/dev/davinci6 \
-  --device=/dev/davinci7 \
-  --device=/dev/davinci8 \
-  --device=/dev/davinci9 \
-  --device=/dev/davinci10 \
-  --device=/dev/davinci11 \
-  --device=/dev/davinci12 \
-  --device=/dev/davinci13 \
-  --device=/dev/davinci14 \
-  --device=/dev/davinci15 \
-  --device=/dev/davinci_manager \
-  --device=/dev/devmm_svm \
-  --device=/dev/hisi_hdc \
-  --shm-size=1200g \
-  -v /usr/local/sbin/npu-smi:/usr/local/sbin/npu-smi \
-  -v /usr/local/dcmi:/usr/local/dcmi \
-  -v /etc/ascend_install.info:/etc/ascend_install.info \
-  -v /sys/fs/cgroup:/sys/fs/cgroup:ro \
-  -v /usr/local/Ascend/driver:/usr/local/Ascend/driver \
-  -v /var/log/npu/:/usr/slog \
-  -v "${WORK_DIR}:${CONTAINER_WORK_DIR}" \
-  --privileged=true \
-  --name "${CONTAINER_NAME}" \
-  "${IMAGE}" \
-  /bin/bash
-```
+Create a container using the latest AReaL NPU image (A3) and the container creation
+commands from the
+[NPU installation guide](https://areal-project.github.io/AReaL/en/tutorial/installation_npu.html).
 
 ______________________________________________________________________
 

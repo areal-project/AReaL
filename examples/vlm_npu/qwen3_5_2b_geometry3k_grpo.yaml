@@ -35,15 +35,15 @@ rollout:
 gconfig:
   n_samples: 4
   min_new_tokens: 0
-  max_new_tokens: 512
+  max_new_tokens: 2048
   greedy: false
   temperature: 1.0
 
 actor:
-  backend: "megatron:d4p1t2"
+  backend: "megatron:d2p4t1"
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
-  path: Qwen/Qwen2.5-VL-3B-Instruct
+  path: Qwen/Qwen3-VL-2B-Instruct
   init_from_scratch: false
   disable_dropout: true
   gradient_checkpointing: true
@@ -60,6 +60,11 @@ actor:
     lr_scheduler_type: constant
     gradient_clipping: 1.0
     warmup_steps_proportion: 0.001
+  mindspeed:
+    swap_optimizer: true
+    use_fused_rotary_pos_emb: true
+    use_fused_swiglu: true
+    position_embedding_type: "rope"
   eps_clip: 0.4
   temperature: ${gconfig.temperature}
   reward_scaling: 10.0
@@ -78,11 +83,15 @@ actor:
   adv_norm:
     mean_level: batch
     std_level: batch
+  megatron:
+    bridge_type: megatron-bridge
+    use_bridge_for_update_weights: true # for live weight sync
   max_new_tokens: ${gconfig.max_new_tokens}
   scheduling_spec:
     - task_type: worker
       port_count: 2
       gpu: 1
+      cpu: 4
       mem: 32
       cmd: python3 -m areal.infra.rpc.rpc_server
       env_vars:
@@ -132,11 +141,13 @@ vllm:
   max_model_len: 32768
   gpu_memory_utilization: 0.9
   disable_sliding_window: false
+  enforce_eager: true
+  gdn_prefill_backend: triton
 
 
 # datasets
 train_dataset:
-  batch_size: 32
+  batch_size: 64
   shuffle: true
   pin_memory: true
   num_workers: 4

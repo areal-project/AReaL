@@ -1,44 +1,215 @@
-# Training VLMs with GRPO on NPU:
+# Training VLMs with GRPO on Ascend NPU
 
-In this instruction, we will introduce how to train VLMs with GRPO on Ascend NPU.
+This directory contains examples for training vision-language models (VLMs) with GRPO on
+Ascend NPU (Atlas A3):
 
-## Examples
+| Config                                 | Model           | Dataset    | Rollout + Train Backend                          | Scale            |
+| -------------------------------------- | --------------- | ---------- | ------------------------------------------------ | ---------------- |
+| `qwen2_5_vl_3b_geometry3k_grpo.yaml`   | Qwen2.5-VL-3B   | Geometry3K | `vllm:d8` + `megatron:d4t2`                      | 1 node, 16 NPUs  |
+| `qwen3_vl_2b_geometry3k_grpo.yaml`     | Qwen3-VL-2B     | Geometry3K | `vllm:d8` + `megatron:d4t2`                      | 1 node, 16 NPUs  |
+| `qwen3_5_2b_geometry3k_grpo.yaml`      | Qwen3.5-2B      | Geometry3K | `vllm:d8` + `megatron:d2p4`                      | 1 node, 16 NPUs  |
+| `qwen3_6_27b_geometry3k_grpo.yaml`     | Qwen3.6-27B     | Geometry3K | `vllm:d4t2` + `megatron:p2t4`                    | 1 node, 16 NPUs  |
+| `qwen3_6_35b_a3b_geometry3k_grpo.yaml` | Qwen3.6-35B-A3B | Geometry3K | `vllm:d8t2` + `megatron:(attn:d2p4t2\|ffn:p4e4)` | 2 nodes, 32 NPUs |
+| `qwen2_5_vl_3b_fsdp_virl39k_grpo.yaml` | Qwen2.5-VL-3B   | ViRL39K    | `vllm:d32` + `fsdp:d16`                          | 3 nodes, 48 NPUs |
 
-This directory contains examples for training vision-language models on NPU with GRPO:
+The single-node Geometry3K examples run with the `local` scheduler; the multi-node
+examples are scheduled via Ray.
 
-1. **Qwen2.5-VL-3B** - `qwen2_5_vl_3b_geometry3k_grpo.*` - GRPO training on Geometry3K
-   with Qwen2.5-VL-2B model dataset
-1. **Qwen2.5-VL-3B (multi-node)** - `qwen2_5_vl_3b_virl39k_grpo_multinode.sh` -
-   multi-node GRPO training on ViRL39K dataset
-1. **Qwen3-VL-2B** - `qwen3_vl_2b_geometry3k_grpo.*` - GRPO training on Geometry3K
-   dataset with Qwen3-VL-2B model
+______________________________________________________________________
 
-## Running the Examples
+# 1. Environment Setup
+
+## 1.1 Create the Container
+
+Create a container using the latest AReaL NPU image (A3) and the container creation
+commands from the
+[NPU installation guide](https://areal-project.github.io/AReaL/en/tutorial/installation_npu.html).
+
+For multi-node training, create the container on every node.
+
+## 1.2 Install AReaL
+
+Inside the container, clone the AReaL repository and check out the `ascend-v1.0.4`
+branch:
+
+```bash
+git clone https://github.com/inclusionAI/AReaL
+cd AReaL
+git checkout ascend-v1.0.4
+pip install -e . --no-deps
+```
+
+______________________________________________________________________
+
+# 2. Prepare Datasets
+
+> If your cluster cannot reach `huggingface.co` directly, set a mirror before
+> downloading, e.g. `export HF_ENDPOINT=https://hf-mirror.com`.
+
+## 2.1 Geometry3K
+
+The Geometry3K configs point `train_dataset.path` / `valid_dataset.path` to
+[`hiyouga/geometry3k`](https://huggingface.co/datasets/hiyouga/geometry3k), which is
+downloaded automatically from the HuggingFace Hub on first run.
+
+To pre-download it instead (recommended for offline clusters):
+
+```bash
+huggingface-cli download hiyouga/geometry3k --repo-type dataset --local-dir data/geometry3k
+```
+
+Then override the dataset paths when launching training:
+
+```bash
+... train_dataset.path=data/geometry3k valid_dataset.path=data/geometry3k
+```
+
+## 2.2 ViRL39K
+
+Download [`TIGER-Lab/ViRL39K`](https://huggingface.co/datasets/TIGER-Lab/ViRL39K) and
+extract the image archive next to the parquet file:
+
+```bash
+huggingface-cli download TIGER-Lab/ViRL39K --repo-type dataset --local-dir data/ViRL39K
+cd data/ViRL39K && unzip images.zip && cd -
+```
+
+The resulting layout should be:
+
+```
+data/ViRL39K/
+├── 39Krelease.parquet
+└── images/
+    ├── Processed-xxx-0.jpg
+    └── ...
+```
+
+The ViRL39K config already sets `train_dataset.path: data/ViRL39K/39Krelease.parquet`
+(relative to the AReaL repository root). The dataset loader expects the `images/` folder
+to sit in the same directory as the parquet file. For multi-node training, the dataset
+must be available at the same path on every node — place it on shared storage (NAS) or
+copy it to each node.
+
+______________________________________________________________________
+
+# 3. Single-Node Training (Geometry3K)
+
+Before launching, disable vllm-ascend optimized models. Some models are optimized by
+vllm-ascend, but the optimized variants may be unsuitable for RLHF training:
+
+```bash
+export USE_OPTIMIZED_MODEL=0
+```
+
+All single-node examples use 16 NPUs, split between vLLM rollout and Megatron
+(MindSpeed) training as listed in the table above. Launch the one you need:
 
 ### Qwen2.5-VL-3B
 
 ```bash
-bash examples/vlm_npu/qwen2_5_vl_3b_geometry3k_grpo.sh
-```
-
-### Qwen2.5-VL-3B (ViRL39K, multi-node)
-
-```bash
-bash examples/vlm_npu/qwen2_5_vl_3b_virl39k_grpo_multinode.sh
+python examples/vlm/geometry3k_grpo.py \
+    --config examples/vlm_npu/qwen2_5_vl_3b_geometry3k_grpo.yaml
 ```
 
 ### Qwen3-VL-2B
 
 ```bash
-bash examples/vlm_npu/qwen3_vl_2b_geometry3k_grpo.sh
+python examples/vlm/geometry3k_grpo.py \
+    --config examples/vlm_npu/qwen3_vl_2b_geometry3k_grpo.yaml
 ```
 
-The Geometry3K examples use the same dataset and GRPO training configuration, but with
-different model architectures. The Qwen3-VL-2B model is smaller and may be more suitable
-for environments with limited resources. The ViRL39K multi-node example customizes the
-default configuration for multi-node training settings.
+### Qwen3.5-2B
 
-## Testing Qwen2.5-VL-3B
+```bash
+python examples/vlm/geometry3k_grpo.py \
+    --config examples/vlm_npu/qwen3_5_2b_geometry3k_grpo.yaml
+```
+
+### Qwen3.6-27B
+
+```bash
+python examples/vlm/geometry3k_grpo.py \
+    --config examples/vlm_npu/qwen3_6_27b_geometry3k_grpo.yaml
+```
+
+The Geometry3K examples share the same dataset and GRPO training configuration but use
+different model architectures and parallelism strategies. The smaller 2B/3B models are
+more suitable for environments with limited resources.
+
+______________________________________________________________________
+
+# 4. Multi-Node Training
+
+Two examples run on multiple nodes via the Ray scheduler:
+
+- **Qwen3.6-35B-A3B (MoE) on Geometry3K** — 2 nodes × 16 NPUs, `vllm:d8t2` rollout +
+  Megatron training with expert parallelism.
+- **Qwen2.5-VL-3B on ViRL39K** — 3 nodes × 16 NPUs, split into 32 NPUs for vLLM rollout
+  and 16 NPUs for FSDP training (`vllm:d32` + `fsdp:d16`), with long-context generation
+  (16384 max new tokens).
+
+## 4.1 Preparation
+
+- Make sure the same AReaL codebase and dataset paths are available on **all nodes**
+  (see [Section 2](#2-prepare-datasets)).
+- Point `cluster.fileroot` and `cluster.name_resolve.nfs_record_root` in the config to
+  shared storage (NAS) accessible from all nodes.
+- Export `USE_OPTIMIZED_MODEL=0` before starting Ray on each node so that workers
+  inherit it. (The ViRL39K config also sets it explicitly via
+  `actor.scheduling_spec.env_vars`.)
+
+## 4.2 Initialize the Ray Cluster
+
+### Start the Ray Head (first node)
+
+```bash
+cd AReaL
+ray start --head
+```
+
+### Start Ray Workers (other nodes)
+
+```bash
+cd AReaL
+
+# Replace with the actual IP address of the head node
+RAY_HEAD_IP=xxx.xxx.xxx.xxx
+
+ray start --address="${RAY_HEAD_IP}:6379"
+```
+
+You can verify the cluster by running:
+
+```bash
+ray status
+```
+
+All nodes declared in the config (`cluster.n_nodes` × `cluster.n_gpus_per_node`) must be
+visible in the Ray cluster before launching.
+
+## 4.3 Launch Training
+
+Run the training command on the head node.
+
+### Qwen3.6-35B-A3B on Geometry3K (2 nodes)
+
+```bash
+python examples/vlm/geometry3k_grpo.py \
+    --config examples/vlm_npu/qwen3_6_35b_a3b_geometry3k_grpo.yaml
+```
+
+### Qwen2.5-VL-3B on ViRL39K (3 nodes)
+
+```bash
+python examples/vlm_npu/virl39k_grpo.py \
+    --config examples/vlm_npu/qwen2_5_vl_3b_fsdp_virl39k_grpo.yaml
+```
+
+______________________________________________________________________
+
+# 5. Benchmark Results
+
+## 5.1 Testing Qwen2.5-VL-3B
 
 ### Hardware
 
@@ -58,7 +229,7 @@ The following hardware configuration has been extensively tested:
   configuration. Took around 19hr to finish full training.
 - Trained model is tested with more than one benchmark using VLMEvalKit.
 
-### Results:
+### Results
 
 We trained Qwen2.5-VL-3B for 70 epochs on Geometry3K and evaluated the checkpoints using
 VLMEvalKit on out of distribution tasks such as MathVision, MathVista, and LogicVista.
@@ -70,7 +241,7 @@ The training was performed on both NPU and GPU and results are as follows:
 | GRPO-GPU   | 35.4       | 20.9            | 55.9           | **37.4** |
 | GRPO-NPU   | 35.3       | 20.5            | 54.7           | **36.8** |
 
-## AReaL vs. verl: Multi-node Training Performance
+## 5.2 AReaL vs. verl: Multi-node Training Performance
 
 We test performance of AReaL for large-scale multi-node training with long context
 generation and compare this performance with verl synchronous training with the same
@@ -87,7 +258,7 @@ AReaL asynchronous settings
 
 We trained Qwen2.5-VL-3B following the settings in the above table:
 
-- **AReaL launcher**: `examples/vlm_npu/qwen2_5_vl_3b_virl39k_grpo_multinode.sh`
+- **AReaL config**: `examples/vlm_npu/qwen2_5_vl_3b_fsdp_virl39k_grpo.yaml`
 - **Dataset**: [`TIGER-Lab/ViRL39K`](https://huggingface.co/datasets/TIGER-Lab/ViRL39K)
 
 ### Performance Comparison

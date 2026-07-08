@@ -3,23 +3,22 @@ trial_name: trial1
 
 seed: 1
 enable_offload: false
-total_train_epochs: 3
+total_train_epochs: 10
 tokenizer_path: ${actor.path}
 
 cluster:
-  n_nodes: 1
+  n_nodes: 2
   n_gpus_per_node: 16
   fileroot: /tmp/areal/experiments
   name_resolve:
     type: nfs
     nfs_record_root: /tmp/areal/name_resolve
 
-
 scheduler:
-  type: local
+  type: ray
 
 rollout:
-  backend: "vllm:d8p1t1"
+  backend: "vllm:d8p1t2"
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
   max_concurrent_rollouts: 256
@@ -35,15 +34,15 @@ rollout:
 gconfig:
   n_samples: 4
   min_new_tokens: 0
-  max_new_tokens: 512
+  max_new_tokens: 2048
   greedy: false
   temperature: 1.0
 
 actor:
-  backend: "megatron:d4p1t2"
+  backend: "megatron:(attn:d2p4t2|ffn:d1p4t1e4)"
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
-  path: Qwen/Qwen2.5-VL-3B-Instruct
+  path: Qwen/Qwen3.6-27B
   init_from_scratch: false
   disable_dropout: true
   gradient_checkpointing: true
@@ -60,6 +59,16 @@ actor:
     lr_scheduler_type: constant
     gradient_clipping: 1.0
     warmup_steps_proportion: 0.001
+  mindspeed:
+    swap_optimizer: true
+    use_fused_rotary_pos_emb: true
+    use_fused_swiglu: true
+    moe_alltoall_overlap_comm: true
+    moe_grouped_gemm: true
+    moe_zero_memory: disable
+    moe_permute_fusion: true
+    gemm_gradient_accumulation_fusion: true
+    position_embedding_type: "rope"
   eps_clip: 0.4
   temperature: ${gconfig.temperature}
   reward_scaling: 10.0
@@ -78,6 +87,10 @@ actor:
   adv_norm:
     mean_level: batch
     std_level: batch
+  megatron:
+    bridge_type: megatron-bridge
+    use_bridge_for_update_weights: true # for live weight sync
+    enable_mtp: false
   max_new_tokens: ${gconfig.max_new_tokens}
   scheduling_spec:
     - task_type: worker
@@ -96,6 +109,7 @@ actor:
         HCCL_CONNECT_TIMEOUT: "7200"
         PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
         TORCH_COMPILE_DISABLE: "1"
+        HCCL_BUFFSIZE : "512"
 
 ref:
   backend: ${actor.backend}
@@ -132,7 +146,9 @@ vllm:
   max_model_len: 32768
   gpu_memory_utilization: 0.9
   disable_sliding_window: false
-
+  enable_expert_parallel: true
+  enforce_eager: true
+  gdn_prefill_backend: triton
 
 # datasets
 train_dataset:

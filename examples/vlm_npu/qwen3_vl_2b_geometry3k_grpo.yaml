@@ -1,4 +1,4 @@
-experiment_name: qwen3-vl-2b-geometry3k-grpo
+experiment_name: geometry3k-grpo
 trial_name: trial1
 
 seed: 1
@@ -8,7 +8,7 @@ tokenizer_path: ${actor.path}
 
 cluster:
   n_nodes: 1
-  n_gpus_per_node: 8
+  n_gpus_per_node: 16
   fileroot: /tmp/areal/experiments
   name_resolve:
     type: nfs
@@ -16,10 +16,10 @@ cluster:
 
 
 scheduler:
-  type: null
+  type: local
 
 rollout:
-  backend: "vllm:d4p1t1"
+  backend: "vllm:d8p1t1"
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
   max_concurrent_rollouts: 256
@@ -40,7 +40,7 @@ gconfig:
   temperature: 1.0
 
 actor:
-  backend: "fsdp:d4p1t1"
+  backend: "megatron:d4p1t2"
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
   path: Qwen/Qwen3-VL-2B-Instruct
@@ -86,7 +86,17 @@ actor:
       cpu: 4
       mem: 32
       cmd: python3 -m areal.infra.rpc.rpc_server
-      env_vars: {}
+      env_vars:
+        VLLM_USE_V1: "1"
+        TASK_QUEUE_ENABLE: "1"
+        HCCL_EXEC_TIMEOUT: "14400"
+        ACL_DEVICE_SYNC_TIMEOUT: "14400"
+        HCCL_EVENT_TIMEOUT: "14500"
+        HCCL_ASYNC_ERROR_HANDLING: "0"
+        ACL_STREAM_TIMEOUT: "14500000"
+        HCCL_CONNECT_TIMEOUT: "7200"
+        PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
+        TORCH_COMPILE_DISABLE: "1"
 
 ref:
   backend: ${actor.backend}

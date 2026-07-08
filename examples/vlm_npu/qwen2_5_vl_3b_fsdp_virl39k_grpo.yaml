@@ -1,13 +1,13 @@
-experiment_name: geometry3k-grpo
+experiment_name: virl39k-grpo-multinode
 trial_name: trial1
 
 seed: 1
 enable_offload: false
-total_train_epochs: 3
+total_train_epochs: 5
 tokenizer_path: ${actor.path}
 
 cluster:
-  n_nodes: 1
+  n_nodes: 3
   n_gpus_per_node: 16
   fileroot: /tmp/areal/experiments
   name_resolve:
@@ -16,13 +16,13 @@ cluster:
 
 
 scheduler:
-  type: local
+  type: ray
 
 rollout:
-  backend: "vllm:d8p1t1"
+  backend: "vllm:d32"
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
-  max_concurrent_rollouts: 256
+  max_concurrent_rollouts: 128
   queue_size: null
   consumer_batch_size: ${train_dataset.batch_size}
   max_head_offpolicyness: 4
@@ -33,14 +33,14 @@ rollout:
   dump_to_file: true
 
 gconfig:
-  n_samples: 4
+  n_samples: 5
   min_new_tokens: 0
-  max_new_tokens: 512
+  max_new_tokens: 16384
   greedy: false
   temperature: 1.0
 
 actor:
-  backend: "megatron:d4p1t2"
+  backend: "fsdp:d16"
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
   path: Qwen/Qwen2.5-VL-3B-Instruct
@@ -49,10 +49,10 @@ actor:
   gradient_checkpointing: true
   dtype: bfloat16
   mb_spec:
-    max_tokens_per_mb: 4096
+    max_tokens_per_mb: 16384
   optimizer:
     type: adam
-    lr: 5e-7
+    lr: 2e-6
     weight_decay: 0.01
     beta1: 0.9
     beta2: 0.999
@@ -86,16 +86,7 @@ actor:
       mem: 32
       cmd: python3 -m areal.infra.rpc.rpc_server
       env_vars:
-        VLLM_USE_V1: "1"
-        TASK_QUEUE_ENABLE: "1"
-        HCCL_EXEC_TIMEOUT: "14400"
-        ACL_DEVICE_SYNC_TIMEOUT: "14400"
-        HCCL_EVENT_TIMEOUT: "14500"
-        HCCL_ASYNC_ERROR_HANDLING: "0"
-        ACL_STREAM_TIMEOUT: "14500000"
-        HCCL_CONNECT_TIMEOUT: "7200"
-        PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
-        TORCH_COMPILE_DISABLE: "1"
+        USE_OPTIMIZED_MODEL: "0"
 
 ref:
   backend: ${actor.backend}
@@ -106,7 +97,7 @@ ref:
   disable_dropout: true
   dtype: ${actor.dtype}
   mb_spec:
-    max_tokens_per_mb: 4096
+    max_tokens_per_mb: 16384
   optimizer: null
   scheduling_strategy:
     type: colocation
@@ -136,15 +127,15 @@ vllm:
 
 # datasets
 train_dataset:
-  batch_size: 32
+  batch_size: 528
   shuffle: true
   pin_memory: true
   num_workers: 4
-  path: hiyouga/geometry3k
+  path: data/ViRL39K/39Krelease.parquet
   type: rl
 
 valid_dataset:
-  batch_size: 32
+  batch_size: 528
   pin_memory: true
   num_workers: 4
   path: hiyouga/geometry3k
