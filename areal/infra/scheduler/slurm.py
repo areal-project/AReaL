@@ -230,7 +230,7 @@ class SlurmScheduler(Scheduler):
         if job_id in self._job_status_cache:
             cached_state, cached_time = self._job_status_cache[job_id]
             if current_time - cached_time < self._status_cache_ttl:
-                if cached_state in [JobState.FAILED, JobState.CANCELLED]:
+                if not cached_state.active():
                     logs = self._read_log_tail(role)
                     raise WorkerFailedError(
                         f"{role}/*", -1, f"Job {job_id} {cached_state}. Logs:\n{logs}"
@@ -248,7 +248,10 @@ class SlurmScheduler(Scheduler):
             state = job_infos[0].state
             self._job_status_cache[job_id] = (state, current_time)
 
-            if state in [JobState.FAILED, JobState.CANCELLED]:
+            # Workers are long-lived rpc_server processes: any terminal state
+            # (FAILED, CANCELLED, but also COMPLETED — e.g. the batch script
+            # exiting 0 after a container FATAL) means they are gone.
+            if not state.active():
                 logs = self._read_log_tail(role)
                 raise WorkerFailedError(
                     f"{role}/*", -1, f"Job {job_id} {state}. Logs:\n{logs}"
@@ -390,6 +393,9 @@ class SlurmScheduler(Scheduler):
 
         # Amend environment variables
         for sch in schedulings:
+            # Save user-specified env vars so they take precedence over system defaults
+            user_env = dict(sch.env_vars)
+
             # AReaL env var forwarding
             if self.enable_tms_offload:
                 sch.env_vars.update(get_tms_env_vars())
@@ -399,6 +405,9 @@ class SlurmScheduler(Scheduler):
                 existing_env_vars=sch.env_vars,
             )
             sch.env_vars.update(thread_env)
+
+            # Re-apply user env vars to allow explicit overrides
+            sch.env_vars.update(user_env)
 
         if len(schedulings) == 1:
             # Expand single spec to all workers
@@ -995,49 +1004,63 @@ class SlurmScheduler(Scheduler):
                 )
 
             target_workers = self._workers[colocate_role]
-            if num_workers != len(target_workers):
-                raise WorkerCreationError(
-                    role,
-                    "Replica count mismatch",
-                    f"Colocated role must have same replica count as target "
-                    f"({num_workers} != {len(target_workers)})",
+            if num_workers == len(target_workers):
+                # Check if fork mode is enabled
+                if strategy.fork:
+                    # Fork mode: spawn new processes on same nodes via /fork endpoint
+                    return self.fork_workers(role, colocate_role)
+
+                # Reuse existing workers - no new Slurm job submitted
+                worker_ids = [w.worker.id for w in target_workers]
+                self._colocated_roles[role] = colocate_role
+
+                logger.info(
+                    f"Role '{role}' colocated with '{colocate_role}': "
+                    f"reusing workers {worker_ids}"
                 )
+                return worker_ids
 
-            # Check if fork mode is enabled
-            if strategy.fork:
-                # Fork mode: spawn new processes on same nodes via /fork endpoint
-                return self.fork_workers(role, colocate_role)
-
-            # Reuse existing workers - no new Slurm job submitted
-            worker_ids = [w.worker.id for w in target_workers]
-            self._colocated_roles[role] = colocate_role
+            # Different worker counts: submit new job on the same nodes
+            # (e.g., AWEX colocation where rollout has TP-grouped instances)
+            target_job_id = self._jobs[colocate_role]
+            job_infos = query_jobs(slurm_ids=[target_job_id])
+            if not job_infos:
+                raise WorkerCreationError(
+                    role, f"Target job {target_job_id} not found in queue"
+                )
+            colocation_nodelist = job_infos[0].host
+            spec = schedulings[0]
+            total_gpus = spec.gpu * replicas
+            nodes = max(
+                1,
+                (total_gpus + self.n_gpus_per_node - 1) // self.n_gpus_per_node,
+            )
+            cpus_per_task = spec.cpu
+            mem_per_task = spec.mem * 1024
+            logger.info(
+                f"Creating {replicas} workers for role '{role}' colocated with "
+                f"'{colocate_role}' on nodes {colocation_nodelist}: "
+                f"nodes={nodes}, cpus={cpus_per_task}, mem={mem_per_task}MB"
+            )
+            nodelist = colocation_nodelist
+        elif strategy_type == SchedulingStrategyType.separation:
+            # Non-colocated: calculate nodes needed and submit new Slurm job
+            spec = schedulings[0]
+            total_gpus = spec.gpu * replicas
+            nodes = max(
+                1, (total_gpus + self.n_gpus_per_node - 1) // self.n_gpus_per_node
+            )
+            nodelist = spec.nodelist
+            cpus_per_task = spec.cpu
+            mem_per_task = spec.mem * 1024  # Convert GB to MB
 
             logger.info(
-                f"Role '{role}' colocated with '{colocate_role}': "
-                f"reusing workers {worker_ids}"
+                f"Creating {replicas} workers for role '{role}': "
+                f"nodes={nodes}, gpus_per_node={self.n_gpus_per_node}, "
+                f"cpus={cpus_per_task}, mem={mem_per_task}MB"
             )
-            return worker_ids
-
-        if strategy_type != SchedulingStrategyType.separation:
+        else:
             raise ValueError(f"Unknown scheduling strategy type: {strategy_type}")
-        # Non-colocated: calculate nodes needed and submit new Slurm job
-        spec = schedulings[0]
-        total_gpus = spec.gpu * replicas
-        nodes = max(1, (total_gpus + self.n_gpus_per_node - 1) // self.n_gpus_per_node)
-        nodelist = spec.nodelist
-
-        # Calculate resource requirements
-        n_gpus_per_node = min(
-            self.n_gpus_per_node, (spec.gpu * replicas + nodes - 1) // nodes
-        )
-        cpus_per_task = spec.cpu
-        mem_per_task = spec.mem * 1024  # Convert GB to MB
-
-        logger.info(
-            f"Creating {replicas} workers for role '{role}': "
-            f"nodes={nodes}, gpus_per_node={n_gpus_per_node}, "
-            f"cpus={cpus_per_task}, mem={mem_per_task}MB"
-        )
 
         # Generate sbatch script
         sbatch_script = self._generate_sbatch_script(
