@@ -1063,6 +1063,23 @@ class SchedulingSpec:
     exclude: str | None = field(
         default=None, metadata={"help": "sbatch/srun's `--exclude` option for slurm."}
     )
+    ray_placement_strategy: str | None = field(
+        default=None,
+        metadata={
+            "help": "Deprecated compatibility field for the legacy Ray scheduler. "
+            "It is ignored by the current Ray scheduler.",
+        },
+    )
+
+    def __post_init__(self):
+        """Validate scheduling spec configuration."""
+        if self.ray_placement_strategy is not None:
+            warnings.warn(
+                "SchedulingSpec.ray_placement_strategy is deprecated and ignored by "
+                "the current Ray scheduler.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
 
 
 @dataclass
