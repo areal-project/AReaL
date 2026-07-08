@@ -120,6 +120,8 @@ def _patch_transformers_flash_linear_attention_available() -> None:
 
 def patch_qwen3_5_chunk_gated_delta_rule_with_mindspeed() -> None:
     try:
+        # patch L2 norm before importing GDN
+        import areal.engine.megatron_utils.triton_l2norm_patch  # noqa: F401, I001
         from mindspeed.core.ssm.chunk_gated_delta_rule import chunk_gated_delta_rule
     except ImportError as exc:
         logger.warning(
