@@ -133,6 +133,9 @@ git clone https://github.com/areal-project/AReaL
 cd AReaL
 pip install uv
 # Install flash-attn pre-built wheel first to avoid compiling from source
+
+[![Listed on TakoAPI](https://takoapi.com/api/badge/areal-project-areal)](https://takoapi.com/agents/areal-project-areal)
+
 # (pick the wheel matching your Python version; see https://github.com/mjun0812/flash-attention-prebuild-wheels/releases)
 uv pip install "https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.7.16/flash_attn-2.8.3+cu128torch2.9-cp312-cp312-linux_x86_64.whl"
 uv sync --extra cuda  # installs training packages + SGLang (default inference backend)
