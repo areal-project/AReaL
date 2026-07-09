@@ -41,13 +41,13 @@ cost-effective** for a broad community of developers and researchers.
 
 ## 📰 News
 
-**\[2026/07/01\] (v2.0.0)** 🎉 We release **AReaL 2.0**, a major architectural
-milestone. This release refactors AReaL into a **microservice architecture** with
-independent [training](./areal/v2/training_service/),
+**\[2026/07/01\]** 🎉 We release **AReaL 2.0**, a major architectural milestone. This
+release refactors AReaL into a **microservice architecture** with independent
+[training](./areal/v2/training_service/),
 [inference](./areal/v2/inference_service/), [agent](./areal/v2/agent_service/), and
-[weight-update](./areal/v2/weight_update/) services, and ships two end-to-end agentic
-RL training examples on the 2.0 loop:
-[Hermes](./examples/hermes) and [SWE agent](./examples/swe). Check out our
+[weight-update](./areal/v2/weight_update/) services, and ships the
+[Hermes online RL loop](./examples/hermes) and
+[end-to-end SWE RL training examples](./examples/swe). Check out our
 [technical report](https://arxiv.org/abs/2607.01120).
 
 **\[2026/06/17\]** 🔬 Introducing **KPop** — bidirectional binary KL divergence token
