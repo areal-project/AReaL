@@ -31,7 +31,7 @@ cost-effective** for a broad community of developers and researchers.
 
 - ⚡ **Flexibility**: Seamless customization for
   [agentic RL](https://areal-project.github.io/AReaL/en/tutorial/agentic_rl.html) and
-  [online RL training](https://www.inclusion-ai.org/AReaL/en/tutorial/online_proxy.html)
+  [online RL training](https://areal-ai.io/en/tutorial/online_proxy.html)
   for **black-box agent applications** by simply replacing the `base_url`.
 - 📈 **Scalability**: **Stable** fully asynchronous RL training with **industry-leading
   speed**.
@@ -40,6 +40,15 @@ cost-effective** for a broad community of developers and researchers.
   [customer service](https://arxiv.org/abs/2601.22607) agents.
 
 ## 📰 News
+
+**\[2026/07/01\] (v2.0.0)** 🎉 We release **AReaL 2.0**, a major architectural
+milestone. This release refactors AReaL into a **microservice architecture** with
+independent [training](./areal/v2/training_service/),
+[inference](./areal/v2/inference_service/), [agent](./areal/v2/agent_service/), and
+[weight-update](./areal/v2/weight_update/) services, and ships two end-to-end agentic
+RL training examples on the 2.0 loop:
+[Hermes](./examples/hermes) and [SWE agent](./examples/swe). Check out our
+[technical report](https://arxiv.org/abs/2607.01120).
 
 **\[2026/06/17\]** 🔬 Introducing **KPop** — bidirectional binary KL divergence token
 masking. Configured via `rejection_sampling.metric=binary_kl`. Also adding an
