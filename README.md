@@ -159,6 +159,9 @@ python3 examples/math/gsm8k_rl.py --config examples/math/gsm8k_grpo.yaml \
 For comprehensive setup instructions, see
 [our quickstart guide](https://areal-project.github.io/AReaL/en/tutorial/quickstart.html).
 
+For Megatron MoE router replay experiments, see the
+[R3 Router Replay guide](r3/README.md).
+
 ## 📚 Examples
 
 ### Math & Reasoning
