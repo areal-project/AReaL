@@ -67,6 +67,7 @@ class InfBridge:
         max_resubmit_retries: int = 20,
         resubmit_wait: float = 0.5,
         version: int = 0,
+        return_routed_experts: bool = False,
     ) -> None:
         self.backend = backend
         self.backend_addr = backend_addr.rstrip("/")
@@ -75,6 +76,7 @@ class InfBridge:
         self.max_resubmit_retries = max_resubmit_retries
         self.resubmit_wait = resubmit_wait
         self._version = version
+        self.return_routed_experts = return_routed_experts
         self._client = httpx.AsyncClient(timeout=request_timeout)
 
     async def aclose(self) -> None:
@@ -172,6 +174,11 @@ class InfBridge:
                 f"InfBridge only supports n_samples=1, got {req.gconfig.n_samples}"
             )
 
+        req = req.copy()
+        if self.return_routed_experts:
+            req.metadata["return_routed_experts"] = True
+        requested_routing = bool(req.metadata.get("return_routed_experts", False))
+
         # Build the initial HTTP request via the backend
         http_req = self.backend.build_generation_request(
             req,
@@ -219,6 +226,19 @@ class InfBridge:
             data = await self._send_request(http_req)
             result = self.backend.parse_generation_response(data)
 
+            if requested_routing and result.routed_experts is None:
+                is_abort_without_tokens = (
+                    result.stop_reason == "abort" and len(result.output_tokens) == 0
+                )
+                if not is_abort_without_tokens:
+                    raise RuntimeError(
+                        "Requested return_routed_experts=True but the inference "
+                        "backend response did not include routed_experts. "
+                        "This usually means the SGLang server was not launched with "
+                        "enable_return_routed_experts=True or the model is not a MoE "
+                        "model."
+                    )
+
             accumulated_tokens.extend(result.output_tokens)
             accumulated_logprobs.extend(result.output_logprobs)
             accumulated_versions.extend([self._version] * len(result.output_tokens))
@@ -228,8 +248,20 @@ class InfBridge:
                 if final_routed_experts is None:
                     final_routed_experts = result.routed_experts
                 else:
+                    consumed_rows = final_routed_experts.shape[0]
+                    if result.routed_experts.shape[0] < consumed_rows:
+                        raise RuntimeError(
+                            "SGLang routed_experts for a resubmitted request is "
+                            "shorter than the previously accumulated routing rows: "
+                            f"new_shape={result.routed_experts.shape}, "
+                            f"accumulated_shape={final_routed_experts.shape}."
+                        )
                     final_routed_experts = np.concatenate(
-                        [final_routed_experts, result.routed_experts], axis=0
+                        [
+                            final_routed_experts,
+                            result.routed_experts[consumed_rows:],
+                        ],
+                        axis=0,
                     )
 
             if stop_reason in ("stop", "tool_calls", "length"):

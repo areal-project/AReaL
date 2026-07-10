@@ -6,9 +6,13 @@ import time
 from unittest.mock import AsyncMock, MagicMock
 
 import httpx
+import numpy as np
 import pytest
 import pytest_asyncio
 
+from areal.api import ModelResponse
+from areal.experimental.openai.types import InteractionWithTokenLogpReward
+from areal.infra.rpc.serialization import deserialize_value
 from areal.v2.inference_service.data_proxy.app import (
     _flush_ready_trajectories,
     create_app,
@@ -819,6 +823,66 @@ async def test_batch_online_set_reward_completes_that_session(client):
     )
     assert export_resp.status_code == 200
     assert "traj" in export_resp.json()
+
+
+@pytest.mark.asyncio
+async def test_export_trajectories_preserves_r3_routing_rtensors(client):
+    app = client._transport.app
+    app.state.config.return_routed_experts = True
+    app.state.config.r3_num_moe_layers = 2
+    app.state.config.r3_topk = 2
+    app.state.config.serving_addr = "127.0.0.1:18082"
+
+    start = await client.post(
+        "/rl/start_session",
+        json={"task_id": "r3-export"},
+        headers=admin_headers(),
+    )
+    session_api_key = start.json()["sessions"][0]["session_api_key"]
+    session_id = start.json()["sessions"][0]["session_id"]
+
+    store: SessionStore = app.state.session_store
+    session = store.get_session(session_id)
+    assert session is not None
+
+    routed = np.arange(1, 1 + 3 * 4, dtype=np.int32).reshape(3, 4)
+    interaction = InteractionWithTokenLogpReward(
+        model_response=ModelResponse(
+            input_tokens=[1, 2],
+            output_tokens=[3, 4],
+            output_logprobs=[-0.2, -0.1],
+            output_versions=[0, 0],
+            routed_experts=routed,
+        ),
+        messages=[{"role": "user", "content": "route"}],
+        output_message_list=[{"role": "assistant", "content": "ok"}],
+    )
+    interaction.interaction_id = "r3-interaction"
+    session.active_completions["r3-interaction"] = interaction
+
+    reward_resp = await client.post(
+        "/rl/set_reward",
+        json={"interaction_id": "r3-interaction", "reward": 1.0},
+        headers=session_headers(session_api_key),
+    )
+    assert reward_resp.status_code == 200
+
+    export_resp = await client.post(
+        "/export_trajectories",
+        json={
+            "session_ids": [session_id],
+            "trajectory_id": 0,
+            "discount": 1.0,
+            "style": "individual",
+        },
+        headers=admin_headers(),
+    )
+
+    assert export_resp.status_code == 200
+    traj = deserialize_value(export_resp.json()["traj"])
+    assert set(("routed_experts", "r3_routing_valid")).issubset(traj)
+    assert traj["routed_experts"].shape == (1, 4, 2, 2)
+    assert traj["r3_routing_valid"].shape == (1,)
 
 
 # =============================================================================

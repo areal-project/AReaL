@@ -1103,6 +1103,10 @@ class PPOTrainer:
             role="rollout",
             server_args=server_args,
         )
+        if config._version == "v2" and self.config.rollout.return_routed_experts:
+            r3_config = self._resolve_actor_r3_moe_config()
+            init_kwargs["r3_num_moe_layers"] = r3_config.num_moe_layers
+            init_kwargs["r3_topk"] = r3_config.topk
         if is_eval:
             assert len(self.rollout.server_infos) > 0
             init_kwargs["server_infos"] = self.rollout.server_infos

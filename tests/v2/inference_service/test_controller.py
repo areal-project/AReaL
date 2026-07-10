@@ -358,7 +358,7 @@ class TestRolloutControllerV2Construction:
         controller.save_perf_tracer()
 
     @pytest.mark.asyncio
-    async def test_async_initialize_passes_callback_and_reward_timeout_to_data_proxy(
+    async def test_async_initialize_passes_data_proxy_runtime_options(
         self,
     ):
         from areal.api.cli_args import SchedulingSpec
@@ -375,6 +375,7 @@ class TestRolloutControllerV2Construction:
             backend="sglang:d1",
             tokenizer_path="mock-tokenizer",
             request_timeout=15.0,
+            return_routed_experts=True,
             agent=AgentConfig(
                 agent_cls_path="tests.experimental.openai.utils.SimpleAgent",
                 set_reward_finish_timeout=7.5,
@@ -407,6 +408,8 @@ class TestRolloutControllerV2Construction:
                         host="127.0.0.1", port=30000, process=MagicMock()
                     )
                 ],
+                r3_num_moe_layers=27,
+                r3_topk=8,
             )
 
         data_proxy_calls = [
@@ -418,6 +421,11 @@ class TestRolloutControllerV2Construction:
         assert "7.5" in data_proxy_cmd
         assert "--callback-server-addr" in data_proxy_cmd
         assert "http://127.0.0.1:19000" in data_proxy_cmd
+        assert "--return-routed-experts" in data_proxy_cmd
+        assert "--r3-num-moe-layers" in data_proxy_cmd
+        assert "27" in data_proxy_cmd
+        assert "--r3-topk" in data_proxy_cmd
+        assert "8" in data_proxy_cmd
 
 
 class TestOnlineCallbackFlow:

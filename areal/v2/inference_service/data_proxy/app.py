@@ -21,6 +21,7 @@ from areal.experimental.openai.client import ArealOpenAI
 from areal.experimental.openai.types import (
     InteractionWithTokenLogpReward,
     concat_string_interactions,
+    configure_r3_interactions,
 )
 from areal.infra.rpc.guard.data_blueprint import (
     data_bp,
@@ -178,6 +179,10 @@ def _create_inf_bridge(
     config: DataProxyConfig,
 ) -> InfBridge:
     """Create an InfBridge instance from proxy config."""
+    if config.return_routed_experts and config.backend_type != "sglang":
+        raise ValueError(
+            "return_routed_experts is only supported for the SGLang data proxy backend."
+        )
     if config.backend_type == "sglang":
         backend = SGLangBridgeBackend()
     elif config.backend_type == "vllm":
@@ -192,6 +197,7 @@ def _create_inf_bridge(
         request_timeout=config.request_timeout,
         max_resubmit_retries=config.max_resubmit_retries,
         resubmit_wait=config.resubmit_wait,
+        return_routed_experts=config.return_routed_experts,
     )
 
 
@@ -739,6 +745,12 @@ def create_app(config: DataProxyConfig) -> FastAPI:
                 merged.update(interactions)
             except KeyError:
                 continue
+
+        configure_r3_interactions(
+            merged,
+            num_moe_layers=config.r3_num_moe_layers,
+            topk=config.r3_topk,
+        )
 
         if all(v.has_tensor_data for v in merged.values()):
             traj = concat_padded_tensors([v.to_tensor_dict() for v in merged.values()])

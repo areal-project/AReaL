@@ -92,6 +92,7 @@ class SGLangBridgeBackend:
         meta_info = response["meta_info"]
         finish_reason = meta_info["finish_reason"]
         stop_reason: str = finish_reason["type"]
+        stop_message: str = finish_reason.get("message", "")
 
         # Routed experts (MoE)
         routed_experts: np.ndarray | None = None
@@ -106,8 +107,15 @@ class SGLangBridgeBackend:
                 source="v2 SGLangBridge",
             )
 
-        # Handle abort-before-prefill: no output tokens
-        output_token_logprobs = meta_info.get("output_token_logprobs", [])
+        if stop_reason == "abort" and stop_message.startswith("Abort before prefill"):
+            return HttpGenerationResult(
+                output_tokens=[],
+                output_logprobs=[],
+                stop_reason=stop_reason,
+                routed_experts=routed_experts,
+            )
+
+        output_token_logprobs = meta_info["output_token_logprobs"]
         output_tokens = [x[1] for x in output_token_logprobs]
         output_logprobs = [x[0] for x in output_token_logprobs]
 
