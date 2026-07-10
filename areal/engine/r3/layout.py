@@ -29,22 +29,6 @@ def slice_local_moe_layers(
     return [packed_routing[:, layer_idx, :].long() for layer_idx in local_moe_indices]
 
 
-def _tensor_int(value: torch.Tensor | int) -> int:
-    return int(value.item()) if torch.is_tensor(value) else int(value)
-
-
-def _zero_rows(rows: torch.Tensor) -> torch.Tensor:
-    return torch.all(rows == 0, dim=tuple(range(1, rows.ndim)))
-
-
-def _nearest_previous_nonzero(rows: torch.Tensor, before: int) -> torch.Tensor | None:
-    for idx in range(before - 1, -1, -1):
-        row = rows[idx]
-        if bool(torch.any(row != 0).item()):
-            return row
-    return None
-
-
 def _pack_routing_to_padded_order(
     routed_experts: torch.Tensor,
     mb_input: Any,
@@ -66,21 +50,24 @@ def _pack_routing_to_padded_order(
         else orig_cu_seqlens
     )
 
-    batch_size = old_cu_seqlens.shape[0] - 1
+    old_cu_list = old_cu_seqlens.tolist()
+    padded_cu_list = padded_cu_seqlens.tolist()
+
+    batch_size = len(old_cu_list) - 1
     if routed_experts.shape[0] != batch_size:
         raise r3_error(
             "R3 micro-batch routed_experts batch size mismatch",
             routed_batch_size=routed_experts.shape[0],
             micro_batch_size=batch_size,
         )
-    if padded_cu_seqlens.shape[0] < batch_size + 1:
+    if len(padded_cu_list) < batch_size + 1:
         raise r3_error(
             "padded cu_seqlens is shorter than R3 micro-batch",
-            padded_cu_len=padded_cu_seqlens.shape[0],
+            padded_cu_len=len(padded_cu_list),
             micro_batch_size=batch_size,
         )
 
-    total_padded_tokens = _tensor_int(padded_cu_seqlens[-1])
+    total_padded_tokens = padded_cu_list[-1]
     packed = torch.empty(
         (total_padded_tokens, *routed_experts.shape[2:]),
         dtype=routed_experts.dtype,
@@ -89,11 +76,11 @@ def _pack_routing_to_padded_order(
 
     fill_row: torch.Tensor | None = None
     for sample_idx in range(batch_size):
-        real_start = _tensor_int(old_cu_seqlens[sample_idx])
-        real_end = _tensor_int(old_cu_seqlens[sample_idx + 1])
+        real_start = old_cu_list[sample_idx]
+        real_end = old_cu_list[sample_idx + 1]
         real_len = real_end - real_start
-        padded_start = _tensor_int(padded_cu_seqlens[sample_idx])
-        padded_end = _tensor_int(padded_cu_seqlens[sample_idx + 1])
+        padded_start = padded_cu_list[sample_idx]
+        padded_end = padded_cu_list[sample_idx + 1]
         padded_len = padded_end - padded_start
 
         if real_len < 0 or padded_len < real_len:
@@ -117,30 +104,13 @@ def _pack_routing_to_padded_order(
                 reason="empty_sequence",
             )
 
-        rows = routed_experts[sample_idx, :real_len].clone()
-        zero_rows = _zero_rows(rows)
-        if real_len > 1 and bool(torch.any(zero_rows[:-1]).item()):
-            return NativeReplaySlabs(
-                slabs=[],
-                skip_replay=True,
-                reason="zero_routing_for_real_token",
-            )
-        if bool(zero_rows[-1].item()):
-            replacement = _nearest_previous_nonzero(rows, real_len - 1)
-            if replacement is None:
-                return NativeReplaySlabs(
-                    slabs=[],
-                    skip_replay=True,
-                    reason="missing_final_token_routing_without_replacement",
-                )
-            rows[-1] = replacement
-
+        rows = routed_experts[sample_idx, :real_len]
         fill_row = rows[-1]
         packed[padded_start : padded_start + real_len] = rows
         if padded_len > real_len:
             packed[padded_start + real_len : padded_end] = fill_row
 
-    batch_padding_start = _tensor_int(padded_cu_seqlens[batch_size])
+    batch_padding_start = padded_cu_list[batch_size]
     if total_padded_tokens > batch_padding_start:
         if fill_row is None:
             return NativeReplaySlabs(

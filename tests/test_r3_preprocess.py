@@ -132,3 +132,17 @@ def test_preprocess_routed_experts_none_marks_invalid_without_fake_routing():
 
     assert out["r3_routing_valid"].tolist() == [False]
     assert torch.count_nonzero(out["routed_experts"]) == 0
+
+
+def test_preprocess_routed_experts_single_zero_row_marks_invalid():
+    raw = np.zeros((1, 4), dtype=np.int32)
+
+    out = preprocess_routed_experts_batch(
+        [raw],
+        seq_lens=[1],
+        num_moe_layers=2,
+        topk=2,
+    )
+
+    assert out["r3_routing_valid"].tolist() == [False]
+    assert torch.count_nonzero(out["routed_experts"]) == 0

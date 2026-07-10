@@ -26,6 +26,23 @@ def test_resolve_r3_moe_config_handles_dense_prefix_and_freq_list():
     assert resolved.topk == 4
 
 
+def test_resolve_r3_moe_config_accepts_omegaconf_list_config():
+    from omegaconf import OmegaConf
+
+    cfg = OmegaConf.create(
+        {
+            "num_layers": 4,
+            "moe_layer_freq": [1, 0, 1, 0],
+            "moe_router_topk": 2,
+        }
+    )
+
+    resolved = resolve_r3_moe_config(cfg)
+
+    assert resolved.moe_layer_indices == (0, 2)
+    assert resolved.num_moe_layers == 2
+
+
 def test_resolve_r3_moe_config_accepts_hf_num_hidden_layers():
     cfg = SimpleNamespace(
         num_hidden_layers=4,

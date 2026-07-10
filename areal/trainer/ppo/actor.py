@@ -207,6 +207,8 @@ class PPOActor:
 
         rollout_logp = torch.roll(data["logprobs"], shifts=-1, dims=-1)
         loss_mask = torch.roll(data["loss_mask"].bool(), shifts=-1, dims=-1)
+        if loss_mask.shape[-1] > 0:
+            loss_mask[..., -1] = False
         if (
             train_logp.shape != rollout_logp.shape
             or train_logp.shape != loss_mask.shape

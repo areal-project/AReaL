@@ -99,6 +99,31 @@ def test_compute_logp_logs_rollout_train_r3_metrics():
     assert exported["compute_logp/r3/rollout_train_extreme_frac_tau5/avg"] == 0.0
 
 
+def test_compute_logp_r3_metrics_do_not_wrap_loss_mask_last_token():
+    _reset_stats_tracker()
+    train_logp = torch.tensor([[-0.5, 10.0, 10.0, 10.0]], dtype=torch.float32)
+    engine = _FakeR3Engine(forward_result=train_logp)
+    actor = PPOActor(PPOActorConfig(), engine)
+    data = {
+        "input_ids": torch.ones(1, 4, dtype=torch.int64),
+        "attention_mask": torch.ones(1, 4, dtype=torch.bool),
+        "logprobs": torch.tensor([[99.0, -0.25, 77.0, 88.0]], dtype=torch.float32),
+        "loss_mask": torch.tensor([[True, True, False, False]]),
+        "routed_experts": torch.ones(1, 4, 3, 2, dtype=torch.int32),
+        "r3_routing_valid": torch.tensor([True]),
+    }
+
+    actor._compute_logp(data)
+
+    exported = stats_tracker.export(reset=True)
+    torch.testing.assert_close(
+        torch.tensor(exported["compute_logp/r3/rollout_train_logp_abs_diff/avg"]),
+        torch.tensor(0.25),
+        rtol=0,
+        atol=1e-6,
+    )
+
+
 def test_compute_logp_logs_r3_disabled_for_rollout_train_metrics():
     _reset_stats_tracker()
     engine = _FakeR3Engine(

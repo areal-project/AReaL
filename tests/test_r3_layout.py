@@ -73,7 +73,9 @@ def test_prepare_native_replay_slabs_invalid_sample_skips(monkeypatch):
     assert slabs.reason == "invalid_sample"
 
 
-def test_prepare_native_replay_slabs_zero_real_token_skips(monkeypatch):
+def test_prepare_native_replay_slabs_trusts_preprocessed_routing_valid(
+    monkeypatch,
+):
     _patch_parallel(monkeypatch)
     routed = torch.ones(1, 4, 1, 2, dtype=torch.int32)
     routed[0, 1] = 0
@@ -86,8 +88,8 @@ def test_prepare_native_replay_slabs_zero_real_token_skips(monkeypatch):
         local_moe_indices=[0],
     )
 
-    assert slabs.skip_replay
-    assert slabs.reason == "zero_routing_for_real_token"
+    assert not slabs.skip_replay
+    torch.testing.assert_close(slabs.slabs[0], routed[0, :, 0].long())
 
 
 def test_prepare_native_replay_slabs_tp_scatter_preserves_layer_slices(monkeypatch):

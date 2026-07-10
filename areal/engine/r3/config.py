@@ -39,14 +39,15 @@ def resolve_moe_layer_indices(config: Any) -> tuple[int, ...]:
             return ()
         step = abs(freq)
         indices = list(range(step - 1, num_layers, step))
-    elif isinstance(freq, (list, tuple)):
-        if len(freq) != num_layers:
+    elif isinstance(freq, (list, tuple)) or type(freq).__name__ == "ListConfig":
+        freq_values = list(freq)
+        if len(freq_values) != num_layers:
             raise r3_error(
                 "moe_layer_freq length must match num_layers",
-                moe_layer_freq_len=len(freq),
+                moe_layer_freq_len=len(freq_values),
                 num_layers=num_layers,
             )
-        indices = [idx for idx, is_moe in enumerate(freq) if is_moe]
+        indices = [idx for idx, is_moe in enumerate(freq_values) if is_moe]
     else:
         raise r3_error(
             "Unsupported moe_layer_freq type",

@@ -165,6 +165,8 @@ def _preprocess_one(
         replacement = _nearest_valid_row(out, seq_len - 1)
         if replacement is not None:
             out[-1] = replacement
+        else:
+            valid = False
 
     return out, valid
 
