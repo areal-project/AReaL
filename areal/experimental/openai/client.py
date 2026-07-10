@@ -76,6 +76,92 @@ os.environ["OPENAI_BASE_URL"] = os.environ.get("OPENAI_BASE_URL", "none")
 
 logger = logging.getLogger("OpenAIClient")
 
+
+def _align_tools_with_sglang(tools_list: list) -> list[dict]:
+    """Round-trip tools through sglang's pydantic Tool model so the dicts
+    fed to ``apply_chat_template`` byte-match what sglang's serving_chat
+    produces on its own ``/v1/chat/completions`` path.
+
+    The goal is behavioral parity with sglang's native route, so a
+    trajectory served here stays reproducible on sglang's own endpoint.
+    Without it the two paths render the ``tools`` block differently (field
+    order and default-field presence, e.g. sglang's ``Function`` dumps
+    ``strict: false`` while LiteLLM omits it). The prompt-token delta this
+    causes is a symptom of the mismatch, not the thing being optimized.
+
+    Assumptions this function cannot verify (see FIXME at the call sites):
+    - Backend is sglang. Call sites only invoke this when the engine class
+      name identifies sglang, so other backends are left unaligned.
+    - The worker venv's sglang version matches the serving version; a skew in
+      disaggregated deployments silently aligns to a stale tool format.
+
+    Behaviour:
+    - sglang not importable → log once + return original list (no alignment).
+    - Responses ``FunctionToolParam`` is flat (top-level ``name``/``parameters``
+      and no ``function`` key); it is normalized to the nested Chat shape that
+      both sglang's ``Tool`` model and ``apply_chat_template`` expect before
+      validation.
+    - per-tool validation failure → log + keep that single tool unchanged
+      (partial alignment is still better than no alignment for the rest).
+    - BaseModel inputs are handled via ``model_dump()`` first.
+    """
+
+    def _to_chat_format(t_dict: dict) -> dict:
+        # Flat Responses FunctionToolParam → nested Chat shape. sglang's
+        # Function model drops fields it doesn't declare (e.g. defer_loading),
+        # so the dump still matches the chat-completions path. Chat tools
+        # already nest under ``function`` and pass through unchanged.
+        if (
+            t_dict.get("type") == "function"
+            and "function" not in t_dict
+            and "name" in t_dict
+        ):
+            function = {k: v for k, v in t_dict.items() if k != "type"}
+            return {"type": "function", "function": function}
+        return t_dict
+
+    try:
+        from sglang.srt.entrypoints.openai.protocol import Tool as _SglTool
+    except Exception as e:
+        if not getattr(_align_tools_with_sglang, "_warned_no_sglang", False):
+            logger.warning(
+                "_align_tools_with_sglang: sglang not importable (%s); tools "
+                "block will diverge from sglang chat-completions path. "
+                "Install sglang in the worker venv to fix this.",
+                e,
+            )
+            _align_tools_with_sglang._warned_no_sglang = True  # type: ignore[attr-defined]
+        return list(tools_list)
+    aligned: list[dict] = []
+    for t in tools_list:
+        # Accept dict (TypedDict at runtime) and BaseModel.
+        if isinstance(t, BaseModel):
+            t_dict = t.model_dump()
+        elif isinstance(t, Mapping):
+            t_dict = dict(t)
+        else:
+            logger.warning(
+                "_align_tools_with_sglang: tool of type %s is neither dict "
+                "nor BaseModel; passing through unchanged.",
+                type(t).__name__,
+            )
+            aligned.append(t)
+            continue
+        t_dict = _to_chat_format(t_dict)
+        try:
+            aligned.append(_SglTool(**t_dict).model_dump())
+        except Exception as e:
+            logger.warning(
+                "_align_tools_with_sglang: pydantic Tool validation failed "
+                "for tool %s (%s); passing through unchanged. This will "
+                "cause partial drift from sglang chat-completions path.",
+                t_dict.get("function", {}).get("name", "<unknown>"),
+                e,
+            )
+            aligned.append(t_dict)
+    return aligned
+
+
 _DEFAULT_MAX_TOTAL_TOKENS = 32768
 
 
@@ -655,6 +741,15 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
             if not isinstance(tools, Iterable):
                 raise TypeError("tools must be an iterable of ChatCompletionToolParam")
             tools_list = list(tools)
+            # FIXME: alignment targets sglang's rendering, so it is only
+            # correct for an sglang backend. Apply it only when the engine is
+            # positively identified as sglang (by class name); any other
+            # backend is left unaligned to avoid aligning to the wrong format
+            # or a misleading "install sglang" hint. A proper fix gates on a
+            # backend identifier exposed by the engine.
+            # See docs/en/tutorial/online_proxy.md.
+            if "sglang" in type(self.engine).__name__.lower():
+                tools_list = _align_tools_with_sglang(tools_list)
 
         image_data, messages_for_tokenizer, vision_messages_for_vllm = (
             _extract_images_from_messages(messages_list)
@@ -1101,6 +1196,15 @@ class AsyncResponsesWithReward(BaseAsyncResponses):
             if not isinstance(tools, Iterable):
                 raise TypeError("tools must be an iterable of ChatCompletionToolParam")
             tools_list = list(tools)
+            # FIXME: alignment targets sglang's rendering, so it is only
+            # correct for an sglang backend. Apply it only when the engine is
+            # positively identified as sglang (by class name); any other
+            # backend is left unaligned to avoid aligning to the wrong format
+            # or a misleading "install sglang" hint. A proper fix gates on a
+            # backend identifier exposed by the engine.
+            # See docs/en/tutorial/online_proxy.md.
+            if "sglang" in type(self.engine).__name__.lower():
+                tools_list = _align_tools_with_sglang(tools_list)
 
         image_data, messages_for_tokenizer, vision_messages_for_vllm = (
             _extract_images_from_messages(messages_list)
