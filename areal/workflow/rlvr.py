@@ -16,6 +16,7 @@ from areal.api import (
     RolloutWorkflow,
 )
 from areal.api.cli_args import GenerationHyperparameters
+from areal.engine.r3.preprocess import preprocess_routed_experts_batch
 from areal.utils import logging, stats_tracker
 from areal.utils.dynamic_import import import_from_string
 from areal.utils.hf_utils import apply_chat_template
@@ -59,6 +60,8 @@ class RLVRWorkflow(RolloutWorkflow):
         | str = default_get_input_ids_fn,
         data_extract_prompt_fn: Callable[[dict[str, Any]], Any]
         | str = default_data_extract_prompt_fn,
+        r3_num_moe_layers: int | None = None,
+        r3_topk: int | None = None,
     ):
         self.reward_fn = reward_fn
         self.tokenizer = tokenizer
@@ -79,6 +82,8 @@ class RLVRWorkflow(RolloutWorkflow):
         if isinstance(data_extract_prompt_fn, str):
             data_extract_prompt_fn = import_from_string(data_extract_prompt_fn)
         self.data_extract_prompt_fn = data_extract_prompt_fn
+        self.r3_num_moe_layers = r3_num_moe_layers
+        self.r3_topk = r3_topk
 
     @trace_session("reward")
     async def _compute_rewards(
@@ -175,4 +180,19 @@ class RLVRWorkflow(RolloutWorkflow):
             "attention_mask": torch.ones(len(seq), dtype=torch.bool),
             "rewards": torch.tensor(reward, dtype=torch.float32),
         }
-        return {k: v.unsqueeze(0) for k, v in res.items()}
+        batched = {k: v.unsqueeze(0) for k, v in res.items()}
+        if resp.routed_experts is not None:
+            if self.r3_num_moe_layers is None or self.r3_topk is None:
+                raise ValueError(
+                    "RLVRWorkflow received routed_experts but R3 MoE shape is not "
+                    "configured. Pass r3_num_moe_layers and r3_topk."
+                )
+            batched.update(
+                preprocess_routed_experts_batch(
+                    [resp.routed_experts],
+                    seq_lens=[len(seq)],
+                    num_moe_layers=self.r3_num_moe_layers,
+                    topk=self.r3_topk,
+                )
+            )
+        return batched

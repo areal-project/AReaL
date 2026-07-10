@@ -29,7 +29,9 @@ def _get_required_int(config: Any, names: tuple[str, ...], *, label: str) -> int
 
 
 def resolve_moe_layer_indices(config: Any) -> tuple[int, ...]:
-    num_layers = _get_required_int(config, ("num_layers",), label="num_layers")
+    num_layers = _get_required_int(
+        config, ("num_layers", "num_hidden_layers"), label="num_layers"
+    )
     freq = getattr(config, "moe_layer_freq", 1)
 
     if isinstance(freq, int):
@@ -65,7 +67,9 @@ def resolve_r3_moe_config(config: Any) -> R3MoEConfig:
     )
     moe_layer_indices = resolve_moe_layer_indices(config)
     return R3MoEConfig(
-        num_layers=_get_required_int(config, ("num_layers",), label="num_layers"),
+        num_layers=_get_required_int(
+            config, ("num_layers", "num_hidden_layers"), label="num_layers"
+        ),
         num_moe_layers=len(moe_layer_indices),
         topk=topk,
         moe_layer_indices=moe_layer_indices,

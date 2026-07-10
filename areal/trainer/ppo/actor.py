@@ -1,12 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import functools
+from contextlib import contextmanager
 from typing import Any
 
 import torch
 
 from areal.api import TrainEngine
 from areal.api.cli_args import MicroBatchSpec, PPOActorConfig, RejectionSamplingConfig
+from areal.engine.r3.transport import (
+    clear_engine_r3_side_channel,
+    localize_r3_tensor,
+    pop_r3_tensors,
+    set_engine_r3_side_channel,
+)
 from areal.infra import TrainController
 from areal.infra.rpc.serialization import serialize_value
 from areal.trainer.ppo.stats import infer_token_denominator
@@ -133,12 +140,46 @@ class PPOActor:
     def compute_logp(self, data: list[dict[str, Any]]) -> list[torch.Tensor] | None:
         return batched_call(self._compute_logp, data)
 
+    def _engine_r3_enabled(self) -> bool:
+        return bool(getattr(self.engine, "_r3_enabled", False))
+
+    @contextmanager
+    def _r3_side_channel(
+        self,
+        routed_experts: Any | None,
+        routing_valid: Any | None,
+    ):
+        has_r3_data = routed_experts is not None or routing_valid is not None
+        if has_r3_data:
+            if not self._engine_r3_enabled():
+                raise ValueError(
+                    "Received routed_experts but actor engine R3 replay is not enabled."
+                )
+            if routed_experts is None or routing_valid is None:
+                raise ValueError(
+                    "Both routed_experts and r3_routing_valid are required for R3."
+                )
+            set_engine_r3_side_channel(self.engine, routed_experts, routing_valid)
+        try:
+            yield
+        finally:
+            if has_r3_data:
+                clear_engine_r3_side_channel(self.engine)
+
     def _compute_logp(self, data: dict[str, Any]) -> torch.Tensor | None:
+        routed_experts, routing_valid = pop_r3_tensors(data)
         self.engine.eval()
-        return self.engine.forward(
-            input_=data,
-            aggregate_fn=lambda xs: torch.cat(xs, dim=-1),
-        )
+        try:
+            with self._r3_side_channel(routed_experts, routing_valid):
+                return self.engine.forward(
+                    input_=data,
+                    aggregate_fn=lambda xs: torch.cat(xs, dim=-1),
+                )
+        finally:
+            if routed_experts is not None:
+                data["routed_experts"] = routed_experts
+            if routing_valid is not None:
+                data["r3_routing_valid"] = routing_valid
 
     @trace_perf("ppo_actor.compute_advantages", category="compute")
     def compute_advantages(self, data: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -344,37 +385,84 @@ class PPOActor:
             data.pop(key, None)
         # NOTE: calling engine.train() is critical to enabling gradient checkpointing
         self.engine.train()
+        routed_experts, routing_valid = pop_r3_tensors(data)
         mb_inputs = split_padded_tensor_dict_into_mb_list(
             data,
             mb_spec=MicroBatchSpec(n_mbs=self.config.ppo_n_minibatches),
+        )
+        r3_mb_inputs = self._split_r3_minibatches(
+            routed_experts, routing_valid, mb_inputs
         )
 
         with stats_tracker.scope("update"):
             # Get current version for proximal approximation metrics
             current_version = self.engine.get_version()
 
-            for mb in mb_inputs.mbs:
-                train_stat = self.engine.train_batch(
-                    mb,
-                    loss_fn=functools.partial(
-                        grpo_loss_fn,
-                        eps_clip=self.config.eps_clip,
-                        eps_clip_higher=self.config.eps_clip_higher,
-                        c_clip=self.config.c_clip,
-                        rejection_sampling=self.config.rejection_sampling,
-                        m2_threshold=self.m2_threshold,
-                        importance_sampling_level=self.config.importance_sampling_level,
-                        current_version=current_version,
-                        prox_logp_method=self.config.prox_logp_method,
-                        use_sapo_loss=self.config.use_sapo_loss,
-                        sapo_tau_pos=self.config.sapo_tau_pos,
-                        sapo_tau_neg=self.config.sapo_tau_neg,
-                        use_cispo_loss=self.config.use_cispo_loss,
-                        use_decoupled_loss=self.config.use_decoupled_loss,
-                    ),
-                    loss_weight_fn=lambda x: x["loss_mask"].count_nonzero(),
-                )
+            for mb, r3_mb in zip(mb_inputs.mbs, r3_mb_inputs, strict=True):
+                with self._r3_side_channel(*r3_mb):
+                    train_stat = self.engine.train_batch(
+                        mb,
+                        loss_fn=functools.partial(
+                            grpo_loss_fn,
+                            eps_clip=self.config.eps_clip,
+                            eps_clip_higher=self.config.eps_clip_higher,
+                            c_clip=self.config.c_clip,
+                            rejection_sampling=self.config.rejection_sampling,
+                            m2_threshold=self.m2_threshold,
+                            importance_sampling_level=self.config.importance_sampling_level,
+                            current_version=current_version,
+                            prox_logp_method=self.config.prox_logp_method,
+                            use_sapo_loss=self.config.use_sapo_loss,
+                            sapo_tau_pos=self.config.sapo_tau_pos,
+                            sapo_tau_neg=self.config.sapo_tau_neg,
+                            use_cispo_loss=self.config.use_cispo_loss,
+                            use_decoupled_loss=self.config.use_decoupled_loss,
+                        ),
+                        loss_weight_fn=lambda x: x["loss_mask"].count_nonzero(),
+                    )
                 stats_tracker.scalar(**train_stat)
+
+    def _split_r3_minibatches(
+        self,
+        routed_experts: Any | None,
+        routing_valid: Any | None,
+        mb_inputs,
+    ) -> list[tuple[Any | None, Any | None]]:
+        if routed_experts is None and routing_valid is None:
+            return [(None, None) for _ in mb_inputs.mbs]
+        if routed_experts is None or routing_valid is None:
+            raise ValueError(
+                "Both routed_experts and r3_routing_valid are required for R3."
+            )
+        if not self._engine_r3_enabled():
+            raise ValueError(
+                "Received routed_experts but actor engine R3 replay is not enabled."
+            )
+
+        routed_experts = localize_r3_tensor(routed_experts)
+        routing_valid = localize_r3_tensor(routing_valid)
+        forward_indices = mb_inputs.forward_indices
+        if forward_indices is not None:
+            routed_experts = routed_experts[forward_indices]
+            routing_valid = routing_valid[forward_indices]
+
+        r3_mbs = []
+        offset = 0
+        for mb in mb_inputs.mbs:
+            n_seqs = mb["input_ids"].shape[0]
+            r3_mbs.append(
+                (
+                    routed_experts[offset : offset + n_seqs],
+                    routing_valid[offset : offset + n_seqs],
+                )
+            )
+            offset += n_seqs
+        if offset != routed_experts.shape[0]:
+            raise RuntimeError(
+                f"R3 routed_experts split consumed {offset} samples, "
+                f"expected {routed_experts.shape[0]}."
+            )
+        return r3_mbs
 
 
 class PPOActorController(TrainController):

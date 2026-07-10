@@ -26,6 +26,21 @@ def test_resolve_r3_moe_config_handles_dense_prefix_and_freq_list():
     assert resolved.topk == 4
 
 
+def test_resolve_r3_moe_config_accepts_hf_num_hidden_layers():
+    cfg = SimpleNamespace(
+        num_hidden_layers=4,
+        first_k_dense_replace=1,
+        num_experts_per_tok=2,
+    )
+
+    resolved = resolve_r3_moe_config(cfg)
+
+    assert resolved.num_layers == 4
+    assert resolved.moe_layer_indices == (1, 2, 3)
+    assert resolved.num_moe_layers == 3
+    assert resolved.topk == 2
+
+
 def test_resolve_r3_moe_config_rejects_flat_dim_guessing():
     cfg = SimpleNamespace(num_layers=2, moe_layer_freq=1)
 

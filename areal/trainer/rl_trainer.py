@@ -35,6 +35,7 @@ from areal.api.cli_args import (
     vLLMConfig,
 )
 from areal.engine import RemoteSGLangEngine, RemotevLLMEngine
+from areal.engine.r3.config import R3MoEConfig, resolve_r3_moe_config
 from areal.infra import (
     LocalScheduler,
     RayScheduler,
@@ -115,6 +116,7 @@ class PPOTrainer:
             logging.setup_file_logging(StatsLogger.get_log_path(config.stats_logger))
 
         self.config = config
+        self._r3_moe_config: R3MoEConfig | None = None
         self.processor, self.tokenizer = load_hf_processor_and_tokenizer(
             config.tokenizer_path
         )
@@ -583,6 +585,12 @@ class PPOTrainer:
             raise ValueError(f"Total epochs must be positive: {total_epochs}")
         steps_per_epoch = len(self.train_dataloader)
         max_steps = total_epochs * steps_per_epoch
+        workflow_kwargs = self._maybe_inject_r3_workflow_kwargs(
+            workflow, workflow_kwargs
+        )
+        eval_workflow_kwargs = self._maybe_inject_r3_workflow_kwargs(
+            eval_workflow, eval_workflow_kwargs
+        )
 
         # Initialize proxy workers if not using RolloutWorkflow
         if workflow is None:
@@ -1290,6 +1298,54 @@ class PPOTrainer:
         if not is_single_controller():
             dist.barrier(group=self.actor.cpu_group)
             current_platform.synchronize()
+
+    def _resolve_actor_r3_moe_config(self) -> R3MoEConfig:
+        if self._r3_moe_config is None:
+            from transformers import AutoConfig
+
+            hf_config = AutoConfig.from_pretrained(
+                self.config.actor.path,
+                trust_remote_code=True,
+            )
+            self._r3_moe_config = resolve_r3_moe_config(hf_config)
+        return self._r3_moe_config
+
+    def _is_rlvr_workflow(self, workflow: WorkflowLike | None) -> bool:
+        if workflow is None:
+            return False
+        if isinstance(workflow, str):
+            return workflow in {
+                "areal.workflow.rlvr.RLVRWorkflow",
+                "areal.workflow.vision_rlvr.VisionRLVRWorkflow",
+            }
+
+        from areal.workflow.rlvr import RLVRWorkflow
+        from areal.workflow.vision_rlvr import VisionRLVRWorkflow
+
+        if isinstance(workflow, type):
+            return issubclass(workflow, (RLVRWorkflow, VisionRLVRWorkflow))
+        return isinstance(workflow, (RLVRWorkflow, VisionRLVRWorkflow))
+
+    def _maybe_inject_r3_workflow_kwargs(
+        self,
+        workflow: WorkflowLike | None,
+        workflow_kwargs: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        if not self.config.rollout.return_routed_experts:
+            return workflow_kwargs
+        if not self._is_rlvr_workflow(workflow):
+            return workflow_kwargs
+
+        r3_config = self._resolve_actor_r3_moe_config()
+        if not isinstance(workflow, (str, type)):
+            setattr(workflow, "r3_num_moe_layers", r3_config.num_moe_layers)
+            setattr(workflow, "r3_topk", r3_config.topk)
+            return workflow_kwargs
+
+        updated = dict(workflow_kwargs or {})
+        updated.setdefault("r3_num_moe_layers", r3_config.num_moe_layers)
+        updated.setdefault("r3_topk", r3_config.topk)
+        return updated
 
     def _validate_cfg(self):
         """validate config for incompatible settings before weight initialization, to avoid wasted resources on spawning workers and loading models."""
