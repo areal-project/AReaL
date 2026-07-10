@@ -112,3 +112,45 @@ def test_export_keeps_default_reduce_group_when_key_sync_group_is_larger():
         )
 
     assert all_reduce_groups == [dp_group]
+
+
+def test_export_scalar_key_missing_on_this_rank_does_not_crash():
+    """A SCALAR key known only via metadata sync must still take part in the
+    collective (aggregating over empty local values) and return 0.0 rather
+    than NaN from a 0/0 division."""
+    tracker = DistributedStatsTracker()
+    dp_group = object()
+    remote_metadata = {"loss_scalar": _StatMetadata(ReduceType.SCALAR, None, False)}
+    all_reduce_groups = []
+
+    def fake_get_world_size(group):
+        return 2
+
+    def fake_all_gather_object(output, local_metadata, group):
+        assert group is dp_group
+        assert local_metadata == {}  # this rank never recorded the scalar
+        output[:] = [local_metadata, remote_metadata]
+
+    def fake_all_reduce(tensor, group=None, op=None):
+        all_reduce_groups.append(group)
+
+    with (
+        patch(
+            "areal.utils.stats_tracker.dist.get_world_size",
+            side_effect=fake_get_world_size,
+        ),
+        patch(
+            "areal.utils.stats_tracker.dist.all_gather_object",
+            side_effect=fake_all_gather_object,
+        ),
+        patch(
+            "areal.utils.stats_tracker.dist.all_reduce",
+            side_effect=fake_all_reduce,
+        ),
+    ):
+        result = tracker.export(reduce_group=dp_group, reset=False)
+
+    # value + cnt are both reduced over the default group.
+    assert all_reduce_groups == [dp_group, dp_group]
+    assert result["loss_scalar"] == 0.0  # guarded 0/0, not NaN
+    assert result["loss_scalar__count"] == 0
