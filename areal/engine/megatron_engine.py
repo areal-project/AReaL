@@ -235,6 +235,7 @@ class MegatronEngine(TrainEngine):
         self._r3_router_groups: dict[int, list[NativeRouterReplayRef]] = {}
         self._r3_local_moe_indices: dict[int, list[int]] = {}
         self._r3_moe_config: R3MoEConfig | None = None
+        self._r3_num_moe_experts: int | None = None
         self._r3_pending_routed_experts: torch.Tensor | None = None
         self._r3_pending_valid: torch.Tensor | None = None
 
@@ -931,12 +932,38 @@ class MegatronEngine(TrainEngine):
     def _model_vp_stage(self, model: torch.nn.Module) -> int:
         return int(getattr(model, "vp_stage", 0) or 0)
 
+    def _resolve_r3_num_moe_experts(self) -> int:
+        for field_name in ("num_moe_experts", "num_experts"):
+            value = getattr(self.tf_config, field_name, None)
+            if value is None:
+                continue
+            value = int(value)
+            if value <= 0:
+                raise r3_error(
+                    "Megatron MoE expert count must be positive for R3",
+                    field=field_name,
+                    value=value,
+                )
+            return value
+        raise r3_error(
+            "Unable to resolve Megatron MoE expert count for R3",
+            candidate_fields=("num_moe_experts", "num_experts"),
+        )
+
     def _initialize_r3_router_replay(self) -> None:
         if not self._r3_enabled:
             return
         assert self.model is not None, "Model must be initialized before R3 discovery."
 
+        if bool(getattr(self.tf_config, "moe_router_fusion", False)):
+            raise r3_error(
+                "R3 router replay is incompatible with effective "
+                "Megatron moe_router_fusion=True",
+                moe_router_fusion=getattr(self.tf_config, "moe_router_fusion", None),
+            )
+
         self._r3_moe_config = resolve_r3_moe_config(self.tf_config)
+        self._r3_num_moe_experts = self._resolve_r3_num_moe_experts()
         if self._r3_moe_config.num_moe_layers <= 0:
             raise r3_error(
                 "R3 router replay is enabled but Megatron config has no MoE layers",
@@ -1079,6 +1106,29 @@ class MegatronEngine(TrainEngine):
                 routed_batch_size=routed_experts.shape[0],
                 valid_batch_size=routing_valid.shape[0],
             )
+        if self._r3_moe_config is None or self._r3_num_moe_experts is None:
+            raise r3_error("R3 MoE config is not initialized")
+        expected_shape_tail = (
+            self._r3_moe_config.num_moe_layers,
+            self._r3_moe_config.topk,
+        )
+        if tuple(routed_experts.shape[2:]) != expected_shape_tail:
+            raise r3_error(
+                "R3 routed_experts layer/topk dims do not match Megatron MoE config",
+                routed_shape=tuple(routed_experts.shape),
+                expected_num_moe_layers=self._r3_moe_config.num_moe_layers,
+                expected_topk=self._r3_moe_config.topk,
+            )
+        if routed_experts.numel() > 0:
+            min_expert = int(routed_experts.min().item())
+            max_expert = int(routed_experts.max().item())
+            if min_expert < 0 or max_expert >= self._r3_num_moe_experts:
+                raise r3_error(
+                    "R3 routed_experts contains expert id outside Megatron MoE range",
+                    min_expert=min_expert,
+                    max_expert=max_expert,
+                    num_moe_experts=self._r3_num_moe_experts,
+                )
 
         routed_experts = routed_experts.to(self.device, non_blocking=True)
         routing_valid = routing_valid.detach().to(device="cpu", dtype=torch.bool)

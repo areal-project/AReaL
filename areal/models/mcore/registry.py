@@ -258,6 +258,12 @@ def make_mcore_model(
             vpp_size > 1 and provider.pipeline_model_parallel_size > 1
         )
         if mcore_config.enable_router_replay:
+            if bool(getattr(provider, "moe_router_fusion", False)):
+                raise ValueError(
+                    "megatron.enable_router_replay=True is incompatible with "
+                    "effective Megatron moe_router_fusion=True. Disable "
+                    "moe_router_fusion to use Megatron-Core native RouterReplay."
+                )
             provider.moe_enable_routing_replay = True
 
         # Aligning tf config settings with provider for consistency.
