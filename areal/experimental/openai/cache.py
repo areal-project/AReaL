@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import hashlib
 import json
 import os
 import threading
 import time
-from collections import OrderedDict
+from collections import OrderedDict, defaultdict
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
@@ -92,6 +93,117 @@ class InteractionCache(OrderedDict[str, InteractionWithTokenLogpReward]):
     def set_last_reward(self, reward: float) -> None:
         """Set reward for the most recent completion/response."""
         self.set_reward(self.last_interaction_id, reward)
+
+    def _find_retry_orphan_ids(self) -> set[str]:
+        """Identify retry-orphan completions/responses.
+
+        Among a group of interactions sharing identical input messages
+        (deep-equal), an entry is a retry orphan when it was not the one the
+        agent actually consumed:
+
+          1) If the group contains an entry with children (a later turn
+             adopted it as parent), that entry is the consumed completion and
+             every childless sibling is an orphan.
+          2) If the whole group is childless (the session ended right after a
+             retry, before any later turn could establish parentage), the tree
+             cannot disambiguate. Fall back to generation time: keep the entry
+             with the largest ``created_at`` (most likely the retry) and treat
+             the earlier duplicates as orphans, so the consumed completion is
+             not lost.
+
+        This pattern is produced when the upstream Agent SDK times out
+        waiting for a response, retries the same request, and the proxy
+        records both the orphaned (never-delivered) completion and the
+        retry. The retry's output is what the agent actually saw and
+        continued from, while the orphan dangles as a leaf.
+        """
+        # Build has_children set from parent pointers wired up at __setitem__.
+        has_children: set[str] = set()
+        for entry in self.values():
+            if entry.parent is not None:
+                pid = entry.parent.interaction_id
+                if pid is not None:
+                    has_children.add(pid)
+
+        # Group entries by hashed input messages, preserving insertion order.
+        groups: dict[str, list[str]] = defaultdict(list)
+        for cid, entry in self.items():
+            if entry.messages is None:
+                continue
+            try:
+                serialized = json.dumps(
+                    entry.messages, sort_keys=True, default=str
+                ).encode("utf-8")
+            except (TypeError, ValueError):
+                continue
+            digest = hashlib.sha1(serialized).hexdigest()
+            groups[digest].append(cid)
+
+        orphan_ids: set[str] = set()
+        for cids in groups.values():
+            if len(cids) < 2:
+                continue
+            # Confirm the group is actually message-equal (hash collisions are
+            # astronomically unlikely but the cost of confirming is trivial).
+            ref_msgs = self[cids[0]].messages
+            if any(self[c].messages != ref_msgs for c in cids[1:]):
+                continue
+            leaves = [c for c in cids if c not in has_children]
+            if len(leaves) < len(cids):
+                # At least one duplicate has a child: the tree tells us which
+                # entry was actually consumed (a later turn adopted it as
+                # parent), so every childless sibling is an orphan.
+                orphan_ids.update(leaves)
+            else:
+                # The whole group is leaves. This happens when the session
+                # ends right after a retry, before any later turn could adopt
+                # the real completion as a parent. The tree can no longer
+                # distinguish orphan from retry, so fall back to generation
+                # time: keep the most recently created entry (most likely the
+                # retry the agent consumed) and drop the earlier duplicates.
+                # Tie-break on insertion order so a coarse (second-resolution)
+                # or missing created_at still keeps the latest deterministically.
+                order = {c: i for i, c in enumerate(cids)}
+                survivor = max(
+                    cids,
+                    key=lambda c: (
+                        self[c].created_at
+                        if self[c].created_at is not None
+                        else float("-inf"),
+                        order[c],
+                    ),
+                )
+                orphan_ids.update(c for c in cids if c != survivor)
+        return orphan_ids
+
+    def drop_retry_orphans(self) -> list[str]:
+        """Remove retry-orphan entries in place; return the dropped IDs.
+
+        Must be called BEFORE :meth:`apply_reward_discount`, otherwise the
+        orphan rewards have already polluted the discounted chain.
+
+        Acquires ``self._lock`` for the find-and-delete so it stays consistent
+        with concurrent :meth:`set_reward` / insertion, and decrements
+        ``self._total_reward`` by each dropped entry's reward to keep the
+        running total accurate.
+        """
+        if self._apply_reward_discount_called:
+            raise RuntimeError(
+                "drop_retry_orphans must be called BEFORE apply_reward_discount."
+            )
+        with self._lock:
+            orphan_ids = self._find_retry_orphan_ids()
+            for oid in orphan_ids:
+                self._total_reward -= self[oid].reward or 0.0
+                del self[oid]
+        if orphan_ids:
+            logger.info(
+                "Session %s: dropped %d retry-orphan completion(s): %s",
+                self._session_id,
+                len(orphan_ids),
+                sorted(orphan_ids),
+            )
+        return list(orphan_ids)
 
     def apply_reward_discount(
         self, turn_discount: float = 1.0
@@ -289,7 +401,10 @@ class InteractionCache(OrderedDict[str, InteractionWithTokenLogpReward]):
             logger.warning("Failed to dump mismatch: %s", e)
 
     def export_interactions(
-        self, style: str, reward_discount: float | None = None
+        self,
+        style: str,
+        reward_discount: float | None = None,
+        drop_retry_orphans: bool = False,
     ) -> dict[str, InteractionWithTokenLogpReward]:
         """Export cached completions/responses in different formats.
 
@@ -320,6 +435,8 @@ class InteractionCache(OrderedDict[str, InteractionWithTokenLogpReward]):
         ValueError
             If an unsupported ``style`` is provided.
         """
+        if drop_retry_orphans:
+            self.drop_retry_orphans()
         if reward_discount is not None and not self._apply_reward_discount_called:
             self.apply_reward_discount(turn_discount=reward_discount)
 
