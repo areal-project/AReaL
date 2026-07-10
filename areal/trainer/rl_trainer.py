@@ -1317,21 +1317,35 @@ class PPOTrainer:
     def _supports_r3_workflow_shape(self, workflow: WorkflowLike | None) -> bool:
         if workflow is None:
             return False
+        if self._is_unsupported_r3_vision_workflow(workflow):
+            return False
         if isinstance(workflow, str):
             return workflow in {
                 "areal.workflow.rlvr.RLVRWorkflow",
-                "areal.workflow.vision_rlvr.VisionRLVRWorkflow",
                 "areal.experimental.openai.proxy.workflow.OpenAIProxyWorkflow",
             }
 
         from areal.experimental.openai.proxy.workflow import OpenAIProxyWorkflow
         from areal.workflow.rlvr import RLVRWorkflow
-        from areal.workflow.vision_rlvr import VisionRLVRWorkflow
 
-        supported_types = (RLVRWorkflow, VisionRLVRWorkflow, OpenAIProxyWorkflow)
+        supported_types = (RLVRWorkflow, OpenAIProxyWorkflow)
         if isinstance(workflow, type):
             return issubclass(workflow, supported_types)
         return isinstance(workflow, supported_types)
+
+    def _is_unsupported_r3_vision_workflow(
+        self, workflow: WorkflowLike | None
+    ) -> bool:
+        if isinstance(workflow, str):
+            return workflow == "areal.workflow.vision_rlvr.VisionRLVRWorkflow"
+        if workflow is None:
+            return False
+
+        from areal.workflow.vision_rlvr import VisionRLVRWorkflow
+
+        if isinstance(workflow, type):
+            return issubclass(workflow, VisionRLVRWorkflow)
+        return isinstance(workflow, VisionRLVRWorkflow)
 
     def _maybe_inject_r3_workflow_kwargs(
         self,
@@ -1340,6 +1354,12 @@ class PPOTrainer:
     ) -> dict[str, Any] | None:
         if not self.config.rollout.return_routed_experts:
             return workflow_kwargs
+        if self._is_unsupported_r3_vision_workflow(workflow):
+            raise ValueError(
+                "return_routed_experts/R3 router replay currently supports packed "
+                "text RLVR and OpenAI proxy workflows only; VisionRLVRWorkflow is "
+                "not supported."
+            )
         if not self._supports_r3_workflow_shape(workflow):
             return workflow_kwargs
 

@@ -486,6 +486,46 @@ class TestInfBridge:
         assert resp.stop_reason == "length"
 
     @pytest.mark.asyncio
+    async def test_abort_with_tokens_missing_routing_can_recover_on_resubmit(self):
+        """Intermediate aborts may omit routing if a later response covers it."""
+        calls = 0
+        final_routing = np.arange(1, 1 + 5 * 4, dtype=np.int32).reshape(5, 4)
+
+        async def mock_send(http_req, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return _make_sglang_response([(-0.5, 100), (-0.3, 101)], "abort")
+            return _make_sglang_response(
+                [(-0.2, 200)],
+                "stop",
+                routed_experts=final_routing,
+                prompt_tokens=5,
+                completion_tokens=1,
+            )
+
+        bridge = _make_bridge(return_routed_experts=True)
+        bridge._send_request = mock_send
+
+        req = _make_request(input_ids=[1, 2, 3], max_new_tokens=5)
+        resp = await bridge.agenerate(req)
+
+        assert resp.output_tokens == [100, 101, 200]
+        np.testing.assert_array_equal(resp.routed_experts, final_routing)
+
+    @pytest.mark.asyncio
+    async def test_abort_with_tokens_missing_routing_raises_after_retries(self):
+        """R3 cannot return generated tokens without any final routing."""
+        bridge = _make_bridge(return_routed_experts=True, max_resubmit_retries=2)
+        bridge._send_request = AsyncMock(
+            return_value=_make_sglang_response([(-0.5, 100)], "abort")
+        )
+
+        req = _make_request(input_ids=[1, 2, 3], max_new_tokens=5)
+        with pytest.raises(RuntimeError, match="no routed_experts"):
+            await bridge.agenerate(req)
+
+    @pytest.mark.asyncio
     async def test_routed_experts_resubmit_drops_duplicate_prefix(self):
         """Resubmitted SGLang routing is stitched without duplicating prompt rows."""
         calls: list[dict[str, Any]] = []

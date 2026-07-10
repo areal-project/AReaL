@@ -14,10 +14,12 @@ from areal.api import ModelResponse
 from areal.experimental.openai.types import InteractionWithTokenLogpReward
 from areal.infra.rpc.serialization import deserialize_value
 from areal.v2.inference_service.data_proxy.app import (
+    _create_inf_bridge,
     _flush_ready_trajectories,
     create_app,
 )
 from areal.v2.inference_service.data_proxy.config import DataProxyConfig
+from areal.v2.inference_service.data_proxy.pause import PauseState
 from areal.v2.inference_service.data_proxy.session import (
     SessionData,
     SessionStore,
@@ -160,6 +162,13 @@ def admin_headers():
 
 def session_headers(api_key: str):
     return {"Authorization": f"Bearer {api_key}"}
+
+
+def test_create_inf_bridge_requires_r3_shape_when_routing_requested(config):
+    config.return_routed_experts = True
+
+    with pytest.raises(ValueError, match="r3_num_moe_layers and r3_topk"):
+        _create_inf_bridge(config.backend_addr, PauseState(), config)
 
 
 # =============================================================================

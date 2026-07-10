@@ -183,6 +183,13 @@ def _create_inf_bridge(
         raise ValueError(
             "return_routed_experts is only supported for the SGLang data proxy backend."
         )
+    if config.return_routed_experts and (
+        config.r3_num_moe_layers is None or config.r3_topk is None
+    ):
+        raise ValueError(
+            "return_routed_experts requires r3_num_moe_layers and r3_topk in "
+            "the data proxy config."
+        )
     if config.backend_type == "sglang":
         backend = SGLangBridgeBackend()
     elif config.backend_type == "vllm":

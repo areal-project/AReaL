@@ -227,10 +227,7 @@ class InfBridge:
             result = self.backend.parse_generation_response(data)
 
             if requested_routing and result.routed_experts is None:
-                is_abort_without_tokens = (
-                    result.stop_reason == "abort" and len(result.output_tokens) == 0
-                )
-                if not is_abort_without_tokens:
+                if result.stop_reason != "abort":
                     raise RuntimeError(
                         "Requested return_routed_experts=True but the inference "
                         "backend response did not include routed_experts. "
@@ -281,6 +278,18 @@ class InfBridge:
         # Final abort at max retries → treat as length
         if stop_reason == "abort" or stop_reason is None:
             stop_reason = "length"
+
+        if (
+            requested_routing
+            and accumulated_tokens
+            and final_routed_experts is None
+        ):
+            raise RuntimeError(
+                "Requested return_routed_experts=True but no routed_experts were "
+                "received after abort/resubmit. This usually means the SGLang "
+                "server was not launched with enable_return_routed_experts=True "
+                "or the model is not a MoE model."
+            )
 
         latency = time.monotonic() - t0
 
