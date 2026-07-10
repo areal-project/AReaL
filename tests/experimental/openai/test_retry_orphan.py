@@ -82,27 +82,35 @@ def test_single_retry_with_subsequent_turn_drops_orphan():
     assert set(cache.keys()) == {"retry", "next"}
 
 
-def test_retry_then_session_ends_keeps_latest():
-    """Two siblings, both leaves → keep latest, drop earlier."""
+def test_retry_then_session_ends_drops_all_leaves():
+    """Two siblings, both leaves → both dropped.
+
+    Relaxed detection (see ``_find_retry_orphan_ids``) treats *any*
+    duplicate-input entry without children as an orphan, because the
+    orphan may be inserted after the retry so "keep latest" is unreliable.
+    When the session ends immediately after a retry there is no subsequent
+    turn to anchor the real completion as a parent, so both leaves are
+    dropped.
+    """
     msgs = [_user_msg("hi")]
     cache = InteractionCache()
     cache["orphan"] = _make_interaction("orphan", msgs)
     cache["retry"] = _make_interaction("retry", msgs)
-    dropped = cache.drop_retry_orphans()
-    assert dropped == ["orphan"]
-    assert "retry" in cache
-    assert "orphan" not in cache
+    dropped = set(cache.drop_retry_orphans())
+    assert dropped == {"orphan", "retry"}
+    assert len(cache) == 0
 
 
-def test_three_retries_drops_two_orphans():
+def test_three_retries_all_leaves_dropped():
+    """Three same-input leaves, none adopted as a parent → all dropped."""
     msgs = [_user_msg("hi")]
     cache = InteractionCache()
     cache["o1"] = _make_interaction("o1", msgs)
     cache["o2"] = _make_interaction("o2", msgs)
     cache["final"] = _make_interaction("final", msgs)
     dropped = set(cache.drop_retry_orphans())
-    assert dropped == {"o1", "o2"}
-    assert set(cache.keys()) == {"final"}
+    assert dropped == {"o1", "o2", "final"}
+    assert len(cache) == 0
 
 
 def test_mid_conversation_retry():
