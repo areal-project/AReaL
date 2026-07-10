@@ -1,0 +1,51 @@
+--- /tmp/opencode/internal-public-AReaL-backup-20260709-161019/remote_inf_engine.py	2026-07-09 16:10:19.880356785 +0800
++++ /storage/openpsi/users/public/projects/AReaL/areal/infra/remote_inf_engine.py	2026-07-09 16:22:40.223960142 +0800
+@@ -444,15 +444,37 @@
+         self._proxy_gateway_addr: str | None = None
+         self.local_server_processes: list[LocalInfServerInfo] = []
+ 
+-    def _wait_for_server(self, address):
++    def _wait_for_server(self, address, process=None):
+         """Wait for a server to become healthy."""
+         base_url = f"http://{address}"
+         tik = time.time()
++        last_report = tik
+         while time.time() - tik < self.config.setup_timeout:
++            if process is not None and process.poll() is not None:
++                raise RuntimeError(
++                    f"Inference server process (pid={process.pid}) exited with "
++                    f"code {process.returncode} before becoming healthy at "
++                    f"{address}. Search the worker log above for the server "
++                    "traceback (e.g. scheduler init errors, port EADDRINUSE)."
++                )
+             if self.check_health(base_url):
+                 return
++            now = time.time()
++            if now - last_report >= 60:
++                logger.info(
++                    "Still waiting for inference server at %s to become "
++                    "healthy (%.0fs elapsed, timeout %.0fs, process alive=%s)",
++                    address,
++                    now - tik,
++                    self.config.setup_timeout,
++                    process is not None and process.poll() is None,
++                )
++                last_report = now
+             time.sleep(1)
+-        raise TimeoutError("server launch failed")
++        raise TimeoutError(
++            f"Inference server at {address} failed to become healthy within "
++            f"{self.config.setup_timeout}s"
++        )
+ 
+     def check_health(self, base_url):
+         """Check if server is healthy."""
+@@ -1377,7 +1399,7 @@
+             process=process,
+         )
+         try:
+-            self._wait_for_server(address)
++            self._wait_for_server(address, process=process)
+             self.local_server_processes.append(server_info)
+             if ray.is_initialized():
+                 # do not return with process for ray as it is not picklable
