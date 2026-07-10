@@ -21,6 +21,7 @@ def _make_interaction(
     messages: list[dict],
     output_messages: list[dict] | None = None,
     reward: float | None = None,
+    created: int = 0,
 ) -> InteractionWithTokenLogpReward:
     """Build a minimal InteractionWithTokenLogpReward usable by the cache.
 
@@ -38,7 +39,7 @@ def _make_interaction(
     )
     completion = MagicMock()
     completion.id = cid
-    completion.created = 0
+    completion.created = created
     interaction.completion = completion
     return interaction
 
@@ -82,35 +83,51 @@ def test_single_retry_with_subsequent_turn_drops_orphan():
     assert set(cache.keys()) == {"retry", "next"}
 
 
-def test_retry_then_session_ends_drops_all_leaves():
-    """Two siblings, both leaves → both dropped.
+def test_retry_then_session_ends_keeps_latest():
+    """Two siblings, both leaves → keep the latest, drop the earlier.
 
-    Relaxed detection (see ``_find_retry_orphan_ids``) treats *any*
-    duplicate-input entry without children as an orphan, because the
-    orphan may be inserted after the retry so "keep latest" is unreliable.
-    When the session ends immediately after a retry there is no subsequent
-    turn to anchor the real completion as a parent, so both leaves are
-    dropped.
+    When the session ends immediately after a retry there is no later turn
+    to anchor the real completion as a parent, so the tree cannot tell orphan
+    from retry. The fallback keeps the most recently created entry (here the
+    later-inserted ``retry``) instead of dropping both, avoiding data loss.
     """
     msgs = [_user_msg("hi")]
     cache = InteractionCache()
     cache["orphan"] = _make_interaction("orphan", msgs)
     cache["retry"] = _make_interaction("retry", msgs)
-    dropped = set(cache.drop_retry_orphans())
-    assert dropped == {"orphan", "retry"}
-    assert len(cache) == 0
+    dropped = cache.drop_retry_orphans()
+    assert dropped == ["orphan"]
+    assert "retry" in cache
+    assert "orphan" not in cache
 
 
-def test_three_retries_all_leaves_dropped():
-    """Three same-input leaves, none adopted as a parent → all dropped."""
+def test_all_leaves_keeps_latest_by_created_at():
+    """All-leaf fallback ranks by created_at, not insertion order.
+
+    The retry is inserted *before* the orphan but carries a larger
+    ``created_at`` (it was generated later, after the SDK timeout). The
+    survivor must be the retry, proving generation time drives the tie, not
+    the order rows landed in the cache.
+    """
     msgs = [_user_msg("hi")]
     cache = InteractionCache()
-    cache["o1"] = _make_interaction("o1", msgs)
-    cache["o2"] = _make_interaction("o2", msgs)
-    cache["final"] = _make_interaction("final", msgs)
+    cache["retry"] = _make_interaction("retry", msgs, created=100)
+    cache["orphan"] = _make_interaction("orphan", msgs, created=50)
+    dropped = cache.drop_retry_orphans()
+    assert dropped == ["orphan"]
+    assert set(cache.keys()) == {"retry"}
+
+
+def test_three_retries_drops_two_orphans():
+    """Three same-input leaves → keep the latest, drop the two earlier."""
+    msgs = [_user_msg("hi")]
+    cache = InteractionCache()
+    cache["o1"] = _make_interaction("o1", msgs, created=1)
+    cache["o2"] = _make_interaction("o2", msgs, created=2)
+    cache["final"] = _make_interaction("final", msgs, created=3)
     dropped = set(cache.drop_retry_orphans())
-    assert dropped == {"o1", "o2", "final"}
-    assert len(cache) == 0
+    assert dropped == {"o1", "o2"}
+    assert set(cache.keys()) == {"final"}
 
 
 def test_mid_conversation_retry():
