@@ -40,6 +40,9 @@ ESCAPABLE_PACKAGES: frozenset[str] = frozenset(
         "nvidia-cudnn-cu12",
         "openai",
         "soundfile",
+        # vLLM keeps a separate x86_64 Linux fastapi-sso resolution while the
+        # other platforms are pinned around the malformed 0.17.0 wheel release.
+        "fastapi-sso",
         "peft",
         "transformers",
     }

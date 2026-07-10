@@ -1,33 +1,32 @@
 # R3 Router Replay
 
-R3 (Rollout Routing Replay) records MoE router choices during rollout and replays
-those choices during Megatron training. It is for SGLang rollout + Megatron MoE actor
-runs where rollout logprobs and training recompute logprobs can diverge because the
-two engines choose different top-k experts.
+R3 (Rollout Routing Replay) records MoE router choices during rollout and replays those
+choices during Megatron training. It is for SGLang rollout + Megatron MoE actor runs
+where rollout logprobs and training recompute logprobs can diverge because the two
+engines choose different top-k experts.
 
 The implementation uses Megatron-Core native `RouterReplay`. AReaL does not replace
-Megatron router math. It transports the routing side channel, validates it, converts
-it to Megatron token order, and drives native replay actions around each micro-batch.
+Megatron router math. It transports the routing side channel, validates it, converts it
+to Megatron token order, and drives native replay actions around each micro-batch.
 
 ## Implementation
 
 End-to-end data flow:
 
 1. **Rollout recording**: `rollout.return_routed_experts=true` makes AReaL send
-   `return_routed_experts=True` to SGLang. SGLang returns base64 int32 routed expert
-   ids in `meta_info["routed_experts"]`; AReaL decodes them into
+   `return_routed_experts=True` to SGLang. SGLang returns base64 int32 routed expert ids
+   in `meta_info["routed_experts"]`; AReaL decodes them into
    `[tokens, num_moe_layers * topk]`.
 1. **Workflow preprocessing**: supported workflows create two trajectory tensors:
    `routed_experts` with shape `[batch, seq_len, num_moe_layers, topk]` and
-   `r3_routing_valid` with shape `[batch]`. Legal missing tail rows are filled from
-   the nearest previous valid row. Internal zero rows or unaligned samples are marked
+   `r3_routing_valid` with shape `[batch]`. Legal missing tail rows are filled from the
+   nearest previous valid row. Internal zero rows or unaligned samples are marked
    invalid instead of being replayed.
 1. **Megatron replay**: before each Megatron micro-batch, AReaL packs routing into
-   Megatron's padded packed-token order, applies CP/SP slicing, slices local MoE
-   layers for the current PP/VPP stage, calls native `set_target_indices()`, and
-   switches native `RouterReplayAction` to `REPLAY_FORWARD`. For backward recompute it
-   switches to `REPLAY_BACKWARD`, so activation checkpointing consumes the same router
-   choices.
+   Megatron's padded packed-token order, applies CP/SP slicing, slices local MoE layers
+   for the current PP/VPP stage, calls native `set_target_indices()`, and switches
+   native `RouterReplayAction` to `REPLAY_FORWARD`. For backward recompute it switches
+   to `REPLAY_BACKWARD`, so activation checkpointing consumes the same router choices.
 
 Key files:
 
@@ -105,8 +104,8 @@ R3 adds two groups of metrics.
 ### Rollout/Training Logprob Mismatch
 
 These metrics are emitted under `compute_logp/r3/*` during actor recompute-logp. They
-compare SGLang rollout token logprobs with Megatron training recompute logprobs on
-valid loss tokens.
+compare SGLang rollout token logprobs with Megatron training recompute logprobs on valid
+loss tokens.
 
 | Metric                                                          | Meaning                                                                                 |
 | --------------------------------------------------------------- | --------------------------------------------------------------------------------------- |
@@ -120,8 +119,8 @@ valid loss tokens.
 
 ### Replay Execution Counters
 
-These metrics are emitted as `r3/*` from the Megatron engine. During PPO update they
-can also appear with a trainer prefix such as `ppo_actor/update/r3/*`.
+These metrics are emitted as `r3/*` from the Megatron engine. During PPO update they can
+also appear with a trainer prefix such as `ppo_actor/update/r3/*`.
 
 | Metric                           | Meaning                                                                                       |
 | -------------------------------- | --------------------------------------------------------------------------------------------- |
@@ -163,8 +162,8 @@ For a healthy R3-on run:
 - `r3/routing_valid_fraction` is close to `1.0`.
 - `r3/skipped_microbatches` and `r3/invalid_samples` stay at `0`, or are explained by
   rollout aborts.
-- `rollout_train_k3_kl`, `rollout_train_logp_abs_diff`, and extreme-fraction metrics
-  are materially lower than an otherwise identical R3-off run.
+- `rollout_train_k3_kl`, `rollout_train_logp_abs_diff`, and extreme-fraction metrics are
+  materially lower than an otherwise identical R3-off run.
 
 In the GSM8K Moonlight-16B-A3B bs32/group8 validation run, both R3-on and R3-off
 completed `233/233` steps. Tail-20 mismatch metrics dropped with R3:
