@@ -1310,21 +1310,24 @@ class PPOTrainer:
             self._r3_moe_config = resolve_r3_moe_config(hf_config)
         return self._r3_moe_config
 
-    def _is_rlvr_workflow(self, workflow: WorkflowLike | None) -> bool:
+    def _supports_r3_workflow_shape(self, workflow: WorkflowLike | None) -> bool:
         if workflow is None:
             return False
         if isinstance(workflow, str):
             return workflow in {
                 "areal.workflow.rlvr.RLVRWorkflow",
                 "areal.workflow.vision_rlvr.VisionRLVRWorkflow",
+                "areal.experimental.openai.proxy.workflow.OpenAIProxyWorkflow",
             }
 
+        from areal.experimental.openai.proxy.workflow import OpenAIProxyWorkflow
         from areal.workflow.rlvr import RLVRWorkflow
         from areal.workflow.vision_rlvr import VisionRLVRWorkflow
 
+        supported_types = (RLVRWorkflow, VisionRLVRWorkflow, OpenAIProxyWorkflow)
         if isinstance(workflow, type):
-            return issubclass(workflow, (RLVRWorkflow, VisionRLVRWorkflow))
-        return isinstance(workflow, (RLVRWorkflow, VisionRLVRWorkflow))
+            return issubclass(workflow, supported_types)
+        return isinstance(workflow, supported_types)
 
     def _maybe_inject_r3_workflow_kwargs(
         self,
@@ -1333,7 +1336,7 @@ class PPOTrainer:
     ) -> dict[str, Any] | None:
         if not self.config.rollout.return_routed_experts:
             return workflow_kwargs
-        if not self._is_rlvr_workflow(workflow):
+        if not self._supports_r3_workflow_shape(workflow):
             return workflow_kwargs
 
         r3_config = self._resolve_actor_r3_moe_config()
