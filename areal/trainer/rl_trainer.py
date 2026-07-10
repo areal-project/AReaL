@@ -1043,6 +1043,7 @@ class PPOTrainer:
         if rollout_backend == "sglang":
             if self.config.rollout.return_routed_experts:
                 self.config.sglang.enable_return_routed_experts = True
+                self.config.actor.megatron.enable_router_replay = True
             if lora_path is not None and self.config.actor.use_lora:
                 self.config.sglang.lora_paths = [
                     f"{self.config.gconfig.lora_name}-v0={lora_path}"
@@ -1323,6 +1324,11 @@ class PPOTrainer:
             raise ValueError(
                 "return_routed_experts is only supported with SGLang backend. "
                 "Please disable return_routed_experts or switch to SGLang backend."
+            )
+        if self.config.rollout.return_routed_experts and actor_backend != "megatron":
+            raise ValueError(
+                "return_routed_experts requires actor.backend='megatron' because "
+                "R3 training replay is only supported by Megatron actors."
             )
         if (
             actor_backend == "megatron"

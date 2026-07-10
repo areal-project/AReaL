@@ -214,6 +214,17 @@ class MegatronEngine(TrainEngine):
         self.bridge_lora: MegatronBridgeLoRA | None = None
         self.is_vision_model: bool = False
         self.processor = None
+        self._r3_enabled: bool = self.mcore_config.enable_router_replay
+        self._r3_router_groups: dict[int, list[Any]] = {}
+        self._r3_pending_routed_experts: torch.Tensor | None = None
+        self._r3_pending_valid: torch.Tensor | None = None
+
+        if self._r3_enabled and self.mcore_config.moe_router_fusion:
+            raise ValueError(
+                "megatron.enable_router_replay=True is incompatible with "
+                "megatron.moe_router_fusion=True. Disable moe_router_fusion to "
+                "use Megatron-Core native RouterReplay."
+            )
 
     def create_process_group(self, parallel_strategy: ParallelStrategy | None = None):
         if parallel_strategy is None:
@@ -569,6 +580,8 @@ class MegatronEngine(TrainEngine):
                 "moe_shared_expert_overlap": self.mcore_config.moe_shared_expert_overlap,
                 "moe_router_bias_update_rate": self.mcore_config.moe_router_bias_update_rate,
             }
+            if self._r3_enabled:
+                moe_extra_args["moe_enable_routing_replay"] = True
             if self.mcore_config.moe_router_dtype is not None:
                 moe_extra_args["moe_router_dtype"] = self.mcore_config.moe_router_dtype
             if self.mcore_config.moe_z_loss_coeff is not None:
