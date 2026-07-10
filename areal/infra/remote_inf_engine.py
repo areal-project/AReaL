@@ -286,7 +286,11 @@ class RemoteInfBackendProtocol(Protocol):
         """
         ...
 
-    def get_offload_request(self) -> HttpRequest:
+    def get_abort_all_request(self) -> HttpRequest:
+        """Get request to abort all in-flight requests."""
+        ...
+
+    def get_offload_request(self, tags: list[str] | None = None) -> HttpRequest:
         """Get request to offload model memory.
 
         Returns
@@ -385,11 +389,33 @@ class RemoteInfEngine(InferenceEngine):
         except ValueError:
             base_url = f"http://{address}"
         tik = time.time()
+        last_report = tik
         while time.time() - tik < self.config.setup_timeout:
+            if process is not None and process.poll() is not None:
+                raise RuntimeError(
+                    f"Inference server process (pid={process.pid}) exited with "
+                    f"code {process.returncode} before becoming healthy at "
+                    f"{address}. Search the worker log above for the server "
+                    "traceback (e.g. scheduler init errors, port EADDRINUSE)."
+                )
             if self.check_health(base_url):
                 return
+            now = time.time()
+            if now - last_report >= 60:
+                logger.info(
+                    "Still waiting for inference server at %s to become "
+                    "healthy (%.0fs elapsed, timeout %.0fs, process alive=%s)",
+                    address,
+                    now - tik,
+                    self.config.setup_timeout,
+                    process is not None and process.poll() is None,
+                )
+                last_report = now
             time.sleep(1)
-        raise TimeoutError("server launch failed")
+        raise TimeoutError(
+            f"Inference server at {address} failed to become healthy within "
+            f"{self.config.setup_timeout}s"
+        )
 
     def check_health(self, base_url):
         """Check if server is healthy."""
@@ -1289,10 +1315,22 @@ class RemoteInfEngine(InferenceEngine):
         """Resume request submission for async rollout."""
         return self.workflow_executor.resume()
 
-    def offload(self) -> None:
+    def offload(self, tags: list[str] | None = None) -> None:
         """Offload model memory on all servers."""
-        offload_req = self.backend.get_offload_request()
+        offload_req = self.backend.get_offload_request(tags=tags)
+        self.logger.info(
+            "RemoteInfEngine.offload(tags=%s) sending to %s: endpoint=%s",
+            tags,
+            self.addresses,
+            offload_req.endpoint,
+        )
         self._run_request_on_all_servers(offload_req)
+        self.logger.info("RemoteInfEngine.offload(tags=%s) completed", tags)
+
+    def abort_all_requests(self) -> None:
+        """Abort all in-flight requests on all servers."""
+        abort_req = self.backend.get_abort_all_request()
+        self._run_request_on_all_servers(abort_req)
 
     def onload(self, tags: list[str] | None = None) -> None:
         """Onload model memory on all servers."""

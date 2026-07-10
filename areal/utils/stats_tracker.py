@@ -227,7 +227,11 @@ class DistributedStatsTracker:
         elif reduce_type == ReduceType.MAX:
             result[key] = self._max_of(key, reduce_group)
         elif reduce_type == ReduceType.SCALAR:
-            if current_platform.is_initialized():
+            effective_group = self._effective_reduce_group(key, reduce_group)
+            # Only place tensors on the accelerator when a collective actually
+            # needs them; a GPU-side allocation here can OOM colocated setups
+            # whose device is fully budgeted by training + inference engines.
+            if effective_group is not None and current_platform.is_initialized():
                 device = current_platform.device_type
             else:
                 device = "cpu"
@@ -235,7 +239,6 @@ class DistributedStatsTracker:
                 sum(self.stats[key]), dtype=torch.float32, device=device
             )
             cnt = torch.tensor(len(self.stats[key]), dtype=torch.float32, device=device)
-            effective_group = self._effective_reduce_group(key, reduce_group)
             if effective_group is not None:
                 dist.all_reduce(value, group=effective_group)
                 dist.all_reduce(cnt, group=effective_group)

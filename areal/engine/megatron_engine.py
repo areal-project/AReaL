@@ -202,6 +202,7 @@ class MegatronEngine(TrainEngine):
         self.own_global_group: bool = False
         self.is_offload: bool = False
         self._offload_depth: int = 0
+        self._awex_adapter = None  # AwexMegatronAdapter for colocate mode
         self.enable_tree_training: bool = self.config.enable_tree_training
         # FP8 configuration
         self.fp8_config = self.mcore_config.fp8_config
@@ -248,6 +249,7 @@ class MegatronEngine(TrainEngine):
             self.own_global_group = True
         self.logger = logging.getLogger(f"[MegatronEngine Rank {dist.get_rank()}]")
         self._context_and_model_parallel_group = None
+        self._cpu_model_parallel_group = None
         self._init_context_and_model_parallel_group()
         # This is needed for barrier synchronization when models are moved to CPU
         self._cpu_group = dist.new_group(
@@ -675,6 +677,11 @@ class MegatronEngine(TrainEngine):
         return self._context_and_model_parallel_group
 
     @property
+    def cpu_model_parallel_group(self) -> dist.ProcessGroup:
+        assert self.process_group_initialized
+        return self._cpu_model_parallel_group
+
+    @property
     def cpu_group(self) -> dist.ProcessGroup:
         assert self.process_group_initialized
         return self._cpu_group
@@ -735,6 +742,17 @@ class MegatronEngine(TrainEngine):
         if meta.type == "xccl" and not self.weight_update_group_initialized:
             self._init_weight_update_from_distributed(meta)
             self.weight_update_group_initialized = True
+        elif meta.type == "awex":
+            from areal.engine.awex_colocate import AwexMegatronAdapter
+
+            if self._awex_adapter is None:
+                self._awex_adapter = AwexMegatronAdapter(self)
+            self._awex_adapter.init_colocate_weight_update(
+                meta_server_addr=meta.nccl_master_address,
+                pair_name=meta.nccl_group_name or "default",
+                transfer_rank=self.rank or 0,
+            )
+            self.logger.info("Initialized AWEX colocate adapter")
 
         current_platform.synchronize()
         dist.barrier(group=self.cpu_group)
@@ -775,6 +793,31 @@ class MegatronEngine(TrainEngine):
 
     def update_weights(self, meta: WeightUpdateMeta):
         self._check_rollout_engine_connected()
+        if meta.type == "awex":
+            # Colocate mode flow (aligned with Asystem HybridEngine):
+            # 1. execute_colocate_weight_update: release grad → convert → offload
+            #    weights → signal offloaded → IPC serialize → wait reader done →
+            #    cleanup shared → signal write_finished
+            # 2. finish: wait all infer engines done → cleanup MetaServer keys
+            # 3. resume kv_cache + continue generation
+            self._awex_adapter.execute_colocate_weight_update(meta.version or 0)
+            # Do NOT flip is_offload here: the AWEX adapter tracks released
+            # memory via _released_tags, and the trainer onloads explicitly
+            # at the next train phase. Marking is_offload would make every
+            # _offload_aware_context RPC (e.g. export_stats) reload optimizer
+            # states onto a GPU already fully occupied by the resumed rollout.
+
+            dist.barrier(group=self.cpu_group)
+
+            self._awex_adapter.finish_colocate_weight_update(
+                training_world_size=dist.get_world_size(self.cpu_group)
+            )
+
+            if dist.get_rank() == 0:
+                self.rollout_engine.onload(tags=["kv_cache"])
+                self.rollout_engine.continue_generation()
+            dist.barrier(group=self.cpu_group)
+            return
         with self._offload_aware_context():
             if meta.type == "xccl":
                 assert self.weight_update_group_initialized
@@ -791,6 +834,14 @@ class MegatronEngine(TrainEngine):
         return self._version
 
     def save(self, meta: SaveLoadMeta):
+        if self._awex_adapter is not None:
+            # P82: post-ppo_update the fp32 grad buffers (~2x param bytes) are
+            # dead weight until the next train_batch (which rebuilds them via
+            # ensure_grad_buffers); drop them here to fund the HF saver's TP
+            # coalesced all-gather transient.
+            self._awex_adapter._release_grad_memory()
+            gc.collect()
+            torch.cuda.empty_cache()
         with self._offload_aware_context():
             if meta.weight_format == "hf":
                 if meta.with_optim:
@@ -994,6 +1045,8 @@ class MegatronEngine(TrainEngine):
         loss_weight_fn: Callable[[dict[str, Any]], torch.Tensor],
     ) -> dict[str, float]:
         self._ensure_ready()
+        if self._awex_adapter is not None:
+            self._awex_adapter.ensure_grad_buffers()
         self.optimizer_zero_grad()
 
         input_batched, _ = self._normalize_batch_input(input_)
@@ -1167,11 +1220,58 @@ class MegatronEngine(TrainEngine):
             data.update(data_list[0])
         return data
 
+    def init_awex_adapter(self, meta_server_addr: str | None = None) -> None:
+        """Create awex adapter early for selective memory management.
+
+        Must be called before offload() in colocate mode so that offload uses
+        the adapter's tag-based mechanism instead of TMS (which is all-or-nothing
+        and causes OOM on resume when SGLang occupies GPU memory).
+        """
+        if self._awex_adapter is None:
+            from areal.engine.awex_colocate import AwexMegatronAdapter
+
+            self._awex_adapter = AwexMegatronAdapter(self)
+            self.logger.info("Created AWEX adapter for memory management")
+
+        self._eager_publish_awex_train_info(meta_server_addr)
+
+    def _eager_publish_awex_train_info(self, meta_server_addr: str | None) -> None:
+        addr = meta_server_addr or os.environ.get("AWEX_META_SERVER_ADDR", "")
+        if not addr or (dist.is_initialized() and dist.get_rank() != 0):
+            return
+        try:
+            from awex.meta.meta_server import MetaServerClient
+
+            host, port = addr.rsplit(":", 1)
+            client = MetaServerClient(host, int(port))
+            world = dist.get_world_size() if dist.is_initialized() else 1
+            client.put_object("awex_train_info", {"train_world_size": world})
+            self.logger.info(
+                "[AWEX] eager-published awex_train_info (train_world_size=%d) to %s",
+                world,
+                addr,
+            )
+        except Exception as e:
+            self.logger.warning("[AWEX] eager publish awex_train_info failed: %s", e)
+
     def offload(self) -> None:
-        """Offload model memory to CPU using torch_memory_saver.
+        """Offload model memory to CPU.
+
+        In colocate mode (awex adapter active): manual tag-based offload via
+        storage resize. Otherwise: torch_memory_saver pause.
 
         Ref: https://github.com/THUDM/slime/blob/main/slime/backends/megatron_utils/actor.py
         """
+        if self._awex_adapter is not None:
+            self.get_device_stats().log("before offload model")
+            current_platform.clear_memory()
+            self._awex_adapter.release_memory(tags=["optimizer", "weights"])
+            current_platform.synchronize()
+            dist.barrier(group=self.cpu_group)
+            self.get_device_stats().log("after offload model")
+            self.is_offload = True
+            return
+
         if not is_tms_enabled():
             raise RuntimeError(
                 "torch_memory_saver requires `enable_offload=True` in yaml config."
@@ -1200,10 +1300,21 @@ class MegatronEngine(TrainEngine):
         self.is_offload = True
 
     def onload(self) -> None:
-        """Onload model memory from CPU back to GPU using torch_memory_saver.
+        """Onload model memory from CPU back to GPU.
+
+        Uses awex adapter (selective, tag-based) when available, otherwise
+        torch_memory_saver.
 
         Ref: https://github.com/THUDM/slime/blob/main/slime/backends/megatron_utils/actor.py
         """
+        if self._awex_adapter is not None:
+            self._awex_adapter.resume_memory(tags=["optimizer", "weights"])
+            current_platform.clear_memory()
+            current_platform.synchronize()
+            dist.barrier(group=self.cpu_group)
+            self.get_device_stats().log("after onload model")
+            self.is_offload = False
+            return
 
         torch_memory_saver.resume()
 
@@ -1381,6 +1492,12 @@ class MegatronEngine(TrainEngine):
             )
             if dp_rank == mpu.get_data_parallel_rank():
                 self._context_and_model_parallel_group = group
+        for dp_rank, ranks in enumerate(context_and_model_parallel_ranks):
+            cpu_group = dist.new_group(
+                ranks, timeout=DIST_GROUP_DEFAULT_TIMEOUT, backend="gloo"
+            )
+            if dp_rank == mpu.get_data_parallel_rank():
+                self._cpu_model_parallel_group = cpu_group
 
     def _create_optimizer(self, ft_spec: FinetuneSpec) -> None:
         if self.optimizer_config is None:
