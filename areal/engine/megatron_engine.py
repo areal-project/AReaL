@@ -1161,13 +1161,44 @@ class MegatronEngine(TrainEngine):
                 consumed=offset,
                 routed_batch_size=routed_experts.shape[0],
             )
+        valid_samples = int(routing_valid.sum().item())
+        total_samples = int(routing_valid.numel())
+        token_padding = (
+            int(sum(mb_list.padding_lengths))
+            if mb_list.padding_lengths is not None
+            else 0
+        )
+        padded_tokens = (
+            int(sum(mb_list.padded_to_lengths))
+            if mb_list.padded_to_lengths is not None
+            else int(sum(mb_list.group_lens))
+        )
         return {
             "routed_mbs": routed_mbs,
             "valid_mbs": valid_mbs,
+            "real_tokens_by_mb": [int(x) for x in mb_list.group_lens],
             "stats": {
+                "batches_with_side_channel": 1,
+                "logical_microbatches": len(mb_list.mbs),
+                "samples_total": total_samples,
+                "routing_valid_samples": valid_samples,
+                "routing_invalid_samples": total_samples - valid_samples,
+                "routing_valid_fraction": valid_samples / max(total_samples, 1),
+                "tokens_real": int(sum(mb_list.group_lens)),
+                "tokens_padded": padded_tokens,
+                "tokens_padding": token_padding,
                 "replayed_microbatches": 0,
                 "skipped_microbatches": 0,
                 "invalid_samples": 0,
+                "router_stage_microbatches": 0,
+                "mode_replay_microbatches": 0,
+                "mode_record_microbatches": 0,
+                "mode_live_microbatches": 0,
+                "mode_no_router_microbatches": 0,
+                "replay_real_tokens": 0,
+                "record_real_tokens": 0,
+                "live_real_tokens": 0,
+                "no_router_real_tokens": 0,
             },
         }
 
@@ -1219,19 +1250,31 @@ class MegatronEngine(TrainEngine):
             )
 
         refs = self._r3_router_groups.get(vp_stage, [])
+        stats = r3_context["stats"]
+        real_tokens_by_mb = r3_context["real_tokens_by_mb"]
+        real_tokens = (
+            real_tokens_by_mb[mb_idx] if mb_idx < len(real_tokens_by_mb) else 0
+        )
         if not refs:
+            stats["mode_no_router_microbatches"] += 1
+            stats["no_router_real_tokens"] += real_tokens
             return None
 
         routed_experts = routed_mbs[mb_idx]
         routing_valid = r3_context["valid_mbs"][mb_idx]
-        stats = r3_context["stats"]
+        stats["router_stage_microbatches"] += 1
         invalid_samples = int((~routing_valid).sum().item())
         if invalid_samples:
             stats["skipped_microbatches"] += 1
             stats["invalid_samples"] += invalid_samples
+            stats["skip_invalid_sample"] = stats.get("skip_invalid_sample", 0) + 1
             if forward_only:
+                stats["mode_live_microbatches"] += 1
+                stats["live_real_tokens"] += real_tokens
                 clear_router_replay_action(refs)
                 return refs, "live"
+            stats["mode_record_microbatches"] += 1
+            stats["record_real_tokens"] += real_tokens
             set_router_replay_action(refs, "RECORD")
             return refs, "record"
 
@@ -1244,9 +1287,15 @@ class MegatronEngine(TrainEngine):
         )
         if slabs.skip_replay:
             stats["skipped_microbatches"] += 1
+            reason = slabs.reason or "unknown"
+            stats[f"skip_{reason}"] = stats.get(f"skip_{reason}", 0) + 1
             if forward_only:
+                stats["mode_live_microbatches"] += 1
+                stats["live_real_tokens"] += real_tokens
                 clear_router_replay_action(refs)
                 return refs, "live"
+            stats["mode_record_microbatches"] += 1
+            stats["record_real_tokens"] += real_tokens
             set_router_replay_action(refs, "RECORD")
             return refs, "record"
         if len(slabs.slabs) != len(refs):
@@ -1261,6 +1310,8 @@ class MegatronEngine(TrainEngine):
         set_target_indices(refs, slabs.slabs)
         set_router_replay_action(refs, "REPLAY_FORWARD")
         stats["replayed_microbatches"] += 1
+        stats["mode_replay_microbatches"] += 1
+        stats["replay_real_tokens"] += real_tokens
         return refs, "replay"
 
     def _finish_r3_microbatch_replay(
@@ -1423,14 +1474,18 @@ class MegatronEngine(TrainEngine):
             self._r3_pending_valid = None
             if r3_completed and r3_context is not None:
                 r3_stats = r3_context["stats"]
-                stats_tracker.scalar(
-                    **{
-                        "r3/enabled": 1.0,
-                        "r3/replayed_microbatches": r3_stats["replayed_microbatches"],
-                        "r3/skipped_microbatches": r3_stats["skipped_microbatches"],
-                        "r3/invalid_samples": r3_stats["invalid_samples"],
-                    }
-                )
+                active_mbs = r3_stats["router_stage_microbatches"]
+                r3_scalar_stats = {
+                    f"r3/{key}": value for key, value in r3_stats.items()
+                }
+                r3_scalar_stats["r3/enabled"] = 1.0
+                r3_scalar_stats["r3/replay_fraction_active"] = r3_stats[
+                    "mode_replay_microbatches"
+                ] / max(active_mbs, 1)
+                r3_scalar_stats["r3/skip_fraction_active"] = r3_stats[
+                    "skipped_microbatches"
+                ] / max(active_mbs, 1)
+                stats_tracker.scalar(**r3_scalar_stats)
 
     def train_batch(
         self,

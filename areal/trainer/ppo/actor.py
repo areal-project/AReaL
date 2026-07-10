@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import functools
+import math
 from contextlib import contextmanager
 from typing import Any
 
@@ -168,18 +169,73 @@ class PPOActor:
 
     def _compute_logp(self, data: dict[str, Any]) -> torch.Tensor | None:
         routed_experts, routing_valid = pop_r3_tensors(data)
+        r3_enabled = routed_experts is not None and routing_valid is not None
         self.engine.eval()
         try:
             with self._r3_side_channel(routed_experts, routing_valid):
-                return self.engine.forward(
+                logp = self.engine.forward(
                     input_=data,
                     aggregate_fn=lambda xs: torch.cat(xs, dim=-1),
                 )
+                self._log_r3_rollout_train_logp_stats(
+                    train_logp=logp,
+                    data=data,
+                    r3_enabled=r3_enabled,
+                )
+                return logp
         finally:
             if routed_experts is not None:
                 data["routed_experts"] = routed_experts
             if routing_valid is not None:
                 data["r3_routing_valid"] = routing_valid
+
+    def _log_r3_rollout_train_logp_stats(
+        self,
+        *,
+        train_logp: torch.Tensor | None,
+        data: dict[str, Any],
+        r3_enabled: bool,
+    ) -> None:
+        if (
+            train_logp is None
+            or "logprobs" not in data
+            or "loss_mask" not in data
+            or not torch.is_tensor(data["logprobs"])
+            or not torch.is_tensor(data["loss_mask"])
+        ):
+            return
+
+        rollout_logp = torch.roll(data["logprobs"], shifts=-1, dims=-1)
+        loss_mask = torch.roll(data["loss_mask"].bool(), shifts=-1, dims=-1)
+        if (
+            train_logp.shape != rollout_logp.shape
+            or train_logp.shape != loss_mask.shape
+        ):
+            logger.warning(
+                "Skipping R3 rollout/train logp metrics due to shape mismatch: "
+                f"train_logp={tuple(train_logp.shape)}, "
+                f"rollout_logp={tuple(rollout_logp.shape)}, "
+                f"loss_mask={tuple(loss_mask.shape)}."
+            )
+            return
+
+        delta = (train_logp.detach().float() - rollout_logp.detach().float()).detach()
+        with stats_tracker.scope("compute_logp"):
+            with stats_tracker.scope("r3"):
+                stats_tracker.scalar(enabled=float(r3_enabled))
+                stats_tracker.denominator(n_valid_tokens=loss_mask)
+                stats_tracker.stat(
+                    rollout_train_k3_kl=torch.expm1(delta) - delta,
+                    rollout_train_extreme_frac_tau2=(
+                        delta.abs() > math.log(2.0)
+                    ).float(),
+                    rollout_train_extreme_frac_tau5=(
+                        delta.abs() > math.log(5.0)
+                    ).float(),
+                    rollout_train_logp_abs_diff=delta.abs(),
+                    rollout_train_logp_sq_diff=delta.square(),
+                    denominator="n_valid_tokens",
+                )
 
     @trace_perf("ppo_actor.compute_advantages", category="compute")
     def compute_advantages(self, data: list[dict[str, Any]]) -> list[dict[str, Any]]:
