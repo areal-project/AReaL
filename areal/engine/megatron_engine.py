@@ -496,6 +496,7 @@ class MegatronEngine(TrainEngine):
             if len(self.model) == 1:
                 model_config.param_sync_func = model_config.param_sync_func[0]
         model_config.finalize_model_grads_func = finalize_model_grads
+        self._mark_duplicated_params()
         self._create_optimizer(ft_spec)
         self._initialized = True
 
@@ -1152,9 +1153,13 @@ class MegatronEngine(TrainEngine):
         return split_batch(res, meta)
 
     def export_stats(self) -> dict[str, float]:
+        key_sync_group = None
+        if self.parallel_strategy.context_parallel_size > 1:
+            key_sync_group = mpu.get_data_parallel_group(with_context_parallel=True)
         with self._offload_aware_context():
             data = stats_tracker.export_all(
                 reduce_group=self.data_parallel_group,
+                key_sync_group=key_sync_group,
             )
         if mpu.get_pipeline_model_parallel_world_size() > 1:
             # Some log info only exist in last pipeline rank
@@ -1563,6 +1568,39 @@ class MegatronEngine(TrainEngine):
                                 duplicated.add(full)
             self._cached_duplicated_param_names = duplicated
         return self._cached_duplicated_param_names
+
+    def _mark_duplicated_params(self) -> None:
+        """Fix TP metadata for params whose parent module is duplicated.
+
+        These params are replicated (not TP-sharded), but TE can mark them with
+        ``tensor_model_parallel=True``. Megatron's optimizer uses that attribute
+        to decide which TP ranks contribute to grad norm/clipping, so leaving it
+        true double-counts duplicated params when TP > 1. We also keep
+        ``_is_duplicated`` for weight collection code that needs the same signal.
+
+        Detection uses module.tp_size == 1 instead of module.parallel_mode ==
+        'duplicated', because Megatron's TELinear converts 'duplicated' to
+        te_parallel_mode=None before calling the TE base class, so
+        module.parallel_mode ends up as None.  tp_size=1 is reliably set for
+        duplicated mode while TP-sharded modules have tp_size > 1.
+
+        Expert modules with explicit TP communication also have tp_size=1
+        (Megatron pre-divides sizes), but their weights ARE TP-sharded.
+        These are excluded by checking the module name for "expert".
+        """
+        if getattr(self, "_duplicated_params_marked", False):
+            return
+        if self.model is not None:
+            for model in self.model:
+                for mod_name, module in model.named_modules():
+                    if getattr(module, "tp_size", None) == 1:
+                        if "expert" in mod_name:
+                            continue
+                        for _, param in module.named_parameters(recurse=False):
+                            if getattr(param, "tensor_model_parallel", False):
+                                param._is_duplicated = True
+                                param.tensor_model_parallel = False
+        self._duplicated_params_marked = True
 
     def _collect_param(
         self,

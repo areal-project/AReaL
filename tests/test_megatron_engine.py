@@ -70,6 +70,39 @@ def mock_loss_fn(
     return torch.mean(logprobs)
 
 
+def test_mark_duplicated_params_clears_tp_metadata_for_replicated_params():
+    model = torch.nn.Module()
+
+    duplicated_linear = torch.nn.Linear(2, 2, bias=False)
+    duplicated_linear.tp_size = 1
+    duplicated_linear.weight.tensor_model_parallel = True
+
+    expert_linear = torch.nn.Linear(2, 2, bias=False)
+    expert_linear.tp_size = 1
+    expert_linear.weight.tensor_model_parallel = True
+
+    sharded_linear = torch.nn.Linear(2, 2, bias=False)
+    sharded_linear.tp_size = 4
+    sharded_linear.weight.tensor_model_parallel = True
+
+    model.add_module("duplicated_linear", duplicated_linear)
+    model.add_module("moe_expert_linear", expert_linear)
+    model.add_module("sharded_linear", sharded_linear)
+
+    engine = type("DummyEngine", (), {"model": [model]})()
+
+    MegatronEngine._mark_duplicated_params(engine)
+
+    assert duplicated_linear.weight._is_duplicated
+    assert not duplicated_linear.weight.tensor_model_parallel
+
+    assert not hasattr(expert_linear.weight, "_is_duplicated")
+    assert expert_linear.weight.tensor_model_parallel
+
+    assert not hasattr(sharded_linear.weight, "_is_duplicated")
+    assert sharded_linear.weight.tensor_model_parallel
+
+
 # Cannot use a "module" scope since process groups can only be initialized once.
 @pytest.fixture
 def engine():
