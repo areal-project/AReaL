@@ -216,7 +216,12 @@ actor:
   reward_scaling: 1.0
   reward_bias: 0.0
   reward_clip: 5.0
-  reward_norm: null
+  reward_norm:
+    mean_level: group
+    std_level: group
+    group_size: ${gconfig.n_samples}
+    std_unbiased: false
+    eps: 1.0e-8
   adv_norm: null
   # Required: AWEX uses MetaServer + CUDA IPC for colocated weight updates.
   weight_update_mode: awex

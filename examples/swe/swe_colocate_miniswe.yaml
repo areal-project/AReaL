@@ -218,6 +218,8 @@ actor:
     mean_level: group
     std_level: group
     group_size: ${gconfig.n_samples}
+    std_unbiased: false
+    eps: 1.0e-8
   adv_norm: null
   # Required: AWEX uses MetaServer + CUDA IPC for colocated weight updates.
   weight_update_mode: awex
