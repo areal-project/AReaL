@@ -18,6 +18,7 @@ class NativeRouterReplayRef:
     router: torch.nn.Module
     router_replay: Any
     layer_number: int | None = None
+    layer_number_is_global: bool = False
 
 
 def _unwrap_module(module: torch.nn.Module) -> torch.nn.Module:
@@ -34,15 +35,17 @@ def _resolve_topk_router_type() -> type:
     return TopKRouter
 
 
-def _infer_layer_number(name: str, router: torch.nn.Module) -> int | None:
+def _infer_layer_number(name: str, router: torch.nn.Module) -> tuple[int | None, bool]:
     layer_number = getattr(router, "layer_number", None)
     if layer_number is not None:
-        return int(layer_number)
+        return max(int(layer_number) - 1, 0), True
 
     match = re.search(r"(?:decoder|transformer|language_model).*layers\.(\d+)", name)
     if match is None:
         match = re.search(r"layers\.(\d+)", name)
-    return int(match.group(1)) if match is not None else None
+    if match is not None:
+        return int(match.group(1)), False
+    return None, False
 
 
 def discover_native_router_replay(
@@ -78,13 +81,15 @@ def discover_native_router_replay(
                     module_name=name,
                     router_type=type(child).__name__,
                 )
+            layer_number, layer_number_is_global = _infer_layer_number(name, child)
             refs.append(
                 NativeRouterReplayRef(
                     vp_stage=vp_stage,
                     name=name,
                     router=child,
                     router_replay=router_replay,
-                    layer_number=_infer_layer_number(name, child),
+                    layer_number=layer_number,
+                    layer_number_is_global=layer_number_is_global,
                 )
             )
         refs.sort(

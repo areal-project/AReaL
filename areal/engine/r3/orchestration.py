@@ -31,6 +31,11 @@ def set_router_replay_action(
         ref.router_replay.set_router_replay_action(action)
 
 
+def clear_router_replay_action(refs: Iterable[NativeRouterReplayRef]) -> None:
+    for ref in refs:
+        ref.router_replay.clear_router_replay_action()
+
+
 def set_target_indices(
     refs: Iterable[NativeRouterReplayRef],
     slabs: Iterable[torch.Tensor],
@@ -39,6 +44,20 @@ def set_target_indices(
         if slab.dtype != torch.long:
             slab = slab.long()
         ref.router_replay.set_target_indices(slab)
+
+
+def enqueue_recorded_indices(refs: Iterable[NativeRouterReplayRef]) -> None:
+    for ref in refs:
+        recorded = ref.router_replay.get_recorded_indices()
+        if recorded is None:
+            raise r3_error(
+                "Megatron RouterReplay RECORD did not produce recorded indices",
+                module_name=ref.name,
+                vp_stage=ref.vp_stage,
+            )
+        if recorded.dtype != torch.long:
+            recorded = recorded.long()
+        ref.router_replay.set_target_indices(recorded)
 
 
 def clear_router_replay_state(refs: Iterable[NativeRouterReplayRef]) -> None:

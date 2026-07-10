@@ -71,8 +71,29 @@ def test_discover_native_router_replay_collects_instance_refs(monkeypatch):
     refs = grouped[0]
     assert len(refs) == 2
     assert [ref.layer_number for ref in refs] == [0, 1]
+    assert [ref.layer_number_is_global for ref in refs] == [False, False]
     assert refs[0].router_replay is model.layers[0].router.router_replay
     assert refs[1].router_replay is model.layers[1].router.router_replay
+
+
+def test_discover_native_router_replay_normalizes_router_layer_number(monkeypatch):
+    class FakeRouter(torch.nn.Module):
+        def __init__(self, layer_number: int):
+            super().__init__()
+            self.router_replay = object()
+            self.layer_number = layer_number
+
+    model = torch.nn.Module()
+    model.layers = torch.nn.ModuleList([FakeRouter(3)])
+    monkeypatch.setattr(
+        "areal.engine.r3.discovery._resolve_topk_router_type",
+        lambda: FakeRouter,
+    )
+
+    refs = discover_native_router_replay(model)[0]
+
+    assert refs[0].layer_number == 2
+    assert refs[0].layer_number_is_global
 
 
 def test_discover_native_router_replay_missing_native_replay_raises(monkeypatch):

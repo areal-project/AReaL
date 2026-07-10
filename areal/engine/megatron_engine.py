@@ -30,6 +30,8 @@ from megatron.core.optimizer import get_megatron_optimizer
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.transformer import TransformerConfig
+from megatron.core.transformer.transformer_block import get_num_layers_to_build
+from megatron.core.transformer.transformer_layer import get_transformer_layer_offset
 from megatron.core.utils import get_model_config
 from torch import nn
 from torchdata.stateful_dataloader import StatefulDataLoader
@@ -85,6 +87,21 @@ from areal.engine.megatron_utils.packed_context_parallel import (
 from areal.engine.megatron_utils.pipeline_parallel import (
     configure_pipeline_layer_splits,
 )
+from areal.engine.r3.asserts import r3_error
+from areal.engine.r3.config import R3MoEConfig, resolve_r3_moe_config
+from areal.engine.r3.discovery import (
+    NativeRouterReplayRef,
+    discover_native_router_replay,
+)
+from areal.engine.r3.layout import prepare_native_replay_slabs
+from areal.engine.r3.orchestration import (
+    clear_router_replay_action,
+    clear_router_replay_state,
+    enqueue_recorded_indices,
+    set_router_replay_action,
+    set_target_indices,
+)
+from areal.engine.r3.transport import localize_r3_tensor
 from areal.infra.dist_rollout import DistRolloutCoordinator
 from areal.infra.platforms import current_platform
 from areal.models.mcore.hf_load import load_weights_from_hf_with_mbridge_fast
@@ -215,7 +232,9 @@ class MegatronEngine(TrainEngine):
         self.is_vision_model: bool = False
         self.processor = None
         self._r3_enabled: bool = self.mcore_config.enable_router_replay
-        self._r3_router_groups: dict[int, list[Any]] = {}
+        self._r3_router_groups: dict[int, list[NativeRouterReplayRef]] = {}
+        self._r3_local_moe_indices: dict[int, list[int]] = {}
+        self._r3_moe_config: R3MoEConfig | None = None
         self._r3_pending_routed_experts: torch.Tensor | None = None
         self._r3_pending_valid: torch.Tensor | None = None
 
@@ -480,15 +499,32 @@ class MegatronEngine(TrainEngine):
         if self.mcore_config.use_deterministic_algorithms:
             set_deterministic_algorithms(model_config)
 
-        # Set vp_stage for DDP models
+        # Set a stable vp_stage on every local model chunk. R3 discovery and
+        # runtime counters both key off this value, including non-DDP VPP chunks.
         for i, model_chunk in enumerate(self.model):
-            if (
-                isinstance(model_chunk, DDP)
-                and self.mcore_config.virtual_pipeline_parallel_size > 1
-            ):
-                vp_stage = getattr(model_chunk.module, "vp_stage", None)
-                self.logger.info(f"Setting vp_stage {vp_stage} for model chunk {i}.")
-                setattr(model_chunk, "vp_stage", vp_stage)
+            unwrapped = (
+                model_chunk.module if hasattr(model_chunk, "module") else model_chunk
+            )
+            vp_stage = getattr(model_chunk, "vp_stage", None)
+            if vp_stage is None:
+                vp_stage = getattr(unwrapped, "vp_stage", None)
+            if vp_stage is None:
+                vp_stage = getattr(
+                    model_chunk, "virtual_pipeline_model_parallel_rank", None
+                )
+            if vp_stage is None:
+                vp_stage = getattr(
+                    unwrapped, "virtual_pipeline_model_parallel_rank", None
+                )
+            if vp_stage is None:
+                vp_stage = i if len(self.model) > 1 else 0
+            vp_stage = int(vp_stage or 0)
+            self.logger.info(f"Setting vp_stage {vp_stage} for model chunk {i}.")
+            setattr(model_chunk, "vp_stage", vp_stage)
+            if hasattr(model_chunk, "module"):
+                setattr(model_chunk.module, "vp_stage", vp_stage)
+
+        self._initialize_r3_router_replay()
 
         if self.mcore_config.ddp.overlap_grad_reduce and isinstance(primary_model, DDP):
             model_config.no_sync_func = [
@@ -892,6 +928,307 @@ class MegatronEngine(TrainEngine):
         assert self.lr_scheduler is not None, "LR Scheduler is not initialized."
         self.lr_scheduler.step(1)
 
+    def _model_vp_stage(self, model: torch.nn.Module) -> int:
+        return int(getattr(model, "vp_stage", 0) or 0)
+
+    def _initialize_r3_router_replay(self) -> None:
+        if not self._r3_enabled:
+            return
+        assert self.model is not None, "Model must be initialized before R3 discovery."
+
+        self._r3_moe_config = resolve_r3_moe_config(self.tf_config)
+        if self._r3_moe_config.num_moe_layers <= 0:
+            raise r3_error(
+                "R3 router replay is enabled but Megatron config has no MoE layers",
+                num_layers=self._r3_moe_config.num_layers,
+                moe_layer_indices=self._r3_moe_config.moe_layer_indices,
+            )
+
+        self._r3_router_groups = discover_native_router_replay(self.model)
+        self._r3_local_moe_indices = {}
+        for vp_stage, refs in self._r3_router_groups.items():
+            local_moe_indices = self._resolve_r3_local_moe_indices(vp_stage, refs)
+            self._r3_local_moe_indices[vp_stage] = local_moe_indices
+            if len(refs) != len(local_moe_indices):
+                raise r3_error(
+                    "R3 local router count does not match local MoE layer count",
+                    vp_stage=vp_stage,
+                    router_count=len(refs),
+                    local_moe_count=len(local_moe_indices),
+                )
+
+        total_local_routers = sum(len(refs) for refs in self._r3_router_groups.values())
+        self.logger.info(
+            "Initialized R3 native RouterReplay refs: vp_stages=%s, local_routers=%s.",
+            {
+                vp_stage: [ref.name for ref in refs]
+                for vp_stage, refs in self._r3_router_groups.items()
+            },
+            total_local_routers,
+        )
+
+    def _resolve_r3_local_moe_indices(
+        self,
+        vp_stage: int,
+        refs: list[NativeRouterReplayRef],
+    ) -> list[int]:
+        assert self._r3_moe_config is not None
+        layer_offset = get_transformer_layer_offset(self.tf_config, vp_stage=vp_stage)
+        num_layers_to_build = get_num_layers_to_build(self.tf_config, vp_stage=vp_stage)
+        expected_global_layers = [
+            layer_idx
+            for layer_idx in self._r3_moe_config.moe_layer_indices
+            if layer_offset <= layer_idx < layer_offset + num_layers_to_build
+        ]
+        expected_moe_indices = [
+            self._r3_moe_config.global_to_moe_index[layer_idx]
+            for layer_idx in expected_global_layers
+        ]
+        if len(refs) != len(expected_moe_indices):
+            raise r3_error(
+                "R3 discovered router count does not match PP/VPP local MoE layers",
+                vp_stage=vp_stage,
+                layer_offset=layer_offset,
+                num_layers_to_build=num_layers_to_build,
+                expected_global_layers=expected_global_layers,
+                expected_moe_indices=expected_moe_indices,
+                discovered_router_names=[ref.name for ref in refs],
+                discovered_layer_numbers=[ref.layer_number for ref in refs],
+            )
+
+        local_moe_indices: list[int] = []
+        for idx, ref in enumerate(refs):
+            if ref.layer_number is None:
+                local_moe_indices.append(expected_moe_indices[idx])
+                continue
+
+            candidates = (
+                (ref.layer_number,)
+                if ref.layer_number_is_global
+                else (layer_offset + ref.layer_number, ref.layer_number)
+            )
+            resolved_global = next(
+                (
+                    candidate
+                    for candidate in candidates
+                    if candidate in expected_global_layers
+                    and candidate in self._r3_moe_config.global_to_moe_index
+                ),
+                None,
+            )
+            if resolved_global is None:
+                raise r3_error(
+                    "Unable to map discovered R3 router to a global MoE layer",
+                    vp_stage=vp_stage,
+                    router_name=ref.name,
+                    router_layer_number=ref.layer_number,
+                    layer_offset=layer_offset,
+                    expected_global_layers=expected_global_layers,
+                )
+            local_moe_indices.append(
+                self._r3_moe_config.global_to_moe_index[resolved_global]
+            )
+        return local_moe_indices
+
+    def _all_r3_router_refs(self) -> list[NativeRouterReplayRef]:
+        return [ref for refs in self._r3_router_groups.values() for ref in refs]
+
+    def _prepare_r3_forward_context(
+        self,
+        mb_list: MicroBatchList,
+    ) -> dict[str, Any] | None:
+        routed_experts = self._r3_pending_routed_experts
+        routing_valid = self._r3_pending_valid
+        has_r3_data = routed_experts is not None or routing_valid is not None
+        if not has_r3_data:
+            return None
+        if not self._r3_enabled:
+            raise r3_error("Received R3 routed_experts but router replay is disabled")
+        use_padded_seq = bool(getattr(self, "use_padded_seq", False))
+        if self.enable_tree_training or self.is_vision_model or use_padded_seq:
+            raise r3_error(
+                "R3 router replay currently requires Megatron packed text training",
+                enable_tree_training=self.enable_tree_training,
+                is_vision_model=self.is_vision_model,
+                use_padded_seq=use_padded_seq,
+            )
+        if routed_experts is None or routing_valid is None:
+            raise r3_error("Both routed_experts and r3_routing_valid are required")
+
+        routed_experts = localize_r3_tensor(routed_experts)
+        routing_valid = localize_r3_tensor(routing_valid)
+        if not torch.is_tensor(routed_experts) or not torch.is_tensor(routing_valid):
+            raise r3_error(
+                "R3 side-channel values must be torch tensors after localization",
+                routed_type=type(routed_experts).__name__,
+                valid_type=type(routing_valid).__name__,
+            )
+        if routed_experts.ndim != 4:
+            raise r3_error(
+                "routed_experts must have shape [batch, seq_len, num_moe_layers, topk]",
+                shape=tuple(routed_experts.shape),
+            )
+        if routing_valid.ndim != 1:
+            raise r3_error(
+                "r3_routing_valid must have shape [batch]",
+                shape=tuple(routing_valid.shape),
+            )
+        if routed_experts.shape[0] != routing_valid.shape[0]:
+            raise r3_error(
+                "R3 routed_experts and r3_routing_valid batch size mismatch",
+                routed_batch_size=routed_experts.shape[0],
+                valid_batch_size=routing_valid.shape[0],
+            )
+
+        routed_experts = routed_experts.to(self.device, non_blocking=True)
+        routing_valid = routing_valid.detach().to(device="cpu", dtype=torch.bool)
+
+        forward_indices = mb_list.forward_indices
+        if forward_indices is not None:
+            if len(forward_indices) != routed_experts.shape[0]:
+                raise r3_error(
+                    "R3 forward_indices length does not match routed_experts batch",
+                    forward_indices_len=len(forward_indices),
+                    routed_batch_size=routed_experts.shape[0],
+                )
+            routed_experts = routed_experts[forward_indices]
+            routing_valid = routing_valid[forward_indices]
+
+        routed_mbs: list[torch.Tensor] = []
+        valid_mbs: list[torch.Tensor] = []
+        offset = 0
+        for mb in mb_list.mbs:
+            cu_seqlens = mb.get("cu_seqlens")
+            if cu_seqlens is None:
+                raise r3_error("R3 micro-batch split requires packed cu_seqlens")
+            n_seqs = int(cu_seqlens.shape[0] - 1)
+            routed_mbs.append(routed_experts[offset : offset + n_seqs])
+            valid_mbs.append(routing_valid[offset : offset + n_seqs])
+            offset += n_seqs
+        if offset != routed_experts.shape[0]:
+            raise r3_error(
+                "R3 micro-batch split did not consume all routed_experts samples",
+                consumed=offset,
+                routed_batch_size=routed_experts.shape[0],
+            )
+        return {
+            "routed_mbs": routed_mbs,
+            "valid_mbs": valid_mbs,
+            "stats": {
+                "replayed_microbatches": 0,
+                "skipped_microbatches": 0,
+                "invalid_samples": 0,
+            },
+        }
+
+    def _validate_r3_microbatch_counters(
+        self,
+        counters: dict[int, int],
+        expected_microbatches: int,
+    ) -> None:
+        expected_vp_stages = {
+            self._model_vp_stage(model_chunk) for model_chunk in self.model
+        }
+        mismatches = {
+            vp_stage: counters.get(vp_stage, 0)
+            for vp_stage in expected_vp_stages
+            if counters.get(vp_stage, 0) != expected_microbatches
+        }
+        extra = {
+            vp_stage: count
+            for vp_stage, count in counters.items()
+            if vp_stage not in expected_vp_stages
+        }
+        if mismatches or extra:
+            raise r3_error(
+                "R3 micro-batch counters do not match Megatron VP schedule",
+                expected_microbatches=expected_microbatches,
+                expected_vp_stages=sorted(expected_vp_stages),
+                counters=counters,
+                mismatches=mismatches,
+                extra=extra,
+            )
+
+    def _begin_r3_microbatch_replay(
+        self,
+        r3_context: dict[str, Any],
+        *,
+        vp_stage: int,
+        mb_idx: int,
+        mb_input: MicroBatchItem,
+        forward_only: bool,
+        sequence_parallel: bool,
+    ) -> tuple[list[NativeRouterReplayRef], str] | None:
+        routed_mbs = r3_context["routed_mbs"]
+        if mb_idx >= len(routed_mbs):
+            raise r3_error(
+                "R3 micro-batch counter exceeded routed_experts split",
+                vp_stage=vp_stage,
+                mb_idx=mb_idx,
+                num_microbatches=len(routed_mbs),
+            )
+
+        refs = self._r3_router_groups.get(vp_stage, [])
+        if not refs:
+            return None
+
+        routed_experts = routed_mbs[mb_idx]
+        routing_valid = r3_context["valid_mbs"][mb_idx]
+        stats = r3_context["stats"]
+        invalid_samples = int((~routing_valid).sum().item())
+        if invalid_samples:
+            stats["skipped_microbatches"] += 1
+            stats["invalid_samples"] += invalid_samples
+            if forward_only:
+                clear_router_replay_action(refs)
+                return refs, "live"
+            set_router_replay_action(refs, "RECORD")
+            return refs, "record"
+
+        slabs = prepare_native_replay_slabs(
+            routed_experts,
+            routing_valid,
+            mb_input,
+            self._r3_local_moe_indices.get(vp_stage, []),
+            sequence_parallel=sequence_parallel,
+        )
+        if slabs.skip_replay:
+            stats["skipped_microbatches"] += 1
+            if forward_only:
+                clear_router_replay_action(refs)
+                return refs, "live"
+            set_router_replay_action(refs, "RECORD")
+            return refs, "record"
+        if len(slabs.slabs) != len(refs):
+            raise r3_error(
+                "R3 layout returned a different number of slabs than local routers",
+                vp_stage=vp_stage,
+                slab_count=len(slabs.slabs),
+                router_count=len(refs),
+                local_moe_indices=self._r3_local_moe_indices.get(vp_stage, []),
+            )
+
+        set_target_indices(refs, slabs.slabs)
+        set_router_replay_action(refs, "REPLAY_FORWARD")
+        stats["replayed_microbatches"] += 1
+        return refs, "replay"
+
+    def _finish_r3_microbatch_replay(
+        self,
+        refs: list[NativeRouterReplayRef],
+        mode: str,
+        *,
+        forward_only: bool,
+    ) -> None:
+        if mode == "live":
+            return
+        if forward_only:
+            clear_router_replay_action(refs)
+            return
+        if mode == "record":
+            enqueue_recorded_indices(refs)
+        set_router_replay_action(refs, "REPLAY_BACKWARD")
+
     def forward_backward_batch(
         self,
         mb_list: MicroBatchList,
@@ -902,9 +1239,13 @@ class MegatronEngine(TrainEngine):
         gather_cp_output: bool = False,
     ) -> None:
         self._ensure_ready()
+        r3_context: dict[str, Any] | None = None
+        r3_mb_counters: dict[int, int] = {}
+        r3_completed = False
 
         def forward_step(batch_iter, model):
             mb_input: MicroBatchItem = next(batch_iter)
+            model_vp_stage = self._model_vp_stage(model)
 
             cu_seqlens = mb_input.padded_mb.get("cu_seqlens", None)
 
@@ -939,6 +1280,22 @@ class MegatronEngine(TrainEngine):
             # value, so the CP-local loss path (_cp_local_labels) is unchanged.
             cp_local = cp_size > 1 and not gather_cp_output
 
+            r3_replay: tuple[list[NativeRouterReplayRef], str] | None = None
+            if r3_context is not None:
+                mb_idx = r3_mb_counters.get(model_vp_stage, 0)
+                r3_mb_counters[model_vp_stage] = mb_idx + 1
+                model_config = get_model_config(model)
+                r3_replay = self._begin_r3_microbatch_replay(
+                    r3_context,
+                    vp_stage=model_vp_stage,
+                    mb_idx=mb_idx,
+                    mb_input=mb_input,
+                    forward_only=forward_only,
+                    sequence_parallel=bool(
+                        getattr(model_config, "sequence_parallel", False)
+                    ),
+                )
+
             output = packed_context_parallel_forward(
                 model,
                 mb_input.padded_mb,
@@ -946,6 +1303,12 @@ class MegatronEngine(TrainEngine):
                 is_vision_model=self.is_vision_model,
                 use_padded_seq=self.use_padded_seq,
             )
+            if r3_replay is not None:
+                self._finish_r3_microbatch_replay(
+                    r3_replay[0],
+                    r3_replay[1],
+                    forward_only=forward_only,
+                )
 
             # Release tree attention metadata after forward pass
             for key in tree_attn_keys:
@@ -957,7 +1320,6 @@ class MegatronEngine(TrainEngine):
                     loss = torch.tensor(1.0, device=output_.device)
                 return loss, {}
 
-            model_vp_stage = getattr(model, "vp_stage", 0)
             if mpu.is_pipeline_last_stage(
                 ignore_virtual=False, vp_stage=model_vp_stage
             ):
@@ -985,20 +1347,40 @@ class MegatronEngine(TrainEngine):
             return output, functools.partial(_process_output, mb_input.orig_mb)
 
         forward_backward_func = get_forward_backward_func()
-        with trace_scope("megatron_engine.forward_backward"):
-            if len(self.model) > 1:
-                data_iterator = [iter(mb_list) for _ in range(len(self.model))]
-            else:
-                data_iterator = iter(mb_list)
-            forward_backward_func(
-                forward_step_func=forward_step,
-                data_iterator=data_iterator,
-                model=self.model if len(self.model) > 1 else self.model[0],
-                num_microbatches=len(mb_list),
-                seq_length=mb_list.max_seqlen,  # no use when input_shapes was set
-                micro_batch_size=1,  # no use when input_shapes was set
-                forward_only=forward_only,
-            )
+        try:
+            r3_context = self._prepare_r3_forward_context(mb_list)
+            with trace_scope("megatron_engine.forward_backward"):
+                if len(self.model) > 1:
+                    data_iterator = [iter(mb_list) for _ in range(len(self.model))]
+                else:
+                    data_iterator = iter(mb_list)
+                forward_backward_func(
+                    forward_step_func=forward_step,
+                    data_iterator=data_iterator,
+                    model=self.model if len(self.model) > 1 else self.model[0],
+                    num_microbatches=len(mb_list),
+                    seq_length=mb_list.max_seqlen,  # no use when input_shapes was set
+                    micro_batch_size=1,  # no use when input_shapes was set
+                    forward_only=forward_only,
+                )
+            if r3_context is not None:
+                self._validate_r3_microbatch_counters(r3_mb_counters, len(mb_list))
+            r3_completed = True
+        finally:
+            if self._r3_enabled:
+                clear_router_replay_state(self._all_r3_router_refs())
+            self._r3_pending_routed_experts = None
+            self._r3_pending_valid = None
+            if r3_completed and r3_context is not None:
+                r3_stats = r3_context["stats"]
+                stats_tracker.scalar(
+                    **{
+                        "r3/enabled": 1.0,
+                        "r3/replayed_microbatches": r3_stats["replayed_microbatches"],
+                        "r3/skipped_microbatches": r3_stats["skipped_microbatches"],
+                        "r3/invalid_samples": r3_stats["invalid_samples"],
+                    }
+                )
 
     def train_batch(
         self,
