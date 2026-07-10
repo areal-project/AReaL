@@ -189,6 +189,9 @@ def areal_run_scheduler_process(
     from areal.v2.inference_service.sglang.pp_bridge import (
         PPSchedulerBridge,
     )
+    from areal.v2.inference_service.sglang.routed_experts_compat import (
+        apply_sglang_routed_experts_token_cache_patch,
+    )
 
     logger = logging.getLogger(__name__)
     dp_rank = configure_scheduler(
@@ -219,6 +222,11 @@ def areal_run_scheduler_process(
 
     # Create a scheduler and run the event loop
     try:
+        # ---- BEGIN AREAL ----
+        if server_args.enable_return_routed_experts:
+            apply_sglang_routed_experts_token_cache_patch()
+        # ---- END AREAL ----
+
         scheduler = Scheduler(
             server_args,
             port_args,

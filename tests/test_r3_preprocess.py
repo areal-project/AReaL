@@ -54,6 +54,31 @@ def test_preprocess_routed_experts_flat_dim_mismatch_raises():
         )
 
 
+def test_preprocess_routed_experts_drops_leading_dense_layer_slots():
+    moe_layers = np.arange(1, 13, dtype=np.int32).reshape(3, 2, 2)
+    dense_layer = np.zeros((3, 1, 2), dtype=np.int32)
+    raw = np.concatenate([dense_layer, moe_layers], axis=1).reshape(3, -1)
+
+    out = preprocess_routed_experts_batch(
+        [raw],
+        seq_lens=[4],
+        num_moe_layers=2,
+        topk=2,
+    )
+
+    routed = out["routed_experts"]
+    valid = out["r3_routing_valid"]
+    assert routed.shape == (1, 4, 2, 2)
+    assert valid.tolist() == [True]
+    torch.testing.assert_close(
+        routed[0, :3],
+        torch.as_tensor(moe_layers, dtype=torch.int32),
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(routed[0, 3], routed[0, 2], rtol=0, atol=0)
+
+
 def test_preprocess_routed_experts_fills_legal_missing_last_token():
     raw = np.arange(1, 13, dtype=np.int32).reshape(3, 4)
 

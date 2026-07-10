@@ -72,7 +72,7 @@ def _reshape_routed_experts(
     arr = np.asarray(routed_experts, dtype=np.int32)
     if arr.ndim == 2:
         expected_flat_dim = num_moe_layers * topk
-        if arr.shape[1] != expected_flat_dim:
+        if arr.shape[1] % topk != 0:
             raise r3_error(
                 "routed_experts flat_dim does not match Megatron MoE config",
                 raw_shape=arr.shape,
@@ -81,8 +81,24 @@ def _reshape_routed_experts(
                 topk=topk,
                 expected_flat_dim=expected_flat_dim,
             )
-        return arr.reshape(arr.shape[0], num_moe_layers, topk)
+        returned_layers = arr.shape[1] // topk
+        if returned_layers < num_moe_layers:
+            raise r3_error(
+                "routed_experts flat_dim does not match Megatron MoE config",
+                raw_shape=arr.shape,
+                flat_dim=arr.shape[1],
+                num_moe_layers=num_moe_layers,
+                topk=topk,
+                expected_flat_dim=expected_flat_dim,
+                returned_layers=returned_layers,
+            )
+        arr = arr.reshape(arr.shape[0], returned_layers, topk)
+        if returned_layers > num_moe_layers:
+            arr = arr[:, returned_layers - num_moe_layers :, :]
+        return arr
     if arr.ndim == 3:
+        if arr.shape[2] == topk and arr.shape[1] > num_moe_layers:
+            return arr[:, arr.shape[1] - num_moe_layers :, :]
         if arr.shape[1:] != (num_moe_layers, topk):
             raise r3_error(
                 "routed_experts layer/topk dims do not match Megatron MoE config",
