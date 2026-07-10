@@ -279,11 +279,7 @@ class InfBridge:
         if stop_reason == "abort" or stop_reason is None:
             stop_reason = "length"
 
-        if (
-            requested_routing
-            and accumulated_tokens
-            and final_routed_experts is None
-        ):
+        if requested_routing and accumulated_tokens and final_routed_experts is None:
             raise RuntimeError(
                 "Requested return_routed_experts=True but no routed_experts were "
                 "received after abort/resubmit. This usually means the SGLang "

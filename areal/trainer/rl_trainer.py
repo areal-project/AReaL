@@ -1333,9 +1333,7 @@ class PPOTrainer:
             return issubclass(workflow, supported_types)
         return isinstance(workflow, supported_types)
 
-    def _is_unsupported_r3_vision_workflow(
-        self, workflow: WorkflowLike | None
-    ) -> bool:
+    def _is_unsupported_r3_vision_workflow(self, workflow: WorkflowLike | None) -> bool:
         if isinstance(workflow, str):
             return workflow == "areal.workflow.vision_rlvr.VisionRLVRWorkflow"
         if workflow is None:
