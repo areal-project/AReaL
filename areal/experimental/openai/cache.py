@@ -181,14 +181,21 @@ class InteractionCache(OrderedDict[str, InteractionWithTokenLogpReward]):
 
         Must be called BEFORE :meth:`apply_reward_discount`, otherwise the
         orphan rewards have already polluted the discounted chain.
+
+        Acquires ``self._lock`` for the find-and-delete so it stays consistent
+        with concurrent :meth:`set_reward` / insertion, and decrements
+        ``self._total_reward`` by each dropped entry's reward to keep the
+        running total accurate.
         """
         if self._apply_reward_discount_called:
             raise RuntimeError(
                 "drop_retry_orphans must be called BEFORE apply_reward_discount."
             )
-        orphan_ids = self._find_retry_orphan_ids()
-        for oid in orphan_ids:
-            del self[oid]
+        with self._lock:
+            orphan_ids = self._find_retry_orphan_ids()
+            for oid in orphan_ids:
+                self._total_reward -= self[oid].reward or 0.0
+                del self[oid]
         if orphan_ids:
             logger.info(
                 "Session %s: dropped %d retry-orphan completion(s): %s",

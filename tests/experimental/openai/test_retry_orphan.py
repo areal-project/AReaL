@@ -213,3 +213,22 @@ def test_export_with_drop_retry_orphans_flag():
     # discounted = next.reward(2.0) propagates to retry → 2.0 + 1.0 = 3.0
     assert exported["next"].reward == pytest.approx(2.0)
     assert exported["retry"].reward == pytest.approx(3.0)
+
+
+def test_drop_updates_total_reward():
+    """Dropping an orphan decrements the running total_reward."""
+    msgs = [_user_msg("hi")]
+    cache = InteractionCache()
+    cache["orphan"] = _make_interaction("orphan", msgs)
+    cache["retry"] = _make_interaction("retry", msgs)
+    cache["next"] = _make_interaction(
+        "next", msgs + [_assistant_msg("out-retry"), _user_msg("more")]
+    )
+    # Rewards set via set_reward feed the running _total_reward.
+    cache.set_reward("orphan", 5.0)
+    cache.set_reward("retry", 3.0)
+    assert cache.total_reward == pytest.approx(8.0)
+    dropped = cache.drop_retry_orphans()
+    assert dropped == ["orphan"]
+    # The orphan's 5.0 must be removed from the running total, leaving retry's.
+    assert cache.total_reward == pytest.approx(3.0)
