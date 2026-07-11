@@ -565,6 +565,7 @@ def grpo_loss_fn(
             denominator="n_valid_tokens",
         )
 
+    logp_diff = (old_logp - logprobs.detach()) * loss_mask
     stats_tracker.stat(
         importance_weight=stat["importance_weight"],
         approx_kl=stat["approx_kl"],
@@ -574,7 +575,21 @@ def grpo_loss_fn(
         actor_loss=stat["loss"],
         clip_ratio=stat["clip_mask"].float(),
         dual_clip_ratio=stat["dual_clip_mask"].float(),
+        logp_diff=logp_diff,
+        logp_abs_diff=logp_diff.abs(),
         denominator="n_valid_tokens",
+    )
+
+    # `valid_logp_abs_diff` averages only over tokens the loss function kept
+    # (`train_loss_mask`), while `logp_abs_diff` averages over the full
+    # loss_mask. Loss functions that do not narrow the mask leave the two
+    # identical; the split keeps dashboards comparable with runs that do.
+    train_loss_mask = stat.get("train_loss_mask", loss_mask)
+    valid_logp_abs_diff = ((old_logp - logprobs.detach()) * train_loss_mask).abs()
+    stats_tracker.denominator(n_trained_tokens=train_loss_mask.bool())
+    stats_tracker.stat(
+        valid_logp_abs_diff=valid_logp_abs_diff,
+        denominator="n_trained_tokens",
     )
     if "behave_imp_weight" in stat:
         stats_tracker.denominator(unclipped_behave_tokens=stat["behave_mask"])
