@@ -58,7 +58,7 @@ rollout:
       # Required for Slurm colocation: actor and rollout are separate jobs on
       # the same nodes, so neither job can request exclusive node ownership.
       exclusive: false
-      reservation: swe-rl
+      reservation: ${oc.env:AREAL_RESERVATION,"swe-rl"}
       image: ${oc.env:AREAL_IMAGE,"/storage/openpsi/images/areal-dev-sglang-20260401.sif"}
       cmd: python3 -m areal.infra.rpc.rpc_server
       env_vars:
@@ -235,7 +235,7 @@ actor:
       # Required for Slurm colocation: actor and rollout are separate jobs on
       # the same nodes, so neither job can request exclusive node ownership.
       exclusive: false
-      reservation: swe-rl
+      reservation: ${oc.env:AREAL_RESERVATION,"swe-rl"}
       image: ${oc.env:AREAL_IMAGE,"/storage/openpsi/images/areal-dev-sglang-20260401.sif"}
       cmd: python3 -m areal.infra.rpc.rpc_server
       env_vars:
@@ -353,7 +353,7 @@ train_dataset:
     mem: 10
     cmd: python3 -m areal.infra.rpc.guard
     image: ${oc.env:AREAL_IMAGE,"/storage/openpsi/images/areal-dev-sglang-20260401.sif"}
-    reservation: swe-rl
+    reservation: ${oc.env:AREAL_RESERVATION,"swe-rl"}
 
 valid_dataset:
   batch_size: 32
@@ -368,7 +368,7 @@ valid_dataset:
     mem: 10
     cmd: python3 -m areal.infra.rpc.guard
     image: ${oc.env:AREAL_IMAGE,"/storage/openpsi/images/areal-dev-sglang-20260401.sif"}
-    reservation: swe-rl
+    reservation: ${oc.env:AREAL_RESERVATION,"swe-rl"}
 
 # Utilities
 saver:
