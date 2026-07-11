@@ -10,21 +10,50 @@ translates between ModelRequest / raw JSON and endpoint-specific payloads.
 from __future__ import annotations
 
 import asyncio
+import copy
+import hashlib
 import time
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 import httpx
 import numpy as np
 
-from areal.api.io_struct import HttpRequest
+from areal.api.io_struct import HttpRequest, ModelRequest, ModelResponse
 from areal.utils import logging
-from areal.v2.inference_service.backend import InfBridgeBackend
+from areal.v2.inference_service.backend import (
+    InfBridgeBackend,
+    TraceableInfBridgeBackend,
+)
+from areal.v2.inference_service.client_trace import (
+    GenerationAttemptTrace,
+    GenerationPhysicalTrace,
+    generation_physical_trace_bytes,
+    generation_physical_trace_sha256,
+    parsed_response_json_sha256,
+    prepared_request_json_sha256,
+    validate_generation_physical_trace_response,
+)
+
+__all__ = [
+    "GenerationAttemptTrace",
+    "GenerationPhysicalTrace",
+    "InfBridge",
+    "generation_physical_trace_bytes",
+    "generation_physical_trace_sha256",
+    "validate_generation_physical_trace_response",
+]
 
 if TYPE_CHECKING:
-    from areal.api.io_struct import ModelRequest, ModelResponse
     from areal.v2.inference_service.data_proxy.pause import PauseState
 
 _StopReason = Literal["length", "stop", "tool_calls", "abort"]
+_TerminalReason = Literal[
+    "backend_stop",
+    "backend_tool_calls",
+    "backend_length",
+    "budget_exhausted",
+    "attempt_limit",
+]
 
 logger = logging.getLogger("InferenceInfBridge")
 
@@ -165,64 +194,187 @@ class InfBridge:
         Implements the ``_AsyncGenerateEngine`` protocol.
         Handles the pause → abort → resubmit loop transparently.
         """
-        from areal.api.io_struct import ModelResponse
+        result = await self._agenerate(req, collect_trace=False)
+        return cast(ModelResponse, result)
 
-        if req.gconfig.n_samples != 1:
+    async def agenerate_with_trace(
+        self,
+        req: ModelRequest,
+    ) -> tuple[ModelResponse, GenerationPhysicalTrace]:
+        """Generate and return immutable client-side physical-call evidence.
+
+        Unlike :meth:`agenerate`, this method content-addresses each patched
+        request and parsed response and records every abort/resubmit attempt.
+        It does not claim to attest the remote model or its weights.
+
+        A trace is returned only after successful transport, parsing, and
+        validation.  Transport errors, parser errors, cancellation, and
+        fail-closed trace checks propagate without being converted to a
+        ``length`` response.
+        """
+        result = await self._agenerate(req, collect_trace=True)
+        return cast(tuple[ModelResponse, GenerationPhysicalTrace], result)
+
+    async def _agenerate(
+        self,
+        req: ModelRequest,
+        *,
+        collect_trace: bool,
+    ) -> ModelResponse | tuple[ModelResponse, GenerationPhysicalTrace]:
+        """Shared generation loop; tracing is opt-in to preserve legacy behavior."""
+        # The traced API snapshots mutable request/configuration state.  The
+        # legacy API intentionally retains its existing object-sharing behavior.
+        if collect_trace:
+            generation_req = req.copy()
+            # ModelRequest.copy() intentionally keeps several nested objects
+            # shallow.  Trace mode isolates mutable JSON-facing state while
+            # retaining heavyweight tokenizer/processor references.
+            generation_req.metadata = copy.deepcopy(req.metadata)
+            generation_req.image_data = copy.deepcopy(req.image_data)
+            generation_req.vision_msg_vllm = copy.deepcopy(req.vision_msg_vllm)
+        else:
+            generation_req = req
+        backend = self.backend
+        backend_addr = self.backend_addr
+        configured_attempt_limit = self.max_resubmit_retries
+        initial_client_version = self._version
+
+        if generation_req.gconfig.n_samples != 1:
             raise ValueError(
-                f"InfBridge only supports n_samples=1, got {req.gconfig.n_samples}"
+                "InfBridge only supports n_samples=1, got "
+                f"{generation_req.gconfig.n_samples}"
             )
+        if collect_trace and (
+            type(configured_attempt_limit) is not int or configured_attempt_limit < 0
+        ):
+            raise ValueError(
+                "traced generation requires a non-negative integer max_resubmit_retries"
+            )
+        if collect_trace:
+            if type(generation_req.rid) is not str or not generation_req.rid:
+                raise ValueError("request_id must be a non-empty str")
+            if any(
+                type(token_id) is not int or token_id < 0
+                for token_id in generation_req.input_ids
+            ):
+                raise ValueError(
+                    "request_input_token_ids must contain non-negative ints"
+                )
+            if type(initial_client_version) is not int:
+                raise TypeError("initial_client_version must be an int")
 
-        # Build the initial HTTP request via the backend
-        http_req = self.backend.build_generation_request(
-            req,
-            with_lora=False,
-            version=self._version,
+        # Avoid hashing/copying trace-only evidence on the legacy path.
+        request_id = generation_req.rid if collect_trace else ""
+        request_input_token_ids = (
+            tuple(generation_req.input_ids) if collect_trace else ()
+        )
+        backend_kind = type(backend).__qualname__ if collect_trace else ""
+        backend_addr_sha256 = (
+            hashlib.sha256(backend_addr.encode("utf-8")).hexdigest()
+            if collect_trace
+            else ""
         )
 
-        # Extract effective max_new_tokens from the payload the backend built
-        ori_max_new_tokens = self.backend.get_generation_max_new_tokens(http_req)
+        # Build the initial HTTP request via the snapshotted backend/version.
+        http_req = backend.build_generation_request(
+            generation_req,
+            with_lora=False,
+            version=initial_client_version,
+        )
+
+        ori_max_new_tokens = backend.get_generation_max_new_tokens(http_req)
         if ori_max_new_tokens <= 0:
             raise ValueError(
                 f"max_new_tokens must be > 0, got {ori_max_new_tokens} "
-                f"(max_tokens={req.gconfig.max_tokens}, "
-                f"input_len={len(req.input_ids)}, "
-                f"max_new_tokens={req.gconfig.max_new_tokens})"
+                f"(max_tokens={generation_req.gconfig.max_tokens}, "
+                f"input_len={len(generation_req.input_ids)}, "
+                f"max_new_tokens={generation_req.gconfig.max_new_tokens})"
             )
+        if collect_trace:
+            if type(ori_max_new_tokens) is not int:
+                raise TypeError("effective_max_new_tokens must be an int")
 
         accumulated_tokens: list[int] = []
         accumulated_logprobs: list[float] = []
         accumulated_versions: list[int] = []
         stop_reason: _StopReason | None = None
         final_routed_experts: np.ndarray | None = None
+        attempt_traces: list[GenerationAttemptTrace] = []
+        terminal_reason: _TerminalReason | None = None
 
         t0 = time.monotonic()
 
-        for _attempt in range(self.max_resubmit_retries):
-            # Wait while paused (weight update in progress)
+        for _attempt in range(configured_attempt_limit):
             while await self.pause_state.is_paused():
                 await asyncio.sleep(self.resubmit_wait)
 
-            # Adjust max_new_tokens for already-generated tokens
             remaining = ori_max_new_tokens - len(accumulated_tokens)
             if remaining <= 0:
                 stop_reason = "length"
+                terminal_reason = "budget_exhausted"
                 break
 
-            # Patch the payload for this iteration (extend input, shrink budget)
-            self.backend.patch_generation_request(
+            backend.patch_generation_request(
                 http_req,
-                req,
+                generation_req,
                 accumulated_tokens,
                 remaining,
             )
 
+            if collect_trace:
+                if self.backend_addr != backend_addr:
+                    raise RuntimeError("backend_addr changed during traced generation")
+                prepared_budget = backend.get_generation_max_new_tokens(http_req)
+                if type(prepared_budget) is not int or prepared_budget != remaining:
+                    raise ValueError(
+                        "patched backend max_new_tokens does not match remaining budget"
+                    )
+                submitted_input_token_ids = (
+                    backend.snapshot_generation_input_ids(http_req)
+                    if isinstance(backend, TraceableInfBridgeBackend)
+                    else None
+                )
+                endpoint = http_req.endpoint
+                method = "GET" if http_req.method == "GET" else "POST"
+                prepared_request_hash = prepared_request_json_sha256(http_req.payload)
+                # This must remain the final synchronous observation before
+                # entering the transport await.
+                client_version_before_send = self._version
+
             data = await self._send_request(http_req)
-            result = self.backend.parse_generation_response(data)
+            if collect_trace:
+                # Bracket the transport return before hashing/parsing locally.
+                client_version_after_receive = self._version
+                parsed_response_hash = parsed_response_json_sha256(data)
+            result = backend.parse_generation_response(data)
 
             accumulated_tokens.extend(result.output_tokens)
             accumulated_logprobs.extend(result.output_logprobs)
-            accumulated_versions.extend([self._version] * len(result.output_tokens))
+            # Preserve the exact legacy read point used to label output tokens.
+            output_version_label = self._version
+            accumulated_versions.extend(
+                [output_version_label] * len(result.output_tokens)
+            )
             stop_reason = cast(_StopReason, result.stop_reason)
+
+            if collect_trace:
+                attempt_traces.append(
+                    GenerationAttemptTrace(
+                        attempt_index=_attempt,
+                        client_version_before_send=client_version_before_send,
+                        client_version_after_receive=client_version_after_receive,
+                        output_version_label=output_version_label,
+                        remaining_new_tokens=remaining,
+                        endpoint=endpoint,
+                        method=method,
+                        prepared_request_json_sha256=prepared_request_hash,
+                        parsed_response_json_sha256=parsed_response_hash,
+                        submitted_input_token_ids=submitted_input_token_ids,
+                        raw_stop_reason=result.stop_reason,
+                        output_token_ids=tuple(result.output_tokens),
+                        output_logprob_count=len(result.output_logprobs),
+                    )
+                )
 
             if result.routed_experts is not None:
                 if final_routed_experts is None:
@@ -233,32 +385,59 @@ class InfBridge:
                     )
 
             if stop_reason in ("stop", "tool_calls", "length"):
+                terminal_reason = {
+                    "stop": "backend_stop",
+                    "tool_calls": "backend_tool_calls",
+                    "length": "backend_length",
+                }[stop_reason]
                 break
 
             if len(accumulated_tokens) >= ori_max_new_tokens:
                 stop_reason = "length"
+                terminal_reason = "budget_exhausted"
                 break
 
-            # stop_reason == "abort" → continue loop (resubmit)
             logger.debug(
                 "Abort detected, resubmit attempt %d, accumulated %d tokens",
                 _attempt + 1,
                 len(accumulated_tokens),
             )
 
-        # Final abort at max retries → treat as length
         if stop_reason == "abort" or stop_reason is None:
             stop_reason = "length"
+            terminal_reason = "attempt_limit"
 
         latency = time.monotonic() - t0
-
-        return ModelResponse(
-            input_tokens=list(req.input_ids),
+        response = ModelResponse(
+            input_tokens=list(generation_req.input_ids),
             output_tokens=accumulated_tokens,
             output_logprobs=accumulated_logprobs,
             output_versions=accumulated_versions,
             stop_reason=stop_reason,
-            tokenizer=req.tokenizer,
+            tokenizer=generation_req.tokenizer,
             latency=latency,
             routed_experts=final_routed_experts,
         )
+
+        if not collect_trace:
+            return response
+        if terminal_reason is None:  # pragma: no cover - defensive invariant
+            raise RuntimeError("generation completed without a terminal reason")
+
+        trace = GenerationPhysicalTrace(
+            schema_version=1,
+            request_id=request_id,
+            backend_kind=backend_kind,
+            backend_addr_sha256=backend_addr_sha256,
+            request_input_token_ids=request_input_token_ids,
+            effective_max_new_tokens=ori_max_new_tokens,
+            configured_attempt_limit=configured_attempt_limit,
+            initial_client_version=initial_client_version,
+            final_client_version=self._version,
+            attempts=tuple(attempt_traces),
+            final_output_token_ids=tuple(accumulated_tokens),
+            final_stop_reason=stop_reason,
+            terminal_reason=terminal_reason,
+        )
+        validate_generation_physical_trace_response(response, trace)
+        return response, trace

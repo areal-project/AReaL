@@ -150,3 +150,17 @@ class VLLMBridgeBackend:
         http_req.payload["max_tokens"] = remaining_tokens
         if "prompt" in http_req.payload:
             http_req.payload["prompt"] = list(req.input_ids) + accumulated_tokens
+
+    def snapshot_generation_input_ids(
+        self,
+        http_req: HttpRequest,
+    ) -> tuple[int, ...] | None:
+        """Snapshot text prompt IDs; multimodal chat payloads have no flat IDs."""
+        if "prompt" not in http_req.payload:
+            return None
+        prompt = http_req.payload["prompt"]
+        if not isinstance(prompt, list) or any(
+            type(token_id) is not int or token_id < 0 for token_id in prompt
+        ):
+            raise ValueError("vLLM prompt must be a list of non-negative ints")
+        return tuple(prompt)

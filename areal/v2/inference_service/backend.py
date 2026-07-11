@@ -92,3 +92,25 @@ class InfBridgeBackend(Protocol):
     ) -> None:
         """Mutate ``http_req`` for an abort/resubmit iteration."""
         ...
+
+
+@runtime_checkable
+class TraceableInfBridgeBackend(Protocol):
+    """Optional backend capability for observing submitted token IDs.
+
+    The snapshot is taken after :meth:`InfBridgeBackend.patch_generation_request`
+    and immediately before the HTTP request is sent.  Backends should return a
+    newly allocated tuple so later payload mutations cannot rewrite history.
+
+    ``None`` means that the physical payload does not expose a flat token-ID
+    sequence (for example, a multimodal chat request).  This protocol is kept
+    separate from :class:`InfBridgeBackend` so third-party backends remain
+    compatible without implementing tracing.
+    """
+
+    def snapshot_generation_input_ids(
+        self,
+        http_req: HttpRequest,
+    ) -> tuple[int, ...] | None:
+        """Return an immutable snapshot of token IDs in the patched payload."""
+        ...

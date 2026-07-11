@@ -146,3 +146,15 @@ class SGLangBridgeBackend:
     ) -> None:
         http_req.payload["input_ids"] = list(req.input_ids) + accumulated_tokens
         http_req.payload["sampling_params"]["max_new_tokens"] = remaining_tokens
+
+    def snapshot_generation_input_ids(
+        self,
+        http_req: HttpRequest,
+    ) -> tuple[int, ...]:
+        """Snapshot the exact token IDs in the patched SGLang payload."""
+        input_ids = http_req.payload["input_ids"]
+        if not isinstance(input_ids, list) or any(
+            type(token_id) is not int or token_id < 0 for token_id in input_ids
+        ):
+            raise ValueError("SGLang input_ids must be a list of non-negative ints")
+        return tuple(input_ids)
