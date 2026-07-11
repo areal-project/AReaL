@@ -283,15 +283,17 @@ class InfBridge:
         """Shared generation loop; tracing is opt-in to preserve legacy behavior."""
         if collect_response_evidence and not collect_trace:
             raise ValueError("response evidence requires physical tracing")
-        # The traced API snapshots mutable request/configuration state.  The
-        # legacy API intentionally retains its existing object-sharing behavior.
+        # The traced API snapshots request containers and transport controls.
+        # The legacy API intentionally retains its existing object sharing.
         if collect_trace:
             generation_req = req.copy()
-            # ModelRequest.copy() intentionally keeps several nested objects
-            # shallow.  Trace mode isolates mutable JSON-facing state while
-            # retaining heavyweight tokenizer/processor references.
-            generation_req.metadata = copy.deepcopy(req.metadata)
-            generation_req.image_data = copy.deepcopy(req.image_data)
+            # ModelRequest.copy() already snapshots the metadata mapping and
+            # image-data list.  Preserve opaque metadata values by reference:
+            # metadata is public ``dict[str, Any]`` state and can contain
+            # intentionally non-copyable values.  Any payload derived from it
+            # is still hashed immediately before each physical send.
+            # vLLM mutates nested vision messages during payload construction,
+            # so those require an isolated deep copy.
             generation_req.vision_msg_vllm = copy.deepcopy(req.vision_msg_vllm)
         else:
             generation_req = req

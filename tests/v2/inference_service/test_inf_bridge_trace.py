@@ -108,6 +108,13 @@ class _ThirdPartyBackendWithoutTrace:
         )
 
 
+class _OpaqueMetadata:
+    """Metadata value accepted by the backend but intentionally not copyable."""
+
+    def __deepcopy__(self, _memo: dict[int, Any]) -> _OpaqueMetadata:
+        raise TypeError("opaque metadata cannot be copied")
+
+
 class TestInfBridgePhysicalTrace:
     """Auditable, immutable client-local observations around HTTP attempts."""
 
@@ -792,6 +799,28 @@ class TestInfBridgePhysicalTrace:
         assert trace.attempts[0].submitted_input_token_ids is None
         assert trace.effective_max_new_tokens == 3
         assert trace.configured_attempt_limit == 20
+
+    @pytest.mark.asyncio
+    async def test_trace_preserves_opaque_metadata_accepted_by_legacy_path(self):
+        raw_response = _make_sglang_response([(-0.5, 100)], "stop")
+        bridge = _make_bridge()
+        bridge._send_request = AsyncMock(
+            side_effect=[deepcopy(raw_response), deepcopy(raw_response)]
+        )
+        req = _make_request(
+            input_ids=[1, 2, 3],
+            max_new_tokens=3,
+            metadata={"opaque": _OpaqueMetadata()},
+        )
+        req.rid = "trace-opaque-metadata"
+
+        legacy_response = await bridge.agenerate(req)
+        traced_response, trace = await bridge.agenerate_with_trace(req)
+
+        assert legacy_response.output_tokens == [100]
+        assert traced_response.output_tokens == [100]
+        assert trace.request_id == "trace-opaque-metadata"
+        assert bridge._send_request.await_count == 2
 
     @pytest.mark.asyncio
     async def test_trace_records_effective_post_method_for_non_get_request_label(self):
