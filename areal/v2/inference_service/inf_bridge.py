@@ -295,6 +295,10 @@ class InfBridge:
         configured_attempt_limit = self.max_resubmit_retries
         initial_client_version = self._version
         initial_client_version_epoch = self._version_epoch
+        if collect_trace:
+            traced_pause_state = self.pause_state
+            traced_request_timeout = self.request_timeout
+            traced_resubmit_wait = self.resubmit_wait
 
         if generation_req.gconfig.n_samples != 1:
             raise ValueError(
@@ -363,8 +367,11 @@ class InfBridge:
         t0 = time.monotonic()
 
         for _attempt in range(configured_attempt_limit):
-            while await self.pause_state.is_paused():
-                await asyncio.sleep(self.resubmit_wait)
+            pause_state = traced_pause_state if collect_trace else self.pause_state
+            while await pause_state.is_paused():
+                await asyncio.sleep(
+                    traced_resubmit_wait if collect_trace else self.resubmit_wait
+                )
 
             remaining = ori_max_new_tokens - len(accumulated_tokens)
             if remaining <= 0:
@@ -400,7 +407,13 @@ class InfBridge:
                 client_version_before_send = self._version
                 client_version_epoch_before_send = self._version_epoch
 
-            data = await self._send_request(http_req)
+            if collect_trace:
+                data = await self._send_request(
+                    http_req,
+                    timeout=traced_request_timeout,
+                )
+            else:
+                data = await self._send_request(http_req)
             if collect_trace:
                 # Bracket the transport return before hashing/parsing locally.
                 client_version_after_receive = self._version

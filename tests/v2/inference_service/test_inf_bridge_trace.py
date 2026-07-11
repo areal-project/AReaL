@@ -887,19 +887,51 @@ class TestInfBridgePhysicalTrace:
         bridge._send_request.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_trace_snapshots_request_and_attempt_config_before_transport(self):
+    async def test_trace_snapshots_request_and_attempt_config_before_transport(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
         call_count = 0
         bridge = _make_bridge(max_resubmit_retries=2)
+        original_pause_state = bridge.pause_state
+        replacement_pause_state = type(original_pause_state)()
         req = _make_request(input_ids=[1, 2], max_new_tokens=5)
         req.rid = "trace-original-request"
+        observed_timeouts: list[float] = []
+        observed_sleeps: list[float] = []
+        pause_check_count = 0
+
+        async def original_is_paused():
+            nonlocal pause_check_count
+            pause_check_count += 1
+            return pause_check_count == 2
+
+        replacement_is_paused = AsyncMock(
+            side_effect=AssertionError("replacement pause state must not be observed")
+        )
+
+        async def record_sleep(delay: float):
+            observed_sleeps.append(delay)
+
+        monkeypatch.setattr(original_pause_state, "is_paused", original_is_paused)
+        monkeypatch.setattr(
+            replacement_pause_state,
+            "is_paused",
+            replacement_is_paused,
+        )
+        monkeypatch.setattr(asyncio, "sleep", record_sleep)
 
         async def mutate_original_state_during_send(http_req, **kwargs):
             nonlocal call_count
             call_count += 1
+            observed_timeouts.append(kwargs["timeout"])
             if call_count == 1:
                 req.rid = "trace-mutated-request"
                 req.input_ids[:] = [9, 9, 9]
                 bridge.max_resubmit_retries = 99
+                bridge.request_timeout = 1e-6
+                bridge.resubmit_wait = 999.0
+                bridge.pause_state = replacement_pause_state
                 return _make_sglang_response([(-0.5, 100)], "abort")
             return _make_sglang_response([(-0.2, 200)], "stop")
 
@@ -911,6 +943,9 @@ class TestInfBridgePhysicalTrace:
         assert req.rid == "trace-mutated-request"
         assert req.input_ids == [9, 9, 9]
         assert bridge.max_resubmit_retries == 99
+        assert observed_timeouts == [120.0, 120.0]
+        assert observed_sleeps == [0.01]
+        assert replacement_is_paused.await_count == 0
         assert resp.input_tokens == [1, 2]
         assert resp.output_tokens == [100, 200]
         assert trace.request_id == "trace-original-request"
