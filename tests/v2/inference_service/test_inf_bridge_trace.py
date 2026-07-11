@@ -41,6 +41,7 @@ from areal.v2.inference_service.client_trace import (
     validate_generation_physical_trace_response,
     validate_generation_response_evidence,
 )
+from areal.v2.inference_service.inf_bridge import GenerationTraceValidationError
 from areal.v2.inference_service.sglang.bridge import SGLangBridgeBackend
 from areal.v2.inference_service.vllm.bridge import VLLMBridgeBackend
 
@@ -535,7 +536,10 @@ class TestInfBridgePhysicalTrace:
         req = _make_request(input_ids=[1, 2], max_new_tokens=8)
         req.rid = "trace-over-budget"
 
-        with pytest.raises(ValueError, match="cannot exceed remaining_new_tokens"):
+        with pytest.raises(
+            GenerationTraceValidationError,
+            match="cannot exceed remaining_new_tokens",
+        ):
             await bridge.agenerate_with_trace(req)
 
         legacy = await bridge.agenerate(req)

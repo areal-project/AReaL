@@ -41,6 +41,7 @@ __all__ = [
     "GenerationAttemptTrace",
     "GenerationPhysicalTrace",
     "GenerationResponseEvidence",
+    "GenerationTraceValidationError",
     "InfBridge",
     "generation_physical_trace_bytes",
     "generation_physical_trace_sha256",
@@ -60,6 +61,10 @@ _TerminalReason = Literal[
 ]
 
 logger = logging.getLogger("InferenceInfBridge")
+
+
+class GenerationTraceValidationError(ValueError):
+    """A traced call completed but failed client-evidence invariants."""
 
 
 class InfBridge:
@@ -515,29 +520,32 @@ class InfBridge:
         if terminal_reason is None:  # pragma: no cover - defensive invariant
             raise RuntimeError("generation completed without a terminal reason")
 
-        trace = GenerationPhysicalTrace(
-            schema_version=2,
-            request_id=request_id,
-            backend_kind=backend_kind,
-            backend_addr_sha256=backend_addr_sha256,
-            request_input_token_ids=request_input_token_ids,
-            effective_max_new_tokens=ori_max_new_tokens,
-            configured_attempt_limit=configured_attempt_limit,
-            initial_client_version=initial_client_version,
-            final_client_version=self._version,
-            initial_client_version_epoch=initial_client_version_epoch,
-            final_client_version_epoch=self._version_epoch,
-            attempts=tuple(attempt_traces),
-            final_output_token_ids=tuple(accumulated_tokens),
-            final_stop_reason=stop_reason,
-            terminal_reason=terminal_reason,
-        )
-        validate_generation_physical_trace_response(response, trace)
-        if not collect_response_evidence:
-            return response, trace
-        response_evidence = GenerationResponseEvidence(
-            schema_version=1,
-            generation_trace_sha256=generation_physical_trace_sha256(trace),
-            attempts=tuple(response_evidence_attempts),
-        )
+        try:
+            trace = GenerationPhysicalTrace(
+                schema_version=2,
+                request_id=request_id,
+                backend_kind=backend_kind,
+                backend_addr_sha256=backend_addr_sha256,
+                request_input_token_ids=request_input_token_ids,
+                effective_max_new_tokens=ori_max_new_tokens,
+                configured_attempt_limit=configured_attempt_limit,
+                initial_client_version=initial_client_version,
+                final_client_version=self._version,
+                initial_client_version_epoch=initial_client_version_epoch,
+                final_client_version_epoch=self._version_epoch,
+                attempts=tuple(attempt_traces),
+                final_output_token_ids=tuple(accumulated_tokens),
+                final_stop_reason=stop_reason,
+                terminal_reason=terminal_reason,
+            )
+            validate_generation_physical_trace_response(response, trace)
+            if not collect_response_evidence:
+                return response, trace
+            response_evidence = GenerationResponseEvidence(
+                schema_version=1,
+                generation_trace_sha256=generation_physical_trace_sha256(trace),
+                attempts=tuple(response_evidence_attempts),
+            )
+        except (TypeError, ValueError) as error:
+            raise GenerationTraceValidationError(str(error)) from error
         return response, trace, response_evidence
