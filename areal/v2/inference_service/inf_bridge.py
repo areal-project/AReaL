@@ -27,6 +27,9 @@ from areal.v2.inference_service.backend import (
 from areal.v2.inference_service.client_trace import (
     GenerationAttemptTrace,
     GenerationPhysicalTrace,
+    GenerationResponseEvidence,
+    ParsedResponseJSONEvidence,
+    canonical_parsed_response_json_bytes,
     generation_physical_trace_bytes,
     generation_physical_trace_sha256,
     parsed_response_json_sha256,
@@ -37,6 +40,7 @@ from areal.v2.inference_service.client_trace import (
 __all__ = [
     "GenerationAttemptTrace",
     "GenerationPhysicalTrace",
+    "GenerationResponseEvidence",
     "InfBridge",
     "generation_physical_trace_bytes",
     "generation_physical_trace_sha256",
@@ -104,6 +108,7 @@ class InfBridge:
         self.max_resubmit_retries = max_resubmit_retries
         self.resubmit_wait = resubmit_wait
         self._version = version
+        self._version_epoch = 0
         self._client = httpx.AsyncClient(timeout=request_timeout)
 
     async def aclose(self) -> None:
@@ -114,9 +119,15 @@ class InfBridge:
 
     def set_version(self, version: int) -> None:
         self._version = version
+        self._version_epoch += 1
 
     def get_version(self) -> int:
         return self._version
+
+    def get_version_epoch(self) -> int:
+        """Return a monotonic count of local :meth:`set_version` calls."""
+
+        return self._version_epoch
 
     # -- pause / resume -----------------------------------------------------
 
@@ -194,7 +205,11 @@ class InfBridge:
         Implements the ``_AsyncGenerateEngine`` protocol.
         Handles the pause → abort → resubmit loop transparently.
         """
-        result = await self._agenerate(req, collect_trace=False)
+        result = await self._agenerate(
+            req,
+            collect_trace=False,
+            collect_response_evidence=False,
+        )
         return cast(ModelResponse, result)
 
     async def agenerate_with_trace(
@@ -212,16 +227,57 @@ class InfBridge:
         fail-closed trace checks propagate without being converted to a
         ``length`` response.
         """
-        result = await self._agenerate(req, collect_trace=True)
+        result = await self._agenerate(
+            req,
+            collect_trace=True,
+            collect_response_evidence=False,
+        )
         return cast(tuple[ModelResponse, GenerationPhysicalTrace], result)
+
+    async def agenerate_with_trace_and_response_evidence(
+        self,
+        req: ModelRequest,
+    ) -> tuple[ModelResponse, GenerationPhysicalTrace, GenerationResponseEvidence]:
+        """Generate with a compact trace plus replayable response JSON sidecar.
+
+        The evidence sidecar can contain generated text and server metadata, so
+        callers should persist it only under prompt-equivalent data controls.
+        It supports offline parser replay but is still client-local evidence,
+        not remote-server or model attestation.
+        """
+
+        result = await self._agenerate(
+            req,
+            collect_trace=True,
+            collect_response_evidence=True,
+        )
+        return cast(
+            tuple[
+                ModelResponse,
+                GenerationPhysicalTrace,
+                GenerationResponseEvidence,
+            ],
+            result,
+        )
 
     async def _agenerate(
         self,
         req: ModelRequest,
         *,
         collect_trace: bool,
-    ) -> ModelResponse | tuple[ModelResponse, GenerationPhysicalTrace]:
+        collect_response_evidence: bool,
+    ) -> (
+        ModelResponse
+        | tuple[ModelResponse, GenerationPhysicalTrace]
+        | tuple[
+            ModelResponse,
+            GenerationPhysicalTrace,
+            GenerationResponseEvidence,
+        ]
+    ):
         """Shared generation loop; tracing is opt-in to preserve legacy behavior."""
+        if collect_response_evidence and not collect_trace:
+            raise ValueError("response evidence requires physical tracing")
         # The traced API snapshots mutable request/configuration state.  The
         # legacy API intentionally retains its existing object-sharing behavior.
         if collect_trace:
@@ -238,6 +294,7 @@ class InfBridge:
         backend_addr = self.backend_addr
         configured_attempt_limit = self.max_resubmit_retries
         initial_client_version = self._version
+        initial_client_version_epoch = self._version_epoch
 
         if generation_req.gconfig.n_samples != 1:
             raise ValueError(
@@ -300,6 +357,7 @@ class InfBridge:
         stop_reason: _StopReason | None = None
         final_routed_experts: np.ndarray | None = None
         attempt_traces: list[GenerationAttemptTrace] = []
+        response_evidence_attempts: list[ParsedResponseJSONEvidence] = []
         terminal_reason: _TerminalReason | None = None
 
         t0 = time.monotonic()
@@ -340,18 +398,23 @@ class InfBridge:
                 # This must remain the final synchronous observation before
                 # entering the transport await.
                 client_version_before_send = self._version
+                client_version_epoch_before_send = self._version_epoch
 
             data = await self._send_request(http_req)
             if collect_trace:
                 # Bracket the transport return before hashing/parsing locally.
                 client_version_after_receive = self._version
+                client_version_epoch_after_receive = self._version_epoch
                 parsed_response_hash = parsed_response_json_sha256(data)
+                if collect_response_evidence:
+                    parsed_response_bytes = canonical_parsed_response_json_bytes(data)
             result = backend.parse_generation_response(data)
 
             accumulated_tokens.extend(result.output_tokens)
             accumulated_logprobs.extend(result.output_logprobs)
             # Preserve the exact legacy read point used to label output tokens.
             output_version_label = self._version
+            output_version_epoch = self._version_epoch
             accumulated_versions.extend(
                 [output_version_label] * len(result.output_tokens)
             )
@@ -364,6 +427,13 @@ class InfBridge:
                         client_version_before_send=client_version_before_send,
                         client_version_after_receive=client_version_after_receive,
                         output_version_label=output_version_label,
+                        client_version_epoch_before_send=(
+                            client_version_epoch_before_send
+                        ),
+                        client_version_epoch_after_receive=(
+                            client_version_epoch_after_receive
+                        ),
+                        output_version_epoch=output_version_epoch,
                         remaining_new_tokens=remaining,
                         endpoint=endpoint,
                         method=method,
@@ -375,6 +445,14 @@ class InfBridge:
                         output_logprob_count=len(result.output_logprobs),
                     )
                 )
+                if collect_response_evidence:
+                    response_evidence_attempts.append(
+                        ParsedResponseJSONEvidence(
+                            attempt_index=_attempt,
+                            parsed_response_json_sha256=parsed_response_hash,
+                            canonical_json_bytes=parsed_response_bytes,
+                        )
+                    )
 
             if result.routed_experts is not None:
                 if final_routed_experts is None:
@@ -425,7 +503,7 @@ class InfBridge:
             raise RuntimeError("generation completed without a terminal reason")
 
         trace = GenerationPhysicalTrace(
-            schema_version=1,
+            schema_version=2,
             request_id=request_id,
             backend_kind=backend_kind,
             backend_addr_sha256=backend_addr_sha256,
@@ -434,10 +512,19 @@ class InfBridge:
             configured_attempt_limit=configured_attempt_limit,
             initial_client_version=initial_client_version,
             final_client_version=self._version,
+            initial_client_version_epoch=initial_client_version_epoch,
+            final_client_version_epoch=self._version_epoch,
             attempts=tuple(attempt_traces),
             final_output_token_ids=tuple(accumulated_tokens),
             final_stop_reason=stop_reason,
             terminal_reason=terminal_reason,
         )
         validate_generation_physical_trace_response(response, trace)
-        return response, trace
+        if not collect_response_evidence:
+            return response, trace
+        response_evidence = GenerationResponseEvidence(
+            schema_version=1,
+            generation_trace_sha256=generation_physical_trace_sha256(trace),
+            attempts=tuple(response_evidence_attempts),
+        )
+        return response, trace, response_evidence

@@ -29,9 +29,17 @@ from areal.v2.inference_service.backend import TraceableInfBridgeBackend
 from areal.v2.inference_service.client_trace import (
     GenerationAttemptTrace,
     GenerationPhysicalTrace,
+    GenerationResponseEvidence,
+    ParsedResponseJSONEvidence,
     generation_physical_trace_bytes,
+    generation_physical_trace_from_bytes,
     generation_physical_trace_sha256,
+    generation_response_evidence_bytes,
+    generation_response_evidence_from_bytes,
+    generation_response_evidence_sha256,
+    generation_response_evidence_values,
     validate_generation_physical_trace_response,
+    validate_generation_response_evidence,
 )
 from areal.v2.inference_service.sglang.bridge import SGLangBridgeBackend
 from areal.v2.inference_service.vllm.bridge import VLLMBridgeBackend
@@ -121,13 +129,15 @@ class TestInfBridgePhysicalTrace:
         assert isinstance(resp, ModelResponse)
         assert isinstance(trace, GenerationPhysicalTrace)
         assert resp.output_tokens == [100, 101]
-        assert trace.schema_version == 1
+        assert trace.schema_version == 2
         assert trace.request_id == "trace-normal"
         assert trace.backend_kind == "SGLangBridgeBackend"
         assert trace.backend_addr_sha256 == hashlib.sha256(b"http://mock").hexdigest()
         assert trace.request_input_token_ids == (1, 2, 3)
         assert trace.initial_client_version == 7
         assert trace.final_client_version == 7
+        assert trace.initial_client_version_epoch == 0
+        assert trace.final_client_version_epoch == 0
         assert trace.effective_max_new_tokens == 5
         assert trace.configured_attempt_limit == 20
         assert trace.final_output_token_ids == (100, 101)
@@ -141,6 +151,9 @@ class TestInfBridgePhysicalTrace:
         assert attempt.client_version_before_send == 7
         assert attempt.client_version_after_receive == 7
         assert attempt.output_version_label == 7
+        assert attempt.client_version_epoch_before_send == 0
+        assert attempt.client_version_epoch_after_receive == 0
+        assert attempt.output_version_epoch == 0
         assert attempt.remaining_new_tokens == 5
         assert attempt.endpoint == "/generate"
         assert attempt.method == "POST"
@@ -166,9 +179,11 @@ class TestInfBridgePhysicalTrace:
             "configured_attempt_limit",
             "effective_max_new_tokens",
             "final_client_version",
+            "final_client_version_epoch",
             "final_output_token_ids",
             "final_stop_reason",
             "initial_client_version",
+            "initial_client_version_epoch",
             "kind",
             "request_id",
             "request_input_token_ids",
@@ -179,23 +194,29 @@ class TestInfBridgePhysicalTrace:
             "attempt_index",
             "client_version_after_receive",
             "client_version_before_send",
+            "client_version_epoch_after_receive",
+            "client_version_epoch_before_send",
             "endpoint",
             "method",
             "output_logprob_count",
             "output_token_ids",
             "output_version_label",
+            "output_version_epoch",
             "parsed_response_json_sha256",
             "prepared_request_json_sha256",
             "raw_stop_reason",
             "remaining_new_tokens",
             "submitted_input_token_ids",
         }
-        assert decoded["kind"] == "areal-generation-physical-trace-v1"
+        assert decoded["kind"] == "areal-generation-physical-trace-v2"
         expected = (
             b'{"attempts":[{"attempt_index":0,"client_version_after_receive":7,'
-            b'"client_version_before_send":7,"endpoint":"/generate","method":"POST",'
+            b'"client_version_before_send":7,"client_version_epoch_after_receive":0,'
+            b'"client_version_epoch_before_send":0,"endpoint":"/generate",'
+            b'"method":"POST",'
             b'"output_logprob_count":2,"output_token_ids":[100,101],'
-            b'"output_version_label":7,"parsed_response_json_sha256":'
+            b'"output_version_epoch":0,"output_version_label":7,'
+            b'"parsed_response_json_sha256":'
             b'"a6139c5961208dbfa553d0c330516f9c234517dc1776cae35627aedbe308fb0d",'
             b'"prepared_request_json_sha256":'
             b'"edef4683dba2caa3a86090ef4a3a61876908d3a1307d348107df9f5fa97acab5",'
@@ -204,14 +225,19 @@ class TestInfBridgePhysicalTrace:
             b'"76f5495ef9aa27156aca83370226a757446a93e03858b06a5b58f9a0e75edfaf",'
             b'"backend_kind":"SGLangBridgeBackend","configured_attempt_limit":20,'
             b'"effective_max_new_tokens":5,"final_client_version":7,'
-            b'"final_output_token_ids":[100,101],"final_stop_reason":"stop",'
-            b'"initial_client_version":7,"kind":"areal-generation-physical-trace-v1",'
+            b'"final_client_version_epoch":0,"final_output_token_ids":[100,101],'
+            b'"final_stop_reason":"stop","initial_client_version":7,'
+            b'"initial_client_version_epoch":0,'
+            b'"kind":"areal-generation-physical-trace-v2",'
             b'"request_id":"trace-normal","request_input_token_ids":[1,2,3],'
-            b'"schema_version":1,"terminal_reason":"backend_stop"}'
+            b'"schema_version":2,"terminal_reason":"backend_stop"}'
         )
         assert encoded == expected
+        restored = generation_physical_trace_from_bytes(encoded)
+        assert restored == trace
+        assert generation_physical_trace_bytes(restored) == encoded
         assert generation_physical_trace_sha256(trace) == (
-            "6a192dae76682434a03a2fda2d20b139b6dcb582b04c99c9daa842c2a2c99e02"
+            "2b6971d8eebfb2ec6b3251f76dced0dc019083608ee399d9a693e514ed6f329d"
         )
 
     @pytest.mark.asyncio
@@ -261,6 +287,189 @@ class TestInfBridgePhysicalTrace:
         assert trace.request_input_token_ids == (1, 2, 3)
         assert trace.attempts[0].submitted_input_token_ids == (1, 2, 3)
         assert trace.attempts[1].submitted_input_token_ids == (1, 2, 3, 100, 101)
+
+    @pytest.mark.asyncio
+    async def test_optional_response_evidence_replays_every_parsed_json_attempt(self):
+        raw_responses = (
+            _make_sglang_response([(-0.5, 100)], "abort"),
+            _make_sglang_response([(-0.2, 200)], "stop"),
+        )
+        bridge = _make_bridge()
+        bridge._send_request = AsyncMock(side_effect=deepcopy(raw_responses))
+        req = _make_request(input_ids=[1, 2, 3], max_new_tokens=5)
+        req.rid = "trace-response-evidence"
+
+        (
+            response,
+            trace,
+            evidence,
+        ) = await bridge.agenerate_with_trace_and_response_evidence(req)
+
+        assert response.output_tokens == [100, 200]
+        assert type(evidence) is GenerationResponseEvidence
+        assert evidence.schema_version == 1
+        assert evidence.generation_trace_sha256 == generation_physical_trace_sha256(
+            trace
+        )
+        assert all(
+            type(attempt) is ParsedResponseJSONEvidence for attempt in evidence.attempts
+        )
+        assert tuple(attempt.attempt_index for attempt in evidence.attempts) == (0, 1)
+        expected_values = tuple(
+            json.loads(json.dumps(value, allow_nan=False)) for value in raw_responses
+        )
+        assert generation_response_evidence_values(trace, evidence) == expected_values
+        assert validate_generation_response_evidence(trace, evidence) is None
+        encoded = generation_response_evidence_bytes(evidence)
+        assert encoded == json.dumps(
+            json.loads(encoded),
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("ascii")
+        assert len(encoded) == 648
+        assert generation_response_evidence_sha256(evidence) == (
+            "553b0ab264d1439189f90bea891fc329232f2b8d9a4ebea35894a4f25d898e0e"
+        )
+        assert (
+            generation_response_evidence_sha256(evidence)
+            == hashlib.sha256(encoded).hexdigest()
+        )
+        restored = generation_response_evidence_from_bytes(encoded)
+        assert restored == evidence
+        assert generation_response_evidence_bytes(restored) == encoded
+
+        changed_preimage = ParsedResponseJSONEvidence(
+            attempt_index=0,
+            parsed_response_json_sha256=_domain_separated_json_sha256(
+                raw_responses[1],
+                domain=b"areal-infbridge-parsed-response-json-v1\0",
+            ),
+            canonical_json_bytes=json.dumps(
+                raw_responses[1],
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("ascii"),
+        )
+        forged = replace(
+            evidence,
+            attempts=(changed_preimage, evidence.attempts[1]),
+        )
+        with pytest.raises(ValueError, match="attempt does not match trace"):
+            validate_generation_response_evidence(trace, forged)
+        assert "canonical_json_bytes" not in repr(evidence.attempts[0])
+        assert "meta_info" not in repr(evidence.attempts[0])
+
+    @pytest.mark.asyncio
+    async def test_compact_trace_api_does_not_collect_response_preimages(self):
+        bridge = _make_bridge()
+        bridge._send_request = AsyncMock(
+            return_value=_make_sglang_response([(-0.5, 100)], "stop")
+        )
+        req = _make_request(input_ids=[1], max_new_tokens=2)
+
+        result = await bridge.agenerate_with_trace(req)
+
+        assert type(result) is tuple
+        assert len(result) == 2
+        assert all(
+            not hasattr(attempt, "canonical_json_bytes")
+            for attempt in result[1].attempts
+        )
+
+    @pytest.mark.parametrize(
+        "canonical_json_bytes",
+        (
+            b'{ "a":1}',
+            b'{"a":1,"a":1}',
+            b'{"value":NaN}',
+            b"[]",
+            bytearray(b'{"a":1}'),
+        ),
+        ids=("whitespace", "duplicate-key", "nan", "non-object", "wrong-type"),
+    )
+    def test_response_evidence_rejects_noncanonical_or_ambiguous_json(
+        self,
+        canonical_json_bytes: object,
+    ):
+        with pytest.raises(ValueError):
+            ParsedResponseJSONEvidence(
+                attempt_index=0,
+                parsed_response_json_sha256="0" * 64,
+                canonical_json_bytes=canonical_json_bytes,  # type: ignore[arg-type]
+            )
+
+    @pytest.mark.asyncio
+    async def test_persisted_trace_and_sidecar_loaders_fail_closed(self):
+        bridge = _make_bridge()
+        bridge._send_request = AsyncMock(
+            return_value=_make_sglang_response([(-0.5, 100)], "stop")
+        )
+        req = _make_request(input_ids=[1], max_new_tokens=2)
+        req.rid = "trace-loader"
+        _, trace, evidence = await bridge.agenerate_with_trace_and_response_evidence(
+            req
+        )
+        trace_bytes = generation_physical_trace_bytes(trace)
+        evidence_bytes = generation_response_evidence_bytes(evidence)
+
+        def canonical(value: object) -> bytes:
+            return json.dumps(
+                value,
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("ascii")
+
+        trace_value = json.loads(trace_bytes)
+        wrong_trace_kind = deepcopy(trace_value)
+        wrong_trace_kind["kind"] = "areal-generation-physical-trace-v1"
+        wrong_trace_schema = deepcopy(trace_value)
+        wrong_trace_schema["schema_version"] = True
+        extra_trace_field = deepcopy(trace_value)
+        extra_trace_field["unknown"] = 0
+        duplicate_trace_key = trace_bytes.replace(
+            b'{"attempts":',
+            b'{"attempts":[],"attempts":',
+            1,
+        )
+        for malformed in (
+            b" " + trace_bytes,
+            canonical(wrong_trace_kind),
+            canonical(wrong_trace_schema),
+            canonical(extra_trace_field),
+            duplicate_trace_key,
+            bytearray(trace_bytes),
+        ):
+            with pytest.raises((TypeError, ValueError)):
+                generation_physical_trace_from_bytes(malformed)  # type: ignore[arg-type]
+
+        evidence_value = json.loads(evidence_bytes)
+        wrong_evidence_kind = deepcopy(evidence_value)
+        wrong_evidence_kind["kind"] = "wrong-kind"
+        wrong_evidence_schema = deepcopy(evidence_value)
+        wrong_evidence_schema["schema_version"] = True
+        extra_evidence_field = deepcopy(evidence_value)
+        extra_evidence_field["unknown"] = 0
+        duplicate_evidence_key = evidence_bytes.replace(
+            b'{"attempts":',
+            b'{"attempts":[],"attempts":',
+            1,
+        )
+        for malformed in (
+            b" " + evidence_bytes,
+            canonical(wrong_evidence_kind),
+            canonical(wrong_evidence_schema),
+            canonical(extra_evidence_field),
+            duplicate_evidence_key,
+            bytearray(evidence_bytes),
+        ):
+            with pytest.raises((TypeError, ValueError)):
+                generation_response_evidence_from_bytes(malformed)  # type: ignore[arg-type]
 
     @pytest.mark.asyncio
     async def test_attempt_limit_preserves_raw_abort_evidence(self):
@@ -315,6 +524,24 @@ class TestInfBridgePhysicalTrace:
         assert trace.terminal_reason == "budget_exhausted"
 
     @pytest.mark.asyncio
+    async def test_traced_api_rejects_backend_output_beyond_remaining_budget(self):
+        bridge = _make_bridge()
+        bridge._send_request = AsyncMock(
+            return_value=_make_sglang_response(
+                [(-0.1, token_id) for token_id in range(9)],
+                "stop",
+            )
+        )
+        req = _make_request(input_ids=[1, 2], max_new_tokens=8)
+        req.rid = "trace-over-budget"
+
+        with pytest.raises(ValueError, match="cannot exceed remaining_new_tokens"):
+            await bridge.agenerate_with_trace(req)
+
+        legacy = await bridge.agenerate(req)
+        assert legacy.output_tokens == list(range(9))
+
+    @pytest.mark.asyncio
     async def test_trace_snapshots_versions_before_send_and_after_receive(self):
         call_count = 0
         bridge = _make_bridge(version=1)
@@ -345,6 +572,38 @@ class TestInfBridgePhysicalTrace:
             3,
         ]
         assert [attempt.output_version_label for attempt in trace.attempts] == [2, 3]
+
+    @pytest.mark.asyncio
+    async def test_version_epoch_exposes_aba_changes_hidden_by_equal_labels(self):
+        bridge = _make_bridge(version=17)
+
+        async def change_and_restore_version(http_req, **kwargs):
+            bridge.set_version(18)
+            bridge.set_version(17)
+            return _make_sglang_response([(-0.5, 100)], "stop")
+
+        bridge._send_request = change_and_restore_version
+        req = _make_request(input_ids=[1], max_new_tokens=2)
+        req.rid = "trace-version-aba"
+
+        response, trace = await bridge.agenerate_with_trace(req)
+
+        assert response.output_versions == [17]
+        assert trace.initial_client_version == trace.final_client_version == 17
+        assert trace.initial_client_version_epoch == 0
+        assert trace.final_client_version_epoch == 2
+        attempt = trace.attempts[0]
+        assert attempt.client_version_before_send == 17
+        assert attempt.client_version_after_receive == 17
+        assert attempt.output_version_label == 17
+        assert attempt.client_version_epoch_before_send == 0
+        assert attempt.client_version_epoch_after_receive == 2
+        assert attempt.output_version_epoch == 2
+
+        forged = deepcopy(trace)
+        object.__setattr__(forged, "final_client_version", 18)
+        with pytest.raises(ValueError, match="one client version epoch"):
+            generation_physical_trace_bytes(forged)
 
     @pytest.mark.asyncio
     async def test_output_version_label_is_observed_after_backend_parsing(self):
@@ -718,6 +977,8 @@ class TestInfBridgePhysicalTrace:
         req.rid = "trace-validation"
         _, trace = await bridge.agenerate_with_trace(req)
 
+        with pytest.raises(ValueError, match="schema_version must be 2"):
+            replace(trace, schema_version=1)
         with pytest.raises(ValueError, match="final_output_token_ids"):
             generation_physical_trace_bytes(
                 replace(trace, final_output_token_ids=(999,))
