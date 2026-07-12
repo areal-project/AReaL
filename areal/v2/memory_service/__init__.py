@@ -38,6 +38,16 @@ from areal.v2.memory_service.release_store import (
     MemoryReleaseStore,
 )
 from areal.v2.memory_service.release_types import MemoryRelease, ReleaseManifest
+from areal.v2.memory_service.runtime_store import (
+    InMemoryMemoryRuntimeStore,
+    MemoryConsumerCallV1,
+    MemoryRenderOutputV1,
+    MemoryRetrievalOutputV1,
+    MemoryRuntimeConsumer,
+    MemoryRuntimeRenderer,
+    MemoryRuntimeRetriever,
+    MemoryRuntimeStore,
+)
 from areal.v2.memory_service.runtime_types import (
     MemoryConsumerAckV1,
     MemoryConsumerKind,
@@ -74,11 +84,13 @@ __all__ = [
     "InMemoryEvidenceStore",
     "InMemoryMemoryHistoryStore",
     "InMemoryMemoryReleaseStore",
+    "InMemoryMemoryRuntimeStore",
     "MemoryBoundaryMismatchError",
     "MemoryCandidate",
     "MemoryConsumerAckConflictError",
     "MemoryConsumerAckNotFoundError",
     "MemoryConsumerAckV1",
+    "MemoryConsumerCallV1",
     "MemoryConsumerKind",
     "MemoryDeliveryConflictError",
     "MemoryDeliveryNotFoundError",
@@ -101,6 +113,12 @@ __all__ = [
     "MemoryRevisionRefV1",
     "MemoryRenderedRevisionRangeV1",
     "MemoryRenderedRevisionSpanV1",
+    "MemoryRetrievalOutputV1",
+    "MemoryRenderOutputV1",
+    "MemoryRuntimeConsumer",
+    "MemoryRuntimeRenderer",
+    "MemoryRuntimeRetriever",
+    "MemoryRuntimeStore",
     "MemoryScope",
     "MemoryServiceError",
     "ReleaseConflictError",
