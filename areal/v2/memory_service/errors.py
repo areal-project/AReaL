@@ -39,3 +39,39 @@ class ReleaseNotFoundError(MemoryServiceError):
 
 class ReleaseConflictError(MemoryServiceError):
     """Raised when a release write conflicts with immutable history."""
+
+
+class MemoryQueryNotFoundError(MemoryServiceError):
+    """Raised when a runtime query attempt or result cannot be resolved."""
+
+
+class MemoryQueryConflictError(MemoryServiceError):
+    """Raised when an immutable runtime query stage conflicts."""
+
+
+class MemoryDeliveryNotFoundError(MemoryServiceError):
+    """Raised when a rendered Memory delivery cannot be resolved."""
+
+
+class MemoryDeliveryConflictError(MemoryServiceError):
+    """Raised when an immutable rendered Memory delivery conflicts."""
+
+
+class MemoryConsumerAckNotFoundError(MemoryServiceError):
+    """Raised when a consumer-boundary acknowledgement cannot be resolved."""
+
+
+class MemoryConsumerAckConflictError(MemoryServiceError):
+    """Raised when a consumer acknowledgement conflicts or is replayed."""
+
+
+class MemoryExposureNotFoundError(MemoryServiceError):
+    """Raised when an actual Memory exposure cannot be resolved."""
+
+
+class MemoryExposureConflictError(MemoryServiceError):
+    """Raised when an actual Memory exposure chain conflicts."""
+
+
+class MemoryBoundaryMismatchError(MemoryServiceError):
+    """Raised when submitted consumer bytes do not match a pending delivery."""
