@@ -17,6 +17,7 @@ from areal.v2.memory_service import (
     EvidenceKind,
     InMemoryEvidenceStore,
     InMemoryMemoryHistoryStore,
+    InMemoryMemoryReleaseControlStore,
     InMemoryMemoryReleaseStore,
     InMemoryMemoryRuntimeStore,
     MemoryBoundaryMismatchError,
@@ -33,6 +34,7 @@ from areal.v2.memory_service import (
     MemoryReleaseAssignmentConflictError,
     MemoryReleaseAssignmentConsumerKind,
     MemoryReleaseAssignmentV1,
+    MemoryReleaseRevocationReason,
     MemoryRenderedRevisionRangeV1,
     MemoryRenderOutputV1,
     MemoryRetrievalOutputV1,
@@ -939,6 +941,125 @@ def test_revoked_assignment_blocks_every_component_and_cached_fast_path() -> Non
     assert store.get_exposure(scope, exposure.exposure_id) == exposure
 
 
+def test_real_control_store_revocation_blocks_cached_consumer_submission() -> None:
+    class Attestor:
+        attestor_id = "runtime-integration-attestor"
+        attestor_version_sha256 = hashlib.sha256(b"attestor-v1").hexdigest()
+        attestor_config_sha256 = hashlib.sha256(b"attestor-config").hexdigest()
+
+        def attest(self, *, release, evaluated_at):
+            del release, evaluated_at
+            return _BASE - timedelta(minutes=1), _BASE + timedelta(hours=1)
+
+    class Revoker:
+        revoker_id = "runtime-integration-revoker"
+        revoker_version_sha256 = hashlib.sha256(b"revoker-v1").hexdigest()
+        revoker_config_sha256 = hashlib.sha256(b"revoker-config").hexdigest()
+
+        def revoke(self, *, attestation, evaluated_at):
+            del attestation, evaluated_at
+            return (
+                MemoryReleaseRevocationReason.OPERATOR,
+                hashlib.sha256(b"runtime integration revocation").hexdigest(),
+            )
+
+    class AssignmentPolicy:
+        assignment_policy_id = "runtime-integration-policy"
+        assignment_policy_version_sha256 = hashlib.sha256(
+            b"assignment-policy-v1"
+        ).hexdigest()
+        assignment_policy_config_sha256 = hashlib.sha256(
+            b"assignment-policy-config"
+        ).hexdigest()
+
+        def authorize(self, **_arguments):
+            return _BASE + timedelta(minutes=30)
+
+    retriever = _ReleaseOrderRetriever()
+    renderer = _LineRenderer()
+    consumer = _ContextConsumer()
+    scope, history, releases, release, _unused_runtime = _graph(
+        retriever=retriever,
+        renderer=renderer,
+        consumers=(consumer,),
+    )
+    control = InMemoryMemoryReleaseControlStore(
+        releases,
+        attestor=Attestor(),
+        revoker=Revoker(),
+        assignment_policy=AssignmentPolicy(),
+        clock=lambda: _BASE,
+    )
+    attestation = control.attest_release(
+        scope,
+        release.release_id,
+        release_content_sha256=release.content_hash,
+        idempotency_key="runtime-integration-attestation",
+    )
+    assignment = control.assign_release(
+        scope,
+        "rollout-group-1",
+        rollout_group_incarnation_sha256=_INCARNATION,
+        attestation_id=attestation.attestation_id,
+        attestation_content_sha256=attestation.content_hash,
+        task_policy_id="frozen-task-agent",
+        task_policy_version_sha256=_HASH_A,
+        task_policy_config_sha256=_CONFIG_A,
+        retrieval_policy_id=retriever.retrieval_policy_id,
+        retrieval_policy_version_sha256=retriever.retrieval_policy_version_sha256,
+        retrieval_policy_config_sha256=retriever.retrieval_policy_config_sha256,
+        renderer_id=renderer.renderer_id,
+        renderer_version_sha256=renderer.renderer_version_sha256,
+        renderer_config_sha256=renderer.renderer_config_sha256,
+        consumer_kind=MemoryReleaseAssignmentConsumerKind.CONTEXT,
+        consumer_id=consumer.consumer_id,
+        consumer_version_sha256=consumer.consumer_version_sha256,
+        consumer_config_sha256=consumer.consumer_config_sha256,
+        max_returned_items=2,
+        max_context_utf8_bytes=4096,
+        idempotency_key="runtime-integration-assignment",
+    )
+    store = InMemoryMemoryRuntimeStore(
+        history,
+        releases,
+        release_control_store=control,
+        retrievers=(retriever,),
+        renderers=(renderer,),
+        consumers=(consumer,),
+    )
+    spec = replace(
+        _spec(scope, release.release_id),
+        assignment_id=assignment.assignment_id,
+        assignment_content_sha256=assignment.content_hash,
+    )
+    attempt, result = _query_all(store, scope, release, spec)
+    context, delivery = _deliver(store, scope, result)
+    exposure, _ack = _ack_context(store, scope, delivery, context)
+    assert consumer.calls == 1
+
+    control.revoke_attestation(
+        scope,
+        attestation.attestation_id,
+        attestation_content_sha256=attestation.content_hash,
+        idempotency_key="runtime-integration-revocation",
+    )
+    with pytest.raises(
+        MemoryConsumerAckConflictError,
+        match="active Memory assignment",
+    ):
+        store.submit_delivery(
+            scope,
+            delivery.delivery_id,
+            consumer_id=consumer.consumer_id,
+            consumer_version_sha256=consumer.consumer_version_sha256,
+            call_id="call-1",
+            query=b"query-a",
+            history=(),
+        )
+    assert consumer.calls == 1
+    assert store.get_exposure(scope, exposure.exposure_id) == exposure
+
+
 @pytest.mark.parametrize(
     ("field_name", "value"),
     (
@@ -1026,8 +1147,10 @@ def test_callable_identity_comparison_never_invokes_hostile_equality() -> None:
     assert replacement_call.calls == 0
 
 
+@pytest.mark.parametrize("mutation", ("component", "revocation"))
 def test_consumer_waiter_revalidates_after_owner_failure(
     monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
 ) -> None:
     class BlockingFailConsumer(_ContextConsumer):
         def __init__(self) -> None:
@@ -1076,17 +1199,59 @@ def test_consumer_waiter_revalidates_after_owner_failure(
         assert consumer.started.wait(timeout=10)
         waiter = executor.submit(submit_once)
         assert waiter_entered.wait(timeout=10)
-        consumer.submit = replacement_submit
-        consumer.consumer_config_sha256 = "4" * 64
+        if mutation == "component":
+            consumer.submit = replacement_submit
+            consumer.consumer_config_sha256 = "4" * 64
+            expected_error = "identity changed"
+        else:
+            store._test_control.active = False
+            expected_error = "active Memory assignment"
         consumer.proceed.set()
         with pytest.raises(RuntimeError, match="owner failure"):
             owner.result(timeout=10)
-        with pytest.raises(MemoryConsumerAckConflictError, match="identity changed"):
+        with pytest.raises(MemoryConsumerAckConflictError, match=expected_error):
             waiter.result(timeout=10)
 
     assert consumer.calls == 1
     assert replacement_calls == 0
     assert store._submission_claim_by_delivery == {}
+    assert store._ack_by_delivery == {}
+    assert store._exposure_by_attempt == {}
+
+
+def test_consumer_guard_setup_interruption_clears_all_claims(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    consumer = _ContextConsumer()
+    scope, _history, _releases, release, store = _graph(consumers=(consumer,))
+    attempt, result = _query_all(
+        store,
+        scope,
+        release,
+        _spec(scope, release.release_id),
+    )
+    context, delivery = _deliver(store, scope, result)
+    owner_thread_id = runtime_store.get_ident()
+    calls = 0
+
+    def interrupt_guard_setup():
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return owner_thread_id
+        raise KeyboardInterrupt("injected component guard interruption")
+
+    monkeypatch.setattr(runtime_store, "get_ident", interrupt_guard_setup)
+    with pytest.raises(KeyboardInterrupt, match="guard interruption"):
+        _ack_context(store, scope, delivery, context)
+
+    assert calls == 2
+    assert consumer.calls == 0
+    assert store._submission_claim_by_delivery == {}
+    assert store._submission_owner_by_delivery == {}
+    assert store._submission_delivery_by_call == {}
+    assert store._submission_call_by_delivery == {}
+    assert store._active_component_thread_ids == set()
     assert store._ack_by_delivery == {}
     assert store._exposure_by_attempt == {}
 

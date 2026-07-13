@@ -3096,6 +3096,9 @@ class InMemoryMemoryRuntimeStore:
             )
             return cached_submission
 
+        component_thread_id: int | None = None
+        component_token = None
+        component_thread_added = False
         try:
             self._resolve_active_assignment(
                 attempt.spec,
@@ -3113,61 +3116,56 @@ class InMemoryMemoryRuntimeStore:
                 consumer_version_sha256=consumer_version_sha256,
                 consumer_config_sha256=registered_config,
             )
-        except BaseException:
-            self._clear_submission_claim(
-                delivery_address,
-                owner_thread_id=owner_thread_id,
-            )
-            raise
-        component_thread_id = get_ident()
-        component_token = _RUNTIME_COMPONENT_CALL_ACTIVE.set(True)
-        with self._lock:
-            self._active_component_thread_ids.add(component_thread_id)
-        try:
-            submitted = self._consumer_call_by_version[
-                (consumer_id, consumer_version_sha256)
-            ](
-                delivery=delivery,
-                rendered_context=expected_context,
-                query=query,
-                history=history,
-                call_id=call_id,
-            )
-            if type(submitted) is not MemoryConsumerCallV1:
-                raise MemoryBoundaryMismatchError(
-                    "registered consumer returned a non-canonical call result"
+            try:
+                component_thread_id = get_ident()
+                component_token = _RUNTIME_COMPONENT_CALL_ACTIVE.set(True)
+                component_thread_added = True
+                with self._lock:
+                    self._active_component_thread_ids.add(component_thread_id)
+                submitted = self._consumer_call_by_version[
+                    (consumer_id, consumer_version_sha256)
+                ](
+                    delivery=delivery,
+                    rendered_context=expected_context,
+                    query=query,
+                    history=history,
+                    call_id=call_id,
                 )
-            if (
-                submitted.delivery_id != delivery.delivery_id
-                or submitted.delivery_content_sha256 != delivery.content_hash
-                or submitted.call_id != call_id
-                or submitted.observed_query_sha256 != sha256(query).hexdigest()
-                or submitted.observed_history_sha256 != _history_sha256(history)
-                or submitted.observed_history_length != len(history)
-            ):
-                raise MemoryBoundaryMismatchError(
-                    "consumer receipt does not bind the exact delivery request"
-                )
-            submitted_prompt = submitted.submitted_prompt
-            context_start = submitted.context_start
-            context_end = submitted.context_end
-            input_token_ids = submitted.input_token_ids
-            actual_context = submitted_prompt[context_start:context_end]
-            if actual_context != expected_context:
-                raise MemoryBoundaryMismatchError(
-                    "consumer call did not contain the exact rendered context slice"
-                )
-        except BaseException:
-            self._clear_submission_claim(
-                delivery_address,
-                owner_thread_id=owner_thread_id,
-            )
-            raise
-        finally:
-            _RUNTIME_COMPONENT_CALL_ACTIVE.reset(component_token)
-            with self._lock:
-                self._active_component_thread_ids.discard(component_thread_id)
-        try:
+                if type(submitted) is not MemoryConsumerCallV1:
+                    raise MemoryBoundaryMismatchError(
+                        "registered consumer returned a non-canonical call result"
+                    )
+                if (
+                    submitted.delivery_id != delivery.delivery_id
+                    or submitted.delivery_content_sha256 != delivery.content_hash
+                    or submitted.call_id != call_id
+                    or submitted.observed_query_sha256 != sha256(query).hexdigest()
+                    or submitted.observed_history_sha256 != _history_sha256(history)
+                    or submitted.observed_history_length != len(history)
+                ):
+                    raise MemoryBoundaryMismatchError(
+                        "consumer receipt does not bind the exact delivery request"
+                    )
+                submitted_prompt = submitted.submitted_prompt
+                context_start = submitted.context_start
+                context_end = submitted.context_end
+                input_token_ids = submitted.input_token_ids
+                actual_context = submitted_prompt[context_start:context_end]
+                if actual_context != expected_context:
+                    raise MemoryBoundaryMismatchError(
+                        "consumer call did not contain the exact rendered context slice"
+                    )
+            finally:
+                try:
+                    if component_token is not None:
+                        _RUNTIME_COMPONENT_CALL_ACTIVE.reset(component_token)
+                finally:
+                    if component_thread_added and component_thread_id is not None:
+                        with self._lock:
+                            self._active_component_thread_ids.discard(
+                                component_thread_id
+                            )
+
             token_hash: str | None
             token_count: int | None
             if consumer_kind is MemoryConsumerKind.CONTEXT:
@@ -3214,13 +3212,6 @@ class InMemoryMemoryRuntimeStore:
                 delivery=delivery,
                 consumer_ack=ack,
             )
-        except BaseException:
-            self._clear_submission_claim(
-                delivery_address,
-                owner_thread_id=owner_thread_id,
-            )
-            raise
-        try:
             return self._commit_consumer_exposure(
                 scope=scope,
                 delivery_address=delivery_address,
