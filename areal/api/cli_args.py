@@ -3193,10 +3193,19 @@ class PPOConfig(BaseExperimentConfig):
         # eval_gconfig's other fields, so eval_gconfig.sampling_seed does not reach
         # SGLang either way. Checked here anyway so this warning stays correct if that
         # changes, but do not read "no warning" as "eval_gconfig.sampling_seed works."
+        # self.sglang is not Optional and the YAML/CLI config loader (OmegaConf
+        # structured-config validation) rejects `sglang: null`, but direct Python
+        # construction (PPOConfig(sglang=None, ...), bypassing that loader) is not
+        # type-checked at runtime, so guard rather than assume non-None here.
+        sglang_deterministic = (
+            self.sglang.enable_deterministic_inference
+            if self.sglang is not None
+            else False
+        )
         if (
             self.gconfig.sampling_seed is not None
             or self.eval_gconfig.sampling_seed is not None
-        ) and not self.sglang.enable_deterministic_inference:
+        ) and not sglang_deterministic:
             warnings.warn(
                 "gconfig.sampling_seed or eval_gconfig.sampling_seed is set but "
                 "sglang.enable_deterministic_inference is False: SGLang silently "
