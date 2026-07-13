@@ -515,49 +515,60 @@ class InMemoryMemoryRuntimeStore:
         visiting: set[str],
         validated: dict[str, MemoryRevision],
     ) -> None:
-        if type(revision) is not MemoryRevision or revision.proposal.scope != scope:
-            raise MemoryQueryConflictError(
-                "history store returned a non-scoped revision"
-            )
-        existing = validated.get(revision.revision_id)
-        if existing is not None:
-            if existing != revision:
-                raise MemoryQueryConflictError(
-                    "one revision ID resolved to different immutable values"
-                )
-            return
-        if revision.revision_id in visiting:
-            raise MemoryQueryConflictError("revision ancestry contains a cycle")
-        visiting.add(revision.revision_id)
+        path: list[tuple[MemoryRevision, str]] = []
+        visited_revision_ids: list[str] = []
         try:
-            expected_hash = sha256(revision.proposal.canonical_bytes()).hexdigest()
-            if (
-                revision.content_hash != expected_hash
-                or revision.revision_id != f"rev_{expected_hash[:24]}"
-            ):
-                raise MemoryQueryConflictError(
-                    "history store returned a revision with invalid commitments"
-                )
-            candidate = self._history_store.get_candidate(
-                scope,
-                revision.proposal.candidate_id,
-            )
-            self._validate_candidate(
-                scope,
-                candidate,
-                expected_candidate_id=revision.proposal.candidate_id,
-            )
-            if revision.proposal.operation is RevisionOperation.ADD:
+            current = revision
+            while True:
                 if (
-                    revision.proposal.parent_revision_id is not None
-                    or revision.generation != 0
-                    or revision.memory_id != f"mem_{expected_hash[:24]}"
+                    type(current) is not MemoryRevision
+                    or current.proposal.scope != scope
                 ):
                     raise MemoryQueryConflictError(
-                        "ADD revision derived fields are invalid"
+                        "history store returned a non-scoped revision"
                     )
-            else:
-                parent_id = revision.proposal.parent_revision_id
+                existing = validated.get(current.revision_id)
+                if existing is not None:
+                    if existing != current:
+                        raise MemoryQueryConflictError(
+                            "one revision ID resolved to different immutable values"
+                        )
+                    break
+                if current.revision_id in visiting:
+                    raise MemoryQueryConflictError("revision ancestry contains a cycle")
+                visiting.add(current.revision_id)
+                visited_revision_ids.append(current.revision_id)
+
+                expected_hash = sha256(current.proposal.canonical_bytes()).hexdigest()
+                path.append((current, expected_hash))
+                if (
+                    current.content_hash != expected_hash
+                    or current.revision_id != f"rev_{expected_hash[:24]}"
+                ):
+                    raise MemoryQueryConflictError(
+                        "history store returned a revision with invalid commitments"
+                    )
+                candidate = self._history_store.get_candidate(
+                    scope,
+                    current.proposal.candidate_id,
+                )
+                self._validate_candidate(
+                    scope,
+                    candidate,
+                    expected_candidate_id=current.proposal.candidate_id,
+                )
+                if current.proposal.operation is RevisionOperation.ADD:
+                    if (
+                        current.proposal.parent_revision_id is not None
+                        or current.generation != 0
+                        or current.memory_id != f"mem_{expected_hash[:24]}"
+                    ):
+                        raise MemoryQueryConflictError(
+                            "ADD revision derived fields are invalid"
+                        )
+                    break
+
+                parent_id = current.proposal.parent_revision_id
                 if type(parent_id) is not str:
                     raise MemoryQueryConflictError(
                         "non-ADD revision has no exact parent"
@@ -567,29 +578,33 @@ class InMemoryMemoryRuntimeStore:
                     raise MemoryQueryConflictError(
                         "history store returned a different parent address"
                     )
-                self._validate_revision(
-                    scope,
-                    parent,
-                    visiting=visiting,
-                    validated=validated,
-                )
+                current = parent
+
+            for current, expected_hash in reversed(path):
+                if current.proposal.operation is not RevisionOperation.ADD:
+                    parent_id = current.proposal.parent_revision_id
+                    parent = validated.get(parent_id)
+                    if parent is None:
+                        raise MemoryQueryConflictError(
+                            "parent revision was not validated"
+                        )
+                    if (
+                        current.memory_id != parent.memory_id
+                        or current.generation != parent.generation + 1
+                    ):
+                        raise MemoryQueryConflictError(
+                            "revision lineage derived fields are invalid"
+                        )
+                repeated_hash = sha256(current.proposal.canonical_bytes()).hexdigest()
                 if (
-                    revision.memory_id != parent.memory_id
-                    or revision.generation != parent.generation + 1
+                    repeated_hash != expected_hash
+                    or current.content_hash != expected_hash
+                    or current.revision_id != f"rev_{expected_hash[:24]}"
                 ):
                     raise MemoryQueryConflictError(
-                        "revision lineage derived fields are invalid"
+                        "revision changed while its ancestry was being validated"
                     )
-            repeated_hash = sha256(revision.proposal.canonical_bytes()).hexdigest()
-            if (
-                repeated_hash != expected_hash
-                or revision.content_hash != expected_hash
-                or revision.revision_id != f"rev_{expected_hash[:24]}"
-            ):
-                raise MemoryQueryConflictError(
-                    "revision changed while its ancestry was being validated"
-                )
-            validated[revision.revision_id] = revision
+                validated[current.revision_id] = current
         except MemoryQueryConflictError:
             raise
         except Exception as error:
@@ -597,7 +612,8 @@ class InMemoryMemoryRuntimeStore:
                 "revision graph failed integrity validation"
             ) from error
         finally:
-            visiting.discard(revision.revision_id)
+            for revision_id in visited_revision_ids:
+                visiting.discard(revision_id)
 
     def _load_release(
         self,

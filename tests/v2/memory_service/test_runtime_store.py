@@ -1484,3 +1484,67 @@ def test_concurrent_exact_retries_converge_at_every_stage() -> None:
     assert len({item.exposure_id for item in exposures}) == 1
     assert consumer.calls == 1
     assert store.list_exposures(scope) == (exposures[0],)
+
+
+def test_revision_validation_is_iterative_for_deep_lineages() -> None:
+    evidence_store = InMemoryEvidenceStore()
+    history_store = InMemoryMemoryHistoryStore(evidence_store)
+    release_store = InMemoryMemoryReleaseStore(history_store)
+    scope = MemoryScope(
+        tenant_id="tenant-1",
+        namespace="agent-long-term-memory",
+        subject_id="deep-lineage",
+    )
+    evidence = evidence_store.append(
+        EvidenceEvent(
+            scope=scope,
+            session_id="capture-session",
+            run_id="capture-run",
+            sequence_no=0,
+            kind=EvidenceKind.USER_MESSAGE,
+            payload="stable evidence",
+            observed_at=_BASE,
+            idempotency_key="deep-evidence",
+        )
+    )
+    parent_revision_id = None
+    # This is deliberately above CPython's default recursion limit.  A valid
+    # lineage must not become unreadable merely because it has many updates.
+    for generation in range(1100):
+        candidate = history_store.append_candidate(
+            CandidateProposal(
+                scope=scope,
+                content=f"preference-version-{generation}",
+                evidence_ids=(evidence.evidence_id,),
+                idempotency_key=f"deep-candidate-{generation}",
+            )
+        )
+        revision = history_store.append_revision(
+            RevisionProposal(
+                scope=scope,
+                candidate_id=candidate.candidate_id,
+                operation=(
+                    RevisionOperation.ADD
+                    if parent_revision_id is None
+                    else RevisionOperation.REFINE
+                ),
+                parent_revision_id=parent_revision_id,
+                idempotency_key=f"deep-revision-{generation}",
+            )
+        )
+        parent_revision_id = revision.revision_id
+
+    assert parent_revision_id is not None
+    release = release_store.append_release(
+        ReleaseManifest(scope=scope, revision_ids=(parent_revision_id,)),
+        idempotency_key="deep-release",
+    )
+    runtime = InMemoryMemoryRuntimeStore(
+        history_store,
+        release_store,
+        retrievers=(_ReleaseOrderRetriever(),),
+    )
+
+    attempt = runtime.begin_query(_spec(scope, release.release_id))
+
+    assert attempt.release_revisions[0].revision_id == parent_revision_id
