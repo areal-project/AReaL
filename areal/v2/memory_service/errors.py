@@ -75,3 +75,27 @@ class MemoryExposureConflictError(MemoryServiceError):
 
 class MemoryBoundaryMismatchError(MemoryServiceError):
     """Raised when submitted consumer bytes do not match a pending delivery."""
+
+
+class MemoryReleaseAttestationNotFoundError(MemoryServiceError):
+    """Raised when a trusted release attestation cannot be resolved."""
+
+
+class MemoryReleaseAttestationConflictError(MemoryServiceError):
+    """Raised when release attestation admission fails or conflicts."""
+
+
+class MemoryReleaseRevocationNotFoundError(MemoryServiceError):
+    """Raised when a release-attestation revocation cannot be resolved."""
+
+
+class MemoryReleaseRevocationConflictError(MemoryServiceError):
+    """Raised when release-attestation revocation fails or conflicts."""
+
+
+class MemoryReleaseAssignmentNotFoundError(MemoryServiceError):
+    """Raised when a rollout-group release assignment cannot be resolved."""
+
+
+class MemoryReleaseAssignmentConflictError(MemoryServiceError):
+    """Raised when rollout-group release assignment fails or conflicts."""
