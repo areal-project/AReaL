@@ -204,6 +204,10 @@ class _RuntimeStore:
         self.block_submit = False
         self.invalid_consumer_result = False
         self.incomplete_exposure_result = False
+        self.fail_prepare_once = False
+        self.fail_after_consumer_once = False
+        self.prepare_error = TimeoutError("injected pre-consumer timeout")
+        self.consumer_error = TimeoutError("response lost after consumer side effect")
 
     def begin_query(self, spec):
         self.calls.append(_RuntimeCall("begin", get_ident(), spec))
@@ -229,6 +233,9 @@ class _RuntimeStore:
     ):
         del scope, renderer_id, renderer_version_sha256
         self.calls.append(_RuntimeCall("render", get_ident(), query_result_id))
+        if self.fail_prepare_once:
+            self.fail_prepare_once = False
+            raise self.prepare_error
         delivery_id = f"delivery-{query_result_id}"
         self.spec_by_delivery_id[delivery_id] = self.spec_by_result_id[query_result_id]
         return SimpleNamespace(delivery_id=delivery_id)
@@ -251,6 +258,9 @@ class _RuntimeStore:
         self.submit_started.set()
         if self.block_submit:
             assert self.submit_release.wait(timeout=5)
+        if self.fail_after_consumer_once:
+            self.fail_after_consumer_once = False
+            raise self.consumer_error
         if self.invalid_consumer_result:
             return "raw-forwarded-without-consumer-receipt", object()
 
@@ -289,8 +299,8 @@ def _async_test(function):
     """Keep these asyncio tests runnable in the minimal Memory test environment."""
 
     @wraps(function)
-    def run():
-        return asyncio.run(function())
+    def run(*args, **kwargs):
+        return asyncio.run(function(*args, **kwargs))
 
     return run
 
@@ -430,7 +440,11 @@ async def test_close_session_allows_new_incarnation_and_invalidates_old_turn() -
     try:
         await coordinator.pin_session("session-1", _pin(assignment))
         old_turn = await coordinator.start_turn("session-1", "run-1")
+        assert not hasattr(coordinator, "_trajectory_ids")
         await coordinator.close_session("session-1")
+        assert not coordinator._turns
+        assert not coordinator._operations
+        assert not hasattr(coordinator, "_trajectory_ids")
 
         await coordinator.pin_session("session-1", _pin(replacement))
         new_turn = await coordinator.start_turn("session-1", "run-1")
@@ -521,6 +535,94 @@ async def test_cancelled_caller_retry_reuses_task_and_consumer_call_id() -> None
 
 
 @_async_test
+async def test_pre_consumer_failure_retries_same_spec_and_call_id(caplog) -> None:
+    assignment = _assignment()
+    runtime = _RuntimeStore()
+    runtime.fail_prepare_once = True
+    coordinator = AsyncMemoryAgentCoordinator(_ControlStore(assignment), runtime)
+    try:
+        await coordinator.pin_session("session-1", _pin(assignment))
+        turn = await coordinator.start_turn("session-1", "run-retry")
+        with caplog.at_level(
+            "ERROR",
+            logger="areal.v2.agent_service.memory",
+        ):
+            with pytest.raises(TimeoutError) as first:
+                await coordinator.expose_memory(
+                    turn,
+                    "query-retry",
+                    query=b"safe before consumer",
+                )
+            await asyncio.sleep(0)
+            operation = coordinator._operations[
+                ("session-1", "run-retry", "query-retry")
+            ]
+            original_spec = operation.spec
+            original_call_id = operation.call_id
+            assert not operation.consumer_boundary_started
+
+            exposure, _ = await coordinator.expose_memory(
+                turn,
+                "query-retry",
+                query=b"safe before consumer",
+            )
+
+        assert first.value is runtime.prepare_error
+        assert exposure.trajectory_id == turn.memory_trajectory_id
+        assert operation.spec is original_spec
+        assert operation.call_id == original_call_id
+        assert len(runtime.specs) == 2
+        assert runtime.specs[0] is runtime.specs[1]
+        assert runtime.call_ids == [original_call_id]
+        assert runtime.consumer_side_effects == 1
+        matching = [
+            record
+            for record in caplog.records
+            if "background task" in record.getMessage()
+        ]
+        assert matching
+        assert matching[0].exc_info is not None
+        assert matching[0].exc_info[1] is runtime.prepare_error
+    finally:
+        await coordinator.aclose()
+
+
+@_async_test
+async def test_consumer_side_effect_failure_is_cached_without_replay() -> None:
+    assignment = _assignment()
+    runtime = _RuntimeStore()
+    runtime.fail_after_consumer_once = True
+    coordinator = AsyncMemoryAgentCoordinator(_ControlStore(assignment), runtime)
+    try:
+        await coordinator.pin_session("session-1", _pin(assignment))
+        turn = await coordinator.start_turn("session-1", "run-uncertain")
+        with pytest.raises(TimeoutError) as first:
+            await coordinator.expose_memory(
+                turn,
+                "consumer-call",
+                query=b"uncertain consumer outcome",
+            )
+        with pytest.raises(TimeoutError) as retry:
+            await coordinator.expose_memory(
+                turn,
+                "consumer-call",
+                query=b"uncertain consumer outcome",
+            )
+
+        operation = coordinator._operations[
+            ("session-1", "run-uncertain", "consumer-call")
+        ]
+        assert operation.consumer_boundary_started
+        assert first.value is runtime.consumer_error
+        assert retry.value is runtime.consumer_error
+        assert runtime.consumer_side_effects == 1
+        assert len(runtime.call_ids) == 1
+        assert len(runtime.specs) == 1
+    finally:
+        await coordinator.aclose()
+
+
+@_async_test
 async def test_operation_retry_conflict_and_forged_turn_fail_before_runtime() -> None:
     assignment = _assignment()
     runtime = _RuntimeStore()
@@ -578,11 +680,22 @@ async def test_incomplete_exact_type_exposure_fails_canonical_validation() -> No
         with pytest.raises(
             MemoryAgentTurnConflictError,
             match="canonical integrity validation",
-        ):
+        ) as first:
             await coordinator.expose_memory(
                 turn,
                 "forged-exposure",
                 query=b"an exact Python type is not an integrity proof",
             )
+        with pytest.raises(
+            MemoryAgentTurnConflictError,
+            match="canonical integrity validation",
+        ) as retry:
+            await coordinator.expose_memory(
+                turn,
+                "forged-exposure",
+                query=b"an exact Python type is not an integrity proof",
+            )
+        assert retry.value is first.value
+        assert runtime.consumer_side_effects == 1
     finally:
         await coordinator.aclose()

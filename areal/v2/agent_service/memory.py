@@ -23,6 +23,7 @@ that a later integration can instantiate with deployment-selected stores.
 from __future__ import annotations
 
 import asyncio
+import logging
 import secrets
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -43,6 +44,8 @@ from areal.v2.memory_service.types import MemoryScope
 
 _T = TypeVar("_T")
 _SHA256_HEX_LENGTH = 64
+
+logger = logging.getLogger(__name__)
 
 
 class MemoryAgentCoordinatorError(MemoryServiceError):
@@ -193,6 +196,7 @@ class _ExposureOperation:
     spec: MemoryQuerySpecV1
     call_id: str
     task: asyncio.Task[tuple[MemoryExposureV1, object]] | None = None
+    consumer_boundary_started: bool = False
 
 
 class AsyncMemoryAgentCoordinator:
@@ -264,7 +268,6 @@ class AsyncMemoryAgentCoordinator:
             tuple[str, str, str],
             _ExposureOperation,
         ] = {}
-        self._trajectory_ids: set[str] = set()
         self._submitted: set[Future[object]] = set()
         self._active_sync_calls = 0
         self._background_tasks: set[asyncio.Task[object]] = set()
@@ -343,7 +346,13 @@ class AsyncMemoryAgentCoordinator:
     def _background_task_done(self, task: asyncio.Task[object]) -> None:
         self._background_tasks.discard(task)
         if not task.cancelled():
-            task.exception()
+            error = task.exception()
+            if error is not None:
+                logger.error(
+                    "Memory Agent background task %s failed",
+                    task.get_name(),
+                    exc_info=(type(error), error, error.__traceback__),
+                )
 
     @staticmethod
     def _matches_pin(
@@ -435,12 +444,7 @@ class AsyncMemoryAgentCoordinator:
     ) -> str:
         while True:
             value = f"mtraj_{secrets.token_hex(32)}"
-            if (
-                value not in self._trajectory_ids
-                and value != session_key
-                and value != turn_idempotency_key
-            ):
-                self._trajectory_ids.add(value)
+            if value != session_key and value != turn_idempotency_key:
                 return value
 
     async def start_turn(
@@ -545,6 +549,10 @@ class AsyncMemoryAgentCoordinator:
             renderer_version_sha256=assignment.renderer_version_sha256,
             _allow_during_close=True,
         )
+        # From this point onward a raised exception cannot prove whether the
+        # configured consumer performed a side effect.  Keep the same failed
+        # task cached rather than automatically replaying the boundary.
+        operation.consumer_boundary_started = True
         submitted = await self._call_sync(
             self._runtime_store.submit_delivery,
             operation.spec.scope,
@@ -667,6 +675,25 @@ class AsyncMemoryAgentCoordinator:
             task = operation.task
             if task is None:  # pragma: no cover - construction is atomic above
                 raise MemoryAgentTurnConflictError("exposure operation is incomplete")
+            if task.done() and not task.cancelled():
+                error = task.exception()
+                if (
+                    error is not None
+                    and isinstance(error, Exception)
+                    and not operation.consumer_boundary_started
+                ):
+                    # Query/render failures are safe to retry because the
+                    # consumer boundary was never entered.  Reuse the exact
+                    # immutable spec, runtime idempotency key, and call ID.
+                    task = asyncio.create_task(
+                        self._execute_exposure(session.assignment, operation),
+                        name=(
+                            "areal-memory-exposure:"
+                            f"{turn.memory_trajectory_id}:{operation_key}:retry"
+                        ),
+                    )
+                    operation.task = task
+                    self._track_background_task(task)
 
         # Caller cancellation must not cancel the consumer operation.  A retry
         # finds and awaits this exact task, preserving the generated call_id.
