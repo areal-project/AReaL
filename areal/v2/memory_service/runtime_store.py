@@ -42,7 +42,7 @@ from areal.v2.memory_service.history_types import (
     RevisionOperation,
 )
 from areal.v2.memory_service.release_store import MemoryReleaseStore
-from areal.v2.memory_service.release_types import MemoryRelease
+from areal.v2.memory_service.release_types import MemoryRelease, ReleaseManifest
 from areal.v2.memory_service.runtime_types import (
     MemoryConsumerAckV1,
     MemoryConsumerKind,
@@ -620,10 +620,16 @@ class InMemoryMemoryRuntimeStore:
         scope: MemoryScope,
         release_id: str,
     ) -> tuple[MemoryRelease, tuple[MemoryRevision, ...]]:
-        release = self._release_store.get_release(scope, release_id)
-        revisions = self._release_store.get_release_revisions(scope, release_id)
+        try:
+            release = self._release_store.get_release(scope, release_id)
+            revisions = self._release_store.get_release_revisions(scope, release_id)
+        except Exception as error:
+            raise MemoryQueryConflictError(
+                "release store failed to resolve the committed source graph"
+            ) from error
         if (
             type(release) is not MemoryRelease
+            or type(release.manifest) is not ReleaseManifest
             or type(revisions) is not tuple
             or any(type(item) is not MemoryRevision for item in revisions)
             or release.manifest.scope != scope
@@ -634,7 +640,13 @@ class InMemoryMemoryRuntimeStore:
             raise MemoryQueryConflictError(
                 "release store returned a non-canonical scoped release graph"
             )
-        expected_release_hash = sha256(release.manifest.canonical_bytes()).hexdigest()
+        try:
+            _digest(release.release_graph_sha256, "release_graph_sha256")
+            expected_release_hash = sha256(release.commitment_bytes()).hexdigest()
+        except (TypeError, ValueError) as error:
+            raise MemoryQueryConflictError(
+                "release store returned a release with invalid commitments"
+            ) from error
         if (
             release.content_hash != expected_release_hash
             or release.release_id != f"rel_{expected_release_hash[:24]}"
@@ -650,7 +662,7 @@ class InMemoryMemoryRuntimeStore:
                 visiting=set(),
                 validated=validated,
             )
-        repeated_release_hash = sha256(release.manifest.canonical_bytes()).hexdigest()
+        repeated_release_hash = sha256(release.commitment_bytes()).hexdigest()
         if (
             repeated_release_hash != expected_release_hash
             or release.content_hash != expected_release_hash
@@ -978,7 +990,7 @@ class InMemoryMemoryRuntimeStore:
             self._query_item(scope, revision, position)
             for position, revision in enumerate(revisions)
         )
-        repeated_release_hash = sha256(release.manifest.canonical_bytes()).hexdigest()
+        repeated_release_hash = sha256(release.commitment_bytes()).hexdigest()
         if (
             repeated_release_hash != release.content_hash
             or release.release_id != attempt.spec.release_id

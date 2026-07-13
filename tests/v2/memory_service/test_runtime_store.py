@@ -43,11 +43,11 @@ _HASH_B = hashlib.sha256(b"retrieval-policy-v1").hexdigest()
 _HASH_C = hashlib.sha256(b"renderer-v1").hexdigest()
 _HASH_D = hashlib.sha256(b"consumer-v1").hexdigest()
 _GOLDEN_RUNTIME_HASHES = (
-    "655c761ad2b8b25b69399fac36e643709c5b0f14bb6763b0c43fa2e1fa6ec7d8",
-    "2649387cd718f165ef2b04cfcbce4f11fbcfbc04126b2ac6ec504e9bc88f5e29",
-    "99f3b76252847056c531689fe68061da80e9711feea96407ff0cb8515ad1cc4a",
-    "565ba294bf5103b3cae1a9e7634bb12d947793b5d8c3c4dda3ef68499563f432",
-    "bd8b2dded955b21c9712f6522a0c2c4551169f7ceaa2d50b5c9fb72961fa2b51",
+    "b97ab95704e8d7c2af7a2d3b429ea1c7557d70c792aece1410e60dba3ec10d1e",
+    "b6c63a6ead1cb751414b301e0c4879549fed3225d1775a0113c702c957458cce",
+    "03b099ff17689ae5b3742893cead3cfb9ffa960458f38f2bc51eb99fdda71357",
+    "c0fa033b21f0f9bf1b730ab676a1b0e806a509118c1901ec9dab3380fe253238",
+    "10b0d471914af9d901615ded59402696fada7b7e1680490b83629469fd347b11",
 )
 
 
