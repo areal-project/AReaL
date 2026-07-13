@@ -16,6 +16,15 @@ Submodules
 - ``protocol`` — WebSocket frame types and helpers
 """
 
+from .memory import (
+    AsyncMemoryAgentCoordinator,
+    MemoryAgentCoordinatorClosedError,
+    MemoryAgentCoordinatorError,
+    MemoryAgentSessionConflictError,
+    MemoryAgentSessionPinV1,
+    MemoryAgentTurnConflictError,
+    MemoryAgentTurnV1,
+)
 from .types import (
     AgentRequest,
     AgentResponse,
@@ -27,5 +36,12 @@ __all__ = [
     "AgentRequest",
     "AgentResponse",
     "AgentRunnable",
+    "AsyncMemoryAgentCoordinator",
     "EventEmitter",
+    "MemoryAgentCoordinatorClosedError",
+    "MemoryAgentCoordinatorError",
+    "MemoryAgentSessionConflictError",
+    "MemoryAgentSessionPinV1",
+    "MemoryAgentTurnConflictError",
+    "MemoryAgentTurnV1",
 ]
