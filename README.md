@@ -211,7 +211,7 @@ For comprehensive setup instructions, see
 ### 🧠 Algorithms
 
 All RL algorithms support both asynchronous and synchronous versions by setting
-`max_head_offpolicyness=0`. See [Asynchronous RL Guide](docs/algorithms/async.md).
+`max_head_offpolicyness=0`. See [Asynchronous RL Guide](docs/en/algorithms/async.md).
 
 | Algorithm                | Documentation                                 | Paper                                          | Configuration                                                     |
 | ------------------------ | --------------------------------------------- | ---------------------------------------------- | ----------------------------------------------------------------- |
