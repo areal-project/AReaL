@@ -56,7 +56,10 @@ masking. Configured via `rejection_sampling.metric=binary_kl`. Also adding an
 Check out [gsm8k_kpop.yaml](examples/math/gsm8k_kpop.yaml) and
 [gsm8k_icepop.yaml](examples/math/gsm8k_icepop.yaml) to get started!
 
-**\[2026/04/23\]** 🚀 We’re excited to release our integration with
+<details>
+<summary><b>[2026/04/23]</b> 🚀 Scaffoldings integration for agentic RL training</summary>
+
+We’re excited to release our integration with
 [Scaffoldings](https://github.com/NVIDIA/TensorRT-LLM/tree/main/tensorrt_llm/scaffolding)
 for agentic RL training - now live in our
 [examples](https://github.com/areal-project/AReaL/tree/main/examples/scaffolding)! Huge
@@ -65,6 +68,8 @@ the Scaffoldings enables it to achieve a thorough decoupling of agent execution,
 calculation, and trajectory acquisition. This enables developers to reuse existing
 modules when implementing an agentic RL method, allowing them to focus on their own
 innovative modules.
+
+</details>
 
 **\[2026/04/18\]** We are thrilled to announce that **AReaL's first Community Biweekly
 Meeting** was successfully held! Thank you to everyone who joined us. Meeting materials
@@ -184,6 +189,8 @@ For comprehensive setup instructions, see
 | Task                                                     | Description                                                            | Performance                                                                  |
 | -------------------------------------------------------- | ---------------------------------------------------------------------- | ---------------------------------------------------------------------------- |
 | **[General Agent](examples/agent_workflow/)**            | General agentic training with any agentic frameworks                   | [Guide](docs/tutorial/agentic_rl.md)                                         |
+| **[Hermes Online RL (v2.0)](examples/hermes/)**          | End-to-end Online RL loop with Hermes agent under AReaL 2.0            | [Guide](examples/hermes/README.md)                                     |
+| **[SWE Agent RL (v2.0)](examples/swe/)**                 | End-to-end coding-agent RL training with AReaL-SWEAgent                | [Guide](examples/swe/README.md)                                              |
 | **[Tau2 Customer Service](examples/tau2/)**              | Customer service agent on Tau2-Bench (retail, airline, telecom)        | [Paper](https://arxiv.org/abs/2601.22607)                                    |
 | **[Search Agent](examples/search_agent/)**               | End-to-end search agent with Tongyi-DeepResearch workflow              | [Training Curve](examples/search_agent/tongyi_deepresearch/reward_curve.png) |
 | **[Tool-Integrated Reasoning](examples/tir/)**           | Multi-turn tool calling during reasoning (Python executor, calculator) | [Training Curve](examples/tir/figures/task_reward.png)                       |
@@ -236,8 +243,8 @@ All RL algorithms support both asynchronous and synchronous versions by setting
 | -------------------------- | -------- | ------------ | -------------- | -------------------------------------------------------- |
 | **Qwen2/3**                | ✅       | ✅           | ✅             | -                                                        |
 | **Qwen3-MoE**              | ✅       | ✅           | ✅             | -                                                        |
-| **Qwen2.5-VL**             | ❌       | ✅           | ❌             | Vision-language model                                    |
-| **Qwen3-VL**               | ❌       | ✅           | ❌             | Vision-language model                                    |
+| **Qwen2.5-VL**             | ✅       | ✅           | ❌             | Vision-language model                                    |
+| **Qwen3-VL**               | ✅       | ✅           | ❌             | Vision-language model                                    |
 | **Gemma 3**                | ❌       | ✅           | ❌             | Vision-language model                                    |
 | **Other Hugging Face LLM** | ❌       | ✅           | ❌             | Compatibility depending on the version of `transformers` |
 
@@ -265,6 +272,7 @@ Check the [AI Coding Assistant Guide](docs/reference/ai_assisted_dev.md) and
 
 - [Installation](docs/en/tutorial/installation.md)
 - [Quickstart](docs/en/tutorial/quickstart.md)
+- [CLI Configurations](docs/en/cli_reference.md)
 - [Agentic RL](docs/en/tutorial/agentic_rl.md)
 - [Evaluation](docs/en/tutorial/eval.md)
 - [Large MoE with Megatron](docs/en/tutorial/megatron.md)
@@ -342,6 +350,7 @@ git push
 ## 🗺️ Future Roadmap
 
 - **[Full Roadmap](ROADMAP.md)**
+- **[2026 H2 Roadmap](https://github.com/areal-project/AReaL/issues/1381)**
 - **[2026 Q1 Roadmap](https://github.com/areal-project/AReaL/issues/907)**
 
 AReaL is under active development with planned minor releases weekly and major releases
