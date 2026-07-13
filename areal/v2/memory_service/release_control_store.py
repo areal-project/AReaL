@@ -300,6 +300,11 @@ class InMemoryMemoryReleaseControlStore:
         ``clock`` must be a pure, non-blocking trusted callable and must not
         read or mutate any control store because it is sampled under this
         store's lock at commit and active-resolution boundaries.
+
+        ``release_store`` must preserve immutable content-addressed records.
+        Repeated graph reads fail closed when they observe a broken contract,
+        but they are not an atomic transaction across a mutable remote backend;
+        such a backend needs its own snapshot or compare-and-set mechanism.
         """
 
         if not callable(clock):
@@ -933,6 +938,9 @@ class InMemoryMemoryReleaseControlStore:
                 conflict_type=MemoryReleaseAttestationConflictError,
                 label="attestor",
             )
+            # This third read is intentional. Component declaration validation
+            # executes deployment-supplied descriptors outside the control lock;
+            # fail closed if graph drift is observed across that final check.
             final_graph = self._load_release_graph(
                 scope,
                 release_id,
@@ -1534,6 +1542,9 @@ class InMemoryMemoryReleaseControlStore:
                 conflict_type=MemoryReleaseAssignmentConflictError,
                 label="assignment policy",
             )
+            # This third read is intentional. Component declaration validation
+            # executes deployment-supplied descriptors outside the control lock;
+            # fail closed if graph drift is observed across that final check.
             final_graph = self._load_release_graph(
                 scope,
                 attestation.release_id,
