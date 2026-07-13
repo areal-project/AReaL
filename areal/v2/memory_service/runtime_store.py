@@ -271,9 +271,15 @@ class MemoryRuntimeConsumer(Protocol):
 
 
 class MemoryRuntimeStore(Protocol):
-    """Backend-neutral phase API for queries and actual exposure."""
+    """Backend-neutral phase and audit-read API for actual exposure."""
 
     def begin_query(self, spec: MemoryQuerySpecV1) -> MemoryQueryAttemptV1: ...
+
+    def get_query_attempt(
+        self,
+        scope: MemoryScope,
+        attempt_id: str,
+    ) -> MemoryQueryAttemptV1: ...
 
     def resolve_query(
         self,
@@ -283,6 +289,12 @@ class MemoryRuntimeStore(Protocol):
         query: bytes,
     ) -> MemoryQueryResultV1: ...
 
+    def get_query_result(
+        self,
+        scope: MemoryScope,
+        query_result_id: str,
+    ) -> MemoryQueryResultV1: ...
+
     def prepare_delivery(
         self,
         scope: MemoryScope,
@@ -290,6 +302,12 @@ class MemoryRuntimeStore(Protocol):
         *,
         renderer_id: str,
         renderer_version_sha256: str,
+    ) -> MemoryDeliveryV1: ...
+
+    def get_delivery(
+        self,
+        scope: MemoryScope,
+        delivery_id: str,
     ) -> MemoryDeliveryV1: ...
 
     def submit_delivery(
@@ -303,6 +321,20 @@ class MemoryRuntimeStore(Protocol):
         query: bytes,
         history: tuple[bytes, ...],
     ) -> tuple[MemoryExposureV1, object]: ...
+
+    def get_consumer_ack(
+        self,
+        scope: MemoryScope,
+        consumer_ack_id: str,
+    ) -> MemoryConsumerAckV1: ...
+
+    def get_exposure(
+        self,
+        scope: MemoryScope,
+        exposure_id: str,
+    ) -> MemoryExposureV1: ...
+
+    def list_exposures(self, scope: MemoryScope) -> tuple[MemoryExposureV1, ...]: ...
 
 
 class InMemoryMemoryRuntimeStore:
@@ -360,7 +392,9 @@ class InMemoryMemoryRuntimeStore:
             if not callable(getattr(renderer, "render", None)):
                 raise TypeError("registered renderer must define render")
             self._renderer_by_version[key] = renderer
-        self._consumer_by_version: dict[tuple[str, str], MemoryRuntimeConsumer] = {}
+        self._consumer_by_version: dict[
+            tuple[str, str], tuple[MemoryRuntimeConsumer, MemoryConsumerKind]
+        ] = {}
         for consumer in tuple.__iter__(consumers):
             consumer_id = _string(
                 getattr(consumer, "consumer_id", None),
@@ -370,7 +404,8 @@ class InMemoryMemoryRuntimeStore:
                 getattr(consumer, "consumer_version_sha256", None),
                 "consumer_version_sha256",
             )
-            if type(getattr(consumer, "consumer_kind", None)) is not MemoryConsumerKind:
+            consumer_kind = getattr(consumer, "consumer_kind", None)
+            if type(consumer_kind) is not MemoryConsumerKind:
                 raise TypeError(
                     "registered consumer must define an exact MemoryConsumerKind"
                 )
@@ -379,7 +414,7 @@ class InMemoryMemoryRuntimeStore:
                 raise ValueError("consumer registry must not contain duplicates")
             if not callable(getattr(consumer, "submit", None)):
                 raise TypeError("registered consumer must define submit")
-            self._consumer_by_version[key] = consumer
+            self._consumer_by_version[key] = (consumer, consumer_kind)
         self._attempt_by_address: dict[
             tuple[MemoryScope, str], MemoryQueryAttemptV1
         ] = {}
@@ -1666,11 +1701,14 @@ class InMemoryMemoryRuntimeStore:
             type(item) is not bytes for item in tuple.__iter__(history)
         ):
             raise TypeError("history must be a tuple of bytes")
-        consumer = self._consumer_by_version.get((consumer_id, consumer_version_sha256))
-        if consumer is None:
+        registered_consumer = self._consumer_by_version.get(
+            (consumer_id, consumer_version_sha256)
+        )
+        if registered_consumer is None:
             raise MemoryConsumerAckConflictError(
                 "requested consumer ID and version are not registered"
             )
+        consumer, registered_consumer_kind = registered_consumer
         try:
             registered_id = _string(
                 getattr(consumer, "consumer_id", None),
@@ -1689,6 +1727,7 @@ class InMemoryMemoryRuntimeStore:
             (registered_id, registered_version)
             != (consumer_id, consumer_version_sha256)
             or type(consumer_kind) is not MemoryConsumerKind
+            or consumer_kind is not registered_consumer_kind
             or not callable(getattr(consumer, "submit", None))
         ):
             raise MemoryConsumerAckConflictError("registered consumer identity changed")

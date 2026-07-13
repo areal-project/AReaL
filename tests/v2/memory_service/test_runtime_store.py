@@ -1423,6 +1423,28 @@ def test_registered_component_identity_is_revalidated_before_each_call() -> None
         )
     assert consumer.calls == 0
 
+    consumer = _ContextConsumer()
+    scope, _history, _releases, release, store = _graph(consumers=(consumer,))
+    _attempt, result = _query_all(
+        store,
+        scope,
+        release,
+        _spec(scope, release.release_id),
+    )
+    _context, delivery = _deliver(store, scope, result)
+    consumer.consumer_kind = MemoryConsumerKind.MODEL_CALL
+    with pytest.raises(MemoryConsumerAckConflictError, match="identity changed"):
+        store.submit_delivery(
+            scope,
+            delivery.delivery_id,
+            consumer_id="test-context-boundary",
+            consumer_version_sha256=_HASH_D,
+            call_id="must-not-run",
+            query=b"query-a",
+            history=(),
+        )
+    assert consumer.calls == 0
+
 
 def test_concurrent_exact_retries_converge_at_every_stage() -> None:
     retriever = _ReleaseOrderRetriever()
