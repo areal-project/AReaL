@@ -148,7 +148,10 @@ def _is_unique_subset(
     while the release tuple preserves the independent eligibility order.
     """
 
-    return len(set(subset)) == len(subset) and all(item in superset for item in subset)
+    superset_members = set(superset)
+    return len(set(subset)) == len(subset) and all(
+        item in superset_members for item in subset
+    )
 
 
 @dataclass(frozen=True, slots=True)
