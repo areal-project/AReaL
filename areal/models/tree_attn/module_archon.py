@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 """Tree attention module for Archon engine.
 
 This module provides a TreeAttentionWrapper that has the same interface as

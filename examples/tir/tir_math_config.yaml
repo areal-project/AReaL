@@ -1,6 +1,5 @@
 experiment_name: tir-math-reasoning
 trial_name: tir-math-reasoning
-allocation_mode: sglang:d4p1t1+d4p1t1
 cluster:
   fileroot: /tmp/areal/experiments
   n_nodes: 1
@@ -13,7 +12,11 @@ enable_offload: false
 total_train_epochs: 3
 tokenizer_path: ${actor.path}
 
+scheduler:
+  type: local
+
 rollout:
+  backend: "sglang:d4p1t1"
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
   max_concurrent_rollouts: 128
@@ -34,6 +37,7 @@ gconfig:
   temperature: 1.0
 
 actor:
+  backend: "fsdp:d4p1t1"
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
   path: Qwen/Qwen2.5-Math-1.5B
@@ -61,7 +65,9 @@ actor:
   ppo_n_minibatches: 1
   recompute_logprob: true
   use_decoupled_loss: true
-  behave_imp_weight_cap: 5.0
+  rejection_sampling:
+    metric: ratio
+    upper: 5.0
   reward_norm:
     mean_level: group
     std_level: group
@@ -79,6 +85,7 @@ actor:
       env_vars: {}
 
 ref:
+  backend: ${actor.backend}
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
   path: ${actor.path}

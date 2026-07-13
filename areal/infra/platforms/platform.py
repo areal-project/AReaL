@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 import os
 
 import torch
@@ -101,6 +103,11 @@ class Platform:
     def set_allocator_settings(cls) -> None:
         """Configure memory allocator settings based on the device type."""
         raise NotImplementedError()
+
+    @classmethod
+    def set_numa_affinity(cls, local_rank: int) -> None:
+        """Bind the current process to CPU cores near the assigned device."""
+        return
 
     @classmethod
     def get_custom_env_vars(cls) -> dict:

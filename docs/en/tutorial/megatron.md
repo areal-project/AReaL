@@ -5,13 +5,29 @@ scaling and efficiency. AReaL fully supports customized RL training with Megatro
 the backend. This guide explains how to harness the Megatron training backend and train
 large MoE models for your application.
 
-## Enabling Megatron in `allocation_mode`
+## Enabling Megatron Backend
 
 Shifting from FSDP to Megatron requires only a single line of change: the
-`allocation_mode` field from `sglang:d4+fsdp:d4` to `sglang:d4+megatron:d4`.
+`actor.backend` field from `fsdp:d4` to `megatron:d4`.
 
 For a complete guide on allocation mode syntax, parallelism dimensions, and GPU
 calculations, see the [Allocation Mode Reference](../reference/alloc_mode.md).
+
+## Bridge Backend Selection
+
+`MegatronEngine` supports two bridge backends configured by
+`actor.megatron.bridge_type`:
+
+```yaml
+actor:
+    megatron:
+        bridge_type: mbridge  # default (backward compatible)
+```
+
+Set `bridge_type: megatron-bridge` to use the new backend.
+
+For trade-offs and migration guidance, see the
+[Megatron Bridge Backend Reference](../reference/bridge_backend.md).
 
 ## MoE Parallel Strategy
 
@@ -47,7 +63,8 @@ As an example, you can run GRPO on the Qwen3 30B-A3B MoE model and GSM8K dataset
 # NOTE: Allocation mode here is only for illustration purposes. It is not optimized.
 python3 examples/math/gsm8k_rl.py --config <megatron_config.yaml> \
     scheduler.type=ray \
-    experiment_name=megatron-moe-gsm8k-grpo trial_name=trial-0 allocation_mode=sglang:d4t4+megatron:(attn:d1p4t2c2|ffn:d1p4t1e4) \
+    experiment_name=megatron-moe-gsm8k-grpo trial_name=trial-0 \
+    rollout.backend=sglang:d4t4 actor.backend=megatron:(attn:d1p4t2c2|ffn:d1p4t1e4) \
     cluster.n_nodes=4 cluster.n_gpus_per_node=8 actor.path=Qwen/Qwen3-30B-A3B \
     actor.megatron.use_deterministic_algorithms=True
 ```

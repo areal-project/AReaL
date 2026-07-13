@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 """Proxy gateway server: lightweight, stateless FastAPI gateway.
 
 Routes external user requests (OpenAI/Anthropic SDK) to session-pinned

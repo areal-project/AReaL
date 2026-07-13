@@ -329,6 +329,7 @@ def create_engine_config(
         TrainEngineConfig configured for testing.
     """
     return TrainEngineConfig(
+        backend="fsdp:d1",
         experiment_name=f"test_{engine_type}_grpo",
         trial_name="test",
         path=model_path,

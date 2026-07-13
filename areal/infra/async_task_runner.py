@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 """Generic asynchronous task runner for executing concurrent async Python functions.
 
 This module provides a reusable, thread-based async task executor that can run

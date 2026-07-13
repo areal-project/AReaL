@@ -14,9 +14,11 @@ cluster:
     type: nfs
     nfs_record_root: /tmp/areal/name_resolve
 
-allocation_mode: d8p1t1
+scheduler:
+  type: local
 
 actor:
+  backend: "fsdp:d8p1t1"
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
   path: Qwen/Qwen2.5-7B

@@ -1,0 +1,369 @@
+# vLLM variant of the AReaL project configuration.
+#
+# sglang and vllm pin mutually-incompatible torch / torchao versions,
+# so they live in separate pyproject files to avoid resolution conflicts.
+# The default pyproject.toml uses SGLang; this file uses vLLM.
+#
+# Usage (custom environment):
+#   cp pyproject.vllm.toml pyproject.toml
+#   uv sync --extra cuda
+#
+# Usage (Docker):
+#   docker build --build-arg VARIANT=vllm -t areal-runtime:dev-vllm .
+#
+# Usage (pip-install without replacing pyproject.toml):
+#   uv pip install -r pyproject.vllm.toml --extra cuda
+
+[build-system]
+requires = ["uv_build>=0.9.18,<0.10.0"]
+build-backend = "uv_build"
+
+[project]
+name = "areal"
+description = "AReaL: A Large-Scale Asynchronous Reinforcement Learning System"
+readme = "README.md"
+license = {text = "Apache-2.0"}
+requires-python = ">=3.11,<3.13"
+version = "2.0.0"
+authors = [
+    {name = "AReaL Team"},
+]
+maintainers = [
+    {name = "AReaL Team"},
+]
+keywords = [
+    "distributed-systems",
+    "reinforcement-learning",
+    "large-language-models",
+    "llm-training",
+    "llm-agent",
+    "agentic-rl",
+]
+classifiers = [
+    #   3 - Alpha
+    #   4 - Beta
+    #   5 - Production/Stable
+    "Development Status :: 2 - Pre-Alpha",
+    "Environment :: GPU :: NVIDIA CUDA :: 12",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: System :: Distributed Computing",
+]
+
+dependencies = [
+    # Core ML/AI libraries
+    "torch>=2.10.0,<2.11; sys_platform != 'darwin' or platform_machine != 'x86_64'",
+    "torch<2.9.1; sys_platform == 'darwin' and platform_machine == 'x86_64'",
+    "torchaudio",
+    "torchvision",
+    "torchdata",
+    "torchao==0.16.0",
+    "huggingface_hub",
+    "datasets>=3.0.0",
+    "transformers>=5.0,!=5.1.*,!=5.2.*,!=5.3.*,!=5.4.*,!=5.5.0",
+    "mistral-common>=1.11.1",
+    "peft<=0.18.1",
+    "qwen_agent",
+    "openai-agents",
+    "anthropic",
+    "claude-agent-sdk",
+    "litellm[proxy]>=1.81.3",
+    "openhands",
+    "langchain",
+    "langchain-openai",
+
+    # Visualization
+    "pandas",
+    "matplotlib",
+    "seaborn",
+
+    # Utilities and data processing
+    "pillow>=12.1.1",
+    "pylatexenc",
+    "zstandard",
+    "setproctitle",
+    "nltk",
+    "sentencepiece",
+    "einops",
+    "orjson",
+    "tqdm",
+    "rich",
+    "pydantic",
+    "PyYAML",
+    "omegaconf==2.4.0.dev2",
+    "hydra-core==1.4.0.dev1",
+    "packaging",
+    "lark",
+    "tabulate",
+    "pybase64",
+    "msgspec",
+    "math-verify==0.8.0",
+    "python-dotenv",
+    "json5",
+    "psutil",
+    "nvidia-ml-py; sys_platform == 'linux'",
+    "ninja",
+    "numba",
+    "blosc",
+    "pybind11>=2.10.0",
+    "networkx==3.3",
+    "aiofiles",
+    "aiohttp>=3.13.3,<4",
+    "httpx>=0.28.1",
+    "pyzmq",
+    "regex",
+    "python_dateutil",
+    "word2number",
+    "pebble",
+    "timeout-decorator",
+    "prettytable",
+    "h5py",
+    "mathruler==0.1.0",
+
+    # Monitoring and logging
+    "wandb",
+    "tensorboardx",
+    "trackio",
+    "colorama",
+    "colorlog",
+    "swanboard==0.1.9b1",
+    "swanlab[dashboard]==0.6.12",
+
+    # Distributed computing
+    "ray[default]",
+    "redis",
+    "awex==0.7.0",
+
+    # Web frameworks
+    "fastapi>=0.115.12",
+    "uvicorn",
+    "uvloop>=0.21.0",
+    "flask",
+    "tenacity>=8.2.0",
+
+    # Build and packaging tools
+    "build>=1.2.1",
+    "wheel>=0.43.0",
+    "cookiecutter>2.1.1",
+    "distro-info>=1.0",
+    "python-debian>=0.1.49",
+]
+
+[project.optional-dependencies]
+# CUDA-dependent extras - these packages only have Linux x86_64 wheels
+# Platform markers ensure they're skipped on unsupported platforms
+vllm = [
+    "vllm==0.19.1; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "torch; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "torchaudio; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "torchvision; sys_platform == 'linux' and platform_machine == 'x86_64'",
+]
+tms = [
+    "torch_memory_saver==0.0.9; sys_platform == 'linux'",
+]
+kernels = [
+    "kernels==0.12.2",
+]
+megatron = [
+    "megatron-core==0.17.0; python_version >= '3.12' and sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "mbridge @ git+https://github.com/ISEEKYAN/mbridge.git@310e8fb; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "megatron-bridge==0.4.0; python_version >= '3.12' and sys_platform == 'linux' and platform_machine == 'x86_64'",
+]
+cuda-train = [
+    "areal[tms]",
+    "areal[megatron]",
+    "areal[kernels]",
+    "nvidia-modelopt[hf]; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "tilelang>=0.1.9; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "flash-linear-attention==0.4.2; sys_platform == 'linux' and platform_machine == 'x86_64'",
+]
+# Full CUDA setup: training packages + vLLM inference
+cuda = [
+    "areal[cuda-train]",
+    "areal[vllm]",
+    "torch; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "torchaudio; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "torchvision; sys_platform == 'linux' and platform_machine == 'x86_64'",
+]
+sandbox = [
+    "daytona>=0.167.0",
+]
+cli = [
+    "click>=8.1",
+    "colorlog",
+]
+
+[project.scripts]
+areal = "areal.v2.cli.main:cli"
+
+[project.urls]
+"Homepage" = "https://github.com/areal-project/AReaL"
+"Repository" = "https://github.com/areal-project/AReaL"
+"Documentation" = "https://areal-project.github.io/AReaL/en/intro.html"
+"Bug Tracker" = "https://github.com/areal-project/AReaL/issues"
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "pytest-asyncio",
+    "ipython",
+    "ruff==0.14.9",
+    "clang-format==19.1.7",
+    "sh",
+    "mdformat==0.7.17",
+    "mdformat-gfm",
+    "mdformat-tables",
+    "mdformat-frontmatter",
+    "plotly",
+    "pre-commit",
+    "sphinx",
+    "sphinx-nefertiti",
+    "jupyter-book==1.0.4.post1",
+]
+
+# =============================================================================
+# Tool configurations: uv
+# =============================================================================
+
+[tool.uv.build-backend]
+module-root = ""
+
+[tool.uv]
+environments = [
+    "sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "sys_platform == 'linux' and platform_machine == 'aarch64'",
+    "sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "sys_platform == 'darwin' and platform_machine == 'x86_64'",
+]
+override-dependencies = [
+    "flash-attn-4>=4.0.0b4",
+
+    # Required by megatron-bridge but are optional (as per docs) cuda-based installs
+    "transformer-engine; sys_platform == 'never'",
+    "nv-grouped-gemm; sys_platform == 'never'",
+    "mamba-ssm; sys_platform == 'never'",
+    "causal-conv1d; sys_platform == 'never'",
+    # nvidia-resiliency-ext 0.5.0 only ships manylinux_2_39 wheels; exclude so
+    # older host kernels can still install megatron-core.
+    "nvidia-resiliency-ext; sys_platform == 'never'",
+
+    # Version conflicts with megatron-bridge (resorting to the existing version)
+    "megatron-core==0.17.0; python_version >= '3.12' and sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "hydra-core==1.4.0.dev1",
+    "timm==1.0.16",
+    "transformers>=5.0,!=5.1.*,!=5.2.*,!=5.3.*,!=5.4.*,!=5.5.0",
+]
+
+[[tool.uv.dependency-metadata]]
+name = "megatron-bridge"
+version = "0.4.0"
+requires-dist = [
+    "accelerate",
+    "comet-ml>=3.50.0",
+    "datasets>=2.20.0",
+    "diffusers>=0.36.0",
+    "einops",
+    "hydra-core",
+    "imageio",
+    "imageio-ffmpeg",
+    "megatron-core",
+    "mlflow>=3.9.0",
+    "nvidia-resiliency-ext",
+    "omegaconf>=2.3.0",
+    "open-clip-torch>=3.2.0",
+    "peft>=0.18.0",
+    "pyyaml>=6.0.2",
+    "qwen-vl-utils",
+    "regex>=2024.11.6",
+    "rich",
+    "six>=1.17.0",
+    "tensorboard>=2.19.0",
+    "timm",
+    "torch>=2.6.0",
+    "tqdm>=4.67.1",
+    "transformers>=5.0.0",
+    "typing-extensions",
+    "wandb>=0.25.0",
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu129"
+url = "https://download.pytorch.org/whl/cu129"
+explicit = true
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cu129", extra = "vllm" },
+    { index = "pytorch-cu129", extra = "cuda" },
+]
+torchaudio = [
+    { index = "pytorch-cu129", extra = "vllm" },
+    { index = "pytorch-cu129", extra = "cuda" },
+]
+torchvision = [
+    { index = "pytorch-cu129", extra = "vllm" },
+    { index = "pytorch-cu129", extra = "cuda" },
+]
+
+# =============================================================================
+# Tool configurations: pytest
+# =============================================================================
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+filterwarnings = [
+    "ignore::DeprecationWarning",
+    "ignore::PendingDeprecationWarning",
+    "ignore::FutureWarning",
+    "ignore::UserWarning:torch.*",
+    "ignore::UserWarning:transformers.*",
+]
+markers = [
+    "slow: mark test as slow, expected to cost more than 30 seconds and will not run in CI by default.",
+    "ci: mark test as must-run in CI (only marked for slow tests).",
+    "gpu: mark test that uses a single GPU",
+    "multi_gpu: mark test that uses more than one GPU",
+    "sglang: mark test that requires the SGLang inference backend",
+    "vllm: mark test that requires the vLLM inference backend",
+    "integration: requires external services or credentials",
+]
+
+# =============================================================================
+# Tool configurations: ruff
+# =============================================================================
+
+[tool.ruff]
+line-length = 88
+target-version = "py311"
+
+[tool.ruff.lint]
+select = [
+    "E",  # pycodestyle errors
+    "W",  # pycodestyle warnings
+    "F",  # pyflakes
+    "I",  # isort
+    "UP", # pyupgrade
+]
+ignore = [
+    "E501",  # E501 Line too long
+]
+
+[tool.ruff.lint.isort]
+section-order = [
+    "future",
+    "standard-library",
+    "third-party",
+    "first-party",
+    "areal",
+    "local-folder",
+]
+from-first = false
+
+[tool.ruff.lint.isort.sections]
+"areal" = ["areal"]

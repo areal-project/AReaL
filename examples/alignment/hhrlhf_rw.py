@@ -1,195 +1,31 @@
-import os
 import sys
 
-import torch
-import torch.distributed as dist
-
-from areal import current_platform
-from areal.api import AllocationMode, FinetuneSpec, StepInfo
+from areal import RWTrainer
 from areal.api.cli_args import RWConfig, load_expr_config
 from areal.dataset import get_custom_dataset
-from areal.engine import FSDPRWEngine
-from areal.utils import seeding, stats_tracker
-from areal.utils.data import (
-    broadcast_tensor_container,
-    tensor_container_to,
-)
-from areal.utils.dataloader import create_dataloader
-from areal.utils.evaluator import Evaluator
 from areal.utils.hf_utils import load_hf_tokenizer
-from areal.utils.recover import RecoverHandler
-from areal.utils.saver import Saver
-from areal.utils.stats_logger import StatsLogger
-
-
-def rw_modeling_colate_fn(items):
-    """Collate reward-model items into per-sequence tensor dicts.
-
-    Each dataset item has ``chosen_ids`` and ``rejected_ids``.  This produces
-    two dicts per item (chosen first, then rejected), each with ``[1, seqlen]``
-    tensors and ``attention_mask``.
-    """
-    result = []
-    for item in items:
-        for ids in (item["chosen_ids"], item["rejected_ids"]):
-            if not torch.is_tensor(ids):
-                ids = torch.tensor(ids)
-            seqlen = ids.shape[0]
-            result.append(
-                {
-                    "input_ids": ids.unsqueeze(0),
-                    "attention_mask": torch.ones(1, seqlen, dtype=torch.bool),
-                }
-            )
-    return result
 
 
 def main(args):
     config, _ = load_expr_config(args, RWConfig)
 
-    rank = int(os.getenv("RANK"))
-
-    seeding.set_random_seed(config.seed, f"trainer{rank}")
-    allocation_mode = AllocationMode.from_str(config.allocation_mode)
-    parallel_strategy = allocation_mode.train
-
-    engine = FSDPRWEngine(config=config.actor)
-    engine.create_process_group(parallel_strategy=parallel_strategy)
-
     tokenizer = load_hf_tokenizer(config.tokenizer_path)
 
     train_dataset = get_custom_dataset(
-        split="train", dataset_config=config.train_dataset, tokenizer=tokenizer
+        split="train",
+        dataset_config=config.train_dataset,
+        tokenizer=tokenizer,
     )
     valid_dataset = get_custom_dataset(
-        split="test", dataset_config=config.valid_dataset, tokenizer=tokenizer
-    )
-
-    # Create dataset and dataloaders
-    train_dataloader = create_dataloader(
-        train_dataset,
-        rank=engine.data_parallel_rank,
-        world_size=engine.data_parallel_world_size,
-        dataset_config=config.train_dataset,
-        collate_fn=rw_modeling_colate_fn,
-    )
-    valid_dataloader = create_dataloader(
-        valid_dataset,
-        rank=engine.data_parallel_rank,
-        world_size=engine.data_parallel_world_size,
+        split="test",
         dataset_config=config.valid_dataset,
-        collate_fn=rw_modeling_colate_fn,
+        tokenizer=tokenizer,
     )
 
-    # Initialize engine
-    ft_spec = FinetuneSpec(
-        total_train_epochs=config.total_train_epochs,
-        dataset_size=len(train_dataloader) * config.train_dataset.batch_size,
-        train_batch_size=config.train_dataset.batch_size,
-    )
-    engine.initialize(None, ft_spec)
-
-    # Run training.
-    saver = Saver(config.saver, ft_spec)
-    stats_logger = StatsLogger(config, ft_spec)
-    evaluator = Evaluator(config.evaluator, ft_spec)
-
-    recover_handler = RecoverHandler(config.recover, ft_spec)
-    recover_info = recover_handler.load(
-        engine,
-        saver,
-        evaluator,
-        stats_logger,
-        train_dataloader,
-    )
-    start_step = (
-        recover_info.last_step_info.next().global_step
-        if recover_info is not None
-        else 0
-    )
-
-    total_epochs = config.total_train_epochs
-
-    global_step = 0
-    for epoch in range(total_epochs):
-        for step, data in enumerate(train_dataloader):
-            if global_step < start_step:
-                global_step += 1
-                continue
-            step_info = StepInfo(
-                global_step=global_step,
-                epoch=epoch,
-                epoch_step=step,
-                steps_per_epoch=len(train_dataloader),
-            )
-
-            with stats_tracker.record_timing("to_device"):
-                # NOTE: data are identical across model+context parallel group
-                data = tensor_container_to(data, current_platform.current_device())
-
-            with stats_tracker.record_timing("bcast"):
-                data = broadcast_tensor_container(
-                    data,
-                    src_rank=engine.current_data_parallel_head(),
-                    group=engine.context_and_model_parallel_group,
-                )
-
-            with stats_tracker.record_timing("train_step"):
-                engine.train_rw(data)
-                engine.step_lr_scheduler()
-
-            with stats_tracker.record_timing("save"):
-                saver.save(engine, epoch, step, global_step, tokenizer=tokenizer)
-
-            with stats_tracker.record_timing("checkpoint_for_recover"):
-                recover_handler.dump(
-                    engine,
-                    step_info,
-                    saver,
-                    evaluator,
-                    stats_logger,
-                    train_dataloader,
-                    tokenizer=tokenizer,
-                )
-
-            current_platform.synchronize()
-            dist.barrier(group=engine.cpu_group)
-
-            with stats_tracker.record_timing("eval"):
-                # No need to log anything. Logging will be handled outside
-                # via stats_tracker.export().
-                def evaluate_fn():
-                    for data in valid_dataloader:
-                        data = tensor_container_to(
-                            data, current_platform.current_device()
-                        )
-                        data = broadcast_tensor_container(
-                            data,
-                            src_rank=engine.current_data_parallel_head(),
-                            group=engine.context_and_model_parallel_group,
-                        )
-                        engine.evaluate_rw(data)
-
-                evaluator.evaluate(
-                    evaluate_fn,
-                    epoch,
-                    step,
-                    global_step,
-                )
-
-            current_platform.synchronize()
-            dist.barrier(group=engine.cpu_group)
-
-            stats_logger.commit(
-                epoch,
-                step,
-                global_step,
-                engine.export_stats(),
-            )
-            global_step += 1
-
-    stats_logger.close()
-    engine.destroy()
+    with RWTrainer(
+        config, train_dataset=train_dataset, valid_dataset=valid_dataset
+    ) as trainer:
+        trainer.train()
 
 
 if __name__ == "__main__":

@@ -1,8 +1,8 @@
 import pytest
 import torch
 
+from areal.api.cli_args import RejectionSamplingConfig
 from areal.utils.functional import (
-    compute_behave_imp_weight,
     ppo_actor_loss_fn,
     sapo_loss_fn,
 )
@@ -258,6 +258,43 @@ class TestPPOActorLossFnSequenceLevel:
             stat["importance_weight"][0, 0], stat["importance_weight"][0, 3], atol=1e-5
         )
 
+    def test_sequence_level_2d_advantage_average_ignores_masked_values(self):
+        """Masked padding advantages must not change valid-token sequence loss."""
+        loss_mask = torch.tensor([[True, True, False, False]])
+        logprobs = torch.zeros(1, 4)
+        proximal_logprobs = torch.zeros(1, 4)
+        old_logprobs = torch.zeros(1, 4)
+        clean_advantages = torch.tensor([[1.0, 1.0, 0.0, 0.0]])
+        contaminated_advantages = torch.tensor([[1.0, 1.0, 10.0, 10.0]])
+
+        clean_loss, clean_stat = ppo_actor_loss_fn(
+            logprobs=logprobs,
+            proximal_logprobs=proximal_logprobs,
+            old_logprobs=old_logprobs,
+            advantages=clean_advantages,
+            eps_clip=0.2,
+            loss_mask=loss_mask,
+            importance_sampling_level="sequence",
+        )
+        contaminated_loss, contaminated_stat = ppo_actor_loss_fn(
+            logprobs=logprobs,
+            proximal_logprobs=proximal_logprobs,
+            old_logprobs=old_logprobs,
+            advantages=contaminated_advantages,
+            eps_clip=0.2,
+            loss_mask=loss_mask,
+            importance_sampling_level="sequence",
+        )
+
+        assert torch.allclose(contaminated_loss, clean_loss)
+        assert torch.allclose(
+            contaminated_stat["loss"][loss_mask], clean_stat["loss"][loss_mask]
+        )
+        assert torch.allclose(
+            contaminated_stat["loss"][~loss_mask],
+            torch.zeros_like(contaminated_stat["loss"][~loss_mask]),
+        )
+
     def test_sequence_level_with_mask_1d(self):
         """Test sequence-level with partial masking for 1D tensors (packed sequences)."""
         # Two sequences: [4 tokens, 4 tokens]
@@ -422,8 +459,41 @@ class TestPPOActorLossFnSequenceLevel:
         assert not torch.isnan(loss)
         assert not torch.isinf(loss)
 
-    def test_sequence_level_with_behave_imp_weight_cap(self):
-        """Test sequence-level with behavior importance weight capping."""
+    def test_sequence_level_with_rejection_sampling(self):
+        """Test sequence-level with rejection sampling (replaces behave_imp_weight_cap)."""
+        batch_size = 2
+        seq_len = 4
+
+        logprobs = torch.randn(batch_size, seq_len)
+        proximal_logprobs = torch.randn(batch_size, seq_len)
+        old_logprobs = torch.randn(batch_size, seq_len)
+        advantages = torch.randn(batch_size, seq_len)
+        loss_mask = torch.ones(batch_size, seq_len, dtype=torch.bool)
+
+        rs_config = RejectionSamplingConfig(metric="ratio", upper=10.0)
+        loss, stat = ppo_actor_loss_fn(
+            logprobs=logprobs,
+            proximal_logprobs=proximal_logprobs,
+            old_logprobs=old_logprobs,
+            advantages=advantages,
+            eps_clip=0.2,
+            loss_mask=loss_mask,
+            rejection_sampling=rs_config,
+            importance_sampling_level="sequence",
+        )
+
+        # Should have behavior stats
+        assert "behave_imp_weight" in stat
+        assert "behave_approx_kl" in stat
+        assert "behave_mask" in stat
+        assert "filtered_fraction" in stat
+
+        # Verify loss is finite
+        assert not torch.isnan(loss)
+        assert not torch.isinf(loss)
+
+    def test_no_rejection_sampling_excludes_behave_stats(self):
+        """When rejection_sampling=None, stat should not contain behave keys."""
         batch_size = 2
         seq_len = 4
 
@@ -440,16 +510,22 @@ class TestPPOActorLossFnSequenceLevel:
             advantages=advantages,
             eps_clip=0.2,
             loss_mask=loss_mask,
-            behave_imp_weight_cap=10.0,
+            rejection_sampling=None,
             importance_sampling_level="sequence",
         )
 
-        # Should have behavior stats
-        assert "behave_imp_weight" in stat
-        assert "behave_approx_kl" in stat
-        assert "behave_mask" in stat
+        # Core PPO stats should be present
+        assert "importance_weight" in stat
+        assert "approx_kl" in stat
+        assert "clip_mask" in stat
 
-        # Verify loss is finite
+        # Rejection sampling stats should NOT be present
+        assert "behave_imp_weight" not in stat
+        assert "behave_approx_kl" not in stat
+        assert "behave_mask" not in stat
+        assert "filtered_fraction" not in stat
+
+        # Loss should be finite
         assert not torch.isnan(loss)
         assert not torch.isinf(loss)
 
@@ -1143,96 +1219,3 @@ class TestSAPOLossFn:
         expected_loss = -(gate * advantages[:, :2]).sum() / 2
 
         assert torch.allclose(loss, expected_loss, atol=1e-5)
-
-
-class TestComputeBehaveImpWeight:
-    """Test cases for compute_behave_imp_weight function."""
-
-    @pytest.fixture
-    def basic_2d_data(self):
-        """Basic 2D tensor test data."""
-        batch_size = 4
-        seq_len = 8
-
-        return {
-            "proximal_logprobs": torch.randn(batch_size, seq_len),
-            "old_logprobs": torch.randn(batch_size, seq_len),
-            "loss_mask": torch.ones(batch_size, seq_len, dtype=torch.bool),
-            "cu_seqlens": None,
-        }
-
-    def test_disabled_mode_raises_error(self, basic_2d_data):
-        """Test that disabled mode raises ValueError."""
-        with pytest.raises(
-            ValueError, match="should not be called with mode='disabled'"
-        ):
-            compute_behave_imp_weight(
-                proximal_logprobs=basic_2d_data["proximal_logprobs"],
-                old_logprobs=basic_2d_data["old_logprobs"],
-                loss_mask=basic_2d_data["loss_mask"],
-                cu_seqlens=basic_2d_data["cu_seqlens"],
-                behave_imp_weight_mode="disabled",
-                behave_imp_weight_cap=None,
-            )
-
-    def test_token_mask_mode(self, basic_2d_data):
-        """Test token_mask mode computes correct weights."""
-        behave_imp_weight, behave_approx_kl, behave_mask = compute_behave_imp_weight(
-            proximal_logprobs=basic_2d_data["proximal_logprobs"],
-            old_logprobs=basic_2d_data["old_logprobs"],
-            loss_mask=basic_2d_data["loss_mask"],
-            cu_seqlens=basic_2d_data["cu_seqlens"],
-            behave_imp_weight_mode="token_mask",
-            behave_imp_weight_cap=5.0,
-        )
-
-        assert behave_imp_weight.shape == basic_2d_data["loss_mask"].shape
-        assert behave_approx_kl.shape == basic_2d_data["proximal_logprobs"].shape
-        assert behave_mask.shape == basic_2d_data["loss_mask"].shape
-        assert behave_mask.dtype == torch.bool
-
-    def test_token_truncate_mode(self, basic_2d_data):
-        """Test token_truncate mode clamps weights correctly."""
-        cap = 3.0
-        behave_imp_weight, _, _ = compute_behave_imp_weight(
-            proximal_logprobs=basic_2d_data["proximal_logprobs"],
-            old_logprobs=basic_2d_data["old_logprobs"],
-            loss_mask=basic_2d_data["loss_mask"],
-            cu_seqlens=basic_2d_data["cu_seqlens"],
-            behave_imp_weight_mode="token_truncate",
-            behave_imp_weight_cap=cap,
-        )
-
-        # All weights should be clamped to [0, cap]
-        assert (behave_imp_weight >= 0).all()
-        assert (behave_imp_weight <= cap).all()
-
-    def test_sequence_mask_mode(self, basic_2d_data):
-        """Test sequence_mask mode computes sequence-level weights."""
-        behave_imp_weight, behave_approx_kl, behave_mask = compute_behave_imp_weight(
-            proximal_logprobs=basic_2d_data["proximal_logprobs"],
-            old_logprobs=basic_2d_data["old_logprobs"],
-            loss_mask=basic_2d_data["loss_mask"],
-            cu_seqlens=basic_2d_data["cu_seqlens"],
-            behave_imp_weight_mode="sequence_mask",
-            behave_imp_weight_cap=5.0,
-        )
-
-        assert behave_imp_weight.shape == basic_2d_data["loss_mask"].shape
-        assert behave_approx_kl.shape == basic_2d_data["proximal_logprobs"].shape
-        assert behave_mask.shape == basic_2d_data["loss_mask"].shape
-
-    def test_without_cap(self, basic_2d_data):
-        """Test that mode works without cap (cap=None)."""
-        behave_imp_weight, _, _ = compute_behave_imp_weight(
-            proximal_logprobs=basic_2d_data["proximal_logprobs"],
-            old_logprobs=basic_2d_data["old_logprobs"],
-            loss_mask=basic_2d_data["loss_mask"],
-            cu_seqlens=basic_2d_data["cu_seqlens"],
-            behave_imp_weight_mode="token_mask",
-            behave_imp_weight_cap=None,
-        )
-
-        assert behave_imp_weight.shape == basic_2d_data["loss_mask"].shape
-        assert not torch.isnan(behave_imp_weight).any()
-        assert not torch.isinf(behave_imp_weight).any()

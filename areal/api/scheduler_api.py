@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 import abc
 from dataclasses import dataclass, field
 from typing import Any
@@ -45,6 +47,12 @@ class Scheduler(abc.ABC):
     allocating resources (GPUs, ports, memory), creating and managing engine instances
     on workers, and facilitating RPC calls to engine methods.
     """
+
+    @property
+    @abc.abstractmethod
+    def n_gpus_per_node(self) -> int:
+        """Return the number of GPUs per node configured for this scheduler."""
+        raise NotImplementedError()
 
     @abc.abstractmethod
     def create_workers(self, job: Job, *args, **kwargs) -> list[str]:
@@ -104,13 +112,22 @@ class Scheduler(abc.ABC):
         raise NotImplementedError()
 
     @abc.abstractmethod
-    def delete_workers(self, role: str | None = None):
+    def delete_workers(self, role: str | None = None, reverse_order: bool = False):
         """Stop and clean up worker processes.
 
         Parameters
         ----------
         role : str, optional
             Specific role to delete. If None, all workers are deleted
+        reverse_order : bool, optional
+            If True, terminate workers in reverse order of their IDs so that
+            rank-0 (which typically owns the global TCPStore server) is the
+            last one to be killed. This helps avoid a noisy
+            ``TCPStore.recvValue failed`` warning emitted by NCCL's
+            HeartbeatMonitor background thread on non-zero ranks during
+            teardown. Implementations that tear down all workers as a single
+            atomic operation (e.g. ``scancel`` for Slurm) may safely ignore
+            this argument. Defaults to False for backward compatibility.
 
         Raises
         ------
@@ -226,6 +243,7 @@ class Scheduler(abc.ABC):
         method: str,
         engine_name: str | None = None,
         *args,
+        rpc_meta: dict[str, Any] | None = None,
         **kwargs,
     ) -> Any:
         """Call a method on an engine instance running on a worker (data plane operation).
@@ -243,6 +261,8 @@ class Scheduler(abc.ABC):
             Defaults to worker_id if not specified.
         *args
             Positional arguments to pass to the method
+        rpc_meta : dict[str, Any] | None, optional
+            RPC metadata, by default None
         **kwargs
             Keyword arguments to pass to the method
 
@@ -269,6 +289,7 @@ class Scheduler(abc.ABC):
         method: str,
         engine_name: str | None = None,
         *args,
+        rpc_meta: dict[str, Any] | None = None,
         **kwargs,
     ) -> Any:
         """Async version of call_engine for calling engine methods asynchronously.
@@ -286,6 +307,8 @@ class Scheduler(abc.ABC):
             Defaults to worker_id if not specified.
         *args
             Positional arguments to pass to the method
+        rpc_meta : dict[str, Any] | None, optional
+            RPC metadata, by default None
         **kwargs
             Keyword arguments to pass to the method
 

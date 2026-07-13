@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 import os
 import subprocess
 import sys
@@ -6,11 +8,13 @@ from collections.abc import Callable
 from concurrent.futures import Future
 from typing import Any
 
+import torch
 from torchdata.stateful_dataloader import StatefulDataLoader
 
 from areal.api import (
     InferenceEngine,
     LocalInfServerInfo,
+    ModelAllocation,
     ModelRequest,
     ModelResponse,
     ParamSpec,
@@ -23,12 +27,14 @@ from areal.api.io_struct import (
     HttpGenerationResult,
     HttpRequest,
     WeightUpdateRequests,
+    detect_image_mime,
     get_versioned_lora_name,
 )
 from areal.infra import RemoteInfEngine, RolloutController, WorkflowExecutor
 from areal.infra.platforms import current_platform
 from areal.infra.utils.launcher import TRITON_CACHE_PATH
 from areal.utils import logging, perf_tracer, stats_tracker
+from areal.utils.network import format_host_for_url
 
 logger = logging.getLogger("vLLMEngine")
 
@@ -52,11 +58,14 @@ class VLLMBackend:
             "stop_token_ids": stop_token_ids,
             "ignore_eos": gconfig.ignore_eos,
             "skip_special_tokens": gconfig.skip_special_tokens,
+            "frequency_penalty": gconfig.frequency_penalty,
             "return_tokens_as_token_ids": True,
             "logprobs": 0,
             "use_beam_search": gconfig.use_beam_search,
             "stream": False,
         }
+        if gconfig.stop:
+            payload["stop"] = gconfig.stop
 
         if with_lora:
             lora_name = gconfig.lora_name
@@ -79,8 +88,9 @@ class VLLMBackend:
                                 raise ValueError(
                                     "Not enough images in req.image_data to match image_url entries."
                                 )
+                            mime = detect_image_mime(base64_img)
                             content["image_url"] = {
-                                "url": f"data:image/jpeg;base64,{base64_img}"
+                                "url": f"data:{mime};base64,{base64_img}"
                             }
             payload["messages"] = parsed_input.copy()
             payload["logprobs"] = True
@@ -119,6 +129,46 @@ class VLLMBackend:
             output_logprobs=output_logprobs,
             stop_reason=stop_reason,
         )
+
+    def build_score_request(
+        self, input_ids: list[int], target_len: int, with_lora: bool, version: int
+    ) -> HttpRequest:
+        payload: dict[str, Any] = {
+            "prompt": input_ids,
+            "max_tokens": 1,
+            "temperature": 0.0,
+            "logprobs": 1,
+            "prompt_logprobs": 1,
+            "echo": True,
+        }
+        if with_lora:
+            raise NotImplementedError(
+                "LoRA scoring request is not supported in vLLM teacher compute_logp yet."
+            )
+        return HttpRequest(endpoint="/v1/completions", payload=payload)
+
+    def parse_score_response(
+        self, response: dict[str, Any], target_len: int
+    ) -> list[float]:
+        choices = response.get("choices")
+        if not choices:
+            raise ValueError("vLLM response missing choices for score request")
+        prompt_logprobs = choices[0].get("prompt_logprobs")
+        if prompt_logprobs is None:
+            raise ValueError("vLLM response missing prompt_logprobs for score request")
+        if len(prompt_logprobs) < target_len + 1:
+            raise ValueError(
+                f"prompt_logprobs too short: got {len(prompt_logprobs)}, need {target_len + 1}"
+            )
+        sliced = prompt_logprobs[-target_len:]
+        token_logps: list[float] = []
+        for item in sliced:
+            if not item:
+                token_logps.append(0.0)
+                continue
+            top = next(iter(item.values()))
+            token_logps.append(float(top["logprob"] if isinstance(top, dict) else top))
+        return token_logps
 
     def build_disk_weight_update_requests(
         self, meta: WeightUpdateMeta
@@ -194,15 +244,14 @@ class VLLMBackend:
         self, addr: str, server_idx: int, meta: WeightUpdateMeta
     ) -> HttpRequest:
         """Build vLLM init weights group request."""
-        assert meta.alloc_mode is not None
-        rank_offset = (
-            1 + server_idx * meta.alloc_mode.gen.tp_size * meta.alloc_mode.gen.pp_size
-        )
+        assert meta.gen_allocation is not None
+        gen_parallel = meta.gen_allocation.parallel
+        rank_offset = 1 + server_idx * gen_parallel.tp_size * gen_parallel.pp_size
         payload = {
-            "master_address": meta.nccl_master_address,
+            "master_address": format_host_for_url(meta.nccl_master_address),
             "master_port": str(meta.nccl_master_port),
             "rank_offset": rank_offset,
-            "world_size": meta.alloc_mode.gen.world_size + 1,
+            "world_size": gen_parallel.world_size + 1,
             "backend": current_platform.communication_backend,
             "group_name": meta.nccl_group_name,
         }
@@ -287,6 +336,45 @@ class RemotevLLMEngine(InferenceEngine):
         # Pure composition - create internal engine with vLLM backend
         self._engine = RemoteInfEngine(config, VLLMBackend())
 
+    @classmethod
+    def from_pretrained(
+        cls,
+        tokenizer_path: str | None = None,
+        dp_size: int = 1,
+        max_concurrent_rollouts: int | None = None,
+        **kwargs,
+    ) -> "RemoteInfEngine":
+        """Create a RemoteInfEngine without kwargs instead of InferenceEngineConfig.
+
+        Parameters
+        ----------
+        tokenizer_path: str | None = None
+            Path to the tokenizer
+        dp_size : int
+            Data parallelism size
+        max_concurrent_rollouts : int | None
+            Maximum concurrent rollouts
+        **kwargs : dict
+            Additional config parameters passed to InferenceEngineConfig
+
+        Returns
+        -------
+        RemoteInfEngine
+        """
+
+        backend_str = f"vllm:d{dp_size}"
+
+        config = InferenceEngineConfig(
+            backend=backend_str,
+            max_concurrent_rollouts=max_concurrent_rollouts,
+            tokenizer_path=tokenizer_path,
+            **kwargs,
+        )
+
+        engine = cls(config)
+
+        return engine
+
     def initialize(
         self,
         engine_id: str | None = None,
@@ -294,6 +382,10 @@ class RemotevLLMEngine(InferenceEngine):
         train_data_parallel_size: int | None = None,
     ):
         """Initialize the engine by discovering and connecting to servers."""
+        if train_data_parallel_size is None:
+            train_data_parallel_size = ModelAllocation.from_str(
+                self.config.backend, name="rollout"
+            ).parallel.data_parallel_size
         return self._engine.initialize(engine_id, addr, train_data_parallel_size)
 
     def destroy(self):
@@ -417,6 +509,9 @@ class RemotevLLMEngine(InferenceEngine):
             dynamic_bs=dynamic_bs,
         )
 
+    def compute_logp(self, data: list[dict[str, Any]]) -> list[torch.Tensor]:
+        return self._engine.compute_logp(data)
+
     def pause(self):
         return self._engine.pause()
 
@@ -445,13 +540,34 @@ class RemotevLLMEngine(InferenceEngine):
         return stats_tracker.export_all(reduce_group=None)
 
     @classmethod
-    def as_controller(
-        cls, config: InferenceEngineConfig, scheduler: Scheduler
-    ) -> RolloutController:
+    def as_controller(cls, config: InferenceEngineConfig, scheduler: Scheduler):
+        if config._version == "v2":
+            from areal.v2.inference_service.controller.controller import (
+                RolloutControllerV2,
+            )
+
+            return RolloutControllerV2(config=config, scheduler=scheduler)
         return RolloutController(cls, config=config, scheduler=scheduler)
 
-    def clear_batches(self, *args):
-        """Placeholder method of single-controller API."""
+    def clear_batches(self, shard_ids: list[str] | None = None) -> None:
+        """Drain this worker's client-side RTensor fetch buffer.
+
+        Called via RPC by ``TrainController.clear_batches`` at step end so
+        cross-node consumer DP heads release cached tensors. See #1209.
+        Non-DP-head ranks receive no positional args via
+        ``_call_workers`` (see train_controller.py:575-577) — accept the
+        no-args call and noop, since their ``_fetch_buffer`` is empty.
+        """
+        from areal.infra.rpc.rtensor import clear_fetch_buffer
+
+        if shard_ids:
+            clear_fetch_buffer(shard_ids)
+
+    def fetch_buffer_stats(self) -> dict[str, int]:
+        """Expose local fetch-buffer stats for post-step drain verification."""
+        from areal.infra.rpc.rtensor import fetch_buffer_stats
+
+        return fetch_buffer_stats()
 
     def save_perf_tracer(self, step: int | None = None, force: bool = False) -> None:
         perf_tracer.save(step=step, force=force)

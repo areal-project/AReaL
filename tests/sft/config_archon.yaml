@@ -4,7 +4,6 @@ cluster:
   n_nodes: 1
   n_gpus_per_node: 1
   fileroot: /tmp/areal/experiments
-allocation_mode: archon:d1
 scheduler:
   type: local
 seed: 1
@@ -33,6 +32,7 @@ recover:
   fileroot: ${cluster.fileroot}
 
 actor:
+  backend: "archon:d1"
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
   path: Qwen/Qwen3-0.6B

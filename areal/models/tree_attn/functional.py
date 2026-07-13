@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 """Logprob and entropy computation utilities for packed tree structures.
 
 This module provides functions to compute log probabilities and entropy

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 import copy
 import os
 import subprocess
@@ -11,7 +13,7 @@ import torch.distributed as dist
 from PIL.Image import Image as ImageObject
 from transformers import PreTrainedTokenizerFast
 
-from areal.api.alloc_mode import AllocationMode
+from areal.api.alloc_mode import ModelAllocation
 from areal.api.cli_args import GenerationHyperparameters
 from areal.infra.platforms import current_platform
 from areal.utils import logging
@@ -161,11 +163,27 @@ def get_versioned_lora_name(lora_name: str, version: int) -> str:
     return f"{lora_name}-v{version}"
 
 
+def detect_image_mime(base64_data: str) -> str:
+    """Detect image MIME type from the first bytes of base64-encoded data.
+
+    Examines base64 magic byte prefixes to determine the actual image format.
+    """
+    if base64_data.startswith("iVBOR"):  # PNG: \x89PNG
+        return "image/png"
+    if base64_data.startswith("/9j/"):  # JPEG: \xff\xd8\xff
+        return "image/jpeg"
+    if base64_data.startswith("R0lGOD"):  # GIF: GIF8
+        return "image/gif"
+    if base64_data.startswith("UklGR"):  # WebP: RIFF
+        return "image/webp"
+    return "image/jpeg"
+
+
 @dataclass
 class WeightUpdateMeta:
-    type: Literal["disk", "nccl"]
+    type: Literal["disk", "xccl", "awex"]
     path: str | None = None
-    alloc_mode: AllocationMode | None = None
+    gen_allocation: ModelAllocation | None = None
 
     nccl_master_address: str | None = None
     nccl_master_port: int | None = None
@@ -177,6 +195,9 @@ class WeightUpdateMeta:
     lora_int_id: int = 0
     base_model_name: str = ""
     peft_config: dict = field(default_factory=dict)
+    # Number of recent LoRA adapter versions to keep loaded on the inference
+    # server. Older versions are unloaded to bound memory; 0 disables cleanup.
+    lora_keep_versions: int = 0
 
     clear_checkpoint_after_load: bool = True
 
@@ -208,6 +229,7 @@ class WeightUpdateMeta:
         lora_name: str = "",
         lora_int_id: int = 1,
         base_model_name: str = "",
+        lora_keep_versions: int = 0,
     ) -> "WeightUpdateMeta":
         from areal.utils.saver import Saver
 
@@ -223,24 +245,13 @@ class WeightUpdateMeta:
             lora_name=lora_name,
             lora_int_id=lora_int_id,
             base_model_name=base_model_name,
+            lora_keep_versions=lora_keep_versions,
         )
 
     @classmethod
     def from_megatron_xccl(
         cls,
-        allocation_mode: AllocationMode,
-        weight_chunked_mem_mb: int = 1024,
-    ):
-        return cls(
-            type="xccl",
-            alloc_mode=allocation_mode,
-            weight_chunked_mem_mb=weight_chunked_mem_mb,
-        )
-
-    @classmethod
-    def from_fsdp_xccl(
-        cls,
-        allocation_mode: AllocationMode,
+        gen_allocation: ModelAllocation,
         weight_chunked_mem_mb: int = 1024,
         use_lora: bool = False,
         lora_name: str = "",
@@ -249,8 +260,44 @@ class WeightUpdateMeta:
     ):
         return cls(
             type="xccl",
-            alloc_mode=allocation_mode,
+            gen_allocation=gen_allocation,
             weight_chunked_mem_mb=weight_chunked_mem_mb,
+            use_lora=use_lora,
+            lora_name=lora_name,
+            lora_int_id=lora_int_id,
+            base_model_name=base_model_name,
+        )
+
+    @classmethod
+    def from_fsdp_xccl(
+        cls,
+        gen_allocation: ModelAllocation,
+        weight_chunked_mem_mb: int = 1024,
+        use_lora: bool = False,
+        lora_name: str = "",
+        lora_int_id: int = 1,
+        base_model_name: str = "",
+    ):
+        return cls(
+            type="xccl",
+            gen_allocation=gen_allocation,
+            weight_chunked_mem_mb=weight_chunked_mem_mb,
+            use_lora=use_lora,
+            lora_name=lora_name,
+            lora_int_id=lora_int_id,
+            base_model_name=base_model_name,
+        )
+
+    @classmethod
+    def from_awex(
+        cls,
+        use_lora: bool = False,
+        lora_name: str = "",
+        lora_int_id: int = 1,
+        base_model_name: str = "",
+    ):
+        return cls(
+            type="awex",
             use_lora=use_lora,
             lora_name=lora_name,
             lora_int_id=lora_int_id,
@@ -265,6 +312,9 @@ class HttpRequest:
     endpoint: str
     payload: dict[str, Any]
     method: str = "POST"
+    # When True, failures are logged and ignored instead of raised. Used for
+    # cleanup requests (e.g. unloading a stale LoRA adapter that may be gone).
+    best_effort: bool = False
 
 
 @dataclass
@@ -329,7 +379,7 @@ class LocalInfServerInfo:
 
     host: str
     port: int
-    process: subprocess.Popen
+    process: subprocess.Popen | None
 
 
 @dataclass

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 """LangChain-based agent workflows for AReaL training."""
 
 from areal.workflow.langchain.math_agent import (

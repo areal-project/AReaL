@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 from __future__ import annotations
 
 import asyncio
@@ -9,7 +11,11 @@ import aiohttp
 import httpx
 
 from areal.infra.utils.concurrent import register_loop_cleanup
-from areal.infra.utils.http import DEFAULT_REQUEST_TIMEOUT, get_default_connector
+from areal.infra.utils.http import (
+    DEFAULT_REQUEST_TIMEOUT,
+    create_httpx_client,
+    get_default_connector,
+)
 from areal.utils import logging
 
 logger = logging.getLogger("WorkflowContext")
@@ -124,7 +130,11 @@ class HttpClientManager:
         await self._check_event_loop_change()
 
         if self._aiohttp_session is None:
-            timeout = aiohttp.ClientTimeout(total=DEFAULT_REQUEST_TIMEOUT)
+            timeout = aiohttp.ClientTimeout(
+                total=DEFAULT_REQUEST_TIMEOUT,
+                sock_connect=DEFAULT_REQUEST_TIMEOUT,
+                connect=DEFAULT_REQUEST_TIMEOUT,
+            )
             self._aiohttp_session = aiohttp.ClientSession(
                 timeout=timeout,
                 read_bufsize=1024 * 1024 * 10,
@@ -163,9 +173,7 @@ class HttpClientManager:
         await self._check_event_loop_change()
 
         if self._httpx_client is None:
-            self._httpx_client = httpx.AsyncClient(
-                timeout=httpx.Timeout(DEFAULT_REQUEST_TIMEOUT)
-            )
+            self._httpx_client = create_httpx_client(timeout=DEFAULT_REQUEST_TIMEOUT)
             # Track which event loop this client belongs to
             self._event_loop = asyncio.get_running_loop()
 

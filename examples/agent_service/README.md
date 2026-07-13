@@ -1,177 +1,119 @@
-# Agent Service Demo — Tau2 with PydanticAI
+# Agent Service — Claude Agent SDK
 
 ## Overview
 
-This example demonstrates AReaL's Agent Service running a **tau2 customer-service
-agent** powered by **PydanticAI**. The agent handles multi-turn conversations, calls
-tau2 environment tools (e.g. flight lookup, reservation booking), and maintains
-conversation history across turns.
+This example demonstrates AReaL's Agent Service running the **Claude Agent SDK**
+(`claude-agent-sdk`) as a scalable HTTP micro-service. It turns Claude's autonomous
+agent capabilities — multi-turn conversations, tool use, file editing, web search — into
+a production-deployable service with session management, load balancing, and dynamic
+scaling.
 
-The Agent Service consists of four independent HTTP services:
-
-```
-Client → Gateway (8080) → Router (8081) → DataProxy (9100) → Worker (9000)
-```
-
-- **Gateway**: public entry point (WebSocket + OpenResponses HTTP bridge)
-- **Router**: session-affine routing (DataProxy registration, round-robin)
-- **DataProxy**: stateful session proxy (conversation history, forwards to Worker)
-- **Worker**: stateless agent execution (loads AgentRunnable, runs one turn)
-
-## Architecture
+**Why this matters**: Projects like
+[claude-agent-acp](https://github.com/agentclientprotocol/claude-agent-acp) expose
+Claude Agent SDK via custom protocols (ACP) for editor integration. AReaL takes a
+different approach — it wraps Claude Agent SDK into standard HTTP micro-services with
+session-affine routing, so you can **scale, orchestrate, and train** Claude agents using
+AReaL's RL infrastructure.
 
 ```
-Client (HTTP/WS)
-    │
-    ▼
-┌──────────┐  POST /route   ┌──────────┐
-│ Gateway  │ ──────────────▶ │ Router   │
-│ :8080    │ ◀────────────── │ :8081    │
-└──────────┘  DataProxy addr └──────────┘
-    │
-    │ POST /session/{key}/turn
-    ▼
-┌──────────┐
-│ DataProxy│
-│ :9100    │  POST /run   ┌──────────┐
-│ (history)│ ────────────▶│ Worker   │
-└──────────┘              │ :9000    │
-                          │ (agent)  │
-                          └──────────┘
+Client → Gateway (HTTP) → Router → DataProxy (session state) → Worker (ClaudeSDKClient)
 ```
-
-## Files
-
-| File          | Description                                           |
-| ------------- | ----------------------------------------------------- |
-| `agent.py`    | `Tau2Agent` — PydanticAI agent with tau2 domain tools |
-| `config.yaml` | Configuration: LLM endpoints, tau2 domain, data path  |
-| `run_demo.py` | One-click: starts all services, runs tau2 demo        |
 
 ## Prerequisites
 
 ```bash
-pip install pydantic-ai
-pip install git+https://github.com/dhh1995/tau2-bench.git@dhh/async-and-custom-completion
+uv pip install claude-agent-sdk
+export ANTHROPIC_API_KEY=sk-...
 ```
-
-## Configuration
-
-Edit `config.yaml` to set your LLM endpoints and tau2 settings:
-
-```yaml
-tau2:
-  domain: airline
-  data_dir: /path/to/tau2-bench/data
-
-agent_llm:
-  model: openai:your-model-name
-  base_url: http://localhost:8000/v1
-  api_key: unused
-
-user_llm:
-  model: null   # set for user simulator, null for scripted messages
-  base_url: null
-  api_key: unused
-```
-
-Alternatively, set `TAU2_DATA_DIR` as an environment variable.
 
 ## Quick Start
 
-### One-click demo
-
 ```bash
-python examples/agent_service/run_demo.py                       # single task, airline
-python examples/agent_service/run_demo.py --domain telecom      # different domain
-python examples/agent_service/run_demo.py --full                # all tasks
-python examples/agent_service/run_demo.py --config my.yaml      # custom config
+python examples/agent_service/run_agent_service.py
 ```
 
-This starts all four services in background threads and runs a multi-turn conversation
-showing tool calls and history accumulation.
+The script creates a `LocalScheduler`, launches Guard workers, then forks Router →
+Worker+DataProxy → Gateway. An interactive prompt lets you chat with the Claude agent.
 
-### Manual startup (separate terminals)
+### Options
 
-```bash
-# Terminal 1: Router
-python -m areal.experimental.agent_service.router --port 8081
-
-# Terminal 2: Worker + DataProxy
-python -m areal.experimental.agent_service.worker \
-    --agent examples.agent_service.agent.Tau2Agent \
-    --router-addr http://localhost:8081 \
-    --worker-port 9000 \
-    --proxy-port 9100
-
-# Terminal 3: Gateway
-python -m areal.experimental.agent_service.gateway \
-    --router-addr http://localhost:8081 \
-    --port 8080
-```
-
-### Send a request
+### Send requests directly
 
 ```bash
-curl -X POST http://localhost:8080/v1/responses \
+curl -X POST http://localhost:<gateway-port>/v1/responses \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer areal-agent-admin" \
   -d '{
-    "input": [{"type": "message", "content": "I need to change my flight AA123"}],
-    "model": "tau2-agent",
+    "input": [{"type": "message", "content": "Explain RLHF in simple terms"}],
+    "model": "claude-agent",
     "user": "my-session"
   }'
 ```
 
-## Implementing Your Own Agent
+## Configuration
 
-Create a class that satisfies the `AgentRunnable` protocol:
+Claude Agent SDK settings are controlled via environment variables:
+
+| Variable               | Default             | Description                 |
+| ---------------------- | ------------------- | --------------------------- |
+| `ANTHROPIC_API_KEY`    | (required)          | Anthropic API key           |
+| `CLAUDE_MODEL`         | `claude-sonnet-4-6` | Model to use                |
+| `CLAUDE_SYSTEM_PROMPT` | (none)              | Optional system prompt      |
+| `CLAUDE_MAX_TURNS`     | `20`                | Max agentic turns per query |
+
+## Architecture
+
+The Worker maintains a **session-persistent `ClaudeSDKClient`** per session key. Unlike
+stateless wrappers, the SDK's internal session retains the full conversation transcript
+— no need to re-send history on each turn.
+
+```
+Turn 1: Client → Gateway → Router → DataProxy → Worker
+         Worker: creates ClaudeSDKClient for session "abc"
+         Claude Agent SDK runs autonomously (tool calls, file ops, etc.)
+         Response streams back through the chain
+
+Turn 2: Client → Gateway → Router (same DataProxy) → DataProxy → Worker
+         Worker: reuses ClaudeSDKClient for session "abc"
+         SDK remembers full context from Turn 1
+```
+
+## Programmatic Usage
 
 ```python
-from areal.experimental.agent_service.agent_worker import (
-    AgentRequest, AgentResponse, EventEmitter,
+import os
+
+from areal.api.cli_args import AgentConfig, SchedulingSpec
+from areal.v2.agent_service.controller import (
+    AgentController,
 )
+from areal.infra.scheduler.local import LocalScheduler
 
-class MyAgent:
-    def __init__(self, **kwargs):
-        # Configure LLM client, tools, etc.
-        pass
-
-    async def run(
-        self,
-        request: AgentRequest,
-        *,
-        emitter: EventEmitter,
-    ) -> AgentResponse:
-        # request.message — current user message
-        # request.history — prior conversation turns
-        # emitter — stream events back to client
-        await emitter.emit_delta("Hello!")
-        return AgentResponse(summary="Hello!")
+scheduler = LocalScheduler(experiment_name="demo", trial_name="run0", gpu_devices=[])
+ctrl = AgentController(
+    config=AgentConfig(
+        agent_cls_path="examples.agent_service.agent.ClaudeAgent",
+        scheduling_spec=(
+            SchedulingSpec(
+                env_vars={"ANTHROPIC_API_KEY": os.environ["ANTHROPIC_API_KEY"]},
+            ),
+        ),
+    ),
+    scheduler=scheduler,
+)
+ctrl.initialize()
+# ctrl.gateway_addr → "http://10.0.0.1:9005"
+# ctrl.scale_up(2)   → add 2 more pairs
+# ctrl.scale_down(1) → remove 1 pair (with graceful drain)
+ctrl.destroy()
 ```
 
-Then start a worker with your agent:
+Use `AgentConfig.scheduling_spec[0].env_vars` to pass environment variables to all
+forked agent-service child processes.
 
-```bash
-python -m areal.experimental.agent_service.worker \
-    --agent mypackage.myagent.MyAgent \
-    --router-addr http://localhost:8081
-```
+## Files
 
-## Multi-turn Conversations
-
-The DataProxy automatically manages conversation history. Each turn:
-
-1. DataProxy reads history for the session
-1. Builds `AgentRequest` with `history` field populated
-1. Forwards to Worker → Agent sees full conversation context
-1. Appends user message + agent response to history
-1. Tool calls and results are also recorded in history
-
-The agent accesses history via `request.history`:
-
-```python
-async def run(self, request, *, emitter):
-    for msg in request.history:
-        print(f"{msg['role']}: {msg['content']}")
-    # ... generate response using full context
-```
+| File                   | Description                                                 |
+| ---------------------- | ----------------------------------------------------------- |
+| `agent.py`             | `ClaudeAgent` — session-persistent Claude Agent SDK wrapper |
+| `run_agent_service.py` | Controller-based launcher + interactive conversation        |

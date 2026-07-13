@@ -64,6 +64,30 @@ repos:
         name: nbstripout - Strip notebook output
         description: Strip output from Jupyter notebooks
 
+  # Check consistency between pyproject.toml variants (sglang vs vllm)
+  - repo: local
+    hooks:
+      - id: check-pyproject-consistency
+        name: Check pyproject.toml consistency
+        entry: python3 areal/tools/check_pyproject_consistency.py
+        language: system
+        files: ^pyproject(\.vllm)?\.toml$
+        pass_filenames: false
+        always_run: false
+        require_serial: true
+
+  # Regenerate uv lockfiles when pyproject files change
+  - repo: local
+    hooks:
+      - id: uv-lock
+        name: Regenerate uv lockfiles
+        entry: bash scripts/uv_lock.sh
+        language: system
+        files: ^pyproject(\.vllm)?\.toml$
+        pass_filenames: false
+        always_run: false
+        require_serial: true
+
   # Generate CLI documentation
   - repo: local
     hooks:
@@ -72,6 +96,28 @@ repos:
         entry: python docs/generate_cli_docs.py
         language: system
         files: ^(areal/api/cli_args\.py|docs/generate_cli_docs\.py)$
+        pass_filenames: false
+        always_run: false
+        require_serial: true
+
+  # Ensure SPDX license header in Python source files
+  - repo: local
+    hooks:
+      - id: check-license-header
+        name: Check SPDX license header
+        entry: python3 areal/tools/check_license_header.py
+        language: system
+        files: ^areal/.*\.py$
+        types: [python]
+
+  # Format and lint .github/CODEOWNERS
+  - repo: local
+    hooks:
+      - id: format-codeowners
+        name: Format CODEOWNERS
+        entry: python3 areal/tools/format_codeowners.py
+        language: system
+        files: ^\.github/CODEOWNERS$
         pass_filenames: false
         always_run: false
         require_serial: true
@@ -86,6 +132,7 @@ repos:
           - feat
           - fix
           - docs
+          - gov
           - style
           - refactor
           - perf

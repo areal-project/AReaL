@@ -80,6 +80,7 @@ def openai_client(sglang_server, tokenizer):
     from areal.engine import RemoteSGLangEngine
 
     config = InferenceEngineConfig(
+        backend="sglang:d1",
         experiment_name=EXPR_NAME,
         trial_name=TRIAL_NAME,
         max_concurrent_rollouts=2,

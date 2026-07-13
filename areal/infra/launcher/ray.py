@@ -1,8 +1,11 @@
+# SPDX-License-Identifier: Apache-2.0
+
 import importlib.util
 import pathlib
 import re
 import sys
 import time
+import warnings
 from collections.abc import Callable
 from functools import partial
 
@@ -13,7 +16,7 @@ from ray.util.placement_group import PlacementGroup
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 import areal.utils.logging as logging
-from areal.api import AllocationMode, AllocationType
+from areal.api.alloc_mode import AllocationType, _AllocationMode
 from areal.api.cli_args import (
     ClusterSpecConfig,
     InferenceEngineConfig,
@@ -31,6 +34,7 @@ from areal.infra.utils.launcher import (
     JobState,
     get_scheduling_spec,
     get_thread_env_vars,
+    run_post_exit_hook,
     validate_config_for_distributed_launcher,
     wait_llm_server_addrs,
 )
@@ -346,6 +350,16 @@ def ray_main(config, run_id: int = 0):
     config.recover = to_structured_cfg(config.recover, RecoverConfig)
     config.cluster = to_structured_cfg(config.cluster, ClusterSpecConfig)
     is_recover_run = check_if_recover(config.recover, run_id)
+    warnings.warn(
+        "SPMD launchers use the deprecated _AllocationMode parser which will be removed. "
+        "Bare dimension strings (e.g., 'd4t2') are NO LONGER ACCEPTED. "
+        "All allocation strings must include an explicit backend prefix "
+        "(e.g., 'fsdp:d4', 'sglang:d4t2'). "
+        "Migrate to single-controller mode (scheduler.type=local) with per-engine 'backend' "
+        "fields (e.g., actor.backend='fsdp:d4'). See docs/en/reference/alloc_mode.md.",
+        FutureWarning,
+        stacklevel=2,
+    )
     validate_config_for_distributed_launcher(config)
 
     name_resolve.reconfigure(config.cluster.name_resolve)
@@ -372,7 +386,7 @@ def ray_main(config, run_id: int = 0):
         launcher = RAY_LAUNCHER
 
     allocation_mode = config.allocation_mode
-    allocation_mode = AllocationMode.from_str(allocation_mode)
+    allocation_mode = _AllocationMode.from_str(allocation_mode)
 
     actor_spec = get_scheduling_spec(config.actor)
 
@@ -477,6 +491,7 @@ def ray_main(config, run_id: int = 0):
             launcher.stop_all(
                 force=False
             )  # force=False will send KeyboardInterrupt to sglang_server.main() to further clean all sglang-related processes
+            run_post_exit_hook(config)
             raise e
     elif allocation_mode.gen_backend == "vllm":
         config.vllm = to_structured_cfg(config.vllm, vLLMConfig)
@@ -518,7 +533,10 @@ def ray_main(config, run_id: int = 0):
                 n_vllm_servers,
             )
         except (TimeoutError, KeyboardInterrupt) as e:
-            launcher.stop_all(force=True)
+            try:
+                launcher.stop_all(force=True)
+            finally:
+                run_post_exit_hook(config)
             raise e
 
     if config.get("enable_offload", False):
@@ -613,6 +631,7 @@ def ray_main(config, run_id: int = 0):
         # Note: For trainer processes, we use force=True because the trainer doesn't
         # handle KeyboardInterrupt properly when force=False.
         launcher.stop_all(force=True, pattern="trainer")
+        run_post_exit_hook(config)
         recover_states = [JobState.FAILED]
         if isinstance(e, JobException):
             recover_this = (

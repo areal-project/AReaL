@@ -1,13 +1,14 @@
 import sys
 from collections.abc import Callable
-from dataclasses import dataclass, field
 
 from openai.types.chat import ChatCompletion
 from transformers import PreTrainedTokenizerFast
 
+from examples.multi_turn_math.config import MultiTurnGRPOConfig
+
 from areal import PPOTrainer, workflow_context
 from areal.api import AsyncRewardWrapper, RolloutWorkflow
-from areal.api.cli_args import GenerationHyperparameters, GRPOConfig, load_expr_config
+from areal.api.cli_args import GenerationHyperparameters, load_expr_config
 from areal.dataset import get_custom_dataset
 from areal.experimental.openai import ArealOpenAI
 from areal.reward import get_math_verify_worker
@@ -107,20 +108,6 @@ class MultiturnRLVRWorkflow(RolloutWorkflow):
         client.apply_reward_discount(turn_discount=0.9)
         completions_with_reward = client.export_interactions(style=self.export_style)
         return completions_with_reward
-
-
-@dataclass
-class MultiTurnGRPOConfig(GRPOConfig):
-    agent_run_args: dict = field(
-        default_factory=dict,
-        metadata={"help": "Arguments for running the agent."},
-    )
-    export_style: str = field(
-        default="concat",
-        metadata={
-            "help": "Export style for the completions. By default export_style=concat."
-        },
-    )
 
 
 def main(args):

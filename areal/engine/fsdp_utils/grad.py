@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 from collections import defaultdict
 
 import torch
@@ -99,10 +101,21 @@ def get_grad_norm_fp32(
     norm_type = float(norm_type)
     total_norm = 0.0
 
-    if not grads_for_norm:
-        return 0.0
-
     device = current_platform.current_device()
+
+    if not grads_for_norm:
+        # Still participate in all_reduce with zero contribution so that
+        # ranks with grads don't hang waiting for this rank (e.g. LoRA frozen ranks).
+        total_norm_cuda = torch.tensor(0.0, dtype=torch.float, device=device)
+        reduce_op = dist.ReduceOp.MAX if norm_type == torch.inf else dist.ReduceOp.SUM
+        if data_parallel_group:
+            dist.all_reduce(total_norm_cuda, op=reduce_op, group=data_parallel_group)
+        if model_parallel_group is not None:
+            dist.all_reduce(total_norm_cuda, op=reduce_op, group=model_parallel_group)
+        total_norm = float(total_norm_cuda.item())
+        if norm_type != torch.inf and total_norm > 0:
+            total_norm = total_norm ** (1.0 / norm_type)
+        return total_norm
 
     if norm_type == torch.inf:
         norms = [grad.abs().max() for grad in grads_for_norm]

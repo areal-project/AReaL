@@ -33,36 +33,41 @@ Refs: #123, #456
 
 ## Type Selection
 
-| Type       | When to Use                     |
-| ---------- | ------------------------------- |
-| `feat`     | New feature or capability       |
-| `fix`      | Bug fix                         |
-| `docs`     | Documentation only              |
-| `refactor` | Code change without feature/fix |
-| `test`     | Adding or fixing tests          |
-| `chore`    | Build, deps, config changes     |
-| `perf`     | Performance improvement         |
+| Type       | When to Use                      |
+| ---------- | -------------------------------- |
+| `feat`     | New feature or capability        |
+| `fix`      | Bug fix                          |
+| `docs`     | Documentation only               |
+| `gov`      | Governance or maintainer changes |
+| `style`    | Formatting/style-only changes    |
+| `refactor` | Code change without feature/fix  |
+| `perf`     | Performance improvement          |
+| `test`     | Adding or fixing tests           |
+| `build`    | Build system or dependencies     |
+| `ci`       | CI pipeline or workflow changes  |
+| `chore`    | Build, deps, config changes      |
+| `revert`   | Revert a previous commit         |
 
 ## Scope Inference
 
 Infer scope from the **primary** changed file paths:
 
-| File Path Pattern        | Scope                          |
-| ------------------------ | ------------------------------ |
-| `areal/workflow/`        | `workflow`                     |
-| `areal/engine/`          | `engine`                       |
-| `areal/reward/`          | `reward`                       |
-| `areal/dataset/`         | `dataset`                      |
-| `areal/api/`             | `api`                          |
-| `areal/utils/`           | `utils`                        |
-| `areal/infra/`           | `infra`                        |
-| `areal/trainer/`         | `trainer`                      |
-| `areal/models/`          | `models`                       |
-| `areal/experimental/`    | `archon`                       |
-| `docs/`                  | `docs`                         |
-| `examples/`              | `examples`                     |
-| `.claude/`, `.opencode/` | `agents`                       |
-| Multiple areas           | Omit scope or use broader term |
+| File Path Pattern                                            | Scope                          |
+| ------------------------------------------------------------ | ------------------------------ |
+| `areal/workflow/`                                            | `workflow`                     |
+| `areal/engine/`                                              | `engine`                       |
+| `areal/reward/`                                              | `reward`                       |
+| `areal/dataset/`                                             | `dataset`                      |
+| `areal/api/`                                                 | `api`                          |
+| `areal/utils/`                                               | `utils`                        |
+| `areal/infra/`                                               | `infra`                        |
+| `areal/trainer/`                                             | `trainer`                      |
+| `areal/models/`                                              | `models`                       |
+| `areal/experimental/`                                        | `archon`                       |
+| `docs/`                                                      | `docs`                         |
+| `examples/`                                                  | `examples`                     |
+| `AGENTS.md`, `.agents/`, `.claude/`, `.codex/`, `.opencode/` | `agents`                       |
+| Multiple areas                                               | Omit scope or use broader term |
 
 ## Rules
 
@@ -115,8 +120,21 @@ delegation instead of hardcoded model names.
 
 Key changes:
 - Create .opencode/command/ with review-pr, create-pr
-- Replace Opus/Sonnet/Haiku with deep/unspecified-high/quick
+- Replace hardcoded model routing with platform-native review routing
 - Add expert subagent consultation patterns
+```
+
+**Governance/maintainer changes:**
+
+```
+gov(agents): add maintainer ownership for service modules
+
+Update CODEOWNERS and maintainer references to reflect
+current governance responsibilities.
+
+Key changes:
+- Add maintainers for agent_service and infra ownership
+- Align governance docs with updated reviewer responsibilities
 ```
 
 ______________________________________________________________________

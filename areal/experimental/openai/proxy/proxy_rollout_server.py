@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 from __future__ import annotations
 
 import argparse
@@ -26,9 +28,10 @@ from openai.types.responses import Response
 from openai.types.responses.response_create_params import ResponseCreateParams
 from pydantic import BaseModel
 
-from areal.api.cli_args import NameResolveConfig, OpenAIProxyConfig
+from areal.api.cli_args import NameResolveConfig
 from areal.experimental.openai.client import ArealOpenAI
 from areal.infra.rpc.serialization import deserialize_value, serialize_value
+from areal.infra.utils.http import validate_admin_api_key
 from areal.utils import name_resolve, names, seeding
 from areal.utils.dynamic_import import import_from_string
 from areal.utils.hf_utils import load_hf_tokenizer
@@ -106,6 +109,14 @@ _session_timeout_seconds: int = 3600  # Default timeout (overridden by config)
 _admin_api_key: str = secrets.token_urlsafe(32)
 _api_key_to_session: dict[str, str] = {}
 _session_to_api_key: dict[str, str] = {}  # Reverse mapping for O(1) cleanup
+
+# Pluggable message preprocessors loaded from config at setup time.
+# Applied in order after Anthropic-to-OpenAI translation, before content
+# reaches the ArealOpenAI client.
+_message_preprocessors: list = []
+
+# Pluggable prefix matcher for InteractionCache parent-child matching.
+_prefix_matcher = None
 
 # Server address (set at startup)
 _server_host: str = "0.0.0.0"
@@ -259,27 +270,48 @@ async def alloc_ports(raw_request: Request):
 
 def _setup_openai_client():
     global _openai_client, _session_timeout_seconds, _admin_api_key
+    global _message_preprocessors, _prefix_matcher
     config = _engine.config
     tokenizer = load_hf_tokenizer(config.tokenizer_path)
-    openai_cfg = config.openai or OpenAIProxyConfig()
+    agent_cfg = config.agent
     _openai_client = ArealOpenAI(
         engine=_engine,
         tokenizer=tokenizer,
-        tool_call_parser=openai_cfg.tool_call_parser,
-        reasoning_parser=openai_cfg.reasoning_parser,
-        engine_max_tokens=openai_cfg.engine_max_tokens,
-        chat_template_type=openai_cfg.chat_template_type,
+        tool_call_parser=agent_cfg.tool_call_parser,
+        reasoning_parser=agent_cfg.reasoning_parser,
+        engine_max_tokens=agent_cfg.engine_max_tokens,
+        chat_template_type=agent_cfg.chat_template_type,
+        lora_name=config.lora_name,
     )
     # Set session timeout from config
-    _session_timeout_seconds = openai_cfg.session_timeout_seconds
-    # Set admin API key from config
+    _session_timeout_seconds = agent_cfg.session_timeout_seconds
+    # Validate admin API key BEFORE assigning it to the global, so a
+    # failed validation cannot leave the default key live on the server.
+    # The default admin key is publicly known; refuse to use it when the
+    # server is reachable from outside the local host (otherwise anyone
+    # who can reach this port can call admin endpoints such as
+    # grant_capacity, start_session, export_trajectories, ...).
+    validate_admin_api_key(
+        _server_host,
+        agent_cfg.admin_api_key,
+        default_key=DEFAULT_ADMIN_API_KEY,
+        config_field="AgentConfig.admin_api_key",
+    )
+    # Only commit the key to the global after validation has passed.
     with _lock:
-        _admin_api_key = openai_cfg.admin_api_key
-        if _admin_api_key == DEFAULT_ADMIN_API_KEY:
-            logger.warning(
-                "Using default admin API key. Change 'admin_api_key' in "
-                "OpenAIProxyConfig for non-local deployments."
-            )
+        _admin_api_key = agent_cfg.admin_api_key
+
+    _message_preprocessors = []
+    for path in agent_cfg.message_preprocessors:
+        cls = import_from_string(path)
+        _message_preprocessors.append(cls())
+        logger.info("Loaded message preprocessor: %s", path)
+
+    if agent_cfg.prefix_matcher:
+        _prefix_matcher = import_from_string(agent_cfg.prefix_matcher)
+        logger.info("Loaded prefix matcher: %s", agent_cfg.prefix_matcher)
+    else:
+        _prefix_matcher = None
 
 
 @app.post("/configure")
@@ -453,7 +485,10 @@ def start_session(request: StartSessionRequest) -> StartSessionResponse:
                 session_api_key = secrets.token_urlsafe(32)
 
         _capacity -= 1
-        _session_cache[session_id] = SessionData(session_id=session_id)
+        _session_cache[session_id] = SessionData(
+            session_id=session_id,
+            prefix_matcher=_prefix_matcher,
+        )
         _api_key_to_session[session_api_key] = session_id
         _session_to_api_key[session_id] = session_api_key
 
@@ -586,7 +621,11 @@ async def _call_client_create(
         kwargs["top_p"] = 1.0
         _warn_once("top_p not set in request, defaulting to 1.0")
 
-    # Add stream parameter if requested
+    # Strip stream from request body to prevent it from bypassing the explicit
+    # `stream` parameter.  Without this, a request with {"stream": true} would
+    # leak through kwargs and cause the client to return an AsyncGenerator even
+    # when the caller did not ask for streaming.
+    kwargs.pop("stream", None)
     if stream:
         kwargs["stream"] = True
 
@@ -601,16 +640,61 @@ async def _call_client_create(
 @app.post(
     f"/{CHAT_COMPLETIONS_PATHNAME}",
     dependencies=[Depends(validate_json_request)],
+    response_model=None,
 )
 async def chat_completions(
     request: CompletionCreateParams, session_id: str = Depends(_require_session_key)
-) -> ChatCompletion:
-    """OpenAI-compatible chat completions endpoint."""
+) -> ChatCompletion | StreamingResponse:
+    """OpenAI-compatible chat completions endpoint.
+
+    Supports both streaming (stream=True) and non-streaming requests.
+    For streaming requests, returns a StreamingResponse with Server-Sent Events
+    in the OpenAI streaming format (data: {json}\\n\\n ... data: [DONE]\\n\\n).
+    """
     if _openai_client is None:
         raise HTTPException(
             status_code=500,
             detail='Proxy server not initialized. Send requests to /create_engine then /call "initialize" first.',
         )
+
+    # CompletionCreateParams is a TypedDict (dict subclass), so use dict access.
+    is_streaming = request.get("stream") is True
+
+    if is_streaming:
+        openai_stream = None
+        try:
+            openai_stream = await _call_client_create(
+                create_fn=_openai_client.chat.completions.create,
+                request=request,
+                session_id=session_id,
+                stream=True,
+            )
+
+            # Convert ChatCompletionChunk objects to OpenAI SSE format
+            async def _openai_sse_generator(
+                chunk_stream: AsyncGenerator[ChatCompletionChunk, None],
+            ) -> AsyncGenerator[str, None]:
+                async for chunk in chunk_stream:
+                    yield f"data: {chunk.model_dump_json()}\n\n"
+                yield "data: [DONE]\n\n"
+
+            safe_stream = _safe_stream_wrapper(_openai_sse_generator(openai_stream))
+
+            return StreamingResponse(
+                safe_stream,
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",
+                },
+            )
+        except Exception as e:
+            if openai_stream is not None and hasattr(openai_stream, "aclose"):
+                await openai_stream.aclose()
+            logger.error(f"Error setting up streaming response: {e}")
+            raise HTTPException(status_code=500, detail=f"Streaming setup failed: {e}")
+
     return await _call_client_create(
         create_fn=_openai_client.chat.completions.create,
         request=request,
@@ -638,6 +722,19 @@ async def responses(
     )
 
 
+def _flatten_content_lists(messages: list[dict]) -> None:
+    """Flatten Anthropic content block lists to strings in-place."""
+    for msg in messages:
+        if isinstance(msg.get("content"), list):
+            text_parts = []
+            for block in msg["content"]:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    text_parts.append(block.get("text", ""))
+                elif isinstance(block, str):
+                    text_parts.append(block)
+            msg["content"] = "\n".join(text_parts)
+
+
 def _translate_anthropic_to_openai_request(anthropic_request: dict[str, Any]) -> dict:
     """Translate an Anthropic Messages API request to OpenAI format."""
     openai_request = _adapter.translate_completion_input_params(
@@ -647,20 +744,10 @@ def _translate_anthropic_to_openai_request(anthropic_request: dict[str, Any]) ->
         raise ValueError("Failed to translate request")
     openai_request = dict(openai_request)
 
-    # Fix message content if it's a list (Anthropic format with content blocks)
-    # LiteLLM's adapter may not properly convert content from list to string
-    # Claude Code CLI sends content as: [{"type":"text","text":"...","cache_control":{...}}, ...]
     if "messages" in openai_request:
-        for msg in openai_request["messages"]:
-            if isinstance(msg.get("content"), list):
-                # Convert list of content blocks to string
-                text_parts = []
-                for block in msg["content"]:
-                    if isinstance(block, dict) and block.get("type") == "text":
-                        text_parts.append(block.get("text", ""))
-                    elif isinstance(block, str):
-                        text_parts.append(block)
-                msg["content"] = "\n".join(text_parts)
+        _flatten_content_lists(openai_request["messages"])
+        for preprocessor in _message_preprocessors:
+            openai_request["messages"] = preprocessor(openai_request["messages"])
 
     return openai_request
 
@@ -968,10 +1055,11 @@ def main():
         # Run uvicorn directly (blocking)
         uvicorn.run(
             app,
-            host="0.0.0.0",
+            host=_server_host,
             port=_server_port,
             log_level="warning",
             timeout_keep_alive=300,
+            access_log=False,
         )
     except KeyboardInterrupt:
         logger.info("Shutting down proxy rollout server")

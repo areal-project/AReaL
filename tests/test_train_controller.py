@@ -11,7 +11,6 @@ import pytest
 import torch
 
 from areal.api import (
-    AllocationMode,
     FinetuneSpec,
     ParallelStrategy,
     SaveLoadMeta,
@@ -98,9 +97,10 @@ class MockScheduler:
         await asyncio.sleep(0.001)
         return None
 
-    def delete_workers(self, role):
+    def delete_workers(self, role, reverse_order: bool = False):
         """Mock worker deletion."""
         self.deleted_roles.append(role)
+        self.delete_reverse_order = reverse_order
         self.workers.clear()
 
 
@@ -117,6 +117,7 @@ def mock_scheduler():
 def train_config():
     """Provide a TrainEngineConfig for testing."""
     return TrainEngineConfig(
+        backend="fsdp:d4t2",
         scheduling_spec=(
             SchedulingSpec(
                 cpu=4,
@@ -125,15 +126,8 @@ def train_config():
                 port_count=2,
                 cmd="python -m areal.infra.rpc.rpc_server",
             ),
-        )
+        ),
     )
-
-
-@pytest.fixture
-def alloc_mode():
-    """Provide an AllocationMode for testing."""
-    mode = AllocationMode.from_str("d4t2p1")
-    return mode
 
 
 @pytest.fixture
@@ -190,18 +184,19 @@ class TestTrainControllerInitialization:
         assert controller.workers == []
         assert controller.workers_is_dp_head == []
 
-    def test_initialize(self, train_controller, alloc_mode, ft_spec):
+    def test_initialize(self, train_controller, ft_spec):
         """Test initialize method creates workers and engines."""
         train_controller.initialize(
             role="train_worker",
-            alloc_mode=alloc_mode,
             ft_spec=ft_spec,
         )
 
         # Verify workers were created
-        assert len(train_controller.workers) == alloc_mode.train.world_size
+        assert (
+            len(train_controller.workers)
+            == train_controller.train_alloc.parallel.world_size
+        )
         assert train_controller._worker_role == "train_worker"
-        assert train_controller.alloc_mode == alloc_mode
 
         # Verify DP heads were identified
         assert len(train_controller.workers_is_dp_head) == len(train_controller.workers)
@@ -213,11 +208,10 @@ class TestTrainControllerInitialization:
             train_controller.workers
         )
 
-    def test_identify_dp_heads(self, train_controller, alloc_mode, ft_spec):
+    def test_identify_dp_heads(self, train_controller, ft_spec):
         """Test _identify_dp_heads correctly identifies DP head workers."""
         train_controller.initialize(
             role="train_worker",
-            alloc_mode=alloc_mode,
             ft_spec=ft_spec,
         )
 
@@ -229,12 +223,11 @@ class TestTrainControllerInitialization:
 class TestTrainControllerDestroy:
     """Tests for TrainController cleanup and destruction."""
 
-    def test_destroy(self, train_controller, alloc_mode, ft_spec):
+    def test_destroy(self, train_controller, ft_spec):
         """Test destroy method cleans up resources."""
         # Initialize first
         train_controller.initialize(
             role="train_worker",
-            alloc_mode=alloc_mode,
             ft_spec=ft_spec,
         )
 
@@ -249,11 +242,10 @@ class TestTrainControllerDestroy:
         assert len(train_controller.workers_is_dp_head) == 0
         assert "train_worker" in train_controller.scheduler.deleted_roles
 
-    def test_destroy_handles_errors(self, train_controller, alloc_mode, ft_spec):
+    def test_destroy_handles_errors(self, train_controller, ft_spec):
         """Test destroy handles errors gracefully."""
         train_controller.initialize(
             role="train_worker",
-            alloc_mode=alloc_mode,
             ft_spec=ft_spec,
         )
 
@@ -268,6 +260,22 @@ class TestTrainControllerDestroy:
 
         # Workers should still be cleared
         assert len(train_controller.workers) == 0
+
+    def test_destroy_requests_reverse_order(self, train_controller, ft_spec):
+        """Workers must be torn down in reverse rank order.
+
+        This protects rank-0 (which owns the global TCPStore server) from
+        being killed before non-zero ranks finish NCCL abort, avoiding a
+        noisy ``TCPStore.recvValue failed`` warning from
+        HeartbeatMonitor.
+        """
+        train_controller.initialize(role="train_worker", ft_spec=ft_spec)
+
+        train_controller.destroy()
+
+        assert (
+            getattr(train_controller.scheduler, "delete_reverse_order", False) is True
+        )
 
 
 class TestTrainControllerMergeResults:
@@ -297,11 +305,10 @@ class TestTrainControllerMergeResults:
 class TestTrainControllerRPCWrappers:
     """Tests for RPC wrapper methods."""
 
-    def test_train_mode(self, train_controller, alloc_mode, ft_spec):
+    def test_train_mode(self, train_controller, ft_spec):
         """Test train() method sets training mode."""
         train_controller.initialize(
             role="train_worker",
-            alloc_mode=alloc_mode,
             ft_spec=ft_spec,
         )
 
@@ -314,11 +321,10 @@ class TestTrainControllerRPCWrappers:
         engine_calls = [call[1] for call in train_controller.scheduler.engine_calls]
         assert "train" in engine_calls
 
-    def test_eval_mode(self, train_controller, alloc_mode, ft_spec):
+    def test_eval_mode(self, train_controller, ft_spec):
         """Test eval() method sets evaluation mode."""
         train_controller.initialize(
             role="train_worker",
-            alloc_mode=alloc_mode,
             ft_spec=ft_spec,
         )
 
@@ -331,11 +337,10 @@ class TestTrainControllerRPCWrappers:
         engine_calls = [call[1] for call in train_controller.scheduler.engine_calls]
         assert "train" in engine_calls
 
-    def test_step_lr_scheduler(self, train_controller, alloc_mode, ft_spec):
+    def test_step_lr_scheduler(self, train_controller, ft_spec):
         """Test step_lr_scheduler() method."""
         train_controller.initialize(
             role="train_worker",
-            alloc_mode=alloc_mode,
             ft_spec=ft_spec,
         )
 
@@ -349,11 +354,10 @@ class TestTrainControllerRPCWrappers:
 class TestTrainControllerWeightManagement:
     """Tests for weight management operations."""
 
-    def test_set_version(self, train_controller, alloc_mode, ft_spec):
+    def test_set_version(self, train_controller, ft_spec):
         """Test set_version() method."""
         train_controller.initialize(
             role="train_worker",
-            alloc_mode=alloc_mode,
             ft_spec=ft_spec,
         )
 
@@ -363,11 +367,10 @@ class TestTrainControllerWeightManagement:
         engine_calls = [call[1] for call in train_controller.scheduler.engine_calls]
         assert "set_version" in engine_calls
 
-    def test_get_version(self, train_controller, alloc_mode, ft_spec):
+    def test_get_version(self, train_controller, ft_spec):
         """Test get_version() method."""
         train_controller.initialize(
             role="train_worker",
-            alloc_mode=alloc_mode,
             ft_spec=ft_spec,
         )
 
@@ -380,11 +383,10 @@ class TestTrainControllerWeightManagement:
         engine_calls = [call[1] for call in train_controller.scheduler.engine_calls]
         assert "get_version" in engine_calls
 
-    def test_save(self, train_controller, alloc_mode, ft_spec):
+    def test_save(self, train_controller, ft_spec):
         """Test save() method."""
         train_controller.initialize(
             role="train_worker",
-            alloc_mode=alloc_mode,
             ft_spec=ft_spec,
         )
 
@@ -397,11 +399,10 @@ class TestTrainControllerWeightManagement:
         engine_calls = [call[1] for call in train_controller.scheduler.engine_calls]
         assert "save" in engine_calls
 
-    def test_load(self, train_controller, alloc_mode, ft_spec):
+    def test_load(self, train_controller, ft_spec):
         """Test load() method."""
         train_controller.initialize(
             role="train_worker",
-            alloc_mode=alloc_mode,
             ft_spec=ft_spec,
         )
 
@@ -419,12 +420,11 @@ class TestTrainControllerCustomFunctionCall:
     """Tests for custom_function_call orchestration."""
 
     def test_custom_function_call_with_distributed_batch(
-        self, train_controller, alloc_mode, ft_spec
+        self, train_controller, ft_spec
     ):
         """Test custom_function_call with batch argument."""
         train_controller.initialize(
             role="train_worker",
-            alloc_mode=alloc_mode,
             ft_spec=ft_spec,
         )
 
@@ -443,13 +443,10 @@ class TestTrainControllerCustomFunctionCall:
         # Should call all workers (DP heads get data, others get empty)
         assert worker_calls == len(train_controller.workers)
 
-    def test_custom_function_call_with_regular_args(
-        self, train_controller, alloc_mode, ft_spec
-    ):
+    def test_custom_function_call_with_regular_args(self, train_controller, ft_spec):
         """Test custom_function_call with non-batch arguments."""
         train_controller.initialize(
             role="train_worker",
-            alloc_mode=alloc_mode,
             ft_spec=ft_spec,
         )
 
@@ -467,13 +464,10 @@ class TestTrainControllerCustomFunctionCall:
             train_controller.workers
         )
 
-    def test_custom_function_call_filters_dp_heads(
-        self, train_controller, alloc_mode, ft_spec
-    ):
+    def test_custom_function_call_filters_dp_heads(self, train_controller, ft_spec):
         """Test custom_function_call only returns results from DP heads."""
         train_controller.initialize(
             role="train_worker",
-            alloc_mode=alloc_mode,
             ft_spec=ft_spec,
         )
 
@@ -491,14 +485,13 @@ class TestTrainControllerEdgeCases:
         # Should not raise - create_process_group is now a no-op
         train_controller.create_process_group(parallel_strategy)
 
-        # parallel_strategy should not be set by create_process_group
-        assert train_controller.parallel_strategy is None
+        # parallel_strategy should be set by constructor (from backend="fsdp:d4t2")
+        assert train_controller.parallel_strategy is not None
 
-    def test_method_chaining(self, train_controller, alloc_mode, ft_spec):
+    def test_method_chaining(self, train_controller, ft_spec):
         """Test that train() and eval() support method chaining."""
         train_controller.initialize(
             role="train_worker",
-            alloc_mode=alloc_mode,
             ft_spec=ft_spec,
         )
 
@@ -510,11 +503,10 @@ class TestTrainControllerEdgeCases:
 class TestTrainControllerRolloutIntegration:
     """Tests for rollout engine integration methods."""
 
-    def test_connect_engine_sets_rollout(self, train_controller, alloc_mode, ft_spec):
+    def test_connect_engine_sets_rollout(self, train_controller, ft_spec):
         """Test connect_engine correctly sets the rollout controller."""
         train_controller.initialize(
             role="train_worker",
-            alloc_mode=alloc_mode,
             ft_spec=ft_spec,
         )
 
@@ -525,13 +517,10 @@ class TestTrainControllerRolloutIntegration:
 
         assert train_controller.rollout == mock_rollout
 
-    def test_connect_engine_warns_on_change(
-        self, train_controller, alloc_mode, ft_spec
-    ):
+    def test_connect_engine_warns_on_change(self, train_controller, ft_spec):
         """Test connect_engine logs warning when rollout controller changes."""
         train_controller.initialize(
             role="train_worker",
-            alloc_mode=alloc_mode,
             ft_spec=ft_spec,
         )
 
@@ -544,13 +533,10 @@ class TestTrainControllerRolloutIntegration:
 
         assert train_controller.rollout == mock_rollout2
 
-    def test_connect_engine_same_rollout_no_warning(
-        self, train_controller, alloc_mode, ft_spec
-    ):
+    def test_connect_engine_same_rollout_no_warning(self, train_controller, ft_spec):
         """Test connect_engine does not warn when same rollout controller is used."""
         train_controller.initialize(
             role="train_worker",
-            alloc_mode=alloc_mode,
             ft_spec=ft_spec,
         )
 
@@ -563,12 +549,11 @@ class TestTrainControllerRolloutIntegration:
         assert train_controller.rollout == mock_rollout
 
     def test_check_rollout_engine_connected_raises_when_not_connected(
-        self, train_controller, alloc_mode, ft_spec
+        self, train_controller, ft_spec
     ):
         """Test _check_rollout_engine_connected raises when rollout is not connected."""
         train_controller.initialize(
             role="train_worker",
-            alloc_mode=alloc_mode,
             ft_spec=ft_spec,
         )
 
@@ -576,12 +561,11 @@ class TestTrainControllerRolloutIntegration:
             train_controller._check_rollout_engine_connected()
 
     def test_check_rollout_engine_connected_passes_when_connected(
-        self, train_controller, alloc_mode, ft_spec
+        self, train_controller, ft_spec
     ):
         """Test _check_rollout_engine_connected passes when rollout is connected."""
         train_controller.initialize(
             role="train_worker",
-            alloc_mode=alloc_mode,
             ft_spec=ft_spec,
         )
 
@@ -592,13 +576,10 @@ class TestTrainControllerRolloutIntegration:
         # Should not raise
         train_controller._check_rollout_engine_connected()
 
-    def test_prepare_batch_delegates_to_rollout(
-        self, train_controller, alloc_mode, ft_spec
-    ):
+    def test_prepare_batch_delegates_to_rollout(self, train_controller, ft_spec):
         """Test prepare_batch delegates to rollout controller."""
         train_controller.initialize(
             role="train_worker",
-            alloc_mode=alloc_mode,
             ft_spec=ft_spec,
         )
 
@@ -623,13 +604,10 @@ class TestTrainControllerRolloutIntegration:
             group_size=1,
         )
 
-    def test_rollout_batch_delegates_to_rollout(
-        self, train_controller, alloc_mode, ft_spec
-    ):
+    def test_rollout_batch_delegates_to_rollout(self, train_controller, ft_spec):
         """Test rollout_batch delegates to rollout controller."""
         train_controller.initialize(
             role="train_worker",
-            alloc_mode=alloc_mode,
             ft_spec=ft_spec,
         )
 
@@ -657,13 +635,10 @@ class TestTrainControllerRolloutIntegration:
 class TestTrainControllerWeightUpdateMethods:
     """Tests for weight update methods."""
 
-    def test_update_weights_raises_when_not_connected(
-        self, train_controller, alloc_mode, ft_spec
-    ):
+    def test_update_weights_raises_when_not_connected(self, train_controller, ft_spec):
         """Test update_weights raises when rollout is not connected."""
         train_controller.initialize(
             role="train_worker",
-            alloc_mode=alloc_mode,
             ft_spec=ft_spec,
         )
 
@@ -676,11 +651,10 @@ class TestTrainControllerWeightUpdateMethods:
 class TestTrainControllerExportStats:
     """Tests for export_stats method."""
 
-    def test_export_stats(self, train_controller, alloc_mode, ft_spec):
+    def test_export_stats(self, train_controller, ft_spec):
         """Test export_stats returns statistics from first worker."""
         train_controller.initialize(
             role="train_worker",
-            alloc_mode=alloc_mode,
             ft_spec=ft_spec,
         )
 
@@ -704,13 +678,10 @@ class TestTrainControllerExportStats:
 class TestTrainControllerDispatchInputs:
     """Tests for input dispatching across DP groups."""
 
-    def test_prepare_dispatch_splits_distributed_batch(
-        self, train_controller, alloc_mode, ft_spec
-    ):
+    def test_prepare_dispatch_splits_distributed_batch(self, train_controller, ft_spec):
         """Test _prepare_dispatch correctly splits batch."""
         train_controller.initialize(
             role="train_worker",
-            alloc_mode=alloc_mode,
             ft_spec=ft_spec,
         )
 
@@ -719,15 +690,41 @@ class TestTrainControllerDispatchInputs:
 
         # Should split into dp_size chunks
         assert len(split_args) == 1
-        assert len(split_args[0]) == alloc_mode.train.dp_size
+        assert len(split_args[0]) == train_controller.parallel_strategy.dp_size
+
+    def test_prepare_dispatch_partitions_without_duplication(
+        self, train_controller, ft_spec
+    ):
+        """Regression for #1202: trajectories are partitioned across DP ranks,
+        never replicated. Each DP rank must see a disjoint slice so that total
+        tokens processed equal the original batch, not batch * dp_size."""
+        train_controller.initialize(
+            role="train_worker",
+            ft_spec=ft_spec,
+        )
+
+        dp_size = train_controller.parallel_strategy.dp_size
+        batch_size = 4 * dp_size
+        batch = create_mock_distributed_batch(size=batch_size)
+
+        split_args, _, group_indices = train_controller._prepare_dispatch(batch)
+
+        # Sanity: tensor-like list triggers the partition path, not replication.
+        assert group_indices is not None
+        assert len(group_indices) == dp_size
+
+        shards = split_args[0]
+        assert sum(len(shard) for shard in shards) == batch_size
+
+        flat_indices = [idx for group in group_indices for idx in group]
+        assert sorted(flat_indices) == list(range(batch_size))
 
     def test_prepare_dispatch_replicates_non_batch_args(
-        self, train_controller, alloc_mode, ft_spec
+        self, train_controller, ft_spec
     ):
         """Test _prepare_dispatch replicates non-batch arguments."""
         train_controller.initialize(
             role="train_worker",
-            alloc_mode=alloc_mode,
             ft_spec=ft_spec,
         )
 
@@ -737,15 +734,12 @@ class TestTrainControllerDispatchInputs:
         # Should replicate to all DP groups
         assert len(split_args) == 1
         assert all(arg == 42 for arg in split_args[0])
-        assert len(split_args[0]) == alloc_mode.train.dp_size
+        assert len(split_args[0]) == train_controller.parallel_strategy.dp_size
 
-    def test_prepare_dispatch_handles_kwargs(
-        self, train_controller, alloc_mode, ft_spec
-    ):
+    def test_prepare_dispatch_handles_kwargs(self, train_controller, ft_spec):
         """Test _prepare_dispatch correctly handles keyword arguments."""
         train_controller.initialize(
             role="train_worker",
-            alloc_mode=alloc_mode,
             ft_spec=ft_spec,
         )
 
@@ -756,5 +750,5 @@ class TestTrainControllerDispatchInputs:
 
         assert "input_" in split_kwargs
         assert "learning_rate" in split_kwargs
-        assert len(split_kwargs["input_"]) == alloc_mode.train.dp_size
+        assert len(split_kwargs["input_"]) == train_controller.parallel_strategy.dp_size
         assert all(lr == 0.001 for lr in split_kwargs["learning_rate"])

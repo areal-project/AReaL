@@ -191,11 +191,14 @@ examples/tir/
 ├── tool_manager.py             # Tool manager
 ├── tir_config.yaml             # Configuration file
 ├── train_tir.py                # Training script
-├── test_tir.py                 # Test script
+├── tests/                      # TIR test suite
+│   ├── conftest.py
+│   └── test_tir.py
 ├── tools/                      # Tool implementations
 │   ├── __init__.py
 │   ├── base.py                 # Tool base class
 │   ├── python_tool.py          # Python executor
+│   ├── daytona_python_tool.py  # Daytona cloud sandbox executor
 │   └── calculator_tool.py      # Calculator
 ├── data/                       # Data files
 │   └── sample_math.jsonl       # Sample data
@@ -203,9 +206,31 @@ examples/tir/
     └── __init__.py
 ```
 
+## Cloud sandbox backend (Daytona)
+
+Install the optional Daytona backend and export your API key:
+
+```bash
+uv sync --extra sandbox
+export DAYTONA_API_KEY=...
+```
+
+Then switch the TIR config to the Daytona-backed tool:
+
+```yaml
+tir:
+  enable_tools: "daytona_python"
+```
+
+Notes:
+
+- `daytona_python` keeps Python state across tool calls within one trajectory.
+- The stock `ToolRegistry` uses Daytona's default sandbox settings. If you want to pin a
+  snapshot or custom image, update the `daytona_python` factory in
+  `examples/tir/tool_manager.py`.
+
 ## TODOs
 
 - [ ] Evaluation script
-- [ ] Support for asynchronous tool calls
 - [ ] Support for multi-machine training
 - [ ] Fine-tuning, provide prompt templates for instruction models

@@ -69,7 +69,8 @@ def test_grpo(tmp_path: Path, backend: str, inference: str) -> None:
 
     # Build CLI overrides for backend-specific values
     cli_overrides = [
-        f"allocation_mode='{inference}:d1+{backend}:d1'",
+        f"rollout.backend='{inference}:d1'",
+        f"actor.backend='{backend}:d1'",
     ]
     if backend == "megatron":
         cli_overrides.extend(_MEGATRON_OVERRIDES)

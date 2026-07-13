@@ -14,9 +14,9 @@ cluster:
     type: ray
     ray_actor_name: ray_kv_store
 
-allocation_mode: sglang:d8+d8
 
 rollout:
+  backend: "sglang:d8"
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
   max_concurrent_rollouts: 256
@@ -37,6 +37,7 @@ gconfig:
   temperature: 1.0
 
 actor:
+  backend: "fsdp:d8"
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
   path: Qwen/Qwen2.5-1.5B-Instruct
@@ -64,7 +65,9 @@ actor:
   ppo_n_minibatches: 1
   recompute_logprob: true
   use_decoupled_loss: true
-  behave_imp_weight_cap: 5.0
+  rejection_sampling:
+    metric: ratio
+    upper: 5.0
   reward_norm:
     mean_level: group
     std_level: group
@@ -82,6 +85,7 @@ actor:
       env_vars: {}
 
 ref:
+  backend: ${actor.backend}
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
   path: ${actor.path}

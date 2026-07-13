@@ -15,7 +15,7 @@ from areal.experimental.openai.client import (
     concat_prompt_token_ids_with_parent,
 )
 from areal.experimental.openai.types import InteractionWithTokenLogpReward
-from areal.utils.hf_utils import load_hf_tokenizer
+from areal.utils.hf_utils import apply_chat_template, load_hf_tokenizer
 
 MODEL_PATH = "Qwen/Qwen3-0.6B"
 LOCAL_MODEL_PATH = "/storage/openpsi/models/Qwen__Qwen3-0.6B"
@@ -62,8 +62,8 @@ def create_interaction_with_response(
 ) -> InteractionWithTokenLogpReward:
     """Create an InteractionWithTokenLogpReward with a fake model response."""
     # Calculate input tokens using chat template
-    input_tokens = tokenizer.apply_chat_template(
-        messages, tools=tools, add_generation_prompt=True, tokenize=True
+    input_tokens = apply_chat_template(
+        tokenizer, messages, tools=tools, add_generation_prompt=True, tokenize=True
     )
 
     # Create fake model response
@@ -136,8 +136,8 @@ class TestConcatPromptTokenIds:
         )
 
         # Direct chat_template application
-        direct_tokens = tokenizer.apply_chat_template(
-            messages, add_generation_prompt=True, tokenize=True
+        direct_tokens = apply_chat_template(
+            tokenizer, messages, add_generation_prompt=True, tokenize=True
         )
 
         # With no parent, concat mode should produce the same tokens
@@ -171,8 +171,12 @@ class TestConcatPromptTokenIds:
         )
 
         # Direct chat_template application
-        direct_tokens = tokenizer.apply_chat_template(
-            messages_round1, tools=tools, add_generation_prompt=True, tokenize=True
+        direct_tokens = apply_chat_template(
+            tokenizer,
+            messages_round1,
+            tools=tools,
+            add_generation_prompt=True,
+            tokenize=True,
         )
 
         assert concat_tokens == direct_tokens, (
@@ -264,8 +268,12 @@ class TestConcatPromptTokenIds:
         )
 
         # Direct chat_template application to full conversation
-        direct_tokens = tokenizer.apply_chat_template(
-            messages_round2, tools=tools, add_generation_prompt=True, tokenize=True
+        direct_tokens = apply_chat_template(
+            tokenizer,
+            messages_round2,
+            tools=tools,
+            add_generation_prompt=True,
+            tokenize=True,
         )
 
         assert concat_tokens == direct_tokens, (
@@ -361,8 +369,12 @@ class TestConcatPromptTokenIds:
         )
 
         # Direct chat_template application to full conversation
-        direct_tokens = tokenizer.apply_chat_template(
-            messages_round2, tools=tools, add_generation_prompt=True, tokenize=True
+        direct_tokens = apply_chat_template(
+            tokenizer,
+            messages_round2,
+            tools=tools,
+            add_generation_prompt=True,
+            tokenize=True,
         )
 
         assert concat_tokens == direct_tokens, (
@@ -456,8 +468,12 @@ class TestConcatPromptTokenIds:
             tools=tools,
         )
 
-        direct_tokens_round2 = tokenizer.apply_chat_template(
-            messages_round2, tools=tools, add_generation_prompt=True, tokenize=True
+        direct_tokens_round2 = apply_chat_template(
+            tokenizer,
+            messages_round2,
+            tools=tools,
+            add_generation_prompt=True,
+            tokenize=True,
         )
 
         assert concat_tokens_round2 == direct_tokens_round2, (
@@ -552,8 +568,12 @@ class TestConcatPromptTokenIds:
             tools=tools,
         )
 
-        direct_tokens = tokenizer.apply_chat_template(
-            messages_round2, tools=tools, add_generation_prompt=True, tokenize=True
+        direct_tokens = apply_chat_template(
+            tokenizer,
+            messages_round2,
+            tools=tools,
+            add_generation_prompt=True,
+            tokenize=True,
         )
 
         assert concat_tokens == direct_tokens, (
@@ -673,8 +693,12 @@ class TestConcatPromptTokenIds:
             tools=tools,
         )
 
-        direct_tokens = tokenizer.apply_chat_template(
-            messages_round2, tools=tools, add_generation_prompt=True, tokenize=True
+        direct_tokens = apply_chat_template(
+            tokenizer,
+            messages_round2,
+            tools=tools,
+            add_generation_prompt=True,
+            tokenize=True,
         )
 
         assert concat_tokens == direct_tokens, (

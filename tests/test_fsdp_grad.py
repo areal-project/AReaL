@@ -112,8 +112,17 @@ class TestGetGradNormFp32:
         return dp_group, mp_group
 
     def test_empty_grads_returns_zero(self, mock_process_groups):
+        # Empty grads must still participate in all_reduce (e.g. LoRA frozen ranks)
+        # so that ranks with real grads don't hang.
         dp_group, mp_group = mock_process_groups
-        result = get_grad_norm_fp32([], dp_group, mp_group)
+        with patch("torch.distributed.all_reduce") as mock_allreduce:
+            result = get_grad_norm_fp32([], dp_group, mp_group)
+        assert result == 0.0
+        assert mock_allreduce.call_count == 2  # called for dp_group and mp_group
+
+    def test_empty_grads_participates_in_allreduce_no_groups(self):
+        # With no process groups, empty grads should still return 0.0 without hanging.
+        result = get_grad_norm_fp32([], None, None)
         assert result == 0.0
 
     @pytest.mark.parametrize("norm_type", [1.0, 2.0, 3.0, float("inf")])

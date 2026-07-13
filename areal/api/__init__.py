@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 __all__ = [
     "RolloutWorkflow",
     "AsyncRewardWrapper",
@@ -6,8 +8,8 @@ __all__ = [
     "Scheduler",
     "Worker",
     "Job",
-    "AllocationMode",
     "AllocationType",
+    "ModelAllocation",
     "ParallelStrategy",
     "FSDPParallelStrategy",
     "MegatronParallelStrategy",
@@ -30,8 +32,8 @@ _LAZY_IMPORTS = {
     "Scheduler": "areal.api.scheduler_api",
     "Worker": "areal.api.scheduler_api",
     "Job": "areal.api.scheduler_api",
-    "AllocationMode": "areal.api.alloc_mode",
     "AllocationType": "areal.api.alloc_mode",
+    "ModelAllocation": "areal.api.alloc_mode",
     "ParallelStrategy": "areal.api.alloc_mode",
     "FSDPParallelStrategy": "areal.api.alloc_mode",
     "MegatronParallelStrategy": "areal.api.alloc_mode",

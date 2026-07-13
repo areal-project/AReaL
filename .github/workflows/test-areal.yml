@@ -40,7 +40,7 @@ concurrency:
 env:
   GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
   RUNNER_VERSION: '2.332.0'
-  GCP_OS_IMAGE: areal-cicd-test-20260317-3
+  GCP_OS_IMAGE: areal-cicd-test-20260506-432
 
 jobs:
   determine-variants:
@@ -73,7 +73,7 @@ jobs:
       matrix:
         variant: ${{ fromJson(needs.determine-variants.outputs.matrix) }}
     env:
-      CONTAINER_IMAGE: ghcr.io/inclusionai/areal-runtime:${{ inputs.image_tag || 'dev' }}-${{ matrix.variant }}
+      CONTAINER_IMAGE: ghcr.io/areal-project/areal-runtime:${{ inputs.image_tag || 'dev' }}-${{ matrix.variant }}
       RUNNER_LABELS: gcp-a2-highgpu-2g,variant-${{ matrix.variant }}
     steps:
       - name: Set instance variables
@@ -286,7 +286,7 @@ jobs:
     needs:
       - determine-variants
       - provision-runner
-    name: Run AReaL tests (${{ matrix.variant }})
+    name: Run AReaL unit tests (${{ matrix.variant }})
     strategy:
       fail-fast: false
       matrix:
@@ -302,14 +302,14 @@ jobs:
     timeout-minutes: 120
     env:
       # Activate the venv created in the Docker image
-      VIRTUAL_ENV: /AReaL/.venv
+      VIRTUAL_ENV: /opt/.venv
       EXCLUDE_BACKEND: ${{ matrix.variant == 'sglang' && 'vllm' || 'sglang' }}
     steps:
       - uses: actions/checkout@v6
 
       - name: Validate Docker installation
         run: |
-          export PATH="/AReaL/.venv/bin:$PATH"
+          export PATH="/opt/.venv/bin:$PATH"
           python areal/tools/validate_docker_installation.py
 
       - name: Run unit tests
@@ -319,32 +319,10 @@ jobs:
           PYTHONPATH: ${{ github.workspace }}
           TOKENIZERS_PARALLELISM: false
           AREAL_IS_IN_CI: 1
-          VIRTUAL_ENV: /AReaL/.venv
+          VIRTUAL_ENV: /opt/.venv
         run: |
-          export PATH="/AReaL/.venv/bin:$PATH"
-          pytest -m "(not slow or ci) and not ${EXCLUDE_BACKEND}" --durations=20 -s -vv tests/test_*.py tests/experimental/
-
-      - name: Run SFT integration tests
-        env:
-          CI: true
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
-          PYTHONPATH: ${{ github.workspace }}
-          TOKENIZERS_PARALLELISM: false
-          VIRTUAL_ENV: /AReaL/.venv
-        run: |
-          export PATH="/AReaL/.venv/bin:$PATH"
-          pytest -m "not ${EXCLUDE_BACKEND}" -s -vv tests/sft/
-
-      - name: Run GRPO integration tests
-        env:
-          CI: true
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
-          PYTHONPATH: ${{ github.workspace }}
-          TOKENIZERS_PARALLELISM: false
-          VIRTUAL_ENV: /AReaL/.venv
-        run: |
-          export PATH="/AReaL/.venv/bin:$PATH"
-          pytest -m "not ${EXCLUDE_BACKEND}" -s -vv tests/grpo/
+          export PATH="/opt/.venv/bin:$PATH"
+          pytest -m "(not slow or ci) and not ${EXCLUDE_BACKEND}" --durations=20 -s -vv tests/test_*.py tests/experimental/ tests/infra/ tests/v2/
 
   cleanup:
     name: Tear down GCP runner (${{ matrix.variant }})

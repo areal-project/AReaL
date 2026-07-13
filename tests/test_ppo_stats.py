@@ -76,7 +76,6 @@ def test_grpo_loss_fn_uses_full_cu_seqlens_for_n_tokens():
             eps_clip=0.2,
             eps_clip_higher=None,
             c_clip=None,
-            behave_imp_weight_cap=None,
         )
 
     n_tokens = next(
@@ -130,7 +129,6 @@ def test_grpo_loss_fn_uses_packed_denominator_for_tree_vocab_stats():
             eps_clip=0.2,
             eps_clip_higher=None,
             c_clip=None,
-            behave_imp_weight_cap=None,
             vocab_min_logits=torch.zeros(3),
             vocab_max_logits=torch.zeros(3),
         )

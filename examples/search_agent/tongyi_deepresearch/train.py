@@ -1,22 +1,21 @@
+from __future__ import annotations
+
 import hashlib
 import json
 import sys
 import uuid
-from dataclasses import dataclass, field
 from pathlib import Path
 
 from datasets import load_dataset
+from openai import AsyncOpenAI
 from transformers import PreTrainedTokenizerFast
 
 from areal import PPOTrainer, workflow_context
 from areal.api import RolloutWorkflow
 from areal.api.cli_args import (
     GenerationHyperparameters,
-    GRPOConfig,
-    InferenceEngineConfig,
     load_expr_config,
 )
-from areal.engine import RemoteSGLangEngine
 from areal.experimental.openai import ArealOpenAI
 from areal.utils import logging, stats_tracker
 from areal.utils.hf_utils import load_hf_tokenizer
@@ -28,6 +27,8 @@ except ImportError:  # Fallback when executed directly (no package parent known)
     if str(module_dir) not in sys.path:
         sys.path.insert(0, str(module_dir))
     from react_agent import MultiTurnReactAgent  # type: ignore
+
+from examples.search_agent.tongyi_deepresearch.config import AgentRLConfig
 
 worker_id = uuid.uuid4().hex[:4]
 
@@ -48,7 +49,7 @@ class TongyiDeepResearchReactWorkflow(RolloutWorkflow):
         tokenizer: PreTrainedTokenizerFast | str,
         max_tokens: int = 32768,
         max_llm_calls_per_run: int = 100,
-        judge_engine_config: InferenceEngineConfig | None = None,
+        judge_engine_addr: str | None = None,
     ):
         if isinstance(tokenizer, str):
             from areal.utils.hf_utils import load_hf_tokenizer
@@ -59,78 +60,44 @@ class TongyiDeepResearchReactWorkflow(RolloutWorkflow):
         self.tokenizer = tokenizer
         self.max_tokens = max_tokens
 
-        # Initialize judge engine from config if provided
-        self._owns_judge_engine = False
-        self.judge_engine = None
-        if judge_engine_config is not None:
-            self.judge_engine = RemoteSGLangEngine(judge_engine_config)
-            self.judge_engine.config.max_head_offpolicyness = int(1e12)
-            self.judge_engine.initialize()
-            self._owns_judge_engine = True
-
-        self.judge_client = ArealOpenAI(engine=self.judge_engine, tokenizer=tokenizer)
-        self.agent = MultiTurnReactAgent(
-            tokenizer=self.tokenizer,
-            max_tokens_per_turn=self.gconfig.max_new_tokens,
-            max_llm_calls_per_run=max_llm_calls_per_run,
-            max_total_tokens=max_tokens,
-            judge_client=self.judge_client,
-        )
-
-    def __del__(self):
-        if self._owns_judge_engine and self.judge_engine is not None:
-            self.judge_engine.destroy()
+        self.judge_engine_addr = judge_engine_addr
+        self.max_llm_calls_per_run = max_llm_calls_per_run
 
     async def arun_episode(self, engine, data):
-        # Get the unique identifier for this prompt
-        qid = None
-        for key in ["query_id", "id", "qid"]:
-            qid = data.get(key, None)
-            if qid is not None:
-                break
-        qid = str(qid) or uuid.uuid4().hex
-        data["qid"] = qid
+        http_client = await workflow_context.get_httpx_client()
+        async with AsyncOpenAI(
+            base_url=self.judge_engine_addr, api_key="EMPTY", http_client=http_client
+        ) as judge_client:
+            agent = MultiTurnReactAgent(
+                tokenizer=self.tokenizer,
+                max_tokens_per_turn=self.gconfig.max_new_tokens,
+                max_llm_calls_per_run=self.max_llm_calls_per_run,
+                max_total_tokens=self.max_tokens,
+                judge_client=judge_client,
+            )
+            # Get the unique identifier for this prompt
+            qid = None
+            for key in ["query_id", "id", "qid"]:
+                qid = data.get(key, None)
+                if qid is not None:
+                    break
+            qid = str(qid) or uuid.uuid4().hex
+            data["qid"] = qid
 
-        client = ArealOpenAI(
-            engine=engine, tokenizer=self.tokenizer, chat_template_type="concat"
-        )
+            client = ArealOpenAI(
+                engine=engine, tokenizer=self.tokenizer, chat_template_type="concat"
+            )
 
-        # Collect single trajectory
-        stats = await self.agent.make_trajectory(
-            data=data,
-            client=client,
-        )
-        stats_tracker.get(workflow_context.stat_scope()).scalar(**stats)
+            # Collect single trajectory
+            stats = await agent.make_trajectory(
+                data=data,
+                client=client,
+            )
+            stats_tracker.get(workflow_context.stat_scope()).scalar(**stats)
 
-        completion_with_rewards = client.export_interactions(style="concat")
-        assert len(completion_with_rewards) == 1, len(completion_with_rewards)
-        return completion_with_rewards
-
-
-@dataclass
-class AgentRLConfig(GRPOConfig):
-    max_llm_calls_per_run: int = field(
-        default=100,
-        metadata={
-            "help": "Maximum number of LLM calls per trajectory. By default max_llm_calls_per_run=100."
-        },
-    )
-    max_tokens_per_trajectory: int = field(
-        default=32768,
-        metadata={
-            "help": "Maximum number of tokens per trajectory. By default max_tokens_per_trajectory=32768."
-        },
-    )
-    # Logging Agent Trajectories
-    log_agent_stats: bool = field(
-        default=False,
-        metadata={"help": "Log stats for agent trajectories"},
-    )
-    log_agent_stats_keys: list[str] = field(
-        default_factory=lambda: [],
-        metadata={"help": "Keys of log stats for agent trajectories"},
-    )
-    judge_engine: InferenceEngineConfig = field(default_factory=InferenceEngineConfig)
+            completion_with_rewards = client.export_interactions(style="concat")
+            assert len(completion_with_rewards) == 1, len(completion_with_rewards)
+            return completion_with_rewards
 
 
 def get_search_dataset(dataset_path, tokenizer):
@@ -151,22 +118,50 @@ def main(args):
     # Load dataset
     train_dataset = get_search_dataset(config.train_dataset.path, tokenizer=tokenizer)
 
-    workflow_kwargs = dict(
-        gconfig=config.gconfig,
-        tokenizer=config.tokenizer_path,
-        max_tokens=config.max_tokens_per_trajectory,
-        max_llm_calls_per_run=config.max_llm_calls_per_run,
-        judge_engine_config=config.judge_engine,
-    )
-
     # Create trainer (no valid_dataset for this example)
     with PPOTrainer(config, train_dataset, valid_dataset=None) as trainer:
-        # Run training
-        trainer.train(
-            workflow="examples.search_agent.tongyi_deepresearch.train.TongyiDeepResearchReactWorkflow",
-            workflow_kwargs=workflow_kwargs,
-            eval_workflow=None,
+        # Launch judge LLM
+        from areal.api import ModelAllocation
+        from areal.api.cli_args import SGLangConfig
+
+        judge_alloc = ModelAllocation.from_str(config.judge_engine.backend)
+        assert judge_alloc.backend == "sglang"
+        server_args = SGLangConfig.build_args(
+            sglang_config=config.sglang,
+            tp_size=judge_alloc.parallel.tp_size,
+            base_gpu_id=0,
         )
+        config.judge_engine.max_head_offpolicyness = int(1e12)
+        from areal.engine.sglang_remote import RemoteSGLangEngine
+
+        controller = None
+        try:
+            controller = RemoteSGLangEngine.as_controller(
+                config.judge_engine, trainer.scheduler
+            )
+            controller.initialize(role="judge_engine", server_args=server_args)
+            controller.start_proxy()
+            controller.start_proxy_gateway()
+
+            judge_engine_addr = controller.proxy_gateway_addr
+
+            workflow_kwargs = dict(
+                gconfig=config.gconfig,
+                tokenizer=config.tokenizer_path,
+                max_tokens=config.max_tokens_per_trajectory,
+                max_llm_calls_per_run=config.max_llm_calls_per_run,
+                judge_engine_addr=judge_engine_addr,
+            )
+
+            # Run training
+            trainer.train(
+                workflow="examples.search_agent.tongyi_deepresearch.train.TongyiDeepResearchReactWorkflow",
+                workflow_kwargs=workflow_kwargs,
+                eval_workflow=None,
+            )
+        finally:
+            if controller is not None:
+                controller.destroy()
 
 
 if __name__ == "__main__":

@@ -17,11 +17,11 @@
 
 ### 支持的后端
 
-| 后端     | 状态 | 备注                           |
-| -------- | ---- | ------------------------------ |
-| FSDP     | 支持 | 通过 FlexAttention 和块掩码    |
-| Megatron | 支持 | 通过 PytorchFlexAttention 模块 |
-| Archon   | 支持 | 通过 TreeAttentionWrapper      |
+| 后端     | 状态 | 备注                                       |
+| -------- | ---- | ------------------------------------------ |
+| FSDP     | 支持 | 通过 FlexAttention 和块掩码                |
+| Megatron | 支持 | 仅 `mbridge`（暂不支持 `megatron-bridge`） |
+| Archon   | 支持 | 通过 TreeAttentionWrapper                  |
 
 ## 配置
 
@@ -161,6 +161,8 @@ if self.enable_tree_training and ctx.trie_node is not None:
 ### Megatron 引擎
 
 **关键文件：** `areal/engine/megatron_engine.py`
+
+> **当前限制**：`MegatronEngine` 的树训练路径目前仅支持 `mbridge` 后端， 暂不支持 `megatron-bridge`。
 
 Megatron 在模型创建期间使用 `patch_bridge_for_tree_training` 上下文管理器：
 

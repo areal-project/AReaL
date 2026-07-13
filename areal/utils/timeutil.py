@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 import dataclasses
 import math
 import threading
@@ -144,10 +146,14 @@ class EpochStepTimeFreqCtl:
     freq_epoch: int | None
     freq_step: int | None
     freq_sec: int | None
+    initial_epoch_value: bool = False
     group: dist.ProcessGroup | None = None
 
     def __post_init__(self):
-        self.epoch_ctl = FrequencyControl(frequency_steps=self.freq_epoch)
+        self.epoch_ctl = FrequencyControl(
+            frequency_steps=self.freq_epoch,
+            initial_value=self.initial_epoch_value,
+        )
         self.step_ctl = FrequencyControl(frequency_steps=self.freq_step)
         self.time_ctl = FrequencyControl(
             frequency_seconds=self.freq_sec, group=self.group

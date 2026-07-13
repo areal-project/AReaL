@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 import functools
 from typing import Any
 
@@ -6,6 +8,7 @@ import torch
 from areal.api import TrainEngine
 from areal.api.cli_args import MicroBatchSpec, PPOCriticConfig
 from areal.infra import TrainController
+from areal.infra.rpc.serialization import serialize_value
 from areal.trainer.ppo.stats import infer_token_denominator
 from areal.utils import stats_tracker
 from areal.utils.data import (
@@ -14,6 +17,9 @@ from areal.utils.data import (
 )
 from areal.utils.functional import ppo_critic_loss_fn
 from areal.utils.perf_tracer import trace_perf
+from areal.v2.training_service.controller.controller import (
+    GatewayTrainController,
+)
 
 
 class PPOCritic:
@@ -70,10 +76,30 @@ class PPOCritic:
 
 class PPOCriticController(TrainController):
     def compute_values(self, *args, **kwargs):
-        return self._custom_function_call("compute_values", *args, **kwargs)
+        return self._custom_function_call(
+            "compute_values", *args, rpc_meta={"broadcast": True}, **kwargs
+        )
 
     def ppo_update(self, *args, **kwargs):
-        self._custom_function_call("ppo_update", *args, **kwargs)
+        self._custom_function_call(
+            "ppo_update", *args, rpc_meta={"broadcast": True}, **kwargs
+        )
+
+
+class PPOCriticControllerV2(GatewayTrainController):
+    def compute_values(self, *args, **kwargs):
+        payload = {
+            "args": serialize_value(list(args)),
+            "kwargs": serialize_value(kwargs),
+        }
+        return self._gateway_post_result("/ppo/critic/compute_values", payload)
+
+    def ppo_update(self, *args, **kwargs) -> None:
+        payload = {
+            "args": serialize_value(list(args)),
+            "kwargs": serialize_value(kwargs),
+        }
+        self._gateway_post("/ppo/critic/update", payload)
 
 
 def ppo_loss_fn(

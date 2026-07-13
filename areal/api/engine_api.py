@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 from __future__ import annotations
 
 import abc
@@ -360,7 +362,7 @@ class TrainEngine(abc.ABC):
     @abc.abstractmethod
     def train_batch(
         self,
-        input_: dict[str, Any],
+        input_: list[dict[str, Any]] | dict[str, Any],
         loss_fn: Callable[..., torch.Tensor],
         loss_weight_fn: Callable[[dict[str, Any]], torch.Tensor],
     ) -> dict[str, float]:
@@ -372,9 +374,11 @@ class TrainEngine(abc.ABC):
 
         Parameters
         ----------
-        input_ : dict[str, Any]
-            The input data for model forward pass and the loss function.
-            Redundant entries are allowed.
+        input_ : list[dict[str, Any]] | dict[str, Any]
+            Input data for model forward pass and loss computation.
+            Preferred format is ``list[dict[str, Any]]`` (trajectory list).
+            Backward compatibility: a pre-batched ``dict[str, Any]`` is
+            also accepted.
         loss_fn : Callable[..., torch.Tensor]
             The loss function. For actor (is_critic=False), it receives
             (logprobs, entropy, input_data). For critic (is_critic=True),
@@ -397,7 +401,7 @@ class TrainEngine(abc.ABC):
     @abc.abstractmethod
     def eval_batch(
         self,
-        input_: dict[str, Any],
+        input_: list[dict[str, Any]] | dict[str, Any],
         loss_fn: Callable[..., torch.Tensor],
         loss_weight_fn: Callable[[dict[str, Any]], torch.Tensor],
     ) -> torch.Tensor | None:
@@ -409,9 +413,11 @@ class TrainEngine(abc.ABC):
 
         Parameters
         ----------
-        input_ : dict[str, Any]
-            The input data for model forward pass and the loss function.
-            Redundant entries are allowed.
+        input_ : list[dict[str, Any]] | dict[str, Any]
+            Input data for model forward pass and loss computation.
+            Preferred format is ``list[dict[str, Any]]`` (trajectory list).
+            Backward compatibility: a pre-batched ``dict[str, Any]`` is
+            also accepted.
         loss_fn : Callable[..., torch.Tensor]
             The loss function. For actor (is_critic=False), it receives
             (logprobs, entropy, input_data). For critic (is_critic=True),
@@ -434,10 +440,10 @@ class TrainEngine(abc.ABC):
     @abc.abstractmethod
     def forward_batch(
         self,
-        input_: dict[str, Any],
+        input_: list[dict[str, Any]] | dict[str, Any],
         output_seqlens: list[int] | None = None,
-        aggregate_fn: Callable[[list[Any]], Any] = torch.cat,
-    ) -> torch.Tensor:
+        aggregate_fn: Callable[[list[torch.Tensor]], torch.Tensor] = torch.cat,
+    ) -> torch.Tensor | list[torch.Tensor]:
         """Run the forward pass or inference on the model.
 
         Note
@@ -446,29 +452,34 @@ class TrainEngine(abc.ABC):
 
         Parameters
         ----------
-        input_ : dict[str, Any]
-            The input data for model forward pass. Redundant entries are allowed.
+        input_ : list[dict[str, Any]] | dict[str, Any]
+            Input data for model forward pass. Redundant entries are allowed.
+            ``list[dict[str, Any]]`` and pre-batched ``dict[str, Any]``
+            are both supported.
         output_seqlens : list[int], optional
             The desired output sequence lengths. If None, assumes that the output
             has the same lengths as inputs, by default None.
-        aggregate_fn : Callable[[list[Any]], Any], optional
+        aggregate_fn : Callable[[list[torch.Tensor]], torch.Tensor], optional
             A function to aggregate micro-batched outputs, by default torch.cat.
+            It should preserve batch dimension 0.
 
         Returns
         -------
-        Any
-            For actor (is_critic=False): logprobs tensor aggregated by `aggregate_fn`.
-            For critic (is_critic=True): values tensor aggregated by `aggregate_fn`.
+        torch.Tensor | list[torch.Tensor]
+            Batched tensor output for dict input.
+            Per-trajectory tensor list for list input.
+            For actor (is_critic=False), return logprobs tensors.
+            For critic (is_critic=True), return value tensors.
         """
         raise NotImplementedError()
 
     @torch.no_grad()
     def forward(
         self,
-        input_: dict[str, Any],
+        input_: list[dict[str, Any]] | dict[str, Any],
         output_seqlens: list[int] | None = None,
-        aggregate_fn: Callable[[list[Any]], Any] = torch.cat,
-    ) -> torch.Tensor:
+        aggregate_fn: Callable[[list[torch.Tensor]], torch.Tensor] = torch.cat,
+    ) -> torch.Tensor | list[torch.Tensor]:
         return self.forward_batch(input_, output_seqlens, aggregate_fn)
 
     @abc.abstractmethod
@@ -498,6 +509,12 @@ class TrainEngine(abc.ABC):
     @abc.abstractmethod
     def get_device_stats(self) -> DeviceRuntimeInfo:
         raise NotImplementedError()
+
+    def start_memory_profile(self, max_entries: int = 100000) -> None:
+        pass
+
+    def stop_memory_profile(self, snapshot_dir: str) -> None:
+        pass
 
     def save_perf_tracer(self, step: int | None = None, force: bool = False) -> None:
         """Save performance tracer data.
@@ -699,6 +716,15 @@ class InferenceEngine(abc.ABC):
             The current weight version number
         """
         raise NotImplementedError()
+
+    def compute_logp(self, data: list[dict[str, Any]]) -> list[torch.Tensor]:
+        """Compute token log-probabilities for teacher distillation.
+
+        Implementations support this as an inference-side scoring API.
+        """
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not implement compute_logp()."
+        )
 
     def submit(
         self,

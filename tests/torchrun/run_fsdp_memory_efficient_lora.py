@@ -8,7 +8,8 @@ import torch.distributed as dist
 
 from tests.utils import get_model_path
 
-from areal.api import AllocationMode, FinetuneSpec
+from areal.api import FinetuneSpec
+from areal.api.alloc_mode import ModelAllocation
 from areal.api.cli_args import (
     FSDPEngineConfig,
     MicroBatchSpec,
@@ -32,11 +33,12 @@ def write_result(out: str, succ: bool):
 
 
 def make_fsdp_engine_with_lora(
-    allocation_mode: str,
+    backend: str,
     memory_efficient_load: bool,
 ):
     """Create FSDPEngine with LoRA and optionally memory_efficient_load."""
     config = TrainEngineConfig(
+        backend=backend,
         experiment_name="test_fsdp_memory_efficient_lora",
         trial_name="test",
         mb_spec=MicroBatchSpec(max_tokens_per_mb=256),
@@ -49,10 +51,10 @@ def make_fsdp_engine_with_lora(
         lora_alpha=16,
         peft_type="lora",
     )
-    alloc_mode = AllocationMode.from_str(allocation_mode)
+    alloc_mode = ModelAllocation.from_str(backend)
     engine = FSDPEngine(config)
     ft_spec = FinetuneSpec(total_train_epochs=1, dataset_size=128, train_batch_size=8)
-    engine.create_process_group(parallel_strategy=alloc_mode.train)
+    engine.create_process_group(parallel_strategy=alloc_mode.parallel)
     engine.initialize(None, ft_spec)
     return engine
 
@@ -137,14 +139,14 @@ def main():
         help="Optional path to save the output result",
     )
     parser.add_argument(
-        "--allocation_mode",
+        "--backend",
         type=str,
-        default="d1t1c1",
-        help="Allocation mode for the model",
+        default="fsdp:d1t1c1",
+        help="Backend allocation string for the model (e.g., 'fsdp:d1t1c1')",
     )
     args = parser.parse_args()
 
-    test_memory_efficient_lora(alloc_mode=args.allocation_mode, output=args.output)
+    test_memory_efficient_lora(alloc_mode=args.backend, output=args.output)
 
 
 if __name__ == "__main__":

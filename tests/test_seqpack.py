@@ -6,7 +6,8 @@ import numpy as np
 import pytest
 import torch
 
-from areal.api import AllocationMode, TrainEngine
+from areal.api import TrainEngine
+from areal.api.alloc_mode import ModelAllocation
 from areal.api.cli_args import SchedulingSpec, TrainEngineConfig
 from areal.infra import TrainController
 from areal.infra.controller.train_controller import (
@@ -743,9 +744,10 @@ class TestTrainControllerDispatchIntegration:
     def train_config(self):
         """Create a TrainEngineConfig for testing."""
         return TrainEngineConfig(
+            backend="fsdp:d1",
             scheduling_spec=(
                 SchedulingSpec(cpu=4, gpu=1, mem=16000, port_count=2, cmd="dummy"),
-            )
+            ),
         )
 
     def _create_traj_list(self, seqlens: list[int]) -> list[dict[str, RTensor]]:
@@ -772,8 +774,7 @@ class TestTrainControllerDispatchIntegration:
             scheduler=mock_scheduler,
         )
 
-        alloc_mode = AllocationMode.from_str(f"d{dp_size}p1t1")
-        controller.parallel_strategy = alloc_mode.train
+        controller.train_alloc = ModelAllocation.from_str(f"fsdp:d{dp_size}p1t1")
 
         # Create batch with sequences that should split equally
         n_seqs = dp_size * 16
@@ -834,8 +835,7 @@ class TestTrainControllerDispatchIntegration:
         )
 
         dp_size = 4
-        alloc_mode = AllocationMode.from_str(f"d{dp_size}p1t1")
-        controller.parallel_strategy = alloc_mode.train
+        controller.train_alloc = ModelAllocation.from_str(f"fsdp:d{dp_size}p1t1")
 
         n_seqs = dp_size * 20
         seqlens = generator_func(n_seqs, seed=42)
@@ -865,8 +865,7 @@ class TestTrainControllerDispatchIntegration:
         )
 
         dp_size = 4
-        alloc_mode = AllocationMode.from_str(f"d{dp_size}p1t1")
-        controller.parallel_strategy = alloc_mode.train
+        controller.train_alloc = ModelAllocation.from_str(f"fsdp:d{dp_size}p1t1")
 
         n_seqs = 100
         seqlens = generate_uniform_seqlens(n=n_seqs, low=100, high=500, seed=42)
@@ -893,8 +892,7 @@ class TestTrainControllerDispatchIntegration:
         )
 
         dp_size = 4
-        alloc_mode = AllocationMode.from_str(f"d{dp_size}p1t1")
-        controller.parallel_strategy = alloc_mode.train
+        controller.train_alloc = ModelAllocation.from_str(f"fsdp:d{dp_size}p1t1")
 
         seqlens = generate_bimodal_seqlens(
             n_long=16,

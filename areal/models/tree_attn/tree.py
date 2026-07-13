@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 """Tree-based sequence packing for efficient training with shared prefixes.
 
 This module provides utilities for building trie structures from sequences,

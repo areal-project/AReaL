@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 from areal.experimental.models.archon.moe.args import MoEArgs
 from areal.experimental.models.archon.moe.grouped_experts import GroupedExperts
 from areal.experimental.models.archon.moe.moe import FeedForward, MoE

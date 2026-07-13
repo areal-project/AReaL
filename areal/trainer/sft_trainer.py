@@ -1,13 +1,15 @@
+# SPDX-License-Identifier: Apache-2.0
+
 from __future__ import annotations
 
 import os
 from typing import TYPE_CHECKING
 
 import torch.distributed as dist
-from datasets import Dataset
 from torchdata.stateful_dataloader import StatefulDataLoader
 
-from areal.api import AllocationMode, FinetuneSpec, Scheduler, StepInfo
+from areal.api import FinetuneSpec, Scheduler, StepInfo
+from areal.api.alloc_mode import ModelAllocation
 from areal.api.cli_args import (
     SFTConfig,
     TrainDatasetConfig,
@@ -20,6 +22,9 @@ from areal.infra import (
     SlurmScheduler,
     current_platform,
 )
+from areal.infra.data_service import DataController
+from areal.infra.data_service.controller.config import DataServiceConfig
+from areal.infra.data_service.rdataset import RDataset
 from areal.utils import logging, perf_tracer, seeding, stats_tracker
 from areal.utils.data import (
     broadcast_tensor_container,
@@ -37,6 +42,8 @@ from areal.utils.saver import Saver
 from areal.utils.stats_logger import StatsLogger
 
 if TYPE_CHECKING:
+    from datasets import Dataset
+
     from areal.engine import FSDPLMEngine, MegatronLMEngine
     from areal.experimental.engine.archon_engine import ArchonLMEngine
     from areal.trainer.sft.lm_engine import LMController
@@ -53,7 +60,6 @@ class SFTTrainer:
     ):
         rank = int(os.getenv("RANK", "0"))
         if is_single_controller():
-            # Set up file logging for controller process
             logging.setup_file_logging(StatsLogger.get_log_path(config.stats_logger))
 
         self.config = config
@@ -63,33 +69,39 @@ class SFTTrainer:
         self.scheduler = None
         if is_single_controller():
             self.scheduler = self._init_scheduler()
+        self.data_controller: DataController | None = None
+        self._train_rdataset: RDataset | None = None
+        self._valid_rdataset: RDataset | None = None
 
-        # Set seed.
         seeding.set_random_seed(config.seed, key=f"trainer{rank}")
 
-        # Parse allocation mode.
-        self.allocation_mode = AllocationMode.from_str(config.allocation_mode)
+        self.actor_alloc = ModelAllocation.from_str(config.actor.backend, name="actor")
 
-        # Create models.
         self.actor = self._create_actor(config.actor)
 
-        # Create dataloaders
-        self.train_dataset = train_dataset
-        self.valid_dataset = valid_dataset
-        self.train_dataloader = self._create_dataloader(
+        if is_single_controller() and isinstance(train_dataset, RDataset):
+            ds_cfg = DataServiceConfig.from_dataset_config(
+                config.train_dataset, seed=config.seed
+            )
+            controller = DataController(ds_cfg, self.scheduler)
+            controller.initialize(role="data", num_dataset_workers=ds_cfg.num_workers)
+            self.data_controller = controller
+
+            train_dataset.connect(
+                controller,
+                dataset_id=f"{config.experiment_name}_{config.trial_name}_train",
+                tokenizer_or_processor_path=config.tokenizer_path,
+                shuffle=config.train_dataset.shuffle,
+                drop_last=config.train_dataset.drop_last,
+            )
+            self._train_rdataset = train_dataset
+
+        self.train_dataloader: StatefulDataLoader = self._create_dataloader(
             train_dataset,
-            dataset_config=self.config.train_dataset,
+            dataset_config=config.train_dataset,
             rank=self.actor.data_parallel_rank,
             world_size=self.actor.data_parallel_world_size,
         )
-        self.valid_dataloader = None
-        if self.config.valid_dataset is not None and valid_dataset is not None:
-            self.valid_dataloader = self._create_dataloader(
-                valid_dataset,
-                dataset_config=self.config.valid_dataset,
-                rank=self.actor.data_parallel_rank,
-                world_size=self.actor.data_parallel_world_size,
-            )
 
         ft_spec = FinetuneSpec(
             total_train_epochs=config.total_train_epochs,
@@ -97,27 +109,33 @@ class SFTTrainer:
             train_batch_size=config.train_dataset.batch_size,
         )
 
-        # Initialize models
-        self.parallel_strategy = self.allocation_mode.train
-        assert self.parallel_strategy is not None
-        engine_init_kwargs = {
-            "addr": None,
-            "ft_spec": ft_spec,
-            "alloc_mode": self.allocation_mode,
-        }
-        self.actor.initialize(**engine_init_kwargs, role="actor")
+        self.actor.initialize(addr=None, ft_spec=ft_spec, role="actor")
 
-        # Set up evaluation
+        self.valid_dataloader: StatefulDataLoader | None = None
+        if config.valid_dataset is not None and valid_dataset is not None:
+            assert config.valid_dataset is not None
+            if is_single_controller() and isinstance(valid_dataset, RDataset):
+                assert self.data_controller is not None
+                valid_dataset.connect(
+                    self.data_controller,
+                    dataset_id=f"{config.experiment_name}_{config.trial_name}_valid",
+                    tokenizer_or_processor_path=config.tokenizer_path,
+                    shuffle=config.valid_dataset.shuffle,
+                    drop_last=config.valid_dataset.drop_last,
+                )
+                self._valid_rdataset = valid_dataset
+
+            self.valid_dataloader = self._create_dataloader(
+                valid_dataset,
+                dataset_config=config.valid_dataset,
+                rank=self.actor.data_parallel_rank,
+                world_size=self.actor.data_parallel_world_size,
+            )
+
         self.evaluator = Evaluator(config.evaluator, ft_spec)
-
-        # Set up save as HF model
         self.saver = Saver(config.saver, ft_spec)
         self.recover_handler = RecoverHandler(config.recover, ft_spec)
-
-        # Set up statistics logging (wandb, tensoboard, etc.)
         self.stats_logger = StatsLogger(config, ft_spec)
-
-        # Set up checkpointing for recover
         self.recover_info = self.recover_handler.load(
             self.actor,
             self.saver,
@@ -125,7 +143,6 @@ class SFTTrainer:
             self.stats_logger,
             self.train_dataloader,
         )
-
         self._config_perf_tracer()
 
     def train(self):
@@ -161,8 +178,13 @@ class SFTTrainer:
             ):
                 batch = self._load_bcast_from(data_generator)
 
-            # Wait for async checkpoint staging to complete before modifying parameters
             self.saver.maybe_wait_for_staging()
+
+            if (
+                config.memory_profiler is not None
+                and global_step in config.memory_profiler.profile_steps
+            ):
+                self.actor.start_memory_profile(config.memory_profiler.max_entries)
 
             with (
                 stats_tracker.record_timing("train_step"),
@@ -175,6 +197,18 @@ class SFTTrainer:
                 self.actor.train_lm(batch)
                 self.actor.step_lr_scheduler()
                 self.actor.get_device_stats().log("after train step")
+
+            if (
+                config.memory_profiler is not None
+                and global_step in config.memory_profiler.profile_steps
+            ):
+                log_dir = StatsLogger.get_log_path(config.stats_logger)
+                snapshot_dir = os.path.join(
+                    log_dir, "memory_snapshots", f"step_{global_step}"
+                )
+                os.makedirs(snapshot_dir, exist_ok=True)
+                self.actor.stop_memory_profile(snapshot_dir)
+                logger.info(f"Memory snapshots saved to {snapshot_dir}")
 
             self.actor.set_version(global_step + 1)
 
@@ -222,7 +256,12 @@ class SFTTrainer:
                     args={"global_step": global_step},
                 ),
             ):
-                self.actor.clear_batches(batch)
+                # SPMD mode never populates ``_fetch_buffer`` (no RTensor
+                # round-trip), so the fan-out is single-controller only.
+                if is_single_controller():
+                    self.actor.clear_batches(batch)
+                    if self.data_controller is not None:
+                        self.data_controller.clear_batches()
 
             with perf_tracer.trace_scope(
                 "train.log_stats",
@@ -237,6 +276,12 @@ class SFTTrainer:
 
     def close(self):
         self.saver.finalize()
+        if self._train_rdataset is not None:
+            self._train_rdataset.close()
+        if self._valid_rdataset is not None:
+            self._valid_rdataset.close()
+        if hasattr(self, "data_controller") and self.data_controller is not None:
+            self.data_controller.destroy()
         self.stats_logger.close()
         self.actor.destroy()
         perf_tracer.save(force=True)
@@ -268,7 +313,7 @@ class SFTTrainer:
 
     def _create_dataloader(
         self,
-        dataset: Dataset,
+        dataset,
         dataset_config: TrainDatasetConfig | ValidDatasetConfig,
         rank: int,
         world_size: int,
@@ -284,28 +329,28 @@ class SFTTrainer:
     def _create_actor(
         self, actor_config: TrainEngineConfig
     ) -> FSDPLMEngine | MegatronLMEngine | ArchonLMEngine | LMController:
-        if self.allocation_mode.train_backend == "fsdp":
+        if self.actor_alloc.backend == "fsdp":
             from areal.engine import FSDPLMEngine
 
             actor_cls = FSDPLMEngine
-        elif self.allocation_mode.train_backend == "megatron":
+        elif self.actor_alloc.backend == "megatron":
             from areal.engine import MegatronLMEngine
 
             actor_cls = MegatronLMEngine
-        elif self.allocation_mode.train_backend == "archon":
+        elif self.actor_alloc.backend == "archon":
             from areal.experimental.engine.archon_engine import ArchonLMEngine
 
             actor_cls = ArchonLMEngine
         else:
             raise ValueError(
-                f"Invalid backend: {self.allocation_mode.train_backend}, "
+                f"Invalid backend: {self.actor_alloc.backend}, "
                 f"expected fsdp, megatron, or archon"
             )
         if is_single_controller():
             actor = actor_cls.as_controller(actor_config, self.scheduler)
         else:
             actor = actor_cls(config=actor_config)
-        actor.create_process_group(parallel_strategy=self.allocation_mode.train)
+        actor.create_process_group(parallel_strategy=self.actor_alloc.parallel)
         return actor
 
     def _load_bcast_from(self, data_generator):
@@ -314,7 +359,6 @@ class SFTTrainer:
         if is_single_controller():
             return batch
 
-        # NOTE: data are identical across model+context parallel group
         batch = tensor_container_to(batch, current_platform.current_device())
         batch = broadcast_tensor_container(
             batch,
@@ -324,7 +368,6 @@ class SFTTrainer:
         return batch
 
     def _save_hf(self, epoch: int, epoch_step: int, global_step: int):
-        # Save as HF models for evaluation
         self.saver.save(
             self.actor,
             epoch,
@@ -334,13 +377,11 @@ class SFTTrainer:
             processor=self.processor,
         )
 
-        # Async mode: synchronization handled by AsyncCheckpointManager
         if not self.saver.is_async:
             dist.barrier(group=self.actor.cpu_group)
             current_platform.synchronize()
 
     def _save_recover_checkpoint(self, epoch: int, epoch_step: int, global_step: int):
-        # Save recoverable checkpoints
         to_save: dict = dict(default=self.actor)
         step_info = StepInfo(
             global_step=global_step,
@@ -389,7 +430,6 @@ class SFTTrainer:
         current_platform.synchronize()
 
     def _export_and_commit_stats(self, epoch: int, epoch_step: int, global_step: int):
-        # Upload statistics to the logger (e.g., wandb)
         stats = self.actor.export_stats()
         self.stats_logger.commit(epoch, epoch_step, global_step, stats)
 

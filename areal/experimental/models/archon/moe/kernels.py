@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 # Adapted from torchtitan: torchtitan/models/moe/kernels.py
 
 import torch

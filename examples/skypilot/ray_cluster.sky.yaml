@@ -1,7 +1,7 @@
 
 resources:
   accelerators: A100:8
-  image_id: docker:ghcr.io/inclusionai/areal-runtime:v1.0.2-sglang
+  image_id: docker:ghcr.io/areal-project/areal-runtime:v2.0.0-sglang
   memory: 32+
   cpus: 8+
 
@@ -35,7 +35,8 @@ run: |
             trial_name=trial0 \
             cluster.n_nodes=$SKYPILOT_NUM_NODES \
             cluster.n_gpus_per_node=$SKYPILOT_NUM_GPUS_PER_NODE \
-            allocation_mode=sglang:d8+d8
+            rollout.backend=sglang:d8 \
+            actor.backend=fsdp:d8
   else
     sleep 10
     echo "Starting Ray worker node..."

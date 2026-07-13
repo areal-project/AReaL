@@ -1,6 +1,6 @@
 import sys
 
-from areal.api import AllocationMode
+from areal.api.alloc_mode import ModelAllocation
 from areal.api.cli_args import GRPOConfig, SGLangConfig, load_expr_config, vLLMConfig
 from areal.dataset import get_custom_dataset
 from areal.engine import RemoteSGLangEngine, RemotevLLMEngine
@@ -20,7 +20,7 @@ def main(args):
     tokenizer = load_hf_tokenizer(config.tokenizer_path)
     seeding.set_random_seed(config.seed, key="eval")
 
-    allocation_mode = AllocationMode.from_str(config.allocation_mode)
+    rollout_alloc = ModelAllocation.from_str(config.rollout.backend, name="rollout")
 
     # Initialize scheduler
     cfg = config.scheduler
@@ -47,29 +47,28 @@ def main(args):
     # Initialize RolloutController
     config.rollout.max_head_offpolicyness = int(1e12)
 
-    if allocation_mode.gen_backend == "sglang":
+    if rollout_alloc.backend == "sglang":
         engine_cls = RemoteSGLangEngine
         server_args = SGLangConfig.build_args(
             sglang_config=config.sglang,
-            tp_size=allocation_mode.gen.tp_size,
+            tp_size=rollout_alloc.parallel.tp_size,
             base_gpu_id=0,
         )
-    elif allocation_mode.gen_backend == "vllm":
+    elif rollout_alloc.backend == "vllm":
         engine_cls = RemotevLLMEngine
         server_args = vLLMConfig.build_args(
             vllm_config=config.vllm,
-            tp_size=allocation_mode.gen.tp_size,
-            pp_size=allocation_mode.gen.pp_size,
+            tp_size=rollout_alloc.parallel.tp_size,
+            pp_size=rollout_alloc.parallel.pp_size,
         )
     else:
-        raise ValueError(f"Invalid backend: {allocation_mode.gen_backend}")
+        raise ValueError(f"Invalid backend: {rollout_alloc.backend}")
 
     eval_rollout = engine_cls.as_controller(config.rollout, scheduler)
 
     try:
         eval_rollout.initialize(
             role="eval-rollout",
-            alloc_mode=allocation_mode,
             server_args=server_args,
         )
 

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 # Adapted from torchtitan: torchtitan/models/utils.py
 
 from __future__ import annotations

@@ -10,7 +10,8 @@ from transformers import AutoTokenizer
 
 from tests.utils import get_model_path
 
-from areal.api import AllocationMode, FinetuneSpec, SaveLoadMeta
+from areal.api import FinetuneSpec, SaveLoadMeta
+from areal.api.alloc_mode import ModelAllocation
 from areal.api.cli_args import (
     MegatronEngineConfig,
     OptimizerConfig,
@@ -83,16 +84,17 @@ def engine():
         }
     )
     config = TrainEngineConfig(
+        backend="fsdp:d1",
         experiment_name="test",
         trial_name="test",
         path=MODEL_PATH,
         optimizer=OptimizerConfig(),
         megatron=MegatronEngineConfig(),
     )
-    alloc_mode = AllocationMode.from_str("d1p1t1")
+    alloc_mode = ModelAllocation.from_str("fsdp:d1p1t1")
     ft_spec = FinetuneSpec(total_train_epochs=1, dataset_size=128, train_batch_size=8)
     engine = MegatronEngine(config)
-    engine.create_process_group(alloc_mode.train)
+    engine.create_process_group(alloc_mode.parallel)
     engine.initialize(addr=None, ft_spec=ft_spec)
     logger.info(f"mcore GPTModel initialized: {engine.model}")
     engine.get_device_stats().log("initialize")

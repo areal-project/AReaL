@@ -12,7 +12,8 @@ import torch
 import torch.nn.functional as F
 from megatron.core import parallel_state as mpu
 
-from areal.api import AllocationMode, FinetuneSpec
+from areal.api import FinetuneSpec
+from areal.api.alloc_mode import ModelAllocation
 from areal.api.cli_args import (
     FP8EngineConfig,
     MegatronEngineConfig,
@@ -249,16 +250,17 @@ def create_engine(
         megatron_config.ddp.fp8_param_gather = True
 
     config = TrainEngineConfig(
+        backend="fsdp:d1",
         experiment_name="test",
         trial_name="test",
         path=model_path,
         optimizer=OptimizerConfig(),
         megatron=megatron_config,
     )
-    alloc_mode = AllocationMode.from_str("d1p1t1")
+    alloc_mode = ModelAllocation.from_str("fsdp:d1p1t1")
     ft_spec = FinetuneSpec(total_train_epochs=1, dataset_size=128, train_batch_size=8)
     engine = MegatronEngine(config)
-    engine.create_process_group(alloc_mode.train)
+    engine.create_process_group(alloc_mode.parallel)
     engine.initialize(addr=None, ft_spec=ft_spec)
     return engine
 

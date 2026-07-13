@@ -1,10 +1,50 @@
+# SPDX-License-Identifier: Apache-2.0
+
+from __future__ import annotations
+
 from functools import lru_cache
+from typing import Any, Literal, overload
 
 import transformers
 
 import areal.utils.logging as logging
+from areal.utils import pkg_version
 
 logger = logging.getLogger("HFUtils")
+
+
+@overload
+def apply_chat_template(
+    tokenizer: transformers.PreTrainedTokenizerFast,
+    messages: list[dict[str, Any]],
+    *,
+    tokenize: Literal[True] = ...,
+    **kwargs: Any,
+) -> list[int]: ...
+
+
+@overload
+def apply_chat_template(
+    tokenizer: transformers.PreTrainedTokenizerFast,
+    messages: list[dict[str, Any]],
+    *,
+    tokenize: Literal[False],
+    **kwargs: Any,
+) -> str: ...
+
+
+def apply_chat_template(
+    tokenizer: transformers.PreTrainedTokenizerFast,
+    messages: list[dict[str, Any]],
+    *,
+    tokenize: bool = True,
+    **kwargs: Any,
+) -> list[int] | str:
+    """Apply chat template, normalising transformers >=5.0 dict return to list[int]."""
+    result = tokenizer.apply_chat_template(messages, tokenize=tokenize, **kwargs)
+    if tokenize and pkg_version.is_version_greater_or_equal("transformers", "5.0"):
+        return list(result["input_ids"])
+    return result
 
 
 @lru_cache(maxsize=8)
@@ -33,7 +73,7 @@ def load_hf_processor_and_tokenizer(
     model_name_or_path: str,
     fast_tokenizer=True,
     padding_side: str | None = None,
-) -> tuple["transformers.ProcessorMixin | None", transformers.PreTrainedTokenizerFast]:
+) -> tuple[transformers.ProcessorMixin | None, transformers.PreTrainedTokenizerFast]:
     """Load a tokenizer and processor from Hugging Face."""
     # NOTE: use the raw type annoation will trigger cuda initialization
     tokenizer = load_hf_tokenizer(model_name_or_path, fast_tokenizer, padding_side)

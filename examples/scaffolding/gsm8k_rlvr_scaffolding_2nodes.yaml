@@ -1,0 +1,187 @@
+# RLVR Scaffolding Example Configuration for GSM8K
+# Multi-node setup: 2 nodes x 8 A100-80GB GPUs (Ray scheduler)
+# allocation: 8 GPUs for SGLang inference, 8 GPUs for actor+ref training
+
+experiment_name: gsm8k-rlvr-scaffolding
+trial_name: trial0
+
+seed: 1
+enable_offload: false
+total_train_epochs: 10
+tokenizer_path: ${actor.path}
+
+cluster:
+  n_nodes: 2
+  n_gpus_per_node: 8
+  fileroot: /tmp/areal/experiments
+  name_resolve:
+    type: ray
+    ray_actor_name: ray_kv_store
+
+allocation_mode: sglang:d8+d8
+
+scheduler:
+  type: ray
+
+rollout:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  max_concurrent_rollouts: 64
+  queue_size: null
+  consumer_batch_size: ${train_dataset.batch_size}
+  max_head_offpolicyness: 2
+  enable_rollout_tracing: false
+  scheduling_spec: ${actor.scheduling_spec}
+  fileroot: ${cluster.fileroot}
+  tokenizer_path: ${tokenizer_path}
+  dump_to_file: false
+
+gconfig:
+  n_samples: 8
+  min_new_tokens: 0
+  max_new_tokens: 1024
+  greedy: false
+  temperature: 1.0
+
+actor:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  path: Qwen/Qwen2.5-3B-Instruct
+  init_from_scratch: false
+  attn_impl: sdpa
+  disable_dropout: true
+  gradient_checkpointing: true
+  dtype: bfloat16
+  mb_spec:
+    max_tokens_per_mb: 10240
+  optimizer:
+    type: adam
+    lr: 1.0e-6
+    weight_decay: 0.01
+    beta1: 0.9
+    beta2: 0.999
+    eps: 1e-8
+    lr_scheduler_type: constant
+    gradient_clipping: 1.0
+    warmup_steps_proportion: 0.001
+  eps_clip: 0.2
+  temperature: ${gconfig.temperature}
+  reward_scaling: 10.0
+  reward_bias: -0.5
+  kl_ctl: 0.0
+  ppo_n_minibatches: 1
+  recompute_logprob: true
+  use_decoupled_loss: true
+  behav_imp_weight_cap: 5.0
+  reward_norm:
+    mean_level: group
+    std_level: group
+    group_size: ${gconfig.n_samples}
+  adv_norm:
+    mean_level: batch
+    std_level: batch
+  weight_update_mode: xccl
+  max_new_tokens: ${gconfig.max_new_tokens}
+  scheduling_spec:
+    - task_type: worker
+      port_count: 2
+      gpu: 1
+      mem: 32
+      cmd: python3 -m areal.infra.rpc.rpc_server
+      env_vars:
+        NCCL_SOCKET_FAMILY: AF_INET6
+        NCCL_SOCKET_IFNAME: eth0
+        TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC: "3600"
+        NCCL_IB_DISABLE: "1"
+
+ref:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  path: ${actor.path}
+  init_from_scratch: false
+  disable_dropout: true
+  dtype: ${actor.dtype}
+  mb_spec:
+    max_tokens_per_mb: 10240
+  optimizer: null
+  scheduling_strategy:
+    type: colocation
+    target: actor
+  scheduling_spec: ${actor.scheduling_spec}
+
+# SGLang
+sglang:
+  model_path: ${actor.path}
+  random_seed: ${seed}
+  skip_tokenizer_init: false
+  dtype: ${actor.dtype}
+  max_running_requests: null
+  context_length: 2048
+  mem_fraction_static: 0.5
+  attention_backend: flashinfer
+
+vllm:
+  model: ${actor.path}
+  seed: ${seed}
+  skip_tokenizer_init: false
+  dtype: ${actor.dtype}
+  max_model_len: 4096
+  gpu_memory_utilization: 0.8
+
+# Datasets
+train_dataset:
+  batch_size: 256
+  shuffle: true
+  pin_memory: false
+  num_workers: 0
+  path: openai/gsm8k
+  type: rl
+  max_length: 2048
+
+valid_dataset:
+  batch_size: 256
+  pin_memory: true
+  num_workers: 4
+  path: openai/gsm8k
+  type: rl
+
+# Utilities
+saver:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: 1
+  freq_steps: null
+  freq_secs: null
+
+recover:
+  mode: disabled
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: 1
+  freq_steps: null
+  freq_secs: 3600
+
+evaluator:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: 1
+  freq_steps: null
+  freq_secs: null
+
+stats_logger:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  wandb:
+    mode: disabled
+
+perf_tracer:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  enabled: false
+  session_tracer:
+    enabled: false

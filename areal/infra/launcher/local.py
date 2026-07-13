@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 import getpass
 import os
 import re
@@ -5,11 +7,12 @@ import signal as signal_module
 import subprocess
 import sys
 import time
+import warnings
 from collections import defaultdict
 
 import psutil
 
-from areal.api import AllocationMode, AllocationType
+from areal.api.alloc_mode import AllocationType, _AllocationMode
 from areal.api.cli_args import (
     ClusterSpecConfig,
     InferenceEngineConfig,
@@ -28,6 +31,7 @@ from areal.infra.utils.launcher import (
     JobState,
     get_scheduling_spec,
     get_thread_env_vars,
+    run_post_exit_hook,
     validate_config_for_launcher,
     wait_llm_server_addrs,
 )
@@ -268,6 +272,16 @@ def local_main(config, run_id: int = 0):
     config.recover = to_structured_cfg(config.recover, RecoverConfig)
     config.cluster = to_structured_cfg(config.cluster, ClusterSpecConfig)
     is_recover_run = check_if_recover(config.recover, run_id)
+    warnings.warn(
+        "SPMD launchers use the deprecated _AllocationMode parser which will be removed. "
+        "Bare dimension strings (e.g., 'd4t2') are NO LONGER ACCEPTED. "
+        "All allocation strings must include an explicit backend prefix "
+        "(e.g., 'fsdp:d4', 'sglang:d4t2'). "
+        "Migrate to single-controller mode (scheduler.type=local) with per-engine 'backend' "
+        "fields (e.g., actor.backend='fsdp:d4'). See docs/en/reference/alloc_mode.md.",
+        FutureWarning,
+        stacklevel=2,
+    )
     validate_config_for_launcher(config)
     launcher = LocalLauncher(
         config.experiment_name, config.trial_name, config.cluster.fileroot
@@ -279,7 +293,7 @@ def local_main(config, run_id: int = 0):
             experiment_name=config.experiment_name, trial_name=config.trial_name
         )
     )
-    alloc_mode = AllocationMode.from_str(config.allocation_mode)
+    alloc_mode = _AllocationMode.from_str(config.allocation_mode)
 
     logger.info(
         f"LocalLauncher: experiment_name={config.experiment_name}, "
@@ -358,7 +372,10 @@ def local_main(config, run_id: int = 0):
                 f"LLM inference server launched at: AREAL_LLM_SERVER_ADDRS={','.join(server_addrs)}"
             )
         except (TimeoutError, KeyboardInterrupt) as e:
-            launcher.stop_all(signal="SIGINT")
+            try:
+                launcher.stop_all(signal="SIGINT")
+            finally:
+                run_post_exit_hook(config)
             raise e
 
     if config.get("enable_offload", False):
@@ -385,7 +402,7 @@ def local_main(config, run_id: int = 0):
         )
         launcher.submit(
             job_name="trainer",
-            cmd=f"torchrun --nnodes 1 --nproc-per-node {nprocs} --master-addr localhost --master-port {find_free_ports(1, (10000, 50000))[0]} {' '.join(sys.argv[1:])}",
+            cmd=f"torchrun --nnodes 1 --nproc-per-node {nprocs} --master-addr localhost --master-port {find_free_ports(1, (10000, 32767))[0]} {' '.join(sys.argv[1:])}",
             gpu=gpu,
             env_vars={
                 **BASE_ENVIRONS,
@@ -408,7 +425,10 @@ def local_main(config, run_id: int = 0):
             remove_status=(),
         )
     except (KeyboardInterrupt, JobException, TimeoutError) as e:
-        launcher.stop_all("SIGTERM")
+        try:
+            launcher.stop_all("SIGTERM")
+        finally:
+            run_post_exit_hook(config)
         # NOTE: For local launcher, We cannot distinguish between a completed job and a failed job.
         # So we will always try to recover the job if it is finished or failed.
         recover_states = [JobState.FAILED, JobState.NOT_FOUND, JobState.COMPLETED]

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 import torch
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec
 from megatron.core.transformer import TransformerConfig

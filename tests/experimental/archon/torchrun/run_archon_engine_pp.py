@@ -109,6 +109,7 @@ def create_archon_engine(
 ) -> ArchonEngine:
     """Create and initialize ArchonEngine with PP enabled."""
     engine_config = TrainEngineConfig(
+        backend=f"archon:d{dp_size}t{tp_size}p{pp_size}e{ep_size}",
         experiment_name="test-archon-pp",
         trial_name="test0",
         path=model_path,

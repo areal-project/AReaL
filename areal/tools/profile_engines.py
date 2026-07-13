@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 """Compare profiling results between Archon and FSDP/HuggingFace engines.
 
 This tool runs profiling on both engines with the same configuration

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 # DeepGEMM detection and configuration
 # Adapted from SGLang sglang/srt/layers/deep_gemm_wrapper/configurer.py
 

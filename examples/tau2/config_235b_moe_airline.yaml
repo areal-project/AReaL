@@ -15,7 +15,6 @@ cluster:
     type: nfs
     nfs_record_root: /tmp/name_resolve
 
-allocation_mode: sglang:d4t8+megatron:(attn:d1p12t4|ffn:d1p12e4)
 
 scheduler:
   type: slurm
@@ -31,6 +30,7 @@ gconfig:
   top_k: 100000000
 
 rollout:
+  backend: "sglang:d4t8"
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
   max_concurrent_rollouts: 128
@@ -45,7 +45,7 @@ rollout:
   setup_timeout: 300.0
   request_timeout: 3600.0
   request_retries: 3
-  openai:
+  agent:
     mode: inline
     tool_call_parser: qwen25
     reasoning_parser: qwen3
@@ -57,6 +57,7 @@ rollout:
     session_timeout_seconds: 3600
 
 actor:
+  backend: "megatron:(attn:d1p12t4|ffn:d1p12e4)"
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
   path: Qwen/Qwen3-235B-A22B
@@ -112,7 +113,9 @@ actor:
   ppo_n_minibatches: 1
   recompute_logprob: true
   use_decoupled_loss: true
-  behave_imp_weight_cap: 5.0
+  rejection_sampling:
+    metric: ratio
+    upper: 5.0
   discount: 1.0
   gae_lambda: 1.0
   adv_norm:
@@ -142,6 +145,7 @@ actor:
         - uv pip install git+https://github.com/dhh1995/tau2-bench.git@dhh/async-and-custom-completion
 
 ref:
+  backend: ${actor.backend}
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
   path: ${actor.path}

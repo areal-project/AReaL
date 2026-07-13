@@ -30,7 +30,7 @@ We observe that the response length first **shrinks in the 8K training stage**, 
 Our experiments are conducted on 16 nodes, each equipped with 8 H800 GPUs. The results,
 along with the associated training curves, are presented below.
 
-![16nodes_reward_length.png](/assets/distill_1.5b_24k_curve.png)
+![16nodes_reward_length.png](/assets/figures/distill_1.5b_24k_curve.png)
 
 *Figure 1. Training rewards and response lengths during RL training. The base model is
 DeepSeek-R1-Distill-Qwen-1.5B. Curves are averaged with a window size of 25.*
@@ -82,7 +82,7 @@ accelerate RL training, significantly boosting research progress. We provide det
 hardware requirements and environment setup guides for different configurations in
 [our tutorials](/examples/README.md).
 
-![hours.png](/assets/1.5b_time_n1n4n16.png)
+![hours.png](/assets/figures/1.5b_time_n1n4n16.png)
 
 *Figure 2. Total RL training time for 10 epochs across different resource
 configurations.*
@@ -96,14 +96,14 @@ rewards and response lengths gradually increasing during training. This **simult
 growth of response lengths and rewards** suggests **emergent deep thinking
 capabilities** in solving complex reasoning problems.
 
-![7b_zero_training_curve.png](/assets/7b_zero_training_curve.png) *Figure 3.
+![7b_zero_training_curve.png](/assets/figures/7b_zero_training_curve.png) *Figure 3.
 Qwen2.5-7B-Zero RL training curve*
 
 Evaluation of intermediate checkpoints on MATH500 and AIME24 datasets shows continuous
 improvement in both accuracy and response length:
 
-![7b_zero_eval_acc.png](/assets/7b_zero_eval_acc.png) *Figure 4. Test accuracy and
-response length on MATH500 and AIME24 datasets*
+![7b_zero_eval_acc.png](/assets/figures/7b_zero_eval_acc.png) *Figure 4. Test accuracy
+and response length on MATH500 and AIME24 datasets*
 
 Additional experiments on the
 [DeepScaleR](https://github.com/agentica-project/deepscaler) dataset show similar

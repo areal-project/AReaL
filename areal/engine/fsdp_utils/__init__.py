@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 import math
 from abc import ABC
 from contextlib import contextmanager
@@ -63,15 +65,24 @@ def apply_fsdp2(model, fsdp_kwargs, wrap_policy):
         "PyTorch version >= 2.4 is required for using fully_shard API (FSDP2)"
     )
 
-    default_transformer_cls_names_to_wrap = getattr(model, "_no_split_modules", list())
+    def _normalize_wrap_class_names(value):
+        if value is None:
+            return []
+        if isinstance(value, str):
+            return [value]
+        return value if isinstance(value, list) else list(value)
+
+    default_transformer_cls_names_to_wrap = _normalize_wrap_class_names(
+        getattr(model, "_no_split_modules", list())
+    )
     fsdp_transformer_layer_cls_to_wrap = (
         wrap_policy.transformer_layer_cls_to_wrap if wrap_policy is not None else list()
     )
+    fsdp_transformer_layer_cls_to_wrap = _normalize_wrap_class_names(
+        fsdp_transformer_layer_cls_to_wrap
+    )
     if not fsdp_transformer_layer_cls_to_wrap:
         fsdp_transformer_layer_cls_to_wrap = default_transformer_cls_names_to_wrap
-
-    if isinstance(fsdp_transformer_layer_cls_to_wrap, str):
-        fsdp_transformer_layer_cls_to_wrap = [fsdp_transformer_layer_cls_to_wrap]
 
     assert (
         len(fsdp_transformer_layer_cls_to_wrap) > 0
@@ -116,7 +127,16 @@ def fsdp2_load_full_state_dict(
     )
 
     device = current_platform.current_device()
-    model = model.to(device=device, non_blocking=True)
+    # Handle meta device models (from memory_efficient_load where non-rank-0
+    # processes use meta tensors). to_empty() materializes meta tensors without
+    # copying data; the actual weights come from set_model_state_dict broadcast.
+    has_meta = any(t.is_meta for t in model.parameters()) or any(
+        t.is_meta for t in model.buffers()
+    )
+    if has_meta:
+        model = model.to_empty(device=device)
+    else:
+        model = model.to(device=device, non_blocking=True)
     cpu_offload = cpu_offload is not None
     options = StateDictOptions(
         full_state_dict=True,

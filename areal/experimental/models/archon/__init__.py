@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 # Import model spec modules to trigger registration
 # Use direct module path to avoid triggering qwen2/qwen3 __init__.py first
 from areal.experimental.models.archon.base import BaseStateDictAdapter

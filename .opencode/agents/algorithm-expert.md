@@ -150,10 +150,10 @@ print(f"Clipping rate: {clipped.float().mean():.2%}")
 
 ## Key Files
 
-| File                             | Purpose                    |
-| -------------------------------- | -------------------------- |
-| `areal/api/cli_args.py`          | PPOActorConfig, NormConfig |
-| `areal/trainer/ppo/actor.py`     | PPO loss computation       |
-| `areal/workflow/rlvr.py`         | Single-turn workflow       |
-| `areal/reward/__init__.py`       | Reward function registry   |
-| `docs/algorithms/grpo_series.md` | Algorithm documentation    |
+| File                                | Purpose                    |
+| ----------------------------------- | -------------------------- |
+| `areal/api/cli_args.py`             | PPOActorConfig, NormConfig |
+| `areal/trainer/ppo/actor.py`        | PPO loss computation       |
+| `areal/workflow/rlvr.py`            | Single-turn workflow       |
+| `areal/reward/__init__.py`          | Reward function registry   |
+| `docs/en/algorithms/grpo_series.md` | Algorithm documentation    |

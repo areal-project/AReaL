@@ -1,13 +1,18 @@
+# SPDX-License-Identifier: Apache-2.0
+
 __all__ = [
     "FSDPEngine",
     "FSDPPPOActor",
     "FSDPPPOCritic",
     "FSDPLMEngine",
     "FSDPRWEngine",
+    "FSDPDPOEngine",
     "MegatronEngine",
     "MegatronPPOActor",
     "MegatronPPOCritic",
     "MegatronLMEngine",
+    "MegatronRWEngine",
+    "MegatronDPOEngine",
     "RemoteSGLangEngine",
     "RemotevLLMEngine",
 ]
@@ -18,10 +23,13 @@ _LAZY_IMPORTS = {
     "FSDPPPOCritic": "areal.engine.fsdp_engine",
     "FSDPLMEngine": "areal.engine.fsdp_engine",
     "FSDPRWEngine": "areal.engine.fsdp_engine",
+    "FSDPDPOEngine": "areal.engine.fsdp_engine",
     "MegatronEngine": "areal.engine.megatron_engine",
     "MegatronPPOActor": "areal.engine.megatron_engine",
     "MegatronPPOCritic": "areal.engine.megatron_engine",
     "MegatronLMEngine": "areal.engine.megatron_engine",
+    "MegatronRWEngine": "areal.engine.megatron_engine",
+    "MegatronDPOEngine": "areal.engine.megatron_engine",
     "RemoteSGLangEngine": "areal.engine.sglang_remote",
     "RemotevLLMEngine": "areal.engine.vllm_remote",
 }

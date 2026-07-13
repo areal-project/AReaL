@@ -1,5 +1,6 @@
 import asyncio
 import os
+import sys
 import time
 from unittest.mock import AsyncMock, Mock, call, patch
 
@@ -785,6 +786,42 @@ class TestWorkerCreation:
                 scheduler.create_workers(job)
 
             assert "exited immediately with code 1" in str(exc_info.value)
+            assert mock_popen.call_count == 1
+
+    @patch("areal.infra.scheduler.local.gethostip")
+    @patch("areal.infra.scheduler.local.subprocess.Popen")
+    @patch("areal.infra.scheduler.local.find_free_ports")
+    def test_create_workers_retries_immediate_port_conflict(
+        self, mock_find_ports, mock_popen, mock_gethostip, tmp_path
+    ):
+        mock_gethostip.return_value = "127.0.0.1"
+        mock_find_ports.side_effect = [[8000, 8001], [8002, 8003]]
+
+        conflict_proc = Mock()
+        conflict_proc.pid = 1234
+        conflict_proc.poll.return_value = 1
+        conflict_proc.returncode = 1
+
+        success_proc = Mock()
+        success_proc.pid = 1235
+        success_proc.poll.return_value = None
+
+        mock_popen.side_effect = [conflict_proc, success_proc]
+
+        scheduler = create_scheduler(tmp_path)
+        job = Job(replicas=1, role="test")
+
+        with patch.object(
+            scheduler,
+            "_read_log_tail",
+            return_value="Address already in use\nPort 8000 is in use by another program",
+        ):
+            worker_ids = scheduler.create_workers(job)
+
+        assert worker_ids == ["test/0"]
+        assert mock_popen.call_count == 2
+        assert scheduler._workers["test"][0].worker.worker_ports == ["8002", "8003"]
+        assert scheduler._allocated_ports == {8002, 8003}
 
     @patch("areal.infra.scheduler.local.gethostip")
     @patch("areal.infra.scheduler.local.subprocess.Popen")
@@ -1062,6 +1099,39 @@ class TestDeleteWorkers:
         """Should log warning and return when role doesn't exist."""
         # Should not raise
         scheduler.delete_workers("nonexistent")
+
+    def test_delete_workers_reverse_order(self, scheduler, tmp_path, monkeypatch):
+        """With reverse_order=True, workers are cleaned up in reverse rank order.
+
+        This protects rank-0 (owner of the global TCPStore server) from being
+        torn down before non-zero ranks finish their final NCCL abort.
+        """
+        workers = [
+            create_worker_info(
+                worker_id=f"role1/{i}",
+                role="role1",
+                ports=[str(8000 + i)],
+                log_file=str(tmp_path / f"role1-{i}.log"),
+            )
+            for i in range(4)
+        ]
+        scheduler._workers["role1"] = workers
+        scheduler._allocated_ports = {8000, 8001, 8002, 8003}
+
+        observed_order: list[str] = []
+
+        original_cleanup = scheduler._cleanup_workers
+
+        def spy(workers_arg):
+            observed_order.extend(w.worker.id for w in workers_arg)
+            original_cleanup(workers_arg)
+
+        monkeypatch.setattr(scheduler, "_cleanup_workers", spy)
+
+        scheduler.delete_workers("role1", reverse_order=True)
+
+        assert observed_order == ["role1/3", "role1/2", "role1/1", "role1/0"]
+        assert "role1" not in scheduler._workers
 
     def test_cleanup_workers_releases_ports(self, scheduler, tmp_path):
         """Should release allocated ports when cleaning up workers."""
@@ -2054,10 +2124,35 @@ class TestForkColocationBehavior:
         """Should spawn a new RPC server process when /fork is called."""
         _, host, port = rpc_server_process
 
-        # Call /fork endpoint
+        alloc_resp = requests.post(
+            f"http://{host}:{port}/alloc_ports",
+            json={"count": 1},
+            timeout=10,
+        )
+        assert alloc_resp.status_code == 200
+        child_port = alloc_resp.json()["ports"][0]
+
+        raw_cmd = [
+            sys.executable,
+            "-m",
+            "areal.infra.rpc.rpc_server",
+            "--host",
+            "0.0.0.0",
+            "--port",
+            str(child_port),
+            "--experiment-name",
+            "test_fork_exp",
+            "--trial-name",
+            "test_fork_trial",
+            "--role",
+            "ref",
+            "--worker-index",
+            "0",
+        ]
+
         response = requests.post(
             f"http://{host}:{port}/fork",
-            json={"role": "ref", "worker_index": 0},
+            json={"role": "ref", "worker_index": 0, "raw_cmd": raw_cmd},
             timeout=60,
         )
 
@@ -2065,40 +2160,85 @@ class TestForkColocationBehavior:
         result = response.json()
         assert result["status"] == "success"
         assert "host" in result
-        assert "port" in result
         assert "pid" in result
 
         forked_pid = result["pid"]
-        forked_port = result["port"]
 
         # Verify new process exists
         assert psutil.pid_exists(forked_pid)
 
-        # Verify forked server is responsive
-        forked_response = requests.get(
-            f"http://{result['host']}:{forked_port}/health", timeout=5
-        )
-        assert forked_response.status_code == 200
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            try:
+                forked_response = requests.get(
+                    f"http://{result['host']}:{child_port}/health", timeout=2
+                )
+                if forked_response.status_code == 200:
+                    break
+            except (
+                requests.exceptions.ConnectionError,
+                requests.exceptions.Timeout,
+            ):
+                pass
+            time.sleep(0.5)
+        else:
+            pytest.fail("Forked worker did not become ready")
 
     def test_forked_worker_inherits_environment(self, rpc_server_process):
         """Forked worker should inherit environment variables from parent."""
         _, host, port = rpc_server_process
 
-        # Call /fork endpoint
+        alloc_resp = requests.post(
+            f"http://{host}:{port}/alloc_ports",
+            json={"count": 1},
+            timeout=10,
+        )
+        assert alloc_resp.status_code == 200
+        child_port = alloc_resp.json()["ports"][0]
+
+        raw_cmd = [
+            sys.executable,
+            "-m",
+            "areal.infra.rpc.rpc_server",
+            "--host",
+            "0.0.0.0",
+            "--port",
+            str(child_port),
+            "--experiment-name",
+            "test_fork_exp",
+            "--trial-name",
+            "test_fork_trial",
+            "--role",
+            "ref",
+            "--worker-index",
+            "0",
+        ]
+
         response = requests.post(
             f"http://{host}:{port}/fork",
-            json={"role": "ref", "worker_index": 0},
+            json={"role": "ref", "worker_index": 0, "raw_cmd": raw_cmd},
             timeout=60,
         )
 
         assert response.status_code == 200
         result = response.json()
 
-        # Verify forked server is alive and accessible
-        forked_response = requests.get(
-            f"http://{result['host']}:{result['port']}/health", timeout=5
-        )
-        assert forked_response.status_code == 200
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            try:
+                forked_response = requests.get(
+                    f"http://{result['host']}:{child_port}/health", timeout=2
+                )
+                if forked_response.status_code == 200:
+                    break
+            except (
+                requests.exceptions.ConnectionError,
+                requests.exceptions.Timeout,
+            ):
+                pass
+            time.sleep(0.5)
+        else:
+            pytest.fail("Forked worker did not become ready")
 
     def test_create_forked_workers_via_scheduler(self, tmp_path):
         """LocalScheduler should create forked workers through /fork endpoint."""

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+
+
 def get_block_size_from_config(
     quantization_config: dict[str, int | str | list[str]] | None,
     default: int = 128,

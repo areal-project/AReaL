@@ -76,12 +76,12 @@ For the offline training guide, see [agentic RL guide](./agentic_rl.md).
 
 ### Step 1: Configure Online Mode
 
-Set `rollout.openai.mode` to `online` in your config YAML:
+Set `rollout.agent.mode` to `online` in your config YAML:
 
 ```yaml
 # config.yaml
 rollout:
-  openai:
+  agent:
     mode: online
     admin_api_key: "my-secret-admin-key"  # Protect management endpoints
     session_timeout_seconds: 3600          # Session timeout (default: 1 hour)
@@ -92,10 +92,10 @@ rollout:
 ```bash
 python3 examples/openclaw/train.py --config examples/openclaw/config.yaml \
     experiment_name=my-exp trial_name=trial-0 \
-    allocation_mode=sglang:d1+fsdp:d1 \
+    rollout.backend=sglang:d1 actor.backend=fsdp:d1 \
     actor.path=Qwen/Qwen3-0.6B \
     scheduler.type=local \
-    rollout.openai.admin_api_key=my-secret-admin-key
+    rollout.agent.admin_api_key=my-secret-admin-key
 ```
 
 After initialization, AReaL prints the gateway address:
@@ -225,10 +225,10 @@ For details of training the OpenClaw agent, see
 
 Online mode uses a two-tier authentication system:
 
-| Auth Type           | Token                          | Used For                                        |
-| ------------------- | ------------------------------ | ----------------------------------------------- |
-| **Admin API key**   | `rollout.openai.admin_api_key` | `start_session`, `export_trajectories`          |
-| **Session API key** | Issued by `start_session`      | `chat/completions`, `set_reward`, `end_session` |
+| Auth Type           | Token                         | Used For                                        |
+| ------------------- | ----------------------------- | ----------------------------------------------- |
+| **Admin API key**   | `rollout.agent.admin_api_key` | `start_session`, `export_trajectories`          |
+| **Session API key** | Issued by `start_session`     | `chat/completions`, `set_reward`, `end_session` |
 
 - The **admin API key** is configured in the YAML and protects management endpoints.
 - The **session API key** is unique per session and scoped to that session's
@@ -332,11 +332,11 @@ training and staleness control, see the [Asynchronous RL Guide](../algorithms/as
 
 ## Configuration Reference
 
-All online mode settings live under `rollout.openai`:
+All online mode settings live under `rollout.agent`:
 
 ```yaml
 rollout:
-  openai:
+  agent:
     mode: online                    # Required: set to "online"
     admin_api_key: "areal-admin-key"  # Admin key for management endpoints
     session_timeout_seconds: 3600   # Session timeout in seconds
@@ -361,8 +361,8 @@ rollout:
 
 ## See Also
 
-- [OpenClaw Example](https://github.com/inclusionAI/AReaL/tree/main/examples/openclaw) -
-  Complete end-to-end example with ZeroClaw
+- [OpenClaw Example](https://github.com/areal-project/AReaL/tree/main/examples/openclaw)
+  \- Complete end-to-end example with ZeroClaw
 - [Agentic RL Tutorial](agentic_rl.md) - Agent framework integration (inline/subproc
   modes)
 - [Custom Agent Workflows](../customization/agent.md) - Creating custom agent workflows

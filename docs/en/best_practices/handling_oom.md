@@ -9,9 +9,9 @@ Before applying fixes, understand which parameters affect memory usage:
 
 ### Core Parameters
 
-- **`allocation_mode`**: How inference and training are distributed across GPUs. For
-  large models, tensor parallelism typically uses less memory per GPU than data
-  parallelism.
+- **Per-engine `backend` fields (`actor.backend`, `rollout.backend`)**: How inference
+  and training are distributed across GPUs. For large models, tensor parallelism
+  typically uses less memory per GPU than data parallelism.
 
 - **`train_dataset.max_length`**: Maximum prompt length. Longer prompts require more
   memory.
@@ -58,9 +58,12 @@ effective solution.
 Increase tensor parallelism to distribute model weights across more GPUs:
 
 ```yaml
-# Before: sglang:d4+fsdp:d4 (4 data parallel processes)
-# After: sglang:d2t2+fsdp:d4 (2 data parallel, 2 tensor parallel)
-allocation_mode: sglang:d2t2+fsdp:d4
+# Before: 4 data parallel processes for rollout
+# After: 2 data parallel, 2 tensor parallel for rollout
+rollout:
+  backend: "sglang:d2t2"
+actor:
+  backend: "fsdp:d4"
 ```
 
 Note that higher tensor parallelism reduces generation throughput.
@@ -112,9 +115,12 @@ For long contexts where `max_tokens_per_mb` cannot be reduced further, use Ulyss
 sequence parallelism to distribute sequences across multiple GPUs:
 
 ```yaml
-# Before: sglang:d4+fsdp:d4 (4 data parallel processes)
-# After: sglang:d4+fsdp:d2c2 (2 data parallel, 2 ulysses context parallel)
-allocation_mode: sglang:d4+fsdp:d2c2
+# Before: 4 data parallel processes for training
+# After: 2 data parallel, 2 ulysses context parallel for training
+rollout:
+  backend: "sglang:d4"
+actor:
+  backend: "fsdp:d2c2"
 ```
 
 > The Ulysses context parallel size must evenly divide the model's attention head count.
@@ -127,18 +133,24 @@ allocation_mode: sglang:d4+fsdp:d2c2
 You can also enable tensor parallelism with FSDP:
 
 ```yaml
-# Before: sglang:d4+fsdp:d4 (4 data parallel processes)
-# After: sglang:d4+fsdp:d2t2 (2 data parallel, 2 tensor parallel)
-allocation_mode: sglang:d4+fsdp:d2t2
+# Before: 4 data parallel processes for training
+# After: 2 data parallel, 2 tensor parallel for training
+rollout:
+  backend: "sglang:d4"
+actor:
+  backend: "fsdp:d2t2"
 ```
 
 For the Megatron and Archon backends, you can also enable pipeline and expert
 parallelism:
 
 ```yaml
-# Before: sglang:d4+fsdp:d4 (4 data parallel processes)
-# After: sglang:d4+archon:d2p2e2 (2 data parallel with 2 overlaid expert parallel, 2 pipeline parallel, still 4 GPUs)
-allocation_mode: sglang:d4+archon:d2p2e2
+# Before: 4 data parallel processes for training
+# After: 2 data parallel with 2 overlaid expert parallel, 2 pipeline parallel, still 4 GPUs
+rollout:
+  backend: "sglang:d4"
+actor:
+  backend: "archon:d2p2e2"
 ```
 
 We recommend pipeline and expert parallelism over tensor/context parallelism. Check
@@ -242,3 +254,55 @@ WeightUpdateMeta.from_fsdp_xccl(
     weight_chunked_mem_mb = 512,  # Reduce from default (typically 1024+)
 )
 ```
+
+## Reducing optimizer state memory
+
+By default, the FSDP backend keeps fp32 master weights and fp32 AdamW optimizer states
+(`exp_avg`, `exp_avg_sq`), matching DeepSpeed ZeRO-3 and Megatron precision-aware
+optimizer behavior. For an `N`-billion parameter model, this costs roughly `12N` GB
+across all GPUs:
+
+| Component                      | Bytes/param |
+| ------------------------------ | ----------- |
+| fp32 master weights (storage)  | 4           |
+| fp32 `exp_avg` (1st moment)    | 4           |
+| fp32 `exp_avg_sq` (2nd moment) | 4           |
+
+**CPU memory note:** when `actor.fsdp.memory_efficient_load=true`, rank 0 loads the full
+model on CPU before broadcasting. fp32 storage doubles this peak — for an 8B model, rank
+0 CPU usage rises from ~16 GB to ~32 GB. Provision the head node accordingly, or set
+`memory_efficient_load=false` to spread CPU load across ranks.
+
+**DCP checkpoint note:** training checkpoints (Distributed Checkpoint) preserve storage
+dtype (fp32) — this is required for correct resume of master weights. HF export and
+rollout weight sync **always** cast back to compute dtype, so deployment artefacts stay
+bf16.
+
+If you hit OOM and cannot increase parallelism, switch to bf16 optimizer states with
+Kahan-summation updates:
+
+```yaml
+actor:
+  dtype: bfloat16
+  optimizer_dtype: bfloat16   # storage in bf16 (matches AdamW state)
+  optimizer:
+    type: adam_bf16           # uses AnyPrecisionAdamW + Kahan summation
+```
+
+This recovers approximately `8N` GB:
+
+| Component                      | Bytes/param |
+| ------------------------------ | ----------- |
+| bf16 master weights            | 2           |
+| bf16 `exp_avg`                 | 2           |
+| bf16 `exp_avg_sq`              | 2           |
+| bf16 Kahan compensation buffer | 2           |
+
+Per the AnyPrecision paper, Kahan summation recovers fp32-equivalent update precision.
+Step time is ~5-10% slower than fused fp32 AdamW; quality is comparable on dense and MoE
+models.
+
+**Do not use `optimizer.type: adam` together with `optimizer_dtype: bfloat16`** —
+`torch.optim.AdamW` will silently create bf16 optimizer states and the late-stage
+convergence will plateau ~3× higher than fp32 master weights (see issue #1292). The
+runtime emits a warning when this combination is detected.

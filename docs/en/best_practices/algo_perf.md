@@ -98,7 +98,7 @@ A, \text{clip}\left(\frac{\pi_\theta}{\pi_{\text{proximal}}}, 1-\epsilon,
 
 **Troubleshooting `behave_imp_weight` deviations:**
 
-- Ensure `behave_imp_weight_cap` is set (recommended value: 5).
+- Ensure `rejection_sampling` is configured (e.g., `rejection_sampling: {level: token, action: mask, metric: ratio, upper: 5.0}`).
 - If deviation persists, reduce `max_head_offpolicyness` to decrease sample staleness.
 
 ### Sequence Length Metrics

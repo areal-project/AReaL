@@ -1,12 +1,17 @@
+# SPDX-License-Identifier: Apache-2.0
+from __future__ import annotations
+
 import dataclasses
 import json
 import os
 import pickle
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch.distributed as dist
-from torchdata.stateful_dataloader import StatefulDataLoader
-from transformers import AutoProcessor, PreTrainedTokenizerFast
+from transformers import PreTrainedTokenizerFast
+
+if TYPE_CHECKING:
+    from transformers import AutoProcessor
 
 from areal.api import (
     FinetuneSpec,
@@ -170,29 +175,75 @@ class RecoverHandler:
             "recover_info",
         )
 
+    @staticmethod
+    def _is_gateway_train_controller(
+        engine: TrainEngine
+        | TrainController
+        | dict[str, TrainEngine | TrainController],
+    ) -> bool:
+        from areal.v2.training_service.controller.controller import (
+            GatewayTrainController,
+        )
+
+        if isinstance(engine, GatewayTrainController):
+            return True
+        if isinstance(engine, dict):
+            return any(
+                isinstance(controller, GatewayTrainController)
+                for controller in engine.values()
+            )
+        return False
+
+    def _ensure_recover_supported(
+        self,
+        engine: TrainEngine
+        | TrainController
+        | dict[str, TrainEngine | TrainController],
+    ) -> None:
+        if self._is_gateway_train_controller(engine):
+            raise NotImplementedError(
+                "Recovery is not supported with GatewayTrainController "
+                '(`_version="v2"`) yet. Disable `recover.mode` or use '
+                '`_version="v1"`.'
+            )
+
+    @staticmethod
+    def _normalize_recover_engines(
+        engine: TrainEngine
+        | TrainController
+        | dict[str, TrainEngine | TrainController],
+    ) -> dict[str, TrainEngine | TrainController]:
+        if isinstance(engine, dict):
+            return engine
+        return {"default": engine}
+
     def dump(
         self,
-        engine: TrainEngine | dict[str, TrainEngine],
+        engine: TrainEngine
+        | TrainController
+        | dict[str, TrainEngine | TrainController],
         step_info: StepInfo,
         saver: Saver,
         evaluator: Evaluator,
-        stats_logger: "StatsLogger",
-        dataloader: StatefulDataLoader,
+        stats_logger: StatsLogger,
+        dataloader: Any,
         tokenizer: PreTrainedTokenizerFast | None = None,
         processor: AutoProcessor | None = None,
         base_model_path: str | None = None,
     ):
         if self.config.mode in ("disabled", "off"):
             return
+        self._ensure_recover_supported(engine)
         # currently only support recover on one engine
         if not self.freq_ctl.check(
             epochs=int(step_info.epoch_step == self.ft_spec.steps_per_epoch - 1),
             steps=1,
         ):
             return
-        if isinstance(engine, TrainEngine):
-            engine = {"default": engine}
-        for name, engine_ in engine.items():
+        normalized_engine: dict[str, TrainEngine | TrainController] = (
+            self._normalize_recover_engines(engine)
+        )
+        for name, engine_ in normalized_engine.items():
             self._save_checkpoint(
                 engine_,
                 name=name,
@@ -223,19 +274,25 @@ class RecoverHandler:
         engine: TrainEngine | dict[str, TrainEngine] | TrainController,
         saver: Saver,
         evaluator: Evaluator,
-        stats_logger: "StatsLogger",
-        dataloader: StatefulDataLoader,
+        stats_logger: StatsLogger,
+        dataloader: Any,
         inference_engine: InferenceEngine | None = None,
         weight_update_meta: WeightUpdateMeta | None = None,
         inference_engine_update_from: str = "default",
     ) -> RecoverInfo | None:
         if self.config.mode in ("disabled", "off"):
             return
+        self._ensure_recover_supported(engine)
         if inference_engine is not None and weight_update_meta is None:
             raise ValueError("Weight update meta is required for recovery.")
 
-        if isinstance(engine, (TrainEngine, TrainController)):
-            engine = {"default": engine}
+        # TODO(agent): GatewayTrainController is currently duck-typed and does
+        # not satisfy this TrainController type check. Extend recovery to accept
+        # controller-v2 instances (or make v2 inherit TrainController) before
+        # relying on resumed runs with `_version="v2"`.
+        normalized_engine: dict[str, TrainEngine | TrainController] = (
+            self._normalize_recover_engines(engine)
+        )
 
         recover_info_path = self.recover_info_path(
             self.config.experiment_name,
@@ -252,13 +309,13 @@ class RecoverHandler:
             stats_logger.load_state_dict(recover_info.stats_logger_info)
             dataloader.load_state_dict(recover_info.dataloader_info)
 
-            for name, engine_ in engine.items():
+            for name, engine_ in normalized_engine.items():
                 self._load_checkpoint(engine_, name=name)
             global_step = recover_info.last_step_info.global_step
 
             if inference_engine is not None:
                 assert weight_update_meta is not None
-                update_engine = engine[inference_engine_update_from]
+                update_engine = normalized_engine[inference_engine_update_from]
                 recovery_version = global_step + 1
                 versioned_meta = weight_update_meta.with_version(recovery_version)
                 update_engine.connect_engine(inference_engine, versioned_meta)
@@ -289,7 +346,7 @@ class RecoverHandler:
             name=name,
         )
         weight_format = "dcp"
-        with_optim = True
+        with_optim = not self.config.no_save_optim
         meta = SaveLoadMeta(
             path=path,
             weight_format=weight_format,
@@ -299,7 +356,7 @@ class RecoverHandler:
             base_model_path=base_model_path,
         )
         engine.save(meta)
-        logger.info(f"Saved recover checkpoint to {path}")
+        logger.info(f"Saved recover checkpoint to {path} (with_optim={with_optim})")
 
     def _load_checkpoint(
         self,
@@ -317,7 +374,7 @@ class RecoverHandler:
         if not os.path.exists(path):
             raise FileNotFoundError(f"Checkpoint path {path} does not exist.")
         weight_format = "dcp"
-        with_optim = True
+        with_optim = not self.config.no_load_optim
         meta = SaveLoadMeta(
             path=path,
             weight_format=weight_format,

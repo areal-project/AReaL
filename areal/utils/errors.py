@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+
+
 class EngineError(Exception):
     def __init__(self, error_type, sub_error, reason):
         self.error_type = error_type

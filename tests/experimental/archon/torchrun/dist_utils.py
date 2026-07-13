@@ -8,9 +8,14 @@ from areal.experimental.models.archon.moe import MoEArgs
 from areal.experimental.models.archon.qwen3 import Qwen3Model, Qwen3ModelArgs
 
 
-def write_result(out: str, succ: bool) -> None:
+def write_result(out: str, succ: bool, error: str = "") -> None:
     with open(out, "w") as f:
-        f.write("Passed" if succ else "Failed")
+        if succ:
+            f.write("Passed")
+        else:
+            f.write("Failed")
+            if error:
+                f.write(f"\n{error}")
 
 
 def create_moe_model_args(

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 # Adapted from torchtitan: torchtitan/distributed/pipeline_parallel.py
 
 import copy

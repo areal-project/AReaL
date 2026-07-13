@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 # UE8M0 format utilities for FP8 quantization
 # Adapted from DeepGEMM and SGLang
 #

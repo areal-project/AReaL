@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 from areal.experimental.models.archon.qwen2.infra.parallelize import (
     parallelize_qwen2,
 )

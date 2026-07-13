@@ -3,12 +3,25 @@
 与 PyTorch FSDP 相比，Megatron-LM 支持完整的 5D 并行性，提供更好的扩展性和效率。AReaL 完全支持使用 Megatron-LM
 作为后端进行自定义 RL 训练。本指南将解释如何利用 Megatron 训练后端，并为您的应用训练大型 MoE 模型。
 
-## 在 `allocation_mode` 中启用 Megatron
+## 启用 Megatron 后端
 
-从 FSDP 切换到 Megatron 只需要更改一行：将 `allocation_mode` 字段从 `sglang:d4+fsdp:d4` 改为
-`sglang:d4+megatron:d4`。
+从 FSDP 切换到 Megatron 只需要更改一行：将 `actor.backend` 字段从 `fsdp:d4` 改为 `megatron:d4`。
 
 有关分配模式语法、并行维度 和 GPU 计算的完整指南，请参阅[分配模式参考](../reference/alloc_mode.md)。
+
+## Bridge 后端选择
+
+`MegatronEngine` 支持通过 `actor.megatron.bridge_type` 选择两种 bridge 后端：
+
+```yaml
+actor:
+    megatron:
+        bridge_type: mbridge  # 默认（向后兼容）
+```
+
+设置 `bridge_type: megatron-bridge` 可启用新后端。
+
+关于取舍与迁移建议，请参阅 [Megatron Bridge 后端参考](../reference/bridge_backend.md)。
 
 ## MoE 并行策略
 
@@ -38,7 +51,8 @@ EP=4。请参阅[MoE 并行折叠](https://github.com/NVIDIA/Megatron-LM/tree/ma
 # 注意：此处的分配模式仅用于说明目的，未经过优化。
 python3 examples/math/gsm8k_rl.py --config <megatron_config.yaml> \
     scheduler.type=ray \
-    experiment_name=megatron-moe-gsm8k-grpo trial_name=trial-0 allocation_mode=sglang:d4t4+megatron:(attn:d1p4t2c2|ffn:d1p4t1e4) \
+    experiment_name=megatron-moe-gsm8k-grpo trial_name=trial-0 \
+    rollout.backend=sglang:d4t4 actor.backend=megatron:(attn:d1p4t2c2|ffn:d1p4t1e4) \
     cluster.n_nodes=4 cluster.n_gpus_per_node=8 actor.path=Qwen/Qwen3-30B-A3B \
     actor.megatron.use_deterministic_algorithms=True
 ```

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 from __future__ import annotations
 
 import asyncio
@@ -18,6 +20,7 @@ import aiohttp
 import numpy as np
 import ray
 import requests
+import torch
 import torch.distributed as dist
 import uvloop
 from torchdata.stateful_dataloader import StatefulDataLoader
@@ -32,7 +35,7 @@ from areal.api import (
     WeightUpdateMeta,
     WorkflowLike,
 )
-from areal.api.cli_args import InferenceEngineConfig, OpenAIProxyConfig
+from areal.api.cli_args import InferenceEngineConfig
 from areal.api.io_struct import (
     HttpGenerationResult,
     HttpRequest,
@@ -47,7 +50,12 @@ from areal.infra.utils.proc import kill_process_tree
 from areal.utils import logging, name_resolve, names
 from areal.utils.data import concat_padded_tensors
 from areal.utils.dynamic_import import import_from_string
-from areal.utils.network import find_free_ports, gethostip
+from areal.utils.network import (
+    find_free_ports,
+    format_hostport,
+    gethostip,
+    split_hostport,
+)
 from areal.utils.perf_tracer import trace_perf
 
 from .workflow_executor import WorkflowExecutor
@@ -165,6 +173,18 @@ class RemoteInfBackendProtocol(Protocol):
         HttpGenerationResult
             Parsed result with tokens, logprobs, and stop reason
         """
+        ...
+
+    def build_score_request(
+        self, input_ids: list[int], target_len: int, with_lora: bool, version: int
+    ) -> HttpRequest:
+        """Build HTTP request for token log-prob scoring."""
+        ...
+
+    def parse_score_response(
+        self, response: dict[str, Any], target_len: int
+    ) -> list[float]:
+        """Parse token log-prob scoring response."""
         ...
 
     def build_disk_weight_update_requests(
@@ -357,9 +377,13 @@ class RemoteInfEngine(InferenceEngine):
         self._proxy_gateway_addr: str | None = None
         self.local_server_processes: list[LocalInfServerInfo] = []
 
-    def _wait_for_server(self, address):
+    def _wait_for_server(self, address: str, process: subprocess.Popen | None = None):
         """Wait for a server to become healthy."""
-        base_url = f"http://{address}"
+        try:
+            host, port = split_hostport(address)
+            base_url = f"http://{format_hostport(host, port)}"
+        except ValueError:
+            base_url = f"http://{address}"
         tik = time.time()
         while time.time() - tik < self.config.setup_timeout:
             if self.check_health(base_url):
@@ -408,7 +432,9 @@ class RemoteInfEngine(InferenceEngine):
             self.addresses = addr if isinstance(addr, list) else [addr]
             self.logger.info("Get server addresses from the `addr` argument.")
         elif len(self.local_server_processes) > 0:
-            self.addresses = [f"{s.host}:{s.port}" for s in self.local_server_processes]
+            self.addresses = [
+                format_hostport(s.host, s.port) for s in self.local_server_processes
+            ]
             self.logger.info("Get server addresses from the local subprocess.")
         elif (
             self.config.experiment_name is not None
@@ -489,6 +515,55 @@ class RemoteInfEngine(InferenceEngine):
         with self.lock:
             return self._version
 
+    def compute_logp(self, data: list[dict[str, Any]]) -> list[torch.Tensor]:
+        results: list[torch.Tensor] = []
+        timeout = self.config.request_timeout
+        version = self.get_version()
+        for traj in data:
+            input_ids = traj["input_ids"]
+            loss_mask = traj["loss_mask"]
+            if input_ids.dim() != 2 or loss_mask.dim() != 2:
+                raise ValueError("input_ids and loss_mask must be 2D tensors")
+            bs = input_ids.shape[0]
+            out = torch.zeros_like(loss_mask, dtype=torch.float32)
+            for i in range(bs):
+                token_ids = input_ids[i].tolist()
+                target_len = int(loss_mask[i].sum().item())
+                if target_len <= 0:
+                    continue
+                if "attention_mask" in traj:
+                    attn_mask = traj["attention_mask"][i]
+                    active_idx = torch.nonzero(attn_mask, as_tuple=False).squeeze(-1)
+                    token_ids = input_ids[i, active_idx].tolist()
+                else:
+                    token_ids = input_ids[i].tolist()
+                server_addr = self.choose_server()
+                http_req = self.backend.build_score_request(
+                    input_ids=token_ids,
+                    target_len=target_len,
+                    with_lora=self.config.use_lora,
+                    version=version,
+                )
+                response = requests.request(
+                    http_req.method,
+                    f"http://{server_addr}{http_req.endpoint}",
+                    json=http_req.payload,
+                    timeout=timeout,
+                )
+                response.raise_for_status()
+                payload = response.json()
+                token_logps = self.backend.parse_score_response(payload, target_len)
+                if len(token_logps) != target_len:
+                    raise ValueError(
+                        f"Expected {target_len} token logprobs, got {len(token_logps)}"
+                    )
+                write_idx = torch.nonzero(loss_mask[i], as_tuple=False).squeeze(-1)
+                out[i, write_idx] = torch.tensor(
+                    token_logps, device=out.device, dtype=out.dtype
+                )
+            results.append(out)
+        return results
+
     def set_proxy_gateway_addr(self, addr: str) -> None:
         """Set the proxy gateway address.
 
@@ -512,16 +587,16 @@ class RemoteInfEngine(InferenceEngine):
         """
         from areal.experimental.openai import OpenAIProxyWorkflow
 
-        openai_cfg = self.config.openai or OpenAIProxyConfig()
+        agent_cfg = self.config.agent
 
         return OpenAIProxyWorkflow(
-            mode=openai_cfg.mode,
+            mode=agent_cfg.mode,
             agent=agent,
             proxy_addr=proxy_addr,
-            admin_api_key=openai_cfg.admin_api_key,
-            discount=openai_cfg.turn_discount,
-            export_style=openai_cfg.export_style,
-            subproc_max_workers=openai_cfg.subproc_max_workers,
+            admin_api_key=agent_cfg.admin_api_key,
+            discount=agent_cfg.turn_discount,
+            export_style=agent_cfg.export_style,
+            subproc_max_workers=agent_cfg.subproc_max_workers,
             proxy_gateway_addr=self._proxy_gateway_addr,
         )
 
@@ -536,10 +611,10 @@ class RemoteInfEngine(InferenceEngine):
 
         # 0. None workflow = online mode (config-driven)
         if workflow is None:
-            openai_cfg = self.config.openai or OpenAIProxyConfig()
-            if openai_cfg.mode != "online":
+            agent_cfg = self.config.agent
+            if agent_cfg is None or agent_cfg.mode != "online":
                 raise ValueError(
-                    "workflow is None but OpenAIProxyConfig.mode is not 'online'. "
+                    "workflow is None but AgentConfig.mode is not 'online'. "
                     "Provide a workflow or set mode='online' in the config."
                 )
             if proxy_addr is None:
@@ -685,7 +760,7 @@ class RemoteInfEngine(InferenceEngine):
         )
 
     def choose_server(self) -> str:
-        """Choose a server based on the scheduling policy.
+        """Choose a server based on the routing strategy.
 
         Returns
         -------
@@ -695,9 +770,9 @@ class RemoteInfEngine(InferenceEngine):
         Raises
         ------
         NotImplementedError
-            If schedule policy other than round-robin is used
+            If routing strategy other than round-robin is used
         """
-        if self.config.schedule_policy == "round_robin":
+        if self.config.routing_strategy == "round_robin":
             server = self.addresses[self.server_idx]
             self.server_idx = (self.server_idx + 1) % len(self.addresses)
             return server
@@ -895,6 +970,12 @@ class RemoteInfEngine(InferenceEngine):
         """
         assert meta.type == "xccl"
 
+        self.logger.info(
+            "Initializing weight update group: group=%s, addresses=%s",
+            meta.nccl_group_name,
+            self.addresses,
+        )
+
         fut = get_executor().submit(
             _init_weights_update_group_remote,
             self.backend,
@@ -905,6 +986,16 @@ class RemoteInfEngine(InferenceEngine):
         )
 
         def callback(fut):
+            if fut.cancelled():
+                return
+            if fut.exception() is not None:
+                self.logger.error(
+                    "Failed to initialize %s group for distributed weight update for %s: %s",
+                    current_platform.communication_backend.upper(),
+                    meta.nccl_group_name,
+                    repr(fut.exception()),
+                )
+                return
             self.logger.info(
                 f"Initialized {current_platform.communication_backend.upper()} group "
                 f"for distributed weight update for {meta.nccl_group_name}."
@@ -1028,7 +1119,7 @@ class RemoteInfEngine(InferenceEngine):
             AgentWorkflow will use this proxy instead of a local one.
         """
         if workflow is None and (
-            self.config.openai is None or self.config.openai.mode != "online"
+            self.config.agent is None or self.config.agent.mode != "online"
         ):
             raise ValueError(
                 "workflow must be specified for submit (unless mode='online')"
@@ -1237,14 +1328,14 @@ class RemoteInfEngine(InferenceEngine):
         server_args["host"] = gethostip()
         server_args["port"] = find_free_ports(1)[0]
         process = self.backend.launch_server(server_args)
-        address = f"{server_args['host']}:{server_args['port']}"
+        address = format_hostport(server_args["host"], server_args["port"])
         server_info = LocalInfServerInfo(
             host=server_args["host"],
             port=server_args["port"],
             process=process,
         )
         try:
-            self._wait_for_server(address)
+            self._wait_for_server(address, process=process)
             self.local_server_processes.append(server_info)
             if ray.is_initialized():
                 # do not return with process for ray as it is not picklable
@@ -1262,7 +1353,7 @@ class RemoteInfEngine(InferenceEngine):
             raise
 
     def _shutdown_one_server(self, server_info: LocalInfServerInfo):
-        addr = f"{server_info.host}:{server_info.port}"
+        addr = format_hostport(server_info.host, server_info.port)
         if addr in self.addresses:
             self.addresses.remove(addr)
         if server_info.process.poll() is not None:
@@ -1320,7 +1411,18 @@ def _update_weights_from_disk(
                     )
                     for addr in addresses
                 ]
-                await asyncio.gather(*jobs)
+                if http_req.best_effort:
+                    # Cleanup requests (e.g. unloading a stale LoRA adapter) must
+                    # not fail the weight update: the target may already be gone.
+                    results = await asyncio.gather(*jobs, return_exceptions=True)
+                    for r in results:
+                        if isinstance(r, Exception):
+                            logger.warning(
+                                f"Best-effort request to {http_req.endpoint} "
+                                f"failed (ignored): {r}"
+                            )
+                else:
+                    await asyncio.gather(*jobs)
 
         return load_timestamp - save_timestamp
 
@@ -1372,7 +1474,19 @@ def _init_weights_update_group_remote(
                         timeout=request_timeout,
                     )
                 )
-            await asyncio.gather(*jobs)
+            results = await asyncio.gather(*jobs, return_exceptions=True)
+            for _idx, _r in enumerate(results):
+                if isinstance(_r, Exception):
+                    logger.error(
+                        "init_weights_update_group request %d to %s failed: %s",
+                        _idx,
+                        addresses[_idx],
+                        _r,
+                    )
+            # Re-raise first exception if any failed
+            for _r in results:
+                if isinstance(_r, Exception):
+                    raise _r
 
     return uvloop.run(_fn())
 

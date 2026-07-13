@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 """Utility functions extracted from ArchonEngine for reuse and testability."""
 
 from __future__ import annotations
@@ -164,7 +166,7 @@ def validate_zero_bubble_compatibility(
     Zero-bubble schedules (split backward with retain_graph=True) conflict with
     torch.compile, donated_buffer (MoE), op-level selective AC, and memory_budget AC.
 
-    Returns updated enable_compile flag.
+    Returns updated ``enable_compile`` flag.
     """
     if get_schedule_class(pp_schedule) not in _ZERO_BUBBLE_SCHEDULES:
         return enable_compile
@@ -314,6 +316,11 @@ def prepare_training_config(
 
     Returns (ac_config, enable_compile). May mutate ``config.pad_to_maximum``
     and set deterministic env vars.
+
+    Note: the returned ``enable_compile`` may differ from
+    ``config.archon.enable_compile`` (zero-bubble or FP8 can disable it).
+    ``config.archon.enable_compile`` is **not** written back — callers
+    must use the returned value.
     """
     ac_config = build_ac_config(config, logger)
     enable_compile = config.archon.enable_compile
@@ -325,6 +332,13 @@ def prepare_training_config(
         ac_config=ac_config,
         logger=logger,
     )
+    if config.archon.fp8_config.enabled and enable_compile:
+        logger.warning(
+            "FP8 blockwise training is incompatible with torch.compile. "
+            "Disabling torch.compile."
+        )
+        enable_compile = False
+
     if config.archon.use_deterministic_algorithms:
         setup_deterministic_mode(ac_config, enable_compile, logger)
     force_pad_to_maximum(

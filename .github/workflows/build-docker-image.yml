@@ -15,7 +15,7 @@ env:
   GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
   VALIDATOR_LABELS: gcp-docker-validator
   RUNNER_VERSION: '2.332.0'
-  IMAGE_NAME: ghcr.io/inclusionai/areal-runtime
+  IMAGE_NAME: ghcr.io/areal-project/areal-runtime
   IMAGE_TAG: test
 
 jobs:
@@ -129,7 +129,7 @@ jobs:
         uses: docker/login-action@v4
         with:
           registry: ghcr.io
-          username: inclusionai
+          username: areal-project
           password: ${{ secrets.GHCR_TOKEN }}
 
       - name: Build and push sglang image
@@ -196,12 +196,12 @@ jobs:
         uses: docker/login-action@v4
         with:
           registry: ghcr.io
-          username: inclusionai
+          username: areal-project
           password: ${{ secrets.GHCR_TOKEN }}
 
       - name: Pull test image and push as dev
         env:
-          IMAGE_NAME: ghcr.io/inclusionai/areal-runtime
+          IMAGE_NAME: ghcr.io/areal-project/areal-runtime
         run: |
           docker pull $IMAGE_NAME:test-${{ matrix.variant }}
           docker tag $IMAGE_NAME:test-${{ matrix.variant }} $IMAGE_NAME:dev-${{ matrix.variant }}
@@ -239,12 +239,12 @@ jobs:
           TAG="test-${{ matrix.variant }}"
           # Get the package version ID for the test tag
           PACKAGE_VERSION_ID=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
-            "https://api.github.com/orgs/inclusionai/packages/container/$PACKAGE_NAME/versions?per_page=100" \
+            "https://api.github.com/orgs/areal-project/packages/container/$PACKAGE_NAME/versions?per_page=100" \
             | jq -r ".[] | select(.metadata.container.tags[] == \"$TAG\") | .id")
 
           if [ -n "$PACKAGE_VERSION_ID" ] && [ "$PACKAGE_VERSION_ID" != "null" ]; then
             curl -X DELETE -H "Authorization: Bearer $GH_TOKEN" \
-              "https://api.github.com/orgs/inclusionai/packages/container/$PACKAGE_NAME/versions/$PACKAGE_VERSION_ID"
+              "https://api.github.com/orgs/areal-project/packages/container/$PACKAGE_NAME/versions/$PACKAGE_VERSION_ID"
             echo "✅ Deleted ${{ matrix.variant }} test image from registry"
           else
             echo "⚠️ ${{ matrix.variant }} test image not found or already deleted"

@@ -75,6 +75,7 @@ def mock_input(
 
 def make_engine(model_type, mb_spec, ulysses_sp_size=1, init_optimizer=False):
     config = TrainEngineConfig(
+        backend="fsdp:d2",
         experiment_name="test",
         trial_name="test",
         path=MODEL_PATHS[model_type],

@@ -34,6 +34,7 @@ parts:
     chapters:
     - file: algorithms/async
     - file: algorithms/distillation
+    - file: algorithms/dpo
     - file: algorithms/grpo_series
     - file: algorithms/m2po
     - file: algorithms/prox_approx
@@ -42,6 +43,8 @@ parts:
     - file: reference/checkpointing
     - file: reference/metrics_tracking
     - file: reference/alloc_mode
+    - file: reference/lora
+    - file: reference/bridge_backend
     - file: reference/tree_training
     - file: reference/rollout_workflow
     - file: reference/agent_workflow

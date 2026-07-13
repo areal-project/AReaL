@@ -8,7 +8,7 @@ description = "AReaL: A Large-Scale Asynchronous Reinforcement Learning System"
 readme = "README.md"
 license = {text = "Apache-2.0"}
 requires-python = ">=3.11,<3.13"
-version = "1.0.2"
+version = "2.0.0"
 authors = [
     {name = "AReaL Team"},
 ]
@@ -42,14 +42,16 @@ classifiers = [
 
 dependencies = [
     # Core ML/AI libraries
-    "torch>=2.9.1,<2.11",
+    "torch>=2.9.1,<2.11; sys_platform != 'darwin' or platform_machine != 'x86_64'",
+    "torch<2.9.1; sys_platform == 'darwin' and platform_machine == 'x86_64'",
     "torchaudio",
     "torchvision",
     "torchdata",
     "huggingface_hub",
     "datasets>=3.0.0",
-    "transformers==4.57.1",
-    "peft",
+    "transformers>=5.0.0,<=5.3.0",
+    "mistral-common>=1.11.1",
+    "peft<=0.18.1",
     "qwen_agent",
     "openai-agents",
     "anthropic",
@@ -65,6 +67,9 @@ dependencies = [
     "seaborn",
 
     # Utilities and data processing
+    "pillow>=12.1.1",
+    "pylatexenc",
+    "zstandard",
     "setproctitle",
     "nltk",
     "sentencepiece",
@@ -108,6 +113,7 @@ dependencies = [
     # Monitoring and logging
     "wandb",
     "tensorboardx",
+    "trackio",
     "colorama",
     "colorlog",
     "swanboard==0.1.9b1",
@@ -116,13 +122,14 @@ dependencies = [
     # Distributed computing
     "ray[default]",
     "redis",
+    "awex==0.7.0",
 
     # Web frameworks
     "fastapi>=0.115.12",
     "uvicorn",
     "uvloop>=0.21.0",
     "flask",
-    "tenacity",
+    "tenacity>=8.2.0",
 
     # Build and packaging tools
     "build>=1.2.1",
@@ -135,68 +142,61 @@ dependencies = [
 [project.optional-dependencies]
 # CUDA-dependent extras - these packages only have Linux x86_64 wheels
 # Platform markers ensure they're skipped on unsupported platforms
+#
+# NOTE: vLLM has a separate pyproject file (pyproject.vllm.toml) because
+# sglang and vllm pin mutually-incompatible torch / torchao versions.
+# See pyproject.vllm.toml for the vLLM variant.
 sglang = [
-    "sglang[tracing]==0.5.9; sys_platform == 'linux' and platform_machine == 'x86_64'",
-    "torch==2.9.1+cu129; sys_platform == 'linux' and platform_machine == 'x86_64'",
-    "torchaudio; sys_platform == 'linux' and platform_machine == 'x86_64'",
-    "torchvision; sys_platform == 'linux' and platform_machine == 'x86_64'",
-]
-vllm = [
-    "vllm==0.17.0; sys_platform == 'linux' and platform_machine == 'x86_64'",
-    "torch==2.10.0+cu129; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "sglang[tracing]==0.5.10.post1; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "nvidia-cudnn-cu12==9.16.0.29; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "torch; sys_platform == 'linux' and platform_machine == 'x86_64'",
     "torchaudio; sys_platform == 'linux' and platform_machine == 'x86_64'",
     "torchvision; sys_platform == 'linux' and platform_machine == 'x86_64'",
 ]
 tms = [
     "torch_memory_saver==0.0.9; sys_platform == 'linux'",
 ]
-flash-attn = [
-    "flash-attn==2.8.3; sys_platform == 'linux' and platform_machine == 'x86_64'",
-]
 kernels = [
     "kernels==0.12.2",
 ]
 megatron = [
-    "megatron-core==0.16.0; sys_platform == 'linux' and platform_machine == 'x86_64'",
-    "mbridge==0.15.1; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "megatron-core==0.17.0; python_version >= '3.12' and sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "mbridge @ git+https://github.com/ISEEKYAN/mbridge.git@310e8fb; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "megatron-bridge==0.4.0; python_version >= '3.12' and sys_platform == 'linux' and platform_machine == 'x86_64'",
 ]
 # Convenience extra for CUDA training packages (no inference backend)
-# Install with --extra sglang or --extra vllm for a complete setup
 cuda-train = [
     "areal[tms]",
     "areal[megatron]",
     "areal[kernels]",
+    "nvidia-modelopt[hf]; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "tilelang>=0.1.9; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "flash-linear-attention==0.4.2; sys_platform == 'linux' and platform_machine == 'x86_64'",
 ]
-# Backward-compatible: `uv sync --extra cuda` installs training packages + sglang.
-# For vllm instead, use: `uv sync --extra cuda-vllm`
-cuda-sglang = [
+# Full CUDA setup: training packages + SGLang inference
+cuda = [
     "areal[cuda-train]",
     "areal[sglang]",
-    "areal[flash-attn]",
-    "torch==2.9.1+cu129; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "torch; sys_platform == 'linux' and platform_machine == 'x86_64'",
     "torchaudio; sys_platform == 'linux' and platform_machine == 'x86_64'",
     "torchvision; sys_platform == 'linux' and platform_machine == 'x86_64'",
 ]
-cuda-vllm = [
-    "areal[cuda-train]",
-    "areal[vllm]",
-    "areal[flash-attn]",
-    "torch==2.10.0+cu129; sys_platform == 'linux' and platform_machine == 'x86_64'",
-    "torchaudio; sys_platform == 'linux' and platform_machine == 'x86_64'",
-    "torchvision; sys_platform == 'linux' and platform_machine == 'x86_64'",
+sandbox = [
+    "daytona>=0.167.0",
 ]
-cuda = [
-    "areal[cuda-sglang]",
-    "torch==2.9.1+cu129; sys_platform == 'linux' and platform_machine == 'x86_64'",
-    "torchaudio; sys_platform == 'linux' and platform_machine == 'x86_64'",
-    "torchvision; sys_platform == 'linux' and platform_machine == 'x86_64'",
+cli = [
+    "click>=8.1",
+    "colorlog",
 ]
 
+[project.scripts]
+areal = "areal.v2.cli.main:cli"
+
 [project.urls]
-"Homepage" = "https://github.com/inclusionAI/AReaL"
-"Repository" = "https://github.com/inclusionAI/AReaL"
-"Documentation" = "https://inclusionai.github.io/AReaL/en/intro.html"
-"Bug Tracker" = "https://github.com/inclusionAI/AReaL/issues"
+"Homepage" = "https://github.com/areal-project/AReaL"
+"Repository" = "https://github.com/areal-project/AReaL"
+"Documentation" = "https://areal-project.github.io/AReaL/en/intro.html"
+"Bug Tracker" = "https://github.com/areal-project/AReaL/issues"
 
 [dependency-groups]
 dev = [
@@ -234,51 +234,33 @@ environments = [
     "sys_platform == 'darwin' and platform_machine == 'arm64'",
     "sys_platform == 'darwin' and platform_machine == 'x86_64'",
 ]
-conflicts = [
-    [
-        { extra = "sglang" },
-        { extra = "vllm" },
-    ],
-    # cuda includes sglang, so it also conflicts with vllm
-    [
-        { extra = "cuda-sglang" },
-        { extra = "vllm" },
-    ],
-    [
-        { extra = "cuda" },
-        { extra = "vllm" },
-    ],
-    # cuda-vllm includes vllm, so it conflicts with sglang and cuda
-    [
-        { extra = "cuda-vllm" },
-        { extra = "sglang" },
-    ],
-    [
-        { extra = "cuda-vllm" },
-        { extra = "cuda" },
-    ],
-    [
-        { extra = "cuda-vllm" },
-        { extra = "cuda-sglang" },
-    ],
-]
 override-dependencies = [
     # litellm[proxy] conflicts with sglang's exact pins:
     # - litellm requires openai>=2.8.0, sglang pins openai==2.6.1
     # - litellm requires soundfile>=0.12.1,<0.13.0, sglang pins soundfile==0.13.1
+    # sglang pins torchao==0.9.0, but we require >=0.15.0 for archon fp8
+    # nvidia-cudnn-cu12 is required for SGLang Vision Models
     "openai>=2.8.0",
     "soundfile>=0.12.1,<0.13.0",
+    "torchao==0.15.0",
+    "nvidia-cudnn-cu12==9.16.0.29; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "flash-attn-4>=4.0.0b4",
+
+    # Required by megatron-bridge but are optional (as per docs) cuda-based installs
+    "transformer-engine; sys_platform == 'never'",
+    "nv-grouped-gemm; sys_platform == 'never'",
+    "mamba-ssm; sys_platform == 'never'",
+    "causal-conv1d; sys_platform == 'never'",
+    # nvidia-resiliency-ext 0.5.0 only ships manylinux_2_39 wheels; exclude so
+    # older host kernels can still install megatron-core.
+    "nvidia-resiliency-ext; sys_platform == 'never'",
+
+    # Version conflicts with megatron-bridge (resorting to the existing version)
+    "megatron-core==0.17.0; python_version >= '3.12' and sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "hydra-core==1.4.0.dev1",
+    "timm==1.0.16",
+    "transformers>=5.0.0,<=5.3.0",
 ]
-
-# Static metadata so uv lock resolves flash-attn without downloading or building.
-# The actual pre-built wheel (variant-specific) is installed in the Dockerfile.
-[[tool.uv.dependency-metadata]]
-name = "flash-attn"
-version = "2.8.3"
-requires-dist = ["torch", "einops"]
-
-[tool.uv.extra-build-dependencies]
-flash-attn = [{ requirement = "torch", match-runtime = true }]
 
 [[tool.uv.index]]
 name = "pytorch-cu129"
@@ -288,24 +270,15 @@ explicit = true
 [tool.uv.sources]
 torch = [
     { index = "pytorch-cu129", extra = "sglang" },
-    { index = "pytorch-cu129", extra = "vllm" },
     { index = "pytorch-cu129", extra = "cuda" },
-    { index = "pytorch-cu129", extra = "cuda-sglang" },
-    { index = "pytorch-cu129", extra = "cuda-vllm" },
 ]
 torchaudio = [
     { index = "pytorch-cu129", extra = "sglang" },
-    { index = "pytorch-cu129", extra = "vllm" },
     { index = "pytorch-cu129", extra = "cuda" },
-    { index = "pytorch-cu129", extra = "cuda-sglang" },
-    { index = "pytorch-cu129", extra = "cuda-vllm" },
 ]
 torchvision = [
     { index = "pytorch-cu129", extra = "sglang" },
-    { index = "pytorch-cu129", extra = "vllm" },
     { index = "pytorch-cu129", extra = "cuda" },
-    { index = "pytorch-cu129", extra = "cuda-sglang" },
-    { index = "pytorch-cu129", extra = "cuda-vllm" },
 ]
 
 # =============================================================================
@@ -328,6 +301,7 @@ markers = [
     "multi_gpu: mark test that uses more than one GPU",
     "sglang: mark test that requires the SGLang inference backend",
     "vllm: mark test that requires the vLLM inference backend",
+    "integration: requires external services or credentials",
 ]
 
 # =============================================================================

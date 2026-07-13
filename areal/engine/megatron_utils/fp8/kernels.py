@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 # FP8 Triton kernels for quantization and dequantization
 # Adapted from slime
 

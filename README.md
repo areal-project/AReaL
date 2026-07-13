@@ -3,27 +3,36 @@
 </h1>
 
 <p align="center">
-| <a href="https://arxiv.org/pdf/2505.24298"><b>Paper</b></a> | <a href="https://inclusionai.github.io/AReaL/"><b>Documentation</b></a> | <a href="https://inclusionai.github.io/AReaL/zh/"><b>中文文档</b></a> | <a href="https://deepwiki.com/inclusionAI/AReaL"><b>Ask DeepWiki</b></a> | <a href="https://huggingface.co/collections/inclusionAI/"><b>🤗 Models & Data</b></a> |
-<a href="./assets/wechat_qrcode.png" target="_blank"><img src="./assets/wechat_icon.png" width="20" style="vertical-align: middle;"> <b>WeChat (微信) Group</b></a> |
+| <a href="https://arxiv.org/pdf/2505.24298"><b>Paper</b></a> | <a href="https://areal-project.github.io/AReaL/"><b>Documentation</b></a> | <a href="https://areal-project.github.io/AReaL/zh/"><b>中文文档</b></a> | <a href="https://deepwiki.com/areal-project/AReaL"><b>Ask DeepWiki</b></a> | <a href="https://huggingface.co/collections/inclusionAI/"><b>🤗 Models & Data</b></a> |
+<a href="./assets/figures/wechat_qrcode.png" target="_blank"><img src="./assets/figures/wechat_icon.png" width="20" style="vertical-align: middle;"> <b>WeChat (微信) Group</b></a> |
+  <a href="https://gitcgr.com/areal-project/AReaL">
+    <img src="https://gitcgr.com/badge/areal-project/AReaL.svg" alt="gitcgr" />
+  <a href="https://www.bestpractices.dev/projects/12770"><img src="https://www.bestpractices.dev/projects/12770/badge"></a>
+  </a>
 </p>
 
-<img align="right" alt="ReaL" src="/assets/logo.png" width="20%">
+<img align="right" alt="ReaL" src="/assets/figures/logo.png" width="20%">
 
-AReaL is an open-source **fully asynchronous** reinforcement learning training system
-for large **reasoning and agentic models**, developed by members from Tsinghua IIIS and
-the AReaL Team at Ant Group. Built upon the open-source project
-[ReaLHF](https://github.com/openpsi-project/ReaLHF), we are fully committed to
-open-source principles by providing the training details, data, and infrastructure
-required to reproduce our results, along with the models themselves. AReaL aims to help
-everyone build their own AI agents easily and affordably. Our team loves milk tea
-because it's delicious, customizable, and affordable—we hope you enjoy our project just
-as much as you'd enjoy real milk tea. Cheers!
+**AReaL** is a reinforcement learning (RL) infrastructure designed to bridge foundation
+model training with modern agent-based applications. It was originally developed by
+researchers and engineers from Tsinghua IIIS and the AReaL Team at Ant Group.
+
+Built on a **fully asynchronous RL training paradigm**, AReaL is optimized for
+efficiency and scalability, making it particularly well-suited for training large-scale
+**reasoning and agentic models**.
+
+AReaL’s mission is to make building AI agents **accessible, efficient, and
+cost-effective** for a broad community of developers and researchers.
+
+> Like milk tea - customizable, scalable, and enjoyable - we hope AReaL brings both
+> flexibility and delight to your AI development experience. Cheers!
 
 **AReaL Highlights**
 
 - ⚡ **Flexibility**: Seamless customization for
-  [agentic RL](https://inclusionai.github.io/AReaL/en/tutorial/agentic_rl.html) and
-  [online RL training](./examples/openclaw/) by simply replacing the `base_url`.
+  [agentic RL](https://areal-project.github.io/AReaL/en/tutorial/agentic_rl.html) and
+  [online RL training](https://www.inclusion-ai.org/AReaL/en/tutorial/online_proxy.html)
+  for **black-box agent applications** by simply replacing the `base_url`.
 - 📈 **Scalability**: **Stable** fully asynchronous RL training with **industry-leading
   speed**.
 - ✨ **Cutting-Edge Performance**: State-of-the-art [math](/blog/AReaL_v0_2.md),
@@ -32,9 +41,36 @@ as much as you'd enjoy real milk tea. Cheers!
 
 ## 📰 News
 
+**\[2026/06/17\]** 🔬 Introducing **KPop** — bidirectional binary KL divergence token
+masking. Configured via `rejection_sampling.metric=binary_kl`. Also adding an
+[IcePop config](examples/math/gsm8k_icepop.yaml) (importance-ratio-based token masking).
+Check out [gsm8k_kpop.yaml](examples/math/gsm8k_kpop.yaml) and
+[gsm8k_icepop.yaml](examples/math/gsm8k_icepop.yaml) to get started!
+
+**\[2026/04/23\]** 🚀 We’re excited to release our integration with
+[Scaffoldings](https://github.com/NVIDIA/TensorRT-LLM/tree/main/tensorrt_llm/scaffolding)
+for agentic RL training - now live in our
+[examples](https://github.com/areal-project/AReaL/tree/main/examples/scaffolding)! Huge
+shoutout to @narutolhy and @WeiHaocheng for making this happen 🙌. The modular design of
+the Scaffoldings enables it to achieve a thorough decoupling of agent execution, reward
+calculation, and trajectory acquisition. This enables developers to reuse existing
+modules when implementing an agentic RL method, allowing them to focus on their own
+innovative modules.
+
+**\[2026/04/18\]** We are thrilled to announce that **AReaL's first Community Biweekly
+Meeting** was successfully held! Thank you to everyone who joined us. Meeting materials
+are now available
+[here](https://github.com/areal-project/AReaL/tree/main/assets/community). Our next
+meeting is scheduled for **2026/05/01** and will also be conducted in Chinese;
+English-language meetings will be scheduled in the future. We warmly welcome everyone to
+participate! See [Community](./assets/community/README.md) for more details.
+
 **\[2026/03/02\]** We provide [a complete example](./examples/openclaw/) to train your
 own 🦞 OpenClaw agent by simply replacing the `base_url` and `api_key` with AReaL's RL
 service - no complicated dependencies, no code changes, works with any agentic runtime!
+
+<details>
+<summary><b>📋 Previous Releases</b></summary>
 
 **\[2026/02/06\]** We are delighted to introduce **AReaL-SEA**, a self-evolving data
 synthesis engine. Combined with RL training on AReaL, the 235B MoE model surpasses GPT 5
@@ -42,7 +78,7 @@ and achieves comparable performance with Gemini 3.0 Pro on $\\tau^2$-bench! Chec
 the [paper](https://arxiv.org/pdf/2601.22607),
 [model](https://huggingface.co/inclusionAI/AReaL-SEA-235B-A22B),
 [data](https://huggingface.co/datasets/inclusionAI/AReaL-tau2-data), and
-[code](https://github.com/inclusionAI/AReaL/tree/main/examples/tau2).
+[code](https://github.com/areal-project/AReaL/tree/main/examples/tau2).
 
 **\[2026/01/15\]** Congrats to our friends at [CAMEL-AI](https://www.camel-ai.org/) for
 open-sourcing [SETA](https://github.com/camel-ai/seta), their terminal agent RL project
@@ -50,14 +86,11 @@ trained with AReaL! Check out
 [their training workflow](https://github.com/camel-ai/seta/tree/main/training/tbench_areal_workflow)
 and the [announcement on X](https://x.com/guohao_li/status/2009678513574408636).
 
-<details>
-<summary><b>📋 Previous Releases</b></summary>
-
 **\[2026/01/01\]** Happy New Year! Thanks to the outstanding contribution from
 @HwVanICI, we are excited to officially announce stable support for AReaL training on
 **Ascend NPU devices**! The code is actively maintained and continuously updated in the
-[`ascend` branch](https://github.com/inclusionAI/AReaL/tree/ascend). Check out
-[our documentation](https://inclusionai.github.io/AReaL/en/tutorial/installation_npu.html)
+[`ascend` branch](https://github.com/areal-project/AReaL/tree/ascend). Check out
+[our documentation](https://areal-project.github.io/AReaL/en/tutorial/installation_npu.html)
 to get started, and feel free to report any issues!
 
 **\[2025/08/30\]** Introducing ASearcher, a state-of-the-art search agent built with
@@ -70,7 +103,7 @@ features an **algorithm-first** API design that prioritizes ease of use and algo
 development, while natively supporting **fully asynchronous agentic RL**. With 80% fewer
 lines of code, AReaL-lite maintains 90% of AReaL's performance and core functionality.
 Check out [our AReaL-lite design documentation](/areal/README.md) and
-[the quickstart guide](https://inclusionai.github.io/AReaL/en/tutorial/quickstart.html)
+[the quickstart guide](https://areal-project.github.io/AReaL/en/tutorial/quickstart.html)
 to begin your journey with **AReaL-lite**!
 
 **\[2025/06/03\] (v0.3, boba²)** We release **boba²** (double-boba) for fully
@@ -96,13 +129,14 @@ state-of-the-art 7B and 32B models for mathematical reasoning. Check out our
 First, install the package:
 
 ```bash
-git clone https://github.com/inclusionAI/AReaL
+git clone https://github.com/areal-project/AReaL
 cd AReaL
 pip install uv
 # Install flash-attn pre-built wheel first to avoid compiling from source
 # (pick the wheel matching your Python version; see https://github.com/mjun0812/flash-attention-prebuild-wheels/releases)
 uv pip install "https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.7.16/flash_attn-2.8.3+cu128torch2.9-cp312-cp312-linux_x86_64.whl"
 uv sync --extra cuda  # installs training packages + SGLang (default inference backend)
+# For vLLM instead: cp pyproject.vllm.toml pyproject.toml && cp uv.vllm.lock uv.lock && uv sync --extra cuda
 ```
 
 Our training scripts automatically download the required dataset (openai/gsm8k) and
@@ -112,17 +146,18 @@ model (Qwen/Qwen2-1.5B-Instruct). To run on a single node:
 python3 examples/math/gsm8k_rl.py --config examples/math/gsm8k_grpo.yaml scheduler.type=local
 ```
 
-To run on a Ray cluster with 2 nodes and 8 GPUs per node (remember to update paths in
-the YAML file to point to your shared storage):
+If you prefer to run experiments on a Ray cluster, update paths in the YAML file to
+point to your shared storage, and run:
 
 ```bash
 python3 examples/math/gsm8k_rl.py --config examples/math/gsm8k_grpo.yaml \
   cluster.n_nodes=2 cluster.n_gpus_per_node=8 \
+  cluster.fileroot=/path/to/nfs \
   scheduler.type=ray
 ```
 
 For comprehensive setup instructions, see
-[our quickstart guide](https://inclusionai.github.io/AReaL/en/tutorial/quickstart.html).
+[our quickstart guide](https://areal-project.github.io/AReaL/en/tutorial/quickstart.html).
 
 ## 📚 Examples
 
@@ -178,8 +213,11 @@ All RL algorithms support both asynchronous and synchronous versions by setting
 | **REINFORCE++**          | -                                             | [📄 Paper](https://arxiv.org/pdf/2501.03262)   | [🔗 GSM8K Example](examples/math/gsm8k_reinforce.yaml)            |
 | **RLOO**                 | [📖 Docs](docs/en/algorithms/grpo_series.md)  | [📄 Paper](https://arxiv.org/pdf/2402.14740v1) | [🔗 GSM8K Example](examples/math/gsm8k_rloo.yaml)                 |
 | **SAPO**                 | [📖 Docs](docs/en/algorithms/grpo_series.md)  | [📄 Paper](https://arxiv.org/abs/2511.20347)   | [🔗 GSM8K Example](examples/math/gsm8k_sapo.yaml)                 |
+| **IcePop**               | [📖 Docs](docs/en/algorithms/grpo_series.md)  | [📄 Blog](https://ringtech.notion.site/icepop) | [🔗 GSM8K Example](examples/math/gsm8k_icepop.yaml)               |
+| **KPop**                 | [📖 Docs](docs/en/algorithms/grpo_series.md)  | [📄 Blog](https://ringtech.notion.site/kpop)   | [🔗 GSM8K Example](examples/math/gsm8k_kpop.yaml)                 |
 | **M2PO**                 | [📖 Docs](docs/algorithms/m2po.md)            | [📄 Paper](https://arxiv.org/abs/2510.01161)   | [🔗 GSM8K Example](examples/math/gsm8k_m2po.yaml)                 |
-| **RLHF Reward Modeling** | -                                             | -                                              | [🔗 RLHF Example](examples/alignment/)                            |
+| **DPO**                  | [📖 Docs](docs/en/algorithms/dpo.md)          | [📄 Paper](https://arxiv.org/abs/2305.18290)   | [🔗 HH-RLHF Example](examples/alignment/hhrlhf_dpo.yaml)          |
+| **RLHF Reward Modeling** | -                                             | -                                              | [🔗 RLHF Example](examples/alignment/hhrlhf_rw.yaml)              |
 | **SFT**                  | -                                             | -                                              | [🔗 GSM8K Example](examples/math/gsm8k_sft.py)                    |
 | **Distillation**         | [📖 Docs](docs/en/algorithms/distillation.md) | [📄 Paper](https://arxiv.org/pdf/2506.02208)   | [🔗 GSM8K Example](examples/distillation/gsm8k_grpo_distill.yaml) |
 
@@ -199,11 +237,11 @@ Check the [AI Coding Assistant Guide](docs/reference/ai_assisted_dev.md) and
 
 ### Training Backends
 
-| Backend            | DP          | Tensor Parallel | Sequence Parallel within TP | Context Parallel | Pipeline Parallel | Expert Parallel | 1D Sequence Packing | LoRA |
-| ------------------ | ----------- | --------------- | --------------------------- | ---------------- | ----------------- | --------------- | ------------------- | ---- |
-| **Megatron**       | ✅ (ZeRO-1) | ✅              | ✅                          | ✅               | ✅                | ✅              | ✅                  | ❌   |
-| **PyTorch FSDP**   | ✅ (FSDP2)  | ✅              | ✅                          | ✅               | ❌                | ❌              | ✅                  | ✅   |
-| **PyTorch Archon** | ✅ (FSDP2)  | ✅              | ✅                          | ✅               | ✅                | ✅              | ✅                  | ❌   |
+| Backend            | DP          | Tensor Parallel | Sequence Parallel within TP | Context Parallel | Pipeline Parallel | Expert Parallel | 1D Sequence Packing | LoRA                             |
+| ------------------ | ----------- | --------------- | --------------------------- | ---------------- | ----------------- | --------------- | ------------------- | -------------------------------- |
+| **Megatron**       | ✅ (ZeRO-1) | ✅              | ✅                          | ✅               | ✅                | ✅              | ✅                  | ✅ (with vLLM inference backend) |
+| **PyTorch FSDP**   | ✅ (FSDP2)  | ✅              | ✅                          | ✅               | ❌                | ❌              | ✅                  | ✅                               |
+| **PyTorch Archon** | ✅ (FSDP2)  | ✅              | ✅                          | ✅               | ✅                | ✅              | ✅                  | ❌                               |
 
 ### Inference Backends
 
@@ -249,6 +287,7 @@ Check the [AI Coding Assistant Guide](docs/reference/ai_assisted_dev.md) and
 ### Reference
 
 - [CLI Configurations](docs/en/cli_reference.md)
+- [LoRA RL](docs/en/reference/lora.md)
 - [Checkpointing](docs/en/reference/checkpointing.md)
 - [Metrics Tracking](docs/en/reference/metrics_tracking.md)
 - [Allocation Mode](docs/en/reference/alloc_mode.md)
@@ -260,7 +299,9 @@ Check the [AI Coding Assistant Guide](docs/reference/ai_assisted_dev.md) and
 
 We warmly welcome contributions from the community! Whether you're fixing bugs, adding
 features, improving documentation, or helping others, your contribution is valued.
-Please check our **[Contributing Guide](CONTRIBUTING.md)** for detailed information.
+Please check our
+**[Contributing Guide](https://github.com/areal-project/community/blob/main/CONTRIBUTING.md)**
+for detailed information.
 
 ```bash
 # Fork and clone the repository
@@ -273,8 +314,8 @@ pip install uv
 uv pip install "https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.7.16/flash_attn-2.8.3+cu128torch2.9-cp312-cp312-linux_x86_64.whl"
 # Use `--extra cuda` on Linux with CUDA (installs training packages + SGLang)
 uv sync --extra cuda --group dev
-# For vLLM instead (note: use torch2.10 flash-attn wheel):
-# uv sync --extra cuda-vllm --group dev
+# For vLLM instead:
+# cp pyproject.vllm.toml pyproject.toml && cp uv.vllm.lock uv.lock && uv sync --extra cuda --group dev
 # Or without CUDA support
 # uv sync --group dev
 
@@ -292,12 +333,24 @@ git push
 ## 🗺️ Future Roadmap
 
 - **[Full Roadmap](ROADMAP.md)**
-- **[2025 Q4 Roadmap](https://github.com/inclusionAI/AReaL/issues/542)**
+- **[2026 Q1 Roadmap](https://github.com/areal-project/AReaL/issues/907)**
 
 AReaL is under active development with planned minor releases weekly and major releases
 monthly. We warmly welcome community engagement and contributions. We are also
 **actively hiring interns and full-time employees** with open positions in both the US
 and China.
+
+## 📢 Community
+
+<img src="./assets/figures/wechat_qrcode.png" width="200" alt="WeChat QR Code">
+
+We warmly welcome everyone to join our community! We have a _**WeChat group**_ for
+real-time discussions and a
+[GitHub discussion board](https://github.com/areal-project/AReaL/discussions) for
+asynchronous conversations.
+
+Check out our [Community Repository](https://github.com/areal-project/community) for
+more details and meeting materials.
 
 ## 🙏 Acknowledgments
 
@@ -334,6 +387,10 @@ outstanding projects, including but not limited to
 [SGLang](https://github.com/sgl-project/sglang), [QwQ](https://github.com/QwenLM/QwQ),
 [Light-R1](https://github.com/Qihoo360/Light-R1), and
 [DAPO](https://github.com/BytedTsinghua-SIA/DAPO).
+
+## 📜 License
+
+This project is licensed under the [Apache License 2.0](LICENSE).
 
 ## 📄 Citation
 

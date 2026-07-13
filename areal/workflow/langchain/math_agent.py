@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 """LangChain-based math agent implementation for AReaL training.
 
 This module provides math agents using LangChain that integrate with AReaL's

@@ -81,6 +81,7 @@ def mock_input(
 def make_engine(model_type: str, mb_spec: MicroBatchSpec):
     """Create and initialize a ArchonEngine."""
     config = TrainEngineConfig(
+        backend="archon:d1",
         experiment_name="test_archon_forward",
         trial_name="test",
         path=MODEL_PATHS[model_type],

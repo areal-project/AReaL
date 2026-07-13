@@ -14,12 +14,12 @@ cluster:
     type: nfs
     nfs_record_root: /tmp/areal/name_resolve
 
-allocation_mode: vllm:d4+d4
 
 scheduler:
   type: null
 
 rollout:
+  backend: "vllm:d4"
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
   max_concurrent_rollouts: 64
@@ -31,15 +31,21 @@ rollout:
   fileroot: ${cluster.fileroot}
   tokenizer_path: ${tokenizer_path}
   dump_to_file: true
+  agent:
+    mode: inline
+    export_style: individual
+    turn_discount: 1.0
 
 gconfig:
   n_samples: 16
   min_new_tokens: 0
   max_new_tokens: 8192
+  max_tokens: 2048
   greedy: false
   temperature: 1.0
 
 actor:
+  backend: "fsdp:d4"
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
   path: deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B
@@ -67,7 +73,9 @@ actor:
   ppo_n_minibatches: 4
   recompute_logprob: true
   use_decoupled_loss: true
-  behave_imp_weight_cap: 5.0
+  rejection_sampling:
+    metric: ratio
+    upper: 5.0
   reward_norm:
     mean_level: group
     std_level: group
@@ -96,6 +104,7 @@ actor:
         PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
 
 ref:
+  backend: ${actor.backend}
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
   path: ${actor.path}

@@ -1,12 +1,12 @@
 ---
 name: review-pr
-description: Intelligent PR code review with dynamic agent allocation based on change types
+description: Intelligent PR code review with dynamic agent allocation based on domains and signals
 allowed-tools: Read, Grep, Glob, Bash, Task
 ---
 
 <!-- Reference data (auto-loaded via @import) -->
 
-@.claude/data/review-pr-change-types.md @.claude/data/review-pr-templates.md
+@.claude/data/review-pr-domains-and-signals.md @.claude/data/review-pr-templates.md
 
 # PR Code Review (Dynamic Agent Allocation)
 
@@ -33,7 +33,7 @@ targeted review tasks based on PR changes.
 Phase 1: Deep PR Analysis [Haiku + Sonnet]
     |- 1.0 PR Status Check [Haiku]
     |- 1.1 Get PR Summary [Haiku]
-    +- 1.2-1.4 Change Type Detection [Sonnet]
++- 1.2-1.4 Domain/Signal Detection [Sonnet]
     |
 Phase 2: Dynamic Agent Planning [Sonnet]
     |
@@ -66,32 +66,33 @@ Check if PR should be reviewed:
 
 Get basic PR info: title, description, modified files, change summary.
 
-### 1.2 Change Type Detection \[Sonnet\]
+### 1.2 Domain & Signal Detection \[Sonnet\]
 
-Analyze each file change, detecting change types by risk level.
+Analyze each file change, detecting L1 domains and L2 signals by risk level.
 
-**Reference**: See `review-pr-change-types.md` for complete detection tables:
+**Reference**: See `review-pr-domains-and-signals.md` for complete domain tables:
 
-- CRITICAL level types (Archon, FSDP, Megatron, DCP)
-- HIGH level types (distributed comm, DTensor, MoE, TP/EP/CP)
-- MEDIUM level types (tensor ops, workflow, API, compile)
-- LOW level types (tests, docs, config)
+- L1 domains (Distributed Runtime, Model Compute & Attention, Inference Backend &
+  Serving, etc.)
+- L2 signals per domain
+- cross-domain linkage rules
 
-### 1.3 Framework-Specific Risk Identification
+### 1.3 Domain-Specific Risk Identification
 
-Based on detected types, identify corresponding risks.
+Based on detected domains/signals, identify corresponding risks and linked checks.
 
-**Reference**: See `review-pr-change-types.md` for risk lists per framework.
+**Reference**: See `review-pr-domains-and-signals.md` for risk lists per domain.
 
 ### 1.4 Output Change Analysis Report
 
 ```
 CHANGE_ANALYSIS_REPORT:
-- detected_types: [ARCHON_PARALLEL, EP_ETP, FSDP_CORE, ...]
+- detected_domains: [Distributed Runtime, Model Compute & Attention, ...]
+- detected_signals: [weight_sync, tree_attn, ...]
 - risk_level: CRITICAL | HIGH | MEDIUM | LOW
 - affected_files: [file1.py, file2.py, ...]
 - identified_risks: [risk1, risk2, ...]
-- related_frameworks: [archon, fsdp, megatron, ...]
+- related_frameworks: [archon, fsdp, megatron, vllm, service-stack, ...]
 ```
 
 ______________________________________________________________________
@@ -102,28 +103,31 @@ ______________________________________________________________________
 
 1. **Generate tasks by risk area**: Each high-risk area gets a dedicated task
 1. **Merge related changes**: Interdependent changes can be merged
-1. **Model selection**: CRITICAL/HIGH -> Opus, MEDIUM -> Sonnet, LOW -> Haiku
+1. **Review depth selection**: CRITICAL/HIGH -> `comprehensive`, MEDIUM -> `targeted`,
+   LOW -> `basic`
+1. **Model routing**: `comprehensive` -> Opus, `targeted` -> Sonnet, `basic` -> Haiku
 1. **Minimum coverage**: Even simple changes get at least 1 basic review task
 
 ### 2.2 Task Template Selection
 
-Based on detected change types, select appropriate review task templates.
+Based on detected domains/signals, select appropriate review task templates.
 
 **Reference**: See `review-pr-templates.md` for complete task templates:
 
-- Framework-specific tasks (Archon, FSDP, Megatron, DCP, Trainer)
-- General tasks (Logic, Concurrency, Tensor, Numerical, TP, etc.)
+- Domain templates (Distributed Runtime, Model Compute & Attention, Inference Backend &
+  Serving, etc.)
+- Universal + signal-specific add-on templates
 
 ### 2.3 Output Review Task List
 
 ```
 GENERATED_REVIEW_TASKS:
-1. [Opus] Task Name
-   - Reason: XXX change type detected
+1. [comprehensive -> Opus] Task Name
+   - Reason: XXX domain/signal detected
    - Checklist: [...]
    - Focus files: [...]
 
-2. [Sonnet] Task Name
+2. [targeted -> Sonnet] Task Name
    - Reason: ...
    ...
 ```
@@ -155,13 +159,13 @@ findings:
     suggestion: "Fix suggestion"
 ```
 
-### 3.3 Review Depth by Model
+### 3.3 Review Depth Mapping
 
-| Model      | Requirements                                                               |
-| ---------- | -------------------------------------------------------------------------- |
-| **Opus**   | Complete context, cross-file traces, verify parallel strategy interactions |
-| **Sonnet** | Changed code + direct callers/callees, type signature consistency          |
-| **Haiku**  | Format and basic correctness only                                          |
+| Review Depth      | Model  | Requirements                                                               |
+| ----------------- | ------ | -------------------------------------------------------------------------- |
+| **comprehensive** | Opus   | Complete context, cross-file traces, verify parallel strategy interactions |
+| **targeted**      | Sonnet | Changed code + direct callers/callees, type signature consistency          |
+| **basic**         | Haiku  | Format and basic correctness only                                          |
 
 ______________________________________________________________________
 
@@ -184,7 +188,8 @@ ______________________________________________________________________
 
 ## PR Overview
 - **Title**: PR title
-- **Detected Change Types**: [...]
+- **Detected Domains**: [...]
+- **Detected Signals**: [...]
 - **Risk Level**: CRITICAL | HIGH | MEDIUM | LOW
 - **Generated Review Tasks**: N
 
@@ -225,13 +230,13 @@ ______________________________________________________________________
 
 ## Dynamic Generation Examples
 
-| PR Type        | Detected Types                        | Generated Tasks |
-| -------------- | ------------------------------------- | --------------- |
-| Docs only      | \[DOCS\]                              | 1 Haiku         |
-| Config only    | \[CONFIG_ONLY\]                       | 1-2 Haiku       |
-| Single bug fix | \[TENSOR_OPS\]                        | 2-4 Sonnet      |
-| Archon core    | \[ARCHON\_\*, EP_ETP, DTENSOR\]       | 4-8 Opus        |
-| Cross-domain   | \[WORKFLOW_ENGINE, FSDP_CORE, TESTS\] | 5-10 mixed      |
+| PR Type        | Detected Domains/Signals                            | Generated Tasks                 |
+| -------------- | --------------------------------------------------- | ------------------------------- |
+| Docs only      | \[Low-Risk Hygiene / tests_docs_config\]            | 1 basic -> Haiku                |
+| Config only    | \[API & Config Compatibility / dataclass_schema\]   | 1-2 basic/targeted              |
+| Single bug fix | \[Numerics & Tensor Semantics / shape_dtype\]       | 2-4 targeted -> Sonnet          |
+| Archon core    | \[Distributed Runtime / mesh_dtensor, weight_sync\] | 4-8 comprehensive -> Opus       |
+| Cross-domain   | \[Workflow & Trainer + Distributed + Hygiene\]      | 5-10 mixed review depths/models |
 
 ______________________________________________________________________
 
@@ -262,26 +267,24 @@ ______________________________________________________________________
 Location: .claude/commands/review-pr.md
 Invocation: /review-pr
 Related files:
-  - .claude/data/review-pr-change-types.md: Change type detection tables
+- .claude/data/review-pr-domains-and-signals.md: Domain and signal detection tables
   - .claude/data/review-pr-templates.md: Review task templates
 
 ## Structure
 
 - Main file (this): workflow and phases, @imports data files
-- data/review-pr-change-types.md: detection tables
+- data/review-pr-domains-and-signals.md: domain and signal detection tables
 - data/review-pr-templates.md: task templates
 
 ## How to Update
 
-### Adding New Change Types
-Edit .claude/data/review-pr-change-types.md:
-1. Add to appropriate level table (CRITICAL/HIGH/MEDIUM/LOW)
-2. Add framework risks if applicable
+### Adding New Domains or Signals
+Edit `.agents/skills/review-pr/references/review-pr-domains-and-signals.md`, then regenerate
+the derived data files with `python3 .agents/skills/review-pr/sync_review_pr_refs.py --write`.
 
 ### Adding New Task Templates
-Edit .claude/data/review-pr-templates.md:
-1. Add to framework-specific or general section
-2. Include checklist
+Edit `.agents/skills/review-pr/references/review-pr-templates.md`, then regenerate the
+derived data files with `python3 .agents/skills/review-pr/sync_review_pr_refs.py --write`.
 
 ### Adjusting Model Selection
 Modify "Model Configuration" table in this file.

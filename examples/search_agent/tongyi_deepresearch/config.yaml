@@ -13,19 +13,19 @@ enable_offload: false
 total_train_epochs: 10
 total_train_steps: null
 tokenizer_path: ${actor.path}
-allocation_mode: sglang:d4p1t1+megatron:d2p2t1
 
 scheduler:
   type: null
 
 rollout:
+  backend: "sglang:d4p1t1"
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
   max_concurrent_rollouts: 160
   queue_size: null
   consumer_batch_size: ${train_dataset.batch_size}
   max_head_offpolicyness: 4
-  enable_rollout_tracing: true
+  enable_rollout_tracing: false
   scheduling_spec: ${actor.scheduling_spec}
   fileroot: ${cluster.fileroot}
   tokenizer_path: ${tokenizer_path}
@@ -39,6 +39,7 @@ gconfig:
   temperature: 1.0
 
 actor:
+  backend: "megatron:d2p2t1"
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
   path: Qwen/Qwen3-1.7B
@@ -70,7 +71,9 @@ actor:
   ppo_n_minibatches: 1
   recompute_logprob: true
   use_decoupled_loss: true
-  behave_imp_weight_cap: 5.0
+  rejection_sampling:
+    metric: ratio
+    upper: 5.0
   megatron:
     use_deterministic_algorithms: true
     recompute_granularity: full
@@ -87,6 +90,7 @@ actor:
       env_vars: {}
 
 ref:
+  backend: ${actor.backend}
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
   path: ${actor.path}
@@ -169,6 +173,7 @@ perf_tracer:
     enabled: false
 
 judge_engine:
+  backend: sglang:d1
   experiment_name: llm-judge
   trial_name: trial0
   max_concurrent_rollouts: 32
@@ -176,6 +181,10 @@ judge_engine:
   consumer_batch_size: ${train_dataset.batch_size}
   max_head_offpolicyness: 10000000
   enable_rollout_tracing: false
+  scheduling_spec: ${actor.scheduling_spec}
+  fileroot: ${cluster.fileroot}
+  tokenizer_path: ${tokenizer_path}
+  dump_to_file: false
 
 max_llm_calls_per_run: 100
 max_tokens_per_trajectory: 27648

@@ -10,9 +10,9 @@ function-based rewards. Ensure you've completed
 To run the experiment, you will need:
 
 - Training script:
-  [examples/math/gsm8k_rl.py](https://github.com/inclusionAI/AReaL/blob/main/examples/math/gsm8k_rl.py)
+  [examples/math/gsm8k_rl.py](https://github.com/areal-project/AReaL/blob/main/examples/math/gsm8k_rl.py)
 - Config YAML:
-  [examples/math/gsm8k_grpo.yaml](https://github.com/inclusionAI/AReaL/blob/main/examples/math/gsm8k_grpo.yaml)
+  [examples/math/gsm8k_grpo.yaml](https://github.com/areal-project/AReaL/blob/main/examples/math/gsm8k_grpo.yaml)
 
 Our training scripts will automatically download the dataset (openai/gsm8k) and model
 (Qwen/Qwen2-1.5B-Instruct). To run the example with default configuration, execute from
@@ -28,11 +28,11 @@ python3 examples/math/gsm8k_rl.py --config examples/math/gsm8k_grpo.yaml schedul
 ## Modifying configuration
 
 All available configuration options are listed in
-[areal/api/cli_args.py](https://github.com/inclusionAI/AReaL/blob/main/areal/api/cli_args.py).
+[areal/api/cli_args.py](https://github.com/areal-project/AReaL/blob/main/areal/api/cli_args.py).
 To customize the experiment (models, resources, algorithm options), you can:
 
 1. Edit the YAML file directly at
-   [examples/math/gsm8k_grpo.yaml](https://github.com/inclusionAI/AReaL/blob/main/examples/math/gsm8k_grpo.yaml).
+   [examples/math/gsm8k_grpo.yaml](https://github.com/areal-project/AReaL/blob/main/examples/math/gsm8k_grpo.yaml).
 1. Add command-line options:
    - For existing options in the YAML file, directly add the option:
      `actor.path=Qwen/Qwen3-1.7B`.
@@ -48,7 +48,7 @@ python3 examples/math/gsm8k_rl.py \
     scheduler.type=local \
     experiment_name=<your experiment name> \
     trial_name=<your trial name> \
-    allocation_mode=sglang:d2p1t1+d2p1t1 \
+    rollout.backend=sglang:d2p1t1 actor.backend=fsdp:d2p1t1 \
     cluster.n_nodes=1 \
     cluster.n_gpus_per_node=4 \
     gconfig.max_new_tokens=2048 \
@@ -87,7 +87,7 @@ python3 examples/math/gsm8k_rl.py \
     scheduler.type=ray \
     experiment_name=<your experiment name> \
     trial_name=<your trial name> \
-    allocation_mode=sglang:d12p1t1+d4p1t1 \
+    rollout.backend=sglang:d12p1t1 actor.backend=fsdp:d4p1t1 \
     cluster.n_nodes=4 \
     cluster.n_gpus_per_node=4
 
@@ -97,7 +97,7 @@ python3 examples/math/gsm8k_rl.py \
     scheduler.type=slurm \
     experiment_name=<your experiment name> \
     trial_name=<your trial name> \
-    allocation_mode=sglang:d96p1t1+d32p1t1 \
+    rollout.backend=sglang:d96p1t1 actor.backend=fsdp:d32p1t1 \
     cluster.n_nodes=16 \
     cluster.n_gpus_per_node=8
 ```
@@ -105,15 +105,16 @@ python3 examples/math/gsm8k_rl.py \
 Additional references:
 
 - For more options for schedulers, check `SchedulerConfig` in
-  [areal/api/cli_args.py](https://github.com/inclusionAI/AReaL/blob/main/areal/api/cli_args.py).
+  [areal/api/cli_args.py](https://github.com/areal-project/AReaL/blob/main/areal/api/cli_args.py).
 - Ray cluster setup guide (see installation.md for distributed setup) for a guide on how
   to set up a ray cluster.
 
-> **Important Note**: Ensure `allocation_mode` matches your cluster configuration
+> **Important Note**: Ensure the total GPUs across `rollout.backend` and `actor.backend`
+> matches your cluster configuration
 > (`#GPUs == cluster.n_nodes * cluster.n_gpus_per_node`)
 
 <!--
-> **Notes**: Before launching distributed experiments, please check if your `allocation_mode` matches your cluster configuration. Make sure #GPUs allocated by `allocation_mode` equals to `cluster.n_nodes * cluster.n_gpus_per_node`.
+> **Notes**: Before launching distributed experiments, please check if your per-engine `backend` fields match your cluster configuration. Make sure the total GPUs allocated by `rollout.backend` and `actor.backend` equals `cluster.n_nodes * cluster.n_gpus_per_node`.
 > **Note**: Ray and Slurm launchers only work for distributed experiments with more than 1 node (`cluster.n_nodes > 1`). They allocate GPUs for training and generation at the granularity of **nodes**, which means the number of GPUs allocated for generation and training must be integer multiples of `cluster.n_gpus_per_node`.
 -->
 
@@ -157,7 +158,7 @@ sky launch -c areal-test examples/skypilot/ray_cluster.sky.yaml --infra k8s
 ```
 
 Check
-[Running AReaL with SkyPilot](https://github.com/inclusionAI/AReaL/blob/main/examples/skypilot/README.md),
+[Running AReaL with SkyPilot](https://github.com/areal-project/AReaL/blob/main/examples/skypilot/README.md),
 for more details about the examples. Check
 [SkyPilot Documentation](https://docs.skypilot.co/en/latest/docs/index.html) for more
 information about SkyPilot.

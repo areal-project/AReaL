@@ -1,7 +1,10 @@
+# SPDX-License-Identifier: Apache-2.0
+
 from __future__ import annotations
 
 import os
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
@@ -59,23 +62,30 @@ def build_streaming_log_cmd(
     else:
         cmd_str = cmd
 
+    # Check if stdbuf is available (not present on macOS by default)
+    _has_stdbuf = shutil.which("stdbuf") is not None
+
     # Build prefix with env vars if provided
     prefix_parts = []
     if env_vars:
         prefix_parts.append(
             " ".join(f"{k}={shlex.quote(str(v))}" for k, v in env_vars.items())
         )
-    prefix_parts.append(f"stdbuf -oL {cmd_str}")
+    if _has_stdbuf:
+        prefix_parts.append(f"stdbuf -oL {cmd_str}")
+    else:
+        prefix_parts.append(cmd_str)
     full_cmd = " ".join(prefix_parts)
 
     # Build log prefix for merged log
     log_prefix = f"[{role}]".ljust(LOG_PREFIX_WIDTH)
 
     # Construct tee/sed pipeline
-    shell_cmd = (
-        f"{full_cmd} 2>&1 "
-        f"| tee -a {log_file} >(stdbuf -oL sed 's/^/{log_prefix}/' >> {merged_log})"
-    )
+    if _has_stdbuf:
+        sed_prefix = f"stdbuf -oL sed 's/^/{log_prefix}/'"
+    else:
+        sed_prefix = f"sed 's/^/{log_prefix}/'"
+    shell_cmd = f"{full_cmd} 2>&1 | tee -a {log_file} >({sed_prefix} >> {merged_log})"
     return shell_cmd
 
 

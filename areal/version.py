@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 import subprocess
 from functools import lru_cache
 from importlib.metadata import PackageNotFoundError, version

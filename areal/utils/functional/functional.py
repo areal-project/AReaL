@@ -1,9 +1,15 @@
+# SPDX-License-Identifier: Apache-2.0
+
 import functools
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
 import torch
 import torch.distributed as dist
+
+from areal.api.cli_args import RejectionSamplingConfig
+from areal.utils.data import KLEstimator
 
 
 @torch.no_grad()
@@ -134,80 +140,313 @@ def _compute_sequence_level_ratio_and_advantages(
         # Average token advantages per sequence
         # This ensures gradient magnitude is independent of sequence length
         seq_lengths = loss_mask.sum(dim=-1, keepdim=True).clamp(min=1)
-        advantages = (advantages.sum(dim=-1, keepdim=True) / seq_lengths).expand_as(
-            log_ratio
-        )
+        masked_advantages = torch.where(loss_mask, advantages, 0.0)
+        advantages = (
+            masked_advantages.sum(dim=-1, keepdim=True) / seq_lengths
+        ).expand_as(log_ratio)
+        advantages = torch.where(loss_mask, advantages, 0.0)
 
     return ratio, advantages
 
 
-def compute_behave_imp_weight(
+@dataclass
+class RejectionSamplingResult:
+    """Result of rejection sampling, used by ppo_actor_loss_fn.
+
+    Attributes:
+        loss_mask: Updated loss mask (mask mode) or original loss mask (clamp mode).
+        behave_imp_weight: Importance weight (clamped in clamp mode, raw in mask mode).
+        filtered_fraction: Fraction of valid tokens that were filtered/clamped (for logging).
+    """
+
+    loss_mask: torch.Tensor
+    behave_imp_weight: torch.Tensor
+    filtered_fraction: float
+
+
+def _check_bounds(
+    metric: torch.Tensor, config: RejectionSamplingConfig
+) -> torch.Tensor:
+    """Check if metric values are within configured bounds.
+
+    Args:
+        metric: Per-token or per-sequence metric values.
+        config: Rejection sampling configuration with upper and optional lower bounds.
+
+    Returns:
+        Boolean tensor, True where metric is within bounds.
+    """
+    if config.lower is not None:
+        return (metric >= config.lower) & (metric <= config.upper)
+    else:
+        return metric <= config.upper
+
+
+def apply_rejection_sampling(
     proximal_logprobs: torch.Tensor,
     old_logprobs: torch.Tensor,
     loss_mask: torch.Tensor,
     cu_seqlens: torch.Tensor | None,
-    behave_imp_weight_mode: str,
-    behave_imp_weight_cap: float | None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Compute behavioural importance weight for decoupled loss correction.
+    config: RejectionSamplingConfig,
+) -> RejectionSamplingResult:
+    """Apply rejection sampling based on divergence between proximal and behavior policy.
+
+    Supports two action modes:
+    - 'mask': zero out loss_mask for tokens/sequences exceeding threshold (rejection)
+    - 'clamp': clamp importance weight to bounds for tokens/sequences exceeding
+      threshold (truncation, tokens still participate in gradient)
 
     Args:
-        proximal_logprobs: Recomputed log probabilities from reference model
-        old_logprobs: Log probabilities from inference engine
-        loss_mask: Boolean mask indicating valid tokens
-        cu_seqlens: Cumulative sequence lengths for packed sequences
-        behave_imp_weight_mode: Mode for importance weight correction
-            - 'token_truncate': clamp token ratio to [0, cap]
-            - 'token_mask': set token ratio to 0 where ratio > cap
-            - 'sequence_truncate': clamp sequence ratio to [0, cap]
-            - 'sequence_mask': set sequence ratio to 0 where ratio > cap
-            - 'disabled': skip importance weight correction
-        behave_imp_weight_cap: Cap value for importance weights
+        proximal_logprobs: Proximal policy log-probabilities,
+            shape [batch, seq_len] (2D padded) or [total_tokens] (1D packed).
+        old_logprobs: Behavior policy log-probabilities from inference engine,
+            same shape as proximal_logprobs.
+        loss_mask: Original loss mask (1 for valid tokens), same shape as proximal_logprobs.
+        cu_seqlens: Cumulative sequence lengths for 1D packed format. Shape: [batch_size + 1].
+            Required when inputs are 1D. None for 2D padded inputs.
+        config: Configuration for rejection sampling.
 
     Returns:
-        Tuple of (behave_imp_weight, behave_approx_kl, behave_mask)
+        RejectionSamplingResult with updated loss_mask, behave_imp_weight, and filtered_fraction.
     """
-    if behave_imp_weight_mode == "disabled":
+    # Step 0: Validate input shapes.
+    if proximal_logprobs.shape != old_logprobs.shape:
         raise ValueError(
-            "compute_behave_imp_weight should not be called with mode='disabled'. "
-            "The caller should guard this call with 'if behave_imp_weight_mode != \"disabled\"'."
+            f"proximal_logprobs shape {proximal_logprobs.shape} != "
+            f"old_logprobs shape {old_logprobs.shape}"
+        )
+    if proximal_logprobs.shape != loss_mask.shape:
+        raise ValueError(
+            f"proximal_logprobs shape {proximal_logprobs.shape} != "
+            f"loss_mask shape {loss_mask.shape}"
+        )
+    if proximal_logprobs.ndim not in (1, 2):
+        raise ValueError(
+            f"Expected 1D (packed) or 2D (padded) tensors, "
+            f"got ndim={proximal_logprobs.ndim}"
         )
 
-    is_sequence_level = "sequence" in behave_imp_weight_mode
-    behave_approx_kl = proximal_logprobs - old_logprobs
-    behave_imp_weight_log_ratio = behave_approx_kl
+    # Step 1: Compute log ratio = log(π_proximal / π_behave)
+    # Upcast operands to fp32 before subtraction to avoid precision loss in bf16/fp16.
+    log_ratio = proximal_logprobs.detach().float() - old_logprobs.detach().float()
+    # Sanitize non-finite values (e.g. -inf - (-inf) = NaN) to prevent NaN propagation.
+    log_ratio = torch.where(torch.isfinite(log_ratio), log_ratio, 0.0)
 
-    if is_sequence_level:
-        # Compute sequence-level geometric mean importance weights
-        dummy_advantages = torch.zeros_like(behave_imp_weight_log_ratio)
-        behave_imp_weight_seq, _ = _compute_sequence_level_ratio_and_advantages(
-            behave_imp_weight_log_ratio,
-            dummy_advantages,
-            loss_mask,
-            cu_seqlens,
+    # Step 2: Compute metric value (reuse existing KLEstimator sign conventions)
+    if config.metric == "ratio":
+        # Direct ratio π_proximal / π_behave
+        metric = torch.exp(log_ratio)
+    elif config.metric in ("kl_k1", "kl_k2", "kl_k3"):
+        # Use existing KLEstimator (note: _compute_approx_kl takes log_probs, log_probs_base)
+        estimator_name = config.metric.replace("kl_", "")  # "k1", "k2", "k3"
+        metric = KLEstimator._compute_approx_kl(
+            log_probs=proximal_logprobs.detach(),
+            log_probs_base=old_logprobs.detach(),
+            kl_estimator=estimator_name,
+            apply_clamp=False,  # Don't clamp; threshold check handles bounds
         )
-        behave_imp_weight = behave_imp_weight_seq
+    elif config.metric == "binary_kl":
+        # Bidirectional binary KL divergence (KPop): mask tokens where
+        # KL(proximal || behave) > upper OR KL(behave || proximal) > upper.
+        kl_fwd = compute_binary_kl_divergence(
+            proximal_logprobs.detach(), old_logprobs.detach()
+        )
+        kl_rev = compute_binary_kl_divergence(
+            old_logprobs.detach(), proximal_logprobs.detach()
+        )
+        # Use max of forward and reverse as the metric; upper bound applies to both.
+        metric = torch.maximum(kl_fwd, kl_rev)
     else:
-        # Token-level importance weights (default)
-        behave_imp_weight = behave_imp_weight_log_ratio.exp()
+        raise ValueError(f"Unknown metric: {config.metric}")
 
-    # Apply cap (truncate or mask) based on mode
-    if behave_imp_weight_cap is not None:
-        if "truncate" in behave_imp_weight_mode:
+    # Step 3: Compute behave_imp_weight (needed for both modes)
+    behave_imp_weight = torch.exp(log_ratio)
+    # Save original weight before any clamping, to compute clamped fraction later.
+    original_weight = behave_imp_weight
+
+    # Step 4: Aggregate and filter
+    #
+    # For ratio metric, aggregate in log space (geometric mean) to match GSPO
+    # semantics and avoid the "length trap" where arithmetic mean inflates
+    # sequence-level ratios. For KL metrics, aggregate in metric space
+    # (arithmetic) since KL divergence is additive.
+    _use_log_agg = config.metric == "ratio"
+
+    if config.level == "sequence":
+        # Pre-compute sequence indexing (shared by filtering and weight broadcast).
+        if loss_mask.ndim == 1:
+            # 1D packed format: use cu_seqlens
+            if cu_seqlens is None:
+                raise ValueError(
+                    "cu_seqlens is required for 1D packed tensors "
+                    "in sequence-level filtering."
+                )
+            batch_size = cu_seqlens.shape[0] - 1
+            seq_lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+            sequence_idx = torch.arange(
+                batch_size, device=metric.device
+            ).repeat_interleave(seq_lengths)
+
+            # For ratio metric: aggregate log_ratio (geometric); else: aggregate metric (arithmetic).
+            agg_values = log_ratio if _use_log_agg else metric
+            masked_agg = torch.where(loss_mask.bool(), agg_values, 0.0)
+            valid_count_per_seq = (
+                torch.zeros(batch_size, device=loss_mask.device, dtype=torch.int32)
+                .scatter_add_(0, sequence_idx, loss_mask.int())
+                .clamp(min=1)
+            )
+
+            # Ratio metric + sequence level: use geometric mean as uniform weight
+            # for all tokens (matches old sequence_mask/sequence_truncate semantics).
+            if _use_log_agg:
+                # masked_agg is already log_ratio masked by loss_mask (computed above).
+                seq_log_sum = torch.zeros(
+                    batch_size, device=log_ratio.device, dtype=log_ratio.dtype
+                ).scatter_add_(0, sequence_idx, masked_agg)
+                seq_log_mean = seq_log_sum / valid_count_per_seq.to(log_ratio.dtype)
+                behave_imp_weight = torch.exp(seq_log_mean)[sequence_idx]
+                original_weight = behave_imp_weight
+
+            if config.agg == "sum":
+                seq_agg = torch.zeros(
+                    batch_size, device=metric.device, dtype=agg_values.dtype
+                ).scatter_add_(0, sequence_idx, masked_agg)
+            elif config.agg == "mean":
+                seq_agg_sum = torch.zeros(
+                    batch_size, device=metric.device, dtype=agg_values.dtype
+                ).scatter_add_(0, sequence_idx, masked_agg)
+                seq_agg = seq_agg_sum / valid_count_per_seq.to(agg_values.dtype)
+            elif config.agg == "max":
+                agg_for_max = agg_values.masked_fill(~loss_mask.bool(), float("-inf"))
+                seq_agg = torch.full(
+                    (batch_size,),
+                    float("-inf"),
+                    device=metric.device,
+                    dtype=agg_values.dtype,
+                ).scatter_reduce_(0, sequence_idx, agg_for_max, reduce="amax")
+                # All-masked sequences stay -inf; treat them as in-bounds (no valid
+                # tokens to filter, and their loss_mask is already all-zero).
+                # Recompute from raw counts to detect true zero.
+                raw_valid = torch.zeros(
+                    batch_size, device=loss_mask.device, dtype=torch.int32
+                ).scatter_add_(0, sequence_idx, loss_mask.int())
+                all_masked = raw_valid == 0
+                seq_agg = torch.where(all_masked, torch.zeros_like(seq_agg), seq_agg)
+            else:
+                raise ValueError(f"Unknown agg method: {config.agg}")
+
+            # Convert back to metric space for threshold comparison.
+            seq_metric = torch.exp(seq_agg) if _use_log_agg else seq_agg
+
+            # Check each sequence against bounds
+            in_bounds_per_seq = _check_bounds(seq_metric, config)
+
+            if config.action == "mask":
+                # Broadcast back to token level, filter entire sequence
+                in_bounds = in_bounds_per_seq[sequence_idx]
+            else:
+                # clamp mode: clamp tokens in out-of-bounds sequences
+                out_of_bounds = (~in_bounds_per_seq)[sequence_idx]
+                behave_imp_weight = torch.where(
+                    out_of_bounds,
+                    behave_imp_weight.clamp(
+                        min=config.lower if config.lower is not None else 0.0,
+                        max=config.upper,
+                    ),
+                    behave_imp_weight,
+                )
+        else:
+            # 2D padded format
+            agg_values = log_ratio if _use_log_agg else metric
+            masked_agg = torch.where(loss_mask.bool(), agg_values, 0.0)
+            valid_count = loss_mask.sum(dim=-1, keepdim=True).clamp(min=1)
+
+            # Ratio metric + sequence level: geometric mean as uniform weight.
+            if _use_log_agg:
+                seq_log_mean = masked_agg.sum(dim=-1, keepdim=True) / valid_count
+                behave_imp_weight = torch.exp(seq_log_mean).expand_as(log_ratio)
+                original_weight = behave_imp_weight
+
+            if config.agg == "sum":
+                seq_agg = masked_agg.sum(dim=-1, keepdim=True)
+            elif config.agg == "mean":
+                seq_agg = masked_agg.sum(dim=-1, keepdim=True) / valid_count
+            elif config.agg == "max":
+                agg_for_max = agg_values.masked_fill(~loss_mask.bool(), float("-inf"))
+                seq_agg = agg_for_max.max(dim=-1, keepdim=True)[0]
+                # All-masked sequences stay -inf; treat them as in-bounds (no valid
+                # tokens to filter, and their loss_mask is already all-zero).
+                all_masked = loss_mask.sum(dim=-1, keepdim=True) == 0
+                seq_agg = torch.where(all_masked, torch.zeros_like(seq_agg), seq_agg)
+            else:
+                raise ValueError(f"Unknown agg method: {config.agg}")
+
+            # Convert back to metric space for threshold comparison.
+            seq_metric = torch.exp(seq_agg) if _use_log_agg else seq_agg
+
+            if config.action == "mask":
+                in_bounds = _check_bounds(seq_metric, config).expand_as(loss_mask)
+            else:
+                # clamp mode: clamp tokens in out-of-bounds sequences
+                out_of_bounds = (~_check_bounds(seq_metric, config)).expand_as(
+                    loss_mask
+                )
+                behave_imp_weight = torch.where(
+                    out_of_bounds,
+                    behave_imp_weight.clamp(
+                        min=config.lower if config.lower is not None else 0.0,
+                        max=config.upper,
+                    ),
+                    behave_imp_weight,
+                )
+    else:
+        # Token level
+        if config.action == "mask":
+            in_bounds = _check_bounds(metric, config)
+        else:
+            # clamp mode: directly clamp importance weight
             behave_imp_weight = behave_imp_weight.clamp(
-                min=0.0, max=behave_imp_weight_cap
-            )
-        else:  # mask
-            behave_imp_weight = torch.where(
-                behave_imp_weight > behave_imp_weight_cap, 0.0, behave_imp_weight
+                min=config.lower if config.lower is not None else 0.0,
+                max=config.upper,
             )
 
-    # Apply loss_mask
-    behave_imp_weight = torch.where(loss_mask, behave_imp_weight, 0.0)
-    behave_mask = (behave_imp_weight > 0).logical_and(loss_mask)
-    behave_approx_kl = torch.where(behave_mask, behave_approx_kl, 0.0)
+    # Step 5: Update loss_mask or keep it based on action mode
+    if config.action == "mask":
+        candidates = loss_mask.bool()
+        updated_mask = (candidates & in_bounds).to(loss_mask.dtype)
+        filtered_count = (candidates & ~in_bounds).sum().item()
+        total_count = candidates.sum().item()
+        filtered_fraction = filtered_count / max(total_count, 1)
+    else:
+        # clamp mode: loss_mask unchanged
+        updated_mask = loss_mask
+        # Report fraction of clamped tokens (for logging)
+        clamped_count = (
+            (loss_mask.bool() & (original_weight != behave_imp_weight)).sum().item()
+        )
+        total_count = loss_mask.bool().sum().item()
+        filtered_fraction = clamped_count / max(total_count, 1)
 
-    return behave_imp_weight, behave_approx_kl, behave_mask
+    # Apply loss_mask to behave_imp_weight
+    behave_imp_weight = torch.where(updated_mask.bool(), behave_imp_weight, 0.0)
+
+    return RejectionSamplingResult(
+        loss_mask=updated_mask,
+        behave_imp_weight=behave_imp_weight,
+        filtered_fraction=filtered_fraction,
+    )
+
+
+def compute_binary_kl_divergence(
+    log_p: torch.Tensor, log_q: torch.Tensor, eps: float = 1e-8
+) -> torch.Tensor:
+    """KL(P||Q) for Bernoulli distributions parameterized by log-probabilities.
+    Treats each element as a Bernoulli: P = [p, 1-p], Q = [q, 1-q].
+    KL(P||Q) = p*log(p/q) + (1-p)*log((1-p)/(1-q))
+    """
+    p = torch.clamp(torch.exp(log_p), eps, 1.0 - eps)
+    q = torch.clamp(torch.exp(log_q), eps, 1.0 - eps)
+    return p * torch.log(p / q) + (1 - p) * torch.log((1 - p) / (1 - q))
 
 
 def ppo_actor_loss_fn(
@@ -219,12 +458,18 @@ def ppo_actor_loss_fn(
     loss_mask: torch.Tensor,
     eps_clip_higher: float | None = None,
     c_clip: float | None = None,
-    behave_imp_weight_cap: float | None = None,
+    rejection_sampling: RejectionSamplingConfig | None = None,
     importance_sampling_level: str = "token",
     cu_seqlens: torch.Tensor | None = None,
-    behave_imp_weight_mode: str = "token_mask",
 ) -> tuple[torch.Tensor, dict]:
-    """
+    """PPO actor loss function with optional rejection sampling.
+
+    The ``rejection_sampling`` parameter replaces the removed
+    ``behave_imp_weight_cap`` / ``behave_imp_weight_mode``.
+
+    - ``action='mask'``: modifies loss_mask before loss computation (rejection)
+    - ``action='clamp'``: clamps importance weight to bounds (truncation)
+
     When decoupled loss is disabled:
     1. if recompute logp, both old_logprobs and proximal_logprobs are recomputed logp;
     2. if no recomputation, both old_logp and proximal_logprobs are produced by the inference backend.
@@ -232,22 +477,49 @@ def ppo_actor_loss_fn(
     When decoupled loss is enabled, proximal_logprobs is the recomputed logp,
     old_logprobs is produced by the inference engine.
 
+    Note: ``importance_sampling_level`` controls PPO ratio (π_θ/π_proximal)
+    aggregation (GSPO), which is orthogonal to ``rejection_sampling.level``
+    that controls staleness filtering (π_proximal/π_behave) granularity.
+
     Args:
+        logprobs: Current policy log-probabilities (π_θ).
+        proximal_logprobs: Proximal policy log-probabilities (π_proximal).
+        old_logprobs: Behavior policy log-probabilities from inference (π_behave).
+        advantages: Per-token advantage estimates.
+        eps_clip: PPO clipping factor for policy ratio.
+        loss_mask: Mask for valid tokens (1 = valid).
+        eps_clip_higher: Upper clipping factor (decoupled clipping). None = use eps_clip.
+        c_clip: Dual clipping factor, must be > 1.0. None disables dual clipping.
+        rejection_sampling: Rejection sampling configuration. None disables filtering.
         importance_sampling_level: Level at which to compute importance sampling ratios.
-            - 'token': Per-token ratios
+            - 'token': Per-token ratios (standard PPO)
             - 'sequence': Sequence-level geometric mean of per-token ratios (GSPO)
         cu_seqlens: Cumulative sequence lengths for packed sequences (1D tensors).
             Required when inputs are 1D and importance_sampling_level='sequence'.
             Shape: [batch_size + 1], where cu_seqlens[i] marks the start of sequence i.
             Not needed for 2D padded inputs (sequences identified by batch dimension).
-        behave_imp_weight_mode: Mode for importance weight correction (mask or truncate).
-            - 'token_truncate': clamp token ratio to [0, cap]
-            - 'token_mask': set token ratio to 0 where ratio > cap
-            - 'sequence_truncate': clamp sequence ratio to [0, cap]
-            - 'sequence_mask': set sequence ratio to 0 where ratio > cap
-            - 'disabled': skip importance weight correction
     """
+    # Save original count BEFORE rejection sampling may modify loss_mask.
+    # This keeps the denominator consistent with loss_weight_fn in actor.py,
+    # which always uses the original loss_mask from input_data. Without this,
+    # mask mode would inflate per-token gradients by N_original / N_kept.
     loss_mask_count = loss_mask.count_nonzero() or 1
+
+    # === Apply rejection sampling (replaces old compute_behave_imp_weight) ===
+    if rejection_sampling is not None:
+        rs_result = apply_rejection_sampling(
+            proximal_logprobs=proximal_logprobs,
+            old_logprobs=old_logprobs,
+            loss_mask=loss_mask,
+            cu_seqlens=cu_seqlens,
+            config=rejection_sampling,
+        )
+        # mask mode updates loss_mask; clamp mode keeps it unchanged
+        loss_mask = rs_result.loss_mask
+        behave_imp_weight = rs_result.behave_imp_weight
+        filtered_fraction = rs_result.filtered_fraction
+    else:
+        filtered_fraction = 0.0
 
     if importance_sampling_level == "sequence":
         # GSPO: Compute sequence-level geometric mean of probability ratios
@@ -282,17 +554,11 @@ def ppo_actor_loss_fn(
     else:
         dual_clip_mask = torch.zeros_like(clip_mask)
 
-    # Compute behavioural importance weight only when not disabled
-    # When disabled, pg_loss remains unchanged (no behavioural correction applied)
-    if behave_imp_weight_mode != "disabled":
-        behave_imp_weight, behave_approx_kl, behave_mask = compute_behave_imp_weight(
-            proximal_logprobs=proximal_logprobs,
-            old_logprobs=old_logprobs,
-            loss_mask=loss_mask,
-            cu_seqlens=cu_seqlens,
-            behave_imp_weight_mode=behave_imp_weight_mode,
-            behave_imp_weight_cap=behave_imp_weight_cap,
-        )
+    # Apply behavioural importance weight from rejection sampling
+    if rejection_sampling is not None:
+        behave_approx_kl = proximal_logprobs.detach() - old_logprobs.detach()
+        behave_mask = (behave_imp_weight > 0).logical_and(loss_mask.bool())
+        behave_approx_kl = torch.where(behave_mask, behave_approx_kl, 0.0)
         pg_loss = pg_loss * behave_imp_weight
 
     logging_loss = pg_loss.detach()
@@ -306,11 +572,13 @@ def ppo_actor_loss_fn(
         clip_mask=clip_mask,
         dual_clip_mask=dual_clip_mask,
     )
-    if proximal_logprobs is not None and behave_imp_weight_mode != "disabled":
+
+    if rejection_sampling is not None:
         stat.update(
             behave_approx_kl=behave_approx_kl.detach(),
             behave_imp_weight=behave_imp_weight.detach(),
             behave_mask=behave_mask,
+            filtered_fraction=filtered_fraction,
         )
     return pg_loss, stat
 
@@ -392,6 +660,188 @@ def sapo_loss_fn(
     )
 
     return pg_loss, stat
+
+
+def cispo_loss_fn(
+    logprobs: torch.Tensor,
+    proximal_logprobs: torch.Tensor,
+    advantages: torch.Tensor,
+    eps_clip: float,
+    loss_mask: torch.Tensor,
+    eps_clip_higher: float | None = None,
+    old_logprobs: torch.Tensor | None = None,
+    rejection_sampling: RejectionSamplingConfig | None = None,
+    cu_seqlens: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, dict]:
+    """CISPO (Clipped IS-weight Policy Optimization) loss from MiniMax-M1.
+
+    PPO/GRPO-style clipping zeroes the gradient of any token whose
+    importance-sampling ratio leaves the clip band: ``min(r*A, clip(r)*A)`` is
+    constant in theta there. MiniMax-M1 (https://arxiv.org/abs/2506.13585,
+    Eq. 4-5) observes those are disproportionately low-probability "fork" tokens
+    (``However``, ``Wait``, ...) that steer reasoning, and instead clips the IS
+    *weight* under stop-gradient while keeping the gradient on every token's
+    ``log pi_theta`` (the choice ScaleRL, https://arxiv.org/abs/2510.13786 Eq. 4,
+    also adopts). Per token::
+
+        ratio         = exp(logprobs - proximal_logprobs)
+        ratio_clipped = clip(ratio, 1 - eps_clip, 1 + eps_clip_higher)   # stop-grad
+        pg_loss       = -sg(ratio_clipped) * advantages * logprobs
+
+    Advantages are never clipped. The clip bounds reuse the same delta-from-1
+    convention as :func:`ppo_actor_loss_fn`. CISPO is canonically single-sided:
+    pass ``eps_clip=1.0`` (lower bound 0) with ``eps_clip_higher=4.0`` for the
+    wide MiniMax-M1 range. Token level only -- the geometric-mean sequence ratio
+    of GSPO is not part of the MiniMax-M1 surrogate.
+
+    Decoupled loss: when ``rejection_sampling`` is set, the detached
+    ``pi_proximal/pi_behave`` weight (from ``old_logprobs``) rescales each token's
+    surrogate, mirroring :func:`ppo_actor_loss_fn`.
+
+    Args:
+        logprobs: Current policy log-probabilities (pi_theta), with autograd.
+        proximal_logprobs: Proximal policy log-probabilities; enters only through
+            the detached ratio path, so it carries no gradient.
+        advantages: Per-token advantage estimates; detached on entry.
+        eps_clip: Lower clipping delta from 1 (ratio lower bound ``1 - eps_clip``).
+        loss_mask: Mask for valid tokens (1 = valid).
+        eps_clip_higher: Upper clipping delta from 1 (ratio upper bound
+            ``1 + eps_clip_higher``); must be positive -- the asymmetric upper
+            clip is the defining knob of CISPO, so ``None`` is rejected.
+        old_logprobs: Behavior policy log-probabilities (pi_behave) from inference.
+            Required only when ``rejection_sampling`` is set (decoupled loss).
+        rejection_sampling: Staleness filtering / off-policy correction config.
+            None disables it (pure on-policy CISPO).
+        cu_seqlens: Cumulative sequence lengths for 1D packed inputs; required when
+            ``rejection_sampling.level == "sequence"``.
+
+    Returns:
+        ``(loss, stat)`` matching the PPO loss signature. ``stat['clip_mask']``
+        flags tokens whose raw ratio left the band (CISPO never zeroes their
+        loss, so band-exit -- not loss-affecting clip -- is the meaningful
+        metric); ``stat['importance_weight']`` reports the unclipped ratio. When
+        rejection sampling is active the ``behave_*`` keys are reported too.
+    """
+    if eps_clip_higher is None or eps_clip_higher <= 0:
+        raise ValueError(
+            "CISPO requires a positive eps_clip_higher; the asymmetric upper "
+            f"clip is the defining knob (MiniMax-M1 Eq. 4-5). Got {eps_clip_higher!r}."
+        )
+    # Pre-rejection token count, so the denominator matches loss_weight_fn.
+    loss_mask_count = loss_mask.count_nonzero() or 1
+
+    # Decoupled off-policy correction: the pi_proximal/pi_behave weight.
+    if rejection_sampling is not None:
+        rs_result = apply_rejection_sampling(
+            proximal_logprobs=proximal_logprobs,
+            old_logprobs=old_logprobs,
+            loss_mask=loss_mask,
+            cu_seqlens=cu_seqlens,
+            config=rejection_sampling,
+        )
+        loss_mask = rs_result.loss_mask
+        behave_imp_weight = rs_result.behave_imp_weight
+        filtered_fraction = rs_result.filtered_fraction
+
+    advantages = advantages.detach()
+
+    # Stop-gradient on the clipped IS weight; gradient flows through logprobs only.
+    log_ratio = (logprobs - proximal_logprobs).detach()
+    ratio = torch.exp(log_ratio)
+    ratio_clipped = torch.clamp(ratio, 1.0 - eps_clip, 1.0 + eps_clip_higher).detach()
+    pg_loss = -ratio_clipped * advantages * logprobs
+
+    if rejection_sampling is not None:
+        # behave_imp_weight is detached at source -> still a valid policy gradient.
+        behave_approx_kl = proximal_logprobs.detach() - old_logprobs.detach()
+        behave_mask = (behave_imp_weight > 0).logical_and(loss_mask.bool())
+        behave_approx_kl = torch.where(behave_mask, behave_approx_kl, 0.0)
+        pg_loss = pg_loss * behave_imp_weight
+
+    logging_loss = pg_loss.detach()
+    pg_loss = torch.where(loss_mask, pg_loss, 0).sum() / loss_mask_count
+
+    clip_mask = (ratio_clipped != ratio).logical_and(loss_mask)
+    stat = dict(
+        loss=logging_loss,
+        importance_weight=ratio.detach(),
+        approx_kl=log_ratio,
+        clip_mask=clip_mask,
+        # CISPO has no dual clip; zeros keep the stat schema stable.
+        dual_clip_mask=torch.zeros_like(loss_mask, dtype=torch.bool),
+    )
+    if rejection_sampling is not None:
+        stat.update(
+            behave_approx_kl=behave_approx_kl.detach(),
+            behave_imp_weight=behave_imp_weight.detach(),
+            behave_mask=behave_mask,
+            filtered_fraction=filtered_fraction,
+        )
+    return pg_loss, stat
+
+
+def dpo_pair_logratios(
+    logprobs: torch.Tensor,
+    ref_logprobs: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    loss_mask: torch.Tensor,
+    valid_pairs: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Aggregate per-sequence masked logprobs over a packed batch and pair them up.
+
+    Sequences are packed and interleaved as ``[chosen_0, rejected_0, chosen_1,
+    rejected_1, ...]``. ``loss_mask`` is shifted by one to align with
+    next-token logprobs, and each sequence's final position is zeroed (no next
+    token exists for it). Aggregation uses ``fp64`` scatter-add to avoid
+    precision loss on long (~2k+ tok) pairs where ``fp32`` accumulation can
+    flip the log-ratio sign.
+
+    Returns:
+        ``(policy_logps, ref_logps, completion_lens)`` each of shape ``(K, 2)``
+        where ``K = valid_pairs.sum()``, column 0 is chosen, column 1 is
+        rejected. ``completion_lens`` counts the shifted-mask response tokens
+        per sequence (needed by IPO for per-token normalization).
+    """
+    device = logprobs.device
+
+    shifted_mask = torch.zeros_like(loss_mask)
+    if loss_mask.shape[0] > 1:
+        shifted_mask[:-1] = loss_mask[1:]
+    seqlens = cu_seqlens[1:] - cu_seqlens[:-1]
+    shifted_mask.index_fill_(0, (cu_seqlens[1:] - 1)[seqlens > 0], False)
+
+    n_seqs = seqlens.shape[0]
+    seq_ids = torch.repeat_interleave(torch.arange(n_seqs, device=device), seqlens)
+    masked = shifted_mask.to(dtype=logprobs.dtype)
+    policy_logps = torch.zeros(n_seqs, dtype=torch.float64, device=device)
+    ref_logps = torch.zeros(n_seqs, dtype=torch.float64, device=device)
+    policy_logps.index_add_(0, seq_ids, (logprobs * masked).double())
+    ref_logps.index_add_(0, seq_ids, (ref_logprobs * masked).double())
+
+    completion_lens = torch.zeros(n_seqs, dtype=torch.float64, device=device)
+    completion_lens.index_add_(0, seq_ids, shifted_mask.double())
+
+    return (
+        policy_logps.view(-1, 2)[valid_pairs],
+        ref_logps.view(-1, 2)[valid_pairs],
+        completion_lens.view(-1, 2)[valid_pairs],
+    )
+
+
+def dpo_preference_loss(
+    logits: torch.Tensor, *, beta: float, loss_type: str = "sigmoid"
+) -> torch.Tensor:
+    """Per-pair preference loss from DPO log-ratio logits.
+
+    For ``"sigmoid"``, ``logits`` is the un-normalized pair delta.
+    For ``"ipo"``, ``logits`` must be **per-token averaged** (length-normalized)
+    before being passed here, matching trl's confirmed-with-authors convention.
+    """
+    if loss_type == "sigmoid":
+        return -torch.nn.functional.logsigmoid(beta * logits.float())
+    if loss_type == "ipo":
+        return (logits.float() - 1.0 / (2.0 * beta)) ** 2
+    raise ValueError(f"Unsupported DPO loss_type: {loss_type!r}")
 
 
 def _huber_loss(x: torch.Tensor, y: torch.Tensor, delta: float):

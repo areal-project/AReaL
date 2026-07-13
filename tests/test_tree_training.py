@@ -6,7 +6,8 @@ import torch
 from tests.utils import get_model_path
 
 import areal
-from areal.api import AllocationMode, FinetuneSpec
+from areal.api import FinetuneSpec
+from areal.api.alloc_mode import ModelAllocation
 from areal.api.cli_args import (
     MicroBatchSpec,
     OptimizerConfig,
@@ -187,6 +188,7 @@ def _create_engine(
         mb_spec_kwargs["n_mbs"] = n_mbs
 
     config = TrainEngineConfig(
+        backend="fsdp:d1",
         experiment_name=experiment_name,
         trial_name="test",
         path=MODEL_PATH,
@@ -203,10 +205,10 @@ def _create_engine(
     else:  # megatron
         engine = MegatronEngine(config)
 
-    alloc_mode = AllocationMode.from_str("d1p1t1")
+    alloc_mode = ModelAllocation.from_str("fsdp:d1p1t1")
     ft_spec = FinetuneSpec(total_train_epochs=1, dataset_size=128, train_batch_size=8)
-    engine.create_process_group(alloc_mode.train)
-    engine.initialize(addr=None, ft_spec=ft_spec, parallel_strategy=alloc_mode.train)
+    engine.create_process_group(alloc_mode.parallel)
+    engine.initialize(addr=None, ft_spec=ft_spec, parallel_strategy=alloc_mode.parallel)
     logger.info(f"{engine_type.upper()} Model initialized: {engine.model}")
 
     return engine

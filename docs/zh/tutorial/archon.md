@@ -13,18 +13,18 @@ Archon 的设计和核心实现灵感来自 [torchtitan](https://github.com/pyto
 
 ## 引擎对比
 
-| 特性          | FSDPEngine          | MegatronEngine | ArchonEngine                |
-| ------------- | ------------------- | -------------- | --------------------------- |
-| 后端          | HuggingFace + FSDP2 | Megatron-Core  | PyTorch 原生                |
-| 模型来源      | 任意 HF 模型        | Megatron 模型  | 自定义 Archon 模型          |
-| torch.compile | 有限                | 否             | 是（默认）                  |
-| 数据并行      | FSDP2               | Megatron DP    | FSDP2                       |
-| 张量并行      | PyTorch DTensor     | Megatron TP    | PyTorch DTensor             |
-| 流水线并行    | 否                  | 是（VPP）      | 是（1F1B、I1F1B、IZB、ZBV） |
-| 专家并行      | 否                  | 完整 EP/ETP    | 完整 EP/ETP                 |
-| 上下文并行    | Ulysses SP          | Megatron CP    | Ulysses SP                  |
-| 支持的模型    | 任意 HF             | 通过 mbridge   | 内置 + 用户自定义           |
-| 状态          | 生产就绪            | 生产就绪       | 实验性                      |
+| 特性          | FSDPEngine          | MegatronEngine                     | ArchonEngine                |
+| ------------- | ------------------- | ---------------------------------- | --------------------------- |
+| 后端          | HuggingFace + FSDP2 | Megatron-Core                      | PyTorch 原生                |
+| 模型来源      | 任意 HF 模型        | Megatron 模型                      | 自定义 Archon 模型          |
+| torch.compile | 有限                | 否                                 | 是（默认）                  |
+| 数据并行      | FSDP2               | Megatron DP                        | FSDP2                       |
+| 张量并行      | PyTorch DTensor     | Megatron TP                        | PyTorch DTensor             |
+| 流水线并行    | 否                  | 是（VPP）                          | 是（1F1B、I1F1B、IZB、ZBV） |
+| 专家并行      | 否                  | 完整 EP/ETP                        | 完整 EP/ETP                 |
+| 上下文并行    | Ulysses SP          | Megatron CP                        | Ulysses SP                  |
+| 支持的模型    | 任意 HF             | 通过 bridge 后端（默认 `mbridge`） | 内置 + 用户自定义           |
+| 状态          | 生产就绪            | 生产就绪                           | 实验性                      |
 
 ## 关键特性
 
@@ -37,10 +37,10 @@ Archon 的设计和核心实现灵感来自 [torchtitan](https://github.com/pyto
 
 ## 启用 Archon
 
-要使用 Archon 作为训练后端，请在 `allocation_mode` 中指定：
+要使用 Archon 作为训练后端，请在 `actor.backend` 字段中指定：
 
 ```bash
-allocation_mode=sglang:d4+archon:d4
+rollout.backend=sglang:d4 actor.backend=archon:d4
 ```
 
 ### 支持的模型
@@ -95,7 +95,7 @@ Archon 使用与 Megatron 相同的并行语法。请参阅[分配模式参考](
 
 ```bash
 # 密集模型：4 DP × 2 PP × 2 TP = 16 GPU
-allocation_mode=sglang:d4t2+archon:d4p2t2
+rollout.backend=sglang:d4t2 actor.backend=archon:d4p2t2
 ```
 
 ### MoE 支持
@@ -105,7 +105,7 @@ FFN（专家）模块使用单独的配置：
 
 ```bash
 # 带混合并行的 MoE 模型
-allocation_mode=sglang:d4t4+archon:(attn:d1p4t2c2|ffn:d1p4t1e4)
+rollout.backend=sglang:d4t4 actor.backend=archon:(attn:d1p4t2c2|ffn:d1p4t1e4)
 ```
 
 这启用了[MoE 并行折叠](https://github.com/NVIDIA/Megatron-LM/tree/main/megatron/core/transformer/moe#moe-parallel-folding)，降低了组合上下文和专家并行性的
@@ -219,14 +219,14 @@ Initialized Archon engine with parallel dims: pp=2, dp_shard=4, tp=2, cp=1, ep=1
 
 从 FSDPEngine 迁移到 Archon：
 
-### 1. 更新 allocation_mode
+### 1. 更新 actor.backend
 
 ```bash
 # 之前（FSDPEngine）
-allocation_mode=sglang:d4t2+fsdp:d8t2
+rollout.backend=sglang:d4t2 actor.backend=fsdp:d8t2
 
 # 之后（Archon）
-allocation_mode=sglang:d4t2+archon:d8t2
+rollout.backend=sglang:d4t2 actor.backend=archon:d8t2
 ```
 
 ### 2. 配置映射
@@ -269,7 +269,10 @@ cluster:
   n_nodes: 3
   n_gpus_per_node: 8
 
-allocation_mode: sglang:d4t2+archon:d4p2t2
+rollout:
+  backend: "sglang:d4t2"
+actor:
+  backend: "archon:d4p2t2"
 
 scheduler:
   type: ray
@@ -305,7 +308,10 @@ cluster:
   n_nodes: 4
   n_gpus_per_node: 8
 
-allocation_mode: "sglang:d4t4+archon:(attn:d1p4t2c2|ffn:d1p4t1e4)"
+rollout:
+  backend: "sglang:d4t4"
+actor:
+  backend: "archon:(attn:d1p4t2c2|ffn:d1p4t1e4)"
 
 scheduler:
   type: ray

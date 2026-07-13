@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 import os
 
 from agents import (
@@ -27,6 +29,7 @@ class MathAgent:
         self.kwargs = kwargs.copy()
         self.kwargs.pop("max_tokens", None)
         self.kwargs.pop("max_turns", None)
+        self._reward_fn = AsyncRewardWrapper(math_reward_fn)
 
     async def run(self, data: dict, **extra_kwargs):
         http_client = extra_kwargs.get("http_client", None)
@@ -39,8 +42,7 @@ class MathAgent:
             messages=data["messages"], model="default", **self.kwargs
         )
 
-        reward_fn = AsyncRewardWrapper(math_reward_fn)
-        return await reward_fn(
+        return await self._reward_fn(
             completions=comp.choices[0].message.content, answer=data["answer"]
         )
 
@@ -50,6 +52,7 @@ class MultiTurnMathAgent:
         self.max_turns = max_turns
         self.kwargs = kwargs.copy()
         self.kwargs.pop("max_tokens", None)
+        self._reward_fn = AsyncRewardWrapper(math_reward_fn)
 
     async def run(self, data: dict, **extra_kwargs):
         http_client = extra_kwargs.get("http_client", None)
@@ -68,8 +71,9 @@ class MultiTurnMathAgent:
             )
             message = response.choices[0].message
             messages.append(message.model_dump(exclude_none=True))
-            reward_fn = AsyncRewardWrapper(math_reward_fn)
-            reward = await reward_fn(completions=message.content, answer=data["answer"])
+            reward = await self._reward_fn(
+                completions=message.content, answer=data["answer"]
+            )
             rewards[response.id] = reward
             if reward == 1:
                 break
@@ -129,6 +133,7 @@ class MathToolAgent:
         self.kwargs = kwargs.copy()
         self.kwargs.pop("max_tokens", None)
         self.kwargs.pop("max_turns", None)
+        self._reward_fn = AsyncRewardWrapper(math_reward_fn)
 
     async def run(self, data: dict, **extra_kwargs):
         http_client = extra_kwargs.get("http_client", None)
@@ -140,7 +145,7 @@ class MathToolAgent:
         content = data["messages"][-1]["content"]
         run_config = RunConfig(
             model_provider=OpenAIProvider(openai_client=client),
-            model="default",  # no need to pass
+            model="default",
             tracing_disabled=True,
             model_settings=ModelSettings(**self.kwargs),
         )
@@ -161,6 +166,6 @@ class MathToolAgent:
             agent, input=content, session=session, run_config=run_config
         )
 
-        reward_fn = AsyncRewardWrapper(math_reward_fn)
-        reward = await reward_fn(completions=result.final_output, answer=data["answer"])
-        return reward
+        return await self._reward_fn(
+            completions=result.final_output, answer=data["answer"]
+        )

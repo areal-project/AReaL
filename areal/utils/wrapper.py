@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 import inspect
 from collections.abc import Callable
 from functools import partial

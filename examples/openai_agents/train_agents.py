@@ -1,13 +1,13 @@
-from dataclasses import dataclass, field
-
 from agents import Agent as OpenAIAgent
 from agents import ModelSettings, OpenAIProvider, RunConfig
 from agents import Runner as OpenAIRunner
 from transformers import PreTrainedTokenizerFast
 
+from examples.openai_agents.config import AgentRLConfig
+
 from areal import PPOTrainer, workflow_context
 from areal.api import AsyncRewardWrapper, RolloutWorkflow
-from areal.api.cli_args import GenerationHyperparameters, GRPOConfig, load_expr_config
+from areal.api.cli_args import GenerationHyperparameters, load_expr_config
 from areal.dataset import get_custom_dataset
 from areal.experimental.openai import ArealOpenAI
 from areal.utils import stats_tracker
@@ -100,28 +100,6 @@ class OpenAIAgentWorkflow(RolloutWorkflow):
         client.apply_reward_discount(turn_discount=0.9)
         interactions_with_reward = client.export_interactions(style="individual")
         return interactions_with_reward
-
-
-@dataclass
-class AgentRLConfig(GRPOConfig):
-    reward_fn_path: str = field(
-        default="areal.reward.gsm8k.gsm8k_reward_fn",
-        metadata={
-            "help": "The path to the reward function. Should follow the API in `areal/api/reward_api.py`."
-        },
-    )
-    agent_builder_path: str = field(
-        default="areal.workflow.openai_agent.math_agent.build_math_agent",
-        metadata={
-            "help": "The path to the OpenAI agent builder. The function should return an `Agent` object with OpenAI SDK."
-        },
-    )
-    agent_builder_kwargs: dict = field(
-        default_factory=dict,
-        metadata={
-            "help": "The initialization arguments for the agent builder function."
-        },
-    )
 
 
 def main(args):

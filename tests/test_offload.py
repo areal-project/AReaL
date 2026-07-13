@@ -11,7 +11,8 @@ import torch.distributed as dist
 
 from tests.utils import get_model_path
 
-from areal.api import AllocationMode, FinetuneSpec
+from areal.api import FinetuneSpec
+from areal.api.alloc_mode import ModelAllocation
 from areal.api.cli_args import MegatronEngineConfig, OptimizerConfig, TrainEngineConfig
 from areal.engine import FSDPEngine, MegatronEngine
 from areal.infra.platforms import current_platform
@@ -36,6 +37,7 @@ def _create_engine(engine_type: str):
     )
 
     config = TrainEngineConfig(
+        backend="fsdp:d1",
         experiment_name="test_offload",
         trial_name=f"{engine_type}_tms",
         path=MODEL_PATH,
@@ -43,7 +45,7 @@ def _create_engine(engine_type: str):
         megatron=MegatronEngineConfig(),
     )
 
-    alloc_mode = AllocationMode.from_str("d1p1t1")
+    alloc_mode = ModelAllocation.from_str("fsdp:d1p1t1")
     ft_spec = FinetuneSpec(total_train_epochs=1, dataset_size=128, train_batch_size=8)
 
     if engine_type == "FSDP":
@@ -53,7 +55,7 @@ def _create_engine(engine_type: str):
     else:
         raise ValueError(f"Unknown engine type: {engine_type}")
 
-    engine.create_process_group(alloc_mode.train)
+    engine.create_process_group(alloc_mode.parallel)
     engine.initialize(addr=None, ft_spec=ft_spec)
 
     print(f"{engine_type} engine initialized")

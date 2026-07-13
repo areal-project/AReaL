@@ -164,13 +164,13 @@ Adapt the model architecture to match the target model.
    - `init_weights()`: Match initialization scheme from HF
    - `init_buffers()`: RoPE cache + MoE buffers
    - `forward()`: Must follow `BaseArchonModel` signature:
-     `(tokens, positions, cu_seqlens, max_seqlen) -> Tensor`
+     `(tokens, positions, cu_seqlens, max_seqlen, tree_attn_meta=None) -> Tensor`
 
 **Base class contract** (`BaseArchonModel`):
 
 ```python
 class <Model>Model(BaseArchonModel):
-    def forward(self, tokens, positions, cu_seqlens, max_seqlen) -> torch.Tensor: ...
+    def forward(self, tokens, positions, cu_seqlens, max_seqlen, tree_attn_meta=None) -> torch.Tensor: ...
     def init_weights(self) -> None: ...
     def init_buffers(self, buffer_device) -> None: ...
 ```

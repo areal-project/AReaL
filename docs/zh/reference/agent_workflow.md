@@ -125,7 +125,7 @@ class MyWorkflow(RolloutWorkflow):
 
 ## 执行模式
 
-代理方式支持两种执行模式，通过 `rollout.openai.mode` 配置：
+代理方式支持两种执行模式，通过 `rollout.agent.mode` 配置：
 
 ### 内联模式（默认）
 
@@ -134,7 +134,7 @@ class MyWorkflow(RolloutWorkflow):
 
 ```yaml
 rollout:
-  openai:
+  agent:
     mode: inline
 ```
 
@@ -151,7 +151,7 @@ rollout:
 
 ```yaml
 rollout:
-  openai:
+  agent:
     mode: subproc
     subproc_max_workers: 4  # 进程池大小
 ```

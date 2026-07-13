@@ -200,6 +200,8 @@ stats_tracker.get("eval-rollout").scalar(reward=0.9)
 all_stats = stats_tracker.export_all(reduce_group=group)
 ```
 
+如果设置 `evaluator.eval_before_train: true`，系统会在第一个训练 step 开始前执行一次评估，以便在微调开始前估计初始模型的性能。
+
 ## 数据流
 
 从收集到记录的完整指标流程：
@@ -234,7 +236,7 @@ RolloutController.export_stats()                 │
 
 ## StatsLogger：日志后端
 
-[`StatsLogger`](https://github.com/inclusionAI/AReaL/blob/main/areal/utils/stats_logger.py)
+[`StatsLogger`](https://github.com/areal-project/AReaL/blob/main/areal/utils/stats_logger.py)
 将聚合指标发送到外部日志后端。它由 `PPOTrainer` 自动管理，仅在 rank 0 运行以避免重复日志。
 
 ### 支持的后端

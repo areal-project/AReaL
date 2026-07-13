@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 """Utilities for torch_memory_saver (TMS) configuration and setup.
 
 This module handles the environment variable setup required for TMS to work

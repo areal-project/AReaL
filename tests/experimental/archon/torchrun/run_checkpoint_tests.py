@@ -57,6 +57,7 @@ from areal.experimental.models.archon.qwen3 import Qwen3Model, parallelize_qwen3
 def create_engine_config(model_path: str) -> TrainEngineConfig:
     """Create engine configuration for testing."""
     return TrainEngineConfig(
+        backend="fsdp:d1",
         experiment_name="test_checkpoint",
         trial_name="test",
         path=model_path,

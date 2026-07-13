@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 from agents import Agent as OpenAIAgent
 from agents import handoff
 from agents.extensions.handoff_prompt import RECOMMENDED_PROMPT_PREFIX

@@ -126,16 +126,16 @@ Place your agent in an importable path, e.g., `my_agent.MyAgent`, then initializ
 rollout controller in AReaL to do batched rollout:
 
 ```python
-from areal.api.alloc_mode import AllocationMode
+from areal.api.alloc_mode import ModelAllocation
 from areal.api.cli_args import GRPOConfig, SGLangConfig, load_expr_config, vLLMConfig
 from areal.engine.sglang_remote import RemoteSGLangEngine
 from areal.engine.vllm_remote import RemotevLLMEngine
 from areal.infra import LocalScheduler, RayScheduler, SlurmScheduler
 import sys
 
-# Load config and parse allocation mode
+# Load config and parse rollout backend
 config, _ = load_expr_config(sys.argv[1:], GRPOConfig)
-allocation_mode = AllocationMode.from_str(config.allocation_mode)
+rollout_alloc = ModelAllocation.from_str(config.rollout.backend)
 
 # Initialize scheduler based on config
 if config.scheduler.type == "local":
@@ -146,26 +146,25 @@ elif config.scheduler.type == "slurm":
     scheduler = SlurmScheduler(exp_config=config)
 
 # Select inference engine and build server args
-if allocation_mode.gen_backend == "sglang":
+if rollout_alloc.backend == "sglang":
     engine_cls = RemoteSGLangEngine
     server_args = SGLangConfig.build_args(
         sglang_config=config.sglang,
-        tp_size=allocation_mode.gen.tp_size,
+        tp_size=rollout_alloc.parallel.tp_size,
         base_gpu_id=0,
     )
-elif allocation_mode.gen_backend == "vllm":
+elif rollout_alloc.backend == "vllm":
     engine_cls = RemotevLLMEngine
     server_args = vLLMConfig.build_args(
         vllm_config=config.vllm,
-        tp_size=allocation_mode.gen.tp_size,
-        pp_size=allocation_mode.gen.pp_size,
+        tp_size=rollout_alloc.parallel.tp_size,
+        pp_size=rollout_alloc.parallel.pp_size,
     )
 
 # Create controller and initialize
 eval_rollout = engine_cls.as_controller(config.rollout, scheduler)
 eval_rollout.initialize(
     role="eval-rollout",
-    alloc_mode=allocation_mode,
     server_args=server_args,
 )
 

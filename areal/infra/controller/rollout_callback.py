@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 from concurrent.futures import Future
 from dataclasses import dataclass
 from typing import Any

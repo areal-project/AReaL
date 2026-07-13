@@ -12,7 +12,7 @@ latex:
     targetname: book.tex
 
 repository:
-  url: https://github.com/inclusionAI/AReaL
+  url: https://github.com/areal-project/AReaL
   path_to_book: docs
   branch: main
 

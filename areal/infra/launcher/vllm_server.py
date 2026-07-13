@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 import os
 import signal
 import subprocess
@@ -5,12 +7,13 @@ import sys
 import time
 import traceback
 import uuid
+import warnings
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 
 import requests
 
-from areal.api import AllocationMode
+from areal.api.alloc_mode import _AllocationMode
 from areal.api.cli_args import (
     ClusterSpecConfig,
     InferenceEngineConfig,
@@ -23,7 +26,7 @@ from areal.infra.platforms import current_platform
 from areal.infra.utils.launcher import TRITON_CACHE_PATH, get_scheduling_spec
 from areal.infra.utils.proc import kill_process_tree
 from areal.utils import logging, name_resolve, names
-from areal.utils.network import find_free_ports, gethostip
+from areal.utils.network import find_free_ports, format_hostport, gethostip
 
 logger = logging.getLogger("VLLMWrapper")
 
@@ -88,7 +91,7 @@ class vLLMServerWrapper:
         experiment_name: str,
         trial_name: str,
         vllm_config: vLLMConfig,
-        allocation_mode: AllocationMode,
+        allocation_mode: _AllocationMode,
         n_gpus_per_node: int,
         cpu_per_gpu: int | None = None,
     ):
@@ -162,8 +165,8 @@ class vLLMServerWrapper:
             server_idx_offset = 0
 
         # Separate ports used by each server in the same node
-        # ports range (10000, 50000)
-        ports_per_server = 40000 // n_servers_per_node
+        # ports range (10000, 32767)
+        ports_per_server = 22767 // n_servers_per_node
         launch_server_args = []
         server_addresses = []
         base_random_seed = self.config.seed
@@ -195,7 +198,7 @@ class vLLMServerWrapper:
                 dist_init_addr=dist_init_addr,
             )
             launch_server_args.append((cmd, host_ip, server_port, custom_env))
-            server_addresses.append(f"http://{host_ip}:{server_port}")
+            server_addresses.append(f"http://{format_hostport(host_ip, server_port)}")
 
         try:
             with ThreadPoolExecutor(max_workers=n_servers_per_proc) as executor:
@@ -239,10 +242,12 @@ class vLLMServerWrapper:
         custom_env: dict[str, str] | None = None,
     ):
         server_process = launch_server_cmd(cmd, custom_env=custom_env)
-        wait_for_server(f"http://{host_ip}:{server_port}")
+        wait_for_server(f"http://{format_hostport(host_ip, server_port)}")
         name = names.gen_servers(self.experiment_name, self.trial_name)
         name_resolve.add_subentry(name, f"{host_ip}:{server_port}")
-        logger.info(f"vllm server launched at: http://{host_ip}:{server_port}")
+        logger.info(
+            f"vllm server launched at: http://{format_hostport(host_ip, server_port)}"
+        )
         return server_process
 
 
@@ -256,8 +261,18 @@ def launch_vllm_server(argv):
     config.rollout = to_structured_cfg(config.rollout, InferenceEngineConfig)
     name_resolve.reconfigure(config.cluster.name_resolve)
 
+    warnings.warn(
+        "SPMD launchers use the deprecated _AllocationMode parser which will be removed. "
+        "Bare dimension strings (e.g., 'd4t2') are NO LONGER ACCEPTED. "
+        "All allocation strings must include an explicit backend prefix "
+        "(e.g., 'fsdp:d4', 'sglang:d4t2'). "
+        "Migrate to single-controller mode (scheduler.type=local) with per-engine 'backend' "
+        "fields (e.g., actor.backend='fsdp:d4'). See docs/en/reference/alloc_mode.md.",
+        FutureWarning,
+        stacklevel=2,
+    )
     allocation_mode = config.allocation_mode
-    allocation_mode = AllocationMode.from_str(allocation_mode)
+    allocation_mode = _AllocationMode.from_str(allocation_mode)
     assert allocation_mode.gen_backend == "vllm"
 
     # Get CPU per GPU from rollout scheduling spec

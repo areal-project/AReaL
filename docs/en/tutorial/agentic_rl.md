@@ -40,7 +40,7 @@ AReaL addresses these limitations by providing:
    for each query.
 
 We demonstrate several concrete examples below. More examples can be found in the
-[`workflow/` directory](https://github.com/inclusionAI/AReaL/tree/main/areal/workflow).
+[`workflow/` directory](https://github.com/areal-project/AReaL/tree/main/areal/workflow).
 
 > **Scheduler Compatibility**: Agent workflows with the proxy approach are supported on
 > `local` and `slurm` schedulers only. The `ray` scheduler is not supported because
@@ -148,7 +148,7 @@ if __name__ == "__main__":
 ```
 
 The full working OpenAI Agents training example is located in
-[**`examples/agent_workflow/`**](https://github.com/inclusionAI/AReaL/blob/main/examples/agent_workflow/).
+[**`examples/agent_workflow/`**](https://github.com/areal-project/AReaL/blob/main/examples/agent_workflow/).
 To run the example on a single node:
 
 ```bash
@@ -318,7 +318,7 @@ workflow = CamelRLVRWorkflow(
 ```
 
 See the
-[complete train script](https://github.com/inclusionAI/AReaL/blob/main/examples/camel/train.py)
+[complete train script](https://github.com/areal-project/AReaL/blob/main/examples/camel/train.py)
 for a full working implementation.
 
 ### More Examples
@@ -328,12 +328,12 @@ frameworks and SDKs:
 
 - **Claude Agent SDK**: Train agents using Anthropic's Claude Agent SDK with MCP tools.
   See the
-  [Claude example](https://github.com/inclusionAI/AReaL/blob/main/areal/workflow/anthropic/claude_math_agent.py)
+  [Claude example](https://github.com/areal-project/AReaL/blob/main/areal/workflow/anthropic/claude_math_agent.py)
   for a math agent with calculator tools.
 
 - **LangChain**: Integrate LangChain agents with AReaL's training infrastructure. See
   the
-  [LangChain example](https://github.com/inclusionAI/AReaL/blob/main/areal/workflow/langchain/math_agent.py)
+  [LangChain example](https://github.com/areal-project/AReaL/blob/main/areal/workflow/langchain/math_agent.py)
   for details.
 
 ## Online Mode
@@ -344,8 +344,8 @@ exposes an OpenAI-compatible HTTP API that any application can connect to, and a
 interactions are automatically collected as RL training data.
 
 See the [Online RL Training Guide](online_proxy.md) for a complete walkthrough, and the
-[OpenClaw example](https://github.com/inclusionAI/AReaL/tree/main/examples/openclaw) for
-a working end-to-end demo.
+[OpenClaw example](https://github.com/areal-project/AReaL/tree/main/examples/openclaw)
+for a working end-to-end demo.
 
 ## Under the Hood
 

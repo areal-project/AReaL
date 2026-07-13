@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 # CUDA device detection utilities
 
 import torch

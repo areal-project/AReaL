@@ -26,7 +26,7 @@ AReaL 通过提供以下功能来解决这些限制：
 1. **并行轨迹收集**：AReaL 的工作流系统支持多个智能体实例的并发执行，允许您为每个查询收集多样化的轨迹。
 
 我们在下面演示了几个具体示例。更多示例可以在
-[`workflow/` 目录](https://github.com/inclusionAI/AReaL/tree/main/areal/workflow)中找到。
+[`workflow/` 目录](https://github.com/areal-project/AReaL/tree/main/areal/workflow)中找到。
 
 > **调度器兼容性**：使用代理方法的智能体工作流仅在 `local` 和 `slurm` 调度器上受支持。`ray` 调度器不支持，因为 Ray 的基于 actor
 > 的编程模型与需要 worker 之间持久连接的 HTTP 代理服务器本质上不兼容。
@@ -130,7 +130,7 @@ if __name__ == "__main__":
 ```
 
 完整的 OpenAI Agents 训练示例位于
-[**`examples/agent_workflow/`**](https://github.com/inclusionAI/AReaL/blob/main/examples/agent_workflow/)。要在单节点上运行示例：
+[**`examples/agent_workflow/`**](https://github.com/areal-project/AReaL/blob/main/examples/agent_workflow/)。要在单节点上运行示例：
 
 ```bash
 python3 examples/agent_workflow/train.py \
@@ -290,17 +290,17 @@ workflow = CamelRLVRWorkflow(
 # AReaL 将为每个批次调用 workflow.arun_episode()
 ```
 
-查看[完整的训练脚本](https://github.com/inclusionAI/AReaL/blob/main/examples/camel/train.py)以获取完整的工作实现。
+查看[完整的训练脚本](https://github.com/areal-project/AReaL/blob/main/examples/camel/train.py)以获取完整的工作实现。
 
 ### 更多示例
 
 除了上述两个示例外，AReaL 还支持与各种其他智能体框架和 SDK 的集成：
 
 - **Claude Agent SDK**：使用 Anthropic 的 Claude Agent SDK 和 MCP
-  工具训练智能体。请参阅[Claude 示例](https://github.com/inclusionAI/AReaL/blob/main/areal/workflow/anthropic/claude_math_agent.py)，了解带有计算器工具的数学智能体。
+  工具训练智能体。请参阅[Claude 示例](https://github.com/areal-project/AReaL/blob/main/areal/workflow/anthropic/claude_math_agent.py)，了解带有计算器工具的数学智能体。
 
 - **LangChain**：将 LangChain 智能体与 AReaL 的训练基础设施集成。请参阅
-  [LangChain 示例](https://github.com/inclusionAI/AReaL/blob/main/areal/workflow/langchain/math_agent.py)了解详情。
+  [LangChain 示例](https://github.com/areal-project/AReaL/blob/main/areal/workflow/langchain/math_agent.py)了解详情。
 
 ## 底层原理
 

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
@@ -273,13 +275,13 @@ class PipelinedRunner(ForwardBackwardRunner):
                     pred = pred.squeeze(0)
                 loss = process_output_fn(pred, ctx.to_dict())
                 if loss is None:
-                    return pred.sum() * 0.0
+                    return pred.mean() * 0.0
                 return loss
         else:
             # Non-last stage: dummy loss that keeps all elements in computation graph
             # so autograd can compute complete pred.grad for upstream stage
             def pp_loss_fn(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-                return pred.sum() * 0.0
+                return pred.mean() * 0.0
 
         return pp_loss_fn
 

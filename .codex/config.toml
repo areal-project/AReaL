@@ -1,0 +1,31 @@
+[agents.algorithm-expert]
+description = "RL algorithm expert for GRPO, PPO, DAPO, reward shaping, and workflow-level RL decisions."
+config_file = "./agents/algorithm-expert.toml"
+
+[agents.archon-expert]
+description = "Archon and MoE expert for expert parallelism, model integration, and troubleshooting."
+config_file = "./agents/archon-expert.toml"
+
+[agents.code-verifier]
+description = "Verification agent for pre-commit, lint, formatting, and targeted test runs."
+config_file = "./agents/code-verifier.toml"
+
+[agents.fsdp-expert]
+description = "FSDP2 expert for configuration, parallel strategy, weight sync, and integration guidance."
+config_file = "./agents/fsdp-expert.toml"
+
+[agents.launcher-expert]
+description = "Launcher and scheduler expert for Slurm, Ray, local launch, and inference server deployment."
+config_file = "./agents/launcher-expert.toml"
+
+[agents.megatron-expert]
+description = "Megatron expert for pipeline parallel training, integration, and troubleshooting."
+config_file = "./agents/megatron-expert.toml"
+
+[agents.planner]
+description = "Implementation planner for multi-file changes, architectural decisions, and new features."
+config_file = "./agents/planner.toml"
+
+[agents.simple-code-reviewer]
+description = "Lightweight reviewer for quick post-change bug and risk checks."
+config_file = "./agents/simple-code-reviewer.toml"

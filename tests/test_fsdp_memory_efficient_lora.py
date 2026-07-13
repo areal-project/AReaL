@@ -2,14 +2,14 @@ import subprocess
 
 import pytest
 
-from areal.api import AllocationMode
+from areal.api.alloc_mode import ModelAllocation
 from areal.infra.platforms import current_platform
 from areal.utils.network import find_free_ports
 
 
 def _run_test_with_torchrun(alloc_mode: str, output: str):
     port = find_free_ports(1)[0]
-    n_gpus = AllocationMode.from_str(alloc_mode).train.world_size
+    n_gpus = ModelAllocation.from_str(alloc_mode).parallel.world_size
     try:
         subprocess.run(
             [
@@ -19,7 +19,7 @@ def _run_test_with_torchrun(alloc_mode: str, output: str):
                 "--master-addr=localhost",
                 f"--master_port={port}",
                 "tests/torchrun/run_fsdp_memory_efficient_lora.py",
-                f"--allocation_mode={alloc_mode}",
+                f"--backend={alloc_mode}",
                 f"--output={output}",
             ],
             check=True,
@@ -38,4 +38,4 @@ def test_fsdp_memory_efficient_lora(tmp_path_factory):
     if current_platform.device_count() < 1:
         pytest.skip("Test requires at least 1 GPU")
     output = tmp_path_factory.mktemp("test_output") / "fsdp_memory_efficient_lora.out"
-    _run_test_with_torchrun("d1t1c1", str(output))
+    _run_test_with_torchrun("fsdp:d1t1c1", str(output))

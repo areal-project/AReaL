@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 """Utility functions for saving and loading experiment metadata."""
 
 import getpass

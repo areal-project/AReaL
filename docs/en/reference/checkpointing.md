@@ -62,7 +62,7 @@ PPOTrainer.train()
 
 ## Saver: HuggingFace Model Export
 
-The [`Saver`](https://github.com/inclusionAI/AReaL/blob/main/areal/utils/saver.py)
+The [`Saver`](https://github.com/areal-project/AReaL/blob/main/areal/utils/saver.py)
 periodically exports model weights in HuggingFace format for evaluation or deployment.
 
 ### Save Mode
@@ -133,7 +133,7 @@ tokenizer = AutoTokenizer.from_pretrained(
 ## RecoverHandler: Fault Tolerance
 
 The
-[`RecoverHandler`](https://github.com/inclusionAI/AReaL/blob/main/areal/utils/recover.py)
+[`RecoverHandler`](https://github.com/areal-project/AReaL/blob/main/areal/utils/recover.py)
 enables resuming training after failures by saving complete training state.
 
 ### Configuration

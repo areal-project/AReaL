@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 """Internal agent for online training mode.
 
 ``_OnlineAgent`` is NOT intended for direct use. It is automatically

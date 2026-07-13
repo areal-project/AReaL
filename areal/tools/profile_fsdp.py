@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 """Profiling tool for FSDP/HuggingFace models (forward + backward).
 
 A profiling tool to analyze op-level performance bottlenecks

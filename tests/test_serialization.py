@@ -1,10 +1,13 @@
 """Tests for RPC serialization utilities."""
 
 from dataclasses import dataclass
+from io import BytesIO
 
 import numpy as np
 import pytest
+import ray
 import torch
+from PIL import Image
 from transformers import AutoTokenizer
 
 from tests.utils import get_model_path
@@ -79,6 +82,24 @@ class TestSerializationRoundTrip:
         with pytest.raises(ValueError, match="Object or void dtype"):
             serialize_value(array)
 
+    def test_pil_image_roundtrip(self):
+        """Test PIL image serialization for VLM RPC payloads."""
+        original = Image.new("RGB", (8, 6), color=(12, 34, 56))
+
+        serialized = serialize_value(original)
+        assert serialized["type"] == "pil_image"
+
+        deserialized = deserialize_value(serialized)
+        assert isinstance(deserialized, Image.Image)
+        assert deserialized.size == original.size
+        assert deserialized.mode == original.mode
+
+        # Validate pixel content with a deterministic byte compare
+        with BytesIO() as o_buf, BytesIO() as d_buf:
+            original.save(o_buf, format="PNG")
+            deserialized.save(d_buf, format="PNG")
+            assert o_buf.getvalue() == d_buf.getvalue()
+
     def test_dataclass(self):
         """Test dataclass serialization with nested tensors."""
         original = SampleData(
@@ -112,6 +133,26 @@ class TestSerializationRoundTrip:
         assert deserialized.vocab_size == original.vocab_size
         assert deserialized.encode("test") == original.encode("test")
 
+    def test_processor(self):
+        """Test Hugging Face processor serialization."""
+        from transformers import AutoProcessor
+
+        original = AutoProcessor.from_pretrained(
+            get_model_path(
+                "/storage/openpsi/models/Qwen__Qwen2.5-VL-3B-Instruct",
+                "Qwen/Qwen2.5-VL-3B-Instruct",
+            )
+        )
+
+        serialized = serialize_value(original)
+        assert serialized["type"] == "processor"
+
+        deserialized = deserialize_value(serialized)
+        assert deserialized.tokenizer.vocab_size == original.tokenizer.vocab_size
+        assert deserialized.tokenizer.encode("test") == original.tokenizer.encode(
+            "test"
+        )
+
     def test_nested_structure(self):
         """Test complex nested structure with multiple types."""
         payload = {
@@ -135,6 +176,20 @@ class TestSerializationRoundTrip:
         assert deserialized["dataclass"].name == "nested"
         assert torch.equal(deserialized["list"][0], payload["list"][0])
         assert deserialized["meta"]["text"] == "value"
+
+    @pytest.mark.skip("skipping the ray test unless skip mark is commented out")
+    def test_ray_object_ref_roundtrip(self):
+        """Ray ObjectRef handles should round-trip through RPC serialization."""
+        ray.init(local_mode=True, ignore_reinit_error=True)
+        try:
+            original = ray.put({"value": 123})
+            serialized = serialize_value({"ref": original})
+            assert serialized["ref"]["type"] == "ray_object_ref"
+
+            deserialized = deserialize_value(serialized)
+            assert ray.get(deserialized["ref"]) == {"value": 123}
+        finally:
+            ray.shutdown()
 
     @pytest.mark.skipif(
         not hasattr(torch, "cuda") or not torch.cuda.is_available(),

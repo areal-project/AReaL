@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 """Launcher modules for different cluster backends."""
 
 from .local import LocalLauncher, local_main

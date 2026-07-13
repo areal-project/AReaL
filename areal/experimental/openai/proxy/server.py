@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 from __future__ import annotations
 
 import asyncio
@@ -64,11 +66,14 @@ class ExportTrajectoriesResponse(BaseModel):
 class SessionData:
     """Data associated with a single RL session."""
 
-    def __init__(self, session_id: str):
+    def __init__(self, session_id: str, prefix_matcher=None):
         self.session_id = session_id
 
         self._completed = False
-        self._completions = InteractionCache()
+        self._completions = InteractionCache(
+            session_id=session_id,
+            prefix_matcher=prefix_matcher,
+        )
         self._completed_event = threading.Event()
         self._start_time = time.time()
         self._last_access_time = time.time()
@@ -132,11 +137,19 @@ def serialize_interactions(
 
     result = {}
     for key, interaction in interactions.items():
-        result[key] = {
-            "tensor_dict": interaction.to_tensor_dict(),
-            "reward": interaction.reward,
-            "interaction_id": interaction.interaction_id,
-        }
+        if interaction.has_tensor_data:
+            result[key] = {
+                "tensor_dict": interaction.to_tensor_dict(),
+                "reward": interaction.reward,
+                "interaction_id": interaction.interaction_id,
+            }
+        else:
+            result[key] = {
+                "messages": interaction.messages,
+                "output_message_list": interaction.output_message_list,
+                "reward": interaction.reward,
+                "interaction_id": interaction.interaction_id,
+            }
     return serialize_value(result)
 
 
@@ -150,9 +163,12 @@ def deserialize_interactions(
     data = deserialize_value(data)
     result = {}
     for key, item in data.items():
-        # Create a minimal InteractionWithTokenLogpReward with cached tensor dict
         interaction = InteractionWithTokenLogpReward()
-        interaction._cache = item["tensor_dict"]
+        if "tensor_dict" in item:
+            interaction._cache = item["tensor_dict"]
+        else:
+            interaction.messages = item["messages"]
+            interaction.output_message_list = item["output_message_list"]
         interaction.reward = item["reward"]
         interaction.interaction_id = item["interaction_id"]
         result[key] = interaction

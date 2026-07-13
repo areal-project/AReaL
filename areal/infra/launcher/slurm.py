@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 import copy
 import getpass
 import os
@@ -5,9 +7,10 @@ import re
 import subprocess
 import sys
 import time
+import warnings
 
 import areal.utils.logging as logging
-from areal.api import AllocationMode, AllocationType
+from areal.api.alloc_mode import AllocationType, _AllocationMode
 from areal.api.cli_args import (
     ClusterSpecConfig,
     InferenceEngineConfig,
@@ -26,6 +29,7 @@ from areal.infra.utils.launcher import (
     JobState,
     get_scheduling_spec,
     get_thread_env_vars,
+    run_post_exit_hook,
     validate_config_for_distributed_launcher,
     wait_llm_server_addrs,
 )
@@ -408,6 +412,16 @@ def slurm_main(config, run_id: int = 0):
     config.cluster = to_structured_cfg(config.cluster, ClusterSpecConfig)
     config.recover = to_structured_cfg(config.recover, RecoverConfig)
     is_recover_run = check_if_recover(config.recover, run_id)
+    warnings.warn(
+        "SPMD launchers use the deprecated _AllocationMode parser which will be removed. "
+        "Bare dimension strings (e.g., 'd4t2') are NO LONGER ACCEPTED. "
+        "All allocation strings must include an explicit backend prefix "
+        "(e.g., 'fsdp:d4', 'sglang:d4t2'). "
+        "Migrate to single-controller mode (scheduler.type=local) with per-engine 'backend' "
+        "fields (e.g., actor.backend='fsdp:d4'). See docs/en/reference/alloc_mode.md.",
+        FutureWarning,
+        stacklevel=2,
+    )
     validate_config_for_distributed_launcher(config)
     logger.info(
         f"SlurmLauncher: experiment_name={config.experiment_name}, "
@@ -435,7 +449,7 @@ def slurm_main(config, run_id: int = 0):
     n_nodes = config.cluster.n_nodes
     n_gpus_per_node = config.cluster.n_gpus_per_node
     allocation_mode = config.allocation_mode
-    allocation_mode = AllocationMode.from_str(allocation_mode)
+    allocation_mode = _AllocationMode.from_str(allocation_mode)
 
     if not is_recover_run:
         metadata_file = save_experiment_metadata(
@@ -558,7 +572,10 @@ def slurm_main(config, run_id: int = 0):
                 n_backend_servers,
             )
         except (TimeoutError, KeyboardInterrupt) as e:
-            launcher.stop_all(force=True)
+            try:
+                launcher.stop_all(force=True)
+            finally:
+                run_post_exit_hook(config)
             raise e
 
     trainer_n_nodes = n_nodes - n_backend_nodes
@@ -662,6 +679,7 @@ def slurm_main(config, run_id: int = 0):
         )
     except (KeyboardInterrupt, JobException, TimeoutError) as e:
         launcher.stop_all(force=True)
+        run_post_exit_hook(config)
         recover_states = [JobState.FAILED, JobState.NOT_FOUND]
         if isinstance(e, JobException):
             recover_this = (

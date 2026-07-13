@@ -17,12 +17,12 @@ cluster:
     type: nfs
     nfs_record_root: /tmp/areal/name_resolve
 
-allocation_mode: sglang:d4p1t1+d4p1t1
 
 scheduler:
   type: null
 
 rollout:
+  backend: "sglang:d4p1t1"
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
   fileroot: ${cluster.fileroot}
@@ -34,7 +34,7 @@ rollout:
   enable_rollout_tracing: false
   scheduling_spec: ${actor.scheduling_spec}
   dump_to_file: true
-  openai:
+  agent:
     mode: inline
     tool_call_parser: qwen25
     reasoning_parser: qwen3
@@ -50,6 +50,7 @@ gconfig:
   temperature: 1.0
 
 actor:
+  backend: "fsdp:d4p1t1"
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
   path: Qwen/Qwen2.5-1.5B-Instruct
@@ -77,7 +78,9 @@ actor:
   ppo_n_minibatches: 1
   recompute_logprob: true
   use_decoupled_loss: true
-  behave_imp_weight_cap: 5.0
+  rejection_sampling:
+    metric: ratio
+    upper: 5.0
   reward_norm: null
   adv_norm:
     mean_level: batch
@@ -106,6 +109,7 @@ actor:
         PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
 
 ref:
+  backend: ${actor.backend}
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
   path: ${actor.path}

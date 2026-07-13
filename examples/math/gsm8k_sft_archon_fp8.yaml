@@ -1,0 +1,97 @@
+experiment_name: gsm8k-sft-archon-fp8
+trial_name: trial0
+
+seed: 1
+enable_offload: false
+total_train_epochs: 1
+tokenizer_path: ${actor.path}
+
+cluster:
+  n_nodes: 1
+  n_gpus_per_node: 8
+  fileroot: /tmp/areal/experiments
+  name_resolve:
+    type: nfs
+    nfs_record_root: /tmp/areal/name_resolve
+
+scheduler:
+  type: local
+
+actor:
+  backend: archon:d8
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  path: Qwen/Qwen3-1.7B
+  init_from_scratch: false
+  gradient_checkpointing: true
+  dtype: bfloat16
+  mb_spec:
+    max_tokens_per_mb: 4096
+  optimizer:
+    type: adam
+    lr: 2e-5
+    weight_decay: 0.05
+    beta1: 0.9
+    beta2: 0.95
+    eps: 1e-5
+    lr_scheduler_type: cosine
+    gradient_clipping: 1.0
+  archon:
+    fp8_config:
+      mode: blockwise
+      # exclude_modules: [output, router, score]  # default; YAML replaces entire list
+  scheduling_spec:
+    - task_type: worker
+      port_count: 2
+      gpu: 1
+      mem: 32
+      cmd: python3 -m areal.infra.rpc.rpc_server
+      env_vars: {}
+
+train_dataset:
+  batch_size: 128
+  shuffle: true
+  pin_memory: true
+  num_workers: 4
+  path: openai/gsm8k
+  type: sft
+
+valid_dataset:
+  batch_size: 128
+  pin_memory: true
+  num_workers: 4
+  path: openai/gsm8k
+  type: sft
+
+# Utilities
+saver:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: 1
+  freq_steps: null
+  freq_secs: null
+
+recover:
+  mode: disabled
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: 1
+  freq_steps: null
+  freq_secs: 3600
+
+evaluator:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: 1
+  freq_steps: null
+  freq_secs: null
+
+stats_logger:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  wandb:
+    mode: disabled

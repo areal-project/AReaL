@@ -83,7 +83,7 @@ dispatched to multiple concurrent executions of workflows, where each dispatched
 corresponds to a single episode.
 
 In the following sections, we take
-[`RLVRWorkflow`](https://github.com/inclusionAI/AReaL/blob/main/areal/workflow/rlvr.py)
+[`RLVRWorkflow`](https://github.com/areal-project/AReaL/blob/main/areal/workflow/rlvr.py)
 as an example. Agent workflows have the same pattern of using input data. You are free
 to modify the customized dataset to include any keys as long as they accord with your
 workflow implementation.

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 # FP8 quantization utilities
 #
 # This module provides FP8 quantization and dequantization utilities for

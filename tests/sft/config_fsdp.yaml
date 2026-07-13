@@ -1,10 +1,11 @@
 experiment_name: tests-sft
 trial_name: trial
+scheduler:
+  type: local
 cluster:
   n_nodes: 1
   n_gpus_per_node: 1
   fileroot: /tmp/areal/experiments
-allocation_mode: d1p1t1
 seed: 1
 total_train_epochs: 1
 total_train_steps: 16
@@ -31,6 +32,7 @@ recover:
   fileroot: ${cluster.fileroot}
 
 actor:
+  backend: "fsdp:d1p1t1"
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
   path: Qwen/Qwen3-0.6B

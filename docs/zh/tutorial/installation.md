@@ -24,7 +24,7 @@
 | Git LFS                  | 用于下载模型、数据集和 AReaL 代码。请参阅[安装指南](https://docs.github.com/en/repositories/working-with-files/managing-large-files/installing-git-large-file-storage) |
 | Docker                   |                                                                                 27.5.1                                                                                 |
 | NVIDIA Container Toolkit |                             请参阅[安装指南](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)                              |
-| AReaL 镜像               |                                 `ghcr.io/inclusionai/areal-runtime:v1.0.2-sglang`（默认）或 `v1.0.2-vllm`。包含运行时依赖和 Ray 组件。                                 |
+| AReaL 镜像               |                                `ghcr.io/areal-project/areal-runtime:v2.0.0-sglang`（默认）或 `v2.0.0-vllm`。包含运行时依赖和 Ray 组件。                                |
 
 **注意**：本教程不涵盖 NVIDIA 驱动、CUDA 或共享存储挂载的安装，因为这些取决于您具体的节点配置和系统版本。请独立完成这些安装。
 
@@ -37,18 +37,18 @@
 我们推荐使用 Docker 和提供的镜像。Dockerfile 位于 AReaL 仓库的顶级目录。
 
 ```bash
-docker pull ghcr.io/inclusionai/areal-runtime:v1.0.2-sglang
+docker pull ghcr.io/areal-project/areal-runtime:v2.0.0-sglang
 docker run -it --name areal-node1 \
    --privileged --gpus all --network host \
    --shm-size 700g -v /path/to/mount:/path/to/mount \
-   ghcr.io/inclusionai/areal-runtime:v1.0.2-sglang \
+   ghcr.io/areal-project/areal-runtime:v2.0.0-sglang \
    /bin/bash
-git clone https://github.com/inclusionAI/AReaL /path/to/mount/AReaL
+git clone https://github.com/areal-project/AReaL /path/to/mount/AReaL
 cd /path/to/mount/AReaL
 uv pip install -e . --no-deps
 ```
 
-vLLM 变体的 Docker 镜像也可使用： `ghcr.io/inclusionai/areal-runtime:v1.0.2-vllm`。如果您偏好使用 vLLM
+vLLM 变体的 Docker 镜像也可使用： `ghcr.io/areal-project/areal-runtime:v2.0.0-vllm`。如果您偏好使用 vLLM
 作为推理后端，请将上述命令中的镜像标签替换为该变体。
 
 ### 方式 2：自定义环境安装
@@ -58,7 +58,7 @@ vLLM 变体的 Docker 镜像也可使用： `ghcr.io/inclusionai/areal-runtime:v
 1. 克隆仓库：
 
 ```bash
-git clone https://github.com/inclusionAI/AReaL
+git clone https://github.com/areal-project/AReaL
 cd AReaL
 ```
 
@@ -88,13 +88,31 @@ uv sync --extra cuda
 这将安装 CUDA 依赖的训练包（Megatron、Torch Memory Saver）以及 **SGLang** 作为默认推理后端。这些包需要 Linux x86_64 和
 CUDA 12.x 及兼容的 NVIDIA 驱动。
 
+#### 使用 vLLM 替代 SGLang
+
+SGLang 和 vLLM 锁定了互不兼容的 `torch` / `torchao` 版本，因此它们位于独立的 pyproject 文件中。默认的
+`pyproject.toml` 使用 SGLang；若需使用 vLLM，请使用 `pyproject.vllm.toml`：
+
+```bash
+cp pyproject.vllm.toml pyproject.toml
+cp uv.vllm.lock uv.lock
+uv sync --extra cuda
+```
+
+也可以不替换 `pyproject.toml`：
+
+```bash
+uv pip install -r pyproject.vllm.toml --extra cuda
+```
+
 #### Flash Attention 预编译 Wheel
 
-Flash Attention v2 包含在 `--extra cuda` 和 `--extra cuda-vllm` 中，但 PyPI 仅提供源码分发包，从源码编译耗时约
-30 分钟。为跳过编译，请在运行 `uv sync` **之前**安装**预编译 wheel**。
+Flash Attention v2 包含在 `--extra cuda` 中，但 PyPI 仅提供源码分发包，从源码编译耗时约 30 分钟。为跳过编译，请在运行
+`uv sync` **之前**安装**预编译 wheel**。
 
-Flash Attention wheel 在编译时与特定 PyTorch 版本绑定。SGLang 使用 **torch 2.9**， vLLM 使用 **torch
-2.10**，请选择对应的 wheel。将 `cpXYZ` 替换为您的 Python 版本 （3.11 对应 `cp311`，3.12 对应 `cp312`）。
+Flash Attention wheel 在编译时与特定 PyTorch 版本绑定。SGLang（默认 `pyproject.toml`）使用 **torch
+2.9**，vLLM（`pyproject.vllm.toml`）使用 **torch 2.10**，请选择对应的 wheel。将 `cpXYZ` 替换为您的 Python
+版本（3.11 对应 `cp311`，3.12 对应 `cp312`）。
 
 **SGLang**（默认，torch 2.9）：
 
@@ -107,15 +125,17 @@ uv pip install "https://github.com/mjun0812/flash-attention-prebuild-wheels/rele
 uv sync --extra cuda
 ```
 
-**vLLM**（torch 2.10）：
+**vLLM**（torch 2.10，需要 `pyproject.vllm.toml`）：
 
 ```bash
+cp pyproject.vllm.toml pyproject.toml
+cp uv.vllm.lock uv.lock
 # Python 3.12
 uv pip install "https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.7.16/flash_attn-2.8.3+cu128torch2.10-cp312-cp312-linux_x86_64.whl"
 # Python 3.11
 # uv pip install "https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.7.16/flash_attn-2.8.3+cu128torch2.10-cp311-cp311-linux_x86_64.whl"
 
-uv sync --extra cuda-vllm
+uv sync --extra cuda
 ```
 
 浏览所有可用 wheel： <https://github.com/mjun0812/flash-attention-prebuild-wheels/releases>。
@@ -125,25 +145,14 @@ CUDA 的训练和推理功能将不可用。此配置仅适用于开发、测试
 
 您也可以单独安装各个 extra，而不是完整的 `cuda` 捆绑包：
 
-- `sglang`：SGLang 推理引擎
-- `vllm`：vLLM 推理引擎
+- `sglang`：SGLang 推理引擎（在 `pyproject.toml` 中）
+- `vllm`：vLLM 推理引擎（在 `pyproject.vllm.toml` 中）
 - `megatron`：Megatron 训练后端
 - `tms`：Torch Memory Saver
 - `flash-attn`：Flash Attention v2
 - `kernels`：Hugging Face Kernels 运行时
-- `cuda-train`：仅训练包（megatron + tms，不含推理后端）
-- `cuda-sglang`：cuda-train + sglang + flash-attn
-- `cuda-vllm`：cuda-train + vllm + flash-attn
-- `cuda`：cuda-sglang 的别名（默认，向后兼容）
-
-**注意**：您可以混合搭配各个 extra：
-
-```bash
-# vLLM 带 Hugging Face Kernels 和 flash-attn（不含 megatron 和 tms）
-uv sync --extra vllm --extra flash-attn --extra kernels
-# vLLM 加所有训练包
-uv sync --extra cuda-train --extra vllm
-```
+- `cuda-train`：仅训练包（megatron + tms + kernels，不含推理后端）
+- `cuda`：cuda-train + 推理后端 + flash-attn
 
 ### 在训练中使用 Hugging Face Kernels
 
@@ -177,7 +186,7 @@ Docker）且需要这些包的优化（例如 FP8 训练、融合 Adam 内核）
 | grouped_gemm      | Megatron 中的 MoE 模型支持        | `uv pip install --no-build-isolation git+https://github.com/fanshiqing/grouped_gemm@v1.1.4`                                                                       |
 | NVIDIA apex       | Megatron 中的融合 Adam 等         | `NVCC_APPEND_FLAGS="--threads 4" APEX_PARALLEL_BUILD=8 APEX_CPP_EXT=1 APEX_CUDA_EXT=1 uv pip install --no-build-isolation git+https://github.com/NVIDIA/apex.git` |
 | TransformerEngine | Megatron 中的 FP8 训练、优化 GEMM | `uv pip install --no-build-isolation git+https://github.com/NVIDIA/TransformerEngine.git@stable`                                                                  |
-| flash-attn-3      | Flash Attention v3（Hopper）      | 从源码构建，请参阅 [Dockerfile](https://github.com/inclusionAI/AReaL/blob/main/Dockerfile)                                                                        |
+| flash-attn-3      | Flash Attention v3（Hopper）      | 从源码构建，请参阅 [Dockerfile](https://github.com/areal-project/AReaL/blob/main/Dockerfile)                                                                      |
 
 **重要**：这些包需要 `--no-build-isolation`，因为它们需要访问已安装的 PyTorch 进行 CUDA 编译。先通过
 `uv sync --extra cuda` 安装 PyTorch，然后再尝试安装这些包。
@@ -185,7 +194,7 @@ Docker）且需要这些包的优化（例如 FP8 训练、融合 Adam 内核）
 ### DeepSeek-V3 优化包（可选）
 
 为了以最佳性能运行 DeepSeek-V3 风格的 MoE 模型，Docker 镜像还包含以下包。这些包有复杂的构建要求和 GPU 架构约束。**请参阅
-[Dockerfile](https://github.com/inclusionAI/AReaL/blob/main/Dockerfile)
+[Dockerfile](https://github.com/areal-project/AReaL/blob/main/Dockerfile)
 获取确切的安装命令和环境变量。**
 
 | 包                     | 用途                             | GPU 要求       |
@@ -259,7 +268,7 @@ sky check
 ```
 
 如果显示 `GCP: enabled` 或 `Kubernetes: enabled`，您就可以将 SkyPilot 与 AReaL 一起使用了。请参阅
-[SkyPilot 示例](https://github.com/inclusionAI/AReaL/blob/main/examples/skypilot/README.md)
+[SkyPilot 示例](https://github.com/areal-project/AReaL/blob/main/examples/skypilot/README.md)
 获取运行 AReaL 的详细指南。更多选项和详细信息，请参阅官方
 [SkyPilot 安装指南](https://docs.skypilot.co/en/latest/getting-started/installation.html)。
 

@@ -11,7 +11,8 @@ from transformers import AutoTokenizer
 
 from tests.utils import get_model_path
 
-from areal.api import AllocationMode, FinetuneSpec, SaveLoadMeta
+from areal.api import FinetuneSpec, SaveLoadMeta
+from areal.api.alloc_mode import ModelAllocation
 from areal.api.cli_args import MicroBatchSpec, OptimizerConfig, TrainEngineConfig
 from areal.engine import FSDPEngine
 from areal.infra.platforms import current_platform
@@ -68,19 +69,20 @@ def mock_loss_fn(
 
 
 def make_fsdp_engine(
-    allocation_mode: str, mb_spec: MicroBatchSpec, init_optimizer: bool = False
+    backend: str, mb_spec: MicroBatchSpec, init_optimizer: bool = False
 ):
     config = TrainEngineConfig(
+        backend=backend,
         experiment_name="test_fsdp_dcp_distributed",
         trial_name="test",
         mb_spec=mb_spec,
         path=MODEL_PATH,
         optimizer=OptimizerConfig() if init_optimizer else None,
     )
-    alloc_mode = AllocationMode.from_str(allocation_mode)
+    alloc_mode = ModelAllocation.from_str(backend)
     engine = FSDPEngine(config)
     ft_spec = FinetuneSpec(total_train_epochs=1, dataset_size=128, train_batch_size=8)
-    engine.create_process_group(parallel_strategy=alloc_mode.train)
+    engine.create_process_group(parallel_strategy=alloc_mode.parallel)
     engine.initialize(None, ft_spec)
     return engine
 
@@ -265,19 +267,19 @@ def main():
         help="Optional path to save the output result",
     )
     parser.add_argument(
-        "--allocation_mode",
+        "--backend",
         type=str,
-        default="d2t1c1",
-        help="Allocation mode for the model",
+        default="fsdp:d2t1c1",
+        help="Backend allocation string for the model (e.g., 'fsdp:d2t1c1')",
     )
     args = parser.parse_args()
 
     print(f"Running {args.test_type} test")
 
     if args.test_type == "simple_dcp_save_load":
-        test_simple_dcp_save_load(alloc_mode=args.allocation_mode, output=args.output)
+        test_simple_dcp_save_load(alloc_mode=args.backend, output=args.output)
     elif args.test_type == "train_dcp_save_load":
-        test_train_dcp_save_load(alloc_mode=args.allocation_mode, output=args.output)
+        test_train_dcp_save_load(alloc_mode=args.backend, output=args.output)
     else:
         raise NotImplementedError(f"Test type {args.test_type} not implemented")
 

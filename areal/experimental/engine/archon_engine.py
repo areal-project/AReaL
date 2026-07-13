@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 from __future__ import annotations
 
 import dataclasses
@@ -6,7 +8,7 @@ import math
 import os
 import time
 from collections.abc import Callable
-from contextlib import nullcontext
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -33,7 +35,10 @@ from areal.api import (
 )
 from areal.api.cli_args import MicroBatchSpec
 from areal.api.io_struct import DeviceRuntimeInfo
-from areal.engine.core.distributed import patch_dist_group_timeout
+from areal.engine.core.distributed import (
+    patch_dist_group_timeout,
+    warmup_process_groups,
+)
 from areal.engine.core.train_engine import (
     aggregate_eval_losses,
     compute_total_loss_weight,
@@ -91,8 +96,10 @@ from areal.utils.data import (
     MicroBatchList,
     amend_position_ids,
     broadcast_tensor,
+    concat_batch,
     pack_tensor_dict,
     pad_mb_list,
+    split_batch,
     split_padded_tensor_dict_into_mb_list,
     unsqueeze_mb_list,
 )
@@ -109,7 +116,7 @@ if TYPE_CHECKING:
     from torchdata.stateful_dataloader import StatefulDataLoader
 
     from areal.api import InferenceEngine, Scheduler, WorkflowLike
-    from areal.api.cli_args import PerfTracerConfig, TrainEngineConfig
+    from areal.api.cli_args import DPOEngineConfig, PerfTracerConfig, TrainEngineConfig
     from areal.experimental.engine.archon_runner import ForwardBackwardRunner
 
 
@@ -189,6 +196,7 @@ class ArchonEngine(TrainEngine):
         self._version: int = 0
         self._initialized = False
         self.is_offload = False
+        self._offload_depth: int = 0
 
     def create_process_group(
         self,
@@ -279,6 +287,15 @@ class ArchonEngine(TrainEngine):
             f"ep={self.parallel_dims.ep}, etp={self.parallel_dims.etp}"
         )
 
+        # Eagerly initialize HCCL/NCCL communicators for the subgroups so
+        # that lazy init doesn't race with colocated engines (issue #1099).
+        warmup_process_groups(
+            self.parallel_dims.world_mesh["dp"].get_group(),
+            self._pp_cp_tp_group,
+            self._tp_group,
+            self._cp_group,
+        )
+
     def initialize(self, addr: str | None, ft_spec: FinetuneSpec, *args, **kwargs):
         """Initialize model, optimizer, and apply parallelism."""
         assert addr is None, "ArchonEngine does not support remote initialization."
@@ -295,6 +312,30 @@ class ArchonEngine(TrainEngine):
         self.state_dict_adapter = self._create_state_dict_adapter()
 
         self.param_dtype = getattr(torch, self.config.dtype)
+
+        # FP8 conversion -- must run on meta device, before parallelism is applied.
+        # This assertion covers the training path (Phase 1A): blockwise FP8 matmuls
+        # require BF16 master weights. Loading an FP8 checkpoint into a BF16 model
+        # (Phase 1B, archon_checkpoint.py) is a separate path and may relax this.
+        if self.config.archon.fp8_config.enabled:
+            if self.config.dtype != "bfloat16":
+                raise ValueError(
+                    f"FP8 training requires dtype=bfloat16 (master weights), "
+                    f"got {self.config.dtype}"
+                )
+            from areal.experimental.models.archon.fp8 import (
+                enable_fp8_experts,
+                enable_fp8_linear,
+            )
+
+            fp8_cfg = self.config.archon.fp8_config
+            enable_fp8_linear(
+                self.model,
+                exclude_fqns=set(fp8_cfg.exclude_modules),
+                use_triton=fp8_cfg.use_triton,
+            )
+            if fp8_cfg.include_experts:
+                enable_fp8_experts(self.model, use_triton=fp8_cfg.use_triton)
 
         # NOTE: may mutate self.config.pad_to_maximum and set env vars
         # (CUBLAS_WORKSPACE_CONFIG, NCCL_ALGO, TORCH_COMPILE_DETERMINISTIC).
@@ -317,6 +358,14 @@ class ArchonEngine(TrainEngine):
         self.logger.info(
             f"Applied parallelism in {time.perf_counter() - tik:.2f} seconds"
         )
+
+        if self.config.archon.fp8_config.enabled:
+            from areal.experimental.models.archon.fp8 import (
+                validate_fp8_shard_alignment,
+            )
+
+            parts = self.model_parts if self.parallel_dims.pp_enabled else [self.model]
+            validate_fp8_shard_alignment(parts)
 
         self._materialize_and_load_weights()
         self._create_optimizer(ft_spec)
@@ -391,7 +440,25 @@ class ArchonEngine(TrainEngine):
         gc.collect()
 
         if dist.is_initialized() and self.own_global_group:
+            # Pre-destroy synchronization on a CPU (gloo) group so that all
+            # ranks leave the NCCL collective phase together. Without this
+            # barrier, rank-0 (which owns the TCPStore server) may exit
+            # before peers finish their final NCCL abort, causing
+            # HeartbeatMonitor background threads on other ranks to observe
+            # "recvValue failed" on the already-closed store. This is
+            # harmless but produces a noisy stderr backtrace at teardown.
+            if getattr(self, "_cpu_group", None) is not None:
+                try:
+                    dist.barrier(group=self._cpu_group)
+                except Exception as e:
+                    self.logger.warning(
+                        f"pre-destroy CPU barrier failed (ignored): {e}"
+                    )
             dist.destroy_process_group()
+            # Make destroy() idempotent: if the controller calls destroy
+            # more than once (e.g. via cleanup hooks), the second call
+            # must not try to destroy already-destroyed groups.
+            self.own_global_group = False
         self._initialized = False
 
     def train(self, mode: bool = True):
@@ -457,7 +524,7 @@ class ArchonEngine(TrainEngine):
 
     def train_batch(
         self,
-        input_: dict[str, Any],
+        input_: list[dict[str, Any]] | dict[str, Any],
         loss_fn: Callable[..., torch.Tensor],
         loss_weight_fn: Callable[[dict[str, Any]], torch.Tensor],
     ) -> dict[str, float]:
@@ -465,7 +532,9 @@ class ArchonEngine(TrainEngine):
         assert self._initialized
         self.optimizer_zero_grad()
 
-        mb_list = self._prepare_mb_list(input_).to(self.device)
+        input_batched, _ = self._normalize_batch_input(input_)
+
+        mb_list = self._prepare_mb_list(input_batched).to(self.device)
 
         total_loss_weight = compute_total_loss_weight(
             mb_list, loss_weight_fn, self.data_parallel_group
@@ -486,19 +555,23 @@ class ArchonEngine(TrainEngine):
 
         self.forward_backward_batch(mb_list, process_output, forward_only=False)
 
-        return self.optimizer_step()
+        stats = self.optimizer_step()
+        stats["num_micro_batches"] = len(mb_list.mbs)
+        return stats
 
     @torch.no_grad()
     def eval_batch(
         self,
-        input_: dict[str, Any],
+        input_: list[dict[str, Any]] | dict[str, Any],
         loss_fn: Callable[..., torch.Tensor],
         loss_weight_fn: Callable[[dict[str, Any]], torch.Tensor],
     ) -> torch.Tensor | None:
         """Evaluate on a batch of data."""
         assert self._initialized
 
-        mb_list = self._prepare_mb_list(input_).to(self.device)
+        input_batched, _ = self._normalize_batch_input(input_)
+
+        mb_list = self._prepare_mb_list(input_batched).to(self.device)
 
         total_loss_weight = compute_total_loss_weight(
             mb_list, loss_weight_fn, self.data_parallel_group
@@ -531,20 +604,32 @@ class ArchonEngine(TrainEngine):
     @torch.no_grad()
     def forward_batch(
         self,
-        input_: dict[str, Any],
+        input_: list[dict[str, Any]] | dict[str, Any],
         output_seqlens: list[int] | None = None,
-        aggregate_fn: Callable[[list[Any]], Any] = torch.cat,
-    ) -> torch.Tensor:
+        aggregate_fn: Callable[[list[torch.Tensor]], torch.Tensor] = torch.cat,
+    ) -> torch.Tensor | list[torch.Tensor]:
         """Forward pass without gradient computation."""
         assert self._initialized
 
-        cu_seqlens = pack_tensor_dict(input_)["cu_seqlens"]
+        input_batched, meta = self._normalize_batch_input(input_)
+
+        if meta is not None:
+            assert isinstance(input_, list)
+            inferred_seqlens = [d["attention_mask"].shape[-1] for d in input_]
+            if output_seqlens is not None and output_seqlens != inferred_seqlens:
+                raise ValueError(
+                    f"output_seqlens mismatch for list input: "
+                    f"given {output_seqlens}, "
+                    f"inferred {inferred_seqlens} from attention_mask shapes."
+                )
+            output_seqlens = inferred_seqlens
+        cu_seqlens = pack_tensor_dict(input_batched)["cu_seqlens"]
         if output_seqlens is None:
             output_seqlens = (cu_seqlens[1:] - cu_seqlens[:-1]).cpu().numpy().tolist()
         assert output_seqlens is not None
         batch_size = len(output_seqlens)
 
-        mb_list = self._prepare_mb_list(input_).to(self.device)
+        mb_list = self._prepare_mb_list(input_batched).to(self.device)
 
         def process_output(
             logits: torch.Tensor, ctx_dict: dict[str, Any]
@@ -574,7 +659,9 @@ class ArchonEngine(TrainEngine):
                 group=self.parallel_dims.get_group("pp"),
             )
         assert res is not None
-        return res
+        if meta is None:
+            return res
+        return split_batch(res, meta)
 
     def connect_engine(self, engine: InferenceEngine, meta: WeightUpdateMeta):
         """Connect to an inference engine for rollout."""
@@ -633,57 +720,99 @@ class ArchonEngine(TrainEngine):
             dynamic_bs=dynamic_bs,
         )
 
-    def clear_batches(self, *args):
-        """Placeholder method of single-controller API."""
+    def clear_batches(self, shard_ids: list[str] | None = None) -> None:
+        """Drain this worker's client-side RTensor fetch buffer.
+
+        Called via RPC by ``TrainController.clear_batches`` at step end so
+        cross-node consumer DP heads release cached tensors. See #1209.
+        Non-DP-head ranks receive no positional args via
+        ``_call_workers`` (see train_controller.py:575-577) — accept the
+        no-args call and noop, since their ``_fetch_buffer`` is empty.
+        """
+        from areal.infra.rpc.rtensor import clear_fetch_buffer
+
+        if shard_ids:
+            clear_fetch_buffer(shard_ids)
+
+    def fetch_buffer_stats(self) -> dict[str, int]:
+        """Expose local fetch-buffer stats for post-step drain verification."""
+        from areal.infra.rpc.rtensor import fetch_buffer_stats
+
+        return fetch_buffer_stats()
 
     def update_weights(self, meta: WeightUpdateMeta):
         """Update weights to inference engine."""
         self._check_rollout_engine_connected()
-        if meta.type == "xccl":
-            assert self._weight_sync_state.group_initialized
-            tms_context = (
-                torch_memory_saver.disable()
-                if self.is_offload and not torch.version.hip
-                else nullcontext()
-            )
-            with tms_context:
+        with self._offload_aware_context():
+            if meta.type == "xccl":
+                assert self._weight_sync_state.group_initialized
                 update_weights_from_distributed(
                     state=self._weight_sync_state,
                     meta=meta,
                     engine=self,
                 )
-        elif meta.type == "disk":
-            update_weights_from_disk(
-                meta=meta,
-                engine=self,
-            )
+            elif meta.type == "disk":
+                update_weights_from_disk(
+                    meta=meta,
+                    engine=self,
+                )
+            else:
+                raise ValueError(f"Unknown weight update type {meta.type}")
 
     def save(self, meta: SaveLoadMeta):
         """Save model in HuggingFace or DCP format."""
-        if meta.weight_format == "hf":
-            save_model_to_hf(self, meta.path, meta.tokenizer, meta.processor)
-        elif meta.weight_format == "dcp":
-            save_to_dcp(self, meta.path, meta.with_optim)
-        else:
-            raise ValueError(f"Unknown weight format {meta.weight_format}.")
+        with self._offload_aware_context():
+            if meta.weight_format == "hf":
+                save_model_to_hf(self, meta.path, meta.tokenizer, meta.processor)
+            elif meta.weight_format == "dcp":
+                save_to_dcp(self, meta.path, meta.with_optim)
+            else:
+                raise ValueError(f"Unknown weight format {meta.weight_format}.")
 
-        if meta.with_optim and meta.weight_format == "hf":
-            save_optimizer_state(self, meta.path)
+            if meta.with_optim and meta.weight_format == "hf":
+                save_optimizer_state(self, meta.path)
 
     def load(self, meta: SaveLoadMeta):
         """Load model from HuggingFace or DCP format."""
-        if meta.weight_format == "hf":
-            load_model_from_hf(self, meta.path)
-        elif meta.weight_format == "dcp":
-            load_from_dcp(self, meta.path, meta.with_optim)
-        else:
-            raise ValueError(f"Unknown weight format {meta.weight_format}.")
+        with self._offload_aware_context():
+            if meta.weight_format == "hf":
+                load_model_from_hf(self, meta.path)
+            elif meta.weight_format == "dcp":
+                load_from_dcp(self, meta.path, meta.with_optim)
+            else:
+                raise ValueError(f"Unknown weight format {meta.weight_format}.")
 
-        if meta.with_optim and meta.weight_format == "hf":
-            load_optimizer_state(self, meta.path)
+            if meta.with_optim and meta.weight_format == "hf":
+                load_optimizer_state(self, meta.path)
+
+    @contextmanager
+    def _offload_aware_context(self):
+        """Temporarily onload parameters for offload-unsafe operations.
+
+        Reentrant: nested calls increment depth; only the outermost
+        call performs actual onload/offload transitions.
+        """
+        if not self.is_offload:
+            yield
+            return
+
+        self._offload_depth += 1
+        if self._offload_depth == 1:
+            self.onload()
+        try:
+            yield
+        finally:
+            self._offload_depth -= 1
+            if self._offload_depth == 0:
+                self.offload()
 
     def offload(self) -> None:
         """Offload model memory to CPU using torch_memory_saver."""
+        if not is_tms_enabled():
+            raise RuntimeError(
+                "torch_memory_saver requires `enable_offload=True` in yaml config."
+            )
+
         self.get_device_stats().log("before offload model")
 
         current_platform.clear_memory()
@@ -707,7 +836,10 @@ class ArchonEngine(TrainEngine):
 
     def export_stats(self) -> dict[str, float]:
         assert self._initialized
-        data = stats_tracker.export_all(reduce_group=self.data_parallel_group)
+        with self._offload_aware_context():
+            data = stats_tracker.export_all(
+                reduce_group=self.data_parallel_group,
+            )
         if self.parallel_dims.pp_enabled:
             data_list = [data]
             dist.broadcast_object_list(
@@ -938,6 +1070,7 @@ class ArchonEngine(TrainEngine):
 
     def _create_device_model(self):
         current_platform.set_device(int(os.environ["LOCAL_RANK"]))
+        current_platform.set_numa_affinity(int(os.environ["LOCAL_RANK"]))
         if current_platform.device_type == "cpu":
             self.device = torch.device("cpu")
         else:
@@ -1034,6 +1167,14 @@ class ArchonEngine(TrainEngine):
 
         self.logger.info(f"Created optimizer in {time.perf_counter() - tik:.2f}s")
 
+    @staticmethod
+    def _normalize_batch_input(
+        input_: list[dict[str, Any]] | dict[str, Any],
+    ) -> tuple[dict[str, Any], Any | None]:
+        if isinstance(input_, list):
+            return concat_batch(input_)
+        return input_, None
+
     def _prepare_mb_list(self, input_: dict[str, Any]) -> MicroBatchList:
         assert "attention_mask" in input_ and "input_ids" in input_
         input_ = input_.copy()
@@ -1082,9 +1223,14 @@ class ArchonEngine(TrainEngine):
         mb_list.mbs = [pack_tensor_dict(mb) for mb in mb_list.mbs]
 
         # LCM ensures page-aligned memory and exact CP slicing without extra padding.
+        model_config = (
+            self.model_config.text_config
+            if hasattr(self.model_config, "text_config")
+            else self.model_config
+        )
         page_size = max(
             DEFAULT_PAGE_SIZE_BYTES
-            // self.model_config.hidden_size
+            // model_config.hidden_size
             // torch.empty([], dtype=self.param_dtype).element_size(),
             1,
         )
@@ -1121,10 +1267,14 @@ class ArchonEngine(TrainEngine):
         loss_multiplier: float = 1.0,
     ) -> torch.Tensor:
         """Compute logprobs/entropy and return scaled loss."""
+        local_weight = loss_weight_fn(ctx.mb_input)
+        if local_weight == 0:
+            return logits.mean() * 0.0
+
         if not self.config.is_critic:
             result = self._gather_actor_train_outputs(logits, ctx)
             if result is None:
-                return logits.sum() * 0.0
+                return logits.mean() * 0.0
             logprobs, entropy, vocab_min_logits, vocab_max_logits = result
             loss = loss_fn(
                 logprobs,
@@ -1137,7 +1287,7 @@ class ArchonEngine(TrainEngine):
             values = self._gather_critic_output(logits, ctx)
             loss = loss_fn(values, ctx.mb_input)
 
-        loss_scale = loss_weight_fn(ctx.mb_input) / total_loss_weight * loss_multiplier
+        loss_scale = local_weight / total_loss_weight * loss_multiplier
         return loss * loss_scale
 
     def _compute_forward_result(
@@ -1271,6 +1421,15 @@ class ArchonPPOActor(ArchonEngine):
 
     @classmethod
     def as_controller(cls, config, scheduler: Scheduler):
+        if config._version == "v2":
+            from areal.trainer.ppo.actor import PPOActorControllerV2
+
+            return PPOActorControllerV2(
+                train_engine=cls,
+                config=config,
+                scheduler=scheduler,
+            )
+
         from areal.trainer.ppo.actor import PPOActorController
 
         return PPOActorController(train_engine=cls, config=config, scheduler=scheduler)
@@ -1294,6 +1453,15 @@ class ArchonPPOCritic(ArchonEngine):
 
     @classmethod
     def as_controller(cls, config, scheduler: Scheduler):
+        if config._version == "v2":
+            from areal.trainer.ppo.critic import PPOCriticControllerV2
+
+            return PPOCriticControllerV2(
+                train_engine=cls,
+                config=config,
+                scheduler=scheduler,
+            )
+
         from areal.trainer.ppo.critic import PPOCriticController
 
         return PPOCriticController(train_engine=cls, config=config, scheduler=scheduler)
@@ -1316,6 +1484,90 @@ class ArchonLMEngine(ArchonEngine):
 
     @classmethod
     def as_controller(cls, config: TrainEngineConfig, scheduler: Scheduler):
+        if config._version == "v2":
+            from areal.trainer.sft.lm_engine import LMControllerV2
+
+            return LMControllerV2(
+                train_engine=cls,
+                config=config,
+                scheduler=scheduler,
+            )
+
         from areal.trainer.sft.lm_engine import LMController
 
         return LMController(train_engine=cls, config=config, scheduler=scheduler)
+
+
+class ArchonRWEngine(ArchonEngine):
+    """Archon-based RW Engine for reward modeling."""
+
+    def __init__(self, config: TrainEngineConfig):
+        from copy import deepcopy
+
+        from areal.trainer.rw.rw_engine import RWEngine
+
+        super().__init__(config)
+        self.rw_engine = RWEngine(self)
+        if self.config.mb_spec.granularity != 2:
+            rw_logger = logging.getLogger("RWEngine")
+            rw_logger.warning("mb_spec.granularity must be 2 for reward modeling")
+            self.config = deepcopy(self.config)
+            self.config.mb_spec.granularity = 2
+
+    def train_rw(self, data):
+        return self.rw_engine.train_rw(data)
+
+    def evaluate_rw(self, data):
+        return self.rw_engine.evaluate_rw(data)
+
+    @classmethod
+    def as_controller(cls, config: TrainEngineConfig, scheduler: Scheduler):
+        if config._version == "v2":
+            from areal.trainer.rw.rw_engine import RWControllerV2
+
+            return RWControllerV2(train_engine=cls, config=config, scheduler=scheduler)
+
+        from areal.trainer.rw.rw_engine import RWController
+
+        return RWController(train_engine=cls, config=config, scheduler=scheduler)
+
+
+class ArchonDPOEngine(ArchonEngine):
+    """Archon-based DPO Engine for direct preference optimization."""
+
+    def __init__(self, config: DPOEngineConfig):
+        from copy import deepcopy
+
+        from areal.trainer.dpo.dpo_engine import DPOEngine
+
+        super().__init__(config)
+        self.dpo_engine = DPOEngine(self)
+        if self.config.mb_spec.granularity != 2:
+            dpo_logger = logging.getLogger("DPOEngine")
+            dpo_logger.warning("mb_spec.granularity must be 2 for DPO training")
+            self.config = deepcopy(self.config)
+            self.config.mb_spec.granularity = 2
+
+    def train_dpo(self, data):
+        return self.dpo_engine.train_dpo(data)
+
+    def evaluate_dpo(self, data):
+        return self.dpo_engine.evaluate_dpo(data)
+
+    def compute_logp(self, data: list[dict[str, Any]]) -> list[torch.Tensor] | None:
+        return self.dpo_engine.compute_logp(data)
+
+    @classmethod
+    def as_controller(
+        cls,
+        config: DPOEngineConfig,
+        scheduler: Scheduler,
+    ):
+        if config._version == "v2":
+            from areal.trainer.dpo.dpo_engine import DPOControllerV2
+
+            return DPOControllerV2(train_engine=cls, config=config, scheduler=scheduler)
+
+        from areal.trainer.dpo.dpo_engine import DPOController
+
+        return DPOController(train_engine=cls, config=config, scheduler=scheduler)

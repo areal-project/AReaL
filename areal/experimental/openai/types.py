@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 from __future__ import annotations  # noqa
 
 from dataclasses import dataclass, field
@@ -54,6 +56,10 @@ class InteractionWithTokenLogpReward:
 
     # Interaction ID cache (used for deserialization)
     _interaction_id: str | None = None
+
+    @property
+    def has_tensor_data(self) -> bool:
+        return self.model_response is not None or self._cache is not None
 
     @property
     def is_completion(self) -> bool:
@@ -198,3 +204,28 @@ class InteractionWithTokenLogpReward:
         )
         self._cache = result
         return result
+
+
+def concat_string_interactions(
+    interactions: dict[str, InteractionWithTokenLogpReward],
+) -> dict[str, list[dict]]:
+    """Concat interactions that lack tensor data (e.g. external API mode).
+
+    Returns a dict with an ``"interactions"`` key containing a list of
+    ``{"request": ..., "response": ..., "reward": ...}`` dicts, one per
+    interaction.  This is the counterpart of
+    :func:`~areal.utils.data.concat_padded_tensors` for string-only
+    trajectories.
+    """
+    return {
+        "interactions": [
+            {
+                "request": v.messages,
+                "response": (
+                    v.output_message_list[0]["content"] if v.output_message_list else ""
+                ),
+                "reward": v.reward,
+            }
+            for v in interactions.values()
+        ]
+    }

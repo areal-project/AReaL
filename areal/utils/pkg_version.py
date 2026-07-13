@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as get_version
 

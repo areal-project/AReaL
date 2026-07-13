@@ -1,0 +1,2 @@
+name = "fsdp-expert"
+model_instructions_file = "./fsdp-expert.md"

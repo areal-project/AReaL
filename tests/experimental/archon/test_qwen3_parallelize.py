@@ -143,7 +143,7 @@ def test_moe_qwen3_tp2_ep2_compile_forward_backward(tmp_path_factory):
     """Test MoE Qwen3 with TP=2 + EP=2 + torch.compile forward/backward (4 GPUs).
 
     This test covers the production scenario where TP, EP, and torch.compile
-    are all enabled together (e.g., Qwen3-30B-A3B with allocation_mode=d4t2e2).
+    are all enabled together (e.g., Qwen3-30B-A3B with backend=megatron:d4t2e2).
 
     IMPORTANT: This test requires 4 GPUs to properly test FSDP + TP + EP + compile.
     With 4 GPUs: dp_shard=2, tp=2, ep=2 → dp_shard_mod_ep=2 (enables FSDP sharding).

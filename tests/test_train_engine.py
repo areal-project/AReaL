@@ -79,6 +79,7 @@ def get_engine(engine_type: str, model_path: str):
     engine_cls = {"fsdp": FSDPEngine}[engine_type]
 
     engine_config = TrainEngineConfig(
+        backend="fsdp:d1",
         experiment_name=f"test-{engine_type}-engine",
         trial_name="test0",
         path=model_path,
@@ -101,7 +102,12 @@ def mock_loss_fn(
     return torch.mean(logprobs)
 
 
-@pytest.fixture(params=["fsdp"])
+@pytest.fixture(
+    params=[
+        {"type": "fsdp", "construction": "config"},
+        {"type": "fsdp", "construction": "from_pretrained"},
+    ]
+)
 def engine(request):
     os.environ.update(
         {
@@ -113,8 +119,31 @@ def engine(request):
         }
     )
 
-    engine = get_engine(request.param, MODEL_PATH)
-    print(f"✓ {request.param.upper()} Engine created successfully")
+    construction = request.param["construction"]
+    engine_type = request.param["type"]
+
+    if construction == "config":
+        engine = get_engine(engine_type, MODEL_PATH)
+    else:
+        # Create the engine using from_pretrained method, without TrainEngineConfig
+        from areal.engine import FSDPEngine
+
+        engine = FSDPEngine.from_pretrained(
+            model=MODEL_PATH,
+            experiment_name="test_exp",
+            trial_name="test_trial",
+            dp_size=1,
+            tp_size=1,
+            learning_rate=1e-5,
+        )
+
+        engine.create_process_group()
+        ft_spec = FinetuneSpec(
+            total_train_epochs=1, dataset_size=100, train_batch_size=2
+        )
+        engine.initialize(None, ft_spec)
+
+    print(f"✓ {engine_type.upper()} Engine created successfully")
     try:
         yield engine
     finally:
@@ -195,6 +224,7 @@ def test_hf_save_load_weights(tmp_path_factory, engine, mock_input):
     assert torch.allclose(old, new)
 
 
+@torch.no_grad()
 @pytest.mark.slow
 def test_dcp_save_load_weights(tmp_path_factory, engine, mock_input):
     tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
@@ -230,6 +260,7 @@ def test_dcp_save_load_weights(tmp_path_factory, engine, mock_input):
 )
 def test_train_engine_config_accepts_builtin_and_kernel_attn_impls(attn_impl):
     config = TrainEngineConfig(
+        backend="fsdp:d1",
         experiment_name="test-experiment",
         trial_name="trial0",
         path="test-model",
@@ -250,6 +281,7 @@ def test_train_engine_config_accepts_builtin_and_kernel_attn_impls(attn_impl):
 def test_train_engine_config_rejects_invalid_kernel_attn_impl(attn_impl):
     with pytest.raises(ValueError, match="attn_impl must be one of"):
         TrainEngineConfig(
+            backend="fsdp:d1",
             experiment_name="test-experiment",
             trial_name="trial0",
             path="test-model",
@@ -288,10 +320,12 @@ def test_create_llm_actor_or_critic_forwards_attn_impl(
     monkeypatch.setattr(fsdp_module, "AutoModelForCausalLM", FakeModelFactory)
 
     config = TrainEngineConfig(
+        backend="fsdp:d1",
         experiment_name="test-experiment",
         trial_name="trial0",
         path="test-model",
         attn_impl="kernels-community/flash-attn",
+        optimizer_dtype="bfloat16",
         fsdp=FSDPEngineConfig(memory_efficient_load=memory_efficient_load),
     )
     engine = fsdp_module.FSDPEngine(config)
@@ -327,6 +361,7 @@ def test_create_device_model_applies_use_kernels(monkeypatch, memory_efficient_l
     )
 
     config = TrainEngineConfig(
+        backend="fsdp:d1",
         experiment_name="test-experiment",
         trial_name="trial0",
         path="test-model",
@@ -343,6 +378,7 @@ def test_create_device_model_applies_use_kernels(monkeypatch, memory_efficient_l
         lambda: dummy_model,
     )
     monkeypatch.setenv("LOCAL_RANK", "0")
+    monkeypatch.setattr(dist, "get_rank", lambda group=None: 0)
 
     engine._create_device_model()
 
@@ -351,3 +387,63 @@ def test_create_device_model_applies_use_kernels(monkeypatch, memory_efficient_l
     assert engine.model.gradient_checkpointing_calls == [
         {"gradient_checkpointing_kwargs": {"use_reentrant": False}}
     ]
+
+
+def test_fsdp_engine_config_construction():
+    """Test that FSDPEngine.from_pretrained builds a valid config."""
+    import areal.engine.fsdp_engine as fsdp_module
+
+    engine = fsdp_module.FSDPEngine.from_pretrained(
+        model=MODEL_PATH,
+        experiment_name="test_exp",
+        trial_name="test_trial",
+        dp_size=1,
+        learning_rate=1e-5,
+        use_lora=True,
+    )
+    config = TrainEngineConfig(
+        path=MODEL_PATH,
+        backend="fsdp:d1t1",
+        optimizer=OptimizerConfig(lr=1e-5),
+        use_lora=True,
+    )
+    engine2 = fsdp_module.FSDPEngine(config=config)
+    assert engine.config.path == engine2.config.path
+    assert engine.config.backend == engine2.config.backend
+    assert engine.config.optimizer.lr == engine2.config.optimizer.lr
+    assert engine.config.use_lora == engine2.config.use_lora
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or torch.cuda.device_count() < 4
+    or int(os.environ.get("WORLD_SIZE", "1")) < 4,
+    reason="requires 4 GPUs and 4 processes (torchrun --nproc_per_node=4)",
+)
+def test_fsdp_engine_alloc_mode_construction():
+    """
+    Test that FSDPEngine.from_pretrained builds a valid config.
+
+    Run with 4 processes (required for dp_size=2, tp_size=2):
+        torchrun --nproc_per_node=4 -m pytest tests/test_train_engine.py -v -k test_fsdp_engine_alloc_mode_construction
+    """
+    import areal.engine.fsdp_engine as fsdp_module
+
+    engine = fsdp_module.FSDPEngine.from_pretrained(
+        model=MODEL_PATH,
+        experiment_name="test_exp",
+        trial_name="test_trial",
+        dp_size=2,
+        tp_size=2,
+        learning_rate=1e-5,
+        use_lora=True,
+    )
+
+    engine.create_process_group()
+
+    dist.barrier()
+
+    assert engine.parallel_helper.dp_size == 2
+    assert engine.parallel_helper.tp_size == 2
+
+    engine.destroy()

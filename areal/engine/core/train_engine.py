@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 """Core operations for training engines.
 
 This module provides stateless utility functions that are shared across
@@ -56,8 +58,10 @@ def compute_total_loss_weight(
         .clone()
         .to(dtype=torch.float32)
     )
-    assert total_weight != 0, "Total loss weight must be non-zero"
     dist.all_reduce(total_weight, group=dp_group)
+    assert total_weight > 0, (
+        "Global total loss weight must be positive after all_reduce"
+    )
     return total_weight
 
 

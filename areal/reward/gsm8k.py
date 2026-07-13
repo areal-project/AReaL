@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 from areal.utils import logging
 
 from . import get_math_verify_worker

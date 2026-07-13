@@ -5,14 +5,18 @@ on:
     branches: [main]
     paths:
       - 'pyproject.toml'
+      - 'pyproject.vllm.toml'
       - 'uv.lock'
+      - 'uv.vllm.lock'
       - 'areal/**'
       - '.github/workflows/install-test.yml'
   push:
     branches: [main]
     paths:
       - 'pyproject.toml'
+      - 'pyproject.vllm.toml'
       - 'uv.lock'
+      - 'uv.vllm.lock'
       - 'areal/**'
       - '.github/workflows/install-test.yml'
   workflow_dispatch:
@@ -39,7 +43,9 @@ jobs:
         uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
-          cache-dependency-glob: 'uv.lock'
+          cache-dependency-glob: |
+            uv.lock
+            uv.vllm.lock
 
       - name: Set up Python
         run: uv python install ${{ matrix.python-version }}
@@ -93,7 +99,9 @@ jobs:
         uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
-          cache-dependency-glob: 'uv.lock'
+          cache-dependency-glob: |
+            uv.lock
+            uv.vllm.lock
 
       - name: Set up Python
         run: uv python install 3.12
@@ -101,7 +109,12 @@ jobs:
       - name: Install package with CUDA extras (excluding flash-attn)
         # flash-attn requires CUDA toolkit for compilation, skip it in CI
         # Test individual extras that have pre-built wheels
-        run: uv sync --extra ${{ matrix.variant }} --extra megatron --extra tms
+        run: |
+          if [ "${{ matrix.variant }}" = "vllm" ]; then
+            cp pyproject.vllm.toml pyproject.toml
+            cp uv.vllm.lock uv.lock
+          fi
+          uv sync --extra ${{ matrix.variant }} --extra megatron --extra tms
 
       - name: Verify package import with CUDA extras
         run: |
@@ -134,7 +147,7 @@ jobs:
         variant: [sglang, vllm]
     name: Install test (Docker ${{ matrix.variant }} image)
     container:
-      image: ghcr.io/inclusionai/areal-runtime:dev-${{ matrix.variant }}
+      image: ghcr.io/areal-project/areal-runtime:dev-${{ matrix.variant }}
 
     steps:
       - name: Checkout repository

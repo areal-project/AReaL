@@ -81,6 +81,7 @@ def mock_input(
 def make_engine_with_tp(model_type: str, mb_spec: MicroBatchSpec, tp_size: int):
     """Create and initialize a ArchonEngine with Tensor Parallelism."""
     config = TrainEngineConfig(
+        backend=f"archon:t{tp_size}",
         experiment_name="test_archon_tp_forward",
         trial_name="test",
         path=MODEL_PATHS[model_type],

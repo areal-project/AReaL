@@ -15,7 +15,6 @@ cluster:
     type: nfs
     nfs_record_root: /path/to/name_resolve  # Replace with your name resolve directory
 
-allocation_mode: sglang:d6+archon:d2
 
 scheduler:
   type: local
@@ -29,6 +28,7 @@ gconfig:
   temperature: 1.0
 
 rollout:
+  backend: "sglang:d6"
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
   max_concurrent_rollouts: 256
@@ -40,7 +40,7 @@ rollout:
   fileroot: ${cluster.fileroot}
   tokenizer_path: ${tokenizer_path}
   dump_to_file: true
-  openai:
+  agent:
     mode: inline
     tool_call_parser: qwen25
     reasoning_parser: qwen3
@@ -49,6 +49,7 @@ rollout:
     turn_discount: 1.0
 
 actor:
+  backend: "archon:d2"
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
   path: Qwen/Qwen3-1.7B  # HuggingFace model path
@@ -76,7 +77,9 @@ actor:
   ppo_n_minibatches: 1
   recompute_logprob: true
   use_decoupled_loss: true
-  behave_imp_weight_cap: 5.0
+  rejection_sampling:
+    metric: ratio
+    upper: 5.0
   reward_norm: null
   adv_norm:
     mean_level: batch
@@ -96,6 +99,7 @@ actor:
         AREAL_PROXY_WARN_ONCE: "1" # Avoid warning spamming
 
 ref:
+  backend: ${actor.backend}
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
   path: ${actor.path}

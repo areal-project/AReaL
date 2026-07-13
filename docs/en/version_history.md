@@ -6,7 +6,7 @@ development history, highlighting the key contributions of each version release.
 ## AReaL-lite (July 2025): Simplifying RL for Everyone
 
 *📖
-[Step-by-step Tutorial](https://inclusionai.github.io/AReaL/en/tutorial/gsm8k_grpo.html)*
+[Step-by-step Tutorial](https://areal-project.github.io/AReaL/en/tutorial/gsm8k_grpo.html)*
 
 AReaL-lite represents a fundamental rethinking of how researchers interact with
 reinforcement learning systems. Born from the recognition that AReaL's system-first
@@ -31,7 +31,8 @@ the first place.
 
 ## AReaL v0.3 (August 2025): Breaking the Speed Barrier
 
-*📖 [Full Blog Post](https://github.com/inclusionAI/AReaL/blob/main/blog/AReaL_v0_3.md)*
+*📖
+[Full Blog Post](https://github.com/areal-project/AReaL/blob/main/blog/AReaL_v0_3.md)*
 
 Version 0.3 marked AReaL's boldest architectural leap: completely decoupling generation
 from training across separate GPU clusters. This wasn't just an incremental
@@ -57,7 +58,8 @@ workflows, opening new possibilities for complex reasoning applications.
 
 ## AReaL v0.2 (March 2025): Engineering Excellence Meets SOTA Performance
 
-*📖 [Full Blog Post](https://github.com/inclusionAI/AReaL/blob/main/blog/AReaL_v0_2.md)*
+*📖
+[Full Blog Post](https://github.com/areal-project/AReaL/blob/main/blog/AReaL_v0_2.md)*
 
 The second major release focused on transforming AReaL from a promising research
 prototype into a production-ready system. At the heart of v0.2 was the transition from
@@ -89,7 +91,8 @@ improvement** that made large-scale experiments accessible to more research team
 
 ## AReaL v0.1 (February 2025): The Foundation That Started It All
 
-*📖 [Full Blog Post](https://github.com/inclusionAI/AReaL/blob/main/blog/AReaL_v0_1.md)*
+*📖
+[Full Blog Post](https://github.com/areal-project/AReaL/blob/main/blog/AReaL_v0_1.md)*
 
 At its initial release, AReaL's 1.5B model surpassed o1-Preview on mathematical
 reasoning in just 40 hours of training. v0.1 also demonstrated emergent thinking

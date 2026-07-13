@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 # Adapted from torchtitan: torchtitan/models/qwen3/model/model.py
 
 import torch

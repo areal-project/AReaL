@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 """
 Vision SP Shard: distribute vision encoder work across Ulysses SP ranks.
 

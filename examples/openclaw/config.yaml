@@ -15,12 +15,11 @@ cluster:
     type: nfs
     nfs_record_root: /tmp/areal/name_resolve
 
-allocation_mode: sglang:d1 + fsdp:d1
-
 scheduler:
   type: local
 
 rollout:
+  backend: "sglang:d1"
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
   max_concurrent_rollouts: 256
@@ -31,14 +30,15 @@ rollout:
   scheduling_spec: ${actor.scheduling_spec}
   fileroot: ${cluster.fileroot}
   tokenizer_path: ${tokenizer_path}
-  dump_to_file: true
-  openai:
+  dump_to_file: false
+  agent:
     mode: online
     tool_call_parser: qwen
     reasoning_parser: qwen3
     export_style: individual
     turn_discount: 1.0
     admin_api_key: sk-test123456
+  admin_api_key: sk-test123456
 
 gconfig:
   n_samples: 1
@@ -48,6 +48,7 @@ gconfig:
   temperature: 1.0
 
 actor:
+  backend: "fsdp:d1"
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
   path: Qwen/Qwen2.5-1.5B-Instruct
@@ -75,7 +76,9 @@ actor:
   ppo_n_minibatches: 1
   recompute_logprob: true
   use_decoupled_loss: true
-  behave_imp_weight_cap: 5.0
+  rejection_sampling:
+    metric: ratio
+    upper: 5.0
   reward_norm:
     mean_level: group
     std_level: group

@@ -22,11 +22,11 @@ FLOPs by up to **10x** and achieves up to **7x** acceleration.
 
 ### Supported Backends
 
-| Backend  | Status    | Notes                              |
-| -------- | --------- | ---------------------------------- |
-| FSDP     | Supported | Via FlexAttention with block masks |
-| Megatron | Supported | Via PytorchFlexAttention module    |
-| Archon   | Supported | Via TreeAttentionWrapper           |
+| Backend  | Status    | Notes                                                   |
+| -------- | --------- | ------------------------------------------------------- |
+| FSDP     | Supported | Via FlexAttention with block masks                      |
+| Megatron | Supported | `mbridge` only (`megatron-bridge` is not supported yet) |
+| Archon   | Supported | Via TreeAttentionWrapper                                |
 
 ## Configuration
 
@@ -169,6 +169,9 @@ The dict keys are `tree_block_mask` or `tree_triton_data` depending on the backe
 ### Megatron Engine
 
 **Key file:** `areal/engine/megatron_engine.py`
+
+> **Current limitation**: Tree training in `MegatronEngine` currently supports only the
+> `mbridge` backend. `megatron-bridge` is not supported in this path yet.
 
 Megatron uses `patch_bridge_for_tree_training` context manager during model creation:
 

@@ -6,7 +6,8 @@ python examples/vlm_npu/virl39k_grpo.py \
    --config examples/vlm_npu/qwen2_5_vl_3b_geometry3k_grpo.yaml \
    scheduler.type=ray \
    experiment_name=virl39k-grpo-multiNode \
-   allocation_mode=vllm:d32+d16 \
+   rollout.backend=vllm:d32 \
+   actor.backend=fsdp:d16 \
    cluster.n_nodes=3 \
    cluster.n_gpus_per_node=16 \
    train_dataset.path=data/ViRL39K \

@@ -74,6 +74,7 @@ def create_batch(model_path: str, dataset_path: str) -> dict:
 def create_config(engine_type: str, model_path: str) -> TrainEngineConfig:
     """Create engine configuration."""
     return TrainEngineConfig(
+        backend="fsdp:d1",
         experiment_name=f"test_{engine_type}_logits",
         trial_name="test",
         path=model_path,

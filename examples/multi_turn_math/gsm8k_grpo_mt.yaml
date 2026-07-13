@@ -18,12 +18,12 @@ cluster:
     type: nfs
     nfs_record_root: /tmp/areal/name_resolve
 
-allocation_mode: sglang:d4p1t1+d4p1t1
 
 scheduler:
   type: null
 
 rollout:
+  backend: "sglang:d4p1t1"
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
   max_concurrent_rollouts: 256
@@ -44,6 +44,7 @@ gconfig:
   temperature: 1.0
 
 actor:
+  backend: "fsdp:d4p1t1"
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
   path: Qwen/Qwen2.5-1.5B-Instruct
@@ -71,7 +72,9 @@ actor:
   ppo_n_minibatches: 1
   recompute_logprob: true
   use_decoupled_loss: true
-  behave_imp_weight_cap: 5.0
+  rejection_sampling:
+    metric: ratio
+    upper: 5.0
   reward_norm:
     mean_level: group
     std_level: group
@@ -89,6 +92,7 @@ actor:
       env_vars: {}
 
 ref:
+  backend: ${actor.backend}
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
   path: ${actor.path}

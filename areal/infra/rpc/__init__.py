@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 """RPC modules for remote communication."""
 
 from .rtensor import RTensor, TensorShardInfo

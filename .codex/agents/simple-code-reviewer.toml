@@ -1,0 +1,2 @@
+name = "simple-code-reviewer"
+model_instructions_file = "./simple-code-reviewer.md"

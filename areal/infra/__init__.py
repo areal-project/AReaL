@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 """Core components for AREAL."""
 
 from . import workflow_context

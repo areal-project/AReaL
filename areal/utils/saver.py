@@ -1,7 +1,14 @@
+# SPDX-License-Identifier: Apache-2.0
+from __future__ import annotations
+
 import getpass
 import os
+from typing import TYPE_CHECKING
 
-from transformers import AutoProcessor, PreTrainedTokenizerFast
+from transformers import PreTrainedTokenizerFast
+
+if TYPE_CHECKING:
+    from transformers import AutoProcessor
 
 from areal.api import FinetuneSpec, SaveLoadMeta, TrainEngine
 from areal.api.cli_args import SaverConfig

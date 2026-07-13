@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 # High-level FP8 quantization and dequantization utilities
 # Adapted from slime
 

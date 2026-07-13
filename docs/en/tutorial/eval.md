@@ -27,14 +27,14 @@ For distributed evaluation:
 python3 examples/math/gsm8k_eval.py \
     --config examples/math/gsm8k_grpo.yaml \
     scheduler.type=ray \
-    allocation_mode=sglang:d12p1t1 \
+    rollout.backend=sglang:d12p1t1 \
     cluster.n_nodes=3
 
 # With Slurm (12 nodes, 96 GPUs)
 python3 examples/math/gsm8k_eval.py \
     --config examples/math/gsm8k_grpo.yaml \
     scheduler.type=slurm \
-    allocation_mode=sglang:d96p1t1 \
+    rollout.backend=sglang:d96p1t1 \
     cluster.n_nodes=12
 ```
 
@@ -113,19 +113,19 @@ GPUs.
 ## Implementation
 
 See
-[`examples/math/gsm8k_eval.py`](https://github.com/inclusionAI/AReaL/blob/main/examples/math/gsm8k_eval.py)
+[`examples/math/gsm8k_eval.py`](https://github.com/areal-project/AReaL/blob/main/examples/math/gsm8k_eval.py)
 for a complete example. The key pattern:
 
 ```python
-from areal.api.alloc_mode import AllocationMode
+from areal.api.alloc_mode import ModelAllocation
 from areal.api.cli_args import GRPOConfig, SGLangConfig, load_expr_config, vLLMConfig
 from areal.engine.sglang_remote import RemoteSGLangEngine
 from areal.engine.vllm_remote import RemotevLLMEngine
 from areal.infra import LocalScheduler, RayScheduler, SlurmScheduler
 
-# Load config and parse allocation mode
+# Load config and parse rollout backend
 config, _ = load_expr_config(args, GRPOConfig)
-allocation_mode = AllocationMode.from_str(config.allocation_mode)
+rollout_alloc = ModelAllocation.from_str(config.rollout.backend)
 
 # Initialize scheduler based on config
 if config.scheduler.type == "local":
@@ -136,26 +136,26 @@ elif config.scheduler.type == "slurm":
     scheduler = SlurmScheduler(exp_config=config)
 
 # Select inference engine and build server args
-if allocation_mode.gen_backend == "sglang":
+if rollout_alloc.backend == "sglang":
     engine_cls = RemoteSGLangEngine
     server_args = SGLangConfig.build_args(
         sglang_config=config.sglang,
-        tp_size=allocation_mode.gen.tp_size,
+        tp_size=rollout_alloc.tp_size,
         base_gpu_id=0,
     )
-elif allocation_mode.gen_backend == "vllm":
+elif rollout_alloc.backend == "vllm":
     engine_cls = RemotevLLMEngine
     server_args = vLLMConfig.build_args(
         vllm_config=config.vllm,
-        tp_size=allocation_mode.gen.tp_size,
-        pp_size=allocation_mode.gen.pp_size,
+        tp_size=rollout_alloc.tp_size,
+        pp_size=rollout_alloc.pp_size,
     )
 
 # Create controller and initialize
 eval_rollout = engine_cls.as_controller(config.rollout, scheduler)
 eval_rollout.initialize(
     role="eval-rollout",
-    alloc_mode=allocation_mode,
+    rollout_alloc=rollout_alloc,
     server_args=server_args,
 )
 
@@ -197,13 +197,12 @@ experiment_name: gsm8k-eval
 trial_name: eval0
 seed: 1
 
-allocation_mode: sglang:d4p1t1  # Inference-only allocation
+rollout:
+  backend: "sglang:d4p1t1"  # Inference-only allocation
+  max_concurrent_rollouts: 256
 
 scheduler:
   type: local  # or 'ray', 'slurm'
-
-rollout:
-  max_concurrent_rollouts: 256
   # max_head_offpolicyness is set to 1e12 internally for eval
 
 gconfig:

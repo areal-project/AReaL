@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 import asyncio
 import atexit
 import concurrent.futures
@@ -5,52 +7,64 @@ import inspect
 import threading
 import weakref
 from functools import partial
+from typing import Any
 
 from areal.utils import logging
 
 # Logger for event loop cleanup functionality
 logger = logging.getLogger("ConcurrentUtils")
 
-# Lazy-initialized shared executor to reduce thread creation/destruction overhead
-# when run_async_task is called frequently
-_shared_executor: concurrent.futures.ThreadPoolExecutor | None = None
-_executor_lock = threading.Lock()
+_executors: dict[str, concurrent.futures.ThreadPoolExecutor] = {}
+_executors_lock = threading.Lock()
+_atexit_registered = False
 
 
-def get_executor() -> concurrent.futures.ThreadPoolExecutor:
-    """Get or create the shared thread pool executor.
+def get_executor(
+    scope: str = "default", *, max_workers: int = 4
+) -> concurrent.futures.ThreadPoolExecutor:
+    """Get or create a named thread pool executor.
 
-    This provides a global shared executor for background tasks that need
-    to run in separate threads. The executor is lazily initialized and
-    automatically cleaned up at process exit.
+    Executors are lazily created per *scope* and cached for the process
+    lifetime.  Using distinct scopes prevents deadlocks when tasks in one
+    pool synchronously wait on tasks they submit to the same pool.
 
-    Returns
-    -------
-    ThreadPoolExecutor
-        A shared thread pool executor with 4 workers.
+    Parameters
+    ----------
+    scope : str
+        Logical namespace for the executor (e.g. ``"default"``,
+        ``"ctrl_init"``).  Each scope gets its own independent pool.
+    max_workers : int
+        Thread count for a *newly created* pool.  Ignored if the pool for
+        *scope* already exists.
     """
-    global _shared_executor
-    if _shared_executor is None:
-        with _executor_lock:
-            if _shared_executor is None:
-                _shared_executor = concurrent.futures.ThreadPoolExecutor(
-                    max_workers=4, thread_name_prefix="shared_executor"
-                )
-                # Register cleanup on process exit
-                atexit.register(_shutdown_executor)
-    return _shared_executor
+    global _atexit_registered
+
+    executor = _executors.get(scope)
+    if executor is not None:
+        return executor
+
+    with _executors_lock:
+        executor = _executors.get(scope)
+        if executor is not None:
+            return executor
+
+        executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=max_workers, thread_name_prefix=f"exec_{scope}"
+        )
+        _executors[scope] = executor
+
+        if not _atexit_registered:
+            atexit.register(_shutdown_all_executors)
+            _atexit_registered = True
+
+    return executor
 
 
-def _shutdown_executor() -> None:
-    """Shutdown the shared thread pool executor if it exists.
-
-    Called via atexit at process exit, when no other threads should be
-    accessing the executor.
-    """
-    global _shared_executor
-    if _shared_executor is not None:
-        _shared_executor.shutdown(wait=False)
-        _shared_executor = None
+def _shutdown_all_executors() -> None:
+    with _executors_lock:
+        for executor in _executors.values():
+            executor.shutdown(wait=False)
+        _executors.clear()
 
 
 def run_async_task(func, *args, **kwargs):
@@ -67,6 +81,21 @@ def run_async_task(func, *args, **kwargs):
     else:
         # Not in async context, use asyncio.run directly
         return asyncio.run(func(*args, **kwargs))
+
+
+def call_maybe_async(method, *args, **kwargs) -> None:
+    """Call a callable and await it if it returns an awaitable.
+
+    This helper lets sync call-sites invoke methods that may be implemented as
+    either sync or async without branching at every call site.
+    """
+    result: Any = method(*args, **kwargs)
+    if inspect.isawaitable(result):
+
+        async def _wait_result() -> None:
+            await result
+
+        run_async_task(_wait_result)
 
 
 # ============================================================================

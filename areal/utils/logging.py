@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 import logging.config
 import os
 import threading
@@ -38,10 +40,12 @@ LOGGER_COLORS_EXACT = {
     "LocalScheduler": "blue",
     "RayScheduler": "blue",
     "SlurmScheduler": "blue",
+    "InfLocalScheduler": "blue",
     # Launchers - blue
     "LocalLauncher": "blue",
     "RayLauncher": "blue",
     "SlurmLauncher": "blue",
+    "InfCli": "blue",
     # Workflows - purple
     "RLVRWorkflow": "light_purple",
     "VisionRLVRWorkflow": "light_purple",
@@ -51,6 +55,7 @@ LOGGER_COLORS_EXACT = {
     "TrainController": "white",
     "RolloutController": "white",
     "WorkflowExecutor": "white",
+    "AgentCli": "white",
     # Stats/Perf - green
     "StatsLogger": "light_green",
     "StatsTracker": "light_green",
@@ -59,6 +64,7 @@ LOGGER_COLORS_EXACT = {
     "SyncRPCServer": "white",
     "RayRPCServer": "white",
     "RPCSerialization": "white",
+    "HttpRTensor": "white",
     # Inference wrappers - white
     "SGLangWrapper": "white",
     "VLLMWrapper": "white",
@@ -94,6 +100,10 @@ LOGGER_COLORS_EXACT = {
     "CUDAPlatform": "light_cyan",
     "NPUPlatform": "light_cyan",
     "UnknownPlatform": "light_cyan",
+    # Sandbox backends
+    "DaytonaClientManager": "blue",
+    "DaytonaRunner": "light_cyan",
+    "DaytonaPythonTool": "light_purple",
     # OpenAI - purple
     "OpenAIClient": "light_purple",
     "OpenAICache": "light_purple",
@@ -101,15 +111,17 @@ LOGGER_COLORS_EXACT = {
     "ToolCallParser": "light_purple",
     "TokenLogpReward": "light_purple",
     "ProxyUtils": "light_purple",
+    "AReaL-SWEAgent": "light_purple",
+    "SWETrain": "light_green",
     # Agent Service - purple
     "AgentGateway": "light_purple",
     "AgentBridge": "light_purple",
     "AgentRouter": "light_purple",
     "AgentWorker": "light_purple",
     "AgentDataProxy": "light_purple",
-    "AgentServiceController": "light_purple",
+    "AgentController": "light_purple",
     # Inference service - white (orchestration)
-    "GatewayInferenceController": "white",
+    "RolloutControllerV2": "white",
     "InferenceDataProxy": "white",
     "InferenceInfBridge": "white",
     "InferenceRouter": "white",
@@ -292,6 +304,38 @@ log_config = {
             "handlers": ["systemHandler"],
             "level": LOGLEVEL,
         },
+        # Suppress verbose HTTP loggers from third-party libraries.
+        "uvicorn": {"handlers": [], "level": "WARNING", "propagate": False},
+        "uvicorn.access": {
+            "handlers": [],
+            "level": "WARNING",
+            "propagate": False,
+        },
+        "uvicorn.error": {
+            "handlers": [],
+            "level": "WARNING",
+            "propagate": False,
+        },
+        "httpx": {"handlers": [], "level": "WARNING", "propagate": False},
+        "httpcore": {"handlers": [], "level": "WARNING", "propagate": False},
+        "aiohttp": {"handlers": [], "level": "WARNING", "propagate": False},
+        "aiohttp.access": {
+            "handlers": [],
+            "level": "WARNING",
+            "propagate": False,
+        },
+        "aiohttp.server": {
+            "handlers": [],
+            "level": "WARNING",
+            "propagate": False,
+        },
+        "werkzeug": {"handlers": [], "level": "WARNING", "propagate": False},
+        "urllib3": {"handlers": [], "level": "WARNING", "propagate": False},
+        "urllib3.connectionpool": {
+            "handlers": [],
+            "level": "WARNING",
+            "propagate": False,
+        },
     },
     "disable_existing_loggers": True,
 }
@@ -335,6 +379,34 @@ def getLogger(
                 logger.addHandler(handler)
 
     return logger
+
+
+_HTTP_LOGGERS = (
+    "uvicorn",
+    "uvicorn.access",
+    "uvicorn.error",
+    "httpx",
+    "httpcore",
+    "aiohttp",
+    "aiohttp.access",
+    "aiohttp.server",
+    "werkzeug",
+    "urllib3",
+    "urllib3.connectionpool",
+)
+
+
+def suppress_http_loggers() -> None:
+    """Force all HTTP-related loggers to WARNING.
+
+    Call this from service __main__.py right before uvicorn.run() or
+    app.run() to ensure third-party HTTP loggers stay quiet even after
+    uvicorn/Flask reconfigure the logging hierarchy.
+    """
+    import logging as _logging
+
+    for name in _HTTP_LOGGERS:
+        _logging.getLogger(name).setLevel(_logging.WARNING)
 
 
 def setup_file_logging(
@@ -413,7 +485,7 @@ _LATEST_LOG_STEP = 0
 
 
 def log_swanlab_wandb_tensorboard(data, step=None, summary_writer=None):
-    # Logs data to SwanLab、 wandb、 TensorBoard.
+    # Logs data to SwanLab, wandb, TensorBoard, and Trackio.
 
     global _LATEST_LOG_STEP
     if step is None:
@@ -433,6 +505,14 @@ def log_swanlab_wandb_tensorboard(data, step=None, summary_writer=None):
     import wandb
 
     wandb.log(data, step=step)
+
+    # trackio
+    try:
+        import trackio
+
+        trackio.log(data, step=step)
+    except (ModuleNotFoundError, ImportError):
+        pass
 
     # tensorboard
     if summary_writer is not None:

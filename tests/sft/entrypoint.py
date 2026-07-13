@@ -7,7 +7,7 @@ import torch.distributed as dist
 from areal import SFTTrainer
 from areal.api.cli_args import SFTConfig, load_expr_config
 from areal.dataset import get_custom_dataset
-from areal.utils import stats_tracker
+from areal.infra.data_service.rdataset import RDataset
 from areal.utils.hf_utils import load_hf_tokenizer
 
 
@@ -20,11 +20,13 @@ class MinimalSFTTrainer(SFTTrainer):
 
     def _export_and_commit_stats(self, epoch, epoch_step, global_step):
         # Collect stats before committing
-        stats = stats_tracker.export_all(reduce_group=self.actor.data_parallel_group)
+        stats = self.actor.export_stats()
         self.losses_history.append(stats["sft/loss/avg"])
 
 
 def main() -> None:
+    os.environ["AREAL_SPMD_MODE"] = "0"
+
     config, _ = load_expr_config(sys.argv[1:], SFTConfig)
     tokenizer = load_hf_tokenizer(config.tokenizer_path)
 
@@ -32,6 +34,10 @@ def main() -> None:
         split="train",
         dataset_config=config.train_dataset,
         tokenizer=tokenizer,
+    )
+    assert isinstance(train_dataset, RDataset), (
+        "SFT integration test expects get_custom_dataset() to return RDataset "
+        "(single-controller data service path)."
     )
 
     with MinimalSFTTrainer(

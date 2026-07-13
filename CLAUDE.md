@@ -40,6 +40,7 @@ uv --version                  # Install: https://docs.astral.sh/uv/
 
 # Sync dependencies
 uv sync --extra cuda          # CUDA + SGLang inference (default)
+# For vLLM: cp pyproject.vllm.toml pyproject.toml && cp uv.vllm.lock uv.lock && uv sync --extra cuda
 uv sync --group dev           # Include dev/test packages
 uv run python3 areal/tools/validate_installation.py  # Validate installation
 
@@ -107,8 +108,8 @@ uv run python docs/generate_cli_docs.py
 
 ## Git Workflow
 
-- **Commits**: Conventional Commits (`feat:`, `fix:`, `docs:`), ~72 chars subject,
-  imperative voice, reasoning in body
+- **Commits**: Conventional Commits (e.g., `feat:`, `fix:`, `docs:`, `gov:`), ~72 chars
+  subject, imperative voice, reasoning in body
 - **Squash**: Squash WIP commits before opening PR
 - **PR requirements**: Run pre-commit, document test coverage, note hardware limitations
 

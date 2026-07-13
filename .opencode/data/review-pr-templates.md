@@ -1,424 +1,320 @@
-# PR Review: Task Templates Reference
+# PR Review: Domain Templates Reference
 
-This file contains the review task templates for PR review. Referenced by:
+This file contains canonical domain templates for PR review. Referenced by:
 `.opencode/command/review-pr.md`
 
 ______________________________________________________________________
 
-## Framework-Specific Review Task Templates
+## Template Selection Rules
 
-### Archon Tasks \[deep\]
+1. Select templates by detected L1 domains and L2 signals.
+1. Use at most one primary template per domain.
+1. Always include **General Logic & Boundary** for non-doc/config-only PRs.
+1. Apply cross-domain linkage checks from `review-pr-domains-and-signals.md`.
 
-**Task: Archon EP/ETP Strategy Correctness Review**
+______________________________________________________________________
+
+## Universal Template
+
+### General Logic & Boundary
 
 ```
+Applicable: Any non-doc/config-only change
 Checklist:
-- ExpertParallel, TensorParallel, ExpertTensorParallel placement implementation
-- Placement dimension matching with mesh dimensions
-- Placement list length in _partition_fn
-- all_to_all communication autograd compatibility
-- ReordererSequenceParallel token index conversion
-```
-
-**Task: ArchonParallelDims Configuration Validation**
-
-```
-Checklist:
-- ETP constraint: etp=1 (TP borrowed by EP) vs etp=tp (independent TP) logic
-- Mesh construction: _build_mesh_with_ep() dimension order and names
-- EP/TP/CP combination validity verification
-- dp_shard * cp * (tp if etp==1 else 1) % ep == 0 constraint
-```
-
-**Task: MoE Layer Implementation Correctness**
-
-```
-Checklist:
-- TokenReorderer and router separation correctness
-- grouped_mm token alignment (8/16/32)
-- Expert weight 3D tensor sharding
-- Load balancing loss calculation
-```
-
-**Task: Model Parallelization Application Order**
-
-```
-Checklist:
-- apply_moe_ep_tp() strategy selection logic
-- FSDP wrap order (EP -> TP -> AC -> FSDP)
-- torch.compile dynamic shape marking
-- Explicit prefetching configuration
-```
-
-### FSDP Tasks \[deep / unspecified-high\]
-
-**Task: FSDP Core Correctness \[deep\]**
-
-```
-Checklist:
-- Shard/reshard operation timing and correctness
-- ShardedTensor and DTensor conversion
-- Mixed precision (param_dtype vs reduce_dtype)
-```
-
-**Task: FSDP Interaction with Other Parallel Strategies \[deep\]**
-
-```
-Checklist:
-- FSDP must be applied after TP/CP/EP
-- Use dp_shard_mod_ep mesh in EP scenarios
-- Gradient divide factor relationship with world size
-```
-
-**Task: FSDP State Management \[unspecified-high\]**
-
-```
-Checklist:
-- state_dict save/load sharded vs full mode
-- Optimizer state sharding and aggregation
-- Checkpoint compatibility
-```
-
-### Megatron Tasks \[deep\]
-
-**Task: Pipeline Parallelism Correctness**
-
-```
-Checklist:
-- Stage splitting correctness and balance
-- Micro-batch scheduling
-- Pipeline flush and bubble handling
-```
-
-**Task: Megatron Model Sharding**
-
-```
-Checklist:
-- Weight sharding and synchronization
-- Tied weights handling
-- Embedding/output layer parallel strategy
-```
-
-### DCP/Checkpoint Tasks \[deep\]
-
-**Task: Distributed Checkpoint Correctness**
-
-```
-Checklist:
-- All ranks participate in DCP save/load operations
-- State dict keys match between save and load
-- No tensor shape/dtype mismatches
-- Storage backend compatibility (filesystem, S3)
-- Checkpoint versioning and migration
-```
-
-**Task: FSDP2 + DCP Integration**
-
-```
-Checklist:
-- FSDP2 state dict options (full vs sharded)
-- Optimizer state handling with DCP
-- Async checkpointing correctness
-- Checkpoint resumption logic
-```
-
-### Trainer Tasks \[deep\]
-
-**Task: Trainer Core Logic**
-
-```
-Checklist:
-- PPOTrainer/SFTTrainer initialization correctness
-- Workflow registration and invocation
-- Engine lifecycle management
-- Distributed training coordination
+- Boundary condition correctness (empty inputs, singleton, max-size)
+- Conditional logic correctness (branch inversion, short-circuit mistakes)
+- Error-path behavior (exceptions propagated with actionable context)
+- Return-value consistency across code paths
+- No newly introduced hidden behavior changes
 ```
 
 ______________________________________________________________________
 
-## General Review Task Templates
-
-### Logic and Boundary Conditions \[deep\]
+## Domain 1 Template: Distributed Runtime Review \[comprehensive\]
 
 ```
-Applicable: Any non-doc/config changes
+Applicable signals: archon_core, archon_parallel, process_group, fsdp_core, megatron_core, collectives, mesh_dtensor, activation_checkpointing, weight_sync
 Checklist:
-- Conditional logic errors (if/else inversion, boundary condition omission, short-circuit issues)
-- Loop errors (off-by-one, infinite loops, early exit, iterator invalidation)
-- Missing null/None/empty list handling
-- Type mismatch or implicit type conversion issues
-- Improper exception handling (swallowing exceptions, wrong exception type, return in finally)
-- Return value errors (wrong type, missing return, inconsistent multi-path returns)
-- Boolean expression errors (De Morgan's law violation, precedence errors)
+- Archon engine and checkpoint lifecycle remain aligned with distributed runtime assumptions
+- FSDP and Megatron engine invariants still match process-group, sharding, and pipeline assumptions
+- Archon parallel-dims and mesh construction still match downstream placement logic
+- Process-group creation/usage/cleanup is rank-consistent
+- Collective operations are called by all required ranks in consistent order
+- DeviceMesh dimensions and DTensor placements are correct for each path
+- Activation checkpoint placement remains compatible with parallel and sharding order requirements
+- Local/global tensor conversion boundaries are explicit and correct
+- Weight version propagation and update ordering are deterministic
+- No debug-only barriers left in hot path
 ```
 
-### Concurrency and Async \[deep\]
+## Domain 2 Template: Model Compute & Attention Review \[comprehensive\]
 
 ```
-Applicable: ASYNC_CONCURRENT type detected
+Applicable signals: tree_attn, sdpa_varlen, sp_cp_attention_mask, triton_kernel, archon_model_family, archon_attention_stack, archon_moe_modeling
 Checklist:
-- Race conditions
-- Deadlock risks (inconsistent lock ordering, nested locks)
-- Non-thread-safe access to shared state
-- Missing await in async code
-- Blocking calls in async functions (should use executor)
-- Resource leaks (file handles, network connections, GPU memory not released)
-- State inconsistency (dirty state after partial update failure)
-- Improper context manager usage
-- Signal handling and graceful shutdown issues
+- Attention mask semantics preserved under TP/SP/CP
+- Archon model-family registration and per-family wiring remain internally consistent
+- Archon attention/Ulysses slicing and gather paths preserve layout assumptions
+- Archon MoE router, grouped experts, and weight-conversion interfaces remain aligned
+- Tree attention index/order invariants are maintained
+- Kernel assumptions on dtype/shape/contiguity are satisfied
+- No silent behavior change in sequence packing/unpacking
+- Tensor layouts remain compatible with downstream modules
 ```
 
-### Tensor Shape and Data Type \[deep\]
+## Domain 3 Template: Inference Backend & Serving Review \[comprehensive\]
 
 ```
-Applicable: TENSOR_OPS type detected with complex tensor operations
+Applicable signals: vllm_ext, remote_inference_backend, request_lifecycle
 Checklist:
-- Tensor shape mismatch (dimension errors, broadcast errors)
-- Batch dimension handling errors (missing batch dim, wrong dimension order)
-- Sequence length and padding handling (missing mask, padding token in computation)
-- Index out of bounds risk (dynamic indexing, negative indexing)
-- dtype mismatch (fp16/fp32/bf16 mixing, integer overflow)
-- Device placement errors (tensor on wrong device, CPU/GPU mixed operations)
-- Gradient-related issues (missing detach, missing no_grad context, gradient accumulation errors)
-- view/reshape contiguity requirements
-- In-place operation effects on gradient computation
+- Request lifecycle (enqueue, execution, cancellation, timeout) is coherent
+- Worker state transitions are safe under concurrency
+- Backend-specific extension points stay API-compatible
+- Error handling does not strand in-flight requests
+- Versioning/weight-update interactions are explicit and safe
 ```
 
-### Numerical Stability \[unspecified-high\]
+## Domain 4 Template: Service Orchestration Review \[comprehensive\]
 
 ```
-Applicable: NUMERICAL type detected
+Applicable signals: service_routing_dataflow, session_consistency
 Checklist:
-- Numerical precision issues (floating point precision loss, accumulated errors)
-- Numerical stability (log(0), division by zero, exp overflow, softmax stability)
-- Numerical issues in loss function computation
-- Gradient vanishing/exploding risks
-- Scaling issues in mixed precision training
+- Gateway/router/data-proxy routing rules are deterministic
+- Session affinity and history consistency are preserved
+- Controller/worker coordination has no lost-update window
+- Async boundaries avoid blocking operations in critical paths
+- Failure/retry behavior does not duplicate or drop work
 ```
 
-### Tensor Parallel (TP) Correctness \[deep\]
+## Domain 5 Template: Workflow & Trainer Contract Review \[comprehensive\]
 
 ```
-Applicable: TENSOR_PARALLEL or DISTRIBUTED_COMM type detected
+Applicable signals: workflow_engine_boundary, dataset_surface, async_contract, weight_version_contract
 Checklist:
-- Missing or misplaced all-reduce
-- Missing or misplaced all-gather
-- Reduce handling after weight sharding (column/row sharding)
-- Input Replicate / output Partial DTensor semantics
-- scatter/gather correctness in Sequence Parallel (SP)
-- TP group communication correctness
+- RolloutWorkflow and Engine interfaces remain contract-compatible
+- Dataset/output structure still matches workflow and trainer consumption expectations
+- Async flow uses await consistently and avoids sync I/O in async paths
+- Weight update/version handshake is preserved end-to-end
+- Trainer lifecycle transitions are valid for all execution branches
+- Call ordering assumptions across trainer/workflow/engine are unchanged or justified
 ```
 
-### Communication and Synchronization \[unspecified-high\]
+## Domain 6 Template: API & Config Compatibility Review \[targeted\]
 
 ```
-Applicable: DISTRIBUTED_COMM type detected
+Applicable signals: dataclass_schema, cli_compat, backward_compat, project_dependency_config
 Checklist:
-- Process group usage errors
-- Device mesh configuration errors
-- Improper barrier placement
-- Unnecessary synchronization operations (GPU-CPU sync)
-- Collective communication order dependencies
+- Public API signature and default value changes are intentional and compatible
+- Dataclass validation remains complete and informative
+- CLI options preserve expected compatibility semantics
+- New fields include safe defaults or explicit migration handling
+- Breaking changes are documented and scoped
+- Dependency and build-system changes remain compatible with supported environments
 ```
 
-### API Compatibility \[unspecified-high\]
+## Domain 7 Template: Numerics & Tensor Semantics Review \[targeted\]
 
 ```
-Applicable: API_CONFIG type detected
+Applicable signals: shape_dtype, numerical_stability, reward_surface, compile_dynamo, mixed_precision_fp8
 Checklist:
-- Function signature changes (parameter add/delete/rename/reorder)
-- Return type changes
-- Default value changes causing behavior changes
-- Breaking changes to public APIs
-- Deprecated API usage
-- Class/module rename or move
+- Tensor shape/dtype transitions are explicit and internally consistent
+- Numerical stability is protected (log/division/softmax/clamp paths)
+- Reward-side numerical behavior remains consistent with workflow consumption expectations
+- torch.compile / dynamo assumptions still hold for dynamic shapes and distributed execution
+- Mixed-precision behavior is correct for forward + backward + reduce paths
+- In-place and view/reshape operations do not corrupt gradient flow
+- Device placement and dtype combinations remain legal across code paths
 ```
 
-### Configuration and Parameter Validation \[unspecified-high\]
+## Domain 8 Template: Checkpoint & Recovery Review \[comprehensive\]
 
 ```
-Applicable: API_CONFIG type detected with dataclass
+Applicable signals: dcp_consistency, optimizer_state, resume_compat
 Checklist:
-- New config items missing validation (__post_init__ validation)
-- Unreasonable config default values
-- Missing parameter range checks
-- Unhandled dependencies between config items
-- Hydra/CLI compatibility issues
-- Backward compatibility of env vars/config files
-- Incorrect dataclass field types
+- Save/load requires and enforces all-rank participation where needed
+- State dict naming/structure is stable or migration-safe
+- Optimizer state sharding/gather behavior is consistent
+- Resume path restores model + optimizer + version state coherently
+- Async checkpoint behavior preserves ordering and durability assumptions
 ```
 
-### Workflow and Engine Interaction \[unspecified-high\]
+## Domain 9 Template: Launcher & Infrastructure Review \[targeted\]
 
 ```
-Applicable: WORKFLOW_ENGINE type detected
+Applicable signals: launcher_resource_match, scheduler_contract, rpc_transport, runtime_image_config
 Checklist:
-- RolloutWorkflow.arun_episode async correctness
-- InferenceEngine.agenerate call patterns
-- Weight version management (set_version/update_weights/WeightUpdateMeta)
-- Tensor output format ([batch, seq_len, ...] convention)
-- concat_padded_tensors usage correctness
-- AsyncRewardWrapper wrapping requirements
+- Resource assignment matches declared parallel strategy assumptions
+- Scheduler decisions preserve required placement/affinity constraints
+- RPC serialization/deserialization keeps shape/dtype/device semantics
+- Transport retries/timeouts do not violate idempotency expectations
+- Cross-process startup/shutdown ordering is robust
+- Runtime image and build configuration remain aligned with supported variants
 ```
 
-### Activation Checkpointing (AC) \[unspecified-high\]
+## Domain 10 Template: Low-Risk Hygiene Review \[basic\]
 
 ```
-Applicable: ACTIVATION_CKPT type detected
+Applicable signals: tests_docs_config, logging_import_security, project_docs_metadata
 Checklist:
-- AC application order (must after TP/CP, before FSDP)
-- Selective AC op registration correctness
-- AC config validation logic
-- Compatibility with torch.compile
+- Tests/docs/config edits are internally consistent and non-misleading
+- Logging follows project conventions and avoids sensitive leakage
+- No wildcard imports or obvious dependency hygiene regressions
+- No accidental secrets/keys/tokens introduced
+- Docs build scripts and project templates stay aligned with real contributor workflow
 ```
 
-### Performance Regression Risk \[unspecified-high\]
+## Domain 11 Template: Harness & Agent Infrastructure Review \[targeted\]
 
 ```
-Applicable: Any non-doc changes, especially TENSOR_OPS, DISTRIBUTED_COMM
+Applicable signals: skill_definition, platform_command_data, agent_registry_config
 Checklist:
-- Unnecessary GPU-CPU sync (.item(), .tolist(), printing tensors)
-- Memory allocation pattern changes (potential OOM)
-- Communication volume increase
-- Computational complexity changes
-- torch.compile compatibility breakage
-- Unnecessary tensor copies
+- Canonical skills and derived platform data remain structurally aligned
+- Command docs still point to the correct data files and execution model
+- Agent registry/config changes preserve command discovery and expert routing
+- Cross-platform mirrors are regenerated after canonical changes
 ```
 
-### Context-Aware Review \[unspecified-high\]
+## Domain 12 Template: CI/CD & Release Automation Review \[comprehensive\]
 
 ```
-Applicable: Any code changes
+Applicable signals: github_workflow_jobs, runner_provisioning, release_delivery
 Checklist:
-- Read git blame and history of modified code
-- Check for accidental rollback of previous fixes
-- Check for breaking previously established patterns or conventions
-- Check if changes violate code comments
-- Check for violations of TODO/FIXME constraints
-- Check for ignored NOTE/WARNING comments
+- Workflow triggers, job dependencies, and permissions still enforce required validation
+- Runner/image provisioning remains reproducible and compatible with job expectations
+- Release, docker, and docs deployment jobs publish the intended artifacts only
+- CI changes do not silently skip tests, formatting, or release gates
 ```
 
-### Sequence Parallel (SP/CP) Correctness \[deep\]
+______________________________________________________________________
+
+## Signal-Specific Add-On Checklists
+
+Use these only when corresponding L2 signals are detected.
+
+### `tree_attn` Add-On \[comprehensive\]
 
 ```
-Applicable: sequence_parallel, context_parallel, SP, CP
-Checklist:
-- scatter/gather operation correctness
-- Attention mask handling under SP
-- Position encoding sharding
-- KV cache handling under CP
-- Combination correctness with TP
+- Node/edge indexing is deterministic and shape-safe
+- Tree traversal order matches attention mask semantics
+- FSDP/Megatron/Archon variant modules remain behaviorally aligned
 ```
 
-### Checkpoint and Recovery \[unspecified-high\]
+### `vllm_ext` Add-On \[comprehensive\]
 
 ```
-Applicable: areal/utils/saver.py, areal/utils/recover.py, state_dict, checkpoint
-Checklist:
-- Checkpoint save/load completeness
-- Distributed checkpoint consistency
-- Version compatibility (can old checkpoints load)
-- Recovery logic correctness
-- Optimizer state handling
+- Server and worker extension hooks still match upstream expectations
+- Request pause/resume/cancel semantics remain coherent
+- Integration-specific monkey-patches are scoped and guarded
 ```
 
-### Reward Function Correctness \[unspecified-high\]
+### `archon_model_family` Add-On \[comprehensive\]
 
 ```
-Applicable: areal/reward/ directory
-Checklist:
-- Reward function signature matches (prompt, completions, prompt_ids, completion_ids, **data)
-- Deterministic computation (same input produces same output)
-- Blocking calls wrapped with AsyncRewardWrapper
-- Numerical range reasonableness
-- Edge case handling (empty input, abnormal answers)
+- ModelSpec registration stays unique and complete for supported model types
+- Per-family model/args/spec/state-adapter wiring remains consistent
+- Pipelining hooks and model-part boundaries stay compatible with runtime assumptions
 ```
 
-### Dataset Loader Correctness \[unspecified-high\]
+### `archon_moe_modeling` Add-On \[comprehensive\]
 
 ```
-Applicable: areal/dataset/ directory
-Checklist:
-- Data format validation (messages, answer, image_path fields)
-- Tokenizer compatibility
-- max_length truncation logic
-- Distributed sampling correctness
-- Memory efficiency (avoid loading all data at once)
+- Router top-k, gating dtype, and expert grouping semantics remain coherent
+- GroupedExperts layout and token reordering assumptions still match expert execution
+- MoE weight conversion paths stay consistent with runtime sharding expectations
 ```
 
-### Launcher and Scheduler Configuration \[unspecified-high\]
+### `service_routing_dataflow` Add-On \[comprehensive\]
 
 ```
-Applicable: areal/infra/launcher/, areal/infra/scheduler/, areal/infra/rpc/ directories
-Checklist:
-- Resource config reasonableness (GPU count, memory)
-- Process group config matches parallel strategy
-- Environment variable passing correctness
-- Container/image config compatibility
-- Slurm/Ray specific configurations
+- Route selection and fallback ordering are deterministic
+- Data proxy transformations preserve payload integrity
+- Session-key partitioning logic is collision-safe
 ```
 
-### torch.compile Compatibility \[unspecified-high\]
+### `remote_inference_backend` Add-On \[targeted\]
 
 ```
-Applicable: COMPILE type detected or hot path code modified
-Checklist:
-- Dynamic shape mark_dynamic marking
-- Graph break risks (Python control flow, data-dependent branches)
-- Unsupported operations (some in-place ops)
-- fullgraph=True compatibility
-- Interaction with FSDP/TP
+- Remote backend request/response semantics remain consistent across supported engines
+- Backend-specific transport options do not change lifecycle expectations silently
+- Shared request payload assumptions remain compatible across remote backends
 ```
 
-### Documentation Format Check \[quick\]
+### `weight_sync` Add-On \[comprehensive\]
 
 ```
-Applicable: DOCS type detected
-Checklist:
-- Markdown format correctness
-- Internal link validity
-- Code example correctness
+- Versioned updates are monotonic and race-safe
+- Broadcast/all-gather points are aligned with consumer expectations
+- Local caching behavior cannot serve stale weights indefinitely
 ```
 
-### Test Coverage Check \[quick\]
+### `activation_checkpointing` Add-On \[targeted\]
 
 ```
-Applicable: TESTS type detected
-Checklist:
-- Test cases cover main paths
-- Boundary condition tests
-- Error handling tests
+- Checkpoint wrappers are applied in a parallelism-safe order
+- Selective checkpoint policies still cover the intended modules only
+- Activation recompute paths do not break sharding or sequence-parallel assumptions
 ```
 
-### Logging and Metrics \[quick\]
+### `reward_surface` Add-On \[targeted\]
 
 ```
-Applicable: logging, stats_tracker, StatsLogger
-Checklist:
-- Use areal.utils.logging.getLogger not print
-- Structured metrics sent via stats_tracker
-- Reasonable log levels (no DEBUG on hot paths)
-- Sensitive info not logged
+- AsyncRewardWrapper-facing reward interfaces remain contract-compatible
+- Reward outputs keep expected shape, dtype, and per-sample semantics
+- Workflow assumptions about reward timing and batching remain valid
 ```
 
-### Import and Dependencies \[quick\]
+### `compile_dynamo` Add-On \[targeted\]
 
 ```
-Applicable: Any Python file changes
-Checklist:
-- Avoid wildcard imports (from x import *)
-- Correct third-party vs internal import grouping
-- Heavy optional deps inside functions
-- Circular import risks
+- torch.compile and dynamo guards still tolerate expected dynamic-shape inputs
+- fullgraph and mark_dynamic choices remain compatible with distributed execution paths
+- Compile-specific changes do not silently alter runtime fallback behavior
 ```
 
-### Security and Sensitive Information \[quick\]
+### `rpc_transport` Add-On \[targeted\]
 
 ```
-Applicable: Config files, environment variables, API calls
-Checklist:
-- No hardcoded keys/tokens/passwords
-- Sensitive info not committed to repo
-- API endpoints configurable
-- Error messages don't leak sensitive details
+- RTensor conversion is reversible and metadata-complete
+- Batch fetch/request framing preserves ordering and boundaries
+- Retry logic does not replay non-idempotent actions incorrectly
+```
+
+### `runtime_image_config` Add-On \[targeted\]
+
+```
+- Docker base image and build args still match supported backend variants
+- Layer ordering preserves expected cache and dependency behavior
+- Image contents remain aligned with runtime assumptions documented in the repo
+```
+
+### `project_dependency_config` Add-On \[targeted\]
+
+```
+- Python/version constraints and extras remain internally consistent
+- Lockfile changes match the intended dependency update scope
+- Build backend/tooling changes do not break install or publish workflows
+```
+
+### `github_workflow_jobs` Add-On \[comprehensive\]
+
+```
+- Workflow triggers and job graph still run required validation paths
+- Required secrets/permissions are scoped correctly
+- Matrix or conditional changes do not silently skip critical jobs
+```
+
+### `project_docs_metadata` Add-On \[basic\]
+
+```
+- Docs build entrypoints and contributor-facing metadata remain mutually consistent
+- Public templates and contributor instructions still match the actual workflow
+- Build/preview guidance still points to the supported commands
+```
+
+### `skill_definition` / `platform_command_data` Add-On \[targeted\]
+
+```
+- Canonical and derived review-pr data files stay in sync after edits
+- Command/import paths remain correct after file moves or renames
+- Wrapper-specific routing stays out of canonical reference files
 ```

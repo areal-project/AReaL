@@ -5,31 +5,56 @@ distributed between inference and training backends during distributed RL traini
 
 ## Overview
 
-The `allocation_mode` configuration option is a pattern-based string that specifies:
+Each engine component (actor, critic, rollout, ref, teacher) has its own `backend`
+configuration field that specifies:
 
-- Which backends to use for inference (SGLang, vLLM) and training (FSDP, Megatron,
-  Archon)
-- The parallelization strategy for each backend
+- Which backend to use (SGLang, vLLM for inference; FSDP, Megatron, Archon for training)
+- The parallelization strategy
 - The total number of GPUs required
 
-AReaL parses this string into an `AllocationMode` object that orchestrates resource
-allocation across the cluster.
+AReaL parses each `backend` string into a `ModelAllocation` object that drives resource
+allocation for that specific engine.
 
-## Syntax
+## Configuration
 
-### Basic Format
+### Per-Engine Backend Fields
+
+Each engine in the YAML config has its own `backend` field:
+
+```yaml
+# Rollout (inference) engine
+rollout:
+  backend: "sglang:d4t2"
+
+# Actor (training) engine
+actor:
+  backend: "fsdp:d8"
+
+# Critic engine (falls back to actor.backend if empty)
+critic:
+  backend: ""
+
+# Ref engine (falls back to actor.backend if empty)
+ref:
+  backend: ""
+```
+
+When `critic.backend` or `ref.backend` is empty, it automatically inherits from
+`actor.backend`.
+
+> **Note:** The top-level `allocation_mode` config field is deprecated and only retained
+> for backward compatibility with legacy SPMD launchers (local/ray/slurm). It is ignored
+> by the single-controller scheduler. Use the per-engine `backend` fields shown above
+> instead.
+
+### Backend String Syntax
 
 ```
 <backend>:<parallelism_dims>
 ```
 
-### Two-Component Format (Inference + Training)
-
-```
-<inference_backend>:<dims> + <training_backend>:<dims>
-```
-
-The `+` operator separates components that run on **separate GPU pools**.
+For example, `fsdp:d4t2` means: use the FSDP backend with data parallelism 4 and tensor
+parallelism 2.
 
 ### Parallelism Dimensions
 
@@ -57,12 +82,22 @@ placed within the existing GPU mesh.
 
 ### Examples
 
-| Allocation Mode                   | Inference GPUs | Training GPUs | Total |
-| --------------------------------- | -------------- | ------------- | ----- |
-| `d8`                              | -              | 8             | 8     |
-| `sglang:d2t4`                     | 8              | -             | 8     |
-| `sglang:d2t4 + fsdp:d4t2`         | 8              | 8             | 16    |
-| `sglang:d4t4 + megatron:d2p2t4e4` | 16             | 16            | 32    |
+| Backend String      | GPUs per Engine | Notes                       |
+| ------------------- | --------------- | --------------------------- |
+| `fsdp:d8`           | 8               | 8 data-parallel replicas    |
+| `sglang:d2t4`       | 8               | 2 instances × 4 TP GPUs     |
+| `megatron:d2p2t4`   | 16              | 2 DP × 2 PP × 4 TP          |
+| `megatron:d2p2t4e4` | 16              | Same mesh, 4-way expert par |
+
+### Full Config Example
+
+```yaml
+# 16-GPU setup: 8 inference + 8 training
+rollout:
+  backend: "sglang:d2t4"    # 2 × 4 = 8 GPUs
+actor:
+  backend: "fsdp:d4t2"      # 4 × 2 = 8 GPUs
+```
 
 ## Backend Selection
 
@@ -70,14 +105,14 @@ placed within the existing GPU mesh.
 
 | Backend  | Supported Dimensions |
 | -------- | -------------------- |
-| `sglang` | `d`, `t`             |
+| `sglang` | `d`, `t`, `p`        |
 | `vllm`   | `d`, `t`, `p`        |
 
 For inference, `d` represents the number of independent server instances, and each
 instance uses `t × p` GPUs.
 
-Note that the internal backed configurations do not affect how AReaL allocate GPUs.
-Given allocation mode `sglang:d4t4`, you can also config `sglang.dp_size=4`,
+Note that the internal backend configurations do not affect how AReaL allocates GPUs.
+Given `rollout.backend: "sglang:d4t4"`, you can also configure `sglang.dp_size=4`,
 `sglang.ep_size=4`, and `sglang.enable_dp_attention=True`. In this case, we launch 4
 model replicas each with 4 GPUs. Within each instance, SGLang will still use DP
 attention and expert parallelism to distribute computations in attention and expert
@@ -91,19 +126,9 @@ layers.
 | `megatron` | `d`, `t`, `p`, `c`, `e` | Required for pipeline or expert parallel |
 | `archon`   | `d`, `t`, `p`, `c`, `e` | Alternative to Megatron (experimental)   |
 
-When the backend is omitted, AReaL auto-selects based on the parallelism configuration:
-
-- **FSDP**: Used when only `d`, `t`, `c` are specified
-- **Megatron**: Used when `p > 1` or `e > 1`
-
-```
-# Equivalent forms
-d4t2           # Auto-selects FSDP
-fsdp:d4t2      # Explicit FSDP
-
-d2p2t4         # Auto-selects Megatron (pp > 1)
-megatron:d2p2t4  # Explicit Megatron
-```
+> **Important**: An explicit backend prefix is **required** in all allocation strings.
+> Bare dimension strings (e.g., `d4t2`) are no longer accepted. Always specify the
+> backend explicitly: `fsdp:d4t2`, `megatron:d2p2t4`, `sglang:d4t2`.
 
 ## MoE Hybrid Parallelism
 
@@ -126,8 +151,9 @@ which reduces the minimum GPU requirement for combined context and expert parall
 
 ### Example
 
-```
-megatron:(attn:d4p2t2c2|ffn:d2p2t4e2)
+```yaml
+actor:
+  backend: "megatron:(attn:d4p2t2c2|ffn:d2p2t4e2)"
 ```
 
 | Module | dp  | pp  | tp  | cp  | ep  | World Size |

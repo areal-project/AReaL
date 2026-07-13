@@ -11,7 +11,7 @@ import torch
 
 from tests.utils import get_model_path
 
-from areal.api import AllocationMode, LocalInfServerInfo
+from areal.api import LocalInfServerInfo
 from areal.api.cli_args import (
     InferenceEngineConfig,
     SGLangConfig,
@@ -160,6 +160,7 @@ class TestProxyIntegration:
         config = InferenceEngineConfig(
             experiment_name=EXPR_NAME,
             trial_name=TRIAL_NAME,
+            backend="sglang:d1",
             max_concurrent_rollouts=2,
             consumer_batch_size=1,
             tokenizer_path=get_test_model_path(),
@@ -181,7 +182,6 @@ class TestProxyIntegration:
 
             rollout.initialize(
                 role="rollout",
-                alloc_mode=AllocationMode.from_str("sglang:d1"),
                 server_infos=[server_info],
             )
 

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 """Triton-based tree attention kernel with sparse block iteration."""
 
 from dataclasses import dataclass

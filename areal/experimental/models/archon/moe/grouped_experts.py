@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 # Adapted from torchtitan: torchtitan/models/moe/moe.py
 
 from __future__ import annotations
@@ -109,6 +111,76 @@ def _run_experts_grouped_mm(
     return out.type_as(x)
 
 
+def _run_experts_fp8_for_loop(
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    w3: torch.Tensor,
+    x: torch.Tensor,
+    num_tokens_per_expert: torch.Tensor,
+    block_size: int = 128,
+    use_triton: bool = True,
+) -> torch.Tensor:
+    """Per-expert FP8 for-loop fallback (no grouped_mm FP8 support yet).
+
+    .. note:: Performance
+
+       ``.tolist()`` forces a GPU→CPU sync every forward call.  The default
+       BF16 path uses ``grouped_mm`` which keeps token counts on-device.
+       This overhead is inherent to the per-expert for-loop approach and
+       will be removed when ``grouped_mm`` gains FP8 support.
+    """
+    from torchao.prototype.blockwise_fp8_training.linear import fp8_blockwise_mm
+
+    # GPU→CPU sync — see docstring.
+    num_tokens_per_expert_list = num_tokens_per_expert.tolist()
+    total_tokens = sum(num_tokens_per_expert_list)
+
+    x_splits = torch.split(
+        x[:total_tokens],
+        split_size_or_sections=[int(n) for n in num_tokens_per_expert_list],
+        dim=0,
+    )
+
+    out_splits = []
+    for expert_idx, x_expert in enumerate(x_splits):
+        n_tokens = x_expert.shape[0]
+        if n_tokens == 0:
+            out_splits.append(x_expert.new_empty(0, w2.shape[1]))
+            continue
+
+        pad_size = (block_size - n_tokens % block_size) % block_size
+        if pad_size > 0:
+            x_expert = F.pad(x_expert, (0, 0, 0, pad_size))
+
+        x_e = x_expert.contiguous()
+        w1_e = w1[expert_idx].contiguous()
+        w2_e = w2[expert_idx].contiguous()
+        w3_e = w3[expert_idx].contiguous()
+
+        # SwiGLU: silu(x @ w1.T) * (x @ w3.T) @ w2.T
+        h1 = fp8_blockwise_mm.apply(x_e, w1_e, block_size, x_e.dtype, use_triton)
+        h3 = fp8_blockwise_mm.apply(x_e, w3_e, block_size, x_e.dtype, use_triton)
+        assert isinstance(h1, torch.Tensor)
+        assert isinstance(h3, torch.Tensor)
+        h = F.silu(h1) * h3
+        h2 = fp8_blockwise_mm.apply(h, w2_e, block_size, h.dtype, use_triton)
+        assert isinstance(h2, torch.Tensor)
+        h = h2
+
+        if pad_size > 0:
+            h = h[:n_tokens]
+
+        out_splits.append(h)
+
+    out = torch.cat(out_splits, dim=0)
+
+    if x.shape[0] > total_tokens:
+        padding = x.new_zeros((x.shape[0] - total_tokens, out.shape[-1]))
+        out = torch.cat([out, padding], dim=0)
+
+    return out
+
+
 def _check_grouped_mm_available() -> bool:
     """Check if torch._grouped_mm is available and functional.
 
@@ -125,6 +197,11 @@ class GroupedExperts(nn.Module):
 
     This module stores expert weights in 3D tensors (num_experts, hidden_dim, dim)
     which enables efficient computation using grouped matrix multiplication.
+
+    FP8 support is enabled externally via :func:`enable_fp8_experts` in
+    ``areal.experimental.models.archon.fp8``, which patches :meth:`forward`
+    with an FP8-aware implementation (following the same construct-then-transform
+    pattern used by :func:`enable_fp8_linear` for ``nn.Linear``).
 
     Args:
         dim: Input/output dimension.
@@ -157,6 +234,14 @@ class GroupedExperts(nn.Module):
         self.w2 = nn.Parameter(torch.empty(num_experts, dim, hidden_dim))
         self.w3 = nn.Parameter(torch.empty(num_experts, hidden_dim, dim))
 
+    def _get_local_weights(
+        self,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return (w1, w2, w3), converting from DTensor to local if needed."""
+        if isinstance(self.w1, DTensor):
+            return self.w1.to_local(), self.w2.to_local(), self.w3.to_local()
+        return self.w1, self.w2, self.w3
+
     def forward(
         self,
         x: torch.Tensor,
@@ -173,15 +258,7 @@ class GroupedExperts(nn.Module):
         Returns:
             Output tensor with same shape as input x.
         """
-        # Handle DTensor case (for distributed parallelism)
-        if isinstance(self.w1, DTensor):
-            w1 = self.w1.to_local()
-            w2 = self.w2.to_local()
-            w3 = self.w3.to_local()
-        else:
-            w1 = self.w1
-            w2 = self.w2
-            w3 = self.w3
+        w1, w2, w3 = self._get_local_weights()
 
         if self.use_grouped_mm:
             # If EP is not used, apply padding wrapper;

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 """FSDP checkpointing utilities for DCP (Distributed Checkpoint) integration."""
 
 from typing import Any

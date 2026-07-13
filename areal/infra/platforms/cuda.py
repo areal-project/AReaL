@@ -1,4 +1,7 @@
+# SPDX-License-Identifier: Apache-2.0
+
 import gc
+import os
 
 import torch
 
@@ -55,6 +58,34 @@ class CudaPlatform(Platform):
     @classmethod
     def set_allocator_settings(cls) -> None:
         torch.cuda.memory._set_allocator_settings("expandable_segments:False")
+
+    @classmethod
+    def set_numa_affinity(cls, local_rank: int) -> None:
+        """Bind the current process to CPU cores local to the assigned GPU."""
+
+        nvml_initialized = False
+        try:
+            import pynvml
+
+            pynvml.nvmlInit()
+            nvml_initialized = True
+            handle = pynvml.nvmlDeviceGetHandleByIndex(local_rank)
+            pynvml.nvmlDeviceSetCpuAffinity(handle)
+            cpu_set = os.sched_getaffinity(0)
+            logger.info(
+                "Set NUMA affinity for GPU %s: bound to %s CPU cores.",
+                local_rank,
+                len(cpu_set),
+            )
+        except ImportError:
+            logger.warning(
+                "pynvml (nvidia-ml-py) not available, skipping NUMA affinity setup."
+            )
+        except Exception as e:
+            logger.warning("Failed to set NUMA affinity for GPU %s: %s", local_rank, e)
+        finally:
+            if nvml_initialized:
+                pynvml.nvmlShutdown()
 
     @classmethod
     def get_custom_env_vars(cls) -> dict:

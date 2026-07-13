@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 from transformers.integrations.hub_kernels import is_kernel
 
 BUILTIN_ATTN_IMPLS = (

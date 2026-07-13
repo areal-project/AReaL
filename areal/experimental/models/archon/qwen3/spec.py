@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 from areal.experimental.models.archon.model_spec import ModelSpec, register_model_spec
 from areal.experimental.models.archon.pipeline_parallel import pipeline_llm
 from areal.experimental.models.archon.qwen3.infra.parallelize import parallelize_qwen3

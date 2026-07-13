@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 from areal.models.tree_attn.constants import USE_TRITON_TREE_ATTN
 from areal.models.tree_attn.module_fsdp import (
     create_block_mask_from_dense,

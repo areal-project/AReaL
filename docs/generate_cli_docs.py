@@ -85,6 +85,7 @@ def categorize_dataclasses(
         "WandBConfig",
         "SwanlabConfig",
         "TensorBoardConfig",
+        "TrackioConfig",
         "SaverConfig",
         "EvaluatorConfig",
         "RecoverConfig",
