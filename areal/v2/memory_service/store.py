@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 from threading import RLock
 from typing import Protocol
 
+from areal.v2.memory_service._atomic import _atomic_publish
 from areal.v2.memory_service.errors import (
     EvidenceConflictError,
     EvidenceNotFoundError,
@@ -89,9 +90,13 @@ class InMemoryEvidenceStore:
                 content_hash=content_hash,
                 created_at=datetime.now(UTC),
             )
-            self._by_evidence_id[evidence_index] = record
-            self._by_idempotency_key[idempotency_index] = record
-            self._by_scope.setdefault(event.scope, []).append(record)
+            _atomic_publish(
+                mapping_writes=(
+                    (self._by_evidence_id, evidence_index, record),
+                    (self._by_idempotency_key, idempotency_index, record),
+                ),
+                sequence_appends=((self._by_scope, event.scope, record),),
+            )
             return record
 
     def get(self, scope: MemoryScope, evidence_id: str) -> EvidenceRecord:

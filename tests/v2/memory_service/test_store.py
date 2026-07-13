@@ -176,6 +176,20 @@ class AlwaysEqualStr(str):
     __hash__ = str.__hash__
 
 
+class SetThenInterruptDict(dict[object, object]):
+    """Expose rollback bugs where a mapping mutates before interruption."""
+
+    def __init__(self, values: dict[object, object] | None = None) -> None:
+        super().__init__({} if values is None else values)
+        self.should_interrupt = True
+
+    def __setitem__(self, key: object, value: object) -> None:
+        super().__setitem__(key, value)
+        if self.should_interrupt:
+            self.should_interrupt = False
+            raise KeyboardInterrupt("injected publication interruption")
+
+
 def make_scope(**overrides: str) -> MemoryScope:
     values = {
         "tenant_id": "tenant-1",
@@ -199,6 +213,28 @@ def make_event(**overrides: object) -> EvidenceEvent:
     }
     values.update(overrides)
     return EvidenceEvent(**values)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("failing_index", ("idempotency", "scope"))
+def test_append_rolls_back_every_index_after_base_exception(
+    failing_index: str,
+) -> None:
+    store = InMemoryEvidenceStore()
+    if failing_index == "idempotency":
+        store._by_idempotency_key = SetThenInterruptDict()
+    else:
+        store._by_scope = SetThenInterruptDict()
+    event = make_event()
+
+    with pytest.raises(KeyboardInterrupt, match="publication interruption"):
+        store.append(event)
+
+    assert store._by_evidence_id == {}
+    assert store._by_idempotency_key == {}
+    assert store._by_scope == {}
+    record = store.append(event)
+    assert store.get(event.scope, record.evidence_id) == record
+    assert store.list(event.scope) == (record,)
 
 
 def test_error_types_share_memory_service_base_error() -> None:
