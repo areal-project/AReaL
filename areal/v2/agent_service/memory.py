@@ -565,6 +565,12 @@ class AsyncMemoryAgentCoordinator:
             raise MemoryAgentTurnConflictError(
                 "runtime consumer did not return a canonical Memory exposure"
             )
+        try:
+            exposure.canonical_bytes()
+        except (AttributeError, TypeError, ValueError) as error:
+            raise MemoryAgentTurnConflictError(
+                "runtime exposure failed canonical integrity validation"
+            ) from error
         if (
             exposure.scope,
             exposure.assignment_id,

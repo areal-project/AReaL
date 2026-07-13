@@ -20,12 +20,16 @@ from areal.v2.agent_service.memory import (
     MemoryAgentTurnConflictError,
     MemoryAgentTurnV1,
 )
+from areal.v2.memory_service import runtime_types
 from areal.v2.memory_service.errors import MemoryReleaseAssignmentConflictError
 from areal.v2.memory_service.release_control_types import (
     MemoryReleaseAssignmentConsumerKind,
     MemoryReleaseAssignmentV1,
 )
-from areal.v2.memory_service.runtime_types import MemoryExposureV1
+from areal.v2.memory_service.runtime_types import (
+    MemoryExposureStatus,
+    MemoryExposureV1,
+)
 from areal.v2.memory_service.types import MemoryScope
 
 _NOW = datetime(2026, 7, 13, tzinfo=UTC)
@@ -86,6 +90,42 @@ def _pin(assignment: MemoryReleaseAssignmentV1) -> MemoryAgentSessionPinV1:
         rollout_group_incarnation_sha256=(assignment.rollout_group_incarnation_sha256),
         assignment_id=assignment.assignment_id,
         assignment_content_sha256=assignment.content_hash,
+    )
+
+
+def _exposure(spec, scope: MemoryScope, delivery_id: str) -> MemoryExposureV1:
+    """Build a complete canonical empty-release receipt for the runtime fake."""
+
+    values = {
+        "scope": scope,
+        "assignment_id": spec.assignment_id,
+        "assignment_content_sha256": spec.assignment_content_sha256,
+        "release_id": spec.release_id,
+        "release_content_sha256": _hash("release"),
+        "trajectory_id": spec.trajectory_id,
+        "rollout_group_id": spec.rollout_group_id,
+        "rollout_group_incarnation_sha256": (spec.rollout_group_incarnation_sha256),
+        "attempt_id": f"attempt-{spec.idempotency_key}",
+        "attempt_content_sha256": _hash(f"attempt-{spec.idempotency_key}"),
+        "query_result_id": f"result-attempt-{spec.idempotency_key}",
+        "query_result_content_sha256": _hash(f"result-attempt-{spec.idempotency_key}"),
+        "delivery_id": delivery_id,
+        "delivery_content_sha256": _hash(delivery_id),
+        "consumer_ack_id": f"ack-{delivery_id}",
+        "consumer_ack_content_sha256": _hash(f"ack-{delivery_id}"),
+        "eligible_revisions": (),
+        "retrieved_revisions": (),
+        "returned_revisions": (),
+        "injected_revisions": (),
+        "status": MemoryExposureStatus.MEMORY_OFF,
+    }
+    canonical = runtime_types._exposure_canonical_bytes(**values)
+    content_hash = sha256(canonical).hexdigest()
+    return MemoryExposureV1(
+        **values,
+        exposure_id=f"mexp_{content_hash[:24]}",
+        content_hash=content_hash,
+        created_at=_NOW,
     )
 
 
@@ -163,6 +203,7 @@ class _RuntimeStore:
         self.submit_release = Event()
         self.block_submit = False
         self.invalid_consumer_result = False
+        self.incomplete_exposure_result = False
 
     def begin_query(self, spec):
         self.calls.append(_RuntimeCall("begin", get_ident(), spec))
@@ -214,6 +255,11 @@ class _RuntimeStore:
             return "raw-forwarded-without-consumer-receipt", object()
 
         spec = self.spec_by_delivery_id[delivery_id]
+        if not self.incomplete_exposure_result:
+            return _exposure(spec, scope, delivery_id), f"output:{call_id}"
+
+        # Exact runtime type, but constructed without canonical invariants.
+        # This is the attack that a type-only check previously accepted.
         exposure = object.__new__(MemoryExposureV1)
         for field_name, value in (
             ("scope", scope),
@@ -515,6 +561,28 @@ async def test_raw_passthrough_without_runtime_exposure_is_rejected() -> None:
                 turn,
                 "raw-passthrough",
                 query=b"forwarded bytes are not an acknowledgement",
+            )
+    finally:
+        await coordinator.aclose()
+
+
+@_async_test
+async def test_incomplete_exact_type_exposure_fails_canonical_validation() -> None:
+    assignment = _assignment()
+    runtime = _RuntimeStore()
+    runtime.incomplete_exposure_result = True
+    coordinator = AsyncMemoryAgentCoordinator(_ControlStore(assignment), runtime)
+    try:
+        await coordinator.pin_session("session-1", _pin(assignment))
+        turn = await coordinator.start_turn("session-1", "forged-exposure-run")
+        with pytest.raises(
+            MemoryAgentTurnConflictError,
+            match="canonical integrity validation",
+        ):
+            await coordinator.expose_memory(
+                turn,
+                "forged-exposure",
+                query=b"an exact Python type is not an integrity proof",
             )
     finally:
         await coordinator.aclose()
