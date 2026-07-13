@@ -22,6 +22,10 @@ from fastapi import (
 from areal.utils import logging
 
 from ..auth import admin_headers, make_admin_dependency
+from ..memory_transport import (
+    MEMORY_ASSIGNMENT_PIN_FIELD,
+    MEMORY_CONTROL_AUTHORIZED_FIELD,
+)
 from ..protocol import (
     FrameType,
     RequestFrame,
@@ -75,14 +79,23 @@ def create_gateway_app(config: GatewayConfig) -> FastAPI:
         queue_mode: str,
         metadata: dict,
     ) -> dict:
+        worker_metadata = dict(metadata)
+        assignment_pin = worker_metadata.pop(MEMORY_ASSIGNMENT_PIN_FIELD, None)
+        assignment_pin_present = MEMORY_ASSIGNMENT_PIN_FIELD in metadata
+        worker_metadata.pop(MEMORY_CONTROL_AUTHORIZED_FIELD, None)
+        body = {
+            "message": message,
+            "run_id": run_id,
+            "queue_mode": queue_mode,
+            "metadata": worker_metadata,
+            MEMORY_CONTROL_AUTHORIZED_FIELD: True,
+        }
+        if assignment_pin_present:
+            body[MEMORY_ASSIGNMENT_PIN_FIELD] = assignment_pin
         resp = await http_client.post(
             f"{data_proxy_addr}/session/{session_key}/turn",
-            json={
-                "message": message,
-                "run_id": run_id,
-                "queue_mode": queue_mode,
-                "metadata": metadata,
-            },
+            json=body,
+            headers=_auth_headers,
         )
         resp.raise_for_status()
         return resp.json()

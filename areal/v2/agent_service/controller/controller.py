@@ -266,6 +266,8 @@ class AgentController:
                 "areal.v2.agent_service.data_proxy",
                 "--worker-addr",
                 worker_addr,
+                "--admin-api-key",
+                cfg.admin_api_key,
             ]
             proxy_host, proxy_port = self._fork_on_guard(
                 guard_addr=guard_addr,

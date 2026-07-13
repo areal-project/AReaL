@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import hmac
 import json
 import uuid
 from abc import ABC, abstractmethod
@@ -16,8 +17,19 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from areal.utils import logging
 
-from ..auth import DEFAULT_ADMIN_API_KEY, admin_headers, make_admin_dependency
+from ..auth import (
+    DEFAULT_ADMIN_API_KEY,
+    admin_headers,
+    make_admin_dependency,
+    verify_admin_key,
+)
+from ..memory_transport import (
+    CHAT_REQUEST_METADATA_KEY,
+    MEMORY_ASSIGNMENT_PIN_FIELD,
+    MEMORY_CONTROL_AUTHORIZED_FIELD,
+)
 from ..protocol import generate_run_id
+from ..streaming import CleanupStreamingResponse
 
 logger = logging.getLogger("AgentBridge")
 
@@ -27,6 +39,13 @@ logger = logging.getLogger("AgentBridge")
 # can reuse it on the next request — including a key derived or randomly minted
 # server-side when the client sent none.
 SESSION_KEY_HEADER = "X-AReaL-Session-Key"
+
+
+def _has_admin_authorization(request: Request, expected: dict[str, str]) -> bool:
+    return hmac.compare_digest(
+        request.headers.get("Authorization", ""),
+        expected["Authorization"],
+    )
 
 
 class AgentBridge(ABC):
@@ -47,6 +66,10 @@ class OpenResponsesBridge(AgentBridge):
 
     async def handle_request(self, request: Request) -> Any:
         body = await request.json()
+        memory_control_authorized = _has_admin_authorization(
+            request,
+            self._auth_headers,
+        )
 
         input_items: list[dict[str, Any]] = body.get("input", [])
         instructions: str = body.get("instructions", "")
@@ -99,6 +122,7 @@ class OpenResponsesBridge(AgentBridge):
                 "run_id": run_id,
                 "queue_mode": "collect",
                 "metadata": metadata,
+                MEMORY_CONTROL_AUTHORIZED_FIELD: memory_control_authorized,
             }
             # Opt-in self-evolution: forward the caller-supplied inference
             # routing fields when present so the DataProxy hands the agent a
@@ -113,11 +137,31 @@ class OpenResponsesBridge(AgentBridge):
             ):
                 if key in body:
                     turn_body[key] = body[key]
+            if MEMORY_ASSIGNMENT_PIN_FIELD in body:
+                turn_body[MEMORY_ASSIGNMENT_PIN_FIELD] = body[
+                    MEMORY_ASSIGNMENT_PIN_FIELD
+                ]
 
             turn_resp = await self._http.post(
                 f"{data_proxy_addr}/session/{session_key}/turn",
                 json=turn_body,
+                headers=self._auth_headers,
             )
+            if 400 <= turn_resp.status_code < 500:
+                try:
+                    error_payload = turn_resp.json()
+                except ValueError:
+                    error_payload = {
+                        "error": {
+                            "message": turn_resp.text,
+                            "type": "invalid_request",
+                        }
+                    }
+                return JSONResponse(
+                    error_payload,
+                    status_code=turn_resp.status_code,
+                    headers={SESSION_KEY_HEADER: session_key},
+                )
             turn_resp.raise_for_status()
             result = turn_resp.json()
 
@@ -280,12 +324,17 @@ def mount_bridge(
         await bridge.close()
 
 
-# Metadata key under which the chat bridge stashes the full, original
-# ``/v1/chat/completions`` request body.  Raw-passthrough agents (those
-# implementing ``AgentRunnable.stream``) read it from ``request.metadata`` and
-# forward it verbatim to their upstream, so no field (``ext_info`` etc.) is lost
-# in the chat → turn translation.
-CHAT_REQUEST_METADATA_KEY = "chat_request"
+# The DataProxy injects the sanitized original ``/v1/chat/completions`` request
+# under :data:`CHAT_REQUEST_METADATA_KEY`.  Raw-passthrough agents read it from
+# ``request.metadata`` and replay it, while Agent Service control fields travel
+# separately and can never leak into that upstream request.
+_CHAT_CONTROL_FIELDS = (
+    MEMORY_ASSIGNMENT_PIN_FIELD,
+    MEMORY_CONTROL_AUTHORIZED_FIELD,
+    "inf_base_url",
+    "inf_model",
+    "session_api_key",
+)
 
 
 class ChatCompletionsBridge(AgentBridge):
@@ -295,11 +344,14 @@ class ChatCompletionsBridge(AgentBridge):
     the worker/agent response **byte-for-byte** (typically SSE), so any
     OpenAI-compatible upstream can call the gateway exactly as it would call the
     backing agent directly — no client change, exact wire format preserved.  The
-    DataProxy uses the response ``Content-Type`` to tell a raw stream apart from
-    a structured turn, so both protocols share the one ``turn`` endpoint.
+    DataProxy uses the Worker's ``x-areal-passthrough`` response marker to tell a
+    raw stream apart from a structured turn, so both protocols share the one
+    ``turn`` endpoint.
 
-    The full original request body is forwarded inside the turn ``metadata``
-    (see :data:`CHAT_REQUEST_METADATA_KEY`) for the agent to replay verbatim.
+    The original request body, after removing Agent Service control fields, is
+    forwarded as a trusted top-level control payload.  DataProxy injects it into
+    Worker ``metadata`` under :data:`CHAT_REQUEST_METADATA_KEY` for the agent to
+    replay verbatim.
 
     **Session model.**  ``/v1/chat/completions`` is a stateless protocol: the
     client carries the full ``messages`` history on every request, so the
@@ -326,6 +378,7 @@ class ChatCompletionsBridge(AgentBridge):
         self, router_addr: str, admin_api_key: str = DEFAULT_ADMIN_API_KEY
     ) -> None:
         self._router_addr = router_addr
+        self._admin_api_key = admin_api_key
         self._auth_headers = admin_headers(admin_api_key)
         self._http = httpx.AsyncClient(timeout=600.0)
 
@@ -341,7 +394,25 @@ class ChatCompletionsBridge(AgentBridge):
                 status_code=400,
             )
 
-        messages = body.get("messages", [])
+        assignment_pin_present = MEMORY_ASSIGNMENT_PIN_FIELD in body
+        assignment_pin = body.get(MEMORY_ASSIGNMENT_PIN_FIELD)
+        memory_control_authorized = _has_admin_authorization(
+            request,
+            self._auth_headers,
+        )
+        if assignment_pin_present and not memory_control_authorized:
+            # Ordinary Chat Completions stays OpenAI-compatible and ungated,
+            # but choosing a Memory assignment is a privileged control-plane
+            # operation.  Reject it before routing so an unauthenticated caller
+            # cannot select another tenant's otherwise valid active assignment.
+            await verify_admin_key(
+                request.headers.get("Authorization", ""),
+                expected_key=self._admin_api_key,
+            )
+        upstream_body = dict(body)
+        for key in _CHAT_CONTROL_FIELDS:
+            upstream_body.pop(key, None)
+        messages = upstream_body.get("messages", [])
         session_key = self._resolve_session_key(request, body)
         if session_key is None:
             return JSONResponse(
@@ -358,7 +429,9 @@ class ChatCompletionsBridge(AgentBridge):
             )
         run_id = generate_run_id()
         message = self._extract_last_user_text(messages)
-        metadata = {CHAT_REQUEST_METADATA_KEY: body}
+        # Memory transport is a control-plane field, not part of the OpenAI
+        # request replayed by a raw-passthrough agent.
+        metadata: dict[str, object] = {}
 
         try:
             route_resp = await self._http.post(
@@ -383,6 +456,8 @@ class ChatCompletionsBridge(AgentBridge):
             "run_id": run_id,
             "queue_mode": "collect",
             "metadata": metadata,
+            CHAT_REQUEST_METADATA_KEY: upstream_body,
+            MEMORY_CONTROL_AUTHORIZED_FIELD: memory_control_authorized,
         }
         # Opt-in self-evolution (same contract as OpenResponsesBridge): forward
         # the caller-supplied inference-routing fields when present so the
@@ -397,11 +472,14 @@ class ChatCompletionsBridge(AgentBridge):
         ):
             if key in body:
                 turn_body[key] = body[key]
+        if assignment_pin_present:
+            turn_body[MEMORY_ASSIGNMENT_PIN_FIELD] = assignment_pin
 
         req = self._http.build_request(
             "POST",
             f"{data_proxy_addr}/session/{session_key}/turn",
             json=turn_body,
+            headers=self._auth_headers,
         )
         try:
             resp = await self._http.send(req, stream=True)
@@ -413,21 +491,16 @@ class ChatCompletionsBridge(AgentBridge):
                 headers={SESSION_KEY_HEADER: session_key},
             )
 
-        async def _relay():
-            try:
-                async for chunk in resp.aiter_raw():
-                    yield chunk
-            finally:
-                await resp.aclose()
-
         headers = {
             k: v
             for k, v in resp.headers.items()
             if k.lower() not in ("content-length", "transfer-encoding", "connection")
         }
         headers[SESSION_KEY_HEADER] = session_key
-        return StreamingResponse(
-            _relay(),
+        return CleanupStreamingResponse(
+            resp.aiter_raw(),
+            cleanup=resp.aclose,
+            cleanup_task_name=(f"areal-chat-downstream-cleanup:{session_key}"),
             status_code=resp.status_code,
             headers=headers,
             media_type=resp.headers.get("content-type"),
@@ -473,9 +546,13 @@ class ChatCompletionsBridge(AgentBridge):
 def mount_chat_bridge(app: FastAPI, bridge: ChatCompletionsBridge) -> None:
     """Mount the chat-completions bridge.
 
-    Deliberately **not** admin-gated: upstreams call ``/v1/chat/completions``
-    exactly as they call the backing agent today (no AReaL admin key).  The
-    internal gateway → router ``/route`` hop still carries the admin header.
+    Ordinary chat requests are deliberately **not** admin-gated: upstreams call
+    ``/v1/chat/completions`` exactly as they call the backing agent today (no
+    AReaL admin key).  A request that selects ``memory_assignment_pin`` must
+    carry the admin key.  Every later turn on that Memory-bound session must
+    also carry it, even when the immutable pin is omitted for reuse; the
+    DataProxy rejects an untrusted per-turn marker.  The internal gateway →
+    router ``/route`` hop still carries the admin header.
     """
 
     @app.post("/v1/chat/completions")
