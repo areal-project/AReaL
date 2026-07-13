@@ -6,6 +6,7 @@ import pytest
 
 from areal.v2.agent_service.auth import DEFAULT_ADMIN_API_KEY, admin_headers
 from areal.v2.agent_service.router.app import create_router_app
+from areal.v2.agent_service.router.client import RouterClient
 from areal.v2.agent_service.router.config import RouterConfig
 
 httpx = pytest.importorskip("httpx")
@@ -99,3 +100,50 @@ class TestRouting:
             )
             health = await client.get("/health")
             assert health.json()["active_sessions"] == 0
+
+    @pytest.mark.parametrize(
+        "session_key",
+        (None, 1, "s/b", "s%252Fb", "s#fragment", "会话"),
+    )
+    @pytest.mark.asyncio
+    async def test_invalid_session_key_cannot_reserve_route(
+        self,
+        session_key: object,
+    ):
+        async with _make_client() as client:
+            await client.post(
+                "/register",
+                json={"addr": "http://p1"},
+                headers=_AUTH,
+            )
+            rejected = await client.post(
+                "/route",
+                json={"session_key": session_key},
+                headers=_AUTH,
+            )
+            health = await client.get("/health")
+
+        assert rejected.status_code == 400
+        assert health.json()["active_sessions"] == 0
+
+
+@pytest.mark.asyncio
+async def test_router_client_rejects_invalid_key_before_network_io():
+    forwarded = []
+
+    def handler(request):
+        forwarded.append(request)
+        return httpx.Response(500, request=request)
+
+    client = RouterClient("http://router")
+    await client._http.aclose()
+    client._http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    try:
+        with pytest.raises(ValueError):
+            await client.route("s%252Fb")
+        with pytest.raises(ValueError):
+            await client.remove_session("s/b")
+    finally:
+        await client.close()
+
+    assert forwarded == []

@@ -18,6 +18,7 @@ from fastapi import (
     WebSocket,
     WebSocketDisconnect,
 )
+from fastapi.responses import JSONResponse
 
 from areal.utils import logging
 
@@ -39,6 +40,7 @@ from ..protocol import (
     parse_frame,
     serialize_frame,
 )
+from ..session_keys import validate_session_key
 from .config import GatewayConfig
 
 logger = logging.getLogger("AgentGateway")
@@ -66,7 +68,14 @@ def create_gateway_app(config: GatewayConfig) -> FastAPI:
     )
     _admin = make_admin_dependency(config.admin_api_key)
 
+    def _validated_http_session_key(value: object) -> str:
+        try:
+            return validate_session_key(value)
+        except (TypeError, ValueError) as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+
     async def _route(session_key: str) -> str:
+        session_key = validate_session_key(session_key)
         resp = await http_client.post(
             f"{config.router_addr}/route",
             json={"session_key": session_key},
@@ -84,6 +93,7 @@ def create_gateway_app(config: GatewayConfig) -> FastAPI:
         queue_mode: str,
         metadata: dict,
     ) -> dict:
+        session_key = validate_session_key(session_key)
         worker_metadata = dict(metadata)
         assignment_pin = worker_metadata.pop(MEMORY_ASSIGNMENT_PIN_FIELD, None)
         assignment_pin_present = MEMORY_ASSIGNMENT_PIN_FIELD in metadata
@@ -129,12 +139,25 @@ def create_gateway_app(config: GatewayConfig) -> FastAPI:
         DataProxy close is idempotent and propagates down to the Worker, so an
         unknown key is a no-op success.
         """
-        session_key = body.get("session_key", "")
-        if not session_key:
-            raise HTTPException(status_code=400, detail="'session_key' is required")
+        session_key = _validated_http_session_key(body.get("session_key"))
         data_proxy_addr = await _route(session_key)
-        resp = await http_client.post(f"{data_proxy_addr}/session/{session_key}/close")
-        resp.raise_for_status()
+        resp = await http_client.post(
+            f"{data_proxy_addr}/sessions/close",
+            json={"session_key": session_key},
+        )
+        if resp.status_code in {404, 405}:
+            # During a rolling upgrade an older DataProxy may expose only the
+            # path-shaped close route.  The shared validator makes this exact
+            # key safe as one segment; never downgrade on auth or close errors.
+            resp = await http_client.post(
+                f"{data_proxy_addr}/session/{session_key}/close"
+            )
+        if not 200 <= resp.status_code < 300:
+            try:
+                payload = resp.json()
+            except ValueError:
+                payload = {"detail": resp.text or "data proxy session close failed"}
+            return JSONResponse(payload, status_code=resp.status_code)
         return {"status": "ok"}
 
     @app.websocket("/ws")
@@ -168,12 +191,15 @@ def create_gateway_app(config: GatewayConfig) -> FastAPI:
                     )
                     continue
 
-                session_key = frame.session_key
-                if not session_key:
+                try:
+                    session_key = validate_session_key(frame.session_key)
+                except (TypeError, ValueError) as error:
                     await websocket.send_text(
                         serialize_frame(
                             make_failed_response(
-                                frame.id, "", "Missing sessionKey in params"
+                                frame.id,
+                                "",
+                                str(error),
                             )
                         )
                     )

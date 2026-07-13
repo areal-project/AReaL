@@ -29,6 +29,7 @@ from ..memory_transport import (
     inject_memory_assignment_pin,
 )
 from ..protocol import PASSTHROUGH_HEADER
+from ..session_keys import session_key_sha256, validate_session_key
 from ..streaming import CleanupStreamingResponse
 from .config import DataProxyConfig
 
@@ -86,23 +87,45 @@ def create_data_proxy_app(config: DataProxyConfig) -> FastAPI:
 
     async def _close_worker_session(session_key: str) -> bool:
         try:
+            session_key = validate_session_key(session_key)
             response = await http_client.post(
-                f"{config.worker_addr}/session/{session_key}/close",
+                f"{config.worker_addr}/sessions/close",
+                json={"session_key": session_key},
                 headers=worker_hop_headers or None,
                 timeout=5,
             )
+            used_legacy_endpoint = response.status_code in {404, 405}
+            if used_legacy_endpoint:
+                # Rolling upgrades may temporarily pair a new DataProxy with
+                # an old Worker.  A validated key is safe in one path segment;
+                # fall back only when the fixed endpoint is absent, never for
+                # authorization or lifecycle failures.
+                response = await http_client.post(
+                    f"{config.worker_addr}/session/{session_key}/close",
+                    headers=worker_hop_headers or None,
+                    timeout=5,
+                )
             response.raise_for_status()
+            receipt = response.json()
+            exact_receipt = {
+                "status": "ok",
+                "session_key_sha256": session_key_sha256(session_key),
+            }
+            valid_receipt = receipt == exact_receipt or (
+                used_legacy_endpoint and receipt == {"status": "ok"}
+            )
+            if not valid_receipt:
+                raise ValueError("Worker returned a mismatched session close receipt")
         except Exception:
             logger.warning("Failed to close worker session %s", session_key)
             return False
         return True
 
-    def _validate_session_key(session_key: str) -> None:
-        if type(session_key) is not str or not session_key.strip():
-            raise HTTPException(
-                status_code=400,
-                detail="session_key must be a non-blank string",
-            )
+    def _validate_session_key(session_key: object) -> str:
+        try:
+            return validate_session_key(session_key)
+        except (TypeError, ValueError) as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
 
     def _parse_inference(body: dict[str, Any]) -> dict[str, Any] | object:
         """Validate optional routing without mutating a live session.
@@ -595,9 +618,8 @@ def create_data_proxy_app(config: DataProxyConfig) -> FastAPI:
             if not lease_transferred:
                 await _finish_response(resp, session)
 
-    @app.post("/session/{session_key}/close")
-    async def close_session(session_key: str):
-        _validate_session_key(session_key)
+    async def _close_session(session_key: object):
+        session_key = _validate_session_key(session_key)
         task = await _begin_session_close(session_key, idle_only=False)
         if task is None:  # pragma: no cover - explicit close always creates one
             raise HTTPException(
@@ -609,6 +631,18 @@ def create_data_proxy_app(config: DataProxyConfig) -> FastAPI:
                 detail="worker session close failed; retry is required",
             )
         return {"status": "ok"}
+
+    @app.post("/sessions/close")
+    async def close_session(body: dict[str, Any]):
+        """Close a session without interpreting its identity as URL syntax."""
+
+        return await _close_session(body.get("session_key"))
+
+    @app.post("/session/{session_key}/close", deprecated=True)
+    async def close_session_legacy(session_key: str):
+        """Compatibility route; internal callers use ``/sessions/close``."""
+
+        return await _close_session(session_key)
 
     @app.get("/session/{session_key}/history")
     async def get_history(session_key: str):

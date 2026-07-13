@@ -106,6 +106,24 @@ class _JsonPassthroughAgent:
         )
 
 
+class _IdentitySpyAgent:
+    run_keys: list[str] = []
+    close_keys: list[str] = []
+
+    async def run(
+        self,
+        request: AgentRequest,
+        *,
+        emitter: EventEmitter,
+    ) -> AgentResponse:
+        del emitter
+        type(self).run_keys.append(request.session_key)
+        return AgentResponse(summary="ok")
+
+    async def close_session(self, session_key: str) -> None:
+        type(self).close_keys.append(session_key)
+
+
 def _make_worker_app(agent_cls, *, worker_hop_api_key: str = ""):
     with patch(
         "areal.v2.agent_service.worker.app.import_from_string",
@@ -214,6 +232,37 @@ class TestWorkerDataProxyIntegration:
             assert "echo: hello" in data["summary"]
 
     @pytest.mark.asyncio
+    async def test_real_worker_run_close_and_receipt_share_exact_identity(self):
+        _IdentitySpyAgent.run_keys.clear()
+        _IdentitySpyAgent.close_keys.clear()
+        worker_app = _make_worker_app(_IdentitySpyAgent)
+        worker_transport = httpx.ASGITransport(app=worker_app)
+        proxy_app = create_data_proxy_app(DataProxyConfig(worker_addr="http://worker"))
+        patched_post, patched_send = _worker_patches(worker_transport)
+        proxy_transport = httpx.ASGITransport(app=proxy_app)
+
+        with (
+            patch.object(httpx.AsyncClient, "post", patched_post),
+            patch.object(httpx.AsyncClient, "send", patched_send),
+        ):
+            async with httpx.AsyncClient(
+                transport=proxy_transport,
+                base_url="http://proxy",
+            ) as client:
+                turn = await client.post(
+                    "/session/chat:model:user/turn",
+                    json={"message": "hello", "run_id": "r1"},
+                )
+                closed = await client.post(
+                    "/sessions/close",
+                    json={"session_key": "chat:model:user"},
+                )
+
+        assert turn.status_code == closed.status_code == 200
+        assert _IdentitySpyAgent.run_keys == ["chat:model:user"]
+        assert _IdentitySpyAgent.close_keys == ["chat:model:user"]
+
+    @pytest.mark.asyncio
     async def test_controller_style_pair_authenticates_run_and_close(self):
         worker_hop_api_key = "test-worker-hop-key"
         worker_app = _make_worker_app(
@@ -256,7 +305,10 @@ class TestWorkerDataProxyIntegration:
                     )
                     assert accepted.status_code == 200
                     assert accepted.json()["summary"] == "echo: paired"
-                    closed = await proxy_client.post("/session/s1/close")
+                    closed = await proxy_client.post(
+                        "/sessions/close",
+                        json={"session_key": "s1"},
+                    )
                     assert closed.status_code == 200
             finally:
                 await proxy_app.router.shutdown()
@@ -345,7 +397,10 @@ class TestWorkerDataProxyIntegration:
                     "/session/s1/turn",
                     json={"message": "hi", "run_id": "r1"},
                 )
-                await proxy_client.post("/session/s1/close")
+                await proxy_client.post(
+                    "/sessions/close",
+                    json={"session_key": "s1"},
+                )
                 h = await proxy_client.get("/session/s1/history")
                 assert h.json()["history"] == []
 
@@ -661,10 +716,75 @@ class TestGatewayHealth:
             assert resp.json()["status"] == "ok"
 
 
+class TestGatewayWebSocketSessionIdentity:
+    @pytest.mark.asyncio
+    async def test_invalid_key_fails_before_accepted_frame_or_router(self):
+        from fastapi import WebSocketDisconnect
+
+        app = create_gateway_app(GatewayConfig(router_addr="http://fake-router"))
+        endpoint = next(
+            route.endpoint
+            for route in app.routes
+            if getattr(route, "path", None) == "/ws"
+        )
+        frames = [
+            {
+                "type": "req",
+                "id": "encoded",
+                "method": "agent",
+                "params": {"sessionKey": "s%252Fb", "message": "hello"},
+            },
+            {
+                "type": "req",
+                "id": "control",
+                "method": "agent",
+                "params": {"sessionKey": "s\x00b", "message": "hello"},
+            },
+        ]
+
+        class FakeWebSocket:
+            def __init__(self):
+                self.sent: list[str] = []
+                self.accepted = False
+
+            async def accept(self):
+                self.accepted = True
+
+            async def close(self, *, code, reason):  # pragma: no cover - valid token
+                raise AssertionError((code, reason))
+
+            async def receive_text(self):
+                if frames:
+                    return json.dumps(frames.pop(0))
+                raise WebSocketDisconnect()
+
+            async def send_text(self, payload):
+                self.sent.append(payload)
+
+        websocket = FakeWebSocket()
+        router_calls = 0
+        original_post = httpx.AsyncClient.post
+
+        async def patched_post(self, url, **kwargs):
+            nonlocal router_calls
+            router_calls += 1
+            return await original_post(self, url, **kwargs)
+
+        with patch.object(httpx.AsyncClient, "post", patched_post):
+            await endpoint(websocket, token=DEFAULT_ADMIN_API_KEY)
+
+        responses = [json.loads(payload) for payload in websocket.sent]
+        assert websocket.accepted is True
+        assert [response["id"] for response in responses] == ["encoded", "control"]
+        assert all(response["ok"] is False for response in responses)
+        assert all(response["payload"]["runId"] == "" for response in responses)
+        assert router_calls == 0
+
+
 class TestGatewayCloseSession:
     """The gateway's ``POST /sessions/close`` (session_key in the body) resolves
     the owning DataProxy via the Router and forwards the close, mirroring the
-    internal ``/session/{key}/close`` endpoint shape."""
+    fixed-body internal endpoint without treating the key as URL syntax."""
 
     @staticmethod
     def _patched_post(calls):
@@ -678,8 +798,8 @@ class TestGatewayCloseSession:
                     json={"data_proxy_addr": "http://proxy1"},
                     request=httpx.Request("POST", url),
                 )
-            if url.startswith("http://proxy1") and url.endswith("/close"):
-                calls.append(url)
+            if url == "http://proxy1/sessions/close":
+                calls.append((url, kwargs.get("json")))
                 return httpx.Response(
                     200, json={"status": "ok"}, request=httpx.Request("POST", url)
                 )
@@ -703,7 +823,7 @@ class TestGatewayCloseSession:
                 assert resp.status_code == 200
                 assert resp.json()["status"] == "ok"
 
-        assert calls == ["http://proxy1/session/s1/close"]
+        assert calls == [("http://proxy1/sessions/close", {"session_key": "s1"})]
 
     @pytest.mark.asyncio
     async def test_close_requires_session_key(self):
@@ -714,6 +834,134 @@ class TestGatewayCloseSession:
         ) as client:
             resp = await client.post("/sessions/close", json={}, headers=_AUTH)
             assert resp.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_close_rejects_ambiguous_key_before_routing(self):
+        app = create_gateway_app(GatewayConfig(router_addr="http://fake-router"))
+        transport = httpx.ASGITransport(app=app)
+        calls: list[object] = []
+
+        with patch.object(httpx.AsyncClient, "post", self._patched_post(calls)):
+            async with httpx.AsyncClient(
+                transport=transport,
+                base_url="http://gw",
+            ) as client:
+                resp = await client.post(
+                    "/sessions/close",
+                    json={"session_key": "s%252Fb"},
+                    headers=_AUTH,
+                )
+
+        assert resp.status_code == 400
+        assert calls == []
+
+    @pytest.mark.asyncio
+    async def test_close_preserves_retryable_data_proxy_failure(self):
+        app = create_gateway_app(GatewayConfig(router_addr="http://fake-router"))
+        transport = httpx.ASGITransport(app=app)
+        route_keys: list[str] = []
+        close_keys: list[str] = []
+        close_attempts = 0
+        original_post = httpx.AsyncClient.post
+
+        async def patched_post(self, url, **kwargs):
+            nonlocal close_attempts
+            url = str(url)
+            if url == "http://fake-router/route":
+                route_keys.append(kwargs["json"]["session_key"])
+                return httpx.Response(
+                    200,
+                    json={"data_proxy_addr": "http://proxy1"},
+                    request=httpx.Request("POST", url),
+                )
+            if url == "http://proxy1/sessions/close":
+                close_attempts += 1
+                close_keys.append(kwargs["json"]["session_key"])
+                return httpx.Response(
+                    503 if close_attempts == 1 else 200,
+                    json=(
+                        {"detail": "worker session close failed; retry is required"}
+                        if close_attempts == 1
+                        else {"status": "ok"}
+                    ),
+                    request=httpx.Request("POST", url),
+                )
+            return await original_post(self, url, **kwargs)
+
+        with patch.object(httpx.AsyncClient, "post", patched_post):
+            async with httpx.AsyncClient(
+                transport=transport,
+                base_url="http://gw",
+            ) as client:
+                first = await client.post(
+                    "/sessions/close",
+                    json={"session_key": "chat:model:user"},
+                    headers=_AUTH,
+                )
+                second = await client.post(
+                    "/sessions/close",
+                    json={"session_key": "chat:model:user"},
+                    headers=_AUTH,
+                )
+
+        assert first.status_code == 503
+        assert first.json() == {
+            "detail": "worker session close failed; retry is required"
+        }
+        assert second.status_code == 200
+        assert route_keys == ["chat:model:user", "chat:model:user"]
+        assert close_keys == ["chat:model:user", "chat:model:user"]
+
+    @pytest.mark.asyncio
+    async def test_close_falls_back_only_when_old_data_proxy_lacks_fixed_route(self):
+        app = create_gateway_app(GatewayConfig(router_addr="http://fake-router"))
+        transport = httpx.ASGITransport(app=app)
+        proxy_calls: list[tuple[str, object]] = []
+        original_post = httpx.AsyncClient.post
+
+        async def patched_post(self, url, **kwargs):
+            url = str(url)
+            if url == "http://fake-router/route":
+                return httpx.Response(
+                    200,
+                    json={"data_proxy_addr": "http://old-proxy"},
+                    request=httpx.Request("POST", url),
+                )
+            if url == "http://old-proxy/sessions/close":
+                proxy_calls.append((url, kwargs.get("json")))
+                return httpx.Response(
+                    404,
+                    json={"detail": "Not Found"},
+                    request=httpx.Request("POST", url),
+                )
+            if url == "http://old-proxy/session/chat:model:user/close":
+                proxy_calls.append((url, kwargs.get("json")))
+                return httpx.Response(
+                    200,
+                    json={"status": "ok"},
+                    request=httpx.Request("POST", url),
+                )
+            return await original_post(self, url, **kwargs)
+
+        with patch.object(httpx.AsyncClient, "post", patched_post):
+            async with httpx.AsyncClient(
+                transport=transport,
+                base_url="http://gw",
+            ) as client:
+                response = await client.post(
+                    "/sessions/close",
+                    json={"session_key": "chat:model:user"},
+                    headers=_AUTH,
+                )
+
+        assert response.status_code == 200
+        assert proxy_calls == [
+            (
+                "http://old-proxy/sessions/close",
+                {"session_key": "chat:model:user"},
+            ),
+            ("http://old-proxy/session/chat:model:user/close", None),
+        ]
 
     @pytest.mark.asyncio
     async def test_close_requires_admin_key(self):
@@ -767,6 +1015,19 @@ class TestBridgeDeriveSessionKey:
         key = OpenResponsesBridge._derive_session_key("u1", "")
         assert key == "agent:default:u1"
 
+    def test_unsafe_business_fields_use_a_stable_path_safe_digest(self):
+        first = OpenResponsesBridge._derive_session_key("用户/a", "org/model")
+        second = OpenResponsesBridge._derive_session_key("用户/a", "org/model")
+
+        assert first == second
+        assert first.startswith("agent:sha256:")
+        assert "/" not in first
+
+    def test_colon_components_cannot_alias_each_other(self):
+        assert OpenResponsesBridge._derive_session_key(
+            "c", "a:b"
+        ) != OpenResponsesBridge._derive_session_key("b:c", "a")
+
 
 class TestChatBridgeResolveSessionKey:
     """``ChatCompletionsBridge`` requires an explicit session key: the
@@ -784,7 +1045,9 @@ class TestChatBridgeResolveSessionKey:
 
         class _Req:
             def __init__(self, key):
-                self.headers = _Headers({SESSION_KEY_HEADER: key} if key else {})
+                self.headers = _Headers(
+                    {SESSION_KEY_HEADER: key} if key is not None else {}
+                )
 
         return _Req(header)
 
@@ -811,6 +1074,30 @@ class TestChatBridgeResolveSessionKey:
         req = self._request(None)
         key = ChatCompletionsBridge._resolve_session_key(req, {"model": "m"})
         assert key is None
+
+    def test_unsafe_derived_fields_use_a_path_safe_digest(self):
+        req = self._request(None)
+        key = ChatCompletionsBridge._resolve_session_key(
+            req,
+            {"user": "用户/a", "model": "org/model"},
+        )
+
+        assert key is not None
+        assert key.startswith("chat:sha256:")
+        assert "/" not in key
+
+    def test_invalid_explicit_key_is_not_rewritten(self):
+        req = self._request("s%252Fb")
+        with pytest.raises(ValueError):
+            ChatCompletionsBridge._resolve_session_key(req, {"model": "m"})
+
+    def test_explicit_blank_key_is_not_replaced_by_user(self):
+        req = self._request("")
+        with pytest.raises(ValueError):
+            ChatCompletionsBridge._resolve_session_key(
+                req,
+                {"model": "m", "user": "u1"},
+            )
 
 
 class TestBridgeBuildOutputItems:
@@ -927,6 +1214,49 @@ class TestBridgeStreamingEndToEnd:
             return await original_post(self, url, **kwargs)
 
         return patched_post
+
+    @pytest.mark.parametrize("session_key", ("s%252Fb", ""))
+    @pytest.mark.asyncio
+    async def test_invalid_explicit_key_fails_before_router_reservation(
+        self,
+        session_key: str,
+    ):
+        from fastapi import FastAPI
+
+        from areal.v2.agent_service.gateway.bridge import mount_bridge
+
+        bridge = OpenResponsesBridge(router_addr="http://router")
+        app = FastAPI()
+        mount_bridge(app, bridge)
+        upstream_calls = 0
+        original_post = httpx.AsyncClient.post
+
+        async def patched_post(self, url, **kwargs):
+            nonlocal upstream_calls
+            if str(url).startswith(("http://router", "http://proxy")):
+                upstream_calls += 1
+            return await original_post(self, url, **kwargs)
+
+        with patch.object(httpx.AsyncClient, "post", patched_post):
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(
+                transport=transport,
+                base_url="http://gw",
+            ) as client:
+                response = await client.post(
+                    "/v1/responses",
+                    headers={**_AUTH, SESSION_KEY_HEADER: session_key},
+                    json={
+                        "model": "GLM-5",
+                        "user": "must-not-replace-explicit-key",
+                        "input": [{"type": "message", "content": "hi"}],
+                    },
+                )
+        await bridge.close()
+
+        assert response.status_code == 400
+        assert response.json()["error"]["type"] == "invalid_request"
+        assert upstream_calls == 0
 
     @pytest.mark.asyncio
     async def test_stream_response_is_sse(self):

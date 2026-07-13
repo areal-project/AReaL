@@ -7,6 +7,7 @@ from unittest.mock import patch
 import pytest
 
 from areal.v2.agent_service.auth import DEFAULT_ADMIN_API_KEY, admin_headers
+from areal.v2.agent_service.session_keys import session_key_sha256
 from areal.v2.agent_service.types import (
     AgentRequest,
     AgentResponse,
@@ -167,6 +168,22 @@ class TestWorkerRun:
             )
             assert resp.status_code == 500
 
+    @pytest.mark.parametrize("session_key", (None, "s/b", "s%252Fb", "会话"))
+    @pytest.mark.asyncio
+    async def test_invalid_session_identity_never_reaches_agent(
+        self,
+        session_key: object,
+    ):
+        _LifecycleAgent.runs = 0
+        async with _make_client(_LifecycleAgent) as client:
+            response = await client.post(
+                "/run",
+                json={"message": "hello", "session_key": session_key, "run_id": "r1"},
+            )
+
+        assert response.status_code == 400
+        assert _LifecycleAgent.runs == 0
+
 
 class TestWorkerHopAuthentication:
     @pytest.mark.asyncio
@@ -228,13 +245,30 @@ class TestWorkerHopAuthentication:
             assert accepted.status_code == 200
             assert _LifecycleAgent.runs == 1
 
-            assert (await client.post("/session/s1/close")).status_code == 401
+            assert (
+                await client.post(
+                    "/sessions/close",
+                    json={"session_key": "s1"},
+                )
+            ).status_code == 401
+            assert _LifecycleAgent.closed_sessions == []
+            invalid_close = await client.post(
+                "/sessions/close",
+                json={"session_key": "s%252Fb"},
+                headers=admin_headers(key),
+            )
+            assert invalid_close.status_code == 400
             assert _LifecycleAgent.closed_sessions == []
             closed = await client.post(
-                "/session/s1/close",
+                "/sessions/close",
+                json={"session_key": "s1"},
                 headers=admin_headers(key),
             )
             assert closed.status_code == 200
+            assert closed.json() == {
+                "status": "ok",
+                "session_key_sha256": session_key_sha256("s1"),
+            }
             assert _LifecycleAgent.closed_sessions == ["s1"]
 
     @pytest.mark.parametrize(

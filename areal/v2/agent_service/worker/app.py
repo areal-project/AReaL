@@ -15,6 +15,7 @@ from areal.utils.dynamic_import import import_from_string
 
 from ..auth import is_source_visible_default_admin_key, verify_admin_key
 from ..protocol import PASSTHROUGH_HEADER, QueueMode
+from ..session_keys import session_key_sha256, validate_session_key
 from ..types import (
     AgentRequest,
     AgentResponse,
@@ -102,6 +103,12 @@ def _create_worker_app(
                 expected_key=worker_hop_api_key,
             )
 
+    def validated_session_key(value: object) -> str:
+        try:
+            return validate_session_key(value)
+        except (TypeError, ValueError) as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+
     @app.get("/health")
     async def health():
         return {"status": "ok"}
@@ -118,13 +125,28 @@ def _create_worker_app(
         await authorize_worker_hop(http_request)
         return {"status": "ok", "worker_hop_auth": True}
 
-    @app.post("/session/{session_key}/close")
-    async def close_session(session_key: str, http_request: Request):
+    async def close_agent_session(session_key: object, http_request: Request):
         await authorize_worker_hop(http_request)
+        session_key = validated_session_key(session_key)
         close_fn = getattr(agent, "close_session", None)
         if close_fn is not None:
             await close_fn(session_key)
-        return {"status": "ok"}
+        return {
+            "status": "ok",
+            "session_key_sha256": session_key_sha256(session_key),
+        }
+
+    @app.post("/sessions/close")
+    async def close_session(body: dict[str, Any], http_request: Request):
+        """Close an exact session identity carried as data, never URL syntax."""
+
+        return await close_agent_session(body.get("session_key"), http_request)
+
+    @app.post("/session/{session_key}/close", deprecated=True)
+    async def close_session_legacy(session_key: str, http_request: Request):
+        """Compatibility route; internal callers use ``/sessions/close``."""
+
+        return await close_agent_session(session_key, http_request)
 
     @app.on_event("shutdown")
     async def shutdown():
@@ -149,9 +171,10 @@ def _create_worker_app(
           ``events``.
         """
         await authorize_worker_hop(http_request)
+        session_key = validated_session_key(body.get("session_key"))
         request = AgentRequest(
             message=body.get("message", ""),
-            session_key=body.get("session_key", ""),
+            session_key=session_key,
             run_id=body.get("run_id", ""),
             history=body.get("history", []),
             queue_mode=QueueMode(body.get("queue_mode", "collect")),

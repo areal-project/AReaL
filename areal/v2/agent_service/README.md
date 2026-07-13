@@ -52,13 +52,13 @@ state.
 
 Controller-managed deployments use a different random credential for every
 DataProxy→Worker pair. The DataProxy creates a fresh Bearer header for both `/run` and
-`/session/{key}/close`; it never forwards the Gateway request's Authorization header.
-The pair credential is distinct from both the external admin key and the
-Gateway→DataProxy Memory-control key, and it is not distributed to Gateway or Router. At
-startup, a configured DataProxy calls the authenticated `/internal/auth-check` route and
-requires its exact typed receipt; a wrong key or a standalone Worker therefore fails
-startup instead of silently weakening the hop. `/health` remains unauthenticated for
-ordinary readiness probes.
+`/sessions/close`; it never forwards the Gateway request's Authorization header. The
+pair credential is distinct from both the external admin key and the Gateway→DataProxy
+Memory-control key, and it is not distributed to Gateway or Router. At startup, a
+configured DataProxy calls the authenticated `/internal/auth-check` route and requires
+its exact typed receipt; a wrong key or a standalone Worker therefore fails startup
+instead of silently weakening the hop. `/health` remains unauthenticated for ordinary
+readiness probes.
 
 An empty Worker-hop key preserves standalone compatibility. Memory-control transport
 cannot be enabled on a DataProxy in that mode. Internal-hop authentication verifies
@@ -70,6 +70,33 @@ protects against unauthenticated network callers and accidental cross-pair routi
 arbitrary code running under the same OS identity: such a process may inspect sibling
 process arguments. A hostile-plugin deployment needs separate OS identities or process
 namespaces plus a protected secret channel (for example UDS permissions or mTLS).
+
+### Canonical session identity
+
+A session key is an identifier, not arbitrary display text. Because turn and history
+APIs currently place it in one URL path segment, every public and internal boundary
+accepts only 1–256 ASCII characters from `A-Z`, `a-z`, `0-9`, `.`, `_`, `~`, `:`, and
+`-`; the complete keys `.` and `..` are also rejected. Validation never trims,
+normalizes, percent-decodes, or silently rewrites a key. In particular, `/`, `\`, `?`,
+`#`, `%`, whitespace, control characters, and Unicode cannot enter Router affinity,
+DataProxy state, or Worker execution.
+
+OpenAI `model` and `user` fields are business data and may still contain paths or
+Unicode. The bridges preserve the readable `agent:model:user` / `chat:model:user` form
+when its components are independently safe and unambiguous; otherwise they derive a
+deterministic, domain-separated SHA-256 key. Thus common model IDs such as `org/model`
+remain supported without turning their slash into routing syntax.
+
+Session close uses the fixed `POST /sessions/close` endpoint with `session_key` in a
+JSON body at Gateway→DataProxy and DataProxy→Worker hops. The Worker returns the exact
+key digest in its close receipt, and the DataProxy clears history and Memory pin state
+only when that receipt matches. This prevents repeated URL decoding from making a turn
+and its close target different agent sessions. The old path-shaped close endpoints are
+deprecated compatibility shims. New callers use the fixed endpoint first and fall back
+to a legacy path only on `404`/`405`, after validating the key, so rolling upgrades do
+not strand a closing session. Authentication or lifecycle failures never trigger that
+downgrade. A legacy Worker's status-only close receipt is accepted only on this explicit
+compatibility path; same-version fixed endpoints always require the exact key digest.
 
 ### Memory authorization contract
 
@@ -242,15 +269,19 @@ class EventEmitter(Protocol):
 | ------------------------ | ------ | ------------------------ |
 | `/health`                | GET    | Health check             |
 | `/session/{key}/turn`    | POST   | Send a message (turn)    |
-| `/session/{key}/close`   | POST   | Close session            |
+| `/sessions/close`        | POST   | Close session (JSON key) |
+| `/session/{key}/close`   | POST   | Deprecated close shim    |
 | `/session/{key}/history` | GET    | Get conversation history |
 
 ### Worker
 
-| Endpoint  | Method | Description            |
-| --------- | ------ | ---------------------- |
-| `/health` | GET    | Health check           |
-| `/run`    | POST   | Execute one agent turn |
+| Endpoint               | Method | Description                    |
+| ---------------------- | ------ | ------------------------------ |
+| `/health`              | GET    | Health check                   |
+| `/run`                 | POST   | Execute one agent turn         |
+| `/sessions/close`      | POST   | Close session (JSON key)       |
+| `/session/{key}/close` | POST   | Deprecated close shim          |
+| `/internal/auth-check` | GET    | Verify pair-hop authentication |
 
 ### Gateway
 
@@ -258,6 +289,7 @@ class EventEmitter(Protocol):
 | ---------------------- | ------ | ------------------------------ |
 | `/health`              | GET    | Health check                   |
 | `/ws`                  | WS     | Gateway WebSocket protocol     |
+| `/sessions/close`      | POST   | Close a session                |
 | `/v1/responses`        | POST   | OpenResponses HTTP bridge      |
 | `/v1/chat/completions` | POST   | OpenAI chat-completions bridge |
 

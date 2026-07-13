@@ -30,6 +30,7 @@ from ..memory_transport import (
     MEMORY_CONTROL_AUTHORIZED_FIELD,
 )
 from ..protocol import generate_run_id
+from ..session_keys import derive_session_key, validate_session_key
 from ..streaming import CleanupStreamingResponse
 
 logger = logging.getLogger("AgentBridge")
@@ -40,6 +41,18 @@ logger = logging.getLogger("AgentBridge")
 # can reuse it on the next request — including a key derived or randomly minted
 # server-side when the client sent none.
 SESSION_KEY_HEADER = "X-AReaL-Session-Key"
+
+
+def _invalid_session_key_response(error: Exception) -> JSONResponse:
+    return JSONResponse(
+        {
+            "error": {
+                "message": str(error),
+                "type": "invalid_request",
+            }
+        },
+        status_code=400,
+    )
 
 
 def _has_admin_authorization(request: Request, expected: dict[str, str]) -> bool:
@@ -130,7 +143,7 @@ class OpenResponsesBridge(AgentBridge):
         # DataProxy/Worker directly; only when it is absent do we fall back to
         # deriving the key from ``user`` (which is then required for affinity).
         explicit_session_key = request.headers.get(SESSION_KEY_HEADER)
-        if not explicit_session_key and not user:
+        if explicit_session_key is None and not user:
             return JSONResponse(
                 {
                     "error": {
@@ -145,7 +158,14 @@ class OpenResponsesBridge(AgentBridge):
             )
 
         message = self._extract_message(input_items, instructions)
-        session_key = explicit_session_key or self._derive_session_key(user, model)
+        try:
+            session_key = (
+                validate_session_key(explicit_session_key)
+                if explicit_session_key is not None
+                else self._derive_session_key(user, model)
+            )
+        except (TypeError, ValueError) as error:
+            return _invalid_session_key_response(error)
         run_id = generate_run_id()
         response_id = f"resp-{uuid.uuid4().hex[:12]}"
 
@@ -355,9 +375,8 @@ class OpenResponsesBridge(AgentBridge):
 
     @staticmethod
     def _derive_session_key(user: str, model: str) -> str:
-        if user:
-            return f"agent:{model or 'default'}:{user}"
-        return f"agent:{model or 'default'}:{uuid.uuid4().hex[:8]}"
+        identity = user if user else uuid.uuid4().hex[:8]
+        return derive_session_key("agent", model or "default", identity)
 
 
 def mount_bridge(
@@ -489,7 +508,10 @@ class ChatCompletionsBridge(AgentBridge):
         for key in _CHAT_CONTROL_FIELDS:
             upstream_body.pop(key, None)
         messages = upstream_body.get("messages", [])
-        session_key = self._resolve_session_key(request, body)
+        try:
+            session_key = self._resolve_session_key(request, body)
+        except (TypeError, ValueError) as error:
+            return _invalid_session_key_response(error)
         if session_key is None:
             return JSONResponse(
                 {
@@ -595,12 +617,12 @@ class ChatCompletionsBridge(AgentBridge):
         ``400`` instead of minting an implicit random key.
         """
         explicit = request.headers.get(SESSION_KEY_HEADER)
-        if explicit:
-            return explicit
+        if explicit is not None:
+            return validate_session_key(explicit)
         user = body.get("user", "")
         if user:
             model = body.get("model") or "default"
-            return f"chat:{model}:{user}"
+            return derive_session_key("chat", model, user)
         return None
 
     @staticmethod

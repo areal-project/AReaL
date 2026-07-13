@@ -12,6 +12,7 @@ from ..memory_transport import (
     MEMORY_CONTROL_AUTHORIZED_FIELD,
     MemoryAssignmentPinWireV1,
 )
+from ..session_keys import validate_session_key
 
 
 class DataProxyClient:
@@ -45,6 +46,7 @@ class DataProxyClient:
         memory_assignment_pin: MemoryAssignmentPinWireV1 | None = None,
         memory_control_authorized: bool = False,
     ) -> dict[str, Any]:
+        session_key = validate_session_key(session_key)
         if type(memory_control_authorized) is not bool:
             raise TypeError("memory_control_authorized must be a bool")
         if memory_assignment_pin is not None and not memory_control_authorized:
@@ -80,10 +82,17 @@ class DataProxyClient:
         return resp.json()
 
     async def close_session(self, session_key: str) -> None:
-        resp = await self._http.post(f"{self._addr}/session/{session_key}/close")
+        session_key = validate_session_key(session_key)
+        resp = await self._http.post(
+            f"{self._addr}/sessions/close",
+            json={"session_key": session_key},
+        )
+        if resp.status_code in {404, 405}:
+            resp = await self._http.post(f"{self._addr}/session/{session_key}/close")
         resp.raise_for_status()
 
     async def get_history(self, session_key: str) -> list[dict[str, Any]]:
+        session_key = validate_session_key(session_key)
         resp = await self._http.get(f"{self._addr}/session/{session_key}/history")
         resp.raise_for_status()
         return resp.json()["history"]

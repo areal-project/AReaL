@@ -20,6 +20,7 @@ from areal.v2.agent_service.memory_transport import (
     MemoryAssignmentPinWireV1,
     parse_memory_assignment_pin_metadata,
 )
+from areal.v2.agent_service.session_keys import session_key_sha256
 from areal.v2.memory_service.types import MemoryScope
 
 httpx = pytest.importorskip("httpx")
@@ -77,6 +78,21 @@ def _internal_request():
     )
 
 
+def _worker_close_session_key(request) -> str:
+    assert request.url.path == "/sessions/close"
+    payload = json.loads(request.content)
+    assert set(payload) == {"session_key"}
+    return payload["session_key"]
+
+
+def _worker_close_receipt(request) -> dict[str, str]:
+    session_key = _worker_close_session_key(request)
+    return {
+        "status": "ok",
+        "session_key_sha256": session_key_sha256(session_key),
+    }
+
+
 def _patched_worker_send(worker_bodies, worker_closes):
     original_send = httpx.AsyncClient.send
 
@@ -90,9 +106,11 @@ def _patched_worker_send(worker_bodies, worker_closes):
                 json={"summary": "ok", "events": [], "metadata": {}},
                 request=request,
             )
-        if request.url.path.endswith("/close"):
-            worker_closes.append(request.url.path)
-            return httpx.Response(200, json={"status": "ok"}, request=request)
+        if request.url.path == "/sessions/close":
+            worker_closes.append(_worker_close_session_key(request))
+            return httpx.Response(
+                200, json=_worker_close_receipt(request), request=request
+            )
         raise AssertionError(f"unexpected worker request: {request.url}")
 
     return patched_send
@@ -195,8 +213,10 @@ async def test_data_proxy_replaces_inbound_auth_with_worker_pair_auth() -> None:
                 json={"summary": "ok", "events": [], "metadata": {}},
                 request=request,
             )
-        if request.url.path.endswith("/close"):
-            return httpx.Response(200, json={"status": "ok"}, request=request)
+        if request.url.path == "/sessions/close":
+            return httpx.Response(
+                200, json=_worker_close_receipt(request), request=request
+            )
         raise AssertionError(f"unexpected Worker request: {request.url}")
 
     app = _proxy_app()
@@ -212,7 +232,10 @@ async def test_data_proxy_replaces_inbound_auth_with_worker_pair_auth() -> None:
                 json={"message": "hello", "run_id": "r1"},
             )
             assert turn.status_code == 200
-            closed = await client.post("/session/s1/close")
+            closed = await client.post(
+                "/sessions/close",
+                json={"session_key": "s1"},
+            )
             assert closed.status_code == 200
 
     assert forwarded_authorization == [
@@ -297,6 +320,41 @@ async def test_source_visible_admin_defaults_cannot_enable_memory_control(
 
     assert response.status_code == 503
     assert "non-default external admin key" in response.json()["error"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_chat_bridge_rejects_ambiguous_key_before_router_reservation() -> None:
+    forwarded = []
+
+    def handler(request):
+        forwarded.append(request)
+        return httpx.Response(500, request=request)
+
+    bridge = gateway_bridge.ChatCompletionsBridge(router_addr="http://router")
+    await bridge._http.aclose()
+    bridge._http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    app = fastapi.FastAPI()
+    gateway_bridge.mount_chat_bridge(app, bridge)
+    transport = httpx.ASGITransport(app=app)
+    try:
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://gateway",
+        ) as client:
+            response = await client.post(
+                "/v1/chat/completions",
+                headers={"X-AReaL-Session-Key": "s%252Fb"},
+                json={
+                    "model": "model-1",
+                    "messages": [{"role": "user", "content": "hello"}],
+                },
+            )
+    finally:
+        await bridge.close()
+
+    assert response.status_code == 400
+    assert response.json()["error"]["type"] == "invalid_request"
+    assert forwarded == []
 
 
 @pytest.mark.asyncio
@@ -521,6 +579,58 @@ async def test_data_proxy_client_sends_hop_key_only_for_memory_control() -> None
 
 
 @pytest.mark.asyncio
+async def test_data_proxy_client_rejects_ambiguous_key_before_network_io() -> None:
+    forwarded = []
+
+    def handler(request):
+        forwarded.append(request)
+        return httpx.Response(500, request=request)
+
+    client = data_proxy_client.DataProxyClient("http://proxy")
+    await client._http.aclose()
+    client._http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    try:
+        with pytest.raises(ValueError):
+            await client.turn("s%252Fb", "hello")
+        with pytest.raises(ValueError):
+            await client.close_session("s/b")
+        with pytest.raises(ValueError):
+            await client.get_history("s#fragment")
+    finally:
+        await client.close()
+
+    assert forwarded == []
+
+
+@pytest.mark.asyncio
+async def test_data_proxy_client_can_close_on_old_proxy_during_upgrade() -> None:
+    forwarded = []
+
+    def handler(request):
+        forwarded.append(request)
+        if request.url.path == "/sessions/close":
+            return httpx.Response(404, request=request)
+        if request.url.path == "/session/chat:model:user/close":
+            return httpx.Response(200, json={"status": "ok"}, request=request)
+        raise AssertionError(f"unexpected request: {request.url}")
+
+    client = data_proxy_client.DataProxyClient("http://proxy")
+    await client._http.aclose()
+    client._http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    try:
+        await client.close_session("chat:model:user")
+    finally:
+        await client.close()
+
+    assert [request.url.path for request in forwarded] == [
+        "/sessions/close",
+        "/session/chat:model:user/close",
+    ]
+    assert json.loads(forwarded[0].content) == {"session_key": "chat:model:user"}
+    assert forwarded[1].content == b""
+
+
+@pytest.mark.asyncio
 async def test_conflicting_pin_and_reserved_metadata_fail_before_worker() -> None:
     worker_bodies: list[dict] = []
     worker_closes: list[str] = []
@@ -648,7 +758,10 @@ async def test_close_clears_pin_and_allows_new_incarnation() -> None:
                     {"message": "a", MEMORY_ASSIGNMENT_PIN_FIELD: _wire("a")}
                 ),
             )
-            closed = await client.post("/session/s1/close")
+            closed = await client.post(
+                "/sessions/close",
+                json={"session_key": "s1"},
+            )
             replacement = await client.post(
                 "/session/s1/turn",
                 json=_authorized(
@@ -657,13 +770,98 @@ async def test_close_clears_pin_and_allows_new_incarnation() -> None:
             )
 
     assert first.status_code == closed.status_code == replacement.status_code == 200
-    assert worker_closes == ["/session/s1/close"]
+    assert worker_closes == ["s1"]
     pins = [
         parse_memory_assignment_pin_metadata(body["metadata"]) for body in worker_bodies
     ]
     assert pins == [
         MemoryAssignmentPinWireV1.from_wire(_wire("a")).to_runtime_pin(),
         MemoryAssignmentPinWireV1.from_wire(_wire("b")).to_runtime_pin(),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_canonical_session_identity_is_exact_at_worker_run_and_close() -> None:
+    worker_bodies: list[dict] = []
+    worker_closes: list[str] = []
+    app = _proxy_app()
+    transport = httpx.ASGITransport(app=app)
+    with patch.object(
+        httpx.AsyncClient,
+        "send",
+        _patched_worker_send(worker_bodies, worker_closes),
+    ):
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://proxy",
+        ) as client:
+            turn = await client.post(
+                "/session/chat:model:user/turn",
+                json={"message": "hello"},
+            )
+            closed = await client.post(
+                "/sessions/close",
+                json={"session_key": "chat:model:user"},
+            )
+
+    assert turn.status_code == closed.status_code == 200
+    assert [body["session_key"] for body in worker_bodies] == ["chat:model:user"]
+    assert worker_closes == ["chat:model:user"]
+
+
+@pytest.mark.asyncio
+async def test_new_data_proxy_can_close_session_on_old_worker_during_upgrade() -> None:
+    worker_run_keys: list[str] = []
+    worker_close_paths: list[str] = []
+    original_send = httpx.AsyncClient.send
+
+    async def patched_send(self, request, **kwargs):
+        if request.url.host != "worker":
+            return await original_send(self, request, **kwargs)
+        if request.url.path == "/run":
+            worker_run_keys.append(json.loads(request.content)["session_key"])
+            return httpx.Response(
+                200,
+                json={"summary": "ok", "events": [], "metadata": {}},
+                request=request,
+            )
+        if request.url.path == "/sessions/close":
+            worker_close_paths.append(request.url.path)
+            return httpx.Response(
+                404,
+                json={"detail": "Not Found"},
+                request=request,
+            )
+        if request.url.path == "/session/chat:model:user/close":
+            worker_close_paths.append(request.url.path)
+            return httpx.Response(200, json={"status": "ok"}, request=request)
+        raise AssertionError(f"unexpected worker request: {request.url}")
+
+    app = _proxy_app()
+    transport = httpx.ASGITransport(app=app)
+    with patch.object(httpx.AsyncClient, "send", patched_send):
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://proxy",
+        ) as client:
+            first = await client.post(
+                "/session/chat:model:user/turn",
+                json={"message": "first"},
+            )
+            closed = await client.post(
+                "/sessions/close",
+                json={"session_key": "chat:model:user"},
+            )
+            replacement = await client.post(
+                "/session/chat:model:user/turn",
+                json={"message": "replacement incarnation"},
+            )
+
+    assert first.status_code == closed.status_code == replacement.status_code == 200
+    assert worker_run_keys == ["chat:model:user", "chat:model:user"]
+    assert worker_close_paths == [
+        "/sessions/close",
+        "/session/chat:model:user/close",
     ]
 
 
@@ -693,7 +891,7 @@ async def test_shutdown_closes_pinned_worker_session_before_clearing_pin() -> No
             await shutdown_handler()
 
     assert response.status_code == 200
-    assert worker_closes == ["/session/s1/close"]
+    assert worker_closes == ["s1"]
     assert app.state.memory_pin_cache.resolve("s1") is None
 
 
@@ -797,6 +995,82 @@ async def test_blank_session_key_fails_without_reserving_session() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "encoded_key",
+    (
+        "s%252Fb",
+        "s%25252Fb",
+        "s%23fragment",
+        "s%3Fquery",
+        "s%5Cb",
+        "s%00b",
+    ),
+)
+async def test_ambiguous_session_key_fails_before_worker_or_state_mutation(
+    encoded_key: str,
+) -> None:
+    """Recursive URL decoding must not change a session's identity by hop.
+
+    The request path is decoded once by the DataProxy.  Before this regression
+    was fixed, the resulting key still contained ``%25`` and was accepted into
+    local state; interpolating it into the Worker close URL decoded it again,
+    so ``run`` and ``close_session`` could address different agent sessions.
+    """
+
+    worker_bodies: list[dict] = []
+    worker_closes: list[str] = []
+    app = _proxy_app()
+    transport = httpx.ASGITransport(app=app)
+    with patch.object(
+        httpx.AsyncClient,
+        "send",
+        _patched_worker_send(worker_bodies, worker_closes),
+    ):
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://proxy",
+            headers=_MEMORY_CONTROL_HEADERS,
+        ) as client:
+            rejected = await client.post(
+                f"/session/{encoded_key}/turn",
+                json={"message": "must not reserve an ambiguous identity"},
+            )
+            health = await client.get("/health")
+
+    assert rejected.status_code == 400
+    assert health.json()["active_sessions"] == 0
+    assert worker_bodies == []
+    assert worker_closes == []
+
+
+@pytest.mark.asyncio
+async def test_fixed_close_rejects_ambiguous_key_before_tombstone_or_worker() -> None:
+    worker_bodies: list[dict] = []
+    worker_closes: list[str] = []
+    app = _proxy_app()
+    transport = httpx.ASGITransport(app=app)
+    with patch.object(
+        httpx.AsyncClient,
+        "send",
+        _patched_worker_send(worker_bodies, worker_closes),
+    ):
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://proxy",
+        ) as client:
+            rejected = await client.post(
+                "/sessions/close",
+                json={"session_key": "s%252Fb"},
+            )
+            health = await client.get("/health")
+
+    assert rejected.status_code == 400
+    assert health.json()["active_sessions"] == 0
+    assert worker_bodies == []
+    assert worker_closes == []
+
+
+@pytest.mark.asyncio
 async def test_conflicting_pin_cannot_mutate_cached_inference_routing() -> None:
     worker_bodies: list[dict] = []
     worker_closes: list[str] = []
@@ -867,11 +1141,13 @@ async def test_close_tombstone_prevents_rebind_before_worker_cleanup() -> None:
                 json={"summary": "ok", "events": [], "metadata": {}},
                 request=request,
             )
-        if request.url.path.endswith("/close"):
-            worker_closes.append(request.url.path)
+        if request.url.path == "/sessions/close":
+            worker_closes.append(_worker_close_session_key(request))
             close_started.set()
             await release_close.wait()
-            return httpx.Response(200, json={"status": "ok"}, request=request)
+            return httpx.Response(
+                200, json=_worker_close_receipt(request), request=request
+            )
         raise AssertionError(f"unexpected worker request: {request.url}")
 
     app = _proxy_app()
@@ -911,7 +1187,7 @@ async def test_close_tombstone_prevents_rebind_before_worker_cleanup() -> None:
     assert first.status_code == closed.status_code == replacement.status_code == 200
     assert during_close.status_code == 409
     assert len(worker_bodies) == 2
-    assert worker_closes == ["/session/s1/close"]
+    assert worker_closes == ["s1"]
     assert parse_memory_assignment_pin_metadata(worker_bodies[0]["metadata"]) != (
         parse_memory_assignment_pin_metadata(worker_bodies[1]["metadata"])
     )
@@ -939,9 +1215,11 @@ async def test_stream_body_holds_turn_lease_until_iterator_finishes() -> None:
                 stream=BlockingStream(),
                 request=request,
             )
-        if request.url.path.endswith("/close"):
-            worker_closes.append(request.url.path)
-            return httpx.Response(200, json={"status": "ok"}, request=request)
+        if request.url.path == "/sessions/close":
+            worker_closes.append(_worker_close_session_key(request))
+            return httpx.Response(
+                200, json=_worker_close_receipt(request), request=request
+            )
         raise AssertionError(f"unexpected worker request: {request.url}")
 
     app = _proxy_app()
@@ -974,7 +1252,7 @@ async def test_stream_body_holds_turn_lease_until_iterator_finishes() -> None:
             await anext(iterator)
         assert await close_task == {"status": "ok"}
 
-    assert worker_closes == ["/session/s1/close"]
+    assert worker_closes == ["s1"]
 
 
 @pytest.mark.asyncio
@@ -1001,9 +1279,11 @@ async def test_stream_close_before_first_byte_releases_turn_lease() -> None:
                 stream=NeverStartedStream(),
                 request=request,
             )
-        if request.url.path.endswith("/close"):
-            worker_closes.append(request.url.path)
-            return httpx.Response(200, json={"status": "ok"}, request=request)
+        if request.url.path == "/sessions/close":
+            worker_closes.append(_worker_close_session_key(request))
+            return httpx.Response(
+                200, json=_worker_close_receipt(request), request=request
+            )
         raise AssertionError(f"unexpected worker request: {request.url}")
 
     app = _proxy_app()
@@ -1029,7 +1309,7 @@ async def test_stream_close_before_first_byte_releases_turn_lease() -> None:
             "status": "ok"
         }
 
-    assert worker_closes == ["/session/s1/close"]
+    assert worker_closes == ["s1"]
 
 
 @pytest.mark.asyncio
@@ -1055,9 +1335,11 @@ async def test_stream_close_failure_cannot_leak_turn_lease() -> None:
                 stream=FailingCloseStream(),
                 request=request,
             )
-        if request.url.path.endswith("/close"):
-            worker_closes.append(request.url.path)
-            return httpx.Response(200, json={"status": "ok"}, request=request)
+        if request.url.path == "/sessions/close":
+            worker_closes.append(_worker_close_session_key(request))
+            return httpx.Response(
+                200, json=_worker_close_receipt(request), request=request
+            )
         raise AssertionError(f"unexpected worker request: {request.url}")
 
     app = _proxy_app()
@@ -1086,7 +1368,7 @@ async def test_stream_close_failure_cannot_leak_turn_lease() -> None:
             "status": "ok"
         }
 
-    assert worker_closes == ["/session/s1/close"]
+    assert worker_closes == ["s1"]
 
 
 @pytest.mark.asyncio
@@ -1123,6 +1405,7 @@ async def test_chat_downstream_close_survives_caller_cancellation() -> None:
 @pytest.mark.asyncio
 async def test_failed_worker_close_keeps_tombstone_until_retry_succeeds() -> None:
     worker_bodies: list[dict] = []
+    worker_close_keys: list[str] = []
     close_attempts = 0
     original_send = httpx.AsyncClient.send
 
@@ -1137,11 +1420,16 @@ async def test_failed_worker_close_keeps_tombstone_until_retry_succeeds() -> Non
                 json={"summary": "ok", "events": [], "metadata": {}},
                 request=request,
             )
-        if request.url.path.endswith("/close"):
+        if request.url.path == "/sessions/close":
             close_attempts += 1
+            worker_close_keys.append(_worker_close_session_key(request))
             return httpx.Response(
                 503 if close_attempts == 1 else 200,
-                json={"status": "retry" if close_attempts == 1 else "ok"},
+                json=(
+                    {"status": "retry"}
+                    if close_attempts == 1
+                    else _worker_close_receipt(request)
+                ),
                 request=request,
             )
         raise AssertionError(f"unexpected worker request: {request.url}")
@@ -1160,14 +1448,20 @@ async def test_failed_worker_close_keeps_tombstone_until_retry_succeeds() -> Non
                     {"message": "first", MEMORY_ASSIGNMENT_PIN_FIELD: _wire("a")}
                 ),
             )
-            failed_close = await client.post("/session/s1/close")
+            failed_close = await client.post(
+                "/sessions/close",
+                json={"session_key": "s1"},
+            )
             blocked = await client.post(
                 "/session/s1/turn",
                 json=_authorized(
                     {"message": "blocked", MEMORY_ASSIGNMENT_PIN_FIELD: _wire("b")}
                 ),
             )
-            successful_close = await client.post("/session/s1/close")
+            successful_close = await client.post(
+                "/sessions/close",
+                json={"session_key": "s1"},
+            )
             replacement = await client.post(
                 "/session/s1/turn",
                 json=_authorized(
@@ -1182,6 +1476,81 @@ async def test_failed_worker_close_keeps_tombstone_until_retry_succeeds() -> Non
     assert blocked.status_code == 409
     assert successful_close.status_code == replacement.status_code == 200
     assert close_attempts == 2
+    assert worker_close_keys == ["s1", "s1"]
+    assert len(worker_bodies) == 2
+
+
+@pytest.mark.asyncio
+async def test_mismatched_worker_close_receipt_keeps_tombstone() -> None:
+    worker_bodies: list[dict] = []
+    worker_close_keys: list[str] = []
+    close_attempts = 0
+    original_send = httpx.AsyncClient.send
+
+    async def patched_send(self, request, **kwargs):
+        nonlocal close_attempts
+        if request.url.host != "worker":
+            return await original_send(self, request, **kwargs)
+        if request.url.path == "/run":
+            worker_bodies.append(json.loads(request.content))
+            return httpx.Response(
+                200,
+                json={"summary": "ok", "events": [], "metadata": {}},
+                request=request,
+            )
+        if request.url.path == "/sessions/close":
+            close_attempts += 1
+            worker_close_keys.append(_worker_close_session_key(request))
+            return httpx.Response(
+                200,
+                json=(
+                    {
+                        "status": "ok",
+                        "session_key_sha256": session_key_sha256("other-session"),
+                    }
+                    if close_attempts == 1
+                    else _worker_close_receipt(request)
+                ),
+                request=request,
+            )
+        raise AssertionError(f"unexpected worker request: {request.url}")
+
+    app = _proxy_app()
+    transport = httpx.ASGITransport(app=app)
+    with patch.object(httpx.AsyncClient, "send", patched_send):
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://proxy",
+            headers=_MEMORY_CONTROL_HEADERS,
+        ) as client:
+            first = await client.post(
+                "/session/s1/turn",
+                json={"message": "first"},
+            )
+            rejected_close = await client.post(
+                "/sessions/close",
+                json={"session_key": "s1"},
+            )
+            blocked = await client.post(
+                "/session/s1/turn",
+                json={"message": "must remain closed"},
+            )
+            health = await client.get("/health")
+            successful_close = await client.post(
+                "/sessions/close",
+                json={"session_key": "s1"},
+            )
+            replacement = await client.post(
+                "/session/s1/turn",
+                json={"message": "replacement incarnation"},
+            )
+
+    assert first.status_code == 200
+    assert rejected_close.status_code == 503
+    assert blocked.status_code == 409
+    assert health.json()["active_sessions"] == 1
+    assert successful_close.status_code == replacement.status_code == 200
+    assert worker_close_keys == ["s1", "s1"]
     assert len(worker_bodies) == 2
 
 

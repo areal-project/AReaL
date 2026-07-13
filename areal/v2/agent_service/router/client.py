@@ -5,6 +5,7 @@ from __future__ import annotations
 import httpx
 
 from ..auth import DEFAULT_ADMIN_API_KEY, admin_headers
+from ..session_keys import validate_session_key
 
 
 class RouterClient:
@@ -28,6 +29,7 @@ class RouterClient:
         resp.raise_for_status()
 
     async def route(self, session_key: str) -> str:
+        session_key = validate_session_key(session_key)
         resp = await self._http.post(
             f"{self._addr}/route",
             json={"session_key": session_key},
@@ -37,6 +39,7 @@ class RouterClient:
         return resp.json()["data_proxy_addr"]
 
     async def remove_session(self, session_key: str) -> None:
+        session_key = validate_session_key(session_key)
         resp = await self._http.post(
             f"{self._addr}/remove_session",
             json={"session_key": session_key},
