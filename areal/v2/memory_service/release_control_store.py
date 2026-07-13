@@ -12,7 +12,9 @@ Callbacks deliberately run outside the store lock.  A permanently blocking
 component can therefore retain its claim and exact-request waiters until their
 optional timeout expires; production deployments should isolate components
 behind a bounded execution boundary.  This process-local implementation
-cannot safely terminate arbitrary Python callbacks.
+cannot safely terminate arbitrary Python callbacks.  Trusted callbacks are
+serialized module-wide so a callback-spawned thread cannot mutate a different
+control-store instance and escape the reentry boundary.
 
 Control records are audit values, not bearer credentials.  Every operation
 that grants authority resolves an ID plus its full SHA-256 in this trusted
@@ -26,6 +28,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from hashlib import sha256
+from math import isfinite
 from threading import Condition, RLock, get_ident
 from time import monotonic
 from typing import Protocol
@@ -66,6 +69,9 @@ _CALLBACK_CONTEXT: ContextVar[_CallbackContext | None] = ContextVar(
     "areal_memory_release_control_callback_context",
     default=None,
 )
+_CALLBACK_GUARD_LOCK = RLock()
+_CALLBACK_ACTIVE = False
+_CALLBACK_REENTRY_ATTEMPTED = False
 
 
 class MemoryReleaseAttestor(Protocol):
@@ -286,11 +292,20 @@ class InMemoryMemoryReleaseControlStore:
     ) -> None:
         if not callable(clock):
             raise TypeError("clock must be callable")
-        if waiter_timeout_seconds is not None and (
-            type(waiter_timeout_seconds) not in (int, float)
-            or waiter_timeout_seconds <= 0
-        ):
-            raise ValueError("waiter_timeout_seconds must be positive or None")
+        if waiter_timeout_seconds is not None:
+            valid_timeout = (
+                type(waiter_timeout_seconds) in (int, float)
+                and waiter_timeout_seconds > 0
+            )
+            if valid_timeout:
+                try:
+                    valid_timeout = isfinite(waiter_timeout_seconds)
+                except OverflowError:
+                    valid_timeout = False
+            if not valid_timeout:
+                raise ValueError(
+                    "waiter_timeout_seconds must be positive, finite, or None"
+                )
         self._release_store = release_store
         self._clock = clock
         self._waiter_timeout_seconds = waiter_timeout_seconds
@@ -347,6 +362,9 @@ class InMemoryMemoryReleaseControlStore:
             tuple[MemoryScope, str], MemoryReleaseAssignmentV1
         ] = {}
         self._assignment_by_group: dict[
+            tuple[MemoryScope, str], MemoryReleaseAssignmentV1
+        ] = {}
+        self._assignment_by_incarnation: dict[
             tuple[MemoryScope, str], MemoryReleaseAssignmentV1
         ] = {}
         self._assignment_by_idempotency: dict[
@@ -408,22 +426,31 @@ class InMemoryMemoryReleaseControlStore:
                 trusted.config_attribute,
             )
             method = getattr(trusted.component, trusted.method_name, None)
-        except (TypeError, ValueError) as error:
+            changed = (
+                component_id != trusted.component_id
+                or version != trusted.version_sha256
+                or config != trusted.config_sha256
+                or not callable(method)
+                or _method_identity(method) != _method_identity(trusted.method)
+            )
+        except Exception as error:
             raise conflict_type(f"trusted {label} declaration changed") from error
-        if (
-            component_id != trusted.component_id
-            or version != trusted.version_sha256
-            or config != trusted.config_sha256
-            or not callable(method)
-            or _method_identity(method) != _method_identity(trusted.method)
-        ):
+        if changed:
             raise conflict_type(f"trusted {label} declaration changed")
 
     def _mutation_entry(self, conflict_type: type[Exception]) -> None:
+        global _CALLBACK_REENTRY_ATTEMPTED
+
         context = _CALLBACK_CONTEXT.get()
         if context is not None:
             context.reentry_attempted = True
             raise conflict_type("control-store mutation from a trusted callback")
+        with _CALLBACK_GUARD_LOCK:
+            if _CALLBACK_ACTIVE:
+                _CALLBACK_REENTRY_ATTEMPTED = True
+                raise conflict_type(
+                    "control-store mutation while a global callback is active"
+                )
         with self._lock:
             if self._callback_active:
                 self._callback_reentry_attempted = True
@@ -437,12 +464,26 @@ class InMemoryMemoryReleaseControlStore:
         label: str,
         arguments: dict[str, object],
     ) -> object:
+        global _CALLBACK_ACTIVE, _CALLBACK_REENTRY_ATTEMPTED
+
         self._validate_component(trusted, conflict_type=conflict_type, label=label)
+        with _CALLBACK_GUARD_LOCK:
+            if _CALLBACK_ACTIVE:
+                _CALLBACK_REENTRY_ATTEMPTED = True
+                raise conflict_type("another global control callback is active")
+            _CALLBACK_ACTIVE = True
+            _CALLBACK_REENTRY_ATTEMPTED = False
+        local_callback_conflict = False
         with self._condition:
             if self._callback_active:
-                raise conflict_type("another control callback is active")
-            self._callback_active = True
-            self._callback_reentry_attempted = False
+                local_callback_conflict = True
+            else:
+                self._callback_active = True
+                self._callback_reentry_attempted = False
+        if local_callback_conflict:
+            with _CALLBACK_GUARD_LOCK:
+                _CALLBACK_ACTIVE = False
+            raise conflict_type("another control callback is active")
         context = _CallbackContext()
         token = _CALLBACK_CONTEXT.set(context)
         try:
@@ -452,12 +493,16 @@ class InMemoryMemoryReleaseControlStore:
                 raise conflict_type(f"trusted {label} failed") from error
         finally:
             _CALLBACK_CONTEXT.reset(token)
+            with _CALLBACK_GUARD_LOCK:
+                global_reentry = _CALLBACK_REENTRY_ATTEMPTED
+                _CALLBACK_ACTIVE = False
+                _CALLBACK_REENTRY_ATTEMPTED = False
             with self._condition:
                 cross_thread_reentry = self._callback_reentry_attempted
                 self._callback_active = False
                 self._callback_reentry_attempted = False
                 self._condition.notify_all()
-        if context.reentry_attempted or cross_thread_reentry:
+        if context.reentry_attempted or cross_thread_reentry or global_reentry:
             raise conflict_type(f"trusted {label} attempted control-store reentry")
         self._validate_component(trusted, conflict_type=conflict_type, label=label)
         return result
@@ -468,14 +513,22 @@ class InMemoryMemoryReleaseControlStore:
         *,
         conflict_type: type[Exception],
     ) -> int:
+        global _CALLBACK_REENTRY_ATTEMPTED
+
         owner = get_ident()
         deadline = (
             None
             if self._waiter_timeout_seconds is None
             else monotonic() + self._waiter_timeout_seconds
         )
-        with self._condition:
-            while True:
+        while True:
+            with _CALLBACK_GUARD_LOCK:
+                if _CALLBACK_ACTIVE:
+                    _CALLBACK_REENTRY_ATTEMPTED = True
+                    raise conflict_type(
+                        "control-store mutation while a global callback is active"
+                    )
+            with self._condition:
                 if self._callback_active:
                     self._callback_reentry_attempted = True
                     raise conflict_type(
@@ -826,16 +879,11 @@ class InMemoryMemoryReleaseControlStore:
                 raise MemoryReleaseAttestationConflictError(
                     "release graph changed during attestation"
                 )
-            attested_at = self._now(MemoryReleaseAttestationConflictError)
-            self._check_commit_time(
-                evaluated_at,
-                attested_at,
-                MemoryReleaseAttestationConflictError,
+            self._validate_component(
+                self._attestor,
+                conflict_type=MemoryReleaseAttestationConflictError,
+                label="attestor",
             )
-            if not valid_from <= attested_at < valid_until:
-                raise MemoryReleaseAttestationConflictError(
-                    "attestation is not valid at commit time"
-                )
             final_graph = self._load_release_graph(
                 scope,
                 release_id,
@@ -846,28 +894,8 @@ class InMemoryMemoryReleaseControlStore:
                 raise MemoryReleaseAttestationConflictError(
                     "release graph changed before attestation commit"
                 )
-            attestation = MemoryReleaseAttestationV1.create(
-                scope=scope,
-                release_id=release_id,
-                release_content_sha256=release_content_sha256,
-                release_graph_sha256=final_graph[0].release_graph_sha256,
-                attestor_id=self._attestor.component_id,
-                attestor_version_sha256=self._attestor.version_sha256,
-                attestor_config_sha256=self._attestor.config_sha256,
-                valid_from=valid_from,
-                valid_until=valid_until,
-                evaluated_at=evaluated_at,
-                attested_at=attested_at,
-                idempotency_key=idempotency_key,
-            )
-            address = (scope, attestation.attestation_id)
             release_address = (scope, release_id)
             with self._lock:
-                self._validate_component(
-                    self._attestor,
-                    conflict_type=MemoryReleaseAttestationConflictError,
-                    label="attestor",
-                )
                 existing = self._attestation_by_idempotency.get(
                     idempotency_address
                 )
@@ -875,6 +903,31 @@ class InMemoryMemoryReleaseControlStore:
                     raise MemoryReleaseAttestationConflictError(
                         "attestation appeared during policy evaluation"
                     )
+                attested_at = self._now(MemoryReleaseAttestationConflictError)
+                self._check_commit_time(
+                    evaluated_at,
+                    attested_at,
+                    MemoryReleaseAttestationConflictError,
+                )
+                if not valid_from <= attested_at < valid_until:
+                    raise MemoryReleaseAttestationConflictError(
+                        "attestation is not valid at commit time"
+                    )
+                attestation = MemoryReleaseAttestationV1.create(
+                    scope=scope,
+                    release_id=release_id,
+                    release_content_sha256=release_content_sha256,
+                    release_graph_sha256=final_graph[0].release_graph_sha256,
+                    attestor_id=self._attestor.component_id,
+                    attestor_version_sha256=self._attestor.version_sha256,
+                    attestor_config_sha256=self._attestor.config_sha256,
+                    valid_from=valid_from,
+                    valid_until=valid_until,
+                    evaluated_at=evaluated_at,
+                    attested_at=attested_at,
+                    idempotency_key=idempotency_key,
+                )
+                address = (scope, attestation.attestation_id)
                 collision = self._attestation_by_address.get(address)
                 if collision is not None and not _canonical_equal(
                     collision,
@@ -1048,32 +1101,12 @@ class InMemoryMemoryReleaseControlStore:
                 raise MemoryReleaseRevocationConflictError(
                     "OTHER revocation reason requires a detail hash"
                 )
-            revoked_at = self._now(MemoryReleaseRevocationConflictError)
-            self._check_commit_time(
-                evaluated_at,
-                revoked_at,
-                MemoryReleaseRevocationConflictError,
+            self._validate_component(
+                self._revoker,
+                conflict_type=MemoryReleaseRevocationConflictError,
+                label="revoker",
             )
-            revocation = MemoryReleaseAttestationRevocationV1.create(
-                scope=scope,
-                attestation_id=attestation_id,
-                attestation_content_sha256=attestation_content_sha256,
-                revoker_id=self._revoker.component_id,
-                revoker_version_sha256=self._revoker.version_sha256,
-                revoker_config_sha256=self._revoker.config_sha256,
-                reason=reason,
-                reason_detail_sha256=reason_detail_sha256,
-                evaluated_at=evaluated_at,
-                revoked_at=revoked_at,
-                idempotency_key=idempotency_key,
-            )
-            address = (scope, revocation.revocation_id)
             with self._lock:
-                self._validate_component(
-                    self._revoker,
-                    conflict_type=MemoryReleaseRevocationConflictError,
-                    label="revoker",
-                )
                 current = self._attestation_by_address.get(attestation_address)
                 if current is None or not _canonical_equal(current, attestation):
                     raise MemoryReleaseRevocationConflictError(
@@ -1087,6 +1120,26 @@ class InMemoryMemoryReleaseControlStore:
                     raise MemoryReleaseRevocationConflictError(
                         "revocation appeared during policy evaluation"
                     )
+                revoked_at = self._now(MemoryReleaseRevocationConflictError)
+                self._check_commit_time(
+                    evaluated_at,
+                    revoked_at,
+                    MemoryReleaseRevocationConflictError,
+                )
+                revocation = MemoryReleaseAttestationRevocationV1.create(
+                    scope=scope,
+                    attestation_id=attestation_id,
+                    attestation_content_sha256=attestation_content_sha256,
+                    revoker_id=self._revoker.component_id,
+                    revoker_version_sha256=self._revoker.version_sha256,
+                    revoker_config_sha256=self._revoker.config_sha256,
+                    reason=reason,
+                    reason_detail_sha256=reason_detail_sha256,
+                    evaluated_at=evaluated_at,
+                    revoked_at=revoked_at,
+                    idempotency_key=idempotency_key,
+                )
+                address = (scope, revocation.revocation_id)
                 collision = self._revocation_by_address.get(address)
                 if collision is not None and not _canonical_equal(
                     collision,
@@ -1292,10 +1345,16 @@ class InMemoryMemoryReleaseControlStore:
         idempotency_key = _string(idempotency_key, "idempotency_key")
         idempotency_address = (scope, idempotency_key)
         group_address = (scope, rollout_group_id)
+        incarnation_address = (scope, rollout_group_incarnation_sha256)
         attestation_address = (scope, attestation_id)
         tokens = (
             ("assignment-idempotency", scope, idempotency_key),
             ("assignment-group", scope, rollout_group_id),
+            (
+                "assignment-incarnation",
+                scope,
+                rollout_group_incarnation_sha256,
+            ),
             ("attestation-control", scope, attestation_id),
         )
         owner = self._claim(tokens, conflict_type=MemoryReleaseAssignmentConflictError)
@@ -1339,6 +1398,14 @@ class InMemoryMemoryReleaseControlStore:
                     )
                     raise MemoryReleaseAssignmentConflictError(
                         "rollout group is already bound; aliases are forbidden"
+                    )
+                incarnation_existing = self._assignment_by_incarnation.get(
+                    incarnation_address
+                )
+                if incarnation_existing is not None:
+                    self._validate_assignment(scope, incarnation_existing)
+                    raise MemoryReleaseAssignmentConflictError(
+                        "rollout group incarnation is already bound"
                     )
                 attestation = self._attestation_by_address.get(attestation_address)
                 if attestation is None:
@@ -1418,20 +1485,11 @@ class InMemoryMemoryReleaseControlStore:
                 raise MemoryReleaseAssignmentConflictError(
                     "release graph changed during assignment"
                 )
-            assigned_at = self._now(MemoryReleaseAssignmentConflictError)
-            self._check_commit_time(
-                evaluated_at,
-                assigned_at,
-                MemoryReleaseAssignmentConflictError,
+            self._validate_component(
+                self._assignment_policy,
+                conflict_type=MemoryReleaseAssignmentConflictError,
+                label="assignment policy",
             )
-            if not attestation.valid_from <= assigned_at < attestation.valid_until:
-                raise MemoryReleaseAssignmentConflictError(
-                    "attestation is not valid at assignment commit time"
-                )
-            if not assigned_at < assignment_valid_until <= attestation.valid_until:
-                raise MemoryReleaseAssignmentConflictError(
-                    "assignment expiry must follow commit and not exceed attestation"
-                )
             final_graph = self._load_release_graph(
                 scope,
                 attestation.release_id,
@@ -1442,45 +1500,7 @@ class InMemoryMemoryReleaseControlStore:
                 raise MemoryReleaseAssignmentConflictError(
                     "release graph changed before assignment commit"
                 )
-            assignment = MemoryReleaseAssignmentV1.create(
-                scope=scope,
-                rollout_group_id=rollout_group_id,
-                rollout_group_incarnation_sha256=rollout_group_incarnation_sha256,
-                attestation_id=attestation_id,
-                attestation_content_sha256=attestation_content_sha256,
-                release_id=attestation.release_id,
-                release_content_sha256=attestation.release_content_sha256,
-                release_graph_sha256=attestation.release_graph_sha256,
-                assignment_policy_id=self._assignment_policy.component_id,
-                assignment_policy_version_sha256=self._assignment_policy.version_sha256,
-                assignment_policy_config_sha256=self._assignment_policy.config_sha256,
-                task_policy_id=task_policy_id,
-                task_policy_version_sha256=task_policy_version_sha256,
-                task_policy_config_sha256=task_policy_config_sha256,
-                retrieval_policy_id=retrieval_policy_id,
-                retrieval_policy_version_sha256=retrieval_policy_version_sha256,
-                retrieval_policy_config_sha256=retrieval_policy_config_sha256,
-                renderer_id=renderer_id,
-                renderer_version_sha256=renderer_version_sha256,
-                renderer_config_sha256=renderer_config_sha256,
-                consumer_kind=consumer_kind,
-                consumer_id=consumer_id,
-                consumer_version_sha256=consumer_version_sha256,
-                consumer_config_sha256=consumer_config_sha256,
-                max_returned_items=max_returned_items,
-                max_context_utf8_bytes=max_context_utf8_bytes,
-                evaluated_at=evaluated_at,
-                assigned_at=assigned_at,
-                assignment_valid_until=assignment_valid_until,
-                idempotency_key=idempotency_key,
-            )
-            address = (scope, assignment.assignment_id)
             with self._lock:
-                self._validate_component(
-                    self._assignment_policy,
-                    conflict_type=MemoryReleaseAssignmentConflictError,
-                    label="assignment policy",
-                )
                 current_attestation = self._attestation_by_address.get(
                     attestation_address
                 )
@@ -1499,10 +1519,82 @@ class InMemoryMemoryReleaseControlStore:
                     raise MemoryReleaseAssignmentConflictError(
                         "rollout group was bound during assignment"
                     )
+                if (
+                    self._assignment_by_incarnation.get(incarnation_address)
+                    is not None
+                ):
+                    raise MemoryReleaseAssignmentConflictError(
+                        "rollout group incarnation was bound during assignment"
+                    )
                 if self._assignment_by_idempotency.get(idempotency_address) is not None:
                     raise MemoryReleaseAssignmentConflictError(
                         "assignment appeared during policy evaluation"
                     )
+                assigned_at = self._now(MemoryReleaseAssignmentConflictError)
+                self._check_commit_time(
+                    evaluated_at,
+                    assigned_at,
+                    MemoryReleaseAssignmentConflictError,
+                )
+                if not (
+                    attestation.valid_from
+                    <= assigned_at
+                    < attestation.valid_until
+                ):
+                    raise MemoryReleaseAssignmentConflictError(
+                        "attestation is not valid at assignment commit time"
+                    )
+                if not (
+                    assigned_at
+                    < assignment_valid_until
+                    <= attestation.valid_until
+                ):
+                    raise MemoryReleaseAssignmentConflictError(
+                        "assignment expiry must follow commit and not exceed attestation"
+                    )
+                assignment = MemoryReleaseAssignmentV1.create(
+                    scope=scope,
+                    rollout_group_id=rollout_group_id,
+                    rollout_group_incarnation_sha256=(
+                        rollout_group_incarnation_sha256
+                    ),
+                    attestation_id=attestation_id,
+                    attestation_content_sha256=attestation_content_sha256,
+                    release_id=attestation.release_id,
+                    release_content_sha256=attestation.release_content_sha256,
+                    release_graph_sha256=attestation.release_graph_sha256,
+                    assignment_policy_id=self._assignment_policy.component_id,
+                    assignment_policy_version_sha256=(
+                        self._assignment_policy.version_sha256
+                    ),
+                    assignment_policy_config_sha256=(
+                        self._assignment_policy.config_sha256
+                    ),
+                    task_policy_id=task_policy_id,
+                    task_policy_version_sha256=task_policy_version_sha256,
+                    task_policy_config_sha256=task_policy_config_sha256,
+                    retrieval_policy_id=retrieval_policy_id,
+                    retrieval_policy_version_sha256=(
+                        retrieval_policy_version_sha256
+                    ),
+                    retrieval_policy_config_sha256=(
+                        retrieval_policy_config_sha256
+                    ),
+                    renderer_id=renderer_id,
+                    renderer_version_sha256=renderer_version_sha256,
+                    renderer_config_sha256=renderer_config_sha256,
+                    consumer_kind=consumer_kind,
+                    consumer_id=consumer_id,
+                    consumer_version_sha256=consumer_version_sha256,
+                    consumer_config_sha256=consumer_config_sha256,
+                    max_returned_items=max_returned_items,
+                    max_context_utf8_bytes=max_context_utf8_bytes,
+                    evaluated_at=evaluated_at,
+                    assigned_at=assigned_at,
+                    assignment_valid_until=assignment_valid_until,
+                    idempotency_key=idempotency_key,
+                )
+                address = (scope, assignment.assignment_id)
                 collision = self._assignment_by_address.get(address)
                 if collision is not None and not _canonical_equal(
                     collision,
@@ -1516,6 +1608,11 @@ class InMemoryMemoryReleaseControlStore:
                     mapping_writes=(
                         (self._assignment_by_address, address, stored),
                         (self._assignment_by_group, group_address, stored),
+                        (
+                            self._assignment_by_incarnation,
+                            incarnation_address,
+                            stored,
+                        ),
                         (
                             self._assignment_by_idempotency,
                             idempotency_address,
@@ -1599,6 +1696,7 @@ class InMemoryMemoryReleaseControlStore:
             label="assignment",
         )
         group_address = (scope, rollout_group_id)
+        incarnation_address = (scope, rollout_group_incarnation_sha256)
         assignment_address = (scope, assignment_id)
         with self._lock:
             assignment = self._assignment_by_address.get(assignment_address)
@@ -1617,6 +1715,8 @@ class InMemoryMemoryReleaseControlStore:
                 assignment.rollout_group_incarnation_sha256
                 != rollout_group_incarnation_sha256
                 or self._assignment_by_group.get(group_address) is not assignment
+                or self._assignment_by_incarnation.get(incarnation_address)
+                is not assignment
             ):
                 raise MemoryReleaseAssignmentConflictError(
                     "assignment does not bind the requested group incarnation"
@@ -1658,7 +1758,6 @@ class InMemoryMemoryReleaseControlStore:
             raise MemoryReleaseAssignmentConflictError(
                 "assignment release graph commitment does not match"
             )
-        now = self._now(MemoryReleaseAssignmentConflictError)
         with self._lock:
             if self._assignment_by_address.get(assignment_address) is not assignment:
                 raise MemoryReleaseAssignmentConflictError(
@@ -1667,6 +1766,13 @@ class InMemoryMemoryReleaseControlStore:
             if self._assignment_by_group.get(group_address) is not assignment:
                 raise MemoryReleaseAssignmentConflictError(
                     "group binding changed during active resolution"
+                )
+            if (
+                self._assignment_by_incarnation.get(incarnation_address)
+                is not assignment
+            ):
+                raise MemoryReleaseAssignmentConflictError(
+                    "group incarnation binding changed during active resolution"
                 )
             current_attestation = self._attestation_by_address.get(
                 attestation_address
@@ -1679,6 +1785,7 @@ class InMemoryMemoryReleaseControlStore:
                 raise MemoryReleaseAssignmentConflictError(
                     "assignment attestation is revoked"
                 )
+            now = self._now(MemoryReleaseAssignmentConflictError)
             if not (
                 attestation.valid_from
                 <= now
