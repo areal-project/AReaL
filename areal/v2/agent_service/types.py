@@ -11,6 +11,56 @@ from typing import Any, Protocol, runtime_checkable
 from .protocol import QueueMode
 
 
+@dataclass(frozen=True, slots=True)
+class MemoryTurnResultV1:
+    """Consumer output plus a ledger pointer for one actual Memory exposure.
+
+    The capability deliberately returns neither an assignment nor a writable
+    acknowledgement object.  ``exposure_id`` and its content hash let trusted
+    evaluation code join the result back to the Memory ledger; they are not
+    proof by themselves and grant no further Memory authority.
+    """
+
+    output: object = field(repr=False, compare=False)
+    exposure_id: str
+    exposure_content_sha256: str
+
+    def __post_init__(self) -> None:
+        if type(self.exposure_id) is not str or not self.exposure_id.strip():
+            raise ValueError("exposure_id must be a non-blank str")
+        digest = self.exposure_content_sha256
+        if (
+            type(digest) is not str
+            or len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+        ):
+            raise ValueError(
+                "exposure_content_sha256 must be a lowercase SHA-256 hex digest"
+            )
+        if self.exposure_id != f"mexp_{digest[:24]}":
+            raise ValueError("exposure_id disagrees with exposure_content_sha256")
+
+
+class MemoryTurnCapability(Protocol):
+    """Turn-scoped, read-only access to the configured Memory consumer.
+
+    The capability is already bound to a scope, assignment, session, and turn.
+    An agent may choose only an idempotent operation key plus query/history
+    bytes.  It cannot choose a scope or consumer and cannot create an
+    acknowledgement or exposure.  The call returns only after the trusted
+    runtime consumer has produced a canonical acknowledgement and the ledger
+    has atomically committed the resulting exposure.
+    """
+
+    async def expose_memory(
+        self,
+        operation_key: str,
+        *,
+        query: bytes,
+        history: tuple[bytes, ...] = (),
+    ) -> MemoryTurnResultV1: ...
+
+
 @dataclass
 class AgentRequest:
     """Structured request passed to the agent.
@@ -52,6 +102,17 @@ class AgentRequest:
     history: list[dict[str, Any]] = field(default_factory=list)
     queue_mode: QueueMode = QueueMode.COLLECT
     metadata: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def memory(self) -> MemoryTurnCapability | None:
+        """Return the host-bound runtime capability, if this turn has one.
+
+        This is intentionally not a dataclass field: wire serializers such as
+        :func:`dataclasses.asdict` must never traverse a live coordinator or
+        include process-local authority in a request payload.
+        """
+
+        return getattr(self, "_areal_memory_turn_capability", None)
 
 
 @dataclass

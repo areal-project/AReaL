@@ -42,6 +42,8 @@ from .types import (
     AgentResponse,
     AgentRunnable,
     EventEmitter,
+    MemoryTurnCapability,
+    MemoryTurnResultV1,
 )
 
 __all__ = [
@@ -64,6 +66,8 @@ __all__ = [
     "MemoryPinWireFormatError",
     "MemorySessionPinCache",
     "MemorySessionPinConflictError",
+    "MemoryTurnCapability",
+    "MemoryTurnResultV1",
     "ReservedMemoryMetadataError",
     "parse_memory_assignment_pin_metadata",
 ]

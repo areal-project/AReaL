@@ -74,7 +74,41 @@ class AgentRequest:
     history: list[dict[str, str]]             # Prior conversation turns
     queue_mode: QueueMode = QueueMode.COLLECT
     metadata: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def memory(self) -> MemoryTurnCapability | None: ...
 ```
+
+`memory` is deliberately narrower than a store or retriever handle. It is
+already bound to one scope, assignment, session, and turn; the agent can submit
+an idempotent operation with query/history bytes but cannot select another
+scope, write an acknowledgement, or manufacture an exposure. A successful call
+returns the configured trusted consumer's output plus an exposure ID/hash that
+evaluation code must join back to the Memory ledger. The output remains opaque:
+the exposure proves that the registered consumer acknowledged exact delivery
+bytes, not that arbitrary output content is correct, that an agent used it, or
+that it improved a later answer.
+
+`memory` is a process-local, read-only property rather than a dataclass field.
+The Worker host binds it after constructing the request, while `asdict(request)`
+and other field-based wire serializers retain the pre-Memory schema. Runtime
+capability identity must not be inferred from `AgentRequest` equality or used as
+an authorization/cache key.
+
+The capability contract is currently an in-process, disabled-by-default seam.
+The Worker HTTP app does **not** yet turn `metadata["areal_memory"]` into a
+capability. Wire activation requires a separate authenticated DataProxy→Worker
+hop and a server-side principal/session→`MemoryScope` grant; an assignment pin
+alone is not authorization. Because agent plugins share the Worker Python
+process, this interface prevents accidental authority leakage rather than
+sandboxing malicious code. Adversarial plugins require an out-of-process Memory
+broker.
+
+Before wire activation, the Worker integration must also define host-controlled
+query/history derivation (or explicitly audit agent-selected values), per-turn
+operation and byte quotas, and a strict DTO for each registered consumer's
+output. Causal evaluation must join **all** exposures recorded for the turn; an
+agent-returned pointer is convenient indexing, not the source of truth.
 
 ### AgentResponse
 
@@ -189,7 +223,7 @@ areal/v2/agent_service/
     ├── __init__.py      # Public exports
     ├── __main__.py      # python -m areal.v2.agent_service.worker
     ├── app.py           # create_worker_app()
-    └── config.py        # WorkerConfig dataclass
+    └── memory.py        # Disabled-by-default turn capability seam
 
 examples/agent_service/
 ├── agent.py                  # ClaudeAgent (Claude Agent SDK)
