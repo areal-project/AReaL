@@ -66,6 +66,9 @@ class SGLangBackend:
         }
         if stop:
             sample_params["stop"] = stop
+        if gconfig.sampling_seed is not None:
+            # Gating relationship: see GenerationHyperparameters.sampling_seed docstring.
+            sample_params["sampling_seed"] = gconfig.sampling_seed
 
         payload = {
             "input_ids": req.input_ids.copy(),

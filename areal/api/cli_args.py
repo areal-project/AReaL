@@ -232,6 +232,16 @@ class GenerationHyperparameters:
             "help": "Enable beam search in the vLLM engine. When enabled, sampling parameters like temperature, top-p, and top-k are auto ignored."
         },
     )
+    sampling_seed: int | None = field(
+        default=None,
+        metadata={
+            "help": "Per-request seed for replayable sampling. On the SGLang backend "
+            "this is forwarded as sampling_params['sampling_seed'], which SGLang only "
+            "honors when the server is launched with "
+            "SGLangConfig.enable_deterministic_inference=True; otherwise it is "
+            "silently ignored. None (default) sends no seed and changes nothing."
+        },
+    )
     # NOTE: to add new parameters, please correctly handle them in the `to_openai_args_dict` method.
 
     def new(self, **kwargs):
@@ -279,6 +289,7 @@ class GenerationHyperparameters:
         "lora_name",  # Not supported by OpenAI
         "use_beam_search",  # Not supported by OpenAI
         "max_tokens",  # deprecated by "completions", not used in "responses", should be `max_new_tokens` in "openai-agents"
+        "sampling_seed",  # SGLang-specific; not an OpenAI-compatible parameter
     }
 
     def to_openai_args_dict(
@@ -1969,6 +1980,10 @@ class SGLangConfig:
     enable_memory_saver: bool = False
     allow_auto_truncate: bool = False
     attention_backend: str | None = "fa3"
+    # Required for per-request GenerationHyperparameters.sampling_seed to be honored
+    # (SGLang gates sampling_seed on this flag). Also enables SGLang's batch-invariant
+    # kernels, at their documented throughput cost, which is why this is opt-in.
+    enable_deterministic_inference: bool = False
     enable_multimodal: bool = False
     sampling_backend: str | None = None
     context_length: int | None = 32768
@@ -3173,6 +3188,20 @@ class PPOConfig(BaseExperimentConfig):
         # the engine config. Single source of truth: gconfig.lora_name.
         if self.rollout.use_lora and not self.rollout.lora_name:
             self.rollout.lora_name = self.gconfig.lora_name
+        if (
+            self.gconfig.sampling_seed is not None
+            and not self.sglang.enable_deterministic_inference
+        ):
+            warnings.warn(
+                "gconfig.sampling_seed is set but sglang.enable_deterministic_inference "
+                "is False: SGLang silently ignores per-request sampling_seed unless the "
+                "server is launched with --enable-deterministic-inference. Rollouts will "
+                "not be seeded as expected. (Not applicable if you're launching SGLang "
+                "servers yourself outside this config, or using the vLLM backend, which "
+                "rejects sampling_seed outright.)",
+                UserWarning,
+                stacklevel=2,
+            )
         super().__post_init__()
 
 

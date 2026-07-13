@@ -49,6 +49,17 @@ class VLLMBackend:
         gconfig = req.gconfig
         stop_token_ids = gconfig.stop_token_ids
 
+        if gconfig.sampling_seed is not None:
+            # No native vLLM equivalent is wired here (vLLM's own per-request `seed`
+            # is stream-based and would misalign under this engine's
+            # interruption/resumption re-submits). Fail loudly rather than silently
+            # dropping the seed and producing non-reproducible rollouts the caller
+            # believes are seeded; mirrors how the SGLang backend raises on
+            # unsupported use_beam_search below.
+            raise NotImplementedError(
+                "sampling_seed is not yet supported on the vLLM backend."
+            )
+
         # NOTE: vLLM uses flat payload structure, not nested sampling_params
         payload = {
             "top_p": gconfig.top_p,
