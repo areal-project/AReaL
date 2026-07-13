@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
-"""Public immutable Memory Service evidence, history, release, and runtime contracts."""
+"""Public immutable Memory Service evidence, history, release, policy, and runtime contracts."""
 
 from areal.v2.memory_service.errors import (
     CandidateConflictError,
@@ -91,6 +91,19 @@ from areal.v2.memory_service.runtime_types import (
     MemorySourceReadTranscriptV1,
 )
 from areal.v2.memory_service.store import EvidenceStore, InMemoryEvidenceStore
+from areal.v2.memory_service.structured_fact_policy import (
+    EvidenceAuthority,
+    EvidenceTrustDecision,
+    EvidenceTrustPolicy,
+    StructuredFactDecision,
+    StructuredFactEvidenceDecisionV1,
+    StructuredFactOperation,
+    StructuredFactPolicy,
+    StructuredFactPolicyResultV1,
+    StructuredFactUpdateV1,
+    parse_structured_fact_state,
+    structured_fact_state_payload,
+)
 from areal.v2.memory_service.types import (
     EvidenceEvent,
     EvidenceKind,
@@ -108,6 +121,9 @@ __all__ = [
     "EvidenceNotFoundError",
     "EvidenceRecord",
     "EvidenceStore",
+    "EvidenceAuthority",
+    "EvidenceTrustDecision",
+    "EvidenceTrustPolicy",
     "InMemoryEvidenceStore",
     "InMemoryMemoryHistoryStore",
     "InMemoryMemoryReleaseControlStore",
@@ -178,4 +194,12 @@ __all__ = [
     "RevisionNotFoundError",
     "RevisionOperation",
     "RevisionProposal",
+    "StructuredFactDecision",
+    "StructuredFactEvidenceDecisionV1",
+    "StructuredFactOperation",
+    "StructuredFactPolicy",
+    "StructuredFactPolicyResultV1",
+    "StructuredFactUpdateV1",
+    "parse_structured_fact_state",
+    "structured_fact_state_payload",
 ]

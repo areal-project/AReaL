@@ -322,8 +322,8 @@ def test_public_module_exports_stable_memory_contracts() -> None:
     )
 
     assert memory_service.__doc__ == (
-        "Public immutable Memory Service evidence, history, release, and runtime "
-        "contracts."
+        "Public immutable Memory Service evidence, history, release, policy, and "
+        "runtime contracts."
     )
     assert memory_service.__all__ == [
         "CandidateConflictError",
@@ -335,6 +335,9 @@ def test_public_module_exports_stable_memory_contracts() -> None:
         "EvidenceNotFoundError",
         "EvidenceRecord",
         "EvidenceStore",
+        "EvidenceAuthority",
+        "EvidenceTrustDecision",
+        "EvidenceTrustPolicy",
         "InMemoryEvidenceStore",
         "InMemoryMemoryHistoryStore",
         "InMemoryMemoryReleaseControlStore",
@@ -405,6 +408,14 @@ def test_public_module_exports_stable_memory_contracts() -> None:
         "RevisionNotFoundError",
         "RevisionOperation",
         "RevisionProposal",
+        "StructuredFactDecision",
+        "StructuredFactEvidenceDecisionV1",
+        "StructuredFactOperation",
+        "StructuredFactPolicy",
+        "StructuredFactPolicyResultV1",
+        "StructuredFactUpdateV1",
+        "parse_structured_fact_state",
+        "structured_fact_state_payload",
     ]
 
     from areal.v2.memory_service import (

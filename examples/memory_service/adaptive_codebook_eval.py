@@ -34,9 +34,11 @@ from datetime import UTC, datetime, timedelta
 
 from areal.v2.memory_service import (
     CandidateProposal,
+    EvidenceAuthority,
     EvidenceEvent,
     EvidenceKind,
     EvidenceRecord,
+    EvidenceTrustDecision,
     InMemoryEvidenceStore,
     InMemoryMemoryHistoryStore,
     InMemoryMemoryReleaseControlStore,
@@ -57,6 +59,12 @@ from areal.v2.memory_service import (
     ReleaseManifest,
     RevisionOperation,
     RevisionProposal,
+    StructuredFactEvidenceDecisionV1,
+    StructuredFactOperation,
+    StructuredFactPolicy,
+    StructuredFactUpdateV1,
+    parse_structured_fact_state,
+    structured_fact_state_payload,
 )
 
 _BASE = datetime(2026, 7, 13, tzinfo=UTC)
@@ -83,51 +91,21 @@ _ATTESTOR_VERSION = _digest("local-smoke-attestor-v1")
 _ATTESTOR_CONFIG = _digest("admit-exact-smoke-release-v1")
 _REVOKER_VERSION = _digest("local-smoke-revoker-v1")
 _REVOKER_CONFIG = _digest("operator-only-smoke-revocation-v1")
+_TRUST_POLICY_VERSION = _digest("fixture-fixed-kind-trust-v1")
+_TRUST_POLICY_CONFIG = _digest("feedback-and-verified-fake-tool-only-v1")
 
 
 def fact_payload(fact_key: str, fact_value: str) -> str:
-    """Return the exact JSON payload accepted by ``StructuredFactUpdater``."""
+    """Return one canonical active fact state for runtime rendering."""
 
-    return json.dumps(
-        {"fact_key": fact_key, "fact_value": fact_value},
-        ensure_ascii=False,
-        separators=(",", ":"),
-        sort_keys=True,
-    )
+    return structured_fact_state_payload(fact_key, fact_value)
 
 
 def _decode_fact(payload: str) -> tuple[str, str] | None:
     try:
-        value = json.loads(payload)
-    except (json.JSONDecodeError, TypeError):
+        return parse_structured_fact_state(payload)
+    except (TypeError, ValueError):
         return None
-    if type(value) is not dict or set(value) != {"fact_key", "fact_value"}:
-        return None
-    fact_key = value["fact_key"]
-    fact_value = value["fact_value"]
-    if (
-        type(fact_key) is not str
-        or not fact_key.strip()
-        or type(fact_value) is not str
-        or not fact_value.strip()
-    ):
-        return None
-    return fact_key, fact_value
-
-
-@dataclass(frozen=True, slots=True)
-class FactUpdateDecision:
-    evidence_id: str
-    fact_key: str | None
-    operation: RevisionOperation | None
-    revision_id: str | None
-    reason: str
-
-
-@dataclass(frozen=True, slots=True)
-class FactUpdateResult:
-    release: MemoryRelease
-    decisions: tuple[FactUpdateDecision, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -136,152 +114,49 @@ class RawHistoryBuildResult:
     selected_evidence_id: str | None
 
 
-class StructuredFactUpdater:
-    """Apply a narrow, auditable fact-update policy to immutable history.
+@dataclass(frozen=True, slots=True)
+class FixedKindFixtureTrustPolicy:
+    """Fixture-only kind policy; this is not production source authentication.
 
-    Only FEEDBACK and TOOL_RESULT evidence may create facts.  A new key becomes
-    an ADD revision, a trusted value change becomes SUPERSEDE, and an identical
-    value is a no-op.  Agent messages and outcomes can remain in the evidence
-    ledger for audit without silently becoming authoritative memory.
-
-    This kind allowlist is an experiment fixture, not source authentication.
-    Production policy must additionally verify provenance and authorization.
+    TOOL_RESULT is authoritative only for this example's locally verified fake
+    tool run marker.  A production policy still needs authenticated source
+    identity, authorization, and anti-replay outside the EvidenceKind enum.
     """
 
-    trusted_kinds = frozenset({EvidenceKind.FEEDBACK, EvidenceKind.TOOL_RESULT})
+    trust_policy_id: str = "fixture-fixed-kind-trust"
+    trust_policy_version_sha256: str = _TRUST_POLICY_VERSION
+    trust_policy_config_sha256: str = _TRUST_POLICY_CONFIG
 
-    def __init__(self, history_store, release_store) -> None:
-        self._history_store = history_store
-        self._release_store = release_store
-
-    def update(
-        self,
-        *,
-        scope: MemoryScope,
-        base_release: MemoryRelease,
-        evidence: Iterable[EvidenceRecord],
-        captured_through: datetime,
-        idempotency_prefix: str,
-    ) -> FactUpdateResult:
-        """Publish the current fact tips as a new immutable release."""
-
-        if base_release.manifest.scope != scope:
-            raise ValueError("base release belongs to a different scope")
-        tips: dict[str, tuple[str, str]] = {}
-        for revision in self._release_store.get_release_revisions(
-            scope, base_release.release_id
+    def evaluate(self, *, evidence, update) -> EvidenceTrustDecision:
+        del update
+        event = evidence.event
+        if event.kind is EvidenceKind.FEEDBACK:
+            return EvidenceTrustDecision(
+                EvidenceAuthority.AUTHORITATIVE,
+                "fixture_feedback_kind",
+            )
+        if (
+            event.kind is EvidenceKind.TOOL_RESULT
+            and event.run_id == "verified-local-fake-tool"
         ):
-            candidate = self._history_store.get_candidate(
-                scope, revision.proposal.candidate_id
+            return EvidenceTrustDecision(
+                EvidenceAuthority.AUTHORITATIVE,
+                "fixture_verified_local_fake_tool",
             )
-            fact = _decode_fact(candidate.proposal.content)
-            if fact is None:
-                raise ValueError("base release contains a non-structured fact")
-            fact_key, fact_value = fact
-            if fact_key in tips:
-                raise ValueError("base release contains duplicate fact keys")
-            tips[fact_key] = (fact_value, revision.revision_id)
-
-        ordered = sorted(
-            tuple(evidence),
-            key=lambda item: (
-                item.event.observed_at,
-                item.event.sequence_no,
-                item.evidence_id,
-            ),
+        if event.kind is EvidenceKind.OUTCOME:
+            return EvidenceTrustDecision(
+                EvidenceAuthority.EVALUATOR_ONLY,
+                "fixture_outcome_evaluator_only",
+            )
+        if event.kind is EvidenceKind.TOOL_RESULT:
+            return EvidenceTrustDecision(
+                EvidenceAuthority.INELIGIBLE,
+                "fixture_tool_result_missing_verified_local_marker",
+            )
+        return EvidenceTrustDecision(
+            EvidenceAuthority.UNTRUSTED,
+            "fixture_untrusted_kind",
         )
-        decisions: list[FactUpdateDecision] = []
-        for record in ordered:
-            event = record.event
-            if event.scope != scope:
-                decisions.append(
-                    FactUpdateDecision(
-                        record.evidence_id, None, None, None, "foreign_scope"
-                    )
-                )
-                continue
-            if event.observed_at > captured_through:
-                decisions.append(
-                    FactUpdateDecision(
-                        record.evidence_id, None, None, None, "after_capture_cutoff"
-                    )
-                )
-                continue
-            if event.kind not in self.trusted_kinds:
-                decisions.append(
-                    FactUpdateDecision(
-                        record.evidence_id, None, None, None, "untrusted_kind"
-                    )
-                )
-                continue
-            fact = _decode_fact(event.payload)
-            if fact is None:
-                decisions.append(
-                    FactUpdateDecision(
-                        record.evidence_id, None, None, None, "malformed_fact"
-                    )
-                )
-                continue
-            fact_key, fact_value = fact
-            current = tips.get(fact_key)
-            if current is not None and current[0] == fact_value:
-                decisions.append(
-                    FactUpdateDecision(
-                        record.evidence_id,
-                        fact_key,
-                        None,
-                        current[1],
-                        "same_value_noop",
-                    )
-                )
-                continue
-
-            candidate = self._history_store.append_candidate(
-                CandidateProposal(
-                    scope=scope,
-                    content=fact_payload(fact_key, fact_value),
-                    evidence_ids=(record.evidence_id,),
-                    idempotency_key=(
-                        f"{idempotency_prefix}:candidate:{record.evidence_id}"
-                    ),
-                )
-            )
-            operation = (
-                RevisionOperation.ADD
-                if current is None
-                else RevisionOperation.SUPERSEDE
-            )
-            revision = self._history_store.append_revision(
-                RevisionProposal(
-                    scope=scope,
-                    candidate_id=candidate.candidate_id,
-                    operation=operation,
-                    parent_revision_id=None if current is None else current[1],
-                    idempotency_key=(
-                        f"{idempotency_prefix}:revision:{record.evidence_id}"
-                    ),
-                )
-            )
-            tips[fact_key] = (fact_value, revision.revision_id)
-            decisions.append(
-                FactUpdateDecision(
-                    record.evidence_id,
-                    fact_key,
-                    operation,
-                    revision.revision_id,
-                    "trusted_update",
-                )
-            )
-
-        manifest = ReleaseManifest(
-            scope=scope,
-            revision_ids=tuple(tips[key][1] for key in sorted(tips)),
-        )
-        release = self._release_store.append_release(
-            manifest,
-            idempotency_key=f"{idempotency_prefix}:release",
-        )
-        return FactUpdateResult(release=release, decisions=tuple(decisions))
 
 
 def _single_fact_release(
@@ -342,7 +217,7 @@ def _raw_history_release(
 ) -> RawHistoryBuildResult:
     """Build an explicit in-scope, pre-cutoff last-write-wins baseline.
 
-    Unlike ``StructuredFactUpdater``, this intentionally grants every event
+    Unlike ``StructuredFactPolicy``, this intentionally grants every event
     kind equal authority.  It therefore models the common but unsafe practice
     of replaying raw chat history, including an agent's own self-report.
     """
@@ -358,9 +233,12 @@ def _raw_history_release(
     ):
         if record.event.scope != scope or record.event.observed_at > captured_through:
             continue
-        fact = _decode_fact(record.event.payload)
-        if fact is not None and fact[0] == _FACT_KEY:
-            eligible.append((record, fact))
+        try:
+            update = StructuredFactUpdateV1.from_payload(record.event.payload)
+        except (TypeError, ValueError):
+            continue
+        if update.fact_key == _FACT_KEY:
+            eligible.append((record, (update.fact_key, update.fact_value)))
 
     if not eligible:
         release = release_store.append_release(
@@ -631,8 +509,8 @@ class SubjectResult:
     captured_evidence_ids: tuple[str, ...]
     measured_scope_evidence_ids: tuple[str, ...]
     raw_selected_evidence_id: str | None
-    static_decisions: tuple[FactUpdateDecision, ...]
-    adaptive_decisions: tuple[FactUpdateDecision, ...]
+    static_decisions: tuple[StructuredFactEvidenceDecisionV1, ...]
+    adaptive_decisions: tuple[StructuredFactEvidenceDecisionV1, ...]
     arms: tuple[ArmObservation, ...]
 
     def arm(self, name: str) -> ArmObservation:
@@ -860,6 +738,8 @@ def _append_event(
     scope: MemoryScope,
     kind: EvidenceKind,
     value: str,
+    operation: StructuredFactOperation,
+    expected_parent_revision_id: str | None,
     sequence_no: int,
     observed_at: datetime,
     case_name: str,
@@ -868,10 +748,19 @@ def _append_event(
         EvidenceEvent(
             scope=scope,
             session_id=f"capture:{case_name}",
-            run_id="shared-capture-stream",
+            run_id=(
+                "verified-local-fake-tool"
+                if kind is EvidenceKind.TOOL_RESULT
+                else "shared-capture-stream"
+            ),
             sequence_no=sequence_no,
             kind=kind,
-            payload=fact_payload(_FACT_KEY, value),
+            payload=StructuredFactUpdateV1(
+                fact_key=_FACT_KEY,
+                fact_value=value,
+                operation=operation,
+                expected_parent_revision_id=expected_parent_revision_id,
+            ).to_payload(),
             observed_at=observed_at,
             idempotency_key=f"{case_name}:evidence:{sequence_no}:{scope.subject_id}",
         )
@@ -1011,25 +900,10 @@ def _evaluate_case(case: _Case, subject_index: int) -> SubjectResult:
                 scope=scope,
                 kind=kind,
                 value=value,
+                operation=StructuredFactOperation.ADD,
+                expected_parent_revision_id=None,
                 sequence_no=sequence_no,
                 observed_at=_BASE + timedelta(seconds=sequence_no),
-                case_name=case.name,
-            )
-        )
-        sequence_no += 1
-    for kind, value in case.later:
-        event_scope = foreign_scope if case.later_is_foreign else scope
-        observed_at = _BASE + timedelta(seconds=20 + sequence_no)
-        if case.later_is_future and kind is EvidenceKind.FEEDBACK:
-            observed_at = _BASE + timedelta(seconds=40 + sequence_no)
-        captured.append(
-            _append_event(
-                evidence_store,
-                scope=event_scope,
-                kind=kind,
-                value=value,
-                sequence_no=sequence_no,
-                observed_at=observed_at,
                 case_name=case.name,
             )
         )
@@ -1039,20 +913,66 @@ def _evaluate_case(case: _Case, subject_index: int) -> SubjectResult:
         ReleaseManifest(scope=scope, revision_ids=()),
         idempotency_key=f"{case.name}:empty-release",
     )
-    updater = StructuredFactUpdater(history_store, release_store)
-    static_update = updater.update(
+    policy = StructuredFactPolicy(
+        history_store,
+        release_store,
+        evidence_store=evidence_store,
+        trust_policy=FixedKindFixtureTrustPolicy(),
+    )
+    seed_static = policy.apply(
         scope=scope,
         base_release=empty_release,
-        evidence=captured,
+        evidence=tuple(captured),
         captured_through=_BASELINE_CUTOFF,
-        idempotency_prefix=f"{case.name}:static",
+        idempotency_key=f"{case.name}:static:release",
     )
-    adaptive_update = updater.update(
+    parent_revision_id = (
+        seed_static.release.manifest.revision_ids[0]
+        if seed_static.release.manifest.revision_ids
+        else None
+    )
+    for kind, value in case.later:
+        event_scope = foreign_scope if case.later_is_foreign else scope
+        observed_at = _BASE + timedelta(seconds=20 + sequence_no)
+        if case.later_is_future and kind is EvidenceKind.FEEDBACK:
+            observed_at = _BASE + timedelta(seconds=40 + sequence_no)
+        if case.change_kind == "add":
+            operation = StructuredFactOperation.ADD
+            expected_parent_revision_id = None
+        elif case.name == "same_value_noop":
+            operation = StructuredFactOperation.CONFIRM
+            expected_parent_revision_id = parent_revision_id
+        else:
+            operation = StructuredFactOperation.SUPERSEDE
+            expected_parent_revision_id = parent_revision_id
+        captured.append(
+            _append_event(
+                evidence_store,
+                scope=event_scope,
+                kind=kind,
+                value=value,
+                operation=operation,
+                expected_parent_revision_id=expected_parent_revision_id,
+                sequence_no=sequence_no,
+                observed_at=observed_at,
+                case_name=case.name,
+            )
+        )
+        sequence_no += 1
+
+    static_update = policy.apply(
+        scope=scope,
+        base_release=empty_release,
+        evidence=tuple(captured),
+        captured_through=_BASELINE_CUTOFF,
+        idempotency_key=f"{case.name}:static:release",
+    )
+    adaptive_update = policy.apply(
         scope=scope,
         base_release=static_update.release,
-        evidence=captured,
+        evidence=tuple(captured),
         captured_through=_ADAPTIVE_CUTOFF,
-        idempotency_prefix=f"{case.name}:adaptive",
+        idempotency_key=f"{case.name}:adaptive:release",
     )
     raw_history = _raw_history_release(
         history_store=history_store,

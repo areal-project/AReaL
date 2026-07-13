@@ -3,14 +3,25 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
 
 from examples.memory_service.adaptive_codebook_eval import (
     DeployRequest,
     FakeDeployTool,
+    FixedKindFixtureTrustPolicy,
     run_smoke_evaluation,
 )
 
-from areal.v2.memory_service import MemoryExposureStatus, RevisionOperation
+from areal.v2.memory_service import (
+    EvidenceAuthority,
+    EvidenceEvent,
+    EvidenceKind,
+    InMemoryEvidenceStore,
+    MemoryExposureStatus,
+    MemoryScope,
+    StructuredFactOperation,
+    StructuredFactUpdateV1,
+)
 
 
 def _by_case(report):
@@ -90,25 +101,25 @@ def test_update_policy_adds_supersedes_noops_and_rejects_pollution() -> None:
         decision.operation
         for decision in cases["feedback_add"].adaptive_decisions
         if decision.operation is not None
-    ] == [RevisionOperation.ADD]
+    ] == [StructuredFactOperation.ADD]
     assert [
         decision.operation
         for decision in cases["tool_result_add"].adaptive_decisions
         if decision.operation is not None
-    ] == [RevisionOperation.ADD]
+    ] == [StructuredFactOperation.ADD]
     for name in ("feedback_supersede", "tool_result_supersede"):
-        assert RevisionOperation.SUPERSEDE in {
+        assert StructuredFactOperation.SUPERSEDE in {
             decision.operation for decision in cases[name].adaptive_decisions
         }
 
     noop = cases["same_value_noop"]
-    assert "same_value_noop" in {
+    assert "confirmed_current_fact" in {
         decision.reason for decision in noop.adaptive_decisions
     }
     assert noop.arm("static").release_id == noop.arm("adaptive").release_id
 
     agent = cases["agent_conflict_ignored"]
-    assert "untrusted_kind" in {
+    assert "fixture_untrusted_kind" in {
         decision.reason for decision in agent.adaptive_decisions
     }
     assert agent.arm("static").release_id == agent.arm("adaptive").release_id
@@ -120,13 +131,57 @@ def test_update_policy_adds_supersedes_noops_and_rejects_pollution() -> None:
     assert foreign.arm("static").release_id == foreign.arm("adaptive").release_id
 
     future = cases["future_outcome_ignored"]
-    assert "untrusted_kind" in {
+    assert "fixture_outcome_evaluator_only" in {
         decision.reason for decision in future.adaptive_decisions
+    }
+    assert EvidenceAuthority.EVALUATOR_ONLY in {
+        decision.authority for decision in future.adaptive_decisions
     }
     assert "after_capture_cutoff" in {
         decision.reason for decision in future.adaptive_decisions
     }
     assert future.arm("static").release_id == future.arm("adaptive").release_id
+
+
+def test_fixture_tool_result_requires_the_verified_local_run_marker() -> None:
+    scope = MemoryScope("local-smoke", "adaptive-codebook", "tool-marker")
+    evidence_store = InMemoryEvidenceStore()
+    update = StructuredFactUpdateV1(
+        fact_key="project_access_code",
+        fact_value="VALUE",
+        operation=StructuredFactOperation.ADD,
+        expected_parent_revision_id=None,
+    )
+
+    def append_tool_result(*, sequence_no: int, run_id: str):
+        return evidence_store.append(
+            EvidenceEvent(
+                scope=scope,
+                session_id="fixture-tool-authority",
+                run_id=run_id,
+                sequence_no=sequence_no,
+                kind=EvidenceKind.TOOL_RESULT,
+                payload=update.to_payload(),
+                observed_at=datetime(2026, 7, 13, tzinfo=UTC),
+                idempotency_key=f"tool-result-{sequence_no}",
+            )
+        )
+
+    verified = append_tool_result(
+        sequence_no=0,
+        run_id="verified-local-fake-tool",
+    )
+    unverified = append_tool_result(sequence_no=1, run_id="unverified-tool")
+    trust = FixedKindFixtureTrustPolicy()
+
+    assert (
+        trust.evaluate(evidence=verified, update=update).authority
+        is EvidenceAuthority.AUTHORITATIVE
+    )
+    assert (
+        trust.evaluate(evidence=unverified, update=update).authority
+        is EvidenceAuthority.INELIGIBLE
+    )
 
 
 def test_fake_deploy_tool_scores_only_the_actual_consumer_output() -> None:
