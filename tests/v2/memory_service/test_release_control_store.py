@@ -27,6 +27,10 @@ from areal.v2.memory_service.history_types import (
 )
 from areal.v2.memory_service.release_control_store import (
     InMemoryMemoryReleaseControlStore,
+    MemoryReleaseAssignmentPolicy,
+    MemoryReleaseAttestationRevoker,
+    MemoryReleaseAttestor,
+    MemoryReleaseControlStore,
 )
 from areal.v2.memory_service.release_control_types import (
     MemoryReleaseAssignmentConsumerKind,
@@ -250,6 +254,43 @@ def test_constructor_selects_one_trusted_component_and_callers_cannot_override()
         )
 
 
+@pytest.mark.parametrize("value", (0, -1, float("nan"), float("inf"), 10**1000))
+def test_constructor_rejects_nonpositive_or_nonfinite_waiter_timeout(
+    value: object,
+) -> None:
+    release_store = InMemoryMemoryReleaseStore(_NoLookupHistory())
+    with pytest.raises(ValueError, match="positive, finite"):
+        InMemoryMemoryReleaseControlStore(
+            release_store,
+            attestor=_Attestor(),
+            revoker=_Revoker(),
+            assignment_policy=_Policy(),
+            waiter_timeout_seconds=value,
+        )
+
+
+def test_public_module_exports_control_store_contracts_by_identity() -> None:
+    from areal.v2.memory_service import (
+        InMemoryMemoryReleaseControlStore as PublicInMemoryStore,
+    )
+    from areal.v2.memory_service import (
+        MemoryReleaseAssignmentPolicy as PublicAssignmentPolicy,
+    )
+    from areal.v2.memory_service import (
+        MemoryReleaseAttestationRevoker as PublicRevoker,
+    )
+    from areal.v2.memory_service import MemoryReleaseAttestor as PublicAttestor
+    from areal.v2.memory_service import (
+        MemoryReleaseControlStore as PublicControlStore,
+    )
+
+    assert PublicInMemoryStore is InMemoryMemoryReleaseControlStore
+    assert PublicAssignmentPolicy is MemoryReleaseAssignmentPolicy
+    assert PublicRevoker is MemoryReleaseAttestationRevoker
+    assert PublicAttestor is MemoryReleaseAttestor
+    assert PublicControlStore is MemoryReleaseControlStore
+
+
 @pytest.mark.parametrize(
     ("operation", "attribute"),
     (
@@ -301,6 +342,82 @@ def test_component_declaration_is_rechecked_after_callback() -> None:
     with pytest.raises(MemoryReleaseAttestationConflictError, match="changed"):
         _attest(control, scope, release)
     assert control.list_release_attestations(scope, release.release_id) == ()
+
+
+def test_component_property_exception_is_wrapped_as_domain_conflict() -> None:
+    scope, release_store, release, _, _, revoker, policy, clock = _seed()
+
+    class RaisingAttestor(_Attestor):
+        reads = 0
+
+        @property
+        def attestor_config_sha256(self):
+            self.reads += 1
+            if self.reads >= 2:
+                raise RuntimeError("property backend unavailable")
+            return _ATTESTOR_CONFIG
+
+    control = InMemoryMemoryReleaseControlStore(
+        release_store,
+        attestor=RaisingAttestor(),
+        revoker=revoker,
+        assignment_policy=policy,
+        clock=clock,
+    )
+    with pytest.raises(
+        MemoryReleaseAttestationConflictError,
+        match="declaration changed",
+    ) as raised:
+        _attest(control, scope, release)
+    assert isinstance(raised.value.__cause__, RuntimeError)
+
+
+def test_component_property_getter_never_runs_under_store_lock() -> None:
+    scope, release_store, release, _, _, revoker, policy, clock = _seed()
+    child_finished = Event()
+    child_errors = []
+
+    class JoiningGetterAttestor(_Attestor):
+        reads = 0
+        control = None
+
+        @property
+        def attestor_config_sha256(self):
+            self.reads += 1
+            if self.reads == 4:
+                def mutate_from_child():
+                    try:
+                        self.control.revoke_attestation(
+                            scope,
+                            f"mrat_{_OTHER_HASH[:24]}",
+                            attestation_content_sha256=_OTHER_HASH,
+                            idempotency_key="getter-child",
+                        )
+                    except Exception as error:
+                        child_errors.append(error)
+                    finally:
+                        child_finished.set()
+
+                thread = Thread(target=mutate_from_child, daemon=True)
+                thread.start()
+                assert child_finished.wait(timeout=2), (
+                    "component getter ran while the store lock was held"
+                )
+                thread.join(timeout=2)
+            return _ATTESTOR_CONFIG
+
+    attestor = JoiningGetterAttestor()
+    control = InMemoryMemoryReleaseControlStore(
+        release_store,
+        attestor=attestor,
+        revoker=revoker,
+        assignment_policy=policy,
+        clock=clock,
+    )
+    attestor.control = control
+    assert _attest(control, scope, release).release_id == release.release_id
+    assert len(child_errors) == 1
+    assert isinstance(child_errors[0], MemoryReleaseAttestationNotFoundError)
 
 
 @pytest.mark.parametrize("operation", ("attest", "revoke", "assign", "resolve"))
@@ -416,6 +533,43 @@ def test_other_revocation_reason_requires_a_hashed_detail() -> None:
         _revoke(control, scope, attestation)
 
 
+def test_revocation_reclocks_after_final_validation_and_lock_wait() -> None:
+    clock = _Clock()
+    scope, _, release, control, _, _, _, _ = _seed(clock=clock)
+    attestation = _attest(control, scope, release)
+    final_validation = Event()
+    continue_to_commit = Event()
+    original_validate = control._validate_component
+    revoker_validations = 0
+
+    def observed_validation(trusted, **keywords):
+        nonlocal revoker_validations
+        result = original_validate(trusted, **keywords)
+        if keywords["label"] == "revoker":
+            revoker_validations += 1
+            if revoker_validations == 3:
+                final_validation.set()
+                assert continue_to_commit.wait(timeout=2)
+        return result
+
+    control._validate_component = observed_validation
+    committed_at = _BASE + timedelta(seconds=5)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(_revoke, control, scope, attestation)
+        assert final_validation.wait(timeout=2)
+        acquired = control._lock.acquire(timeout=2)
+        if not acquired:
+            continue_to_commit.set()
+            pytest.fail("component validation ran while the store lock was held")
+        try:
+            clock.value = committed_at
+            continue_to_commit.set()
+        finally:
+            control._lock.release()
+        revocation = future.result(timeout=2)
+    assert revocation.revoked_at == committed_at
+
+
 def test_attestation_must_be_valid_at_its_commit_boundary() -> None:
     clock = _Clock()
     scope, _, release, control, attestor, _, _, _ = _seed(clock=clock)
@@ -483,6 +637,40 @@ def test_group_cas_binds_incarnation_and_policy_snapshot() -> None:
         )
 
 
+def test_group_and_incarnation_are_independent_one_to_one_indexes() -> None:
+    scope, _, release, control, _, _, _, _ = _seed()
+    attestation = _attest(control, scope, release)
+    assignment = _assign(control, scope, attestation)
+
+    assert _assign(control, scope, attestation) == assignment
+    with pytest.raises(MemoryReleaseAssignmentConflictError, match="incarnation"):
+        _assign(
+            control,
+            scope,
+            attestation,
+            group="different-group",
+            idempotency_key="same-incarnation-alias",
+        )
+    assert (scope, "different-group") not in control._assignment_by_group
+    assert (
+        scope,
+        "same-incarnation-alias",
+    ) not in control._assignment_by_idempotency
+
+    with pytest.raises(MemoryReleaseAssignmentConflictError, match="aliases"):
+        _assign(
+            control,
+            scope,
+            attestation,
+            rollout_group_incarnation_sha256=_OTHER_HASH,
+            idempotency_key="same-group-alias",
+        )
+    assert (scope, _OTHER_HASH) not in control._assignment_by_incarnation
+    assert control._assignment_by_incarnation[
+        (scope, _GROUP_INCARNATION)
+    ] is assignment
+
+
 def test_concurrent_group_compare_and_set_publishes_only_one_request() -> None:
     scope, _, release, control, _, _, _, _ = _seed()
     left = _attest(control, scope, release, key="left-attestation")
@@ -522,6 +710,52 @@ def test_concurrent_group_compare_and_set_publishes_only_one_request() -> None:
     assert len(control._assignment_by_idempotency) == 1
 
 
+def test_concurrent_groups_cannot_claim_the_same_incarnation() -> None:
+    scope, _, release, control, _, _, _, _ = _seed()
+    attestation = _attest(control, scope, release)
+    barrier = Barrier(2, timeout=5)
+    original_claim = control._claim
+
+    def synchronized_claim(*arguments, **keywords):
+        barrier.wait()
+        return original_claim(*arguments, **keywords)
+
+    control._claim = synchronized_claim
+
+    def compete(group: str):
+        try:
+            return _assign(
+                control,
+                scope,
+                attestation,
+                group=group,
+                idempotency_key=f"assign-{group}",
+            )
+        except MemoryReleaseAssignmentConflictError as error:
+            return error
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = tuple(executor.map(compete, ("group-left", "group-right")))
+    successes = tuple(item for item in results if not isinstance(item, Exception))
+    failures = tuple(item for item in results if isinstance(item, Exception))
+    assert len(successes) == len(failures) == 1
+    assert "incarnation" in str(failures[0])
+    assert len(control._assignment_by_group) == 1
+    assert len(control._assignment_by_incarnation) == 1
+    assert len(control._assignment_by_idempotency) == 1
+
+
+def test_active_resolution_fails_closed_on_incarnation_index_drift() -> None:
+    scope, _, release, control, _, _, _, _ = _seed()
+    attestation = _attest(control, scope, release)
+    assignment = _assign(control, scope, attestation)
+    del control._assignment_by_incarnation[(scope, _GROUP_INCARNATION)]
+
+    with pytest.raises(MemoryReleaseAssignmentConflictError, match="incarnation"):
+        _resolve(control, scope, assignment)
+    assert control.get_assignment(scope, assignment.assignment_id) == assignment
+
+
 def test_active_resolution_is_distinct_from_historical_lookup_on_expiry() -> None:
     scope, _, release, control, _, _, policy, clock = _seed()
     attestation = _attest(control, scope, release)
@@ -548,6 +782,43 @@ def test_active_resolution_rejects_clock_rollback_before_assignment_commit() -> 
     with pytest.raises(MemoryReleaseAssignmentConflictError, match="not yet valid"):
         _resolve(control, scope, assignment)
     assert control.get_assignment(scope, assignment.assignment_id) == assignment
+
+
+def test_active_resolution_reclocks_inside_final_lock_after_waiting() -> None:
+    clock = _Clock()
+    scope, _, release, control, _, _, policy, _ = _seed(clock=clock)
+    attestation = _attest(control, scope, release)
+    policy.valid_until = _BASE + timedelta(seconds=1)
+    assignment = _assign(control, scope, attestation)
+    graph_loaded = Event()
+    allow_final_lock = Event()
+    clock_called = Event()
+    original_load = control._load_release_graph
+
+    def blocking_graph_load(*arguments, **keywords):
+        result = original_load(*arguments, **keywords)
+        graph_loaded.set()
+        assert allow_final_lock.wait(timeout=2)
+        return result
+
+    def observed_clock():
+        clock_called.set()
+        return clock.value
+
+    control._load_release_graph = blocking_graph_load
+    control._clock = observed_clock
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(_resolve, control, scope, assignment)
+        assert graph_loaded.wait(timeout=2)
+        with control._lock:
+            allow_final_lock.set()
+            assert not clock_called.wait(timeout=0.1), (
+                "active resolver sampled time before acquiring its final lock"
+            )
+            clock.value = assignment.assignment_valid_until
+        with pytest.raises(MemoryReleaseAssignmentConflictError, match="expired"):
+            future.result(timeout=2)
+    assert clock_called.is_set()
 
 
 def test_revocation_is_an_immediate_active_resolution_kill_switch() -> None:
@@ -674,6 +945,48 @@ def test_context_guard_rejects_same_thread_cross_store_reentry() -> None:
     assert other.list_release_attestations(other_release.manifest.scope, other_release.release_id) == ()
 
 
+def test_global_guard_rejects_cross_thread_cross_store_reentry() -> None:
+    scope, release_store, release, _, _, revoker, policy, clock = _seed()
+    other_scope, _, other_release, other, _, _, _, _ = _seed(
+        scope=MemoryScope("tenant", "memory", "other")
+    )
+    child_finished = Event()
+    child_errors = []
+
+    class CrossThreadCrossStoreAttestor(_Attestor):
+        def attest(self, **arguments):
+            def child():
+                try:
+                    _attest(other, other_scope, other_release)
+                except Exception as error:
+                    child_errors.append(error)
+                finally:
+                    child_finished.set()
+
+            thread = Thread(target=child, daemon=True)
+            thread.start()
+            assert child_finished.wait(timeout=2), "global callback guard deadlocked"
+            thread.join(timeout=2)
+            return super().attest(**arguments)
+
+    control = InMemoryMemoryReleaseControlStore(
+        release_store,
+        attestor=CrossThreadCrossStoreAttestor(),
+        revoker=revoker,
+        assignment_policy=policy,
+        clock=clock,
+    )
+    with pytest.raises(MemoryReleaseAttestationConflictError, match="reentry"):
+        _attest(control, scope, release)
+    assert len(child_errors) == 1
+    assert isinstance(child_errors[0], MemoryReleaseAttestationConflictError)
+    assert control.list_release_attestations(scope, release.release_id) == ()
+    assert other.list_release_attestations(
+        other_scope,
+        other_release.release_id,
+    ) == ()
+
+
 def test_revoke_during_assignment_callback_fails_closed_then_kills_retry() -> None:
     scope, _, release, control, _, _, policy, _ = _seed()
     attestation = _attest(control, scope, release)
@@ -755,8 +1068,14 @@ class _FailAfterWriteDict(dict):
         raise _InjectedBaseException("injected publication interruption")
 
 
-@pytest.mark.parametrize("operation", ("attest", "revoke", "assign"))
-@pytest.mark.parametrize("write_index", range(3))
+@pytest.mark.parametrize(
+    ("operation", "write_index"),
+    (
+        *(("attest", index) for index in range(3)),
+        *(("revoke", index) for index in range(3)),
+        *(("assign", index) for index in range(4)),
+    ),
+)
 def test_base_exception_at_every_publication_point_rolls_back_all_indexes(
     operation: str,
     write_index: int,
@@ -779,6 +1098,7 @@ def test_base_exception_at_every_publication_point_rolls_back_all_indexes(
         "assign": (
             "_assignment_by_address",
             "_assignment_by_group",
+            "_assignment_by_incarnation",
             "_assignment_by_idempotency",
         ),
     }[operation]
@@ -849,6 +1169,65 @@ class _DriftingReleaseStore:
         if self.revision_calls >= self.drift_on_call:
             return (replace(revisions[0], generation=1),)
         return revisions
+
+
+class _AdvanceClockOnGraphCall:
+    def __init__(self, delegate, clock, *, call: int, value: datetime) -> None:
+        self.delegate = delegate
+        self.clock = clock
+        self.call = call
+        self.value = value
+        self.revision_calls = 0
+
+    def get_release(self, scope, release_id):
+        return self.delegate.get_release(scope, release_id)
+
+    def get_release_revisions(self, scope, release_id):
+        self.revision_calls += 1
+        revisions = self.delegate.get_release_revisions(scope, release_id)
+        if self.revision_calls == self.call:
+            self.clock.value = self.value
+        return revisions
+
+
+def test_attestation_reclocks_after_final_graph_read_before_publication() -> None:
+    clock = _Clock()
+    scope, release_store, release, control, attestor, _, _, _ = _seed(clock=clock)
+    attestor.valid_until = _BASE + timedelta(microseconds=1)
+    advancing = _AdvanceClockOnGraphCall(
+        release_store,
+        clock,
+        call=3,
+        value=attestor.valid_until,
+    )
+    control._release_store = advancing
+
+    with pytest.raises(MemoryReleaseAttestationConflictError, match="commit time"):
+        _attest(control, scope, release)
+    assert advancing.revision_calls == 3
+    assert control.list_release_attestations(scope, release.release_id) == ()
+
+
+def test_assignment_reclocks_after_final_graph_read_before_publication() -> None:
+    clock = _Clock()
+    scope, release_store, release, control, _, _, policy, _ = _seed(clock=clock)
+    attestation = _attest(control, scope, release)
+    policy.valid_until = _BASE + timedelta(microseconds=1)
+    advancing = _AdvanceClockOnGraphCall(
+        release_store,
+        clock,
+        call=3,
+        value=policy.valid_until,
+    )
+    control._release_store = advancing
+
+    with pytest.raises(MemoryReleaseAssignmentConflictError, match="expiry"):
+        _assign(control, scope, attestation)
+    assert advancing.revision_calls == 3
+    assert control._assignment_by_address == {}
+    assert control._assignment_by_group == {}
+    assert control._assignment_by_incarnation == {}
+    assert control._assignment_by_idempotency == {}
 
 
 @pytest.mark.parametrize("drift_on_call", (2, 3))
