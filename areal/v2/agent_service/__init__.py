@@ -14,6 +14,7 @@ Submodules
 - ``data_proxy`` — stateful session proxy
 - ``worker`` — stateless agent execution
 - ``memory_authorization`` — default-deny principal/session assignment grants
+- ``memory_authorization_store`` — revocable exact-grant control store
 - ``memory_broker`` — host-owned grant admission and incarnation lifecycle
 - ``protocol`` — WebSocket frame types and helpers
 """
@@ -41,6 +42,14 @@ from .memory_authorization import (
     MemoryScopeGrantV1,
     MemorySessionIncarnationV1,
     MemoryWorkerAudienceV1,
+)
+from .memory_authorization_store import (
+    InMemoryMemoryScopeGrantStore,
+    MemoryScopeGrantConflictError,
+    MemoryScopeGrantNotFoundError,
+    MemoryScopeGrantRevocationReasonV1,
+    MemoryScopeGrantRevocationV1,
+    MemoryScopeGrantStore,
 )
 from .memory_broker import (
     AuthorizedMemoryAgentBroker,
@@ -78,6 +87,7 @@ __all__ = [
     "AuthorizedMemoryTurnV1",
     "AsyncMemoryAgentCoordinator",
     "EventEmitter",
+    "InMemoryMemoryScopeGrantStore",
     "MEMORY_ASSIGNMENT_PIN_FIELD",
     "MemoryAgentMetadataWireV1",
     "MemoryAgentCoordinatorClosedError",
@@ -99,8 +109,13 @@ __all__ = [
     "MemoryScopeAuthorizationDisabledError",
     "MemoryScopeAuthorizationError",
     "MemoryScopeGrantAuthorizer",
+    "MemoryScopeGrantConflictError",
+    "MemoryScopeGrantNotFoundError",
     "MemoryScopeGrantRequestV1",
     "MemoryScopeGrantResolver",
+    "MemoryScopeGrantRevocationReasonV1",
+    "MemoryScopeGrantRevocationV1",
+    "MemoryScopeGrantStore",
     "MemoryScopeGrantV1",
     "MemorySessionIncarnationV1",
     "MemoryTurnCapability",

@@ -91,6 +91,27 @@ resolver must return an active exact grant for every authorization operation. A
 successful resolution admits only that operation. Later revocation blocks new
 admissions; it does not roll back a consumer side effect that was already admitted.
 
+`InMemoryMemoryScopeGrantStore` is the process-local reference resolver and control
+store. It linearizes create, revoke, and resolve under one lock and publishes an
+irreversible, content-addressed revocation tombstone. One canonical request may create
+only one grant for the lifetime of that store: expiry or revocation cannot be bypassed
+with a fresh idempotency key. A deliberately new authorization lifetime therefore needs
+a fresh host-minted session incarnation or Worker audience. Future renewable grants must
+add an explicit generation/supersession lineage instead of silently reusing the same
+request identity.
+
+The reference store scopes control addresses and idempotency keys by `MemoryScope`,
+returns detached audit records, and treats IDs and hashes as non-authoritative pointers.
+A new grant must already be active at its commit point, and its later half-open validity
+interval is `valid_from <= now < valid_until`; a backwards clock observation fails
+closed. Scheduled grants are intentionally deferred until explicit generation semantics
+exist.
+
+The store is non-durable and has no HTTP/admin surface, so process restart loses all
+grants rather than restoring authority. A durable backend must atomically restore both
+grants and their tombstones while preserving exact-request and linearization semantics;
+an incomplete recovery must fail closed.
+
 The `AuthorizedMemoryAgentBroker` is the default-off host seam that enforces this
 contract around the async coordinator. It mints its own Worker audience and session
 incarnations, checks `pin_assignment` before the release-control lookup, and checks
@@ -267,6 +288,8 @@ areal/v2/agent_service/
 ├── __init__.py          # Public exports (AgentRequest, AgentResponse, etc.)
 ├── README.md            # This document
 ├── auth.py              # Admin key auth helpers (hmac-safe comparison)
+├── memory_authorization.py       # Exact principal/session/action grant contract
+├── memory_authorization_store.py # Revocable in-memory grant control store
 ├── memory_broker.py     # Exact-grant host broker and session/turn incarnations
 ├── protocol.py          # Gateway protocol frame types
 ├── types.py             # AgentRequest, AgentResponse, EventEmitter, AgentRunnable
