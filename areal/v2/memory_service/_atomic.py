@@ -16,8 +16,9 @@ def _atomic_publish(
 
     The helper deliberately catches ``BaseException`` because cancellation,
     ``KeyboardInterrupt``, and allocation failures must not leave only some
-    indexes visible.  Rollback is best-effort for hostile test doubles; normal
-    built-in dictionaries and lists restore their exact prior state.
+    indexes visible.  Store indexes are private built-in dictionaries and
+    lists.  Rollback calls the built-in mutation methods directly so a fault-
+    injection subclass cannot interrupt both publication and its own undo.
     """
 
     undo: list[tuple[str, object, object, object]] = []
@@ -40,11 +41,14 @@ def _atomic_publish(
         for kind, target, key_or_length, previous in reversed(undo):
             try:
                 if kind == "sequence":
-                    del target[key_or_length:]
+                    list.__delitem__(target, slice(key_or_length, None))
                 elif previous is _MISSING:
-                    target.pop(key_or_length, None)
+                    dict.pop(target, key_or_length, None)
                 else:
-                    target[key_or_length] = previous
+                    dict.__setitem__(target, key_or_length, previous)
             except BaseException:
+                # A second process-level interruption can still make rollback
+                # impossible.  Continue undoing the other independent indexes
+                # and preserve the original publication exception.
                 pass
         raise

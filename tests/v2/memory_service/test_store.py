@@ -18,6 +18,7 @@ import pytest
 
 import areal.v2.memory_service as memory_service
 from areal.v2.memory_service import store as store_module
+from areal.v2.memory_service._atomic import _atomic_publish
 from areal.v2.memory_service.errors import (
     EvidenceConflictError,
     EvidenceNotFoundError,
@@ -190,6 +191,13 @@ class SetThenInterruptDict(dict[object, object]):
             raise KeyboardInterrupt("injected publication interruption")
 
 
+class InterruptingRollbackDict(SetThenInterruptDict):
+    """Try to interrupt rollback through an overridden mapping method."""
+
+    def pop(self, key: object, default: object = None) -> object:
+        raise KeyboardInterrupt("rollback override must be bypassed")
+
+
 def make_scope(**overrides: str) -> MemoryScope:
     values = {
         "tenant_id": "tenant-1",
@@ -235,6 +243,40 @@ def test_append_rolls_back_every_index_after_base_exception(
     record = store.append(event)
     assert store.get(event.scope, record.evidence_id) == record
     assert store.list(event.scope) == (record,)
+
+
+def test_rollback_bypasses_fault_injection_mapping_overrides() -> None:
+    store = InMemoryEvidenceStore()
+    store._by_idempotency_key = InterruptingRollbackDict()
+    event = make_event()
+
+    with pytest.raises(KeyboardInterrupt, match="publication interruption"):
+        store.append(event)
+
+    assert store._by_evidence_id == {}
+    assert store._by_idempotency_key == {}
+    assert store._by_scope == {}
+    record = store.append(event)
+    assert store.get(event.scope, record.evidence_id) == record
+
+
+def test_atomic_publish_restores_an_existing_scope_list() -> None:
+    old_record = object()
+    new_record = object()
+    scope_index: dict[object, list[object]] = {"scope": [old_record]}
+    failing_index = SetThenInterruptDict()
+
+    with pytest.raises(KeyboardInterrupt, match="publication interruption"):
+        _atomic_publish(
+            mapping_writes=(),
+            sequence_appends=(
+                (scope_index, "scope", new_record),
+                (failing_index, "later-scope", new_record),
+            ),
+        )
+
+    assert scope_index == {"scope": [old_record]}
+    assert failing_index == {}
 
 
 def test_error_types_share_memory_service_base_error() -> None:
