@@ -5,10 +5,7 @@
 <p align="center">
 | <a href="https://arxiv.org/pdf/2505.24298"><b>Paper</b></a> | <a href="https://areal-project.github.io/AReaL/"><b>Documentation</b></a> | <a href="https://areal-project.github.io/AReaL/zh/"><b>中文文档</b></a> | <a href="https://deepwiki.com/areal-project/AReaL"><b>Ask DeepWiki</b></a> | <a href="https://huggingface.co/collections/inclusionAI/"><b>🤗 Models & Data</b></a> |
 <a href="./assets/figures/wechat_qrcode.png" target="_blank"><img src="./assets/figures/wechat_icon.png" width="20" style="vertical-align: middle;"> <b>WeChat (微信) Group</b></a> |
-  <a href="https://gitcgr.com/areal-project/AReaL">
-    <img src="https://gitcgr.com/badge/areal-project/AReaL.svg" alt="gitcgr" />
   <a href="https://www.bestpractices.dev/projects/12770"><img src="https://www.bestpractices.dev/projects/12770/badge"></a>
-  </a>
 </p>
 
 <img align="right" alt="ReaL" src="/assets/figures/logo.png" width="20%">
