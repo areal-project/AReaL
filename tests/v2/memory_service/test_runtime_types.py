@@ -34,11 +34,11 @@ from areal.v2.memory_service import (
 
 _CREATED_AT = datetime(2026, 7, 12, tzinfo=UTC)
 _GOLDEN_CHAIN_HASHES = (
-    "b7f0db3f75f467da569c759cddf05eca4f850ef99ae80ddb414b1939781af745",
-    "fbca92ff928821b766dfd5e295da386b78515e7ec2708f80300f543bbfe18fb4",
-    "bde480ed20735b398a0af6bac6ce9799176b93341cc11f4774d23746b92c112f",
-    "8953da421b7f6f16c67bad5a927f7bc22b0baac8674a618f019bae91413a2c97",
-    "ce83a58acd7efd7a3a8959d8e0416cd501250715dceb7caaa34cb3eef515d48c",
+    "65fbd035cd41ebeeb16b4e29a952d0d719581561f05a3f0dcda95d02ac805be3",
+    "5a9e5a488d5a057b184b6304bb3639248bfe4dbe4f116471134a7614ec7e791e",
+    "a07af32060a17338a7b3ad721aaa5538eb0890220e0f2435175a5c1abe9440ae",
+    "853d33eda75d243e7d55d6ac479452d4e2625dcf3d6ce8e14031af1365caadea",
+    "6c0989152ae1ed147acae13e4d42135b9024462686adf5fc9f08c3a9b8b9489d",
 )
 
 
@@ -53,21 +53,27 @@ def _empty_history_hash() -> str:
 
 
 def _spec(*, suffix: str = "a") -> MemoryQuerySpecV1:
+    assignment_hash = _hash("assignment-v1")
     return MemoryQuerySpecV1(
         scope=MemoryScope(
             tenant_id="tenant-1",
             namespace="agent-memory",
             subject_id="subject-1",
         ),
+        assignment_id=f"masn_{assignment_hash[:24]}",
+        assignment_content_sha256=assignment_hash,
         release_id="rel_1234567890abcdef12345678",
         trajectory_id=f"trajectory-{suffix}",
         rollout_group_id="rollout-group-1",
+        rollout_group_incarnation_sha256=_hash("rollout-incarnation-v1"),
         query_sequence_no=0,
         query_sha256=_hash(f"query-{suffix}"),
         task_policy_id="frozen-agent",
         task_policy_version_sha256=_hash("task-policy-v1"),
+        task_policy_config_sha256=_hash("task-policy-config-v1"),
         retrieval_policy_id="release-order",
         retrieval_policy_version_sha256=_hash("retrieval-v1"),
+        retrieval_policy_config_sha256=_hash("retrieval-config-v1"),
         max_returned_items=2,
         max_context_utf8_bytes=1024,
         idempotency_key=f"query-{suffix}",
@@ -301,8 +307,8 @@ def test_source_read_receipt_has_golden_bytes_hash_and_id() -> None:
     _attempt, receipt = _canonical_source_receipt()
 
     assert receipt.canonical_bytes() == (
-        b'{"attempt_content_sha256":"05ceeb4171014af2a6cb29c7213b4b286a838119cf174dfb'
-        b'd82748f1b223eeb1","attempt_id":"mqat_05ceeb4171014af2a6cb29c7","read_event'
+        b'{"attempt_content_sha256":"d443a194d8e6dd69fe95f53a03b5a9cfa0fac11f50372f1'
+        b'eb887ed2d364c0f42","attempt_id":"mqat_d443a194d8e6dd69fe95f53a","read_event'
         b's":[{"operation":"get_release","requested_ids":["rel_2c177320e7d3e84d689b4ae'
         b'0"],"returned_objects":[{"kind":"release","object_content_sha256":"2c177320e'
         b'7d3e84d689b4ae0a3100c19b524f437d440eb480adea9b3b67f7b90","object_id":"re'
@@ -316,9 +322,9 @@ def test_source_read_receipt_has_golden_bytes_hash_and_id() -> None:
     )
     assert (
         receipt.content_hash
-        == "eacedf74057c8dc2aaaa5f517c0c8225c4b33a143d3b570620a196e57d50dcb7"
+        == "18cc7be8a1f762a981efec1c5e1d975958ba9d7f1754ca49389f866f31f484f0"
     )
-    assert receipt.source_read_receipt_id == "msrr_eacedf74057c8dc2aaaa5f51"
+    assert receipt.source_read_receipt_id == "msrr_18cc7be8a1f762a981efec1c"
     assert b"receipt-release" not in receipt.canonical_bytes()
 
 

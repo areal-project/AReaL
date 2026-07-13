@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import secrets
+from collections.abc import Callable
 from contextvars import ContextVar
 from dataclasses import dataclass
 from hashlib import sha256
@@ -39,12 +40,19 @@ from areal.v2.memory_service.errors import (
     MemoryExposureNotFoundError,
     MemoryQueryConflictError,
     MemoryQueryNotFoundError,
+    MemoryReleaseAssignmentConflictError,
+    MemoryReleaseAssignmentNotFoundError,
 )
 from areal.v2.memory_service.history_store import MemoryHistoryStore
 from areal.v2.memory_service.history_types import (
     MemoryCandidate,
     MemoryRevision,
     RevisionOperation,
+)
+from areal.v2.memory_service.release_control_store import MemoryReleaseControlStore
+from areal.v2.memory_service.release_control_types import (
+    MemoryReleaseAssignmentConsumerKind,
+    MemoryReleaseAssignmentV1,
 )
 from areal.v2.memory_service.release_store import MemoryReleaseStore
 from areal.v2.memory_service.release_types import MemoryRelease, ReleaseManifest
@@ -244,6 +252,24 @@ def _canonical_equal(left: object, right: object) -> bool:
     return left.canonical_bytes() == right.canonical_bytes()  # type: ignore[attr-defined]
 
 
+def _method_identity(value: object, field_name: str) -> tuple[object, object]:
+    if not callable(value):
+        raise TypeError(f"{field_name} must be callable")
+    return (
+        getattr(value, "__self__", None),
+        getattr(value, "__func__", value),
+    )
+
+
+def _same_method_identity(
+    left: tuple[object, object],
+    right: tuple[object, object],
+) -> bool:
+    """Compare callable identity without invoking attacker-controlled equality."""
+
+    return left[0] is right[0] and left[1] is right[1]
+
+
 @dataclass(frozen=True, slots=True)
 class MemoryRenderOutputV1:
     """Ephemeral output returned only by a store-registered trusted renderer."""
@@ -274,6 +300,7 @@ class MemoryRuntimeRetriever(Protocol):
 
     retrieval_policy_id: str
     retrieval_policy_version_sha256: str
+    retrieval_policy_config_sha256: str
 
     def retrieve(
         self,
@@ -289,6 +316,7 @@ class MemoryRuntimeRenderer(Protocol):
 
     renderer_id: str
     renderer_version_sha256: str
+    renderer_config_sha256: str
 
     def render(self, query_result: MemoryQueryResultV1) -> MemoryRenderOutputV1: ...
 
@@ -358,6 +386,7 @@ class MemoryRuntimeConsumer(Protocol):
     consumer_kind: MemoryConsumerKind
     consumer_id: str
     consumer_version_sha256: str
+    consumer_config_sha256: str
 
     def submit(
         self,
@@ -457,6 +486,7 @@ class InMemoryMemoryRuntimeStore:
         history_store: MemoryHistoryStore,
         release_store: MemoryReleaseStore,
         *,
+        release_control_store: MemoryReleaseControlStore,
         retrievers: tuple[MemoryRuntimeRetriever, ...] = (),
         renderers: tuple[MemoryRuntimeRenderer, ...] = (),
         consumers: tuple[MemoryRuntimeConsumer, ...] = (),
@@ -469,10 +499,23 @@ class InMemoryMemoryRuntimeStore:
             raise TypeError("consumers must be a tuple")
         self._history_store = history_store
         self._release_store = release_store
+        if not callable(
+            getattr(release_control_store, "resolve_active_assignment", None)
+        ):
+            raise TypeError(
+                "release_control_store must define resolve_active_assignment"
+            )
+        self._release_control_store = release_control_store
         self._lock = RLock()
         self._submission_condition = Condition(self._lock)
         self._active_component_thread_ids: set[int] = set()
         self._retriever_by_version: dict[tuple[str, str], MemoryRuntimeRetriever] = {}
+        self._retriever_method_by_version: dict[
+            tuple[str, str], tuple[object, object]
+        ] = {}
+        self._retriever_call_by_version: dict[
+            tuple[str, str], Callable[..., object]
+        ] = {}
         for retriever in tuple.__iter__(retrievers):
             retrieval_policy_id = _string(
                 getattr(retriever, "retrieval_policy_id", None),
@@ -482,13 +525,28 @@ class InMemoryMemoryRuntimeStore:
                 getattr(retriever, "retrieval_policy_version_sha256", None),
                 "retrieval_policy_version_sha256",
             )
+            _digest(
+                getattr(retriever, "retrieval_policy_config_sha256", None),
+                "retrieval_policy_config_sha256",
+            )
             key = (retrieval_policy_id, retrieval_policy_version)
             if key in self._retriever_by_version:
                 raise ValueError("retriever registry must not contain duplicates")
-            if not callable(getattr(retriever, "retrieve", None)):
-                raise TypeError("registered retriever must define retrieve")
+            retrieve_call = getattr(retriever, "retrieve", None)
+            method_identity = _method_identity(
+                retrieve_call,
+                "retrieve",
+            )
             self._retriever_by_version[key] = retriever
+            self._retriever_method_by_version[key] = method_identity
+            self._retriever_call_by_version[key] = retrieve_call
         self._renderer_by_version: dict[tuple[str, str], MemoryRuntimeRenderer] = {}
+        self._renderer_method_by_version: dict[
+            tuple[str, str], tuple[object, object]
+        ] = {}
+        self._renderer_call_by_version: dict[
+            tuple[str, str], Callable[..., object]
+        ] = {}
         for renderer in tuple.__iter__(renderers):
             renderer_id = _string(
                 getattr(renderer, "renderer_id", None),
@@ -498,14 +556,29 @@ class InMemoryMemoryRuntimeStore:
                 getattr(renderer, "renderer_version_sha256", None),
                 "renderer_version_sha256",
             )
+            _digest(
+                getattr(renderer, "renderer_config_sha256", None),
+                "renderer_config_sha256",
+            )
             key = (renderer_id, renderer_version)
             if key in self._renderer_by_version:
                 raise ValueError("renderer registry must not contain duplicates")
-            if not callable(getattr(renderer, "render", None)):
-                raise TypeError("registered renderer must define render")
+            render_call = getattr(renderer, "render", None)
+            method_identity = _method_identity(
+                render_call,
+                "render",
+            )
             self._renderer_by_version[key] = renderer
+            self._renderer_method_by_version[key] = method_identity
+            self._renderer_call_by_version[key] = render_call
         self._consumer_by_version: dict[
             tuple[str, str], tuple[MemoryRuntimeConsumer, MemoryConsumerKind]
+        ] = {}
+        self._consumer_method_by_version: dict[
+            tuple[str, str], tuple[object, object]
+        ] = {}
+        self._consumer_call_by_version: dict[
+            tuple[str, str], Callable[..., object]
         ] = {}
         for consumer in tuple.__iter__(consumers):
             consumer_id = _string(
@@ -516,6 +589,10 @@ class InMemoryMemoryRuntimeStore:
                 getattr(consumer, "consumer_version_sha256", None),
                 "consumer_version_sha256",
             )
+            _digest(
+                getattr(consumer, "consumer_config_sha256", None),
+                "consumer_config_sha256",
+            )
             consumer_kind = getattr(consumer, "consumer_kind", None)
             if type(consumer_kind) is not MemoryConsumerKind:
                 raise TypeError(
@@ -524,9 +601,14 @@ class InMemoryMemoryRuntimeStore:
             key = (consumer_id, consumer_version)
             if key in self._consumer_by_version:
                 raise ValueError("consumer registry must not contain duplicates")
-            if not callable(getattr(consumer, "submit", None)):
-                raise TypeError("registered consumer must define submit")
+            submit_call = getattr(consumer, "submit", None)
+            method_identity = _method_identity(
+                submit_call,
+                "submit",
+            )
             self._consumer_by_version[key] = (consumer, consumer_kind)
+            self._consumer_method_by_version[key] = method_identity
+            self._consumer_call_by_version[key] = submit_call
         self._attempt_by_address: dict[
             tuple[MemoryScope, str], MemoryQueryAttemptV1
         ] = {}
@@ -536,12 +618,8 @@ class InMemoryMemoryRuntimeStore:
         self._attempt_by_trajectory_slot: dict[
             tuple[MemoryScope, str, int], MemoryQueryAttemptV1
         ] = {}
-        self._trajectory_binding: dict[
-            tuple[MemoryScope, str], tuple[str, str, str, str, str]
-        ] = {}
-        self._rollout_group_binding: dict[
-            tuple[MemoryScope, str], tuple[str, str, str, str]
-        ] = {}
+        self._trajectory_binding: dict[tuple[MemoryScope, str], tuple[str, ...]] = {}
+        self._rollout_group_binding: dict[tuple[MemoryScope, str], tuple[str, ...]] = {}
         self._source_read_transcript_by_address: dict[
             tuple[MemoryScope, str], MemorySourceReadTranscriptV1
         ] = {}
@@ -578,6 +656,198 @@ class InMemoryMemoryRuntimeStore:
         self._exposure_by_address: dict[tuple[MemoryScope, str], MemoryExposureV1] = {}
         self._exposure_by_attempt: dict[tuple[MemoryScope, str], MemoryExposureV1] = {}
         self._exposure_by_ack: dict[tuple[MemoryScope, str], MemoryExposureV1] = {}
+
+    def _resolve_active_assignment(
+        self,
+        spec: MemoryQuerySpecV1,
+        *,
+        conflict_type: type[Exception],
+        release_content_sha256: str | None = None,
+        release_graph_sha256: str | None = None,
+        renderer_id: str | None = None,
+        renderer_version_sha256: str | None = None,
+        renderer_config_sha256: str | None = None,
+        consumer_kind: MemoryConsumerKind | None = None,
+        consumer_id: str | None = None,
+        consumer_version_sha256: str | None = None,
+        consumer_config_sha256: str | None = None,
+    ) -> MemoryReleaseAssignmentV1:
+        """Resolve live authority and compare the complete execution snapshot."""
+
+        try:
+            assignment = self._release_control_store.resolve_active_assignment(
+                spec.scope,
+                spec.rollout_group_id,
+                spec.rollout_group_incarnation_sha256,
+                spec.assignment_id,
+                spec.assignment_content_sha256,
+            )
+            if type(assignment) is not MemoryReleaseAssignmentV1:
+                raise TypeError("resolver returned a non-canonical assignment")
+            assignment.canonical_bytes()
+        except (
+            MemoryReleaseAssignmentConflictError,
+            MemoryReleaseAssignmentNotFoundError,
+            TypeError,
+            ValueError,
+        ) as error:
+            raise conflict_type("active Memory assignment resolution failed") from error
+
+        expected = (
+            spec.scope,
+            spec.assignment_id,
+            spec.assignment_content_sha256,
+            spec.rollout_group_id,
+            spec.rollout_group_incarnation_sha256,
+            spec.release_id,
+            spec.task_policy_id,
+            spec.task_policy_version_sha256,
+            spec.task_policy_config_sha256,
+            spec.retrieval_policy_id,
+            spec.retrieval_policy_version_sha256,
+            spec.retrieval_policy_config_sha256,
+            spec.max_returned_items,
+            spec.max_context_utf8_bytes,
+        )
+        actual = (
+            assignment.scope,
+            assignment.assignment_id,
+            assignment.content_hash,
+            assignment.rollout_group_id,
+            assignment.rollout_group_incarnation_sha256,
+            assignment.release_id,
+            assignment.task_policy_id,
+            assignment.task_policy_version_sha256,
+            assignment.task_policy_config_sha256,
+            assignment.retrieval_policy_id,
+            assignment.retrieval_policy_version_sha256,
+            assignment.retrieval_policy_config_sha256,
+            assignment.max_returned_items,
+            assignment.max_context_utf8_bytes,
+        )
+        if actual != expected:
+            raise conflict_type(
+                "active Memory assignment does not match the query snapshot"
+            )
+        if (
+            release_content_sha256 is not None
+            and assignment.release_content_sha256 != release_content_sha256
+        ) or (
+            release_graph_sha256 is not None
+            and assignment.release_graph_sha256 != release_graph_sha256
+        ):
+            raise conflict_type(
+                "active Memory assignment does not match the release graph"
+            )
+        if renderer_id is not None and (
+            assignment.renderer_id,
+            assignment.renderer_version_sha256,
+            assignment.renderer_config_sha256,
+        ) != (
+            renderer_id,
+            renderer_version_sha256,
+            renderer_config_sha256,
+        ):
+            raise conflict_type(
+                "active Memory assignment does not match the renderer snapshot"
+            )
+        if consumer_kind is not None:
+            assignment_consumer_kind = {
+                MemoryConsumerKind.CONTEXT: (
+                    MemoryReleaseAssignmentConsumerKind.CONTEXT
+                ),
+                MemoryConsumerKind.MODEL_CALL: (
+                    MemoryReleaseAssignmentConsumerKind.MODEL_CALL
+                ),
+            }[consumer_kind]
+            if (
+                assignment.consumer_kind,
+                assignment.consumer_id,
+                assignment.consumer_version_sha256,
+                assignment.consumer_config_sha256,
+            ) != (
+                assignment_consumer_kind,
+                consumer_id,
+                consumer_version_sha256,
+                consumer_config_sha256,
+            ):
+                raise conflict_type(
+                    "active Memory assignment does not match the consumer snapshot"
+                )
+        return assignment
+
+    def _renderer_config(
+        self,
+        renderer_id: str,
+        renderer_version_sha256: str,
+        conflict_type: type[Exception],
+    ) -> str:
+        renderer = self._renderer_by_version.get((renderer_id, renderer_version_sha256))
+        if renderer is None:
+            raise conflict_type("assigned renderer is no longer registered")
+        try:
+            actual = (
+                _string(getattr(renderer, "renderer_id", None), "renderer_id"),
+                _digest(
+                    getattr(renderer, "renderer_version_sha256", None),
+                    "renderer_version_sha256",
+                ),
+                _digest(
+                    getattr(renderer, "renderer_config_sha256", None),
+                    "renderer_config_sha256",
+                ),
+            )
+        except (TypeError, ValueError) as error:
+            raise conflict_type("assigned renderer identity changed") from error
+        if actual[:2] != (renderer_id, renderer_version_sha256):
+            raise conflict_type("assigned renderer identity changed")
+        return actual[2]
+
+    def _consumer_registration(
+        self,
+        consumer_id: str,
+        consumer_version_sha256: str,
+    ) -> tuple[MemoryConsumerKind, str]:
+        key = (consumer_id, consumer_version_sha256)
+        registered = self._consumer_by_version.get(key)
+        if registered is None:
+            raise MemoryConsumerAckConflictError(
+                "requested consumer ID and version are not registered"
+            )
+        consumer, frozen_kind = registered
+        try:
+            current_id = _string(
+                getattr(consumer, "consumer_id", None),
+                "consumer_id",
+            )
+            current_version = _digest(
+                getattr(consumer, "consumer_version_sha256", None),
+                "consumer_version_sha256",
+            )
+            current_config = _digest(
+                getattr(consumer, "consumer_config_sha256", None),
+                "consumer_config_sha256",
+            )
+            current_kind = getattr(consumer, "consumer_kind", None)
+            current_method = _method_identity(
+                getattr(consumer, "submit", None),
+                "submit",
+            )
+        except (TypeError, ValueError) as error:
+            raise MemoryConsumerAckConflictError(
+                "registered consumer identity changed"
+            ) from error
+        if (
+            (current_id, current_version) != key
+            or type(current_kind) is not MemoryConsumerKind
+            or current_kind is not frozen_kind
+            or not _same_method_identity(
+                current_method,
+                self._consumer_method_by_version[key],
+            )
+        ):
+            raise MemoryConsumerAckConflictError("registered consumer identity changed")
+        return current_kind, current_config
 
     @staticmethod
     def _atomic_writes(writes: tuple[tuple[dict, tuple, object], ...]) -> None:
@@ -1123,6 +1393,10 @@ class InMemoryMemoryRuntimeStore:
                 )
         if type(spec) is not MemoryQuerySpecV1:
             raise TypeError("spec must be a MemoryQuerySpecV1")
+        self._resolve_active_assignment(
+            spec,
+            conflict_type=MemoryQueryConflictError,
+        )
         idempotency_address = (spec.scope, spec.idempotency_key)
         with self._lock:
             existing = self._attempt_by_idempotency.get(idempotency_address)
@@ -1145,6 +1419,12 @@ class InMemoryMemoryRuntimeStore:
             read_session,
             expected_events,
         )
+        self._resolve_active_assignment(
+            spec,
+            conflict_type=MemoryQueryConflictError,
+            release_content_sha256=release.content_hash,
+            release_graph_sha256=release.release_graph_sha256,
+        )
         read_events = read_session.snapshot()
         self._validate_pin_read_events(
             spec=spec,
@@ -1166,6 +1446,9 @@ class InMemoryMemoryRuntimeStore:
         trajectory_address = (spec.scope, spec.trajectory_id)
         group_address = (spec.scope, spec.rollout_group_id)
         trajectory_binding = (
+            spec.assignment_id,
+            spec.assignment_content_sha256,
+            spec.rollout_group_incarnation_sha256,
             spec.rollout_group_id,
             release.release_id,
             release.content_hash,
@@ -1173,10 +1456,19 @@ class InMemoryMemoryRuntimeStore:
             spec.task_policy_version_sha256,
         )
         group_binding = (
+            spec.assignment_id,
+            spec.assignment_content_sha256,
+            spec.rollout_group_incarnation_sha256,
             release.release_id,
             release.content_hash,
             spec.task_policy_id,
             spec.task_policy_version_sha256,
+            spec.task_policy_config_sha256,
+            spec.retrieval_policy_id,
+            spec.retrieval_policy_version_sha256,
+            spec.retrieval_policy_config_sha256,
+            str(spec.max_returned_items),
+            str(spec.max_context_utf8_bytes),
         )
         with self._lock:
             claimed_slot = self._attempt_by_trajectory_slot.get(slot_address)
@@ -1565,6 +1857,11 @@ class InMemoryMemoryRuntimeStore:
             raise MemoryBoundaryMismatchError(
                 "retrieval query does not match the frozen query commitment"
             )
+        self._resolve_active_assignment(
+            attempt.spec,
+            conflict_type=MemoryQueryConflictError,
+            release_content_sha256=attempt.release_content_sha256,
+        )
         retriever_key = (
             attempt.spec.retrieval_policy_id,
             attempt.spec.retrieval_policy_version_sha256,
@@ -1631,21 +1928,40 @@ class InMemoryMemoryRuntimeStore:
                 getattr(retriever, "retrieval_policy_version_sha256", None),
                 "retrieval_policy_version_sha256",
             )
+            registered_config = _digest(
+                getattr(retriever, "retrieval_policy_config_sha256", None),
+                "retrieval_policy_config_sha256",
+            )
+            registered_method = _method_identity(
+                getattr(retriever, "retrieve", None),
+                "retrieve",
+            )
         except (TypeError, ValueError) as error:
             raise MemoryQueryConflictError(
                 "registered retriever identity changed"
             ) from error
-        if (registered_id, registered_version) != retriever_key or not callable(
-            getattr(retriever, "retrieve", None)
+        if (
+            (registered_id, registered_version) != retriever_key
+            or registered_config != attempt.spec.retrieval_policy_config_sha256
+            or not _same_method_identity(
+                registered_method,
+                self._retriever_method_by_version[retriever_key],
+            )
         ):
             raise MemoryQueryConflictError("registered retriever identity changed")
+        self._resolve_active_assignment(
+            attempt.spec,
+            conflict_type=MemoryQueryConflictError,
+            release_content_sha256=release.content_hash,
+            release_graph_sha256=release.release_graph_sha256,
+        )
         component_thread_id = get_ident()
         component_token = _RUNTIME_COMPONENT_CALL_ACTIVE.set(True)
         with self._lock:
             self._active_component_thread_ids.add(component_thread_id)
         try:
             try:
-                selected = retriever.retrieve(
+                selected = self._retriever_call_by_version[retriever_key](
                     attempt=attempt,
                     query=query,
                     eligible_items=eligible_items,
@@ -1922,6 +2238,11 @@ class InMemoryMemoryRuntimeStore:
             or result.release_content_sha256 != attempt.release_content_sha256
             or result.trajectory_id != attempt.spec.trajectory_id
             or result.rollout_group_id != attempt.spec.rollout_group_id
+            or result.rollout_group_incarnation_sha256
+            != attempt.spec.rollout_group_incarnation_sha256
+            or result.assignment_id != attempt.spec.assignment_id
+            or result.assignment_content_sha256
+            != attempt.spec.assignment_content_sha256
             or result.eligible_revisions != attempt.release_revisions
             or len(events) < 2
             or len(pin_events) < 2
@@ -2013,6 +2334,35 @@ class InMemoryMemoryRuntimeStore:
                 "requested renderer ID and version are not registered"
             )
         try:
+            registered_id = _string(
+                getattr(renderer, "renderer_id", None),
+                "renderer_id",
+            )
+            registered_version = _digest(
+                getattr(renderer, "renderer_version_sha256", None),
+                "renderer_version_sha256",
+            )
+            registered_config = _digest(
+                getattr(renderer, "renderer_config_sha256", None),
+                "renderer_config_sha256",
+            )
+            registered_method = _method_identity(
+                getattr(renderer, "render", None),
+                "render",
+            )
+        except (TypeError, ValueError) as error:
+            raise MemoryDeliveryConflictError(
+                "registered renderer identity changed"
+            ) from error
+        if (registered_id, registered_version) != (
+            renderer_id,
+            renderer_version_sha256,
+        ) or not _same_method_identity(
+            registered_method,
+            self._renderer_method_by_version[(renderer_id, renderer_version_sha256)],
+        ):
+            raise MemoryDeliveryConflictError("registered renderer identity changed")
+        try:
             result, attempt = self._load_validated_query_chain(
                 scope,
                 query_result_id,
@@ -2021,6 +2371,14 @@ class InMemoryMemoryRuntimeStore:
             raise MemoryDeliveryConflictError(
                 "query result chain failed integrity validation"
             ) from error
+        self._resolve_active_assignment(
+            attempt.spec,
+            conflict_type=MemoryDeliveryConflictError,
+            release_content_sha256=attempt.release_content_sha256,
+            renderer_id=renderer_id,
+            renderer_version_sha256=renderer_version_sha256,
+            renderer_config_sha256=registered_config,
+        )
         result_address = (scope, query_result_id)
         with self._lock:
             existing = self._delivery_by_result.get(result_address)
@@ -2042,6 +2400,14 @@ class InMemoryMemoryRuntimeStore:
                 getattr(renderer, "renderer_version_sha256", None),
                 "renderer_version_sha256",
             )
+            registered_config = _digest(
+                getattr(renderer, "renderer_config_sha256", None),
+                "renderer_config_sha256",
+            )
+            registered_method = _method_identity(
+                getattr(renderer, "render", None),
+                "render",
+            )
         except (TypeError, ValueError) as error:
             raise MemoryDeliveryConflictError(
                 "registered renderer identity changed"
@@ -2049,15 +2415,28 @@ class InMemoryMemoryRuntimeStore:
         if (registered_id, registered_version) != (
             renderer_id,
             renderer_version_sha256,
-        ) or not callable(getattr(renderer, "render", None)):
+        ) or not _same_method_identity(
+            registered_method,
+            self._renderer_method_by_version[(renderer_id, renderer_version_sha256)],
+        ):
             raise MemoryDeliveryConflictError("registered renderer identity changed")
+        self._resolve_active_assignment(
+            attempt.spec,
+            conflict_type=MemoryDeliveryConflictError,
+            release_content_sha256=attempt.release_content_sha256,
+            renderer_id=renderer_id,
+            renderer_version_sha256=renderer_version_sha256,
+            renderer_config_sha256=registered_config,
+        )
         component_thread_id = get_ident()
         component_token = _RUNTIME_COMPONENT_CALL_ACTIVE.set(True)
         with self._lock:
             self._active_component_thread_ids.add(component_thread_id)
         try:
             try:
-                rendered = renderer.render(result)
+                rendered = self._renderer_call_by_version[
+                    (renderer_id, renderer_version_sha256)
+                ](result)
             except Exception as error:
                 raise MemoryDeliveryConflictError(
                     "registered renderer failed"
@@ -2325,6 +2704,16 @@ class InMemoryMemoryRuntimeStore:
             or delivery.trajectory_id != result.trajectory_id
             or result.trajectory_id != attempt.spec.trajectory_id
             or result.rollout_group_id != attempt.spec.rollout_group_id
+            or delivery.rollout_group_id != result.rollout_group_id
+            or result.rollout_group_incarnation_sha256
+            != attempt.spec.rollout_group_incarnation_sha256
+            or delivery.rollout_group_incarnation_sha256
+            != result.rollout_group_incarnation_sha256
+            or result.assignment_id != attempt.spec.assignment_id
+            or result.assignment_content_sha256
+            != attempt.spec.assignment_content_sha256
+            or delivery.assignment_id != result.assignment_id
+            or delivery.assignment_content_sha256 != result.assignment_content_sha256
             or result.eligible_revisions != attempt.release_revisions
             or len(receipt.read_events) < 2
             or receipt.read_events[0].operation
@@ -2536,6 +2925,14 @@ class InMemoryMemoryRuntimeStore:
                 getattr(consumer, "consumer_version_sha256", None),
                 "consumer_version_sha256",
             )
+            registered_config = _digest(
+                getattr(consumer, "consumer_config_sha256", None),
+                "consumer_config_sha256",
+            )
+            registered_method = _method_identity(
+                getattr(consumer, "submit", None),
+                "submit",
+            )
             consumer_kind = getattr(consumer, "consumer_kind", None)
         except (TypeError, ValueError) as error:
             raise MemoryConsumerAckConflictError(
@@ -2546,7 +2943,12 @@ class InMemoryMemoryRuntimeStore:
             != (consumer_id, consumer_version_sha256)
             or type(consumer_kind) is not MemoryConsumerKind
             or consumer_kind is not registered_consumer_kind
-            or not callable(getattr(consumer, "submit", None))
+            or not _same_method_identity(
+                registered_method,
+                self._consumer_method_by_version[
+                    (consumer_id, consumer_version_sha256)
+                ],
+            )
         ):
             raise MemoryConsumerAckConflictError("registered consumer identity changed")
         delivery, result, attempt, expected_context = (
@@ -2555,6 +2957,22 @@ class InMemoryMemoryRuntimeStore:
                 delivery_id,
                 query=query,
             )
+        )
+        self._resolve_active_assignment(
+            attempt.spec,
+            conflict_type=MemoryConsumerAckConflictError,
+            release_content_sha256=attempt.release_content_sha256,
+            renderer_id=delivery.renderer_id,
+            renderer_version_sha256=delivery.renderer_version_sha256,
+            renderer_config_sha256=self._renderer_config(
+                delivery.renderer_id,
+                delivery.renderer_version_sha256,
+                MemoryConsumerAckConflictError,
+            ),
+            consumer_kind=consumer_kind,
+            consumer_id=consumer_id,
+            consumer_version_sha256=consumer_version_sha256,
+            consumer_config_sha256=registered_config,
         )
         claim = (
             consumer_id,
@@ -2567,6 +2985,7 @@ class InMemoryMemoryRuntimeStore:
         delivery_address = (scope, delivery_id)
         call_address = (scope, delivery.trajectory_id, call_id)
         owner_thread_id = get_ident()
+        cached_submission: tuple[MemoryExposureV1, object] | None = None
         with self._submission_condition:
             if owner_thread_id in self._submission_owner_by_delivery.values():
                 raise MemoryConsumerAckConflictError(
@@ -2618,34 +3037,96 @@ class InMemoryMemoryRuntimeStore:
                         raise MemoryExposureConflictError(
                             "acknowledgement has no stored consumer output"
                         )
-                    return (
+                    cached_submission = (
                         exposure,
                         self._consumer_output_by_ack[output_address],
                     )
-                raise MemoryConsumerAckConflictError(
-                    "delivery already has a different consumer acknowledgement"
-                )
-            existing_call = self._ack_by_call.get(call_address)
-            if existing_call is not None:
-                raise MemoryConsumerAckConflictError(
-                    "consumer call ID is already bound to another acknowledgement"
-                )
-            claimed_delivery = self._submission_delivery_by_call.get(call_address)
-            if claimed_delivery is not None and claimed_delivery != delivery_address:
-                raise MemoryConsumerAckConflictError(
-                    "consumer call ID has a conflicting in-flight delivery"
-                )
-            self._submission_claim_by_delivery[delivery_address] = claim
-            self._submission_owner_by_delivery[delivery_address] = owner_thread_id
-            self._submission_delivery_by_call[call_address] = delivery_address
-            self._submission_call_by_delivery[delivery_address] = call_address
+                else:
+                    raise MemoryConsumerAckConflictError(
+                        "delivery already has a different consumer acknowledgement"
+                    )
+            else:
+                existing_call = self._ack_by_call.get(call_address)
+                if existing_call is not None:
+                    raise MemoryConsumerAckConflictError(
+                        "consumer call ID is already bound to another acknowledgement"
+                    )
+                claimed_delivery = self._submission_delivery_by_call.get(call_address)
+                if (
+                    claimed_delivery is not None
+                    and claimed_delivery != delivery_address
+                ):
+                    raise MemoryConsumerAckConflictError(
+                        "consumer call ID has a conflicting in-flight delivery"
+                    )
+                self._submission_claim_by_delivery[delivery_address] = claim
+                self._submission_owner_by_delivery[delivery_address] = owner_thread_id
+                self._submission_delivery_by_call[call_address] = delivery_address
+                self._submission_call_by_delivery[delivery_address] = call_address
 
+        try:
+            consumer_kind, registered_config = self._consumer_registration(
+                consumer_id,
+                consumer_version_sha256,
+            )
+        except BaseException:
+            if cached_submission is None:
+                self._clear_submission_claim(
+                    delivery_address,
+                    owner_thread_id=owner_thread_id,
+                )
+            raise
+
+        if cached_submission is not None:
+            self._resolve_active_assignment(
+                attempt.spec,
+                conflict_type=MemoryConsumerAckConflictError,
+                release_content_sha256=attempt.release_content_sha256,
+                renderer_id=delivery.renderer_id,
+                renderer_version_sha256=delivery.renderer_version_sha256,
+                renderer_config_sha256=self._renderer_config(
+                    delivery.renderer_id,
+                    delivery.renderer_version_sha256,
+                    MemoryConsumerAckConflictError,
+                ),
+                consumer_kind=consumer_kind,
+                consumer_id=consumer_id,
+                consumer_version_sha256=consumer_version_sha256,
+                consumer_config_sha256=registered_config,
+            )
+            return cached_submission
+
+        try:
+            self._resolve_active_assignment(
+                attempt.spec,
+                conflict_type=MemoryConsumerAckConflictError,
+                release_content_sha256=attempt.release_content_sha256,
+                renderer_id=delivery.renderer_id,
+                renderer_version_sha256=delivery.renderer_version_sha256,
+                renderer_config_sha256=self._renderer_config(
+                    delivery.renderer_id,
+                    delivery.renderer_version_sha256,
+                    MemoryConsumerAckConflictError,
+                ),
+                consumer_kind=consumer_kind,
+                consumer_id=consumer_id,
+                consumer_version_sha256=consumer_version_sha256,
+                consumer_config_sha256=registered_config,
+            )
+        except BaseException:
+            self._clear_submission_claim(
+                delivery_address,
+                owner_thread_id=owner_thread_id,
+            )
+            raise
         component_thread_id = get_ident()
         component_token = _RUNTIME_COMPONENT_CALL_ACTIVE.set(True)
         with self._lock:
             self._active_component_thread_ids.add(component_thread_id)
         try:
-            submitted = consumer.submit(
+            submitted = self._consumer_call_by_version[
+                (consumer_id, consumer_version_sha256)
+            ](
                 delivery=delivery,
                 rendered_context=expected_context,
                 query=query,

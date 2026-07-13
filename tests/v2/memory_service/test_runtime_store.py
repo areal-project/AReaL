@@ -7,6 +7,7 @@ import json
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import FrozenInstanceError, replace
 from datetime import UTC, datetime, timedelta
+from threading import Event
 
 import pytest
 
@@ -29,6 +30,9 @@ from areal.v2.memory_service import (
     MemoryQueryNotFoundError,
     MemoryQuerySpecV1,
     MemoryRelease,
+    MemoryReleaseAssignmentConflictError,
+    MemoryReleaseAssignmentConsumerKind,
+    MemoryReleaseAssignmentV1,
     MemoryRenderedRevisionRangeV1,
     MemoryRenderOutputV1,
     MemoryRetrievalOutputV1,
@@ -48,18 +52,29 @@ _HASH_A = hashlib.sha256(b"task-policy-v1").hexdigest()
 _HASH_B = hashlib.sha256(b"retrieval-policy-v1").hexdigest()
 _HASH_C = hashlib.sha256(b"renderer-v1").hexdigest()
 _HASH_D = hashlib.sha256(b"consumer-v1").hexdigest()
+_CONFIG_A = hashlib.sha256(b"task-policy-config-v1").hexdigest()
+_CONFIG_B = hashlib.sha256(b"retrieval-policy-config-v1").hexdigest()
+_CONFIG_C = hashlib.sha256(b"renderer-config-v1").hexdigest()
+_CONFIG_D = hashlib.sha256(b"consumer-config-v1").hexdigest()
+_INCARNATION = hashlib.sha256(b"rollout-group-incarnation-1").hexdigest()
+_ATTESTATION_HASH = hashlib.sha256(b"test-attestation").hexdigest()
+_ASSIGNMENT_POLICY_VERSION = hashlib.sha256(b"test-assignment-policy-v1").hexdigest()
+_ASSIGNMENT_POLICY_CONFIG = hashlib.sha256(
+    b"test-assignment-policy-config-v1"
+).hexdigest()
 _GOLDEN_RUNTIME_HASHES = (
-    "aa4b04d626da600944cca01c90f712b9c5a52c1fe1da8e18f791cf1f74c8c57e",
-    "25d04094d3ac9a37f130e3e5bfa44c70f070fd224fc1e97e495d74be2baa18d2",
-    "886d6e677bbc275f5ece654845927c86d9dc53f3fb4f6e95aa93a974ba5b9f42",
-    "db5bb538754252e731d6a0691c28f76cca12f0913d4daadf248583aaebea8ccb",
-    "318dd7ae356d0a5b4d5210afd2e52ff462d217c0e3ec4b883cc6f16eb7c0c626",
+    "b42bbc7219e3c1109ef396ce0e0f2125735067dbac9474831a7a501c8d0b4369",
+    "de95af75fcc61a71f656318281fb5b5af12ca1c04e596bdc86c295e0a0086a89",
+    "4c8058c76921957ade02a47e3f4bf57583f53011869b864d9cd26da63d3da3d8",
+    "21a4cbf6db919c09a8f195a2b73f17d34b6efe80cb79e87f8176556d7949f96e",
+    "bc451df3a4b560b2f712671082ade145de3ad6d2fb75d16d2fd995693d862988",
 )
 
 
 class _ReleaseOrderRetriever:
     retrieval_policy_id = "release-order-v1"
     retrieval_policy_version_sha256 = _HASH_B
+    retrieval_policy_config_sha256 = _CONFIG_B
 
     def __init__(self, *, returned: bool = True, reverse: bool = False) -> None:
         self.returned = returned
@@ -103,6 +118,7 @@ class _FixedRetriever(_ReleaseOrderRetriever):
 class _LineRenderer:
     renderer_id = "json-lines-v1"
     renderer_version_sha256 = _HASH_C
+    renderer_config_sha256 = _CONFIG_C
 
     def __init__(self) -> None:
         self.calls = 0
@@ -129,6 +145,7 @@ class _ContextConsumer:
     consumer_kind = MemoryConsumerKind.CONTEXT
     consumer_id = "test-context-boundary"
     consumer_version_sha256 = _HASH_D
+    consumer_config_sha256 = _CONFIG_D
 
     def __init__(self) -> None:
         self.calls = 0
@@ -442,6 +459,136 @@ class _LoggingReleaseStore:
         return values
 
 
+_CONTROL_BY_RELEASE_ID = {}
+
+
+class _ActiveAssignmentResolver:
+    """Small exact-value resolver used to isolate runtime-boundary tests."""
+
+    def __init__(self, release, retriever, renderer, consumers) -> None:
+        self.release = release
+        self.retriever = retriever
+        self.renderer = renderer
+        self.consumers = consumers
+        self.assignments = {}
+        self.active = True
+        self.resolve_calls = 0
+        self.runtime = None
+
+    def make_assignment(
+        self,
+        scope,
+        *,
+        max_returned_items,
+        max_context_utf8_bytes,
+        consumer_index=0,
+    ):
+        consumer = self.consumers[consumer_index]
+        consumer_kind = {
+            MemoryConsumerKind.CONTEXT: MemoryReleaseAssignmentConsumerKind.CONTEXT,
+            MemoryConsumerKind.MODEL_CALL: (
+                MemoryReleaseAssignmentConsumerKind.MODEL_CALL
+            ),
+        }[consumer.consumer_kind]
+        assignment = MemoryReleaseAssignmentV1.create(
+            scope=scope,
+            rollout_group_id="rollout-group-1",
+            rollout_group_incarnation_sha256=_INCARNATION,
+            attestation_id=f"mrat_{_ATTESTATION_HASH[:24]}",
+            attestation_content_sha256=_ATTESTATION_HASH,
+            release_id=self.release.release_id,
+            release_content_sha256=self.release.content_hash,
+            release_graph_sha256=self.release.release_graph_sha256,
+            assignment_policy_id="test-assignment-policy",
+            assignment_policy_version_sha256=_ASSIGNMENT_POLICY_VERSION,
+            assignment_policy_config_sha256=_ASSIGNMENT_POLICY_CONFIG,
+            task_policy_id="frozen-task-agent",
+            task_policy_version_sha256=_HASH_A,
+            task_policy_config_sha256=_CONFIG_A,
+            retrieval_policy_id=self.retriever.retrieval_policy_id,
+            retrieval_policy_version_sha256=(
+                self.retriever.retrieval_policy_version_sha256
+            ),
+            retrieval_policy_config_sha256=(
+                self.retriever.retrieval_policy_config_sha256
+            ),
+            renderer_id=self.renderer.renderer_id,
+            renderer_version_sha256=self.renderer.renderer_version_sha256,
+            renderer_config_sha256=self.renderer.renderer_config_sha256,
+            consumer_kind=consumer_kind,
+            consumer_id=consumer.consumer_id,
+            consumer_version_sha256=consumer.consumer_version_sha256,
+            consumer_config_sha256=consumer.consumer_config_sha256,
+            max_returned_items=max_returned_items,
+            max_context_utf8_bytes=max_context_utf8_bytes,
+            evaluated_at=_BASE,
+            assigned_at=_BASE,
+            assignment_valid_until=_BASE + timedelta(days=1),
+            idempotency_key=(
+                f"assignment-{max_returned_items}-{max_context_utf8_bytes}-"
+                f"{consumer_index}"
+            ),
+        )
+        self.assignments[assignment.assignment_id] = assignment
+        return assignment
+
+    def resolve_active_assignment(
+        self,
+        scope,
+        rollout_group_id,
+        rollout_group_incarnation_sha256,
+        assignment_id,
+        assignment_content_sha256,
+    ):
+        self.resolve_calls += 1
+        if self.runtime is not None:
+            assert not self.runtime._lock._is_owned()
+        if not self.active:
+            raise MemoryReleaseAssignmentConflictError("assignment revoked")
+        assignment = self.assignments.get(assignment_id)
+        if assignment is None or (
+            assignment.scope,
+            assignment.rollout_group_id,
+            assignment.rollout_group_incarnation_sha256,
+            assignment.content_hash,
+        ) != (
+            scope,
+            rollout_group_id,
+            rollout_group_incarnation_sha256,
+            assignment_content_sha256,
+        ):
+            raise MemoryReleaseAssignmentConflictError("assignment mismatch")
+        return assignment
+
+
+def _runtime(
+    history_store,
+    release_store,
+    release,
+    *,
+    retriever,
+    renderer=None,
+    consumers=None,
+):
+    if renderer is None:
+        renderer = _LineRenderer()
+    if consumers is None:
+        consumers = (_ContextConsumer(),)
+    control = _ActiveAssignmentResolver(release, retriever, renderer, consumers)
+    _CONTROL_BY_RELEASE_ID[release.release_id] = control
+    runtime = InMemoryMemoryRuntimeStore(
+        history_store,
+        release_store,
+        release_control_store=control,
+        retrievers=(retriever,),
+        renderers=(renderer,),
+        consumers=consumers,
+    )
+    runtime._test_control = control
+    control.runtime = runtime
+    return runtime
+
+
 def _graph(
     *,
     empty: bool = False,
@@ -507,11 +654,12 @@ def _graph(
         history_store,
         release_store,
         release,
-        InMemoryMemoryRuntimeStore(
+        _runtime(
             history_store,
             release_store,
-            retrievers=(retriever,),
-            renderers=(renderer,),
+            release,
+            retriever=retriever,
+            renderer=renderer,
             consumers=consumers,
         ),
     )
@@ -586,18 +734,35 @@ def _spec(
     suffix: str = "a",
     max_returned_items: int = 2,
     max_context_utf8_bytes: int = 4096,
+    consumer_index: int = 0,
 ) -> MemoryQuerySpecV1:
+    control = _CONTROL_BY_RELEASE_ID[release_id]
+    assignment = control.make_assignment(
+        scope,
+        max_returned_items=max_returned_items,
+        max_context_utf8_bytes=max_context_utf8_bytes,
+        consumer_index=consumer_index,
+    )
     return MemoryQuerySpecV1(
         scope=scope,
+        assignment_id=assignment.assignment_id,
+        assignment_content_sha256=assignment.content_hash,
         release_id=release_id,
         trajectory_id=f"trajectory-{suffix}",
         rollout_group_id="rollout-group-1",
+        rollout_group_incarnation_sha256=_INCARNATION,
         query_sequence_no=0,
         query_sha256=hashlib.sha256(f"query-{suffix}".encode()).hexdigest(),
         task_policy_id="frozen-task-agent",
         task_policy_version_sha256=_HASH_A,
-        retrieval_policy_id="release-order-v1",
-        retrieval_policy_version_sha256=_HASH_B,
+        task_policy_config_sha256=_CONFIG_A,
+        retrieval_policy_id=control.retriever.retrieval_policy_id,
+        retrieval_policy_version_sha256=(
+            control.retriever.retrieval_policy_version_sha256
+        ),
+        retrieval_policy_config_sha256=(
+            control.retriever.retrieval_policy_config_sha256
+        ),
         max_returned_items=max_returned_items,
         max_context_utf8_bytes=max_context_utf8_bytes,
         idempotency_key=f"query-{suffix}",
@@ -654,7 +819,10 @@ def test_query_to_actual_exposure_derives_all_runtime_stages(monkeypatch) -> Non
     monkeypatch.setattr(runtime_store, "_new_runtime_nonce", lambda: next(nonces))
     scope, _history, _releases, release, store = _graph()
     attempt, result = _query_all(
-        store, scope, release, _spec(scope, release.release_id)
+        store,
+        scope,
+        release,
+        _spec(scope, release.release_id),
     )
     context, delivery = _deliver(store, scope, result)
     exposure, ack = _ack_context(store, scope, delivery, context)
@@ -707,6 +875,222 @@ def test_query_to_actual_exposure_derives_all_runtime_stages(monkeypatch) -> Non
         assert public_id == prefix + record.content_hash[:24]
 
 
+def test_revoked_assignment_blocks_every_component_and_cached_fast_path() -> None:
+    retriever = _ReleaseOrderRetriever()
+    renderer = _LineRenderer()
+    consumer = _ContextConsumer()
+    scope, _history, _releases, release, store = _graph(
+        retriever=retriever,
+        renderer=renderer,
+        consumers=(consumer,),
+    )
+    control = store._test_control
+    spec = _spec(scope, release.release_id)
+    attempt = store.begin_query(spec)
+
+    control.active = False
+    with pytest.raises(MemoryQueryConflictError, match="active Memory assignment"):
+        store.resolve_query(scope, attempt.attempt_id, query=b"query-a")
+    assert retriever.calls == 0
+
+    control.active = True
+    result = store.resolve_query(scope, attempt.attempt_id, query=b"query-a")
+    assert retriever.calls == 1
+    control.active = False
+    with pytest.raises(MemoryQueryConflictError, match="active Memory assignment"):
+        store.resolve_query(scope, attempt.attempt_id, query=b"query-a")
+    assert retriever.calls == 1
+
+    with pytest.raises(MemoryDeliveryConflictError, match="active Memory assignment"):
+        _deliver(store, scope, result)
+    assert renderer.calls == 0
+    control.active = True
+    context, delivery = _deliver(store, scope, result)
+    assert renderer.calls == 1
+    control.active = False
+    with pytest.raises(MemoryDeliveryConflictError, match="active Memory assignment"):
+        _deliver(store, scope, result)
+    assert renderer.calls == 1
+
+    with pytest.raises(
+        MemoryConsumerAckConflictError,
+        match="active Memory assignment",
+    ):
+        _ack_context(store, scope, delivery, context)
+    assert consumer.calls == 0
+    control.active = True
+    exposure, _ack = _ack_context(store, scope, delivery, context)
+    assert consumer.calls == 1
+    control.active = False
+    with pytest.raises(
+        MemoryConsumerAckConflictError,
+        match="active Memory assignment",
+    ):
+        store.submit_delivery(
+            scope,
+            delivery.delivery_id,
+            consumer_id=consumer.consumer_id,
+            consumer_version_sha256=consumer.consumer_version_sha256,
+            call_id="call-1",
+            query=b"query-a",
+            history=(),
+        )
+    assert consumer.calls == 1
+    assert store.get_exposure(scope, exposure.exposure_id) == exposure
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    (
+        ("task_policy_config_sha256", "0" * 64),
+        ("retrieval_policy_config_sha256", "1" * 64),
+        ("max_returned_items", 1),
+        ("max_context_utf8_bytes", 2048),
+        ("release_id", "rel_" + "2" * 24),
+    ),
+)
+def test_query_snapshot_must_match_assignment_exactly(field_name, value) -> None:
+    retriever = _ReleaseOrderRetriever()
+    scope, _history, _releases, release, store = _graph(retriever=retriever)
+    spec = replace(_spec(scope, release.release_id), **{field_name: value})
+
+    with pytest.raises(MemoryQueryConflictError, match="assignment"):
+        store.begin_query(spec)
+    assert retriever.calls == 0
+    assert store._attempt_by_address == {}
+
+
+def test_registered_component_config_and_callable_are_immutable() -> None:
+    retriever = _ReleaseOrderRetriever()
+    renderer = _LineRenderer()
+    consumer = _ContextConsumer()
+    scope, _history, _releases, release, store = _graph(
+        retriever=retriever,
+        renderer=renderer,
+        consumers=(consumer,),
+    )
+    attempt = store.begin_query(_spec(scope, release.release_id))
+
+    original_retrieve = retriever.retrieve
+    retriever.retrieve = lambda **_kwargs: MemoryRetrievalOutputV1((), ())
+    with pytest.raises(MemoryQueryConflictError, match="identity changed"):
+        store.resolve_query(scope, attempt.attempt_id, query=b"query-a")
+    assert retriever.calls == 0
+    retriever.retrieve = original_retrieve
+    result = store.resolve_query(scope, attempt.attempt_id, query=b"query-a")
+
+    original_render = renderer.render
+    renderer.render = lambda _result: MemoryRenderOutputV1(b"", ())
+    with pytest.raises(MemoryDeliveryConflictError, match="identity changed"):
+        _deliver(store, scope, result)
+    assert renderer.calls == 0
+    renderer.render = original_render
+    context, delivery = _deliver(store, scope, result)
+
+    original_submit = consumer.submit
+    consumer.submit = lambda **_kwargs: None
+    with pytest.raises(MemoryConsumerAckConflictError, match="identity changed"):
+        _ack_context(store, scope, delivery, context)
+    assert consumer.calls == 0
+    consumer.submit = original_submit
+
+    consumer.consumer_config_sha256 = "3" * 64
+    with pytest.raises(MemoryConsumerAckConflictError, match="assignment"):
+        _ack_context(store, scope, delivery, context)
+    assert consumer.calls == 0
+
+
+def test_callable_identity_comparison_never_invokes_hostile_equality() -> None:
+    class AlwaysEqualCall:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def __eq__(self, _other) -> bool:
+            return True
+
+        def __call__(self, **_kwargs):
+            self.calls += 1
+            return MemoryRetrievalOutputV1((), ())
+
+    retriever = _ReleaseOrderRetriever()
+    registered_call = AlwaysEqualCall()
+    replacement_call = AlwaysEqualCall()
+    retriever.retrieve = registered_call
+    scope, _history, _releases, release, store = _graph(retriever=retriever)
+    attempt = store.begin_query(_spec(scope, release.release_id))
+    retriever.retrieve = replacement_call
+
+    with pytest.raises(MemoryQueryConflictError, match="identity changed"):
+        store.resolve_query(scope, attempt.attempt_id, query=b"query-a")
+    assert registered_call.calls == 0
+    assert replacement_call.calls == 0
+
+
+def test_consumer_waiter_revalidates_after_owner_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class BlockingFailConsumer(_ContextConsumer):
+        def __init__(self) -> None:
+            super().__init__()
+            self.started = Event()
+            self.proceed = Event()
+
+        def submit(self, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                self.started.set()
+                assert self.proceed.wait(timeout=10)
+                raise RuntimeError("injected owner failure")
+            return super().submit(**kwargs)
+
+    consumer = BlockingFailConsumer()
+    replacement_calls = 0
+
+    def replacement_submit(**_kwargs):
+        nonlocal replacement_calls
+        replacement_calls += 1
+        return None
+
+    scope, _history, _releases, release, store = _graph(consumers=(consumer,))
+    attempt, result = _query_all(
+        store,
+        scope,
+        release,
+        _spec(scope, release.release_id),
+    )
+    context, delivery = _deliver(store, scope, result)
+    waiter_entered = Event()
+    original_wait = store._submission_condition.wait
+
+    def observed_wait(*args, **kwargs):
+        waiter_entered.set()
+        return original_wait(*args, **kwargs)
+
+    monkeypatch.setattr(store._submission_condition, "wait", observed_wait)
+
+    def submit_once():
+        return _ack_context(store, scope, delivery, context)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        owner = executor.submit(submit_once)
+        assert consumer.started.wait(timeout=10)
+        waiter = executor.submit(submit_once)
+        assert waiter_entered.wait(timeout=10)
+        consumer.submit = replacement_submit
+        consumer.consumer_config_sha256 = "4" * 64
+        consumer.proceed.set()
+        with pytest.raises(RuntimeError, match="owner failure"):
+            owner.result(timeout=10)
+        with pytest.raises(MemoryConsumerAckConflictError, match="identity changed"):
+            waiter.result(timeout=10)
+
+    assert consumer.calls == 1
+    assert replacement_calls == 0
+    assert store._submission_claim_by_delivery == {}
+    assert store._ack_by_delivery == {}
+    assert store._exposure_by_attempt == {}
+
+
 def test_source_read_receipt_records_real_runtime_getters_without_content() -> None:
     scope, _history, _releases, release, store = _graph()
     attempt, result = _query_all(
@@ -753,10 +1137,11 @@ def test_source_read_receipt_records_real_runtime_getters_without_content() -> N
 def test_source_transcripts_match_independent_backend_getter_log() -> None:
     scope, history, releases, release, _store = _graph()
     backend_calls = []
-    runtime = InMemoryMemoryRuntimeStore(
+    runtime = _runtime(
         _LoggingHistoryStore(history, backend_calls),
         _LoggingReleaseStore(releases, backend_calls),
-        retrievers=(_ReleaseOrderRetriever(),),
+        release,
+        retriever=_ReleaseOrderRetriever(),
     )
     spec = _spec(scope, release.release_id)
 
@@ -825,10 +1210,11 @@ def test_evidence_snapshot_cannot_drift_between_receipt_and_result(
             return self.last_evidence
 
     cloning_history = CloningEvidenceHistory()
-    runtime = InMemoryMemoryRuntimeStore(
+    runtime = _runtime(
         cloning_history,
         releases,
-        retrievers=(_ReleaseOrderRetriever(),),
+        release,
+        retriever=_ReleaseOrderRetriever(),
     )
     attempt = runtime.begin_query(_spec(scope, release.release_id))
     original_validate_candidate = runtime._validate_candidate
@@ -866,10 +1252,11 @@ def test_missing_iterative_parent_read_fails_closed_during_resolution(
     monkeypatch,
 ) -> None:
     scope, history, releases, release, _root, _children = _lineage_graph()
-    runtime = InMemoryMemoryRuntimeStore(
+    runtime = _runtime(
         history,
         releases,
-        retrievers=(_ReleaseOrderRetriever(),),
+        release,
+        retriever=_ReleaseOrderRetriever(),
     )
     attempt = runtime.begin_query(_spec(scope, release.release_id))
 
@@ -887,10 +1274,11 @@ def test_missing_iterative_parent_read_fails_closed_during_resolution(
 
 def test_iterative_transcript_records_child_to_add_ancestry_exactly() -> None:
     scope, history, releases, release, root, children = _lineage_graph()
-    runtime = InMemoryMemoryRuntimeStore(
+    runtime = _runtime(
         history,
         releases,
-        retrievers=(_ReleaseOrderRetriever(),),
+        release,
+        retriever=_ReleaseOrderRetriever(),
     )
     attempt = runtime.begin_query(_spec(scope, release.release_id))
     pin = runtime.get_source_read_transcript(scope, attempt.pin_read_transcript_id)
@@ -951,10 +1339,11 @@ def test_shared_ancestry_transcript_records_each_parent_getter_once_per_child() 
             assert release_id == shared_release.release_id
             return children
 
-    runtime = InMemoryMemoryRuntimeStore(
+    runtime = _runtime(
         history,
         SharedAncestryReleaseStore(),
-        retrievers=(_ReleaseOrderRetriever(returned=False),),
+        shared_release,
+        retriever=_ReleaseOrderRetriever(returned=False),
     )
     attempt = runtime.begin_query(_spec(scope, shared_release.release_id))
     transcript = runtime.get_source_read_transcript(
@@ -1093,7 +1482,10 @@ def test_corrupt_pin_transcript_blocks_retriever_side_effect() -> None:
 def test_model_call_ack_hashes_actual_prompt_slice_and_token_ids() -> None:
     scope, _history, _releases, release, store = _graph()
     attempt, result = _query_all(
-        store, scope, release, _spec(scope, release.release_id)
+        store,
+        scope,
+        release,
+        _spec(scope, release.release_id, consumer_index=1),
     )
     context, delivery = _deliver(store, scope, result)
     tokens = (101, 202, 303)
@@ -1679,11 +2071,17 @@ def test_query_slot_trajectory_and_rollout_group_are_immutably_pinned() -> None:
         ReleaseManifest(scope=scope, revision_ids=()),
         idempotency_key="empty-release",
     )
+    control = store._test_control
+    original_release = control.release
+    control.release = empty
+    _CONTROL_BY_RELEASE_ID[empty.release_id] = control
+    empty_spec = _spec(scope, empty.release_id, suffix="other-trajectory")
+    control.release = original_release
     with pytest.raises(MemoryQueryConflictError, match="trajectory execution"):
         store.begin_query(
             replace(
-                first,
-                release_id=empty.release_id,
+                empty_spec,
+                trajectory_id=first.trajectory_id,
                 query_sequence_no=1,
                 query_sha256=hashlib.sha256(b"next-query").hexdigest(),
                 idempotency_key="next-query",
@@ -1692,11 +2090,11 @@ def test_query_slot_trajectory_and_rollout_group_are_immutably_pinned() -> None:
     with pytest.raises(MemoryQueryConflictError, match="rollout group"):
         store.begin_query(
             replace(
-                _spec(scope, empty.release_id, suffix="other-trajectory"),
+                empty_spec,
                 idempotency_key="other-trajectory-empty",
             )
         )
-    with pytest.raises(MemoryQueryConflictError, match="rollout group"):
+    with pytest.raises(MemoryQueryConflictError, match="assignment"):
         store.begin_query(
             replace(
                 _spec(scope, release.release_id, suffix="policy-drift"),
@@ -1713,6 +2111,7 @@ def test_query_slot_trajectory_and_rollout_group_are_immutably_pinned() -> None:
 )
 def test_begin_query_reloads_and_rejects_mutated_source_graph(mutation: str) -> None:
     scope, history, _releases, release, store = _graph()
+    spec = _spec(scope, release.release_id)
     revision = history.get_revision(scope, release.manifest.revision_ids[0])
     candidate = history.get_candidate(scope, revision.proposal.candidate_id)
     evidence = history.get_candidate_evidence(scope, candidate.candidate_id)[0]
@@ -1726,7 +2125,7 @@ def test_begin_query_reloads_and_rejects_mutated_source_graph(mutation: str) -> 
         object.__setattr__(evidence.event, "payload", "forged-evidence")
 
     with pytest.raises(MemoryQueryConflictError):
-        store.begin_query(_spec(scope, release.release_id))
+        store.begin_query(spec)
 
 
 def test_source_backends_must_return_the_exact_requested_addresses() -> None:
@@ -1748,10 +2147,11 @@ def test_source_backends_must_return_the_exact_requested_addresses() -> None:
                 empty.release_id,
             )
 
-    wrong_release_runtime = InMemoryMemoryRuntimeStore(
+    wrong_release_runtime = _runtime(
         history,
         WrongReleaseStore(),
-        retrievers=(_ReleaseOrderRetriever(),),
+        release,
+        retriever=_ReleaseOrderRetriever(),
     )
     with pytest.raises(MemoryQueryConflictError, match="release graph"):
         wrong_release_runtime.begin_query(_spec(scope, release.release_id))
@@ -1777,10 +2177,11 @@ def test_source_backends_must_return_the_exact_requested_addresses() -> None:
             )
 
     assert first_revision.proposal.candidate_id != second_revision.proposal.candidate_id
-    wrong_candidate_runtime = InMemoryMemoryRuntimeStore(
+    wrong_candidate_runtime = _runtime(
         WrongCandidateHistory(),
         releases,
-        retrievers=(_ReleaseOrderRetriever(),),
+        release,
+        retriever=_ReleaseOrderRetriever(),
     )
     with pytest.raises(MemoryQueryConflictError, match="invalid commitments"):
         wrong_candidate_runtime.begin_query(_spec(scope, release.release_id))
@@ -1806,10 +2207,11 @@ def test_candidate_cannot_change_while_evidence_is_loaded() -> None:
             )
             return evidence
 
-    runtime = InMemoryMemoryRuntimeStore(
+    runtime = _runtime(
         MutatingHistory(),
         releases,
-        retrievers=(_ReleaseOrderRetriever(),),
+        release,
+        retriever=_ReleaseOrderRetriever(),
     )
     with pytest.raises(MemoryQueryConflictError, match="changed"):
         runtime.begin_query(_spec(scope, release.release_id))
@@ -1850,10 +2252,11 @@ def test_revision_cannot_change_while_query_item_is_materialized() -> None:
 
     mutating_history = MutatingRevisionHistory()
     retriever = _ReleaseOrderRetriever()
-    runtime = InMemoryMemoryRuntimeStore(
+    runtime = _runtime(
         mutating_history,
         releases,
-        retrievers=(retriever,),
+        release,
+        retriever=retriever,
     )
     attempt = runtime.begin_query(_spec(scope, release.release_id))
 
@@ -2208,10 +2611,11 @@ def test_revision_validation_is_iterative_for_deep_lineages() -> None:
         ReleaseManifest(scope=scope, revision_ids=(parent_revision_id,)),
         idempotency_key="deep-release",
     )
-    runtime = InMemoryMemoryRuntimeStore(
+    runtime = _runtime(
         history_store,
         release_store,
-        retrievers=(_ReleaseOrderRetriever(),),
+        release,
+        retriever=_ReleaseOrderRetriever(),
     )
 
     attempt = runtime.begin_query(_spec(scope, release.release_id))

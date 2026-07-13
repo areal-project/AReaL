@@ -159,15 +159,20 @@ class MemoryQuerySpecV1:
     """One explicit release-pinned runtime query assignment."""
 
     scope: MemoryScope
+    assignment_id: str
+    assignment_content_sha256: str
     release_id: str
     trajectory_id: str
     rollout_group_id: str
+    rollout_group_incarnation_sha256: str
     query_sequence_no: int
     query_sha256: str
     task_policy_id: str
     task_policy_version_sha256: str
+    task_policy_config_sha256: str
     retrieval_policy_id: str
     retrieval_policy_version_sha256: str
+    retrieval_policy_config_sha256: str
     max_returned_items: int
     max_context_utf8_bytes: int
     idempotency_key: str
@@ -175,6 +180,7 @@ class MemoryQuerySpecV1:
     def __post_init__(self) -> None:
         _scope_value(self.scope)
         for field_name in (
+            "assignment_id",
             "release_id",
             "trajectory_id",
             "rollout_group_id",
@@ -191,8 +197,12 @@ class MemoryQuerySpecV1:
         _integer(self.max_returned_items, "max_returned_items")
         _integer(self.max_context_utf8_bytes, "max_context_utf8_bytes")
         for field_name in (
+            "assignment_content_sha256",
             "query_sha256",
+            "rollout_group_incarnation_sha256",
+            "task_policy_config_sha256",
             "task_policy_version_sha256",
+            "retrieval_policy_config_sha256",
             "retrieval_policy_version_sha256",
         ):
             object.__setattr__(
@@ -200,9 +210,25 @@ class MemoryQuerySpecV1:
                 field_name,
                 _sha256(getattr(self, field_name), field_name),
             )
+        _record_id(
+            self.assignment_id,
+            "assignment_id",
+            prefix="masn_",
+            content_hash=self.assignment_content_sha256,
+        )
 
     def _canonical_value(self) -> dict[str, object]:
         return {
+            "assignment_content_sha256": _sha256(
+                self.assignment_content_sha256,
+                "assignment_content_sha256",
+            ),
+            "assignment_id": _record_id(
+                self.assignment_id,
+                "assignment_id",
+                prefix="masn_",
+                content_hash=self.assignment_content_sha256,
+            ),
             "idempotency_key": _string(self.idempotency_key, "idempotency_key"),
             "max_context_utf8_bytes": _integer(
                 self.max_context_utf8_bytes,
@@ -222,6 +248,10 @@ class MemoryQuerySpecV1:
                 self.retrieval_policy_id,
                 "retrieval_policy_id",
             ),
+            "retrieval_policy_config_sha256": _sha256(
+                self.retrieval_policy_config_sha256,
+                "retrieval_policy_config_sha256",
+            ),
             "retrieval_policy_version_sha256": _sha256(
                 self.retrieval_policy_version_sha256,
                 "retrieval_policy_version_sha256",
@@ -230,8 +260,16 @@ class MemoryQuerySpecV1:
                 self.rollout_group_id,
                 "rollout_group_id",
             ),
+            "rollout_group_incarnation_sha256": _sha256(
+                self.rollout_group_incarnation_sha256,
+                "rollout_group_incarnation_sha256",
+            ),
             "scope": _scope_value(self.scope),
             "task_policy_id": _string(self.task_policy_id, "task_policy_id"),
+            "task_policy_config_sha256": _sha256(
+                self.task_policy_config_sha256,
+                "task_policy_config_sha256",
+            ),
             "task_policy_version_sha256": _sha256(
                 self.task_policy_version_sha256,
                 "task_policy_version_sha256",
@@ -970,10 +1008,13 @@ class MemoryQueryAttemptV1:
 def _query_result_canonical_bytes(
     *,
     scope: object,
+    assignment_id: object,
+    assignment_content_sha256: object,
     release_id: object,
     release_content_sha256: object,
     trajectory_id: object,
     rollout_group_id: object,
+    rollout_group_incarnation_sha256: object,
     attempt_id: object,
     attempt_content_sha256: object,
     source_read_receipt_id: object,
@@ -1008,6 +1049,16 @@ def _query_result_canonical_bytes(
     )
     return _canonical_json_bytes(
         {
+            "assignment_content_sha256": _sha256(
+                assignment_content_sha256,
+                "assignment_content_sha256",
+            ),
+            "assignment_id": _record_id(
+                assignment_id,
+                "assignment_id",
+                prefix="masn_",
+                content_hash=assignment_content_sha256,
+            ),
             "attempt_content_sha256": _sha256(
                 attempt_content_sha256,
                 "attempt_content_sha256",
@@ -1023,6 +1074,10 @@ def _query_result_canonical_bytes(
             "retrieved_revisions": [item._canonical_value() for item in retrieved],
             "returned_items": [item._canonical_value() for item in returned],
             "rollout_group_id": _string(rollout_group_id, "rollout_group_id"),
+            "rollout_group_incarnation_sha256": _sha256(
+                rollout_group_incarnation_sha256,
+                "rollout_group_incarnation_sha256",
+            ),
             "schema_version": _SCHEMA_VERSION,
             "scope": _scope_value(scope),
             "source_read_receipt_content_sha256": source_receipt_hash,
@@ -1088,10 +1143,13 @@ class MemoryQueryResultV1:
     """Ordered retrieval provenance and store-authentic returned content."""
 
     scope: MemoryScope
+    assignment_id: str
+    assignment_content_sha256: str
     release_id: str
     release_content_sha256: str
     trajectory_id: str
     rollout_group_id: str
+    rollout_group_incarnation_sha256: str
     attempt_id: str
     attempt_content_sha256: str
     source_read_receipt_id: str
@@ -1106,10 +1164,13 @@ class MemoryQueryResultV1:
     def __post_init__(self) -> None:
         canonical = _query_result_canonical_bytes(
             scope=self.scope,
+            assignment_id=self.assignment_id,
+            assignment_content_sha256=self.assignment_content_sha256,
             release_id=self.release_id,
             release_content_sha256=self.release_content_sha256,
             trajectory_id=self.trajectory_id,
             rollout_group_id=self.rollout_group_id,
+            rollout_group_incarnation_sha256=(self.rollout_group_incarnation_sha256),
             attempt_id=self.attempt_id,
             attempt_content_sha256=self.attempt_content_sha256,
             source_read_receipt_id=self.source_read_receipt_id,
@@ -1170,10 +1231,15 @@ class MemoryQueryResultV1:
             )
         values = {
             "scope": attempt.spec.scope,
+            "assignment_id": attempt.spec.assignment_id,
+            "assignment_content_sha256": attempt.spec.assignment_content_sha256,
             "release_id": attempt.spec.release_id,
             "release_content_sha256": attempt.release_content_sha256,
             "trajectory_id": attempt.spec.trajectory_id,
             "rollout_group_id": attempt.spec.rollout_group_id,
+            "rollout_group_incarnation_sha256": (
+                attempt.spec.rollout_group_incarnation_sha256
+            ),
             "attempt_id": attempt.attempt_id,
             "attempt_content_sha256": attempt.content_hash,
             "source_read_receipt_id": (source_read_receipt.source_read_receipt_id),
@@ -1198,10 +1264,13 @@ class MemoryQueryResultV1:
     def canonical_bytes(self) -> bytes:
         canonical = _query_result_canonical_bytes(
             scope=self.scope,
+            assignment_id=self.assignment_id,
+            assignment_content_sha256=self.assignment_content_sha256,
             release_id=self.release_id,
             release_content_sha256=self.release_content_sha256,
             trajectory_id=self.trajectory_id,
             rollout_group_id=self.rollout_group_id,
+            rollout_group_incarnation_sha256=(self.rollout_group_incarnation_sha256),
             attempt_id=self.attempt_id,
             attempt_content_sha256=self.attempt_content_sha256,
             source_read_receipt_id=self.source_read_receipt_id,
@@ -1303,9 +1372,13 @@ def _rendered_spans(
 def _delivery_canonical_bytes(
     *,
     scope: object,
+    assignment_id: object,
+    assignment_content_sha256: object,
     release_id: object,
     release_content_sha256: object,
     trajectory_id: object,
+    rollout_group_id: object,
+    rollout_group_incarnation_sha256: object,
     query_result_id: object,
     query_result_content_sha256: object,
     renderer_id: object,
@@ -1322,6 +1395,16 @@ def _delivery_canonical_bytes(
     spans = _rendered_spans(rendered_spans, context_utf8_bytes=byte_count)
     return _canonical_json_bytes(
         {
+            "assignment_content_sha256": _sha256(
+                assignment_content_sha256,
+                "assignment_content_sha256",
+            ),
+            "assignment_id": _record_id(
+                assignment_id,
+                "assignment_id",
+                prefix="masn_",
+                content_hash=assignment_content_sha256,
+            ),
             "delivery_nonce": _nonce(delivery_nonce, "delivery_nonce"),
             "query_result_content_sha256": _sha256(
                 query_result_content_sha256,
@@ -1345,6 +1428,14 @@ def _delivery_canonical_bytes(
                 renderer_version_sha256,
                 "renderer_version_sha256",
             ),
+            "rollout_group_id": _string(
+                rollout_group_id,
+                "rollout_group_id",
+            ),
+            "rollout_group_incarnation_sha256": _sha256(
+                rollout_group_incarnation_sha256,
+                "rollout_group_incarnation_sha256",
+            ),
             "schema_version": _SCHEMA_VERSION,
             "scope": _scope_value(scope),
             "trajectory_id": _string(trajectory_id, "trajectory_id"),
@@ -1357,9 +1448,13 @@ class MemoryDeliveryV1:
     """A rendered query result awaiting one consumer-boundary acknowledgement."""
 
     scope: MemoryScope
+    assignment_id: str
+    assignment_content_sha256: str
     release_id: str
     release_content_sha256: str
     trajectory_id: str
+    rollout_group_id: str
+    rollout_group_incarnation_sha256: str
     query_result_id: str
     query_result_content_sha256: str
     renderer_id: str
@@ -1375,9 +1470,13 @@ class MemoryDeliveryV1:
     def __post_init__(self) -> None:
         canonical = _delivery_canonical_bytes(
             scope=self.scope,
+            assignment_id=self.assignment_id,
+            assignment_content_sha256=self.assignment_content_sha256,
             release_id=self.release_id,
             release_content_sha256=self.release_content_sha256,
             trajectory_id=self.trajectory_id,
+            rollout_group_id=self.rollout_group_id,
+            rollout_group_incarnation_sha256=(self.rollout_group_incarnation_sha256),
             query_result_id=self.query_result_id,
             query_result_content_sha256=self.query_result_content_sha256,
             renderer_id=self.renderer_id,
@@ -1423,9 +1522,15 @@ class MemoryDeliveryV1:
             raise TypeError("query_result must be a MemoryQueryResultV1")
         values = {
             "scope": query_result.scope,
+            "assignment_id": query_result.assignment_id,
+            "assignment_content_sha256": query_result.assignment_content_sha256,
             "release_id": query_result.release_id,
             "release_content_sha256": query_result.release_content_sha256,
             "trajectory_id": query_result.trajectory_id,
+            "rollout_group_id": query_result.rollout_group_id,
+            "rollout_group_incarnation_sha256": (
+                query_result.rollout_group_incarnation_sha256
+            ),
             "query_result_id": query_result.query_result_id,
             "query_result_content_sha256": query_result.content_hash,
             "renderer_id": renderer_id,
@@ -1447,9 +1552,13 @@ class MemoryDeliveryV1:
     def canonical_bytes(self) -> bytes:
         canonical = _delivery_canonical_bytes(
             scope=self.scope,
+            assignment_id=self.assignment_id,
+            assignment_content_sha256=self.assignment_content_sha256,
             release_id=self.release_id,
             release_content_sha256=self.release_content_sha256,
             trajectory_id=self.trajectory_id,
+            rollout_group_id=self.rollout_group_id,
+            rollout_group_incarnation_sha256=(self.rollout_group_incarnation_sha256),
             query_result_id=self.query_result_id,
             query_result_content_sha256=self.query_result_content_sha256,
             renderer_id=self.renderer_id,
@@ -1760,10 +1869,13 @@ def _exposure_status(
 def _exposure_canonical_bytes(
     *,
     scope: object,
+    assignment_id: object,
+    assignment_content_sha256: object,
     release_id: object,
     release_content_sha256: object,
     trajectory_id: object,
     rollout_group_id: object,
+    rollout_group_incarnation_sha256: object,
     attempt_id: object,
     attempt_content_sha256: object,
     query_result_id: object,
@@ -1793,6 +1905,16 @@ def _exposure_canonical_bytes(
         raise ValueError("status disagrees with returned and injected revisions")
     return _canonical_json_bytes(
         {
+            "assignment_content_sha256": _sha256(
+                assignment_content_sha256,
+                "assignment_content_sha256",
+            ),
+            "assignment_id": _record_id(
+                assignment_id,
+                "assignment_id",
+                prefix="masn_",
+                content_hash=assignment_content_sha256,
+            ),
             "attempt_content_sha256": _sha256(
                 attempt_content_sha256,
                 "attempt_content_sha256",
@@ -1824,6 +1946,10 @@ def _exposure_canonical_bytes(
             "retrieved_revisions": [item._canonical_value() for item in retrieved],
             "returned_revisions": [item._canonical_value() for item in returned],
             "rollout_group_id": _string(rollout_group_id, "rollout_group_id"),
+            "rollout_group_incarnation_sha256": _sha256(
+                rollout_group_incarnation_sha256,
+                "rollout_group_incarnation_sha256",
+            ),
             "schema_version": _SCHEMA_VERSION,
             "scope": _scope_value(scope),
             "status": status.value,
@@ -1837,10 +1963,13 @@ class MemoryExposureV1:
     """The store-joined record of what exact memory reached a consumer."""
 
     scope: MemoryScope
+    assignment_id: str
+    assignment_content_sha256: str
     release_id: str
     release_content_sha256: str
     trajectory_id: str
     rollout_group_id: str
+    rollout_group_incarnation_sha256: str
     attempt_id: str
     attempt_content_sha256: str
     query_result_id: str
@@ -1861,10 +1990,13 @@ class MemoryExposureV1:
     def __post_init__(self) -> None:
         canonical = _exposure_canonical_bytes(
             scope=self.scope,
+            assignment_id=self.assignment_id,
+            assignment_content_sha256=self.assignment_content_sha256,
             release_id=self.release_id,
             release_content_sha256=self.release_content_sha256,
             trajectory_id=self.trajectory_id,
             rollout_group_id=self.rollout_group_id,
+            rollout_group_incarnation_sha256=(self.rollout_group_incarnation_sha256),
             attempt_id=self.attempt_id,
             attempt_content_sha256=self.attempt_content_sha256,
             query_result_id=self.query_result_id,
@@ -1923,12 +2055,23 @@ class MemoryExposureV1:
             or query_result.release_content_sha256 != attempt.release_content_sha256
             or query_result.trajectory_id != attempt.spec.trajectory_id
             or query_result.rollout_group_id != attempt.spec.rollout_group_id
+            or query_result.rollout_group_incarnation_sha256
+            != attempt.spec.rollout_group_incarnation_sha256
+            or query_result.assignment_id != attempt.spec.assignment_id
+            or query_result.assignment_content_sha256
+            != attempt.spec.assignment_content_sha256
             or query_result.attempt_id != attempt.attempt_id
             or query_result.attempt_content_sha256 != attempt.content_hash
             or delivery.scope != query_result.scope
             or delivery.release_id != query_result.release_id
             or delivery.release_content_sha256 != query_result.release_content_sha256
             or delivery.trajectory_id != query_result.trajectory_id
+            or delivery.rollout_group_id != query_result.rollout_group_id
+            or delivery.rollout_group_incarnation_sha256
+            != query_result.rollout_group_incarnation_sha256
+            or delivery.assignment_id != query_result.assignment_id
+            or delivery.assignment_content_sha256
+            != query_result.assignment_content_sha256
             or delivery.query_result_id != query_result.query_result_id
             or delivery.query_result_content_sha256 != query_result.content_hash
             or consumer_ack.scope != delivery.scope
@@ -1947,10 +2090,15 @@ class MemoryExposureV1:
             raise ValueError("exposure sources do not form one acknowledged chain")
         values = {
             "scope": attempt.spec.scope,
+            "assignment_id": attempt.spec.assignment_id,
+            "assignment_content_sha256": attempt.spec.assignment_content_sha256,
             "release_id": attempt.spec.release_id,
             "release_content_sha256": attempt.release_content_sha256,
             "trajectory_id": attempt.spec.trajectory_id,
             "rollout_group_id": attempt.spec.rollout_group_id,
+            "rollout_group_incarnation_sha256": (
+                attempt.spec.rollout_group_incarnation_sha256
+            ),
             "attempt_id": attempt.attempt_id,
             "attempt_content_sha256": attempt.content_hash,
             "query_result_id": query_result.query_result_id,
@@ -1981,10 +2129,13 @@ class MemoryExposureV1:
     def canonical_bytes(self) -> bytes:
         canonical = _exposure_canonical_bytes(
             scope=self.scope,
+            assignment_id=self.assignment_id,
+            assignment_content_sha256=self.assignment_content_sha256,
             release_id=self.release_id,
             release_content_sha256=self.release_content_sha256,
             trajectory_id=self.trajectory_id,
             rollout_group_id=self.rollout_group_id,
+            rollout_group_incarnation_sha256=(self.rollout_group_incarnation_sha256),
             attempt_id=self.attempt_id,
             attempt_content_sha256=self.attempt_content_sha256,
             query_result_id=self.query_result_id,
