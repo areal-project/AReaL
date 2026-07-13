@@ -282,7 +282,9 @@ async def test_invalid_structured_worker_response_preserves_status_without_histo
                 "/session/s1/turn",
                 json={"message": "must not enter history"},
             )
-            history = await client.get("/session/s1/history")
+            history = await client.get(
+                "/session/s1/history", headers=_MEMORY_CONTROL_HEADERS
+            )
 
     assert response.status_code == expected_status
     assert response.json() == {
@@ -709,6 +711,40 @@ async def test_controlled_data_proxy_client_authenticates_both_close_routes() ->
 
 
 @pytest.mark.asyncio
+async def test_controlled_data_proxy_client_authenticates_history_read() -> None:
+    forwarded = []
+    expected_history = [{"role": "user", "content": "hello"}]
+
+    def handler(request):
+        forwarded.append(request)
+        return httpx.Response(
+            200,
+            json={"history": expected_history},
+            request=request,
+        )
+
+    client = data_proxy_client.DataProxyClient(
+        "http://proxy",
+        memory_control_api_key=_MEMORY_CONTROL_API_KEY,
+    )
+    await client._http.aclose()
+    client._http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    try:
+        history = await client.get_history("chat:model:user")
+    finally:
+        await client.close()
+
+    assert history == expected_history
+    assert len(forwarded) == 1
+    assert forwarded[0].method == "GET"
+    assert forwarded[0].url.path == "/session/chat:model:user/history"
+    assert (
+        forwarded[0].headers["Authorization"]
+        == _MEMORY_CONTROL_HEADERS["Authorization"]
+    )
+
+
+@pytest.mark.asyncio
 async def test_conflicting_pin_and_reserved_metadata_fail_before_worker() -> None:
     worker_bodies: list[dict] = []
     worker_closes: list[str] = []
@@ -940,6 +976,89 @@ async def test_memory_capable_data_proxy_authenticates_close_before_state_oracle
 
 
 @pytest.mark.asyncio
+async def test_memory_capable_data_proxy_authenticates_history_before_state_oracle() -> (
+    None
+):
+    worker_bodies: list[dict] = []
+    worker_closes: list[str] = []
+    app = _proxy_app()
+    transport = httpx.ASGITransport(app=app)
+    with patch.object(
+        httpx.AsyncClient,
+        "send",
+        _patched_worker_send(worker_bodies, worker_closes),
+    ):
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://proxy",
+        ) as client:
+            ordinary = await client.post(
+                "/session/ordinary/turn",
+                json={"message": "ordinary"},
+            )
+            memory = await client.post(
+                "/session/memory/turn",
+                headers=_MEMORY_CONTROL_HEADERS,
+                json=_authorized(
+                    {"message": "memory", MEMORY_ASSIGNMENT_PIN_FIELD: _wire("a")}
+                ),
+            )
+
+            denied = []
+            for target in ("ordinary", "memory", "unknown", "s%252Fb"):
+                for headers in (
+                    None,
+                    admin_headers("wrong-memory-control-key"),
+                    admin_headers(_EXTERNAL_ADMIN_API_KEY),
+                ):
+                    denied.append(
+                        await client.get(
+                            f"/session/{target}/history",
+                            headers=headers,
+                        )
+                    )
+
+            ordinary_history = await client.get(
+                "/session/ordinary/history",
+                headers=_MEMORY_CONTROL_HEADERS,
+            )
+            memory_history = await client.get(
+                "/session/memory/history",
+                headers=_MEMORY_CONTROL_HEADERS,
+            )
+            unknown_history = await client.get(
+                "/session/unknown/history",
+                headers=_MEMORY_CONTROL_HEADERS,
+            )
+            invalid_key = await client.get(
+                "/session/s%252Fb/history",
+                headers=_MEMORY_CONTROL_HEADERS,
+            )
+
+    assert ordinary.status_code == memory.status_code == 200
+    assert [(response.status_code, response.json()) for response in denied] == [
+        (401, {"detail": "Invalid admin key"})
+    ] * 12
+    assert ordinary_history.status_code == memory_history.status_code == 200
+    assert ordinary_history.json() == {
+        "history": [
+            {"role": "user", "content": "ordinary"},
+            {"role": "assistant", "content": "ok"},
+        ]
+    }
+    assert memory_history.json() == {
+        "history": [
+            {"role": "user", "content": "memory"},
+            {"role": "assistant", "content": "ok"},
+        ]
+    }
+    assert unknown_history.status_code == 200
+    assert unknown_history.json() == {"history": []}
+    assert invalid_key.status_code == 400
+    assert worker_closes == []
+
+
+@pytest.mark.asyncio
 async def test_standalone_data_proxy_preserves_anonymous_close_compatibility() -> None:
     worker_bodies: list[dict] = []
     worker_closes: list[str] = []
@@ -973,6 +1092,43 @@ async def test_standalone_data_proxy_preserves_anonymous_close_compatibility() -
     assert first.status_code == fixed_close.status_code == 200
     assert replacement.status_code == legacy_close.status_code == 200
     assert worker_closes == ["s1", "s1"]
+
+
+@pytest.mark.asyncio
+async def test_standalone_data_proxy_preserves_anonymous_history_compatibility() -> (
+    None
+):
+    worker_bodies: list[dict] = []
+    worker_closes: list[str] = []
+    app = data_proxy_app.create_data_proxy_app(
+        data_proxy_config.DataProxyConfig(worker_addr="http://worker")
+    )
+    transport = httpx.ASGITransport(app=app)
+    with patch.object(
+        httpx.AsyncClient,
+        "send",
+        _patched_worker_send(worker_bodies, worker_closes),
+    ):
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://proxy",
+        ) as client:
+            turn = await client.post(
+                "/session/s1/turn",
+                json={"message": "standalone"},
+            )
+            history = await client.get("/session/s1/history")
+            unknown = await client.get("/session/unknown/history")
+
+    assert turn.status_code == history.status_code == unknown.status_code == 200
+    assert history.json() == {
+        "history": [
+            {"role": "user", "content": "standalone"},
+            {"role": "assistant", "content": "ok"},
+        ]
+    }
+    assert unknown.json() == {"history": []}
+    assert worker_closes == []
 
 
 @pytest.mark.asyncio

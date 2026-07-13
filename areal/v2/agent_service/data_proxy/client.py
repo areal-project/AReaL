@@ -97,7 +97,10 @@ class DataProxyClient:
 
     async def get_history(self, session_key: str) -> list[dict[str, Any]]:
         session_key = validate_session_key(session_key)
-        resp = await self._http.get(f"{self._addr}/session/{session_key}/history")
+        resp = await self._http.get(
+            f"{self._addr}/session/{session_key}/history",
+            headers=self._memory_control_headers or None,
+        )
         resp.raise_for_status()
         return resp.json()["history"]
 

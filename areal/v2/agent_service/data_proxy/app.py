@@ -631,14 +631,15 @@ def create_data_proxy_app(config: DataProxyConfig) -> FastAPI:
             if not lease_transferred:
                 await _finish_response(resp, session)
 
-    async def _authorize_session_close(request: Request) -> None:
+    async def _authorize_session_state_access(request: Request) -> None:
         if config.memory_control_api_key:
-            # Close destroys the session's pin and lifecycle state, so it
-            # belongs to the same Gateway→DataProxy trust boundary as a
-            # privileged Memory turn.  Authenticate before key validation or
-            # lookup so unauthorized callers cannot use close as a state
-            # oracle.  Standalone deployments retain anonymous close when
-            # Memory transport is disabled.
+            # History reveals conversation state, while close destroys the
+            # session's pin and lifecycle state.  Both belong to the same
+            # Gateway→DataProxy trust boundary as a privileged Memory turn.
+            # Authenticate before key validation or lookup so unauthorized
+            # callers cannot use either route as a state oracle.  Standalone
+            # deployments retain anonymous access when Memory transport is
+            # disabled.
             await verify_admin_key(
                 request.headers.get("Authorization", ""),
                 expected_key=config.memory_control_api_key,
@@ -662,19 +663,20 @@ def create_data_proxy_app(config: DataProxyConfig) -> FastAPI:
     async def close_session(request: Request, body: dict[str, Any]):
         """Close a session without interpreting its identity as URL syntax."""
 
-        await _authorize_session_close(request)
+        await _authorize_session_state_access(request)
         return await _close_session(body.get("session_key"))
 
     @app.post("/session/{session_key}/close", deprecated=True)
     async def close_session_legacy(session_key: str, request: Request):
         """Compatibility route; internal callers use ``/sessions/close``."""
 
-        await _authorize_session_close(request)
+        await _authorize_session_state_access(request)
         return await _close_session(session_key)
 
     @app.get("/session/{session_key}/history")
-    async def get_history(session_key: str):
-        _validate_session_key(session_key)
+    async def get_history(session_key: str, request: Request):
+        await _authorize_session_state_access(request)
+        session_key = _validate_session_key(session_key)
         session = sessions.get(session_key)
         if session is None:
             return {"history": []}
