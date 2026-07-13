@@ -987,6 +987,45 @@ def test_global_guard_rejects_cross_thread_cross_store_reentry() -> None:
     ) == ()
 
 
+def test_condition_interrupt_cannot_leak_module_global_callback_guard() -> None:
+    scope, _, release, control, attestor, _, _, _ = _seed()
+
+    class InterruptSecondEnter:
+        def __init__(self, delegate) -> None:
+            self.delegate = delegate
+            self.enters = 0
+
+        def __enter__(self):
+            self.enters += 1
+            if self.enters == 2:
+                raise KeyboardInterrupt("injected condition entry interruption")
+            return self.delegate.__enter__()
+
+        def __exit__(self, *arguments):
+            return self.delegate.__exit__(*arguments)
+
+        def wait(self, timeout=None):
+            return self.delegate.wait(timeout=timeout)
+
+        def notify_all(self):
+            return self.delegate.notify_all()
+
+    condition = InterruptSecondEnter(control._condition)
+    control._condition = condition
+    with pytest.raises(KeyboardInterrupt, match="condition entry"):
+        _attest(control, scope, release)
+    assert attestor.calls == 0
+    assert control._claim_owner == {}
+    assert control.list_release_attestations(scope, release.release_id) == ()
+
+    new_scope, _, new_release, new_control, _, _, _, _ = _seed(
+        scope=MemoryScope("tenant", "memory", "fresh-store")
+    )
+    assert _attest(new_control, new_scope, new_release).release_id == (
+        new_release.release_id
+    )
+
+
 def test_revoke_during_assignment_callback_fails_closed_then_kills_retry() -> None:
     scope, _, release, control, _, _, policy, _ = _seed()
     attestation = _attest(control, scope, release)

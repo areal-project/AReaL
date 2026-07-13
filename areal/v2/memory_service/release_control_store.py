@@ -16,6 +16,11 @@ cannot safely terminate arbitrary Python callbacks.  Trusted callbacks are
 serialized module-wide so a callback-spawned thread cannot mutate a different
 control-store instance and escape the reentry boundary.
 
+The injected clock is part of the trusted computing base.  It must be pure,
+non-blocking, and must never access a control store: commit and active
+resolution deliberately sample it while holding the store lock so expiry is
+checked at the operation's true linearization boundary.
+
 Control records are audit values, not bearer credentials.  Every operation
 that grants authority resolves an ID plus its full SHA-256 in this trusted
 store.  SHA-256 proves integrity, not publisher identity or usefulness.
@@ -290,6 +295,13 @@ class InMemoryMemoryReleaseControlStore:
         clock: Callable[[], datetime] = _utc_now,
         waiter_timeout_seconds: float | None = None,
     ) -> None:
+        """Build a reference store around singular trusted components.
+
+        ``clock`` must be a pure, non-blocking trusted callable and must not
+        read or mutate any control store because it is sampled under this
+        store's lock at commit and active-resolution boundaries.
+        """
+
         if not callable(clock):
             raise TypeError("clock must be callable")
         if waiter_timeout_seconds is not None:
@@ -467,41 +479,84 @@ class InMemoryMemoryReleaseControlStore:
         global _CALLBACK_ACTIVE, _CALLBACK_REENTRY_ATTEMPTED
 
         self._validate_component(trusted, conflict_type=conflict_type, label=label)
-        with _CALLBACK_GUARD_LOCK:
-            if _CALLBACK_ACTIVE:
-                _CALLBACK_REENTRY_ATTEMPTED = True
-                raise conflict_type("another global control callback is active")
-            _CALLBACK_ACTIVE = True
-            _CALLBACK_REENTRY_ATTEMPTED = False
-        local_callback_conflict = False
-        with self._condition:
-            if self._callback_active:
-                local_callback_conflict = True
-            else:
+        context = _CallbackContext()
+        token = None
+        global_acquired = False
+        local_acquired = False
+        global_reentry = False
+        cross_thread_reentry = False
+        body_failed = False
+        cleanup_error: BaseException | None = None
+        try:
+            with _CALLBACK_GUARD_LOCK:
+                if _CALLBACK_ACTIVE:
+                    _CALLBACK_REENTRY_ATTEMPTED = True
+                    raise conflict_type("another global control callback is active")
+                # Mark acquisition before publishing the flag so every later
+                # BaseException is covered by the outer finally below.
+                global_acquired = True
+                _CALLBACK_ACTIVE = True
+                _CALLBACK_REENTRY_ATTEMPTED = False
+
+            with self._condition:
+                if self._callback_active:
+                    raise conflict_type("another control callback is active")
+                local_acquired = True
                 self._callback_active = True
                 self._callback_reentry_attempted = False
-        if local_callback_conflict:
-            with _CALLBACK_GUARD_LOCK:
-                _CALLBACK_ACTIVE = False
-            raise conflict_type("another control callback is active")
-        context = _CallbackContext()
-        token = _CALLBACK_CONTEXT.set(context)
-        try:
+
+            token = _CALLBACK_CONTEXT.set(context)
             try:
                 result = trusted.method(**arguments)
             except Exception as error:
                 raise conflict_type(f"trusted {label} failed") from error
+        except BaseException:
+            body_failed = True
+            raise
         finally:
-            _CALLBACK_CONTEXT.reset(token)
-            with _CALLBACK_GUARD_LOCK:
-                global_reentry = _CALLBACK_REENTRY_ATTEMPTED
-                _CALLBACK_ACTIVE = False
-                _CALLBACK_REENTRY_ATTEMPTED = False
-            with self._condition:
-                cross_thread_reentry = self._callback_reentry_attempted
-                self._callback_active = False
-                self._callback_reentry_attempted = False
-                self._condition.notify_all()
+            if token is not None:
+                try:
+                    _CALLBACK_CONTEXT.reset(token)
+                except BaseException as error:
+                    cleanup_error = error
+                    try:
+                        _CALLBACK_CONTEXT.set(None)
+                    except BaseException:
+                        pass
+            elif local_acquired:
+                # Also cover an interruption between ContextVar.set returning
+                # and its token being stored in the local variable.
+                try:
+                    _CALLBACK_CONTEXT.set(None)
+                except BaseException as error:
+                    cleanup_error = error
+            if local_acquired:
+                try:
+                    # Use the underlying lock directly so a failing custom
+                    # Condition.__enter__ cannot prevent local cleanup.
+                    with self._lock:
+                        cross_thread_reentry = self._callback_reentry_attempted
+                        self._callback_active = False
+                        self._callback_reentry_attempted = False
+                        self._condition.notify_all()
+                except BaseException as error:
+                    self._callback_active = False
+                    self._callback_reentry_attempted = False
+                    if cleanup_error is None:
+                        cleanup_error = error
+            if global_acquired:
+                try:
+                    with _CALLBACK_GUARD_LOCK:
+                        global_reentry = _CALLBACK_REENTRY_ATTEMPTED
+                        _CALLBACK_ACTIVE = False
+                        _CALLBACK_REENTRY_ATTEMPTED = False
+                except BaseException as error:
+                    _CALLBACK_ACTIVE = False
+                    _CALLBACK_REENTRY_ATTEMPTED = False
+                    if cleanup_error is None:
+                        cleanup_error = error
+            if cleanup_error is not None and not body_failed:
+                raise cleanup_error
         if context.reentry_attempted or cross_thread_reentry or global_reentry:
             raise conflict_type(f"trusted {label} attempted control-store reentry")
         self._validate_component(trusted, conflict_type=conflict_type, label=label)
