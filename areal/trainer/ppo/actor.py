@@ -271,9 +271,14 @@ class PPOActor:
         seqlens = attn_mask.sum(-1)
 
         ########## Logging code starts ##########
+        task_reward = (
+            data["original_rewards"].float()
+            if "original_rewards" in data
+            else reward_score.float()
+        )
         result_denominators = {
-            "correct_n_seqs": (reward_score > 0).bool(),
-            "incorrect_n_seqs": (reward_score <= 0).bool(),
+            "correct_n_seqs": (task_reward > 0).bool(),
+            "incorrect_n_seqs": (task_reward <= 0).bool(),
         }
         if self.config.log_agent_stats:
             if "begin_of_trajectory" not in data:
@@ -310,7 +315,7 @@ class PPOActor:
         prompt_lens = data["attention_mask"].sum(-1) - data["loss_mask"].sum(-1)
         seq_stats = dict(
             no_eos_ratios=(seqlens == attn_mask.shape[-1]).float(),
-            task_reward=reward_score.float(),
+            task_reward=task_reward,
             prompt_len=prompt_lens.float(),
             seq_len=seqlens.float(),
         )

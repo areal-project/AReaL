@@ -627,6 +627,8 @@ class PPOTrainer:
                     should_accept_fn=dynamic_filter_fn,
                     group_size=config.gconfig.n_samples,
                     dynamic_bs=self.config.dynamic_bs,
+                    reward_normalization=config.gconfig.reward_normalization,
+                    drop_incomplete_group=config.gconfig.drop_incomplete_group,
                 )
             if self._should_offload_rollout:
                 self._offload_rollout()
@@ -1242,6 +1244,8 @@ class PPOTrainer:
                         eval_workflow_kwargs,
                         group_size=self.config.eval_gconfig.n_samples,
                         is_eval=True,
+                        reward_normalization=False,
+                        drop_incomplete_group=False,
                     )
                     cnt += 1
             self.eval_rollout.wait(cnt, timeout=None)

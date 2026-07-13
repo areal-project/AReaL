@@ -1005,6 +1005,10 @@ class WorkflowExecutor:
                     if split["segments"] is not None:
                         record["segments"] = split["segments"]
 
+                    original_rewards = traj.get("original_rewards")
+                    if original_rewards is not None:
+                        record["original_reward"] = original_rewards[i].item()
+
                     await f.write(json.dumps(record) + "\n")
             return True, ""
         except Exception as e:
