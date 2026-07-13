@@ -8,6 +8,7 @@ import asyncio
 import time
 from contextlib import suppress
 from dataclasses import dataclass, field
+from enum import StrEnum
 from typing import Any
 
 import httpx
@@ -44,12 +45,23 @@ _CHAT_CONTROL_FIELDS = (
 )
 
 
+class _SessionSecurityMode(StrEnum):
+    ORDINARY = "ordinary"
+    MEMORY = "memory"
+
+
 @dataclass
 class _SessionData:
     history: list[dict[str, Any]] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
     last_active: float = field(default_factory=time.monotonic)
     reward: float | None = None
+    # Fixed by the first admitted turn.  A caller must close the whole
+    # incarnation before changing between ordinary Agent state and a
+    # principal/grant-gated Memory session; otherwise DataProxy history and
+    # routing state could be smuggled across the security boundary.  The
+    # future Worker runtime must independently bind its own state/incarnation.
+    security_mode: _SessionSecurityMode | None = None
     # Per-session inference routing for self-evolution.  Holds
     # ``{"base_url", "api_key", "model"}`` where ``api_key`` is the
     # ``sk-sess-*`` the **caller** obtained itself and passed on the turn
@@ -279,6 +291,22 @@ def create_data_proxy_app(config: DataProxyConfig) -> FastAPI:
                         detail="Memory assignment use requires trusted ingress",
                     )
 
+                # Reject an authorized ordinary→Memory upgrade before the
+                # submitted pin can win the transport CAS.  Authentication is
+                # checked first so an untrusted caller cannot use the status
+                # code as a session-mode oracle.
+                if (
+                    session.security_mode is _SessionSecurityMode.ORDINARY
+                    and submitted_pin_present
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            "session security mode cannot change; close the "
+                            "session before rebinding"
+                        ),
+                    )
+
                 assignment_pin = (
                     memory_pin_cache.resolve(session_key, submitted_pin)
                     if submitted_pin_present
@@ -288,6 +316,22 @@ def create_data_proxy_app(config: DataProxyConfig) -> FastAPI:
                     raise HTTPException(
                         status_code=403,
                         detail="Memory assignment use requires trusted ingress",
+                    )
+                requested_mode = (
+                    _SessionSecurityMode.MEMORY
+                    if assignment_pin is not None
+                    else _SessionSecurityMode.ORDINARY
+                )
+                if (
+                    session.security_mode is not None
+                    and session.security_mode is not requested_mode
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            "session security mode cannot change; close the "
+                            "session before rebinding"
+                        ),
                     )
                 resolved_metadata = inject_memory_assignment_pin(
                     user_metadata,
@@ -307,6 +351,8 @@ def create_data_proxy_app(config: DataProxyConfig) -> FastAPI:
 
                 # Commit mutable session routing only after pin CAS and all
                 # metadata construction have succeeded.
+                if session.security_mode is None:
+                    session.security_mode = requested_mode
                 if inference is not _INFERENCE_OMITTED:
                     session.inference = dict(inference)
                 session.active_turns += 1

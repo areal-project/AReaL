@@ -43,6 +43,19 @@ The Router assigns new sessions round-robin and maintains session → DataProxy 
 conversation history. On each turn: reads history → constructs `AgentRequest` (with
 history) → forwards to Worker → appends messages to history → returns response.
 
+The first admitted turn also fixes the DataProxy session's security mode. A session is
+either ordinary (no assignment pin) or Memory-bound (one immutable pin); it cannot be
+upgraded, downgraded, or rebound in place. In particular, a later pin is rejected before
+it can mutate the pin cache, so DataProxy history and routing state cannot cross the
+Memory authorization boundary in place. The caller must drain and close the session
+before opening another mode.
+
+This mode is process-local defense in depth, not proof that Worker/plugin state was
+erased. A stateful Agent's optional `close_session` hook must cooperate, and a future
+authorized Worker runtime must independently bind its principal, pin, and broker-issued
+incarnation. DataProxy restart or successful close alone is not a security assertion
+about arbitrary plugin state.
+
 **Worker** — Stateless agent execution server. Loads an `AgentRunnable` implementation
 at startup. Each `POST /run` request is a single turn — the agent receives the full
 conversation history in the request and returns a response. The Worker has no session

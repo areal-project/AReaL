@@ -452,6 +452,223 @@ async def test_first_turn_pin_is_reused_and_forwarded_as_reserved_metadata() -> 
 
 
 @pytest.mark.asyncio
+async def test_session_mode_blocks_ordinary_to_memory_upgrade_until_close() -> None:
+    worker_bodies: list[dict] = []
+    worker_closes: list[str] = []
+    app = _proxy_app()
+    transport = httpx.ASGITransport(app=app)
+    with patch.object(
+        httpx.AsyncClient,
+        "send",
+        _patched_worker_send(worker_bodies, worker_closes),
+    ):
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://proxy",
+            headers=_MEMORY_CONTROL_HEADERS,
+        ) as client:
+            ordinary = await client.post(
+                "/session/s1/turn",
+                json={
+                    "message": "ordinary",
+                    "inf_base_url": "http://trusted-inference",
+                    "session_api_key": "sk-sess-trusted",
+                },
+            )
+            untrusted_upgrade = await client.post(
+                "/session/s1/turn",
+                json={
+                    "message": "untrusted upgrade",
+                    MEMORY_ASSIGNMENT_PIN_FIELD: _wire("a"),
+                },
+            )
+            upgrade = await client.post(
+                "/session/s1/turn",
+                json=_authorized(
+                    {
+                        "message": "upgrade",
+                        MEMORY_ASSIGNMENT_PIN_FIELD: _wire("a"),
+                        "inf_base_url": "http://attacker-inference",
+                        "session_api_key": "sk-sess-attacker",
+                    }
+                ),
+            )
+            assert app.state.memory_pin_cache.resolve("s1") is None
+            retry = await client.post(
+                "/session/s1/turn",
+                json={"message": "still ordinary"},
+            )
+            closed = await client.post(
+                "/sessions/close",
+                json={"session_key": "s1"},
+            )
+            replacement = await client.post(
+                "/session/s1/turn",
+                json=_authorized(
+                    {
+                        "message": "new Memory incarnation",
+                        MEMORY_ASSIGNMENT_PIN_FIELD: _wire("a"),
+                    }
+                ),
+            )
+
+    assert ordinary.status_code == retry.status_code == 200
+    assert untrusted_upgrade.status_code == 403
+    assert upgrade.status_code == 409
+    assert "security mode cannot change" in upgrade.json()["detail"]
+    assert closed.status_code == replacement.status_code == 200
+    assert worker_closes == ["s1"]
+    assert len(worker_bodies) == 3
+    assert AREAL_MEMORY_METADATA_KEY not in worker_bodies[0]["metadata"]
+    assert AREAL_MEMORY_METADATA_KEY not in worker_bodies[1]["metadata"]
+    assert worker_bodies[1]["metadata"][AREAL_INFERENCE_METADATA_KEY] == {
+        "base_url": "http://trusted-inference",
+        "api_key": "sk-sess-trusted",
+        "model": "",
+    }
+    assert parse_memory_assignment_pin_metadata(worker_bodies[2]["metadata"]) == (
+        MemoryAssignmentPinWireV1.from_wire(_wire("a")).to_runtime_pin()
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_mode", ("worker_500", "send_error"))
+async def test_admitted_failed_turn_still_fixes_session_mode(failure_mode) -> None:
+    worker_bodies: list[dict] = []
+    original_send = httpx.AsyncClient.send
+
+    async def patched_send(self, request, **kwargs):
+        if request.url.host != "worker":
+            return await original_send(self, request, **kwargs)
+        if request.url.path != "/run":
+            raise AssertionError(f"unexpected worker request: {request.url}")
+        worker_bodies.append(json.loads(request.content))
+        if len(worker_bodies) == 1:
+            if failure_mode == "worker_500":
+                return httpx.Response(
+                    500,
+                    json={"error": {"message": "injected", "type": "test"}},
+                    request=request,
+                )
+            raise httpx.ConnectError("injected send failure", request=request)
+        return httpx.Response(
+            200,
+            json={"summary": "ok", "events": [], "metadata": {}},
+            request=request,
+        )
+
+    app = _proxy_app()
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+    with patch.object(httpx.AsyncClient, "send", patched_send):
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://proxy",
+            headers=_MEMORY_CONTROL_HEADERS,
+        ) as client:
+            failed = await client.post(
+                "/session/s1/turn",
+                json={
+                    "message": "admitted ordinary failure",
+                    "inf_base_url": "http://trusted-inference",
+                    "session_api_key": "sk-sess-trusted",
+                },
+            )
+            upgrade = await client.post(
+                "/session/s1/turn",
+                json=_authorized(
+                    {
+                        "message": "unsafe retry as Memory",
+                        MEMORY_ASSIGNMENT_PIN_FIELD: _wire("a"),
+                        "inf_base_url": "http://attacker-inference",
+                        "session_api_key": "sk-sess-attacker",
+                    }
+                ),
+            )
+            retry = await client.post(
+                "/session/s1/turn",
+                json={"message": "retry in the original mode"},
+            )
+
+    assert failed.status_code == 500
+    assert upgrade.status_code == 409
+    assert retry.status_code == 200
+    assert app.state.memory_pin_cache.resolve("s1") is None
+    assert len(worker_bodies) == 2
+    assert AREAL_MEMORY_METADATA_KEY not in worker_bodies[1]["metadata"]
+    assert worker_bodies[1]["metadata"][AREAL_INFERENCE_METADATA_KEY] == {
+        "base_url": "http://trusted-inference",
+        "api_key": "sk-sess-trusted",
+        "model": "",
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_mode", ("worker_500", "send_error"))
+async def test_admitted_failed_memory_turn_preserves_pin_for_trusted_reuse(
+    failure_mode,
+) -> None:
+    worker_bodies: list[dict] = []
+    original_send = httpx.AsyncClient.send
+
+    async def patched_send(self, request, **kwargs):
+        if request.url.host != "worker":
+            return await original_send(self, request, **kwargs)
+        if request.url.path != "/run":
+            raise AssertionError(f"unexpected worker request: {request.url}")
+        worker_bodies.append(json.loads(request.content))
+        if len(worker_bodies) == 1:
+            if failure_mode == "worker_500":
+                return httpx.Response(
+                    500,
+                    json={"error": {"message": "injected", "type": "test"}},
+                    request=request,
+                )
+            raise httpx.ConnectError("injected send failure", request=request)
+        return httpx.Response(
+            200,
+            json={"summary": "ok", "events": [], "metadata": {}},
+            request=request,
+        )
+
+    app = _proxy_app()
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+    with patch.object(httpx.AsyncClient, "send", patched_send):
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://proxy",
+            headers=_MEMORY_CONTROL_HEADERS,
+        ) as client:
+            failed = await client.post(
+                "/session/s1/turn",
+                json=_authorized(
+                    {
+                        "message": "admitted Memory failure",
+                        MEMORY_ASSIGNMENT_PIN_FIELD: _wire("a"),
+                    }
+                ),
+            )
+            untrusted_reuse = await client.post(
+                "/session/s1/turn",
+                headers={"Authorization": ""},
+                json={"message": "untrusted retry cannot reuse the retained pin"},
+            )
+            retry = await client.post(
+                "/session/s1/turn",
+                json=_authorized({"message": "trusted retry reuses the retained pin"}),
+            )
+
+    assert failed.status_code == 500
+    assert untrusted_reuse.status_code == 403
+    assert retry.status_code == 200
+    assert app.state.memory_pin_cache.resolve("s1") is not None
+    assert len(worker_bodies) == 2
+    first_pin = parse_memory_assignment_pin_metadata(worker_bodies[0]["metadata"])
+    retry_pin = parse_memory_assignment_pin_metadata(worker_bodies[1]["metadata"])
+    assert first_pin == retry_pin
+    assert first_pin == MemoryAssignmentPinWireV1.from_wire(_wire("a")).to_runtime_pin()
+
+
+@pytest.mark.asyncio
 async def test_reusing_pinned_session_requires_trusted_ingress_on_every_turn() -> None:
     worker_bodies: list[dict] = []
     worker_closes: list[str] = []
@@ -851,6 +1068,95 @@ async def test_concurrent_first_pin_is_compare_and_set() -> None:
 
 
 @pytest.mark.asyncio
+async def test_concurrent_first_turn_atomically_selects_one_security_mode() -> None:
+    worker_bodies: list[dict] = []
+    ordinary_worker_request_started = asyncio.Event()
+    release_ordinary_worker_request = asyncio.Event()
+    original_send = httpx.AsyncClient.send
+
+    async def patched_send(self, request, **kwargs):
+        if request.url.host != "worker":
+            return await original_send(self, request, **kwargs)
+        if request.url.path != "/run":
+            raise AssertionError(f"unexpected worker request: {request.url}")
+        worker_bodies.append(json.loads(request.content))
+        if len(worker_bodies) == 1:
+            ordinary_worker_request_started.set()
+            await release_ordinary_worker_request.wait()
+        return httpx.Response(
+            200,
+            json={"summary": "ok", "events": [], "metadata": {}},
+            request=request,
+        )
+
+    app = _proxy_app()
+    transport = httpx.ASGITransport(app=app)
+    with patch.object(httpx.AsyncClient, "send", patched_send):
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://proxy",
+            headers=_MEMORY_CONTROL_HEADERS,
+        ) as client:
+            ordinary = asyncio.create_task(
+                client.post(
+                    "/session/race/turn",
+                    json={"message": "ordinary fixes the session mode"},
+                )
+            )
+            memory = None
+            try:
+                await asyncio.wait_for(
+                    ordinary_worker_request_started.wait(), timeout=1
+                )
+                assert len(worker_bodies) == 1
+                assert (
+                    parse_memory_assignment_pin_metadata(worker_bodies[0]["metadata"])
+                    is None
+                )
+
+                memory = asyncio.create_task(
+                    client.post(
+                        "/session/race/turn",
+                        json=_authorized(
+                            {
+                                "message": "Memory cannot replace ordinary",
+                                MEMORY_ASSIGNMENT_PIN_FIELD: _wire("a"),
+                            }
+                        ),
+                    )
+                )
+                rejected = await asyncio.wait_for(asyncio.shield(memory), timeout=1)
+
+                # The ordinary request is still blocked inside Worker I/O, but
+                # its mode stamp is already visible to the overlapping Memory
+                # request.  The rejection must not reach Worker.
+                assert not ordinary.done()
+                assert rejected.status_code == 409
+                assert len(worker_bodies) == 1
+
+                release_ordinary_worker_request.set()
+                accepted = await asyncio.wait_for(ordinary, timeout=1)
+                assert accepted.status_code == 200
+
+                follow_up = await client.post(
+                    "/session/race/turn",
+                    json={"message": "reuse ordinary"},
+                )
+            finally:
+                release_ordinary_worker_request.set()
+                requests = [task for task in (ordinary, memory) if task is not None]
+                for task in requests:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*requests, return_exceptions=True)
+
+    assert follow_up.status_code == 200
+    assert len(worker_bodies) == 2
+    assert parse_memory_assignment_pin_metadata(worker_bodies[1]["metadata"]) is None
+    assert app.state.memory_pin_cache.resolve("race") is None
+
+
+@pytest.mark.asyncio
 async def test_close_clears_pin_and_allows_new_incarnation() -> None:
     worker_bodies: list[dict] = []
     worker_closes: list[str] = []
@@ -1129,6 +1435,62 @@ async def test_standalone_data_proxy_preserves_anonymous_history_compatibility()
     }
     assert unknown.json() == {"history": []}
     assert worker_closes == []
+
+
+@pytest.mark.asyncio
+async def test_memory_close_allows_ordinary_new_incarnation() -> None:
+    worker_bodies: list[dict] = []
+    worker_closes: list[str] = []
+    app = _proxy_app()
+    transport = httpx.ASGITransport(app=app)
+    with patch.object(
+        httpx.AsyncClient,
+        "send",
+        _patched_worker_send(worker_bodies, worker_closes),
+    ):
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://proxy",
+            headers=_MEMORY_CONTROL_HEADERS,
+        ) as client:
+            memory_turn = await client.post(
+                "/session/s1/turn",
+                json=_authorized(
+                    {"message": "Memory", MEMORY_ASSIGNMENT_PIN_FIELD: _wire("a")}
+                ),
+            )
+            closed = await client.post(
+                "/sessions/close",
+                json={"session_key": "s1"},
+            )
+            ordinary_turn = await client.post(
+                "/session/s1/turn",
+                json={"message": "ordinary new incarnation"},
+            )
+            rejected_upgrade = await client.post(
+                "/session/s1/turn",
+                json=_authorized(
+                    {
+                        "message": "cannot silently restore Memory",
+                        MEMORY_ASSIGNMENT_PIN_FIELD: _wire("b"),
+                    }
+                ),
+            )
+
+    assert (
+        memory_turn.status_code
+        == closed.status_code
+        == ordinary_turn.status_code
+        == 200
+    )
+    assert rejected_upgrade.status_code == 409
+    assert worker_closes == ["s1"]
+    assert len(worker_bodies) == 2
+    assert parse_memory_assignment_pin_metadata(worker_bodies[0]["metadata"]) == (
+        MemoryAssignmentPinWireV1.from_wire(_wire("a")).to_runtime_pin()
+    )
+    assert AREAL_MEMORY_METADATA_KEY not in worker_bodies[1]["metadata"]
+    assert app.state.memory_pin_cache.resolve("s1") is None
 
 
 @pytest.mark.asyncio
@@ -1726,6 +2088,115 @@ async def test_stream_close_failure_cannot_leak_turn_lease() -> None:
 
 
 @pytest.mark.asyncio
+async def test_stream_cancellation_releases_lease_but_preserves_ordinary_mode() -> None:
+    second_read_started = asyncio.Event()
+    release_second_read = asyncio.Event()
+    upstream_closed = asyncio.Event()
+    worker_bodies: list[dict] = []
+    worker_closes: list[str] = []
+    original_send = httpx.AsyncClient.send
+
+    class CancellableStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield b"first"
+            second_read_started.set()
+            await release_second_read.wait()
+            yield b"unreachable"
+
+        async def aclose(self):
+            upstream_closed.set()
+
+    async def patched_send(self, request, **kwargs):
+        if request.url.host != "worker":
+            return await original_send(self, request, **kwargs)
+        if request.url.path == "/run":
+            worker_bodies.append(json.loads(request.content))
+            if len(worker_bodies) == 1:
+                return httpx.Response(
+                    200,
+                    headers={"x-areal-passthrough": "1"},
+                    stream=CancellableStream(),
+                    request=request,
+                )
+            return httpx.Response(
+                200,
+                json={"summary": "ok", "events": [], "metadata": {}},
+                request=request,
+            )
+        if request.url.path == "/sessions/close":
+            worker_closes.append(_worker_close_session_key(request))
+            return httpx.Response(
+                200, json=_worker_close_receipt(request), request=request
+            )
+        raise AssertionError(f"unexpected worker request: {request.url}")
+
+    app = _proxy_app()
+    turn_endpoint = next(
+        route.endpoint
+        for route in app.routes
+        if getattr(route, "path", None) == "/session/{session_key}/turn"
+    )
+    transport = httpx.ASGITransport(app=app)
+    with patch.object(httpx.AsyncClient, "send", patched_send):
+        blocked_read = None
+        try:
+            response = await turn_endpoint(
+                "s1",
+                {"message": "ordinary stream"},
+                _internal_request(),
+            )
+            iterator = response.body_iterator.__aiter__()
+            assert await anext(iterator) == b"first"
+
+            blocked_read = asyncio.create_task(anext(iterator))
+            await asyncio.wait_for(second_read_started.wait(), timeout=1)
+            blocked_read.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(blocked_read, timeout=1)
+            await asyncio.wait_for(upstream_closed.wait(), timeout=1)
+
+            async with httpx.AsyncClient(
+                transport=transport,
+                base_url="http://proxy",
+                headers=_MEMORY_CONTROL_HEADERS,
+            ) as client:
+                rejected_upgrade = await client.post(
+                    "/session/s1/turn",
+                    json=_authorized(
+                        {
+                            "message": "stream cancellation is not a close",
+                            MEMORY_ASSIGNMENT_PIN_FIELD: _wire("a"),
+                        }
+                    ),
+                )
+                ordinary_retry = await client.post(
+                    "/session/s1/turn",
+                    json={"message": "ordinary retry"},
+                )
+                closed = await asyncio.wait_for(
+                    client.post(
+                        "/sessions/close",
+                        json={"session_key": "s1"},
+                    ),
+                    timeout=1,
+                )
+        finally:
+            release_second_read.set()
+            if blocked_read is not None and not blocked_read.done():
+                blocked_read.cancel()
+            if blocked_read is not None:
+                await asyncio.gather(blocked_read, return_exceptions=True)
+
+    assert rejected_upgrade.status_code == 409
+    assert ordinary_retry.status_code == closed.status_code == 200
+    assert len(worker_bodies) == 2
+    assert all(
+        AREAL_MEMORY_METADATA_KEY not in body["metadata"] for body in worker_bodies
+    )
+    assert worker_closes == ["s1"]
+
+
+@pytest.mark.asyncio
 async def test_chat_downstream_close_survives_caller_cancellation() -> None:
     close_started = asyncio.Event()
     allow_close = asyncio.Event()
@@ -1757,7 +2228,7 @@ async def test_chat_downstream_close_survives_caller_cancellation() -> None:
 
 
 @pytest.mark.asyncio
-async def test_failed_worker_close_keeps_tombstone_until_retry_succeeds() -> None:
+async def test_failed_memory_close_retry_allows_ordinary() -> None:
     worker_bodies: list[dict] = []
     worker_close_keys: list[str] = []
     close_attempts = 0
@@ -1796,7 +2267,7 @@ async def test_failed_worker_close_keeps_tombstone_until_retry_succeeds() -> Non
             base_url="http://proxy",
             headers=_MEMORY_CONTROL_HEADERS,
         ) as client:
-            await client.post(
+            memory_turn = await client.post(
                 "/session/s1/turn",
                 json=_authorized(
                     {"message": "first", MEMORY_ASSIGNMENT_PIN_FIELD: _wire("a")}
@@ -1808,9 +2279,7 @@ async def test_failed_worker_close_keeps_tombstone_until_retry_succeeds() -> Non
             )
             blocked = await client.post(
                 "/session/s1/turn",
-                json=_authorized(
-                    {"message": "blocked", MEMORY_ASSIGNMENT_PIN_FIELD: _wire("b")}
-                ),
+                json={"message": "ordinary blocked by close tombstone"},
             )
             successful_close = await client.post(
                 "/sessions/close",
@@ -1818,20 +2287,31 @@ async def test_failed_worker_close_keeps_tombstone_until_retry_succeeds() -> Non
             )
             replacement = await client.post(
                 "/session/s1/turn",
+                json={"message": "ordinary replacement"},
+            )
+            rejected_upgrade = await client.post(
+                "/session/s1/turn",
                 json=_authorized(
                     {
-                        "message": "replacement",
+                        "message": "new incarnation remains ordinary",
                         MEMORY_ASSIGNMENT_PIN_FIELD: _wire("b"),
                     }
                 ),
             )
 
+    assert memory_turn.status_code == 200
     assert failed_close.status_code == 503
     assert blocked.status_code == 409
     assert successful_close.status_code == replacement.status_code == 200
+    assert rejected_upgrade.status_code == 409
     assert close_attempts == 2
     assert worker_close_keys == ["s1", "s1"]
     assert len(worker_bodies) == 2
+    assert parse_memory_assignment_pin_metadata(worker_bodies[0]["metadata"]) == (
+        MemoryAssignmentPinWireV1.from_wire(_wire("a")).to_runtime_pin()
+    )
+    assert AREAL_MEMORY_METADATA_KEY not in worker_bodies[1]["metadata"]
+    assert app.state.memory_pin_cache.resolve("s1") is None
 
 
 @pytest.mark.asyncio
