@@ -18,13 +18,29 @@ class DataProxyConfig:
     request_timeout: float = 600.0
     session_timeout: int = 3600
     log_level: str = "warning"
+    # Appended for positional-call compatibility.  Empty preserves standalone
+    # use; Controller-managed pairs always use an independently generated key.
+    worker_hop_api_key: str = ""
 
     def __post_init__(self) -> None:
-        if type(self.memory_control_api_key) is not str:
-            raise TypeError("memory_control_api_key must be a string")
-        if self.memory_control_api_key and not self.memory_control_api_key.strip():
-            raise ValueError("memory_control_api_key must not be blank")
-        if is_source_visible_default_admin_key(self.memory_control_api_key):
+        for field_name in ("worker_hop_api_key", "memory_control_api_key"):
+            value = getattr(self, field_name)
+            if type(value) is not str:
+                raise TypeError(f"{field_name} must be a string")
+            if value and not value.strip():
+                raise ValueError(f"{field_name} must not be blank")
+            if is_source_visible_default_admin_key(value):
+                raise ValueError(
+                    f"{field_name} must not use a source-visible default key"
+                )
+        if (
+            self.worker_hop_api_key
+            and self.worker_hop_api_key == self.memory_control_api_key
+        ):
             raise ValueError(
-                "memory_control_api_key must not use a source-visible default key"
+                "worker_hop_api_key must differ from memory_control_api_key"
+            )
+        if self.memory_control_api_key and not self.worker_hop_api_key:
+            raise ValueError(
+                "memory_control_api_key requires an independent worker_hop_api_key"
             )

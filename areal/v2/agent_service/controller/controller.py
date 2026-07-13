@@ -94,6 +94,11 @@ class AgentController:
         # controller incarnation so a documented/default admin key can never
         # authorize cross-scope Memory assignment transport.
         self._memory_control_api_key = secrets.token_urlsafe(32)
+        # Each Worker/DataProxy pair receives a different internal credential,
+        # limiting accidental cross-pair calls and remote callers that lack a
+        # pair key.  This is not isolation from same-UID process compromise.
+        # The capability is never intentionally shared with Gateway or Router.
+        self._issued_worker_hop_api_keys: set[str] = set()
 
         self._pairs: dict[int, _WorkerPair] = {}
         self._pairs_lock = threading.Lock()
@@ -231,6 +236,7 @@ class AgentController:
         self._workers.clear()
         self._guard_addrs.clear()
         self._base_env.clear()
+        self._issued_worker_hop_api_keys.clear()
         with self._pairs_lock:
             self._pairs.clear()
         self._router_addr = ""
@@ -250,6 +256,15 @@ class AgentController:
             self._next_pair_index += 1
 
             guard_addr = self._guard_addrs[pair_index % len(self._guard_addrs)]
+            while True:
+                worker_hop_api_key = secrets.token_urlsafe(32)
+                if (
+                    worker_hop_api_key != self._memory_control_api_key
+                    and worker_hop_api_key != cfg.admin_api_key
+                    and worker_hop_api_key not in self._issued_worker_hop_api_keys
+                ):
+                    self._issued_worker_hop_api_keys.add(worker_hop_api_key)
+                    break
 
             worker_cmd = [
                 sys.executable,
@@ -257,6 +272,8 @@ class AgentController:
                 "areal.v2.agent_service.worker",
                 "--agent",
                 cfg.agent_cls_path,
+                "--worker-hop-api-key",
+                worker_hop_api_key,
                 "--log-level",
                 _DEFAULT_AGENT_LOG_LEVEL,
             ]
@@ -274,6 +291,8 @@ class AgentController:
                 "areal.v2.agent_service.data_proxy",
                 "--worker-addr",
                 worker_addr,
+                "--worker-hop-api-key",
+                worker_hop_api_key,
                 "--memory-control-api-key",
                 self._memory_control_api_key,
             ]

@@ -30,7 +30,10 @@ from areal.v2.agent_service.types import (
     EventEmitter,
     StreamResponse,
 )
-from areal.v2.agent_service.worker.app import create_worker_app
+from areal.v2.agent_service.worker.app import (
+    create_worker_app,
+    create_worker_app_with_hop_auth,
+)
 
 httpx = pytest.importorskip("httpx")
 
@@ -103,12 +106,19 @@ class _JsonPassthroughAgent:
         )
 
 
-def _make_worker_app(agent_cls):
+def _make_worker_app(agent_cls, *, worker_hop_api_key: str = ""):
     with patch(
         "areal.v2.agent_service.worker.app.import_from_string",
         return_value=agent_cls,
     ):
-        return create_worker_app("mock.path")
+        return (
+            create_worker_app_with_hop_auth(
+                "mock.path",
+                worker_hop_api_key,
+            )
+            if worker_hop_api_key
+            else create_worker_app("mock.path")
+        )
 
 
 def _worker_patches(worker_transport):
@@ -121,29 +131,41 @@ def _worker_patches(worker_transport):
     original_post = httpx.AsyncClient.post
     original_send = httpx.AsyncClient.send
 
-    async def _forward(path, body):
+    async def _forward(method, path, body, headers=None):
         # Use the unbound original ``send`` so the inner ASGI call does not
         # re-enter the patched ``post``/``send`` (which would recurse forever).
         async with httpx.AsyncClient(
             transport=worker_transport, base_url="http://worker"
         ) as wc:
-            req = wc.build_request("POST", path, json=body)
+            req = wc.build_request(method, path, json=body, headers=headers)
             return await original_send(wc, req)
 
     async def patched_post(self, url, **kwargs):
         if "http://worker" in str(url):
             path = str(url).split("http://worker")[-1]
-            return await _forward(path, kwargs.get("json"))
+            return await _forward(
+                "POST",
+                path,
+                kwargs.get("json"),
+                kwargs.get("headers"),
+            )
         return await original_post(self, url, **kwargs)
 
     async def patched_send(self, request, **kwargs):
         if "http://worker" in str(request.url):
             path = str(request.url).split("http://worker")[-1]
             body = json.loads(request.content) if request.content else None
-            r = await _forward(path, body)
+            r = await _forward(request.method, path, body, request.headers)
             headers = {
                 "content-type": r.headers.get("content-type", "application/json")
             }
+            if request.method == "GET":
+                return httpx.Response(
+                    r.status_code,
+                    headers=headers,
+                    content=r.content,
+                    request=request,
+                )
             # Preserve the passthrough marker so the DataProxy's relay-vs-parse
             # decision is exercised faithfully end-to-end.
             if PASSTHROUGH_HEADER in r.headers:
@@ -190,6 +212,83 @@ class TestWorkerDataProxyIntegration:
             assert resp.status_code == 200
             data = resp.json()
             assert "echo: hello" in data["summary"]
+
+    @pytest.mark.asyncio
+    async def test_controller_style_pair_authenticates_run_and_close(self):
+        worker_hop_api_key = "test-worker-hop-key"
+        worker_app = _make_worker_app(
+            _EchoAgent,
+            worker_hop_api_key=worker_hop_api_key,
+        )
+        worker_transport = httpx.ASGITransport(app=worker_app)
+        proxy_app = create_data_proxy_app(
+            DataProxyConfig(
+                worker_addr="http://worker",
+                worker_hop_api_key=worker_hop_api_key,
+            )
+        )
+        patched_post, patched_send = _worker_patches(worker_transport)
+        proxy_transport = httpx.ASGITransport(app=proxy_app)
+
+        async with httpx.AsyncClient(
+            transport=worker_transport,
+            base_url="http://worker",
+        ) as direct_worker:
+            rejected = await direct_worker.post(
+                "/run",
+                json={"message": "direct", "session_key": "s1", "run_id": "r0"},
+            )
+            assert rejected.status_code == 401
+
+        with (
+            patch.object(httpx.AsyncClient, "post", patched_post),
+            patch.object(httpx.AsyncClient, "send", patched_send),
+        ):
+            await proxy_app.router.startup()
+            try:
+                async with httpx.AsyncClient(
+                    transport=proxy_transport,
+                    base_url="http://proxy",
+                ) as proxy_client:
+                    accepted = await proxy_client.post(
+                        "/session/s1/turn",
+                        json={"message": "paired", "run_id": "r1"},
+                    )
+                    assert accepted.status_code == 200
+                    assert accepted.json()["summary"] == "echo: paired"
+                    closed = await proxy_client.post("/session/s1/close")
+                    assert closed.status_code == 200
+            finally:
+                await proxy_app.router.shutdown()
+
+    @pytest.mark.parametrize("worker_mode", ("wrong-key", "standalone"))
+    @pytest.mark.asyncio
+    async def test_data_proxy_startup_rejects_unpaired_worker(self, worker_mode):
+        data_proxy_key = "test-worker-hop-key"
+        worker_app = _make_worker_app(
+            _EchoAgent,
+            worker_hop_api_key=(
+                "different-worker-hop-key" if worker_mode == "wrong-key" else ""
+            ),
+        )
+        worker_transport = httpx.ASGITransport(app=worker_app)
+        proxy_app = create_data_proxy_app(
+            DataProxyConfig(
+                worker_addr="http://worker",
+                worker_hop_api_key=data_proxy_key,
+            )
+        )
+        patched_post, patched_send = _worker_patches(worker_transport)
+
+        with (
+            patch.object(httpx.AsyncClient, "post", patched_post),
+            patch.object(httpx.AsyncClient, "send", patched_send),
+            pytest.raises(
+                RuntimeError,
+                match="Worker hop authentication check failed",
+            ),
+        ):
+            await proxy_app.router.startup()
 
     @pytest.mark.asyncio
     async def test_data_proxy_manages_history(self):

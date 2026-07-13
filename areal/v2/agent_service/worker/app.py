@@ -7,12 +7,13 @@ from __future__ import annotations
 from dataclasses import asdict
 from typing import Any
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from areal.utils import logging
 from areal.utils.dynamic_import import import_from_string
 
+from ..auth import is_source_visible_default_admin_key, verify_admin_key
 from ..protocol import PASSTHROUGH_HEADER, QueueMode
 from ..types import (
     AgentRequest,
@@ -42,6 +43,47 @@ def create_worker_app(
     agent_cls_path: str,
     **agent_kwargs: Any,
 ) -> FastAPI:
+    """Create the backward-compatible standalone Worker application.
+
+    Every keyword remains an Agent constructor argument.  In particular, this
+    factory does not reserve ``worker_hop_api_key`` from existing plugins.
+    Controller-managed deployments use
+    :func:`create_worker_app_with_hop_auth` instead.
+    """
+
+    return _create_worker_app(
+        agent_cls_path,
+        worker_hop_api_key="",
+        agent_kwargs=agent_kwargs,
+    )
+
+
+def create_worker_app_with_hop_auth(
+    agent_cls_path: str,
+    worker_hop_api_key: str,
+    **agent_kwargs: Any,
+) -> FastAPI:
+    """Create a Worker whose state-changing HTTP routes require a pair key."""
+
+    if type(worker_hop_api_key) is not str:
+        raise TypeError("worker_hop_api_key must be a string")
+    if not worker_hop_api_key.strip():
+        raise ValueError("worker_hop_api_key must not be blank")
+    if is_source_visible_default_admin_key(worker_hop_api_key):
+        raise ValueError("worker_hop_api_key must not use a source-visible default key")
+    return _create_worker_app(
+        agent_cls_path,
+        worker_hop_api_key=worker_hop_api_key,
+        agent_kwargs=agent_kwargs,
+    )
+
+
+def _create_worker_app(
+    agent_cls_path: str,
+    *,
+    worker_hop_api_key: str,
+    agent_kwargs: dict[str, Any],
+) -> FastAPI:
     app = FastAPI(title="AReaL Agent Worker")
 
     cls = import_from_string(agent_cls_path)
@@ -53,12 +95,32 @@ def create_worker_app(
         )
     logger.info("Agent loaded: %s", agent_cls_path)
 
+    async def authorize_worker_hop(http_request: Request) -> None:
+        if worker_hop_api_key:
+            await verify_admin_key(
+                http_request.headers.get("Authorization", ""),
+                expected_key=worker_hop_api_key,
+            )
+
     @app.get("/health")
     async def health():
         return {"status": "ok"}
 
+    @app.get("/internal/auth-check")
+    async def auth_check(http_request: Request):
+        """Prove that this Worker enforces the configured pair credential."""
+
+        if not worker_hop_api_key:
+            raise HTTPException(
+                status_code=503,
+                detail="Worker hop authentication is not enabled",
+            )
+        await authorize_worker_hop(http_request)
+        return {"status": "ok", "worker_hop_auth": True}
+
     @app.post("/session/{session_key}/close")
-    async def close_session(session_key: str):
+    async def close_session(session_key: str, http_request: Request):
+        await authorize_worker_hop(http_request)
         close_fn = getattr(agent, "close_session", None)
         if close_fn is not None:
             await close_fn(session_key)
@@ -71,7 +133,7 @@ def create_worker_app(
             await close_all_fn()
 
     @app.post("/run")
-    async def run(body: dict[str, Any]):
+    async def run(body: dict[str, Any], http_request: Request):
         """Single agent entry point for every protocol and streaming mode.
 
         Calls the agent's ``run`` and relays whichever shape it returns:
@@ -86,6 +148,7 @@ def create_worker_app(
           events}`` (``application/json``); the DataProxy rebuilds history from
           ``events``.
         """
+        await authorize_worker_hop(http_request)
         request = AgentRequest(
             message=body.get("message", ""),
             session_key=body.get("session_key", ""),

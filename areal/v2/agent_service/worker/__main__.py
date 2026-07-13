@@ -14,12 +14,20 @@ import argparse
 
 import uvicorn
 
-from .app import create_worker_app
+from .app import create_worker_app, create_worker_app_with_hop_auth
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Agent Worker")
     parser.add_argument("--agent", required=True, help="Agent import path")
+    parser.add_argument(
+        "--worker-hop-api-key",
+        default="",
+        help=(
+            "Dedicated DataProxy-to-Worker credential; empty preserves "
+            "standalone compatibility"
+        ),
+    )
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=9000)
     parser.add_argument(
@@ -27,7 +35,14 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    app = create_worker_app(args.agent)
+    app = (
+        create_worker_app_with_hop_auth(
+            args.agent,
+            args.worker_hop_api_key,
+        )
+        if args.worker_hop_api_key
+        else create_worker_app(args.agent)
+    )
     uvicorn.run(
         app,
         host=args.host,

@@ -137,7 +137,11 @@ class TestInitialize:
         ctrl.destroy()
 
     @patch(f"{CTRL}.requests")
-    def test_memory_hop_uses_a_dedicated_controller_secret(self, mock_requests, config):
+    def test_internal_hops_use_separate_least_privilege_secrets(
+        self,
+        mock_requests,
+        config,
+    ):
         fork_payloads = []
 
         def mock_post(url, **kwargs):
@@ -163,25 +167,44 @@ class TestInitialize:
 
         by_role = {payload["role"]: payload["raw_cmd"] for payload in fork_payloads}
         proxy_cmd = by_role["agent-proxy-0"]
+        worker_cmd = by_role["agent-worker-0"]
         gateway_cmd = by_role["agent-gateway"]
 
-        proxy_key = proxy_cmd[proxy_cmd.index("--memory-control-api-key") + 1]
-        gateway_key = gateway_cmd[gateway_cmd.index("--memory-control-api-key") + 1]
-        assert proxy_key == gateway_key
-        assert proxy_key != config.admin_api_key
-        assert len(proxy_key) >= 32
+        memory_key = proxy_cmd[proxy_cmd.index("--memory-control-api-key") + 1]
+        gateway_memory_key = gateway_cmd[
+            gateway_cmd.index("--memory-control-api-key") + 1
+        ]
+        worker_key = worker_cmd[worker_cmd.index("--worker-hop-api-key") + 1]
+        proxy_worker_key = proxy_cmd[proxy_cmd.index("--worker-hop-api-key") + 1]
+        assert memory_key == gateway_memory_key
+        assert worker_key == proxy_worker_key
+        assert len(memory_key) >= 32
+        assert len(worker_key) >= 32
+        assert len({memory_key, worker_key, config.admin_api_key}) == 3
         assert "--admin-api-key" not in proxy_cmd
         assert gateway_cmd[gateway_cmd.index("--admin-api-key") + 1] == (
             config.admin_api_key
         )
-        assert proxy_key not in by_role["agent-router"]
-        assert proxy_key not in by_role["agent-worker-0"]
+        assert memory_key not in by_role["agent-router"]
+        assert memory_key not in worker_cmd
+        assert worker_key not in by_role["agent-router"]
+        assert worker_key not in gateway_cmd
+
         scaled_proxy_cmd = by_role["agent-proxy-1"]
+        scaled_worker_cmd = by_role["agent-worker-1"]
         assert (
             scaled_proxy_cmd[scaled_proxy_cmd.index("--memory-control-api-key") + 1]
-            == proxy_key
+            == memory_key
         )
-        assert proxy_key not in by_role["agent-worker-1"]
+        scaled_worker_key = scaled_worker_cmd[
+            scaled_worker_cmd.index("--worker-hop-api-key") + 1
+        ]
+        assert (
+            scaled_proxy_cmd[scaled_proxy_cmd.index("--worker-hop-api-key") + 1]
+            == scaled_worker_key
+        )
+        assert scaled_worker_key != worker_key
+        assert memory_key not in scaled_worker_cmd
 
         ctrl.destroy()
 

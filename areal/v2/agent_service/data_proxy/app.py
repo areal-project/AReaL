@@ -16,7 +16,7 @@ from fastapi.responses import JSONResponse
 
 from areal.utils import logging
 
-from ..auth import verify_admin_key
+from ..auth import admin_headers, verify_admin_key
 from ..memory_transport import (
     AREAL_INFERENCE_METADATA_KEY,
     CHAT_REQUEST_METADATA_KEY,
@@ -80,11 +80,16 @@ def create_data_proxy_app(config: DataProxyConfig) -> FastAPI:
     memory_pin_cache = MemorySessionPinCache()
     app.state.memory_pin_cache = memory_pin_cache
     http_client = httpx.AsyncClient(timeout=config.request_timeout)
+    worker_hop_headers = (
+        admin_headers(config.worker_hop_api_key) if config.worker_hop_api_key else {}
+    )
 
     async def _close_worker_session(session_key: str) -> bool:
         try:
             response = await http_client.post(
-                f"{config.worker_addr}/session/{session_key}/close", timeout=5
+                f"{config.worker_addr}/session/{session_key}/close",
+                headers=worker_hop_headers or None,
+                timeout=5,
             )
             response.raise_for_status()
         except Exception:
@@ -358,6 +363,30 @@ def create_data_proxy_app(config: DataProxyConfig) -> FastAPI:
 
     @app.on_event("startup")
     async def startup():
+        if config.worker_hop_api_key:
+            try:
+                response = await http_client.get(
+                    f"{config.worker_addr}/internal/auth-check",
+                    headers=worker_hop_headers,
+                    timeout=5,
+                )
+                response.raise_for_status()
+                payload = response.json()
+                valid_receipt = (
+                    type(payload) is dict
+                    and set(payload) == {"status", "worker_hop_auth"}
+                    and type(payload["status"]) is str
+                    and payload["status"] == "ok"
+                    and type(payload["worker_hop_auth"]) is bool
+                    and payload["worker_hop_auth"] is True
+                )
+                if not valid_receipt:
+                    raise ValueError(
+                        "Worker returned a malformed hop-authentication receipt"
+                    )
+            except Exception as error:
+                await http_client.aclose()
+                raise RuntimeError("Worker hop authentication check failed") from error
         app.state.reaper_task = asyncio.create_task(_reap_idle_sessions())
 
     @app.on_event("shutdown")
@@ -481,7 +510,10 @@ def create_data_proxy_app(config: DataProxyConfig) -> FastAPI:
         resp: httpx.Response | None = None
         try:
             req = http_client.build_request(
-                "POST", f"{config.worker_addr}/run", json=worker_request
+                "POST",
+                f"{config.worker_addr}/run",
+                json=worker_request,
+                headers=worker_hop_headers or None,
             )
             resp = await http_client.send(req, stream=True)
             is_passthrough = resp.headers.get(PASSTHROUGH_HEADER) == "1"

@@ -14,6 +14,14 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Agent DataProxy")
     parser.add_argument("--worker-addr", required=True, help="Worker HTTP address")
     parser.add_argument(
+        "--worker-hop-api-key",
+        default="",
+        help=(
+            "Dedicated DataProxy-to-Worker credential; empty preserves "
+            "standalone compatibility"
+        ),
+    )
+    parser.add_argument(
         "--memory-control-api-key",
         default="",
         help=(
@@ -34,6 +42,7 @@ def main() -> None:
         host=args.host,
         port=args.port,
         worker_addr=args.worker_addr,
+        worker_hop_api_key=args.worker_hop_api_key,
         memory_control_api_key=args.memory_control_api_key,
         request_timeout=args.request_timeout,
         session_timeout=args.session_timeout,

@@ -32,6 +32,8 @@ fastapi = pytest.importorskip("fastapi")
 
 _MEMORY_CONTROL_API_KEY = "test-memory-control-hop-key"
 _MEMORY_CONTROL_HEADERS = admin_headers(_MEMORY_CONTROL_API_KEY)
+_WORKER_HOP_API_KEY = "test-worker-hop-key"
+_WORKER_HOP_HEADERS = admin_headers(_WORKER_HOP_API_KEY)
 _EXTERNAL_ADMIN_API_KEY = "test-external-admin-key"
 
 
@@ -100,6 +102,7 @@ def _proxy_app():
     return data_proxy_app.create_data_proxy_app(
         data_proxy_config.DataProxyConfig(
             worker_addr="http://worker",
+            worker_hop_api_key=_WORKER_HOP_API_KEY,
             memory_control_api_key=_MEMORY_CONTROL_API_KEY,
         )
     )
@@ -158,6 +161,102 @@ def test_gateway_requires_a_distinct_memory_hop_key() -> None:
         admin_api_key=_EXTERNAL_ADMIN_API_KEY,
         memory_control_api_key=_MEMORY_CONTROL_API_KEY,
     ).memory_control_enabled
+
+
+def test_data_proxy_requires_independent_memory_and_worker_hops() -> None:
+    with pytest.raises(ValueError, match="requires an independent"):
+        data_proxy_config.DataProxyConfig(
+            memory_control_api_key=_MEMORY_CONTROL_API_KEY,
+        )
+    with pytest.raises(ValueError, match="must differ"):
+        data_proxy_config.DataProxyConfig(
+            memory_control_api_key="same-hop-key",
+            worker_hop_api_key="same-hop-key",
+        )
+    for source_visible_default in (DEFAULT_ADMIN_API_KEY, "areal-admin-key"):
+        with pytest.raises(ValueError, match="source-visible default"):
+            data_proxy_config.DataProxyConfig(
+                worker_hop_api_key=source_visible_default,
+            )
+
+
+@pytest.mark.asyncio
+async def test_data_proxy_replaces_inbound_auth_with_worker_pair_auth() -> None:
+    forwarded_authorization: list[str | None] = []
+    original_send = httpx.AsyncClient.send
+
+    async def patched_send(self, request, **kwargs):
+        if request.url.host != "worker":
+            return await original_send(self, request, **kwargs)
+        forwarded_authorization.append(request.headers.get("Authorization"))
+        if request.url.path == "/run":
+            return httpx.Response(
+                200,
+                json={"summary": "ok", "events": [], "metadata": {}},
+                request=request,
+            )
+        if request.url.path.endswith("/close"):
+            return httpx.Response(200, json={"status": "ok"}, request=request)
+        raise AssertionError(f"unexpected Worker request: {request.url}")
+
+    app = _proxy_app()
+    transport = httpx.ASGITransport(app=app)
+    with patch.object(httpx.AsyncClient, "send", patched_send):
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://proxy",
+            headers=_MEMORY_CONTROL_HEADERS,
+        ) as client:
+            turn = await client.post(
+                "/session/s1/turn",
+                json={"message": "hello", "run_id": "r1"},
+            )
+            assert turn.status_code == 200
+            closed = await client.post("/session/s1/close")
+            assert closed.status_code == 200
+
+    assert forwarded_authorization == [
+        _WORKER_HOP_HEADERS["Authorization"],
+        _WORKER_HOP_HEADERS["Authorization"],
+    ]
+    assert _WORKER_HOP_API_KEY != _MEMORY_CONTROL_API_KEY
+
+
+@pytest.mark.parametrize(
+    "payload",
+    (
+        {"status": "ok"},
+        {"status": "ok", "worker_hop_auth": 1},
+        ["ok", True],
+    ),
+)
+@pytest.mark.asyncio
+async def test_data_proxy_startup_rejects_malformed_worker_auth_receipt(
+    payload: object,
+) -> None:
+    forwarded_authorization: list[str | None] = []
+    original_send = httpx.AsyncClient.send
+
+    async def patched_send(self, request, **kwargs):
+        if request.url.host != "worker":
+            return await original_send(self, request, **kwargs)
+        assert request.method == "GET"
+        assert request.url.path == "/internal/auth-check"
+        forwarded_authorization.append(request.headers.get("Authorization"))
+        return httpx.Response(200, json=payload, request=request)
+
+    app = _proxy_app()
+    with (
+        patch.object(httpx.AsyncClient, "send", patched_send),
+        pytest.raises(
+            RuntimeError,
+            match="Worker hop authentication check failed",
+        ) as error,
+    ):
+        await app.router.startup()
+
+    assert isinstance(error.value.__cause__, ValueError)
+    assert forwarded_authorization == [_WORKER_HOP_HEADERS["Authorization"]]
 
 
 @pytest.mark.parametrize(

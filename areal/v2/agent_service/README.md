@@ -48,6 +48,29 @@ at startup. Each `POST /run` request is a single turn — the agent receives the
 conversation history in the request and returns a response. The Worker has no session
 state.
 
+### Internal hop authentication
+
+Controller-managed deployments use a different random credential for every
+DataProxy→Worker pair. The DataProxy creates a fresh Bearer header for both `/run` and
+`/session/{key}/close`; it never forwards the Gateway request's Authorization header.
+The pair credential is distinct from both the external admin key and the
+Gateway→DataProxy Memory-control key, and it is not distributed to Gateway or Router. At
+startup, a configured DataProxy calls the authenticated `/internal/auth-check` route and
+requires its exact typed receipt; a wrong key or a standalone Worker therefore fails
+startup instead of silently weakening the hop. `/health` remains unauthenticated for
+ordinary readiness probes.
+
+An empty Worker-hop key preserves standalone compatibility. Memory-control transport
+cannot be enabled on a DataProxy in that mode. Internal-hop authentication verifies
+possession of the pair key; it is **not** a principal/session grant for any
+`MemoryScope`.
+
+The Controller currently supplies pair keys through child-process arguments. This
+protects against unauthenticated network callers and accidental cross-pair routing, not
+arbitrary code running under the same OS identity: such a process may inspect sibling
+process arguments. A hostile-plugin deployment needs separate OS identities or process
+namespaces plus a protected secret channel (for example UDS permissions or mTLS).
+
 ## Agent Protocol
 
 Any class that satisfies the `AgentRunnable` protocol can run on the Worker:
