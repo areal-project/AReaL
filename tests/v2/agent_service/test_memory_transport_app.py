@@ -246,6 +246,52 @@ async def test_data_proxy_replaces_inbound_auth_with_worker_pair_auth() -> None:
 
 
 @pytest.mark.parametrize(
+    ("worker_status", "worker_body", "expected_status"),
+    (
+        (200, b"<html>not json</html>", 502),
+        (503, b"upstream unavailable", 503),
+        (200, b"[]", 502),
+    ),
+)
+@pytest.mark.asyncio
+async def test_invalid_structured_worker_response_preserves_status_without_history(
+    worker_status: int,
+    worker_body: bytes,
+    expected_status: int,
+) -> None:
+    original_send = httpx.AsyncClient.send
+
+    async def patched_send(self, request, **kwargs):
+        if request.url.host != "worker":
+            return await original_send(self, request, **kwargs)
+        assert request.url.path == "/run"
+        return httpx.Response(
+            worker_status,
+            content=worker_body,
+            request=request,
+        )
+
+    app = _proxy_app()
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+    with patch.object(httpx.AsyncClient, "send", patched_send):
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://proxy",
+        ) as client:
+            response = await client.post(
+                "/session/s1/turn",
+                json={"message": "must not enter history"},
+            )
+            history = await client.get("/session/s1/history")
+
+    assert response.status_code == expected_status
+    assert response.json() == {
+        "detail": "worker returned an invalid structured response"
+    }
+    assert history.json() == {"history": []}
+
+
+@pytest.mark.parametrize(
     "payload",
     (
         {"status": "ok"},

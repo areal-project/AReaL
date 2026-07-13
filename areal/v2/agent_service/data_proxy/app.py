@@ -569,7 +569,20 @@ def create_data_proxy_app(config: DataProxyConfig) -> FastAPI:
             # Structured turn: read the full JSON body, then rebuild history.
             await resp.aread()
             status_code = resp.status_code
-            result = resp.json()
+            try:
+                result = resp.json()
+            except ValueError:
+                result = None
+
+            if not isinstance(result, dict):
+                # A structured Worker response is an object by contract.  Do
+                # not turn an upstream HTML page, empty body, or JSON array
+                # into an unhandled DataProxy exception, and never append a
+                # turn to history when its response cannot be interpreted.
+                return JSONResponse(
+                    {"detail": "worker returned an invalid structured response"},
+                    status_code=status_code if status_code >= 400 else 502,
+                )
 
             if status_code >= 400:
                 return JSONResponse(result, status_code=status_code)
