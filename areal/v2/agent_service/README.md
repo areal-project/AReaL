@@ -91,11 +91,34 @@ resolver must return an active exact grant for every authorization operation. A
 successful resolution admits only that operation. Later revocation blocks new
 admissions; it does not roll back a consumer side effect that was already admitted.
 
+The `AuthorizedMemoryAgentBroker` is the default-off host seam that enforces this
+contract around the async coordinator. It mints its own Worker audience and session
+incarnations, checks `pin_assignment` before the release-control lookup, and checks
+`expose_memory` before **every** capability invocation—including retries that the
+coordinator could otherwise answer from a completed operation. Synchronous resolver work
+runs through the coordinator's bounded executor rather than on the Worker event loop.
+
+There are three distinct lifecycle points:
+
+```text
+grant resolution pending → admitted coordinator operation → consumer side effect
+```
+
+Cancellation or close during the first stage cannot start a later coordinator action.
+Close waits for the second stage, and revocation after admission does not attempt to
+undo the third. Closing and reopening the same textual session creates a new
+incarnation, while replacing the broker creates a new Worker audience; old handles and
+grant decisions cannot cross either boundary. Resolver request objects and coordinator
+pins/turns use detached snapshots, while public handles are checked against private
+scalar snapshots, so mutation of one alias cannot silently rewrite another authority
+dimension.
+
 The authorizer is default-disabled when no resolver is configured. Current HTTP ingress
-does not establish an end-user principal and the Worker still does not turn a pin
-envelope into a Memory capability, so this contract alone enables no Memory access. In
-particular, the shared admin key, either internal hop key, caller-chosen session key,
-pin scope, and inference `sk-sess-*` handle are not principal proof.
+does not establish an end-user principal, and the Worker app still does not turn a pin
+envelope into a Memory capability. The broker is constructed and called only by trusted
+host code, so adding it enables no HTTP Memory access by itself. In particular, the
+shared admin key, either internal hop key, caller-chosen session key, pin scope, and
+inference `sk-sess-*` handle are not principal proof.
 
 ## Agent Protocol
 
@@ -142,10 +165,16 @@ Worker host binds it after constructing the request, while `asdict(request)` and
 field-based wire serializers retain the pre-Memory schema. Runtime capability identity
 must not be inferred from `AgentRequest` equality or used as an authorization/cache key.
 
-The capability contract is currently an in-process, disabled-by-default seam. The Worker
-HTTP app does **not** yet turn `metadata["areal_memory"]` into a capability. Wire
-activation requires a separate authenticated DataProxy→Worker hop and a server-side
-principal/session→`MemoryScope` grant; an assignment pin alone is not authorization.
+The capability contract is currently an in-process, disabled-by-default seam. Trusted
+host code can use `bind_authorized_memory_turn_capability(...)` only with a turn issued
+by `AuthorizedMemoryAgentBroker`; each public `expose_memory(...)` call resolves a new
+exact grant before it may reach the coordinator. The older bare-coordinator constructor
+remains available for compatibility and tests, but is not the production authorization
+path.
+
+The Worker HTTP app does **not** yet turn `metadata["areal_memory"]` into a capability.
+Wire activation still requires a trusted HTTP principal source in addition to the
+authenticated DataProxy→Worker hop; an assignment pin alone is not authorization.
 Because agent plugins share the Worker Python process, this interface prevents
 accidental authority leakage rather than sandboxing malicious code. Adversarial plugins
 require an out-of-process Memory broker.
@@ -238,6 +267,7 @@ areal/v2/agent_service/
 ├── __init__.py          # Public exports (AgentRequest, AgentResponse, etc.)
 ├── README.md            # This document
 ├── auth.py              # Admin key auth helpers (hmac-safe comparison)
+├── memory_broker.py     # Exact-grant host broker and session/turn incarnations
 ├── protocol.py          # Gateway protocol frame types
 ├── types.py             # AgentRequest, AgentResponse, EventEmitter, AgentRunnable
 ├── controller/

@@ -14,6 +14,7 @@ Submodules
 - ``data_proxy`` — stateful session proxy
 - ``worker`` — stateless agent execution
 - ``memory_authorization`` — default-deny principal/session assignment grants
+- ``memory_broker`` — host-owned grant admission and incarnation lifecycle
 - ``protocol`` — WebSocket frame types and helpers
 """
 
@@ -41,6 +42,11 @@ from .memory_authorization import (
     MemorySessionIncarnationV1,
     MemoryWorkerAudienceV1,
 )
+from .memory_broker import (
+    AuthorizedMemoryAgentBroker,
+    AuthorizedMemorySessionV1,
+    AuthorizedMemoryTurnV1,
+)
 from .memory_transport import (
     AREAL_MEMORY_METADATA_KEY,
     MEMORY_ASSIGNMENT_PIN_FIELD,
@@ -67,6 +73,9 @@ __all__ = [
     "AgentRequest",
     "AgentResponse",
     "AgentRunnable",
+    "AuthorizedMemoryAgentBroker",
+    "AuthorizedMemorySessionV1",
+    "AuthorizedMemoryTurnV1",
     "AsyncMemoryAgentCoordinator",
     "EventEmitter",
     "MEMORY_ASSIGNMENT_PIN_FIELD",
