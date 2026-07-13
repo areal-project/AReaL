@@ -3236,8 +3236,8 @@ class PPOConfig(BaseExperimentConfig):
                 "ignores per-request sampling_seed unless the server is launched "
                 "with --enable-deterministic-inference. Rollouts will not be seeded "
                 "as expected. (Not applicable if you're launching SGLang servers "
-                "yourself outside this config, or using the vLLM backend, which "
-                "rejects sampling_seed outright.)",
+                "yourself outside this config -- the vLLM case is already rejected "
+                "above, before this warning can be reached.)",
                 UserWarning,
                 stacklevel=2,
             )
