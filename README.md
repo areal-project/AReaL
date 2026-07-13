@@ -28,8 +28,8 @@ cost-effective** for a broad community of developers and researchers.
 
 - ⚡ **Flexibility**: Seamless customization for
   [agentic RL](https://areal-project.github.io/AReaL/en/tutorial/agentic_rl.html) and
-  [online RL training](https://areal-ai.io/en/tutorial/online_proxy.html)
-  for **black-box agent applications** by simply replacing the `base_url`.
+  [online RL training](https://areal-ai.io/en/tutorial/online_proxy.html) for
+  **black-box agent applications** by simply replacing the `base_url`.
 - 📈 **Scalability**: **Stable** fully asynchronous RL training with **industry-leading
   speed**.
 - ✨ **Cutting-Edge Performance**: State-of-the-art [math](/blog/AReaL_v0_2.md),
@@ -40,10 +40,9 @@ cost-effective** for a broad community of developers and researchers.
 
 **\[2026/07/01\]** 🎉 We release **AReaL 2.0**, a major architectural milestone. This
 release refactors AReaL into a **microservice architecture** with independent
-[training](./areal/v2/training_service/),
-[inference](./areal/v2/inference_service/), [agent](./areal/v2/agent_service/), and
-[weight-update](./areal/v2/weight_update/) services, and ships the
-[Hermes online RL loop](./examples/hermes) and
+[training](./areal/v2/training_service/), [inference](./areal/v2/inference_service/),
+[agent](./areal/v2/agent_service/), and [weight-update](./areal/v2/weight_update/)
+services, and ships the [Hermes online RL loop](./examples/hermes) and
 [end-to-end SWE RL training examples](./examples/swe). Check out our
 [technical report](https://arxiv.org/abs/2607.01120).
 
@@ -178,16 +177,16 @@ For comprehensive setup instructions, see
 
 ### Agentic RL
 
-| Task                                                     | Description                                                            | Performance                                                                  |
-| -------------------------------------------------------- | ---------------------------------------------------------------------- | ---------------------------------------------------------------------------- |
-| **[General Agent](examples/agent_workflow/)**            | General agentic training with any agentic frameworks                   | [Guide](docs/tutorial/agentic_rl.md)                                         |
-| **[Hermes Online RL](examples/hermes/)**                 | End-to-end Online RL loop with Hermes agent under AReaL 2.0            | [Guide](examples/hermes/README.md)                                     |
-| **[Coding Agent RL](examples/swe/)**                     | End-to-end coding-agent RL training with AReaL-SWEAgent/Claude Code Agent | [Guide](examples/swe/README.md)                                           |
-| **[Tau2 Customer Service](examples/tau2/)**              | Customer service agent on Tau2-Bench (retail, airline, telecom)        | [Paper](https://arxiv.org/abs/2601.22607)                                    |
-| **[Search Agent](examples/search_agent/)**               | End-to-end search agent with Tongyi-DeepResearch workflow              | [Training Curve](examples/search_agent/tongyi_deepresearch/reward_curve.png) |
-| **[Tool-Integrated Reasoning](examples/tir/)**           | Multi-turn tool calling during reasoning (Python executor, calculator) | [Training Curve](examples/tir/figures/task_reward.png)                       |
-| **[OpenAI Agents Integration](examples/openai_agents/)** | Integration with OpenAI Agents SDK for agentic workflows               | -                                                                            |
-| **[CAMEL-AI Integration](examples/camel/)**              | Integration with CAMEL-AI framework for agentic RL                     | -                                                                            |
+| Task                                                     | Description                                                               | Performance                                                                  |
+| -------------------------------------------------------- | ------------------------------------------------------------------------- | ---------------------------------------------------------------------------- |
+| **[General Agent](examples/agent_workflow/)**            | General agentic training with any agentic frameworks                      | [Guide](docs/tutorial/agentic_rl.md)                                         |
+| **[Hermes Online RL](examples/hermes/)**                 | End-to-end Online RL loop with Hermes agent under AReaL 2.0               | [Guide](examples/hermes/README.md)                                           |
+| **[Coding Agent RL](examples/swe/)**                     | End-to-end coding-agent RL training with AReaL-SWEAgent/Claude Code Agent | [Guide](examples/swe/README.md)                                              |
+| **[Tau2 Customer Service](examples/tau2/)**              | Customer service agent on Tau2-Bench (retail, airline, telecom)           | [Paper](https://arxiv.org/abs/2601.22607)                                    |
+| **[Search Agent](examples/search_agent/)**               | End-to-end search agent with Tongyi-DeepResearch workflow                 | [Training Curve](examples/search_agent/tongyi_deepresearch/reward_curve.png) |
+| **[Tool-Integrated Reasoning](examples/tir/)**           | Multi-turn tool calling during reasoning (Python executor, calculator)    | [Training Curve](examples/tir/figures/task_reward.png)                       |
+| **[OpenAI Agents Integration](examples/openai_agents/)** | Integration with OpenAI Agents SDK for agentic workflows                  | -                                                                            |
+| **[CAMEL-AI Integration](examples/camel/)**              | Integration with CAMEL-AI framework for agentic RL                        | -                                                                            |
 
 ### Vision-Language Models
 

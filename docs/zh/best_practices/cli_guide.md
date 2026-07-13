@@ -3,29 +3,27 @@
 `areal` CLI 在 AReaL 2.0 微服务架构下提供三个顶层子命令组，每个对应一种服务：
 
 - **`areal train`** — 解析实验 driver 与配置文件，转发 hydra 覆盖参数，将控制权交给训练脚本。
-- **`areal inf`** — 启动并管理本机上的推理服务（gateway、router、model worker、data
-  proxy）。
-- **`areal agent`** — 启动并管理本机上的 agent 服务（gateway、router、N 对 worker /
-  data-proxy）。
+- **`areal inf`** — 启动并管理本机上的推理服务（gateway、router、model worker、data proxy）。
+- **`areal agent`** — 启动并管理本机上的 agent 服务（gateway、router、N 对 worker / data-proxy）。
 
-`areal inf` 与 `areal agent` 共用同一套生命周期模型 —— `run`、`ps`、`status`、
-`logs`、`stop`，每个服务的状态存放在 `~/.areal/` 下（可通过 `AREAL_HOME` 环境变量覆盖）。`areal train` 有意保持无状态：它只是将 argv 传递给 Python `main(args)` driver。
+`areal inf` 与 `areal agent` 共用同一套生命周期模型 —— `run`、`ps`、`status`、 `logs`、`stop`，每个服务的状态存放在
+`~/.areal/` 下（可通过 `AREAL_HOME` 环境变量覆盖）。`areal train` 有意保持无状态：它只是将 argv 传递给 Python
+`main(args)` driver。
 
 ## 训练 CLI（`areal train`）
 
-`areal train` 将 AReaL 训练 driver 函数与实验配置文件封装为一条命令。它并不管理训练进程的生命周期（不像 `areal inf` 会维护服务状态），只做「找到 driver、加载配置，并把 hydra 风格的覆盖参数透传下去」这件事。
+`areal train` 将 AReaL 训练 driver 函数与实验配置文件封装为一条命令。它并不管理训练进程的生命周期（不像 `areal inf`
+会维护服务状态），只做「找到 driver、加载配置，并把 hydra 风格的覆盖参数透传下去」这件事。
 
 ### 基础概念
 
-训练任务的最小执行单元是 **driver 函数** —— 通常是 `examples/` 下某个脚本中的
-`main(args: list[str])`。CLI 只做三件事：
+训练任务的最小执行单元是 **driver 函数** —— 通常是 `examples/` 下某个脚本中的 `main(args: list[str])`。CLI 只做三件事：
 
 1. 从 `module.path:func` 解析 driver。
 1. 将 `--config <path>` 解析为绝对路径并放在 argv 最前面。
 1. 将其余尾部参数原封不动追加到 argv（通常是 hydra 覆盖参数）。
 
-driver 函数的返回值会被用作退出码 —— 如果返回 `int` 则直接使用；其他情况（包括
-`None`）都视为 0。
+driver 函数的返回值会被用作退出码 —— 如果返回 `int` 则直接使用；其他情况（包括 `None`）都视为 0。
 
 ### 用法
 
@@ -36,14 +34,14 @@ areal train run \
   [<hydra-override-1> <hydra-override-2> ...]
 ```
 
-| flag / arg     | 是否必填 | 说明                                                                 |
-| -------------- | -------- | -------------------------------------------------------------------- |
-| `--config`     | 是       | 实验 YAML 路径；文件必须存在（CLI 会执行 `exists` 检查）             |
-| `--driver`     | 是       | driver 入口，形如 `module.path:func`（冒号分隔）                     |
-| 尾部位置参数   | 否       | 原样转发给 driver；通常是 hydra 风格的 `key=value` 覆盖参数          |
+| flag / arg   | 是否必填 | 说明                                                        |
+| ------------ | -------- | ----------------------------------------------------------- |
+| `--config`   | 是       | 实验 YAML 路径；文件必须存在（CLI 会执行 `exists` 检查）    |
+| `--driver`   | 是       | driver 入口，形如 `module.path:func`（冒号分隔）            |
+| 尾部位置参数 | 否       | 原样转发给 driver；通常是 hydra 风格的 `key=value` 覆盖参数 |
 
-`run_cmd` 启用了 `context_settings={"ignore_unknown_options": True}` —— 尾部位置参数
-**可以包含 `--xxx` 形式的选项**，CLI 不会去解析它们，原样转发给 driver。
+`run_cmd` 启用了 `context_settings={"ignore_unknown_options": True}` —— 尾部位置参数 **可以包含
+`--xxx` 形式的选项**，CLI 不会去解析它们，原样转发给 driver。
 
 ### 示例
 
@@ -76,9 +74,8 @@ def main(args: list[str]) -> int | None:
     return 0
 ```
 
-`load_expr_config` 位于 `areal.api.cli_args`，它自己消费 `args`：识别 `--config` 后面的
-YAML 路径，将剩余的 `key=value` 作为 hydra 覆盖合并进 config dataclass。也就是说，hydra
-解析是 **由 driver 完成**，而不是由 CLI 完成。
+`load_expr_config` 位于 `areal.api.cli_args`，它自己消费 `args`：识别 `--config` 后面的 YAML 路径，将剩余的
+`key=value` 作为 hydra 覆盖合并进 config dataclass。也就是说，hydra 解析是 **由 driver 完成**，而不是由 CLI 完成。
 
 编写新 driver 的最小模板：
 
@@ -120,14 +117,14 @@ CLI 不会校验这些 key 是否合法；driver 加载配置时 hydra 会报告
 
 ### 退出码
 
-| 场景                                     | 退出码                                     |
-| ---------------------------------------- | ------------------------------------------ |
-| driver 返回 `int`                        | 直接使用其返回值                           |
-| driver 返回 `None` / 其他                | 0                                          |
-| `--driver` 不包含 `:`                    | UsageError（click 默认 2）                 |
-| `--driver` 引用的模块无法导入            | ClickException（1）                        |
-| `--driver` 引用的函数不在模块上          | ClickException（1）                        |
-| `--config` 路径不存在                    | click 的 `exists=True` 捕获（2）           |
+| 场景                            | 退出码                           |
+| ------------------------------- | -------------------------------- |
+| driver 返回 `int`               | 直接使用其返回值                 |
+| driver 返回 `None` / 其他       | 0                                |
+| `--driver` 不包含 `:`           | UsageError（click 默认 2）       |
+| `--driver` 引用的模块无法导入   | ClickException（1）              |
+| `--driver` 引用的函数不在模块上 | ClickException（1）              |
+| `--config` 路径不存在           | click 的 `exists=True` 捕获（2） |
 
 driver 内部抛出的异常 **CLI 不做捕获** —— 走 Python 默认行为（打印 traceback、退出进程）。
 
@@ -170,7 +167,8 @@ areal inf run \
   --detach
 ```
 
-`--scheduler` 用于选择 worker / data-proxy 的调度后端。当前仅支持 `local`（也是默认值）。服务一旦启动，这个值就会固化到服务状态里 —— 后续的 `register` / `stop` / `status` 会从状态中读取，不必再传 `--scheduler`。
+`--scheduler` 用于选择 worker / data-proxy 的调度后端。当前仅支持 `local`（也是默认值）。服务一旦启动，这个值就会固化到服务状态里
+—— 后续的 `register` / `stop` / `status` 会从状态中读取，不必再传 `--scheduler`。
 
 列出本机已知的服务：
 
@@ -202,8 +200,8 @@ areal inf register \
   --proxy-args "--request-timeout 120 --chat-template-type hf"
 ```
 
-`--engine-args` 是一个 shell 风格字符串，原样转发给 sglang / vllm 的 worker 进程；
-`--proxy-args` 是 data-proxy 进程对应的参数。可用的 data-proxy 参数包括
+`--engine-args` 是一个 shell 风格字符串，原样转发给 sglang / vllm 的 worker 进程； `--proxy-args` 是
+data-proxy 进程对应的参数。可用的 data-proxy 参数包括
 `--request-timeout`、`--set-reward-finish-timeout`、`--tool-call-parser`、
 `--reasoning-parser`、`--engine-max-tokens`、`--chat-template-type {hf|concat}`。
 
@@ -308,8 +306,8 @@ proxy_args = "--request-timeout 120 --chat-template-type hf"
 
 ## Agent 服务 CLI（`areal agent`）
 
-`areal agent` 用于在本机启动一组 agent 服务进程（gateway / router + N 对 worker /
-data-proxy），供上层应用通过 HTTP 与 agent 交互。形态上与 `areal inf` 非常接近，但它服务的是 agent（有会话状态的多轮交互）而非无状态推理。
+`areal agent` 用于在本机启动一组 agent 服务进程（gateway / router + N 对 worker / data-proxy），供上层应用通过
+HTTP 与 agent 交互。形态上与 `areal inf` 非常接近，但它服务的是 agent（有会话状态的多轮交互）而非无状态推理。
 
 ### 基础概念
 
@@ -317,10 +315,9 @@ data-proxy），供上层应用通过 HTTP 与 agent 交互。形态上与 `area
 
 - `gateway`：对外暴露会话与 agent API，每个服务一个。
 - `router`：根据负载把请求路由到某个 data-proxy，每个服务一个。
-- `worker[i]`：真正跑用户 agent 代码的进程。agent 类通过 `--agent` 传入的
-  `module.path` 形式导入。
-- `data-proxy[i]`：位于 `worker[i]` 前面的会话管理 / 记账层。每个 worker 与一个 proxy
-  组成 **一对**。`--num-pairs` 控制副本数。
+- `worker[i]`：真正跑用户 agent 代码的进程。agent 类通过 `--agent` 传入的 `module.path` 形式导入。
+- `data-proxy[i]`：位于 `worker[i]` 前面的会话管理 / 记账层。每个 worker 与一个 proxy 组成
+  **一对**。`--num-pairs` 控制副本数。
 
 请求流：
 
@@ -373,8 +370,7 @@ areal agent ps --json
 areal agent status --service default
 ```
 
-输出包含 gateway、router，以及每对 worker + proxy。`--watch` 模式按间隔刷新（默认 2
-秒）：
+输出包含 gateway、router，以及每对 worker + proxy。`--watch` 模式按间隔刷新（默认 2 秒）：
 
 ```bash
 areal agent status --service default --watch --interval 1
@@ -458,8 +454,7 @@ drain_timeout = 30
 session_timeout = 1800
 ```
 
-优先级：**CLI 参数 > 通过 `--config` 传入的 TOML > `~/.areal/agent/config.toml` > 内置
-默认值**。
+优先级：**CLI 参数 > 通过 `--config` 传入的 TOML > `~/.areal/agent/config.toml` > 内置 默认值**。
 
 ### 尚未实现
 
