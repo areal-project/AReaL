@@ -271,9 +271,14 @@ class PPOActor:
         seqlens = attn_mask.sum(-1)
 
         ########## Logging code starts ##########
+        task_reward = (
+            data["original_rewards"].float()
+            if "original_rewards" in data
+            else reward_score.float()
+        )
         result_denominators = {
-            "correct_n_seqs": (reward_score > 0).bool(),
-            "incorrect_n_seqs": (reward_score <= 0).bool(),
+            "correct_n_seqs": (task_reward > 0).bool(),
+            "incorrect_n_seqs": (task_reward <= 0).bool(),
         }
         if self.config.log_agent_stats:
             if "begin_of_trajectory" not in data:
@@ -319,11 +324,6 @@ class PPOActor:
         has_gen = loss_mask_long.any(dim=-1)
         prompt_lens = torch.where(
             has_gen, first_gen_idx, data["attention_mask"].long().sum(-1)
-        )
-        task_reward = (
-            data["original_rewards"].float()
-            if "original_rewards" in data
-            else reward_score.float()
         )
         seq_stats = dict(
             no_eos_ratios=(seqlens == attn_mask.shape[-1]).float(),

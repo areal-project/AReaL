@@ -200,6 +200,8 @@ class TrainEngine(abc.ABC):
         workflow: WorkflowLike,
         workflow_kwargs: dict[str, Any] | None = None,
         group_size: int = 1,
+        reward_normalization: bool = False,
+        drop_incomplete_group: bool = False,
     ) -> list[dict[str, Any]]:
         """Submit a batch of requests and wait for results.
 
@@ -237,6 +239,8 @@ class TrainEngine(abc.ABC):
         should_accept_fn: Callable[[dict[str, Any]], bool] | str | None = None,
         group_size: int = 1,
         dynamic_bs: bool = False,
+        reward_normalization: bool = False,
+        drop_incomplete_group: bool = False,
     ) -> list[dict[str, Any]]:
         """Prepare a batch of data for training from a dataloader.
 
@@ -735,6 +739,8 @@ class InferenceEngine(abc.ABC):
         group_size: int = 1,
         task_id: int | None = None,
         is_eval: bool = False,
+        reward_normalization: bool = False,
+        drop_incomplete_group: bool = False,
     ) -> int:
         """Submit a request to the inference engine and return immediately.
 
@@ -838,6 +844,8 @@ class InferenceEngine(abc.ABC):
         workflow: WorkflowLike,
         workflow_kwargs: dict[str, Any] | None = None,
         group_size: int = 1,
+        reward_normalization: bool = False,
+        drop_incomplete_group: bool = False,
     ) -> list[dict[str, Any]]:
         """Submit a batch of requests to the inference engine and wait for the results.
 
@@ -883,6 +891,8 @@ class InferenceEngine(abc.ABC):
         should_accept_fn: Callable | None = None,
         group_size: int = 1,
         dynamic_bs: bool = False,
+        reward_normalization: bool = False,
+        drop_incomplete_group: bool = False,
     ) -> list[dict[str, Any]]:
         """Asynchronously submit and wait until a full batch is ready with controlled staleness.
 
