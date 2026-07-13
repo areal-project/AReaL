@@ -57,9 +57,9 @@ Check out [gsm8k_kpop.yaml](examples/math/gsm8k_kpop.yaml) and
 [gsm8k_icepop.yaml](examples/math/gsm8k_icepop.yaml) to get started!
 
 <details>
-<summary><b>[2026/04/23]</b> 🚀 Scaffoldings integration for agentic RL training</summary>
+<summary><b>📋 Previous Releases</b></summary>
 
-We’re excited to release our integration with
+**\[2026/04/23\]** 🚀 We’re excited to release our integration with
 [Scaffoldings](https://github.com/NVIDIA/TensorRT-LLM/tree/main/tensorrt_llm/scaffolding)
 for agentic RL training - now live in our
 [examples](https://github.com/areal-project/AReaL/tree/main/examples/scaffolding)! Huge
@@ -68,8 +68,6 @@ the Scaffoldings enables it to achieve a thorough decoupling of agent execution,
 calculation, and trajectory acquisition. This enables developers to reuse existing
 modules when implementing an agentic RL method, allowing them to focus on their own
 innovative modules.
-
-</details>
 
 **\[2026/04/18\]** We are thrilled to announce that **AReaL's first Community Biweekly
 Meeting** was successfully held! Thank you to everyone who joined us. Meeting materials
@@ -82,9 +80,6 @@ participate! See [Community](./assets/community/README.md) for more details.
 **\[2026/03/02\]** We provide [a complete example](./examples/openclaw/) to train your
 own 🦞 OpenClaw agent by simply replacing the `base_url` and `api_key` with AReaL's RL
 service - no complicated dependencies, no code changes, works with any agentic runtime!
-
-<details>
-<summary><b>📋 Previous Releases</b></summary>
 
 **\[2026/02/06\]** We are delighted to introduce **AReaL-SEA**, a self-evolving data
 synthesis engine. Combined with RL training on AReaL, the 235B MoE model surpasses GPT 5
@@ -189,8 +184,8 @@ For comprehensive setup instructions, see
 | Task                                                     | Description                                                            | Performance                                                                  |
 | -------------------------------------------------------- | ---------------------------------------------------------------------- | ---------------------------------------------------------------------------- |
 | **[General Agent](examples/agent_workflow/)**            | General agentic training with any agentic frameworks                   | [Guide](docs/tutorial/agentic_rl.md)                                         |
-| **[Hermes Online RL (v2.0)](examples/hermes/)**          | End-to-end Online RL loop with Hermes agent under AReaL 2.0            | [Guide](examples/hermes/README.md)                                     |
-| **[SWE Agent RL (v2.0)](examples/swe/)**                 | End-to-end coding-agent RL training with AReaL-SWEAgent                | [Guide](examples/swe/README.md)                                              |
+| **[Hermes Online RL](examples/hermes/)**                 | End-to-end Online RL loop with Hermes agent under AReaL 2.0            | [Guide](examples/hermes/README.md)                                     |
+| **[Coding Agent RL](examples/swe/)**                     | End-to-end coding-agent RL training with AReaL-SWEAgent/Claude Code Agent | [Guide](examples/swe/README.md)                                           |
 | **[Tau2 Customer Service](examples/tau2/)**              | Customer service agent on Tau2-Bench (retail, airline, telecom)        | [Paper](https://arxiv.org/abs/2601.22607)                                    |
 | **[Search Agent](examples/search_agent/)**               | End-to-end search agent with Tongyi-DeepResearch workflow              | [Training Curve](examples/search_agent/tongyi_deepresearch/reward_curve.png) |
 | **[Tool-Integrated Reasoning](examples/tir/)**           | Multi-turn tool calling during reasoning (Python executor, calculator) | [Training Curve](examples/tir/figures/task_reward.png)                       |
@@ -272,7 +267,7 @@ Check the [AI Coding Assistant Guide](docs/reference/ai_assisted_dev.md) and
 
 - [Installation](docs/en/tutorial/installation.md)
 - [Quickstart](docs/en/tutorial/quickstart.md)
-- [CLI Configurations](docs/en/cli_reference.md)
+- [AReaL CLI Guide](docs/en/best_practices/cli_guide.md)
 - [Agentic RL](docs/en/tutorial/agentic_rl.md)
 - [Evaluation](docs/en/tutorial/eval.md)
 - [Large MoE with Megatron](docs/en/tutorial/megatron.md)
@@ -351,7 +346,7 @@ git push
 
 - **[Full Roadmap](ROADMAP.md)**
 - **[2026 H2 Roadmap](https://github.com/areal-project/AReaL/issues/1381)**
-- **[2026 Q1 Roadmap](https://github.com/areal-project/AReaL/issues/907)**
+- **[2026 Q2 Roadmap](https://github.com/areal-project/AReaL/issues/1302)**
 
 AReaL is under active development with planned minor releases weekly and major releases
 monthly. We warmly welcome community engagement and contributions. We are also
