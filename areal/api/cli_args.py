@@ -3188,16 +3188,22 @@ class PPOConfig(BaseExperimentConfig):
         # the engine config. Single source of truth: gconfig.lora_name.
         if self.rollout.use_lora and not self.rollout.lora_name:
             self.rollout.lora_name = self.gconfig.lora_name
+        # NOTE: eval_gconfig is currently only consumed for its n_samples field
+        # (areal/trainer/rl_trainer.py); no stock eval workflow builds a request from
+        # eval_gconfig's other fields, so eval_gconfig.sampling_seed does not reach
+        # SGLang either way. Checked here anyway so this warning stays correct if that
+        # changes, but do not read "no warning" as "eval_gconfig.sampling_seed works."
         if (
             self.gconfig.sampling_seed is not None
-            and not self.sglang.enable_deterministic_inference
-        ):
+            or self.eval_gconfig.sampling_seed is not None
+        ) and not self.sglang.enable_deterministic_inference:
             warnings.warn(
-                "gconfig.sampling_seed is set but sglang.enable_deterministic_inference "
-                "is False: SGLang silently ignores per-request sampling_seed unless the "
-                "server is launched with --enable-deterministic-inference. Rollouts will "
-                "not be seeded as expected. (Not applicable if you're launching SGLang "
-                "servers yourself outside this config, or using the vLLM backend, which "
+                "gconfig.sampling_seed or eval_gconfig.sampling_seed is set but "
+                "sglang.enable_deterministic_inference is False: SGLang silently "
+                "ignores per-request sampling_seed unless the server is launched "
+                "with --enable-deterministic-inference. Rollouts will not be seeded "
+                "as expected. (Not applicable if you're launching SGLang servers "
+                "yourself outside this config, or using the vLLM backend, which "
                 "rejects sampling_seed outright.)",
                 UserWarning,
                 stacklevel=2,
