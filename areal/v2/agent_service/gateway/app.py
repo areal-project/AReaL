@@ -61,10 +61,13 @@ def create_gateway_app(config: GatewayConfig) -> FastAPI:
     app = FastAPI(title="AReaL Agent Gateway")
     http_client = httpx.AsyncClient(timeout=config.forward_timeout)
     _admin_headers = admin_headers(config.admin_api_key)
-    _memory_control_headers = (
+    _data_proxy_control_headers = (
         admin_headers(config.memory_control_api_key)
-        if config.memory_control_enabled
+        if config.memory_control_api_key
         else {}
+    )
+    _memory_control_headers = (
+        _data_proxy_control_headers if config.memory_control_enabled else {}
     )
     _admin = make_admin_dependency(config.admin_api_key)
 
@@ -144,13 +147,15 @@ def create_gateway_app(config: GatewayConfig) -> FastAPI:
         resp = await http_client.post(
             f"{data_proxy_addr}/sessions/close",
             json={"session_key": session_key},
+            headers=_data_proxy_control_headers or None,
         )
         if resp.status_code in {404, 405}:
             # During a rolling upgrade an older DataProxy may expose only the
             # path-shaped close route.  The shared validator makes this exact
             # key safe as one segment; never downgrade on auth or close errors.
             resp = await http_client.post(
-                f"{data_proxy_addr}/session/{session_key}/close"
+                f"{data_proxy_addr}/session/{session_key}/close",
+                headers=_data_proxy_control_headers or None,
             )
         if not 200 <= resp.status_code < 300:
             try:

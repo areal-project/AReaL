@@ -65,6 +65,18 @@ cannot be enabled on a DataProxy in that mode. Internal-hop authentication verif
 possession of the pair key; it is **not** a principal/session grant for any
 `MemoryScope`.
 
+When a DataProxy has a Memory-control key, both its fixed and deprecated session-close
+routes require that key before session-key validation or state lookup. Close destroys
+the incarnation's history and Memory pin, so accepting it from an unauthenticated caller
+would let that caller reset a privileged lifecycle. The public Gateway close route still
+authenticates the external admin key, then replaces it with the dedicated Memory-control
+credential for Gateway→DataProxy; it never forwards the external credential. A
+configured `DataProxyClient` follows the same rule on fixed and legacy close routes.
+DataProxies with Memory control disabled retain anonymous close for standalone
+compatibility. During a rolling upgrade, upgrade these callers before enabling close
+authentication on the DataProxy; an old caller receives `401` from a new Memory-capable
+DataProxy rather than silently weakening the boundary.
+
 The Controller currently supplies pair keys through child-process arguments. This
 protects against unauthenticated network callers and accidental cross-pair routing, not
 arbitrary code running under the same OS identity: such a process may inspect sibling

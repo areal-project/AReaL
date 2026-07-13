@@ -631,6 +631,19 @@ def create_data_proxy_app(config: DataProxyConfig) -> FastAPI:
             if not lease_transferred:
                 await _finish_response(resp, session)
 
+    async def _authorize_session_close(request: Request) -> None:
+        if config.memory_control_api_key:
+            # Close destroys the session's pin and lifecycle state, so it
+            # belongs to the same Gateway→DataProxy trust boundary as a
+            # privileged Memory turn.  Authenticate before key validation or
+            # lookup so unauthorized callers cannot use close as a state
+            # oracle.  Standalone deployments retain anonymous close when
+            # Memory transport is disabled.
+            await verify_admin_key(
+                request.headers.get("Authorization", ""),
+                expected_key=config.memory_control_api_key,
+            )
+
     async def _close_session(session_key: object):
         session_key = _validate_session_key(session_key)
         task = await _begin_session_close(session_key, idle_only=False)
@@ -646,15 +659,17 @@ def create_data_proxy_app(config: DataProxyConfig) -> FastAPI:
         return {"status": "ok"}
 
     @app.post("/sessions/close")
-    async def close_session(body: dict[str, Any]):
+    async def close_session(request: Request, body: dict[str, Any]):
         """Close a session without interpreting its identity as URL syntax."""
 
+        await _authorize_session_close(request)
         return await _close_session(body.get("session_key"))
 
     @app.post("/session/{session_key}/close", deprecated=True)
-    async def close_session_legacy(session_key: str):
+    async def close_session_legacy(session_key: str, request: Request):
         """Compatibility route; internal callers use ``/sessions/close``."""
 
+        await _authorize_session_close(request)
         return await _close_session(session_key)
 
     @app.get("/session/{session_key}/history")

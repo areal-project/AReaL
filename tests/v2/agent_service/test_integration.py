@@ -964,6 +964,164 @@ class TestGatewayCloseSession:
         ]
 
     @pytest.mark.asyncio
+    async def test_controlled_close_uses_internal_auth_on_both_proxy_routes(self):
+        external_key = "test-external-admin-key"
+        memory_control_key = "test-memory-control-hop-key"
+        app = create_gateway_app(
+            GatewayConfig(
+                router_addr="http://fake-router",
+                admin_api_key=external_key,
+                memory_control_api_key=memory_control_key,
+            )
+        )
+        transport = httpx.ASGITransport(app=app)
+        close_calls: list[tuple[str, str | None]] = []
+        original_post = httpx.AsyncClient.post
+
+        async def patched_post(self, url, **kwargs):
+            url = str(url)
+            if url == "http://fake-router/route":
+                assert kwargs["headers"] == admin_headers(external_key)
+                return httpx.Response(
+                    200,
+                    json={"data_proxy_addr": "http://old-proxy"},
+                    request=httpx.Request("POST", url),
+                )
+            if url == "http://old-proxy/sessions/close":
+                close_calls.append((url, kwargs["headers"].get("Authorization")))
+                return httpx.Response(
+                    404,
+                    json={"detail": "Not Found"},
+                    request=httpx.Request("POST", url),
+                )
+            if url == "http://old-proxy/session/chat:model:user/close":
+                close_calls.append((url, kwargs["headers"].get("Authorization")))
+                return httpx.Response(
+                    200,
+                    json={"status": "ok"},
+                    request=httpx.Request("POST", url),
+                )
+            return await original_post(self, url, **kwargs)
+
+        with patch.object(httpx.AsyncClient, "post", patched_post):
+            async with httpx.AsyncClient(
+                transport=transport,
+                base_url="http://gw",
+            ) as client:
+                response = await client.post(
+                    "/sessions/close",
+                    json={"session_key": "chat:model:user"},
+                    headers=admin_headers(external_key),
+                )
+
+        assert response.status_code == 200
+        assert close_calls == [
+            (
+                "http://old-proxy/sessions/close",
+                f"Bearer {memory_control_key}",
+            ),
+            (
+                "http://old-proxy/session/chat:model:user/close",
+                f"Bearer {memory_control_key}",
+            ),
+        ]
+        assert all(
+            authorization != f"Bearer {external_key}"
+            for _, authorization in close_calls
+        )
+
+    @pytest.mark.asyncio
+    async def test_close_uses_internal_auth_when_memory_turns_are_disabled(self):
+        memory_control_key = "test-memory-control-hop-key"
+        config = GatewayConfig(
+            router_addr="http://fake-router",
+            memory_control_api_key=memory_control_key,
+        )
+        assert config.memory_control_enabled is False
+        app = create_gateway_app(config)
+        transport = httpx.ASGITransport(app=app)
+        forwarded_authorization: list[str | None] = []
+        original_post = httpx.AsyncClient.post
+
+        async def patched_post(self, url, **kwargs):
+            url = str(url)
+            if url == "http://fake-router/route":
+                return httpx.Response(
+                    200,
+                    json={"data_proxy_addr": "http://proxy1"},
+                    request=httpx.Request("POST", url),
+                )
+            if url == "http://proxy1/sessions/close":
+                forwarded_authorization.append(kwargs["headers"].get("Authorization"))
+                return httpx.Response(
+                    200,
+                    json={"status": "ok"},
+                    request=httpx.Request("POST", url),
+                )
+            return await original_post(self, url, **kwargs)
+
+        with patch.object(httpx.AsyncClient, "post", patched_post):
+            async with httpx.AsyncClient(
+                transport=transport,
+                base_url="http://gw",
+            ) as client:
+                response = await client.post(
+                    "/sessions/close",
+                    json={"session_key": "s1"},
+                    headers=_AUTH,
+                )
+
+        assert response.status_code == 200
+        assert forwarded_authorization == [f"Bearer {memory_control_key}"]
+
+    @pytest.mark.asyncio
+    async def test_controlled_close_does_not_fallback_on_auth_failure(self):
+        external_key = "test-external-admin-key"
+        memory_control_key = "test-memory-control-hop-key"
+        app = create_gateway_app(
+            GatewayConfig(
+                router_addr="http://fake-router",
+                admin_api_key=external_key,
+                memory_control_api_key=memory_control_key,
+            )
+        )
+        transport = httpx.ASGITransport(app=app)
+        proxy_paths: list[str] = []
+        original_post = httpx.AsyncClient.post
+
+        async def patched_post(self, url, **kwargs):
+            url = str(url)
+            if url == "http://fake-router/route":
+                return httpx.Response(
+                    200,
+                    json={"data_proxy_addr": "http://proxy1"},
+                    request=httpx.Request("POST", url),
+                )
+            if url.startswith("http://proxy1/"):
+                proxy_paths.append(httpx.URL(url).path)
+                return httpx.Response(
+                    401,
+                    json={"detail": "Invalid admin key"},
+                    request=httpx.Request("POST", url),
+                )
+            return await original_post(self, url, **kwargs)
+
+        with patch.object(httpx.AsyncClient, "post", patched_post):
+            async with httpx.AsyncClient(
+                transport=transport,
+                base_url="http://gw",
+            ) as client:
+                response = await client.post(
+                    "/sessions/close",
+                    json={"session_key": "s1"},
+                    headers=admin_headers(external_key),
+                )
+
+        assert response.status_code == 401
+        assert response.json() == {"detail": "Invalid admin key"}
+        assert proxy_paths == ["/sessions/close"]
+
+    @pytest.mark.asyncio
     async def test_close_requires_admin_key(self):
         app = create_gateway_app(GatewayConfig(router_addr="http://fake-router"))
         transport = httpx.ASGITransport(app=app)

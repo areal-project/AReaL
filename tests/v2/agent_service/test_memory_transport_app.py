@@ -677,6 +677,38 @@ async def test_data_proxy_client_can_close_on_old_proxy_during_upgrade() -> None
 
 
 @pytest.mark.asyncio
+async def test_controlled_data_proxy_client_authenticates_both_close_routes() -> None:
+    forwarded = []
+
+    def handler(request):
+        forwarded.append(request)
+        if request.url.path == "/sessions/close":
+            return httpx.Response(404, request=request)
+        if request.url.path == "/session/chat:model:user/close":
+            return httpx.Response(200, json={"status": "ok"}, request=request)
+        raise AssertionError(f"unexpected request: {request.url}")
+
+    client = data_proxy_client.DataProxyClient(
+        "http://proxy",
+        memory_control_api_key=_MEMORY_CONTROL_API_KEY,
+    )
+    await client._http.aclose()
+    client._http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    try:
+        await client.close_session("chat:model:user")
+    finally:
+        await client.close()
+
+    assert [request.url.path for request in forwarded] == [
+        "/sessions/close",
+        "/session/chat:model:user/close",
+    ]
+    assert {request.headers["Authorization"] for request in forwarded} == {
+        _MEMORY_CONTROL_HEADERS["Authorization"]
+    }
+
+
+@pytest.mark.asyncio
 async def test_conflicting_pin_and_reserved_metadata_fail_before_worker() -> None:
     worker_bodies: list[dict] = []
     worker_closes: list[str] = []
@@ -827,6 +859,123 @@ async def test_close_clears_pin_and_allows_new_incarnation() -> None:
 
 
 @pytest.mark.asyncio
+async def test_memory_capable_data_proxy_authenticates_close_before_state_oracle() -> (
+    None
+):
+    worker_bodies: list[dict] = []
+    worker_closes: list[str] = []
+    app = _proxy_app()
+    transport = httpx.ASGITransport(app=app)
+    with patch.object(
+        httpx.AsyncClient,
+        "send",
+        _patched_worker_send(worker_bodies, worker_closes),
+    ):
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://proxy",
+        ) as client:
+            ordinary = await client.post(
+                "/session/ordinary/turn",
+                json={"message": "ordinary"},
+            )
+            memory = await client.post(
+                "/session/memory/turn",
+                headers=_MEMORY_CONTROL_HEADERS,
+                json=_authorized(
+                    {"message": "memory", MEMORY_ASSIGNMENT_PIN_FIELD: _wire("a")}
+                ),
+            )
+
+            denied = [
+                await client.post(
+                    "/sessions/close",
+                    json={"session_key": "unknown"},
+                ),
+                await client.post(
+                    "/session/ordinary/close",
+                    headers=admin_headers("wrong-memory-control-key"),
+                ),
+                await client.post(
+                    "/sessions/close",
+                    headers=admin_headers(_EXTERNAL_ADMIN_API_KEY),
+                    json={"session_key": "memory"},
+                ),
+                await client.post(
+                    "/sessions/close",
+                    json={"session_key": "s%252Fb"},
+                ),
+            ]
+
+            ordinary_retry = await client.post(
+                "/session/ordinary/turn",
+                json={"message": "still ordinary"},
+            )
+            memory_retry = await client.post(
+                "/session/memory/turn",
+                headers=_MEMORY_CONTROL_HEADERS,
+                json=_authorized({"message": "same pin"}),
+            )
+            authorized_close = await client.post(
+                "/sessions/close",
+                headers=_MEMORY_CONTROL_HEADERS,
+                json={"session_key": "memory"},
+            )
+            replacement = await client.post(
+                "/session/memory/turn",
+                json={"message": "new ordinary incarnation"},
+            )
+            authorized_legacy_close = await client.post(
+                "/session/ordinary/close",
+                headers=_MEMORY_CONTROL_HEADERS,
+            )
+
+    assert ordinary.status_code == memory.status_code == 200
+    assert [response.status_code for response in denied] == [401, 401, 401, 401]
+    assert ordinary_retry.status_code == memory_retry.status_code == 200
+    assert authorized_close.status_code == replacement.status_code == 200
+    assert authorized_legacy_close.status_code == 200
+    assert worker_closes == ["memory", "ordinary"]
+    assert app.state.memory_pin_cache.resolve("memory") is None
+
+
+@pytest.mark.asyncio
+async def test_standalone_data_proxy_preserves_anonymous_close_compatibility() -> None:
+    worker_bodies: list[dict] = []
+    worker_closes: list[str] = []
+    app = data_proxy_app.create_data_proxy_app(
+        data_proxy_config.DataProxyConfig(worker_addr="http://worker")
+    )
+    transport = httpx.ASGITransport(app=app)
+    with patch.object(
+        httpx.AsyncClient,
+        "send",
+        _patched_worker_send(worker_bodies, worker_closes),
+    ):
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://proxy",
+        ) as client:
+            first = await client.post(
+                "/session/s1/turn",
+                json={"message": "first"},
+            )
+            fixed_close = await client.post(
+                "/sessions/close",
+                json={"session_key": "s1"},
+            )
+            replacement = await client.post(
+                "/session/s1/turn",
+                json={"message": "replacement"},
+            )
+            legacy_close = await client.post("/session/s1/close")
+
+    assert first.status_code == fixed_close.status_code == 200
+    assert replacement.status_code == legacy_close.status_code == 200
+    assert worker_closes == ["s1", "s1"]
+
+
+@pytest.mark.asyncio
 async def test_canonical_session_identity_is_exact_at_worker_run_and_close() -> None:
     worker_bodies: list[dict] = []
     worker_closes: list[str] = []
@@ -840,6 +989,7 @@ async def test_canonical_session_identity_is_exact_at_worker_run_and_close() -> 
         async with httpx.AsyncClient(
             transport=transport,
             base_url="http://proxy",
+            headers=_MEMORY_CONTROL_HEADERS,
         ) as client:
             turn = await client.post(
                 "/session/chat:model:user/turn",
@@ -889,6 +1039,7 @@ async def test_new_data_proxy_can_close_session_on_old_worker_during_upgrade() -
         async with httpx.AsyncClient(
             transport=transport,
             base_url="http://proxy",
+            headers=_MEMORY_CONTROL_HEADERS,
         ) as client:
             first = await client.post(
                 "/session/chat:model:user/turn",
@@ -1103,6 +1254,7 @@ async def test_fixed_close_rejects_ambiguous_key_before_tombstone_or_worker() ->
         async with httpx.AsyncClient(
             transport=transport,
             base_url="http://proxy",
+            headers=_MEMORY_CONTROL_HEADERS,
         ) as client:
             rejected = await client.post(
                 "/sessions/close",
@@ -1285,7 +1437,7 @@ async def test_stream_body_holds_turn_lease_until_iterator_finishes() -> None:
             _authorized({"message": "stream", MEMORY_ASSIGNMENT_PIN_FIELD: _wire("a")}),
             _internal_request(),
         )
-        close_task = asyncio.create_task(close_endpoint("s1"))
+        close_task = asyncio.create_task(close_endpoint("s1", _internal_request()))
         await asyncio.sleep(0)
         assert worker_closes == []
 
@@ -1351,9 +1503,9 @@ async def test_stream_close_before_first_byte_releases_turn_lease() -> None:
         )
         await response.body_iterator.aclose()
         await asyncio.wait_for(upstream_closed.wait(), timeout=1)
-        assert await asyncio.wait_for(close_endpoint("s1"), timeout=1) == {
-            "status": "ok"
-        }
+        assert await asyncio.wait_for(
+            close_endpoint("s1", _internal_request()), timeout=1
+        ) == {"status": "ok"}
 
     assert worker_closes == ["s1"]
 
@@ -1410,9 +1562,9 @@ async def test_stream_close_failure_cannot_leak_turn_lease() -> None:
         with pytest.raises(RuntimeError, match="injected upstream close failure"):
             await iterator.aclose()
 
-        assert await asyncio.wait_for(close_endpoint("s1"), timeout=1) == {
-            "status": "ok"
-        }
+        assert await asyncio.wait_for(
+            close_endpoint("s1", _internal_request()), timeout=1
+        ) == {"status": "ok"}
 
     assert worker_closes == ["s1"]
 

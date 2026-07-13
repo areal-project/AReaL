@@ -86,9 +86,13 @@ class DataProxyClient:
         resp = await self._http.post(
             f"{self._addr}/sessions/close",
             json={"session_key": session_key},
+            headers=self._memory_control_headers or None,
         )
         if resp.status_code in {404, 405}:
-            resp = await self._http.post(f"{self._addr}/session/{session_key}/close")
+            resp = await self._http.post(
+                f"{self._addr}/session/{session_key}/close",
+                headers=self._memory_control_headers or None,
+            )
         resp.raise_for_status()
 
     async def get_history(self, session_key: str) -> list[dict[str, Any]]:
