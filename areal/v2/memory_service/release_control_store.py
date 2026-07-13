@@ -839,10 +839,7 @@ class InMemoryMemoryReleaseControlStore:
             or value.assignment_id != f"masn_{content_hash[:24]}"
             or (expected_id is not None and value.assignment_id != expected_id)
             or (expected_hash is not None and value.content_hash != expected_hash)
-            or (
-                expected_group is not None
-                and value.rollout_group_id != expected_group
-            )
+            or (expected_group is not None and value.rollout_group_id != expected_group)
         ):
             raise MemoryReleaseAssignmentConflictError(
                 "stored assignment failed integrity validation"
@@ -885,15 +882,12 @@ class InMemoryMemoryReleaseControlStore:
         )
         try:
             with self._lock:
-                existing = self._attestation_by_idempotency.get(
-                    idempotency_address
-                )
+                existing = self._attestation_by_idempotency.get(idempotency_address)
                 if existing is not None:
                     existing = self._validate_attestation(scope, existing)
                     if (
                         existing.release_id == release_id
-                        and existing.release_content_sha256
-                        == release_content_sha256
+                        and existing.release_content_sha256 == release_content_sha256
                     ):
                         return existing
                     raise MemoryReleaseAttestationConflictError(
@@ -951,9 +945,7 @@ class InMemoryMemoryReleaseControlStore:
                 )
             release_address = (scope, release_id)
             with self._lock:
-                existing = self._attestation_by_idempotency.get(
-                    idempotency_address
-                )
+                existing = self._attestation_by_idempotency.get(idempotency_address)
                 if existing is not None:
                     raise MemoryReleaseAttestationConflictError(
                         "attestation appeared during policy evaluation"
@@ -996,7 +988,10 @@ class InMemoryMemoryReleaseControlStore:
                     release_address,
                     (),
                 )
-                if any(item.attestation_id == stored.attestation_id for item in release_values):
+                if any(
+                    item.attestation_id == stored.attestation_id
+                    for item in release_values
+                ):
                     raise MemoryReleaseAttestationConflictError(
                         "release-attestation index already contains the record"
                     )
@@ -1291,10 +1286,8 @@ class InMemoryMemoryReleaseControlStore:
             and value.task_policy_version_sha256 == task_policy_version_sha256
             and value.task_policy_config_sha256 == task_policy_config_sha256
             and value.retrieval_policy_id == retrieval_policy_id
-            and value.retrieval_policy_version_sha256
-            == retrieval_policy_version_sha256
-            and value.retrieval_policy_config_sha256
-            == retrieval_policy_config_sha256
+            and value.retrieval_policy_version_sha256 == retrieval_policy_version_sha256
+            and value.retrieval_policy_config_sha256 == retrieval_policy_config_sha256
             and value.renderer_id == renderer_id
             and value.renderer_version_sha256 == renderer_version_sha256
             and value.renderer_config_sha256 == renderer_config_sha256
@@ -1474,9 +1467,7 @@ class InMemoryMemoryReleaseControlStore:
                     expected_hash=attestation_content_sha256,
                 )
                 if self._revocation_by_attestation.get(attestation_address) is not None:
-                    raise MemoryReleaseAssignmentConflictError(
-                        "attestation is revoked"
-                    )
+                    raise MemoryReleaseAssignmentConflictError("attestation is revoked")
 
             before = self._load_release_graph(
                 scope,
@@ -1506,9 +1497,7 @@ class InMemoryMemoryReleaseControlStore:
                     "retrieval_policy_version_sha256": (
                         retrieval_policy_version_sha256
                     ),
-                    "retrieval_policy_config_sha256": (
-                        retrieval_policy_config_sha256
-                    ),
+                    "retrieval_policy_config_sha256": (retrieval_policy_config_sha256),
                     "renderer_id": renderer_id,
                     "renderer_version_sha256": renderer_version_sha256,
                     "renderer_config_sha256": renderer_config_sha256,
@@ -1574,10 +1563,7 @@ class InMemoryMemoryReleaseControlStore:
                     raise MemoryReleaseAssignmentConflictError(
                         "rollout group was bound during assignment"
                     )
-                if (
-                    self._assignment_by_incarnation.get(incarnation_address)
-                    is not None
-                ):
+                if self._assignment_by_incarnation.get(incarnation_address) is not None:
                     raise MemoryReleaseAssignmentConflictError(
                         "rollout group incarnation was bound during assignment"
                     )
@@ -1592,17 +1578,13 @@ class InMemoryMemoryReleaseControlStore:
                     MemoryReleaseAssignmentConflictError,
                 )
                 if not (
-                    attestation.valid_from
-                    <= assigned_at
-                    < attestation.valid_until
+                    attestation.valid_from <= assigned_at < attestation.valid_until
                 ):
                     raise MemoryReleaseAssignmentConflictError(
                         "attestation is not valid at assignment commit time"
                     )
                 if not (
-                    assigned_at
-                    < assignment_valid_until
-                    <= attestation.valid_until
+                    assigned_at < assignment_valid_until <= attestation.valid_until
                 ):
                     raise MemoryReleaseAssignmentConflictError(
                         "assignment expiry must follow commit and not exceed attestation"
@@ -1610,9 +1592,7 @@ class InMemoryMemoryReleaseControlStore:
                 assignment = MemoryReleaseAssignmentV1.create(
                     scope=scope,
                     rollout_group_id=rollout_group_id,
-                    rollout_group_incarnation_sha256=(
-                        rollout_group_incarnation_sha256
-                    ),
+                    rollout_group_incarnation_sha256=(rollout_group_incarnation_sha256),
                     attestation_id=attestation_id,
                     attestation_content_sha256=attestation_content_sha256,
                     release_id=attestation.release_id,
@@ -1629,12 +1609,8 @@ class InMemoryMemoryReleaseControlStore:
                     task_policy_version_sha256=task_policy_version_sha256,
                     task_policy_config_sha256=task_policy_config_sha256,
                     retrieval_policy_id=retrieval_policy_id,
-                    retrieval_policy_version_sha256=(
-                        retrieval_policy_version_sha256
-                    ),
-                    retrieval_policy_config_sha256=(
-                        retrieval_policy_config_sha256
-                    ),
+                    retrieval_policy_version_sha256=(retrieval_policy_version_sha256),
+                    retrieval_policy_config_sha256=(retrieval_policy_config_sha256),
                     renderer_id=renderer_id,
                     renderer_version_sha256=renderer_version_sha256,
                     renderer_config_sha256=renderer_config_sha256,
@@ -1792,8 +1768,7 @@ class InMemoryMemoryReleaseControlStore:
                 assignment.release_id != attestation.release_id
                 or assignment.release_content_sha256
                 != attestation.release_content_sha256
-                or assignment.release_graph_sha256
-                != attestation.release_graph_sha256
+                or assignment.release_graph_sha256 != attestation.release_graph_sha256
             ):
                 raise MemoryReleaseAssignmentConflictError(
                     "assignment release binding disagrees with its attestation"
@@ -1829,9 +1804,7 @@ class InMemoryMemoryReleaseControlStore:
                 raise MemoryReleaseAssignmentConflictError(
                     "group incarnation binding changed during active resolution"
                 )
-            current_attestation = self._attestation_by_address.get(
-                attestation_address
-            )
+            current_attestation = self._attestation_by_address.get(attestation_address)
             if current_attestation is not attestation:
                 raise MemoryReleaseAssignmentConflictError(
                     "attestation changed during active resolution"
@@ -1842,9 +1815,9 @@ class InMemoryMemoryReleaseControlStore:
                 )
             now = self._now(MemoryReleaseAssignmentConflictError)
             if not (
-                attestation.valid_from
+                attestation.valid_from <= now
+                and assignment.assigned_at
                 <= now
-                and assignment.assigned_at <= now
                 < assignment.assignment_valid_until
                 <= attestation.valid_until
             ):

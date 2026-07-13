@@ -239,7 +239,9 @@ def test_store_creates_exact_control_records_without_mutating_release() -> None:
     assert release_store.list_releases(scope) == before == (release,)
 
 
-def test_constructor_selects_one_trusted_component_and_callers_cannot_override() -> None:
+def test_constructor_selects_one_trusted_component_and_callers_cannot_override() -> (
+    None
+):
     signature = inspect.signature(InMemoryMemoryReleaseControlStore)
     assert {"attestor", "revoker", "assignment_policy"} <= set(signature.parameters)
     assert "attestors" not in signature.parameters
@@ -307,7 +309,9 @@ def test_component_declaration_mutation_fails_closed(
     component = {"attest": attestor, "revoke": revoker, "assign": policy}[operation]
     if operation != "attest":
         attestation = _attest(control, scope, release)
-    setattr(component, attribute, "changed" if attribute.endswith("_id") else _OTHER_HASH)
+    setattr(
+        component, attribute, "changed" if attribute.endswith("_id") else _OTHER_HASH
+    )
     error = {
         "attest": MemoryReleaseAttestationConflictError,
         "revoke": MemoryReleaseRevocationConflictError,
@@ -385,6 +389,7 @@ def test_component_property_getter_never_runs_under_store_lock() -> None:
         def attestor_config_sha256(self):
             self.reads += 1
             if self.reads == 4:
+
                 def mutate_from_child():
                     try:
                         self.control.revoke_attestation(
@@ -666,9 +671,7 @@ def test_group_and_incarnation_are_independent_one_to_one_indexes() -> None:
             idempotency_key="same-group-alias",
         )
     assert (scope, _OTHER_HASH) not in control._assignment_by_incarnation
-    assert control._assignment_by_incarnation[
-        (scope, _GROUP_INCARNATION)
-    ] is assignment
+    assert control._assignment_by_incarnation[(scope, _GROUP_INCARNATION)] is assignment
 
 
 def test_concurrent_group_compare_and_set_publishes_only_one_request() -> None:
@@ -942,7 +945,12 @@ def test_context_guard_rejects_same_thread_cross_store_reentry() -> None:
     )
     with pytest.raises(MemoryReleaseAttestationConflictError, match="reentry"):
         _attest(control, scope, release)
-    assert other.list_release_attestations(other_release.manifest.scope, other_release.release_id) == ()
+    assert (
+        other.list_release_attestations(
+            other_release.manifest.scope, other_release.release_id
+        )
+        == ()
+    )
 
 
 def test_global_guard_rejects_cross_thread_cross_store_reentry() -> None:
@@ -981,10 +989,13 @@ def test_global_guard_rejects_cross_thread_cross_store_reentry() -> None:
     assert len(child_errors) == 1
     assert isinstance(child_errors[0], MemoryReleaseAttestationConflictError)
     assert control.list_release_attestations(scope, release.release_id) == ()
-    assert other.list_release_attestations(
-        other_scope,
-        other_release.release_id,
-    ) == ()
+    assert (
+        other.list_release_attestations(
+            other_scope,
+            other_release.release_id,
+        )
+        == ()
+    )
 
 
 def test_condition_interrupt_cannot_leak_module_global_callback_guard() -> None:
