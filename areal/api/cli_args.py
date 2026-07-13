@@ -3188,6 +3188,25 @@ class PPOConfig(BaseExperimentConfig):
         # the engine config. Single source of truth: gconfig.lora_name.
         if self.rollout.use_lora and not self.rollout.lora_name:
             self.rollout.lora_name = self.gconfig.lora_name
+        # vLLM has no sampling_seed support (both VLLMBackend and VLLMBridgeBackend
+        # raise NotImplementedError on the first request); fail here instead, before
+        # any server launch or model load wastes time on an unsupported config.
+        # rollout.backend is the current per-engine field (e.g. "vllm:d2t4"),
+        # confirmed authoritative via RolloutController.__init__ parsing
+        # config.backend; not Optional but guarded the same way as self.sglang below.
+        rollout_backend = self.rollout.backend if self.rollout is not None else None
+        if (
+            isinstance(rollout_backend, str)
+            and rollout_backend.split(":")[0] == "vllm"
+            and (
+                self.gconfig.sampling_seed is not None
+                or self.eval_gconfig.sampling_seed is not None
+            )
+        ):
+            raise ValueError(
+                "gconfig.sampling_seed or eval_gconfig.sampling_seed is set, but "
+                "rollout.backend is vLLM, which does not support sampling_seed."
+            )
         # NOTE: eval_gconfig is currently only consumed for its n_samples field
         # (areal/trainer/rl_trainer.py); no stock eval workflow builds a request from
         # eval_gconfig's other fields, so eval_gconfig.sampling_seed does not reach
