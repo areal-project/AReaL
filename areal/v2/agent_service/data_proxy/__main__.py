@@ -26,7 +26,8 @@ def main() -> None:
         default="",
         help=(
             "Dedicated Gateway-to-DataProxy credential for Memory assignment "
-            "transport; an empty value disables Memory pins"
+            "transport and session close; an empty value disables Memory pins "
+            "and preserves anonymous standalone close"
         ),
     )
     parser.add_argument("--host", default="0.0.0.0")

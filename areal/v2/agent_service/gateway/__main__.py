@@ -30,7 +30,8 @@ def main() -> None:
         default="",
         help=(
             "Dedicated Gateway-to-DataProxy credential for Memory assignment "
-            "transport; an empty value disables Memory pins"
+            "transport and session close; an empty value disables Memory pins "
+            "and authenticated DataProxy lifecycle control"
         ),
     )
     parser.add_argument("--router-timeout", type=float, default=2.0)
