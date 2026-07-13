@@ -11,12 +11,6 @@
 `areal inf` 与 `areal agent` 共用同一套生命周期模型 —— `run`、`ps`、`status`、
 `logs`、`stop`，每个服务的状态存放在 `~/.areal/` 下（可通过 `AREAL_HOME` 环境变量覆盖）。`areal train` 有意保持无状态：它只是将 argv 传递给 Python `main(args)` driver。
 
-原始文档保存在代码旁边 —— 请参阅
-[`areal/v2/cli/training/cli_guide.md`](../../../areal/v2/cli/training/cli_guide.md)、
-[`areal/v2/cli/inference/cli_guide.md`](../../../areal/v2/cli/inference/cli_guide.md)
-和 [`areal/v2/cli/agent/cli_guide.md`](../../../areal/v2/cli/agent/cli_guide.md)。本页
-将它们合并到一处方便查阅。
-
 ## 训练 CLI（`areal train`）
 
 `areal train` 将 AReaL 训练 driver 函数与实验配置文件封装为一条命令。它并不管理训练进程的生命周期（不像 `areal inf` 会维护服务状态），只做「找到 driver、加载配置，并把 hydra 风格的覆盖参数透传下去」这件事。

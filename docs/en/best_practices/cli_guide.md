@@ -15,12 +15,6 @@ The `areal` CLI ships three top-level subcommand groups, one per service in the 
 `AREAL_HOME` env var). `areal train` is deliberately stateless: it only wires argv
 through to a Python `main(args)` driver.
 
-The canonical source lives next to the code — see
-[`areal/v2/cli/training/cli_guide.md`](../../../areal/v2/cli/training/cli_guide.md),
-[`areal/v2/cli/inference/cli_guide.md`](../../../areal/v2/cli/inference/cli_guide.md),
-and [`areal/v2/cli/agent/cli_guide.md`](../../../areal/v2/cli/agent/cli_guide.md). This
-page consolidates them for convenience.
-
 ## Training CLI (`areal train`)
 
 `areal train` wires an AReaL training driver function and an experiment config file into
