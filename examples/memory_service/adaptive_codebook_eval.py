@@ -10,6 +10,12 @@ The three arms share one immutable evidence stream:
 * ``static`` freezes the release before later feedback arrives;
 * ``adaptive`` applies trusted updates and publishes a new immutable release.
 
+Counterfactual controls add an equal-UTF-8-byte target mask, the stale release,
+an explicit raw-history last-write-wins policy, and an oracle ceiling.  A frozen
+cyclic arm schedule balances marginal execution position across subjects.  Every arm,
+including the controls, still traverses the real release-control and runtime
+exposure ledgers.
+
 This is not a benchmark or a claim of statistical significance.  It is an
 executable check that one concrete update rule can improve paired future tasks,
 and that the improvement travels through assignment, retrieval, rendering,
@@ -124,6 +130,12 @@ class FactUpdateResult:
     decisions: tuple[FactUpdateDecision, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class RawHistoryBuildResult:
+    release: MemoryRelease
+    selected_evidence_id: str | None
+
+
 class StructuredFactUpdater:
     """Apply a narrow, auditable fact-update policy to immutable history.
 
@@ -131,6 +143,9 @@ class StructuredFactUpdater:
     an ADD revision, a trusted value change becomes SUPERSEDE, and an identical
     value is a no-op.  Agent messages and outcomes can remain in the evidence
     ledger for audit without silently becoming authoritative memory.
+
+    This kind allowlist is an experiment fixture, not source authentication.
+    Production policy must additionally verify provenance and authorization.
     """
 
     trusted_kinds = frozenset({EvidenceKind.FEEDBACK, EvidenceKind.TOOL_RESULT})
@@ -267,6 +282,131 @@ class StructuredFactUpdater:
             idempotency_key=f"{idempotency_prefix}:release",
         )
         return FactUpdateResult(release=release, decisions=tuple(decisions))
+
+
+def _single_fact_release(
+    *,
+    evidence_store: InMemoryEvidenceStore,
+    history_store: InMemoryMemoryHistoryStore,
+    release_store: InMemoryMemoryReleaseStore,
+    scope: MemoryScope,
+    value: str,
+    label: str,
+) -> tuple[MemoryRelease, str]:
+    """Build one release inside an evaluator-owned isolated control store."""
+
+    evidence = evidence_store.append(
+        EvidenceEvent(
+            scope=scope,
+            session_id="counterfactual-control",
+            run_id=label,
+            sequence_no=0,
+            kind=EvidenceKind.ENVIRONMENT,
+            payload=fact_payload(_FACT_KEY, value),
+            observed_at=_BASE,
+            idempotency_key=f"{label}:evidence",
+        )
+    )
+    candidate = history_store.append_candidate(
+        CandidateProposal(
+            scope=scope,
+            content=fact_payload(_FACT_KEY, value),
+            evidence_ids=(evidence.evidence_id,),
+            idempotency_key=f"{label}:candidate",
+        )
+    )
+    revision = history_store.append_revision(
+        RevisionProposal(
+            scope=scope,
+            candidate_id=candidate.candidate_id,
+            operation=RevisionOperation.ADD,
+            parent_revision_id=None,
+            idempotency_key=f"{label}:revision",
+        )
+    )
+    release = release_store.append_release(
+        ReleaseManifest(scope=scope, revision_ids=(revision.revision_id,)),
+        idempotency_key=f"{label}:release",
+    )
+    return release, evidence.evidence_id
+
+
+def _raw_history_release(
+    *,
+    history_store: InMemoryMemoryHistoryStore,
+    release_store: InMemoryMemoryReleaseStore,
+    scope: MemoryScope,
+    evidence: Iterable[EvidenceRecord],
+    captured_through: datetime,
+    label: str,
+) -> RawHistoryBuildResult:
+    """Build an explicit in-scope, pre-cutoff last-write-wins baseline.
+
+    Unlike ``StructuredFactUpdater``, this intentionally grants every event
+    kind equal authority.  It therefore models the common but unsafe practice
+    of replaying raw chat history, including an agent's own self-report.
+    """
+
+    eligible: list[tuple[EvidenceRecord, tuple[str, str]]] = []
+    for record in sorted(
+        tuple(evidence),
+        key=lambda item: (
+            item.event.observed_at,
+            item.event.sequence_no,
+            item.evidence_id,
+        ),
+    ):
+        if record.event.scope != scope or record.event.observed_at > captured_through:
+            continue
+        fact = _decode_fact(record.event.payload)
+        if fact is not None and fact[0] == _FACT_KEY:
+            eligible.append((record, fact))
+
+    if not eligible:
+        release = release_store.append_release(
+            ReleaseManifest(scope=scope, revision_ids=()),
+            idempotency_key=f"{label}:release",
+        )
+        return RawHistoryBuildResult(release, None)
+
+    revision_ids = []
+    for record, fact in eligible:
+        candidate = history_store.append_candidate(
+            CandidateProposal(
+                scope=scope,
+                content=fact_payload(*fact),
+                evidence_ids=(record.evidence_id,),
+                idempotency_key=f"{label}:candidate:{record.evidence_id}",
+            )
+        )
+        revision = history_store.append_revision(
+            RevisionProposal(
+                scope=scope,
+                candidate_id=candidate.candidate_id,
+                operation=RevisionOperation.ADD,
+                parent_revision_id=None,
+                idempotency_key=f"{label}:revision:{record.evidence_id}",
+            )
+        )
+        revision_ids.append(revision.revision_id)
+    release = release_store.append_release(
+        ReleaseManifest(scope=scope, revision_ids=tuple(revision_ids)),
+        idempotency_key=f"{label}:release",
+    )
+    return RawHistoryBuildResult(release, eligible[-1][0].evidence_id)
+
+
+def _equal_utf8_mask(value: str) -> str:
+    """Mask an ASCII target without changing its rendered UTF-8 byte length."""
+
+    try:
+        value.encode("ascii")
+    except UnicodeEncodeError as error:
+        raise ValueError("the local mask control requires an ASCII target") from error
+    masked = "*" * len(value.encode())
+    if masked == value:
+        raise ValueError("mask must differ from the target")
+    return masked
 
 
 @dataclass(frozen=True, slots=True)
@@ -472,8 +612,11 @@ class ArmObservation:
     retrieved_revision_ids: tuple[str, ...]
     returned_revision_ids: tuple[str, ...]
     injected_revision_ids: tuple[str, ...]
+    returned_evidence_ids: tuple[str, ...]
     exposure_id: str
     exposure_status: str
+    rendered_context_utf8_bytes: int
+    chain_bound: bool
     consumer_output: DeployRequest
     reward: int
 
@@ -482,8 +625,12 @@ class ArmObservation:
 class SubjectResult:
     case_name: str
     subject_id: str
+    changed_case: bool
+    change_kind: str
     expected_access_code: str
     captured_evidence_ids: tuple[str, ...]
+    measured_scope_evidence_ids: tuple[str, ...]
+    raw_selected_evidence_id: str | None
     static_decisions: tuple[FactUpdateDecision, ...]
     adaptive_decisions: tuple[FactUpdateDecision, ...]
     arms: tuple[ArmObservation, ...]
@@ -517,10 +664,83 @@ class EvaluationReport:
             )
         return tuple(rows)
 
+    def counterfactual_utility(self) -> tuple[dict[str, object], ...]:
+        """Report every preregistered comparison as a subject-level pair."""
+
+        rows = []
+        for subject in self.subjects:
+            reward = {item.arm: item.reward for item in subject.arms}
+            rows.append(
+                {
+                    "case_name": subject.case_name,
+                    "subject_id": subject.subject_id,
+                    "changed_case": subject.changed_case,
+                    "change_kind": subject.change_kind,
+                    **reward,
+                    "adaptive_gt_masked": (
+                        reward["adaptive"] > reward["target_masked"]
+                    ),
+                    "adaptive_gt_stale": reward["adaptive"] > reward["stale"],
+                    "adaptive_not_worse_than_stale": (
+                        reward["adaptive"] >= reward["stale"]
+                    ),
+                    "oracle_is_ceiling": reward["oracle"] == 1,
+                }
+            )
+        return tuple(rows)
+
+    def mechanism_coverage(self) -> dict[str, int]:
+        """Count mechanism checks; do not turn eight cases into significance."""
+
+        changed = tuple(item for item in self.subjects if item.changed_case)
+        stable = tuple(item for item in self.subjects if not item.changed_case)
+        additions = tuple(item for item in changed if item.change_kind == "add")
+        supersedes = tuple(item for item in changed if item.change_kind == "supersede")
+        observations = tuple(
+            observation for subject in self.subjects for observation in subject.arms
+        )
+        return {
+            "subjects": len(self.subjects),
+            "actual_runtime_exposures": sum(item.chain_bound for item in observations),
+            "masked_equal_length_subjects": sum(
+                subject.arm("target_masked").rendered_context_utf8_bytes
+                == subject.arm("adaptive").rendered_context_utf8_bytes
+                for subject in self.subjects
+            ),
+            "changed_adaptive_gt_masked": sum(
+                subject.arm("adaptive").reward > subject.arm("target_masked").reward
+                for subject in changed
+            ),
+            "add_adaptive_gt_missing_stale": sum(
+                subject.arm("adaptive").reward > subject.arm("stale").reward
+                for subject in additions
+            ),
+            "supersede_adaptive_gt_old_value_stale": sum(
+                subject.arm("adaptive").reward > subject.arm("stale").reward
+                for subject in supersedes
+            ),
+            "stable_adaptive_no_regression": sum(
+                subject.arm("adaptive").reward >= subject.arm("stale").reward
+                for subject in stable
+            ),
+            "oracle_ceiling_subjects": sum(
+                subject.arm("oracle").reward == 1 for subject in self.subjects
+            ),
+            "raw_positive_subjects": sum(
+                subject.arm("raw_history").reward > 0 for subject in self.subjects
+            ),
+            "raw_negative_subjects": sum(
+                subject.arm("raw_history").reward < 0 for subject in self.subjects
+            ),
+        }
+
     def to_json(self) -> str:
         return json.dumps(
             {
+                "counterfactual_utility": self.counterfactual_utility(),
+                "mechanism_coverage": self.mechanism_coverage(),
                 "paired_utility": self.paired_utility(),
+                "preregistered_relations": PREREGISTERED_RELATIONS,
                 "subjects": [asdict(subject) for subject in self.subjects],
             },
             ensure_ascii=False,
@@ -535,24 +755,44 @@ class _Case:
     expected_code: str
     baseline: tuple[tuple[EvidenceKind, str], ...]
     later: tuple[tuple[EvidenceKind, str], ...]
+    changed: bool = False
+    change_kind: str = "stable"
     later_is_foreign: bool = False
     later_is_future: bool = False
 
 
 _CASES = (
-    _Case("feedback_add", "AC-101", (), ((EvidenceKind.FEEDBACK, "AC-101"),)),
-    _Case("tool_result_add", "AC-102", (), ((EvidenceKind.TOOL_RESULT, "AC-102"),)),
+    _Case(
+        "feedback_add",
+        "AC-101",
+        (),
+        ((EvidenceKind.FEEDBACK, "AC-101"),),
+        changed=True,
+        change_kind="add",
+    ),
+    _Case(
+        "tool_result_add",
+        "AC-102",
+        (),
+        ((EvidenceKind.TOOL_RESULT, "AC-102"),),
+        changed=True,
+        change_kind="add",
+    ),
     _Case(
         "feedback_supersede",
         "AC-203",
         ((EvidenceKind.FEEDBACK, "OLD-203"),),
         ((EvidenceKind.FEEDBACK, "AC-203"),),
+        changed=True,
+        change_kind="supersede",
     ),
     _Case(
         "tool_result_supersede",
         "AC-204",
         ((EvidenceKind.TOOL_RESULT, "OLD-204"),),
         ((EvidenceKind.TOOL_RESULT, "AC-204"),),
+        changed=True,
+        change_kind="supersede",
     ),
     _Case(
         "same_value_noop",
@@ -584,6 +824,34 @@ _CASES = (
         later_is_future=True,
     ),
 )
+
+_ARM_NAMES = (
+    "no_memory",
+    "static",
+    "adaptive",
+    "target_masked",
+    "stale",
+    "raw_history",
+    "oracle",
+)
+PREREGISTERED_RELATIONS = (
+    "changed cases: adaptive > target_masked",
+    "ADD cases: adaptive > pre-update missing-key stale release",
+    "SUPERSEDE cases: adaptive > pre-update old-value stale release",
+    "stable cases: adaptive >= stale",
+    "oracle reward == +1 ceiling",
+    "raw_history has no directional claim; report signed utility unchanged",
+)
+
+
+def _balanced_arm_order(subject_index: int) -> tuple[str, ...]:
+    """Balance marginal position for this stateless local smoke test.
+
+    This is not a carryover-balanced schedule for a stateful model experiment.
+    """
+
+    offset = subject_index % len(_ARM_NAMES)
+    return _ARM_NAMES[offset:] + _ARM_NAMES[:offset]
 
 
 def _append_event(
@@ -663,6 +931,34 @@ def _run_arm(
     )
     if type(output) is not DeployRequest:
         raise TypeError("project consumer returned an unexpected output")
+    chain_bound = (
+        assignment.assignment_id
+        == attempt.spec.assignment_id
+        == result.assignment_id
+        == delivery.assignment_id
+        == exposure.assignment_id
+        and assignment.content_hash
+        == attempt.spec.assignment_content_sha256
+        == result.assignment_content_sha256
+        == delivery.assignment_content_sha256
+        == exposure.assignment_content_sha256
+        and assignment.release_id
+        == attempt.spec.release_id
+        == result.release_id
+        == delivery.release_id
+        == exposure.release_id
+        and assignment.release_content_sha256
+        == attempt.release_content_sha256
+        == result.release_content_sha256
+        == delivery.release_content_sha256
+        == exposure.release_content_sha256
+        and result.query_result_id
+        == delivery.query_result_id
+        == exposure.query_result_id
+        and delivery.delivery_id == exposure.delivery_id
+    )
+    if not chain_bound:
+        raise AssertionError("runtime exposure chain is not fully bound")
     reward = FakeDeployTool().reward(
         output,
         project_id=scope.subject_id,
@@ -685,14 +981,21 @@ def _run_arm(
         injected_revision_ids=tuple(
             item.revision_id for item in exposure.injected_revisions
         ),
+        returned_evidence_ids=tuple(
+            evidence.evidence_id
+            for item in result.returned_items
+            for evidence in item.evidence
+        ),
         exposure_id=exposure.exposure_id,
         exposure_status=exposure.status.value,
+        rendered_context_utf8_bytes=delivery.rendered_context_utf8_bytes,
+        chain_bound=chain_bound,
         consumer_output=output,
         reward=reward,
     )
 
 
-def _evaluate_case(case: _Case) -> SubjectResult:
+def _evaluate_case(case: _Case, subject_index: int) -> SubjectResult:
     evidence_store = InMemoryEvidenceStore()
     history_store = InMemoryMemoryHistoryStore(evidence_store)
     release_store = InMemoryMemoryReleaseStore(history_store)
@@ -751,12 +1054,54 @@ def _evaluate_case(case: _Case) -> SubjectResult:
         captured_through=_ADAPTIVE_CUTOFF,
         idempotency_prefix=f"{case.name}:adaptive",
     )
+    raw_history = _raw_history_release(
+        history_store=history_store,
+        release_store=release_store,
+        scope=scope,
+        evidence=captured,
+        captured_through=_ADAPTIVE_CUTOFF,
+        label=f"{case.name}:raw-history",
+    )
+    measured_scope_evidence_ids = tuple(
+        item.evidence_id for item in evidence_store.list(scope)
+    )
+
+    control_evidence_store = InMemoryEvidenceStore()
+    control_history_store = InMemoryMemoryHistoryStore(control_evidence_store)
+    control_release_store = InMemoryMemoryReleaseStore(control_history_store)
+    masked_release, _masked_evidence_id = _single_fact_release(
+        evidence_store=control_evidence_store,
+        history_store=control_history_store,
+        release_store=control_release_store,
+        scope=scope,
+        value=_equal_utf8_mask(case.expected_code),
+        label=f"{case.name}:target-masked",
+    )
+    oracle_release, _oracle_evidence_id = _single_fact_release(
+        evidence_store=control_evidence_store,
+        history_store=control_history_store,
+        release_store=control_release_store,
+        scope=scope,
+        value=case.expected_code,
+        label=f"{case.name}:oracle",
+    )
+    if tuple(item.evidence_id for item in evidence_store.list(scope)) != (
+        measured_scope_evidence_ids
+    ):
+        raise AssertionError("counterfactual truth leaked into measured evidence")
 
     retriever = ReleaseOrderRetriever()
     renderer = StructuredFactRenderer()
     consumer = ProjectAgentConsumer()
-    control = InMemoryMemoryReleaseControlStore(
+    measured_control = InMemoryMemoryReleaseControlStore(
         release_store,
+        attestor=_LocalAttestor(),
+        revoker=_LocalRevoker(),
+        assignment_policy=_LocalAssignmentPolicy(),
+        clock=lambda: _BASE,
+    )
+    counterfactual_control = InMemoryMemoryReleaseControlStore(
+        control_release_store,
         attestor=_LocalAttestor(),
         revoker=_LocalRevoker(),
         assignment_policy=_LocalAssignmentPolicy(),
@@ -766,10 +1111,22 @@ def _evaluate_case(case: _Case) -> SubjectResult:
         "no_memory": empty_release,
         "static": static_update.release,
         "adaptive": adaptive_update.release,
+        "target_masked": masked_release,
+        "stale": static_update.release,
+        "raw_history": raw_history.release,
+        "oracle": oracle_release,
+    }
+    control_by_arm = {
+        **{
+            arm: measured_control
+            for arm in ("no_memory", "static", "adaptive", "stale", "raw_history")
+        },
+        "target_masked": counterfactual_control,
+        "oracle": counterfactual_control,
     }
     assignments = {
         arm: _assign_release(
-            control=control,
+            control=control_by_arm[arm],
             scope=scope,
             release=release,
             arm=arm,
@@ -779,31 +1136,51 @@ def _evaluate_case(case: _Case) -> SubjectResult:
         )
         for arm, release in releases.items()
     }
-    runtime = InMemoryMemoryRuntimeStore(
+    measured_runtime = InMemoryMemoryRuntimeStore(
         history_store,
         release_store,
-        release_control_store=control,
+        release_control_store=measured_control,
         retrievers=(retriever,),
         renderers=(renderer,),
         consumers=(consumer,),
     )
+    counterfactual_runtime = InMemoryMemoryRuntimeStore(
+        control_history_store,
+        control_release_store,
+        release_control_store=counterfactual_control,
+        retrievers=(retriever,),
+        renderers=(renderer,),
+        consumers=(consumer,),
+    )
+    runtime_by_arm = {
+        **{
+            arm: measured_runtime
+            for arm in ("no_memory", "static", "adaptive", "stale", "raw_history")
+        },
+        "target_masked": counterfactual_runtime,
+        "oracle": counterfactual_runtime,
+    }
     arms = tuple(
         _run_arm(
             arm=arm,
             scope=scope,
             assignment=assignments[arm],
-            runtime=runtime,
+            runtime=runtime_by_arm[arm],
             renderer=renderer,
             consumer=consumer,
             expected_access_code=case.expected_code,
         )
-        for arm in ("no_memory", "static", "adaptive")
+        for arm in _balanced_arm_order(subject_index)
     )
     return SubjectResult(
         case_name=case.name,
         subject_id=scope.subject_id,
+        changed_case=case.changed,
+        change_kind=case.change_kind,
         expected_access_code=case.expected_code,
         captured_evidence_ids=tuple(item.evidence_id for item in captured),
+        measured_scope_evidence_ids=measured_scope_evidence_ids,
+        raw_selected_evidence_id=raw_history.selected_evidence_id,
         static_decisions=static_update.decisions,
         adaptive_decisions=adaptive_update.decisions,
         arms=arms,
@@ -813,7 +1190,9 @@ def _evaluate_case(case: _Case) -> SubjectResult:
 def run_smoke_evaluation() -> EvaluationReport:
     """Run eight paired subjects locally with no model or GPU dependency."""
 
-    report = EvaluationReport(tuple(_evaluate_case(case) for case in _CASES))
+    report = EvaluationReport(
+        tuple(_evaluate_case(case, index) for index, case in enumerate(_CASES))
+    )
     if len(report.subjects) < 8:
         raise AssertionError("the adaptive smoke evaluation requires at least 8 cases")
     return report

@@ -51,8 +51,8 @@ def test_reward_path_contains_real_assignment_retrieval_and_exposure() -> None:
     report = run_smoke_evaluation()
 
     for subject in report.subjects:
-        assert len({item.assignment_id for item in subject.arms}) == 3
-        assert len({item.exposure_id for item in subject.arms}) == 3
+        assert len({item.assignment_id for item in subject.arms}) == len(subject.arms)
+        assert len({item.exposure_id for item in subject.arms}) == len(subject.arms)
         for observation in subject.arms:
             assert subject.expected_access_code not in observation.query_text
             assert observation.assignment_id.startswith("masn_")
