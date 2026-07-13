@@ -13,6 +13,7 @@ Submodules
 - ``router`` — session-affine routing
 - ``data_proxy`` — stateful session proxy
 - ``worker`` — stateless agent execution
+- ``memory_authorization`` — default-deny principal/session assignment grants
 - ``protocol`` — WebSocket frame types and helpers
 """
 
@@ -24,6 +25,21 @@ from .memory import (
     MemoryAgentSessionPinV1,
     MemoryAgentTurnConflictError,
     MemoryAgentTurnV1,
+)
+from .memory_authorization import (
+    MemoryAssignmentGrantTargetV1,
+    MemoryPrincipalV1,
+    MemoryScopeActionV1,
+    MemoryScopeAuthorizationConflictError,
+    MemoryScopeAuthorizationDeniedError,
+    MemoryScopeAuthorizationDisabledError,
+    MemoryScopeAuthorizationError,
+    MemoryScopeGrantAuthorizer,
+    MemoryScopeGrantRequestV1,
+    MemoryScopeGrantResolver,
+    MemoryScopeGrantV1,
+    MemorySessionIncarnationV1,
+    MemoryWorkerAudienceV1,
 )
 from .memory_transport import (
     AREAL_MEMORY_METADATA_KEY,
@@ -61,13 +77,26 @@ __all__ = [
     "MemoryAgentSessionPinV1",
     "MemoryAgentTurnConflictError",
     "MemoryAgentTurnV1",
+    "MemoryAssignmentGrantTargetV1",
     "MemoryAssignmentPinWireV1",
     "MemoryPinTransportError",
     "MemoryPinWireFormatError",
     "MemorySessionPinCache",
     "MemorySessionPinConflictError",
+    "MemoryPrincipalV1",
+    "MemoryScopeActionV1",
+    "MemoryScopeAuthorizationConflictError",
+    "MemoryScopeAuthorizationDeniedError",
+    "MemoryScopeAuthorizationDisabledError",
+    "MemoryScopeAuthorizationError",
+    "MemoryScopeGrantAuthorizer",
+    "MemoryScopeGrantRequestV1",
+    "MemoryScopeGrantResolver",
+    "MemoryScopeGrantV1",
+    "MemorySessionIncarnationV1",
     "MemoryTurnCapability",
     "MemoryTurnResultV1",
+    "MemoryWorkerAudienceV1",
     "ReservedMemoryMetadataError",
     "parse_memory_assignment_pin_metadata",
 ]

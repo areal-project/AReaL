@@ -28,6 +28,12 @@ authorize cross-scope assignment selection. The same public values are rejected
 as internal hop credentials.
 Deployments should still isolate this hop and may replace the credential with
 mTLS.
+
+The process-local value contract for that separate decision lives in
+``memory_authorization``.  Current routes do not create its trusted principal,
+session incarnation, or Worker audience and do not invoke its default-disabled
+resolver.  Its grant records have no wire representation and must not be added
+to this assignment-pin envelope.
 """
 
 from __future__ import annotations
