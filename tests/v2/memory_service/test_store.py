@@ -322,7 +322,8 @@ def test_public_module_exports_stable_memory_contracts() -> None:
     )
 
     assert memory_service.__doc__ == (
-        "Public contracts for immutable Memory Service evidence, history, and releases."
+        "Public immutable Memory Service evidence, history, release, and runtime "
+        "contracts."
     )
     assert memory_service.__all__ == [
         "CandidateConflictError",
@@ -364,6 +365,11 @@ def test_public_module_exports_stable_memory_contracts() -> None:
         "MemoryReleaseStore",
         "MemoryRevision",
         "MemoryRevisionRefV1",
+        "MemorySourceObjectKind",
+        "MemorySourceObjectRefV1",
+        "MemorySourceReadEventV1",
+        "MemorySourceReadOperation",
+        "MemorySourceReadReceiptV1",
         "MemoryRenderedRevisionRangeV1",
         "MemoryRenderedRevisionSpanV1",
         "MemoryRetrievalOutputV1",

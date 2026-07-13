@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
-"""Public contracts for immutable Memory Service evidence, history, and releases."""
+"""Public immutable Memory Service evidence, history, release, and runtime contracts."""
 
 from areal.v2.memory_service.errors import (
     CandidateConflictError,
@@ -62,6 +62,11 @@ from areal.v2.memory_service.runtime_types import (
     MemoryRenderedRevisionRangeV1,
     MemoryRenderedRevisionSpanV1,
     MemoryRevisionRefV1,
+    MemorySourceObjectKind,
+    MemorySourceObjectRefV1,
+    MemorySourceReadEventV1,
+    MemorySourceReadOperation,
+    MemorySourceReadReceiptV1,
 )
 from areal.v2.memory_service.store import EvidenceStore, InMemoryEvidenceStore
 from areal.v2.memory_service.types import (
@@ -111,6 +116,11 @@ __all__ = [
     "MemoryReleaseStore",
     "MemoryRevision",
     "MemoryRevisionRefV1",
+    "MemorySourceObjectKind",
+    "MemorySourceObjectRefV1",
+    "MemorySourceReadEventV1",
+    "MemorySourceReadOperation",
+    "MemorySourceReadReceiptV1",
     "MemoryRenderedRevisionRangeV1",
     "MemoryRenderedRevisionSpanV1",
     "MemoryRetrievalOutputV1",

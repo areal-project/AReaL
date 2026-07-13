@@ -31,6 +31,9 @@ from areal.v2.memory_service import (
     MemoryRenderOutputV1,
     MemoryRetrievalOutputV1,
     MemoryScope,
+    MemorySourceObjectKind,
+    MemorySourceReadOperation,
+    MemorySourceReadReceiptV1,
     ReleaseManifest,
     RevisionOperation,
     RevisionProposal,
@@ -44,10 +47,10 @@ _HASH_C = hashlib.sha256(b"renderer-v1").hexdigest()
 _HASH_D = hashlib.sha256(b"consumer-v1").hexdigest()
 _GOLDEN_RUNTIME_HASHES = (
     "b97ab95704e8d7c2af7a2d3b429ea1c7557d70c792aece1410e60dba3ec10d1e",
-    "b6c63a6ead1cb751414b301e0c4879549fed3225d1775a0113c702c957458cce",
-    "03b099ff17689ae5b3742893cead3cfb9ffa960458f38f2bc51eb99fdda71357",
-    "c0fa033b21f0f9bf1b730ab676a1b0e806a509118c1901ec9dab3380fe253238",
-    "10b0d471914af9d901615ded59402696fada7b7e1680490b83629469fd347b11",
+    "2fd4f77d7c3c8b3887aac73d97f0d814a1a86c89f3b0d8bab00bf7543fd24962",
+    "0056cbe4df65105fd1e8c63504e32c816a41305f9d913c77edc884b124c4f311",
+    "a5118b9842fb4f232354baeee23e94c40de0f653bc5ddf085b5a103ef0d5279d",
+    "7255186f71f0c17c260805c0af0969e21e64eabd9ff0ffe1afac06f00335f2c4",
 )
 
 
@@ -526,7 +529,6 @@ def test_query_to_actual_exposure_derives_all_runtime_stages(monkeypatch) -> Non
         )
         == _GOLDEN_RUNTIME_HASHES
     )
-
     for record, prefix, id_field in (
         (attempt, "mqat_", "attempt_id"),
         (result, "mqres_", "query_result_id"),
@@ -539,6 +541,125 @@ def test_query_to_actual_exposure_derives_all_runtime_stages(monkeypatch) -> Non
         )
         public_id = getattr(record, id_field)
         assert public_id == prefix + record.content_hash[:24]
+
+
+def test_source_read_receipt_records_real_runtime_getters_without_content() -> None:
+    scope, _history, _releases, release, store = _graph()
+    attempt, result = _query_all(
+        store,
+        scope,
+        release,
+        _spec(scope, release.release_id),
+    )
+    receipt = store.get_source_read_receipt(
+        scope,
+        result.source_read_receipt_id,
+    )
+
+    assert receipt.attempt_id == attempt.attempt_id
+    assert receipt.attempt_content_sha256 == attempt.content_hash
+    assert result.source_read_receipt_content_sha256 == receipt.content_hash
+    assert tuple(event.sequence_no for event in receipt.read_events) == tuple(
+        range(len(receipt.read_events))
+    )
+    assert tuple(event.operation for event in receipt.read_events[:2]) == (
+        MemorySourceReadOperation.GET_RELEASE,
+        MemorySourceReadOperation.GET_RELEASE_REVISIONS,
+    )
+    assert receipt.read_events[0].returned_objects[0].kind is (
+        MemorySourceObjectKind.RELEASE
+    )
+    assert (
+        tuple(item.object_id for item in receipt.read_events[1].returned_objects)
+        == release.manifest.revision_ids
+    )
+    assert (
+        tuple(event.operation for event in receipt.read_events[2:])
+        == (
+            MemorySourceReadOperation.GET_CANDIDATE,
+            MemorySourceReadOperation.GET_CANDIDATE_EVIDENCE,
+        )
+        * 6
+    )
+    canonical = receipt.canonical_bytes()
+    assert b"timezone=Asia/Shanghai" not in canonical
+    assert b"language=zh-CN" not in canonical
+
+
+def test_missing_getter_capture_fails_closed_without_publishing_receipt(
+    monkeypatch,
+) -> None:
+    scope, history, _releases, release, store = _graph()
+    attempt = store.begin_query(_spec(scope, release.release_id))
+
+    def omit_candidate_event(requested_scope, candidate_id, read_session):
+        del read_session
+        return history.get_candidate(requested_scope, candidate_id)
+
+    monkeypatch.setattr(store, "_read_candidate", omit_candidate_event)
+    with pytest.raises(MemoryQueryConflictError, match="capture is incomplete"):
+        store.resolve_query(scope, attempt.attempt_id, query=b"query-a")
+
+    assert store._source_read_receipt_by_address == {}
+    assert store._source_read_receipt_by_attempt == {}
+    assert store._result_by_address == {}
+    assert store._result_by_attempt == {}
+
+
+def test_caller_cannot_submit_posthoc_or_cross_scope_source_receipt() -> None:
+    scope, _history, _releases, release, store = _graph()
+    attempt, result = _query_all(
+        store,
+        scope,
+        release,
+        _spec(scope, release.release_id),
+    )
+    genuine = store.get_source_read_receipt(scope, result.source_read_receipt_id)
+    reconstructed = MemorySourceReadReceiptV1.create(
+        attempt=attempt,
+        read_events=genuine.read_events[:2],
+    )
+    assert reconstructed.source_read_receipt_id != genuine.source_read_receipt_id
+    with pytest.raises(MemoryQueryNotFoundError):
+        store.get_source_read_receipt(
+            scope,
+            reconstructed.source_read_receipt_id,
+        )
+    with pytest.raises(TypeError):
+        store.resolve_query(
+            scope,
+            attempt.attempt_id,
+            query=b"query-a",
+            source_read_receipt=reconstructed,  # type: ignore[call-arg]
+        )
+    other_scope = replace(scope, subject_id="other-subject")
+    with pytest.raises(MemoryQueryNotFoundError):
+        store.get_source_read_receipt(
+            other_scope,
+            genuine.source_read_receipt_id,
+        )
+
+
+def test_corrupt_source_receipt_blocks_downstream_renderer_side_effect() -> None:
+    renderer = _LineRenderer()
+    scope, _history, _releases, release, store = _graph(renderer=renderer)
+    _attempt, result = _query_all(
+        store,
+        scope,
+        release,
+        _spec(scope, release.release_id),
+    )
+    receipt = store.get_source_read_receipt(scope, result.source_read_receipt_id)
+    object.__setattr__(receipt, "content_hash", "0" * 64)
+
+    with pytest.raises(MemoryDeliveryConflictError, match="integrity validation"):
+        store.prepare_delivery(
+            scope,
+            result.query_result_id,
+            renderer_id=renderer.renderer_id,
+            renderer_version_sha256=renderer.renderer_version_sha256,
+        )
+    assert renderer.calls == 0
 
 
 def test_model_call_ack_hashes_actual_prompt_slice_and_token_ids() -> None:
@@ -962,6 +1083,8 @@ def test_attempt_result_and_delivery_publication_are_rollback_safe() -> None:
     store._result_by_attempt = _FailFirstWriteDict(store._result_by_attempt)
     with pytest.raises(KeyboardInterrupt, match="commit interruption"):
         store.resolve_query(scope, attempt.attempt_id, query=b"query-a")
+    assert store._source_read_receipt_by_address == {}
+    assert store._source_read_receipt_by_attempt == {}
     assert store._result_by_address == {}
     assert store._result_by_attempt == {}
     assert store._resolution_claim_by_attempt == {}
@@ -1474,6 +1597,11 @@ def test_concurrent_exact_retries_converge_at_every_stage() -> None:
     assert len({item.query_result_id for item in results}) == 1
     assert retriever.calls == 1
     result = results[0]
+    assert len(store._source_read_receipt_by_address) == 1
+    assert len(store._source_read_receipt_by_attempt) == 1
+    assert {item.source_read_receipt_id for item in results} == {
+        result.source_read_receipt_id
+    }
 
     def deliver(_):
         return store.prepare_delivery(

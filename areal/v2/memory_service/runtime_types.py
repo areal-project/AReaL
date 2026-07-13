@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
-"""Immutable runtime query, delivery, and actual-exposure values.
+"""Immutable runtime query, source-read, delivery, and exposure values.
 
 The records in this module distinguish memory selected by a retriever from
 memory acknowledged at a consumer or model-call boundary.  Hashes are
@@ -322,6 +322,265 @@ class MemoryEvidenceRefV1:
         }
 
 
+class MemorySourceObjectKind(StrEnum):
+    """Kinds of immutable source objects returned to the runtime."""
+
+    RELEASE = "release"
+    REVISION = "revision"
+    CANDIDATE = "candidate"
+    EVIDENCE = "evidence"
+
+
+class MemorySourceReadOperation(StrEnum):
+    """Source-store calls whose returned objects can affect query resolution."""
+
+    GET_RELEASE = "get_release"
+    GET_RELEASE_REVISIONS = "get_release_revisions"
+    GET_REVISION = "get_revision"
+    GET_CANDIDATE = "get_candidate"
+    GET_CANDIDATE_EVIDENCE = "get_candidate_evidence"
+
+
+_SOURCE_PREFIX_BY_KIND = {
+    MemorySourceObjectKind.RELEASE: "rel_",
+    MemorySourceObjectKind.REVISION: "rev_",
+    MemorySourceObjectKind.CANDIDATE: "cand_",
+    MemorySourceObjectKind.EVIDENCE: "evd_",
+}
+
+_SOURCE_KIND_BY_OPERATION = {
+    MemorySourceReadOperation.GET_RELEASE: MemorySourceObjectKind.RELEASE,
+    MemorySourceReadOperation.GET_RELEASE_REVISIONS: MemorySourceObjectKind.REVISION,
+    MemorySourceReadOperation.GET_REVISION: MemorySourceObjectKind.REVISION,
+    MemorySourceReadOperation.GET_CANDIDATE: MemorySourceObjectKind.CANDIDATE,
+    MemorySourceReadOperation.GET_CANDIDATE_EVIDENCE: MemorySourceObjectKind.EVIDENCE,
+}
+
+
+@dataclass(frozen=True, slots=True)
+class MemorySourceObjectRefV1:
+    """A source object address paired with its full content commitment."""
+
+    kind: MemorySourceObjectKind
+    object_id: str
+    object_content_sha256: str
+
+    def __post_init__(self) -> None:
+        if type(self.kind) is not MemorySourceObjectKind:
+            raise TypeError("kind must be a MemorySourceObjectKind")
+        object_id = _string(self.object_id, "object_id")
+        content_hash = _sha256(
+            self.object_content_sha256,
+            "object_content_sha256",
+        )
+        if object_id != f"{_SOURCE_PREFIX_BY_KIND[self.kind]}{content_hash[:24]}":
+            raise ValueError("object_id disagrees with kind and full content hash")
+        object.__setattr__(self, "object_id", object_id)
+        object.__setattr__(self, "object_content_sha256", content_hash)
+
+    def _canonical_value(self) -> dict[str, object]:
+        if type(self.kind) is not MemorySourceObjectKind:
+            raise TypeError("kind must be a MemorySourceObjectKind")
+        object_id = _string(self.object_id, "object_id")
+        content_hash = _sha256(
+            self.object_content_sha256,
+            "object_content_sha256",
+        )
+        if object_id != f"{_SOURCE_PREFIX_BY_KIND[self.kind]}{content_hash[:24]}":
+            raise ValueError("object_id disagrees with kind and full content hash")
+        return {
+            "kind": self.kind.value,
+            "object_content_sha256": content_hash,
+            "object_id": object_id,
+        }
+
+
+def _source_object_refs(
+    value: object,
+    field_name: str,
+) -> tuple[MemorySourceObjectRefV1, ...]:
+    values = _exact_tuple(value, field_name)
+    if any(type(item) is not MemorySourceObjectRefV1 for item in values):
+        raise TypeError(f"{field_name} must contain MemorySourceObjectRefV1 values")
+    result = tuple(values)
+    if len({(item.kind, item.object_id) for item in result}) != len(result):
+        raise ValueError(f"{field_name} must not contain duplicate source objects")
+    return result
+
+
+@dataclass(frozen=True, slots=True)
+class MemorySourceReadEventV1:
+    """One ordered source-store call and the immutable objects it returned."""
+
+    sequence_no: int
+    operation: MemorySourceReadOperation
+    returned_objects: tuple[MemorySourceObjectRefV1, ...]
+
+    def __post_init__(self) -> None:
+        _integer(self.sequence_no, "sequence_no")
+        if type(self.operation) is not MemorySourceReadOperation:
+            raise TypeError("operation must be a MemorySourceReadOperation")
+        returned = _source_object_refs(self.returned_objects, "returned_objects")
+        expected_kind = _SOURCE_KIND_BY_OPERATION[self.operation]
+        if any(item.kind is not expected_kind for item in returned):
+            raise ValueError("returned object kind disagrees with read operation")
+        if (
+            self.operation
+            in {
+                MemorySourceReadOperation.GET_RELEASE,
+                MemorySourceReadOperation.GET_REVISION,
+                MemorySourceReadOperation.GET_CANDIDATE,
+            }
+            and len(returned) != 1
+        ):
+            raise ValueError("single-object read operations must return one object")
+
+    def _canonical_value(self) -> dict[str, object]:
+        returned = _source_object_refs(self.returned_objects, "returned_objects")
+        if type(self.operation) is not MemorySourceReadOperation:
+            raise TypeError("operation must be a MemorySourceReadOperation")
+        expected_kind = _SOURCE_KIND_BY_OPERATION[self.operation]
+        if any(item.kind is not expected_kind for item in returned):
+            raise ValueError("returned object kind disagrees with read operation")
+        if (
+            self.operation
+            in {
+                MemorySourceReadOperation.GET_RELEASE,
+                MemorySourceReadOperation.GET_REVISION,
+                MemorySourceReadOperation.GET_CANDIDATE,
+            }
+            and len(returned) != 1
+        ):
+            raise ValueError("single-object read operations must return one object")
+        return {
+            "operation": self.operation.value,
+            "returned_objects": [item._canonical_value() for item in returned],
+            "sequence_no": _integer(self.sequence_no, "sequence_no"),
+        }
+
+
+def _source_read_events(value: object) -> tuple[MemorySourceReadEventV1, ...]:
+    values = _exact_tuple(value, "read_events")
+    if not values:
+        raise ValueError("read_events must not be empty")
+    if any(type(item) is not MemorySourceReadEventV1 for item in values):
+        raise TypeError("read_events must contain MemorySourceReadEventV1 values")
+    result = tuple(values)
+    if tuple(item.sequence_no for item in result) != tuple(range(len(result))):
+        raise ValueError("read_events must have contiguous canonical sequence numbers")
+    return result
+
+
+def _source_read_receipt_canonical_bytes(
+    *,
+    scope: object,
+    attempt_id: object,
+    attempt_content_sha256: object,
+    read_events: object,
+) -> bytes:
+    events = _source_read_events(read_events)
+    return _canonical_json_bytes(
+        {
+            "attempt_content_sha256": _sha256(
+                attempt_content_sha256,
+                "attempt_content_sha256",
+            ),
+            "attempt_id": _string(attempt_id, "attempt_id"),
+            "read_events": [item._canonical_value() for item in events],
+            "record_kind": "memory_source_read_receipt",
+            "schema_version": _SCHEMA_VERSION,
+            "scope": _scope_value(scope),
+        }
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class MemorySourceReadReceiptV1:
+    """Runtime-owned proof of source objects read and validated for one attempt.
+
+    This receipt proves which immutable source objects the honest runtime read
+    while resolving a query.  It does not prove that a model used those values
+    or that they improved task utility.
+    """
+
+    scope: MemoryScope
+    attempt_id: str
+    attempt_content_sha256: str
+    read_events: tuple[MemorySourceReadEventV1, ...]
+    source_read_receipt_id: str
+    content_hash: str
+    created_at: datetime
+
+    def __post_init__(self) -> None:
+        canonical = _source_read_receipt_canonical_bytes(
+            scope=self.scope,
+            attempt_id=self.attempt_id,
+            attempt_content_sha256=self.attempt_content_sha256,
+            read_events=self.read_events,
+        )
+        expected_hash = sha256(canonical).hexdigest()
+        object.__setattr__(
+            self,
+            "source_read_receipt_id",
+            _record_id(
+                self.source_read_receipt_id,
+                "source_read_receipt_id",
+                prefix="msrr_",
+                content_hash=expected_hash,
+            ),
+        )
+        if _sha256(self.content_hash, "content_hash") != expected_hash:
+            raise ValueError("content_hash disagrees with canonical source-read bytes")
+        object.__setattr__(
+            self,
+            "created_at",
+            _aware_datetime(self.created_at, "created_at"),
+        )
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        attempt: MemoryQueryAttemptV1,
+        read_events: tuple[MemorySourceReadEventV1, ...],
+        created_at: datetime | None = None,
+    ) -> MemorySourceReadReceiptV1:
+        if type(attempt) is not MemoryQueryAttemptV1:
+            raise TypeError("attempt must be a MemoryQueryAttemptV1")
+        values = {
+            "scope": attempt.spec.scope,
+            "attempt_id": attempt.attempt_id,
+            "attempt_content_sha256": attempt.content_hash,
+            "read_events": read_events,
+        }
+        canonical = _source_read_receipt_canonical_bytes(**values)
+        content_hash = sha256(canonical).hexdigest()
+        return cls(
+            **values,
+            source_read_receipt_id=f"msrr_{content_hash[:24]}",
+            content_hash=content_hash,
+            created_at=datetime.now(UTC) if created_at is None else created_at,
+        )
+
+    def canonical_bytes(self) -> bytes:
+        canonical = _source_read_receipt_canonical_bytes(
+            scope=self.scope,
+            attempt_id=self.attempt_id,
+            attempt_content_sha256=self.attempt_content_sha256,
+            read_events=self.read_events,
+        )
+        expected_hash = sha256(canonical).hexdigest()
+        if _sha256(self.content_hash, "content_hash") != expected_hash:
+            raise ValueError("content_hash disagrees with canonical source-read bytes")
+        _record_id(
+            self.source_read_receipt_id,
+            "source_read_receipt_id",
+            prefix="msrr_",
+            content_hash=expected_hash,
+        )
+        return canonical
+
+
 def _evidence_refs(value: object) -> tuple[MemoryEvidenceRefV1, ...]:
     values = _exact_tuple(value, "evidence")
     if not values:
@@ -520,6 +779,8 @@ def _query_result_canonical_bytes(
     rollout_group_id: object,
     attempt_id: object,
     attempt_content_sha256: object,
+    source_read_receipt_id: object,
+    source_read_receipt_content_sha256: object,
     eligible_revisions: object,
     retrieved_revisions: object,
     returned_items: object,
@@ -538,6 +799,16 @@ def _query_result_canonical_bytes(
         for item in returned
     ):
         raise ValueError("returned item positions must match the pinned release")
+    source_receipt_hash = _sha256(
+        source_read_receipt_content_sha256,
+        "source_read_receipt_content_sha256",
+    )
+    source_receipt_id = _record_id(
+        source_read_receipt_id,
+        "source_read_receipt_id",
+        prefix="msrr_",
+        content_hash=source_receipt_hash,
+    )
     return _canonical_json_bytes(
         {
             "attempt_content_sha256": _sha256(
@@ -557,6 +828,8 @@ def _query_result_canonical_bytes(
             "rollout_group_id": _string(rollout_group_id, "rollout_group_id"),
             "schema_version": _SCHEMA_VERSION,
             "scope": _scope_value(scope),
+            "source_read_receipt_content_sha256": source_receipt_hash,
+            "source_read_receipt_id": source_receipt_id,
             "trajectory_id": _string(trajectory_id, "trajectory_id"),
         }
     )
@@ -573,6 +846,8 @@ class MemoryQueryResultV1:
     rollout_group_id: str
     attempt_id: str
     attempt_content_sha256: str
+    source_read_receipt_id: str
+    source_read_receipt_content_sha256: str
     eligible_revisions: tuple[MemoryRevisionRefV1, ...]
     retrieved_revisions: tuple[MemoryRevisionRefV1, ...]
     returned_items: tuple[MemoryQueryItemV1, ...]
@@ -589,6 +864,10 @@ class MemoryQueryResultV1:
             rollout_group_id=self.rollout_group_id,
             attempt_id=self.attempt_id,
             attempt_content_sha256=self.attempt_content_sha256,
+            source_read_receipt_id=self.source_read_receipt_id,
+            source_read_receipt_content_sha256=(
+                self.source_read_receipt_content_sha256
+            ),
             eligible_revisions=self.eligible_revisions,
             retrieved_revisions=self.retrieved_revisions,
             returned_items=self.returned_items,
@@ -617,12 +896,22 @@ class MemoryQueryResultV1:
         cls,
         *,
         attempt: MemoryQueryAttemptV1,
+        source_read_receipt: MemorySourceReadReceiptV1,
         retrieved_revisions: tuple[MemoryRevisionRefV1, ...],
         returned_items: tuple[MemoryQueryItemV1, ...],
         created_at: datetime | None = None,
     ) -> MemoryQueryResultV1:
         if type(attempt) is not MemoryQueryAttemptV1:
             raise TypeError("attempt must be a MemoryQueryAttemptV1")
+        if type(source_read_receipt) is not MemorySourceReadReceiptV1:
+            raise TypeError("source_read_receipt must be a MemorySourceReadReceiptV1")
+        source_read_receipt.canonical_bytes()
+        if (
+            source_read_receipt.scope != attempt.spec.scope
+            or source_read_receipt.attempt_id != attempt.attempt_id
+            or source_read_receipt.attempt_content_sha256 != attempt.content_hash
+        ):
+            raise ValueError("source-read receipt is not bound to the exact attempt")
         values = {
             "scope": attempt.spec.scope,
             "release_id": attempt.spec.release_id,
@@ -631,6 +920,8 @@ class MemoryQueryResultV1:
             "rollout_group_id": attempt.spec.rollout_group_id,
             "attempt_id": attempt.attempt_id,
             "attempt_content_sha256": attempt.content_hash,
+            "source_read_receipt_id": (source_read_receipt.source_read_receipt_id),
+            "source_read_receipt_content_sha256": source_read_receipt.content_hash,
             "eligible_revisions": attempt.release_revisions,
             "retrieved_revisions": retrieved_revisions,
             "returned_items": returned_items,
@@ -657,6 +948,10 @@ class MemoryQueryResultV1:
             rollout_group_id=self.rollout_group_id,
             attempt_id=self.attempt_id,
             attempt_content_sha256=self.attempt_content_sha256,
+            source_read_receipt_id=self.source_read_receipt_id,
+            source_read_receipt_content_sha256=(
+                self.source_read_receipt_content_sha256
+            ),
             eligible_revisions=self.eligible_revisions,
             retrieved_revisions=self.retrieved_revisions,
             returned_items=self.returned_items,
