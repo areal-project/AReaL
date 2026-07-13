@@ -63,3 +63,16 @@ def test_ppo_config_does_not_warn_when_eval_flags_are_consistent():
         )
 
     assert not any("sampling_seed is set but" in str(w.message) for w in caught)
+
+
+def test_ppo_config_warns_without_crashing_when_sglang_is_none():
+    """sglang is not Optional and the YAML/CLI loader rejects `sglang: null`, but
+    direct Python construction (PPOConfig(sglang=None, ...)) bypasses that loader and
+    is not type-checked at runtime, so this must not raise AttributeError."""
+    with pytest.warns(UserWarning, match="sampling_seed is set but"):
+        PPOConfig(
+            experiment_name="exp",
+            trial_name="trial",
+            gconfig=GenerationHyperparameters(sampling_seed=42),
+            sglang=None,
+        )
