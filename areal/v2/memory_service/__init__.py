@@ -66,7 +66,9 @@ from areal.v2.memory_service.runtime_types import (
     MemorySourceObjectRefV1,
     MemorySourceReadEventV1,
     MemorySourceReadOperation,
+    MemorySourceReadPhase,
     MemorySourceReadReceiptV1,
+    MemorySourceReadTranscriptV1,
 )
 from areal.v2.memory_service.store import EvidenceStore, InMemoryEvidenceStore
 from areal.v2.memory_service.types import (
@@ -120,7 +122,9 @@ __all__ = [
     "MemorySourceObjectRefV1",
     "MemorySourceReadEventV1",
     "MemorySourceReadOperation",
+    "MemorySourceReadPhase",
     "MemorySourceReadReceiptV1",
+    "MemorySourceReadTranscriptV1",
     "MemoryRenderedRevisionRangeV1",
     "MemoryRenderedRevisionSpanV1",
     "MemoryRetrievalOutputV1",

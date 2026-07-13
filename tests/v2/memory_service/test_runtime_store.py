@@ -23,16 +23,19 @@ from areal.v2.memory_service import (
     MemoryConsumerCallV1,
     MemoryConsumerKind,
     MemoryDeliveryConflictError,
+    MemoryEvidenceRefV1,
     MemoryExposureStatus,
     MemoryQueryConflictError,
     MemoryQueryNotFoundError,
     MemoryQuerySpecV1,
+    MemoryRelease,
     MemoryRenderedRevisionRangeV1,
     MemoryRenderOutputV1,
     MemoryRetrievalOutputV1,
     MemoryScope,
     MemorySourceObjectKind,
     MemorySourceReadOperation,
+    MemorySourceReadPhase,
     MemorySourceReadReceiptV1,
     ReleaseManifest,
     RevisionOperation,
@@ -46,11 +49,11 @@ _HASH_B = hashlib.sha256(b"retrieval-policy-v1").hexdigest()
 _HASH_C = hashlib.sha256(b"renderer-v1").hexdigest()
 _HASH_D = hashlib.sha256(b"consumer-v1").hexdigest()
 _GOLDEN_RUNTIME_HASHES = (
-    "b97ab95704e8d7c2af7a2d3b429ea1c7557d70c792aece1410e60dba3ec10d1e",
-    "2fd4f77d7c3c8b3887aac73d97f0d814a1a86c89f3b0d8bab00bf7543fd24962",
-    "0056cbe4df65105fd1e8c63504e32c816a41305f9d913c77edc884b124c4f311",
-    "a5118b9842fb4f232354baeee23e94c40de0f653bc5ddf085b5a103ef0d5279d",
-    "7255186f71f0c17c260805c0af0969e21e64eabd9ff0ffe1afac06f00335f2c4",
+    "aa4b04d626da600944cca01c90f712b9c5a52c1fe1da8e18f791cf1f74c8c57e",
+    "25d04094d3ac9a37f130e3e5bfa44c70f070fd224fc1e97e495d74be2baa18d2",
+    "886d6e677bbc275f5ece654845927c86d9dc53f3fb4f6e95aa93a974ba5b9f42",
+    "db5bb538754252e731d6a0691c28f76cca12f0913d4daadf248583aaebea8ccb",
+    "318dd7ae356d0a5b4d5210afd2e52ff462d217c0e3ec4b883cc6f16eb7c0c626",
 )
 
 
@@ -340,6 +343,105 @@ class _FailFirstWriteDict(dict):
         return super().__setitem__(key, value)
 
 
+def _logged_signature(operation, requested_ids, values, kind):
+    return (
+        operation,
+        requested_ids,
+        tuple((kind, item_id, content_hash) for item_id, content_hash in values),
+    )
+
+
+def _event_signature(event):
+    return (
+        event.operation,
+        event.requested_ids,
+        tuple(
+            (item.kind, item.object_id, item.object_content_sha256)
+            for item in event.returned_objects
+        ),
+    )
+
+
+class _LoggingHistoryStore:
+    """Independent observer of the backend's actual public getter calls."""
+
+    def __init__(self, backend, calls) -> None:
+        self.backend = backend
+        self.calls = calls
+
+    def __getattr__(self, name):
+        return getattr(self.backend, name)
+
+    def get_revision(self, scope, revision_id):
+        value = self.backend.get_revision(scope, revision_id)
+        self.calls.append(
+            _logged_signature(
+                MemorySourceReadOperation.GET_REVISION,
+                (revision_id,),
+                ((value.revision_id, value.content_hash),),
+                MemorySourceObjectKind.REVISION,
+            )
+        )
+        return value
+
+    def get_candidate(self, scope, candidate_id):
+        value = self.backend.get_candidate(scope, candidate_id)
+        self.calls.append(
+            _logged_signature(
+                MemorySourceReadOperation.GET_CANDIDATE,
+                (candidate_id,),
+                ((value.candidate_id, value.content_hash),),
+                MemorySourceObjectKind.CANDIDATE,
+            )
+        )
+        return value
+
+    def get_candidate_evidence(self, scope, candidate_id):
+        values = self.backend.get_candidate_evidence(scope, candidate_id)
+        self.calls.append(
+            _logged_signature(
+                MemorySourceReadOperation.GET_CANDIDATE_EVIDENCE,
+                (candidate_id,),
+                tuple((item.evidence_id, item.content_hash) for item in values),
+                MemorySourceObjectKind.EVIDENCE,
+            )
+        )
+        return values
+
+
+class _LoggingReleaseStore:
+    def __init__(self, backend, calls) -> None:
+        self.backend = backend
+        self.calls = calls
+
+    def __getattr__(self, name):
+        return getattr(self.backend, name)
+
+    def get_release(self, scope, release_id):
+        value = self.backend.get_release(scope, release_id)
+        self.calls.append(
+            _logged_signature(
+                MemorySourceReadOperation.GET_RELEASE,
+                (release_id,),
+                ((value.release_id, value.content_hash),),
+                MemorySourceObjectKind.RELEASE,
+            )
+        )
+        return value
+
+    def get_release_revisions(self, scope, release_id):
+        values = self.backend.get_release_revisions(scope, release_id)
+        self.calls.append(
+            _logged_signature(
+                MemorySourceReadOperation.GET_RELEASE_REVISIONS,
+                (release_id,),
+                tuple((item.revision_id, item.content_hash) for item in values),
+                MemorySourceObjectKind.REVISION,
+            )
+        )
+        return values
+
+
 def _graph(
     *,
     empty: bool = False,
@@ -413,6 +515,68 @@ def _graph(
             consumers=consumers,
         ),
     )
+
+
+def _lineage_graph():
+    evidence_store = InMemoryEvidenceStore()
+    history = InMemoryMemoryHistoryStore(evidence_store)
+    releases = InMemoryMemoryReleaseStore(history)
+    scope = MemoryScope("tenant-1", "agent-long-term-memory", "lineage-subject")
+    evidence = evidence_store.append(
+        EvidenceEvent(
+            scope=scope,
+            session_id="lineage-session",
+            run_id="lineage-run",
+            sequence_no=0,
+            kind=EvidenceKind.USER_MESSAGE,
+            payload="lineage evidence",
+            observed_at=_BASE,
+            idempotency_key="lineage-evidence",
+        )
+    )
+    root_candidate = history.append_candidate(
+        CandidateProposal(
+            scope=scope,
+            content="root",
+            evidence_ids=(evidence.evidence_id,),
+            idempotency_key="root-candidate",
+        )
+    )
+    root = history.append_revision(
+        RevisionProposal(
+            scope=scope,
+            candidate_id=root_candidate.candidate_id,
+            operation=RevisionOperation.ADD,
+            parent_revision_id=None,
+            idempotency_key="root-revision",
+        )
+    )
+    children = []
+    for index in range(2):
+        candidate = history.append_candidate(
+            CandidateProposal(
+                scope=scope,
+                content=f"child-{index}",
+                evidence_ids=(evidence.evidence_id,),
+                idempotency_key=f"child-candidate-{index}",
+            )
+        )
+        children.append(
+            history.append_revision(
+                RevisionProposal(
+                    scope=scope,
+                    candidate_id=candidate.candidate_id,
+                    operation=RevisionOperation.REFINE,
+                    parent_revision_id=root.revision_id,
+                    idempotency_key=f"child-revision-{index}",
+                )
+            )
+        )
+    release = releases.append_release(
+        ReleaseManifest(scope=scope, revision_ids=(children[0].revision_id,)),
+        idempotency_key="lineage-release",
+    )
+    return scope, history, releases, release, root, tuple(children)
 
 
 def _spec(
@@ -586,10 +750,41 @@ def test_source_read_receipt_records_real_runtime_getters_without_content() -> N
     assert b"language=zh-CN" not in canonical
 
 
+def test_source_transcripts_match_independent_backend_getter_log() -> None:
+    scope, history, releases, release, _store = _graph()
+    backend_calls = []
+    runtime = InMemoryMemoryRuntimeStore(
+        _LoggingHistoryStore(history, backend_calls),
+        _LoggingReleaseStore(releases, backend_calls),
+        retrievers=(_ReleaseOrderRetriever(),),
+    )
+    spec = _spec(scope, release.release_id)
+
+    attempt = runtime.begin_query(spec)
+    transcript = runtime.get_source_read_transcript(
+        scope,
+        attempt.pin_read_transcript_id,
+    )
+    assert transcript.phase is MemorySourceReadPhase.ATTEMPT_PIN
+    assert tuple(map(_event_signature, transcript.read_events)) == tuple(backend_calls)
+    assert transcript.read_events[0].requested_ids == (release.release_id,)
+    assert transcript.read_events[1].requested_ids == (release.release_id,)
+
+    backend_calls.clear()
+    result = runtime.resolve_query(scope, attempt.attempt_id, query=b"query-a")
+    receipt = runtime.get_source_read_receipt(
+        scope,
+        result.source_read_receipt_id,
+    )
+    assert tuple(map(_event_signature, receipt.read_events)) == tuple(backend_calls)
+    assert all(len(event.requested_ids) == 1 for event in receipt.read_events)
+
+
 def test_missing_getter_capture_fails_closed_without_publishing_receipt(
     monkeypatch,
 ) -> None:
-    scope, history, _releases, release, store = _graph()
+    retriever = _ReleaseOrderRetriever()
+    scope, history, _releases, release, store = _graph(retriever=retriever)
     attempt = store.begin_query(_spec(scope, release.release_id))
 
     def omit_candidate_event(requested_scope, candidate_id, read_session):
@@ -604,6 +799,195 @@ def test_missing_getter_capture_fails_closed_without_publishing_receipt(
     assert store._source_read_receipt_by_attempt == {}
     assert store._result_by_address == {}
     assert store._result_by_attempt == {}
+    assert retriever.calls == 0
+
+
+def test_evidence_snapshot_cannot_drift_between_receipt_and_result(
+    monkeypatch,
+) -> None:
+    scope, history, releases, release, _store = _graph()
+
+    class CloningEvidenceHistory:
+        def __init__(self) -> None:
+            self.last_evidence = ()
+
+        def __getattr__(self, name):
+            return getattr(history, name)
+
+        def get_candidate_evidence(self, requested_scope, candidate_id):
+            self.last_evidence = tuple(
+                replace(item)
+                for item in history.get_candidate_evidence(
+                    requested_scope,
+                    candidate_id,
+                )
+            )
+            return self.last_evidence
+
+    cloning_history = CloningEvidenceHistory()
+    runtime = InMemoryMemoryRuntimeStore(
+        cloning_history,
+        releases,
+        retrievers=(_ReleaseOrderRetriever(),),
+    )
+    attempt = runtime.begin_query(_spec(scope, release.release_id))
+    original_validate_candidate = runtime._validate_candidate
+
+    def mutate_after_validation(*args, **kwargs):
+        evidence_refs = original_validate_candidate(*args, **kwargs)
+        for record in cloning_history.last_evidence:
+            object.__setattr__(record, "content_hash", "0" * 64)
+        return evidence_refs
+
+    monkeypatch.setattr(runtime, "_validate_candidate", mutate_after_validation)
+    result = runtime.resolve_query(scope, attempt.attempt_id, query=b"query-a")
+    receipt = runtime.get_source_read_receipt(scope, result.source_read_receipt_id)
+    returned_tail = receipt.read_events[-2 * len(result.returned_items) :]
+    evidence_events = returned_tail[1::2]
+
+    assert tuple(item.evidence for item in result.returned_items) == tuple(
+        tuple(
+            MemoryEvidenceRefV1(
+                evidence_id=source.object_id,
+                evidence_content_sha256=source.object_content_sha256,
+            )
+            for source in event.returned_objects
+        )
+        for event in evidence_events
+    )
+    assert all(
+        evidence.evidence_content_sha256 != "0" * 64
+        for item in result.returned_items
+        for evidence in item.evidence
+    )
+
+
+def test_missing_iterative_parent_read_fails_closed_during_resolution(
+    monkeypatch,
+) -> None:
+    scope, history, releases, release, _root, _children = _lineage_graph()
+    runtime = InMemoryMemoryRuntimeStore(
+        history,
+        releases,
+        retrievers=(_ReleaseOrderRetriever(),),
+    )
+    attempt = runtime.begin_query(_spec(scope, release.release_id))
+
+    def omit_parent_event(requested_scope, revision_id, read_session):
+        del read_session
+        return history.get_revision(requested_scope, revision_id)
+
+    monkeypatch.setattr(runtime, "_read_revision", omit_parent_event)
+    with pytest.raises(MemoryQueryConflictError, match="capture is incomplete"):
+        runtime.resolve_query(scope, attempt.attempt_id, query=b"query-a")
+
+    assert runtime._source_read_receipt_by_address == {}
+    assert runtime._result_by_address == {}
+
+
+def test_iterative_transcript_records_child_to_add_ancestry_exactly() -> None:
+    scope, history, releases, release, root, children = _lineage_graph()
+    runtime = InMemoryMemoryRuntimeStore(
+        history,
+        releases,
+        retrievers=(_ReleaseOrderRetriever(),),
+    )
+    attempt = runtime.begin_query(_spec(scope, release.release_id))
+    pin = runtime.get_source_read_transcript(scope, attempt.pin_read_transcript_id)
+
+    assert tuple(event.operation for event in pin.read_events) == (
+        MemorySourceReadOperation.GET_RELEASE,
+        MemorySourceReadOperation.GET_RELEASE_REVISIONS,
+        MemorySourceReadOperation.GET_CANDIDATE,
+        MemorySourceReadOperation.GET_CANDIDATE_EVIDENCE,
+        MemorySourceReadOperation.GET_REVISION,
+        MemorySourceReadOperation.GET_CANDIDATE,
+        MemorySourceReadOperation.GET_CANDIDATE_EVIDENCE,
+    )
+    assert pin.read_events[2].requested_ids == (children[0].proposal.candidate_id,)
+    assert pin.read_events[4].requested_ids == (root.revision_id,)
+    assert pin.read_events[5].requested_ids == (root.proposal.candidate_id,)
+
+    result = runtime.resolve_query(scope, attempt.attempt_id, query=b"query-a")
+    receipt = runtime.get_source_read_receipt(scope, result.source_read_receipt_id)
+    assert receipt.read_events[: len(pin.read_events)] == pin.read_events
+
+
+def test_shared_ancestry_transcript_records_each_parent_getter_once_per_child() -> None:
+    scope, history, _releases, _release, root, children = _lineage_graph()
+    manifest = ReleaseManifest(
+        scope=scope,
+        revision_ids=tuple(item.revision_id for item in children),
+    )
+    graph_hash = hashlib.sha256(b"shared-ancestry-test-graph").hexdigest()
+    commitment = json.dumps(
+        {
+            "manifest_sha256": hashlib.sha256(manifest.canonical_bytes()).hexdigest(),
+            "record_kind": "memory_release_commitment",
+            "release_graph_sha256": graph_hash,
+            "schema_version": 1,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
+    release_hash = hashlib.sha256(commitment).hexdigest()
+    shared_release = MemoryRelease(
+        release_id=f"rel_{release_hash[:24]}",
+        manifest=manifest,
+        content_hash=release_hash,
+        release_graph_sha256=graph_hash,
+        created_at=_BASE,
+    )
+
+    class SharedAncestryReleaseStore:
+        def get_release(self, requested_scope, release_id):
+            assert requested_scope == scope
+            assert release_id == shared_release.release_id
+            return shared_release
+
+        def get_release_revisions(self, requested_scope, release_id):
+            assert requested_scope == scope
+            assert release_id == shared_release.release_id
+            return children
+
+    runtime = InMemoryMemoryRuntimeStore(
+        history,
+        SharedAncestryReleaseStore(),
+        retrievers=(_ReleaseOrderRetriever(returned=False),),
+    )
+    attempt = runtime.begin_query(_spec(scope, shared_release.release_id))
+    transcript = runtime.get_source_read_transcript(
+        scope,
+        attempt.pin_read_transcript_id,
+    )
+
+    parent_reads = tuple(
+        event
+        for event in transcript.read_events
+        if event.operation is MemorySourceReadOperation.GET_REVISION
+    )
+    assert len(parent_reads) == 2
+    assert all(event.requested_ids == (root.revision_id,) for event in parent_reads)
+    root_candidate_reads = tuple(
+        event
+        for event in transcript.read_events
+        if event.operation is MemorySourceReadOperation.GET_CANDIDATE
+        and event.requested_ids == (root.proposal.candidate_id,)
+    )
+    assert len(root_candidate_reads) == 1
+
+    result = runtime.resolve_query(scope, attempt.attempt_id, query=b"query-a")
+    receipt = runtime.get_source_read_receipt(scope, result.source_read_receipt_id)
+    assert receipt.read_events[: len(transcript.read_events)] == transcript.read_events
+    assert (
+        sum(
+            event.operation is MemorySourceReadOperation.GET_REVISION
+            and event.requested_ids == (root.revision_id,)
+            for event in receipt.read_events
+        )
+        == 2
+    )
 
 
 def test_caller_cannot_submit_posthoc_or_cross_scope_source_receipt() -> None:
@@ -660,6 +1044,50 @@ def test_corrupt_source_receipt_blocks_downstream_renderer_side_effect() -> None
             renderer_version_sha256=renderer.renderer_version_sha256,
         )
     assert renderer.calls == 0
+
+
+def test_cached_delivery_revalidates_receipt_before_returning() -> None:
+    renderer = _LineRenderer()
+    scope, _history, _releases, release, store = _graph(renderer=renderer)
+    _attempt, result = _query_all(
+        store,
+        scope,
+        release,
+        _spec(scope, release.release_id),
+    )
+    store.prepare_delivery(
+        scope,
+        result.query_result_id,
+        renderer_id=renderer.renderer_id,
+        renderer_version_sha256=renderer.renderer_version_sha256,
+    )
+    assert renderer.calls == 1
+    receipt = store.get_source_read_receipt(scope, result.source_read_receipt_id)
+    object.__setattr__(receipt, "content_hash", "0" * 64)
+
+    with pytest.raises(MemoryDeliveryConflictError, match="integrity validation"):
+        store.prepare_delivery(
+            scope,
+            result.query_result_id,
+            renderer_id=renderer.renderer_id,
+            renderer_version_sha256=renderer.renderer_version_sha256,
+        )
+    assert renderer.calls == 1
+
+
+def test_corrupt_pin_transcript_blocks_retriever_side_effect() -> None:
+    retriever = _ReleaseOrderRetriever()
+    scope, _history, _releases, release, store = _graph(retriever=retriever)
+    attempt = store.begin_query(_spec(scope, release.release_id))
+    transcript = store.get_source_read_transcript(
+        scope,
+        attempt.pin_read_transcript_id,
+    )
+    object.__setattr__(transcript, "content_hash", "0" * 64)
+
+    with pytest.raises(MemoryQueryConflictError, match="integrity validation"):
+        store.resolve_query(scope, attempt.attempt_id, query=b"query-a")
+    assert retriever.calls == 0
 
 
 def test_model_call_ack_hashes_actual_prompt_slice_and_token_ids() -> None:
@@ -1076,6 +1504,8 @@ def test_attempt_result_and_delivery_publication_are_rollback_safe() -> None:
     assert store._attempt_by_address == {}
     assert store._attempt_by_idempotency == {}
     assert store._attempt_by_trajectory_slot == {}
+    assert store._source_read_transcript_by_address == {}
+    assert store._source_read_transcript_by_attempt == {}
     assert store._trajectory_binding == {}
     assert store._rollout_group_binding == {}
     attempt = store.begin_query(spec)
@@ -1497,6 +1927,93 @@ def test_complete_chain_is_revalidated_before_consumer_side_effects(
     assert store.list_exposures(scope) == ()
 
 
+def test_receipt_tamper_after_prepare_blocks_consumer_before_side_effect() -> None:
+    consumer = _ContextConsumer()
+    scope, _history, _releases, release, store = _graph(consumers=(consumer,))
+    _attempt, result = _query_all(
+        store,
+        scope,
+        release,
+        _spec(scope, release.release_id),
+    )
+    _context, delivery = _deliver(store, scope, result)
+    receipt = store.get_source_read_receipt(scope, result.source_read_receipt_id)
+    object.__setattr__(receipt, "content_hash", "0" * 64)
+
+    with pytest.raises(MemoryBoundaryMismatchError, match="integrity validation"):
+        store.submit_delivery(
+            scope,
+            delivery.delivery_id,
+            consumer_id=consumer.consumer_id,
+            consumer_version_sha256=consumer.consumer_version_sha256,
+            call_id="must-not-run",
+            query=b"query-a",
+            history=(),
+        )
+    assert consumer.calls == 0
+
+
+def test_cached_delivery_replay_revalidates_receipt_chain_before_return() -> None:
+    consumer = _ContextConsumer()
+    scope, _history, _releases, release, store = _graph(consumers=(consumer,))
+    _attempt, result = _query_all(
+        store,
+        scope,
+        release,
+        _spec(scope, release.release_id),
+    )
+    _context, delivery = _deliver(store, scope, result)
+    store.submit_delivery(
+        scope,
+        delivery.delivery_id,
+        consumer_id=consumer.consumer_id,
+        consumer_version_sha256=consumer.consumer_version_sha256,
+        call_id="cached-call",
+        query=b"query-a",
+        history=(),
+    )
+    assert consumer.calls == 1
+    receipt = store.get_source_read_receipt(scope, result.source_read_receipt_id)
+    object.__setattr__(receipt, "content_hash", "0" * 64)
+
+    with pytest.raises(MemoryBoundaryMismatchError, match="integrity validation"):
+        store.submit_delivery(
+            scope,
+            delivery.delivery_id,
+            consumer_id=consumer.consumer_id,
+            consumer_version_sha256=consumer.consumer_version_sha256,
+            call_id="cached-call",
+            query=b"query-a",
+            history=(),
+        )
+    assert consumer.calls == 1
+
+
+def test_missing_receipt_reverse_index_blocks_consumer_before_side_effect() -> None:
+    consumer = _ContextConsumer()
+    scope, _history, _releases, release, store = _graph(consumers=(consumer,))
+    attempt, result = _query_all(
+        store,
+        scope,
+        release,
+        _spec(scope, release.release_id),
+    )
+    _context, delivery = _deliver(store, scope, result)
+    store._source_read_receipt_by_attempt.pop((scope, attempt.attempt_id))
+
+    with pytest.raises(MemoryBoundaryMismatchError, match="incomplete"):
+        store.submit_delivery(
+            scope,
+            delivery.delivery_id,
+            consumer_id=consumer.consumer_id,
+            consumer_version_sha256=consumer.consumer_version_sha256,
+            call_id="must-not-run",
+            query=b"query-a",
+            history=(),
+        )
+    assert consumer.calls == 0
+
+
 def test_registered_component_identity_is_revalidated_before_each_call() -> None:
     retriever = _ReleaseOrderRetriever()
     scope, _history, _releases, release, store = _graph(retriever=retriever)
@@ -1584,6 +2101,8 @@ def test_concurrent_exact_retries_converge_at_every_stage() -> None:
         attempts = tuple(pool.map(lambda _: store.begin_query(spec), range(32)))
     assert len({item.attempt_id for item in attempts}) == 1
     attempt = attempts[0]
+    assert len(store._source_read_transcript_by_address) == 1
+    assert len(store._source_read_transcript_by_attempt) == 1
 
     def resolve(_):
         return store.resolve_query(

@@ -8,9 +8,10 @@ consumer-call receipts; callers never submit those records themselves.  The
 final join reloads the complete stored chain and derives injection from
 acknowledged byte spans.
 
-Source-read receipts contain only object IDs and full content hashes.  They
-show what this honest runtime read and validated for one attempt; they do not
-show that a model used the memory or that the memory improved task utility.
+Attempt-pin transcripts and resolution receipts contain only requested object
+IDs plus returned object IDs and full content hashes.  They show what this
+honest runtime read and validated; they do not show that a model used the
+memory or that the memory improved task utility.
 
 This is an honest-runtime integrity boundary.  Python object privacy and
 content hashes do not authenticate a malicious in-process caller.  A remote
@@ -64,7 +65,9 @@ from areal.v2.memory_service.runtime_types import (
     MemorySourceObjectRefV1,
     MemorySourceReadEventV1,
     MemorySourceReadOperation,
+    MemorySourceReadPhase,
     MemorySourceReadReceiptV1,
+    MemorySourceReadTranscriptV1,
 )
 from areal.v2.memory_service.types import EvidenceRecord, MemoryScope
 
@@ -85,18 +88,43 @@ class _SourceReadSession:
     def record(
         self,
         operation: MemorySourceReadOperation,
+        requested_ids: tuple[str, ...],
         returned_objects: tuple[MemorySourceObjectRefV1, ...],
     ) -> None:
-        self._events.append(
-            MemorySourceReadEventV1(
+        try:
+            event = MemorySourceReadEventV1(
                 sequence_no=len(self._events),
                 operation=operation,
+                requested_ids=requested_ids,
                 returned_objects=returned_objects,
             )
-        )
+        except (TypeError, ValueError) as error:
+            raise MemoryQueryConflictError(
+                "source getter returned invalid commitments or address"
+            ) from error
+        self._events.append(event)
 
     def snapshot(self) -> tuple[MemorySourceReadEventV1, ...]:
         return tuple(self._events)
+
+
+def _expected_read_event(
+    expected_events: list[MemorySourceReadEventV1] | None,
+    operation: MemorySourceReadOperation,
+    requested_ids: tuple[str, ...],
+    returned_objects: tuple[MemorySourceObjectRefV1, ...],
+) -> None:
+    """Build the semantic transcript outside the getter logging wrapper."""
+
+    if expected_events is not None:
+        expected_events.append(
+            MemorySourceReadEventV1(
+                sequence_no=len(expected_events),
+                operation=operation,
+                requested_ids=requested_ids,
+                returned_objects=returned_objects,
+            )
+        )
 
 
 def _source_ref(
@@ -353,6 +381,12 @@ class MemoryRuntimeStore(Protocol):
         attempt_id: str,
     ) -> MemoryQueryAttemptV1: ...
 
+    def get_source_read_transcript(
+        self,
+        scope: MemoryScope,
+        source_read_transcript_id: str,
+    ) -> MemorySourceReadTranscriptV1: ...
+
     def resolve_query(
         self,
         scope: MemoryScope,
@@ -508,6 +542,12 @@ class InMemoryMemoryRuntimeStore:
         self._rollout_group_binding: dict[
             tuple[MemoryScope, str], tuple[str, str, str, str]
         ] = {}
+        self._source_read_transcript_by_address: dict[
+            tuple[MemoryScope, str], MemorySourceReadTranscriptV1
+        ] = {}
+        self._source_read_transcript_by_attempt: dict[
+            tuple[MemoryScope, str], MemorySourceReadTranscriptV1
+        ] = {}
         self._result_by_address: dict[tuple[MemoryScope, str], MemoryQueryResultV1] = {}
         self._result_by_attempt: dict[tuple[MemoryScope, str], MemoryQueryResultV1] = {}
         self._source_read_receipt_by_address: dict[
@@ -567,6 +607,7 @@ class InMemoryMemoryRuntimeStore:
         if read_session is not None:
             read_session.record(
                 MemorySourceReadOperation.GET_RELEASE,
+                (release_id,),
                 (_source_ref(MemorySourceObjectKind.RELEASE, value),),
             )
         return value
@@ -585,6 +626,7 @@ class InMemoryMemoryRuntimeStore:
         if read_session is not None:
             read_session.record(
                 MemorySourceReadOperation.GET_RELEASE_REVISIONS,
+                (release_id,),
                 tuple(
                     _source_ref(MemorySourceObjectKind.REVISION, item)
                     for item in values
@@ -602,6 +644,7 @@ class InMemoryMemoryRuntimeStore:
         if read_session is not None:
             read_session.record(
                 MemorySourceReadOperation.GET_REVISION,
+                (revision_id,),
                 (_source_ref(MemorySourceObjectKind.REVISION, value),),
             )
         return value
@@ -616,6 +659,7 @@ class InMemoryMemoryRuntimeStore:
         if read_session is not None:
             read_session.record(
                 MemorySourceReadOperation.GET_CANDIDATE,
+                (candidate_id,),
                 (_source_ref(MemorySourceObjectKind.CANDIDATE, value),),
             )
         return value
@@ -634,6 +678,7 @@ class InMemoryMemoryRuntimeStore:
         if read_session is not None:
             read_session.record(
                 MemorySourceReadOperation.GET_CANDIDATE_EVIDENCE,
+                (candidate_id,),
                 tuple(
                     _source_ref(MemorySourceObjectKind.EVIDENCE, item)
                     for item in values
@@ -642,117 +687,154 @@ class InMemoryMemoryRuntimeStore:
         return values
 
     @staticmethod
-    def _item_read_signatures(
-        item: MemoryQueryItemV1,
-    ) -> tuple[
-        tuple[MemorySourceReadOperation, tuple[MemorySourceObjectRefV1, ...]],
-        tuple[MemorySourceReadOperation, tuple[MemorySourceObjectRefV1, ...]],
-    ]:
-        return (
-            (
-                MemorySourceReadOperation.GET_CANDIDATE,
-                (
-                    MemorySourceObjectRefV1(
-                        kind=MemorySourceObjectKind.CANDIDATE,
-                        object_id=item.candidate_id,
-                        object_content_sha256=item.candidate_content_sha256,
-                    ),
-                ),
-            ),
-            (
-                MemorySourceReadOperation.GET_CANDIDATE_EVIDENCE,
-                tuple(
-                    MemorySourceObjectRefV1(
-                        kind=MemorySourceObjectKind.EVIDENCE,
-                        object_id=evidence.evidence_id,
-                        object_content_sha256=evidence.evidence_content_sha256,
-                    )
-                    for evidence in item.evidence
-                ),
-            ),
-        )
+    def _validate_pin_read_events(
+        *,
+        spec: MemoryQuerySpecV1,
+        release: MemoryRelease,
+        revisions: tuple[MemoryRevision, ...],
+        events: tuple[MemorySourceReadEventV1, ...],
+        expected_events: tuple[MemorySourceReadEventV1, ...],
+    ) -> None:
+        """Bind begin-query reads to the exact release and derived traversal."""
 
-    @classmethod
+        expected_release_ref = _source_ref(MemorySourceObjectKind.RELEASE, release)
+        expected_revision_refs = tuple(
+            _source_ref(MemorySourceObjectKind.REVISION, item) for item in revisions
+        )
+        if (
+            len(expected_events) < 2
+            or expected_events[0].operation is not MemorySourceReadOperation.GET_RELEASE
+            or expected_events[0].requested_ids != (spec.release_id,)
+            or expected_events[0].returned_objects != (expected_release_ref,)
+            or expected_events[1].operation
+            is not MemorySourceReadOperation.GET_RELEASE_REVISIONS
+            or expected_events[1].requested_ids != (spec.release_id,)
+            or expected_events[1].returned_objects != expected_revision_refs
+            or events != expected_events
+        ):
+            raise MemoryQueryConflictError(
+                "attempt-pin source-read capture is incomplete or out of order"
+            )
+
+    @staticmethod
     def _validate_resolution_read_events(
-        cls,
         *,
         attempt: MemoryQueryAttemptV1,
         events: tuple[MemorySourceReadEventV1, ...],
-        graph_event_count: int,
-        eligible_event_count: int,
-        eligible_items: tuple[MemoryQueryItemV1, ...],
-        returned_items: tuple[MemoryQueryItemV1, ...],
+        expected_events: tuple[MemorySourceReadEventV1, ...],
     ) -> None:
-        """Fail closed if private capture missed or reordered a runtime getter."""
+        """Compare capture with the independently derived iterative transcript."""
 
-        signatures = tuple(
-            (event.operation, event.returned_objects) for event in events
+        release_ref = MemorySourceObjectRefV1(
+            kind=MemorySourceObjectKind.RELEASE,
+            object_id=attempt.spec.release_id,
+            object_content_sha256=attempt.release_content_sha256,
         )
-        expected_release = (
-            MemorySourceReadOperation.GET_RELEASE,
-            (
-                MemorySourceObjectRefV1(
-                    kind=MemorySourceObjectKind.RELEASE,
-                    object_id=attempt.spec.release_id,
-                    object_content_sha256=attempt.release_content_sha256,
-                ),
-            ),
-        )
-        expected_revisions = (
-            MemorySourceReadOperation.GET_RELEASE_REVISIONS,
-            tuple(
-                MemorySourceObjectRefV1(
-                    kind=MemorySourceObjectKind.REVISION,
-                    object_id=item.revision_id,
-                    object_content_sha256=item.revision_content_sha256,
-                )
-                for item in attempt.release_revisions
-            ),
-        )
-        eligible_signatures = tuple(
-            signature
-            for item in eligible_items
-            for signature in cls._item_read_signatures(item)
-        )
-        returned_signatures = tuple(
-            signature
-            for item in returned_items
-            for signature in cls._item_read_signatures(item)
-        )
-        graph_signatures = signatures[:graph_event_count]
-        graph_body = graph_signatures[2:]
-        if (
-            len(signatures) < 2
-            or signatures[:2] != (expected_release, expected_revisions)
-            or signatures[graph_event_count:eligible_event_count] != eligible_signatures
-            or signatures[eligible_event_count:] != returned_signatures
-            or any(
-                not any(
-                    graph_body[index : index + 2] == cls._item_read_signatures(item)
-                    for index in range(max(0, len(graph_body) - 1))
-                )
-                for item in eligible_items
+        revision_refs = tuple(
+            MemorySourceObjectRefV1(
+                kind=MemorySourceObjectKind.REVISION,
+                object_id=item.revision_id,
+                object_content_sha256=item.revision_content_sha256,
             )
+            for item in attempt.release_revisions
+        )
+        if (
+            len(expected_events) < 2
+            or expected_events[0].operation is not MemorySourceReadOperation.GET_RELEASE
+            or expected_events[0].requested_ids != (attempt.spec.release_id,)
+            or expected_events[0].returned_objects != (release_ref,)
+            or expected_events[1].operation
+            is not MemorySourceReadOperation.GET_RELEASE_REVISIONS
+            or expected_events[1].requested_ids != (attempt.spec.release_id,)
+            or expected_events[1].returned_objects != revision_refs
+            or events != expected_events
         ):
             raise MemoryQueryConflictError(
                 "runtime source-read capture is incomplete or out of order"
             )
 
+    @staticmethod
+    def _receipt_tail_matches_returned_items(
+        result: MemoryQueryResultV1,
+        receipt: MemorySourceReadReceiptV1,
+    ) -> bool:
+        """Bind result content to the exact final candidate/evidence reads."""
+
+        expected = tuple(
+            signature
+            for item in result.returned_items
+            for signature in (
+                (
+                    MemorySourceReadOperation.GET_CANDIDATE,
+                    (item.candidate_id,),
+                    (
+                        (
+                            MemorySourceObjectKind.CANDIDATE,
+                            item.candidate_id,
+                            item.candidate_content_sha256,
+                        ),
+                    ),
+                ),
+                (
+                    MemorySourceReadOperation.GET_CANDIDATE_EVIDENCE,
+                    (item.candidate_id,),
+                    tuple(
+                        (
+                            MemorySourceObjectKind.EVIDENCE,
+                            evidence.evidence_id,
+                            evidence.evidence_content_sha256,
+                        )
+                        for evidence in item.evidence
+                    ),
+                ),
+            )
+        )
+        if not expected:
+            return True
+        if len(receipt.read_events) < len(expected):
+            return False
+        actual = tuple(
+            (
+                event.operation,
+                event.requested_ids,
+                tuple(
+                    (source.kind, source.object_id, source.object_content_sha256)
+                    for source in event.returned_objects
+                ),
+            )
+            for event in receipt.read_events[-len(expected) :]
+        )
+        return actual == expected
+
     def _validate_evidence(
         self,
         scope: MemoryScope,
         record: EvidenceRecord,
-    ) -> None:
+    ) -> MemoryEvidenceRefV1:
         if type(record) is not EvidenceRecord or record.event.scope != scope:
             raise MemoryQueryConflictError("history store returned non-scoped evidence")
+        evidence_id = record.evidence_id
         expected_hash = sha256(record.event.canonical_bytes()).hexdigest()
         if (
             record.content_hash != expected_hash
-            or record.evidence_id != f"evd_{expected_hash[:24]}"
+            or evidence_id != f"evd_{expected_hash[:24]}"
         ):
             raise MemoryQueryConflictError(
                 "history store returned evidence with invalid commitments"
             )
+        repeated_hash = sha256(record.event.canonical_bytes()).hexdigest()
+        if (
+            repeated_hash != expected_hash
+            or record.content_hash != expected_hash
+            or record.evidence_id != evidence_id
+        ):
+            raise MemoryQueryConflictError(
+                "evidence changed while its commitment was being validated"
+            )
+        return MemoryEvidenceRefV1(
+            evidence_id=evidence_id,
+            evidence_content_sha256=expected_hash,
+        )
 
     def _validate_candidate(
         self,
@@ -761,7 +843,8 @@ class InMemoryMemoryRuntimeStore:
         *,
         expected_candidate_id: str | None = None,
         read_session: _SourceReadSession | None = None,
-    ) -> tuple[EvidenceRecord, ...]:
+        expected_events: list[MemorySourceReadEventV1] | None = None,
+    ) -> tuple[MemoryEvidenceRefV1, ...]:
         if type(candidate) is not MemoryCandidate or candidate.proposal.scope != scope:
             raise MemoryQueryConflictError(
                 "history store returned a non-scoped candidate"
@@ -783,6 +866,14 @@ class InMemoryMemoryRuntimeStore:
             candidate.candidate_id,
             read_session,
         )
+        _expected_read_event(
+            expected_events,
+            MemorySourceReadOperation.GET_CANDIDATE_EVIDENCE,
+            (candidate.candidate_id,),
+            tuple(
+                _source_ref(MemorySourceObjectKind.EVIDENCE, item) for item in evidence
+            ),
+        )
         if (
             type(evidence) is not tuple
             or any(type(item) is not EvidenceRecord for item in evidence)
@@ -792,8 +883,9 @@ class InMemoryMemoryRuntimeStore:
             raise MemoryQueryConflictError(
                 "candidate evidence does not match its immutable proposal"
             )
-        for record in evidence:
-            self._validate_evidence(scope, record)
+        evidence_refs = tuple(
+            self._validate_evidence(scope, record) for record in evidence
+        )
         repeated_hash = sha256(candidate.proposal.canonical_bytes()).hexdigest()
         if (
             repeated_hash != expected_hash
@@ -807,7 +899,7 @@ class InMemoryMemoryRuntimeStore:
             raise MemoryQueryConflictError(
                 "candidate changed while its evidence was being validated"
             )
-        return evidence
+        return evidence_refs
 
     def _validate_revision(
         self,
@@ -817,6 +909,7 @@ class InMemoryMemoryRuntimeStore:
         visiting: set[str],
         validated: dict[str, MemoryRevision],
         read_session: _SourceReadSession | None = None,
+        expected_events: list[MemorySourceReadEventV1] | None = None,
     ) -> None:
         path: list[tuple[MemoryRevision, str]] = []
         visited_revision_ids: list[str] = []
@@ -856,11 +949,18 @@ class InMemoryMemoryRuntimeStore:
                     current.proposal.candidate_id,
                     read_session,
                 )
+                _expected_read_event(
+                    expected_events,
+                    MemorySourceReadOperation.GET_CANDIDATE,
+                    (current.proposal.candidate_id,),
+                    (_source_ref(MemorySourceObjectKind.CANDIDATE, candidate),),
+                )
                 self._validate_candidate(
                     scope,
                     candidate,
                     expected_candidate_id=current.proposal.candidate_id,
                     read_session=read_session,
+                    expected_events=expected_events,
                 )
                 if current.proposal.operation is RevisionOperation.ADD:
                     if (
@@ -879,6 +979,12 @@ class InMemoryMemoryRuntimeStore:
                         "non-ADD revision has no exact parent"
                     )
                 parent = self._read_revision(scope, parent_id, read_session)
+                _expected_read_event(
+                    expected_events,
+                    MemorySourceReadOperation.GET_REVISION,
+                    (parent_id,),
+                    (_source_ref(MemorySourceObjectKind.REVISION, parent),),
+                )
                 if parent.revision_id != parent_id:
                     raise MemoryQueryConflictError(
                         "history store returned a different parent address"
@@ -925,17 +1031,33 @@ class InMemoryMemoryRuntimeStore:
         scope: MemoryScope,
         release_id: str,
         read_session: _SourceReadSession | None = None,
+        expected_events: list[MemorySourceReadEventV1] | None = None,
     ) -> tuple[MemoryRelease, tuple[MemoryRevision, ...]]:
         try:
             release = self._read_release(scope, release_id, read_session)
+            _expected_read_event(
+                expected_events,
+                MemorySourceReadOperation.GET_RELEASE,
+                (release_id,),
+                (_source_ref(MemorySourceObjectKind.RELEASE, release),),
+            )
             revisions = self._read_release_revisions(
                 scope,
                 release_id,
                 read_session,
             )
+            _expected_read_event(
+                expected_events,
+                MemorySourceReadOperation.GET_RELEASE_REVISIONS,
+                (release_id,),
+                tuple(
+                    _source_ref(MemorySourceObjectKind.REVISION, item)
+                    for item in revisions
+                ),
+            )
         except Exception as error:
             raise MemoryQueryConflictError(
-                "release store failed to resolve the committed source graph"
+                "release graph source store failed integrity validation"
             ) from error
         if (
             type(release) is not MemoryRelease
@@ -972,6 +1094,7 @@ class InMemoryMemoryRuntimeStore:
                 visiting=set(),
                 validated=validated,
                 read_session=read_session,
+                expected_events=expected_events,
             )
         repeated_release_hash = sha256(release.commitment_bytes()).hexdigest()
         if (
@@ -1005,12 +1128,36 @@ class InMemoryMemoryRuntimeStore:
             existing = self._attempt_by_idempotency.get(idempotency_address)
             if existing is not None:
                 if existing.spec == spec:
-                    return existing
+                    validated, _transcript = self._load_validated_attempt_chain(
+                        spec.scope,
+                        existing.attempt_id,
+                    )
+                    return validated
                 raise MemoryQueryConflictError(
                     "scoped query idempotency key has different content"
                 )
 
-        release, revisions = self._load_release(spec.scope, spec.release_id)
+        read_session = _SourceReadSession()
+        expected_events: list[MemorySourceReadEventV1] = []
+        release, revisions = self._load_release(
+            spec.scope,
+            spec.release_id,
+            read_session,
+            expected_events,
+        )
+        read_events = read_session.snapshot()
+        self._validate_pin_read_events(
+            spec=spec,
+            release=release,
+            revisions=revisions,
+            events=read_events,
+            expected_events=tuple(expected_events),
+        )
+        pin_read_transcript = MemorySourceReadTranscriptV1.create(
+            scope=spec.scope,
+            phase=MemorySourceReadPhase.ATTEMPT_PIN,
+            read_events=read_events,
+        )
         slot_address = (
             spec.scope,
             spec.trajectory_id,
@@ -1035,7 +1182,11 @@ class InMemoryMemoryRuntimeStore:
             claimed_slot = self._attempt_by_trajectory_slot.get(slot_address)
             if claimed_slot is not None:
                 if claimed_slot.spec == spec:
-                    return claimed_slot
+                    validated, _transcript = self._load_validated_attempt_chain(
+                        spec.scope,
+                        claimed_slot.attempt_id,
+                    )
+                    return validated
                 raise MemoryQueryConflictError(
                     "trajectory query sequence is already bound"
                 )
@@ -1063,21 +1214,34 @@ class InMemoryMemoryRuntimeStore:
             spec=spec,
             release_content_sha256=release.content_hash,
             release_revisions=tuple(_revision_ref(item) for item in revisions),
+            pin_read_transcript=pin_read_transcript,
             attempt_nonce=_new_runtime_nonce(),
         )
         address = (spec.scope, attempt.attempt_id)
+        transcript_address = (
+            spec.scope,
+            pin_read_transcript.source_read_transcript_id,
+        )
         with self._lock:
             existing = self._attempt_by_idempotency.get(idempotency_address)
             if existing is not None:
                 if existing.spec == spec:
-                    return existing
+                    validated, _transcript = self._load_validated_attempt_chain(
+                        spec.scope,
+                        existing.attempt_id,
+                    )
+                    return validated
                 raise MemoryQueryConflictError(
                     "scoped query idempotency key has different content"
                 )
             claimed_slot = self._attempt_by_trajectory_slot.get(slot_address)
             if claimed_slot is not None:
                 if claimed_slot.spec == spec:
-                    return claimed_slot
+                    validated, _transcript = self._load_validated_attempt_chain(
+                        spec.scope,
+                        claimed_slot.attempt_id,
+                    )
+                    return validated
                 raise MemoryQueryConflictError(
                     "trajectory query sequence is already bound"
                 )
@@ -1104,13 +1268,43 @@ class InMemoryMemoryRuntimeStore:
             collision = self._attempt_by_address.get(address)
             if collision is not None:
                 if _canonical_equal(collision, attempt):
-                    self._attempt_by_idempotency[idempotency_address] = collision
-                    return collision
+                    validated, _transcript = self._load_validated_attempt_chain(
+                        spec.scope,
+                        collision.attempt_id,
+                    )
+                    self._attempt_by_idempotency[idempotency_address] = validated
+                    return validated
                 raise MemoryQueryConflictError(
                     f"query attempt ID collision for {attempt.attempt_id!r}"
                 )
+            transcript_collision = self._source_read_transcript_by_address.get(
+                transcript_address
+            )
+            if transcript_collision is not None and not _canonical_equal(
+                transcript_collision,
+                pin_read_transcript,
+            ):
+                raise MemoryQueryConflictError(
+                    "source-read transcript ID collision for "
+                    f"{pin_read_transcript.source_read_transcript_id!r}"
+                )
+            stored_transcript = (
+                transcript_collision
+                if transcript_collision is not None
+                else pin_read_transcript
+            )
             self._atomic_writes(
                 (
+                    (
+                        self._source_read_transcript_by_address,
+                        transcript_address,
+                        stored_transcript,
+                    ),
+                    (
+                        self._source_read_transcript_by_attempt,
+                        address,
+                        stored_transcript,
+                    ),
                     (self._attempt_by_address, address, attempt),
                     (
                         self._attempt_by_idempotency,
@@ -1143,12 +1337,106 @@ class InMemoryMemoryRuntimeStore:
                 )
             return value
 
+    def get_source_read_transcript(
+        self,
+        scope: MemoryScope,
+        source_read_transcript_id: str,
+    ) -> MemorySourceReadTranscriptV1:
+        """Return one runtime-published attempt-pin transcript."""
+
+        scope = _scope(scope)
+        source_read_transcript_id = _string(
+            source_read_transcript_id,
+            "source_read_transcript_id",
+        )
+        with self._lock:
+            value = self._source_read_transcript_by_address.get(
+                (scope, source_read_transcript_id)
+            )
+            if value is None:
+                raise MemoryQueryNotFoundError(
+                    f"source-read transcript {source_read_transcript_id!r} was not found"
+                )
+            return value
+
+    def _load_validated_attempt_chain(
+        self,
+        scope: MemoryScope,
+        attempt_id: str,
+    ) -> tuple[MemoryQueryAttemptV1, MemorySourceReadTranscriptV1]:
+        """Validate an attempt and its acyclic attempt-pin transcript edge."""
+
+        with self._lock:
+            attempt = self._attempt_by_address.get((scope, attempt_id))
+            transcript = (
+                None
+                if attempt is None
+                else self._source_read_transcript_by_address.get(
+                    (scope, attempt.pin_read_transcript_id)
+                )
+            )
+            transcript_reverse = self._source_read_transcript_by_attempt.get(
+                (scope, attempt_id)
+            )
+        if attempt is None or transcript is None or transcript_reverse is None:
+            if attempt is None:
+                raise MemoryQueryNotFoundError(
+                    f"query attempt {attempt_id!r} was not found"
+                )
+            raise MemoryQueryConflictError("stored attempt-pin chain is incomplete")
+        try:
+            attempt.canonical_bytes()
+            transcript.canonical_bytes()
+            transcript_reverse.canonical_bytes()
+            release_ref = MemorySourceObjectRefV1(
+                kind=MemorySourceObjectKind.RELEASE,
+                object_id=attempt.spec.release_id,
+                object_content_sha256=attempt.release_content_sha256,
+            )
+            revision_refs = tuple(
+                MemorySourceObjectRefV1(
+                    kind=MemorySourceObjectKind.REVISION,
+                    object_id=item.revision_id,
+                    object_content_sha256=item.revision_content_sha256,
+                )
+                for item in attempt.release_revisions
+            )
+        except (TypeError, ValueError) as error:
+            raise MemoryQueryConflictError(
+                "stored attempt-pin chain failed integrity validation"
+            ) from error
+        events = transcript.read_events
+        if (
+            attempt.attempt_id != attempt_id
+            or attempt.spec.scope != scope
+            or transcript.scope != scope
+            or transcript.phase is not MemorySourceReadPhase.ATTEMPT_PIN
+            or attempt.pin_read_transcript_id != transcript.source_read_transcript_id
+            or attempt.pin_read_transcript_content_sha256 != transcript.content_hash
+            or transcript_reverse.source_read_transcript_id
+            != transcript.source_read_transcript_id
+            or transcript_reverse.content_hash != transcript.content_hash
+            or len(events) < 2
+            or events[0].operation is not MemorySourceReadOperation.GET_RELEASE
+            or events[0].requested_ids != (attempt.spec.release_id,)
+            or events[0].returned_objects != (release_ref,)
+            or events[1].operation
+            is not MemorySourceReadOperation.GET_RELEASE_REVISIONS
+            or events[1].requested_ids != (attempt.spec.release_id,)
+            or events[1].returned_objects != revision_refs
+        ):
+            raise MemoryQueryConflictError(
+                "stored attempt is not bound to its exact pin-read transcript"
+            )
+        return attempt, transcript
+
     def _query_item(
         self,
         scope: MemoryScope,
         revision: MemoryRevision,
         release_position: int,
         read_session: _SourceReadSession,
+        expected_events: list[MemorySourceReadEventV1],
     ) -> MemoryQueryItemV1:
         revision_id = revision.revision_id
         revision_content_sha256 = revision.content_hash
@@ -1163,14 +1451,21 @@ class InMemoryMemoryRuntimeStore:
             candidate_address,
             read_session,
         )
+        _expected_read_event(
+            expected_events,
+            MemorySourceReadOperation.GET_CANDIDATE,
+            (candidate_address,),
+            (_source_ref(MemorySourceObjectKind.CANDIDATE, candidate),),
+        )
         candidate_id = candidate.candidate_id
         candidate_content_sha256 = candidate.content_hash
         candidate_content = candidate.proposal.content
-        evidence = self._validate_candidate(
+        evidence_refs = self._validate_candidate(
             scope,
             candidate,
             expected_candidate_id=candidate_address,
             read_session=read_session,
+            expected_events=expected_events,
         )
         if (
             sha256(revision.proposal.canonical_bytes()).hexdigest()
@@ -1186,9 +1481,8 @@ class InMemoryMemoryRuntimeStore:
             or candidate.content_hash != candidate_content_sha256
             or candidate.proposal.content != candidate_content
             or candidate_id != candidate_address
-            or tuple(item.evidence_id for item in evidence)
+            or tuple(item.evidence_id for item in evidence_refs)
             != candidate.proposal.evidence_ids
-            or any(item.event.scope != scope for item in evidence)
         ):
             raise MemoryQueryConflictError(
                 "history store returned a non-canonical scoped memory graph"
@@ -1203,13 +1497,7 @@ class InMemoryMemoryRuntimeStore:
             generation=generation,
             candidate_id=candidate_id,
             candidate_content_sha256=candidate_content_sha256,
-            evidence=tuple(
-                MemoryEvidenceRefV1(
-                    evidence_id=item.evidence_id,
-                    evidence_content_sha256=item.content_hash,
-                )
-                for item in evidence
-            ),
+            evidence=evidence_refs,
             content=candidate_content,
         )
 
@@ -1263,7 +1551,10 @@ class InMemoryMemoryRuntimeStore:
         attempt_id = _string(attempt_id, "attempt_id")
         if type(query) is not bytes:
             raise TypeError("query must be bytes")
-        attempt = self.get_query_attempt(scope, attempt_id)
+        attempt, _pin_read_transcript = self._load_validated_attempt_chain(
+            scope,
+            attempt_id,
+        )
         try:
             attempt.canonical_bytes()
         except (TypeError, ValueError) as error:
@@ -1290,10 +1581,12 @@ class InMemoryMemoryRuntimeStore:
                 )
                 return validated
         read_session = _SourceReadSession()
+        expected_events: list[MemorySourceReadEventV1] = []
         release, revisions = self._load_release(
             scope,
             attempt.spec.release_id,
             read_session,
+            expected_events,
         )
         refs = tuple(_revision_ref(item) for item in revisions)
         if (
@@ -1303,12 +1596,16 @@ class InMemoryMemoryRuntimeStore:
             raise MemoryQueryConflictError(
                 "query attempt no longer matches its pinned release graph"
             )
-        graph_event_count = len(read_session.snapshot())
         eligible_items = tuple(
-            self._query_item(scope, revision, position, read_session)
+            self._query_item(
+                scope,
+                revision,
+                position,
+                read_session,
+                expected_events,
+            )
             for position, revision in enumerate(revisions)
         )
-        eligible_event_count = len(read_session.snapshot())
         repeated_release_hash = sha256(release.commitment_bytes()).hexdigest()
         if (
             repeated_release_hash != release.content_hash
@@ -1320,6 +1617,11 @@ class InMemoryMemoryRuntimeStore:
             raise MemoryQueryConflictError(
                 "release graph changed while query items were being resolved"
             )
+        self._validate_resolution_read_events(
+            attempt=attempt,
+            events=read_session.snapshot(),
+            expected_events=tuple(expected_events),
+        )
         try:
             registered_id = _string(
                 getattr(retriever, "retrieval_policy_id", None),
@@ -1391,6 +1693,7 @@ class InMemoryMemoryRuntimeStore:
                 revision,
                 position_by_revision_id[revision.revision_id],
                 read_session,
+                expected_events,
             )
             for revision in returned_revisions
         )
@@ -1403,10 +1706,7 @@ class InMemoryMemoryRuntimeStore:
             self._validate_resolution_read_events(
                 attempt=attempt,
                 events=read_events,
-                graph_event_count=graph_event_count,
-                eligible_event_count=eligible_event_count,
-                eligible_items=eligible_items,
-                returned_items=returned,
+                expected_events=tuple(expected_events),
             )
             source_read_receipt = MemorySourceReadReceiptV1.create(
                 attempt=attempt,
@@ -1544,12 +1844,28 @@ class InMemoryMemoryRuntimeStore:
                     (scope, attempt.attempt_id)
                 )
             )
+            pin_transcript = (
+                None
+                if attempt is None
+                else self._source_read_transcript_by_address.get(
+                    (scope, attempt.pin_read_transcript_id)
+                )
+            )
+            pin_transcript_reverse = (
+                None
+                if attempt is None
+                else self._source_read_transcript_by_attempt.get(
+                    (scope, attempt.attempt_id)
+                )
+            )
         if (
             result is None
             or attempt is None
             or reverse is None
             or receipt is None
             or receipt_reverse is None
+            or pin_transcript is None
+            or pin_transcript_reverse is None
         ):
             raise MemoryQueryConflictError("stored query chain is incomplete")
         try:
@@ -1558,6 +1874,8 @@ class InMemoryMemoryRuntimeStore:
             reverse.canonical_bytes()
             receipt.canonical_bytes()
             receipt_reverse.canonical_bytes()
+            pin_transcript.canonical_bytes()
+            pin_transcript_reverse.canonical_bytes()
             expected_release_ref = MemorySourceObjectRefV1(
                 kind=MemorySourceObjectKind.RELEASE,
                 object_id=attempt.spec.release_id,
@@ -1576,6 +1894,7 @@ class InMemoryMemoryRuntimeStore:
                 "stored query chain failed integrity validation"
             ) from error
         events = receipt.read_events
+        pin_events = pin_transcript.read_events
         if (
             result.query_result_id != query_result_id
             or reverse.query_result_id != result.query_result_id
@@ -1589,6 +1908,14 @@ class InMemoryMemoryRuntimeStore:
             or receipt.scope != scope
             or receipt.attempt_id != attempt.attempt_id
             or receipt.attempt_content_sha256 != attempt.content_hash
+            or attempt.pin_read_transcript_id
+            != pin_transcript.source_read_transcript_id
+            or attempt.pin_read_transcript_content_sha256 != pin_transcript.content_hash
+            or pin_transcript_reverse.source_read_transcript_id
+            != pin_transcript.source_read_transcript_id
+            or pin_transcript_reverse.content_hash != pin_transcript.content_hash
+            or pin_transcript.scope != scope
+            or pin_transcript.phase is not MemorySourceReadPhase.ATTEMPT_PIN
             or result.scope != scope
             or attempt.spec.scope != scope
             or result.release_id != attempt.spec.release_id
@@ -1597,11 +1924,22 @@ class InMemoryMemoryRuntimeStore:
             or result.rollout_group_id != attempt.spec.rollout_group_id
             or result.eligible_revisions != attempt.release_revisions
             or len(events) < 2
+            or len(pin_events) < 2
+            or pin_events[0].operation is not MemorySourceReadOperation.GET_RELEASE
+            or pin_events[0].requested_ids != (attempt.spec.release_id,)
+            or pin_events[0].returned_objects != (expected_release_ref,)
+            or pin_events[1].operation
+            is not MemorySourceReadOperation.GET_RELEASE_REVISIONS
+            or pin_events[1].requested_ids != (attempt.spec.release_id,)
+            or pin_events[1].returned_objects != expected_revision_refs
             or events[0].operation is not MemorySourceReadOperation.GET_RELEASE
+            or events[0].requested_ids != (attempt.spec.release_id,)
             or events[0].returned_objects != (expected_release_ref,)
             or events[1].operation
             is not MemorySourceReadOperation.GET_RELEASE_REVISIONS
+            or events[1].requested_ids != (attempt.spec.release_id,)
             or events[1].returned_objects != expected_revision_refs
+            or not self._receipt_tail_matches_returned_items(result, receipt)
         ):
             raise MemoryQueryConflictError(
                 "stored query result is not bound to its exact attempt"
@@ -1674,6 +2012,15 @@ class InMemoryMemoryRuntimeStore:
             raise MemoryDeliveryConflictError(
                 "requested renderer ID and version are not registered"
             )
+        try:
+            result, attempt = self._load_validated_query_chain(
+                scope,
+                query_result_id,
+            )
+        except MemoryQueryConflictError as error:
+            raise MemoryDeliveryConflictError(
+                "query result chain failed integrity validation"
+            ) from error
         result_address = (scope, query_result_id)
         with self._lock:
             existing = self._delivery_by_result.get(result_address)
@@ -1686,15 +2033,6 @@ class InMemoryMemoryRuntimeStore:
                 raise MemoryDeliveryConflictError(
                     "query result already has a different immutable delivery"
                 )
-        try:
-            result, attempt = self._load_validated_query_chain(
-                scope,
-                query_result_id,
-            )
-        except MemoryQueryConflictError as error:
-            raise MemoryDeliveryConflictError(
-                "query result chain failed integrity validation"
-            ) from error
         try:
             registered_id = _string(
                 getattr(renderer, "renderer_id", None),
@@ -1884,12 +2222,44 @@ class InMemoryMemoryRuntimeStore:
                 if attempt is None
                 else self._result_by_attempt.get((scope, attempt.attempt_id))
             )
+            receipt = (
+                None
+                if result is None
+                else self._source_read_receipt_by_address.get(
+                    (scope, result.source_read_receipt_id)
+                )
+            )
+            receipt_reverse = (
+                None
+                if attempt is None
+                else self._source_read_receipt_by_attempt.get(
+                    (scope, attempt.attempt_id)
+                )
+            )
+            pin_transcript = (
+                None
+                if attempt is None
+                else self._source_read_transcript_by_address.get(
+                    (scope, attempt.pin_read_transcript_id)
+                )
+            )
+            pin_transcript_reverse = (
+                None
+                if attempt is None
+                else self._source_read_transcript_by_attempt.get(
+                    (scope, attempt.attempt_id)
+                )
+            )
         if (
             delivery is None
             or result is None
             or attempt is None
             or reverse_delivery is None
             or reverse_result is None
+            or receipt is None
+            or receipt_reverse is None
+            or pin_transcript is None
+            or pin_transcript_reverse is None
             or type(context) is not bytes
         ):
             raise MemoryBoundaryMismatchError("consumer delivery chain is incomplete")
@@ -1899,6 +2269,23 @@ class InMemoryMemoryRuntimeStore:
             attempt.canonical_bytes()
             reverse_delivery.canonical_bytes()
             reverse_result.canonical_bytes()
+            receipt.canonical_bytes()
+            receipt_reverse.canonical_bytes()
+            pin_transcript.canonical_bytes()
+            pin_transcript_reverse.canonical_bytes()
+            expected_release_ref = MemorySourceObjectRefV1(
+                kind=MemorySourceObjectKind.RELEASE,
+                object_id=attempt.spec.release_id,
+                object_content_sha256=attempt.release_content_sha256,
+            )
+            expected_revision_refs = tuple(
+                MemorySourceObjectRefV1(
+                    kind=MemorySourceObjectKind.REVISION,
+                    object_id=item.revision_id,
+                    object_content_sha256=item.revision_content_sha256,
+                )
+                for item in attempt.release_revisions
+            )
         except (TypeError, ValueError) as error:
             raise MemoryBoundaryMismatchError(
                 "consumer delivery chain failed integrity validation"
@@ -1913,6 +2300,21 @@ class InMemoryMemoryRuntimeStore:
             or reverse_result.content_hash != result.content_hash
             or result.attempt_id != attempt.attempt_id
             or result.attempt_content_sha256 != attempt.content_hash
+            or result.source_read_receipt_id != receipt.source_read_receipt_id
+            or result.source_read_receipt_content_sha256 != receipt.content_hash
+            or receipt_reverse.source_read_receipt_id != receipt.source_read_receipt_id
+            or receipt_reverse.content_hash != receipt.content_hash
+            or receipt.scope != scope
+            or receipt.attempt_id != attempt.attempt_id
+            or receipt.attempt_content_sha256 != attempt.content_hash
+            or attempt.pin_read_transcript_id
+            != pin_transcript.source_read_transcript_id
+            or attempt.pin_read_transcript_content_sha256 != pin_transcript.content_hash
+            or pin_transcript_reverse.source_read_transcript_id
+            != pin_transcript.source_read_transcript_id
+            or pin_transcript_reverse.content_hash != pin_transcript.content_hash
+            or pin_transcript.scope != scope
+            or pin_transcript.phase is not MemorySourceReadPhase.ATTEMPT_PIN
             or delivery.scope != scope
             or result.scope != scope
             or attempt.spec.scope != scope
@@ -1924,6 +2326,25 @@ class InMemoryMemoryRuntimeStore:
             or result.trajectory_id != attempt.spec.trajectory_id
             or result.rollout_group_id != attempt.spec.rollout_group_id
             or result.eligible_revisions != attempt.release_revisions
+            or len(receipt.read_events) < 2
+            or receipt.read_events[0].operation
+            is not MemorySourceReadOperation.GET_RELEASE
+            or receipt.read_events[0].requested_ids != (attempt.spec.release_id,)
+            or receipt.read_events[0].returned_objects != (expected_release_ref,)
+            or receipt.read_events[1].operation
+            is not MemorySourceReadOperation.GET_RELEASE_REVISIONS
+            or receipt.read_events[1].requested_ids != (attempt.spec.release_id,)
+            or receipt.read_events[1].returned_objects != expected_revision_refs
+            or not self._receipt_tail_matches_returned_items(result, receipt)
+            or len(pin_transcript.read_events) < 2
+            or pin_transcript.read_events[0].operation
+            is not MemorySourceReadOperation.GET_RELEASE
+            or pin_transcript.read_events[0].requested_ids != (attempt.spec.release_id,)
+            or pin_transcript.read_events[0].returned_objects != (expected_release_ref,)
+            or pin_transcript.read_events[1].operation
+            is not MemorySourceReadOperation.GET_RELEASE_REVISIONS
+            or pin_transcript.read_events[1].requested_ids != (attempt.spec.release_id,)
+            or pin_transcript.read_events[1].returned_objects != expected_revision_refs
         ):
             raise MemoryBoundaryMismatchError(
                 "consumer delivery chain has mismatched addresses"

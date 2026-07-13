@@ -27,16 +27,18 @@ from areal.v2.memory_service import (
     MemorySourceObjectRefV1,
     MemorySourceReadEventV1,
     MemorySourceReadOperation,
+    MemorySourceReadPhase,
     MemorySourceReadReceiptV1,
+    MemorySourceReadTranscriptV1,
 )
 
 _CREATED_AT = datetime(2026, 7, 12, tzinfo=UTC)
 _GOLDEN_CHAIN_HASHES = (
-    "a25e87f46b9b1168ad9839ec1d7ad375d09cfd8d481125bbbd8b77a66282f22e",
-    "51f65c4782b9334800711d739ed42ff5a5c2e077c16f2421d5af0e5f7371dddf",
-    "40803e83ba9a783b378bf7fc637080d48eea0cf95273d7f81cb170cb76c3aaa5",
-    "f3f224dff80a274bb677d444662339415cff5b5e2af5e2ff102420c4b25adc57",
-    "255da6db16dbdcd51a04acd7d62ddc253dc86eb2f7f32824b29f957d30584a8b",
+    "b7f0db3f75f467da569c759cddf05eca4f850ef99ae80ddb414b1939781af745",
+    "fbca92ff928821b766dfd5e295da386b78515e7ec2708f80300f543bbfe18fb4",
+    "bde480ed20735b398a0af6bac6ce9799176b93341cc11f4774d23746b92c112f",
+    "8953da421b7f6f16c67bad5a927f7bc22b0baac8674a618f019bae91413a2c97",
+    "ce83a58acd7efd7a3a8959d8e0416cd501250715dceb7caaa34cb3eef515d48c",
 )
 
 
@@ -72,13 +74,64 @@ def _spec(*, suffix: str = "a") -> MemoryQuerySpecV1:
     )
 
 
-def _source_receipt(attempt: MemoryQueryAttemptV1) -> MemorySourceReadReceiptV1:
+def _source_receipt(
+    attempt: MemoryQueryAttemptV1,
+    returned_items: tuple[MemoryQueryItemV1, ...] = (),
+) -> MemorySourceReadReceiptV1:
+    events = [
+        MemorySourceReadEventV1(
+            sequence_no=0,
+            operation=MemorySourceReadOperation.GET_RELEASE_REVISIONS,
+            requested_ids=(attempt.spec.release_id,),
+            returned_objects=(),
+        )
+    ]
+    for item in returned_items:
+        events.extend(
+            (
+                MemorySourceReadEventV1(
+                    sequence_no=len(events),
+                    operation=MemorySourceReadOperation.GET_CANDIDATE,
+                    requested_ids=(item.candidate_id,),
+                    returned_objects=(
+                        MemorySourceObjectRefV1(
+                            kind=MemorySourceObjectKind.CANDIDATE,
+                            object_id=item.candidate_id,
+                            object_content_sha256=item.candidate_content_sha256,
+                        ),
+                    ),
+                ),
+                MemorySourceReadEventV1(
+                    sequence_no=len(events) + 1,
+                    operation=MemorySourceReadOperation.GET_CANDIDATE_EVIDENCE,
+                    requested_ids=(item.candidate_id,),
+                    returned_objects=tuple(
+                        MemorySourceObjectRefV1(
+                            kind=MemorySourceObjectKind.EVIDENCE,
+                            object_id=evidence.evidence_id,
+                            object_content_sha256=evidence.evidence_content_sha256,
+                        )
+                        for evidence in item.evidence
+                    ),
+                ),
+            )
+        )
     return MemorySourceReadReceiptV1.create(
         attempt=attempt,
+        read_events=tuple(events),
+        created_at=_CREATED_AT,
+    )
+
+
+def _pin_transcript(spec: MemoryQuerySpecV1) -> MemorySourceReadTranscriptV1:
+    return MemorySourceReadTranscriptV1.create(
+        scope=spec.scope,
+        phase=MemorySourceReadPhase.ATTEMPT_PIN,
         read_events=(
             MemorySourceReadEventV1(
                 sequence_no=0,
                 operation=MemorySourceReadOperation.GET_RELEASE_REVISIONS,
+                requested_ids=(spec.release_id,),
                 returned_objects=(),
             ),
         ),
@@ -107,8 +160,9 @@ def _canonical_source_receipt() -> tuple[
 ]:
     release = _address(MemorySourceObjectKind.RELEASE, "receipt-release")
     revision = _address(MemorySourceObjectKind.REVISION, "receipt-revision")
+    spec = replace(_spec(), release_id=release.object_id)
     attempt = MemoryQueryAttemptV1.create(
-        spec=replace(_spec(), release_id=release.object_id),
+        spec=spec,
         release_content_sha256=release.object_content_sha256,
         release_revisions=(
             MemoryRevisionRefV1(
@@ -116,6 +170,7 @@ def _canonical_source_receipt() -> tuple[
                 revision_content_sha256=revision.object_content_sha256,
             ),
         ),
+        pin_read_transcript=_pin_transcript(spec),
         attempt_nonce="03" * 32,
         created_at=_CREATED_AT,
     )
@@ -125,11 +180,13 @@ def _canonical_source_receipt() -> tuple[
             MemorySourceReadEventV1(
                 sequence_no=0,
                 operation=MemorySourceReadOperation.GET_RELEASE,
+                requested_ids=(release.object_id,),
                 returned_objects=(release,),
             ),
             MemorySourceReadEventV1(
                 sequence_no=1,
                 operation=MemorySourceReadOperation.GET_RELEASE_REVISIONS,
+                requested_ids=(release.object_id,),
                 returned_objects=(revision,),
             ),
         ),
@@ -152,11 +209,11 @@ def _chain(*, empty: bool = False):
                 revision=revision,
                 memory_id=f"mem_{index}",
                 generation=0,
-                candidate_id=f"cand_{index}",
+                candidate_id=("cand_" + _hash(f"candidate-{index}")[:24]),
                 candidate_content_sha256=_hash(f"candidate-{index}"),
                 evidence=(
                     MemoryEvidenceRefV1(
-                        evidence_id=f"evd_{index}",
+                        evidence_id=("evd_" + _hash(f"evidence-{index}")[:24]),
                         evidence_content_sha256=_hash(f"evidence-{index}"),
                     ),
                 ),
@@ -169,10 +226,11 @@ def _chain(*, empty: bool = False):
         spec=spec,
         release_content_sha256=_hash("release"),
         release_revisions=refs,
+        pin_read_transcript=_pin_transcript(spec),
         attempt_nonce="01" * 32,
         created_at=_CREATED_AT,
     )
-    receipt = _source_receipt(attempt)
+    receipt = _source_receipt(attempt, items)
     result = MemoryQueryResultV1.create(
         attempt=attempt,
         source_read_receipt=receipt,
@@ -243,22 +301,24 @@ def test_source_read_receipt_has_golden_bytes_hash_and_id() -> None:
     _attempt, receipt = _canonical_source_receipt()
 
     assert receipt.canonical_bytes() == (
-        b'{"attempt_content_sha256":"f9b52e3b10f02abd23297e2975f6154e010c8653f1e435ce'
-        b'876caf45a5903a3c","attempt_id":"mqat_f9b52e3b10f02abd23297e29","read_events"'
-        b':[{"operation":"get_release","returned_objects":[{"kind":"release","object_co'
-        b'ntent_sha256":"2c177320e7d3e84d689b4ae0a3100c19b524f437d440eb480adea9b3b67f7b'
-        b'90","object_id":"rel_2c177320e7d3e84d689b4ae0"}],"sequence_no":0},{"operat'
-        b'ion":"get_release_revisions","returned_objects":[{"kind":"revision","object_'
-        b'content_sha256":"9cfc4ce35446d35f9c356550260f77241e629f25cc3e3f1d088940a8a4e47'
-        b'3d6","object_id":"rev_9cfc4ce35446d35f9c356550"}],"sequence_no":1}],"recor'
-        b'd_kind":"memory_source_read_receipt","schema_version":1,"scope":{"namespace"'
-        b':"agent-memory","subject_id":"subject-1","tenant_id":"tenant-1"}}'
+        b'{"attempt_content_sha256":"05ceeb4171014af2a6cb29c7213b4b286a838119cf174dfb'
+        b'd82748f1b223eeb1","attempt_id":"mqat_05ceeb4171014af2a6cb29c7","read_event'
+        b's":[{"operation":"get_release","requested_ids":["rel_2c177320e7d3e84d689b4ae'
+        b'0"],"returned_objects":[{"kind":"release","object_content_sha256":"2c177320e'
+        b'7d3e84d689b4ae0a3100c19b524f437d440eb480adea9b3b67f7b90","object_id":"re'
+        b'l_2c177320e7d3e84d689b4ae0"}],"sequence_no":0},{"operation":"get_release_revi'
+        b'sions","requested_ids":["rel_2c177320e7d3e84d689b4ae0"],"returned_objects"'
+        b':[{"kind":"revision","object_content_sha256":"9cfc4ce35446d35f9c356550260f772'
+        b'41e629f25cc3e3f1d088940a8a4e473d6","object_id":"rev_9cfc4ce35446d35f9c356'
+        b'550"}],"sequence_no":1}],"record_kind":"memory_source_read_receipt","schema_v'
+        b'ersion":1,"scope":{"namespace":"agent-memory","subject_id":"subject-1","tenan'
+        b't_id":"tenant-1"}}'
     )
     assert (
         receipt.content_hash
-        == "b61ce51b81f6c8d89f2c5531bd4a9c433ad66c5e6a9d893399dafb3972dd240d"
+        == "eacedf74057c8dc2aaaa5f517c0c8225c4b33a143d3b570620a196e57d50dcb7"
     )
-    assert receipt.source_read_receipt_id == "msrr_b61ce51b81f6c8d89f2c5531"
+    assert receipt.source_read_receipt_id == "msrr_eacedf74057c8dc2aaaa5f51"
     assert b"receipt-release" not in receipt.canonical_bytes()
 
 
@@ -276,10 +336,23 @@ def test_source_read_values_reject_address_kind_order_and_duplicate_mutants() ->
             receipt.read_events[0],
             returned_objects=(revision_ref,),
         )
+    with pytest.raises(ValueError, match="request and return"):
+        replace(
+            receipt.read_events[0],
+            requested_ids=("rel_" + "0" * 24,),
+        )
+    with pytest.raises(TypeError):
+        replace(receipt.read_events[0], requested_ids=[release_ref.object_id])
+    with pytest.raises(ValueError, match="source address"):
+        replace(
+            receipt.read_events[1],
+            requested_ids=(revision_ref.object_id,),
+        )
     with pytest.raises(ValueError, match="duplicate"):
         MemorySourceReadEventV1(
             sequence_no=0,
             operation=MemorySourceReadOperation.GET_RELEASE_REVISIONS,
+            requested_ids=(attempt.spec.release_id,),
             returned_objects=(revision_ref, revision_ref),
         )
     with pytest.raises(ValueError, match="contiguous"):
@@ -292,12 +365,30 @@ def test_source_read_values_reject_address_kind_order_and_duplicate_mutants() ->
         )
 
 
+def test_attempt_commits_to_acyclic_pin_read_transcript() -> None:
+    attempt, _receipt = _canonical_source_receipt()
+    transcript = _pin_transcript(attempt.spec)
+    rebound = MemoryQueryAttemptV1.create(
+        spec=attempt.spec,
+        release_content_sha256=attempt.release_content_sha256,
+        release_revisions=attempt.release_revisions,
+        pin_read_transcript=transcript,
+        attempt_nonce="05" * 32,
+    )
+
+    assert rebound.pin_read_transcript_id == transcript.source_read_transcript_id
+    assert rebound.pin_read_transcript_content_sha256 == transcript.content_hash
+    assert b"attempt_id" not in transcript.canonical_bytes()
+    assert transcript.phase is MemorySourceReadPhase.ATTEMPT_PIN
+
+
 def test_query_result_rejects_cross_attempt_or_forged_receipt_reference() -> None:
     attempt, receipt = _canonical_source_receipt()
     other_attempt = MemoryQueryAttemptV1.create(
-        spec=replace(attempt.spec, trajectory_id="other-trajectory"),
+        spec=(other_spec := replace(attempt.spec, trajectory_id="other-trajectory")),
         release_content_sha256=attempt.release_content_sha256,
         release_revisions=attempt.release_revisions,
+        pin_read_transcript=_pin_transcript(other_spec),
         attempt_nonce="04" * 32,
     )
     with pytest.raises(ValueError, match="exact attempt"):
@@ -336,6 +427,11 @@ def test_runtime_chain_is_content_addressed_and_injection_is_derived() -> None:
             record.content_hash
         )
         assert getattr(record, id_field) == prefix + record.content_hash[:24]
+    with pytest.raises(ValueError, match="evidence_id"):
+        replace(
+            result.returned_items[0].evidence[0],
+            evidence_content_sha256=_hash("different-evidence"),
+        )
 
 
 def test_empty_release_has_a_first_class_memory_off_exposure() -> None:
@@ -402,16 +498,29 @@ def test_query_result_preserves_policy_rank_and_release_positions() -> None:
 
     reranked = MemoryQueryResultV1.create(
         attempt=attempt,
-        source_read_receipt=_source_receipt(attempt),
+        source_read_receipt=_source_receipt(
+            attempt,
+            tuple(reversed(result.returned_items)),
+        ),
         retrieved_revisions=tuple(reversed(refs)),
         returned_items=tuple(reversed(result.returned_items)),
     )
     assert reranked.retrieved_revisions == tuple(reversed(refs))
     assert tuple(item.release_position for item in reranked.returned_items) == (1, 0)
+    with pytest.raises(ValueError, match="source-read receipt"):
+        MemoryQueryResultV1.create(
+            attempt=attempt,
+            source_read_receipt=_source_receipt(attempt, result.returned_items),
+            retrieved_revisions=tuple(reversed(refs)),
+            returned_items=tuple(reversed(result.returned_items)),
+        )
     with pytest.raises(ValueError, match="ordered retrieved"):
         MemoryQueryResultV1.create(
             attempt=attempt,
-            source_read_receipt=_source_receipt(attempt),
+            source_read_receipt=_source_receipt(
+                attempt,
+                (result.returned_items[1],),
+            ),
             retrieved_revisions=(refs[0],),
             returned_items=(result.returned_items[1],),
         )
@@ -426,6 +535,7 @@ def test_query_result_preserves_policy_rank_and_release_positions() -> None:
             spec=attempt.spec,
             release_content_sha256=attempt.release_content_sha256,
             release_revisions=(refs[0], same_public_id),
+            pin_read_transcript=_pin_transcript(attempt.spec),
             attempt_nonce="04" * 32,
         )
     first_evidence = result.returned_items[0].evidence[0]
@@ -434,10 +544,7 @@ def test_query_result_preserves_policy_rank_and_release_positions() -> None:
             result.returned_items[0],
             evidence=(
                 first_evidence,
-                replace(
-                    first_evidence,
-                    evidence_content_sha256=_hash("other-evidence-hash"),
-                ),
+                first_evidence,
             ),
         )
 
