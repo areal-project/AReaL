@@ -25,6 +25,14 @@ def main() -> None:
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8080)
     parser.add_argument("--admin-api-key", default=DEFAULT_ADMIN_API_KEY)
+    parser.add_argument(
+        "--memory-control-api-key",
+        default="",
+        help=(
+            "Dedicated Gateway-to-DataProxy credential for Memory assignment "
+            "transport; an empty value disables Memory pins"
+        ),
+    )
     parser.add_argument("--router-timeout", type=float, default=2.0)
     parser.add_argument("--forward-timeout", type=float, default=120.0)
     parser.add_argument(
@@ -40,6 +48,7 @@ def main() -> None:
         host=args.host,
         port=args.port,
         admin_api_key=args.admin_api_key,
+        memory_control_api_key=args.memory_control_api_key,
         router_addr=args.router_addr,
         router_timeout=args.router_timeout,
         forward_timeout=args.forward_timeout,
@@ -49,14 +58,18 @@ def main() -> None:
     mount_bridge(
         app,
         OpenResponsesBridge(
-            router_addr=config.router_addr, admin_api_key=config.admin_api_key
+            router_addr=config.router_addr,
+            admin_api_key=config.admin_api_key,
+            memory_control_api_key=config.memory_control_api_key,
         ),
         admin_api_key=config.admin_api_key,
     )
     mount_chat_bridge(
         app,
         ChatCompletionsBridge(
-            router_addr=config.router_addr, admin_api_key=config.admin_api_key
+            router_addr=config.router_addr,
+            admin_api_key=config.admin_api_key,
+            memory_control_api_key=config.memory_control_api_key,
         ),
     )
     uvicorn.run(

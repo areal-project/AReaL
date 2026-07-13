@@ -20,6 +20,7 @@ from areal.utils import logging
 from ..auth import (
     DEFAULT_ADMIN_API_KEY,
     admin_headers,
+    is_source_visible_default_admin_key,
     make_admin_dependency,
     verify_admin_key,
 )
@@ -48,6 +49,31 @@ def _has_admin_authorization(request: Request, expected: dict[str, str]) -> bool
     )
 
 
+def _dedicated_memory_control_headers(
+    admin_api_key: str,
+    memory_control_api_key: str,
+) -> dict[str, str]:
+    if type(admin_api_key) is not str:
+        raise TypeError("admin_api_key must be a string")
+    if not admin_api_key.strip():
+        raise ValueError("admin_api_key must not be blank")
+    if type(memory_control_api_key) is not str:
+        raise TypeError("memory_control_api_key must be a string")
+    if not memory_control_api_key:
+        return {}
+    if not memory_control_api_key.strip():
+        raise ValueError("memory_control_api_key must not be blank")
+    if is_source_visible_default_admin_key(memory_control_api_key):
+        raise ValueError(
+            "memory_control_api_key must not use a source-visible default key"
+        )
+    if hmac.compare_digest(memory_control_api_key, admin_api_key):
+        raise ValueError(
+            "memory_control_api_key must differ from the external admin_api_key"
+        )
+    return admin_headers(memory_control_api_key)
+
+
 class AgentBridge(ABC):
     @abstractmethod
     async def handle_request(self, request: Request) -> Any: ...
@@ -55,10 +81,21 @@ class AgentBridge(ABC):
 
 class OpenResponsesBridge(AgentBridge):
     def __init__(
-        self, router_addr: str, admin_api_key: str = DEFAULT_ADMIN_API_KEY
+        self,
+        router_addr: str,
+        admin_api_key: str = DEFAULT_ADMIN_API_KEY,
+        memory_control_api_key: str = "",
     ) -> None:
         self._router_addr = router_addr
-        self._auth_headers = admin_headers(admin_api_key)
+        self._admin_headers = admin_headers(admin_api_key)
+        self._memory_control_headers = _dedicated_memory_control_headers(
+            admin_api_key,
+            memory_control_api_key,
+        )
+        self._memory_control_enabled = bool(
+            self._memory_control_headers
+            and not is_source_visible_default_admin_key(admin_api_key)
+        )
         self._http = httpx.AsyncClient(timeout=600.0)
 
     async def close(self) -> None:
@@ -66,10 +103,23 @@ class OpenResponsesBridge(AgentBridge):
 
     async def handle_request(self, request: Request) -> Any:
         body = await request.json()
-        memory_control_authorized = _has_admin_authorization(
-            request,
-            self._auth_headers,
+        memory_control_authorized = bool(
+            self._memory_control_enabled
+            and _has_admin_authorization(request, self._admin_headers)
         )
+        if MEMORY_ASSIGNMENT_PIN_FIELD in body and not self._memory_control_enabled:
+            return JSONResponse(
+                {
+                    "error": {
+                        "message": (
+                            "Memory assignment transport requires a non-default "
+                            "external admin key and a dedicated internal hop key"
+                        ),
+                        "type": "server_error",
+                    }
+                },
+                status_code=503,
+            )
 
         input_items: list[dict[str, Any]] = body.get("input", [])
         instructions: str = body.get("instructions", "")
@@ -112,7 +162,7 @@ class OpenResponsesBridge(AgentBridge):
             route_resp = await self._http.post(
                 f"{self._router_addr}/route",
                 json={"session_key": session_key},
-                headers=self._auth_headers,
+                headers=self._admin_headers,
             )
             route_resp.raise_for_status()
             data_proxy_addr = route_resp.json()["data_proxy_addr"]
@@ -145,7 +195,9 @@ class OpenResponsesBridge(AgentBridge):
             turn_resp = await self._http.post(
                 f"{data_proxy_addr}/session/{session_key}/turn",
                 json=turn_body,
-                headers=self._auth_headers,
+                headers=(
+                    self._memory_control_headers if memory_control_authorized else None
+                ),
             )
             if 400 <= turn_resp.status_code < 500:
                 try:
@@ -375,11 +427,22 @@ class ChatCompletionsBridge(AgentBridge):
     """
 
     def __init__(
-        self, router_addr: str, admin_api_key: str = DEFAULT_ADMIN_API_KEY
+        self,
+        router_addr: str,
+        admin_api_key: str = DEFAULT_ADMIN_API_KEY,
+        memory_control_api_key: str = "",
     ) -> None:
         self._router_addr = router_addr
         self._admin_api_key = admin_api_key
-        self._auth_headers = admin_headers(admin_api_key)
+        self._admin_headers = admin_headers(admin_api_key)
+        self._memory_control_headers = _dedicated_memory_control_headers(
+            admin_api_key,
+            memory_control_api_key,
+        )
+        self._memory_control_enabled = bool(
+            self._memory_control_headers
+            and not is_source_visible_default_admin_key(admin_api_key)
+        )
         self._http = httpx.AsyncClient(timeout=600.0)
 
     async def close(self) -> None:
@@ -396,9 +459,9 @@ class ChatCompletionsBridge(AgentBridge):
 
         assignment_pin_present = MEMORY_ASSIGNMENT_PIN_FIELD in body
         assignment_pin = body.get(MEMORY_ASSIGNMENT_PIN_FIELD)
-        memory_control_authorized = _has_admin_authorization(
-            request,
-            self._auth_headers,
+        memory_control_authorized = bool(
+            self._memory_control_enabled
+            and _has_admin_authorization(request, self._admin_headers)
         )
         if assignment_pin_present and not memory_control_authorized:
             # Ordinary Chat Completions stays OpenAI-compatible and ungated,
@@ -408,6 +471,19 @@ class ChatCompletionsBridge(AgentBridge):
             await verify_admin_key(
                 request.headers.get("Authorization", ""),
                 expected_key=self._admin_api_key,
+            )
+        if assignment_pin_present and not self._memory_control_enabled:
+            return JSONResponse(
+                {
+                    "error": {
+                        "message": (
+                            "Memory assignment transport requires a non-default "
+                            "external admin key and a dedicated internal hop key"
+                        ),
+                        "type": "server_error",
+                    }
+                },
+                status_code=503,
             )
         upstream_body = dict(body)
         for key in _CHAT_CONTROL_FIELDS:
@@ -437,7 +513,7 @@ class ChatCompletionsBridge(AgentBridge):
             route_resp = await self._http.post(
                 f"{self._router_addr}/route",
                 json={"session_key": session_key},
-                headers=self._auth_headers,
+                headers=self._admin_headers,
             )
             route_resp.raise_for_status()
             data_proxy_addr = route_resp.json()["data_proxy_addr"]
@@ -479,7 +555,9 @@ class ChatCompletionsBridge(AgentBridge):
             "POST",
             f"{data_proxy_addr}/session/{session_key}/turn",
             json=turn_body,
-            headers=self._auth_headers,
+            headers=(
+                self._memory_control_headers if memory_control_authorized else None
+            ),
         )
         try:
             resp = await self._http.send(req, stream=True)

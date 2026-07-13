@@ -18,9 +18,16 @@ Deployments must separately bind an authenticated principal and session to the
 requested :class:`MemoryScope` at ingress.  The current per-turn
 ``memory_control_authorized`` boolean is only a trusted internal-hop assertion;
 it is not a credential and cannot establish principal-to-scope authorization.
-DataProxy accepts a true assertion only with the authenticated internal admin
-header.  Deployments should still isolate this hop and may replace the shared
-key with a dedicated hop key or mTLS.
+DataProxy accepts a true assertion only with the authenticated internal hop
+header.  The controller generates a dedicated credential for this hop instead
+of reusing the externally configured Agent admin key; standalone deployments
+that omit it keep ordinary turns enabled but fail closed for Memory pins.
+The Gateway also disables Memory control while the external admin credential
+is either source-visible project default, so compatibility defaults cannot
+authorize cross-scope assignment selection. The same public values are rejected
+as internal hop credentials.
+Deployments should still isolate this hop and may replace the credential with
+mTLS.
 """
 
 from __future__ import annotations

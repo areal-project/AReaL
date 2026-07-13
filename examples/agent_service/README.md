@@ -111,6 +111,33 @@ ctrl.destroy()
 Use `AgentConfig.scheduling_spec[0].env_vars` to pass environment variables to all
 forked agent-service child processes.
 
+## Experimental Memory assignment transport
+
+An Agent session can carry an immutable `memory_assignment_pin`: a version ticket for
+one active Memory assignment, not the Memory text itself. The DataProxy binds the first
+pin to the session with compare-and-set semantics, reuses that exact pin when later
+turns omit it, and rejects a different pin until the old session is closed. Reserved
+Memory metadata cannot be supplied through ordinary agent metadata.
+
+Memory control uses two separate gates:
+
+1. the caller must use a non-default `AgentConfig.admin_api_key`; and
+1. the Controller generates an independent random Gateway-to-DataProxy hop credential
+   for each Controller incarnation.
+
+The source-visible compatibility defaults (`areal-agent-admin` and `areal-admin-key`)
+continue to support ordinary Agent traffic but cannot enable Memory pin transport. A
+standalone Gateway or DataProxy without the dedicated hop credential likewise keeps
+ordinary turns working and fails closed for pins. Those public defaults are also
+rejected if supplied as the internal hop credential.
+
+This stage only transports and pins the version ticket. It does **not** resolve Memory
+inside the Worker, inject content into a model prompt, or claim an exposure. The next
+Worker-owned integration must resolve the active assignment again and expose only a
+narrow turn capability. A custom admin key is still coarse rollout-control authority,
+not a principal-to-tenant/subject ACL; deployments must add that authorization layer
+before treating this as multi-tenant isolation.
+
 ## Files
 
 | File                   | Description                                                 |

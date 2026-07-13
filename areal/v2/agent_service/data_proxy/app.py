@@ -426,13 +426,24 @@ def create_data_proxy_app(config: DataProxyConfig) -> FastAPI:
             memory_control_asserted = _parse_memory_control_authorized(body)
             if memory_control_asserted:
                 # The JSON marker controls protocol flow but is forgeable.  A
-                # trusted Gateway→DataProxy hop must authenticate it before any
-                # session creation or pin CAS.
+                # dedicated Gateway→DataProxy hop must authenticate it before
+                # any session creation or pin CAS.  Never reuse the externally
+                # configured Agent admin key for this cross-scope capability.
+                if not config.memory_control_api_key:
+                    raise HTTPException(
+                        status_code=503,
+                        detail="Memory assignment transport is not configured",
+                    )
                 await verify_admin_key(
                     request.headers.get("Authorization", ""),
-                    expected_key=config.admin_api_key,
+                    expected_key=config.memory_control_api_key,
                 )
             memory_control_authorized = memory_control_asserted
+            if submitted_pin_present and not config.memory_control_api_key:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Memory assignment transport is not configured",
+                )
             if submitted_pin_present and not memory_control_authorized:
                 raise HTTPException(
                     status_code=403,

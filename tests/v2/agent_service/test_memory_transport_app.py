@@ -24,11 +24,15 @@ from areal.v2.memory_service.types import MemoryScope
 
 httpx = pytest.importorskip("httpx")
 data_proxy_app = pytest.importorskip("areal.v2.agent_service.data_proxy.app")
+data_proxy_client = pytest.importorskip("areal.v2.agent_service.data_proxy.client")
 data_proxy_config = pytest.importorskip("areal.v2.agent_service.data_proxy.config")
 gateway_bridge = pytest.importorskip("areal.v2.agent_service.gateway.bridge")
+gateway_config = pytest.importorskip("areal.v2.agent_service.gateway.config")
 fastapi = pytest.importorskip("fastapi")
 
-_ADMIN_HEADERS = admin_headers(DEFAULT_ADMIN_API_KEY)
+_MEMORY_CONTROL_API_KEY = "test-memory-control-hop-key"
+_MEMORY_CONTROL_HEADERS = admin_headers(_MEMORY_CONTROL_API_KEY)
+_EXTERNAL_ADMIN_API_KEY = "test-external-admin-key"
 
 
 def _wire(suffix: str = "a") -> dict[str, object]:
@@ -64,7 +68,7 @@ def _internal_request():
             "headers": [
                 (
                     b"authorization",
-                    f"Bearer {DEFAULT_ADMIN_API_KEY}".encode(),
+                    f"Bearer {_MEMORY_CONTROL_API_KEY}".encode(),
                 )
             ],
         }
@@ -94,8 +98,106 @@ def _patched_worker_send(worker_bodies, worker_closes):
 
 def _proxy_app():
     return data_proxy_app.create_data_proxy_app(
-        data_proxy_config.DataProxyConfig(worker_addr="http://worker")
+        data_proxy_config.DataProxyConfig(
+            worker_addr="http://worker",
+            memory_control_api_key=_MEMORY_CONTROL_API_KEY,
+        )
     )
+
+
+def test_gateway_requires_a_distinct_memory_hop_key() -> None:
+    for blank_admin in ("", "   "):
+        with pytest.raises(ValueError, match="admin_api_key must not be blank"):
+            gateway_config.GatewayConfig(
+                admin_api_key=blank_admin,
+                memory_control_api_key=_MEMORY_CONTROL_API_KEY,
+            )
+        with pytest.raises(ValueError, match="admin_api_key must not be blank"):
+            gateway_bridge.ChatCompletionsBridge(
+                router_addr="http://router",
+                admin_api_key=blank_admin,
+                memory_control_api_key=_MEMORY_CONTROL_API_KEY,
+            )
+    with pytest.raises(ValueError, match="must differ"):
+        gateway_config.GatewayConfig(
+            admin_api_key="same-public-key",
+            memory_control_api_key="same-public-key",
+        )
+    with pytest.raises(ValueError, match="must differ"):
+        gateway_bridge.ChatCompletionsBridge(
+            router_addr="http://router",
+            admin_api_key="same-public-key",
+            memory_control_api_key="same-public-key",
+        )
+    for source_visible_default in (DEFAULT_ADMIN_API_KEY, "areal-admin-key"):
+        assert not gateway_config.GatewayConfig(
+            admin_api_key=source_visible_default,
+            memory_control_api_key=_MEMORY_CONTROL_API_KEY,
+        ).memory_control_enabled
+        with pytest.raises(ValueError, match="source-visible default"):
+            gateway_config.GatewayConfig(
+                admin_api_key=_EXTERNAL_ADMIN_API_KEY,
+                memory_control_api_key=source_visible_default,
+            )
+        with pytest.raises(ValueError, match="source-visible default"):
+            gateway_bridge.ChatCompletionsBridge(
+                router_addr="http://router",
+                admin_api_key=_EXTERNAL_ADMIN_API_KEY,
+                memory_control_api_key=source_visible_default,
+            )
+        with pytest.raises(ValueError, match="source-visible default"):
+            data_proxy_config.DataProxyConfig(
+                memory_control_api_key=source_visible_default,
+            )
+        with pytest.raises(ValueError, match="source-visible default"):
+            data_proxy_client.DataProxyClient(
+                "http://proxy",
+                memory_control_api_key=source_visible_default,
+            )
+    assert gateway_config.GatewayConfig(
+        admin_api_key=_EXTERNAL_ADMIN_API_KEY,
+        memory_control_api_key=_MEMORY_CONTROL_API_KEY,
+    ).memory_control_enabled
+
+
+@pytest.mark.parametrize(
+    "source_visible_default",
+    (DEFAULT_ADMIN_API_KEY, "areal-admin-key"),
+)
+@pytest.mark.asyncio
+async def test_source_visible_admin_defaults_cannot_enable_memory_control(
+    source_visible_default: str,
+) -> None:
+    bridge = gateway_bridge.ChatCompletionsBridge(
+        router_addr="http://router",
+        admin_api_key=source_visible_default,
+        memory_control_api_key=_MEMORY_CONTROL_API_KEY,
+    )
+    app = fastapi.FastAPI()
+    gateway_bridge.mount_chat_bridge(app, bridge)
+    transport = httpx.ASGITransport(app=app)
+    try:
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://gateway",
+        ) as client:
+            response = await client.post(
+                "/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {source_visible_default}",
+                    "X-AReaL-Session-Key": "default-key-session",
+                },
+                json={
+                    "model": "model-1",
+                    "messages": [{"role": "user", "content": "hello"}],
+                    MEMORY_ASSIGNMENT_PIN_FIELD: _wire(),
+                },
+            )
+    finally:
+        await bridge.close()
+
+    assert response.status_code == 503
+    assert "non-default external admin key" in response.json()["error"]["message"]
 
 
 @pytest.mark.asyncio
@@ -112,7 +214,7 @@ async def test_first_turn_pin_is_reused_and_forwarded_as_reserved_metadata() -> 
         async with httpx.AsyncClient(
             transport=transport,
             base_url="http://proxy",
-            headers=_ADMIN_HEADERS,
+            headers=_MEMORY_CONTROL_HEADERS,
         ) as client:
             first = await client.post(
                 "/session/s1/turn",
@@ -158,7 +260,7 @@ async def test_reusing_pinned_session_requires_trusted_ingress_on_every_turn() -
         async with httpx.AsyncClient(
             transport=transport,
             base_url="http://proxy",
-            headers=_ADMIN_HEADERS,
+            headers=_MEMORY_CONTROL_HEADERS,
         ) as client:
             missing_hop_auth = await client.post(
                 "/session/missing-hop/turn",
@@ -172,6 +274,16 @@ async def test_reusing_pinned_session_requires_trusted_ingress_on_every_turn() -
                 headers={"Authorization": "Bearer wrong-key"},
                 json=_authorized(
                     {"message": "forged marker", MEMORY_ASSIGNMENT_PIN_FIELD: _wire()}
+                ),
+            )
+            external_admin_is_not_hop_auth = await client.post(
+                "/session/external-admin/turn",
+                headers={"Authorization": f"Bearer {DEFAULT_ADMIN_API_KEY}"},
+                json=_authorized(
+                    {
+                        "message": "wrong capability",
+                        MEMORY_ASSIGNMENT_PIN_FIELD: _wire(),
+                    }
                 ),
             )
             unauthorized_bind = await client.post(
@@ -198,13 +310,115 @@ async def test_reusing_pinned_session_requires_trusted_ingress_on_every_turn() -
             )
 
     assert bound.status_code == authorized_reuse.status_code == 200
-    assert missing_hop_auth.status_code == wrong_hop_auth.status_code == 401
+    assert (
+        missing_hop_auth.status_code
+        == wrong_hop_auth.status_code
+        == external_admin_is_not_hop_auth.status_code
+        == 401
+    )
     assert unauthorized_bind.status_code == unauthorized_reuse.status_code == 403
     assert health_after_rejection.json()["active_sessions"] == 0
     assert len(worker_bodies) == 2
     first_pin = parse_memory_assignment_pin_metadata(worker_bodies[0]["metadata"])
     second_pin = parse_memory_assignment_pin_metadata(worker_bodies[1]["metadata"])
     assert first_pin == second_pin
+
+
+@pytest.mark.asyncio
+async def test_unconfigured_memory_hop_allows_plain_turns_but_rejects_pins() -> None:
+    worker_bodies: list[dict] = []
+    worker_closes: list[str] = []
+    app = data_proxy_app.create_data_proxy_app(
+        data_proxy_config.DataProxyConfig(worker_addr="http://worker")
+    )
+    transport = httpx.ASGITransport(app=app)
+    with patch.object(
+        httpx.AsyncClient,
+        "send",
+        _patched_worker_send(worker_bodies, worker_closes),
+    ):
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://proxy",
+            # A source-visible Agent admin default must not substitute for the
+            # dedicated, controller-generated Memory hop capability.
+            headers=admin_headers("areal-admin-key"),
+        ) as client:
+            ordinary = await client.post(
+                "/session/plain/turn",
+                json={"message": "plain"},
+            )
+            disabled = await client.post(
+                "/session/pinned/turn",
+                json=_authorized(
+                    {"message": "pin", MEMORY_ASSIGNMENT_PIN_FIELD: _wire()}
+                ),
+            )
+            health = await client.get("/health")
+
+    assert ordinary.status_code == 200
+    assert disabled.status_code == 503
+    assert "not configured" in disabled.json()["detail"]
+    assert health.json()["active_sessions"] == 1
+    assert len(worker_bodies) == 1
+    assert AREAL_MEMORY_METADATA_KEY not in worker_bodies[0]["metadata"]
+
+
+@pytest.mark.asyncio
+async def test_data_proxy_client_sends_hop_key_only_for_memory_control() -> None:
+    forwarded = []
+
+    def handler(request):
+        forwarded.append(request)
+        return httpx.Response(
+            200,
+            json={"summary": "ok", "events": [], "metadata": {}},
+            request=request,
+        )
+
+    client = data_proxy_client.DataProxyClient("http://proxy")
+    await client._http.aclose()
+    client._http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    try:
+        await client.turn("plain", "hello")
+        with pytest.raises(ValueError, match="dedicated Memory control key"):
+            await client.turn(
+                "pinned",
+                "hello",
+                memory_control_authorized=True,
+                memory_assignment_pin=MemoryAssignmentPinWireV1.from_wire(_wire()),
+            )
+    finally:
+        await client.close()
+
+    assert len(forwarded) == 1
+    assert "Authorization" not in forwarded[0].headers
+    assert MEMORY_CONTROL_AUTHORIZED_FIELD not in json.loads(forwarded[0].content)
+
+    controlled = data_proxy_client.DataProxyClient(
+        "http://proxy",
+        memory_control_api_key=_MEMORY_CONTROL_API_KEY,
+    )
+    await controlled._http.aclose()
+    controlled._http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    try:
+        await controlled.turn(
+            "pinned",
+            "hello",
+            memory_control_authorized=True,
+            memory_assignment_pin=MemoryAssignmentPinWireV1.from_wire(_wire()),
+        )
+    finally:
+        await controlled.close()
+
+    assert len(forwarded) == 2
+    assert (
+        forwarded[1].headers["Authorization"]
+        == (_MEMORY_CONTROL_HEADERS["Authorization"])
+    )
+    controlled_body = json.loads(forwarded[1].content)
+    assert controlled_body[MEMORY_CONTROL_AUTHORIZED_FIELD] is True
+    assert controlled_body[MEMORY_ASSIGNMENT_PIN_FIELD] == _wire()
 
 
 @pytest.mark.asyncio
@@ -221,7 +435,7 @@ async def test_conflicting_pin_and_reserved_metadata_fail_before_worker() -> Non
         async with httpx.AsyncClient(
             transport=transport,
             base_url="http://proxy",
-            headers=_ADMIN_HEADERS,
+            headers=_MEMORY_CONTROL_HEADERS,
         ) as client:
             first = await client.post(
                 "/session/s1/turn",
@@ -292,7 +506,7 @@ async def test_concurrent_first_pin_is_compare_and_set() -> None:
         async with httpx.AsyncClient(
             transport=transport,
             base_url="http://proxy",
-            headers=_ADMIN_HEADERS,
+            headers=_MEMORY_CONTROL_HEADERS,
         ) as client:
             responses = await asyncio.gather(
                 client.post(
@@ -327,7 +541,7 @@ async def test_close_clears_pin_and_allows_new_incarnation() -> None:
         async with httpx.AsyncClient(
             transport=transport,
             base_url="http://proxy",
-            headers=_ADMIN_HEADERS,
+            headers=_MEMORY_CONTROL_HEADERS,
         ) as client:
             first = await client.post(
                 "/session/s1/turn",
@@ -368,7 +582,7 @@ async def test_shutdown_closes_pinned_worker_session_before_clearing_pin() -> No
         async with httpx.AsyncClient(
             transport=transport,
             base_url="http://proxy",
-            headers=_ADMIN_HEADERS,
+            headers=_MEMORY_CONTROL_HEADERS,
         ) as client:
             response = await client.post(
                 "/session/s1/turn",
@@ -400,7 +614,7 @@ async def test_malformed_pin_fails_without_reserving_session() -> None:
         async with httpx.AsyncClient(
             transport=transport,
             base_url="http://proxy",
-            headers=_ADMIN_HEADERS,
+            headers=_MEMORY_CONTROL_HEADERS,
         ) as client:
             rejected = await client.post(
                 "/session/s1/turn",
@@ -439,7 +653,7 @@ async def test_falsy_non_string_inference_fields_fail_before_session_mutation(
         async with httpx.AsyncClient(
             transport=transport,
             base_url="http://proxy",
-            headers=_ADMIN_HEADERS,
+            headers=_MEMORY_CONTROL_HEADERS,
         ) as client:
             rejected = await client.post(
                 "/session/s1/turn",
@@ -470,7 +684,7 @@ async def test_blank_session_key_fails_without_reserving_session() -> None:
         async with httpx.AsyncClient(
             transport=transport,
             base_url="http://proxy",
-            headers=_ADMIN_HEADERS,
+            headers=_MEMORY_CONTROL_HEADERS,
         ) as client:
             rejected = await client.post(
                 "/session/%20/turn",
@@ -497,7 +711,7 @@ async def test_conflicting_pin_cannot_mutate_cached_inference_routing() -> None:
         async with httpx.AsyncClient(
             transport=transport,
             base_url="http://proxy",
-            headers=_ADMIN_HEADERS,
+            headers=_MEMORY_CONTROL_HEADERS,
         ) as client:
             first = await client.post(
                 "/session/s1/turn",
@@ -567,7 +781,7 @@ async def test_close_tombstone_prevents_rebind_before_worker_cleanup() -> None:
         async with httpx.AsyncClient(
             transport=transport,
             base_url="http://proxy",
-            headers=_ADMIN_HEADERS,
+            headers=_MEMORY_CONTROL_HEADERS,
         ) as client:
             first = await client.post(
                 "/session/s1/turn",
@@ -839,7 +1053,7 @@ async def test_failed_worker_close_keeps_tombstone_until_retry_succeeds() -> Non
         async with httpx.AsyncClient(
             transport=transport,
             base_url="http://proxy",
-            headers=_ADMIN_HEADERS,
+            headers=_MEMORY_CONTROL_HEADERS,
         ) as client:
             await client.post(
                 "/session/s1/turn",
@@ -880,6 +1094,9 @@ async def test_chat_bridge_separates_memory_control_from_upstream_request() -> N
     def handler(request):
         nonlocal routed
         if request.url.host == "router" and request.url.path == "/route":
+            assert request.headers["Authorization"] == (
+                f"Bearer {_EXTERNAL_ADMIN_API_KEY}"
+            )
             routed += 1
             return httpx.Response(
                 200,
@@ -887,8 +1104,15 @@ async def test_chat_bridge_separates_memory_control_from_upstream_request() -> N
                 request=request,
             )
         if request.url.host == "proxy" and request.url.path.endswith("/turn"):
-            assert request.headers["Authorization"] == _ADMIN_HEADERS["Authorization"]
-            forwarded.append(json.loads(request.content))
+            turn = json.loads(request.content)
+            if turn[MEMORY_CONTROL_AUTHORIZED_FIELD]:
+                assert (
+                    request.headers["Authorization"]
+                    == (_MEMORY_CONTROL_HEADERS["Authorization"])
+                )
+            else:
+                assert "Authorization" not in request.headers
+            forwarded.append(turn)
             return httpx.Response(
                 200,
                 stream=httpx.ByteStream(b'{"id":"chatcmpl-test"}'),
@@ -897,7 +1121,11 @@ async def test_chat_bridge_separates_memory_control_from_upstream_request() -> N
             )
         raise AssertionError(f"unexpected bridge request: {request.url}")
 
-    bridge = gateway_bridge.ChatCompletionsBridge(router_addr="http://router")
+    bridge = gateway_bridge.ChatCompletionsBridge(
+        router_addr="http://router",
+        admin_api_key=_EXTERNAL_ADMIN_API_KEY,
+        memory_control_api_key=_MEMORY_CONTROL_API_KEY,
+    )
     await bridge._http.aclose()
     bridge._http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     app = fastapi.FastAPI()
@@ -940,7 +1168,7 @@ async def test_chat_bridge_separates_memory_control_from_upstream_request() -> N
             response = await client.post(
                 "/v1/chat/completions",
                 headers={
-                    "Authorization": f"Bearer {DEFAULT_ADMIN_API_KEY}",
+                    "Authorization": f"Bearer {_EXTERNAL_ADMIN_API_KEY}",
                     "X-AReaL-Session-Key": "session-1",
                 },
                 json={
@@ -983,13 +1211,19 @@ async def test_responses_bridge_forwards_trusted_pin_and_preserves_conflict() ->
 
     def handler(request):
         if request.url.host == "router" and request.url.path == "/route":
+            assert request.headers["Authorization"] == (
+                f"Bearer {_EXTERNAL_ADMIN_API_KEY}"
+            )
             return httpx.Response(
                 200,
                 json={"data_proxy_addr": "http://proxy"},
                 request=request,
             )
         if request.url.host == "proxy" and request.url.path.endswith("/turn"):
-            assert request.headers["Authorization"] == _ADMIN_HEADERS["Authorization"]
+            assert (
+                request.headers["Authorization"]
+                == _MEMORY_CONTROL_HEADERS["Authorization"]
+            )
             forwarded.append(json.loads(request.content))
             return httpx.Response(
                 409,
@@ -998,11 +1232,19 @@ async def test_responses_bridge_forwards_trusted_pin_and_preserves_conflict() ->
             )
         raise AssertionError(f"unexpected bridge request: {request.url}")
 
-    bridge = gateway_bridge.OpenResponsesBridge(router_addr="http://router")
+    bridge = gateway_bridge.OpenResponsesBridge(
+        router_addr="http://router",
+        admin_api_key=_EXTERNAL_ADMIN_API_KEY,
+        memory_control_api_key=_MEMORY_CONTROL_API_KEY,
+    )
     await bridge._http.aclose()
     bridge._http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     app = fastapi.FastAPI()
-    gateway_bridge.mount_bridge(app, bridge)
+    gateway_bridge.mount_bridge(
+        app,
+        bridge,
+        admin_api_key=_EXTERNAL_ADMIN_API_KEY,
+    )
     transport = httpx.ASGITransport(app=app)
     try:
         async with httpx.AsyncClient(
@@ -1012,7 +1254,7 @@ async def test_responses_bridge_forwards_trusted_pin_and_preserves_conflict() ->
             response = await client.post(
                 "/v1/responses",
                 headers={
-                    "Authorization": f"Bearer {DEFAULT_ADMIN_API_KEY}",
+                    "Authorization": f"Bearer {_EXTERNAL_ADMIN_API_KEY}",
                     "X-AReaL-Session-Key": "session-1",
                 },
                 json={

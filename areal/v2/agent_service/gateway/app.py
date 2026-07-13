@@ -58,14 +58,19 @@ def _make_accepted_json(request_id: str, run_id: str) -> str:
 def create_gateway_app(config: GatewayConfig) -> FastAPI:
     app = FastAPI(title="AReaL Agent Gateway")
     http_client = httpx.AsyncClient(timeout=config.forward_timeout)
-    _auth_headers = admin_headers(config.admin_api_key)
+    _admin_headers = admin_headers(config.admin_api_key)
+    _memory_control_headers = (
+        admin_headers(config.memory_control_api_key)
+        if config.memory_control_enabled
+        else {}
+    )
     _admin = make_admin_dependency(config.admin_api_key)
 
     async def _route(session_key: str) -> str:
         resp = await http_client.post(
             f"{config.router_addr}/route",
             json={"session_key": session_key},
-            headers=_auth_headers,
+            headers=_admin_headers,
             timeout=config.router_timeout,
         )
         resp.raise_for_status()
@@ -82,20 +87,28 @@ def create_gateway_app(config: GatewayConfig) -> FastAPI:
         worker_metadata = dict(metadata)
         assignment_pin = worker_metadata.pop(MEMORY_ASSIGNMENT_PIN_FIELD, None)
         assignment_pin_present = MEMORY_ASSIGNMENT_PIN_FIELD in metadata
+        if assignment_pin_present and not config.memory_control_enabled:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "Memory assignment transport requires a non-default external "
+                    "admin key and a dedicated internal hop key"
+                ),
+            )
         worker_metadata.pop(MEMORY_CONTROL_AUTHORIZED_FIELD, None)
         body = {
             "message": message,
             "run_id": run_id,
             "queue_mode": queue_mode,
             "metadata": worker_metadata,
-            MEMORY_CONTROL_AUTHORIZED_FIELD: True,
+            MEMORY_CONTROL_AUTHORIZED_FIELD: config.memory_control_enabled,
         }
         if assignment_pin_present:
             body[MEMORY_ASSIGNMENT_PIN_FIELD] = assignment_pin
         resp = await http_client.post(
             f"{data_proxy_addr}/session/{session_key}/turn",
             json=body,
-            headers=_auth_headers,
+            headers=_memory_control_headers,
         )
         resp.raise_for_status()
         return resp.json()

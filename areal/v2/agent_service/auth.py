@@ -9,6 +9,17 @@ import hmac
 from fastapi import Header, HTTPException
 
 DEFAULT_ADMIN_API_KEY = "areal-agent-admin"
+SOURCE_VISIBLE_DEFAULT_ADMIN_API_KEYS = frozenset(
+    {
+        DEFAULT_ADMIN_API_KEY,
+        # Public AgentConfig / shared HTTP default retained for compatibility.
+        "areal-admin-key",
+    }
+)
+
+
+def is_source_visible_default_admin_key(value: object) -> bool:
+    return type(value) is str and value in SOURCE_VISIBLE_DEFAULT_ADMIN_API_KEYS
 
 
 async def verify_admin_key(

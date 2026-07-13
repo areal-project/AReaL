@@ -137,6 +137,55 @@ class TestInitialize:
         ctrl.destroy()
 
     @patch(f"{CTRL}.requests")
+    def test_memory_hop_uses_a_dedicated_controller_secret(self, mock_requests, config):
+        fork_payloads = []
+
+        def mock_post(url, **kwargs):
+            if "/alloc_ports" in url:
+                return _mock_alloc_ports_response("10.0.0.1", [9001])
+            if "/fork" in url:
+                fork_payloads.append(kwargs["json"])
+                return _mock_fork_response("10.0.0.1", 100)
+            if "/register" in url:
+                return _mock_register_response()
+            if "/kill_forked_worker" in url:
+                return _mock_kill_response()
+            return MagicMock(status_code=404)
+
+        mock_requests.post = mock_post
+        mock_requests.get = lambda url, **kw: _mock_health_response()
+        mock_requests.RequestException = Exception
+
+        scheduler = _make_scheduler(("10.0.0.1", "8090"))
+        ctrl = AgentController(config=config, scheduler=scheduler)
+        ctrl.initialize()
+        ctrl.scale_up(1)
+
+        by_role = {payload["role"]: payload["raw_cmd"] for payload in fork_payloads}
+        proxy_cmd = by_role["agent-proxy-0"]
+        gateway_cmd = by_role["agent-gateway"]
+
+        proxy_key = proxy_cmd[proxy_cmd.index("--memory-control-api-key") + 1]
+        gateway_key = gateway_cmd[gateway_cmd.index("--memory-control-api-key") + 1]
+        assert proxy_key == gateway_key
+        assert proxy_key != config.admin_api_key
+        assert len(proxy_key) >= 32
+        assert "--admin-api-key" not in proxy_cmd
+        assert gateway_cmd[gateway_cmd.index("--admin-api-key") + 1] == (
+            config.admin_api_key
+        )
+        assert proxy_key not in by_role["agent-router"]
+        assert proxy_key not in by_role["agent-worker-0"]
+        scaled_proxy_cmd = by_role["agent-proxy-1"]
+        assert (
+            scaled_proxy_cmd[scaled_proxy_cmd.index("--memory-control-api-key") + 1]
+            == proxy_key
+        )
+        assert proxy_key not in by_role["agent-worker-1"]
+
+        ctrl.destroy()
+
+    @patch(f"{CTRL}.requests")
     def test_initialize_uses_scheduling_spec_env_vars(self, mock_requests):
         fork_payloads = []
 

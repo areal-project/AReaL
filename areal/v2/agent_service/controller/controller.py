@@ -22,6 +22,7 @@ Lifecycle::
 
 from __future__ import annotations
 
+import secrets
 import sys
 import threading
 import time
@@ -88,6 +89,11 @@ class AgentController:
 
         self._router_addr: str = ""
         self._gateway_addr: str = ""
+        # Memory control is an internal Gateway -> DataProxy capability, not
+        # the externally configured Agent admin credential.  Generate it per
+        # controller incarnation so a documented/default admin key can never
+        # authorize cross-scope Memory assignment transport.
+        self._memory_control_api_key = secrets.token_urlsafe(32)
 
         self._pairs: dict[int, _WorkerPair] = {}
         self._pairs_lock = threading.Lock()
@@ -175,6 +181,8 @@ class AgentController:
             self._router_addr,
             "--admin-api-key",
             cfg.admin_api_key,
+            "--memory-control-api-key",
+            self._memory_control_api_key,
         ]
         gw_host, gw_port = self._fork_on_guard(
             guard_addr=guard_0,
@@ -266,8 +274,8 @@ class AgentController:
                 "areal.v2.agent_service.data_proxy",
                 "--worker-addr",
                 worker_addr,
-                "--admin-api-key",
-                cfg.admin_api_key,
+                "--memory-control-api-key",
+                self._memory_control_api_key,
             ]
             proxy_host, proxy_port = self._fork_on_guard(
                 guard_addr=guard_addr,
