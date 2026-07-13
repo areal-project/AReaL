@@ -25,6 +25,18 @@ from .memory import (
     MemoryAgentTurnConflictError,
     MemoryAgentTurnV1,
 )
+from .memory_transport import (
+    AREAL_MEMORY_METADATA_KEY,
+    MEMORY_ASSIGNMENT_PIN_FIELD,
+    MemoryAgentMetadataWireV1,
+    MemoryAssignmentPinWireV1,
+    MemoryPinTransportError,
+    MemoryPinWireFormatError,
+    MemorySessionPinCache,
+    MemorySessionPinConflictError,
+    ReservedMemoryMetadataError,
+    parse_memory_assignment_pin_metadata,
+)
 from .types import (
     AgentRequest,
     AgentResponse,
@@ -33,15 +45,25 @@ from .types import (
 )
 
 __all__ = [
+    "AREAL_MEMORY_METADATA_KEY",
     "AgentRequest",
     "AgentResponse",
     "AgentRunnable",
     "AsyncMemoryAgentCoordinator",
     "EventEmitter",
+    "MEMORY_ASSIGNMENT_PIN_FIELD",
+    "MemoryAgentMetadataWireV1",
     "MemoryAgentCoordinatorClosedError",
     "MemoryAgentCoordinatorError",
     "MemoryAgentSessionConflictError",
     "MemoryAgentSessionPinV1",
     "MemoryAgentTurnConflictError",
     "MemoryAgentTurnV1",
+    "MemoryAssignmentPinWireV1",
+    "MemoryPinTransportError",
+    "MemoryPinWireFormatError",
+    "MemorySessionPinCache",
+    "MemorySessionPinConflictError",
+    "ReservedMemoryMetadataError",
+    "parse_memory_assignment_pin_metadata",
 ]

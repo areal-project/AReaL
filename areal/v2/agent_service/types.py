@@ -19,9 +19,19 @@ class AgentRequest:
     parameters should go in *metadata*.
 
     Reserved metadata keys:
-        ``areal_inference``: present when the turn opts into AReaL's own
-            inference service for self-evolution (the turn carries the
-            inference-routing fields ``inf_base_url`` + ``session_api_key``).
+        ``areal_memory``: DataProxy-authored, closed-schema assignment-pin
+            envelope requested through the trusted control-plane field.
+            Callers cannot set this key through ordinary metadata.  This
+            transport layer does not yet resolve it in the Worker; a future
+            Worker-owned integration must do so before handing an agent a
+            narrow Memory turn capability.  The raw envelope may therefore
+            still be visible to an agent plugin.  It is neither caller
+            authorization nor an exposure receipt and does not mean Memory
+            reached a model.  Ingress must separately authorize the
+            principal/session for its MemoryScope.
+        ``areal_inference``: DataProxy-authored when the turn opts into AReaL's
+            own inference service for self-evolution (the turn carries the
+            top-level routing fields ``inf_base_url`` + ``session_api_key``).
             Value is ``{"base_url", "api_key", "model"}`` where ``api_key`` is
             the per-session ``sk-sess-*`` the **caller** obtained itself (e.g.
             via its own ``/rl/start_session``) and passed in on the request.  The
@@ -29,10 +39,11 @@ class AgentRequest:
             forwards these fields through.  Agents should route their internal
             LLM calls to this upstream so the trajectory's tokens/logprobs are
             captured for training.
-        ``chat_request``: present on the ``/v1/chat/completions`` path; the
-            full original request body, so an agent that fronts an
-            OpenAI-compatible upstream can replay it verbatim and return a
-            :class:`StreamResponse` for byte-for-byte relay.
+        ``chat_request``: DataProxy-authored on the ``/v1/chat/completions``
+            path; the original request body with Agent Service control fields
+            removed, so an agent that fronts an OpenAI-compatible upstream can
+            safely replay it and return a :class:`StreamResponse` for
+            byte-for-byte relay.
     """
 
     message: str
