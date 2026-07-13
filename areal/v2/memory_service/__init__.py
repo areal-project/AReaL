@@ -39,6 +39,13 @@ from areal.v2.memory_service.history_types import (
     RevisionOperation,
     RevisionProposal,
 )
+from areal.v2.memory_service.release_control_store import (
+    InMemoryMemoryReleaseControlStore,
+    MemoryReleaseAssignmentPolicy,
+    MemoryReleaseAttestationRevoker,
+    MemoryReleaseAttestor,
+    MemoryReleaseControlStore,
+)
 from areal.v2.memory_service.release_control_types import (
     MemoryReleaseAssignmentConsumerKind,
     MemoryReleaseAssignmentV1,
@@ -103,6 +110,7 @@ __all__ = [
     "EvidenceStore",
     "InMemoryEvidenceStore",
     "InMemoryMemoryHistoryStore",
+    "InMemoryMemoryReleaseControlStore",
     "InMemoryMemoryReleaseStore",
     "InMemoryMemoryRuntimeStore",
     "MemoryBoundaryMismatchError",
@@ -131,11 +139,15 @@ __all__ = [
     "MemoryReleaseAssignmentConsumerKind",
     "MemoryReleaseAssignmentConflictError",
     "MemoryReleaseAssignmentNotFoundError",
+    "MemoryReleaseAssignmentPolicy",
     "MemoryReleaseAssignmentV1",
     "MemoryReleaseAttestationConflictError",
     "MemoryReleaseAttestationNotFoundError",
+    "MemoryReleaseAttestationRevoker",
     "MemoryReleaseAttestationRevocationV1",
     "MemoryReleaseAttestationV1",
+    "MemoryReleaseAttestor",
+    "MemoryReleaseControlStore",
     "MemoryReleaseRevocationConflictError",
     "MemoryReleaseRevocationNotFoundError",
     "MemoryReleaseRevocationReason",
