@@ -54,8 +54,14 @@ class VLLMBackend:
             # is stream-based and would misalign under this engine's
             # interruption/resumption re-submits). Fail loudly rather than silently
             # dropping the seed and producing non-reproducible rollouts the caller
-            # believes are seeded; mirrors how the SGLang backend raises on
-            # unsupported use_beam_search below.
+            # believes are seeded; mirrors how SGLangBackend rejects its own
+            # unsupported use_beam_search (areal/engine/sglang_remote.py).
+            # Note: PPOConfig.__post_init__ validates this combination once at
+            # config-construction time. A seed set dynamically per-request after
+            # that (e.g. by a future per-rollout seed-minting workflow) still raises
+            # here, but on the async rollout path this exception is caught
+            # generically further up the call stack and surfaces as a rejected
+            # rollout, not a hard crash.
             raise NotImplementedError(
                 "sampling_seed is not yet supported on the vLLM backend."
             )

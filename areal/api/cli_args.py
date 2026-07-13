@@ -3191,13 +3191,18 @@ class PPOConfig(BaseExperimentConfig):
         # vLLM has no sampling_seed support (both VLLMBackend and VLLMBridgeBackend
         # raise NotImplementedError on the first request); fail here instead, before
         # any server launch or model load wastes time on an unsupported config.
-        # rollout.backend is the current per-engine field (e.g. "vllm:d2t4"),
-        # confirmed authoritative via RolloutController.__init__ parsing
-        # config.backend; not Optional but guarded the same way as self.sglang below.
+        # rollout.backend is the current per-engine field, e.g. "vllm:d2t4" or the
+        # named form "vllm[name]:d2t4" -- confirmed authoritative via
+        # RolloutController.__init__ parsing config.backend through
+        # ModelAllocation.from_str, whose grammar allows that optional "[name]", so
+        # strip it before comparing rather than only splitting on ":".
+        # Unlike self.sglang below, self.rollout is never None in practice here (the
+        # `self.rollout.use_lora` check above already dereferences it unconditionally),
+        # so this ternary is defense-in-depth, not a live guard.
         rollout_backend = self.rollout.backend if self.rollout is not None else None
         if (
             isinstance(rollout_backend, str)
-            and rollout_backend.split(":")[0] == "vllm"
+            and rollout_backend.split(":")[0].split("[")[0] == "vllm"
             and (
                 self.gconfig.sampling_seed is not None
                 or self.eval_gconfig.sampling_seed is not None
