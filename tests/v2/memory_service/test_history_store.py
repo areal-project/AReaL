@@ -121,6 +121,20 @@ class YieldingMissingContainsDict(dict[object, object]):
         return exists
 
 
+class SetThenInterruptDict(dict[object, object]):
+    """Mutate once before raising to exercise BaseException rollback."""
+
+    def __init__(self, values: dict[object, object] | None = None) -> None:
+        super().__init__({} if values is None else values)
+        self.should_interrupt = True
+
+    def __setitem__(self, key: object, value: object) -> None:
+        super().__setitem__(key, value)
+        if self.should_interrupt:
+            self.should_interrupt = False
+            raise KeyboardInterrupt("injected publication interruption")
+
+
 class StubHash:
     """Return one test-controlled hexadecimal digest."""
 
@@ -408,6 +422,27 @@ def test_append_candidate_requires_existing_evidence_in_same_scope() -> None:
     assert history.get_candidate_evidence(proposal.scope, candidate.candidate_id) == (
         evidence,
     )
+
+
+@pytest.mark.parametrize(
+    "failing_index",
+    ("_candidate_by_idempotency", "_candidates_by_scope"),
+)
+def test_candidate_publication_rolls_back_every_index_after_base_exception(
+    failing_index: str,
+) -> None:
+    evidence_store, evidence = seeded_evidence_store()
+    history = InMemoryMemoryHistoryStore(evidence_store)
+    setattr(history, failing_index, SetThenInterruptDict())
+    proposal = make_candidate_proposal(evidence_ids=(evidence.evidence_id,))
+
+    with pytest.raises(KeyboardInterrupt, match="publication interruption"):
+        history.append_candidate(proposal)
+
+    assert_candidate_indexes_empty(history)
+    candidate = history.append_candidate(proposal)
+    assert history.get_candidate(proposal.scope, candidate.candidate_id) == candidate
+    assert history.list_candidates(proposal.scope) == (candidate,)
 
 
 def test_append_candidate_rejects_proposal_subclass_before_any_write() -> None:
@@ -781,6 +816,33 @@ def test_add_creates_generation_zero_logical_memory() -> None:
     assert revision.proposal.parent_revision_id is None
     assert revision.generation == 0
     assert revision.memory_id == "mem_" + revision.content_hash[:24]
+
+
+@pytest.mark.parametrize(
+    "failing_index",
+    (
+        "_revision_by_idempotency",
+        "_revision_by_candidate",
+        "_revisions_by_scope",
+    ),
+)
+def test_revision_publication_rolls_back_every_index_after_base_exception(
+    failing_index: str,
+) -> None:
+    history, candidate, _evidence = seeded_history_candidate()
+    setattr(history, failing_index, SetThenInterruptDict())
+    proposal = make_revision_proposal(candidate_id=candidate.candidate_id)
+
+    with pytest.raises(KeyboardInterrupt, match="publication interruption"):
+        history.append_revision(proposal)
+
+    assert history._revision_by_id == {}
+    assert history._revision_by_idempotency == {}
+    assert history._revision_by_candidate == {}
+    assert history._revisions_by_scope == {}
+    revision = history.append_revision(proposal)
+    assert history.get_revision(proposal.scope, revision.revision_id) == revision
+    assert history.list_revisions(proposal.scope) == (revision,)
 
 
 def test_append_revision_rejects_proposal_subclass_before_any_write() -> None:
@@ -1263,11 +1325,14 @@ def test_revision_relationship_checks_and_writes_share_one_lock_epoch() -> None:
         "revision:get",
         "candidate:get",
         "candidate-revision:contains",
+        "revision:get",
         "revision:set",
+        "idempotency:get",
         "idempotency:set",
+        "candidate-revision:get",
         "candidate-revision:set",
-        "scope:setdefault",
-        "scope:append",
+        "scope:get",
+        "scope:set",
     ]
     assert tuple(history._revision_by_id.values()) == (revision,)
     assert tuple(history._revision_by_idempotency.values()) == (revision,)

@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 from threading import RLock
 from typing import Protocol
 
+from areal.v2.memory_service._atomic import _atomic_publish
 from areal.v2.memory_service.errors import (
     CandidateConflictError,
     CandidateNotFoundError,
@@ -137,9 +138,19 @@ class InMemoryMemoryHistoryStore:
                 content_hash=content_hash,
                 created_at=datetime.now(UTC),
             )
-            self._candidate_by_id[candidate_index] = candidate
-            self._candidate_by_idempotency[idempotency_index] = candidate
-            self._candidates_by_scope.setdefault(proposal.scope, []).append(candidate)
+            _atomic_publish(
+                mapping_writes=(
+                    (self._candidate_by_id, candidate_index, candidate),
+                    (
+                        self._candidate_by_idempotency,
+                        idempotency_index,
+                        candidate,
+                    ),
+                ),
+                sequence_appends=(
+                    (self._candidates_by_scope, proposal.scope, candidate),
+                ),
+            )
             return candidate
 
     def get_candidate(self, scope: MemoryScope, candidate_id: str) -> MemoryCandidate:
@@ -246,10 +257,20 @@ class InMemoryMemoryHistoryStore:
                 content_hash=content_hash,
                 created_at=datetime.now(UTC),
             )
-            self._revision_by_id[revision_index] = revision
-            self._revision_by_idempotency[idempotency_index] = revision
-            self._revision_by_candidate[candidate_index] = revision
-            self._revisions_by_scope.setdefault(proposal.scope, []).append(revision)
+            _atomic_publish(
+                mapping_writes=(
+                    (self._revision_by_id, revision_index, revision),
+                    (
+                        self._revision_by_idempotency,
+                        idempotency_index,
+                        revision,
+                    ),
+                    (self._revision_by_candidate, candidate_index, revision),
+                ),
+                sequence_appends=(
+                    (self._revisions_by_scope, proposal.scope, revision),
+                ),
+            )
             return revision
 
     def get_revision(self, scope: MemoryScope, revision_id: str) -> MemoryRevision:
