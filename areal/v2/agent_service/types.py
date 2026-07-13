@@ -19,16 +19,15 @@ class AgentRequest:
     parameters should go in *metadata*.
 
     Reserved metadata keys:
-        ``areal_memory``: DataProxy-authored, closed-schema assignment-pin
-            envelope requested through the trusted control-plane field.
-            Callers cannot set this key through ordinary metadata.  This
-            transport layer does not yet resolve it in the Worker; a future
-            Worker-owned integration must do so before handing an agent a
-            narrow Memory turn capability.  The raw envelope may therefore
-            still be visible to an agent plugin.  It is neither caller
-            authorization nor an exposure receipt and does not mean Memory
-            reached a model.  Ingress must separately authorize the
-            principal/session for its MemoryScope.
+        ``areal_memory``: reserved for a DataProxy-authored, closed-schema
+            assignment-pin envelope requested through the trusted control-plane
+            field.  A follow-up integration must make DataProxy the only writer
+            and resolve the pin in the Worker before handing an agent a narrow
+            Memory turn capability.  The raw envelope may therefore still be
+            visible to an agent plugin.  It is neither caller authorization nor
+            an exposure receipt and does not mean Memory reached a model.
+            Ingress must separately authorize the principal/session for its
+            MemoryScope.
         ``areal_inference``: DataProxy-authored when the turn opts into AReaL's
             own inference service for self-evolution (the turn carries the
             top-level routing fields ``inf_base_url`` + ``session_api_key``).

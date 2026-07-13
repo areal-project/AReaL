@@ -3,10 +3,11 @@
 """Strict Agent Service wire transport for immutable Memory assignment pins.
 
 This module transports assignment *references*, never exposure or authorization
-claims.  A trusted rollout control-plane caller may ask a DataProxy to bind one
-pin to a session; the DataProxy then forwards a closed-schema reserved envelope.
-This transport layer does not yet install a Worker coordinator: a future
-Worker-owned integration must parse the envelope and call
+claims.  It defines the closed JSON schema, reserved metadata namespace, and a
+first-writer session compare-and-set primitive.  It does not yet wire those
+primitives into the Gateway, DataProxy, or Worker.  A follow-up integration must
+authenticate a dedicated control-plane hop before binding a pin, then parse the
+envelope in a Worker-owned adapter and call
 ``AsyncMemoryAgentCoordinator.pin_session`` so the trusted control store can
 resolve the assignment again.  Until then, the raw envelope remains ordinary
 Worker request metadata.  Parsing alone does not retrieve, render, inject,
@@ -16,11 +17,11 @@ The active-assignment resolver proves integrity, expiry, and revocation state;
 it cannot prove that the caller may read the referenced tenant or subject.
 Deployments must separately bind an authenticated principal and session to the
 requested :class:`MemoryScope` at ingress.  The current per-turn
-``memory_control_authorized`` boolean is only a trusted internal-hop assertion;
-it is not a credential and cannot establish principal-to-scope authorization.
-DataProxy accepts a true assertion only with the authenticated internal admin
-header.  Deployments should still isolate this hop and may replace the shared
-key with a dedicated hop key or mTLS.
+``memory_control_authorized`` field is only a reserved wire assertion; it is not
+a credential and cannot establish principal-to-scope authorization.  The
+follow-up integration must recompute it at trusted ingress, authenticate the
+internal hop independently from the external admin credential, and fail closed
+when either boundary is absent.
 """
 
 from __future__ import annotations
