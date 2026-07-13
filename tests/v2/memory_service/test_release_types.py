@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 from dataclasses import FrozenInstanceError, fields
 from datetime import UTC, datetime, timedelta, timezone, tzinfo
+from hashlib import sha256
 
 import pytest
 
@@ -70,6 +71,43 @@ def make_manifest(**overrides: object) -> ReleaseManifest:
     }
     values.update(overrides)
     return ReleaseManifest(**values)  # type: ignore[arg-type]
+
+
+def release_identity(
+    manifest: ReleaseManifest,
+    release_graph_sha256: str = "b" * 64,
+) -> tuple[str, str, bytes]:
+    manifest_sha256 = sha256(manifest.canonical_bytes()).hexdigest()
+    commitment_bytes = json.dumps(
+        {
+            "manifest_sha256": manifest_sha256,
+            "record_kind": "memory_release_commitment",
+            "release_graph_sha256": release_graph_sha256,
+            "schema_version": 1,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
+    content_hash = sha256(commitment_bytes).hexdigest()
+    return f"rel_{content_hash[:24]}", content_hash, commitment_bytes
+
+
+def make_release(**overrides: object) -> MemoryRelease:
+    manifest = overrides.pop("manifest", make_manifest())
+    assert isinstance(manifest, ReleaseManifest)
+    graph_hash = overrides.pop("release_graph_sha256", "b" * 64)
+    assert isinstance(graph_hash, str)
+    release_id, content_hash, _ = release_identity(manifest, graph_hash)
+    values: dict[str, object] = {
+        "release_id": release_id,
+        "manifest": manifest,
+        "content_hash": content_hash,
+        "release_graph_sha256": graph_hash,
+        "created_at": datetime.now(UTC),
+    }
+    values.update(overrides)
+    return MemoryRelease(**values)  # type: ignore[arg-type]
 
 
 def test_release_manifest_canonical_schema_v1_is_frozen() -> None:
@@ -175,10 +213,13 @@ def test_release_manifest_rejects_memory_scope_subclass() -> None:
 
 
 def test_memory_release_snapshots_identifiers_and_utc_datetime() -> None:
+    manifest = make_manifest()
+    release_id, content_hash, _ = release_identity(manifest)
     release = MemoryRelease(
-        release_id=StringSubclass(" rel_a "),
-        manifest=make_manifest(),
-        content_hash=StringSubclass(" hash_a "),
+        release_id=StringSubclass(release_id),
+        manifest=manifest,
+        content_hash=StringSubclass(content_hash),
+        release_graph_sha256=StringSubclass("b" * 64),
         created_at=datetime(
             2026,
             7,
@@ -192,9 +233,11 @@ def test_memory_release_snapshots_identifiers_and_utc_datetime() -> None:
     )
 
     assert type(release.release_id) is str
-    assert release.release_id == " rel_a "
+    assert release.release_id == release_id
     assert type(release.content_hash) is str
-    assert release.content_hash == " hash_a "
+    assert release.content_hash == content_hash
+    assert type(release.release_graph_sha256) is str
+    assert release.release_graph_sha256 == "b" * 64
     assert type(release.created_at) is datetime
     assert release.created_at == datetime(2026, 7, 7, 4, 5, 6, 789000, tzinfo=UTC)
     assert release.created_at.tzinfo is UTC
@@ -203,18 +246,11 @@ def test_memory_release_snapshots_identifiers_and_utc_datetime() -> None:
 def test_memory_release_detaches_mutable_timezone_and_datetime_subclass() -> None:
     mutable_timezone = MutableTimezone()
     mutable_source = datetime(2026, 7, 7, 5, tzinfo=mutable_timezone)
-    mutable_release = MemoryRelease(
-        "rel_a",
-        make_manifest(),
-        "a" * 64,
-        mutable_source,
-    )
+    mutable_release = make_release(created_at=mutable_source)
     subclass_source = StatefulDatetime(2026, 7, 7, 4, tzinfo=UTC)
-    subclass_release = MemoryRelease(
-        "rel_b",
-        make_manifest(),
-        "b" * 64,
-        subclass_source,
+    subclass_release = make_release(
+        manifest=make_manifest(revision_ids=("rev_c",)),
+        created_at=subclass_source,
     )
     mutable_timezone.offset = timedelta(hours=2)
 
@@ -235,7 +271,7 @@ def test_memory_release_rejects_naive_or_non_normalizable_datetime(
     created_at: datetime,
 ) -> None:
     with pytest.raises(ValueError, match="created_at"):
-        MemoryRelease("rel_a", make_manifest(), "a" * 64, created_at)
+        make_release(created_at=created_at)
 
 
 def test_memory_release_requires_exact_manifest() -> None:
@@ -246,6 +282,7 @@ def test_memory_release_requires_exact_manifest() -> None:
             "rel_a",
             manifest_subclass,
             "a" * 64,
+            "b" * 64,
             datetime.now(UTC),
         )
     with pytest.raises(TypeError, match="manifest must be a ReleaseManifest"):
@@ -253,17 +290,23 @@ def test_memory_release_requires_exact_manifest() -> None:
             "rel_a",
             object(),  # type: ignore[arg-type]
             "a" * 64,
+            "b" * 64,
             datetime.now(UTC),
         )
 
 
-@pytest.mark.parametrize("field", ["release_id", "content_hash"])
+@pytest.mark.parametrize(
+    "field", ["release_id", "content_hash", "release_graph_sha256"]
+)
 @pytest.mark.parametrize("value", ["", " \t\n", LONE_SURROGATE])
 def test_memory_release_rejects_invalid_text(field: str, value: str) -> None:
+    manifest = make_manifest()
+    release_id, content_hash, _ = release_identity(manifest)
     values: dict[str, object] = {
-        "release_id": "rel_a",
-        "manifest": make_manifest(),
-        "content_hash": "a" * 64,
+        "release_id": release_id,
+        "manifest": manifest,
+        "content_hash": content_hash,
+        "release_graph_sha256": "b" * 64,
         "created_at": datetime.now(UTC),
     }
     values[field] = value
@@ -272,13 +315,18 @@ def test_memory_release_rejects_invalid_text(field: str, value: str) -> None:
         MemoryRelease(**values)  # type: ignore[arg-type]
 
 
-@pytest.mark.parametrize("field", ["release_id", "content_hash"])
+@pytest.mark.parametrize(
+    "field", ["release_id", "content_hash", "release_graph_sha256"]
+)
 @pytest.mark.parametrize("value", [None, 7, b"value"])
 def test_memory_release_rejects_non_string_text(field: str, value: object) -> None:
+    manifest = make_manifest()
+    release_id, content_hash, _ = release_identity(manifest)
     values: dict[str, object] = {
-        "release_id": "rel_a",
-        "manifest": make_manifest(),
-        "content_hash": "a" * 64,
+        "release_id": release_id,
+        "manifest": manifest,
+        "content_hash": content_hash,
+        "release_graph_sha256": "b" * 64,
         "created_at": datetime.now(UTC),
     }
     values[field] = value
@@ -289,12 +337,7 @@ def test_memory_release_rejects_non_string_text(field: str, value: object) -> No
 
 def test_release_values_are_frozen_slotted_and_have_exact_fields() -> None:
     manifest = make_manifest()
-    release = MemoryRelease(
-        "rel_a",
-        manifest,
-        "a" * 64,
-        datetime.now(UTC),
-    )
+    release = make_release(manifest=manifest)
 
     assert tuple(field.name for field in fields(ReleaseManifest)) == (
         "scope",
@@ -304,6 +347,7 @@ def test_release_values_are_frozen_slotted_and_have_exact_fields() -> None:
         "release_id",
         "manifest",
         "content_hash",
+        "release_graph_sha256",
         "created_at",
     )
     assert not hasattr(manifest, "__dict__")
@@ -312,3 +356,54 @@ def test_release_values_are_frozen_slotted_and_have_exact_fields() -> None:
         manifest.revision_ids = ()
     with pytest.raises(FrozenInstanceError):
         release.release_id = "rel_changed"
+
+
+def test_memory_release_commitment_has_stable_domain_separated_wire_value() -> None:
+    manifest = make_manifest(revision_ids=())
+    release_id, content_hash, expected = release_identity(manifest, "c" * 64)
+    release = MemoryRelease(
+        release_id=release_id,
+        manifest=manifest,
+        content_hash=content_hash,
+        release_graph_sha256="c" * 64,
+        created_at=datetime.now(UTC),
+    )
+
+    assert release.commitment_bytes() == expected
+    assert release.commitment_bytes() == (
+        b'{"manifest_sha256":"b3acef085dae55b17b05e651e1071f20961db204'
+        b'acad245d5285b4f27cf5f5f1","record_kind":"memory_release_commitment",'
+        b'"release_graph_sha256":"cccccccccccccccccccccccccccccccccccccccc'
+        b'cccccccccccccccccccccccc","schema_version":1}'
+    )
+    assert release.content_hash == sha256(expected).hexdigest()
+    assert release.release_id == f"rel_{release.content_hash[:24]}"
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("content_hash", "0" * 64, "content_hash"),
+        ("release_id", "rel_" + "0" * 24, "release_id"),
+        ("content_hash", "A" * 64, "lowercase SHA-256"),
+        ("release_graph_sha256", "g" * 64, "lowercase SHA-256"),
+    ],
+)
+def test_memory_release_rejects_incoherent_commitments(
+    field: str,
+    value: str,
+    message: str,
+) -> None:
+    manifest = make_manifest()
+    release_id, content_hash, _ = release_identity(manifest)
+    values: dict[str, object] = {
+        "release_id": release_id,
+        "manifest": manifest,
+        "content_hash": content_hash,
+        "release_graph_sha256": "b" * 64,
+        "created_at": datetime.now(UTC),
+    }
+    values[field] = value
+
+    with pytest.raises(ValueError, match=message):
+        MemoryRelease(**values)  # type: ignore[arg-type]

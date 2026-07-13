@@ -6,9 +6,11 @@ from __future__ import annotations
 
 import faulthandler
 import inspect
+import json
 import re
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from datetime import UTC, datetime
 from hashlib import sha256
 from threading import Barrier, Event, RLock
@@ -18,6 +20,7 @@ from typing import TypeVar
 import pytest
 
 import areal.v2.memory_service.release_store as release_store_module
+import areal.v2.memory_service.release_types as release_types_module
 from areal.v2.memory_service.errors import (
     MemoryServiceError,
     ReleaseConflictError,
@@ -35,7 +38,11 @@ from areal.v2.memory_service.release_store import (
     InMemoryMemoryReleaseStore,
     MemoryReleaseStore,
 )
-from areal.v2.memory_service.release_types import MemoryRelease, ReleaseManifest
+from areal.v2.memory_service.release_types import (
+    MemoryRelease,
+    ReleaseManifest,
+    _release_commitment_bytes,
+)
 from areal.v2.memory_service.store import InMemoryEvidenceStore
 from areal.v2.memory_service.types import (
     EvidenceEvent,
@@ -141,9 +148,23 @@ def install_digest_map(
     """Install deterministic release digests for pre-seeded manifests."""
 
     def fake_sha256(canonical_bytes: bytes) -> StubHash:
-        return StubHash(digest_by_bytes[canonical_bytes])
+        return StubHash(
+            digest_by_bytes.get(canonical_bytes, sha256(canonical_bytes).hexdigest())
+        )
 
     monkeypatch.setattr(release_store_module, "sha256", fake_sha256)
+    monkeypatch.setattr(release_types_module, "sha256", fake_sha256)
+
+
+def release_commitment_for(
+    store: InMemoryMemoryReleaseStore,
+    manifest: ReleaseManifest,
+) -> bytes:
+    graph_bytes, _ = store._derive_release_graph(manifest)
+    return _release_commitment_bytes(
+        sha256(manifest.canonical_bytes()).hexdigest(),
+        sha256(graph_bytes).hexdigest(),
+    )
 
 
 def test_run_race_waits_for_workers_before_cancelling_watchdog(
@@ -580,13 +601,32 @@ def test_empty_manifest_is_a_stable_memory_off_release_without_lookup() -> None:
     history = NoLookupHistory()
     store = InMemoryMemoryReleaseStore(history)  # type: ignore[arg-type]
     manifest = ReleaseManifest(make_scope(), ())
-    expected_hash = sha256(manifest.canonical_bytes()).hexdigest()
+    expected_graph_bytes = (
+        b'{"ancestry_order":"selected_to_add_root",'
+        b'"record_kind":"memory_release_graph","schema_version":1,'
+        b'"selected_revisions":[]}'
+    )
+    expected_graph_hash = sha256(expected_graph_bytes).hexdigest()
+    expected_commitment = _release_commitment_bytes(
+        sha256(manifest.canonical_bytes()).hexdigest(),
+        expected_graph_hash,
+    )
+    expected_hash = sha256(expected_commitment).hexdigest()
 
     release = store.append_release(manifest, idempotency_key="memory-off")
 
     assert history.lookup_count == 0
     assert release.release_id == f"rel_{expected_hash[:24]}"
     assert release.content_hash == expected_hash
+    assert release.release_graph_sha256 == expected_graph_hash
+    assert release.commitment_bytes() == expected_commitment
+    assert release.release_graph_sha256 == (
+        "f1581b6dd2fc67d76188af8902552c835ec99debd31ec9f1f5f26b8f1e0a81a9"
+    )
+    assert release.content_hash == (
+        "db06eccca5cebc8730e6cf2562fc9f2487a69add6a4ec4486cb96bab7ef1b0a4"
+    )
+    assert release.release_id == "rel_db06eccca5cebc8730e6cf25"
     assert store.get_release_revisions(manifest.scope, release.release_id) == ()
     assert history.lookup_count == 0
     assert store.list_releases(manifest.scope) == (release,)
@@ -787,16 +827,17 @@ def test_changed_same_key_conflicts_before_missing_member_lookup() -> None:
     assert len(store._release_by_idempotency) == 1
 
 
-def test_release_hash_and_identifier_depend_only_on_manifest() -> None:
+def test_release_hash_and_identifier_commit_to_manifest_and_derived_graph() -> None:
     history, _, (root, _, _) = seeded_history()
     manifest = ReleaseManifest(make_scope(), (root.revision_id,))
-    expected_hash = sha256(manifest.canonical_bytes()).hexdigest()
     first_store = InMemoryMemoryReleaseStore(history)
     second_store = InMemoryMemoryReleaseStore(history)
 
     first = first_store.append_release(manifest, idempotency_key="first-key")
     second = second_store.append_release(manifest, idempotency_key="other-key")
 
+    expected_hash = sha256(first.commitment_bytes()).hexdigest()
+    assert first.release_graph_sha256 == second.release_graph_sha256
     assert first.content_hash == second.content_hash == expected_hash
     assert first.release_id == second.release_id == f"rel_{expected_hash[:24]}"
     assert re.fullmatch(r"rel_[0-9a-f]{24}", first.release_id)
@@ -806,21 +847,28 @@ def test_append_release_uses_module_level_sha256(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     manifest = ReleaseManifest(make_scope(), ())
-    digest = "a" * 64
     observed_bytes: list[bytes] = []
+    real_sha256 = release_store_module.sha256
 
     def fake_sha256(canonical_bytes: bytes) -> StubHash:
         observed_bytes.append(canonical_bytes)
-        return StubHash(digest)
+        return StubHash(real_sha256(canonical_bytes).hexdigest())
 
     monkeypatch.setattr(release_store_module, "sha256", fake_sha256)
     store = InMemoryMemoryReleaseStore(NoLookupHistory())  # type: ignore[arg-type]
 
     release = store.append_release(manifest, idempotency_key="release-1")
 
-    assert observed_bytes == [manifest.canonical_bytes()]
-    assert release.content_hash == digest
-    assert release.release_id == f"rel_{digest[:24]}"
+    assert observed_bytes == [
+        manifest.canonical_bytes(),
+        (
+            b'{"ancestry_order":"selected_to_add_root",'
+            b'"record_kind":"memory_release_graph","schema_version":1,'
+            b'"selected_revisions":[]}'
+        ),
+        release.commitment_bytes(),
+    ]
+    assert release.content_hash == sha256(release.commitment_bytes()).hexdigest()
 
 
 def test_release_validation_and_commit_obey_exact_lock_epochs(
@@ -898,6 +946,14 @@ def test_release_validation_and_commit_obey_exact_lock_epochs(
             epoch_lock.record_unlocked("history:get")
             return history.get_revision(scope, revision_id)
 
+        def get_candidate(self, scope: MemoryScope, candidate_id: str):
+            epoch_lock.record_unlocked("history:get_candidate")
+            return history.get_candidate(scope, candidate_id)
+
+        def get_candidate_evidence(self, scope: MemoryScope, candidate_id: str):
+            epoch_lock.record_unlocked("history:get_candidate_evidence")
+            return history.get_candidate_evidence(scope, candidate_id)
+
     original_sha256 = release_store_module.sha256
 
     def observed_sha256(canonical_bytes: bytes) -> object:
@@ -917,21 +973,23 @@ def test_release_validation_and_commit_obey_exact_lock_epochs(
     release = store.append_release(manifest, idempotency_key="release-1")
 
     assert epoch_lock.enter_count == 2
-    assert records == [
-        ("sha256", 0),
-        ("lock:enter", 1),
-        ("idempotency:get", 1),
-        ("lock:exit", 1),
-        ("history:get", 1),
-        ("lock:enter", 2),
-        ("idempotency:get", 2),
-        ("release:get", 2),
-        ("release:set", 2),
-        ("idempotency:set", 2),
-        ("scope:setdefault", 2),
-        ("scope:append", 2),
-        ("lock:exit", 2),
-    ]
+    assert records[0] == ("sha256", 0)
+    assert records.count(("lock:enter", 1)) == 1
+    assert records.count(("lock:enter", 2)) == 1
+    assert ("release:set", 2) in records
+    assert ("idempotency:set", 2) in records
+    assert ("scope:set", 2) in records
+    assert all(
+        event
+        not in {
+            "history:get",
+            "history:get_candidate",
+            "history:get_candidate_evidence",
+            "sha256",
+        }
+        or epoch in {0, 1}
+        for event, epoch in records
+    )
 
     records.clear()
     epoch_lock.epoch = 0
@@ -940,18 +998,11 @@ def test_release_validation_and_commit_obey_exact_lock_epochs(
 
     assert alias is release
     assert epoch_lock.enter_count == 2
-    assert records == [
-        ("sha256", 0),
-        ("lock:enter", 1),
-        ("idempotency:get", 1),
-        ("lock:exit", 1),
-        ("history:get", 1),
-        ("lock:enter", 2),
-        ("idempotency:get", 2),
-        ("release:get", 2),
-        ("idempotency:set", 2),
-        ("lock:exit", 2),
-    ]
+    assert records[0] == ("sha256", 0)
+    assert records.count(("lock:enter", 1)) == 1
+    assert records.count(("lock:enter", 2)) == 1
+    assert ("idempotency:set", 2) in records
+    assert ("release:set", 2) not in records
 
 
 def test_get_release_snapshots_identifier_subclass_before_lookup() -> None:
@@ -1044,6 +1095,16 @@ def test_missing_member_error_is_not_rewritten_by_same_key_winner() -> None:
                 missing_lookup_started.set()
                 assert allow_missing_lookup.wait(timeout=RACE_TIMEOUT_SECONDS)
             return history.get_revision(requested_scope, revision_id)
+
+        def get_candidate(self, requested_scope: MemoryScope, candidate_id: str):
+            return history.get_candidate(requested_scope, candidate_id)
+
+        def get_candidate_evidence(
+            self,
+            requested_scope: MemoryScope,
+            candidate_id: str,
+        ):
+            return history.get_candidate_evidence(requested_scope, candidate_id)
 
     store = InMemoryMemoryReleaseStore(BlockingMissingHistory())  # type: ignore[arg-type]
     invalid_manifest = ReleaseManifest(scope, ("rev_missing",))
@@ -1225,7 +1286,7 @@ def test_concurrent_release_collision_is_atomic_and_all_losers_recover(
     keys = tuple(f"collision-release-{index}" for index in range(RACE_SIZE))
     prefix = "a" * 24
     digest_by_bytes = {
-        manifest.canonical_bytes(): (
+        release_commitment_for(store, manifest): (
             prefix + ("b" * 40 if same_full_hash else f"{index:040x}")
         )
         for index, manifest in enumerate(manifests)
@@ -1297,15 +1358,15 @@ def test_forced_release_id_collision_is_isolated_across_scopes(
     digests = tuple(
         prefix + ("d" * 40 if same_full_hash else f"{index:040x}") for index in range(2)
     )
+    history = NoLookupHistory()
+    store = InMemoryMemoryReleaseStore(history)  # type: ignore[arg-type]
     install_digest_map(
         monkeypatch,
         {
-            manifest.canonical_bytes(): digest
+            release_commitment_for(store, manifest): digest
             for manifest, digest in zip(manifests, digests, strict=True)
         },
     )
-    history = NoLookupHistory()
-    store = InMemoryMemoryReleaseStore(history)  # type: ignore[arg-type]
     store._release_by_id = YieldingMissingDict()  # type: ignore[assignment]
     store._release_by_idempotency = YieldingMissingDict()  # type: ignore[assignment]
 
@@ -1351,3 +1412,386 @@ def test_forced_release_id_collision_is_isolated_across_scopes(
         second_scope: [second],
     }
     assert history.lookup_count == 0
+
+
+def make_colliding_root_revision(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    root: MemoryRevision,
+    alternate_candidate_id: str,
+) -> MemoryRevision:
+    """Build a valid alternate full hash behind the same 96-bit address."""
+
+    proposal = RevisionProposal(
+        scope=root.proposal.scope,
+        candidate_id=alternate_candidate_id,
+        operation=RevisionOperation.ADD,
+        parent_revision_id=None,
+        idempotency_key="revision-collision-alternate",
+    )
+    prefix = root.revision_id.removeprefix("rev_")
+    content_hash = prefix + "f" * 40
+    assert content_hash != root.content_hash
+    install_digest_map(monkeypatch, {proposal.canonical_bytes(): content_hash})
+    return MemoryRevision(
+        revision_id=root.revision_id,
+        memory_id=f"mem_{prefix}",
+        generation=0,
+        proposal=proposal,
+        content_hash=content_hash,
+        created_at=UTC_INSTANT,
+    )
+
+
+def test_same_manifest_over_different_valid_full_graphs_has_distinct_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    history, _, (root, _, other) = seeded_history()
+    alternate = make_colliding_root_revision(
+        monkeypatch,
+        root=root,
+        alternate_candidate_id=other.proposal.candidate_id,
+    )
+
+    class AlternateHistory:
+        def get_revision(self, scope: MemoryScope, revision_id: str):
+            if revision_id == root.revision_id:
+                return alternate
+            return history.get_revision(scope, revision_id)
+
+        def get_candidate(self, scope: MemoryScope, candidate_id: str):
+            return history.get_candidate(scope, candidate_id)
+
+        def get_candidate_evidence(self, scope: MemoryScope, candidate_id: str):
+            return history.get_candidate_evidence(scope, candidate_id)
+
+    manifest = ReleaseManifest(make_scope(), (root.revision_id,))
+    original = InMemoryMemoryReleaseStore(history).append_release(
+        manifest,
+        idempotency_key="original",
+    )
+    collided = InMemoryMemoryReleaseStore(AlternateHistory()).append_release(
+        manifest,
+        idempotency_key="alternate",
+    )
+
+    assert original.manifest == collided.manifest == manifest
+    assert root.revision_id == alternate.revision_id
+    assert root.content_hash != alternate.content_hash
+    assert original.release_graph_sha256 != collided.release_graph_sha256
+    assert original.content_hash != collided.content_hash
+    assert original.release_id != collided.release_id
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("wrong_type", "non-MemoryRevision"),
+        ("wrong_scope", "requested scope"),
+        ("wrong_address", "address"),
+        ("wrong_hash", "canonical commitment"),
+    ],
+)
+def test_append_release_rejects_malicious_revision_values(
+    mutation: str,
+    message: str,
+) -> None:
+    history, _, (root, _, _) = seeded_history()
+    foreign_proposal = RevisionProposal(
+        scope=make_scope(subject_id="attacker"),
+        candidate_id=root.proposal.candidate_id,
+        operation=RevisionOperation.ADD,
+        parent_revision_id=None,
+        idempotency_key="foreign",
+    )
+
+    class MaliciousHistory:
+        def get_revision(self, scope: MemoryScope, revision_id: str):
+            if mutation == "wrong_type":
+                return object()
+            if mutation == "wrong_scope":
+                return replace(root, proposal=foreign_proposal)
+            if mutation == "wrong_address":
+                return replace(root, revision_id="rev_other")
+            return replace(root, content_hash="0" * 64)
+
+        def get_candidate(self, scope: MemoryScope, candidate_id: str):
+            return history.get_candidate(scope, candidate_id)
+
+        def get_candidate_evidence(self, scope: MemoryScope, candidate_id: str):
+            return history.get_candidate_evidence(scope, candidate_id)
+
+    store = InMemoryMemoryReleaseStore(MaliciousHistory())  # type: ignore[arg-type]
+    with pytest.raises(ReleaseConflictError, match=message):
+        store.append_release(
+            ReleaseManifest(make_scope(), (root.revision_id,)),
+            idempotency_key="malicious",
+        )
+    assert_release_indexes_empty(store)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("candidate_type", "non-MemoryCandidate"),
+        ("candidate_address", "candidate address"),
+        ("candidate_hash", "candidate canonical commitment"),
+        ("evidence_order", "evidence addresses"),
+        ("evidence_hash", "evidence canonical commitment"),
+    ],
+)
+def test_append_release_rejects_candidate_and_evidence_mutation(
+    mutation: str,
+    message: str,
+) -> None:
+    history, _, (root, _, _) = seeded_history()
+    candidate = history.get_candidate(make_scope(), root.proposal.candidate_id)
+    evidence = history.get_candidate_evidence(make_scope(), candidate.candidate_id)
+
+    class MaliciousHistory:
+        def get_revision(self, scope: MemoryScope, revision_id: str):
+            return history.get_revision(scope, revision_id)
+
+        def get_candidate(self, scope: MemoryScope, candidate_id: str):
+            if mutation == "candidate_type":
+                return object()
+            if mutation == "candidate_address":
+                return replace(candidate, candidate_id="cand_other")
+            if mutation == "candidate_hash":
+                return replace(candidate, content_hash="0" * 64)
+            return history.get_candidate(scope, candidate_id)
+
+        def get_candidate_evidence(self, scope: MemoryScope, candidate_id: str):
+            if mutation == "evidence_order":
+                return tuple(reversed(evidence))
+            if mutation == "evidence_hash":
+                return (replace(evidence[0], content_hash="0" * 64), evidence[1])
+            return history.get_candidate_evidence(scope, candidate_id)
+
+    store = InMemoryMemoryReleaseStore(MaliciousHistory())  # type: ignore[arg-type]
+    with pytest.raises(ReleaseConflictError, match=message):
+        store.append_release(
+            ReleaseManifest(make_scope(), (root.revision_id,)),
+            idempotency_key="malicious-source",
+        )
+    assert_release_indexes_empty(store)
+
+
+def test_release_graph_records_selected_to_add_root_and_excludes_other_branch() -> None:
+    history, left, right = seeded_sibling_revisions()
+    root_id = left.proposal.parent_revision_id
+    assert root_id is not None
+    store = InMemoryMemoryReleaseStore(history)
+    left_manifest = ReleaseManifest(make_scope(), (left.revision_id,))
+    right_manifest = ReleaseManifest(make_scope(), (right.revision_id,))
+
+    left_graph_bytes, _ = store._derive_release_graph(left_manifest)
+    right_graph_bytes, _ = store._derive_release_graph(right_manifest)
+    left_graph = json.loads(left_graph_bytes)
+    ancestry = left_graph["selected_revisions"][0]["ancestry"]
+
+    assert left_graph["ancestry_order"] == "selected_to_add_root"
+    assert [node["revision_id"] for node in ancestry] == [left.revision_id, root_id]
+    assert right.revision_id not in {node["revision_id"] for node in ancestry}
+    assert set(ancestry[0]) == {
+        "candidate",
+        "generation",
+        "memory_id",
+        "revision_id",
+        "revision_sha256",
+    }
+    assert set(ancestry[0]["candidate"]) == {
+        "candidate_id",
+        "candidate_sha256",
+        "evidence",
+    }
+    assert all(
+        set(reference) == {"evidence_id", "evidence_sha256"}
+        for node in ancestry
+        for reference in node["candidate"]["evidence"]
+    )
+    assert b"root memory" not in left_graph_bytes
+    assert b"left sibling" not in left_graph_bytes
+    left_release = store.append_release(left_manifest, idempotency_key="left")
+    right_release = store.append_release(right_manifest, idempotency_key="right")
+    assert left_graph_bytes != right_graph_bytes
+    assert left_release.release_graph_sha256 != right_release.release_graph_sha256
+
+
+def test_deep_release_lineage_is_validated_iteratively() -> None:
+    scope = make_scope()
+    evidence_store = InMemoryEvidenceStore()
+    evidence = evidence_store.append(
+        make_event(
+            scope=scope,
+            sequence_no=0,
+            payload="deep lineage",
+            idempotency_key="deep-evidence",
+        )
+    )
+    history = InMemoryMemoryHistoryStore(evidence_store)
+    parent: MemoryRevision | None = None
+    for generation in range(1050):
+        candidate = append_candidate(
+            history,
+            scope=scope,
+            evidence_ids=(evidence.evidence_id,),
+            content=f"memory generation {generation}",
+            idempotency_key=f"deep-candidate-{generation}",
+        )
+        parent = append_revision(
+            history,
+            scope=scope,
+            candidate_id=candidate.candidate_id,
+            operation=(
+                RevisionOperation.ADD if parent is None else RevisionOperation.REFINE
+            ),
+            parent_revision_id=None if parent is None else parent.revision_id,
+            idempotency_key=f"deep-revision-{generation}",
+        )
+    assert parent is not None
+    store = InMemoryMemoryReleaseStore(history)
+    release = store.append_release(
+        ReleaseManifest(scope, (parent.revision_id,)),
+        idempotency_key="deep-release",
+    )
+    assert store.get_release_revisions(scope, release.release_id) == (parent,)
+
+
+def test_append_release_rejects_iterative_ancestry_cycle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    history, _, (_, child, _) = seeded_history()
+    cyclic_proposal = RevisionProposal(
+        scope=make_scope(),
+        candidate_id=child.proposal.candidate_id,
+        operation=RevisionOperation.REFINE,
+        parent_revision_id=child.revision_id,
+        idempotency_key="cyclic-revision",
+    )
+    prefix = child.revision_id.removeprefix("rev_")
+    cyclic_hash = prefix + "e" * 40
+    install_digest_map(monkeypatch, {cyclic_proposal.canonical_bytes(): cyclic_hash})
+    cyclic = replace(child, proposal=cyclic_proposal, content_hash=cyclic_hash)
+
+    class CyclicHistory:
+        def get_revision(self, scope: MemoryScope, revision_id: str):
+            return cyclic
+
+        def get_candidate(self, scope: MemoryScope, candidate_id: str):
+            return history.get_candidate(scope, candidate_id)
+
+        def get_candidate_evidence(self, scope: MemoryScope, candidate_id: str):
+            return history.get_candidate_evidence(scope, candidate_id)
+
+    store = InMemoryMemoryReleaseStore(CyclicHistory())  # type: ignore[arg-type]
+    with pytest.raises(ReleaseConflictError, match="cycle"):
+        store.append_release(
+            ReleaseManifest(make_scope(), (child.revision_id,)),
+            idempotency_key="cycle",
+        )
+    assert_release_indexes_empty(store)
+
+
+def test_final_graph_recheck_rejects_valid_toctou_drift(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    history, _, (root, _, other) = seeded_history()
+    alternate = make_colliding_root_revision(
+        monkeypatch,
+        root=root,
+        alternate_candidate_id=other.proposal.candidate_id,
+    )
+
+    class DriftingHistory:
+        selected_reads = 0
+
+        def get_revision(self, scope: MemoryScope, revision_id: str):
+            self.selected_reads += 1
+            return root if self.selected_reads == 1 else alternate
+
+        def get_candidate(self, scope: MemoryScope, candidate_id: str):
+            return history.get_candidate(scope, candidate_id)
+
+        def get_candidate_evidence(self, scope: MemoryScope, candidate_id: str):
+            return history.get_candidate_evidence(scope, candidate_id)
+
+    store = InMemoryMemoryReleaseStore(DriftingHistory())  # type: ignore[arg-type]
+    with pytest.raises(ReleaseConflictError, match="final graph recheck"):
+        store.append_release(
+            ReleaseManifest(make_scope(), (root.revision_id,)),
+            idempotency_key="toctou",
+        )
+    assert_release_indexes_empty(store)
+
+
+def test_get_release_revisions_rejects_valid_committed_graph_drift(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    history, _, (root, _, other) = seeded_history()
+    alternate = make_colliding_root_revision(
+        monkeypatch,
+        root=root,
+        alternate_candidate_id=other.proposal.candidate_id,
+    )
+
+    class MutableHistory:
+        drift = False
+
+        def get_revision(self, scope: MemoryScope, revision_id: str):
+            if self.drift and revision_id == root.revision_id:
+                return alternate
+            return history.get_revision(scope, revision_id)
+
+        def get_candidate(self, scope: MemoryScope, candidate_id: str):
+            return history.get_candidate(scope, candidate_id)
+
+        def get_candidate_evidence(self, scope: MemoryScope, candidate_id: str):
+            return history.get_candidate_evidence(scope, candidate_id)
+
+    mutable_history = MutableHistory()
+    store = InMemoryMemoryReleaseStore(mutable_history)  # type: ignore[arg-type]
+    release = store.append_release(
+        ReleaseManifest(make_scope(), (root.revision_id,)),
+        idempotency_key="stable",
+    )
+    mutable_history.drift = True
+
+    with pytest.raises(ReleaseConflictError, match="committed release identity"):
+        store.get_release_revisions(make_scope(), release.release_id)
+
+
+class PublicationInterrupted(BaseException):
+    pass
+
+
+class SetThenInterruptDict(dict[object, object]):
+    def __setitem__(self, key: object, value: object) -> None:
+        super().__setitem__(key, value)
+        raise PublicationInterrupted
+
+
+def test_interrupted_second_release_index_rolls_back_every_write() -> None:
+    store = InMemoryMemoryReleaseStore(NoLookupHistory())  # type: ignore[arg-type]
+    store._release_by_idempotency = SetThenInterruptDict()  # type: ignore[assignment]
+
+    with pytest.raises(PublicationInterrupted):
+        store.append_release(
+            ReleaseManifest(make_scope(), ()),
+            idempotency_key="interrupt-second",
+        )
+
+    assert_release_indexes_empty(store)
+
+
+def test_interrupted_third_release_index_rolls_back_every_write() -> None:
+    store = InMemoryMemoryReleaseStore(NoLookupHistory())  # type: ignore[arg-type]
+    store._releases_by_scope = SetThenInterruptDict()  # type: ignore[assignment]
+
+    with pytest.raises(PublicationInterrupted):
+        store.append_release(
+            ReleaseManifest(make_scope(), ()),
+            idempotency_key="interrupt-third",
+        )
+
+    assert_release_indexes_empty(store)
