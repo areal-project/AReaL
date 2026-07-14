@@ -393,9 +393,15 @@ def create_data_proxy_app(config: DataProxyConfig) -> FastAPI:
         while True:
             session = sessions.get(session_key)
             if session is None:
+                # The idle reaper walks a detached key snapshot.  Another
+                # close may retire a later key while this scan is waiting on
+                # an earlier one; do not resurrect that stale snapshot entry.
+                if idle_only:
+                    return None
                 # Even an unknown local session may still exist in the Worker
                 # after a prior partial failure.  The tombstone prevents a new
-                # incarnation from racing ahead of that cleanup attempt.
+                # incarnation from racing ahead of that explicit cleanup
+                # attempt.
                 candidate = _SessionData()
                 session = sessions.setdefault(session_key, candidate)
             async with session.lifecycle_lock:
