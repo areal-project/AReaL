@@ -748,10 +748,7 @@ class AuthorizedMemoryAgentBroker:
                 "Memory exposure authorization ticket is not active"
             )
         state = ticket.state
-        try:
-            current_state, current_turn = self._turn_state(ticket.turn)
-        except (MemoryAgentSessionConflictError, MemoryAgentTurnConflictError):
-            raise
+        current_state, current_turn = self._turn_state(ticket.turn)
         assert state.capabilities is not None
         if (
             self.__closed
