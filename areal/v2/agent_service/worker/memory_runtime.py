@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from enum import Enum, auto
 
 from areal.v2.agent_service.memory import (
     MemoryAgentCoordinatorClosedError,
@@ -36,7 +37,14 @@ from areal.v2.agent_service.memory_broker import (
     AuthorizedMemoryAgentBroker,
     AuthorizedMemorySessionV1,
 )
-from areal.v2.agent_service.types import AgentRequest
+from areal.v2.agent_service.streaming import CleanupAsyncIterator
+from areal.v2.agent_service.types import (
+    AgentRequest,
+    AgentResponse,
+    AgentRunnable,
+    EventEmitter,
+    StreamResponse,
+)
 from areal.v2.agent_service.worker.memory import (
     WorkerMemoryTurnCapability,
     bind_authorized_memory_turn_capability,
@@ -95,31 +103,187 @@ def _assignment_pin(value: object) -> MemoryAgentSessionPinV1:
     )
 
 
+class _TurnLeaseState(Enum):
+    NEW = auto()
+    RUNNING = auto()
+    STREAM_OWNED = auto()
+    CLOSED = auto()
+
+
 class MemoryWorkerTurnLease:
     """Host-owned lifetime for one request's process-local Memory capability.
 
-    The lease intentionally publishes no broker session or authorized turn.
-    Trusted host code must keep it alive for the complete Agent response body
-    lifetime and call :meth:`aclose` afterwards.  Cancelling one close waiter
-    does not cancel capability cleanup; a later call rejoins the same task.
+    The lease intentionally publishes no request, broker session, or authorized
+    turn.  Its single-use :meth:`run_agent` always runs the exact request bound
+    by the runtime.  A structured response closes the capability before return;
+    a streaming response transfers cleanup to its lazy body.  Cancelling one
+    close waiter does not cancel capability cleanup; a later call rejoins the
+    same task.
     """
 
-    __slots__ = ("__capability", "__close_task")
+    __slots__ = (
+        "__request",
+        "__session_key",
+        "__run_id",
+        "__capability",
+        "__close_task",
+        "__state",
+    )
 
-    def __init__(self, capability: WorkerMemoryTurnCapability) -> None:
+    def __init__(
+        self,
+        request: AgentRequest,
+        capability: WorkerMemoryTurnCapability,
+    ) -> None:
+        if type(request) is not AgentRequest:
+            raise TypeError("request must be an AgentRequest")
         if type(capability) is not WorkerMemoryTurnCapability:
             raise TypeError("capability must be a WorkerMemoryTurnCapability")
+        if request.memory is not capability:
+            raise MemoryAgentTurnConflictError(
+                "AgentRequest does not carry the Memory capability owned by its lease"
+            )
+        self.__request = request
+        self.__session_key = request.session_key
+        self.__run_id = request.run_id
         self.__capability = capability
         self.__close_task: asyncio.Task[None] | None = None
+        self.__state = _TurnLeaseState.NEW
 
     @staticmethod
     def _observe_close(task: asyncio.Task[None]) -> None:
         if not task.cancelled():
             task.exception()
 
+    async def _close_preserving(self, primary_error: BaseException) -> None:
+        """Close without replacing the Agent or stream-construction failure."""
+
+        try:
+            await self.aclose()
+        except BaseException as cleanup_error:
+            primary_error.add_note(
+                f"Memory turn lease cleanup also failed: {cleanup_error!r}"
+            )
+
+    def _ensure_request_intact(self) -> None:
+        """Reject mutation of the capability-bound request identity."""
+
+        request = self.__request
+        if request.memory is not self.__capability:
+            raise MemoryAgentTurnConflictError(
+                "AgentRequest Memory capability changed after lease binding"
+            )
+        if (
+            type(request.session_key) is not str
+            or request.session_key != self.__session_key
+            or type(request.run_id) is not str
+            or request.run_id != self.__run_id
+        ):
+            raise MemoryAgentTurnConflictError(
+                "AgentRequest identity changed after Memory lease binding"
+            )
+
+    async def _close_stream_preserving(
+        self,
+        source: object,
+        primary_error: BaseException,
+    ) -> None:
+        """Close an unreturned source before revoking Memory authority."""
+
+        async def finish() -> None:
+            try:
+                close = getattr(source, "aclose", None)
+                if callable(close):
+                    await close()
+            finally:
+                await self.aclose()
+
+        task = asyncio.create_task(
+            finish(),
+            name="areal-memory-worker-failed-stream-handoff-cleanup",
+        )
+        task.add_done_callback(self._observe_close)
+        try:
+            await asyncio.shield(task)
+        except BaseException as cleanup_error:
+            # The owned task survives caller cancellation.  Keep the synchronous
+            # handoff failure as the actionable exception.
+            primary_error.add_note(
+                f"Memory stream handoff cleanup also failed: {cleanup_error!r}"
+            )
+
+    async def run_agent(
+        self,
+        agent: AgentRunnable,
+        *,
+        emitter: EventEmitter,
+    ) -> AgentResponse | StreamResponse:
+        """Run the exactly bound request and own its complete response lifetime.
+
+        This method is single-use.  A lazy stream receives ownership of cleanup
+        synchronously when ``AgentRunnable.run`` returns, with no intervening
+        await at which cancellation could orphan the capability.  A host that
+        abandons the returned stream must explicitly close its body.
+        """
+
+        if self.__state is not _TurnLeaseState.NEW:
+            raise MemoryAgentTurnConflictError(
+                "Memory Worker turn lease has already run or been closed"
+            )
+        # Claim synchronously so two event-loop callers cannot run the same
+        # exact request or transfer one capability to two response bodies.
+        self.__state = _TurnLeaseState.RUNNING
+        stream_cleanup_started = False
+        try:
+            self._ensure_request_intact()
+            response = await agent.run(self.__request, emitter=emitter)
+            if self.__state is not _TurnLeaseState.RUNNING:
+                raise MemoryAgentTurnConflictError(
+                    "Memory Worker turn lease closed while its Agent was running"
+                )
+            self._ensure_request_intact()
+            if isinstance(response, StreamResponse):
+                source = response.body
+                body: CleanupAsyncIterator | None = None
+                try:
+                    body = CleanupAsyncIterator(
+                        source,
+                        cleanup=self.aclose,
+                        cleanup_task_name="areal-memory-worker-turn-stream-cleanup",
+                    )
+                    wrapped = StreamResponse(
+                        status_code=response.status_code,
+                        headers=dict(response.headers),
+                        body=body,
+                    )
+                except BaseException as error:
+                    stream_cleanup_started = True
+                    await self._close_stream_preserving(
+                        body if body is not None else source,
+                        error,
+                    )
+                    raise
+                # Construction above is synchronous.  Publish body ownership
+                # only after the complete replacement response exists.
+                self.__state = _TurnLeaseState.STREAM_OWNED
+                return wrapped
+            if not isinstance(response, AgentResponse):
+                raise TypeError(
+                    "AgentRunnable.run must return AgentResponse or StreamResponse"
+                )
+        except BaseException as error:
+            if not stream_cleanup_started:
+                await self._close_preserving(error)
+            raise
+
+        await self.aclose()
+        return response
+
     async def aclose(self) -> None:
         """Close exactly once while shielding cleanup from caller cancellation."""
 
+        # Revocation is fail-closed even if capability cleanup later fails.
+        self.__state = _TurnLeaseState.CLOSED
         task = self.__close_task
         if task is None:
             # There is no await before publication, so concurrent event-loop
@@ -462,7 +626,7 @@ class AuthorizedMemoryWorkerRuntime:
             turn,
         )
         try:
-            return MemoryWorkerTurnLease(capability)
+            return MemoryWorkerTurnLease(request, capability)
         except BaseException as construction_error:
             # Construction is intentionally tiny, but keep this defensive path
             # so a future constructor change cannot orphan broker registration.

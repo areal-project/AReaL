@@ -32,7 +32,13 @@ from areal.v2.agent_service.memory_broker import (
     AuthorizedMemoryAgentBroker,
     AuthorizedMemorySessionV1,
 )
-from areal.v2.agent_service.types import AgentRequest, MemoryTurnResultV1
+from areal.v2.agent_service.types import (
+    AgentRequest,
+    AgentResponse,
+    EventEmitter,
+    MemoryTurnResultV1,
+    StreamResponse,
+)
 from areal.v2.agent_service.worker.memory_runtime import (
     AuthorizedMemoryWorkerRuntime,
     MemoryWorkerSessionReservationV1,
@@ -709,6 +715,573 @@ async def test_bind_turn_uses_only_explicit_pin_and_broker_owned_identity() -> N
     await runtime.aclose()
 
 
+class _DiscardEmitter:
+    async def emit_delta(self, text: str) -> None:
+        del text
+
+    async def emit_tool_call(self, name: str, args: str) -> None:
+        del name, args
+
+    async def emit_tool_result(self, name: str, result: str) -> None:
+        del name, result
+
+
+async def _bound_response_lease(
+    run_id: str,
+) -> tuple[
+    AuthorizedMemoryWorkerRuntime,
+    AuthorizedMemoryAgentBroker,
+    _BindingCoordinator,
+    AgentRequest,
+    MemoryWorkerTurnLease,
+]:
+    runtime, broker, coordinator, _ = _binding_runtime()
+    reservation = await runtime.reserve_session(_principal("one"), "session-1")
+    request = AgentRequest("hello", "session-1", run_id)
+    lease = await runtime.bind_turn(reservation, request, assignment_pin=_pin())
+    return runtime, broker, coordinator, request, lease
+
+
+@pytest.mark.parametrize("mutation", ["session_key", "run_id", "capability"])
+@pytest.mark.asyncio
+async def test_request_authority_mutation_before_run_rejects_agent(
+    mutation: str,
+) -> None:
+    runtime, _, _, request, lease = await _bound_response_lease(
+        f"mutated-before-run-{mutation}"
+    )
+    capability = request.memory
+    assert capability is not None
+    calls = 0
+
+    class NeverRunAgent:
+        async def run(
+            self,
+            agent_request: AgentRequest,
+            *,
+            emitter: EventEmitter,
+        ) -> AgentResponse:
+            nonlocal calls
+            del agent_request, emitter
+            calls += 1
+            return AgentResponse(summary="unreachable")
+
+    if mutation == "session_key":
+        request.session_key = "changed-session"
+    elif mutation == "run_id":
+        request.run_id = "changed-run"
+    else:
+        request._areal_memory_turn_capability = object()  # type: ignore[attr-defined]
+
+    with pytest.raises(MemoryAgentTurnConflictError, match="changed after"):
+        await lease.run_agent(NeverRunAgent(), emitter=_DiscardEmitter())
+    assert calls == 0
+    with pytest.raises(MemoryAgentTurnConflictError, match="closed"):
+        await capability.expose_memory("after-mutation", query=b"question")
+    await runtime.aclose()
+
+
+@pytest.mark.asyncio
+async def test_agent_cannot_return_after_mutating_bound_request_identity() -> None:
+    runtime, _, _, request, lease = await _bound_response_lease("mutated-during-run")
+    capability = request.memory
+    assert capability is not None
+
+    class MutatingAgent:
+        async def run(
+            self,
+            agent_request: AgentRequest,
+            *,
+            emitter: EventEmitter,
+        ) -> AgentResponse:
+            del emitter
+            agent_request.run_id = "mutated-by-agent"
+            return AgentResponse(summary="must not escape")
+
+    with pytest.raises(MemoryAgentTurnConflictError, match="identity changed"):
+        await lease.run_agent(MutatingAgent(), emitter=_DiscardEmitter())
+    with pytest.raises(MemoryAgentTurnConflictError, match="closed"):
+        await capability.expose_memory("after-agent-mutation", query=b"question")
+    await runtime.aclose()
+
+
+@pytest.mark.asyncio
+async def test_lease_runs_exact_request_and_closes_structured_response() -> None:
+    runtime, broker, _, request, lease = await _bound_response_lease("structured")
+    capability = request.memory
+    assert capability is not None
+
+    class StructuredAgent:
+        seen_request: AgentRequest | None = None
+        calls = 0
+
+        async def run(
+            self,
+            agent_request: AgentRequest,
+            *,
+            emitter: EventEmitter,
+        ) -> AgentResponse:
+            del emitter
+            self.calls += 1
+            self.seen_request = agent_request
+            assert agent_request.memory is capability
+            result = await agent_request.memory.expose_memory(
+                "structured-read",
+                query=b"question",
+            )
+            return AgentResponse(summary=result.output["answer"])
+
+    agent = StructuredAgent()
+    response = await lease.run_agent(agent, emitter=_DiscardEmitter())
+
+    assert response == AgentResponse(summary="from-memory")
+    assert agent.calls == 1
+    assert agent.seen_request is request
+    with pytest.raises(MemoryAgentTurnConflictError, match="closed"):
+        await capability.expose_memory("after-response", query=b"question")
+    with pytest.raises(MemoryAgentTurnConflictError, match="already run"):
+        await lease.run_agent(agent, emitter=_DiscardEmitter())
+    states = getattr(broker, "_AuthorizedMemoryAgentBroker__sessions")
+    assert capability not in states["session-1"].capabilities
+    await runtime.aclose()
+
+
+@pytest.mark.parametrize(
+    ("mode", "error_type", "message"),
+    [
+        ("agent-error", RuntimeError, "injected Agent failure"),
+        ("invalid-return", TypeError, "must return AgentResponse or StreamResponse"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_agent_failure_or_invalid_return_closes_lease(
+    mode: str,
+    error_type: type[BaseException],
+    message: str,
+) -> None:
+    runtime, _, _, request, lease = await _bound_response_lease(mode)
+    capability = request.memory
+    assert capability is not None
+
+    class BrokenAgent:
+        async def run(
+            self,
+            agent_request: AgentRequest,
+            *,
+            emitter: EventEmitter,
+        ) -> object:
+            del agent_request, emitter
+            if mode == "agent-error":
+                raise RuntimeError("injected Agent failure")
+            return object()
+
+    with pytest.raises(error_type, match=message):
+        await lease.run_agent(  # type: ignore[arg-type]
+            BrokenAgent(),
+            emitter=_DiscardEmitter(),
+        )
+    with pytest.raises(MemoryAgentTurnConflictError, match="closed"):
+        await capability.expose_memory("after-failure", query=b"question")
+    await runtime.aclose()
+
+
+@pytest.mark.asyncio
+async def test_agent_cancellation_closes_lease() -> None:
+    runtime, _, _, request, lease = await _bound_response_lease("cancel-agent")
+    capability = request.memory
+    assert capability is not None
+    started = asyncio.Event()
+
+    class BlockingAgent:
+        async def run(
+            self,
+            agent_request: AgentRequest,
+            *,
+            emitter: EventEmitter,
+        ) -> AgentResponse:
+            del agent_request, emitter
+            started.set()
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+    running = asyncio.create_task(
+        lease.run_agent(BlockingAgent(), emitter=_DiscardEmitter())
+    )
+    await asyncio.wait_for(started.wait(), timeout=1)
+    running.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await running
+    with pytest.raises(MemoryAgentTurnConflictError, match="closed"):
+        await capability.expose_memory("after-cancel", query=b"question")
+    await runtime.aclose()
+
+
+@pytest.mark.asyncio
+async def test_close_during_structured_agent_run_cannot_return_success() -> None:
+    runtime, _, _, _, lease = await _bound_response_lease("close-during-run")
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    class BlockingStructuredAgent:
+        async def run(
+            self,
+            request: AgentRequest,
+            *,
+            emitter: EventEmitter,
+        ) -> AgentResponse:
+            del request, emitter
+            started.set()
+            await release.wait()
+            return AgentResponse(summary="must not escape after close")
+
+    running = asyncio.create_task(
+        lease.run_agent(BlockingStructuredAgent(), emitter=_DiscardEmitter())
+    )
+    await asyncio.wait_for(started.wait(), timeout=1)
+    await lease.aclose()
+    release.set()
+    with pytest.raises(MemoryAgentTurnConflictError, match="closed while"):
+        await running
+    await runtime.aclose()
+
+
+@pytest.mark.parametrize(
+    ("failure_phase", "message", "source_close_fails"),
+    [
+        ("iterator", "injected iterator construction failure", False),
+        ("headers", "injected headers clone failure", False),
+        ("headers-close-error", "injected headers clone failure", True),
+    ],
+)
+@pytest.mark.asyncio
+async def test_failed_stream_handoff_closes_source_before_lease(
+    failure_phase: str,
+    message: str,
+    source_close_fails: bool,
+) -> None:
+    runtime, _, _, request, lease = await _bound_response_lease(
+        f"stream-handoff-{failure_phase}"
+    )
+    capability = request.memory
+    assert capability is not None
+    events: list[str] = []
+    capability_close = capability.aclose
+
+    async def observed_capability_close() -> None:
+        events.append("lease-close")
+        await capability_close()
+
+    capability.aclose = observed_capability_close  # type: ignore[method-assign]
+
+    class CloseAwareBody:
+        def __aiter__(self):
+            if failure_phase == "iterator":
+                raise RuntimeError("injected iterator construction failure")
+            return self
+
+        async def __anext__(self) -> bytes:
+            raise AssertionError("failed handoff body must never be read")
+
+        async def aclose(self) -> None:
+            events.append("source-close-start")
+            result = await capability.expose_memory(
+                "failed-handoff-finalizer",
+                query=b"finalize",
+            )
+            assert result.output == {"answer": "from-memory"}
+            events.append("source-close-done")
+            if source_close_fails:
+                raise LookupError("injected source close failure")
+
+    class BrokenHeaders:
+        def keys(self):
+            raise RuntimeError("injected headers clone failure")
+
+        def __getitem__(self, key: object) -> object:  # pragma: no cover
+            raise AssertionError(key)
+
+    source = CloseAwareBody()
+
+    class BrokenStreamAgent:
+        async def run(
+            self,
+            agent_request: AgentRequest,
+            *,
+            emitter: EventEmitter,
+        ) -> StreamResponse:
+            del agent_request, emitter
+            headers = BrokenHeaders() if failure_phase.startswith("headers") else {}
+            return StreamResponse(  # type: ignore[arg-type]
+                status_code=200,
+                headers=headers,
+                body=source,
+            )
+
+    with pytest.raises(RuntimeError, match=message) as raised:
+        await lease.run_agent(BrokenStreamAgent(), emitter=_DiscardEmitter())
+
+    assert events == ["source-close-start", "source-close-done", "lease-close"]
+    notes = getattr(raised.value, "__notes__", ())
+    assert any("injected source close failure" in note for note in notes) is (
+        source_close_fails
+    )
+    with pytest.raises(MemoryAgentTurnConflictError, match="closed"):
+        await capability.expose_memory("after-handoff-failure", query=b"question")
+    await runtime.aclose()
+
+
+@pytest.mark.asyncio
+async def test_stream_keeps_memory_until_eof_and_rejects_a_second_run() -> None:
+    runtime, _, coordinator, request, lease = await _bound_response_lease("stream-eof")
+    capability = request.memory
+    assert capability is not None
+
+    class LazyAgent:
+        calls = 0
+
+        async def run(
+            self,
+            agent_request: AgentRequest,
+            *,
+            emitter: EventEmitter,
+        ) -> StreamResponse:
+            del emitter
+            self.calls += 1
+
+            async def body():
+                first = await agent_request.memory.expose_memory(
+                    "stream-first",
+                    query=b"first",
+                )
+                yield first.output["answer"].encode()
+                second = await agent_request.memory.expose_memory(
+                    "stream-second",
+                    query=b"second",
+                )
+                yield second.output["answer"].encode()
+
+            return StreamResponse(
+                status_code=201,
+                headers={"content-type": "application/octet-stream"},
+                body=body(),
+            )
+
+    agent = LazyAgent()
+    response = await lease.run_agent(agent, emitter=_DiscardEmitter())
+    assert response.status_code == 201
+    assert response.headers == {"content-type": "application/octet-stream"}
+    assert coordinator.expose_calls == []
+
+    with pytest.raises(MemoryAgentTurnConflictError, match="already run"):
+        await lease.run_agent(agent, emitter=_DiscardEmitter())
+    assert agent.calls == 1
+    assert [chunk async for chunk in response.body] == [
+        b"from-memory",
+        b"from-memory",
+    ]
+    assert len(coordinator.expose_calls) == 2
+    with pytest.raises(MemoryAgentTurnConflictError, match="closed"):
+        await capability.expose_memory("after-eof", query=b"question")
+    await runtime.aclose()
+
+
+@pytest.mark.asyncio
+async def test_stream_error_closes_lease() -> None:
+    runtime, _, _, request, lease = await _bound_response_lease("stream-error")
+    capability = request.memory
+    assert capability is not None
+
+    class FailingStreamAgent:
+        async def run(
+            self,
+            agent_request: AgentRequest,
+            *,
+            emitter: EventEmitter,
+        ) -> StreamResponse:
+            del agent_request, emitter
+
+            async def body():
+                yield b"first"
+                raise RuntimeError("injected stream failure")
+
+            return StreamResponse(status_code=200, headers={}, body=body())
+
+    response = await lease.run_agent(FailingStreamAgent(), emitter=_DiscardEmitter())
+    assert await anext(response.body) == b"first"
+    with pytest.raises(RuntimeError, match="injected stream failure"):
+        await anext(response.body)
+    with pytest.raises(MemoryAgentTurnConflictError, match="closed"):
+        await capability.expose_memory("after-stream-error", query=b"question")
+    await runtime.aclose()
+
+
+@pytest.mark.asyncio
+async def test_stream_read_cancellation_closes_lease() -> None:
+    runtime, _, _, request, lease = await _bound_response_lease("stream-cancel")
+    capability = request.memory
+    assert capability is not None
+    blocked = asyncio.Event()
+
+    class BlockingStreamAgent:
+        async def run(
+            self,
+            agent_request: AgentRequest,
+            *,
+            emitter: EventEmitter,
+        ) -> StreamResponse:
+            del agent_request, emitter
+
+            async def body():
+                yield b"first"
+                blocked.set()
+                await asyncio.Event().wait()
+                yield b"unreachable"
+
+            return StreamResponse(status_code=200, headers={}, body=body())
+
+    response = await lease.run_agent(BlockingStreamAgent(), emitter=_DiscardEmitter())
+    assert await anext(response.body) == b"first"
+    reading = asyncio.create_task(anext(response.body))
+    await asyncio.wait_for(blocked.wait(), timeout=1)
+    reading.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await reading
+    with pytest.raises(MemoryAgentTurnConflictError, match="closed"):
+        await capability.expose_memory("after-stream-cancel", query=b"question")
+    await runtime.aclose()
+
+
+@pytest.mark.asyncio
+async def test_explicit_close_cancels_active_read_before_lease_close() -> None:
+    runtime, _, _, request, lease = await _bound_response_lease("active-stream-close")
+    capability = request.memory
+    assert capability is not None
+    read_started = asyncio.Event()
+    events: list[str] = []
+    capability_close = capability.aclose
+
+    async def observed_capability_close() -> None:
+        events.append("lease-close")
+        await capability_close()
+
+    capability.aclose = observed_capability_close  # type: ignore[method-assign]
+
+    class ActiveStreamAgent:
+        async def run(
+            self,
+            agent_request: AgentRequest,
+            *,
+            emitter: EventEmitter,
+        ) -> StreamResponse:
+            del emitter
+
+            async def body():
+                try:
+                    read_started.set()
+                    await asyncio.Event().wait()
+                    yield b"unreachable"
+                finally:
+                    events.append("source-finally-start")
+                    await agent_request.memory.expose_memory(
+                        "active-read-finalizer",
+                        query=b"finalize",
+                    )
+                    events.append("source-finally-done")
+
+            return StreamResponse(status_code=200, headers={}, body=body())
+
+    response = await lease.run_agent(ActiveStreamAgent(), emitter=_DiscardEmitter())
+    reading = asyncio.create_task(anext(response.body))
+    await asyncio.wait_for(read_started.wait(), timeout=1)
+    await asyncio.wait_for(response.body.aclose(), timeout=1)
+    with pytest.raises(asyncio.CancelledError):
+        await reading
+
+    assert events == [
+        "source-finally-start",
+        "source-finally-done",
+        "lease-close",
+    ]
+    await runtime.aclose()
+
+
+@pytest.mark.asyncio
+async def test_explicit_stream_close_runs_source_finally_before_lease_close() -> None:
+    runtime, _, _, request, lease = await _bound_response_lease("stream-close")
+    capability = request.memory
+    assert capability is not None
+    events: list[str] = []
+    capability_close = capability.aclose
+
+    async def observed_capability_close() -> None:
+        events.append("lease-close")
+        await capability_close()
+
+    capability.aclose = observed_capability_close  # type: ignore[method-assign]
+
+    class FinalizingStreamAgent:
+        async def run(
+            self,
+            agent_request: AgentRequest,
+            *,
+            emitter: EventEmitter,
+        ) -> StreamResponse:
+            del emitter
+
+            async def body():
+                try:
+                    yield b"first"
+                    await asyncio.Event().wait()
+                finally:
+                    events.append("source-finally-start")
+                    await agent_request.memory.expose_memory(
+                        "stream-finalizer",
+                        query=b"finalize",
+                    )
+                    events.append("source-finally-done")
+
+            return StreamResponse(status_code=200, headers={}, body=body())
+
+    response = await lease.run_agent(FinalizingStreamAgent(), emitter=_DiscardEmitter())
+    assert await anext(response.body) == b"first"
+    await response.body.aclose()
+
+    assert events == [
+        "source-finally-start",
+        "source-finally-done",
+        "lease-close",
+    ]
+    with pytest.raises(MemoryAgentTurnConflictError, match="closed"):
+        await capability.expose_memory("after-explicit-close", query=b"question")
+    await runtime.aclose()
+
+
+@pytest.mark.asyncio
+async def test_closed_lease_rejects_agent_before_invocation() -> None:
+    runtime, _, _, _, lease = await _bound_response_lease("closed-before-run")
+    calls = 0
+
+    class NeverRunAgent:
+        async def run(
+            self,
+            request: AgentRequest,
+            *,
+            emitter: EventEmitter,
+        ) -> AgentResponse:
+            nonlocal calls
+            del request, emitter
+            calls += 1
+            return AgentResponse(summary="unreachable")
+
+    await lease.aclose()
+    with pytest.raises(
+        MemoryAgentTurnConflictError, match="already run or been closed"
+    ):
+        await lease.run_agent(NeverRunAgent(), emitter=_DiscardEmitter())
+    assert calls == 0
+    await runtime.aclose()
+
+
 def _pin_with_one_changed_field(field_name: str) -> MemoryAgentSessionPinV1:
     candidate = _pin()
     if field_name in {"tenant_id", "namespace", "subject_id"}:
@@ -1180,7 +1753,11 @@ async def test_lease_construction_failure_closes_registered_capability(
 
     broker._unregister_capability = observed_unregister  # type: ignore[method-assign]
 
-    def fail_lease_construction(capability: object) -> None:
+    def fail_lease_construction(
+        bound_request: object,
+        capability: object,
+    ) -> None:
+        assert bound_request is request
         raise RuntimeError("injected lease construction failure")
 
     monkeypatch.setattr(
@@ -1209,7 +1786,11 @@ async def test_lease_construction_error_survives_cleanup_failure(
     request = AgentRequest("hello", "session-1", "run-1")
     captured: dict[str, object] = {}
 
-    def fail_lease_construction(capability: object) -> None:
+    def fail_lease_construction(
+        bound_request: object,
+        capability: object,
+    ) -> None:
+        assert bound_request is request
         captured["capability"] = capability
         captured["aclose"] = capability.aclose  # type: ignore[attr-defined]
 

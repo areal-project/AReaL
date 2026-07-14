@@ -204,18 +204,25 @@ close must finish before the same key can receive a fresh incarnation. This is o
 process-local Worker state. A trusted host may explicitly bind a complete
 `MemoryAgentSessionPinV1` and an exact runtime-issued reservation to an `AgentRequest`;
 request metadata is ignored as authority. The returned `MemoryWorkerTurnLease` owns only
-capability cleanup and exposes neither the private broker session nor its authorized
-turn. Repeating a `run_id` reuses the broker trajectory but creates a fresh independent
-capability lifetime.
+the exact request's capability lifetime and exposes neither the request, private broker
+session, nor authorized turn. Its single-use `run_agent(...)` closes a structured turn
+before returning, closes on Agent failure or cancellation, and transfers a lazy
+`StreamResponse` to a cleanup iterator that keeps Memory valid through body EOF,
+failure, cancellation, or explicit close. The source iterator closes before the
+capability, so its `finally` block may still use the turn's Memory. The lease snapshots
+the capability-bound `session_key` and `run_id` and rejects mutation before or during
+the Agent call. Repeating a `run_id` reuses the broker trajectory but creates a fresh
+independent capability lifetime.
 
-This binding still is **not** an Agent runner or streaming adapter. No Worker route
+This remains a **default-off host adapter**, not Worker HTTP activation. No Worker route
 constructs the runtime, no DataProxy envelope carries its descriptor, and no HTTP field
-is accepted as a principal. Trusted host code must keep each turn lease alive through
-the complete structured or streaming response body and call `aclose`; wrapping only
-`agent.run` would release Memory too early for a lazy `StreamResponse.body`. HTTP
-integration requires a separate versioned identity protocol, trusted principal resolver,
-and response-lifetime adapter. Passing a broker to the runtime is an ownership transfer:
-trusted host code must neither wrap it again nor call or close it directly afterwards.
+is accepted as a principal. Trusted host code should pass a bound lease to
+`run_agent(...)`; if it abandons a returned stream without iterating it, it must
+explicitly close `response.body`. A future HTTP integration must additionally close a
+never-started body on response-construction failure or disconnect before the first byte.
+That integration also requires a separate versioned identity protocol and trusted
+principal resolver. Passing a broker to the runtime is an ownership transfer: trusted
+host code must neither wrap it again nor call or close it directly afterwards.
 
 ## Agent Protocol
 
