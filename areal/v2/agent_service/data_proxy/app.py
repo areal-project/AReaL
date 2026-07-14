@@ -162,15 +162,22 @@ def create_data_proxy_app(config: DataProxyConfig) -> FastAPI:
         carries it, so a multi-turn session may send these fields once and omit
         them afterwards.
         """
-        base_url_value = body.get("inf_base_url", "")
-        api_key = body.get("session_api_key", "")
-        model = body.get("inf_model", "")
-        if any(type(value) is not str for value in (base_url_value, api_key, model)):
+        base_url_value = body.get("inf_base_url")
+        api_key_value = body.get("session_api_key")
+        model_value = body.get("inf_model")
+        values = (base_url_value, api_key_value, model_value)
+        if any(value is not None and type(value) is not str for value in values):
             raise HTTPException(
                 status_code=400,
                 detail="self-evolution routing fields must be strings",
             )
-        base_url = base_url_value.rstrip("/")
+        # These fields predate the stricter request validation and callers may
+        # serialize an absent optional value as JSON null.  Preserve that wire
+        # compatibility without letting other falsy values (for example False
+        # or 0) bypass the exact-string check above.
+        base_url = (base_url_value or "").rstrip("/")
+        api_key = api_key_value or ""
+        model = model_value or ""
         if base_url or api_key:
             if not base_url or not api_key:
                 raise HTTPException(

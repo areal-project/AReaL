@@ -1649,8 +1649,10 @@ async def test_malformed_pin_fails_without_reserving_session() -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("bad_value", (None, False, 0, [], {}))
+@pytest.mark.parametrize("bad_field", ("inf_base_url", "session_api_key", "inf_model"))
+@pytest.mark.parametrize("bad_value", (False, 0, [], {}))
 async def test_falsy_non_string_inference_fields_fail_before_session_mutation(
+    bad_field,
     bad_value,
 ) -> None:
     worker_bodies: list[dict] = []
@@ -1671,13 +1673,109 @@ async def test_falsy_non_string_inference_fields_fail_before_session_mutation(
                 "/session/s1/turn",
                 json={
                     "message": "bad routing",
-                    "inf_base_url": bad_value,
-                    "session_api_key": "sk-sess-valid",
+                    bad_field: bad_value,
                 },
             )
             health = await client.get("/health")
 
     assert rejected.status_code == 400
+    assert health.json()["active_sessions"] == 0
+    assert worker_bodies == []
+
+
+@pytest.mark.asyncio
+async def test_null_inference_fields_are_equivalent_to_omitted_fields() -> None:
+    worker_bodies: list[dict] = []
+    worker_closes: list[str] = []
+    app = _proxy_app()
+    transport = httpx.ASGITransport(app=app)
+    with patch.object(
+        httpx.AsyncClient,
+        "send",
+        _patched_worker_send(worker_bodies, worker_closes),
+    ):
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://proxy",
+            headers=_MEMORY_CONTROL_HEADERS,
+        ) as client:
+            response = await client.post(
+                "/session/s1/turn",
+                json={
+                    "message": "ordinary",
+                    "inf_base_url": None,
+                    "session_api_key": None,
+                    "inf_model": None,
+                },
+            )
+
+    assert response.status_code == 200
+    assert len(worker_bodies) == 1
+    assert AREAL_INFERENCE_METADATA_KEY not in worker_bodies[0]["metadata"]
+
+
+@pytest.mark.asyncio
+async def test_null_optional_inference_model_uses_empty_model_id() -> None:
+    worker_bodies: list[dict] = []
+    worker_closes: list[str] = []
+    app = _proxy_app()
+    transport = httpx.ASGITransport(app=app)
+    with patch.object(
+        httpx.AsyncClient,
+        "send",
+        _patched_worker_send(worker_bodies, worker_closes),
+    ):
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://proxy",
+            headers=_MEMORY_CONTROL_HEADERS,
+        ) as client:
+            response = await client.post(
+                "/session/s1/turn",
+                json={
+                    "message": "routed",
+                    "inf_base_url": "http://inference/",
+                    "session_api_key": "sk-sess-valid",
+                    "inf_model": None,
+                },
+            )
+
+    assert response.status_code == 200
+    assert worker_bodies[0]["metadata"][AREAL_INFERENCE_METADATA_KEY] == {
+        "base_url": "http://inference",
+        "api_key": "sk-sess-valid",
+        "model": "",
+    }
+
+
+@pytest.mark.asyncio
+async def test_null_inference_api_key_still_requires_complete_routing_pair() -> None:
+    worker_bodies: list[dict] = []
+    worker_closes: list[str] = []
+    app = _proxy_app()
+    transport = httpx.ASGITransport(app=app)
+    with patch.object(
+        httpx.AsyncClient,
+        "send",
+        _patched_worker_send(worker_bodies, worker_closes),
+    ):
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://proxy",
+            headers=_MEMORY_CONTROL_HEADERS,
+        ) as client:
+            rejected = await client.post(
+                "/session/s1/turn",
+                json={
+                    "message": "incomplete routing",
+                    "inf_base_url": "http://inference",
+                    "session_api_key": None,
+                },
+            )
+            health = await client.get("/health")
+
+    assert rejected.status_code == 400
+    assert "requires both" in rejected.json()["detail"]
     assert health.json()["active_sessions"] == 0
     assert worker_bodies == []
 
