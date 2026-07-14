@@ -2088,6 +2088,63 @@ async def test_stream_close_failure_cannot_leak_turn_lease() -> None:
 
 
 @pytest.mark.asyncio
+async def test_structured_close_failure_cannot_mask_primary_read_failure() -> None:
+    worker_closes: list[str] = []
+    original_send = httpx.AsyncClient.send
+
+    class FailingReadAndCloseStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            raise ValueError("injected primary read failure")
+            yield b""  # pragma: no cover - make this an async generator
+
+        async def aclose(self):
+            raise RuntimeError("injected secondary close failure")
+
+    async def patched_send(self, request, **kwargs):
+        if request.url.host != "worker":
+            return await original_send(self, request, **kwargs)
+        if request.url.path == "/run":
+            return httpx.Response(
+                200,
+                stream=FailingReadAndCloseStream(),
+                request=request,
+            )
+        if request.url.path == "/sessions/close":
+            worker_closes.append(_worker_close_session_key(request))
+            return httpx.Response(
+                200, json=_worker_close_receipt(request), request=request
+            )
+        raise AssertionError(f"unexpected worker request: {request.url}")
+
+    app = _proxy_app()
+    turn_endpoint = next(
+        route.endpoint
+        for route in app.routes
+        if getattr(route, "path", None) == "/session/{session_key}/turn"
+    )
+    close_endpoint = next(
+        route.endpoint
+        for route in app.routes
+        if getattr(route, "path", None) == "/session/{session_key}/close"
+    )
+    with patch.object(httpx.AsyncClient, "send", patched_send):
+        with pytest.raises(ValueError, match="injected primary read failure"):
+            await turn_endpoint(
+                "s1",
+                _authorized(
+                    {"message": "read", MEMORY_ASSIGNMENT_PIN_FIELD: _wire("a")}
+                ),
+                _internal_request(),
+            )
+
+        assert await asyncio.wait_for(
+            close_endpoint("s1", _internal_request()), timeout=1
+        ) == {"status": "ok"}
+
+    assert worker_closes == ["s1"]
+
+
+@pytest.mark.asyncio
 async def test_stream_cancellation_releases_lease_but_preserves_ordinary_mode() -> None:
     second_read_started = asyncio.Event()
     release_second_read = asyncio.Event()

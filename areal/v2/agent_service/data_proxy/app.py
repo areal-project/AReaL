@@ -577,6 +577,7 @@ def create_data_proxy_app(config: DataProxyConfig) -> FastAPI:
         # still using its Worker-side state.
         lease_transferred = False
         resp: httpx.Response | None = None
+        primary_error: BaseException | None = None
         try:
             req = http_client.build_request(
                 "POST",
@@ -673,9 +674,24 @@ def create_data_proxy_app(config: DataProxyConfig) -> FastAPI:
             if summary:
                 session.history.append({"role": "assistant", "content": summary})
             return JSONResponse(result, status_code=status_code)
+        except BaseException as error:
+            primary_error = error
+            raise
         finally:
             if not lease_transferred:
-                await _finish_response(resp, session)
+                try:
+                    await _finish_response(resp, session)
+                except BaseException:
+                    if primary_error is None:
+                        raise
+                    # Cleanup must release the turn lease, but a secondary
+                    # response-close failure must not replace the actual turn
+                    # failure (including caller cancellation).  With no
+                    # primary failure, cleanup errors still propagate.
+                    logger.warning(
+                        "Failed to close Worker response while handling turn failure",
+                        exc_info=True,
+                    )
 
     async def _authorize_session_state_access(request: Request) -> None:
         if config.memory_control_api_key:
