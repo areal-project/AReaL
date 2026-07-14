@@ -422,11 +422,31 @@ def create_data_proxy_app(config: DataProxyConfig) -> FastAPI:
     async def _reap_idle_sessions() -> None:
         while True:
             await asyncio.sleep(60)
-            reaped = 0
+            close_tasks: list[tuple[str, asyncio.Task[bool]]] = []
             for session_key in tuple(sessions):
                 task = await _begin_session_close(session_key, idle_only=True)
-                if task is not None and await asyncio.shield(task):
-                    reaped += 1
+                if task is not None:
+                    close_tasks.append((session_key, task))
+            if not close_tasks:
+                continue
+
+            # Start every eligible close in this scan before waiting.  A slow
+            # Worker cleanup for one session must not head-of-line block the
+            # remaining idle sessions.  Shielding preserves the existing
+            # shutdown contract: cancelling the reaper stops future scans but
+            # does not cancel an already installed exact close task.
+            results = await asyncio.gather(
+                *(asyncio.shield(task) for _, task in close_tasks),
+                return_exceptions=True,
+            )
+            for (session_key, _), result in zip(close_tasks, results, strict=True):
+                if isinstance(result, BaseException):
+                    logger.error(
+                        "Unexpected failure while reaping idle session %s: %r",
+                        session_key,
+                        result,
+                    )
+            reaped = sum(result is True for result in results)
             if reaped:
                 logger.info("Reaped %d idle sessions", reaped)
 

@@ -1611,6 +1611,227 @@ async def test_shutdown_closes_pinned_worker_session_before_clearing_pin() -> No
 
 
 @pytest.mark.asyncio
+async def test_idle_reaper_closes_sessions_concurrently_without_duplicate_tasks() -> (
+    None
+):
+    worker_close_keys: list[str] = []
+    close_started = {"s1": asyncio.Event(), "s2": asyncio.Event()}
+    release_close = {"s1": asyncio.Event(), "s2": asyncio.Event()}
+    never_resume = asyncio.Event()
+    sleep_calls = 0
+    original_send = httpx.AsyncClient.send
+    real_sleep = asyncio.sleep
+
+    async def patched_send(self, request, **kwargs):
+        if request.url.host != "worker":
+            return await original_send(self, request, **kwargs)
+        if request.url.path == "/run":
+            return httpx.Response(
+                200,
+                json={"summary": "ok", "events": [], "metadata": {}},
+                request=request,
+            )
+        if request.url.path == "/sessions/close":
+            session_key = _worker_close_session_key(request)
+            worker_close_keys.append(session_key)
+            close_started[session_key].set()
+            await release_close[session_key].wait()
+            return httpx.Response(
+                200, json=_worker_close_receipt(request), request=request
+            )
+        raise AssertionError(f"unexpected worker request: {request.url}")
+
+    async def run_one_scan(delay: float) -> None:
+        nonlocal sleep_calls
+        assert delay == 60
+        sleep_calls += 1
+        if sleep_calls == 1:
+            return
+        await never_resume.wait()
+
+    app = data_proxy_app.create_data_proxy_app(
+        data_proxy_config.DataProxyConfig(
+            worker_addr="http://worker",
+            session_timeout=0,
+        )
+    )
+    transport = httpx.ASGITransport(app=app)
+    with patch.object(httpx.AsyncClient, "send", patched_send):
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://proxy",
+        ) as client:
+            for session_key in ("s1", "s2"):
+                turn = await client.post(
+                    f"/session/{session_key}/turn",
+                    json={"message": session_key},
+                )
+                assert turn.status_code == 200
+
+            with patch.object(data_proxy_app.asyncio, "sleep", run_one_scan):
+                for startup_handler in app.router.on_startup:
+                    await startup_handler()
+                shutdown_task = None
+                try:
+                    # Both Worker closes must start even though the first one
+                    # remains blocked.  The old serial loop times out waiting
+                    # for s2 here.
+                    await asyncio.wait_for(close_started["s1"].wait(), timeout=1)
+                    await asyncio.wait_for(close_started["s2"].wait(), timeout=1)
+
+                    # Join the exact task already installed by the reaper,
+                    # then let only s2 complete.  This also proves that a
+                    # concurrent explicit close does not duplicate Worker I/O.
+                    s2_waiter = asyncio.create_task(
+                        client.post(
+                            "/sessions/close",
+                            json={"session_key": "s2"},
+                        )
+                    )
+                    await real_sleep(0)
+                    release_close["s2"].set()
+                    s2_closed = await asyncio.wait_for(s2_waiter, timeout=1)
+                    assert s2_closed.status_code == 200
+                    assert worker_close_keys.count("s2") == 1
+                    assert not release_close["s1"].is_set()
+                    health_while_s1_blocked = await client.get("/health")
+                    assert health_while_s1_blocked.json()["active_sessions"] == 1
+
+                    async def run_shutdown() -> None:
+                        for shutdown_handler in app.router.on_shutdown:
+                            await shutdown_handler()
+
+                    # Shutdown cancels only the scanning coroutine.  The
+                    # shielded exact s1 close must keep running and shutdown
+                    # must join it instead of declaring cleanup complete.
+                    shutdown_task = asyncio.create_task(run_shutdown())
+                    with pytest.raises(asyncio.CancelledError):
+                        await asyncio.wait_for(app.state.reaper_task, timeout=1)
+                    assert not shutdown_task.done()
+                    assert worker_close_keys.count("s1") == 1
+
+                    release_close["s1"].set()
+                    await asyncio.wait_for(shutdown_task, timeout=1)
+                    health_after_scan = await client.get("/health")
+                    assert health_after_scan.json()["active_sessions"] == 0
+                    assert sorted(worker_close_keys) == ["s1", "s2"]
+                finally:
+                    release_close["s1"].set()
+                    release_close["s2"].set()
+                    if shutdown_task is None:
+                        app.state.reaper_task.cancel()
+                        await asyncio.gather(
+                            app.state.reaper_task,
+                            return_exceptions=True,
+                        )
+                        for shutdown_handler in app.router.on_shutdown:
+                            await shutdown_handler()
+                    else:
+                        await asyncio.gather(shutdown_task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_idle_reaper_isolates_worker_close_failure_and_preserves_retry() -> None:
+    worker_close_keys: list[str] = []
+    s1_attempts = 0
+    next_scan_started = asyncio.Event()
+    never_resume = asyncio.Event()
+    sleep_calls = 0
+    original_send = httpx.AsyncClient.send
+
+    async def patched_send(self, request, **kwargs):
+        nonlocal s1_attempts
+        if request.url.host != "worker":
+            return await original_send(self, request, **kwargs)
+        if request.url.path == "/run":
+            return httpx.Response(
+                200,
+                json={"summary": "ok", "events": [], "metadata": {}},
+                request=request,
+            )
+        if request.url.path == "/sessions/close":
+            session_key = _worker_close_session_key(request)
+            worker_close_keys.append(session_key)
+            if session_key == "s1":
+                s1_attempts += 1
+                if s1_attempts == 1:
+                    raise RuntimeError("injected Worker close failure")
+            return httpx.Response(
+                200, json=_worker_close_receipt(request), request=request
+            )
+        raise AssertionError(f"unexpected worker request: {request.url}")
+
+    async def run_one_scan(delay: float) -> None:
+        nonlocal sleep_calls
+        assert delay == 60
+        sleep_calls += 1
+        if sleep_calls == 1:
+            return
+        next_scan_started.set()
+        await never_resume.wait()
+
+    app = data_proxy_app.create_data_proxy_app(
+        data_proxy_config.DataProxyConfig(
+            worker_addr="http://worker",
+            session_timeout=0,
+        )
+    )
+    transport = httpx.ASGITransport(app=app)
+    with patch.object(httpx.AsyncClient, "send", patched_send):
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://proxy",
+        ) as client:
+            for session_key in ("s1", "s2"):
+                turn = await client.post(
+                    f"/session/{session_key}/turn",
+                    json={"message": session_key},
+                )
+                assert turn.status_code == 200
+
+            with (
+                patch.object(data_proxy_app.asyncio, "sleep", run_one_scan),
+                patch.object(data_proxy_app.logger, "info") as log_info,
+            ):
+                for startup_handler in app.router.on_startup:
+                    await startup_handler()
+                try:
+                    await asyncio.wait_for(next_scan_started.wait(), timeout=1)
+
+                    # s2 succeeds in the same scan even though s1 raises.  The
+                    # failed s1 incarnation remains a closing tombstone until
+                    # an explicit retry confirms Worker cleanup.
+                    assert sorted(worker_close_keys) == ["s1", "s2"]
+                    health_after_scan = await client.get("/health")
+                    assert health_after_scan.json()["active_sessions"] == 1
+                    blocked = await client.post(
+                        "/session/s1/turn",
+                        json={"message": "must remain tombstoned"},
+                    )
+                    assert blocked.status_code == 409
+                    log_info.assert_called_once_with("Reaped %d idle sessions", 1)
+
+                    retried = await client.post(
+                        "/sessions/close",
+                        json={"session_key": "s1"},
+                    )
+                    assert retried.status_code == 200
+                    assert worker_close_keys.count("s1") == 2
+                    assert worker_close_keys.count("s2") == 1
+                    health_after_retry = await client.get("/health")
+                    assert health_after_retry.json()["active_sessions"] == 0
+                finally:
+                    app.state.reaper_task.cancel()
+                    await asyncio.gather(
+                        app.state.reaper_task,
+                        return_exceptions=True,
+                    )
+
+        for shutdown_handler in app.router.on_shutdown:
+            await shutdown_handler()
+
+
+@pytest.mark.asyncio
 async def test_malformed_pin_fails_without_reserving_session() -> None:
     worker_bodies: list[dict] = []
     worker_closes: list[str] = []
