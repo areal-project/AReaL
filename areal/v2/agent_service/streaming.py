@@ -54,36 +54,126 @@ class AsyncCleanupOnce:
             raise
 
 
-class _CleanupAsyncIterator(AsyncIterator[bytes]):
-    """Trigger cleanup on EOF, failure, cancellation, or explicit early close."""
+class CleanupAsyncIterator(AsyncIterator[bytes]):
+    """Close one async source before running one downstream cleanup.
+
+    EOF, source failure, cancellation, and explicit early close all join the
+    same cancellation-shielded finish task.  Once finishing starts, further
+    reads fail closed even if source close or downstream cleanup later fails.
+    """
 
     def __init__(
         self,
         content: AsyncIterable[bytes],
-        cleanup: AsyncCleanupOnce,
+        *,
+        cleanup: Callable[[], Awaitable[None]],
+        cleanup_task_name: str,
     ) -> None:
-        self._iterator = content.__aiter__()
+        # Preserve CleanupStreamingResponse's eager constructor validation:
+        # invalid cleanup configuration must fail before touching the source.
+        if not callable(cleanup):
+            raise TypeError("callback must be callable")
         self._cleanup = cleanup
+        self._finished = False
+        self._finish_once = AsyncCleanupOnce(
+            self._finish,
+            task_name=cleanup_task_name,
+        )
+        self._iterator = content.__aiter__()
+        self._read_task: asyncio.Task[bytes] | None = None
 
-    def __aiter__(self) -> _CleanupAsyncIterator:
+    def __aiter__(self) -> CleanupAsyncIterator:
         return self
 
     async def __anext__(self) -> bytes:
+        if self._finished:
+            raise StopAsyncIteration
+        if self._read_task is not None:
+            raise RuntimeError("concurrent stream reads are not supported")
+
+        # Own the source read in a distinct task.  Explicit close can then
+        # cancel and join that task without waiting for (or cancelling) the
+        # consumer that is itself waiting for finish, avoiding a close cycle.
+        read_task = asyncio.create_task(
+            self._read_next(),
+            name="areal-cleanup-async-iterator-read",
+        )
+        self._read_task = read_task
         try:
-            return await self._iterator.__anext__()
-        except BaseException:
-            await self._cleanup()
+            chunk = await read_task
+        except BaseException as primary_error:
+            # Publish the terminal state before the first cleanup await.  A
+            # failed close must not make this source readable again.
+            self._finished = True
+            try:
+                await self._finish_once()
+            except BaseException as finish_error:
+                if isinstance(primary_error, StopAsyncIteration):
+                    # EOF has no primary failure to preserve.  A source-close
+                    # or downstream-cleanup failure must remain observable.
+                    raise
+                primary_error.add_note(
+                    f"stream finalization also failed: {finish_error!r}"
+                )
+                for note in getattr(finish_error, "__notes__", ()):
+                    primary_error.add_note(f"stream finalization detail: {note}")
             raise
+        else:
+            # Close may win after the source produced a chunk but before this
+            # consumer resumed.  Never publish bytes after authority teardown
+            # has begun.
+            if self._finished:
+                await self._finish_once()
+                raise StopAsyncIteration
+            return chunk
+        finally:
+            if self._read_task is read_task and read_task.done():
+                self._read_task = None
+
+    async def _read_next(self) -> bytes:
+        return await self._iterator.__anext__()
+
+    async def _cancel_active_read(self) -> None:
+        read_task = self._read_task
+        if read_task is None:
+            return
+        if not read_task.done():
+            read_task.cancel()
+        # The read's exception is delivered to its consumer.  Finish only
+        # needs to know that source code (including its finally block) has
+        # stopped before it calls source.aclose and downstream cleanup.
+        await asyncio.gather(read_task, return_exceptions=True)
+        if self._read_task is read_task:
+            self._read_task = None
+
+    async def _finish(self) -> None:
+        await self._cancel_active_read()
+        close = getattr(self._iterator, "aclose", None)
+        if callable(close):
+            try:
+                await close()
+            except BaseException as source_close_error:
+                try:
+                    await self._cleanup()
+                except BaseException as cleanup_error:
+                    source_close_error.add_note(
+                        f"downstream cleanup also failed: {cleanup_error!r}"
+                    )
+                raise
+        else:
+            await self._cleanup()
+            return
+
+        # Without a source-close failure, downstream cleanup remains the
+        # primary finish failure and is propagated unchanged.
+        await self._cleanup()
 
     async def aclose(self) -> None:
-        close = getattr(self._iterator, "aclose", None)
-        try:
-            if callable(close):
-                await close()
-        finally:
-            # Unlike an unstarted async generator's ``aclose``, this always
-            # executes, so a disconnect before the first byte cannot leak state.
-            await self._cleanup()
+        # Unlike an unstarted async generator's own ``aclose``, this wrapper's
+        # finish task always executes, so a pre-first-byte close cannot skip
+        # downstream cleanup.
+        self._finished = True
+        await self._finish_once()
 
 
 class CleanupStreamingResponse(StreamingResponse):
@@ -97,22 +187,47 @@ class CleanupStreamingResponse(StreamingResponse):
         cleanup_task_name: str,
         **kwargs,
     ) -> None:
-        self._cleanup_once = AsyncCleanupOnce(
-            cleanup,
-            task_name=cleanup_task_name,
+        self._cleanup_iterator = CleanupAsyncIterator(
+            content,
+            cleanup=cleanup,
+            cleanup_task_name=cleanup_task_name,
         )
         super().__init__(
-            _CleanupAsyncIterator(content, self._cleanup_once),
+            self._cleanup_iterator,
             **kwargs,
         )
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         try:
             await super().__call__(scope, receive, send)
-        finally:
-            # Covers ASGI disconnect/cancellation before Starlette starts the
-            # body iterator.  Iterator cleanup and this path share one task.
-            await self._cleanup_once()
+        except BaseException as primary_error:
+            # Covers ASGI disconnect/cancellation before iteration and while a
+            # yielded chunk is being sent.  Closing the iterator first ensures
+            # the source body cannot outlive its downstream authority.
+            try:
+                await self._cleanup_iterator.aclose()
+            except BaseException as close_error:
+                # The response failure explains why cleanup began.  Preserve
+                # it as primary and retain close/cleanup failures as notes.  A
+                # finish failure may already be the same object propagated by
+                # body iteration; avoid adding a recursive self-note then.
+                if close_error is not primary_error:
+                    primary_error.add_note(
+                        f"response stream finalization also failed: {close_error!r}"
+                    )
+                    for note in tuple(getattr(close_error, "__notes__", ())):
+                        primary_error.add_note(
+                            f"response stream finalization detail: {note}"
+                        )
+            raise
+        else:
+            # Without a response failure, close/cleanup failure remains the
+            # primary error and must be propagated to the caller.
+            await self._cleanup_iterator.aclose()
 
 
-__all__ = ["AsyncCleanupOnce", "CleanupStreamingResponse"]
+__all__ = [
+    "AsyncCleanupOnce",
+    "CleanupAsyncIterator",
+    "CleanupStreamingResponse",
+]
