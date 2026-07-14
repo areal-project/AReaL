@@ -348,6 +348,60 @@ async def test_exact_pin_retry_reauthorizes_before_coordinator_lookup() -> None:
 
 
 @pytest.mark.asyncio
+async def test_pin_integrity_conflict_always_clears_transient_candidate() -> None:
+    """An invariant error cannot leak admission-only pin state.
+
+    Normal broker admission prevents two different targets from reaching the
+    coordinator concurrently.  This deliberately injects the defensive
+    post-coordinator mismatch to prove that its exception path still performs
+    the unconditional candidate cleanup promised by ``finally``.
+    """
+
+    resolver = _Resolver()
+    broker, coordinator, _ = _broker(resolver=resolver)
+    session = await broker.open_session(_principal(), "session-1")
+    first_pin = _pin(suffix="1")
+    replacement_pin = _pin(suffix="2")
+    coordinator.pin_release.clear()
+
+    pinning = asyncio.create_task(broker.pin_session(session, first_pin))
+    try:
+        await asyncio.wait_for(coordinator.pin_started.wait(), timeout=1)
+        states = getattr(broker, "_AuthorizedMemoryAgentBroker__sessions")
+        state = states["session-1"]
+        candidate = state.pin_candidate
+        assert candidate is not None
+        assert state.pin_candidate_count == 1
+
+        # Simulate detection that the coordinator/session already carries another
+        # durable assignment.  The integrity error is expected; the transient
+        # first-pin candidate must still be released.
+        state.target = type(candidate).from_pin(replacement_pin)
+        coordinator.pin_release.set()
+        with pytest.raises(
+            MemoryAgentSessionConflictError,
+            match="coordinator pinned a different",
+        ):
+            await pinning
+
+        assert state.pin_candidate_count == 0
+        assert state.pin_candidate is None
+
+        # Once the injected durable state is cleared by its hypothetical recovery
+        # owner, a valid replacement can be admitted.  The old implementation left
+        # ``first_pin`` behind here and rejected this public call.
+        state.target = None
+        await broker.pin_session(session, replacement_pin)
+        assert len(coordinator.pin_calls) == 2
+    finally:
+        coordinator.pin_release.set()
+        if not pinning.done():
+            pinning.cancel()
+        await asyncio.gather(pinning, return_exceptions=True)
+        await broker.aclose()
+
+
+@pytest.mark.asyncio
 async def test_revoked_exposure_cannot_read_a_completed_coordinator_result() -> None:
     resolver = _Resolver()
     broker, coordinator, _ = _broker(resolver=resolver)

@@ -491,18 +491,24 @@ class AuthorizedMemoryAgentBroker:
         finally:
             async with self.__state_lock:
                 state.pin_candidate_count -= 1
-                if (
-                    succeeded
-                    and self.__sessions.get(state.session_key) is state
-                    and state.epoch == expected_epoch
-                ):
-                    if state.target is not None and state.target != target:
-                        raise MemoryAgentSessionConflictError(
-                            "coordinator pinned a different Memory assignment"
-                        )
-                    state.target = target
-                if state.pin_candidate_count == 0:
-                    state.pin_candidate = None
+                try:
+                    if (
+                        succeeded
+                        and self.__sessions.get(state.session_key) is state
+                        and state.epoch == expected_epoch
+                    ):
+                        if state.target is not None and state.target != target:
+                            raise MemoryAgentSessionConflictError(
+                                "coordinator pinned a different Memory assignment"
+                            )
+                        state.target = target
+                finally:
+                    # Integrity failures above must not strand an in-flight
+                    # candidate after its last operation has drained.  The
+                    # candidate is transient admission state, not a durable
+                    # assignment binding.
+                    if state.pin_candidate_count == 0:
+                        state.pin_candidate = None
 
     async def pin_session(
         self,
