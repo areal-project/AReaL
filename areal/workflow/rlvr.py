@@ -116,11 +116,11 @@ class RLVRWorkflow(RolloutWorkflow):
     @session_context()
     async def _collect_samples(
         self,
-        engine: "InferenceEngine",
+        engine: InferenceEngine,
         req: ModelRequest,
         prompt_str: str,
         task_data: dict[str, Any],
-    ) -> tuple["ModelResponse", RewardResult]:
+    ) -> tuple[ModelResponse, RewardResult]:
         """Generate one sample and compute its reward.
 
         Registers a new session for this sample, calls engine.agenerate,
@@ -153,7 +153,7 @@ class RLVRWorkflow(RolloutWorkflow):
     def _build_stepwise_reward_tensors(
         self,
         reward: RewardResult,
-        resp: "ModelResponse",
+        resp: ModelResponse,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Convert stepwise rewards into completion-aligned tensors.
 
@@ -197,7 +197,7 @@ class RLVRWorkflow(RolloutWorkflow):
         return step_rewards, step_reward_mask
 
     async def arun_episode(
-        self, engine: "InferenceEngine", data: dict[str, Any]
+        self, engine: InferenceEngine, data: dict[str, Any]
     ) -> dict[str, torch.Tensor]:
         # NOTE: load reward function dynamically if given as string
         if isinstance(self.reward_fn, str):
@@ -229,7 +229,6 @@ class RLVRWorkflow(RolloutWorkflow):
         step_rewards, step_reward_mask = self._build_stepwise_reward_tensors(
             reward, resp
         )
-
         res = {
             "input_ids": torch.tensor(seq, dtype=torch.int32),
             "loss_mask": torch.tensor(loss_mask, dtype=torch.int32),

@@ -71,7 +71,11 @@ class RewardResult:
         Sequence-level terminal reward. This is the compatibility anchor used
         by existing workflows and PPO code paths.
     step_rewards:
-        Optional reward value for each process step.
+        Optional additive reward increment for each process step, expressed in
+        the same raw units as ``final_reward``. Increments with the same
+        ``step_end`` are summed at their aligned reward timestep before PPO
+        applies ``reward_scaling`` and ``reward_clip``. Sequence-level reward
+        bias and ``reward_norm`` do not apply to process increments.
     step_ends:
         Optional 1-based completion-token end offsets for each step. Each entry
         points to the completion token whose prediction timestep should receive
