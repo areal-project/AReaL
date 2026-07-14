@@ -274,6 +274,56 @@ versioned open/run/close identity protocol and a trusted principal resolver. Pas
 broker to the runtime, or a broker and Agent to the outer host, is an exclusive
 ownership transfer: trusted code must not retain a second execution or cleanup path.
 
+`session_lifecycle_transport` defines the next default-off boundary: strict V1 JSON
+values for a future DataProxy→Worker protocol. The `exact_session_lifecycle_v1`
+capability is deliberately indivisible. Advertising it commits one authenticated Worker
+pair to an idempotent open handshake, exact identity on every stateful run, and exact
+close; it must never mean “exact close plus legacy run.” An exact client must not fall
+back to a key-only route after selecting the capability.
+
+Open sends a canonical reusable key, a DataProxy-owned `aopen_*` idempotency key, and
+the expected Worker audience from capability negotiation. A future adapter must compare
+that audience before reserving any state. For one Worker audience, the open ledger key
+is `(worker_audience_id, open_request_id)` and its immutable binding is
+`(trusted principal, session_key, expected_worker_audience_id)`. The same logical retry
+must reuse the same request id. Reusing it with any changed binding is a conflict that
+must not reveal the old identity; a new logical open needs a new id.
+
+Before reserve, the adapter must capacity-check an unseen id and publish a pending
+entry. Concurrent calls with the same binding join one owned, cancellation-shielded
+task. Reserve and publication of its receipt form one cancellation-safe commit:
+completed or unknown-effect entries remain replayable for the complete Worker-audience
+lifetime and must not be LRU-evicted. A full ledger rejects only unseen ids before
+reserve; an existing retry still replays while full. These rules ensure a lost response
+replays A instead of creating B. The receipt echoes the request id and returns the
+Worker-minted tuple of key, session incarnation, and audience. Run carries that complete
+identity beside an immutable snapshot of the turn; the key is not duplicated inside the
+turn. Close carries the same identity and returns either `closed` or `not_current`
+through explicitly named full Agent-Worker receipt types. Only a matching `closed`
+receipt proves full-host retirement. `not_current` is not cleanup success, must not
+clear the DataProxy tombstone, and reveals no successor identity.
+
+Capability, identity, open, run, and close values use exact field sets and integer
+schema version 1; booleans, unknown fields, unsafe keys, malformed identity prefixes,
+duplicate capability tokens, non-finite JSON, and non-JSON history or metadata are
+rejected. Valid history and metadata within explicit depth, node, UTF-8 string-byte, and
+16 MiB encoded payload budgets are canonicalized into private immutable snapshots before
+later reconstruction. The paired canonical encoder applies the final 16 MiB limit to the
+whole body after JSON escaping, so every accepted run request can pass the same module's
+raw decoder. The raw decoder limits already-collected bytes before JSON materialization
+and rejects invalid UTF-8, excessive parser nesting, non-finite numbers, malformed JSON,
+and duplicate object names. Because it accepts `bytes`, it cannot by itself bound an
+HTTP framework's earlier body read: a future adapter must stream at most `limit + 1`
+bytes and reject overflow before assembling the body, rather than first calling an
+unbounded `request.body()`.
+
+These wire identities remain non-secret descriptions and grant no authority. The module
+registers no HTTP route and performs no principal resolution. A future adapter must
+authenticate the pair hop before raw decoding, bind open to a trusted principal, verify
+that every returned request id, audience, and identity exactly matches its cached
+expectation, use the paired canonical encoder for every outgoing lifecycle body, and
+activate open/run/close together rather than exposing any partial protocol.
+
 ## Agent Protocol
 
 Any class that satisfies the `AgentRunnable` protocol can run on the Worker:

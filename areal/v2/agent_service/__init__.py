@@ -68,6 +68,23 @@ from .memory_transport import (
     ReservedMemoryMetadataError,
     parse_memory_assignment_pin_metadata,
 )
+from .session_lifecycle_transport import (
+    EXACT_SESSION_LIFECYCLE_CAPABILITY_V1,
+    MAX_AGENT_SESSION_LIFECYCLE_BODY_BYTES_V1,
+    AgentSessionLifecycleTransportError,
+    AgentSessionLifecycleWireFormatError,
+    AgentWorkerSessionCloseOutcomeWireV1,
+    AgentWorkerSessionCloseReceiptWireV1,
+    AgentWorkerSessionCloseRequestWireV1,
+    WorkerSessionCapabilitiesReceiptWireV1,
+    WorkerSessionIdentityWireV1,
+    WorkerSessionOpenReceiptWireV1,
+    WorkerSessionOpenRequestWireV1,
+    WorkerSessionRunRequestWireV1,
+    WorkerSessionTurnWireV1,
+    decode_agent_session_lifecycle_json_v1,
+    encode_agent_session_lifecycle_json_v1,
+)
 from .types import (
     AgentRequest,
     AgentResponse,
@@ -79,6 +96,13 @@ from .types import (
 
 __all__ = [
     "AREAL_MEMORY_METADATA_KEY",
+    "EXACT_SESSION_LIFECYCLE_CAPABILITY_V1",
+    "MAX_AGENT_SESSION_LIFECYCLE_BODY_BYTES_V1",
+    "AgentWorkerSessionCloseOutcomeWireV1",
+    "AgentWorkerSessionCloseReceiptWireV1",
+    "AgentWorkerSessionCloseRequestWireV1",
+    "AgentSessionLifecycleTransportError",
+    "AgentSessionLifecycleWireFormatError",
     "AgentRequest",
     "AgentResponse",
     "AgentRunnable",
@@ -122,5 +146,13 @@ __all__ = [
     "MemoryTurnResultV1",
     "MemoryWorkerAudienceV1",
     "ReservedMemoryMetadataError",
+    "WorkerSessionCapabilitiesReceiptWireV1",
+    "WorkerSessionIdentityWireV1",
+    "WorkerSessionOpenReceiptWireV1",
+    "WorkerSessionOpenRequestWireV1",
+    "WorkerSessionRunRequestWireV1",
+    "WorkerSessionTurnWireV1",
+    "decode_agent_session_lifecycle_json_v1",
+    "encode_agent_session_lifecycle_json_v1",
     "parse_memory_assignment_pin_metadata",
 ]
