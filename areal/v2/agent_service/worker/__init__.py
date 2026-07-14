@@ -11,6 +11,12 @@ from .memory import (
     bind_authorized_memory_turn_capability,
     bind_memory_turn_capability,
 )
+from .memory_agent_host import (
+    AuthorizedMemoryAgentWorkerHost,
+    MemoryAgentWorkerSessionCloseOutcomeV1,
+    MemoryAgentWorkerSessionCloseReceiptV1,
+    MemoryAgentWorkerSessionReservationV1,
+)
 from .memory_runtime import (
     AuthorizedMemoryWorkerRuntime,
     MemoryWorkerSessionReservationV1,
@@ -18,7 +24,11 @@ from .memory_runtime import (
 )
 
 __all__ = [
+    "AuthorizedMemoryAgentWorkerHost",
     "AuthorizedMemoryWorkerRuntime",
+    "MemoryAgentWorkerSessionCloseOutcomeV1",
+    "MemoryAgentWorkerSessionCloseReceiptV1",
+    "MemoryAgentWorkerSessionReservationV1",
     "MemoryWorkerSessionReservationV1",
     "MemoryWorkerSessionCloseOutcomeV1",
     "MemoryWorkerSessionCloseReceiptV1",

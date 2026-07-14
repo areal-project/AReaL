@@ -232,24 +232,47 @@ A damaged private state fails closed rather than being reported as absent. If a 
 ever repeats a still-retained incarnation identity, the runtime quarantines that text
 key until shutdown instead of publishing an ambiguous successor.
 
-A `closed` receipt currently means only that the Worker-owned **Memory runtime**
-completed its broker cleanup; `not_current` makes no cleanup claim. Neither result
-proves that an Agent plugin's key-indexed state was cleaned, and no HTTP route consumes
-or produces these receipts. A full Worker receipt must be published only after a
-long-lived host adapter has drained the response body, closed Memory, and completed the
-Agent lifecycle hook under one exact-incarnation state machine. Retirements are
-process-local and non-durable: LRU eviction discards only old replay detail, while
-runtime shutdown discards the cache together with its fresh Worker audience.
+A `MemoryWorkerSessionCloseReceiptV1` with outcome `closed` means only that the
+Worker-owned **Memory runtime** completed its broker cleanup; `not_current` makes no
+cleanup claim. It does not prove that an Agent plugin's key-indexed state was cleaned.
+
+`AuthorizedMemoryAgentWorkerHost` adds that complete, still default-off ownership
+boundary. Trusted host code transfers one Agent and one broker to it. The Agent must
+provide `close_session(session_key)`; the host does not weaken `AgentRunnable` for
+ordinary Workers. For every admitted turn, the host keeps an outer lease until a
+structured response returns or a streaming body reaches EOF, fails, or is explicitly
+closed. When an exact session close is requested, the host first waits for all such
+outer leases to drain. It then closes the exact Memory reservation, invokes the Agent
+hook, and only after both complete atomically publishes a distinct
+`MemoryAgentWorkerSessionCloseReceiptV1` tombstone with outcome `closed`. The reusable
+text key cannot be reopened between these stages, so A's delayed key-only Agent hook
+cannot delete a new B. Shutdown also closes abandoned response bodies and cancels
+in-flight Agent calls before it drains sessions.
+
+The outer host owns its close task and recent full-host retirement LRU. Caller
+cancellation cannot cancel publication, a lost-response retry replays A's full receipt,
+and an evicted or mismatched identity returns `not_current` without touching B. If the
+legacy Agent hook fails after it starts, the host cannot know whether its side effects
+happened. It therefore quarantines the key for the rest of that host lifetime and
+replays the same failure instead of repeating the hook. Shutdown is the only remaining
+containment path: it drains the Memory runtime and calls the optional
+`close_all_sessions()` hook when available, but does not retry the uncertain per-key
+hook. Any shutdown error deliberately keeps the process-wide Agent ownership claim, so
+uncertain plugin state cannot be attached to another exact host. A fully successful
+shutdown releases the claim and permits deliberate reuse.
+
+Both retirement ledgers are process-local and non-durable: LRU eviction discards only
+old replay detail, while successful shutdown discards the caches together with the fresh
+Worker audience. Neither receipt is currently consumed or produced by an HTTP route.
 
 This remains a **default-off host adapter**, not Worker HTTP activation. No Worker route
-constructs the runtime, no DataProxy envelope carries its descriptor, and no HTTP field
-is accepted as a principal. Trusted host code should pass a bound lease to
-`run_agent(...)`; if it abandons a returned stream without iterating it, it must
-explicitly close `response.body`. A future HTTP integration must additionally close a
-never-started body on response-construction failure or disconnect before the first byte.
-That integration also requires a separate versioned identity protocol and trusted
-principal resolver. Passing a broker to the runtime is an ownership transfer: trusted
-host code must neither wrap it again nor call or close it directly afterwards.
+constructs either ownership layer, no DataProxy envelope carries a reservation, and no
+HTTP field is accepted as a principal. The lower runtime still requires its caller to
+close an abandoned stream explicitly; the outer host additionally tracks published
+bodies so its own shutdown can close them. HTTP integration still requires an atomic,
+versioned open/run/close identity protocol and a trusted principal resolver. Passing a
+broker to the runtime, or a broker and Agent to the outer host, is an exclusive
+ownership transfer: trusted code must not retain a second execution or cleanup path.
 
 ## Agent Protocol
 
