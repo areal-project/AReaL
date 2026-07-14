@@ -11,14 +11,16 @@ assignment pin to a turn-scoped capability.  It does not expose the broker's
 private handles or enable any Worker route.
 
 The reservation's audience and incarnation are non-secret replay domains, not
-bearer credentials.  Runtime operations accept only the exact object they
-issued for their current private state.  Reconstructing an equal dataclass is
-therefore descriptive forgery, not local authority.
+bearer credentials.  Authority-bearing runtime operations accept only the
+exact object they issued for current private state.  A separate conditional
+close compares a descriptive identity without granting pin, run, or exposure
+authority; it is intended only for a future authenticated host adapter.
 """
 
 from __future__ import annotations
 
 import asyncio
+from collections import OrderedDict
 from dataclasses import dataclass
 from enum import Enum, auto
 
@@ -36,6 +38,11 @@ from areal.v2.agent_service.memory_authorization import (
 from areal.v2.agent_service.memory_broker import (
     AuthorizedMemoryAgentBroker,
     AuthorizedMemorySessionV1,
+)
+from areal.v2.agent_service.memory_session_lifecycle import (
+    MemoryWorkerSessionCloseOutcomeV1,
+    MemoryWorkerSessionCloseReceiptV1,
+    MemoryWorkerSessionIdentityV1,
 )
 from areal.v2.agent_service.streaming import CleanupAsyncIterator
 from areal.v2.agent_service.types import (
@@ -326,6 +333,15 @@ class MemoryWorkerSessionReservationV1:
         object.__setattr__(self, "session", session)
         object.__setattr__(self, "audience", audience)
 
+    @property
+    def identity(self) -> MemoryWorkerSessionIdentityV1:
+        """Return a detached, non-authoritative exact-session description."""
+
+        return MemoryWorkerSessionIdentityV1(
+            session=self.session,
+            audience=self.audience,
+        )
+
 
 @dataclass(slots=True, eq=False)
 class _ReservationState:
@@ -337,7 +353,17 @@ class _ReservationState:
     incarnation_id: str
     audience_id: str
     closing: bool = False
-    close_task: asyncio.Task[None] | None = None
+    close_task: asyncio.Task[MemoryWorkerSessionCloseReceiptV1] | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _RetiredReservation:
+    """Private anti-replay tombstone for one completed local reservation."""
+
+    descriptor: MemoryWorkerSessionReservationV1
+    session_key: str
+    incarnation_id: str
+    audience_id: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -357,11 +383,25 @@ class AuthorizedMemoryWorkerRuntime:
     or close that broker afterwards.  ``aclose`` owns and closes it.
     """
 
-    def __init__(self, broker: AuthorizedMemoryAgentBroker) -> None:
-        """Take exclusive lifecycle ownership of ``broker``."""
+    def __init__(
+        self,
+        broker: AuthorizedMemoryAgentBroker,
+        *,
+        max_retired_sessions: int = 4096,
+    ) -> None:
+        """Take exclusive lifecycle ownership of ``broker``.
+
+        ``max_retired_sessions`` bounds exact ``CLOSED`` replay metadata, not
+        active ownership.  An evicted descriptive identity returns
+        ``NOT_CURRENT`` and can never select a same-key successor.
+        """
 
         if type(broker) is not AuthorizedMemoryAgentBroker:
             raise TypeError("broker must be an AuthorizedMemoryAgentBroker")
+        if type(max_retired_sessions) is not int:
+            raise TypeError("max_retired_sessions must be an int")
+        if max_retired_sessions <= 0:
+            raise ValueError("max_retired_sessions must be positive")
         audience = broker.audience
         audience.canonical_bytes()
         broker._claim_worker_runtime()
@@ -371,6 +411,21 @@ class AuthorizedMemoryWorkerRuntime:
         self.__owner_loop: asyncio.AbstractEventLoop | None = None
         self.__sessions: dict[str, _ReservationState] = {}
         self.__pending: dict[str, _ReservationAttempt] = {}
+        # Recent destructive operations remain exactly replayable in a bounded
+        # LRU.  Keeping the issued descriptor separately from the scalar identity
+        # preserves local object authority while also providing the conditional
+        # compare-and-delete core needed by a future authenticated wire hop.
+        self.__retired_by_descriptor: dict[int, _RetiredReservation] = {}
+        self.__retired_by_identity: OrderedDict[
+            tuple[str, str, str],
+            _RetiredReservation,
+        ] = OrderedDict()
+        self.__max_retired_sessions = max_retired_sessions
+        # A retained-identity collision proves that this key's incarnation
+        # generator cannot currently provide the uniqueness invariant.  Keep a
+        # fail-closed quarantine beyond ordinary LRU eviction; shutdown owns the
+        # private broker binding that triggered it.
+        self.__quarantined_session_keys: set[str] = set()
         self.__closed = False
         self.__shutdown_task: asyncio.Task[None] | None = None
 
@@ -425,6 +480,62 @@ class AuthorizedMemoryWorkerRuntime:
             state.incarnation_id,
             state.audience_id,
         )
+
+    @staticmethod
+    def _identity_key(
+        identity: object,
+    ) -> tuple[MemoryWorkerSessionIdentityV1, tuple[str, str, str]]:
+        if type(identity) is not MemoryWorkerSessionIdentityV1:
+            raise TypeError("identity must be a MemoryWorkerSessionIdentityV1")
+        detached = MemoryWorkerSessionIdentityV1(
+            session=identity.session,
+            audience=identity.audience,
+        )
+        return detached, (
+            detached.audience.audience_id,
+            detached.session.session_key,
+            detached.session.incarnation_id,
+        )
+
+    @staticmethod
+    def _state_identity_key(state: _ReservationState) -> tuple[str, str, str]:
+        return (state.audience_id, state.session_key, state.incarnation_id)
+
+    @staticmethod
+    def _receipt(
+        *,
+        session_key: str,
+        incarnation_id: str,
+        audience_id: str,
+        outcome: MemoryWorkerSessionCloseOutcomeV1,
+    ) -> MemoryWorkerSessionCloseReceiptV1:
+        return MemoryWorkerSessionCloseReceiptV1(
+            identity=MemoryWorkerSessionIdentityV1(
+                session=MemorySessionIncarnationV1(
+                    session_key=session_key,
+                    incarnation_id=incarnation_id,
+                ),
+                audience=MemoryWorkerAudienceV1(audience_id),
+            ),
+            outcome=outcome,
+        )
+
+    @classmethod
+    def _retired_receipt(
+        cls,
+        retired: _RetiredReservation,
+    ) -> MemoryWorkerSessionCloseReceiptV1:
+        try:
+            return cls._receipt(
+                session_key=retired.session_key,
+                incarnation_id=retired.incarnation_id,
+                audience_id=retired.audience_id,
+                outcome=MemoryWorkerSessionCloseOutcomeV1.CLOSED,
+            )
+        except (TypeError, ValueError) as error:
+            raise MemoryAgentSessionConflictError(
+                "retired Memory reservation identity is corrupted"
+            ) from error
 
     def _reservation_state(
         self,
@@ -487,6 +598,21 @@ class AuthorizedMemoryWorkerRuntime:
                     ),
                     audience=MemoryWorkerAudienceV1(self.__audience_id),
                 )
+                identity_key = (
+                    self.__audience_id,
+                    session_key,
+                    broker_session.session.incarnation_id,
+                )
+                if identity_key in self.__retired_by_identity:
+                    # Cryptographic incarnation IDs should never repeat.  Check
+                    # before publishing B so an injected RNG failure cannot make
+                    # a retired A request address a successor or defer the error
+                    # until after B's destructive cleanup.  The private broker
+                    # binding remains fail-closed and is drained by shutdown.
+                    self.__quarantined_session_keys.add(session_key)
+                    raise MemoryAgentSessionConflictError(
+                        "broker reused a retained Memory session identity"
+                    )
                 self.__sessions[session_key] = _ReservationState(
                     descriptor=descriptor,
                     broker_session=broker_session,
@@ -520,6 +646,10 @@ class AuthorizedMemoryWorkerRuntime:
         session_key = _session_key(session_key)
         async with self.__state_lock:
             self._ensure_open()
+            if session_key in self.__quarantined_session_keys:
+                raise MemoryAgentSessionConflictError(
+                    "session key is quarantined after an incarnation collision"
+                )
             existing = self.__sessions.get(session_key)
             if existing is not None:
                 if existing.closing:
@@ -662,44 +792,186 @@ class AuthorizedMemoryWorkerRuntime:
         if not task.cancelled():
             task.exception()
 
-    async def _close_state(self, state: _ReservationState) -> None:
+    @staticmethod
+    def _observe_close_task(
+        task: asyncio.Task[MemoryWorkerSessionCloseReceiptV1],
+    ) -> None:
+        if not task.cancelled():
+            task.exception()
+
+    def _start_close_task(
+        self,
+        state: _ReservationState,
+    ) -> asyncio.Task[MemoryWorkerSessionCloseReceiptV1]:
+        """Publish one owned close task while the runtime lock is held."""
+
+        task = state.close_task
+        if task is None:
+            state.closing = True
+            task = asyncio.create_task(
+                self._close_state(state),
+                name=f"areal-memory-worker-close:{state.session_key}",
+            )
+            state.close_task = task
+            task.add_done_callback(self._observe_close_task)
+        return task
+
+    async def _close_state(
+        self,
+        state: _ReservationState,
+    ) -> MemoryWorkerSessionCloseReceiptV1:
+        retired = _RetiredReservation(
+            descriptor=state.descriptor,
+            session_key=state.session_key,
+            incarnation_id=state.incarnation_id,
+            audience_id=state.audience_id,
+        )
+        receipt = self._retired_receipt(retired)
         try:
             await self.__broker.close_session(state.broker_session)
+            async with self.__state_lock:
+                if self.__sessions.get(state.session_key) is not state:
+                    raise MemoryAgentSessionConflictError(
+                        "Memory reservation changed while it was closing"
+                    )
+                if not self._state_is_intact(state):
+                    raise MemoryAgentSessionConflictError(
+                        "Memory reservation state is corrupted while closing"
+                    )
+                identity_key = self._state_identity_key(state)
+                existing_identity = self.__retired_by_identity.get(identity_key)
+                existing_descriptor = self.__retired_by_descriptor.get(
+                    id(state.descriptor)
+                )
+                if (
+                    existing_identity is not None
+                    and existing_identity.descriptor is not state.descriptor
+                ) or (
+                    existing_descriptor is not None
+                    and existing_descriptor.descriptor is not state.descriptor
+                ):
+                    raise MemoryAgentSessionConflictError(
+                        "Memory retirement identity was already used"
+                    )
+                # Publish retirement before releasing the reusable key.  Both
+                # writes and active-state removal share one lock, so a successor
+                # is visible only after A's cleanup completed and retirement was
+                # atomically recorded.  Later LRU eviction may discard replay
+                # detail, but stale A still compares unequal and cannot touch B.
+                self.__retired_by_identity[identity_key] = retired
+                self.__retired_by_identity.move_to_end(identity_key)
+                self.__retired_by_descriptor[id(state.descriptor)] = retired
+                while len(self.__retired_by_identity) > self.__max_retired_sessions:
+                    _, evicted = self.__retired_by_identity.popitem(last=False)
+                    descriptor_id = id(evicted.descriptor)
+                    if self.__retired_by_descriptor.get(descriptor_id) is evicted:
+                        self.__retired_by_descriptor.pop(descriptor_id, None)
+                self.__sessions.pop(state.session_key, None)
         except BaseException:
             async with self.__state_lock:
                 if self.__sessions.get(state.session_key) is state:
                     state.close_task = None
             raise
-        else:
-            async with self.__state_lock:
-                if self.__sessions.get(state.session_key) is state:
-                    self.__sessions.pop(state.session_key, None)
+        return receipt
 
     async def close_session(
         self,
         reservation: MemoryWorkerSessionReservationV1,
-    ) -> None:
-        """Close one exact reservation; equal or stale records are rejected."""
+    ) -> MemoryWorkerSessionCloseReceiptV1:
+        """Close one exact local handle and replay its completed receipt.
+
+        A value-equal reconstructed descriptor still has no local authority.
+        While its bounded retirement tombstone is retained, the exact issued
+        object remains an idempotent address so response loss cannot turn a
+        retry into an operation against a same-key successor.  After eviction it
+        is rejected as stale and still cannot resolve through that successor.
+        """
 
         self._running_loop()
         async with self.__state_lock:
             self._ensure_open()
-            state = self._reservation_state(reservation, allow_closing=True)
-            task = state.close_task
-            if task is None:
-                state.closing = True
-                task = asyncio.create_task(
-                    self._close_state(state),
-                    name=f"areal-memory-worker-close:{state.session_key}",
+            if type(reservation) is not MemoryWorkerSessionReservationV1:
+                raise TypeError(
+                    "reservation must be a MemoryWorkerSessionReservationV1"
                 )
-                state.close_task = task
-                task.add_done_callback(self._observe_task)
-        await asyncio.shield(task)
+            retired = self.__retired_by_descriptor.get(id(reservation))
+            if retired is not None:
+                if retired.descriptor is not reservation:
+                    raise MemoryAgentSessionConflictError(
+                        "Memory reservation is not current for this Worker runtime"
+                    )
+                retired_key = (
+                    retired.audience_id,
+                    retired.session_key,
+                    retired.incarnation_id,
+                )
+                if self.__retired_by_identity.get(retired_key) is not retired:
+                    raise MemoryAgentSessionConflictError(
+                        "retired Memory reservation indexes disagree"
+                    )
+                self.__retired_by_identity.move_to_end(retired_key)
+                return self._retired_receipt(retired)
+            state = self._reservation_state(reservation, allow_closing=True)
+            task = self._start_close_task(state)
+        receipt = await asyncio.shield(task)
+        return MemoryWorkerSessionCloseReceiptV1(
+            identity=receipt.identity,
+            outcome=receipt.outcome,
+        )
+
+    async def close_session_if_current(
+        self,
+        identity: MemoryWorkerSessionIdentityV1,
+    ) -> MemoryWorkerSessionCloseReceiptV1:
+        """Conditionally close a descriptive exact identity.
+
+        Unlike :meth:`close_session`, this value API intentionally carries no
+        local object authority.  It is the default-off compare-and-delete core
+        for a future *authenticated* Worker hop.  A mismatch returns a receipt
+        for the requested identity without revealing or modifying the current
+        same-key incarnation.
+        """
+
+        self._running_loop()
+        identity, identity_key = self._identity_key(identity)
+        async with self.__state_lock:
+            self._ensure_open()
+            retired = self.__retired_by_identity.get(identity_key)
+            if retired is not None:
+                self.__retired_by_identity.move_to_end(identity_key)
+                return self._retired_receipt(retired)
+
+            state = self.__sessions.get(identity.session_key)
+            if state is None:
+                return MemoryWorkerSessionCloseReceiptV1(
+                    identity=identity,
+                    outcome=MemoryWorkerSessionCloseOutcomeV1.NOT_CURRENT,
+                )
+            if not self._state_is_intact(state):
+                raise MemoryAgentSessionConflictError(
+                    "Memory reservation state disagrees with its broker"
+                )
+            if self._state_identity_key(state) != identity_key:
+                return MemoryWorkerSessionCloseReceiptV1(
+                    identity=identity,
+                    outcome=MemoryWorkerSessionCloseOutcomeV1.NOT_CURRENT,
+                )
+            task = self._start_close_task(state)
+
+        receipt = await asyncio.shield(task)
+        return MemoryWorkerSessionCloseReceiptV1(
+            identity=receipt.identity,
+            outcome=receipt.outcome,
+        )
 
     async def _shutdown(
         self,
         pending_tasks: tuple[
             asyncio.Task[MemoryWorkerSessionReservationV1],
+            ...,
+        ],
+        close_tasks: tuple[
+            asyncio.Task[MemoryWorkerSessionCloseReceiptV1],
             ...,
         ],
     ) -> None:
@@ -710,11 +982,20 @@ class AuthorizedMemoryWorkerRuntime:
             )
             if pending_tasks:
                 await asyncio.gather(*pending_tasks, return_exceptions=True)
+            # A runtime close publishes its retirement receipt only after the
+            # broker task finishes.  Rejoin every already-admitted close before
+            # clearing runtime state so shutdown cannot turn successful broker
+            # cleanup into a spurious "reservation changed" failure.
+            if close_tasks:
+                await asyncio.gather(*close_tasks, return_exceptions=True)
             await broker_close
         finally:
             async with self.__state_lock:
                 self.__sessions.clear()
                 self.__pending.clear()
+                self.__retired_by_descriptor.clear()
+                self.__retired_by_identity.clear()
+                self.__quarantined_session_keys.clear()
 
     async def aclose(self) -> None:
         """Reject new reservations and close the exclusively owned broker."""
@@ -728,7 +1009,12 @@ class AuthorizedMemoryWorkerRuntime:
                     state.closing = True
                 task = asyncio.create_task(
                     self._shutdown(
-                        tuple(pending.task for pending in self.__pending.values())
+                        tuple(pending.task for pending in self.__pending.values()),
+                        tuple(
+                            state.close_task
+                            for state in self.__sessions.values()
+                            if state.close_task is not None
+                        ),
                     ),
                     name="areal-memory-worker-runtime-shutdown",
                 )

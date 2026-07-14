@@ -32,6 +32,11 @@ from areal.v2.agent_service.memory_broker import (
     AuthorizedMemoryAgentBroker,
     AuthorizedMemorySessionV1,
 )
+from areal.v2.agent_service.memory_session_lifecycle import (
+    MemoryWorkerSessionCloseOutcomeV1,
+    MemoryWorkerSessionCloseReceiptV1,
+    MemoryWorkerSessionIdentityV1,
+)
 from areal.v2.agent_service.types import (
     AgentRequest,
     AgentResponse,
@@ -100,6 +105,30 @@ def _principal(suffix: str) -> MemoryPrincipalV1:
     )
 
 
+def _identity(
+    reservation: MemoryWorkerSessionReservationV1,
+    *,
+    session_key: str | None = None,
+    incarnation_id: str | None = None,
+    audience_id: str | None = None,
+) -> MemoryWorkerSessionIdentityV1:
+    return MemoryWorkerSessionIdentityV1(
+        session=MemorySessionIncarnationV1(
+            session_key=(
+                reservation.session_key if session_key is None else session_key
+            ),
+            incarnation_id=(
+                reservation.session.incarnation_id
+                if incarnation_id is None
+                else incarnation_id
+            ),
+        ),
+        audience=MemoryWorkerAudienceV1(
+            reservation.audience.audience_id if audience_id is None else audience_id
+        ),
+    )
+
+
 def _broker() -> tuple[
     AuthorizedMemoryAgentBroker,
     _Coordinator,
@@ -119,6 +148,24 @@ def _runtime() -> tuple[
 ]:
     broker, coordinator = _broker()
     return AuthorizedMemoryWorkerRuntime(broker), broker, coordinator
+
+
+def _runtime_with_retirement_capacity(
+    capacity: int,
+) -> tuple[
+    AuthorizedMemoryWorkerRuntime,
+    AuthorizedMemoryAgentBroker,
+    _Coordinator,
+]:
+    broker, coordinator = _broker()
+    return (
+        AuthorizedMemoryWorkerRuntime(
+            broker,
+            max_retired_sessions=capacity,
+        ),
+        broker,
+        coordinator,
+    )
 
 
 def _hash(label: str) -> str:
@@ -312,6 +359,43 @@ def _binding_runtime() -> tuple[
     return AuthorizedMemoryWorkerRuntime(broker), broker, coordinator, resolver
 
 
+def test_session_lifecycle_values_are_strict_detached_descriptions() -> None:
+    source_session = MemorySessionIncarnationV1(
+        session_key="session-1",
+        incarnation_id=f"msinc_{'1' * 64}",
+    )
+    source_audience = MemoryWorkerAudienceV1(f"maud_{'2' * 64}")
+    identity = MemoryWorkerSessionIdentityV1(
+        session=source_session,
+        audience=source_audience,
+    )
+    receipt = MemoryWorkerSessionCloseReceiptV1(
+        identity=identity,
+        outcome=MemoryWorkerSessionCloseOutcomeV1.CLOSED,
+    )
+
+    assert identity.session_key == "session-1"
+    assert identity.session is not source_session
+    assert identity.audience is not source_audience
+    assert receipt.identity == identity
+    assert receipt.identity is not identity
+    assert set(receipt.__dataclass_fields__) == {  # type: ignore[attr-defined]
+        "identity",
+        "outcome",
+    }
+
+    with pytest.raises(TypeError, match="identity"):
+        MemoryWorkerSessionCloseReceiptV1(  # type: ignore[arg-type]
+            identity=object(),
+            outcome=MemoryWorkerSessionCloseOutcomeV1.CLOSED,
+        )
+    with pytest.raises(TypeError, match="outcome"):
+        MemoryWorkerSessionCloseReceiptV1(  # type: ignore[arg-type]
+            identity=identity,
+            outcome="closed",
+        )
+
+
 @pytest.mark.asyncio
 async def test_one_broker_cannot_be_owned_by_two_worker_runtimes() -> None:
     runtime, broker, _ = _runtime()
@@ -479,7 +563,7 @@ async def test_concurrent_principals_have_one_owner_and_same_owner_is_idempotent
 
 @pytest.mark.asyncio
 async def test_close_reopen_rejects_stale_and_value_equal_descriptors() -> None:
-    runtime, _, _ = _runtime()
+    runtime, _, coordinator = _runtime()
     principal = _principal("one")
     original = await runtime.reserve_session(principal, "reused-session")
     forged = MemoryWorkerSessionReservationV1(
@@ -492,11 +576,265 @@ async def test_close_reopen_rejects_stale_and_value_equal_descriptors() -> None:
     with pytest.raises(MemoryAgentSessionConflictError, match="not current"):
         await runtime.close_session(forged)
 
-    await runtime.close_session(original)
+    closed = await runtime.close_session(original)
+    assert closed == MemoryWorkerSessionCloseReceiptV1(
+        identity=original.identity,
+        outcome=MemoryWorkerSessionCloseOutcomeV1.CLOSED,
+    )
     replacement = await runtime.reserve_session(principal, "reused-session")
     assert replacement.session.incarnation_id != original.session.incarnation_id
+
+    # A response-loss retry is served from A's retirement record.  It neither
+    # re-runs cleanup nor resolves the reusable key to the current B.
+    replayed = await runtime.close_session(original)
+    assert replayed == closed
+    assert replayed is not closed
+    assert replayed.identity is not closed.identity
+    assert await runtime.reserve_session(principal, "reused-session") is replacement
+    assert coordinator.close_calls == ["reused-session"]
+
+    # Equal data remains descriptive rather than acquiring local handle power,
+    # even after the genuine descriptor has become replayable.
+    with pytest.raises(MemoryAgentSessionConflictError, match="not current"):
+        await runtime.close_session(forged)
+    await runtime.aclose()
+
+
+@pytest.mark.asyncio
+async def test_retired_receipt_uses_private_snapshot_not_public_descriptor_alias() -> (
+    None
+):
+    runtime, _, coordinator = _runtime()
+    reservation = await runtime.reserve_session(_principal("one"), "session-1")
+    identity = reservation.identity
+    closed = await runtime.close_session(reservation)
+    object.__setattr__(
+        reservation.session,
+        "incarnation_id",
+        f"msinc_{'4' * 64}",
+    )
+
+    scalar_replay = await runtime.close_session_if_current(identity)
+    object_replay = await runtime.close_session(reservation)
+
+    assert scalar_replay == object_replay == closed
+    assert scalar_replay.identity == identity
+    assert coordinator.close_calls == ["session-1"]
+    await runtime.aclose()
+
+
+@pytest.mark.asyncio
+async def test_conditional_close_replays_a_without_touching_same_key_b() -> None:
+    runtime, _, coordinator, _ = _binding_runtime()
+    principal = _principal("one")
+    original = await runtime.reserve_session(principal, "reused-session")
+    original_identity = original.identity
+    coordinator.close_release.clear()
+
+    # Model a lost HTTP response: the caller disappears after the Worker has
+    # admitted A's destructive operation, while the shielded owned task keeps
+    # running to its retirement linearization point.
+    lost_waiter = asyncio.create_task(
+        runtime.close_session_if_current(original_identity)
+    )
+    await asyncio.wait_for(coordinator.close_started.wait(), timeout=1)
+    lost_waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await lost_waiter
+    coordinator.close_release.set()
+    await asyncio.wait_for(
+        _wait_for_runtime_session_absent(runtime, "reused-session"),
+        timeout=1,
+    )
+
+    replacement = await runtime.reserve_session(principal, "reused-session")
+    assert replacement.identity != original_identity
+
+    delayed_retry = await runtime.close_session_if_current(original_identity)
+
+    assert delayed_retry.outcome is MemoryWorkerSessionCloseOutcomeV1.CLOSED
+    assert delayed_retry.identity == original_identity
+    assert await runtime.reserve_session(principal, "reused-session") is replacement
+    assert coordinator.close_calls == ["reused-session"]
+    request = AgentRequest("B remains usable", "reused-session", "run-b")
+    lease = await runtime.bind_turn(replacement, request, assignment_pin=_pin("b"))
+    assert request.memory is not None
+    await lease.aclose()
+    await runtime.aclose()
+
+
+@pytest.mark.asyncio
+async def test_object_and_value_close_share_one_owned_destructive_task() -> None:
+    runtime, _, coordinator = _runtime()
+    reservation = await runtime.reserve_session(_principal("one"), "session-1")
+    coordinator.close_release.clear()
+    second_admission = asyncio.Event()
+    start_close_task = runtime._start_close_task
+    admissions = 0
+
+    def observed_start_close_task(state: object):
+        nonlocal admissions
+        admissions += 1
+        if admissions == 2:
+            second_admission.set()
+        return start_close_task(state)  # type: ignore[arg-type]
+
+    runtime._start_close_task = observed_start_close_task  # type: ignore[method-assign]
+
+    object_close = asyncio.create_task(runtime.close_session(reservation))
+    await asyncio.wait_for(coordinator.close_started.wait(), timeout=1)
+    value_close = asyncio.create_task(
+        runtime.close_session_if_current(reservation.identity)
+    )
+    await asyncio.wait_for(second_admission.wait(), timeout=1)
+
+    assert coordinator.close_calls == ["session-1"]
+    coordinator.close_release.set()
+    object_receipt, value_receipt = await asyncio.gather(object_close, value_close)
+
+    assert object_receipt == value_receipt
+    assert object_receipt.outcome is MemoryWorkerSessionCloseOutcomeV1.CLOSED
+    assert coordinator.close_calls == ["session-1"]
+    await runtime.aclose()
+
+
+@pytest.mark.parametrize(
+    "identity_mutation",
+    (
+        {"session_key": "another-session"},
+        {"incarnation_id": f"msinc_{'1' * 64}"},
+        {"audience_id": f"maud_{'2' * 64}"},
+    ),
+)
+@pytest.mark.asyncio
+async def test_conditional_close_mismatch_is_a_side_effect_free_receipt(
+    identity_mutation: dict[str, str],
+) -> None:
+    runtime, _, coordinator = _runtime()
+    principal = _principal("one")
+    current = await runtime.reserve_session(principal, "session-1")
+    requested = _identity(current, **identity_mutation)
+
+    receipt = await runtime.close_session_if_current(requested)
+
+    assert receipt == MemoryWorkerSessionCloseReceiptV1(
+        identity=requested,
+        outcome=MemoryWorkerSessionCloseOutcomeV1.NOT_CURRENT,
+    )
+    assert receipt.identity == requested
+    assert receipt.identity != current.identity
+    assert coordinator.close_calls == []
+    assert await runtime.reserve_session(principal, "session-1") is current
+    await runtime.aclose()
+
+
+@pytest.mark.asyncio
+async def test_retirement_cache_eviction_remains_safe_for_a_same_key_successor() -> (
+    None
+):
+    runtime, _, coordinator = _runtime_with_retirement_capacity(1)
+    principal = _principal("one")
+    original = await runtime.reserve_session(principal, "session-1")
+    await runtime.close_session(original)
+    evicting = await runtime.reserve_session(principal, "session-2")
+    await runtime.close_session(evicting)
+
+    replacement = await runtime.reserve_session(principal, "session-1")
+    evicted_retry = await runtime.close_session_if_current(original.identity)
+
+    assert evicted_retry == MemoryWorkerSessionCloseReceiptV1(
+        identity=original.identity,
+        outcome=MemoryWorkerSessionCloseOutcomeV1.NOT_CURRENT,
+    )
     with pytest.raises(MemoryAgentSessionConflictError, match="not current"):
         await runtime.close_session(original)
+    assert await runtime.reserve_session(principal, "session-1") is replacement
+    assert coordinator.close_calls == ["session-1", "session-2"]
+    retired_identities = getattr(
+        runtime,
+        "_AuthorizedMemoryWorkerRuntime__retired_by_identity",
+    )
+    retired_descriptors = getattr(
+        runtime,
+        "_AuthorizedMemoryWorkerRuntime__retired_by_descriptor",
+    )
+    assert len(retired_identities) == len(retired_descriptors) == 1
+    await runtime.aclose()
+    assert retired_identities == retired_descriptors == {}
+
+
+@pytest.mark.asyncio
+async def test_retained_incarnation_collision_fails_before_successor_publication(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime, broker, coordinator = _runtime_with_retirement_capacity(1)
+    principal = _principal("one")
+    original = await runtime.reserve_session(principal, "session-1")
+    await runtime.close_session(original)
+
+    def colliding_incarnation(
+        cls: type[MemorySessionIncarnationV1],
+        session_key: str,
+    ) -> MemorySessionIncarnationV1:
+        del cls
+        return MemorySessionIncarnationV1(
+            session_key=session_key,
+            incarnation_id=original.session.incarnation_id,
+        )
+
+    monkeypatch.setattr(
+        MemorySessionIncarnationV1,
+        "create",
+        classmethod(colliding_incarnation),
+    )
+    with pytest.raises(MemoryAgentSessionConflictError, match="reused"):
+        await runtime.reserve_session(principal, "session-1")
+
+    sessions = getattr(runtime, "_AuthorizedMemoryWorkerRuntime__sessions")
+    assert sessions == {}
+    assert coordinator.close_calls == ["session-1"]
+    retired = await runtime.close_session_if_current(original.identity)
+    assert retired.outcome is MemoryWorkerSessionCloseOutcomeV1.CLOSED
+
+    # Evict A's ordinary replay record.  Collision knowledge is a stronger
+    # invariant than receipt caching and must keep the key quarantined.
+    other = await runtime.reserve_session(principal, "session-2")
+    await runtime.close_session(other)
+    evicted = await runtime.close_session_if_current(original.identity)
+    assert evicted.outcome is MemoryWorkerSessionCloseOutcomeV1.NOT_CURRENT
+    with pytest.raises(MemoryAgentSessionConflictError, match="quarantined"):
+        await runtime.reserve_session(principal, "session-1")
+    assert coordinator.close_calls == ["session-1", "session-2"]
+
+    await runtime.aclose()
+    # The unpublishable private broker binding is cleaned only at shutdown; no
+    # Agent turn or runtime descriptor could observe it in between.
+    assert coordinator.close_calls == ["session-1", "session-2", "session-1"]
+    assert getattr(broker, "_AuthorizedMemoryAgentBroker__sessions") == {}
+    assert (
+        getattr(
+            runtime,
+            "_AuthorizedMemoryWorkerRuntime__quarantined_session_keys",
+        )
+        == set()
+    )
+
+
+@pytest.mark.asyncio
+async def test_conditional_close_fails_closed_on_corrupted_private_state() -> None:
+    runtime, _, coordinator = _runtime()
+    current = await runtime.reserve_session(_principal("one"), "session-1")
+    requested = current.identity
+    object.__setattr__(
+        current.session,
+        "incarnation_id",
+        f"msinc_{'3' * 64}",
+    )
+
+    with pytest.raises(MemoryAgentSessionConflictError, match="disagrees"):
+        await runtime.close_session_if_current(requested)
+
+    assert coordinator.close_calls == []
     await runtime.aclose()
 
 
@@ -511,6 +849,12 @@ async def test_new_runtime_rejects_an_old_runtime_audience_and_descriptor() -> N
     assert current.audience != old.audience
     with pytest.raises(MemoryAgentSessionConflictError, match="not current"):
         await second.close_session(old)
+    conditional = await second.close_session_if_current(old.identity)
+    assert conditional == MemoryWorkerSessionCloseReceiptV1(
+        identity=old.identity,
+        outcome=MemoryWorkerSessionCloseOutcomeV1.NOT_CURRENT,
+    )
+    assert await second.reserve_session(_principal("one"), "session-1") is current
     await second.aclose()
 
 
@@ -529,6 +873,15 @@ async def _wait_for_pending_reservation(
 ) -> None:
     pending = getattr(runtime, "_AuthorizedMemoryWorkerRuntime__pending")
     while session_key not in pending:
+        await asyncio.sleep(0)
+
+
+async def _wait_for_runtime_session_absent(
+    runtime: AuthorizedMemoryWorkerRuntime,
+    session_key: str,
+) -> None:
+    sessions = getattr(runtime, "_AuthorizedMemoryWorkerRuntime__sessions")
+    while session_key in sessions:
         await asyncio.sleep(0)
 
 
@@ -595,11 +948,80 @@ async def test_failed_or_cancelled_close_does_not_release_ownership_early() -> N
         await runtime.reserve_session(_principal("two"), "session-1")
 
     coordinator.close_release.set()
-    await runtime.close_session(original)
+    closed = await runtime.close_session(original)
+    assert closed.outcome is MemoryWorkerSessionCloseOutcomeV1.CLOSED
     replacement = await runtime.reserve_session(_principal("two"), "session-1")
     assert replacement.session.incarnation_id != original.session.incarnation_id
+    assert await runtime.close_session(original) == closed
+    assert await runtime.reserve_session(_principal("two"), "session-1") is replacement
     assert coordinator.close_calls == ["session-1", "session-1"]
     await runtime.aclose()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_rejoins_admitted_close_until_receipt_publication() -> None:
+    runtime, broker, coordinator = _runtime()
+    reservation = await runtime.reserve_session(_principal("one"), "session-1")
+    coordinator.close_release.clear()
+    broker_cleanup_returned = asyncio.Event()
+    allow_runtime_publication = asyncio.Event()
+    close_broker_session = broker.close_session
+
+    async def gated_broker_close(session: object) -> None:
+        await close_broker_session(session)  # type: ignore[arg-type]
+        broker_cleanup_returned.set()
+        await allow_runtime_publication.wait()
+
+    broker.close_session = gated_broker_close  # type: ignore[method-assign]
+    closing = asyncio.create_task(runtime.close_session(reservation))
+    await asyncio.wait_for(coordinator.close_started.wait(), timeout=1)
+    shutdown = asyncio.create_task(runtime.aclose())
+
+    async def wait_for_shutdown_admission() -> None:
+        while (
+            getattr(
+                runtime,
+                "_AuthorizedMemoryWorkerRuntime__shutdown_task",
+            )
+            is None
+        ):
+            await asyncio.sleep(0)
+
+    await asyncio.wait_for(wait_for_shutdown_admission(), timeout=1)
+    coordinator.close_release.set()
+    await asyncio.wait_for(broker_cleanup_returned.wait(), timeout=1)
+
+    async def wait_for_broker_shutdown() -> None:
+        while True:
+            task = getattr(broker, "_AuthorizedMemoryAgentBroker__shutdown_task")
+            if task is not None and task.done():
+                await task
+                return
+            await asyncio.sleep(0)
+
+    await asyncio.wait_for(wait_for_broker_shutdown(), timeout=1)
+
+    # Broker cleanup has succeeded, but runtime close is deliberately paused
+    # before publishing A's retirement.  Shutdown must not clear A underneath
+    # that already-admitted task.
+    assert not shutdown.done()
+    sessions = getattr(runtime, "_AuthorizedMemoryWorkerRuntime__sessions")
+    assert sessions["session-1"].closing
+
+    allow_runtime_publication.set()
+    receipt = await closing
+    await shutdown
+
+    assert receipt.outcome is MemoryWorkerSessionCloseOutcomeV1.CLOSED
+    assert coordinator.close_calls == ["session-1"]
+    assert sessions == {}
+    assert (
+        getattr(
+            runtime,
+            "_AuthorizedMemoryWorkerRuntime__retired_by_identity",
+        )
+        == {}
+    )
 
 
 @pytest.mark.asyncio

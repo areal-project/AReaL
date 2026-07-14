@@ -214,6 +214,33 @@ the capability-bound `session_key` and `run_id` and rejects mutation before or d
 the Agent call. Repeating a `run_id` reuses the broker trajectory but creates a fresh
 independent capability lifetime.
 
+Session retirement also has a process-local exact result. A reservation exposes a
+detached `MemoryWorkerSessionIdentityV1` containing the broker-minted session
+incarnation and Worker audience; this description is not a bearer capability and cannot
+pin, run, or expose Memory. Closing the exact runtime-issued reservation returns a
+`MemoryWorkerSessionCloseReceiptV1`. The runtime retains recent private retirement
+tombstones in a bounded LRU, so a lost-response retry of A returns the same `closed`
+result even after the text key has been reopened as B. It never resolves that retry
+through the reusable key or repeats A's destructive cleanup. After an old tombstone is
+evicted, a conditional identity retry safely degrades to `not_current`; it still cannot
+touch B. The evicted process-local object handle is no longer replayable and is rejected
+as stale. The capacity defaults to 4096 and is configurable at runtime construction. An
+authenticated future host adapter may use `close_session_if_current(identity)`: an
+unknown or mismatched identity returns `not_current` without revealing or modifying the
+current incarnation, while an exact current or known-retired identity returns `closed`.
+A damaged private state fails closed rather than being reported as absent. If a broker
+ever repeats a still-retained incarnation identity, the runtime quarantines that text
+key until shutdown instead of publishing an ambiguous successor.
+
+A `closed` receipt currently means only that the Worker-owned **Memory runtime**
+completed its broker cleanup; `not_current` makes no cleanup claim. Neither result
+proves that an Agent plugin's key-indexed state was cleaned, and no HTTP route consumes
+or produces these receipts. A full Worker receipt must be published only after a
+long-lived host adapter has drained the response body, closed Memory, and completed the
+Agent lifecycle hook under one exact-incarnation state machine. Retirements are
+process-local and non-durable: LRU eviction discards only old replay detail, while
+runtime shutdown discards the cache together with its fresh Worker audience.
+
 This remains a **default-off host adapter**, not Worker HTTP activation. No Worker route
 constructs the runtime, no DataProxy envelope carries its descriptor, and no HTTP field
 is accepted as a principal. Trusted host code should pass a bound lease to
