@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime, timedelta
+from hashlib import sha256
 
 import pytest
 
@@ -12,10 +14,17 @@ from areal.v2.agent_service.memory import (
     AsyncMemoryAgentCoordinator,
     MemoryAgentCoordinatorClosedError,
     MemoryAgentSessionConflictError,
+    MemoryAgentSessionPinV1,
+    MemoryAgentTurnConflictError,
+    MemoryAgentTurnV1,
 )
 from areal.v2.agent_service.memory_authorization import (
     MemoryPrincipalV1,
+    MemoryScopeActionV1,
+    MemoryScopeAuthorizationDeniedError,
     MemoryScopeGrantAuthorizer,
+    MemoryScopeGrantRequestV1,
+    MemoryScopeGrantV1,
     MemorySessionIncarnationV1,
     MemoryWorkerAudienceV1,
 )
@@ -23,10 +32,22 @@ from areal.v2.agent_service.memory_broker import (
     AuthorizedMemoryAgentBroker,
     AuthorizedMemorySessionV1,
 )
+from areal.v2.agent_service.types import AgentRequest, MemoryTurnResultV1
 from areal.v2.agent_service.worker.memory_runtime import (
     AuthorizedMemoryWorkerRuntime,
     MemoryWorkerSessionReservationV1,
+    MemoryWorkerTurnLease,
 )
+from areal.v2.memory_service import runtime_types
+from areal.v2.memory_service.runtime_types import (
+    MemoryExposureStatus,
+    MemoryExposureV1,
+)
+from areal.v2.memory_service.types import MemoryScope
+
+_NOW = datetime(2026, 7, 14, 10, 0, tzinfo=UTC)
+_RESOLVER_VERSION = sha256(b"worker-runtime-resolver-v1").hexdigest()
+_RESOLVER_CONFIG = sha256(b"worker-runtime-resolver-config-v1").hexdigest()
 
 
 class _UnusedReleaseStore:
@@ -92,6 +113,197 @@ def _runtime() -> tuple[
 ]:
     broker, coordinator = _broker()
     return AuthorizedMemoryWorkerRuntime(broker), broker, coordinator
+
+
+def _hash(label: str) -> str:
+    return sha256(label.encode()).hexdigest()
+
+
+def _pin(suffix: str = "1") -> MemoryAgentSessionPinV1:
+    assignment_hash = _hash(f"assignment-{suffix}")
+    return MemoryAgentSessionPinV1(
+        scope=MemoryScope(
+            tenant_id=f"tenant-{suffix}",
+            namespace="agent-long-term-memory",
+            subject_id=f"subject-{suffix}",
+        ),
+        rollout_group_id=f"rollout-group-{suffix}",
+        rollout_group_incarnation_sha256=_hash(f"incarnation-{suffix}"),
+        assignment_id=f"masn_{assignment_hash[:24]}",
+        assignment_content_sha256=assignment_hash,
+    )
+
+
+def _exposure(
+    turn: MemoryAgentTurnV1,
+    pin: MemoryAgentSessionPinV1,
+) -> MemoryExposureV1:
+    values = {
+        "scope": pin.scope,
+        "assignment_id": pin.assignment_id,
+        "assignment_content_sha256": pin.assignment_content_sha256,
+        "release_id": f"rel_{_hash('release')[:24]}",
+        "release_content_sha256": _hash("release"),
+        "trajectory_id": turn.memory_trajectory_id,
+        "rollout_group_id": pin.rollout_group_id,
+        "rollout_group_incarnation_sha256": (pin.rollout_group_incarnation_sha256),
+        "attempt_id": "attempt-1",
+        "attempt_content_sha256": _hash("attempt"),
+        "query_result_id": "result-1",
+        "query_result_content_sha256": _hash("result"),
+        "delivery_id": "delivery-1",
+        "delivery_content_sha256": _hash("delivery"),
+        "consumer_ack_id": "ack-1",
+        "consumer_ack_content_sha256": _hash("ack"),
+        "eligible_revisions": (),
+        "retrieved_revisions": (),
+        "returned_revisions": (),
+        "injected_revisions": (),
+        "status": MemoryExposureStatus.MEMORY_OFF,
+    }
+    canonical = runtime_types._exposure_canonical_bytes(**values)
+    content_hash = sha256(canonical).hexdigest()
+    return MemoryExposureV1(
+        **values,
+        exposure_id=f"mexp_{content_hash[:24]}",
+        content_hash=content_hash,
+        created_at=_NOW,
+    )
+
+
+class _BindingResolver:
+    resolver_id = "test-worker-runtime-grant-policy"
+    resolver_version_sha256 = _RESOLVER_VERSION
+    resolver_config_sha256 = _RESOLVER_CONFIG
+
+    def __init__(self) -> None:
+        self.active_actions = {
+            MemoryScopeActionV1.PIN_ASSIGNMENT,
+            MemoryScopeActionV1.EXPOSE_MEMORY,
+        }
+        self.calls: list[MemoryScopeGrantRequestV1] = []
+        self.block_action: MemoryScopeActionV1 | None = None
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.release.set()
+
+    def resolve_active_grant(
+        self,
+        request: MemoryScopeGrantRequestV1,
+    ) -> MemoryScopeGrantV1:
+        self.calls.append(request)
+        if request.action is self.block_action:
+            self.started.set()
+            self.release.wait(timeout=5)
+        if request.action not in self.active_actions:
+            raise MemoryScopeAuthorizationDeniedError(
+                "active Memory scope grant is unavailable"
+            )
+        return MemoryScopeGrantV1.create(
+            request=request,
+            resolver_id=self.resolver_id,
+            resolver_version_sha256=self.resolver_version_sha256,
+            resolver_config_sha256=self.resolver_config_sha256,
+            valid_from=_NOW - timedelta(minutes=1),
+            valid_until=_NOW + timedelta(minutes=1),
+            evaluated_at=_NOW - timedelta(minutes=2),
+            granted_at=_NOW - timedelta(minutes=2),
+            idempotency_key=f"grant-{len(self.calls)}",
+        )
+
+
+class _BindingCoordinator(AsyncMemoryAgentCoordinator):
+    def __init__(self, pin: MemoryAgentSessionPinV1 | None = None) -> None:
+        super().__init__(
+            _UnusedReleaseStore(),  # type: ignore[arg-type]
+            _UnusedRuntimeStore(),  # type: ignore[arg-type]
+            max_workers=1,
+            max_pending_calls=1,
+        )
+        self.pin = pin or _pin()
+        self.pin_calls: list[tuple[str, MemoryAgentSessionPinV1]] = []
+        self.start_calls: list[tuple[str, str]] = []
+        self.expose_calls: list[tuple[object, ...]] = []
+        self.close_calls: list[str] = []
+        self.pin_started = asyncio.Event()
+        self.pin_release = asyncio.Event()
+        self.pin_release.set()
+        self.start_started = asyncio.Event()
+        self.start_release = asyncio.Event()
+        self.start_release.set()
+        self.expose_started = asyncio.Event()
+        self.expose_release = asyncio.Event()
+        self.expose_release.set()
+        self.close_started = asyncio.Event()
+        self.close_release = asyncio.Event()
+        self.close_release.set()
+        self.pin_failures = 0
+        self.start_failures = 0
+
+    async def pin_session(  # type: ignore[override]
+        self,
+        session_key: str,
+        pin: MemoryAgentSessionPinV1,
+    ) -> object:
+        self.pin_calls.append((session_key, pin))
+        self.pin_started.set()
+        await self.pin_release.wait()
+        if self.pin_failures:
+            self.pin_failures -= 1
+            raise RuntimeError("injected pin failure")
+        self.pin = pin
+        return {"assignment": pin.assignment_id}
+
+    async def start_turn(
+        self,
+        session_key: str,
+        turn_idempotency_key: str,
+    ) -> MemoryAgentTurnV1:
+        self.start_calls.append((session_key, turn_idempotency_key))
+        self.start_started.set()
+        await self.start_release.wait()
+        if self.start_failures:
+            self.start_failures -= 1
+            raise RuntimeError("injected start failure")
+        trajectory_hash = _hash(f"{session_key}:{turn_idempotency_key}")
+        return MemoryAgentTurnV1(
+            session_key=session_key,
+            turn_idempotency_key=turn_idempotency_key,
+            memory_trajectory_id=f"mtraj_{trajectory_hash}",
+        )
+
+    async def expose_memory(
+        self,
+        turn: MemoryAgentTurnV1,
+        operation_key: str,
+        *,
+        query: bytes,
+        history: tuple[bytes, ...] = (),
+    ) -> tuple[MemoryExposureV1, object]:
+        self.expose_calls.append((turn, operation_key, query, history))
+        self.expose_started.set()
+        await self.expose_release.wait()
+        return _exposure(turn, self.pin), {"answer": "from-memory"}
+
+    async def close_session(self, session_key: str) -> None:
+        self.close_calls.append(session_key)
+        self.close_started.set()
+        await self.close_release.wait()
+
+
+def _binding_runtime() -> tuple[
+    AuthorizedMemoryWorkerRuntime,
+    AuthorizedMemoryAgentBroker,
+    _BindingCoordinator,
+    _BindingResolver,
+]:
+    coordinator = _BindingCoordinator()
+    resolver = _BindingResolver()
+    broker = AuthorizedMemoryAgentBroker(
+        coordinator,
+        MemoryScopeGrantAuthorizer(resolver, clock=lambda: _NOW),
+    )
+    return AuthorizedMemoryWorkerRuntime(broker), broker, coordinator, resolver
 
 
 @pytest.mark.asyncio
@@ -434,3 +646,595 @@ async def test_shutdown_drains_pending_reservation_without_late_publication() ->
     assert owned_task.done()
     assert sessions == {}
     assert pending_states == {}
+
+
+@pytest.mark.asyncio
+async def test_bind_turn_uses_only_explicit_pin_and_broker_owned_identity() -> None:
+    runtime, _, coordinator, resolver = _binding_runtime()
+    principal = _principal("one")
+    reservation = await runtime.reserve_session(principal, "session-1")
+    pin = _pin()
+    request = AgentRequest(
+        message="hello",
+        session_key="session-1",
+        run_id="run-1",
+        metadata={"areal_memory": _pin("forged-metadata")},
+    )
+
+    lease = await runtime.bind_turn(
+        reservation,
+        request,
+        assignment_pin=pin,
+    )
+    assert type(lease) is MemoryWorkerTurnLease
+    assert not hasattr(lease, "broker_session")
+    assert not hasattr(lease, "authorized_turn")
+    assert not hasattr(lease, "__dict__")
+    assert request.memory is not None
+    result = await request.memory.expose_memory(
+        "lookup",
+        query=b"future question",
+        history=(b"prior turn",),
+    )
+
+    assert type(result) is MemoryTurnResultV1
+    assert result.output == {"answer": "from-memory"}
+    assert [call.action for call in resolver.calls] == [
+        MemoryScopeActionV1.PIN_ASSIGNMENT,
+        MemoryScopeActionV1.EXPOSE_MEMORY,
+    ]
+    for grant_request in resolver.calls:
+        assert grant_request.principal == principal
+        assert grant_request.session == reservation.session
+        assert grant_request.audience == reservation.audience == runtime.audience
+        assert grant_request.target.scope == pin.scope
+        assert grant_request.target.rollout_group_id == pin.rollout_group_id
+        assert (
+            grant_request.target.rollout_group_incarnation_sha256
+            == pin.rollout_group_incarnation_sha256
+        )
+        assert grant_request.target.assignment_id == pin.assignment_id
+        assert (
+            grant_request.target.assignment_content_sha256
+            == pin.assignment_content_sha256
+        )
+    assert coordinator.pin_calls == [("session-1", pin)]
+    assert coordinator.start_calls == [("session-1", "run-1")]
+    assert coordinator.expose_calls[0][1:] == (
+        "lookup",
+        b"future question",
+        (b"prior turn",),
+    )
+    await lease.aclose()
+    await runtime.aclose()
+
+
+def _pin_with_one_changed_field(field_name: str) -> MemoryAgentSessionPinV1:
+    candidate = _pin()
+    if field_name in {"tenant_id", "namespace", "subject_id"}:
+        object.__setattr__(candidate.scope, field_name, f"changed-{field_name}")
+    elif field_name == "rollout_group_id":
+        object.__setattr__(candidate, field_name, "changed-rollout-group")
+    elif field_name == "rollout_group_incarnation_sha256":
+        object.__setattr__(candidate, field_name, _hash("changed-incarnation"))
+    elif field_name == "assignment_id":
+        object.__setattr__(
+            candidate,
+            field_name,
+            f"masn_{_hash('changed-assignment')[:24]}",
+        )
+    elif field_name == "assignment_content_sha256":
+        object.__setattr__(candidate, field_name, _hash("changed-assignment"))
+    else:  # pragma: no cover - test helper invariant
+        raise AssertionError(field_name)
+    return candidate
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    [
+        "tenant_id",
+        "namespace",
+        "subject_id",
+        "rollout_group_id",
+        "rollout_group_incarnation_sha256",
+        "assignment_id",
+        "assignment_content_sha256",
+    ],
+)
+@pytest.mark.asyncio
+async def test_bound_assignment_rejects_every_changed_pin_field_before_resolution(
+    field_name: str,
+) -> None:
+    runtime, _, coordinator, resolver = _binding_runtime()
+    reservation = await runtime.reserve_session(_principal("one"), "session-1")
+    original_request = AgentRequest("hello", "session-1", "run-original")
+    original_lease = await runtime.bind_turn(
+        reservation,
+        original_request,
+        assignment_pin=_pin(),
+    )
+    await original_lease.aclose()
+    resolver_calls = len(resolver.calls)
+    pin_calls = len(coordinator.pin_calls)
+    start_calls = len(coordinator.start_calls)
+
+    with pytest.raises((MemoryAgentSessionConflictError, ValueError)):
+        await runtime.bind_turn(
+            reservation,
+            AgentRequest("retry", "session-1", f"run-{field_name}"),
+            assignment_pin=_pin_with_one_changed_field(field_name),
+        )
+
+    assert len(resolver.calls) == resolver_calls
+    assert len(coordinator.pin_calls) == pin_calls
+    assert len(coordinator.start_calls) == start_calls
+    await runtime.aclose()
+
+
+@pytest.mark.asyncio
+async def test_bound_assignment_rejects_complete_alternative_before_resolution() -> (
+    None
+):
+    runtime, _, coordinator, resolver = _binding_runtime()
+    reservation = await runtime.reserve_session(_principal("one"), "session-1")
+    original_pin = _pin()
+    original_lease = await runtime.bind_turn(
+        reservation,
+        AgentRequest("original", "session-1", "run-original"),
+        assignment_pin=original_pin,
+    )
+    await original_lease.aclose()
+    resolver_calls = len(resolver.calls)
+    pin_calls = len(coordinator.pin_calls)
+    alternative_assignment = _pin("alternative")
+    alternative_pin = MemoryAgentSessionPinV1(
+        scope=original_pin.scope,
+        rollout_group_id=original_pin.rollout_group_id,
+        rollout_group_incarnation_sha256=(
+            original_pin.rollout_group_incarnation_sha256
+        ),
+        assignment_id=alternative_assignment.assignment_id,
+        assignment_content_sha256=(alternative_assignment.assignment_content_sha256),
+    )
+
+    with pytest.raises(
+        MemoryAgentSessionConflictError,
+        match="another Memory assignment",
+    ):
+        await runtime.bind_turn(
+            reservation,
+            AgentRequest("alternative", "session-1", "run-alternative"),
+            assignment_pin=alternative_pin,
+        )
+
+    assert len(resolver.calls) == resolver_calls
+    assert len(coordinator.pin_calls) == pin_calls
+    assert coordinator.start_calls == [("session-1", "run-original")]
+    await runtime.aclose()
+
+
+@pytest.mark.asyncio
+async def test_bind_rejects_equal_stale_and_cross_runtime_reservations_first() -> None:
+    runtime, _, coordinator, resolver = _binding_runtime()
+    other_runtime, _, other_coordinator, other_resolver = _binding_runtime()
+    principal = _principal("one")
+    reservation = await runtime.reserve_session(principal, "session-1")
+    forged = MemoryWorkerSessionReservationV1(
+        session_key=reservation.session_key,
+        session=reservation.session,
+        audience=reservation.audience,
+    )
+    assert forged == reservation and forged is not reservation
+
+    with pytest.raises(MemoryAgentSessionConflictError, match="not current"):
+        await runtime.bind_turn(
+            forged,
+            object(),  # type: ignore[arg-type]
+            assignment_pin=object(),  # type: ignore[arg-type]
+        )
+
+    await runtime.close_session(reservation)
+    replacement = await runtime.reserve_session(principal, "session-1")
+    assert replacement.session != reservation.session
+    with pytest.raises(MemoryAgentSessionConflictError, match="not current"):
+        await runtime.bind_turn(
+            reservation,
+            AgentRequest("hello", "session-1", "stale-run"),
+            assignment_pin=_pin(),
+        )
+
+    cross_runtime = await other_runtime.reserve_session(principal, "session-1")
+    with pytest.raises(MemoryAgentSessionConflictError, match="not current"):
+        await runtime.bind_turn(
+            cross_runtime,
+            AgentRequest("hello", "session-1", "cross-run"),
+            assignment_pin=_pin(),
+        )
+
+    assert resolver.calls == []
+    assert coordinator.pin_calls == []
+    assert coordinator.start_calls == []
+    assert other_resolver.calls == []
+    assert other_coordinator.pin_calls == []
+    assert other_coordinator.start_calls == []
+    await runtime.aclose()
+    await other_runtime.aclose()
+
+
+@pytest.mark.asyncio
+async def test_request_and_pin_validation_precede_resolver_and_coordinator() -> None:
+    runtime, _, coordinator, resolver = _binding_runtime()
+    reservation = await runtime.reserve_session(_principal("one"), "session-1")
+    invalid_requests: list[object] = [
+        object(),
+        AgentRequest("hello", "another-session", "run-session"),
+        AgentRequest("hello", "session-1", ""),
+        AgentRequest("hello", "session-1", "   "),
+        AgentRequest("hello", "session-1", "invalid-\ud800"),
+        AgentRequest("hello", "session-1", 7),  # type: ignore[arg-type]
+    ]
+    already_bound = AgentRequest("hello", "session-1", "run-bound")
+    already_bound._areal_memory_turn_capability = object()  # type: ignore[attr-defined]
+    invalid_requests.append(already_bound)
+
+    for invalid in invalid_requests:
+        with pytest.raises(
+            (TypeError, ValueError, MemoryAgentTurnConflictError),
+        ):
+            await runtime.bind_turn(
+                reservation,
+                invalid,  # type: ignore[arg-type]
+                assignment_pin=_pin(),
+            )
+
+    with pytest.raises(TypeError, match="assignment_pin"):
+        await runtime.bind_turn(
+            reservation,
+            AgentRequest("hello", "session-1", "run-bad-pin-type"),
+            assignment_pin=object(),  # type: ignore[arg-type]
+        )
+    malformed_pin = _pin()
+    object.__setattr__(malformed_pin, "assignment_content_sha256", "not-a-hash")
+    with pytest.raises(ValueError):
+        await runtime.bind_turn(
+            reservation,
+            AgentRequest("hello", "session-1", "run-bad-pin"),
+            assignment_pin=malformed_pin,
+        )
+
+    assert resolver.calls == []
+    assert coordinator.pin_calls == []
+    assert coordinator.start_calls == []
+    await runtime.aclose()
+
+
+@pytest.mark.asyncio
+async def test_duplicate_run_reuses_trajectory_with_independent_capabilities() -> None:
+    runtime, broker, coordinator, _ = _binding_runtime()
+    reservation = await runtime.reserve_session(_principal("one"), "session-1")
+    first_request = AgentRequest("first", "session-1", "same-run")
+    second_request = AgentRequest("second", "session-1", "same-run")
+    first_lease = await runtime.bind_turn(
+        reservation,
+        first_request,
+        assignment_pin=_pin(),
+    )
+    second_lease = await runtime.bind_turn(
+        reservation,
+        second_request,
+        assignment_pin=_pin(),
+    )
+    assert first_request.memory is not None
+    assert second_request.memory is not None
+    assert first_request.memory is not second_request.memory
+
+    await first_request.memory.expose_memory("first-read", query=b"one")
+    await first_lease.aclose()
+    with pytest.raises(MemoryAgentTurnConflictError, match="closed"):
+        await first_request.memory.expose_memory("closed-read", query=b"closed")
+    await second_request.memory.expose_memory("second-read", query=b"two")
+
+    first_turn = coordinator.expose_calls[0][0]
+    second_turn = coordinator.expose_calls[1][0]
+    assert type(first_turn) is MemoryAgentTurnV1
+    assert type(second_turn) is MemoryAgentTurnV1
+    assert first_turn.memory_trajectory_id == second_turn.memory_trajectory_id
+    assert coordinator.start_calls == [("session-1", "same-run")]
+    states = getattr(broker, "_AuthorizedMemoryAgentBroker__sessions")
+    assert second_request.memory in states["session-1"].capabilities
+    await second_lease.aclose()
+    await runtime.aclose()
+
+
+@pytest.mark.asyncio
+async def test_turn_lease_close_is_idempotent_and_cancellation_safe() -> None:
+    runtime, _, coordinator, _ = _binding_runtime()
+    reservation = await runtime.reserve_session(_principal("one"), "session-1")
+    request = AgentRequest("hello", "session-1", "run-1")
+    lease = await runtime.bind_turn(reservation, request, assignment_pin=_pin())
+    assert request.memory is not None
+    capability = request.memory
+    coordinator.expose_release.clear()
+    exposing = asyncio.create_task(capability.expose_memory("read", query=b"question"))
+    await asyncio.wait_for(coordinator.expose_started.wait(), timeout=1)
+
+    capability_close = capability.aclose
+    close_started = asyncio.Event()
+
+    async def observed_capability_close() -> None:
+        close_started.set()
+        await capability_close()
+
+    capability.aclose = observed_capability_close  # type: ignore[method-assign]
+    close_waiter = asyncio.create_task(lease.aclose())
+    await asyncio.wait_for(close_started.wait(), timeout=1)
+    close_waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await close_waiter
+
+    coordinator.expose_release.set()
+    result = await exposing
+    assert result.output == {"answer": "from-memory"}
+    await lease.aclose()
+    await lease.aclose()
+    with pytest.raises(MemoryAgentTurnConflictError, match="closed"):
+        await capability.expose_memory("after-close", query=b"question")
+    await runtime.aclose()
+
+
+@pytest.mark.asyncio
+async def test_denied_pin_never_binds_and_valid_retry_recovers() -> None:
+    runtime, _, coordinator, resolver = _binding_runtime()
+    reservation = await runtime.reserve_session(_principal("one"), "session-1")
+    request = AgentRequest("hello", "session-1", "run-1")
+    resolver.active_actions.remove(MemoryScopeActionV1.PIN_ASSIGNMENT)
+
+    with pytest.raises(MemoryScopeAuthorizationDeniedError):
+        await runtime.bind_turn(reservation, request, assignment_pin=_pin())
+    assert request.memory is None
+    assert coordinator.pin_calls == []
+    assert coordinator.start_calls == []
+
+    resolver.active_actions.add(MemoryScopeActionV1.PIN_ASSIGNMENT)
+    lease = await runtime.bind_turn(reservation, request, assignment_pin=_pin())
+    assert request.memory is not None
+    await lease.aclose()
+    await runtime.aclose()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_pin_leaves_no_capability_and_retry_recovers() -> None:
+    runtime, broker, coordinator, _ = _binding_runtime()
+    reservation = await runtime.reserve_session(_principal("one"), "session-1")
+    request = AgentRequest("hello", "session-1", "run-1")
+    coordinator.pin_release.clear()
+    binding = asyncio.create_task(
+        runtime.bind_turn(reservation, request, assignment_pin=_pin())
+    )
+    try:
+        await asyncio.wait_for(coordinator.pin_started.wait(), timeout=1)
+        binding.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await binding
+        assert request.memory is None
+    finally:
+        coordinator.pin_release.set()
+
+    lease = await runtime.bind_turn(reservation, request, assignment_pin=_pin())
+    states = getattr(broker, "_AuthorizedMemoryAgentBroker__sessions")
+    assert states["session-1"].admitted == 0
+    assert request.memory in states["session-1"].capabilities
+    await lease.aclose()
+    await runtime.aclose()
+
+
+@pytest.mark.parametrize("failure_mode", ["cancel", "failure"])
+@pytest.mark.asyncio
+async def test_cancelled_or_failed_start_leaves_no_capability_and_retry_recovers(
+    failure_mode: str,
+) -> None:
+    runtime, broker, coordinator, _ = _binding_runtime()
+    reservation = await runtime.reserve_session(_principal("one"), "session-1")
+    failed_request = AgentRequest("hello", "session-1", "same-run")
+    if failure_mode == "cancel":
+        coordinator.start_release.clear()
+    else:
+        coordinator.start_failures = 1
+
+    binding = asyncio.create_task(
+        runtime.bind_turn(reservation, failed_request, assignment_pin=_pin())
+    )
+    if failure_mode == "cancel":
+        try:
+            await asyncio.wait_for(coordinator.start_started.wait(), timeout=1)
+            binding.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await binding
+        finally:
+            coordinator.start_release.set()
+    else:
+        with pytest.raises(RuntimeError, match="injected start failure"):
+            await binding
+    assert failed_request.memory is None
+
+    retry = AgentRequest("retry", "session-1", "same-run")
+    lease = await runtime.bind_turn(reservation, retry, assignment_pin=_pin())
+    states = getattr(broker, "_AuthorizedMemoryAgentBroker__sessions")
+    assert states["session-1"].admitted == 0
+    assert retry.memory in states["session-1"].capabilities
+    await lease.aclose()
+    await runtime.aclose()
+
+
+@pytest.mark.parametrize("blocked_phase", ["pin", "start"])
+@pytest.mark.asyncio
+async def test_close_race_cannot_publish_a_capability_and_reopen_recovers(
+    blocked_phase: str,
+) -> None:
+    runtime, broker, coordinator, _ = _binding_runtime()
+    principal = _principal("one")
+    reservation = await runtime.reserve_session(principal, "session-1")
+    request = AgentRequest("hello", "session-1", "run-before-close")
+    if blocked_phase == "pin":
+        coordinator.pin_release.clear()
+        phase_started = coordinator.pin_started
+        phase_release = coordinator.pin_release
+    else:
+        coordinator.start_release.clear()
+        phase_started = coordinator.start_started
+        phase_release = coordinator.start_release
+
+    binding = asyncio.create_task(
+        runtime.bind_turn(reservation, request, assignment_pin=_pin())
+    )
+    await asyncio.wait_for(phase_started.wait(), timeout=1)
+
+    close_admitted = asyncio.Event()
+    broker_close_state = broker._close_state
+
+    async def observed_close_state(state: object) -> None:
+        close_admitted.set()
+        await broker_close_state(state)  # type: ignore[arg-type]
+
+    broker._close_state = observed_close_state  # type: ignore[method-assign]
+    closing = asyncio.create_task(runtime.close_session(reservation))
+    await asyncio.wait_for(close_admitted.wait(), timeout=1)
+    broker_states = getattr(broker, "_AuthorizedMemoryAgentBroker__sessions")
+    assert broker_states["session-1"].closing
+
+    phase_release.set()
+    with pytest.raises(MemoryAgentSessionConflictError):
+        await binding
+    await closing
+    assert request.memory is None
+    assert "session-1" not in broker_states
+
+    replacement = await runtime.reserve_session(principal, "session-1")
+    retry = AgentRequest("retry", "session-1", "run-after-close")
+    lease = await runtime.bind_turn(replacement, retry, assignment_pin=_pin())
+    assert retry.memory is not None
+    await lease.aclose()
+    await runtime.aclose()
+
+
+@pytest.mark.asyncio
+async def test_runtime_close_handoff_cannot_publish_an_existing_turn() -> None:
+    runtime, broker, _, _ = _binding_runtime()
+    reservation = await runtime.reserve_session(_principal("one"), "session-1")
+    first_request = AgentRequest("first", "session-1", "same-run")
+    first_lease = await runtime.bind_turn(
+        reservation,
+        first_request,
+        assignment_pin=_pin(),
+    )
+    await first_lease.aclose()
+
+    pin_entered = asyncio.Event()
+    pin_release = asyncio.Event()
+
+    async def delayed_existing_pin(session: object, pin: object) -> object:
+        pin_entered.set()
+        await pin_release.wait()
+        return object()
+
+    broker.pin_session = delayed_existing_pin  # type: ignore[method-assign]
+    second_request = AgentRequest("second", "session-1", "same-run")
+    binding = asyncio.create_task(
+        runtime.bind_turn(reservation, second_request, assignment_pin=_pin())
+    )
+    await asyncio.wait_for(pin_entered.wait(), timeout=1)
+
+    async def release_then_close() -> None:
+        # Queue the binding first, then synchronously mark the runtime state as
+        # closing before its broker close task gets an event-loop turn.
+        pin_release.set()
+        await runtime.close_session(reservation)
+
+    closing = asyncio.create_task(release_then_close())
+    with pytest.raises(MemoryAgentSessionConflictError, match="closing"):
+        await binding
+    await closing
+
+    assert second_request.memory is None
+    runtime_states = getattr(runtime, "_AuthorizedMemoryWorkerRuntime__sessions")
+    assert "session-1" not in runtime_states
+    await runtime.aclose()
+
+
+@pytest.mark.asyncio
+async def test_lease_construction_failure_closes_registered_capability(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from areal.v2.agent_service.worker import memory_runtime as runtime_module
+
+    runtime, broker, _, _ = _binding_runtime()
+    reservation = await runtime.reserve_session(_principal("one"), "session-1")
+    request = AgentRequest("hello", "session-1", "run-1")
+    unregistered = asyncio.Event()
+    unregister = broker._unregister_capability
+
+    def observed_unregister(capability: object) -> None:
+        unregister(capability)  # type: ignore[arg-type]
+        unregistered.set()
+
+    broker._unregister_capability = observed_unregister  # type: ignore[method-assign]
+
+    def fail_lease_construction(capability: object) -> None:
+        raise RuntimeError("injected lease construction failure")
+
+    monkeypatch.setattr(
+        runtime_module,
+        "MemoryWorkerTurnLease",
+        fail_lease_construction,
+    )
+    with pytest.raises(RuntimeError, match="injected lease construction failure"):
+        await runtime.bind_turn(reservation, request, assignment_pin=_pin())
+    await asyncio.wait_for(unregistered.wait(), timeout=1)
+
+    assert request.memory is None
+    states = getattr(broker, "_AuthorizedMemoryAgentBroker__sessions")
+    assert states["session-1"].capabilities == set()
+    await runtime.aclose()
+
+
+@pytest.mark.asyncio
+async def test_lease_construction_error_survives_cleanup_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from areal.v2.agent_service.worker import memory_runtime as runtime_module
+
+    runtime, broker, _, _ = _binding_runtime()
+    reservation = await runtime.reserve_session(_principal("one"), "session-1")
+    request = AgentRequest("hello", "session-1", "run-1")
+    captured: dict[str, object] = {}
+
+    def fail_lease_construction(capability: object) -> None:
+        captured["capability"] = capability
+        captured["aclose"] = capability.aclose  # type: ignore[attr-defined]
+
+        async def fail_cleanup() -> None:
+            raise RuntimeError("injected cleanup failure")
+
+        capability.aclose = fail_cleanup  # type: ignore[attr-defined]
+        raise ValueError("injected construction failure")
+
+    monkeypatch.setattr(
+        runtime_module,
+        "MemoryWorkerTurnLease",
+        fail_lease_construction,
+    )
+    with pytest.raises(ValueError, match="injected construction failure") as raised:
+        await runtime.bind_turn(reservation, request, assignment_pin=_pin())
+
+    assert any(
+        "injected cleanup failure" in note
+        for note in getattr(raised.value, "__notes__", ())
+    )
+    assert request.memory is None
+    capability = captured["capability"]
+    capability.aclose = captured["aclose"]  # type: ignore[attr-defined]
+    await capability.aclose()  # type: ignore[attr-defined]
+    states = getattr(broker, "_AuthorizedMemoryAgentBroker__sessions")
+    assert states["session-1"].capabilities == set()
+    await runtime.aclose()

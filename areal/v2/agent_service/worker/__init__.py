@@ -9,11 +9,13 @@ from .memory import (
 from .memory_runtime import (
     AuthorizedMemoryWorkerRuntime,
     MemoryWorkerSessionReservationV1,
+    MemoryWorkerTurnLease,
 )
 
 __all__ = [
     "AuthorizedMemoryWorkerRuntime",
     "MemoryWorkerSessionReservationV1",
+    "MemoryWorkerTurnLease",
     "WorkerMemoryTurnCapability",
     "bind_authorized_memory_turn_capability",
     "bind_memory_turn_capability",

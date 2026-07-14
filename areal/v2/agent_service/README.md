@@ -201,11 +201,21 @@ broker-minted Worker audience and session incarnation; it contains neither the p
 nor the private broker handle, and an equal reconstructed descriptor has no local
 authority. A cancelled reservation cannot release the broker's principal binding, while
 close must finish before the same key can receive a fresh incarnation. This is only
-process-local Worker state: no Worker route constructs the runtime, no DataProxy
-envelope carries its descriptor, and no HTTP field is accepted as a principal. Those
-integrations require a separate versioned identity protocol and trusted principal
-resolver. Passing a broker to the runtime is an ownership transfer: trusted host code
-must neither wrap it again nor call or close it directly afterwards.
+process-local Worker state. A trusted host may explicitly bind a complete
+`MemoryAgentSessionPinV1` and an exact runtime-issued reservation to an `AgentRequest`;
+request metadata is ignored as authority. The returned `MemoryWorkerTurnLease` owns only
+capability cleanup and exposes neither the private broker session nor its authorized
+turn. Repeating a `run_id` reuses the broker trajectory but creates a fresh independent
+capability lifetime.
+
+This binding still is **not** an Agent runner or streaming adapter. No Worker route
+constructs the runtime, no DataProxy envelope carries its descriptor, and no HTTP field
+is accepted as a principal. Trusted host code must keep each turn lease alive through
+the complete structured or streaming response body and call `aclose`; wrapping only
+`agent.run` would release Memory too early for a lazy `StreamResponse.body`. HTTP
+integration requires a separate versioned identity protocol, trusted principal resolver,
+and response-lifetime adapter. Passing a broker to the runtime is an ownership transfer:
+trusted host code must neither wrap it again nor call or close it directly afterwards.
 
 ## Agent Protocol
 

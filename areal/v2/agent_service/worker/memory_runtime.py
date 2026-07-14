@@ -5,9 +5,10 @@
 This default-off runtime is deliberately smaller than a Worker integration.  A
 trusted host passes an already authenticated :class:`MemoryPrincipalV1`; HTTP
 metadata, session keys, assignment scopes, and hop credentials are not identity
-inputs here.  The runtime owns one :class:`AuthorizedMemoryAgentBroker` and
-publishes only a descriptive reservation.  It does not expose the broker's
-private session handle or enable any Worker route.
+inputs here.  The runtime owns one :class:`AuthorizedMemoryAgentBroker`,
+publishes only a descriptive reservation, and can bind one explicitly supplied
+assignment pin to a turn-scoped capability.  It does not expose the broker's
+private handles or enable any Worker route.
 
 The reservation's audience and incarnation are non-secret replay domains, not
 bearer credentials.  Runtime operations accept only the exact object they
@@ -23,6 +24,8 @@ from dataclasses import dataclass
 from areal.v2.agent_service.memory import (
     MemoryAgentCoordinatorClosedError,
     MemoryAgentSessionConflictError,
+    MemoryAgentSessionPinV1,
+    MemoryAgentTurnConflictError,
 )
 from areal.v2.agent_service.memory_authorization import (
     MemoryPrincipalV1,
@@ -33,6 +36,12 @@ from areal.v2.agent_service.memory_broker import (
     AuthorizedMemoryAgentBroker,
     AuthorizedMemorySessionV1,
 )
+from areal.v2.agent_service.types import AgentRequest
+from areal.v2.agent_service.worker.memory import (
+    WorkerMemoryTurnCapability,
+    bind_authorized_memory_turn_capability,
+)
+from areal.v2.memory_service.types import MemoryScope
 
 
 def _principal(value: object) -> MemoryPrincipalV1:
@@ -52,6 +61,76 @@ def _session_key(value: object) -> str:
     except UnicodeEncodeError as error:
         raise ValueError("session_key must be valid UTF-8") from error
     return value
+
+
+def _run_id(value: object) -> str:
+    if type(value) is not str:
+        raise TypeError("request.run_id must be a str")
+    if not value.strip():
+        raise ValueError("request.run_id must not be blank")
+    try:
+        value.encode("utf-8", "strict")
+    except UnicodeEncodeError as error:
+        raise ValueError("request.run_id must be valid UTF-8") from error
+    return value
+
+
+def _assignment_pin(value: object) -> MemoryAgentSessionPinV1:
+    """Validate and detach every authority-relevant assignment dimension."""
+
+    if type(value) is not MemoryAgentSessionPinV1:
+        raise TypeError("assignment_pin must be a MemoryAgentSessionPinV1")
+    if type(value.scope) is not MemoryScope:
+        raise TypeError("assignment_pin.scope must be a MemoryScope")
+    return MemoryAgentSessionPinV1(
+        scope=MemoryScope(
+            tenant_id=value.scope.tenant_id,
+            namespace=value.scope.namespace,
+            subject_id=value.scope.subject_id,
+        ),
+        rollout_group_id=value.rollout_group_id,
+        rollout_group_incarnation_sha256=(value.rollout_group_incarnation_sha256),
+        assignment_id=value.assignment_id,
+        assignment_content_sha256=value.assignment_content_sha256,
+    )
+
+
+class MemoryWorkerTurnLease:
+    """Host-owned lifetime for one request's process-local Memory capability.
+
+    The lease intentionally publishes no broker session or authorized turn.
+    Trusted host code must keep it alive for the complete Agent response body
+    lifetime and call :meth:`aclose` afterwards.  Cancelling one close waiter
+    does not cancel capability cleanup; a later call rejoins the same task.
+    """
+
+    __slots__ = ("__capability", "__close_task")
+
+    def __init__(self, capability: WorkerMemoryTurnCapability) -> None:
+        if type(capability) is not WorkerMemoryTurnCapability:
+            raise TypeError("capability must be a WorkerMemoryTurnCapability")
+        self.__capability = capability
+        self.__close_task: asyncio.Task[None] | None = None
+
+    @staticmethod
+    def _observe_close(task: asyncio.Task[None]) -> None:
+        if not task.cancelled():
+            task.exception()
+
+    async def aclose(self) -> None:
+        """Close exactly once while shielding cleanup from caller cancellation."""
+
+        task = self.__close_task
+        if task is None:
+            # There is no await before publication, so concurrent event-loop
+            # callers cannot create two cleanup tasks.
+            task = asyncio.create_task(
+                self.__capability.aclose(),
+                name="areal-memory-worker-turn-lease-close",
+            )
+            self.__close_task = task
+            task.add_done_callback(self._observe_close)
+        await asyncio.shield(task)
 
 
 @dataclass(frozen=True, slots=True)
@@ -319,6 +398,94 @@ class AuthorizedMemoryWorkerRuntime:
                 task.add_done_callback(self._observe_reservation_task)
         return await asyncio.shield(task)
 
+    async def bind_turn(
+        self,
+        reservation: MemoryWorkerSessionReservationV1,
+        request: AgentRequest,
+        *,
+        assignment_pin: MemoryAgentSessionPinV1,
+    ) -> MemoryWorkerTurnLease:
+        """Authorize and bind one explicit assignment to one exact request.
+
+        The reservation, request identity, existing capability state, and full
+        assignment pin are validated before a resolver or coordinator can run.
+        Request metadata is deliberately ignored: it is neither principal nor
+        assignment authority.  This method only binds process-local state; it
+        does not run an Agent or manage a streaming response lifetime.
+        """
+
+        self._running_loop()
+        async with self.__state_lock:
+            self._ensure_open()
+            state = self._reservation_state(reservation)
+            if type(request) is not AgentRequest:
+                raise TypeError("request must be an AgentRequest")
+            if type(request.session_key) is not str:
+                raise TypeError("request.session_key must be a str")
+            if request.session_key != state.session_key:
+                raise MemoryAgentTurnConflictError(
+                    "AgentRequest session does not match the Memory reservation"
+                )
+            request_run_id = _run_id(request.run_id)
+            if request.memory is not None:
+                raise MemoryAgentTurnConflictError(
+                    "AgentRequest already has a Memory turn capability"
+                )
+            detached_pin = _assignment_pin(assignment_pin)
+            # Only the private handle captured from the exact runtime-issued
+            # descriptor crosses the lock boundary.  It is never returned.
+            broker_session = state.broker_session
+
+        await self.__broker.pin_session(broker_session, detached_pin)
+        turn = await self.__broker.start_turn(broker_session, request_run_id)
+
+        # Runtime close is admitted under ``__state_lock`` before its broker
+        # close task runs.  Recheck the process-local ownership boundary after
+        # the two broker awaits so that handoff window cannot publish a lease
+        # for a reservation the runtime has already started closing.  All
+        # runtime state belongs to this event loop, and there is deliberately
+        # no await from this check through capability publication.
+        self._ensure_open()
+        current = self._reservation_state(reservation)
+        if current is not state or current.broker_session is not broker_session:
+            raise MemoryAgentSessionConflictError(
+                "Memory reservation changed while its turn was binding"
+            )
+
+        # No await is permitted from capability registration through lease
+        # publication.  Session close therefore cannot miss a registered
+        # capability, and cancellation cannot strand one before its lease is
+        # returned to the trusted host.
+        capability = bind_authorized_memory_turn_capability(
+            request,
+            self.__broker,
+            turn,
+        )
+        try:
+            return MemoryWorkerTurnLease(capability)
+        except BaseException as construction_error:
+            # Construction is intentionally tiny, but keep this defensive path
+            # so a future constructor change cannot orphan broker registration.
+            if request.memory is capability:
+                del request._areal_memory_turn_capability  # type: ignore[attr-defined]
+            cleanup = asyncio.create_task(
+                capability.aclose(),
+                name="areal-memory-worker-failed-turn-lease-cleanup",
+            )
+            try:
+                await asyncio.shield(cleanup)
+            except asyncio.CancelledError:
+                cleanup.add_done_callback(self._observe_task)
+                raise
+            except Exception as cleanup_error:
+                # Keep the first failure actionable.  Cleanup is best-effort
+                # only on this defensive constructor path, but its failure is
+                # still retained on runtimes that expose exception notes.
+                construction_error.add_note(
+                    f"Memory capability cleanup also failed: {cleanup_error!r}"
+                )
+            raise
+
     @staticmethod
     def _observe_reservation_task(
         task: asyncio.Task[MemoryWorkerSessionReservationV1],
@@ -417,4 +584,5 @@ class AuthorizedMemoryWorkerRuntime:
 __all__ = [
     "AuthorizedMemoryWorkerRuntime",
     "MemoryWorkerSessionReservationV1",
+    "MemoryWorkerTurnLease",
 ]
