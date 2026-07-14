@@ -6,8 +6,14 @@ from .memory import (
     bind_authorized_memory_turn_capability,
     bind_memory_turn_capability,
 )
+from .memory_runtime import (
+    AuthorizedMemoryWorkerRuntime,
+    MemoryWorkerSessionReservationV1,
+)
 
 __all__ = [
+    "AuthorizedMemoryWorkerRuntime",
+    "MemoryWorkerSessionReservationV1",
     "WorkerMemoryTurnCapability",
     "bind_authorized_memory_turn_capability",
     "bind_memory_turn_capability",

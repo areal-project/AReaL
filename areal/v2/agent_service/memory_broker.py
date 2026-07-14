@@ -23,6 +23,7 @@ process.  One broker exclusively owns one coordinator and closes it during
 from __future__ import annotations
 
 import asyncio
+import threading
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -262,6 +263,8 @@ class AuthorizedMemoryAgentBroker:
         self.__sessions: dict[str, _SessionState] = {}
         self.__closed = False
         self.__shutdown_task: asyncio.Task[None] | None = None
+        self.__worker_runtime_claim_lock = threading.Lock()
+        self.__worker_runtime_claimed = False
 
     @property
     def audience(self) -> MemoryWorkerAudienceV1:
@@ -282,6 +285,17 @@ class AuthorizedMemoryAgentBroker:
     def _ensure_open(self) -> None:
         if self.__closed:
             raise MemoryAgentCoordinatorClosedError("Memory broker is closed")
+
+    def _claim_worker_runtime(self) -> None:
+        """Bind this broker to exactly one Worker runtime for its lifetime."""
+
+        with self.__worker_runtime_claim_lock:
+            self._ensure_open()
+            if self.__worker_runtime_claimed:
+                raise MemoryAgentSessionConflictError(
+                    "Memory broker already belongs to a Worker runtime"
+                )
+            self.__worker_runtime_claimed = True
 
     @staticmethod
     def _handle_matches_state(state: _SessionState) -> bool:
@@ -854,7 +868,8 @@ class AuthorizedMemoryAgentBroker:
         async with self.__state_lock:
             task = self.__shutdown_task
             if task is None:
-                self.__closed = True
+                with self.__worker_runtime_claim_lock:
+                    self.__closed = True
                 close_tasks: list[asyncio.Task[None]] = []
                 for state in tuple(self.__sessions.values()):
                     close_task = state.close_task

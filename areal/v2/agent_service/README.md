@@ -194,6 +194,19 @@ host code, so adding it enables no HTTP Memory access by itself. In particular, 
 shared admin key, either internal hop key, caller-chosen session key, pin scope, and
 inference `sk-sess-*` handle are not principal proof.
 
+`AuthorizedMemoryWorkerRuntime` adds the next, still default-off ownership boundary. It
+takes exclusive lifecycle ownership of one broker and reserves each textual session key
+for exactly one trusted `MemoryPrincipalV1`. Its public descriptor contains only the
+broker-minted Worker audience and session incarnation; it contains neither the principal
+nor the private broker handle, and an equal reconstructed descriptor has no local
+authority. A cancelled reservation cannot release the broker's principal binding, while
+close must finish before the same key can receive a fresh incarnation. This is only
+process-local Worker state: no Worker route constructs the runtime, no DataProxy
+envelope carries its descriptor, and no HTTP field is accepted as a principal. Those
+integrations require a separate versioned identity protocol and trusted principal
+resolver. Passing a broker to the runtime is an ownership transfer: trusted host code
+must neither wrap it again nor call or close it directly afterwards.
+
 ## Agent Protocol
 
 Any class that satisfies the `AgentRunnable` protocol can run on the Worker:
