@@ -39,7 +39,7 @@ AWEAGENT_ROOT=${AWEAGENT_ROOT:-/storage/openpsi/users/zjw531248/AWEAgent}
 FLA_DIR=${FLA_DIR:-/storage/openpsi/users/public/projects/flash-linear-attention}
 AWEX_ROOT=${AWEX_ROOT:-/storage/openpsi/users/public/projects/asystem-awex/}
 AREAL_EXTRA_PYTHONPATH=${AREAL_EXTRA_PYTHONPATH:-/storage/openpsi/users/zjw531248/monolith_pkgs}
-SGLANG_PYTHON_ROOT=${SGLANG_PYTHON_ROOT:-/storage/openpsi/users/chucai.dzq/codes/sglang/python}
+SGLANG_PYTHON_ROOT=${SGLANG_PYTHON_ROOT:-/storage/openpsi/users/zjw531248/sglang/python}
 
 EXP_NAME=${EXP_NAME:-zjw-monolith-swe-cc}
 TRIAL_NAME=${TRIAL_NAME:-aligned-8n-0708}

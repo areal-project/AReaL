@@ -53,6 +53,7 @@ PATCHES = [
         ),
         "check": 'elif model_arch in ["BailingMoeV2_5ForCausalLM"]:',
     },
+
     # ── 2. scheduler.py ──
     {
         "name": "2. scheduler: is_hybrid_ssm += hybrid_lightning_config",
@@ -72,13 +73,17 @@ PATCHES = [
         ),
         "check": "hybrid_lightning_config is not None",
     },
+
     # ── 3a. dp_attention.py: _USE_SUM_LEN_ATTN_DP global ──
     {
         "name": "3a. dp_attention: add _USE_SUM_LEN_ATTN_DP global",
         "rel_path": os.path.join("srt", "layers", "dp_attention.py"),
         "old": "class DpPaddingMode(IntEnum):",
         "new": (
-            "_USE_SUM_LEN_ATTN_DP: bool = False\n\n\nclass DpPaddingMode(IntEnum):"
+            "_USE_SUM_LEN_ATTN_DP: bool = False\n"
+            "\n"
+            "\n"
+            "class DpPaddingMode(IntEnum):"
         ),
         "check": "_USE_SUM_LEN_ATTN_DP: bool = False",
     },
@@ -156,6 +161,7 @@ PATCHES = [
         ),
         "check": "def is_use_sum_len_attn_dp",
     },
+
     # ── 4. model_runner.py ──
     {
         "name": "4. model_runner: pass force_sum_len_attn_dp",
@@ -175,12 +181,11 @@ PATCHES = [
         ),
         "check": "force_sum_len_attn_dp=True if self.hybrid_lightning_config",
     },
+
     # ── 5. forward_batch_deepseek_mha_mixin.py: support HybridLinearKVPool for chunked prefix cache ──
     {
         "name": "5. chunked_prefix_cache: support HybridLinearKVPool",
-        "rel_path": os.path.join(
-            "srt", "model_executor", "forward_batch_deepseek_mha_mixin.py"
-        ),
+        "rel_path": os.path.join("srt", "model_executor", "forward_batch_deepseek_mha_mixin.py"),
         "old": (
             "        from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool\n"
             "\n"
@@ -197,6 +202,7 @@ PATCHES = [
         ),
         "check": "MLATokenToKVPool, HybridLinearKVPool",
     },
+
     # ── 6. common.py: fix mamba eviction factor for no_buffer mode ──
     {
         "name": "6. common: fix mamba eviction factor (3x -> 1x for no_buffer)",
@@ -258,7 +264,6 @@ PATCHES = [
 def find_sglang_root():
     try:
         import sglang
-
         return os.path.dirname(sglang.__file__)
     except ImportError:
         return None
@@ -268,6 +273,9 @@ def resolve(root, rel):
     p = os.path.join(root, rel)
     if os.path.exists(p):
         return p
+    p1 = os.path.join(root, "sglang", rel)
+    if os.path.exists(p1):
+        return p1
     p2 = os.path.join(root, "python", "sglang", rel)
     return p2 if os.path.exists(p2) else p
 
@@ -276,7 +284,7 @@ def apply_patch(root, patch, dry_run=False):
     fp = resolve(root, patch["rel_path"])
     if not os.path.exists(fp):
         return "MISSING", f"File not found: {fp}"
-    with open(fp) as f:
+    with open(fp, "r") as f:
         content = f.read()
     if patch["check"] in content:
         return "SKIP", "Already patched"
@@ -290,7 +298,7 @@ def apply_patch(root, patch, dry_run=False):
     new_content = content.replace(patch["old"], patch["new"], 1)
     with open(fp, "w") as f:
         f.write(new_content)
-    with open(fp) as f:
+    with open(fp, "r") as f:
         if patch["check"] in f.read():
             return "OK", f"Patched {os.path.basename(fp)}"
     return "FAIL", f"Verify failed for {os.path.basename(fp)}"
@@ -305,7 +313,7 @@ def revert_patch(root, patch):
         shutil.copy2(bak, fp)
         os.remove(bak)
         return "OK", "Restored from backup"
-    with open(fp) as f:
+    with open(fp, "r") as f:
         content = f.read()
     if patch["new"] in content:
         content = content.replace(patch["new"], patch["old"], 1)
@@ -316,29 +324,12 @@ def revert_patch(root, patch):
 
 
 def clear_pycache(root):
-    subprocess.run(
-        [
-            "find",
-            root,
-            "-name",
-            "__pycache__",
-            "-type",
-            "d",
-            "-exec",
-            "rm",
-            "-rf",
-            "{}",
-            "+",
-        ],
-        capture_output=True,
-    )
+    subprocess.run(["find", root, "-name", "__pycache__", "-type", "d", "-exec", "rm", "-rf", "{}", "+"], capture_output=True)
     subprocess.run(["find", root, "-name", "*.pyc", "-delete"], capture_output=True)
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Patch SGLang for Bailing Hybrid radix cache (rc2-aligned)"
-    )
+    parser = argparse.ArgumentParser(description="Patch SGLang for Bailing Hybrid radix cache (rc2-aligned)")
     parser.add_argument("--sglang-path", type=str, default=None)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--revert", action="store_true")
