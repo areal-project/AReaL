@@ -307,10 +307,27 @@ class PPOActor:
         )
         stats_tracker.stat(**stats, denominator="n_valid_tokens")
 
-        prompt_lens = data["attention_mask"].sum(-1) - data["loss_mask"].sum(-1)
+        # Real prompt length is the index of the first generated token. For
+        # multi-turn agent rollouts the loss_mask is interleaved
+        # (prompt, asst, tool, asst, tool, ...), so `attention_mask.sum() -
+        # loss_mask.sum()` actually counts "all non-generated tokens" (prompt
+        # + every tool/user span) and inflates prompt_len with the number of
+        # turns. Use the index of the first 1 in loss_mask instead, falling
+        # back to the full sequence length when loss_mask is all zero.
+        loss_mask_long = data["loss_mask"].long()
+        first_gen_idx = loss_mask_long.argmax(dim=-1)
+        has_gen = loss_mask_long.any(dim=-1)
+        prompt_lens = torch.where(
+            has_gen, first_gen_idx, data["attention_mask"].long().sum(-1)
+        )
+        task_reward = (
+            data["original_rewards"].float()
+            if "original_rewards" in data
+            else reward_score.float()
+        )
         seq_stats = dict(
             no_eos_ratios=(seqlens == attn_mask.shape[-1]).float(),
-            task_reward=reward_score.float(),
+            task_reward=task_reward,
             prompt_len=prompt_lens.float(),
             seq_len=seqlens.float(),
         )
@@ -597,6 +614,19 @@ def grpo_loss_fn(
             behave_imp_weight=stat["behave_imp_weight"],
             behave_approx_kl=stat["behave_approx_kl"],
             denominator="unclipped_behave_tokens",
+        )
+        behave_filtered_mask = loss_mask & ~stat["behave_mask"]
+        stats_tracker.stat(
+            behave_filtered_ratio=behave_filtered_mask.float(),
+            denominator="n_valid_tokens",
+        )
+
+    if "n_valid_tokens" in stat:
+        stats_tracker.scalar(
+            n_total_tokens=stat["n_total_tokens"],
+            n_valid_tokens_in_loss=stat["n_valid_tokens"],
+            n_masked_tokens=stat["n_masked_tokens"],
+            masked_token_ratio=stat["masked_token_ratio"],
         )
     if "filtered_fraction" in stat:
         stats_tracker.scalar(rs_filtered_fraction=stat["filtered_fraction"])
