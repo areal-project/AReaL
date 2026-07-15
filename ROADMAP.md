@@ -37,6 +37,7 @@ in contributing, please reach out to discuss implementation details.
 - [ ] Proxy server support via RayScheduler (HTTP launcher actor) `[CC]`
 - [ ] Weight delta update with `awex`
 - [ ] Memory service for self-evolving agent
+- [ ] Support [OpenEnv](https://github.com/huggingface/OpenEnv) in Agentic RL
 
 ### Usability
 
