@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import gc
 import os
 import random
 
@@ -435,6 +436,14 @@ class MegatronCheckpointManager:
             self.load_rng_states(rng_state)
             log_with_rank(f"Loaded RNG states from {local_path}", rank=self.rank)
 
+        # Release the allocator cache built up while materializing the loaded
+        # state dict (weights + optimizer moments). The reserved-but-free
+        # blocks are invisible to NCCL's cudaMalloc, so the first
+        # post-recover collective would otherwise OOM on memory PyTorch is
+        # still caching.
+        gc.collect()
+        torch.cuda.empty_cache()
+
     def save_checkpoint(
         self,
         local_path: str,
@@ -454,6 +463,10 @@ class MegatronCheckpointManager:
 
         # Generate state dict for saving
         state_dict = self.generate_state_dict(with_model, with_optimizer, with_rng)
+        # Same NCCL-vs-allocator interaction as in load_checkpoint: the
+        # fully-parallel save strategy issues collectives that allocate
+        # outside the PyTorch allocator.
+        torch.cuda.empty_cache()
         # Start Async save if enabled
         async_save_request = save_dist_checkpointing(
             sharded_state_dict=state_dict,

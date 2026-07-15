@@ -801,6 +801,11 @@ class MegatronEngine(TrainEngine):
             #    cleanup shared → signal write_finished
             # 2. finish: wait all infer engines done → cleanup MetaServer keys
             # 3. resume kv_cache + continue generation
+            # Return reserved-but-free allocator blocks to CUDA first: the
+            # transfer and the next train step allocate through NCCL/IPC
+            # outside the PyTorch allocator, which cannot see cached blocks.
+            gc.collect()
+            current_platform.empty_cache()
             self._awex_adapter.execute_colocate_weight_update(meta.version or 0)
             # Do NOT flip is_offload here: the AWEX adapter tracks released
             # memory via _released_tags, and the trainer onloads explicitly
@@ -818,6 +823,10 @@ class MegatronEngine(TrainEngine):
                 self.rollout_engine.onload(tags=["kv_cache"])
                 self.rollout_engine.continue_generation()
             dist.barrier(group=self.cpu_group)
+            # Mirror cleanup after the transfer so serialization buffers do
+            # not linger as allocator cache into the next train step.
+            gc.collect()
+            current_platform.empty_cache()
             return
         with self._offload_aware_context():
             if meta.type == "xccl":
