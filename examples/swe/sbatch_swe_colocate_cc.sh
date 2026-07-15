@@ -35,7 +35,7 @@ IMAGE=${AREAL_IMAGE:-/storage/openpsi/images/areal-dev-sglang-20260401.sif}
 
 MODEL_PATH=${MODEL_PATH:-/storage/openpsi/experiments/checkpoints/admin/hcy-ring-sft/0531_flash_moe_bs256_g64_lr5e-5_stepfun_v9_no_agentic_continue_stepfun_ring_swe_v2_scaleswe/default/epoch2epochstep596globalstep1790}
 TRAIN_DATA=${TRAIN_DATA:-/storage/openpsi/users/fenghui/projects/AWEAgent_DEV/AWEAgent/src/data/swe_bench_verified_rl.jsonl}
-AWEAGENT_ROOT=${AWEAGENT_ROOT:-/storage/openpsi/users/public/projects/AWEAgent}
+AWEAGENT_ROOT=${AWEAGENT_ROOT:-/storage/openpsi/users/zjw531248/AWEAgent}
 FLA_DIR=${FLA_DIR:-/storage/openpsi/users/public/projects/flash-linear-attention}
 AWEX_ROOT=${AWEX_ROOT:-/storage/openpsi/users/public/projects/asystem-awex/}
 AREAL_EXTRA_PYTHONPATH=${AREAL_EXTRA_PYTHONPATH:-/storage/openpsi/users/zjw531248/monolith_pkgs}
