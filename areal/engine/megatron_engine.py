@@ -1457,6 +1457,84 @@ class MegatronEngine(TrainEngine):
     def get_device_stats(self) -> DeviceRuntimeInfo:
         return DeviceRuntimeInfo.get_current()
 
+    def warmup_communicators(self) -> None:
+        """Eagerly build every NCCL communicator the train step needs.
+
+        PyTorch creates 2-rank communicators for unbatched pipeline
+        send/recv lazily, and NCCL connects transport buffers per
+        protocol on first use. After a recover restart those connects
+        would otherwise happen inside the first ppo_update, when the
+        device is already at peak occupancy, and the ~10MB transport
+        calloc fails on the PP-last-stage ranks. Exercising each group
+        and message-size class here, while memory is still light, makes
+        those allocations happen up front; the buffers persist across
+        offload/onload for the lifetime of the process.
+        """
+        if os.environ.get("AREAL_SKIP_COMM_WARMUP", "").strip() == "1":
+            return
+        if not dist.is_initialized():
+            return
+        device = torch.cuda.current_device()
+        small = torch.ones(1024, dtype=torch.bfloat16, device=device)
+        large = torch.ones(16 * 1024 * 1024, dtype=torch.bfloat16, device=device)
+        for group in (
+            mpu.get_tensor_model_parallel_group(),
+            mpu.get_data_parallel_group(with_context_parallel=True),
+            mpu.get_model_parallel_group(),
+        ):
+            if dist.get_world_size(group=group) <= 1:
+                continue
+            dist.all_reduce(small.clone(), group=group)
+            dist.all_reduce(large.clone(), group=group)
+        dp_group = mpu.get_data_parallel_group(with_context_parallel=True)
+        dp_size = dist.get_world_size(group=dp_group)
+        if dp_size > 1:
+            shard = torch.empty(
+                large.numel() // dp_size, dtype=large.dtype, device=device
+            )
+            dist.reduce_scatter_tensor(shard, large, group=dp_group)
+            dist.all_gather_into_tensor(large, shard, group=dp_group)
+        pp_size = mpu.get_pipeline_model_parallel_world_size()
+        if pp_size > 1:
+            pp_rank = mpu.get_pipeline_model_parallel_rank()
+            nxt = mpu.get_pipeline_model_parallel_next_rank()
+            prv = mpu.get_pipeline_model_parallel_prev_rank()
+            is_first = mpu.is_pipeline_first_stage(ignore_virtual=True)
+            is_last = mpu.is_pipeline_last_stage(ignore_virtual=True)
+            for buf in (small, large):
+                send_buf = buf.clone()
+                recv_buf = torch.empty_like(buf)
+                # Unbatched pair comms, both directions; even ranks send
+                # first so the chain cannot deadlock.
+                for send_peer, recv_peer, do_send, do_recv in (
+                    (nxt, prv, not is_last, not is_first),
+                    (prv, nxt, not is_first, not is_last),
+                ):
+                    if pp_rank % 2 == 0:
+                        if do_send:
+                            dist.send(send_buf, send_peer)
+                        if do_recv:
+                            dist.recv(recv_buf, recv_peer)
+                    else:
+                        if do_recv:
+                            dist.recv(recv_buf, recv_peer)
+                        if do_send:
+                            dist.send(send_buf, send_peer)
+                ops = []
+                if not is_last:
+                    ops.append(dist.P2POp(dist.isend, send_buf, nxt))
+                if not is_first:
+                    ops.append(dist.P2POp(dist.irecv, recv_buf, prv))
+                if ops:
+                    for work in dist.batch_isend_irecv(ops):
+                        work.wait()
+        del small, large
+        torch.cuda.synchronize()
+        dist.barrier(group=self.cpu_group)
+        self.logger.info(
+            "[COMM-WARMUP rank %s] communicator warmup complete", dist.get_rank()
+        )
+
     def start_memory_profile(self, max_entries: int = 100000) -> None:
         torch.cuda.memory._record_memory_history(max_entries=max_entries)
 

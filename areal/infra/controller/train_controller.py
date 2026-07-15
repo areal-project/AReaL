@@ -726,6 +726,10 @@ class TrainController:
             "init_awex_adapter", meta_server_addr=meta_server_addr
         )
 
+    def warmup_communicators(self):
+        """Eagerly build train-step NCCL communicators on all workers."""
+        self._custom_function_call("warmup_communicators")
+
     def step_lr_scheduler(self):
         """Step the learning rate scheduler.
 
