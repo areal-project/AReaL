@@ -1477,15 +1477,41 @@ class MegatronEngine(TrainEngine):
         device = torch.cuda.current_device()
         small = torch.ones(1024, dtype=torch.bfloat16, device=device)
         large = torch.ones(16 * 1024 * 1024, dtype=torch.bfloat16, device=device)
-        for group in (
-            mpu.get_tensor_model_parallel_group(),
-            mpu.get_data_parallel_group(with_context_parallel=True),
-            mpu.get_model_parallel_group(),
-        ):
-            if dist.get_world_size(group=group) <= 1:
-                continue
-            dist.all_reduce(small.clone(), group=group)
-            dist.all_reduce(large.clone(), group=group)
+        # Sweep every registered NCCL group (attention DP/TP, expert
+        # EP/expert-DP, model-parallel variants, ...) instead of naming
+        # them: the MoE grad-bucket reduction connected lazily 14 minutes
+        # into the first update, after the named-group warmup passed.
+        # pg_map insertion order is the collective creation order, so all
+        # member ranks reach shared groups in the same relative order.
+        from torch.distributed.distributed_c10d import _world
+
+        for group in list(_world.pg_map):
+            try:
+                if "nccl" not in str(dist.get_backend(group)).lower():
+                    continue
+                ws = dist.get_world_size(group=group)
+                if ws <= 1:
+                    continue
+                dist.all_reduce(small.clone(), group=group)
+                dist.all_reduce(large.clone(), group=group)
+                chunk = 4096
+                a2a_in = torch.ones(
+                    chunk * ws, dtype=torch.bfloat16, device=device
+                )
+                dist.all_to_all_single(
+                    torch.empty_like(a2a_in), a2a_in, group=group
+                )
+                big_chunk = (4 * 1024 * 1024 // ws) * ws
+                a2a_big = torch.ones(
+                    big_chunk, dtype=torch.bfloat16, device=device
+                )
+                dist.all_to_all_single(
+                    torch.empty_like(a2a_big), a2a_big, group=group
+                )
+            except Exception:
+                self.logger.warning(
+                    "communicator warmup skipped one group", exc_info=True
+                )
         dp_group = mpu.get_data_parallel_group(with_context_parallel=True)
         dp_size = dist.get_world_size(group=dp_group)
         if dp_size > 1:
