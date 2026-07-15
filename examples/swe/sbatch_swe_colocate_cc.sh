@@ -89,7 +89,7 @@ rm -rf "${NFS_ROOT}" 2>/dev/null || true
 echo "=== CC colocate run nodes=${N_NODES} trial=${TRIAL_NAME} ==="
 echo "=== areal=${AREAL_DIR} model=${MODEL_PATH} aweagent=${AWEAGENT_ROOT} ==="
 
-MAX_DRIVER_RETRIES=${MAX_DRIVER_RETRIES:-1}
+MAX_DRIVER_RETRIES=${MAX_DRIVER_RETRIES:-5}
 attempt=1
 while true; do
   echo "=== driver attempt ${attempt}/${MAX_DRIVER_RETRIES} trial=${TRIAL_NAME} $(date) ==="
