@@ -366,6 +366,15 @@ class PPOTrainer:
         # Proxy worker initialization (lazy, for AgentWorkflow support)
         self._proxy_started = False
 
+        self._debug_replay_rollout_data = (
+            config.debug is not None and config.debug.replay_rollout_data
+        )
+        if self._debug_replay_rollout_data:
+            logger.info(
+                "Replay mode enabled: training batches will be loaded from "
+                "dump files instead of running rollout."
+            )
+
         # Prepare weight update meta and connect to inference engine.
         # v2 controllers pick transport from use_lora: LoRA must go through
         # disk (P2P transports cannot carry PEFT-wrapped tensors); non-LoRA
@@ -654,29 +663,34 @@ class PPOTrainer:
             epoch = global_step // steps_per_epoch
             step = global_step % steps_per_epoch
 
-            if self._should_offload_rollout:
-                self._onload_rollout()
-            with (
-                stats_tracker.record_timing("rollout"),
-                perf_tracer.trace_scope(
-                    "train.rollout",
-                    category=Category.COMPUTE,
-                    args={
-                        "global_step": global_step,
-                        "epoch_step": step,
-                    },
-                ),
-            ):
-                rollout_batch = self.actor.prepare_batch(
-                    self.train_dataloader,
-                    workflow=workflow,
-                    workflow_kwargs=workflow_kwargs,
-                    should_accept_fn=dynamic_filter_fn,
-                    group_size=config.gconfig.n_samples,
-                    dynamic_bs=self.config.dynamic_bs,
-                )
-            if self._should_offload_rollout:
-                self._offload_rollout()
+            if self._should_replay_rollout_data(global_step):
+                rollout_batch = self._load_replay_rollout_data(global_step)
+            else:
+                if self._should_offload_rollout:
+                    self._onload_rollout()
+                with (
+                    stats_tracker.record_timing("rollout"),
+                    perf_tracer.trace_scope(
+                        "train.rollout",
+                        category=Category.COMPUTE,
+                        args={
+                            "global_step": global_step,
+                            "epoch_step": step,
+                        },
+                    ),
+                ):
+                    rollout_batch = self.actor.prepare_batch(
+                        self.train_dataloader,
+                        workflow=workflow,
+                        workflow_kwargs=workflow_kwargs,
+                        should_accept_fn=dynamic_filter_fn,
+                        group_size=config.gconfig.n_samples,
+                        dynamic_bs=self.config.dynamic_bs,
+                    )
+                if self._should_offload_rollout:
+                    self._offload_rollout()
+            if self._should_dump_rollout_data(global_step):
+                self._dump_replay_rollout_data(rollout_batch, global_step)
 
             if self.critic is not None:
                 if self._should_offload_critic:
@@ -964,6 +978,61 @@ class PPOTrainer:
                 epoch_step=epoch_step,
                 global_step=global_step,
             )
+
+    def _should_replay_rollout_data(self, global_step: int) -> bool:  # noqa: ARG002
+        return self._debug_replay_rollout_data
+
+    def _should_dump_rollout_data(self, global_step: int) -> bool:  # noqa: ARG002
+        debug_cfg = self.config.debug
+        return debug_cfg is not None and debug_cfg.dump_rollout_data
+
+    def _get_debug_replay_path(self) -> str:
+        debug_cfg = self.config.debug
+        if debug_cfg and debug_cfg.path:
+            return debug_cfg.path
+        import getpass
+
+        return os.path.join(
+            self.config.cluster.fileroot,
+            "checkpoints",
+            getpass.getuser(),
+            self.config.experiment_name,
+            self.config.trial_name,
+            "train_data",
+        )
+
+    def _dump_replay_rollout_data(
+        self, batch: list[dict[str, Any]], global_step: int
+    ) -> None:
+        """Save full training batch tensors to disk. Only rank 0 writes."""
+        rank = int(os.getenv("RANK", "0"))
+        if rank != 0:
+            return
+        import torch
+
+        from areal.infra.rpc.rtensor import RTensor
+
+        local_batch = RTensor.localize(batch)
+        dump_dir = self._get_debug_replay_path()
+        os.makedirs(dump_dir, exist_ok=True)
+        filepath = os.path.join(dump_dir, f"step_{global_step:06d}.pt")
+        torch.save(local_batch, filepath)
+        logger.info(f"Dumped replay batch to {filepath}")
+
+    def _load_replay_rollout_data(self, global_step: int) -> list[dict[str, Any]]:
+        """Load training batch from dump file."""
+        import torch
+
+        dump_dir = self._get_debug_replay_path()
+        filepath = os.path.join(dump_dir, f"step_{global_step:06d}.pt")
+        if not os.path.exists(filepath):
+            raise FileNotFoundError(
+                f"Replay file not found: {filepath}. "
+                f"Ensure dump files exist for step {global_step}."
+            )
+        batch = torch.load(filepath, map_location="cpu", weights_only=False)
+        logger.info(f"Loaded replay batch from {filepath} ({len(batch)} trajectories)")
+        return batch
 
     def close(self):
         # P87: must tolerate a partially-constructed trainer (called from

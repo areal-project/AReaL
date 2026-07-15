@@ -3151,6 +3151,37 @@ class TeacherConfig:
 
 
 @dataclass
+class DebugConfig:
+    """Debug utilities: dump and replay full tensor-level training batches.
+
+    Dumping saves each step's training batch (token IDs, masks, logprobs,
+    rewards, versions) to disk; replaying loads them back, skipping rollout.
+    """
+
+    dump_rollout_data: bool = field(
+        default=False,
+        metadata={"help": "Save full tensor batch to disk at each training step."},
+    )
+    replay_rollout_data: bool = field(
+        default=False,
+        metadata={"help": "Load batches from disk, skipping rollout."},
+    )
+    path: str | None = field(
+        default=None,
+        metadata={
+            "help": "Directory for dump/replay .pt files. "
+            "Defaults to <fileroot>/checkpoints/<user>/<experiment>/<trial>/train_data/."
+        },
+    )
+
+    def __post_init__(self):
+        if self.dump_rollout_data and self.replay_rollout_data:
+            raise ValueError(
+                "debug.dump_rollout_data and debug.replay_rollout_data are mutually exclusive."
+            )
+
+
+@dataclass
 class PPOConfig(BaseExperimentConfig):
     """Configuration for Proximal Policy Optimization (PPO) reinforcement learning experiments."""
 
@@ -3184,6 +3215,12 @@ class PPOConfig(BaseExperimentConfig):
             "help": "Enable dynamic batch sizing in prepare_batch. When True, batch collection "
             "stops when (accepted + rejected) >= batch_size, returning only accepted results. "
             "This results in variable-sized batches of valid data."
+        },
+    )
+    debug: DebugConfig | None = field(
+        default=None,
+        metadata={
+            "help": "Debug configuration for dumping/replaying training batches."
         },
     )
 
