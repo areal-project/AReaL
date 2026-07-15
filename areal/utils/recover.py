@@ -317,9 +317,15 @@ class RecoverHandler:
                 and getattr(weight_update_meta, "type", None) == "awex"
             )
 
-            if not is_awex_colocate:
-                for name, engine_ in normalized_engine.items():
-                    self._load_checkpoint(engine_, name=name)
+            # Load checkpoints before any engine pause/offload, matching the
+            # internal recover sequence. Deferring the load until after the
+            # rollout engine released its memory looks safer on paper, but it
+            # changes the allocator segment layout that the first post-recover
+            # train step inherits, and that layout ran out of memory on the
+            # PP-last-stage ranks in practice. The pre-offload load order is
+            # the one validated by repeated in-place recovers.
+            for name, engine_ in normalized_engine.items():
+                self._load_checkpoint(engine_, name=name)
 
             if inference_engine is not None:
                 assert weight_update_meta is not None
@@ -343,12 +349,6 @@ class RecoverHandler:
                         inference_engine.pause_generation_sync()
                         inference_engine.offload(tags=["kv_cache"])
                         inference_engine.offload(tags=["weights"])
-                        # Load the actor checkpoint only after the colocated
-                        # rollout engine has released its GPU memory; loading
-                        # first would stack DCP weights/optimizer on top of the
-                        # still-resident sglang allocation and risk OOM.
-                        for name, engine_ in normalized_engine.items():
-                            self._load_checkpoint(engine_, name=name)
                     update_engine.update_weights(versioned_meta)
                 finally:
                     # Always resume: leaving rollout paused after a failed
