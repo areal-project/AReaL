@@ -350,6 +350,17 @@ def split_and_unpad_tensor(
                 )
                 for i, s in enumerate(splits):
                     split_result[i][key] = s
+            elif isinstance(value, (list, tuple)) and len(value) == total:
+                # Per-sample payloads (e.g. multi_modal_input): give each
+                # trajectory ITS slice by reference. The deepcopy fallback
+                # below would replicate the FULL list into every trajectory
+                # dict — n_trajs copies of all vision tensors (observed as a
+                # 73GB retention with 64 trajs x 512 images) and semantically
+                # wrong ownership.
+                offset = 0
+                for i, g in enumerate(traj_group_sizes):
+                    split_result[i][key] = list(value[offset : offset + g])
+                    offset += g
             else:
                 for i in range(n_trajs):
                     split_result[i][key] = copy.deepcopy(value)
