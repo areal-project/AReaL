@@ -577,11 +577,14 @@ def ppo_actor_loss_fn(
         approx_kl=(logprobs - proximal_logprobs).detach(),
         clip_mask=clip_mask,
         dual_clip_mask=dual_clip_mask,
-        n_total_tokens=float(loss_mask.numel()),
-        n_valid_tokens=float(loss_mask.count_nonzero().item()),
-        n_masked_tokens=float(loss_mask.numel() - loss_mask.count_nonzero().item()),
+        n_total_tokens=float(stat_loss_mask.numel()),
+        n_valid_tokens=float(stat_loss_mask.count_nonzero().item()),
+        n_masked_tokens=float(
+            stat_loss_mask.numel() - stat_loss_mask.count_nonzero().item()
+        ),
         masked_token_ratio=float(
-            1.0 - loss_mask.count_nonzero().item() / max(loss_mask.numel(), 1)
+            1.0
+            - stat_loss_mask.count_nonzero().item() / max(stat_loss_mask.numel(), 1)
         ),
     )
 
