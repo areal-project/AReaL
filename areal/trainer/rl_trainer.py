@@ -330,8 +330,11 @@ class PPOTrainer:
         # In colocate (awex) mode, offload training weights before SGLang starts
         # so that GPU memory is available for inference engine allocation.
         # Uses adapter-based manual offload (not TMS), so enable_offload is not required.
+        self._debug_replay_rollout_data = (
+            config.debug is not None and config.debug.replay_rollout_data
+        )
         self._awex_meta_server_addr: str | None = None
-        if config.actor.weight_update_mode == "awex":
+        if config.actor.weight_update_mode == "awex" and not self._debug_replay_rollout_data:
             from awex.meta.meta_server import start_meta_server
 
             from areal.utils.network import gethostip
@@ -348,32 +351,31 @@ class PPOTrainer:
             self.actor.offload()
 
         # Initialize inference with LoRA path
-        self.rollout = self._init_rollout(
-            config.rollout, is_eval=False, lora_path=initial_lora_path
-        )
-
+        self.rollout = None
         self.eval_rollout = None
-        if not self._online_mode:
-            self.eval_rollout = self._init_rollout(
-                config.rollout, is_eval=True, lora_path=initial_lora_path
+        if not self._debug_replay_rollout_data:
+            self.rollout = self._init_rollout(
+                config.rollout, is_eval=False, lora_path=initial_lora_path
             )
-        if (
-            self.config.teacher is not None
-            and self.config.teacher.engine_type == "rollout"
-        ):
-            self.teacher = self._init_teacher_rollout(self.config.teacher.rollout)
+
+            if not self._online_mode:
+                self.eval_rollout = self._init_rollout(
+                    config.rollout, is_eval=True, lora_path=initial_lora_path
+                )
+            if (
+                self.config.teacher is not None
+                and self.config.teacher.engine_type == "rollout"
+            ):
+                self.teacher = self._init_teacher_rollout(self.config.teacher.rollout)
+        else:
+            logger.info(
+                "Replay mode enabled: skipping rollout and inference engine creation"
+            )
 
         # Proxy worker initialization (lazy, for AgentWorkflow support)
         self._proxy_started = False
 
-        self._debug_replay_rollout_data = (
-            config.debug is not None and config.debug.replay_rollout_data
-        )
-        if self._debug_replay_rollout_data:
-            logger.info(
-                "Replay mode enabled: training batches will be loaded from "
-                "dump files instead of running rollout."
-            )
+
 
         # Prepare weight update meta and connect to inference engine.
         # v2 controllers pick transport from use_lora: LoRA must go through
@@ -451,7 +453,8 @@ class PPOTrainer:
                 f"Invalid weight update mode: {self.config.actor.weight_update_mode}"
             )
 
-        self.actor.connect_engine(self.rollout, self.weight_update_meta)
+        if not self._debug_replay_rollout_data:
+            self.actor.connect_engine(self.rollout, self.weight_update_meta)
 
         # Set up evaluation (skip in online mode)
         self.evaluator = Evaluator(config.evaluator, ft_spec)
@@ -476,7 +479,7 @@ class PPOTrainer:
 
         # After recovery, sync the staleness manager so its capacity formula
         # stays bounded despite the version jumping from 0 to recovery_version.
-        if self.recover_info is not None:
+        if self.recover_info is not None and self.rollout is not None:
             recovery_version = self.recover_info.last_step_info.global_step + 1
             if is_single_controller():
                 sm = self.rollout.staleness_manager
@@ -641,18 +644,19 @@ class PPOTrainer:
         max_steps = total_epochs * steps_per_epoch
 
         # Initialize proxy workers if not using RolloutWorkflow
-        if workflow is None:
-            agent_cfg = self.config.rollout.agent
-            if agent_cfg is not None and agent_cfg.mode == "online":
+        if not self._debug_replay_rollout_data:
+            if workflow is None:
+                agent_cfg = self.config.rollout.agent
+                if agent_cfg is not None and agent_cfg.mode == "online":
+                    self._ensure_proxy_started()
+                else:
+                    raise ValueError(
+                        "workflow must be specified for train() unless "
+                        "agent.mode='online' is configured. "
+                        "Pass a RolloutWorkflow, AgentWorkflow, or callable."
+                    )
+            elif self._requires_proxy_workflow(workflow):
                 self._ensure_proxy_started()
-            else:
-                raise ValueError(
-                    "workflow must be specified for train() unless "
-                    "agent.mode='online' is configured. "
-                    "Pass a RolloutWorkflow, AgentWorkflow, or callable."
-                )
-        elif self._requires_proxy_workflow(workflow):
-            self._ensure_proxy_started()
 
         for global_step in range(start_step, max_steps):
             if (
@@ -691,10 +695,9 @@ class PPOTrainer:
                     )
                 if self._should_offload_rollout:
                     self._offload_rollout()
-            if self._should_dump_rollout_data(global_step):
-                self._dump_replay_rollout_data(rollout_batch, global_step)
+            replay_step = self._should_replay_rollout_data(global_step)
 
-            if self.critic is not None:
+            if self.critic is not None and not replay_step:
                 if self._should_offload_critic:
                     self._onload_model(self.critic, role="critic")
                 with (
@@ -711,7 +714,7 @@ class PPOTrainer:
                     self.critic.get_device_stats().log("critic values")
                 # Critic stays onloaded — offloaded after ppo_update below
 
-            if self.ref is not None:
+            if self.ref is not None and not replay_step:
                 if self._should_offload_ref:
                     self._onload_model(self.ref, role="ref")
                 with (
@@ -729,7 +732,7 @@ class PPOTrainer:
                 if self._should_offload_ref:
                     self._offload_model(self.ref, role="ref")
 
-            if self.teacher is not None:
+            if self.teacher is not None and not replay_step:
                 if self._should_offload_teacher:
                     self._onload_model(self.teacher, role="teacher")
                 with (
@@ -752,7 +755,7 @@ class PPOTrainer:
 
             # In colocate (awex) mode: switch GPU from inference to training.
             # Release SGLang KV cache + weights to free GPU for actor.
-            if self.config.actor.weight_update_mode == "awex":
+            if self.config.actor.weight_update_mode == "awex" and not replay_step:
                 logger.info("[AWEX] colocate: pausing rollout...")
                 self.rollout.pause()
                 logger.info("[AWEX] colocate: pause_generation_sync...")
@@ -766,7 +769,7 @@ class PPOTrainer:
 
             if self._should_offload_actor:
                 self._onload_model(self.actor, role="actor")
-            if config.actor.should_compute_prox_logp():
+            if config.actor.should_compute_prox_logp() and not replay_step:
                 with (
                     stats_tracker.record_timing("recompute_logp"),
                     perf_tracer.trace_scope(
@@ -779,6 +782,11 @@ class PPOTrainer:
                     for traj, logp in zip(rollout_batch, prox_logps):
                         traj["prox_logp"] = logp
                     self.actor.get_device_stats().log("recompute logp")
+
+            # Dump after all logps so a replayed batch feeds the training
+            # math the exact tensors the original step trained on.
+            if self._should_dump_rollout_data(global_step):
+                self._dump_replay_rollout_data(rollout_batch, global_step)
 
             with (
                 stats_tracker.record_timing("compute_advantage"),
@@ -856,30 +864,33 @@ class PPOTrainer:
                 )
 
             # pause inference for updating weights, save, and evaluation
-            self.rollout.pause()
+            if not replay_step:
+                self.rollout.pause()
 
             # Actor already onloaded; engine-internal _offload_aware_context
             # calls in update_weights/save are no-ops.
 
-            with (
-                stats_tracker.record_timing("update_weights"),
-                perf_tracer.trace_scope(
-                    "train.update_weights",
-                    category=Category.COMM,
-                    args={"global_step": global_step},
-                ),
-            ):
-                # Use versioned path for weight updates
-                new_version = global_step + 1
-                versioned_meta = self.weight_update_meta.with_version(new_version)
-                self.actor.update_weights(versioned_meta)
+            if not replay_step:
+                with (
+                    stats_tracker.record_timing("update_weights"),
+                    perf_tracer.trace_scope(
+                        "train.update_weights",
+                        category=Category.COMM,
+                        args={"global_step": global_step},
+                    ),
+                ):
+                    new_version = global_step + 1
+                    versioned_meta = self.weight_update_meta.with_version(
+                        new_version
+                    )
+                    self.actor.update_weights(versioned_meta)
 
-                self.actor.set_version(new_version)
-                if self.critic is not None:
-                    self.critic.set_version(new_version)
-                self.rollout.set_version(new_version)
-                if self.eval_rollout is not None:
-                    self.eval_rollout.set_version(new_version)
+                    self.actor.set_version(new_version)
+                    if self.critic is not None:
+                        self.critic.set_version(new_version)
+                    self.rollout.set_version(new_version)
+                    if self.eval_rollout is not None:
+                        self.eval_rollout.set_version(new_version)
 
             if config.actor.weight_update_mode != "awex":
                 self._save_training_state(
@@ -892,7 +903,7 @@ class PPOTrainer:
             if self._should_offload_actor:
                 self._offload_model(self.actor, role="actor")
 
-            if self._should_offload_rollout:
+            if self._should_offload_rollout and not replay_step:
                 self._onload_rollout(is_eval=True)
             with (
                 stats_tracker.record_timing("eval"),
@@ -902,14 +913,15 @@ class PPOTrainer:
                     args={"global_step": global_step},
                 ),
             ):
-                self._evaluate(
-                    eval_workflow=eval_workflow,
-                    eval_workflow_kwargs=eval_workflow_kwargs,
-                    epoch=epoch,
-                    epoch_step=step,
-                    global_step=global_step,
-                )
-            if self._should_offload_rollout:
+                if not replay_step:
+                    self._evaluate(
+                        eval_workflow=eval_workflow,
+                        eval_workflow_kwargs=eval_workflow_kwargs,
+                        epoch=epoch,
+                        epoch_step=step,
+                        global_step=global_step,
+                    )
+            if self._should_offload_rollout and not replay_step:
                 self._offload_rollout(is_eval=True)
 
             with (
@@ -946,7 +958,8 @@ class PPOTrainer:
                 )
 
             # Resume rollout
-            self.rollout.resume()
+            if not replay_step:
+                self.rollout.resume()
 
             self._save_perf_tracer(step=global_step)
 
@@ -1092,7 +1105,8 @@ class PPOTrainer:
             self.critic.config_perf_tracer(self.config.perf_tracer, role="critic")
         if self.ref is not None:
             self.ref.config_perf_tracer(self.config.perf_tracer, role="ref")
-        self.rollout.config_perf_tracer(self.config.perf_tracer, role="rollout")
+        if self.rollout is not None:
+            self.rollout.config_perf_tracer(self.config.perf_tracer, role="rollout")
         if self.eval_rollout is not None:
             self.eval_rollout.config_perf_tracer(
                 self.config.perf_tracer, role="eval-rollout"
@@ -1106,7 +1120,8 @@ class PPOTrainer:
             self.critic.save_perf_tracer(step=step)
         if self.eval_rollout is not None:
             self.eval_rollout.save_perf_tracer(step=step)
-        self.rollout.save_perf_tracer(step=step)
+        if self.rollout is not None:
+            self.rollout.save_perf_tracer(step=step)
         perf_tracer.save(step=step)
 
     def _init_scheduler(self) -> Scheduler:
@@ -1471,7 +1486,8 @@ class PPOTrainer:
     def _export_and_commit_stats(self, epoch: int, epoch_step: int, global_step: int):
         # Upload statistics to the logger (e.g., wandb)
         stats = self.actor.export_stats()
-        stats.update(self.rollout.export_stats())
+        if self.rollout is not None:
+            stats.update(self.rollout.export_stats())
         if self.eval_rollout is not None:
             stats.update(self.eval_rollout.export_stats())
         self.stats_logger.commit(epoch, epoch_step, global_step, stats)
