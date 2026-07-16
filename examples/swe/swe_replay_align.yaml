@@ -1,0 +1,419 @@
+experiment_name: ${oc.env:EXP_NAME,"zjw-align-oss"}
+trial_name: ${oc.env:TRIAL_NAME,"replay-step1"}
+
+seed: 42
+enable_offload: false
+total_train_epochs: 1000
+tokenizer_path: ${actor.path}
+should_accept_fn: "examples.swe.filter_function.filter_function"
+
+post_exit_hook: 'cd \${AWEAGENT_ROOT:-\${SWE_AGENT_ROOT:-/path/to/AWEAgent}} && PYTHONPATH=$PWD:$PYTHONPATH pip install -q -r requirements.txt && AENV_SYSTEM_URL=\${AENV_SYSTEM_URL} python -m aweagent.maintenance.clean_instances'
+
+cluster:
+  # Colocation keeps the same actor/rollout parallelism as the 16-node
+  # separated CC baseline, but actor and rollout share the same 64 GPUs.
+  n_nodes: ${oc.env:N_NODES,8}
+  n_gpus_per_node: ${oc.env:N_GPUS,8}
+  fileroot: ${oc.env:FILEROOT,"/storage/openpsi/experiments"}
+  name_resolve:
+    type: nfs
+    nfs_record_root: ${cluster.fileroot}/name_resolve/${experiment_name}
+
+# Required for Megatron + SGLang colocation:
+# - Use "|" rather than "+" so actor and rollout share the same GPUs.
+# - Keep the same logical parallelism as the CC separated baseline:
+#   rollout SGLang = 16 DP x 4 TP x 1 PP = 64 GPUs
+#   actor Megatron = d2p8t4 / d2p8e4 = 64 GPUs
+allocation_mode: "megatron[actor]:(attn:d2p8t4|ffn:d2p8e4)|sglang[rollout]:d16t4p1"
+
+scheduler:
+  type: slurm
+
+gconfig:
+  n_samples: 8
+  min_new_tokens: 0
+  max_new_tokens: 131071
+  max_tokens: 131071
+  greedy: false
+  lora_name: ""
+  temperature: 1.0
+  top_p: 1.0
+  top_k: 1000000
+
+rollout:
+  backend: "sglang:d16t4p1"
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  max_concurrent_rollouts: 720
+  queue_size: null
+  consumer_batch_size: 32 # 32 prompts x 8 samples
+  max_head_offpolicyness: 1
+  enable_rollout_tracing: true
+  scheduling_spec:
+    - task_type: worker
+      port_count: 2
+      gpu: 1
+      cpu: 4
+      mem: 32
+      # Required for Slurm colocation: actor and rollout are separate jobs on
+      # the same nodes, so neither job can request exclusive node ownership.
+      exclusive: false
+      reservation: ${oc.env:AREAL_RESERVATION,"swe-rl"}
+      image: ${oc.env:AREAL_IMAGE,"/storage/openpsi/images/areal-dev-sglang-20260401.sif"}
+      cmd: python3 -m areal.infra.rpc.rpc_server
+      env_vars:
+        NCCL_TIMEOUT: 1800
+        NCCL_DEBUG: WARN
+        NCCL_IB_DISABLE: ${oc.env:NCCL_IB_DISABLE,"0"}
+        NCCL_NET: ${oc.env:NCCL_NET,"IB"}
+        NCCL_SOCKET_IFNAME: ${oc.env:NCCL_SOCKET_IFNAME,"bond0"}
+        NCCL_IB_HCA: ${oc.env:NCCL_IB_HCA,"mlx5_bond"}
+        NCCL_IB_GID_INDEX: ${oc.env:NCCL_IB_GID_INDEX,"3"}
+        NCCL_IB_TC: ${oc.env:NCCL_IB_TC,"136"}
+        NCCL_IB_SL: ${oc.env:NCCL_IB_SL,"5"}
+        NCCL_IB_QPS_PER_CONNECTION: ${oc.env:NCCL_IB_QPS_PER_CONNECTION,"8"}
+        NCCL_IB_TIMEOUT: ${oc.env:NCCL_IB_TIMEOUT,"22"}
+        NCCL_IB_RETRY_CNT: ${oc.env:NCCL_IB_RETRY_CNT,"7"}
+        NCCL_SET_THREAD_NAME: ${oc.env:NCCL_SET_THREAD_NAME,"1"}
+        NCCL_ASYNC_ERROR_HANDLING: "1"
+        TORCH_NCCL_ASYNC_ERROR_HANDLING: "1"
+        NCCL_P2P_PXN_LEVEL: "0"
+        # Required for AWEX colocate: actor/ref opt into expandable segments
+        # before CUDA allocator initialization; rollout/SGLang are ignored by
+        # the role guard in areal.__init__/rpc_server. Set env to "" to opt out.
+        AWEX_ACTOR_ALLOC_CONF: ${oc.env:AWEX_ACTOR_ALLOC_CONF,"expandable_segments:True"}
+        # Keep the shared worker allocator env empty. The role-gated early hook
+        # merges AWEX_ACTOR_ALLOC_CONF into actor/ref only.
+        PYTORCH_CUDA_ALLOC_CONF: ""
+        TRITON_CACHE_DIR: "/tmp/triton_cache"
+        # flash-linear-attention: required for BailingMoeV2.5 Lightning Attention
+        FLASH_LINEAR_ATTENTION_ROOT: ${oc.env:FLASH_LINEAR_ATTENTION_ROOT,"/storage/openpsi/users/public/projects/flash-linear-attention"}
+        # AWEX must be importable by both the training adapter and SGLang plugin.
+        AWEX_ROOT: ${oc.env:AWEX_ROOT,"/storage/openpsi/users/public/projects/asystem-awex/"}
+        AREAL_EXTRA_PYTHONPATH: ${oc.env:AREAL_EXTRA_PYTHONPATH,"/storage/openpsi/users/zjw531248/monolith_pkgs"}
+        AREAL_ALLOW_DEFAULT_ADMIN_KEY: "1"
+        SGLANG_PYTHON_ROOT: ${oc.env:SGLANG_PYTHON_ROOT,"/storage/openpsi/users/chucai.dzq/codes/sglang/python"}
+        TMPDIR: ${oc.env:TMPDIR,"/tmp"}
+        TEMP: ${oc.env:TEMP,"/tmp"}
+        TMP: ${oc.env:TMP,"/tmp"}
+        AREAL_DIR: ${oc.env:AREAL_DIR,"."}
+        PYTHONPATH: ${.FLASH_LINEAR_ATTENTION_ROOT}
+        AENV_SYSTEM_URL: ${oc.env:AENV_SYSTEM_URL,""}
+        AWEAGENT_ROOT: ${oc.env:AWEAGENT_ROOT,"/storage/openpsi/users/public/projects/AWEAgent"}
+        WANDB_BASE_URL: ${oc.env:WANDB_BASE_URL,"http://8.150.1.98:8080"}
+        WANDB_API_KEY: ${oc.env:WANDB_API_KEY,"local-3bca3d5f00a980f3075b3e8ff2e16adc4ef43ffe"}
+        AWEX_COLOCATE_TIMEOUT_S: ${oc.env:AWEX_COLOCATE_TIMEOUT_S,"7200"}
+        SGLANG_WAIT_WEIGHTS_READY_TIMEOUT: ${oc.env:SGLANG_WAIT_WEIGHTS_READY_TIMEOUT,"600"}
+        SGLANG_ENABLE_LOGITS_PROCESSER_CHUNK: ${oc.env:SGLANG_ENABLE_LOGITS_PROCESSER_CHUNK,"1"}
+        SGLANG_LOGITS_PROCESSER_CHUNK_SIZE: ${oc.env:SGLANG_LOGITS_PROCESSER_CHUNK_SIZE,"2048"}
+        AWEX_CHUNK_MB: ${oc.env:AWEX_CHUNK_MB,"2048"}
+        AWEX_CHUNK_OPS: ${oc.env:AWEX_CHUNK_OPS,"128"}
+      additional_bash_cmds:
+        # Required for reused Slurm nodes after cancelled colocate jobs.
+        - >-
+          pkill -9 -f '[ -]m areal[.]engine[.]awex_sglang_plugin' 2>/dev/null || true;
+          pkill -9 -f 'awex_sglang_plugin[.]py' 2>/dev/null || true;
+          pkill -9 -f '[ -]m sglang[.]launch_server' 2>/dev/null || true;
+          pkill -9 -f 'sglang[.]srt' 2>/dev/null || true;
+          pkill -9 -f 'multiprocessing[.]spawn.*sglang' 2>/dev/null || true;
+          sleep 5
+        - export UV_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/ && uv pip install torch_memory_saver
+        - cd $AWEAGENT_ROOT && uv pip install -r requirements.txt
+        - python $AREAL_DIR/examples/swe/rl/apply_sgl_radix_cache_patch.py
+        - export LD_PRELOAD=$(find /AReaL/.venv -name torch_memory_saver_hook_mode_preload.abi3.so 2>/dev/null | head -1)
+        - export PYTHONPATH=$AREAL_EXTRA_PYTHONPATH:$SGLANG_PYTHON_ROOT:$FLASH_LINEAR_ATTENTION_ROOT:$AWEX_ROOT:$AREAL_DIR:$PYTHONPATH
+
+  # Required: launch rollout workers on the actor nodes.
+  scheduling_strategy:
+    type: colocation
+    target: actor
+  fileroot: ${cluster.fileroot}
+  tokenizer_path: ${tokenizer_path}
+  dump_to_file: true
+  setup_timeout: 3600.0
+  request_timeout: 20000.0
+  request_retries: 3
+  pause_grace_period: 30
+  routing_strategy: round_robin
+  agent:
+    mode: inline
+    drop_retry_orphans: true
+    tool_call_parser: qwen25
+    reasoning_parser: deepseek-r1
+    chat_template_type: concat
+    engine_max_tokens: ${gconfig.max_tokens}
+    export_style: concat
+    turn_discount: 1.0
+    session_timeout_seconds: 3600
+    # CC-specific message hygiene; no-ops for OpenAI-shape SWE rollouts.
+    prefix_matcher: examples.swe.prefix_matchers.swe_prefix_matcher
+    message_preprocessors:
+      - examples.swe.preprocessors.StripAnthropicBillingHeader
+      - examples.swe.preprocessors.StripAllSystemReminders
+      - examples.swe.preprocessors.StripAnthropicCacheFields
+      - examples.swe.preprocessors.NormalizeToolCallArguments
+
+actor:
+  backend: "megatron:(attn:d2p8t4|ffn:d2p8e4)"
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  path: ${oc.env:ACTOR_MODEL_PATH,"/storage/openpsi/experiments/checkpoints/admin/hcy-ring-sft/0531_flash_moe_bs256_g64_lr5e-5_stepfun_v9_no_agentic_continue_stepfun_ring_swe_v2_scaleswe/default/epoch2epochstep596globalstep1790"}
+  init_from_scratch: false
+  disable_dropout: true
+  gradient_checkpointing: true
+  dtype: bfloat16
+  grad_reduce_dtype: float32
+  mb_spec:
+    n_mbs: 1
+    granularity: 1
+    max_tokens_per_mb: 131072
+    n_mbs_divisor: 1
+  optimizer:
+    type: adam
+    lr: 3.0e-6
+    weight_decay: 0.01
+    beta1: 0.9
+    beta2: 0.999
+    eps: 1.0e-8 #1.0e-6
+    lr_scheduler_type: constant
+    gradient_clipping: 1.0
+    warmup_steps_proportion: 0.0006544
+  megatron:
+    wrap_with_ddp: true
+    ddp:
+      grad_reduce_in_fp32: true
+      overlap_grad_reduce: true
+      overlap_param_gather: false
+      use_distributed_optimizer: true
+    use_deterministic_algorithms: true
+    # Keep enabled for this refactor branch; the separated CC baseline had
+    # false, so review this explicitly before launching comparison runs.
+    enable_fp32_lm_head: ${oc.env:ENABLE_FP32_LM_HEAD,true}
+    cross_entropy_loss_fusion: false
+    recompute_granularity: full
+    recompute_method: uniform
+    recompute_num_layers: 1
+    moe_router_dtype: fp32
+    moe_token_dispatcher_type: alltoall
+    moe_router_bias_update_rate: 0.0
+  # PPO / GRPO settings: aligned with the CC separated baseline.
+  eps_clip: 0.2
+  eps_clip_higher: 0.28
+  temperature: ${gconfig.temperature}
+  kl_ctl: 0.0
+  ppo_n_minibatches: 1
+  recompute_logprob: false
+  prox_logp_method: reuse_train_logp
+  use_decoupled_loss: true
+  rejection_sampling:
+    level: token
+    action: mask
+    metric: ratio
+    upper: 5.0
+    lower: 0.5
+  discount: 1.0
+  gae_lambda: 1.0
+  reward_scaling: 1.0
+  reward_bias: 0.0
+  reward_clip: 5.0
+  reward_norm: null
+  adv_norm: null
+  # Required: AWEX uses MetaServer + CUDA IPC for colocated weight updates.
+  weight_update_mode: awex
+  max_new_tokens: ${gconfig.max_new_tokens}
+  scheduling_spec:
+    - task_type: worker
+      port_count: 2
+      gpu: 1
+      cpu: 4
+      mem: 32
+      # Required for Slurm colocation: actor and rollout are separate jobs on
+      # the same nodes, so neither job can request exclusive node ownership.
+      exclusive: false
+      reservation: ${oc.env:AREAL_RESERVATION,"swe-rl"}
+      image: ${oc.env:AREAL_IMAGE,"/storage/openpsi/images/areal-dev-sglang-20260401.sif"}
+      cmd: python3 -m areal.infra.rpc.rpc_server
+      env_vars:
+        NCCL_TIMEOUT: 1800
+        NCCL_DEBUG: WARN
+        NCCL_IB_DISABLE: ${oc.env:NCCL_IB_DISABLE,"0"}
+        NCCL_NET: ${oc.env:NCCL_NET,"IB"}
+        NCCL_SOCKET_IFNAME: ${oc.env:NCCL_SOCKET_IFNAME,"bond0"}
+        NCCL_IB_HCA: ${oc.env:NCCL_IB_HCA,"mlx5_bond"}
+        NCCL_IB_GID_INDEX: ${oc.env:NCCL_IB_GID_INDEX,"3"}
+        NCCL_IB_TC: ${oc.env:NCCL_IB_TC,"136"}
+        NCCL_IB_SL: ${oc.env:NCCL_IB_SL,"5"}
+        NCCL_IB_QPS_PER_CONNECTION: ${oc.env:NCCL_IB_QPS_PER_CONNECTION,"8"}
+        NCCL_IB_TIMEOUT: ${oc.env:NCCL_IB_TIMEOUT,"22"}
+        NCCL_IB_RETRY_CNT: ${oc.env:NCCL_IB_RETRY_CNT,"7"}
+        NCCL_SET_THREAD_NAME: ${oc.env:NCCL_SET_THREAD_NAME,"1"}
+        NCCL_ASYNC_ERROR_HANDLING: "1"
+        TORCH_NCCL_ASYNC_ERROR_HANDLING: "1"
+        NCCL_P2P_PXN_LEVEL: "0"
+        # Required for AWEX colocate: actor/ref opt into expandable segments
+        # before CUDA allocator initialization; rollout/SGLang are ignored by
+        # the role guard in areal.__init__/rpc_server. Set env to "" to opt out.
+        AWEX_ACTOR_ALLOC_CONF: ${oc.env:AWEX_ACTOR_ALLOC_CONF,"expandable_segments:True"}
+        # Keep the shared worker allocator env empty. The role-gated early hook
+        # merges AWEX_ACTOR_ALLOC_CONF into actor/ref only.
+        PYTORCH_CUDA_ALLOC_CONF: ""
+        TRITON_CACHE_DIR: "/tmp/triton_cache"
+        # flash-linear-attention: required for BailingMoeV2.5 Lightning Attention
+        FLASH_LINEAR_ATTENTION_ROOT: ${oc.env:FLASH_LINEAR_ATTENTION_ROOT,"/storage/openpsi/users/public/projects/flash-linear-attention"}
+        # AWEX must be importable by both the training adapter and SGLang plugin.
+        AWEX_ROOT: ${oc.env:AWEX_ROOT,"/storage/openpsi/users/public/projects/asystem-awex/"}
+        AREAL_EXTRA_PYTHONPATH: ${oc.env:AREAL_EXTRA_PYTHONPATH,"/storage/openpsi/users/zjw531248/monolith_pkgs"}
+        AREAL_ALLOW_DEFAULT_ADMIN_KEY: "1"
+        SGLANG_PYTHON_ROOT: ${oc.env:SGLANG_PYTHON_ROOT,"/storage/openpsi/users/chucai.dzq/codes/sglang/python"}
+        TMPDIR: ${oc.env:TMPDIR,"/tmp"}
+        TEMP: ${oc.env:TEMP,"/tmp"}
+        TMP: ${oc.env:TMP,"/tmp"}
+        AREAL_DIR: ${oc.env:AREAL_DIR,"."}
+        PYTHONPATH: ${.FLASH_LINEAR_ATTENTION_ROOT}
+        AENV_SYSTEM_URL: ${oc.env:AENV_SYSTEM_URL,""}
+        AWEAGENT_ROOT: ${oc.env:AWEAGENT_ROOT,"/storage/openpsi/users/public/projects/AWEAgent"}
+        WANDB_BASE_URL: ${oc.env:WANDB_BASE_URL,"http://8.150.1.98:8080"}
+        WANDB_API_KEY: ${oc.env:WANDB_API_KEY,"local-3bca3d5f00a980f3075b3e8ff2e16adc4ef43ffe"}
+        AWEX_COLOCATE_TIMEOUT_S: ${oc.env:AWEX_COLOCATE_TIMEOUT_S,"7200"}
+        SGLANG_WAIT_WEIGHTS_READY_TIMEOUT: ${oc.env:SGLANG_WAIT_WEIGHTS_READY_TIMEOUT,"600"}
+        SGLANG_ENABLE_LOGITS_PROCESSER_CHUNK: ${oc.env:SGLANG_ENABLE_LOGITS_PROCESSER_CHUNK,"1"}
+        SGLANG_LOGITS_PROCESSER_CHUNK_SIZE: ${oc.env:SGLANG_LOGITS_PROCESSER_CHUNK_SIZE,"2048"}
+        AWEX_CHUNK_MB: ${oc.env:AWEX_CHUNK_MB,"2048"}
+        AWEX_CHUNK_OPS: ${oc.env:AWEX_CHUNK_OPS,"128"}
+      additional_bash_cmds:
+        # Required for reused Slurm nodes after cancelled colocate jobs.
+        - >-
+          pkill -9 -f '[ -]m areal[.]engine[.]awex_sglang_plugin' 2>/dev/null || true;
+          pkill -9 -f 'awex_sglang_plugin[.]py' 2>/dev/null || true;
+          pkill -9 -f '[ -]m sglang[.]launch_server' 2>/dev/null || true;
+          pkill -9 -f 'sglang[.]srt' 2>/dev/null || true;
+          pkill -9 -f 'multiprocessing[.]spawn.*sglang' 2>/dev/null || true;
+          sleep 5
+        - export UV_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/ && uv pip install torch_memory_saver
+        - cd $AWEAGENT_ROOT && uv pip install -r requirements.txt
+        - python $AREAL_DIR/examples/swe/rl/apply_sgl_radix_cache_patch.py
+        - export LD_PRELOAD=$(find /AReaL/.venv -name torch_memory_saver_hook_mode_preload.abi3.so 2>/dev/null | head -1)
+        - export PYTHONPATH=$AREAL_EXTRA_PYTHONPATH:$SGLANG_PYTHON_ROOT:$FLASH_LINEAR_ATTENTION_ROOT:$AWEX_ROOT:$AREAL_DIR:$PYTHONPATH
+
+# kl_ctl is 0.0, so the ref engine is never instantiated; null skips its
+# mandatory per-engine backend field on this tree.
+ref: null
+
+# Mixed-agent environment: prompt-level weighted sampling from agent_pool.
+# All n_samples rollouts of one prompt use the same agent; across training
+# steps the same prompt is re-sampled. Per-agent rollout counts and rewards
+# are logged under agent/<type>/... in WandB.
+econfig:
+  dataset_path: ""
+  agent_type: cc
+  agent_config: 1_0_0/cc_overfit
+  swe_agent_root: ""
+  timeout: 3600.0
+
+# SGLang inference server: CC-agent logic stays aligned with the separated
+# baseline, but memory knobs below are required for actor + SGLang colocation.
+sglang:
+  model_path: ${actor.path}
+  random_seed: ${seed}
+  skip_tokenizer_init: true
+  dtype: ${actor.dtype}
+  context_length: 131072
+  max_prefill_tokens: 8192
+  chunked_prefill_size: 8192
+  max_running_requests: 128
+  mem_fraction_static: 0.65
+  schedule_policy: fcfs
+  attention_backend: fa3
+  log_level: info
+  log_requests: false
+  sampling_backend: pytorch # flashinfer
+  enable_memory_saver: true
+  disable_radix_cache: false
+  triton_attention_num_kv_splits: 16
+  disable_custom_all_reduce: true
+
+# Datasets
+train_dataset:
+  batch_size: 32 # 32 prompts x 8 samples
+  shuffle: true
+  pin_memory: true
+  num_workers: 4
+  path: ${oc.env:SWE_RL_DATASET_PATH,"/storage/openpsi/users/fenghui/projects/AWEAgent_DEV/AWEAgent/src/data/swe_bench_verified_rl.jsonl"}
+  type: rl
+  max_length: 32768 # TODO check
+  drop_last: true
+  scheduling_spec:
+    cpu: 1
+    gpu: 0
+    mem: 10
+    cmd: python3 -m areal.infra.rpc.guard
+    image: ${oc.env:AREAL_IMAGE,"/storage/openpsi/images/areal-dev-sglang-20260401.sif"}
+    reservation: ${oc.env:AREAL_RESERVATION,"swe-rl"}
+
+valid_dataset:
+  batch_size: 32
+  shuffle: true
+  pin_memory: true
+  num_workers: 4
+  path: ${train_dataset.path}
+  type: rl
+  scheduling_spec:
+    cpu: 1
+    gpu: 0
+    mem: 10
+    cmd: python3 -m areal.infra.rpc.guard
+    image: ${oc.env:AREAL_IMAGE,"/storage/openpsi/images/areal-dev-sglang-20260401.sif"}
+    reservation: ${oc.env:AREAL_RESERVATION,"swe-rl"}
+
+# Utilities
+saver:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: 1
+  freq_steps: 10
+  freq_secs: null
+
+recover:
+  mode: auto
+  retries: 3
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: 1
+  freq_secs: 7200
+  no_save_optim: false
+  no_load_optim: false
+  freq_steps: 10
+
+evaluator:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: null
+  freq_steps: null
+  freq_secs: null
+
+stats_logger:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  wandb:
+    mode: online
+    wandb_base_url: ${oc.env:WANDB_BASE_URL,"http://8.150.1.98:8080"}
+    wandb_api_key: ${oc.env:WANDB_API_KEY,"local-3bca3d5f00a980f3075b3e8ff2e16adc4ef43ffe"}
+
+perf_tracer:
+  enabled: false
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  session_tracer:
+    enabled: false
+
+
+total_train_steps: 1
+
+debug:
+  replay_rollout_data: true
+  path: /storage/openpsi/users/zjw531248/alignment-one-step/dump-step1/train_data
