@@ -1490,6 +1490,22 @@ class PPOTrainer:
             stats.update(self.rollout.export_stats())
         if self.eval_rollout is not None:
             stats.update(self.eval_rollout.export_stats())
+        if self.config.debug is not None:
+            import getpass
+            import json
+
+            full_dir = os.path.join(
+                self.config.cluster.fileroot,
+                "logs",
+                getpass.getuser(),
+                self.config.experiment_name,
+                self.config.trial_name,
+            )
+            os.makedirs(full_dir, exist_ok=True)
+            full_path = os.path.join(full_dir, f"stats_full_{global_step:06d}.json")
+            with open(full_path, "w") as f:
+                json.dump({k: float(v) for k, v in stats.items()}, f, indent=1)
+
         self.stats_logger.commit(epoch, epoch_step, global_step, stats)
 
         if not is_single_controller():
