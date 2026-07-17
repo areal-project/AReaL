@@ -349,6 +349,13 @@ class MegatronEngine(TrainEngine):
                 self.parallel_strategy, self.hf_config, self.tf_config
             )
 
+            # deterministic_mode must be engaged before the model is built:
+            # TP linear layers and TE modules copy config flags at __init__,
+            # so the post-build call below only reaches runtime consumers
+            # such as loss fusions.
+            if self.mcore_config.use_deterministic_algorithms:
+                set_deterministic_algorithms(self.tf_config, prebuild=True)
+
             self.is_vision_model = is_valid_vision_model(self.hf_config.model_type)
             # GDN/SSM models (e.g. Qwen3.5) reject packed THD input and must run
             # the padded BSHD forward. Derived from model type rather than a
