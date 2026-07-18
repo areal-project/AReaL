@@ -66,10 +66,8 @@ def _sequence_sums(
     sequence_lengths = (cu_seqlens[1:] - cu_seqlens[:-1]).to(
         device=values.device, dtype=torch.long
     )
-    if torch.any(sequence_lengths < 0):
-        raise ValueError("cu_seqlens must be non-decreasing.")
     sequence_ids = torch.arange(n_sequences, device=values.device).repeat_interleave(
-        sequence_lengths
+        sequence_lengths, output_size=values.numel()
     )
     if sequence_ids.numel() != values.numel():
         raise ValueError(
@@ -110,7 +108,7 @@ def _unit_ids(
     sizes = _validate_group_sizes(n_sequences, group_sizes)
     return (
         torch.arange(len(sizes), device=device).repeat_interleave(
-            torch.tensor(sizes, device=device)
+            torch.tensor(sizes, device=device), output_size=n_sequences
         ),
         len(sizes),
     )
