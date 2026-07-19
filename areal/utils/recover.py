@@ -371,6 +371,8 @@ class RecoverHandler:
                 for name, engine_ in normalized_engine.items():
                     self._load_checkpoint(engine_, name=name)
 
+            self._warmup_communicators(normalized_engine)
+
             if inference_engine is not None:
                 assert weight_update_meta is not None
                 update_engine = normalized_engine[inference_engine_update_from]
@@ -439,6 +441,24 @@ class RecoverHandler:
         )
         engine.save(meta)
         logger.info(f"Saved recover checkpoint to {path} (with_optim={with_optim})")
+
+    @staticmethod
+    def _warmup_communicators(
+        normalized_engine: dict[str, TrainEngine | TrainController],
+    ) -> None:
+        for name, engine_ in normalized_engine.items():
+            warmup = getattr(engine_, "warmup_communicators", None)
+            if warmup is None:
+                continue
+            try:
+                warmup()
+            except Exception:
+                logger.warning(
+                    "Communicator warmup failed for engine %s; the first "
+                    "train step will connect lazily instead.",
+                    name,
+                    exc_info=True,
+                )
 
     def _load_checkpoint(
         self,
