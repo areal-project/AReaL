@@ -10,7 +10,14 @@ class SWEEnvConfig:
     """Environment configuration for AReaL-SWEAgent-backed SWE-bench training.
 
     Attributes:
+        dataset_source: Dataset and agent backend, either ``jsonl`` or ``arena``.
         dataset_path: Path to the SWE-bench JSONL dataset file.
+        stream_id: Target Arena Stream. The first active Stream is used when empty.
+        arena_base_url: Arena OpenAPI base URL. Defaults to ARENA_OPENAPI_BASE.
+        arena_request_timeout: Timeout for Stream and dataset discovery requests.
+        arena_request_retries: Retries for transient Arena HTTP failures.
+        arena_poll_interval: Delay between asynchronous task-result requests.
+        arena_registration_timeout: Timeout for LLM registration and deletion.
         agent_type: AReaL-SWEAgent agent type to train, e.g. ``swe`` or ``cc``.
         agent_config: Generic AReaL-SWEAgent config name. When set, this overrides
             the compatibility fields below.
@@ -26,9 +33,50 @@ class SWEEnvConfig:
         timeout: Maximum time allowed for a single episode in seconds.
     """
 
+    dataset_source: str = field(
+        default="jsonl",
+        metadata={
+            "help": "Dataset and agent backend: 'jsonl' or 'arena'.",
+            "choices": ["jsonl", "arena"],
+        },
+    )
     dataset_path: str = field(
         default="",
         metadata={"help": "Path to the SWE-bench JSONL dataset file."},
+    )
+    stream_id: str = field(
+        default="",
+        metadata={
+            "help": (
+                "Arena Stream id. When empty, the first active Stream returned by "
+                "the Arena OpenAPI is used."
+            )
+        },
+    )
+    arena_base_url: str = field(
+        default="",
+        metadata={
+            "help": (
+                "Arena OpenAPI base URL. Defaults to the ARENA_OPENAPI_BASE "
+                "environment variable."
+            )
+        },
+    )
+    arena_request_timeout: float = field(
+        default=60.0,
+        metadata={"help": "Arena Stream and dataset request timeout in seconds."},
+    )
+    arena_request_retries: int = field(
+        default=3,
+        metadata={"help": "Retries for transient Arena HTTP request failures."},
+    )
+    arena_poll_interval: float = field(
+        default=5.0,
+        metadata={"help": "Arena task-result polling interval in seconds."},
+    )
+    arena_registration_timeout: float = field(
+        default=180.0,
+        metadata={"help": "Arena LLM registration request timeout in seconds."},
     )
     agent_type: str = field(
         default="swe",

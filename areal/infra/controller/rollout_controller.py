@@ -917,6 +917,13 @@ class RolloutController:
 
         return [r.trajectory if r is not None else None for r in results]
 
+    def wait_for_task(
+        self, task_id: int, timeout: float | None = None, raise_timeout: bool = True
+    ) -> dict[str, Any] | None:
+        """Wait for one submitted rollout while preserving its task identity."""
+        result = self.dispatcher.wait_for_task(task_id, timeout, raise_timeout)
+        return result.trajectory if result is not None else None
+
     @trace_perf("rollout_controller.rollout_batch", category="scheduler")
     def rollout_batch(
         self,

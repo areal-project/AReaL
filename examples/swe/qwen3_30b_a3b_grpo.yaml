@@ -1,23 +1,20 @@
-experiment_name: qwen3_30b_a3b_grpo
-trial_name: trial0
+experiment_name: ${oc.env:EXPERIMENT_NAME}
+trial_name: ${oc.env:TRIAL_NAME}
 
 seed: 42
-enable_offload: true
+enable_offload: false
 total_train_epochs: 10
 total_train_steps: 100
 tokenizer_path: ${actor.path}
 
-# Clean up external SWE sandbox instances after the run (LOG_DIR is injected).
-post_exit_hook: 'AWE_ROOT=\${AWEAGENT_ROOT:-\${SWE_AGENT_ROOT:-/path/to/AReaL-SWEAgent}}; cd "$AWE_ROOT" && PYTHONPATH=$PWD:$PYTHONPATH pip install -q -r requirements.txt && AENV_SYSTEM_URL=\${AENV_SYSTEM_URL} python -m aweagent.maintenance.clean_instances'
-
 cluster:
-  # 4 nodes x 8 GPUs: 2 for rollout (SGLang), 2 for actor (Megatron).
-  n_nodes: 4
+  # 2 nodes x 8 GPUs: 1 for rollout (SGLang), 1 for actor (Megatron).
+  n_nodes: 2
   n_gpus_per_node: 8
-  fileroot: /tmp/areal/experiments
+  fileroot: ${oc.env:AREAL_FILEROOT}
   name_resolve:
     type: nfs
-    nfs_record_root: /tmp/areal/name_resolve
+    nfs_record_root: ${cluster.fileroot}/name_resolve/${experiment_name}
 
 scheduler:
   type: slurm
@@ -35,7 +32,7 @@ gconfig:
 rollout:
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
-  backend: "sglang:d4t8p1"
+  backend: "sglang:d2t4p1"
   max_concurrent_rollouts: 32
   queue_size: null
   consumer_batch_size: ${train_dataset.batch_size}
@@ -70,9 +67,9 @@ rollout:
 actor:
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
-  # attn DP4 PP1 TP4 CP2; ffn DP4 PP1 EP8. CP=2 shards long sequences.
-  backend: "megatron:(attn:d4p1t4c2|ffn:d4p1e8)"
-  path: /path/to/Qwen3-Coder-30B-A3B-Instruct
+  # attn DP1 PP1 TP2 CP4; ffn DP1 PP1 EP8. CP=4 shards long sequences.
+  backend: "megatron:(attn:d1p1t2c4|ffn:d1p1e8)"
+  path: ${oc.env:MODEL_PATH}
   init_from_scratch: false
   disable_dropout: true
   gradient_checkpointing: true
@@ -142,32 +139,24 @@ actor:
       gpu: 1
       cpu: 4
       mem: 32
-      exclusive: true
-      reservation: null
       nodelist: null
       exclude: null
-      image: /path/to/areal.sif
+      image: ${oc.env:AREAL_IMAGE}
       cmd: python3 -m areal.infra.rpc.rpc_server
       env_vars:
         NCCL_TIMEOUT: 600
         PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
         # Point HOME and caches at shared storage to avoid filling the
         # container's small default HOME during JIT compilation.
-        HOME: "/path/to/cache/home"
-        HF_HOME: "/path/to/cache/hf"
-        XDG_CACHE_HOME: "/path/to/cache/xdg"
-        # Workers must import both AReaL and the external AReaL-SWEAgent.
-        PYTHONPATH: "/path/to/AReaL-SWEAgent:/path/to/AReaL"
-        AENV_SYSTEM_URL: "http://your-aenv-service:8080"
-        SWE_AGENT_ROOT: "/path/to/AReaL-SWEAgent"
-        AWEAGENT_ROOT: "/path/to/AReaL-SWEAgent"
+        HOME: "${oc.env:AREAL_CACHE_ROOT}/home"
+        HF_HOME: "${oc.env:AREAL_CACHE_ROOT}/hf"
+        XDG_CACHE_HOME: "${oc.env:AREAL_CACHE_ROOT}/xdg"
+        PYTHONPATH: ${oc.env:AREAL_DIR}
+        # Expand on the worker at launch time; do not store credentials in config.
+        ARENA_OPENAPI_BASE: "$ARENA_OPENAPI_BASE"
+        ARENA_OPENAPI_TOKEN: "$ARENA_OPENAPI_TOKEN"
+        ARENA_LLM_API_KEY: "$ARENA_LLM_API_KEY"
         OPENAI_MODEL: "Qwen3-Coder-30B-A3B-Instruct"
-      additional_bash_cmds:
-        # Install AReaL-SWEAgent's aenv/fastmcp into the venv the workers use.
-        - "/opt/.venv/bin/python -m ensurepip --upgrade >/dev/null 2>&1 || true"
-        - "/opt/.venv/bin/python -m pip install --no-deps aenvironment==0.1.8rc2 || echo 'WARN: aenvironment install failed'"
-        - "/opt/.venv/bin/python -m pip install 'fastmcp<3' || echo 'WARN: fastmcp install failed'"
-        - "/opt/.venv/bin/python -c 'import aenv, aweagent' || echo 'WARN: aenv/aweagent import failed'"
 
 ref:
   experiment_name: ${experiment_name}
@@ -188,20 +177,16 @@ ref:
     target: actor
   scheduling_spec: ${actor.scheduling_spec}
 
-# SWE-bench agent environment. Set agent_type=cc to train Claude Code through
-# the same proxy path. agent_root points at the external AReaL-SWEAgent checkout.
+# Arena Stream dataset and task environment. Leave stream_id empty to use the
+# first active Stream returned by GET /openapi/v1/streams.
 econfig:
-  dataset_path: ""
-  agent_type: swe
-  agent_config: ""
-  swe_agent_config: 1_0_0/min-swe-agent-train-top1
-  cc_agent_config: train_cc_time3600
-  agent_root: /path/to/AReaL-SWEAgent
-  swe_agent_root: /path/to/AReaL-SWEAgent
-  llm_model: ""
-  opencode_provider: ""
-  codex_provider: ""
-  max_completion_tokens: 131071
+  dataset_source: arena
+  stream_id: swe-bench-verified
+  arena_base_url: ${oc.env:ARENA_OPENAPI_BASE}
+  arena_request_timeout: 180.0
+  arena_request_retries: 3
+  arena_poll_interval: 5.0
+  arena_registration_timeout: 180.0
   timeout: 3600.0
 
 sglang:
@@ -226,14 +211,14 @@ sglang:
   disable_custom_all_reduce: true
   disable_cuda_graph: false
 
-# Datasets: SWE-bench style jsonl with instance_id / problem_statement /
-# eval_script per line.
+# Dataset paths are unused when econfig.dataset_source=arena; the data ids are
+# loaded from the selected Stream before PPOTrainer starts.
 train_dataset:
   batch_size: 4
   shuffle: true
   pin_memory: true
   num_workers: 4
-  path: /path/to/swe_bench_rl.jsonl
+  path: ""
   type: rl
   max_length: 32768
   drop_last: true
@@ -243,7 +228,7 @@ valid_dataset:
   shuffle: true
   pin_memory: true
   num_workers: 4
-  path: /path/to/swe_bench_rl.jsonl
+  path: ""
   type: rl
 
 # Utilities
@@ -280,7 +265,9 @@ stats_logger:
   trial_name: ${trial_name}
   fileroot: ${cluster.fileroot}
   wandb:
-    mode: disabled
+    mode: online
+    project: ${experiment_name}
+    name: ${trial_name}
 
 perf_tracer:
   enabled: false

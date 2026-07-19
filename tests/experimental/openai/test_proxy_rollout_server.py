@@ -42,6 +42,67 @@ def _admin_headers():
 
 
 # ---------------------------------------------------------------------------
+# Tests: message preprocessing
+# ---------------------------------------------------------------------------
+
+
+def test_preprocess_messages_flattens_text_blocks_and_preserves_images(monkeypatch):
+    """OpenAI-routed Claude text blocks should be flattened before inference."""
+
+    class RemoveReminder:
+        def __call__(self, messages):
+            for message in messages:
+                if isinstance(message.get("content"), str):
+                    message["content"] = message["content"].replace(
+                        "reminder", "processed"
+                    )
+            return messages
+
+    monkeypatch.setattr(srv, "_message_preprocessors", [RemoveReminder()])
+    image_content = [
+        {"type": "text", "text": "describe"},
+        {"type": "image_url", "image_url": {"url": "https://example/image.png"}},
+    ]
+    messages = [
+        {"role": "system", "content": image_content},
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "hello"},
+                {
+                    "type": "tool_result",
+                    "content": [{"type": "text", "text": "reminder"}],
+                },
+            ],
+        },
+        {"role": "user", "content": image_content},
+    ]
+
+    result = srv._preprocess_messages(messages)
+
+    assert isinstance(result[0]["content"], str)
+    assert result[1]["content"] == "hello\nprocessed"
+    assert result[2]["content"] == image_content
+
+
+def test_prepare_request_messages_normalizes_tuple_and_system_content(monkeypatch):
+    """Tuple-backed request messages should not bypass system normalization."""
+    monkeypatch.setattr(srv, "_message_preprocessors", [])
+    messages = (
+        {
+            "role": "system",
+            "content": ({"type": "text", "text": "system prompt"},),
+        },
+        {"role": "user", "content": "hello"},
+    )
+
+    result = srv._prepare_request_messages(messages)
+
+    assert isinstance(result, list)
+    assert result[0]["content"] == "system prompt"
+
+
+# ---------------------------------------------------------------------------
 # Tests: start_session with provided api_key
 # ---------------------------------------------------------------------------
 

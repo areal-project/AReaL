@@ -201,5 +201,6 @@ api_key.json
 .vscode/
 wandb/
 outputs/
+rl_logs/
 sympy/
 !/docs/figures/*

@@ -1,5 +1,40 @@
 # SWE-bench RL training with AReaL-SWEAgent
 
+## Arena Stream mode
+
+The example config can also load data ids from the Arena online Stream OpenAPI and
+delegate each rollout to `launch_one_task`, without installing AReaL-SWEAgent. Set:
+
+```bash
+export ARENA_OPENAPI_BASE=https://your-arena-service
+export ARENA_OPENAPI_TOKEN=your-token
+export ARENA_LLM_API_KEY=your-llm-gateway-key
+export SWE_RL_ADMIN_API_KEY=your-rollout-admin-key
+```
+
+```yaml
+econfig:
+  dataset_source: arena
+  stream_id: ""  # empty selects the first active Stream
+  arena_base_url: ${oc.env:ARENA_OPENAPI_BASE}
+```
+
+The trainer first requests one dataset row to discover `total`, then requests
+`limit=total` and constructs the training dataset from the returned `data_ids`. The
+initial implementation intentionally rejects Streams with more than the API's
+single-request limit of 1000 rows; it does not paginate or shard the dataset.
+
+For every rollout, `ArenaStreamAgentWorkflow` registers the current AReaL proxy through
+`/llm/model/new`, then posts the returned model id and the row's `data_id` to
+`launch_one_task`. The task environment receives `MODEL_NAME`, `BASE_URL`, and
+`API_KEY`; the workflow polls the returned task id until it is terminal and returns its
+numeric score as the reward. Model registrations are deleted in a `finally` block.
+Credentials are read only from environment variables and are not stored in this
+repository or experiment configs.
+
+The sections below document the original external AReaL-SWEAgent mode, selected with
+`econfig.dataset_source=jsonl`.
+
 This example runs SWE-bench coding-agent RL (GRPO) in AReaL. The actual agent loop,
 sandboxing and reward computation live in a **separate repository**,
 [AReaL-SWEAgent](https://github.com/areal-project/AReaL-SWEAgent): for each SWE-bench
