@@ -202,5 +202,6 @@ api_key.json
 wandb/
 outputs/
 rl_logs/
+.arena-rollout.env
 sympy/
 !/docs/figures/*
