@@ -1404,9 +1404,6 @@ class PPOTrainer:
         if not is_single_controller():
             raise NotImplementedError("Proxy workers not supported in SPMD mode")
 
-        if self.config.scheduler.type == "ray":
-            raise NotImplementedError("Proxy workers not supported with RayScheduler")
-
         if not isinstance(self.rollout, RolloutController):
             self._proxy_started = True
             return

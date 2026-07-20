@@ -72,6 +72,9 @@ class RayRPCServer:
     def ping(self) -> str:
         return "ok"
 
+    def get_node_id(self) -> str:
+        return ray.get_runtime_context().get_node_id()
+
     def alloc_ports(self, count: int):
         ports = find_free_ports(count, exclude_ports=self._allocated_port)
         self._allocated_port.update(ports)

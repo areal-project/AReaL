@@ -4,16 +4,22 @@ import asyncio
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
+import aiohttp
+import orjson
 import ray
 import ray.exceptions
+import requests
 from ray.runtime_env import RuntimeEnv
 from ray.util.placement_group import (
     PlacementGroup,
     remove_placement_group,
 )
-from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
+from ray.util.scheduling_strategies import (
+    NodeAffinitySchedulingStrategy,
+    PlacementGroupSchedulingStrategy,
+)
 
 from areal.api import Job, Scheduler, Worker
 from areal.api.cli_args import (
@@ -21,14 +27,22 @@ from areal.api.cli_args import (
     SchedulingSpec,
     SchedulingStrategyType,
 )
+from areal.infra.rpc.ray_http_worker_manager import RayHTTPWorkerManager
 from areal.infra.rpc.ray_rpc_server import RayRPCServer
+from areal.infra.rpc.serialization import deserialize_value, serialize_value
 from areal.infra.scheduler.exceptions import (
     EngineCallError,
+    EngineCreationError,
+    EngineImportError,
+    RPCConnectionError,
+    SchedulerError,
+    WorkerConfigurationError,
     WorkerCreationError,
     WorkerFailedError,
     WorkerNotFoundError,
     WorkerTimeoutError,
 )
+from areal.infra.utils.http import get_default_connector
 from areal.infra.utils.launcher import get_env_vars, get_thread_env_vars
 from areal.infra.utils.ray import get_placement_group_master_ip_and_port
 from areal.infra.utils.ray_placement_group import (
@@ -39,6 +53,7 @@ from areal.infra.utils.ray_placement_group import (
     ray_resource_type,
 )
 from areal.utils import logging
+from areal.utils.network import format_hostport
 from areal.utils.offload import get_tms_env_vars
 
 logger = logging.getLogger("RayScheduler")
@@ -46,6 +61,17 @@ logger = logging.getLogger("RayScheduler")
 
 @dataclass
 class RayWorkerInfo:
+    """RayScheduler worker metadata.
+
+    For ``ray_rpc`` workers, ``actor`` is the RayRPCServer that serves engine
+    control calls directly over Ray actor RPC.
+
+    For ``http_server`` workers, ``actor`` is the RayHTTPWorkerManager that
+    manages the HTTP subprocess lifecycle; ``worker.ip`` and
+    ``worker.worker_ports[0]`` are the actual ProxyRolloutServer endpoint
+    used for scheduler control calls and agent traffic.
+    """
+
     worker: Worker
     actor: ray.actor.ActorHandle
     role: str
@@ -53,6 +79,9 @@ class RayWorkerInfo:
     bundle_index: int | None
     created_at: float
     env_vars: dict[str, str] = field(default_factory=dict)
+    worker_kind: Literal["ray_rpc", "http_server"] = "ray_rpc"
+    target_worker_id: str | None = None
+    target_node_id: str | None = None
 
 
 class RayScheduler(Scheduler):
@@ -104,9 +133,15 @@ class RayScheduler(Scheduler):
     def _ping_workers(self, role: str, timeout: float | None = None):
         worker_info_list = self._workers[role]
         timeout = timeout if timeout is not None else self.startup_timeout
-        refs = [wi.actor.ping.remote() for wi in worker_info_list]
+        http_workers = [
+            wi for wi in worker_info_list if wi.worker_kind == "http_server"
+        ]
+        for wi in http_workers:
+            self._ping_http_worker(wi, timeout)
 
-        ref_to_worker = {ref: wi for wi, ref in zip(worker_info_list, refs)}
+        ray_workers = [wi for wi in worker_info_list if wi.worker_kind == "ray_rpc"]
+        refs = [wi.actor.ping.remote() for wi in ray_workers]
+        ref_to_worker = {ref: wi for wi, ref in zip(ray_workers, refs)}
 
         pending = refs
         while pending:
@@ -126,6 +161,46 @@ class RayScheduler(Scheduler):
             except ray.exceptions.RayActorError:
                 failed_worker = ref_to_worker[ref]
                 raise WorkerFailedError(failed_worker.worker.id, -1)
+
+    def _ping_http_worker(self, wi: RayWorkerInfo, timeout: float) -> None:
+        """Validate manager/target fate-sharing for managed HTTP workers."""
+        try:
+            if wi.target_worker_id is None or wi.target_node_id is None:
+                raise RuntimeError("HTTP worker is missing target worker metadata")
+            target_wi = self._worker_info_by_id.get(wi.target_worker_id)
+            if target_wi is None:
+                raise RuntimeError(f"Target worker {wi.target_worker_id} not found")
+
+            ray.get(target_wi.actor.ping.remote(), timeout=timeout)
+            target_node_id = ray.get(
+                target_wi.actor.get_node_id.remote(), timeout=timeout
+            )
+            if target_node_id != wi.target_node_id:
+                raise RuntimeError(
+                    f"Target worker moved from node {wi.target_node_id} to "
+                    f"{target_node_id}"
+                )
+
+            launcher_node_id = ray.get(wi.actor.get_node_id.remote(), timeout=timeout)
+            if launcher_node_id != wi.target_node_id:
+                raise RuntimeError(
+                    f"HTTP launcher moved from node {wi.target_node_id} to "
+                    f"{launcher_node_id}"
+                )
+            ray.get(wi.actor.ping.remote(), timeout=timeout)
+        except ray.exceptions.GetTimeoutError as e:
+            self._fail_http_worker(wi, f"health check timed out: {e}")
+        except Exception as e:
+            self._fail_http_worker(wi, str(e))
+
+    def _fail_http_worker(self, wi: RayWorkerInfo, reason: str) -> None:
+        logger.warning("HTTP worker %s failed: %s", wi.worker.id, reason)
+        self._cleanup_forked_workers([wi])
+        self._worker_info_by_id.pop(wi.worker.id, None)
+        workers = self._workers.get(wi.role)
+        if workers is not None:
+            self._workers[wi.role] = [w for w in workers if w.worker.id != wi.worker.id]
+        raise WorkerFailedError(wi.worker.id, -1, reason)
 
     def _build_env_vars(self, spec: SchedulingSpec) -> dict[str, str]:
         """Helper to build environment variables for a worker."""
@@ -344,6 +419,476 @@ class RayScheduler(Scheduler):
         )
 
         return worker_ids
+
+    def _create_managed_http_workers(
+        self,
+        role: str,
+        target_role: str,
+        target_workers: list[RayWorkerInfo],
+        command: str,
+    ) -> list[str]:
+        """Create HTTP workers managed by Ray actors colocated with targets.
+
+        This is the RayScheduler equivalent of LocalScheduler's parent guard
+        ``/fork`` path: it creates a small Ray manager actor on the target
+        Ray node, and that manager owns the HTTP worker subprocess lifecycle.
+        The manager is not a generic RayRPC worker and does not proxy engine
+        control calls; those calls go directly to the HTTP worker endpoint.
+        """
+        if self.exp_config is None:
+            raise WorkerCreationError(
+                role,
+                "Missing experiment config",
+                "Ray HTTP workers require exp_config to pass experiment/trial, "
+                "name_resolve, and fileroot settings to the launched server.",
+            )
+
+        worker_info_list: list[RayWorkerInfo] = []
+        worker_ids: list[str] = []
+        launched_manager_actor: ray.actor.ActorHandle | None = None
+
+        try:
+            name_resolve_config = self.exp_config.cluster.name_resolve
+            for idx, target_wi in enumerate(target_workers):
+                launched_manager_actor = None
+                worker_id = f"{role}/{idx}"
+                target_node_id = ray.get(
+                    target_wi.actor.get_node_id.remote(), timeout=self.startup_timeout
+                )
+                worker_ports = ray.get(
+                    target_wi.actor.alloc_ports.remote(count=1),
+                    timeout=self.startup_timeout,
+                )
+                port = int(worker_ports[0])
+
+                manager_actor = RayHTTPWorkerManager.options(
+                    num_cpus=0,
+                    max_restarts=0,
+                    max_task_retries=0,
+                    name=worker_id,
+                    runtime_env=RuntimeEnv(env_vars=target_wi.env_vars.copy()),
+                    scheduling_strategy=NodeAffinitySchedulingStrategy(
+                        node_id=target_node_id,
+                        soft=False,
+                    ),
+                ).remote()
+                launched_manager_actor = manager_actor
+
+                manager_node_id = ray.get(
+                    manager_actor.get_node_id.remote(), timeout=self.startup_timeout
+                )
+                if manager_node_id != target_node_id:
+                    raise WorkerCreationError(
+                        role,
+                        "HTTP manager placement mismatch",
+                        f"worker={worker_id}, target_node={target_node_id}, "
+                        f"manager_node={manager_node_id}",
+                    )
+
+                launch_info = ray.get(
+                    manager_actor.launch.remote(
+                        module=command,
+                        host="0.0.0.0",
+                        port=port,
+                        experiment_name=str(self.exp_config.experiment_name),
+                        trial_name=str(self.exp_config.trial_name),
+                        role=role,
+                        worker_index=idx,
+                        name_resolve_type=name_resolve_config.type,
+                        nfs_record_root=name_resolve_config.nfs_record_root,
+                        etcd3_addr=name_resolve_config.etcd3_addr,
+                        fileroot=str(self.exp_config.cluster.fileroot),
+                        env=target_wi.env_vars.copy(),
+                        startup_timeout=self.startup_timeout,
+                    ),
+                    timeout=self.startup_timeout + 30.0,
+                )
+
+                http_worker = Worker(
+                    id=worker_id,
+                    ip=str(launch_info["host"]),
+                    worker_ports=[str(launch_info["port"])],
+                    engine_ports=[],
+                )
+                wi = RayWorkerInfo(
+                    worker=http_worker,
+                    actor=manager_actor,
+                    role=role,
+                    placement_group=target_wi.placement_group,
+                    bundle_index=target_wi.bundle_index,
+                    created_at=time.time(),
+                    env_vars=target_wi.env_vars.copy(),
+                    worker_kind="http_server",
+                    target_worker_id=target_wi.worker.id,
+                    target_node_id=target_node_id,
+                )
+                worker_info_list.append(wi)
+                worker_ids.append(worker_id)
+                launched_manager_actor = None
+
+            self._workers[role] = worker_info_list
+            for wi in worker_info_list:
+                self._worker_info_by_id[wi.worker.id] = wi
+
+            self._ping_workers(role, self.startup_timeout)
+
+            for rank, wi in enumerate(worker_info_list):
+                self._configure_http_worker(wi, rank)
+
+        except Exception as e:
+            if launched_manager_actor is not None:
+                try:
+                    ray.get(launched_manager_actor.destroy.remote(), timeout=10.0)
+                except Exception:
+                    try:
+                        ray.kill(launched_manager_actor, no_restart=True)
+                    except Exception:
+                        pass
+            self._cleanup_forked_workers(worker_info_list)
+            self._workers.pop(role, None)
+            for worker_id in worker_ids:
+                self._worker_info_by_id.pop(worker_id, None)
+            if isinstance(e, SchedulerError):
+                raise
+            raise WorkerCreationError(
+                role, "HTTP worker creation failed", str(e)
+            ) from e
+
+        logger.info(
+            f"Role '{role}' forked from '{target_role}': "
+            f"created {len(worker_ids)} HTTP workers with Ray managers"
+        )
+        return worker_ids
+
+    def _http_worker_url(self, wi: RayWorkerInfo, endpoint: str) -> str:
+        port = int(wi.worker.worker_ports[0])
+        return f"http://{format_hostport(wi.worker.ip, port)}{endpoint}"
+
+    def _extract_response_error(self, data: Any) -> str:
+        if isinstance(data, dict):
+            detail = data.get("error") or data.get("detail")
+            if detail is not None:
+                return str(detail)
+        return "Unknown error"
+
+    async def _read_aiohttp_error(self, response: aiohttp.ClientResponse) -> str:
+        try:
+            return self._extract_response_error(await response.json())
+        except Exception:
+            return await response.text()
+
+    def _read_requests_error(self, response: requests.Response) -> str:
+        try:
+            return self._extract_response_error(response.json())
+        except Exception:
+            return response.text
+
+    def _configure_http_worker(self, wi: RayWorkerInfo, worker_rank: int) -> None:
+        if self.exp_config is None:
+            return
+        worker_id = wi.worker.id
+        url = self._http_worker_url(wi, "/configure")
+        try:
+            response = requests.post(
+                url,
+                data=orjson.dumps(
+                    serialize_value(
+                        dict(
+                            config=self.exp_config,
+                            role=wi.role,
+                            rank=worker_rank,
+                        )
+                    )
+                ),
+                headers={"Content-Type": "application/json"},
+                timeout=300.0,
+            )
+            if response.status_code == 200:
+                logger.info(f"Configuration successful on worker '{worker_id}'")
+                return
+            raise WorkerConfigurationError(
+                worker_id,
+                self._read_requests_error(response),
+                str(response.status_code),
+            )
+        except requests.exceptions.ConnectionError as e:
+            port = int(wi.worker.worker_ports[0])
+            raise RPCConnectionError(worker_id, wi.worker.ip, port, str(e)) from e
+        except requests.exceptions.Timeout as e:
+            raise WorkerConfigurationError(worker_id, f"Request timed out: {e}") from e
+
+    async def _set_http_worker_env(
+        self, wi: RayWorkerInfo, env: dict[str, str]
+    ) -> None:
+        """Set environment variables on a real HTTP worker endpoint.
+
+        ``wi.actor`` is only the RayHTTPWorkerManager lifecycle owner. Scheduler
+        control requests must go directly to ``wi.worker.ip:worker_ports[0]``.
+        """
+        worker_id = wi.worker.id
+        port = int(wi.worker.worker_ports[0])
+        url = self._http_worker_url(wi, "/set_env")
+        try:
+            timeout = aiohttp.ClientTimeout(total=30.0)
+            async with aiohttp.ClientSession(
+                timeout=timeout,
+                connector=get_default_connector(),
+            ) as session:
+                async with session.post(
+                    url,
+                    data=orjson.dumps({"env": env}),
+                    headers={"Content-Type": "application/json"},
+                ) as response:
+                    if response.status == 200:
+                        wi.env_vars.update(env)
+                        return
+                    detail = await self._read_aiohttp_error(response)
+                    raise SchedulerError(
+                        f"Failed to set env on worker {worker_id}: "
+                        f"HTTP {response.status}: {detail}"
+                    )
+        except (aiohttp.ClientConnectionError, aiohttp.ClientConnectorError) as e:
+            try:
+                self._ping_http_worker(wi, 5.0)
+            except WorkerFailedError:
+                raise
+            raise RPCConnectionError(worker_id, wi.worker.ip, port, str(e)) from e
+        except TimeoutError as e:
+            raise SchedulerError(f"set_env timed out on worker {worker_id}: {e}") from e
+
+    async def _create_engine_on_http_worker(
+        self,
+        wi: RayWorkerInfo,
+        engine: str,
+        engine_name: str | None,
+        *args,
+        **kwargs,
+    ) -> Any:
+        """Create an engine inside the real HTTP worker endpoint."""
+        worker_id = wi.worker.id
+        if engine_name is None:
+            engine_name = worker_id
+        if not isinstance(engine, str):
+            raise EngineCreationError(
+                worker_id,
+                f"Engine must be a string import path, got {type(engine)}",
+            )
+
+        payload = {
+            "engine": engine,
+            "engine_name": engine_name,
+            "init_args": serialize_value(list(args)),
+            "init_kwargs": serialize_value(kwargs),
+        }
+        port = int(wi.worker.worker_ports[0])
+        url = self._http_worker_url(wi, "/create_engine")
+        try:
+            timeout = aiohttp.ClientTimeout(total=300.0)
+            async with aiohttp.ClientSession(
+                timeout=timeout,
+                read_bufsize=1024 * 1024 * 10,
+                connector=get_default_connector(),
+            ) as session:
+                async with session.post(
+                    url,
+                    data=orjson.dumps(payload),
+                    headers={"Content-Type": "application/json"},
+                ) as response:
+                    if response.status == 200:
+                        result = await response.json()
+                        return result.get("result")
+                    error_detail = await self._read_aiohttp_error(response)
+                    if response.status == 400 and "Failed to import" in error_detail:
+                        raise EngineImportError(engine, error_detail)
+                    raise EngineCreationError(worker_id, error_detail, response.status)
+        except (aiohttp.ClientConnectionError, aiohttp.ClientConnectorError) as e:
+            try:
+                self._ping_http_worker(wi, 5.0)
+            except WorkerFailedError:
+                raise
+            raise RPCConnectionError(worker_id, wi.worker.ip, port, str(e)) from e
+        except TimeoutError as e:
+            raise EngineCreationError(worker_id, f"Request timed out: {e}") from e
+
+    def _call_http_worker_engine(
+        self,
+        wi: RayWorkerInfo,
+        method: str,
+        engine_name: str | None,
+        *args,
+        rpc_meta: dict[str, Any] | None = None,
+        http_timeout: float = 7200.0,
+        max_retries: int = 3,
+        retry_delay: float = 1.0,
+        **kwargs,
+    ) -> Any:
+        """Call an engine method through the real HTTP worker endpoint."""
+        worker_id = wi.worker.id
+        if engine_name is None:
+            engine_name = worker_id
+        payload = {
+            "method": method,
+            "engine_name": engine_name,
+            "args": serialize_value(list(args)),
+            "kwargs": serialize_value(kwargs),
+            "rpc_meta": rpc_meta,
+        }
+        url = self._http_worker_url(wi, "/call")
+        last_error: str | None = None
+
+        for attempt in range(1, max_retries + 1):
+            try:
+                response = requests.post(url, json=payload, timeout=http_timeout)
+                if response.status_code == 200:
+                    result = response.json()
+                    if attempt > 1:
+                        logger.info(
+                            f"Method '{method}' on '{worker_id}' "
+                            f"succeeded after {attempt} attempts"
+                        )
+                    return deserialize_value(result.get("result"))
+
+                error_detail = self._read_requests_error(response)
+                if response.status_code == 503:
+                    last_error = "Service unavailable (503)"
+                elif (
+                    response.status_code == 500
+                    and attempt < max_retries
+                    and "timeout" in error_detail.lower()
+                ):
+                    last_error = f"Engine method timeout: {error_detail}"
+                else:
+                    raise EngineCallError(
+                        worker_id,
+                        method,
+                        f"HTTP {response.status_code}: {error_detail}",
+                        attempt=attempt,
+                    )
+            except requests.exceptions.Timeout as e:
+                last_error = f"Request timeout: {e}"
+            except requests.exceptions.ConnectionError as e:
+                last_error = f"Connection error: {e}"
+                try:
+                    self._ping_http_worker(wi, min(http_timeout, 5.0))
+                except WorkerFailedError:
+                    raise
+            except EngineCallError:
+                raise
+            except Exception as e:
+                last_error = f"Unexpected error: {e}"
+
+            if attempt < max_retries:
+                delay = retry_delay * (2 ** (attempt - 1))
+                logger.warning(
+                    f"Method '{method}' failed on worker '{worker_id}' "
+                    f"(attempt {attempt}/{max_retries}): {last_error}. "
+                    f"Retrying in {delay:.1f}s..."
+                )
+                time.sleep(delay)
+
+        raise EngineCallError(
+            worker_id,
+            method,
+            last_error or "Max retries exceeded",
+            attempt=max_retries,
+        )
+
+    async def _async_call_http_worker_engine(
+        self,
+        wi: RayWorkerInfo,
+        method: str,
+        engine_name: str | None,
+        *args,
+        rpc_meta: dict[str, Any] | None = None,
+        http_timeout: float = 7200.0,
+        max_retries: int = 3,
+        retry_delay: float = 1.0,
+        **kwargs,
+    ) -> Any:
+        """Async-call an engine method through the real HTTP worker endpoint."""
+        worker_id = wi.worker.id
+        if engine_name is None:
+            engine_name = worker_id
+        payload = {
+            "method": method,
+            "engine_name": engine_name,
+            "args": serialize_value(list(args)),
+            "kwargs": serialize_value(kwargs),
+            "rpc_meta": rpc_meta,
+        }
+        url = self._http_worker_url(wi, "/call")
+        last_error: str | None = None
+
+        for attempt in range(1, max_retries + 1):
+            try:
+                timeout = aiohttp.ClientTimeout(
+                    total=http_timeout,
+                    sock_connect=http_timeout,
+                    connect=http_timeout,
+                )
+                async with aiohttp.ClientSession(
+                    timeout=timeout,
+                    read_bufsize=1024 * 1024 * 10,
+                    connector=get_default_connector(),
+                ) as session:
+                    async with session.post(
+                        url,
+                        data=orjson.dumps(payload),
+                        headers={"Content-Type": "application/json"},
+                    ) as response:
+                        if response.status == 200:
+                            result = await response.json()
+                            if attempt > 1:
+                                logger.info(
+                                    f"Method '{method}' on '{worker_id}' "
+                                    f"succeeded after {attempt} attempts"
+                                )
+                            return deserialize_value(result.get("result"))
+
+                        error_detail = await self._read_aiohttp_error(response)
+                        if response.status == 503:
+                            last_error = "Service unavailable (503)"
+                        elif (
+                            response.status == 500
+                            and attempt < max_retries
+                            and "timeout" in error_detail.lower()
+                        ):
+                            last_error = f"Engine method timeout: {error_detail}"
+                        else:
+                            raise EngineCallError(
+                                worker_id,
+                                method,
+                                f"HTTP {response.status}: {error_detail}",
+                                attempt=attempt,
+                            )
+            except (aiohttp.ClientConnectionError, aiohttp.ClientConnectorError) as e:
+                last_error = f"Connection error: {e}"
+                try:
+                    self._ping_http_worker(wi, min(http_timeout, 5.0))
+                except WorkerFailedError:
+                    raise
+            except TimeoutError as e:
+                last_error = f"Request timeout: {e}"
+            except EngineCallError:
+                raise
+            except Exception as e:
+                last_error = f"Unexpected error: {e}"
+
+            if attempt < max_retries:
+                delay = retry_delay * (2 ** (attempt - 1))
+                logger.warning(
+                    f"Method '{method}' failed on worker '{worker_id}' "
+                    f"(attempt {attempt}/{max_retries}): {last_error}. "
+                    f"Retrying in {delay:.1f}s..."
+                )
+                await asyncio.sleep(delay)
+
+        raise EngineCallError(
+            worker_id,
+            method,
+            last_error or "Max retries exceeded",
+            attempt=max_retries,
+        )
 
     def _cleanup_forked_workers(self, workers: list[RayWorkerInfo]):
         """Clean up forked workers without removing placement groups.
@@ -586,6 +1131,14 @@ class RayScheduler(Scheduler):
             del self._colocated_roles[role]
             return
 
+        child_roles = [
+            child_role
+            for child_role, target in list(self._colocated_roles.items())
+            if target == role
+        ]
+        for child_role in child_roles:
+            self.delete_workers(child_role, reverse_order=reverse_order)
+
         if role not in self._workers:
             logger.warning(f"Worker role '{role}' not found, skipping deletion")
             return
@@ -607,27 +1160,37 @@ class RayScheduler(Scheduler):
         target_role: str,
         command: str | None = None,
     ) -> list[str]:
-        """Fork new worker processes from existing workers.
+        """Fork new workers from existing workers.
 
-        Creates new Ray actors colocated with existing workers of the target role.
-        The ``command`` parameter is ignored — Ray actors always run RayRPCServer.
+        Without ``command`` this creates RayRPCServer actors colocated by
+        placement group. With ``command`` this creates manager actors bound to
+        the target actor's Ray node and launches the requested HTTP module as a
+        managed subprocess.
         """
-        if command is not None:
-            logger.warning(
-                f"RayScheduler.fork_workers: 'command' parameter is ignored. "
-                f"Ray actors always use RayRPCServer. Got command='{command}'"
+        if role in self._workers or role in self._colocated_roles:
+            raise WorkerCreationError(
+                role,
+                "Worker group already exists",
+                f"Use delete_workers('{role}') first to remove existing workers.",
             )
 
         if target_role not in self._workers:
             raise WorkerNotFoundError(f"Target role '{target_role}' not found for fork")
         target_workers = self._workers[target_role]
 
+        if command is not None:
+            worker_ids = self._create_managed_http_workers(
+                role, target_role, target_workers, command
+            )
+            self._colocated_roles[role] = target_role
+            return worker_ids
+
         schedulings = []
         for target_wi in target_workers:
             # Use minimal resources for forked workers
             schedulings.append(SchedulingSpec(cpu=0, mem=0, gpu=1, port_count=1))
 
-        worker_ids = self._create_forked_workers(
+        worker_ids = self._create_forked_workers_internal(
             role, target_role, target_workers, schedulings
         )
         self._colocated_roles[role] = target_role
@@ -709,6 +1272,9 @@ class RayScheduler(Scheduler):
             if pg in self._placement_groups:
                 self._placement_groups.remove(pg)
 
+        for wi in workers:
+            self._worker_info_by_id.pop(wi.worker.id, None)
+
     def _get_worker_info_by_id(self, worker_id: str) -> RayWorkerInfo | None:
         return self._worker_info_by_id.get(worker_id, None)
 
@@ -718,6 +1284,9 @@ class RayScheduler(Scheduler):
             raise WorkerNotFoundError(worker_id)
         if not env:
             return
+
+        if wi.worker_kind == "http_server":
+            return await self._set_http_worker_env(wi, env)
 
         await wi.actor.set_env.remote(env)
         wi.env_vars.update(env)
@@ -733,6 +1302,11 @@ class RayScheduler(Scheduler):
         wi = self._get_worker_info_by_id(worker_id)
         if wi is None:
             raise WorkerNotFoundError(worker_id)
+
+        if wi.worker_kind == "http_server":
+            return await self._create_engine_on_http_worker(
+                wi, engine, engine_name, *args, **kwargs
+            )
 
         if not isinstance(engine, str):
             raise WorkerCreationError(
@@ -758,6 +1332,19 @@ class RayScheduler(Scheduler):
         wi = self._get_worker_info_by_id(worker_id)
         if wi is None:
             raise WorkerNotFoundError(worker_id)
+
+        if wi.worker_kind == "http_server":
+            return self._call_http_worker_engine(
+                wi,
+                method,
+                engine_name,
+                *args,
+                rpc_meta=rpc_meta,
+                http_timeout=http_timeout,
+                max_retries=max_retries,
+                retry_delay=retry_delay,
+                **kwargs,
+            )
 
         last_error: str | None = None
 
@@ -818,6 +1405,19 @@ class RayScheduler(Scheduler):
         wi = self._get_worker_info_by_id(worker_id)
         if wi is None:
             raise WorkerNotFoundError(worker_id)
+
+        if wi.worker_kind == "http_server":
+            return await self._async_call_http_worker_engine(
+                wi,
+                method,
+                engine_name,
+                *args,
+                rpc_meta=rpc_meta,
+                http_timeout=http_timeout,
+                max_retries=max_retries,
+                retry_delay=retry_delay,
+                **kwargs,
+            )
 
         last_error: str | None = None
 

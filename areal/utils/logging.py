@@ -46,6 +46,7 @@ LOGGER_COLORS_EXACT = {
     "RayLauncher": "blue",
     "SlurmLauncher": "blue",
     "InfCli": "blue",
+    "RayHTTPWorkerManager": "blue",
     # Workflows - purple
     "RLVRWorkflow": "light_purple",
     "VisionRLVRWorkflow": "light_purple",
