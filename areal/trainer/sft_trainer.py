@@ -33,7 +33,11 @@ from areal.utils.data import (
     tensor_container_to,
 )
 from areal.utils.dataloader import create_dataloader
-from areal.utils.environ import is_single_controller
+from areal.utils.environ import (
+    get_bool_env_var,
+    is_single_controller,
+    rank_in_env_filter,
+)
 from areal.utils.evaluator import Evaluator
 from areal.utils.hf_utils import load_hf_processor_and_tokenizer
 from areal.utils.perf_tracer import Category
@@ -147,6 +151,13 @@ class SFTTrainer:
 
     def train(self):
         config = self.config
+        rank = int(os.getenv("RANK", "0"))
+        memory_profile_this_rank = rank_in_env_filter(
+            "AREAL_MEMORY_PROFILER_RANKS", rank
+        )
+        torch_profiler_profile_memory = get_bool_env_var(
+            "AREAL_TORCH_PROFILER_PROFILE_MEMORY", default="true"
+        )
         start_step = (
             self.recover_info.last_step_info.next().global_step
             if self.recover_info is not None
@@ -183,6 +194,7 @@ class SFTTrainer:
             if (
                 config.memory_profiler is not None
                 and global_step in config.memory_profiler.profile_steps
+                and memory_profile_this_rank
             ):
                 self.actor.start_memory_profile(config.memory_profiler.max_entries)
 
@@ -191,6 +203,12 @@ class SFTTrainer:
                 perf_tracer.trace_scope(
                     "train.sft_step",
                     category=Category.COMPUTE,
+                    enable_profiler=True,
+                    profiler_args={
+                        "record_shapes": True,
+                        "with_stack": False,
+                        "profile_memory": torch_profiler_profile_memory,
+                    },
                     args={"global_step": global_step},
                 ),
             ):
@@ -201,6 +219,7 @@ class SFTTrainer:
             if (
                 config.memory_profiler is not None
                 and global_step in config.memory_profiler.profile_steps
+                and memory_profile_this_rank
             ):
                 log_dir = StatsLogger.get_log_path(config.stats_logger)
                 snapshot_dir = os.path.join(

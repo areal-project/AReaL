@@ -202,6 +202,170 @@ class TestExtractVisionFromMultiModal:
         assert torch.equal(padded_mb["pixel_values"], torch.cat(pixel_values, dim=0))
 
 
+class TestPackedContextParallelForward:
+    def test_hidden_state_mode_bypasses_post_process_and_restores_model(self):
+        from areal.engine.megatron_utils import packed_context_parallel
+
+        class HiddenModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.post_process = True
+                self.seen_post_process = True
+
+            def forward(self, **_kwargs):
+                self.seen_post_process = self.post_process
+                return torch.ones(2, 1, 3)
+
+        model = HiddenModel()
+        output = packed_context_parallel.packed_context_parallel_forward(
+            model,
+            {"input_ids": torch.ones(2, dtype=torch.long)},
+            return_hidden_states=True,
+        )
+
+        assert output.shape == (2, 1, 3)
+        assert model.seen_post_process is False
+        assert model.post_process is True
+
+    @pytest.mark.parametrize(
+        (
+            "use_areal_lm_head",
+            "model_dtype",
+            "expected",
+        ),
+        [
+            (True, torch.bfloat16, False),
+            (True, torch.float16, False),
+            (True, torch.float32, None),
+            (False, torch.bfloat16, None),
+        ],
+    )
+    def test_float16_wrapper_override_follows_areal_lm_head(
+        self,
+        use_areal_lm_head,
+        model_dtype,
+        expected,
+    ):
+        from areal.engine.megatron_engine import _float16_wrapper_fp32_output
+
+        assert (
+            _float16_wrapper_fp32_output(
+                use_areal_lm_head,
+                model_dtype,
+            )
+            is expected
+        )
+
+    @pytest.mark.parametrize(
+        (
+            "use_areal_lm_head",
+            "enable_fp32_lm_head",
+            "cross_entropy_loss_fusion",
+            "expected",
+        ),
+        [
+            (True, True, False, {}),
+            (False, False, False, {}),
+            (False, True, False, {"enable_fp32_lm_head": True}),
+            (True, False, True, {"cross_entropy_loss_fusion": True}),
+            (True, True, True, {"cross_entropy_loss_fusion": True}),
+            (
+                False,
+                True,
+                True,
+                {
+                    "enable_fp32_lm_head": True,
+                    "cross_entropy_loss_fusion": True,
+                },
+            ),
+        ],
+    )
+    def test_mbridge_precision_args_preserve_native_fallback(
+        self,
+        use_areal_lm_head,
+        enable_fp32_lm_head,
+        cross_entropy_loss_fusion,
+        expected,
+    ):
+        from areal.engine.megatron_engine import _mbridge_precision_args
+
+        assert (
+            _mbridge_precision_args(
+                use_areal_lm_head,
+                enable_fp32_lm_head,
+                cross_entropy_loss_fusion,
+            )
+            == expected
+        )
+
+    @pytest.mark.parametrize(
+        ("use_areal_lm_head", "expected"),
+        [
+            (False, False),
+            (True, True),
+        ],
+    )
+    def test_logits_reuse_follows_areal_lm_head(
+        self,
+        use_areal_lm_head,
+        expected,
+    ):
+        from areal.engine.megatron_engine import _reuse_areal_lm_head_logits
+
+        assert (
+            _reuse_areal_lm_head_logits(
+                use_areal_lm_head,
+            )
+            is expected
+        )
+
+    @pytest.mark.parametrize("fp32_output", [False, True])
+    def test_forwards_explicit_fp32_output(self, monkeypatch, fp32_output):
+        from areal.engine.megatron_utils import packed_context_parallel
+
+        model = MagicMock(return_value=torch.ones(1, 2, 3))
+        monkeypatch.setattr(
+            packed_context_parallel.mpu,
+            "is_pipeline_last_stage",
+            lambda **_kwargs: True,
+        )
+        monkeypatch.setattr(
+            packed_context_parallel.mpu,
+            "get_context_parallel_world_size",
+            lambda: 1,
+        )
+
+        packed_context_parallel.packed_context_parallel_forward(
+            model,
+            {"input_ids": torch.ones(2, dtype=torch.long)},
+            fp32_output=fp32_output,
+        )
+
+        assert model.call_args.kwargs["fp32_output"] is fp32_output
+
+    def test_omits_unspecified_fp32_output(self, monkeypatch):
+        from areal.engine.megatron_utils import packed_context_parallel
+
+        model = MagicMock(return_value=torch.ones(1, 2, 3))
+        monkeypatch.setattr(
+            packed_context_parallel.mpu,
+            "is_pipeline_last_stage",
+            lambda **_kwargs: True,
+        )
+        monkeypatch.setattr(
+            packed_context_parallel.mpu,
+            "get_context_parallel_world_size",
+            lambda: 1,
+        )
+
+        packed_context_parallel.packed_context_parallel_forward(
+            model,
+            {"input_ids": torch.ones(2, dtype=torch.long)},
+        )
+
+        assert "fp32_output" not in model.call_args.kwargs
+
+
 class TestPrepareMbListRebindCallerSafety:
     """Verify _prepare_mb_list rebinds mb_list.data to a filtered copy so the
     caller's input dict survives across repeated forward() calls.
