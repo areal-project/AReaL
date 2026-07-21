@@ -30,6 +30,7 @@ class ArenaStreamAgentWorkflow:
         self.registration_timeout = float(
             self.econfig.get("arena_registration_timeout", 180.0)
         )
+        self.task_envs = dict(self.econfig.get("arena_task_envs") or {})
         self.client = ArenaOpenAPIClient(
             base_url=str(self.econfig.get("arena_base_url", "")),
             timeout=self.timeout,
@@ -98,6 +99,7 @@ class ArenaStreamAgentWorkflow:
                     model_name=registered_model_id,
                     proxy_base_url=registered_url,
                     proxy_api_key=self.client.llm_api_key,
+                    task_envs=self.task_envs,
                     client=client,
                 ),
                 timeout=self.timeout,

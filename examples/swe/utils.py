@@ -18,6 +18,7 @@ class SWEEnvConfig:
         arena_request_retries: Retries for transient Arena HTTP failures.
         arena_poll_interval: Delay between asynchronous task-result requests.
         arena_registration_timeout: Timeout for LLM registration and deletion.
+        arena_task_envs: Extra environment variables injected into Arena tasks.
         agent_type: AReaL-SWEAgent agent type to train, e.g. ``swe`` or ``cc``.
         agent_config: Generic AReaL-SWEAgent config name. When set, this overrides
             the compatibility fields below.
@@ -77,6 +78,15 @@ class SWEEnvConfig:
     arena_registration_timeout: float = field(
         default=180.0,
         metadata={"help": "Arena LLM registration request timeout in seconds."},
+    )
+    arena_task_envs: dict[str, str] = field(
+        default_factory=dict,
+        metadata={
+            "help": (
+                "Additional environment variables passed to launch_one_task. "
+                "MODEL_NAME, BASE_URL, and API_KEY are managed by AReaL."
+            )
+        },
     )
     agent_type: str = field(
         default="swe",

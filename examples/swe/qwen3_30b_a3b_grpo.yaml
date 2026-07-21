@@ -187,6 +187,10 @@ econfig:
   arena_request_retries: 3
   arena_poll_interval: 5.0
   arena_registration_timeout: 180.0
+  # Extra environment variables injected into the Arena Harness/Agent sandbox.
+  arena_task_envs:
+    # Prevent Claude Code from changing the terminal title during rollouts.
+    CLAUDE_CODE_DISABLE_TERMINAL_TITLE: "1"
   timeout: 3600.0
 
 sglang:

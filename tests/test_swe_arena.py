@@ -349,6 +349,7 @@ def test_agent_launches_task_through_proxy_and_returns_reward(monkeypatch):
                     "MODEL_NAME": deployment_id,
                     "BASE_URL": "https://arena.example/llm",
                     "API_KEY": "test-llm-key",
+                    "CLAUDE_CODE_DISABLE_TERMINAL_TITLE": "1",
                 },
             }
             return httpx.Response(
@@ -373,6 +374,7 @@ def test_agent_launches_task_through_proxy_and_returns_reward(monkeypatch):
                 econfig={
                     "arena_base_url": "https://arena.example",
                     "arena_poll_interval": 0.0,
+                    "arena_task_envs": {"CLAUDE_CODE_DISABLE_TERMINAL_TITLE": "1"},
                     "timeout": 10.0,
                 }
             )

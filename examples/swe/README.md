@@ -17,6 +17,8 @@ econfig:
   dataset_source: arena
   stream_id: ""  # empty selects the first active Stream
   arena_base_url: ${oc.env:ARENA_OPENAPI_BASE}
+  arena_task_envs:
+    CLAUDE_CODE_DISABLE_TERMINAL_TITLE: "1"
 ```
 
 The trainer first requests one dataset row to discover `total`, then requests
@@ -26,11 +28,12 @@ single-request limit of 1000 rows; it does not paginate or shard the dataset.
 
 For every rollout, `ArenaStreamAgentWorkflow` registers the current AReaL proxy through
 `/llm/model/new`, then posts the returned model id and the row's `data_id` to
-`launch_one_task`. The task environment receives `MODEL_NAME`, `BASE_URL`, and
-`API_KEY`; the workflow polls the returned task id until it is terminal and returns its
-numeric score as the reward. Model registrations are deleted in a `finally` block.
-Credentials are read only from environment variables and are not stored in this
-repository or experiment configs.
+`launch_one_task`. The task environment receives the managed `MODEL_NAME`, `BASE_URL`,
+and `API_KEY` variables plus values configured in `econfig.arena_task_envs`; the
+workflow polls the returned task id until it is terminal and returns its numeric score
+as the reward. Model registrations are deleted in a `finally` block. Credentials are
+read only from environment variables and are not stored in this repository or experiment
+configs.
 
 The sections below document the original external AReaL-SWEAgent mode, selected with
 `econfig.dataset_source=jsonl`.

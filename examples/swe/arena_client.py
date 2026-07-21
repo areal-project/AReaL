@@ -499,21 +499,31 @@ class ArenaOpenAPIClient:
         proxy_base_url: str,
         proxy_api_key: str,
         *,
+        task_envs: Mapping[str, str] | None = None,
         client: httpx.AsyncClient | None = None,
     ) -> float:
         """Launch one Arena task through the rollout proxy and return its reward."""
         encoded_stream_id = quote(stream_id, safe="")
         url = f"{self.base_url}/openapi/v1/streams/{encoded_stream_id}/launch_one_task"
+        envs = dict(task_envs or {})
+        if not all(
+            isinstance(key, str) and key and isinstance(value, str)
+            for key, value in envs.items()
+        ):
+            raise ValueError("Arena task environment variables must be strings")
+        envs.update(
+            {
+                "MODEL_NAME": model_name,
+                "BASE_URL": proxy_base_url,
+                "API_KEY": proxy_api_key,
+            }
+        )
         request = {
             "data_id": data_id,
             "model_name": model_name,
             "base_url": proxy_base_url,
             "api_key": proxy_api_key,
-            "envs": {
-                "MODEL_NAME": model_name,
-                "BASE_URL": proxy_base_url,
-                "API_KEY": proxy_api_key,
-            },
+            "envs": envs,
         }
         if client is not None:
             return await self._launch_and_wait(client, url, request)
