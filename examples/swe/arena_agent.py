@@ -8,7 +8,7 @@ from typing import Any
 
 import httpx
 
-from examples.swe.arena_client import ArenaOpenAPIClient
+from examples.swe.arena_client import ArenaOpenAPIClient, LLMProtocol
 
 from areal.utils import logging
 
@@ -45,6 +45,7 @@ class ArenaStreamAgentWorkflow:
         """Launch the row's task with the current rollout proxy session."""
         stream_id = str(data.get("stream_id") or self.econfig.get("stream_id") or "")
         data_id = str(data.get("data_id") or "")
+        llm_protocol: LLMProtocol = data.get("llm_protocol", "chat_completions")
         proxy_base_url = extra_kwargs.get("base_url")
         proxy_api_key = extra_kwargs.get("api_key")
         arena_http_client: httpx.AsyncClient | None = extra_kwargs.get(
@@ -75,15 +76,17 @@ class ArenaStreamAgentWorkflow:
                 upstream_base_url=str(proxy_base_url),
                 upstream_api_key=str(proxy_api_key),
                 deployment_id=deployment_id,
+                protocol=llm_protocol,
                 client=client,
                 timeout=self.registration_timeout,
             )
             logger.info(
                 "Registered Arena LLM proxy: model_name=%s, model_id=%s, "
-                "registered_url=%s",
+                "registered_url=%s, protocol=%s",
                 model_name,
                 registered_model_id,
                 registered_url,
+                llm_protocol,
             )
             logger.info(
                 f"Launching Arena task: stream_id={stream_id}, data_id={data_id}"

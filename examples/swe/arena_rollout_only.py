@@ -16,7 +16,7 @@ from typing import Any
 import httpx
 import torch
 
-from examples.swe.arena_client import ArenaOpenAPIClient
+from examples.swe.arena_client import ArenaOpenAPIClient, infer_llm_protocol
 from examples.swe.utils import SWEPPOConfig
 
 from areal.api.alloc_mode import ModelAllocation
@@ -228,17 +228,29 @@ def main(args: list[str]) -> None:
     if not rollout_args.registry_smoke:
         smoke_data_id = os.getenv("ARENA_ROLLOUT_DATA_ID", "")
         if smoke_data_id:
-            stream_id = arena_client.resolve_stream_id(econfig.stream_id)
-            selected_rows = [{"data_id": smoke_data_id, "stream_id": stream_id}]
+            stream = arena_client.resolve_stream(econfig.stream_id)
+            stream_id = str(stream["stream_id"])
+            llm_protocol = infer_llm_protocol(stream)
+            selected_rows = [
+                {
+                    "data_id": smoke_data_id,
+                    "stream_id": stream_id,
+                    "llm_protocol": llm_protocol,
+                }
+            ]
             logger.info(
-                "Using preselected Arena smoke row: stream_id=%s, data_id=%s",
+                "Using preselected Arena smoke row: stream_id=%s, data_id=%s, "
+                "protocol=%s",
                 stream_id,
                 smoke_data_id,
+                llm_protocol,
             )
         else:
             logger.info("Loading Arena Stream dataset")
-            stream_id = arena_client.resolve_stream_id(econfig.stream_id)
-            rows = arena_client.get_all_dataset_rows(stream_id)
+            stream = arena_client.resolve_stream(econfig.stream_id)
+            stream_id = str(stream["stream_id"])
+            llm_protocol = infer_llm_protocol(stream)
+            rows = arena_client.get_all_dataset_rows(stream_id, llm_protocol)
             selection_rng = random.Random(config.seed)
             selected_rows = selection_rng.sample(
                 rows, k=min(rollout_args.num_rollouts, len(rows))
@@ -249,9 +261,10 @@ def main(args: list[str]) -> None:
                     f"{rollout_args.num_rollouts} were requested"
                 )
             logger.info(
-                "Loaded %d rows from Arena Stream %s; running %d rollout(s)",
+                "Loaded %d rows from Arena Stream %s using %s; running %d rollout(s)",
                 len(rows),
                 stream_id,
+                llm_protocol,
                 len(selected_rows),
             )
 

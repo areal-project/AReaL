@@ -8,7 +8,7 @@ from typing import Any
 
 from datasets import Dataset
 
-from examples.swe.arena_client import ArenaOpenAPIClient
+from examples.swe.arena_client import ArenaOpenAPIClient, infer_llm_protocol
 from examples.swe.utils import SWEPPOConfig
 
 from areal import PPOTrainer
@@ -89,11 +89,14 @@ def get_arena_dataset(econfig) -> tuple[Dataset, str]:
         timeout=econfig.arena_request_timeout,
         request_retries=econfig.arena_request_retries,
     )
-    stream_id = client.resolve_stream_id(econfig.stream_id)
-    rows = client.get_all_dataset_rows(stream_id)
+    stream = client.resolve_stream(econfig.stream_id)
+    stream_id = str(stream["stream_id"])
+    llm_protocol = infer_llm_protocol(stream)
+    rows = client.get_all_dataset_rows(stream_id, llm_protocol)
     dataset = Dataset.from_list(rows)
     logger.info(
-        f"Created Arena dataset with {len(dataset)} items from stream {stream_id}"
+        f"Created Arena dataset with {len(dataset)} items from stream {stream_id} "
+        f"using {llm_protocol}"
     )
     return dataset, stream_id
 

@@ -8,10 +8,12 @@ import time
 import uuid
 from collections.abc import Mapping
 from numbers import Real
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import quote
 
 import httpx
+
+LLMProtocol = Literal["anthropic", "responses", "chat_completions"]
 
 
 class ArenaAPIError(RuntimeError):
@@ -70,6 +72,60 @@ def _extract_reward(value: Any) -> float | None:
         if nested_reward is not None:
             return nested_reward
     return None
+
+
+def infer_llm_protocol(stream: Mapping[str, Any]) -> LLMProtocol:
+    """Select the native LLM protocol from a Stream's default Harness."""
+    harness_ref = stream.get("default_harness_ref")
+    harness_key = ""
+    if isinstance(harness_ref, Mapping):
+        key = harness_ref.get("key")
+        if isinstance(key, str):
+            harness_key = key.lower()
+
+    if "claude" in harness_key:
+        return "anthropic"
+    if "codex" in harness_key:
+        return "responses"
+    return "chat_completions"
+
+
+def _llm_registration_payload(
+    model_name: str,
+    upstream_base_url: str,
+    upstream_api_key: str,
+    deployment_id: str,
+    protocol: LLMProtocol,
+) -> dict[str, Any]:
+    if protocol == "anthropic":
+        provider = "anthropic"
+        model = f"anthropic/{model_name}"
+        mode = "chat"
+    elif protocol == "responses":
+        provider = "openai"
+        model = f"openai/{model_name}"
+        mode = "responses"
+    elif protocol == "chat_completions":
+        provider = "openai"
+        model = f"openai/{model_name}"
+        mode = "chat"
+    else:
+        raise ValueError(f"Unsupported Arena LLM protocol: {protocol!r}")
+
+    return {
+        "model_name": model_name,
+        "litellm_params": {
+            "model": model,
+            "api_base": upstream_base_url.rstrip("/"),
+            "api_key": upstream_api_key,
+            "custom_llm_provider": provider,
+        },
+        "model_info": {
+            "id": deployment_id,
+            "mode": mode,
+            "disable_background_health_check": True,
+        },
+    }
 
 
 class ArenaOpenAPIClient:
@@ -138,6 +194,24 @@ class ArenaOpenAPIClient:
             raise ArenaAPIError("Stream list response is missing an 'items' array")
         return [dict(item) for item in items if isinstance(item, Mapping)]
 
+    def resolve_stream(
+        self,
+        stream_id: str = "",
+        *,
+        client: httpx.Client | None = None,
+    ) -> dict[str, Any]:
+        """Resolve a Stream and retain metadata needed by the rollout Harness."""
+        streams = self.list_streams(client=client)
+        if not streams:
+            raise ArenaAPIError("Arena OpenAPI returned no active Streams")
+
+        if stream_id:
+            for stream in streams:
+                if stream.get("stream_id") == stream_id:
+                    return stream
+            raise ArenaAPIError(f"Active Stream {stream_id!r} was not found")
+        return streams[0]
+
     def resolve_stream_id(
         self,
         stream_id: str = "",
@@ -145,14 +219,10 @@ class ArenaOpenAPIClient:
         client: httpx.Client | None = None,
     ) -> str:
         """Use an explicit Stream id or fall back to the first active Stream."""
-        if stream_id:
-            return stream_id
-        streams = self.list_streams(client=client)
-        if not streams:
-            raise ArenaAPIError("Arena OpenAPI returned no active Streams")
-        selected = streams[0].get("stream_id")
+        stream = self.resolve_stream(stream_id, client=client)
+        selected = stream.get("stream_id")
         if not isinstance(selected, str) or not selected:
-            raise ArenaAPIError("The first Stream is missing 'stream_id'")
+            raise ArenaAPIError("The selected Stream is missing 'stream_id'")
         return selected
 
     def _select_dataset_page(
@@ -178,6 +248,7 @@ class ArenaOpenAPIClient:
     def get_all_dataset_rows(
         self,
         stream_id: str,
+        llm_protocol: LLMProtocol = "chat_completions",
         *,
         client: httpx.Client | None = None,
     ) -> list[dict[str, str]]:
@@ -217,7 +288,14 @@ class ArenaOpenAPIClient:
             raise ArenaAPIError(
                 f"Dataset response returned {len(data_ids)} rows, expected {total}"
             )
-        return [{"data_id": data_id, "stream_id": stream_id} for data_id in data_ids]
+        return [
+            {
+                "data_id": data_id,
+                "stream_id": stream_id,
+                "llm_protocol": llm_protocol,
+            }
+            for data_id in data_ids
+        ]
 
     def register_llm_proxy(
         self,
@@ -226,6 +304,7 @@ class ArenaOpenAPIClient:
         upstream_api_key: str,
         *,
         deployment_id: str | None = None,
+        protocol: LLMProtocol = "chat_completions",
         client: httpx.Client | None = None,
     ) -> tuple[str, str]:
         """Register one AReaL proxy and return its external URL and model id."""
@@ -237,19 +316,13 @@ class ArenaOpenAPIClient:
             raise ValueError("upstream_api_key is required")
 
         resolved_deployment_id = deployment_id or str(uuid.uuid4())
-        payload = {
-            "model_name": model_name,
-            "litellm_params": {
-                "model": f"openai/{model_name}",
-                "api_base": upstream_base_url.rstrip("/"),
-                "api_key": upstream_api_key,
-                "custom_llm_provider": "openai",
-            },
-            "model_info": {
-                "id": resolved_deployment_id,
-                "disable_background_health_check": True,
-            },
-        }
+        payload = _llm_registration_payload(
+            model_name=model_name,
+            upstream_base_url=upstream_base_url,
+            upstream_api_key=upstream_api_key,
+            deployment_id=resolved_deployment_id,
+            protocol=protocol,
+        )
         response = self._sync_request(
             "POST",
             f"{self.base_url}/llm/model/new",
@@ -294,6 +367,7 @@ class ArenaOpenAPIClient:
         upstream_api_key: str,
         deployment_id: str,
         *,
+        protocol: LLMProtocol = "chat_completions",
         client: httpx.AsyncClient,
         timeout: float = 180.0,
     ) -> tuple[str, str]:
@@ -304,19 +378,13 @@ class ArenaOpenAPIClient:
             raise ValueError("upstream_base_url is required")
         if not upstream_api_key:
             raise ValueError("upstream_api_key is required")
-        payload = {
-            "model_name": model_name,
-            "litellm_params": {
-                "model": f"openai/{model_name}",
-                "api_base": upstream_base_url.rstrip("/"),
-                "api_key": upstream_api_key,
-                "custom_llm_provider": "openai",
-            },
-            "model_info": {
-                "id": deployment_id,
-                "disable_background_health_check": True,
-            },
-        }
+        payload = _llm_registration_payload(
+            model_name=model_name,
+            upstream_base_url=upstream_base_url,
+            upstream_api_key=upstream_api_key,
+            deployment_id=deployment_id,
+            protocol=protocol,
+        )
         response = await self._async_request(
             client,
             "POST",

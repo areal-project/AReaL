@@ -8,7 +8,11 @@ import pytest
 import torch
 
 from examples.swe.arena_agent import ArenaStreamAgentWorkflow
-from examples.swe.arena_client import ArenaAPIError, ArenaOpenAPIClient
+from examples.swe.arena_client import (
+    ArenaAPIError,
+    ArenaOpenAPIClient,
+    infer_llm_protocol,
+)
 from examples.swe.arena_rollout_only import _run_rollout_tasks, _trajectory_reward
 
 
@@ -34,6 +38,49 @@ def test_resolve_stream_id_when_unspecified_returns_first_active(monkeypatch):
         stream_id = client.resolve_stream_id(client=http_client)
 
     assert stream_id == "stream-first"
+
+
+def test_resolve_stream_when_id_is_explicit_returns_matching_metadata(monkeypatch):
+    """An explicit Stream should still be discovered so its Harness is available."""
+    monkeypatch.setenv("ARENA_OPENAPI_TOKEN", "test-token")
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "items": [
+                    {"stream_id": "stream-first"},
+                    {
+                        "stream_id": "stream-selected",
+                        "default_harness_ref": {"key": "claude-code"},
+                    },
+                ]
+            },
+        )
+
+    client = ArenaOpenAPIClient(base_url="https://arena.example")
+    with httpx.Client(transport=httpx.MockTransport(handler)) as http_client:
+        stream = client.resolve_stream("stream-selected", client=http_client)
+
+    assert stream["default_harness_ref"] == {"key": "claude-code"}
+
+
+@pytest.mark.parametrize(
+    ("harness_key", "expected_protocol"),
+    [
+        ("Claude-Code-With-Skills", "anthropic"),
+        ("openai-codex", "responses"),
+        ("swe-agent", "chat_completions"),
+        (None, "chat_completions"),
+    ],
+)
+def test_infer_llm_protocol_from_harness_key(harness_key, expected_protocol):
+    """Harness names should select their native protocol case-insensitively."""
+    stream = (
+        {"default_harness_ref": {"key": harness_key}} if harness_key is not None else {}
+    )
+
+    assert infer_llm_protocol(stream) == expected_protocol
 
 
 def test_list_streams_transient_timeout_retries(monkeypatch):
@@ -120,9 +167,21 @@ def test_get_all_dataset_rows_uses_total_as_limit(monkeypatch):
 
     assert requested_limits == [1, 3]
     assert rows == [
-        {"data_id": "data-1", "stream_id": "stream-1"},
-        {"data_id": "data-2", "stream_id": "stream-1"},
-        {"data_id": "data-3", "stream_id": "stream-1"},
+        {
+            "data_id": "data-1",
+            "stream_id": "stream-1",
+            "llm_protocol": "chat_completions",
+        },
+        {
+            "data_id": "data-2",
+            "stream_id": "stream-1",
+            "llm_protocol": "chat_completions",
+        },
+        {
+            "data_id": "data-3",
+            "stream_id": "stream-1",
+            "llm_protocol": "chat_completions",
+        },
     ]
 
 
@@ -171,6 +230,7 @@ def test_register_and_delete_llm_proxy(monkeypatch):
                 },
                 "model_info": {
                     "id": deployment_id,
+                    "mode": "chat",
                     "disable_background_health_check": True,
                 },
             }
@@ -203,6 +263,49 @@ def test_register_and_delete_llm_proxy(monkeypatch):
     assert len(requests) == 2
 
 
+@pytest.mark.parametrize(
+    ("protocol", "expected_model", "expected_provider", "expected_mode"),
+    [
+        (
+            "anthropic",
+            "anthropic/stream-areal-test-1",
+            "anthropic",
+            "chat",
+        ),
+        ("responses", "openai/stream-areal-test-1", "openai", "responses"),
+    ],
+)
+def test_register_llm_proxy_selects_native_protocol(
+    monkeypatch,
+    protocol,
+    expected_model,
+    expected_provider,
+    expected_mode,
+):
+    """Registration should route Claude and Codex Harnesses natively."""
+    monkeypatch.setenv("ARENA_OPENAPI_TOKEN", "arena-token")
+    monkeypatch.setenv("ARENA_LLM_API_KEY", "test-llm-key")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        assert payload["litellm_params"]["model"] == expected_model
+        assert payload["litellm_params"]["custom_llm_provider"] == expected_provider
+        assert payload["model_info"]["mode"] == expected_mode
+        assert payload["model_info"]["disable_background_health_check"] is True
+        return httpx.Response(200, json="https://arena.example/llm")
+
+    client = ArenaOpenAPIClient(base_url="https://arena.example")
+    with httpx.Client(transport=httpx.MockTransport(handler)) as http_client:
+        client.register_llm_proxy(
+            model_name="stream-areal-test-1",
+            upstream_base_url="http://rollout-proxy",
+            upstream_api_key="session-key",
+            deployment_id="deployment-1",
+            protocol=protocol,
+            client=http_client,
+        )
+
+
 def test_agent_launches_task_through_proxy_and_returns_reward(monkeypatch):
     """The Arena agent should forward proxy credentials and return task reward."""
     monkeypatch.setenv("ARENA_OPENAPI_TOKEN", "arena-token")
@@ -218,11 +321,12 @@ def test_agent_launches_task_through_proxy_and_returns_reward(monkeypatch):
             payload = json.loads(request.content)
             assert payload["model_name"].startswith("stream-areal-")
             assert payload["litellm_params"] == {
-                "model": f"openai/{payload['model_name']}",
+                "model": f"anthropic/{payload['model_name']}",
                 "api_base": "http://rollout-proxy",
                 "api_key": "session-key",
-                "custom_llm_provider": "openai",
+                "custom_llm_provider": "anthropic",
             }
+            assert payload["model_info"]["mode"] == "chat"
             assert payload["model_info"]["disable_background_health_check"] is True
             deployment_id = payload["model_info"]["id"]
             return httpx.Response(
@@ -273,7 +377,11 @@ def test_agent_launches_task_through_proxy_and_returns_reward(monkeypatch):
                 }
             )
             return await workflow.run(
-                {"stream_id": "stream-1", "data_id": "data-1"},
+                {
+                    "stream_id": "stream-1",
+                    "data_id": "data-1",
+                    "llm_protocol": "anthropic",
+                },
                 base_url="http://rollout-proxy",
                 api_key="session-key",
                 arena_http_client=http_client,
