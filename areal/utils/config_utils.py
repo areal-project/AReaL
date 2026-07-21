@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 """Utilities for safely serializing application configuration."""
 
 from __future__ import annotations

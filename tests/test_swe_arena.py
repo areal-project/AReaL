@@ -169,7 +169,10 @@ def test_register_and_delete_llm_proxy(monkeypatch):
                     "api_key": "session-key",
                     "custom_llm_provider": "openai",
                 },
-                "model_info": {"id": deployment_id},
+                "model_info": {
+                    "id": deployment_id,
+                    "disable_background_health_check": True,
+                },
             }
             return httpx.Response(
                 200,
@@ -220,6 +223,7 @@ def test_agent_launches_task_through_proxy_and_returns_reward(monkeypatch):
                 "api_key": "session-key",
                 "custom_llm_provider": "openai",
             }
+            assert payload["model_info"]["disable_background_health_check"] is True
             deployment_id = payload["model_info"]["id"]
             return httpx.Response(
                 200,

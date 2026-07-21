@@ -245,7 +245,10 @@ class ArenaOpenAPIClient:
                 "api_key": upstream_api_key,
                 "custom_llm_provider": "openai",
             },
-            "model_info": {"id": resolved_deployment_id},
+            "model_info": {
+                "id": resolved_deployment_id,
+                "disable_background_health_check": True,
+            },
         }
         response = self._sync_request(
             "POST",
@@ -309,7 +312,10 @@ class ArenaOpenAPIClient:
                 "api_key": upstream_api_key,
                 "custom_llm_provider": "openai",
             },
-            "model_info": {"id": deployment_id},
+            "model_info": {
+                "id": deployment_id,
+                "disable_background_health_check": True,
+            },
         }
         response = await self._async_request(
             client,
