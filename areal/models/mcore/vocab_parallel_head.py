@@ -9,11 +9,15 @@ import torch.distributed as dist
 from megatron.core.tensor_parallel import layers as mcore_layers
 
 
-def _matches_storage(tensor: torch.Tensor, storage_ref: weakref.ReferenceType) -> bool:
-    expected_storage = storage_ref()
+def _matches_storage(
+    tensor: torch.Tensor,
+    tensor_ref: weakref.ReferenceType[torch.Tensor],
+) -> bool:
+    expected_tensor = tensor_ref()
     return (
-        expected_storage is not None
-        and tensor.untyped_storage()._cdata == expected_storage._cdata
+        expected_tensor is not None
+        and tensor.untyped_storage().data_ptr()
+        == expected_tensor.untyped_storage().data_ptr()
     )
 
 
@@ -203,7 +207,7 @@ class _LinearWithFp32Output(
             out=output.view(-1, weight.size(0)),
             out_dtype=torch.float32,
         )
-        ctx.output_storage_ref = weakref.ref(output.untyped_storage())
+        ctx.output_tensor_ref = weakref.ref(output)
         ctx.output_numel = output.numel()
         if bias is not None:
             output.add_(bias)
@@ -219,7 +223,7 @@ class _LinearWithFp32Output(
             and grad_output.dtype is torch.float32
             and grad_output.is_contiguous()
             and grad_output.storage_offset() == 0
-            and _matches_storage(grad_output, ctx.output_storage_ref)
+            and _matches_storage(grad_output, ctx.output_tensor_ref)
             and grad_output.numel() == ctx.output_numel
             and weight.dtype in (torch.bfloat16, torch.float16)
         )
@@ -264,7 +268,7 @@ class _LinearWithFrozenFp32Output(mcore_layers.LinearWithFrozenWeight):
             out=output.view(-1, weight.size(0)),
             out_dtype=torch.float32,
         )
-        ctx.output_storage_ref = weakref.ref(output.untyped_storage())
+        ctx.output_tensor_ref = weakref.ref(output)
         ctx.output_numel = output.numel()
         if bias is not None:
             output.add_(bias)
@@ -278,7 +282,7 @@ class _LinearWithFrozenFp32Output(mcore_layers.LinearWithFrozenWeight):
             and grad_output.dtype is torch.float32
             and grad_output.is_contiguous()
             and grad_output.storage_offset() == 0
-            and _matches_storage(grad_output, ctx.output_storage_ref)
+            and _matches_storage(grad_output, ctx.output_tensor_ref)
             and grad_output.numel() == ctx.output_numel
             and weight.dtype in (torch.bfloat16, torch.float16)
         )

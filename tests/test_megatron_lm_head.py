@@ -347,15 +347,15 @@ def test_storage_identity_rejects_recycled_cuda_address():
     shape = (1024, 1024)
     source = torch.empty(shape, dtype=torch.float32, device="cuda")
     source_ptr = source.data_ptr()
-    storage_ref = weakref.ref(source.untyped_storage())
+    tensor_ref = weakref.ref(source)
     del source
     gc.collect()
-    assert storage_ref() is None
+    assert tensor_ref() is None
 
     replacement = torch.empty(shape, dtype=torch.float32, device="cuda")
 
     assert replacement.data_ptr() == source_ptr
-    assert not _matches_storage(replacement, storage_ref)
+    assert not _matches_storage(replacement, tensor_ref)
 
 
 @pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA is required for direct FP32 mm")
@@ -715,11 +715,11 @@ def test_direct_fp32_lm_head_does_not_pack_reused_allocator_address(monkeypatch)
     logits = linear_with_fp32_output(
         input_, weight, None, False, False, False, tp_group=None
     )
-    storage_ref = weakref.ref(logits.untyped_storage())
+    tensor_ref = weakref.ref(logits)
     loss = _ReleaseLogits.apply(logits)
     del logits
     gc.collect()
-    assert storage_ref() is None
+    assert tensor_ref() is None
 
     loss.backward()
 
