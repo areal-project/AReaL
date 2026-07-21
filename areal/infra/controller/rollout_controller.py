@@ -184,13 +184,6 @@ class RolloutController:
         if sch_spec.gpu > 0:
             sch_spec.gpu = instance_size
 
-        if sch_spec.ray_placement_strategy == "shared":
-            # do not support shared placement for rollout
-            logger.warning(
-                "Placement strategy 'shared' is not supported for rollouts. Forcing to 'separate' strategy"
-            )
-            sch_spec.ray_placement_strategy = "separate"
-
         job = Job(
             replicas=dp_size,
             tasks=[sch_spec for _ in range(dp_size)],
