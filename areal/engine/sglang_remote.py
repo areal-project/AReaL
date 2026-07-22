@@ -35,7 +35,10 @@ from areal.infra import RemoteInfEngine, RolloutController, WorkflowExecutor
 from areal.infra.platforms import current_platform
 from areal.infra.utils.launcher import TRITON_CACHE_PATH
 from areal.utils import perf_tracer, stats_tracker
+from areal.utils.logging import getLogger
 from areal.utils.network import format_host_for_url
+
+logger = getLogger("SGLangRemote")
 
 
 class SGLangBackend:
@@ -331,19 +334,24 @@ class SGLangBackend:
 
     def get_pause_request(self) -> HttpRequest:
         """Get SGLang pause request."""
-        return HttpRequest(endpoint="/pause_generation", payload={})
+        return HttpRequest(endpoint="/pause_generation", payload={"mode": "retract"})
 
     def get_resume_request(self) -> HttpRequest:
         """Get SGLang resume request."""
         return HttpRequest(endpoint="/continue_generation", payload={})
 
+    def get_abort_all_request(self) -> HttpRequest:
+        """Get SGLang abort all requests."""
+        return HttpRequest(endpoint="/abort_request", payload={"abort_all": True})
+
     def get_health_check_request(self) -> HttpRequest:
         """Get SGLang health check request."""
         return HttpRequest(endpoint="/health", payload={}, method="GET")
 
-    def get_offload_request(self) -> HttpRequest:
+    def get_offload_request(self, tags: list[str] | None = None) -> HttpRequest:
         """Get SGLang offload request."""
-        return HttpRequest(endpoint="/release_memory_occupation", payload={})
+        payload = {"tags": tags} if tags is not None else {}
+        return HttpRequest(endpoint="/release_memory_occupation", payload=payload)
 
     def get_onload_request(self, tags: list[str] | None = None) -> HttpRequest:
         """Get SGLang onload request.
@@ -358,8 +366,47 @@ class SGLangBackend:
 
     def launch_server(self, server_args: dict[str, Any]) -> subprocess.Popen:
         """Launch SGLang server subprocess."""
+        awex_meta_addr = server_args.pop("awex_meta_server_addr", None)
+        awex_colocate = server_args.pop("awex_colocate_mode", False)
+        # Colocate placement: derive base_gpu_id from SLURM_LOCALID so two SGLang
+        # servers sharing a node never claim the same GPU range. The controller
+        # cannot do this reliably because its global rank -> node-slot mapping is
+        # not guaranteed by SLURM task dispatch (Problem 33: collision degrades the
+        # TP group into an unsharded single-GPU load -> OOM). SLURM_LOCALID is the
+        # only id guaranteed unique per node-slot, and only the worker sees it at
+        # runtime. `_awex_gpus_per_server` is injected by the controller exclusively
+        # for real colocation, so its presence doubles as the colocate gate; it is
+        # absent for separated mode (where CVD isolation keeps base_gpu_id at 0).
+        awex_gpus_per_server = server_args.pop("_awex_gpus_per_server", None)
+        if awex_gpus_per_server is not None:
+            slurm_localid = os.environ.get("SLURM_LOCALID")
+            if slurm_localid is not None:
+                base_gpu_id = int(slurm_localid) * int(awex_gpus_per_server)
+                server_args["base_gpu_id"] = base_gpu_id
+                logger.info(
+                    "AWEX colocate base_gpu_id override: SLURM_LOCALID=%s x "
+                    "gpus_per_server=%s -> base_gpu_id=%s",
+                    slurm_localid,
+                    awex_gpus_per_server,
+                    base_gpu_id,
+                )
         cmd = SGLangConfig.build_cmd_from_args(server_args)
         _env = self.build_server_env(os.environ)
+
+        if not awex_meta_addr:
+            awex_meta_addr = os.environ.get("AWEX_META_SERVER_ADDR")
+        if awex_colocate or awex_meta_addr:
+            sglang_entrypoints = (
+                "sglang.launch_server",
+                "areal.v2.inference_service.sglang.launch_server",
+            )
+            cmd = [
+                "areal.engine.awex_sglang_plugin" if c in sglang_entrypoints else c
+                for c in cmd
+            ]
+            if awex_meta_addr:
+                _env["AWEX_META_SERVER_ADDR"] = awex_meta_addr
+            logger.info("AWEX mode: using awex_sglang_plugin entry, cmd=%s", cmd[:4])
 
         return subprocess.Popen(
             cmd,
@@ -580,8 +627,14 @@ class RemoteSGLangEngine(InferenceEngine):
     def teardown_server(self):
         return self._engine.teardown_server()
 
-    def offload(self):
-        return self._engine.offload()
+    def offload(self, tags: list[str] | None = None):
+        logger.info("RemoteSGLangEngine.offload(tags=%s) called", tags)
+        result = self._engine.offload(tags=tags)
+        logger.info("RemoteSGLangEngine.offload(tags=%s) done", tags)
+        return result
+
+    def abort_all_requests(self):
+        return self._engine.abort_all_requests()
 
     def onload(self, tags: list[str] | None = None):
         return self._engine.onload(tags=tags)

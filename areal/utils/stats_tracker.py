@@ -361,36 +361,30 @@ class DistributedStatsTracker:
 
         result = {}
         if reduce_type == ReduceType.AVG_MIN_MAX:
-            result["/".join([key, "avg"])] = self._avg_of(
-                key, reduce_group, sync_metadata, key_sync_group
-            )
-            result["/".join([key, "min"])] = self._min_of(
-                key, reduce_group, sync_metadata, key_sync_group
-            )
-            result["/".join([key, "max"])] = self._max_of(
-                key, reduce_group, sync_metadata, key_sync_group
-            )
+            result["/".join([key, "avg"])] = self._avg_of(key, reduce_group)
+            result["/".join([key, "min"])] = self._min_of(key, reduce_group)
+            result["/".join([key, "max"])] = self._max_of(key, reduce_group)
         elif reduce_type == ReduceType.AVG:
-            result[key] = self._avg_of(key, reduce_group, sync_metadata, key_sync_group)
+            result[key] = self._avg_of(key, reduce_group)
         elif reduce_type == ReduceType.SUM:
-            result[key] = self._sum_of(key, reduce_group, sync_metadata, key_sync_group)
+            result[key] = self._sum_of(key, reduce_group)
         elif reduce_type == ReduceType.MIN:
-            result[key] = self._min_of(key, reduce_group, sync_metadata, key_sync_group)
+            result[key] = self._min_of(key, reduce_group)
         elif reduce_type == ReduceType.MAX:
-            result[key] = self._max_of(key, reduce_group, sync_metadata, key_sync_group)
+            result[key] = self._max_of(key, reduce_group)
         elif reduce_type == ReduceType.SCALAR:
-            effective_group = self._effective_reduce_group(
-                key, reduce_group, sync_metadata, key_sync_group
+            effective_group = self._effective_reduce_group(key, reduce_group)
+            # Only place tensors on the accelerator when a collective actually
+            # needs them; a GPU-side allocation here can OOM colocated setups
+            # whose device is fully budgeted by training + inference engines.
+            if effective_group is not None and current_platform.is_initialized():
+                device = current_platform.device_type
+            else:
+                device = "cpu"
+            value = torch.tensor(
+                sum(self.stats[key]), dtype=torch.float32, device=device
             )
-            # `.get`: a rank may learn about this key via key/metadata sync
-            # without holding any local values for it.
-            stats = self.stats.get(key, [])
-            value = self._placeholder_scalar(
-                fill=float(sum(stats)), group=effective_group
-            )
-            cnt = self._placeholder_scalar(
-                fill=float(len(stats)), group=effective_group
-            )
+            cnt = torch.tensor(len(self.stats[key]), dtype=torch.float32, device=device)
             if effective_group is not None:
                 dist.all_reduce(value, group=effective_group)
                 dist.all_reduce(cnt, group=effective_group)

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -203,7 +204,15 @@ class SGLangServerWrapper:
         self._monitor_server_processes(server_addresses)
 
     def launch_one_server(self, cmd, host_ip, server_port, node_rank):
-        server_process = launch_server_cmd(cmd)
+        custom_env = None
+        awex_meta_addr = os.environ.get("AWEX_META_SERVER_ADDR")
+        if awex_meta_addr:
+            custom_env = {"AWEX_META_SERVER_ADDR": awex_meta_addr}
+            cmd = [
+                "areal.engine.awex_sglang_plugin" if c == "sglang.launch_server" else c
+                for c in cmd
+            ]
+        server_process = launch_server_cmd(cmd, custom_env=custom_env)
         wait_for_server(f"http://{format_hostport(host_ip, server_port)}")
         if node_rank == 0:
             name = names.gen_servers(self.experiment_name, self.trial_name)
@@ -256,8 +265,22 @@ def launch_sglang_server(argv):
 
 
 def main(argv):
+    # scancel sends SIGTERM, which Python terminates on without running
+    # finally blocks, orphaning the sglang child tree (awex plugin plus its
+    # multiprocessing scheduler/detokenizer workers) and draining the node.
+    # Convert SIGTERM/SIGINT into SystemExit so the finally-block
+    # kill_process_tree below reaps the whole tree.
+    def _term_handler(signum, _frame):
+        logger.warning(f"sglang launcher received signal {signum}, cleaning up...")
+        raise SystemExit(128 + signum)
+
+    signal.signal(signal.SIGTERM, _term_handler)
+    signal.signal(signal.SIGINT, _term_handler)
+
     try:
         launch_sglang_server(argv)
+    except SystemExit:
+        raise
     except Exception:
         logger.error(traceback.format_exc())
         sys.exit(1)
