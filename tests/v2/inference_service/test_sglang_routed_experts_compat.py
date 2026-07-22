@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from areal.v2.inference_service.sglang import routed_experts_compat as compat
@@ -50,6 +51,8 @@ def test_normalize_routed_experts_server_args_keeps_non_r3_path_unchanged():
 
 
 def test_token_cache_patch_handles_token_level_prefill_rows(monkeypatch):
+    pytest.importorskip("sglang")
+
     from sglang.srt import server_args as sglang_server_args
     from sglang.srt.layers.moe import routed_experts_capturer
 

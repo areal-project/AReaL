@@ -43,7 +43,7 @@ def test_returns_param_data_when_tensor_model_parallel_false(monkeypatch):
 
     out = megatron.all_gather_param("decoder.layers.0.mlp.dense.weight", param)
 
-    assert out is param.data
+    assert out.untyped_storage().data_ptr() == param.untyped_storage().data_ptr()
     assert calls == []  # never entered the all-gather path
 
 
@@ -60,7 +60,7 @@ def test_returns_param_data_when_name_in_duplicated_set(monkeypatch):
 
     out = megatron.all_gather_param(name, param, duplicated_param_names={name})
 
-    assert out is param.data
+    assert out.untyped_storage().data_ptr() == param.untyped_storage().data_ptr()
     assert calls == []
 
 
