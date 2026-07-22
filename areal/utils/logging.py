@@ -62,7 +62,6 @@ LOGGER_COLORS_EXACT = {
     "PerfTracer": "light_green",
     # RPC servers - white
     "SyncRPCServer": "white",
-    "RayRPCServer": "white",
     "RPCSerialization": "white",
     "HttpRTensor": "white",
     # Inference wrappers - white
