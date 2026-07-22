@@ -695,6 +695,13 @@ def create_app(config: DataProxyConfig) -> FastAPI:
 
     @app.post("/register_model", response_model=RegisterModelResponse)
     async def register_model(request: Request):
+        # /register_model configures an external upstream URL that the data
+        # proxy will fetch on behalf of /chat/completions callers. Without
+        # authentication, any network-adjacent attacker could point a model
+        # name at an internal address (e.g. cloud metadata service) and then
+        # trigger a server-side fetch via /chat/completions, exfiltrating the
+        # response — a classic SSRF (CWE-918). Restrict to the admin key.
+        _require_admin_key(request, app.state.session_store)
         body = await request.json()
         name = body.get("name") or body.get("model")
         url = body.get("url", "")
