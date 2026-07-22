@@ -1239,6 +1239,12 @@ class TrainEngineConfig:
     )
 
     # Lora
+    use_merged_lora: bool = field(
+        default=False,
+        metadata={
+            "help": "Train with LoRA adapters while sending merged full weights to the inference engine."
+        },
+    )
     use_lora: bool = field(
         default=False,
         metadata={
@@ -1247,6 +1253,7 @@ class TrainEngineConfig:
     )
     lora_rank: int = field(default=32, metadata={"help": "lora rank"})
     lora_alpha: int = field(default=16, metadata={"help": "lora alpha"})
+    lora_dropout: float = field(default=0.1, metadata={"help": "lora dropout"})
     target_modules: list[str] = field(
         default_factory=list,
         metadata={"help": "lora target_modules."},
@@ -1325,6 +1332,8 @@ class TrainEngineConfig:
 
     def __post_init__(self):
         """Validate scheduling_spec length and config combinations."""
+        if self.use_lora and self.use_merged_lora:
+            raise ValueError("use_lora and use_merged_lora are mutually exclusive")
         if len(self.scheduling_spec) not in (1, 2):
             raise ValueError(
                 f"scheduling_spec must contain 1 or 2 SchedulingSpec, "

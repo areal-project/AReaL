@@ -400,3 +400,44 @@ def _monkey_patch_save_hf_adapter():
 # Future: This code is however present in main branch of megatron-bridge so this patch is temporary
 # and can be removed later when we upgrade the megatron-bridge version.
 _monkey_patch_save_hf_adapter()
+
+
+def patch_mbridge_name_mapping(bridge):
+    """
+    Patch mbridge name mapping to handle unfused layernorms in GLM-4 and Qwen models.
+    This patch is required for megatron lora where we use unfused layers.
+
+    Handles explicit layernorm names for:
+    - input_layernorm -> input_layernorm (not fused with qkv)
+    - pre_mlp_layernorm -> post_attention_layernorm (not fused with mlp)
+    - q_layernorm -> q_norm (QK layernorm)
+    - k_layernorm -> k_norm (QK layernorm)
+    """
+    import re
+
+    orig = bridge._weight_name_mapping_mcore_to_hf
+
+    def new_mapping(name: str):
+        # Handle unfused norms + q/k norms
+        m = re.match(r"^decoder\.layers\.(\d+)\.(.+)$", name)
+        if m:
+            i = m.group(1)
+            tail = m.group(2)
+
+            if tail == "input_layernorm.weight":
+                return [f"model.layers.{i}.input_layernorm.weight"]
+
+            if tail == "pre_mlp_layernorm.weight":
+                return [f"model.layers.{i}.post_attention_layernorm.weight"]
+
+            if tail == "self_attention.q_layernorm.weight":
+                return [f"model.layers.{i}.self_attn.q_norm.weight"]
+
+            if tail == "self_attention.k_layernorm.weight":
+                return [f"model.layers.{i}.self_attn.k_norm.weight"]
+
+        # Fallback to the original implementation for everything else
+        return orig(name)
+
+    bridge._weight_name_mapping_mcore_to_hf = new_mapping
+    return bridge

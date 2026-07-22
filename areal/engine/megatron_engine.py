@@ -113,10 +113,14 @@ from areal.engine.megatron_utils.megatron import (
     all_gather_param,
     convert_to_hf,
     get_named_parameters,
+    get_named_parameters_lora_merged,
     patch_torch_all_gather_object,
     remove_padding,
 )
-from areal.engine.megatron_utils.megatron_lora import get_vllm_lora_target_modules
+from areal.engine.megatron_utils.megatron_lora import (
+    get_vllm_lora_target_modules,
+    patch_mbridge_name_mapping,
+)
 from areal.engine.megatron_utils.packed_context_parallel import (
     _is_multi_modal_payload_key,
     extract_vision_from_multi_modal,
@@ -375,6 +379,7 @@ class MegatronEngine(TrainEngine):
         self.is_vision_model: bool = False
         self.processor = None
         self.awex_writer: AwexMegatronWriterAdapter | None = None
+        self.lora_mode = self.config.use_lora or self.config.use_merged_lora
 
     def create_process_group(self, parallel_strategy: ParallelStrategy | None = None):
         if parallel_strategy is None:
@@ -464,6 +469,76 @@ class MegatronEngine(TrainEngine):
             100.0 * trainable_params / max(total_params, 1),
         )
 
+    def _apply_merged_lora(self) -> None:
+        """Inject PEFT LoRA layers while retaining full-weight synchronization."""
+        assert self.model is not None, "Model must be initialized before applying LoRA."
+        from peft import LoraConfig, get_peft_model
+
+        config = {
+            "num_layers": self.hf_config.num_hidden_layers,
+            "hidden_size": self.hf_config.hidden_size,
+            "num_attention_heads": self.hf_config.num_attention_heads,
+            "num_query_groups": self.hf_config.num_key_value_heads,
+            "ffn_hidden_size": self.hf_config.intermediate_size,
+            "layernorm_epsilon": self.hf_config.rms_norm_eps,
+            "attention_dropout": self.hf_config.attention_dropout,
+            "hidden_dropout": getattr(self.hf_config, "hidden_dropout", 0.0),
+            "num_moe_experts": getattr(
+                self.hf_config,
+                "num_experts",
+                getattr(self.hf_config, "n_routed_experts", None),
+            ),
+            "moe_router_topk": getattr(self.hf_config, "num_experts_per_tok", None),
+            "moe_ffn_hidden_size": getattr(
+                self.hf_config, "moe_intermediate_size", None
+            ),
+            "tensor_model_parallel_size": self.parallel_strategy.tensor_parallel_size,
+            "pipeline_model_parallel_size": self.parallel_strategy.pipeline_parallel_size,
+            "sequence_parallel": self.parallel_strategy.use_sequence_parallel,
+            "expert_model_parallel_size": self.parallel_strategy.expert_parallel_size,
+            "expert_tensor_parallel_size": self.parallel_strategy.expert_tensor_parallel_size,
+            "bf16": self.dtype is torch.bfloat16,
+            "fp16": self.dtype is torch.float16,
+            "params_dtype": self.dtype,
+            "pipeline_dtype": self.dtype,
+            "normalization": "RMSNorm",
+            "gated_linear_unit": True,
+            "add_bias_linear": False,
+            "add_qkv_bias": False,
+            "qk_layernorm": getattr(self.hf_config, "use_qk_norm", False),
+            "use_cpu_initialization": True,
+            "init_method_std": self.hf_config.initializer_range,
+        }
+        config = {key: value for key, value in config.items() if value is not None}
+        peft_config = LoraConfig(
+            r=self.config.lora_rank,
+            lora_alpha=self.config.lora_alpha,
+            target_modules=self.config.target_modules,
+            lora_dropout=self.config.lora_dropout,
+            bias="none",
+            megatron_config=config,
+            megatron_core="megatron.core",
+        )
+
+        # get_peft_model injects adapters into the supplied module in place. Keep
+        # AReaL's model list rather than the Transformers-oriented PEFT wrapper.
+        get_peft_model(self.model[0], peft_config)
+        total_params = sum(param.numel() for param in self.model.parameters())
+        trainable_params = sum(
+            param.numel() for param in self.model.parameters() if param.requires_grad
+        )
+        self.logger.info(
+            "Applied merged LoRA: target_modules=%s, rank=%s, alpha=%s, "
+            "dropout=%s, trainable=%s/%s (%.4f%%)",
+            self.config.target_modules,
+            self.config.lora_rank,
+            self.config.lora_alpha,
+            self.config.lora_dropout,
+            trainable_params,
+            total_params,
+            100.0 * trainable_params / max(total_params, 1),
+        )
+
     def initialize(self, addr: str | None, ft_spec: FinetuneSpec, *args, **kwargs):
         try:
             self.seed = get_seed()
@@ -497,6 +572,10 @@ class MegatronEngine(TrainEngine):
                 "MegatronEngine LoRA POC currently only supports bridge_type='megatron-bridge'. "
                 "mbridge does not support LoRA in this path."
             )
+        if self.config.use_merged_lora and self.bridge_cls != "mbridge":
+            raise NotImplementedError(
+                "Merged LoRA currently requires bridge_type='mbridge'."
+            )
 
         self.tokenizer = load_hf_tokenizer(self.config.path)
 
@@ -504,6 +583,9 @@ class MegatronEngine(TrainEngine):
             self.enable_tree_training and self.bridge_cls == "mbridge"
         ):
             self.bridge = self._build_hf_mcore_bridge()
+
+            if self.config.use_merged_lora:
+                self.bridge = patch_mbridge_name_mapping(self.bridge)
 
             self.hf_config, self.tf_config = make_hf_and_mcore_config(
                 self.config.path,
@@ -600,16 +682,18 @@ class MegatronEngine(TrainEngine):
                     hf_config=self.hf_config,
                     tf_config=self.tf_config,
                     mcore_config=self.mcore_config,
-                    bridge=self.bridge,
+                    bridge=None if self.config.use_merged_lora else self.bridge,
                     bridge_type=self.bridge_cls,
                     is_critic=self.config.is_critic,
-                    use_lora=self.config.use_lora,
+                    use_lora=self.lora_mode,
                 )
 
         self.model = _MegatronModelList(models)
 
         if self.config.use_lora:
             self._apply_megatron_bridge_lora()
+        elif self.config.use_merged_lora:
+            self._apply_merged_lora()
 
         if self.config.init_from_scratch:
             self.logger.info("init_from_scratch=True; skipping HF weight loading.")
@@ -1563,9 +1647,7 @@ class MegatronEngine(TrainEngine):
         assert self.model is not None and len(self.model) > 0
 
         use_distributed_optimizer = (
-            False
-            if self.config.use_lora
-            else self.mcore_config.ddp.use_distributed_optimizer
+            False if self.lora_mode else self.mcore_config.ddp.use_distributed_optimizer
         )
 
         assert self.optimizer_config.type in [
@@ -1638,7 +1720,7 @@ class MegatronEngine(TrainEngine):
         self.lr_scheduler = lr_scheduler
 
         # MegatronCheckpointManager now only support distributed optimizer which lora does not support
-        if not self.config.use_lora:
+        if not self.lora_mode:
             self.checkpointer = MegatronCheckpointManager(
                 model=self.model,
                 optimizer=self.optimizer,
@@ -2047,6 +2129,7 @@ class MegatronEngine(TrainEngine):
             and self.mcore_config.use_bridge_for_update_weights
             and not self.quantization_config
             and not self.config.use_lora
+            and not self.config.use_merged_lora
         )
         if use_bridge:
             self._update_weights_via_bridge(meta)
@@ -2072,7 +2155,12 @@ class MegatronEngine(TrainEngine):
         buffer_size = 0
         converted_named_tensors = []
 
-        for name, param in get_named_parameters(self.model, num_moe_experts):
+        named_parameters = (
+            get_named_parameters_lora_merged(self.model, num_moe_experts)
+            if self.config.use_merged_lora
+            else get_named_parameters(self.model, num_moe_experts)
+        )
+        for name, param in named_parameters:
             if ".experts." in name and not self.config.use_lora:
                 continue
             if self.config.use_lora and (
@@ -2102,7 +2190,12 @@ class MegatronEngine(TrainEngine):
         buffer_size = 0
         named_tensors = []
 
-        for name, param in get_named_parameters(self.model, num_moe_experts):
+        named_parameters = (
+            get_named_parameters_lora_merged(self.model, num_moe_experts)
+            if self.config.use_merged_lora
+            else get_named_parameters(self.model, num_moe_experts)
+        )
+        for name, param in named_parameters:
             if ".experts." not in name or self.config.use_lora:
                 continue
             buffer_size = self._impl_update_expert_weight_from_distributed(
@@ -2292,7 +2385,19 @@ class MegatronEngine(TrainEngine):
                 )
         else:
             with patch_torch_all_gather_object():
-                if self.mcore_config.use_mbridge_save:
+                if self.config.use_merged_lora:
+                    from areal.models.mcore.hf_save import save_lora_adapters_to_hf
+
+                    save_lora_adapters_to_hf(
+                        models=self.model,
+                        output_dir=path,
+                        base_model_name=base_model_path or self.config.path,
+                        rank=self.config.lora_rank,
+                        lora_alpha=self.config.lora_alpha,
+                        target_modules=self.config.target_modules,
+                        tf_config=self.tf_config,
+                    )
+                elif self.mcore_config.use_mbridge_save:
                     # when loading model using AreaL's fast hf load, the safetensor_io is never set
                     if (
                         not hasattr(self.bridge, "safetensor_io")

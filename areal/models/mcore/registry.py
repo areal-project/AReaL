@@ -12,6 +12,10 @@ from megatron.core import tensor_parallel
 from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.distributed import DistributedDataParallelConfig as MCoreDDPConfig
 from megatron.core.models.gpt.gpt_model import GPTModel
+from megatron.core.tensor_parallel.layers import (
+    ColumnParallelLinear,
+    RowParallelLinear,
+)
 from megatron.core.transformer import TransformerConfig
 from transformers import AutoConfig, PretrainedConfig
 
@@ -20,6 +24,10 @@ from areal.infra.platforms import is_npu_available
 from areal.models.mcore.bailing_moe import (
     hf_to_mcore_config_bailing_moe,
     make_mcore_layer_specs_bailing_moe,
+)
+from areal.models.mcore.glm4 import (
+    hf_to_mcore_config_glm4moe,
+    make_mcore_layer_specs_glm4moe,
 )
 from areal.models.mcore.qwen3 import (
     hf_to_mcore_config_qwen3_dense,
@@ -139,6 +147,8 @@ def make_hf_and_mcore_config(
         architecture = hf_config.architectures[0]
         if architecture == "Qwen3ForCausalLM":
             return hf_config, hf_to_mcore_config_qwen3_dense(hf_config, dtype)
+        elif architecture == "Glm4MoeForCausalLM":
+            return hf_config, hf_to_mcore_config_glm4moe(hf_config, dtype)
         elif architecture in (
             "BailingMoeV2_5ForCausalLM",
             "BailingMoeLinearForCausalLM",
@@ -151,21 +161,143 @@ def make_hf_and_mcore_config(
             )
 
 
-def make_mcore_layer_specs(hf_config: PretrainedConfig, tf_config: TransformerConfig):
+# These hybrid specs are for lora related unfused layers
+def make_hybrid_spec_qwen3_dense(base_spec):
+    from copy import deepcopy
+
+    from mindspeed.core.megatron_basic.megatron_basic import PTNorm
+
+    spec = deepcopy(base_spec)
+    for layer in spec.layer_specs:
+        sm = layer.submodules
+
+        # norms
+        sm.input_layernorm = PTNorm
+        sm.pre_mlp_layernorm = PTNorm
+
+        # attention
+        attn = sm.self_attention.submodules
+        attn.linear_qkv = ColumnParallelLinear
+        attn.linear_proj = RowParallelLinear
+
+        # mlp
+        mlp = sm.mlp.submodules
+        mlp.linear_fc1 = ColumnParallelLinear
+    return spec
+
+
+# # Works for Qwen3-30BB
+def make_hybrid_spec_qwen3_moe(base_spec):
+    from copy import deepcopy
+
+    from mindspeed.core.megatron_basic.megatron_basic import PTNorm
+
+    spec = deepcopy(base_spec)
+    for layer in spec.layer_specs:
+        sm = layer.submodules
+
+        # norms
+        sm.input_layernorm = PTNorm
+
+        # attention
+        attn = sm.self_attention.submodules
+        attn.linear_qkv = ColumnParallelLinear
+        attn.linear_proj = RowParallelLinear
+
+    return spec
+
+
+def make_hybrid_spec_glm4moe(base_spec):
+    """
+    Unfuse layer norms for GLM-4 MoE to ensure PEFT compatibility.
+
+    GLM-4 has additional layernorms compared to Qwen3:
+    - input_layernorm (pre-attention)
+    - post_self_attn_layernorm (after attention residual)
+    - post_attention_layernorm / pre_mlp_layernorm (pre-MLP)
+    - post_mlp_layernorm (after MLP residual)
+    - q_layernorm, k_layernorm (QK normalization)
+    """
+    from copy import deepcopy
+
+    from mindspeed.core.megatron_basic.megatron_basic import PTNorm
+
+    spec = deepcopy(base_spec)
+    for layer in spec.layer_specs:
+        sm = layer.submodules
+
+        # Replace all layer norms with PTNorm (no fused implementations)
+        sm.input_layernorm = PTNorm
+
+        # GLM-4 specific: post-attention layernorm
+        if hasattr(sm, "post_self_attn_layernorm"):
+            sm.post_self_attn_layernorm = PTNorm
+
+        # Pre-MLP layernorm (can be named differently in GLM-4)
+        if hasattr(sm, "pre_mlp_layernorm"):
+            sm.pre_mlp_layernorm = PTNorm
+        if hasattr(sm, "post_attention_layernorm"):
+            sm.post_attention_layernorm = PTNorm
+
+        # GLM-4 specific: post-MLP layernorm
+        if hasattr(sm, "post_mlp_layernorm"):
+            sm.post_mlp_layernorm = PTNorm
+
+        # Attention: unfuse QKV and replace QK layernorms
+        attn = sm.self_attention.submodules
+        attn.linear_qkv = ColumnParallelLinear
+        attn.linear_proj = RowParallelLinear
+
+        # GLM-4 QK layernorms (if present)
+        if hasattr(attn, "q_layernorm"):
+            # attn.q_layernorm = PTNorm
+            attn.q_layernorm = None
+        if hasattr(attn, "k_layernorm"):
+            # attn.k_layernorm = PTNorm
+            attn.k_layernorm = None
+
+        # MoE layers are kept as-is (handled by Megatron's MoE)
+        # No need to modify expert layers
+
+    return spec
+
+
+def make_mcore_layer_specs(
+    hf_config: PretrainedConfig, tf_config: TransformerConfig, use_lora: bool
+):
     assert len(hf_config.architectures) == 1
     architecture = hf_config.architectures[0]
     if architecture == "Qwen3ForCausalLM":
-        return make_mcore_layer_specs_qwen3_dense(tf_config, use_te=True)
+        transformer_layer_spec = make_mcore_layer_specs_qwen3_dense(
+            tf_config, use_te=True
+        )
+        if use_lora:
+            transformer_layer_spec = make_hybrid_spec_qwen3_dense(
+                transformer_layer_spec
+            )
+    elif architecture == "Qwen3MoeForCausalLM":
+        transformer_layer_spec = make_mcore_layer_specs_qwen3_dense(
+            tf_config, use_te=True
+        )
+        if use_lora:
+            transformer_layer_spec = make_hybrid_spec_qwen3_moe(transformer_layer_spec)
+    elif architecture == "Glm4MoeForCausalLM":
+        transformer_layer_spec = make_mcore_layer_specs_glm4moe(tf_config, use_te=True)
+        if use_lora:
+            transformer_layer_spec = make_hybrid_spec_glm4moe(transformer_layer_spec)
     elif architecture in (
         "BailingMoeV2_5ForCausalLM",
         "BailingMoeLinearForCausalLM",
         "BailingHybridForCausalLM",
     ):
-        return make_mcore_layer_specs_bailing_moe(tf_config, hf_config, use_te=True)
+        transformer_layer_spec = make_mcore_layer_specs_bailing_moe(
+            tf_config, hf_config, use_te=True
+        )
     else:
         raise ValueError(
             f"Architecture not registered for config conversion: {architecture}."
         )
+    return transformer_layer_spec
 
 
 def make_mcore_model(
@@ -328,27 +460,50 @@ def make_mcore_model(
             raise NotImplementedError(
                 "Virtual pipeline parallelism requires mbridge-backed models."
             )
-        transformer_layer_spec = make_mcore_layer_specs(hf_config, tf_config)
+        transformer_layer_spec = make_mcore_layer_specs(
+            hf_config, tf_config, use_lora=use_lora
+        )
+
         rope_scaling_args = {}
-        if hf_config.rope_scaling is not None:
-            if hf_config.rope_scaling["type"] != "linear":
+        rope_scaling = getattr(hf_config, "rope_scaling", None)
+        if rope_scaling:
+            rope_type = rope_scaling.get(
+                "type", rope_scaling.get("rope_type", "default")
+            )
+
+            if rope_type == "linear":
+                rope_scaling_args["seq_len_interpolation_factor"] = rope_scaling[
+                    "factor"
+                ]
+            elif rope_type != "default":
                 raise NotImplementedError(
-                    f"Rope scaling type {hf_config.rope_scaling['type']} not supported yet."
+                    f"Rope scaling type {rope_type} not supported yet."
                 )
-            rope_scaling_args["seq_len_interpolation_factor"] = hf_config.rope_scaling[
-                "factor"
-            ]
+
+        rotary_base = (
+            getattr(hf_config, "rope_theta", None)
+            or (rope_scaling or {}).get("rope_theta")
+            or 10000
+        )
+
+        pp_size = mpu.get_pipeline_model_parallel_world_size()
+        if pp_size > 1:
+            pre_process = mpu.is_pipeline_first_stage(ignore_virtual=False)
+            post_process = mpu.is_pipeline_last_stage(ignore_virtual=False)
+        else:
+            pre_process = True
+            post_process = True
 
         model = GPTModel(
             config=tf_config,
             transformer_layer_spec=transformer_layer_spec,
             vocab_size=hf_config.vocab_size,
             max_sequence_length=hf_config.max_position_embeddings,
-            pre_process=True,  # TODO: pipeline parallel
-            post_process=True,  # TODO: pipeline parallel
+            pre_process=pre_process,
+            post_process=post_process,
             share_embeddings_and_output_weights=False,  # TODO: implement share output weights
             position_embedding_type="rope",
-            rotary_base=hf_config.rope_theta,
+            rotary_base=rotary_base,
             **rope_scaling_args,
             # vp_stage=None TODO: virtual pipeline parallel
         )
