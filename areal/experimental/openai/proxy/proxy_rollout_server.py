@@ -118,6 +118,10 @@ _message_preprocessors: list = []
 # Pluggable prefix matcher for InteractionCache parent-child matching.
 _prefix_matcher = None
 
+# R3 routed_experts shape for server-side tensor export.
+_r3_num_moe_layers: int | None = None
+_r3_topk: int | None = None
+
 # Server address (set at startup)
 _server_host: str = "0.0.0.0"
 _server_port: int = 8000
@@ -316,10 +320,26 @@ def _setup_openai_client():
 
 @app.post("/configure")
 async def configure(raw_request: Request):
+    global _r3_num_moe_layers, _r3_topk
     data = await raw_request.json()
     config = deserialize_value(data.get("config"))
     rank = data.get("rank", 0)
     seeding.set_random_seed(config.seed, key=f"proxy{rank}")
+    if getattr(config.rollout, "return_routed_experts", False):
+        from transformers import AutoConfig
+
+        from areal.engine.r3.config import resolve_r3_moe_config
+
+        hf_config = AutoConfig.from_pretrained(
+            config.actor.path,
+            trust_remote_code=True,
+        )
+        r3_config = resolve_r3_moe_config(hf_config)
+        _r3_num_moe_layers = r3_config.num_moe_layers
+        _r3_topk = r3_config.topk
+    else:
+        _r3_num_moe_layers = None
+        _r3_topk = None
     return {"status": "success"}
 
 
@@ -940,7 +960,11 @@ async def export_trajectories(
         _remove_api_keys_for_session(session_id)
 
     # Serialize for HTTP transport
-    serialized = serialize_interactions(interactions)
+    serialized = serialize_interactions(
+        interactions,
+        r3_num_moe_layers=_r3_num_moe_layers,
+        r3_topk=_r3_topk,
+    )
     return ExportTrajectoriesResponse(interactions=serialized)
 
 

@@ -8,8 +8,6 @@ from collections.abc import Callable, Mapping
 from concurrent.futures import Future
 from typing import Any
 
-import numpy as np
-import pybase64
 import torch
 from torchdata.stateful_dataloader import StatefulDataLoader
 
@@ -31,6 +29,7 @@ from areal.api.io_struct import (
     WeightUpdateRequests,
     get_versioned_lora_name,
 )
+from areal.engine.r3.preprocess import decode_sglang_routed_experts
 from areal.infra import RemoteInfEngine, RolloutController, WorkflowExecutor
 from areal.infra.platforms import current_platform
 from areal.infra.utils.launcher import TRITON_CACHE_PATH
@@ -108,13 +107,12 @@ class SGLangBackend:
         # Extract routed_experts information if available
         routed_experts = meta_info.get("routed_experts", None)
         if routed_experts is not None:
-            num_sgl_token = (
-                meta_info["prompt_tokens"] + meta_info["completion_tokens"] - 1
+            routed_experts = decode_sglang_routed_experts(
+                routed_experts,
+                prompt_tokens=meta_info["prompt_tokens"],
+                completion_tokens=meta_info["completion_tokens"],
+                source="v1 SGLangBackend",
             )
-            # Extract expert_id and reshape to (num_sgl_token, num_layers*expert_top_k)
-            routed_experts = np.frombuffer(
-                pybase64.b64decode(routed_experts.encode("utf-8")), dtype=np.int32
-            ).reshape(num_sgl_token, -1)
 
         if stop_reason == "abort" and stop_message.startswith("Abort before prefill"):
             return HttpGenerationResult(

@@ -928,6 +928,12 @@ class MegatronEngineConfig:
             "Requires TransformerEngine >= 2.7.0.",
         },
     )
+    enable_router_replay: bool = field(
+        default=False,
+        metadata={
+            "help": "Enable Megatron-Core native MoE router replay for R3 training."
+        },
+    )
     moe_router_bias_update_rate: float = field(
         default=0.0,
         metadata={

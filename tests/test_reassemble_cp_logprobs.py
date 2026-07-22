@@ -39,7 +39,9 @@ def _split_for_cp_rank(
     batch_size = input_lens.shape[0]
     output_len = input_lens.sum().item() // cp_size
 
-    splitted = torch.zeros(output_len, dtype=tensor.dtype, device=tensor.device)
+    splitted = torch.zeros(
+        (output_len, *tensor.shape[1:]), dtype=tensor.dtype, device=tensor.device
+    )
     for i in range(batch_size):
         seqlen = input_lens[i] // cp_size
         half_seqlen = seqlen // 2
@@ -432,6 +434,31 @@ class TestSplitReassembleConsistencyWithMegatron:
         cu_seqlens = _make_cu_seqlens(seq_lengths)
         total_len = cu_seqlens[-1].item()
         original = torch.randn(total_len)
+
+        for rank in range(cp_size):
+            reference = _split_for_cp_rank(original, cu_seqlens, rank, cp_size)
+
+            with patch(
+                "areal.engine.megatron_utils.packed_context_parallel.mpu"
+            ) as mock_mpu:
+                mock_mpu.get_context_parallel_world_size.return_value = cp_size
+                mock_mpu.get_context_parallel_rank.return_value = rank
+
+                from areal.engine.megatron_utils.packed_context_parallel import (
+                    split_packed_seqs_for_context_parallel,
+                )
+
+                actual = split_packed_seqs_for_context_parallel(original, cu_seqlens)
+
+            torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+
+    @pytest.mark.parametrize("cp_size", [2, 4])
+    def test_split_preserves_trailing_dims(self, cp_size):
+        """Verify CP split supports tensors shaped [tokens, layers, topk]."""
+        seq_lengths = [_len * 2 * cp_size for _len in [5, 3, 7]]
+        cu_seqlens = _make_cu_seqlens(seq_lengths)
+        total_len = cu_seqlens[-1].item()
+        original = torch.arange(total_len * 2 * 3).reshape(total_len, 2, 3)
 
         for rank in range(cp_size):
             reference = _split_for_cp_rank(original, cu_seqlens, rank, cp_size)

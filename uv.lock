@@ -21,6 +21,7 @@ supported-markers = [
 [manifest]
 overrides = [
     { name = "causal-conv1d", marker = "sys_platform == 'never'" },
+    { name = "fastapi-sso", specifier = "==0.16.0" },
     { name = "flash-attn-4", specifier = ">=4.0.0b4" },
     { name = "hydra-core", specifier = "==1.4.0.dev1" },
     { name = "mamba-ssm", marker = "sys_platform == 'never'" },

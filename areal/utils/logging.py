@@ -126,6 +126,9 @@ LOGGER_COLORS_EXACT = {
     "InferenceRouter": "white",
     "InferenceGateway": "white",
     "RPCGuard": "white",
+    # R3 native router replay - cyan
+    "R3Replay": "light_cyan",
+    "R3Layout": "light_cyan",
 }
 
 # Prefix patterns checked in order (first match wins)

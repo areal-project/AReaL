@@ -257,12 +257,22 @@ def make_mcore_model(
         provider.overlap_p2p_comm = (
             vpp_size > 1 and provider.pipeline_model_parallel_size > 1
         )
+        if mcore_config.enable_router_replay:
+            if bool(getattr(provider, "moe_router_fusion", False)):
+                raise ValueError(
+                    "megatron.enable_router_replay=True is incompatible with "
+                    "effective Megatron moe_router_fusion=True. Disable "
+                    "moe_router_fusion to use Megatron-Core native RouterReplay."
+                )
+            provider.moe_enable_routing_replay = True
 
         # Aligning tf config settings with provider for consistency.
         tf_config.variable_seq_lengths = provider.variable_seq_lengths
         tf_config.moe_token_dispatcher_type = provider.moe_token_dispatcher_type
         tf_config.batch_p2p_comm = provider.batch_p2p_comm
         tf_config.overlap_p2p_comm = provider.overlap_p2p_comm
+        if mcore_config.enable_router_replay:
+            tf_config.moe_enable_routing_replay = True
 
         provider.finalize()
 
@@ -291,6 +301,8 @@ def make_mcore_model(
         return models
 
     else:
+        if mcore_config is not None and mcore_config.enable_router_replay:
+            tf_config.moe_enable_routing_replay = True
         if (
             mcore_config is not None
             and mcore_config.virtual_pipeline_parallel_size is not None

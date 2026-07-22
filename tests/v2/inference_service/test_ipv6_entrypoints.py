@@ -24,6 +24,9 @@ def test_data_proxy_main_formats_ipv6_serving_addr():
         reasoning_parser="qwen3",
         engine_max_tokens=None,
         chat_template_type="hf",
+        return_routed_experts=False,
+        r3_num_moe_layers=None,
+        r3_topk=None,
     )
 
     with (

@@ -15,6 +15,16 @@ import sys
 
 
 def areal_launch_server(server_args) -> None:
+    # ---- BEGIN AREAL ----
+    from areal.v2.inference_service.sglang.routed_experts_compat import (
+        normalize_routed_experts_server_args,
+    )
+    # ---- END AREAL ----
+
+    # ---- BEGIN AREAL ----
+    normalize_routed_experts_server_args(server_args)
+    # ---- END AREAL ----
+
     from sglang.srt.entrypoints.engine import Engine, init_tokenizer_manager
     from sglang.srt.entrypoints.http_server import (
         _execute_server_warmup,

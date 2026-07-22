@@ -825,7 +825,7 @@ class RemoteInfEngine(InferenceEngine):
         accumulated_output_tokens = []
         accumulated_output_logprobs = []
         accumulated_versions = []
-        accumulated_routed_experts: list[np.ndarray] = []
+        final_routed_experts: np.ndarray | None = None
 
         # A single "rid" shares the same server to allow KV cache reuse
         if req.rid in self.rid_to_address:
@@ -899,9 +899,28 @@ class RemoteInfEngine(InferenceEngine):
             accumulated_versions.extend(
                 [self.get_version()] * len(gen_result.output_tokens)
             )
-            # Accumulate routed_experts for MoE models
+            # Accumulate routed_experts for MoE models. SGLang returns routing
+            # for the full request prefix on abort/resubmit, so keep already
+            # accepted rows and append only the newly covered suffix.
             if gen_result.routed_experts is not None:
-                accumulated_routed_experts.append(gen_result.routed_experts)
+                if final_routed_experts is None:
+                    final_routed_experts = gen_result.routed_experts
+                else:
+                    consumed_rows = final_routed_experts.shape[0]
+                    if gen_result.routed_experts.shape[0] < consumed_rows:
+                        raise RuntimeError(
+                            "SGLang routed_experts for a resubmitted request is "
+                            "shorter than the previously accumulated routing rows: "
+                            f"new_shape={gen_result.routed_experts.shape}, "
+                            f"accumulated_shape={final_routed_experts.shape}."
+                        )
+                    final_routed_experts = np.concatenate(
+                        [
+                            final_routed_experts,
+                            gen_result.routed_experts[consumed_rows:],
+                        ],
+                        axis=0,
+                    )
 
             # Update request for next iteration
             req.input_ids += gen_result.output_tokens
@@ -921,11 +940,17 @@ class RemoteInfEngine(InferenceEngine):
 
         latency = time.perf_counter() - start_time
 
-        accumulated_routed_experts = (
-            np.concatenate(accumulated_routed_experts)
-            if accumulated_routed_experts
-            else None
-        )
+        if (
+            req.metadata.get("return_routed_experts", False)
+            and accumulated_output_tokens
+            and final_routed_experts is None
+        ):
+            raise RuntimeError(
+                "Requested return_routed_experts=True but no routed_experts were "
+                "received after abort/resubmit. This usually means the SGLang "
+                "server was not launched with enable_return_routed_experts=True "
+                "or the model is not a MoE model."
+            )
 
         response = ModelResponse(
             input_tokens=req.input_ids[
@@ -940,7 +965,7 @@ class RemoteInfEngine(InferenceEngine):
             ttft=latency,  # Simplified for non-streaming
             tokenizer=req.tokenizer,
             processor=req.processor,
-            routed_experts=accumulated_routed_experts,
+            routed_experts=final_routed_experts,
         )
         return response
 

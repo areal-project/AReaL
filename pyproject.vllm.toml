@@ -253,6 +253,10 @@ override-dependencies = [
     # older host kernels can still install megatron-core.
     "nvidia-resiliency-ext; sys_platform == 'never'",
 
+    # fastapi-sso 0.17.0 was published with 0.16.0 wheel filenames, which uv
+    # rejects as malformed. Keep the newer x86_64 Linux split from the lockfile.
+    "fastapi-sso==0.16.0; sys_platform != 'linux' or platform_machine != 'x86_64'",
+
     # Version conflicts with megatron-bridge (resorting to the existing version)
     "megatron-core==0.17.0; python_version >= '3.12' and sys_platform == 'linux' and platform_machine == 'x86_64'",
     "hydra-core==1.4.0.dev1",

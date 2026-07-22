@@ -131,9 +131,19 @@ class SessionData:
 
 def serialize_interactions(
     interactions: dict[str, InteractionWithTokenLogpReward],
+    *,
+    r3_num_moe_layers: int | None = None,
+    r3_topk: int | None = None,
 ) -> dict[str, Any]:
     """Serialize interactions into a json-compatible format for HTTP transport."""
+    from areal.experimental.openai.types import configure_r3_interactions
     from areal.infra.rpc.serialization import serialize_value
+
+    configure_r3_interactions(
+        interactions,
+        num_moe_layers=r3_num_moe_layers,
+        topk=r3_topk,
+    )
 
     result = {}
     for key, interaction in interactions.items():
