@@ -454,9 +454,20 @@ class TestDataProxyExternalEndpoints:
         resp = await data_proxy_client.post(
             "/register_model",
             json={"name": "ext-1", "url": "http://ext-api", "model": "gpt-4o"},
+            headers={"Authorization": "Bearer areal-admin-key"},
         )
         assert resp.status_code == 200
         assert resp.json()["status"] == "ok"
+
+    @pytest.mark.asyncio
+    async def test_register_external_model_without_admin_key_401(
+        self, data_proxy_client
+    ):
+        resp = await data_proxy_client.post(
+            "/register_model",
+            json={"name": "ext-1", "url": "http://ext-api", "model": "gpt-4o"},
+        )
+        assert resp.status_code == 401
 
     @pytest.mark.asyncio
     async def test_external_chat_completions_non_streaming(
@@ -468,6 +479,7 @@ class TestDataProxyExternalEndpoints:
         await data_proxy_client.post(
             "/register_model",
             json={"name": "ext-1", "url": "http://ext-api", "model": "gpt-4o"},
+            headers={"Authorization": "Bearer areal-admin-key"},
         )
 
         class _FakeClient:
@@ -520,6 +532,7 @@ class TestDataProxyExternalEndpoints:
         await data_proxy_client.post(
             "/register_model",
             json={"name": "ext-1", "url": "http://ext-api", "model": "gpt-4o"},
+            headers={"Authorization": "Bearer areal-admin-key"},
         )
 
         class _FakeStreamResponse:
@@ -624,6 +637,7 @@ class TestDataProxyExternalEndpoints:
                 "model": "gpt-4o",
                 "api_key": "sk-provider-key-99",
             },
+            headers={"Authorization": "Bearer areal-admin-key"},
         )
 
         captured_headers: dict[str, str] = {}
