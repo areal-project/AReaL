@@ -12,7 +12,6 @@ from typing import Any, Protocol, cast
 
 import aiohttp
 import orjson
-import ray
 import torch
 
 from areal.infra.utils.concurrent import run_async_task
@@ -49,7 +48,7 @@ class RTensorBackend(Protocol):
         Returns
         -------
         Any
-            Shard ID (str for HTTP backend, ray.ObjectRef for Ray backend)
+            Shard ID for the HTTP backend.
         """
         ...
 
@@ -76,9 +75,9 @@ class TensorShardInfo:
     Attributes
     ----------
     shard_id : Any
-        Unique identifier for the shard (str for HTTP, ray.ObjectRef for Ray)
+        Unique identifier for the shard.
     node_addr : str
-        Network address where shard is stored (empty for Ray backend)
+        Network address where shard is stored.
     """
 
     shard_id: Any
@@ -270,32 +269,13 @@ class HttpRTensorBackend:
                     await resp.json()
 
 
-class RayRTensorBackend:
-    def fetch(self, shards: list[TensorShardInfo]) -> list[torch.Tensor]:
-        """Fetch multiple shards from Ray object store."""
-        if not shards:
-            return []
-        return ray.get([s.shard_id for s in shards])
-
-    def store(self, tensor: torch.Tensor) -> ray.ObjectRef:
-        """Store tensor in Ray object store, return ObjectRef."""
-        return ray.put(tensor)
-
-    async def delete(self, node_addr: str, shard_ids: list[Any]) -> None:
-        """Free objects from Ray object store."""
-        ray.internal.free(shard_ids)
-
-
 _backend: RTensorBackend | None = None
 
 
 def get_backend() -> RTensorBackend:
     global _backend
     if _backend is None:
-        if ray.is_initialized():
-            _backend = RayRTensorBackend()
-        else:
-            _backend = HttpRTensorBackend()
+        _backend = HttpRTensorBackend()
     return _backend
 
 
