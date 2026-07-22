@@ -149,6 +149,7 @@ class PPOTrainer:
         self._validate_cfg()
 
         self._amend_xccl_weight_update_envvar()
+        self._amend_deterministic_envvar()
 
         agent_cfg = config.rollout.agent
         self._online_mode = agent_cfg is not None and agent_cfg.mode == "online"
@@ -959,6 +960,38 @@ class PPOTrainer:
         for spec in self.config.actor.scheduling_spec:
             spec.env_vars["NCCL_CUMEM_ENABLE"] = "0"
             spec.env_vars["NCCL_NVLS_ENABLE"] = "0"
+
+    def _amend_deterministic_envvar(self):
+        if not is_single_controller():
+            # This environ is set by the launcher in the SPMD mode.
+            return
+
+        engine_cfgs = [(self.config.actor, self.actor_alloc)]
+        if self.config.critic is not None:
+            engine_cfgs.append(
+                (
+                    self.config.critic,
+                    ModelAllocation.from_str(self.config.critic.backend, name="critic"),
+                )
+            )
+        if self.config.actor.kl_ctl > 0 and self.config.ref is not None:
+            engine_cfgs.append(
+                (
+                    self.config.ref,
+                    ModelAllocation.from_str(self.config.ref.backend, name="ref"),
+                )
+            )
+
+        for engine_cfg, alloc in engine_cfgs:
+            if alloc.backend != "megatron":
+                continue
+            if not engine_cfg.megatron.use_deterministic_algorithms:
+                continue
+            # TransformerEngine snapshots this env var at import or attention
+            # module construction depending on version; exporting it at worker
+            # launch is the only ordering safe for all of them.
+            for spec in engine_cfg.scheduling_spec:
+                spec.env_vars["NVTE_ALLOW_NONDETERMINISTIC_ALGO"] = "0"
 
     def _create_train_engine(
         self, actor_config: PPOActorConfig, alloc: ModelAllocation
