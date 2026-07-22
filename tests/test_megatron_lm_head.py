@@ -343,16 +343,20 @@ def test_pack_fp32_to_half_inplace_preserves_values_and_storage(
 
 @pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA is required for storage reuse")
 def test_storage_identity_rejects_recycled_cuda_address():
-    torch.cuda.empty_cache()
     shape = (1024, 1024)
     source = torch.empty(shape, dtype=torch.float32, device="cuda")
     source_ptr = source.data_ptr()
+    source_storage = source.untyped_storage()
     tensor_ref = weakref.ref(source)
     del source
     gc.collect()
     assert tensor_ref() is None
 
-    replacement = torch.empty(shape, dtype=torch.float32, device="cuda")
+    replacement = torch.empty(0, dtype=torch.float32, device="cuda").set_(
+        source_storage,
+        0,
+        shape,
+    )
 
     assert replacement.data_ptr() == source_ptr
     assert not _matches_storage(replacement, tensor_ref)
