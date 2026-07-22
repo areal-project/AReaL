@@ -71,9 +71,6 @@ from areal.engine.core.distributed import (
 from areal.engine.core.model import (
     disable_dropout_in_model,
     is_gemma3_model,
-    is_qwen3_5_model,
-    is_qwen3_moe_model,
-    is_qwen3_vl_model,
     is_qwen_vl_model,
     is_valid_vision_model,
 )
@@ -1889,18 +1886,12 @@ class FSDPEngine(TrainEngine):
             ]
             mb["use_cache"] = False
             padded_mb["use_cache"] = False
-            if (
-                is_qwen3_moe_model(self.model_config.model_type)
-                or is_qwen3_vl_model(self.model_config.model_type)
-                or is_qwen3_5_model(self.model_config.model_type)
-            ):
-                mb["attention_mask"] = None
-                padded_mb["attention_mask"] = None
-            else:
-                mb["attention_mask"] = dict(full_attention=None, sliding_attention=None)
-                padded_mb["attention_mask"] = dict(
-                    full_attention=None, sliding_attention=None
-                )
+            # Transformers models do not share a common dict schema for
+            # per-layer attention masks. Mapping-aware models build their own
+            # backend-specific masks from ``None`` and the reset position IDs;
+            # passing a hard-coded mapping breaks tensor-mask models such as Llama.
+            mb["attention_mask"] = None
+            padded_mb["attention_mask"] = None
             _prepare_multimodal_forward_inputs(mb, padded_mb)
         _drop_multimodal_payloads(mb_list.data)
         return mb_list
