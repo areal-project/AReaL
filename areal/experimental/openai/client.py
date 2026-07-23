@@ -357,13 +357,23 @@ def _resolve_max_total_tokens(
     return min(prompt_len + max_new_tokens, cap)
 
 
-def _parse_tool_call_arguments(messages: list[dict]) -> list[dict]:
-    """Return a new message list with tool_call arguments parsed from JSON strings
-    to dicts. Some chat templates (e.g. GLM-5.1) iterate over arguments with
-    .items(), which fails when arguments is a JSON string per OpenAI API convention.
+def _mapping_shaped_tool_call_arguments(arguments: Any) -> Mapping:
+    parsed = arguments
+    if isinstance(arguments, str):
+        try:
+            parsed = json.loads(arguments)
+        except (json.JSONDecodeError, TypeError):
+            pass
+    if isinstance(parsed, Mapping):
+        return parsed
+    return {"arguments": parsed}
 
-    Only creates new dicts where modifications are needed; unaffected messages
-    are shared with the input list to avoid expensive deep copies.
+
+def _parse_tool_call_arguments(messages: list[dict]) -> list[dict]:
+    """Return tokenizer messages with mapping-shaped tool-call arguments.
+
+    JSON strings are decoded; invalid or non-object arguments are wrapped under
+    ``arguments``. Only modified containers are copied.
     """
     result = []
     for msg in messages:
@@ -379,13 +389,10 @@ def _parse_tool_call_arguments(messages: list[dict]) -> list[dict]:
                 new_tool_calls.append(tc)
                 continue
             args = fn.get("arguments")
-            if isinstance(args, str):
-                try:
-                    parsed = json.loads(args)
-                    tc = {**tc, "function": {**fn, "arguments": parsed}}
-                    modified = True
-                except (json.JSONDecodeError, TypeError):
-                    pass
+            parsed = _mapping_shaped_tool_call_arguments(args)
+            if parsed is not args:
+                tc = {**tc, "function": {**fn, "arguments": parsed}}
+                modified = True
             new_tool_calls.append(tc)
         if modified:
             result.append({**msg, "tool_calls": new_tool_calls})
