@@ -373,6 +373,15 @@ def convert_qwen3moe_to_hf(
         elif rest == "self_attention.k_layernorm.weight":
             return [(f"model.layers.{layer_idx}.self_attn.k_norm.weight", param)]
 
+        # for lora layer patching
+        elif rest == "input_layernorm.weight":
+            return [(f"model.layers.{layer_idx}.input_layernorm.weight", param)]
+
+        elif rest == "pre_mlp_layernorm.weight":
+            return [
+                (f"model.layers.{layer_idx}.post_attention_layernorm.weight", param)
+            ]
+
     raise ValueError(f"Unknown parameter name: {name}")
 
 
@@ -891,6 +900,15 @@ def convert_qwen2_to_hf(
             return [(f"model.layers.{layer_idx}.self_attn.q_norm.weight", param)]
         elif rest == "self_attention.k_layernorm.weight":
             return [(f"model.layers.{layer_idx}.self_attn.k_norm.weight", param)]
+
+        # for lora layer patching
+        elif rest == "input_layernorm.weight":
+            return [(f"model.layers.{layer_idx}.input_layernorm.weight", param)]
+
+        elif rest == "pre_mlp_layernorm.weight":
+            return [
+                (f"model.layers.{layer_idx}.post_attention_layernorm.weight", param)
+            ]
 
     raise ValueError(f"Unknown parameter name: {name}")
 
@@ -1426,6 +1444,236 @@ def get_named_parameters(model_module, num_experts):
                     f"module.module.{lm_prefix}decoder.layers.{layer_idx}.{rest}",
                     buffer,
                 )
+
+    if isinstance(model_module, (list, tuple)):
+        try:
+            vp_world = mpu.get_virtual_pipeline_model_parallel_world_size()
+            original_vp_rank = mpu.get_virtual_pipeline_model_parallel_rank()
+        except AssertionError:
+            original_vp_rank = None
+            vp_world = None
+
+        for vpp_rank, single_module in enumerate(model_module):
+            if vp_world and vp_world > 1:
+                mpu.set_virtual_pipeline_model_parallel_rank(vpp_rank)
+            yield from _iter_single(single_module)
+
+        if (
+            vp_world
+            and vp_world > 1
+            and original_vp_rank is not None
+            and original_vp_rank >= 0
+        ):
+            mpu.set_virtual_pipeline_model_parallel_rank(original_vp_rank)
+        return
+
+    yield from _iter_single(model_module)
+
+
+def merged_weight_as_param(base_param, merged_tensor):
+    """Create a Parameter from merged weights, preserving attributes from base param."""
+    import torch.nn as nn
+
+    out = nn.Parameter(merged_tensor, requires_grad=False)
+    for k in [
+        "tensor_model_parallel",
+        "partition_dim",
+        "partition_stride",
+        "is_embedding_or_output_parameter",
+    ]:
+        if hasattr(base_param, k):
+            setattr(out, k, getattr(base_param, k))
+    return out
+
+
+def get_named_parameters_lora_merged(model_module, num_experts):
+    """
+    Iterator yielding (name, param) for merged LoRA weights + non-LoRA params.
+
+    For LoRA-wrapped modules, merges lora_A and lora_B into the base weight.
+    For non-LoRA modules, yields parameters as-is.
+    """
+
+    def _canonical_name(name: str) -> str:
+        if name.startswith("module.module."):
+            return name
+        if name.startswith("module."):
+            return "module." + name
+        return "module.module." + name
+
+    def _merge_lora_linear(layer):
+        """
+        Return merged weight tensor in a new buffer.
+        Does NOT modify model weights.
+        """
+        Wp = layer.base_layer.weight  # nn.Parameter with metadata
+        W = Wp.detach()  # Tensor view for math
+
+        if not hasattr(layer, "lora_A") or not layer.lora_A:
+            return W.clone()
+
+        A = layer.lora_A["default"].weight.detach()
+        B = layer.lora_B["default"].weight.detach()
+
+        scaling = 1.0
+        if hasattr(layer, "scaling"):
+            scaling = layer.scaling.get("default", 1.0)
+
+        merged = (W + (B @ A) * scaling).clone()
+        return merged_weight_as_param(Wp, merged)
+
+    def _iter_single(single_module):
+        ep_size = mpu.get_expert_model_parallel_world_size()
+        ep_rank = mpu.get_expert_model_parallel_rank()
+        expert_offset = ep_rank * num_experts // ep_size if num_experts else 0
+
+        config = getattr(single_module, "config", None)
+        if config is None and hasattr(single_module, "module"):
+            config = getattr(single_module.module, "config", None)
+        if config is None:
+            raise AttributeError("Megatron module does not expose transformer config")
+
+        layer_offset = get_transformer_layer_offset(config)
+
+        # Build a mapping from parameter object -> fully qualified parameter name.
+        # This avoids relying on module_dict key equality.
+        param_name_by_id = {}
+        for n, p in single_module.named_parameters():
+            n = _canonical_name(n)
+            param_name_by_id[id(p)] = n
+
+        skip_names = set()
+        emitted_merged = set()
+
+        # -------------------------
+        # Pass 1: emit merged LoRA weights with layer-offset-corrected names
+        # -------------------------
+        for mod_name, mod in single_module.named_modules():
+            mod_name = _canonical_name(mod_name)
+
+            if not (
+                hasattr(mod, "base_layer")
+                and hasattr(mod, "lora_A")
+                and hasattr(mod, "lora_B")
+            ):
+                continue
+
+            # Apply the same layer-offset rename that Pass 2 does
+            decoder_layers_pattern = r"module\.module\.decoder\.layers\.(\d+)\.(.+)"
+            match = re.match(decoder_layers_pattern, mod_name)
+            if match:
+                layer_idx, rest = match.groups()
+                layer_idx = int(layer_idx) + layer_offset
+                mod_name = f"module.module.decoder.layers.{layer_idx}.{rest}"
+
+            merged_name = f"{mod_name}.weight"
+            if merged_name in emitted_merged:
+                continue
+
+            yield merged_name, _merge_lora_linear(mod)
+            emitted_merged.add(merged_name)
+
+            # Skip underlying params by *object identity* -> name
+            # base weight
+            base_w = getattr(getattr(mod, "base_layer", None), "weight", None)
+            if base_w is not None:
+                bn = param_name_by_id.get(id(base_w))
+                if bn:
+                    skip_names.add(bn)
+
+            # base bias
+            base_b = getattr(getattr(mod, "base_layer", None), "bias", None)
+            if base_b is not None:
+                bb = param_name_by_id.get(id(base_b))
+                if bb:
+                    skip_names.add(bb)
+
+            # lora_A
+            loraA = None
+            try:
+                loraA = mod.lora_A["default"].weight
+            except Exception:
+                loraA = None
+            if loraA is not None:
+                an = param_name_by_id.get(id(loraA))
+                if an:
+                    skip_names.add(an)
+
+            # lora_B
+            loraB = None
+            try:
+                loraB = mod.lora_B["default"].weight
+            except Exception:
+                loraB = None
+            if loraB is not None:
+                bn2 = param_name_by_id.get(id(loraB))
+                if bn2:
+                    skip_names.add(bn2)
+
+        # -------------------------
+        # Pass 2: emit all other params as-is (with your existing renames),
+        # skipping any underlying LoRA pieces already merged.
+        # -------------------------
+        for name, param in single_module.named_parameters():
+            name = _canonical_name(name)
+
+            if name in skip_names:
+                continue
+
+            decoder_layers_pattern = r"module\.module\.decoder\.layers\.(\d+)\.(.+)"
+            match = re.match(decoder_layers_pattern, name)
+            if not match:
+                mtp_layers_pattern = r"module\.module\.mtp\.layers\.(\d+)\.(.+)"
+                match = re.match(mtp_layers_pattern, name)
+                if not match:
+                    yield name, param
+                    continue
+
+                layer_idx, rest = match.groups()
+                expert_pattern = r"transformer_layer.mlp.experts\.(.+)\.weight(\d+)"
+                match = re.match(expert_pattern, rest)
+                if not match:
+                    yield name, param
+                    continue
+
+                rest, expert_idx = match.groups()
+                expert_idx = int(expert_idx) + expert_offset
+                yield (
+                    f"module.module.mtp.layers.{layer_idx}.transformer_layer.mlp.experts.{rest}.weight{expert_idx}",
+                    param,
+                )
+                continue
+
+            layer_idx, rest = match.groups()
+            layer_idx = int(layer_idx) + layer_offset
+
+            expert_pattern = r"mlp.experts\.(.+)\.weight(\d+)"
+            match = re.match(expert_pattern, rest)
+            if match:
+                rest, expert_idx = match.groups()
+                expert_idx = int(expert_idx) + expert_offset
+                yield (
+                    f"module.module.decoder.layers.{layer_idx}.mlp.experts.{rest}.weight{expert_idx}",
+                    param,
+                )
+            else:
+                yield f"module.module.decoder.layers.{layer_idx}.{rest}", param
+
+        # treat expert bias as normal parameters
+        for name, buffer in single_module.named_buffers():
+            if "expert_bias" not in name:
+                continue
+            # for model without ddp wrap
+            name = _canonical_name(name)
+
+            decoder_layers_pattern = r"module\.module\.decoder\.layers\.(\d+)\.(.+)"
+            match = re.match(decoder_layers_pattern, name)
+            if not match:
+                yield name, buffer
+            else:
+                layer_idx, rest = match.groups()
+                layer_idx = int(layer_idx) + layer_offset
+                yield f"module.module.decoder.layers.{layer_idx}.{rest}", buffer
 
     if isinstance(model_module, (list, tuple)):
         try:

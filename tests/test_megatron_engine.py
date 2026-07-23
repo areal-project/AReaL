@@ -29,6 +29,25 @@ MODEL_PATH = get_model_path(
 )
 
 
+def test_merged_weight_as_param_preserves_parallel_metadata():
+    """Merged weights retain metadata needed by tensor-parallel gathering."""
+    from areal.engine.megatron_utils.megatron import merged_weight_as_param
+
+    base = torch.nn.Parameter(torch.zeros(2, 3))
+    base.tensor_model_parallel = True
+    base.partition_dim = 0
+    base.partition_stride = 1
+    merged = torch.ones(2, 3)
+
+    result = merged_weight_as_param(base, merged)
+
+    torch.testing.assert_close(result, merged, rtol=0.0, atol=0.0)
+    assert result.requires_grad is False
+    assert result.tensor_model_parallel is True
+    assert result.partition_dim == 0
+    assert result.partition_stride == 1
+
+
 @pytest.fixture(scope="module")
 def mock_input(
     batch_size=5,

@@ -442,6 +442,264 @@ def _emit_per_expert_flat_expert_sd(
     return expert_sd
 
 
+def save_lora_adapters_to_hf(
+    models: list,
+    output_dir: str,
+    base_model_name: str,
+    rank: int = 8,
+    lora_alpha: int = 16,
+    target_modules: list[str] | None = None,
+    tf_config=None,  # Pass transformer config for QKV splitting
+) -> None:
+    """
+    Save LoRA adapter weights in HuggingFace PEFT format with TP gather and QKV splitting.
+    """
+    import json
+    import os
+
+    import torch
+    import torch.distributed as dist
+    from megatron.core import parallel_state as mpu
+    from safetensors.torch import save_file
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Currently only supports linear qkv, and linear proj
+    if target_modules is None:
+        target_modules = ["q_proj", "k_proj", "v_proj", "o_proj"]
+
+    def all_gather_lora_param(name: str, param: torch.Tensor) -> torch.Tensor:
+        """Gather LoRA parameter across TP ranks (adapted from all_gather_param)."""
+        if not hasattr(param, "tensor_model_parallel"):
+            return param.data
+
+        if (
+            not param.tensor_model_parallel
+            or getattr(param, "parallel_mode", None) == "duplicated"
+        ):
+            return param.data
+
+        # LoRA adapters on attention should use regular TP group
+        tp_size = mpu.get_tensor_model_parallel_world_size()
+        tp_group = mpu.get_tensor_model_parallel_group()
+
+        if tp_size <= 1:
+            return param.data
+
+        # Gather across TP ranks
+        param_partitions = [torch.empty_like(param.data) for _ in range(tp_size)]
+        dist.all_gather(param_partitions, param.data, group=tp_group)
+
+        partition_dim = param.partition_dim
+        assert param.partition_stride == 1, "partition_stride != 1 is not supported"
+
+        # Concatenate along partition dimension
+        gathered_param = torch.cat(param_partitions, dim=partition_dim)
+        return gathered_param
+
+    def split_qkv_lora(param: torch.Tensor, is_lora_A: bool, tf_config) -> tuple:
+        """
+        Split fused QKV LoRA weights into separate Q, K, V weights.
+
+        Args:
+            param: LoRA weight tensor
+            is_lora_A: True if this is lora_A (input side), False if lora_B (output side)
+            tf_config: Transformer config for dimensions
+
+        Returns:
+            (q_param, k_param, v_param)
+        """
+        if is_lora_A:
+            # lora_A: [lora_rank, hidden_size]
+            # Same for Q, K, V - just duplicate
+            return param.clone(), param.clone(), param.clone()
+        else:
+            # lora_B: [qkv_combined_dim, lora_rank]
+            # Need to split based on num_attention_heads and num_query_groups (GQA)
+            try:
+                head_dim = (
+                    tf_config.kv_channels
+                    if tf_config.kv_channels is not None
+                    else tf_config.hidden_size // tf_config.num_attention_heads
+                )
+            except (AttributeError, TypeError):
+                head_dim = tf_config.hidden_size // tf_config.num_attention_heads
+
+            num_query_groups = tf_config.num_query_groups
+            value_num_per_group = tf_config.num_attention_heads // num_query_groups
+
+            # Total dims: q_dim + k_dim + v_dim
+            q_dim = tf_config.num_attention_heads * head_dim
+            k_dim = num_query_groups * head_dim
+            v_dim = num_query_groups * head_dim
+
+            # Reshape to [num_query_groups, (q_heads_per_group + 1 + 1), head_dim, lora_rank]
+            lora_rank = param.shape[1]
+            param_reshaped = param.view(num_query_groups, -1, head_dim, lora_rank)
+
+            # Split Q, K, V
+            q_param, k_param, v_param = torch.split(
+                param_reshaped,
+                split_size_or_sections=[value_num_per_group, 1, 1],
+                dim=1,
+            )
+
+            # Reshape back to 2D
+            q_param = q_param.reshape(q_dim, lora_rank)
+            k_param = k_param.reshape(k_dim, lora_rank)
+            v_param = v_param.reshape(v_dim, lora_rank)
+
+            return q_param, k_param, v_param
+
+    def convert_lora_name_to_hf(megatron_name: str) -> str:
+        """Convert Megatron LoRA parameter name to HuggingFace format."""
+        name = megatron_name.replace(".default.weight", ".weight")
+        name = name.replace(".default.bias", ".bias")
+
+        name = (
+            name.replace("decoder.layers", "layers")
+            .replace("self_attention.linear_proj", "self_attn.o_proj")
+            .replace("self_attention.linear_qkv", "self_attn.qkv_proj")
+            .replace("mlp.linear_fc1", "mlp.gate_proj")
+            .replace("mlp.linear_fc2", "mlp.down_proj")
+        )
+
+        return name
+
+    # Get transformer config from first model
+    first_model = models[0]
+    if hasattr(first_model, "module"):
+        first_model = first_model.module
+    if tf_config is None:
+        tf_config = getattr(first_model, "config", None)
+        if tf_config is None:
+            raise ValueError("Cannot find transformer config")
+
+    # Extract LoRA parameters with TP gathering
+    lora_state_dict = {}
+
+    for vpp_rank, model in enumerate(models):
+        if hasattr(model, "module"):
+            model = model.module
+
+        for name, param in model.named_parameters():
+            if (".lora_A." in name or ".lora_B." in name) and param is not None:
+                # Step 1: Gather across TP ranks
+                gathered_param = all_gather_lora_param(name, param)
+                param_cpu = gathered_param.detach().cpu().contiguous()
+
+                # Step 2: Convert name to HF format
+                hf_name = convert_lora_name_to_hf(name)
+
+                # Step 3: Handle QKV splitting
+                if "qkv_proj" in hf_name:
+                    is_lora_A = "lora_A" in hf_name
+                    q_param, k_param, v_param = split_qkv_lora(
+                        param_cpu, is_lora_A, tf_config
+                    )
+
+                    # Create separate entries for Q, K, V
+                    hf_name_q = hf_name.replace("qkv_proj", "q_proj")
+                    hf_name_k = hf_name.replace("qkv_proj", "k_proj")
+                    hf_name_v = hf_name.replace("qkv_proj", "v_proj")
+
+                    lora_state_dict[f"base_model.model.{hf_name_q}"] = q_param
+                    lora_state_dict[f"base_model.model.{hf_name_k}"] = k_param
+                    lora_state_dict[f"base_model.model.{hf_name_v}"] = v_param
+                else:
+                    lora_state_dict[f"base_model.model.{hf_name}"] = param_cpu
+
+    print(
+        f"Rank {dist.get_rank() if dist.is_initialized() else 0}: Found {len(lora_state_dict)} LoRA parameters"
+    )
+
+    # Gather across PP ranks
+    if dist.is_initialized():
+        pp_size = mpu.get_pipeline_model_parallel_world_size()
+        pp_group = mpu.get_pipeline_model_parallel_group()
+
+        gathered_state_dicts = [None] * pp_size
+        dist.all_gather_object(gathered_state_dicts, lora_state_dict, group=pp_group)
+
+        if dist.get_rank() == 0:
+            merged_state_dict = {}
+            for sd in gathered_state_dicts:
+                if sd is not None:
+                    merged_state_dict.update(sd)
+            lora_state_dict = merged_state_dict
+            print(f"Total LoRA parameters after gathering: {len(lora_state_dict)}")
+
+    # Only rank 0 saves
+    if (not dist.is_initialized()) or dist.get_rank() == 0:
+        if len(lora_state_dict) == 0:
+            raise ValueError("No LoRA parameters found!")
+
+        print("\nSaved LoRA weight names (showing Q/K/V split):")
+        for key in sorted(lora_state_dict.keys())[:15]:
+            shape = lora_state_dict[key].shape
+            print(f"  {key}: {list(shape)}")
+        if len(lora_state_dict) > 15:
+            print(f"  ... and {len(lora_state_dict) - 15} more")
+
+        # Verify no shared memory
+        tensor_data_ptrs = {}
+        for name, tensor in lora_state_dict.items():
+            ptr = tensor.data_ptr()
+            if ptr in tensor_data_ptrs:
+                print(f"WARNING: {name} shares memory with {tensor_data_ptrs[ptr]}")
+            tensor_data_ptrs[ptr] = name
+
+        # Save adapter weights
+        adapter_file = os.path.join(output_dir, "adapter_model.safetensors")
+        save_file(lora_state_dict, adapter_file)
+
+        # Create adapter_config.json
+        adapter_config = {
+            "base_model_name_or_path": base_model_name,
+            "bias": "none",
+            "fan_in_fan_out": False,
+            "inference_mode": True,
+            "init_lora_weights": True,
+            "lora_alpha": lora_alpha,
+            "lora_dropout": 0.0,
+            "modules_to_save": None,
+            "peft_type": "LORA",
+            "r": rank,
+            "target_modules": target_modules,
+            "task_type": "CAUSAL_LM",
+        }
+
+        with open(os.path.join(output_dir, "adapter_config.json"), "w") as f:
+            json.dump(adapter_config, f, indent=2)
+
+        # Create index file
+        weight_map = {k: "adapter_model.safetensors" for k in lora_state_dict.keys()}
+        total_size = sum(p.numel() * p.element_size() for p in lora_state_dict.values())
+        index = {
+            "metadata": {"total_size": total_size},
+            "weight_map": weight_map,
+        }
+
+        with open(
+            os.path.join(output_dir, "adapter_model.safetensors.index.json"), "w"
+        ) as f:
+            json.dump(index, f, indent=2)
+
+        num_params = sum(p.numel() for p in lora_state_dict.values())
+        size_mb = total_size / (1024 * 1024)
+        print(f"\n✅ Saved LoRA adapter to {output_dir}")
+        print(
+            f"   Parameters: {len(lora_state_dict)} tensors ({num_params:,} total params)"
+        )
+        print(f"   Size: {size_mb:.2f} MB")
+        print(
+            f"   TP gathering: {'enabled' if mpu.get_tensor_model_parallel_world_size() > 1 else 'not needed (TP=1)'}"
+        )
+
+    if dist.is_initialized():
+        dist.barrier()
+
+
 def save_weights_to_hf_with_mbridge_fast(
     bridge: Bridge,
     models: list,

@@ -22,13 +22,15 @@ def hf_to_mcore_base_args(
     dtype: torch.dtype,
     **override_transformer_config_kwargs,
 ) -> dict:
+    from megatron.core import parallel_state as mpu
+
     # TODO: add parallel configs for transformer configs
     # Common parallel state parameters
-    # overlap_p2p_comm = (
-    #     mpu.get_virtual_pipeline_model_parallel_world_size() is not None
-    #     and mpu.get_virtual_pipeline_model_parallel_world_size() > 1
-    # )
-    # batch_p2p_comm = False
+    overlap_p2p_comm = (
+        mpu.get_virtual_pipeline_model_parallel_world_size() is not None
+        and mpu.get_virtual_pipeline_model_parallel_world_size() > 1
+    )
+    batch_p2p_comm = False
 
     # Base configuration with common parameters
     base_config = {
@@ -52,15 +54,17 @@ def hf_to_mcore_base_args(
         "params_dtype": dtype,
         "bf16": dtype is torch.bfloat16,
         # Parallel configuration
-        "tensor_model_parallel_size": 1,  # mpu.get_tensor_model_parallel_world_size(),
-        "pipeline_model_parallel_size": 1,  # mpu.get_pipeline_model_parallel_world_size(),
-        "expert_model_parallel_size": 1,  # mpu.get_expert_model_parallel_world_size(),
-        "expert_tensor_parallel_size": 1,  # mpu.get_experget_virtual_pipeline_model_parallel_world_size(),
-        "context_parallel_size": 1,  # mpu.get_context_part_tensor_parallel_world_size(),
-        "virtual_pipeline_model_parallel_size": 1,
-        "overlap_p2p_comm": False,
-        "batch_p2p_comm": False,
-        "sequence_parallel": False,  # mpu.get_tensor_model_parallel_world_size() > 1,
+        "tensor_model_parallel_size": mpu.get_tensor_model_parallel_world_size(),
+        "pipeline_model_parallel_size": mpu.get_pipeline_model_parallel_world_size(),
+        "expert_model_parallel_size": mpu.get_expert_model_parallel_world_size(),
+        "expert_tensor_parallel_size": getattr(
+            mpu, "get_expert_tensor_parallel_world_size", lambda: 1
+        )(),
+        "context_parallel_size": mpu.get_context_parallel_world_size(),
+        "virtual_pipeline_model_parallel_size": mpu.get_virtual_pipeline_model_parallel_world_size(),
+        "overlap_p2p_comm": overlap_p2p_comm,
+        "batch_p2p_comm": batch_p2p_comm,
+        "sequence_parallel": mpu.get_tensor_model_parallel_world_size() > 1,
         # Common settings
         "variable_seq_lengths": True,
         "masked_softmax_fusion": True,

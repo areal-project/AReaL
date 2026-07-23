@@ -289,6 +289,19 @@ def test_train_engine_config_rejects_invalid_kernel_attn_impl(attn_impl):
         )
 
 
+def test_train_engine_config_rejects_both_lora_sync_modes():
+    """Regular adapter sync and merged full-weight sync cannot be combined."""
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        TrainEngineConfig(
+            backend="megatron:d1",
+            experiment_name="test-experiment",
+            trial_name="trial0",
+            path="test-model",
+            use_lora=True,
+            use_merged_lora=True,
+        )
+
+
 @pytest.mark.parametrize(
     ("memory_efficient_load", "expected_loader"),
     [(False, "from_pretrained"), (True, "from_config")],

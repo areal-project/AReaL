@@ -29,6 +29,18 @@ from areal.utils import logging
 logger = logging.getLogger("HFLoader")
 
 
+def is_lora_param(global_name: str) -> bool:
+    """Return whether a parameter belongs to a PEFT LoRA adapter."""
+    return ".lora_A." in global_name or ".lora_B." in global_name
+
+
+def normalize_base_layer(name: str) -> str:
+    """Map a PEFT-wrapped base-layer name back to its original name."""
+    return name.replace(".base_layer.weight", ".weight").replace(
+        ".base_layer.bias", ".bias"
+    )
+
+
 def _get_tp_slice(shape, dim, tp_rank, tp_size) -> tuple:
     size_per_tp = shape[dim] // tp_size
     res = [slice(None) for _ in range(dim)]
@@ -680,12 +692,22 @@ def load_weights_from_hf_with_mbridge_fast(
     for model_index, model in enumerate(models):
         # map local weight names to global weight names
         local_to_global_map = bridge._weight_name_mapping_mcore_local_to_global(model)
-        # map local weight names to huggingface weight names
-        local_to_hf_map = {
-            k: bridge._weight_name_mapping_mcore_to_hf(v)
-            for k, v in local_to_global_map.items()
-            if "_extra_state" not in k
+        # LoRA parameters are initialized by PEFT rather than loaded from the
+        # base checkpoint. Normalize PEFT's base-layer wrapper before asking
+        # mbridge for the corresponding Hugging Face names.
+        local_to_global_map = {
+            local_name: normalize_base_layer(global_name)
+            for local_name, global_name in local_to_global_map.items()
+            if not is_lora_param(global_name)
         }
+        local_to_hf_map = {}
+        for local_name, global_name in local_to_global_map.items():
+            if "_extra_state" in local_name:
+                continue
+            hf_names = bridge._weight_name_mapping_mcore_to_hf(global_name)
+            local_to_hf_map[local_name] = (
+                [hf_names] if isinstance(hf_names, str) else hf_names
+            )
         if manual_tie_word_embedding:
             for k, v in local_to_hf_map.items():
                 if "lm_head.weight" in v:
