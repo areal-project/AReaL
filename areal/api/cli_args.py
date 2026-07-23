@@ -232,6 +232,16 @@ class GenerationHyperparameters:
             "help": "Enable beam search in the vLLM engine. When enabled, sampling parameters like temperature, top-p, and top-k are auto ignored."
         },
     )
+    sampling_seed: int | None = field(
+        default=None,
+        metadata={
+            "help": "Per-request seed for replayable sampling. On the SGLang backend "
+            "this is forwarded as sampling_params['sampling_seed'], which SGLang only "
+            "honors when the server is launched with "
+            "SGLangConfig.enable_deterministic_inference=True; otherwise it is "
+            "silently ignored. None (default) sends no seed and changes nothing."
+        },
+    )
     # NOTE: to add new parameters, please correctly handle them in the `to_openai_args_dict` method.
 
     def new(self, **kwargs):
@@ -279,6 +289,7 @@ class GenerationHyperparameters:
         "lora_name",  # Not supported by OpenAI
         "use_beam_search",  # Not supported by OpenAI
         "max_tokens",  # deprecated by "completions", not used in "responses", should be `max_new_tokens` in "openai-agents"
+        "sampling_seed",  # SGLang-specific; not an OpenAI-compatible parameter
     }
 
     def to_openai_args_dict(
@@ -1967,6 +1978,10 @@ class SGLangConfig:
     enable_memory_saver: bool = False
     allow_auto_truncate: bool = False
     attention_backend: str | None = "fa3"
+    # Required for per-request GenerationHyperparameters.sampling_seed to be honored
+    # (SGLang gates sampling_seed on this flag). Also enables SGLang's batch-invariant
+    # kernels, at their documented throughput cost, which is why this is opt-in.
+    enable_deterministic_inference: bool = False
     enable_multimodal: bool = False
     sampling_backend: str | None = None
     context_length: int | None = 32768
@@ -3182,6 +3197,59 @@ class PPOConfig(BaseExperimentConfig):
         # the engine config. Single source of truth: gconfig.lora_name.
         if self.rollout.use_lora and not self.rollout.lora_name:
             self.rollout.lora_name = self.gconfig.lora_name
+        # vLLM has no sampling_seed support (both VLLMBackend and VLLMBridgeBackend
+        # raise NotImplementedError on the first request); fail here instead, before
+        # any server launch or model load wastes time on an unsupported config.
+        # rollout.backend is the current per-engine field, e.g. "vllm:d2t4" or the
+        # named form "vllm[name]:d2t4" -- confirmed authoritative via
+        # RolloutController.__init__ parsing config.backend through
+        # ModelAllocation.from_str, whose grammar allows that optional "[name]", so
+        # strip it before comparing rather than only splitting on ":".
+        # Unlike self.sglang below, self.rollout is never None in practice here (the
+        # `self.rollout.use_lora` check above already dereferences it unconditionally),
+        # so this ternary is defense-in-depth, not a live guard.
+        rollout_backend = self.rollout.backend if self.rollout is not None else None
+        if (
+            isinstance(rollout_backend, str)
+            and rollout_backend.split(":")[0].split("[")[0] == "vllm"
+            and (
+                self.gconfig.sampling_seed is not None
+                or self.eval_gconfig.sampling_seed is not None
+            )
+        ):
+            raise ValueError(
+                "gconfig.sampling_seed or eval_gconfig.sampling_seed is set, but "
+                "rollout.backend is vLLM, which does not support sampling_seed."
+            )
+        # NOTE: eval_gconfig is currently only consumed for its n_samples field
+        # (areal/trainer/rl_trainer.py); no stock eval workflow builds a request from
+        # eval_gconfig's other fields, so eval_gconfig.sampling_seed does not reach
+        # SGLang either way. Checked here anyway so this warning stays correct if that
+        # changes, but do not read "no warning" as "eval_gconfig.sampling_seed works."
+        # self.sglang is not Optional and the YAML/CLI config loader (OmegaConf
+        # structured-config validation) rejects `sglang: null`, but direct Python
+        # construction (PPOConfig(sglang=None, ...), bypassing that loader) is not
+        # type-checked at runtime, so guard rather than assume non-None here.
+        sglang_deterministic = (
+            self.sglang.enable_deterministic_inference
+            if self.sglang is not None
+            else False
+        )
+        if (
+            self.gconfig.sampling_seed is not None
+            or self.eval_gconfig.sampling_seed is not None
+        ) and not sglang_deterministic:
+            warnings.warn(
+                "gconfig.sampling_seed or eval_gconfig.sampling_seed is set but "
+                "sglang.enable_deterministic_inference is False: SGLang silently "
+                "ignores per-request sampling_seed unless the server is launched "
+                "with --enable-deterministic-inference. Rollouts will not be seeded "
+                "as expected. (Not applicable if you're launching SGLang servers "
+                "yourself outside this config -- the vLLM case is already rejected "
+                "above, before this warning can be reached.)",
+                UserWarning,
+                stacklevel=2,
+            )
         super().__post_init__()
 
 

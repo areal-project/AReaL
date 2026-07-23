@@ -34,6 +34,21 @@ class VLLMBridgeBackend:
         """Build a ``/v1/completions`` or ``/v1/chat/completions`` request."""
         gconfig = req.gconfig
 
+        if gconfig.sampling_seed is not None:
+            # No native vLLM equivalent is wired here; mirrors
+            # areal.engine.vllm_remote.VLLMBackend's rejection -- fail loudly rather
+            # than silently drop the seed and produce non-reproducible rollouts the
+            # caller believes are seeded.
+            # Note: PPOConfig.__post_init__ validates this combination once at
+            # config-construction time. A seed set dynamically per-request after
+            # that (e.g. by a future per-rollout seed-minting workflow) still raises
+            # here, but on the async rollout path this exception is caught
+            # generically further up the call stack and surfaces as a rejected
+            # rollout, not a hard crash.
+            raise NotImplementedError(
+                "sampling_seed is not yet supported on the vLLM backend."
+            )
+
         # Compute effective max_new_tokens (cap by remaining context window)
         max_new_tokens = min(
             gconfig.max_tokens - len(req.input_ids),
