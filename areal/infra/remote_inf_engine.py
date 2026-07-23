@@ -47,8 +47,13 @@ from areal.infra.utils.http import arequest_with_retry, get_default_connector
 from areal.infra.utils.launcher import wait_llm_server_addrs
 from areal.infra.utils.proc import kill_process_tree
 from areal.utils import logging, name_resolve, names
+from areal.utils.cross_tokenizer_distill import (
+    align_teacher_logps_to_student,
+    retokenize_for_distillation,
+)
 from areal.utils.data import concat_padded_tensors
 from areal.utils.dynamic_import import import_from_string
+from areal.utils.hf_utils import load_hf_tokenizer
 from areal.utils.network import (
     find_free_ports,
     format_hostport,
@@ -375,6 +380,8 @@ class RemoteInfEngine(InferenceEngine):
         self._initialized = False
         self._proxy_gateway_addr: str | None = None
         self.local_server_processes: list[LocalInfServerInfo] = []
+        self._teacher_tokenizer = None
+        self._student_tokenizers = {}
 
     def _wait_for_server(self, address: str, process: subprocess.Popen | None = None):
         """Wait for a server to become healthy."""
@@ -518,6 +525,25 @@ class RemoteInfEngine(InferenceEngine):
         results: list[torch.Tensor] = []
         timeout = self.config.request_timeout
         version = self.get_version()
+        student_tokenizer_path = next(
+            (
+                traj.get("student_tokenizer_path")
+                for traj in data
+                if traj.get("student_tokenizer_path")
+            ),
+            None,
+        )
+
+        cross_tokenizer = student_tokenizer_path is not None
+        student_tokenizer = None
+        if cross_tokenizer:
+            if student_tokenizer_path not in self._student_tokenizers:
+                self._student_tokenizers[student_tokenizer_path] = load_hf_tokenizer(
+                    student_tokenizer_path
+                )
+            student_tokenizer = self._student_tokenizers[student_tokenizer_path]
+        if cross_tokenizer and self._teacher_tokenizer is None:
+            self._teacher_tokenizer = load_hf_tokenizer(self.config.tokenizer_path)
         for traj in data:
             input_ids = traj["input_ids"]
             loss_mask = traj["loss_mask"]
@@ -534,8 +560,27 @@ class RemoteInfEngine(InferenceEngine):
                     attn_mask = traj["attention_mask"][i]
                     active_idx = torch.nonzero(attn_mask, as_tuple=False).squeeze(-1)
                     token_ids = input_ids[i, active_idx].tolist()
+                    active_loss_mask = loss_mask[i, active_idx].bool()
                 else:
                     token_ids = input_ids[i].tolist()
+                    active_loss_mask = loss_mask[i].bool()
+                student_response_ids: list[int] | None = None
+                teacher_response_ids: list[int] | None = None
+                if cross_tokenizer:
+                    assert student_tokenizer is not None
+                    assert self._teacher_tokenizer is not None
+                    encoded = retokenize_for_distillation(
+                        token_ids,
+                        active_loss_mask.tolist(),
+                        student_tokenizer,
+                        self._teacher_tokenizer,
+                    )
+                    token_ids = encoded.teacher_input_ids
+                    student_response_ids = encoded.student_response_ids
+                    teacher_response_ids = encoded.teacher_response_ids
+                    target_len = len(teacher_response_ids)
+                    if target_len <= 0:
+                        continue
                 server_addr = self.choose_server()
                 http_req = self.backend.build_score_request(
                     input_ids=token_ids,
@@ -557,9 +602,29 @@ class RemoteInfEngine(InferenceEngine):
                         f"Expected {target_len} token logprobs, got {len(token_logps)}"
                     )
                 write_idx = torch.nonzero(loss_mask[i], as_tuple=False).squeeze(-1)
-                out[i, write_idx] = torch.tensor(
+                token_logps_tensor = torch.tensor(
                     token_logps, device=out.device, dtype=out.dtype
                 )
+                if cross_tokenizer:
+                    assert student_tokenizer is not None
+                    assert self._teacher_tokenizer is not None
+                    assert student_response_ids is not None
+                    assert teacher_response_ids is not None
+                    student_logps = None
+                    if "logprobs" in traj:
+                        student_logps = traj["logprobs"][i, write_idx].to(
+                            device=token_logps_tensor.device,
+                            dtype=token_logps_tensor.dtype,
+                        )
+                    token_logps_tensor = align_teacher_logps_to_student(
+                        student_response_ids,
+                        teacher_response_ids,
+                        token_logps_tensor,
+                        student_tokenizer,
+                        self._teacher_tokenizer,
+                        student_logps,
+                    )
+                out[i, write_idx] = token_logps_tensor
             results.append(out)
         return results
 
