@@ -80,6 +80,7 @@ class OpenAIProxyWorkflow(RolloutWorkflow):
         export_style: str = "individual",
         subproc_max_workers: int = 4,
         proxy_gateway_addr: str | None = None,
+        drop_retry_orphans: bool = False,
     ):
         if mode not in ("inline", "subproc", "online"):
             raise ValueError(
@@ -117,6 +118,7 @@ class OpenAIProxyWorkflow(RolloutWorkflow):
         self.discount = discount
         self.export_style = export_style
         self.subproc_max_workers = subproc_max_workers
+        self.drop_retry_orphans = drop_retry_orphans
 
     @trace_session("run_agent")
     async def _run_agent(self, session_api_key: str, data: dict):
@@ -196,6 +198,7 @@ class OpenAIProxyWorkflow(RolloutWorkflow):
             interactions = await proxy_client.export_interactions(
                 discount=self.discount,
                 style=self.export_style,
+                drop_retry_orphans=self.drop_retry_orphans,
             )
 
             # Return None if no interactions (empty session — user never sent chat/completions)
@@ -246,6 +249,7 @@ class OpenAIProxyWorkflow(RolloutWorkflow):
         interactions = await proxy_client.export_interactions(
             discount=self.discount,
             style=self.export_style,
+            drop_retry_orphans=self.drop_retry_orphans,
         )
 
         # Record stats

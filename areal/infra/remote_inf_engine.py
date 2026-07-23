@@ -597,6 +597,7 @@ class RemoteInfEngine(InferenceEngine):
             export_style=agent_cfg.export_style,
             subproc_max_workers=agent_cfg.subproc_max_workers,
             proxy_gateway_addr=self._proxy_gateway_addr,
+            drop_retry_orphans=agent_cfg.drop_retry_orphans,
         )
 
     def _resolve_workflow(

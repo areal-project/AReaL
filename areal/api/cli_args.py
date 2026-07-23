@@ -2206,6 +2206,17 @@ class AgentConfig:
             "help": "Maximum number of worker processes for subprocess mode execution pool."
         },
     )
+    drop_retry_orphans: bool = field(
+        default=False,
+        metadata={
+            "help": "Drop retry-orphan completions before export. "
+            "When upstream Agent SDK times out and retries the same request, "
+            "the proxy records both the orphan (never delivered to the agent) "
+            "and the retry, producing extra leaves in concat-mode export "
+            "(trajectory split). Enable this to discard orphans before reward "
+            "discounting."
+        },
+    )
     session_timeout_seconds: int = field(
         default=3600,
         metadata={
