@@ -389,6 +389,14 @@ live rollout is unchanged.
   `ray` scheduler is not supported.
 - **Single-controller mode**: Online mode only works in single-controller mode
   (`scheduler.type=local` or `scheduler.type=slurm`).
+- **Tool-schema alignment assumes sglang**: For behavioral parity with sglang's native
+  route, the proxy round-trips request `tools` through sglang's `Tool` model so they
+  byte-match sglang's own `/v1/chat/completions` rendering (keeping trajectories
+  reproducible on that endpoint). This is only correct for an **sglang** backend whose
+  version matches the worker venv's installed sglang. The alignment therefore runs only
+  when the engine class name identifies sglang; any other backend (e.g. vLLM) is left
+  unaligned. Robust backend-aware gating is tracked as a FIXME in
+  `areal/experimental/openai/client.py`.
 
 ## See Also
 
