@@ -927,6 +927,24 @@ class MegatronEngine(TrainEngine):
             # value, so the CP-local loss path (_cp_local_labels) is unchanged.
             cp_local = cp_size > 1 and not gather_cp_output
 
+            # MTP training: feed the MTP head an independent label channel
+            # (mtp_kwargs) so the main forward keeps labels=None and returns
+            # logits, while the MTP loss trains on next-tokens. Skip during
+            # eval/inference (forward_only) and on vision models.
+            if (
+                not forward_only
+                and self.mcore_config.enable_mtp_training
+                and not self.is_vision_model
+            ):
+                if cp_size > 1:
+                    raise NotImplementedError(
+                        "MTP training (megatron.enable_mtp_training) with "
+                        "context parallel > 1 is not supported yet."
+                    )
+                mb_input.padded_mb["mtp_kwargs"] = {
+                    "mtp_labels": mb_input.padded_mb["input_ids"]
+                }
+
             output = packed_context_parallel_forward(
                 model,
                 mb_input.padded_mb,
@@ -934,6 +952,9 @@ class MegatronEngine(TrainEngine):
                 is_vision_model=self.is_vision_model,
                 use_padded_seq=self.use_padded_seq,
             )
+
+            # Release MTP label channel after forward pass
+            mb_input.padded_mb.pop("mtp_kwargs", None)
 
             # Release tree attention metadata after forward pass
             for key in tree_attn_keys:
@@ -1047,7 +1068,40 @@ class MegatronEngine(TrainEngine):
         # Step 4: Optimizer step
         stats = self.optimizer_step()
         stats["num_micro_batches"] = len(mb_list.mbs)
+
+        # Step 5: Surface the auxiliary MTP loss for logging (if enabled).
+        mtp_loss = self._collect_mtp_loss(len(mb_list.mbs))
+        if mtp_loss is not None:
+            stats["mtp_loss"] = mtp_loss
         return stats
+
+    def _collect_mtp_loss(self, num_microbatches: int) -> float | None:
+        """Reduce and return the per-microbatch Multi-Token-Prediction loss.
+
+        Megatron-Core's ``process_mtp_loss`` accumulates the (detached) per-layer
+        MTP loss across micro-batches into ``MTPLossLoggingHelper.tracker`` and
+        records the reduce/avg groups. The tracker only holds ``values`` on the
+        last pipeline stage (where the MTP loss is computed); other stages skip
+        the reduction. The reduce step's collectives stay matched because the
+        avg_group (data-parallel + context-parallel) is contained within a single
+        pipeline stage. Returns ``None`` on ranks without an MTP loss value.
+        """
+        if not self.mcore_config.enable_mtp_training:
+            return None
+
+        from megatron.core.transformer.multi_token_prediction import (
+            MTPLossLoggingHelper,
+        )
+
+        tracker = MTPLossLoggingHelper.tracker
+        if "values" not in tracker:
+            return None
+
+        MTPLossLoggingHelper.reduce_loss_in_tracker()
+        # `values` is summed over micro-batches; normalize to a per-microbatch loss.
+        mtp_loss = tracker["values"].sum().item() / max(num_microbatches, 1)
+        MTPLossLoggingHelper.clean_loss_in_tracker()
+        return mtp_loss
 
     @torch.no_grad()
     def eval_batch(

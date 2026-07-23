@@ -385,12 +385,22 @@ def packed_context_parallel_forward(
     if dense_mask_text_forward:
         position_ids = None
 
+    # MTP training: forward the independent label channel to the (patched)
+    # GPTModel.forward so the MTP head trains on next-tokens while the main
+    # path keeps labels=None. Only set on the cp_size==1 path (enforced by the
+    # caller in megatron_engine.forward_step).
+    extra_forward_kwargs: dict[str, Any] = {}
+    mtp_kwargs = input_.get("mtp_kwargs", None)
+    if mtp_kwargs is not None:
+        extra_forward_kwargs["mtp_kwargs"] = mtp_kwargs
+
     try:
         output = model(
             input_ids=input_ids,
             attention_mask=final_attention_mask,
             position_ids=position_ids,
             packed_seq_params=packed_seq_params,
+            **extra_forward_kwargs,
             **vlm_kwargs,
         )
     except Exception as e:
