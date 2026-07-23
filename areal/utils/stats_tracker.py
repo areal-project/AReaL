@@ -391,6 +391,7 @@ class DistributedStatsTracker:
             cnt = self._placeholder_scalar(
                 fill=float(len(stats)), group=effective_group
             )
+
             if effective_group is not None:
                 dist.all_reduce(value, group=effective_group)
                 dist.all_reduce(cnt, group=effective_group)
