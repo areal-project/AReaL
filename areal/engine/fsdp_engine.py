@@ -1295,9 +1295,11 @@ class FSDPEngine(TrainEngine):
         """Cast fp32 master storage to compute dtype for export / rollout sync.
 
         When optimizer_dtype=float32 (the fp32 master weights default), the
-        underlying storage is fp32. HF export and xccl weight sync to rollout
-        engines (SGLang/vLLM) must cast back to compute dtype (typically bf16)
-        so deployment artefacts and broadcast bandwidth stay unchanged.
+        underlying storage is fp32. HF export, xccl weight sync, and the
+        awex FSDP adapter (see areal/v2/weight_update/awex/fsdp_adapter.py)
+        all cast back to compute dtype (typically bf16) so deployment
+        artefacts and broadcast bandwidth stay unchanged and NCCL sees
+        matching byte counts on both ends of the transfer.
         No-op when storage already matches compute dtype.
         """
         compute_dtype = self._compute_dtype()
