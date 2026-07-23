@@ -55,7 +55,10 @@ from areal.api import ModelRequest, ModelResponse
 from areal.api.cli_args import GenerationHyperparameters
 from areal.experimental.openai.cache import InteractionCache
 from areal.experimental.openai.tool_call_parser import process_tool_calls
-from areal.experimental.openai.types import InteractionWithTokenLogpReward
+from areal.experimental.openai.types import (
+    InteractionWithTokenLogpReward,
+    ensure_parent_token_prefix,
+)
 from areal.utils import logging
 from areal.utils.hf_utils import apply_chat_template
 
@@ -405,6 +408,7 @@ def concat_prompt_token_ids_with_parent(
     Concatenate prompt token IDs with parent interaction's tokens.
     """
     parent_tokens: list[int] = []
+    expected_parent_tokens: list[int] | None = None
     all_message_list: list[dict] = []
     eos_token_id = tokenizer.eos_token_id
 
@@ -420,6 +424,9 @@ def concat_prompt_token_ids_with_parent(
         parent_tokens = (
             parent.model_response.input_tokens
             + parent.model_response.output_tokens_without_stop  # without stop tokens
+        )
+        expected_parent_tokens = (
+            parent.model_response.input_tokens + parent.model_response.output_tokens
         )
         all_message_list += parent.messages if parent.messages is not None else []
         all_message_list += (
@@ -462,6 +469,8 @@ def concat_prompt_token_ids_with_parent(
         child_tokens_truncate_idx = -1
 
     prompt_token_ids = parent_tokens + all_tokens[child_tokens_truncate_idx + 1 :]
+    if expected_parent_tokens is not None:
+        ensure_parent_token_prefix(prompt_token_ids, expected_parent_tokens)
     return prompt_token_ids
 
 
@@ -684,13 +693,18 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
                 )
             else:
                 concat_tok_messages = concat_messages
-            prompt_token_ids = concat_prompt_token_ids_with_parent(
-                concat_tok_messages,
-                interaction.parent if interaction is not None else None,
-                self.tokenizer,
-                tools=tools_list,
-                extra_body=extra_body,
-            )
+            try:
+                prompt_token_ids = concat_prompt_token_ids_with_parent(
+                    concat_tok_messages,
+                    interaction.parent if interaction is not None else None,
+                    self.tokenizer,
+                    tools=tools_list,
+                    extra_body=extra_body,
+                )
+            except Exception:
+                if cache is not None:
+                    cache.pop(completion_id, None)
+                raise
         else:
             raise RuntimeError(
                 f"Unsupported chat_template_type {self.chat_template_type}"
@@ -1124,13 +1138,17 @@ class AsyncResponsesWithReward(BaseAsyncResponses):
                 _, remaining_tok, _ = _extract_images_from_messages(remaining)
             else:
                 remaining_tok = remaining
-            prompt_token_ids = concat_prompt_token_ids_with_parent(
-                remaining_tok,
-                interaction.parent if interaction is not None else None,
-                self.tokenizer,
-                tools=tools_list,
-                extra_body=extra_body,
-            )
+            try:
+                prompt_token_ids = concat_prompt_token_ids_with_parent(
+                    remaining_tok,
+                    interaction.parent if interaction is not None else None,
+                    self.tokenizer,
+                    tools=tools_list,
+                    extra_body=extra_body,
+                )
+            except Exception:
+                cache.pop(resp_id, None)
+                raise
         else:
             raise RuntimeError(
                 f"Unsupported chat_template_type {self.chat_template_type}"
