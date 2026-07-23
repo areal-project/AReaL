@@ -3,6 +3,8 @@
 __all__ = [
     "RolloutWorkflow",
     "AsyncRewardWrapper",
+    "RewardResult",
+    "normalize_reward_result",
     "TrainEngine",
     "InferenceEngine",
     "Scheduler",
@@ -49,6 +51,8 @@ _LAZY_IMPORTS = {
     "WorkflowLike": "areal.api.workflow_api",
     "AgentWorkflow": "areal.api.workflow_api",
     "AsyncRewardWrapper": "areal.api.reward_api",
+    "RewardResult": "areal.api.reward_api",
+    "normalize_reward_result": "areal.api.reward_api",
     "RolloutWorkflow": "areal.api.workflow_api",
 }
 

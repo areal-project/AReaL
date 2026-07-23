@@ -152,7 +152,13 @@ class PPOActor:
         batch_indices = torch.arange(
             bs, device=data["input_ids"].device, dtype=torch.long
         )
-
+        step_rewards = data.get("step_rewards")
+        step_reward_mask = data.get("step_reward_mask")
+        if (step_rewards is None) != (step_reward_mask is None):
+            raise ValueError(
+                "step_rewards and step_reward_mask must either both be provided "
+                "or both be absent"
+            )
         # Reward Penalty on length
         if self.config.overlong_reward_penalty:
             overlong_tokens = self.config.overlong_tokens
@@ -210,6 +216,35 @@ class PPOActor:
         seq_no_eos_mask = seqlens == attn_mask.shape[1]
         rewards = -self.kl_ctl * self.kl_estimator(old_logp, ref_logp)
         kl_rewards = rewards.clone()
+        if step_rewards is not None:
+            assert step_reward_mask is not None
+            step_reward_mask = step_reward_mask.to(
+                device=rewards.device,
+                dtype=torch.bool,
+            )
+            step_rewards = step_rewards.to(
+                device=rewards.device,
+                dtype=rewards.dtype,
+            )
+            data["step_rewards"] = step_rewards
+            data["step_reward_mask"] = step_reward_mask
+            processed_step_rewards = torch.where(
+                step_reward_mask,
+                step_rewards,
+                0.0,
+            )
+            # Process rewards are additive deltas, so sequence-level reward_bias
+            # and group normalization do not apply to each individual event.
+            processed_step_rewards = torch.clip(
+                processed_step_rewards * self.reward_scaling,
+                max=self.reward_clip,
+                min=-self.reward_clip,
+            )
+            if self.mask_no_eos_with_zero:
+                processed_step_rewards = torch.where(
+                    seq_no_eos_mask.unsqueeze(-1), 0.0, processed_step_rewards
+                )
+            rewards = rewards + processed_step_rewards
         # KL rewards at the next token after eos is zero.
         rewards[batch_indices, seqlens - 1] = 0
         indices = torch.clip(seqlens - 2, min=0)
@@ -268,6 +303,23 @@ class PPOActor:
         attn_mask = data["attention_mask"]
         loss_mask = data["loss_mask"]
         reward_score = data["rewards"]
+        step_rewards = data.pop("step_rewards", None)
+        step_reward_mask = data.pop("step_reward_mask", None)
+        if (step_rewards is None) != (step_reward_mask is None):
+            raise ValueError(
+                "step_rewards and step_reward_mask must either both be provided "
+                "or both be absent"
+            )
+        if step_rewards is not None:
+            assert step_reward_mask is not None
+            step_rewards = step_rewards.to(
+                device=loss_mask.device,
+                dtype=torch.float32,
+            )
+            step_reward_mask = step_reward_mask.to(
+                device=loss_mask.device,
+                dtype=torch.bool,
+            )
         seqlens = attn_mask.sum(-1)
 
         ########## Logging code starts ##########
@@ -275,6 +327,8 @@ class PPOActor:
             "correct_n_seqs": (reward_score > 0).bool(),
             "incorrect_n_seqs": (reward_score <= 0).bool(),
         }
+        if step_reward_mask is not None:
+            result_denominators["step_reward_events"] = step_reward_mask
         if self.config.log_agent_stats:
             if "begin_of_trajectory" not in data:
                 raise RuntimeError(
@@ -306,6 +360,13 @@ class PPOActor:
             final_reward=data["tot_rewards"],
         )
         stats_tracker.stat(**stats, denominator="n_valid_tokens")
+        if step_rewards is not None:
+            assert step_reward_mask is not None
+            step_reward_values = torch.where(step_reward_mask, step_rewards, 0.0)
+            stats_tracker.stat(
+                step_reward=step_reward_values,
+                denominator="step_reward_events",
+            )
 
         prompt_lens = data["attention_mask"].sum(-1) - data["loss_mask"].sum(-1)
         seq_stats = dict(
