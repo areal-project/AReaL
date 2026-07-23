@@ -697,6 +697,38 @@ class MicroBatchList:
 DEFAULT_MAX_TOKENS_PER_MB = int(1e12)
 
 
+def _resolve_microbatch_sequence_groups(
+    bs: int,
+    granularity: int,
+    group_sizes: Sequence[int] | torch.Tensor | None,
+) -> tuple[list[list[int]], list[int] | None]:
+    if group_sizes is None:
+        if bs % granularity != 0:
+            raise RuntimeError(
+                f"Batch size {bs} cannot divide granularity {granularity}."
+            )
+        return [
+            list(range(i * granularity, (i + 1) * granularity))
+            for i in range(bs // granularity)
+        ], None
+
+    if torch.is_tensor(group_sizes):
+        group_sizes = group_sizes.detach().cpu().tolist()
+    sizes = [int(size) for size in group_sizes]
+    if any(size <= 0 for size in sizes):
+        raise ValueError(f"group_sizes must be positive, got {sizes}.")
+    total = sum(sizes)
+    if total != bs:
+        raise ValueError(f"group_sizes sum to {total} but batch size is {bs}.")
+
+    groups = []
+    offset = 0
+    for size in sizes:
+        groups.append(list(range(offset, offset + size)))
+        offset += size
+    return groups, sizes
+
+
 def split_padded_tensor_dict_into_mb_list(
     data: dict[str, Any],
     mb_spec: MicroBatchSpec,
@@ -721,18 +753,12 @@ def split_padded_tensor_dict_into_mb_list(
         )
     granularity = mb_spec.granularity
     bs = data["attention_mask"].shape[0]
-    if bs % granularity != 0:
-        raise RuntimeError(f"Batch size {bs} cannot divide granularity {granularity}.")
+    seq_groups, explicit_group_sizes = _resolve_microbatch_sequence_groups(
+        bs, granularity, data.get("group_sizes")
+    )
     max_seqlen = data["attention_mask"].shape[1]
     seq_lens = data["attention_mask"].sum(1).long().cpu().numpy().tolist()
-    input_lens = (
-        data["attention_mask"]
-        .view(bs // granularity, granularity, -1)
-        .sum(dim=(1, 2))
-        .long()
-        .cpu()
-        .numpy()
-    )
+    input_lens = [sum(seq_lens[i] for i in group) for group in seq_groups]
 
     # check for multimodal input data
     multimodal_keys = {key for key in data if is_multi_modal_key(key)}
@@ -741,6 +767,8 @@ def split_padded_tensor_dict_into_mb_list(
     to_split = {}
     not_to_split = {}
     for key, value in data.items():
+        if key == "group_sizes":
+            continue
         if key in multimodal_keys:
             continue
         if key == "position_ids" or (
@@ -753,10 +781,13 @@ def split_padded_tensor_dict_into_mb_list(
 
     # split
     group_indices = allocate_balanced_mbs_synced(mb_spec, input_lens, group=group)
+    mb_group_sizes = (
+        [[len(seq_groups[i]) for i in group_index] for group_index in group_indices]
+        if explicit_group_sizes is not None
+        else None
+    )
     group_indices = [
-        seqpack.flat2d(
-            [list(range(i * granularity, (i + 1) * granularity)) for i in group_index]
-        )
+        seqpack.flat2d([seq_groups[i] for i in group_index])
         for group_index in group_indices
     ]
     splitted_lens = [
@@ -804,6 +835,8 @@ def split_padded_tensor_dict_into_mb_list(
     # organize splitted micro batches
     assert len(mbs) == len(splitted_lens), (len(mbs), len(splitted_lens))
     for i, (mb, lens) in enumerate(zip(mbs, splitted_lens)):
+        if mb_group_sizes is not None:
+            mb["group_sizes"] = mb_group_sizes[i]
         results.append({**mb, **not_to_split})
 
     return MicroBatchList(

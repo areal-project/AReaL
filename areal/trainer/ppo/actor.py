@@ -26,6 +26,7 @@ from areal.utils.data import (
     Normalization,
     TrajBatchMeta,
     batched_call,
+    concat_batch,
     split_padded_tensor_dict_into_mb_list,
 )
 from areal.utils.functional import (
@@ -34,6 +35,7 @@ from areal.utils.functional import (
     reward_overlong_penalty,
     sapo_loss_fn,
 )
+from areal.utils.functional.loss_aggregation import PolicyGradientReduction
 from areal.utils.perf_tracer import trace_perf
 from areal.v2.training_service.controller.controller import (
     GatewayTrainController,
@@ -262,7 +264,10 @@ class PPOActor:
     @trace_perf("ppo_actor.ppo_update", category="compute")
     @stats_tracker.scope_func_wrapper("ppo_actor")
     def ppo_update(self, data: list[dict[str, Any]]) -> None:
-        batched_call(self._ppo_update, data, unpack=False)
+        batched, meta = concat_batch(data)
+        if self.config.loss_aggregation == "prompt_mean":
+            batched["group_sizes"] = meta.traj_group_sizes
+        self._ppo_update(batched)
 
     def _ppo_update(self, data: dict[str, Any]) -> None:
         attn_mask = data["attention_mask"]
@@ -352,27 +357,33 @@ class PPOActor:
         with stats_tracker.scope("update"):
             # Get current version for proximal approximation metrics
             current_version = self.engine.get_version()
+            pg_reduction = PolicyGradientReduction(
+                mode=self.config.loss_aggregation,
+                divisor=self.config.loss_aggregation_divisor,
+            )
 
             for mb in mb_inputs.mbs:
+                loss_fn = functools.partial(
+                    grpo_loss_fn,
+                    eps_clip=self.config.eps_clip,
+                    eps_clip_higher=self.config.eps_clip_higher,
+                    c_clip=self.config.c_clip,
+                    rejection_sampling=self.config.rejection_sampling,
+                    m2_threshold=self.m2_threshold,
+                    importance_sampling_level=self.config.importance_sampling_level,
+                    current_version=current_version,
+                    prox_logp_method=self.config.prox_logp_method,
+                    use_sapo_loss=self.config.use_sapo_loss,
+                    sapo_tau_pos=self.config.sapo_tau_pos,
+                    sapo_tau_neg=self.config.sapo_tau_neg,
+                    use_cispo_loss=self.config.use_cispo_loss,
+                    use_decoupled_loss=self.config.use_decoupled_loss,
+                    pg_reduction=pg_reduction,
+                )
                 train_stat = self.engine.train_batch(
                     mb,
-                    loss_fn=functools.partial(
-                        grpo_loss_fn,
-                        eps_clip=self.config.eps_clip,
-                        eps_clip_higher=self.config.eps_clip_higher,
-                        c_clip=self.config.c_clip,
-                        rejection_sampling=self.config.rejection_sampling,
-                        m2_threshold=self.m2_threshold,
-                        importance_sampling_level=self.config.importance_sampling_level,
-                        current_version=current_version,
-                        prox_logp_method=self.config.prox_logp_method,
-                        use_sapo_loss=self.config.use_sapo_loss,
-                        sapo_tau_pos=self.config.sapo_tau_pos,
-                        sapo_tau_neg=self.config.sapo_tau_neg,
-                        use_cispo_loss=self.config.use_cispo_loss,
-                        use_decoupled_loss=self.config.use_decoupled_loss,
-                    ),
-                    loss_weight_fn=lambda x: x["loss_mask"].count_nonzero(),
+                    loss_fn=loss_fn,
+                    loss_weight_fn=pg_reduction.normalizer_fn,
                 )
                 stats_tracker.scalar(**train_stat)
 
@@ -434,6 +445,7 @@ def grpo_loss_fn(
     sapo_tau_neg: float = 1.05,
     use_cispo_loss: bool = False,
     use_decoupled_loss: bool = False,
+    pg_reduction: PolicyGradientReduction | None = None,
     vocab_min_logits: torch.Tensor | None = None,
     vocab_max_logits: torch.Tensor | None = None,
     vocab_mean_logits: torch.Tensor | None = None,
@@ -443,7 +455,8 @@ def grpo_loss_fn(
     pipeline micro batches, returns loss and logging stats."""
     old_logp = input_data["logprobs"]
     advantages = input_data["advantages"]
-    loss_mask = input_data["loss_mask"].bool()
+    denominator_mask = input_data["loss_mask"].bool()
+    loss_mask = denominator_mask
     prox_logp_gt = input_data.get("prox_logp")  # Could be None if skipped
 
     entropy = entropy.detach()
@@ -464,6 +477,8 @@ def grpo_loss_fn(
     # Apply M2PO masking if threshold is set
     if m2_threshold is not None:
         loss_mask = _apply_m2po_masking(old_logp, prox_logp, loss_mask, m2_threshold)
+
+    pg_reduction = pg_reduction or PolicyGradientReduction()
 
     # Use CISPO, SAPO, or PPO loss
     if use_cispo_loss:
@@ -487,6 +502,9 @@ def grpo_loss_fn(
             old_logprobs=old_logp,
             rejection_sampling=rejection_sampling,
             cu_seqlens=input_data.get("cu_seqlens"),
+            group_sizes=input_data.get("group_sizes"),
+            pg_reduction=pg_reduction,
+            denominator_mask=denominator_mask,
         )
     elif use_sapo_loss:
         if use_decoupled_loss:
@@ -503,6 +521,9 @@ def grpo_loss_fn(
             loss_mask=loss_mask,
             importance_sampling_level=importance_sampling_level,
             cu_seqlens=input_data.get("cu_seqlens"),
+            group_sizes=input_data.get("group_sizes"),
+            pg_reduction=pg_reduction,
+            denominator_mask=denominator_mask,
         )
     else:
         loss, stat = ppo_actor_loss_fn(
@@ -517,12 +538,20 @@ def grpo_loss_fn(
             rejection_sampling=rejection_sampling,
             importance_sampling_level=importance_sampling_level,
             cu_seqlens=input_data.get("cu_seqlens"),
+            group_sizes=input_data.get("group_sizes"),
+            pg_reduction=pg_reduction,
+            denominator_mask=denominator_mask,
         )
 
     # Joint Distillation KL Loss
     teacher_logp = input_data.get("teacher_logp")
     rkl_stat = None
     if teacher_logp is not None:
+        if pg_reduction.mode != "token_mean":
+            raise ValueError(
+                "teacher_logp distillation is only supported with "
+                "loss_aggregation='token_mean'."
+            )
         # Coefficients for RL and Knowledge Distillation
         rl_loss_weight = input_data.get("rl_loss_weight", 1.0)
         distill_loss_weight = input_data.get("distill_loss_weight", 0.005)
