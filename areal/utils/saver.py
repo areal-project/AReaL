@@ -130,6 +130,12 @@ class Saver:
         processor: AutoProcessor | None = None,
         base_model_path: str | None = None,
     ):
+        if (
+            self.config.freq_epochs is None
+            and self.config.freq_steps is None
+            and self.config.freq_secs is None
+        ):
+            return
         if not self.freq_ctl.check(
             epochs=int(step == self.ft_spec.steps_per_epoch - 1), steps=1
         ):
