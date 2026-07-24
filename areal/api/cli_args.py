@@ -339,30 +339,48 @@ class OptimizerConfig:
     type: str = field(
         default="adam",
         metadata={
-            "help": "Optimizer type. For FSDP Engine, adam_bf16 enables memory-efficient BF16 optimizer states. "
-            "For Megatron Engine, adam_bf16 requires dtype=bfloat16 and is automatically converted to adam "
-            "with precision-aware optimizer enabled.",
-            "choices": ["adam", "sgd", "adam_bf16"],
+            "help": "Optimizer type. 'adam': AdamW (default). 'adam_bf16': memory-efficient BF16 AdamW "
+            "(FSDP: uses AnyPrecisionAdamW; Megatron: requires dtype=bfloat16, auto-converted to adam "
+            "with precision-aware optimizer). 'sgd': plain SGD. 'muon': Muon optimizer for >=2D params "
+            "with AdamW backend for <2D params (biases, norms, embeddings).",
+            "choices": ["adam", "sgd", "adam_bf16", "muon"],
         },
     )
-    lr: float = field(default=1e-3, metadata={"help": "Learning rate"})
-    weight_decay: float = field(default=0.01, metadata={"help": "Weight decay"})
+    lr: float = field(
+        default=1e-3,
+        metadata={
+            "help": "Learning rate. When type='muon', this is shared by both the Muon sub-optimizer "
+            "(>=2D params) and the AdamW backend (<2D params). Pair "
+            "muon_scale_mode='spectral' with muon_extra_scale_factor=0.2 (Moonlight-style) to "
+            "make Muon's update RMS match AdamW so a single lr works for both."
+        },
+    )
+    weight_decay: float = field(
+        default=0.01,
+        metadata={
+            "help": "Weight decay. Applied to all optimizer types including Muon (>=2D params) "
+            "and AdamW backend (<2D params)."
+        },
+    )
     beta1: float = field(
         default=0.9,
         metadata={
-            "help": "Adam beta1 parameter. Only effective when optimizer_type is adam/adam_bf16"
+            "help": "Adam beta1 parameter. Used by adam/adam_bf16, and by the AdamW backend "
+            "when type='muon'. Not used by the Muon sub-optimizer itself."
         },
     )
     beta2: float = field(
         default=0.999,
         metadata={
-            "help": "Adam beta2 parameter. Only effective when optimizer_type is adam/adam_bf16"
+            "help": "Adam beta2 parameter. Used by adam/adam_bf16, and by the AdamW backend "
+            "when type='muon'. Not used by the Muon sub-optimizer itself."
         },
     )
     eps: float = field(
         default=1e-8,
         metadata={
-            "help": "Adam epsilon parameter. Only effective when optimizer_type is adam/adam_bf16"
+            "help": "Adam epsilon for numerical stability. Used by adam/adam_bf16, and by the "
+            "AdamW backend when type='muon'. Not used by the Muon sub-optimizer itself."
         },
     )
     min_lr_ratio: float = field(
@@ -399,6 +417,50 @@ class OptimizerConfig:
     gradient_clipping: float = field(
         default=1.0, metadata={"help": "Gradient clipping threshold"}
     )
+    muon_momentum: float = field(
+        default=0.95,
+        metadata={
+            "help": "Muon momentum parameter. Only effective when optimizer_type is muon."
+        },
+    )
+    muon_use_nesterov: bool = field(
+        default=True,
+        metadata={
+            "help": "Whether to use Nesterov momentum in Muon. Only effective when type='muon'. "
+            "Mirrors Megatron-Core OptimizerConfig.muon_use_nesterov."
+        },
+    )
+    muon_num_ns_steps: int = field(
+        default=5,
+        metadata={
+            "help": "Number of Newton-Schulz iteration steps in Muon. Only effective when type='muon'. "
+            "Mirrors Megatron-Core OptimizerConfig.muon_num_ns_steps."
+        },
+    )
+    muon_scale_mode: str = field(
+        default="spectral",
+        metadata={
+            "help": "Muon update scaling mode (final scale = mode_factor * muon_extra_scale_factor):"
+            "Only used when type='muon'. Mirrors Megatron-Core OptimizerConfig.muon_scale_mode.",
+            "choices": ["spectral", "unit_rms_norm", "shape_scaling"],
+        },
+    )
+    muon_extra_scale_factor: float = field(
+        default=1.0,
+        metadata={
+            "help": "Extra multiplier on top of muon_scale_mode. Use 0.2 with "
+            "scale_mode='spectral' for Moonlight-style RMS-matched scaling. "
+            "Only used when type='muon'. Mirrors Megatron-Core OptimizerConfig.muon_extra_scale_factor."
+        },
+    )
+
+    def __post_init__(self):
+        """Validate optimizer configuration."""
+        valid_muon_scale_modes = {"spectral", "unit_rms_norm", "shape_scaling"}
+        if self.muon_scale_mode not in valid_muon_scale_modes:
+            raise ValueError(
+                f"muon_scale_mode must be one of {valid_muon_scale_modes}, got {self.muon_scale_mode!r}. "
+            )
 
 
 @dataclass
