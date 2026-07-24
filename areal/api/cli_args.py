@@ -232,6 +232,30 @@ class GenerationHyperparameters:
             "help": "Enable beam search in the vLLM engine. When enabled, sampling parameters like temperature, top-p, and top-k are auto ignored."
         },
     )
+    reward_normalization: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "If True, apply per-prompt reward normalization across the "
+                "n_samples rollouts of the same prompt inside "
+                "GroupedRolloutWorkflow. Only affects InteractionWithTokenLogpReward "
+                "workflows such as SWE agent workflows. Not supported by "
+                "RolloutControllerV2 yet."
+            )
+        },
+    )
+    drop_incomplete_group: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "If True, discard the entire group when any of the n_samples "
+                "rollouts fails or returns None. prepare_batch will automatically "
+                "retry with a new prompt. This prevents partial groups from "
+                "causing reward normalization group misalignment. Not supported by "
+                "RolloutControllerV2 yet."
+            )
+        },
+    )
     # NOTE: to add new parameters, please correctly handle them in the `to_openai_args_dict` method.
 
     def new(self, **kwargs):
@@ -281,6 +305,13 @@ class GenerationHyperparameters:
         "max_tokens",  # deprecated by "completions", not used in "responses", should be `max_new_tokens` in "openai-agents"
     }
 
+    # Workflow-layer flags, not generation arguments. Exclude silently from
+    # OpenAI client kwargs even when users enable them.
+    _WORKFLOW_ONLY_ARGS: ClassVar[set[str]] = {
+        "reward_normalization",
+        "drop_incomplete_group",
+    }
+
     def to_openai_args_dict(
         self, exclude_args: list[str] | None = None, api_format: str = "completions"
     ) -> dict[str, Any]:
@@ -302,6 +333,8 @@ class GenerationHyperparameters:
 
         res = {}
         for k, v in asdict(self).items():
+            if k in self._WORKFLOW_ONLY_ARGS:
+                continue
             if k in final_exclude_args:
                 should_warn = False
 
@@ -3176,6 +3209,12 @@ class PPOConfig(BaseExperimentConfig):
         """Validate the eval generation config."""
         if self.eval_gconfig is None:
             self.eval_gconfig = self.gconfig.new()
+        if self.gconfig.reward_normalization and self.actor.reward_norm is not None:
+            raise ValueError(
+                "gconfig.reward_normalization (rollout-time, per-prompt) and "
+                "actor.reward_norm (training-time, on collected batch) both apply "
+                "reward normalization. Enable only one."
+            )
         # Propagate the LoRA adapter name to the rollout engine so the OpenAI-proxy
         # generation path requests the same adapter the trainer loads. The request
         # side (ArealOpenAI) cannot read gconfig.lora_name, so it must come from
