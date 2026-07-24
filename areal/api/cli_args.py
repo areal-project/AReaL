@@ -2692,6 +2692,124 @@ class SessionTracerConfig:
 
 
 @dataclass
+class TrajectoryDebugConfig:
+    """Configuration for trajectory dump/replay debugging.
+
+    Enables dumping rollout data to disk during training and replaying from
+    disk without running inference, useful for deterministic reproduction of
+    training-side bugs.
+
+    Attributes:
+        dump_rollout_data: Enable dumping rollout batch to disk each step.
+        replay_rollout_data: Enable replaying from dumped files (skips inference).
+        path: Custom directory for trajectory files. If None, uses default
+            ``<fileroot>/<experiment>/<trial>/debug_trajectories/``.
+        dump_steps: Only dump at these global steps (must be non-negative).
+            None means dump every step.
+        max_keep: Keep only the most recent N trajectory *steps* on disk.
+            In SPMD mode each step produces one file per DP rank; all files
+            belonging to the same step are treated as a unit. Older steps are
+            deleted after each dump. None means keep all.
+        pin_steps: Steps whose files are never deleted by max_keep rotation.
+            Useful for preserving known-bad steps for later replay.
+        dump_scope: What to dump. "rollout" saves prepare_batch output only.
+            "full" saves the batch after critic/ref/teacher enrichment, enabling
+            replay that skips all model forward passes except the actor PPO update.
+    """
+
+    dump_rollout_data: bool = field(
+        default=False,
+        metadata={"help": "Enable dumping rollout batch to disk each step."},
+    )
+    replay_rollout_data: bool = field(
+        default=False,
+        metadata={
+            "help": "Enable replaying from dumped trajectory files (skips inference)."
+        },
+    )
+    path: str | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Custom directory for trajectory files. "
+                "If None, uses <fileroot>/<experiment>/<trial>/debug_trajectories/."
+            )
+        },
+    )
+    dump_steps: list[int] | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Only dump at these global steps. None means dump every step. "
+                "Example: [95, 96, 97, 98, 99, 100]"
+            )
+        },
+    )
+    max_keep: int | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Keep only the most recent N trajectory steps on disk. "
+                "In SPMD mode all DP-rank files for a step are treated as "
+                "one unit. Older steps are deleted after each dump. "
+                "None means keep all (no rotation)."
+            )
+        },
+    )
+    pin_steps: list[int] | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Steps whose trajectory files are pinned and never deleted "
+                "by max_keep rotation. Useful for preserving known-bad steps "
+                "while still using sliding-window cleanup. "
+                "Example: [100, 200, 500]"
+            )
+        },
+    )
+    dump_scope: str = field(
+        default="rollout",
+        metadata={
+            "help": (
+                "What data to dump. 'rollout' saves prepare_batch output only. "
+                "'full' saves batch after critic/ref/teacher, so replay skips "
+                "all forward passes except the actor PPO update."
+            )
+        },
+    )
+
+    def __post_init__(self):
+        """Validate trajectory debug configuration."""
+        if self.dump_rollout_data and self.replay_rollout_data:
+            raise ValueError(
+                "trajectory_debug: dump_rollout_data and replay_rollout_data "
+                "are mutually exclusive — cannot dump and replay simultaneously."
+            )
+        if self.dump_steps is not None:
+            if any(s < 0 for s in self.dump_steps):
+                raise ValueError(
+                    "trajectory_debug: dump_steps must contain non-negative "
+                    f"integers, got {self.dump_steps}."
+                )
+        if self.max_keep is not None and self.max_keep <= 0:
+            raise ValueError(
+                f"trajectory_debug: max_keep must be a positive integer, "
+                f"got {self.max_keep}."
+            )
+        if self.pin_steps is not None:
+            if any(s < 0 for s in self.pin_steps):
+                raise ValueError(
+                    "trajectory_debug: pin_steps must contain non-negative "
+                    f"integers, got {self.pin_steps}."
+                )
+        if self.dump_scope not in ("rollout", "full"):
+            raise ValueError(
+                f"trajectory_debug: dump_scope must be 'rollout' or 'full', "
+                f"got '{self.dump_scope}'."
+            )
+
+
+@dataclass
 class MemoryProfilerConfig:
     """CUDA memory snapshot profiling configuration.
 
@@ -3169,6 +3287,16 @@ class PPOConfig(BaseExperimentConfig):
             "help": "Enable dynamic batch sizing in prepare_batch. When True, batch collection "
             "stops when (accepted + rejected) >= batch_size, returning only accepted results. "
             "This results in variable-sized batches of valid data."
+        },
+    )
+    trajectory_debug: TrajectoryDebugConfig | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Trajectory dump/replay configuration for offline debugging of "
+                "the PPO training loop. Only meaningful for experiments with a "
+                "rollout phase. None means disabled."
+            )
         },
     )
 
