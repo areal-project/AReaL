@@ -35,6 +35,7 @@ from areal.infra.platforms import current_platform
 from areal.infra.utils.launcher import TRITON_CACHE_PATH
 from areal.utils import logging, perf_tracer, stats_tracker
 from areal.utils.network import format_host_for_url
+from areal.utils.vllm_response import parse_vllm_generation_response
 
 logger = logging.getLogger("vLLMEngine")
 
@@ -115,32 +116,7 @@ class VLLMBackend:
         self, response: dict[str, Any]
     ) -> HttpGenerationResult:
         """Parse vLLM generation response."""
-        meta_info = response["choices"][0]
-        stop_reason = meta_info["finish_reason"]
-
-        # Parse tokens from "token:123" format
-        if "tokens" in meta_info["logprobs"]:
-            output_tokens = meta_info["logprobs"]["tokens"]
-            output_tokens = [int(t.split(":")[1]) for t in output_tokens]
-            output_logprobs = meta_info["logprobs"]["token_logprobs"]
-        elif "content" in meta_info["logprobs"]:
-            outputs = meta_info["logprobs"]["content"]
-            output_tokens = [int(t["token"].split(":")[1]) for t in outputs]
-            output_logprobs = [t["logprob"] for t in outputs]
-        else:
-            raise ValueError("Unexpected vLLM response format.")
-
-        if stop_reason == "abort" and len(output_tokens) == 0:
-            return HttpGenerationResult(
-                output_tokens=[],
-                output_logprobs=[],
-                stop_reason=stop_reason,
-            )
-        return HttpGenerationResult(
-            output_tokens=output_tokens,
-            output_logprobs=output_logprobs,
-            stop_reason=stop_reason,
-        )
+        return parse_vllm_generation_response(response)
 
     def build_score_request(
         self, input_ids: list[int], target_len: int, with_lora: bool, version: int

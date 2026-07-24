@@ -313,6 +313,7 @@ rollout:
     session_timeout_seconds: 3600   # 会话超时时间（秒）
     turn_discount: 1.0              # 多轮对话的奖励折扣
     export_style: individual        # "individual" 或 "concat"
+    drop_retry_orphans: false       # 丢弃 Agent 侧重试产生的孤儿 completion
 ```
 
 | 字段                      | 默认值            | 描述                                |
@@ -322,6 +323,26 @@ rollout:
 | `session_timeout_seconds` | `3600`            | 超时后自动清理过期会话              |
 | `turn_discount`           | `1.0`             | 多轮奖励的几何折扣因子              |
 | `export_style`            | `individual`      | 交互数据的导出方式                  |
+| `drop_retry_orphans`      | `false`           | 导出前丢弃重试产生的孤儿 completion |
+
+## 丢弃重试孤儿（Retry-Orphan）Completion
+
+当上游 Agent SDK 等待响应超时并**重试同一个请求**时，代理会记录下两条输入 messages 完全相同的 completion：
+
+- **孤儿（orphan）**——服务端已经生成，但从未交付给 Agent（SDK 此时已放弃等待）；
+- **重试（retry）**——Agent 实际收到并据此继续对话的那一条。
+
+孤儿不会被任何后续轮次引用，因而在交互树中悬挂为叶子节点。若不处理，它会在 `concat` 导出时造成**轨迹分裂（split
+trajectory）**，并污染反向奖励折扣链——因为 它那条（通常无奖励的）分支会与真实分支一同参与折扣。
+
+设置 `drop_retry_orphans: true` 可在奖励折扣与导出之前丢弃这些孤儿。检测逻辑保守， 绝不会误删真实的对话分支：
+
+- 在输入 messages 相同的一组 completion 中，若某条有子节点（后续轮次将其认作 父节点），则该条即为被消费的
+  completion，其余无子节点的兄弟作为孤儿被丢弃。
+- 若某组同输入 completion **全部无子节点**——即会话在重试后立即结束，来不及建立 父子关系——则保留 `created_at`
+  最大的一条（最可能是超时后生成的重试），丢弃更早的 重复项，从而确保被消费的 completion 不会丢失。
+
+该开关默认为 `false` 以保持向后兼容，且仅影响导出，不改变在线 rollout 过程。
 
 ## 限制
 

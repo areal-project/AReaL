@@ -50,6 +50,7 @@ class ExportTrajectoriesRequest(BaseModel):
     session_id: str
     discount: float = 1.0
     style: str = "individual"
+    drop_retry_orphans: bool = False
 
 
 class ExportTrajectoriesResponse(BaseModel):
@@ -116,10 +117,12 @@ class SessionData:
         return True
 
     def export_interactions(
-        self, discount: float, style: str
+        self, discount: float, style: str, drop_retry_orphans: bool = False
     ) -> dict[str, InteractionWithTokenLogpReward]:
         if len(self.completions) == 0:
             return {}
+        if drop_retry_orphans:
+            self.completions.drop_retry_orphans()
         self.completions.apply_reward_discount(turn_discount=discount)
         return self.completions.export_interactions(style=style)
 
