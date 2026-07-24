@@ -1,0 +1,226 @@
+experiment_name: osworld-grpo
+trial_name: trial1
+
+seed: 1
+enable_offload: false
+total_train_epochs: 5
+tokenizer_path: ${actor.path}
+
+# OSWorld agent / environment knobs (consumed by OSWorldAgentConfig).
+n_trajs: 2
+max_steps: 15
+max_workers: 4
+sleep_after_execution: 1.0
+env_reset_wait_secs: 60.0
+turn_discount: 0.9
+
+provider_name: docker
+path_to_vm: null
+os_type: Ubuntu
+headless: true
+screen_width: 1920
+screen_height: 1080
+observation_type: screenshot
+action_space: pyautogui
+
+# Leave these empty to auto-discover: ../../../OSWorld relative to AReaL/.
+osworld_root: ""
+evaluation_examples_dir: ""
+test_meta_path: ""
+osworld_cache_dir: /tmp/areal/osworld_cache
+
+# Set to e.g. "http://<remote-ip>:8000" to drive OSWorld on a separate host
+# that actually has docker. Leave empty for in-process DesktopEnv.
+remote_server_url: ""
+remote_request_timeout_secs: 1800.0
+
+# Vendor-neutral remote sandbox cluster behind an HTTPS gateway. Set both
+# endpoint + token to route rollouts through the gateway. Takes precedence
+# over remote_server_url.
+gateway_endpoint: ""
+gateway_token: ""
+gateway_timeout_secs: 1800
+
+# Smoke ablation: drop screenshots from user turns so a text-only base model
+# can be used (skips the multimodal training path that needs mm_token_type_ids).
+text_only: false
+
+cluster:
+  n_nodes: 1
+  # Target: 2x H200 box. SGLang takes 1 GPU for inference, FSDP actor (and
+  # colocated ref) takes the other. If you redeploy to a 4/8-GPU box, bump
+  # n_gpus_per_node and re-shard rollout.backend / actor.backend.
+  n_gpus_per_node: 2
+  # On a shared filesystem so logs/checkpoints are visible from any machine
+  # that mounts it. Changing from /tmp/... to a shared path also lets the
+  # other (non-GPU) host tail rollout/0.log when SGLang fails to come up.
+  fileroot: ${AREAL_REPO}/logs/experiments
+  name_resolve:
+    type: nfs
+    nfs_record_root: ${AREAL_REPO}/logs/name_resolve
+
+scheduler:
+  type: local
+
+rollout:
+  backend: "sglang:d1p1t1"
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  max_concurrent_rollouts: 16
+  queue_size: null
+  consumer_batch_size: ${train_dataset.batch_size}
+  max_head_offpolicyness: 4
+  # First-time SGLang launch on a new model can exceed 300s (model load from
+  # beegfs + torch.compile + kernel autotune). Bump to 15min for safety.
+  setup_timeout: 900.0
+  enable_rollout_tracing: false
+  scheduling_spec: ${actor.scheduling_spec}
+  fileroot: ${cluster.fileroot}
+  tokenizer_path: ${tokenizer_path}
+  dump_to_file: true
+
+gconfig:
+  n_samples: 1
+  min_new_tokens: 0
+  max_new_tokens: 1024
+  greedy: false
+  temperature: 1.0
+
+actor:
+  backend: "fsdp:d1p1t1"
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  path: /path/to/Qwen3-VL-4B-Instruct
+  # Conda env has flash-attn-4 (alpha) which doesn't expose `flash_attn_func`,
+  # so transformers' default `flash_attention_2` import fails. Fall back to
+  # PyTorch SDPA — fast enough for 4B on H200.
+  attn_impl: sdpa
+  init_from_scratch: false
+  disable_dropout: true
+  gradient_checkpointing: true
+  dtype: bfloat16
+  mb_spec:
+    max_tokens_per_mb: 8192
+  optimizer:
+    type: adam
+    lr: 1e-6
+    weight_decay: 0.01
+    beta1: 0.9
+    beta2: 0.999
+    eps: 1e-8
+    lr_scheduler_type: constant
+    gradient_clipping: 1.0
+    warmup_steps_proportion: 0.01
+  eps_clip: 0.4
+  temperature: ${gconfig.temperature}
+  reward_scaling: 1.0
+  reward_bias: 0.0
+  kl_ctl: 0.0
+  ppo_n_minibatches: 1
+  recompute_logprob: true
+  use_decoupled_loss: true
+  rejection_sampling:
+    level: token
+    action: mask
+    metric: ratio
+    upper: 5.0
+  adv_norm:
+    mean_level: batch
+    std_level: batch
+  max_new_tokens: ${gconfig.max_new_tokens}
+  scheduling_spec:
+    - task_type: worker
+      port_count: 2
+      gpu: 1
+      cpu: 4
+      mem: 32
+      cmd: python3 -m areal.infra.rpc.rpc_server
+      env_vars: {}
+
+ref:
+  backend: ${actor.backend}
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  path: ${actor.path}
+  attn_impl: ${actor.attn_impl}
+  init_from_scratch: false
+  disable_dropout: true
+  dtype: ${actor.dtype}
+  mb_spec:
+    max_tokens_per_mb: 8192
+  optimizer: null
+  scheduling_strategy:
+    type: colocation
+    target: actor
+  scheduling_spec: ${actor.scheduling_spec}
+
+# SGLang (vision backend for Qwen2.5-VL).
+sglang:
+  model_path: ${actor.path}
+  random_seed: ${seed}
+  skip_tokenizer_init: true
+  dtype: ${actor.dtype}
+  max_running_requests: 16
+  context_length: 32768
+  mem_fraction_static: 0.8
+  enable_multimodal: true
+
+# Datasets — OSWorld tasks are loaded in-process from evaluation_examples,
+# but train/valid dataset configs are still required by the harness for
+# batching / worker setup.
+train_dataset:
+  batch_size: 4
+  shuffle: true
+  pin_memory: true
+  num_workers: 0
+  path: osworld_tasks
+  type: rl
+
+valid_dataset:
+  batch_size: 4
+  shuffle: false
+  pin_memory: true
+  num_workers: 0
+  path: osworld_tasks
+  type: rl
+
+# Utilities
+saver:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: 1
+  freq_steps: null
+  freq_secs: null
+
+recover:
+  mode: disabled
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: 1
+  freq_steps: null
+  freq_secs: 3600
+
+evaluator:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: null
+  freq_steps: null
+  freq_secs: null
+
+stats_logger:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  wandb:
+    mode: disabled
+
+perf_tracer:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  enabled: false
+  session_tracer:
+    enabled: false
