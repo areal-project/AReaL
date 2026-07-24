@@ -42,7 +42,9 @@ def get_gsm8k_sft_dataset(
             sample["question"] + sample["answer"] + tokenizer.eos_token
         )
         prompt_token = tokenizer.encode(sample["question"])
-        loss_mask = [0] * len(prompt_token) + [1] * (len(seq_token) - len(prompt_token))
+        # BPE may merge across the Q/A join; supervise that token as answer.
+        prompt_len = _common_prefix_len(prompt_token, seq_token)
+        loss_mask = [0] * prompt_len + [1] * (len(seq_token) - prompt_len)
         return {"input_ids": seq_token, "loss_mask": loss_mask}
 
     dataset = dataset.map(process).remove_columns(["question", "answer"])
