@@ -98,33 +98,28 @@ def _llm_registration_payload(
     protocol: LLMProtocol,
 ) -> dict[str, Any]:
     if protocol == "anthropic":
-        provider = "anthropic"
-        model = f"anthropic/{model_name}"
-        mode = "chat"
+        inbound_proto = "messages"
     elif protocol == "responses":
-        provider = "openai"
-        model = f"openai/{model_name}"
-        mode = "responses"
+        inbound_proto = "responses"
     elif protocol == "chat_completions":
-        provider = "openai"
-        model = f"openai/{model_name}"
-        mode = "chat"
+        inbound_proto = "chat"
     else:
         raise ValueError(f"Unsupported Arena LLM protocol: {protocol!r}")
 
     return {
         "model_name": model_name,
-        "litellm_params": {
-            "model": model,
-            "api_base": upstream_base_url.rstrip("/"),
-            "api_key": upstream_api_key,
-            "custom_llm_provider": provider,
-        },
-        "model_info": {
-            "id": deployment_id,
-            "mode": mode,
-            "disable_background_health_check": True,
-        },
+        "endpoints": [
+            {
+                "endpoint_id": deployment_id,
+                "upstream_model": model_name,
+                "base_url": upstream_base_url.rstrip("/"),
+                "api_key": upstream_api_key,
+                "inbound_protos": [inbound_proto],
+                "enabled": True,
+            }
+        ],
+        "enabled": True,
+        "metadata": {"deployment_id": deployment_id},
     }
 
 
@@ -169,7 +164,7 @@ class ArenaOpenAPIClient:
     def _llm_headers(self) -> dict[str, str]:
         if not self.llm_api_key:
             raise ValueError(
-                "ARENA_LLM_API_KEY is required for /llm model registration"
+                "ARENA_LLM_API_KEY is required for LLM gateway traffic"
             )
         return {"Authorization": f"Bearer {self.llm_api_key}"}
 
@@ -307,7 +302,7 @@ class ArenaOpenAPIClient:
         protocol: LLMProtocol = "chat_completions",
         client: httpx.Client | None = None,
     ) -> tuple[str, str]:
-        """Register one AReaL proxy and return its external URL and model id."""
+        """Register one AReaL proxy and return its external URL and model alias."""
         if not model_name.startswith("stream-areal-"):
             raise ValueError("Arena model_name must start with 'stream-areal-'")
         if not upstream_base_url:
@@ -325,40 +320,35 @@ class ArenaOpenAPIClient:
         )
         response = self._sync_request(
             "POST",
-            f"{self.base_url}/llm/model/new",
+            f"{self.base_url}/openapi/v1/llm/models",
             client=client,
-            headers=self._llm_headers,
+            headers=self._headers,
             json=payload,
         )
         registration = _response_json(response)
         registered_url, registered_model_id = self._registered_llm_target(
             registration,
-            resolved_deployment_id,
+            model_name,
         )
         return registered_url, registered_model_id
 
     def _registered_llm_target(
         self,
         registration: Any,
-        deployment_id: str,
+        model_name: str,
     ) -> tuple[str, str]:
-        """Resolve the external API base and model id returned by registration."""
-        if isinstance(registration, str) and registration:
-            registered_url = registration
-            registered_model_id = deployment_id
-        elif isinstance(registration, Mapping):
-            response_id = registration.get("model_id")
-            if not isinstance(response_id, str) or not response_id:
-                raise ArenaAPIError("LLM registration response is missing model_id")
-            # The production API returns a deployment object rather than the
-            # documented URL string. Its OpenAI-compatible endpoint is fixed.
-            registered_url = f"{self.base_url}/llm"
-            registered_model_id = response_id
-        else:
+        """Resolve the LLM gateway API base and model alias from registration."""
+        if not isinstance(registration, Mapping):
+            raise ArenaAPIError("LLM registration response must be a JSON object")
+        registered_model_id = registration.get("model_name")
+        if not isinstance(registered_model_id, str) or not registered_model_id:
+            raise ArenaAPIError("LLM registration response is missing model_name")
+        if registered_model_id != model_name:
             raise ArenaAPIError(
-                "LLM registration response must be a URL or deployment object"
+                "LLM registration response returned an unexpected model_name: "
+                f"{registered_model_id!r}"
             )
-        return registered_url.rstrip("/"), registered_model_id
+        return f"{self.base_url}/api", registered_model_id
 
     async def register_llm_proxy_async(
         self,
@@ -388,49 +378,51 @@ class ArenaOpenAPIClient:
         response = await self._async_request(
             client,
             "POST",
-            f"{self.base_url}/llm/model/new",
-            headers=self._llm_headers,
+            f"{self.base_url}/openapi/v1/llm/models",
+            headers=self._headers,
             json=payload,
             timeout=timeout,
         )
         registration = _response_json(response)
-        return self._registered_llm_target(registration, deployment_id)
+        return self._registered_llm_target(registration, model_name)
 
     def delete_llm_proxy(
         self,
-        deployment_id: str,
+        model_name: str,
         *,
         client: httpx.Client | None = None,
     ) -> None:
-        """Delete one registered LLM deployment; missing deployments are clean."""
+        """Delete one registered LLM model; missing models are clean."""
         response = self._sync_request(
-            "POST",
-            f"{self.base_url}/llm/model/delete",
+            "DELETE",
+            f"{self.base_url}/openapi/v1/llm/models/{quote(model_name, safe='')}",
             client=client,
-            headers=self._llm_headers,
-            json={"id": deployment_id},
+            headers=self._headers,
         )
         if response.status_code == 404:
+            return
+        if 200 <= response.status_code < 300:
             return
         _response_json(response)
 
     async def delete_llm_proxy_async(
         self,
-        deployment_id: str,
+        model_name: str,
         *,
         client: httpx.AsyncClient,
         timeout: float = 180.0,
     ) -> None:
-        """Asynchronously delete one registered LLM deployment."""
+        """Asynchronously delete one registered LLM model."""
         response = await self._async_request(
             client,
-            "POST",
-            f"{self.base_url}/llm/model/delete",
-            headers=self._llm_headers,
-            json={"id": deployment_id},
+            "DELETE",
+            f"{self.base_url}/openapi/v1/llm/models/{quote(model_name, safe='')}",
+            headers=self._headers,
             timeout=timeout,
         )
         if response.status_code == 404:
+            return
+        if 200 <= response.status_code < 300:
             return
         _response_json(response)
 
