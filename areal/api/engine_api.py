@@ -241,6 +241,7 @@ class TrainEngine(abc.ABC):
         dynamic_bs: bool = False,
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
+        min_usable_group_size: int = 1,
     ) -> list[dict[str, Any]]:
         """Prepare a batch of data for training from a dataloader.
 
@@ -261,6 +262,9 @@ class TrainEngine(abc.ABC):
             If True, enables dynamic batch sizing. The method will stop collecting
             when (accepted + rejected) >= batch_size, returning only accepted results.
             This results in variable-sized batches of valid data. Default is False.
+        min_usable_group_size : int, optional
+            Minimum usable members required to accept a grouped result. Estimators
+            that require a peer set this to 2. Default is 1.
 
         Returns
         -------
@@ -741,6 +745,7 @@ class InferenceEngine(abc.ABC):
         is_eval: bool = False,
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
+        min_usable_group_size: int = 1,
     ) -> int:
         """Submit a request to the inference engine and return immediately.
 
@@ -773,6 +778,8 @@ class InferenceEngine(abc.ABC):
         is_eval : bool, optional
             Whether this is an evaluation workflow. Affects variables like trajectory dump path
             and statistics keys. By default False.
+        min_usable_group_size : int, optional
+            Minimum usable members required to accept a grouped result. Default is 1.
 
         Returns
         -------
@@ -893,6 +900,7 @@ class InferenceEngine(abc.ABC):
         dynamic_bs: bool = False,
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
+        min_usable_group_size: int = 1,
     ) -> list[dict[str, Any]]:
         """Asynchronously submit and wait until a full batch is ready with controlled staleness.
 
@@ -902,9 +910,10 @@ class InferenceEngine(abc.ABC):
 
             This method caches an internal data generator on the first call.
             The ``dataloader``, ``workflow``, ``workflow_kwargs``, ``group_size``,
-            and ``should_accept_fn`` parameters are captured at the first invocation
-            and reused in all subsequent calls. Passing different arguments in
-            later calls will **not** take effect.
+            ``reward_normalization``, ``drop_incomplete_group``,
+            ``min_usable_group_size``, and ``should_accept_fn`` parameters are captured
+            at the first invocation and reused in all subsequent calls. Passing
+            different arguments in later calls will **not** take effect.
 
             If you need to switch configurations mid-training, consider:
 
@@ -936,6 +945,9 @@ class InferenceEngine(abc.ABC):
             If True, enables dynamic batch sizing. The method will stop collecting
             when (accepted + rejected) >= batch_size, returning only accepted results.
             This results in variable-sized batches of valid data. Default is False.
+        min_usable_group_size : int, optional
+            Minimum usable members required to accept a grouped result. Estimators
+            that require a peer set this to 2. Default is 1.
 
         Returns
         -------

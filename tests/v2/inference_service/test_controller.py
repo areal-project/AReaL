@@ -126,11 +126,15 @@ class TestControllerWorkflowResolution:
         resolved = controller._resolve_workflow(
             MockAgent,
             workflow_kwargs={},
+            group_size=4,
+            min_usable_group_size=2,
         )
 
         assert isinstance(resolved, InferenceServiceWorkflow)
         assert resolved.agent is not None
         assert isinstance(resolved.agent, MockAgent)
+        assert resolved.group_size == 4
+        assert resolved.min_usable_group_size == 2
 
     def test_resolve_should_accept_fn_none(self):
         assert RolloutControllerV2._resolve_should_accept_fn(None) is None
@@ -533,6 +537,28 @@ class TestOnlineCallbackFlow:
 
 
 class TestInferenceServiceWorkflow:
+    @pytest.mark.asyncio
+    async def test_duplicate_export_conflict_is_not_retried(self):
+        workflow = InferenceServiceWorkflow(
+            controller=MagicMock(),
+            gateway_addr="http://test:8080",
+            admin_api_key="test-key",
+        )
+        response = MagicMock(status=409)
+        response.json = AsyncMock(
+            return_value={"detail": "duplicate interaction IDs: duplicate-id"}
+        )
+        response_cm = MagicMock()
+        response_cm.__aenter__ = AsyncMock(return_value=response)
+        response_cm.__aexit__ = AsyncMock(return_value=False)
+        http_session = MagicMock()
+        http_session.post.return_value = response_cm
+
+        with pytest.raises(ValueError, match="duplicate interaction IDs"):
+            await workflow._export_interactions(http_session, ["sess-1", "sess-2"])
+
+        http_session.post.assert_called_once()
+
     @pytest.mark.skip(reason="pending /export_trajectories traj schema migration")
     @pytest.mark.asyncio
     async def test_online_mode_waits_on_controller(self):
@@ -635,7 +661,115 @@ class TestInferenceServiceWorkflow:
         workflow._start_session.assert_awaited_once()
         workflow._set_last_reward.assert_awaited_once()
         workflow._export_interactions.assert_awaited_once_with(
-            mock_http_session, ["sess-1"], group_id="grp-test-1"
+            mock_http_session,
+            ["sess-1"],
+            group_id="grp-test-1",
+            exclude_session_ids=[],
+        )
+
+    @pytest.mark.asyncio
+    async def test_offline_mode_keeps_only_usable_group_sessions(self):
+        controller = MagicMock()
+
+        class PartialAgent:
+            async def run(self, data, **kwargs):
+                if kwargs["api_key"] == "bad-key":
+                    raise ValueError("unusable")
+                return 1.0
+
+        workflow = InferenceServiceWorkflow(
+            controller=controller,
+            agent=PartialAgent(),
+            gateway_addr="http://test:8080",
+            admin_api_key="test-key",
+            group_size=3,
+            min_usable_group_size=2,
+        )
+        sessions = [
+            ("sess-1", "good-key-1"),
+            ("sess-2", "bad-key"),
+            ("sess-3", "good-key-2"),
+        ]
+        workflow._start_session = AsyncMock(return_value=("grp-test-1", sessions))
+        workflow._set_last_reward = AsyncMock(return_value=None)
+        workflow._export_interactions = AsyncMock(
+            return_value={"chatcmpl-1": MagicMock(reward=1.0)}
+        )
+
+        with (
+            patch(
+                "areal.v2.inference_service.controller.workflow.workflow_context"
+            ) as mock_wf_ctx,
+            patch("areal.v2.inference_service.controller.workflow.stats_tracker"),
+        ):
+            mock_http_session = AsyncMock()
+            mock_wf_ctx.get_aiohttp_session = AsyncMock(return_value=mock_http_session)
+            mock_wf_ctx.get.return_value = MagicMock(task_id=42)
+            mock_wf_ctx.get_httpx_client = AsyncMock(return_value=MagicMock())
+            mock_wf_ctx.stat_scope.return_value = "rollout"
+
+            result = await workflow.arun_episode(engine=MagicMock(), data={})
+
+        assert result is not None
+        workflow._export_interactions.assert_awaited_once_with(
+            mock_http_session,
+            ["sess-1", "sess-2", "sess-3"],
+            group_id="grp-test-1",
+            exclude_session_ids=["sess-2"],
+        )
+
+    @pytest.mark.asyncio
+    async def test_offline_mode_masks_group_below_estimator_minimum(self):
+        controller = MagicMock()
+
+        class SingletonAgent:
+            async def run(self, data, **kwargs):
+                if kwargs["api_key"] != "good-key":
+                    raise ValueError("unusable")
+                return 1.0
+
+        workflow = InferenceServiceWorkflow(
+            controller=controller,
+            agent=SingletonAgent(),
+            gateway_addr="http://test:8080",
+            admin_api_key="test-key",
+            group_size=3,
+            min_usable_group_size=2,
+        )
+        workflow._start_session = AsyncMock(
+            return_value=(
+                "grp-test-1",
+                [
+                    ("sess-1", "good-key"),
+                    ("sess-2", "bad-key-1"),
+                    ("sess-3", "bad-key-2"),
+                ],
+            )
+        )
+        workflow._set_last_reward = AsyncMock(return_value=None)
+        workflow._export_interactions = AsyncMock(
+            return_value={"chatcmpl-1": MagicMock(reward=1.0)}
+        )
+
+        with (
+            patch(
+                "areal.v2.inference_service.controller.workflow.workflow_context"
+            ) as mock_wf_ctx,
+            patch("areal.v2.inference_service.controller.workflow.stats_tracker"),
+        ):
+            mock_wf_ctx.get_aiohttp_session = AsyncMock(return_value=AsyncMock())
+            mock_wf_ctx.get.return_value = MagicMock(task_id=42)
+            mock_wf_ctx.get_httpx_client = AsyncMock(return_value=MagicMock())
+            mock_wf_ctx.stat_scope.return_value = "rollout"
+
+            result = await workflow.arun_episode(engine=MagicMock(), data={})
+
+        assert result is None
+        workflow._export_interactions.assert_awaited_once_with(
+            mock_wf_ctx.get_aiohttp_session.return_value,
+            ["sess-1", "sess-2", "sess-3"],
+            group_id="grp-test-1",
+            exclude_session_ids=["sess-1", "sess-2", "sess-3"],
         )
 
 

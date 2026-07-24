@@ -46,7 +46,7 @@ from areal.infra.utils.concurrent import get_executor
 from areal.infra.utils.http import arequest_with_retry, get_default_connector
 from areal.infra.utils.launcher import wait_llm_server_addrs
 from areal.infra.utils.proc import kill_process_tree
-from areal.utils import logging, name_resolve, names
+from areal.utils import logging, name_resolve, names, stats_tracker
 from areal.utils.data import concat_padded_tensors
 from areal.utils.dynamic_import import import_from_string
 from areal.utils.network import (
@@ -75,14 +75,33 @@ class GroupedRolloutWorkflow(RolloutWorkflow):
         logger: Logger,
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
+        min_usable_group_size: int = 1,
     ):
         if group_size < 1:
             raise ValueError(f"group_size must be >= 1, got {group_size}")
+        if not 1 <= min_usable_group_size <= group_size:
+            raise ValueError(
+                "min_usable_group_size must be between 1 and group_size "
+                f"({group_size}), got {min_usable_group_size}"
+            )
         self.workflow = workflow
         self.group_size = group_size
+        self.min_usable_group_size = min_usable_group_size
         self.logger = logger
         self.reward_normalization = reward_normalization
         self.drop_incomplete_group = drop_incomplete_group
+
+    def _record_group_stats(self, usable_slot_count: int, *, trainable: bool) -> None:
+        trainable_slot_count = usable_slot_count if trainable else 0
+        stats_tracker.get(workflow_context.stat_scope()).scalar(
+            target_slot_count=self.group_size,
+            usable_slot_count=usable_slot_count,
+            trainable_slot_count=trainable_slot_count,
+            fully_masked_group=usable_slot_count == 0,
+            singleton_slot_group=usable_slot_count == 1,
+            pre_filter_usable_slot_yield=usable_slot_count / self.group_size,
+            pre_filter_trainable_slot_yield=trainable_slot_count / self.group_size,
+        )
 
     async def arun_episode(
         self, engine: InferenceEngine, data: dict[str, Any]
@@ -94,9 +113,10 @@ class GroupedRolloutWorkflow(RolloutWorkflow):
         )
 
         valid_results = [r for r in results if r is not None]
+        usable_slot_count = len(valid_results)
 
-        # All results None -> return None
         if not valid_results:
+            self._record_group_stats(usable_slot_count, trainable=False)
             return None
 
         # Some results None -> drop entire group if requested. Reward
@@ -110,12 +130,25 @@ class GroupedRolloutWorkflow(RolloutWorkflow):
                     "(drop_incomplete_group=True). prepare_batch will retry "
                     "with a new prompt from the dataloader."
                 )
+                self._record_group_stats(usable_slot_count, trainable=False)
                 return None
             if not self.reward_normalization:
+                action = (
+                    "dropping group below min_usable_group_size"
+                    if usable_slot_count < self.min_usable_group_size
+                    else "using remaining results"
+                )
                 self.logger.warning(
                     f"GroupedRolloutWorkflow: {n_failed}/{len(results)} "
-                    "trajectories returned None, using remaining results"
+                    f"trajectories returned None, {action}"
                 )
+
+        # The estimator owns its minimum. Returning None below that boundary gives
+        # the group zero weight and lets the asynchronous collector backfill from
+        # another ready prompt without retrying or copying this prompt's slots.
+        if usable_slot_count < self.min_usable_group_size:
+            self._record_group_stats(usable_slot_count, trainable=False)
+            return None
 
         # Check if results are InteractionWithTokenLogpReward dicts
         first = valid_results[0]
@@ -128,15 +161,24 @@ class GroupedRolloutWorkflow(RolloutWorkflow):
         ):
             if self.reward_normalization and self.group_size > 1:
                 if not self._normalize_group_rewards(results):
+                    self._record_group_stats(usable_slot_count, trainable=False)
                     return None
             # Merge dicts - each result is {completion_id: InteractionWithTokenLogpReward}
             merged: dict[str, InteractionWithTokenLogpReward] = {}
             for result in valid_results:
+                duplicate_ids = merged.keys() & result.keys()
+                if duplicate_ids:
+                    raise ValueError(
+                        "Grouped rollout results contain duplicate interaction IDs: "
+                        f"{sorted(duplicate_ids)}"
+                    )
                 merged.update(result)
+            self._record_group_stats(usable_slot_count, trainable=bool(merged))
             return merged if merged else None
 
         # Otherwise, tensor dicts - concatenate
         concatenated = concat_padded_tensors(valid_results)
+        self._record_group_stats(usable_slot_count, trainable=bool(concatenated))
         return concatenated if concatenated else None
 
     def _normalize_group_rewards(
@@ -673,6 +715,7 @@ class RemoteInfEngine(InferenceEngine):
         workflow: WorkflowLike | None,
         workflow_kwargs: dict[str, Any] | None,
         group_size: int = 1,
+        min_usable_group_size: int = 1,
         proxy_addr: str | None = None,
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
@@ -697,6 +740,7 @@ class RemoteInfEngine(InferenceEngine):
                     self.logger,
                     reward_normalization=reward_normalization,
                     drop_incomplete_group=drop_incomplete_group,
+                    min_usable_group_size=min_usable_group_size,
                 )
             return resolved
 
@@ -794,6 +838,7 @@ class RemoteInfEngine(InferenceEngine):
                 self.logger,
                 reward_normalization=reward_normalization,
                 drop_incomplete_group=drop_incomplete_group,
+                min_usable_group_size=min_usable_group_size,
             )
 
         return resolved
@@ -1177,6 +1222,7 @@ class RemoteInfEngine(InferenceEngine):
         proxy_addr: str | None = None,
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
+        min_usable_group_size: int = 1,
     ) -> int:
         """Submit a request to the inference engine and return immediately.
 
@@ -1216,6 +1262,7 @@ class RemoteInfEngine(InferenceEngine):
             workflow,
             workflow_kwargs,
             group_size,
+            min_usable_group_size=min_usable_group_size,
             proxy_addr=proxy_addr,
             reward_normalization=reward_normalization,
             drop_incomplete_group=drop_incomplete_group,
@@ -1319,6 +1366,7 @@ class RemoteInfEngine(InferenceEngine):
         dynamic_bs: bool = False,
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
+        min_usable_group_size: int = 1,
     ) -> list[dict[str, Any]]:
         """Asynchronously submit and wait until a full batch is ready.
 
@@ -1352,6 +1400,7 @@ class RemoteInfEngine(InferenceEngine):
             workflow,
             workflow_kwargs,
             group_size,
+            min_usable_group_size=min_usable_group_size,
             reward_normalization=reward_normalization,
             drop_incomplete_group=drop_incomplete_group,
         )

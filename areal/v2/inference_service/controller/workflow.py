@@ -53,7 +53,13 @@ class InferenceServiceWorkflow(RolloutWorkflow):
         export_style: str = "individual",
         timeout: float | None = None,
         group_size: int = 1,
+        min_usable_group_size: int = 1,
     ):
+        if not 1 <= min_usable_group_size <= group_size:
+            raise ValueError(
+                "min_usable_group_size must be between 1 and group_size "
+                f"({group_size}), got {min_usable_group_size}"
+            )
         self.controller = controller
         self.agent = agent
         self.gateway_addr = gateway_addr.rstrip("/") if gateway_addr else ""
@@ -62,6 +68,21 @@ class InferenceServiceWorkflow(RolloutWorkflow):
         self.export_style = export_style
         self.timeout = timeout
         self.group_size = group_size
+        self.min_usable_group_size = min_usable_group_size
+
+    def _record_group_stats(self, usable_slot_count: int) -> None:
+        trainable_slot_count = (
+            usable_slot_count if usable_slot_count >= self.min_usable_group_size else 0
+        )
+        stats_tracker.get(workflow_context.stat_scope()).scalar(
+            target_slot_count=self.group_size,
+            usable_slot_count=usable_slot_count,
+            trainable_slot_count=trainable_slot_count,
+            fully_masked_group=usable_slot_count == 0,
+            singleton_slot_group=usable_slot_count == 1,
+            pre_filter_usable_slot_yield=usable_slot_count / self.group_size,
+            pre_filter_trainable_slot_yield=trainable_slot_count / self.group_size,
+        )
 
     @async_http_retry
     async def _start_session(
@@ -106,11 +127,13 @@ class InferenceServiceWorkflow(RolloutWorkflow):
         session_ids: list[str],
         group_id: str | None = None,
         trajectory_id: int | None = None,
+        exclude_session_ids: list[str] | None = None,
     ) -> dict[str, Any]:
         url = f"{self.gateway_addr}/{_EXPORT_TRAJECTORIES_PATHNAME}"
         headers = {"Authorization": f"Bearer {self._admin_api_key}"}
         payload: dict[str, Any] = {
             "session_ids": session_ids,
+            "exclude_session_ids": exclude_session_ids or [],
             "group_id": group_id,
             "trajectory_id": trajectory_id,
             "discount": self.discount,
@@ -118,6 +141,9 @@ class InferenceServiceWorkflow(RolloutWorkflow):
             "remove_session": True,
         }
         async with session.post(url, json=payload, headers=headers) as resp:
+            if resp.status == 409:
+                body = await resp.json()
+                raise ValueError(body.get("detail", "duplicate interaction IDs"))
             resp.raise_for_status()
             data = await resp.json()
 
@@ -200,30 +226,49 @@ class InferenceServiceWorkflow(RolloutWorkflow):
         )
 
         session_ids = [sid for sid, _ in sessions]
+        unusable_session_ids = [
+            sid
+            for (sid, _), result in zip(sessions, results, strict=True)
+            if result is None
+        ]
+        usable_slot_count = len(results) - len(unusable_session_ids)
+        self._record_group_stats(usable_slot_count)
+        group_is_trainable = usable_slot_count >= self.min_usable_group_size
+        excluded_session_ids = (
+            unusable_session_ids if group_is_trainable else session_ids
+        )
 
         # Always export to trigger session cleanup on the data proxy,
-        # even when we intend to discard the trajectories.
+        # even when we intend to discard the trajectories. Unusable sessions are
+        # cleaned up without merging their interactions into the training result.
         traj = await self._export_interactions(
             http_session,
             session_ids,
             group_id=group_id,
+            exclude_session_ids=excluded_session_ids,
         )
-        if not traj:
-            return None
 
-        n_failed = sum(r is None for r in results)
-        if n_failed > 0:
+        if unusable_session_ids:
             logger.warning(
-                "Abandoning group %s: %d/%d sessions failed",
+                "Grouped inference-service rollout %s: %d/%d sessions returned "
+                "None; %s",
                 group_id,
-                n_failed,
+                len(unusable_session_ids),
                 len(sessions),
+                (
+                    "dropping group below min_usable_group_size"
+                    if not group_is_trainable
+                    else "using remaining sessions"
+                ),
             )
+
+        if not group_is_trainable or not traj:
             return None
 
         tracker = stats_tracker.get(workflow_context.stat_scope())
         for r in results:
-            tracker.scalar(reward=r)
+            if r is not None:
+                tracker.scalar(reward=r)
 
         return traj
 

@@ -516,7 +516,9 @@ def create_app(config: GatewayConfig) -> FastAPI:
             client=_client(),
         )
 
-        if resp.status_code == 200 and group_id is not None:
+        # Duplicate IDs are a terminal group conflict: the data proxy has already
+        # discarded all group sessions in its cleanup path, so revoke router state too.
+        if resp.status_code in {200, 409} and group_id is not None:
             await revoke_session_in_router(
                 config.router_addr,
                 config.admin_api_key,

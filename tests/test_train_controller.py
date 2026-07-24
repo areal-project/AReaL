@@ -604,6 +604,7 @@ class TestTrainControllerRolloutIntegration:
             group_size=1,
             reward_normalization=False,
             drop_incomplete_group=False,
+            min_usable_group_size=1,
         )
 
     def test_rollout_batch_delegates_to_rollout(self, train_controller, ft_spec):

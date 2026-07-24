@@ -162,3 +162,34 @@ class TestGatewayTrainControllerInitialization:
         assert controller._gateway_addr == "http://127.0.0.1:18080"
         assert controller.api_key is not None
         assert controller.api_key.startswith("ak-train-role-")
+
+
+def test_prepare_batch_forwards_estimator_minimum():
+    controller = _make_controller()
+    controller.rollout = MagicMock()
+    controller.rollout.prepare_batch.return_value = [{"trajectory": 1}]
+    dataloader = MagicMock()
+
+    result = controller.prepare_batch(
+        dataloader,
+        workflow="test.Agent",
+        workflow_kwargs={"key": "value"},
+        group_size=4,
+        dynamic_bs=True,
+        reward_normalization=False,
+        drop_incomplete_group=False,
+        min_usable_group_size=2,
+    )
+
+    assert result == [{"trajectory": 1}]
+    controller.rollout.prepare_batch.assert_called_once_with(
+        dataloader=dataloader,
+        workflow="test.Agent",
+        workflow_kwargs={"key": "value"},
+        should_accept_fn=None,
+        group_size=4,
+        dynamic_bs=True,
+        reward_normalization=False,
+        drop_incomplete_group=False,
+        min_usable_group_size=2,
+    )

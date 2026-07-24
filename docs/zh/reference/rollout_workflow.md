@@ -196,8 +196,22 @@ rollout:
 1. 根据类型合并结果：
    - **张量字典**：沿批次维度连接
    - **InteractionWithTokenLogpReward 字典**：合并为单个字典
-1. 如果某些运行返回 `None`（拒绝），仅保留有效结果
-1. 如果所有运行都返回 `None`，则整个分组结果为 `None`
+1. 每个 slot 可用时返回正常结果类型，不可用时返回 `None`。`None` 有意保持不透明； 原因分类与重试策略仍由 producer 负责。
+1. 包装器只等待最初提交的 slots，既不会重试不可用 slot，也不会复制可用结果。
+1. 可用 slots 会各保留一次并连接；实际数量会在 reward 和 advantage normalization 中继续作为 prompt-group 边界。
+1. `min_usable_group_size` 默认为 `1`。仅当 reward 或 advantage 的中心化采用 group-relative 方式、因而需要
+   peer 时，RL trainer 才会将其设为 `2`。低于该 estimator 自有下限的 group 返回 `None`，异步 collector
+   随后会接收另一个已就绪的 prompt group。采用 batch-relative PPO 或 REINFORCE 时则会保留可用的 singleton。
+
+PPO 系列 actor loss 默认仍按全局 token 加权。因此，有更多有效 response tokens 的 partial group 会比更小或更短的
+group 获得更高 loss weight。这是保持向后兼容的现有 estimator，并不表示各 prompt 隐式等权。
+
+Grouped rollout 会导出 `target_slot_count`、`usable_slot_count`、
+`trainable_slot_count`、`fully_masked_group`、`singleton_slot_group`、
+`pre_filter_usable_slot_yield` 和 `pre_filter_trainable_slot_yield`。这些指标统计最初的 rollout
+调用；一条可用的 agent trajectory 可以投影成多个物理 training members。`should_accept_fn` 运行后的最终 accepted
+和 rejected 数量仍由 collector metrics 提供。PPO 训练会另外报告物理 usable group size 与有效 token 的
+loss-weight 分布，其中包括按 size 区分的 `group_loss_weight_size_<N>` 指标。
 
 ### 输出形状
 
@@ -216,9 +230,9 @@ class GroupedRolloutWorkflow(RolloutWorkflow):
               for _ in range(self.group_size)]
         )
 
-        # 过滤 None 结果
+        # 正常结果表示可用，None 表示不可用
         valid_results = [r for r in results if r is not None]
-        if not valid_results:
+        if len(valid_results) < self.min_usable_group_size:
             return None
 
         # 根据结果类型合并

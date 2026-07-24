@@ -60,6 +60,7 @@ class _RemoteRolloutTaskInput:
     should_accept_fn: str | None
     is_eval: bool = False
     group_size: int = 1
+    min_usable_group_size: int = 1
     proxy_addr: str | None = None
     reward_normalization: bool = False
     drop_incomplete_group: bool = False
@@ -810,6 +811,7 @@ class RolloutController:
                     http_timeout=self.config.request_timeout,
                     is_eval=pending_task.is_eval,
                     group_size=pending_task.group_size,
+                    min_usable_group_size=pending_task.min_usable_group_size,
                     task_id=task_id,
                     callback_addr=f"http://{self.callback_addr}/callback/rollout_complete",
                     proxy_addr=proxy_addr,
@@ -879,6 +881,7 @@ class RolloutController:
         proxy_addr: str | None = None,
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
+        min_usable_group_size: int = 1,
     ) -> int:
         workflow_str = self._resolve_workflow_str(workflow)
         should_accept_fn = self._resolve_should_accept_fn(should_accept_fn)
@@ -898,6 +901,7 @@ class RolloutController:
             task_id=task_id,
             is_eval=is_eval,
             group_size=group_size,
+            min_usable_group_size=min_usable_group_size,
             proxy_addr=proxy_addr,
             reward_normalization=reward_normalization,
             drop_incomplete_group=drop_incomplete_group,
@@ -959,6 +963,7 @@ class RolloutController:
         dynamic_bs: bool = False,
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
+        min_usable_group_size: int = 1,
     ) -> list[dict[str, Any]]:
         """Prepare a batch with controlled staleness.
 
@@ -984,6 +989,7 @@ class RolloutController:
                         group_size=group_size,
                         reward_normalization=reward_normalization,
                         drop_incomplete_group=drop_incomplete_group,
+                        min_usable_group_size=min_usable_group_size,
                     )
 
         if not hasattr(self, "data_generator"):

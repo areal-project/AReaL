@@ -12,7 +12,7 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from areal.experimental.openai.cache import InteractionCache
 from areal.experimental.openai.types import InteractionWithTokenLogpReward
@@ -64,12 +64,15 @@ class SetRewardRequest(BaseModel):
 class ExportTrajectoriesRequest(BaseModel):
     """Request to export trajectories for one or more sessions.
 
-    All sessions are exported and merged into a single interactions dict.
+    Sessions not listed in ``exclude_session_ids`` are exported and merged into a
+    single interactions dict. Excluded sessions are still removed when
+    ``remove_session`` is true.
     ``group_id`` is optional metadata used by the gateway for router cleanup;
     the data proxy itself does not use it.
     """
 
     session_ids: list[str]
+    exclude_session_ids: list[str] = Field(default_factory=list)
     group_id: str | None = None
     trajectory_id: int | None = None
     discount: float = 1.0

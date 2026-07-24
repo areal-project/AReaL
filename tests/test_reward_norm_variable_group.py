@@ -75,6 +75,15 @@ def test_group_sizes_none_matches_fixed_group_size():
     torch.testing.assert_close(out_default, out_explicit, rtol=1e-6, atol=1e-6)
 
 
+def test_implicit_group_sizes_reject_partial_tail():
+    """Fixed-size grouping must not silently leave an unnormalized tail."""
+    norm = Normalization(_group_norm_config())
+    x = torch.tensor([0.0, 2.0, 10.0], dtype=torch.float32)
+
+    with pytest.raises(ValueError, match="must be divisible"):
+        norm(x)
+
+
 def test_variable_group_with_zero_variance_group_is_finite():
     """A zero-variance group stays finite thanks to eps in the denominator.
 
@@ -125,6 +134,27 @@ def test_leave_one_out_singleton_group_outputs_zero():
 
     assert torch.isfinite(out).all()
     assert out[0].item() == 0.0
+
+
+def test_leave_one_out_uses_actual_partial_group_denominator():
+    """RLOO uses only usable peers and gives a singleton no peer signal."""
+    cfg = NormConfig(
+        mean_level="group",
+        std_level=None,
+        group_size=3,
+        mean_leave1out=True,
+    )
+    norm = Normalization(cfg)
+    rewards = torch.tensor([1.0, 4.0, 7.0, 2.0, 8.0, 5.0])
+
+    out = norm(rewards, group_sizes=[3, 2, 1])
+
+    torch.testing.assert_close(
+        out,
+        torch.tensor([-4.5, 0.0, 4.5, -6.0, 6.0, 0.0]),
+        rtol=0,
+        atol=0,
+    )
 
 
 def test_group_sizes_sum_mismatch_raises():

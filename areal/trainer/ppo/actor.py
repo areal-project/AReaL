@@ -42,6 +42,30 @@ from areal.v2.training_service.controller.controller import (
 logger = logging.getLogger("PPOActor")
 
 
+def _group_training_metrics(
+    loss_mask: torch.Tensor, group_sizes: list[int]
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    batch_size = loss_mask.shape[0]
+    if any(size < 1 for size in group_sizes) or sum(group_sizes) != batch_size:
+        raise ValueError(
+            f"group_sizes must be positive and sum to batch size {batch_size}, "
+            f"got {group_sizes}"
+        )
+
+    group_starts = torch.zeros(batch_size, dtype=torch.bool, device=loss_mask.device)
+    usable_group_sizes = torch.zeros(
+        batch_size, dtype=torch.float32, device=loss_mask.device
+    )
+    group_loss_weights = torch.zeros_like(usable_group_sizes)
+    offset = 0
+    for size in group_sizes:
+        group_starts[offset] = True
+        usable_group_sizes[offset] = size
+        group_loss_weights[offset] = loss_mask[offset : offset + size].count_nonzero()
+        offset += size
+    return group_starts, usable_group_sizes, group_loss_weights
+
+
 class PPOActor:
     def __init__(self, config: PPOActorConfig, engine: TrainEngine):
         self.config = config
@@ -262,9 +286,11 @@ class PPOActor:
     @trace_perf("ppo_actor.ppo_update", category="compute")
     @stats_tracker.scope_func_wrapper("ppo_actor")
     def ppo_update(self, data: list[dict[str, Any]]) -> None:
-        batched_call(self._ppo_update, data, unpack=False)
+        batched_call(self._ppo_update, data, unpack=False, pass_meta=True)
 
-    def _ppo_update(self, data: dict[str, Any]) -> None:
+    def _ppo_update(
+        self, data: dict[str, Any], meta: TrajBatchMeta | None = None
+    ) -> None:
         attn_mask = data["attention_mask"]
         loss_mask = data["loss_mask"]
         reward_score = data["rewards"]
@@ -297,6 +323,10 @@ class PPOActor:
             n_valid_tokens=loss_mask.bool(),
             **result_denominators,
         )
+        group_metrics = None
+        if meta is not None:
+            group_metrics = _group_training_metrics(loss_mask, meta.traj_group_sizes)
+            global_denominators["n_groups"] = group_metrics[0]
         stats_tracker.denominator(**global_denominators)
         stats_tracker.stat(
             correct_seq_len=seqlens.float(), denominator="correct_n_seqs"
@@ -320,6 +350,22 @@ class PPOActor:
             seq_len=seqlens.float(),
         )
         stats_tracker.stat(**seq_stats, denominator="n_seqs")
+        if group_metrics is not None:
+            group_starts, usable_group_sizes, group_loss_weights = group_metrics
+            stats_tracker.stat(
+                usable_group_size=usable_group_sizes,
+                group_loss_weight=group_loss_weights,
+                denominator="n_groups",
+            )
+            for group_size in sorted(set(meta.traj_group_sizes)):
+                denominator = f"n_groups_size_{group_size}"
+                stats_tracker.denominator(
+                    **{denominator: group_starts & (usable_group_sizes == group_size)}
+                )
+                stats_tracker.stat(
+                    denominator=denominator,
+                    **{f"group_loss_weight_size_{group_size}": group_loss_weights},
+                )
         scalars = dict(
             mask_no_eos_with_zero=self.config.mask_no_eos_with_zero,
             eps_clip=self.config.eps_clip,

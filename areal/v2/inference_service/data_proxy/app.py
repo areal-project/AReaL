@@ -731,8 +731,16 @@ def create_app(config: DataProxyConfig) -> FastAPI:
             )
 
         merged: dict[str, InteractionWithTokenLogpReward] = {}
+        excluded_session_ids = set(body.exclude_session_ids)
+
+        def _remove_sessions() -> None:
+            if body.remove_session:
+                for sid in body.session_ids:
+                    store.remove_session(sid)
 
         for sid in body.session_ids:
+            if sid in excluded_session_ids:
+                continue
             session = store.get_session(sid)
             if session is None:
                 continue
@@ -743,20 +751,30 @@ def create_app(config: DataProxyConfig) -> FastAPI:
                     style=body.style,
                     trajectory_id=body.trajectory_id,
                 )
-                merged.update(interactions)
             except KeyError:
                 continue
 
-        if all(v.has_tensor_data for v in merged.values()):
+            duplicate_ids = merged.keys() & interactions.keys()
+            if duplicate_ids:
+                _remove_sessions()
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Grouped rollout sessions contain duplicate interaction "
+                        f"IDs: {sorted(duplicate_ids)}"
+                    ),
+                )
+            merged.update(interactions)
+
+        if not merged:
+            traj = {}
+        elif all(v.has_tensor_data for v in merged.values()):
             traj = concat_padded_tensors([v.to_tensor_dict() for v in merged.values()])
             traj = RTensor.remotize(traj, node_addr=config.serving_addr)
         else:
             traj = concat_string_interactions(merged)
 
-        if body.remove_session:
-            for sid in body.session_ids:
-                store.remove_session(sid)
-
+        _remove_sessions()
         serialized = serialize_value(traj)
         return ExportTrajectoriesResponse(traj=serialized)
 

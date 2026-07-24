@@ -75,6 +75,35 @@ if TYPE_CHECKING:
 logger = logging.getLogger("RLTrainer")
 
 
+def _minimum_usable_group_size(
+    actor_config: PPOActorConfig, target_group_size: int
+) -> int:
+    """Return the minimum group size required by the configured estimator."""
+    normalizations = (actor_config.reward_norm, actor_config.adv_norm)
+    return (
+        2
+        if target_group_size > 1
+        and any(n is not None and n.mean_level == "group" for n in normalizations)
+        else 1
+    )
+
+
+def _collect_nonempty_rollout_batch(
+    prepare_batch: Callable[[], list[dict[str, Any]]], *, dynamic_bs: bool
+) -> list[dict[str, Any]]:
+    """Collect until a dynamic batch contains at least one trainable trajectory."""
+    while True:
+        batch = prepare_batch()
+        if batch:
+            return batch
+        if not dynamic_bs:
+            raise RuntimeError("rollout preparation returned an empty fixed-size batch")
+        logger.warning(
+            "Dynamic rollout batch contained no trainable groups; "
+            "collecting from the ready queue again"
+        )
+
+
 class _EmptyDataLoader:
     """Minimal dataloader for online mode that yields empty dicts.
 
@@ -575,6 +604,9 @@ class PPOTrainer:
         total_epochs: int | None = None,
     ):
         config = self.config
+        min_usable_group_size = _minimum_usable_group_size(
+            config.actor, config.gconfig.n_samples
+        )
         start_step = (
             self.recover_info.last_step_info.next().global_step
             if self.recover_info is not None
@@ -624,15 +656,20 @@ class PPOTrainer:
                     },
                 ),
             ):
-                rollout_batch = self.actor.prepare_batch(
-                    self.train_dataloader,
-                    workflow=workflow,
-                    workflow_kwargs=workflow_kwargs,
-                    should_accept_fn=dynamic_filter_fn,
-                    group_size=config.gconfig.n_samples,
-                    dynamic_bs=self.config.dynamic_bs,
-                    reward_normalization=config.gconfig.reward_normalization,
-                    drop_incomplete_group=config.gconfig.drop_incomplete_group,
+                rollout_batch = _collect_nonempty_rollout_batch(
+                    functools.partial(
+                        self.actor.prepare_batch,
+                        self.train_dataloader,
+                        workflow=workflow,
+                        workflow_kwargs=workflow_kwargs,
+                        should_accept_fn=dynamic_filter_fn,
+                        group_size=config.gconfig.n_samples,
+                        min_usable_group_size=min_usable_group_size,
+                        dynamic_bs=config.dynamic_bs,
+                        reward_normalization=config.gconfig.reward_normalization,
+                        drop_incomplete_group=config.gconfig.drop_incomplete_group,
+                    ),
+                    dynamic_bs=config.dynamic_bs,
                 )
             if self._should_offload_rollout:
                 self._offload_rollout()

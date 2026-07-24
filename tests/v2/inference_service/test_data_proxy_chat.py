@@ -821,6 +821,112 @@ async def test_batch_online_set_reward_completes_that_session(client):
     assert "traj" in export_resp.json()
 
 
+@pytest.mark.asyncio
+async def test_export_excludes_unusable_session_but_cleans_entire_group(client):
+    start = await client.post(
+        "/rl/start_session",
+        json={"task_id": "partial-group", "group_size": 2},
+        headers=admin_headers(),
+    )
+    credentials = start.json()["sessions"]
+
+    for credential in credentials:
+        headers = session_headers(credential["session_api_key"])
+        await client.post(
+            "/chat/completions",
+            json={"model": "sglang", "messages": [{"role": "user", "content": "q"}]},
+            headers=headers,
+        )
+        await client.post("/rl/set_reward", json={"reward": 1.0}, headers=headers)
+
+    store: SessionStore = client._transport.app.state.session_store
+    included_id = credentials[0]["session_id"]
+    excluded_id = credentials[1]["session_id"]
+    included = store.get_session(included_id)
+    excluded = store.get_session(excluded_id)
+    assert included is not None
+    assert excluded is not None
+    included_export = MagicMock(wraps=included.export_trajectory)
+    excluded_export = MagicMock(wraps=excluded.export_trajectory)
+    included.export_trajectory = included_export
+    excluded.export_trajectory = excluded_export
+
+    export_resp = await client.post(
+        "/export_trajectories",
+        json={
+            "session_ids": [included_id, excluded_id],
+            "exclude_session_ids": [excluded_id],
+            "discount": 1.0,
+            "style": "individual",
+        },
+        headers=admin_headers(),
+    )
+
+    assert export_resp.status_code == 200
+    included_export.assert_called_once()
+    excluded_export.assert_not_called()
+    assert store.get_session(included_id) is None
+    assert store.get_session(excluded_id) is None
+
+
+@pytest.mark.asyncio
+async def test_export_rejects_duplicate_interaction_ids_and_cleans_group(client):
+    start = await client.post(
+        "/rl/start_session",
+        json={"task_id": "duplicate-group", "group_size": 2},
+        headers=admin_headers(),
+    )
+    session_ids = [item["session_id"] for item in start.json()["sessions"]]
+    store: SessionStore = client._transport.app.state.session_store
+    sessions = [store.get_session(session_id) for session_id in session_ids]
+    assert all(session is not None for session in sessions)
+    duplicate_interactions = {"duplicate-id": MagicMock()}
+    for session in sessions:
+        assert session is not None
+        session.export_trajectory = MagicMock(return_value=(0, duplicate_interactions))
+
+    export_resp = await client.post(
+        "/export_trajectories",
+        json={"session_ids": session_ids},
+        headers=admin_headers(),
+    )
+
+    assert export_resp.status_code == 409
+    assert "duplicate interaction IDs" in export_resp.json()["detail"]
+    assert all(store.get_session(session_id) is None for session_id in session_ids)
+
+
+@pytest.mark.asyncio
+async def test_cleanup_only_export_does_not_materialize_trajectories(client):
+    start = await client.post(
+        "/rl/start_session",
+        json={"task_id": "cleanup-only", "group_size": 2},
+        headers=admin_headers(),
+    )
+    session_ids = [item["session_id"] for item in start.json()["sessions"]]
+    store: SessionStore = client._transport.app.state.session_store
+    sessions = [store.get_session(session_id) for session_id in session_ids]
+    assert all(session is not None for session in sessions)
+    for session in sessions:
+        assert session is not None
+        session.export_trajectory = MagicMock(
+            side_effect=AssertionError("cleanup-only export materialized a trajectory")
+        )
+
+    export_resp = await client.post(
+        "/export_trajectories",
+        json={
+            "session_ids": session_ids,
+            "exclude_session_ids": session_ids,
+        },
+        headers=admin_headers(),
+    )
+
+    assert export_resp.status_code == 200
+    assert export_resp.json()["traj"] == {}
+    assert all(store.get_session(session_id) is None for session_id in session_ids)
+
+
 # =============================================================================
 # Coexistence tests — HITL and batch running simultaneously
 # =============================================================================

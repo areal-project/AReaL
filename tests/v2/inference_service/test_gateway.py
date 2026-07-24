@@ -279,6 +279,30 @@ class TestAdminEndpoints:
         mock_revoke.assert_not_called()
 
     @pytest.mark.asyncio
+    @patch(f"{MODULE}.revoke_session_in_router", new_callable=AsyncMock)
+    @patch(f"{MODULE}.query_router", new_callable=AsyncMock)
+    @patch(f"{MODULE}.forward_request", new_callable=AsyncMock)
+    async def test_duplicate_export_conflict_revokes_terminal_group(
+        self, mock_forward, mock_query_router, mock_revoke, client
+    ):
+        mock_query_router.return_value = WORKER_ADDR
+        mock_forward.return_value = httpx.Response(
+            409, json={"detail": "duplicate interaction IDs"}
+        )
+
+        resp = await client.post(
+            "/export_trajectories",
+            json={
+                "session_ids": ["task-1-0", "task-1-1"],
+                "group_id": "grp-test",
+            },
+            headers=admin_headers(),
+        )
+
+        assert resp.status_code == 409
+        mock_revoke.assert_awaited_once()
+
+    @pytest.mark.asyncio
     async def test_export_trajectories_missing_session_id(self, client):
         """Admin key → /export_trajectories without session_id → 400."""
         resp = await client.post(
