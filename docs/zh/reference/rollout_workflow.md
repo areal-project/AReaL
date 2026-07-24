@@ -184,9 +184,16 @@ engine.submit(
 或通过 CLI：
 
 ```yaml
+gconfig:
+  n_samples: 4
 rollout:
-  group_size: 4
+  min_valid_group_size: 4
 ```
+
+`min_valid_group_size` 表示一个分组至少需要多少个非 `None` 结果才会被保留。默认值为
+`1`，即只要分组中至少有一个有效结果，就会保留这个部分分组。将它设为 `gconfig.n_samples` 可以要求只保留完整分组。如果有效结果数低于该阈值，
+`GroupedRolloutWorkflow` 会返回 `None`，从而丢弃整个分组。启用分组 Rollout 时， 该值必须在
+`[1, gconfig.n_samples]` 范围内。
 
 ### 工作原理
 

@@ -2271,6 +2271,14 @@ class InferenceEngineConfig:
         default=1,
         metadata={"help": "Batch size for consuming rollouts from the queue."},
     )
+    min_valid_group_size: int = field(
+        default=1,
+        metadata={
+            "help": "Minimum valid trajectories required to keep a grouped rollout. "
+            "Default 1 keeps partial groups; set to gconfig.n_samples to require "
+            "full groups. Applies when group_size > 1 and must not exceed it."
+        },
+    )
     max_head_offpolicyness: int = field(
         default=0,
         metadata={
@@ -2429,6 +2437,10 @@ class InferenceEngineConfig:
             )
         if not self.admin_api_key or not self.admin_api_key.strip():
             raise ValueError("admin_api_key must not be empty or whitespace-only")
+        if self.min_valid_group_size < 1:
+            raise ValueError(
+                f"min_valid_group_size must be >= 1, got {self.min_valid_group_size}"
+            )
         if (
             self._version == "v2"
             and self.agent is not None

@@ -193,9 +193,17 @@ engine.submit(
 Or via CLI:
 
 ```yaml
+gconfig:
+  n_samples: 4
 rollout:
-  group_size: 4
+  min_valid_group_size: 4
 ```
+
+`min_valid_group_size` is the minimum number of non-`None` results required to keep a
+group. Its default of `1` keeps a partial group whenever at least one trajectory is
+valid. Set it to `gconfig.n_samples` to require complete groups. If fewer results are
+valid, `GroupedRolloutWorkflow` returns `None` and drops the whole group. The value must
+be in `[1, gconfig.n_samples]` when grouped rollout is enabled.
 
 ### How It Works
 
