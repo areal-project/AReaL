@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import os
+
 import ray
 from ray.util.placement_group import PlacementGroup
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
@@ -48,6 +50,12 @@ def create_resource_spec(device, cpu: int, gpu: int, mem_in_bytes: int):
 
 
 def ray_resource_type():
+    hidden = os.environ.get("AREAL_CONTROLLER_HIDDEN_DEVICE_ENV")
+    if hidden == "ASCEND_RT_VISIBLE_DEVICES":
+        return "NPU"
+    if hidden == "CUDA_VISIBLE_DEVICES":
+        return "GPU"
+
     # npu before cuda because mindspeed patches cuda.is_available
     import torch
 

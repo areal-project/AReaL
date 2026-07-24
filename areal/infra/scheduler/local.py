@@ -89,6 +89,21 @@ def _get_device_count_safely() -> int | None:
         return None
 
 
+def _worker_device_control_env_var() -> str:
+    """Return the visibility env var to set on GPU workers.
+
+    When the controller has hidden its own accelerators (see
+    ``AREAL_HIDE_CONTROLLER_DEVICES`` in ``areal/__init__.py``), ``current_platform``
+    degrades to the CPU platform and its ``device_control_env_var`` is empty. In that
+    case the real accelerator env var is read from the value the controller stashed
+    before blanking, so workers still receive the correct assignment.
+    """
+    hidden = os.environ.get("AREAL_CONTROLLER_HIDDEN_DEVICE_ENV")
+    if hidden:
+        return hidden
+    return current_platform.device_control_env_var
+
+
 class LocalScheduler(Scheduler):
     """Local scheduler that manages worker subprocesses on a single GPU node.
 
@@ -186,6 +201,30 @@ class LocalScheduler(Scheduler):
         return len(self.gpu_devices)
 
     def _detect_gpus(self) -> list[int]:
+        # If the controller has hidden its own accelerators
+        # (AREAL_HIDE_CONTROLLER_DEVICES), enumerate the worker device pool from the
+        # stashed original visibility rather than this process's (now empty) view.
+        hidden_env = os.environ.get("AREAL_CONTROLLER_HIDDEN_DEVICE_ENV")
+        if hidden_env:
+            if os.environ.get("AREAL_CONTROLLER_ORIG_DEVICES_SET") == "1":
+                # The original visibility was explicitly set; honor it exactly. An
+                # empty string means "no devices visible" (e.g. a CPU-only controller
+                # or one given no GPU allocation), which must NOT be confused with an
+                # unset variable that conventionally exposes all devices.
+                orig = os.environ.get("AREAL_CONTROLLER_ORIG_DEVICES", "")
+                if orig == "":
+                    return []
+                try:
+                    return [int(x) for x in orig.split(",")]
+                except ValueError:
+                    logger.warning(
+                        f"Invalid stashed {hidden_env}: {orig}, using default [0]"
+                    )
+                    return [0]
+            # Original visibility was unset -> all physical devices are available.
+            cnt = _get_device_count_safely()
+            return list(range(cnt)) if cnt is not None else [0]
+
         cuda_visible = os.environ.get(current_platform.device_control_env_var)
         if current_platform.device_control_env_var and cuda_visible:
             try:
@@ -740,10 +779,9 @@ class LocalScheduler(Scheduler):
                 env = get_env_vars(
                     ",".join([f"{k}={v}" for k, v in scheduling.env_vars.items()]),
                 )
-                if current_platform.device_control_env_var:
-                    env[current_platform.device_control_env_var] = ",".join(
-                        map(str, gpu_devices)
-                    )
+                worker_device_env_var = _worker_device_control_env_var()
+                if worker_device_env_var:
+                    env[worker_device_env_var] = ",".join(map(str, gpu_devices))
 
                 thread_env = get_thread_env_vars(
                     cpus_per_task=scheduling.cpu,
