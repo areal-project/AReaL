@@ -42,6 +42,16 @@ from areal.v2.training_service.controller.controller import (
 logger = logging.getLogger("PPOActor")
 
 
+def _infer_prompt_lens(
+    attention_mask: torch.Tensor, loss_mask: torch.Tensor
+) -> torch.Tensor:
+    """Return the index of the first generated token for each trajectory."""
+    loss_mask_long = loss_mask.long()
+    first_gen_idx = loss_mask_long.argmax(dim=-1)
+    has_gen = loss_mask_long.any(dim=-1)
+    return torch.where(has_gen, first_gen_idx, attention_mask.long().sum(-1))
+
+
 class PPOActor:
     def __init__(self, config: PPOActorConfig, engine: TrainEngine):
         self.config = config
@@ -307,10 +317,15 @@ class PPOActor:
         )
         stats_tracker.stat(**stats, denominator="n_valid_tokens")
 
-        prompt_lens = data["attention_mask"].sum(-1) - data["loss_mask"].sum(-1)
+        prompt_lens = _infer_prompt_lens(data["attention_mask"], data["loss_mask"])
+        task_reward = (
+            data["original_rewards"].float()
+            if "original_rewards" in data
+            else reward_score.float()
+        )
         seq_stats = dict(
             no_eos_ratios=(seqlens == attn_mask.shape[-1]).float(),
-            task_reward=reward_score.float(),
+            task_reward=task_reward,
             prompt_len=prompt_lens.float(),
             seq_len=seqlens.float(),
         )
@@ -565,6 +580,7 @@ def grpo_loss_fn(
             denominator="n_valid_tokens",
         )
 
+    logp_diff = (old_logp - logprobs.detach()) * loss_mask
     stats_tracker.stat(
         importance_weight=stat["importance_weight"],
         approx_kl=stat["approx_kl"],
@@ -574,7 +590,21 @@ def grpo_loss_fn(
         actor_loss=stat["loss"],
         clip_ratio=stat["clip_mask"].float(),
         dual_clip_ratio=stat["dual_clip_mask"].float(),
+        logp_diff=logp_diff,
+        logp_abs_diff=logp_diff.abs(),
         denominator="n_valid_tokens",
+    )
+
+    # `valid_logp_abs_diff` averages only over tokens the loss function kept
+    # (`train_loss_mask`), while `logp_abs_diff` averages over the full
+    # loss_mask. Loss functions that do not narrow the mask leave the two
+    # identical; the split keeps dashboards comparable with runs that do.
+    train_loss_mask = stat.get("train_loss_mask", loss_mask)
+    valid_logp_abs_diff = ((old_logp - logprobs.detach()) * train_loss_mask).abs()
+    stats_tracker.denominator(n_trained_tokens=train_loss_mask.bool())
+    stats_tracker.stat(
+        valid_logp_abs_diff=valid_logp_abs_diff,
+        denominator="n_trained_tokens",
     )
     if "behave_imp_weight" in stat:
         stats_tracker.denominator(unclipped_behave_tokens=stat["behave_mask"])
@@ -582,6 +612,19 @@ def grpo_loss_fn(
             behave_imp_weight=stat["behave_imp_weight"],
             behave_approx_kl=stat["behave_approx_kl"],
             denominator="unclipped_behave_tokens",
+        )
+        behave_filtered_mask = loss_mask & ~stat["behave_mask"]
+        stats_tracker.stat(
+            behave_filtered_ratio=behave_filtered_mask.float(),
+            denominator="n_valid_tokens",
+        )
+
+    if "n_valid_tokens" in stat:
+        stats_tracker.scalar(
+            n_total_tokens=stat["n_total_tokens"],
+            n_valid_tokens_in_loss=stat["n_valid_tokens"],
+            n_masked_tokens=stat["n_masked_tokens"],
+            masked_token_ratio=stat["masked_token_ratio"],
         )
     if "filtered_fraction" in stat:
         stats_tracker.scalar(rs_filtered_fraction=stat["filtered_fraction"])
