@@ -9,7 +9,6 @@ from glob import glob
 
 import torch
 import torch.distributed as dist
-from mbridge.core.bridge import Bridge
 from megatron.core import parallel_state as mpu
 from megatron.core.fp8_utils import is_float8tensor
 from safetensors import safe_open
@@ -451,7 +450,7 @@ def _weight_to_mcore_tp(
 
 
 def _load_weight_with_bridge_worker(
-    bridge: Bridge,
+    bridge,
     state_dict: dict[str, torch.Tensor],
     local_names: list[str],
     filenames: list[str],
@@ -639,7 +638,7 @@ def make_filename_bins(
 
 
 def load_weights_from_hf_with_mbridge_fast(
-    bridge: Bridge,
+    bridge,
     models: list[torch.nn.Module],
     weights_path: str,
     max_workers: int | None = None,
