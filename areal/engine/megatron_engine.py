@@ -1771,12 +1771,19 @@ class MegatronEngine(TrainEngine):
     def _init_weight_update_from_distributed(self, meta: WeightUpdateMeta) -> None:
         assert meta.type == "xccl"
         gen_pp_size = meta.gen_allocation.parallel.pp_size if meta.gen_allocation else 1
+        gen_backend = meta.gen_allocation.backend if meta.gen_allocation else None
 
         # NOTE: Processes launched with torchrun will set the following env var to True,
         # which blocks creating another TCP store for weight update.
         os.environ["TORCHELASTIC_USE_AGENT_STORE"] = str(False)
 
-        if gen_pp_size > 1:
+        # The per-PP-rank path is specific to SGLang: its rollout-side
+        # `build_init_weights_group_request` forms one NCCL group per PP stage
+        # (see areal/engine/sglang_remote.py), so it requires a 1:1 mapping to
+        # the training PP stages. vLLM instead joins a single flat group
+        # spanning every inference worker (see areal/engine/vllm_remote.py) and
+        # therefore does not need train_pp_size == gen_pp_size.
+        if gen_backend == "sglang" and gen_pp_size > 1:
             # Per-PP-rank weight sync requires a 1:1 mapping between training
             # PP stages and inference (sglang) PP stages, because each training
             # PP head creates exactly the group update_weight_group_{train_pp_rank}
@@ -1847,9 +1854,17 @@ class MegatronEngine(TrainEngine):
                 self.weight_update_master_addr = ""
                 self.weight_update_master_port = 0
         else:
-            # PP==1: original behaviour – only the pp_rank=0 head creates
-            # a single group spanning all inference workers.
-            # Only one PP head exists, so no port race is possible.
+            # Single-group path: taken when the inference side needs only one
+            # flat group per training PP stage. This covers both
+            #   * gen_pp_size == 1 (any backend), and
+            #   * vLLM with gen_pp_size > 1 (vLLM joins one flat group over all
+            #     inference workers regardless of its internal PP).
+            # Each training PP-stage head (dp=tp=0, one per PP rank) creates its
+            # own group update_weight_group_{pp_rank} spanning all inference
+            # workers and later broadcasts the parameters owned by that stage.
+            # When train_pp_size == 1 only one PP head exists, so no port race
+            # is possible; with train_pp_size > 1 the per-head engine_lock and
+            # distinct group names keep the concurrent heads isolated.
             if self.is_pipeline_parallel_head():
                 assert meta.gen_allocation is not None
 
