@@ -24,7 +24,7 @@ from areal.api.engine_api import InferenceEngine
 from areal.api.workflow_api import RolloutWorkflow
 from areal.utils import logging
 from areal.utils.dynamic_import import import_from_string
-from areal.utils.hf_utils import apply_chat_template
+from areal.utils.hf_utils import apply_chat_template, tokenizer_stop_token_ids
 
 from ._compat import (
     NativeGenerationController,
@@ -78,7 +78,9 @@ class ScaffoldingWorkflow(RolloutWorkflow):
             from areal.utils.hf_utils import load_hf_tokenizer
 
             self.tokenizer = load_hf_tokenizer(self.tokenizer)
-        self.gconfig = gconfig.new_with_stop_and_pad_token_ids(self.tokenizer)
+        self.gconfig = gconfig.new_with_stop_token_ids(
+            tokenizer_stop_token_ids(self.tokenizer)
+        )
         self.enable_thinking = enable_thinking
 
         # Lazily created from engine server addresses via build_scaffolding_llm

@@ -11,6 +11,7 @@ from areal import PPOTrainer, workflow_context
 from areal.api import InferenceEngine, ModelRequest, RolloutWorkflow
 from areal.api.cli_args import GenerationHyperparameters, GRPOConfig, load_expr_config
 from areal.utils import logging, stats_tracker
+from areal.utils.hf_utils import tokenizer_stop_token_ids
 
 worker_id = uuid.uuid4().hex[:4]
 
@@ -27,7 +28,9 @@ class CountDownWorkflow(RolloutWorkflow):
             from areal.utils.hf_utils import load_hf_tokenizer
 
             tokenizer = load_hf_tokenizer(tokenizer)
-        self.gconfig = gconfig.new_with_stop_and_pad_token_ids(tokenizer)
+        self.gconfig = gconfig.new_with_stop_token_ids(
+            tokenizer_stop_token_ids(tokenizer)
+        )
         self.tokenizer = tokenizer
 
     async def arun_episode(self, engine: InferenceEngine, data):

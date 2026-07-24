@@ -22,7 +22,7 @@ from areal.api.cli_args import (
     field,
 )
 from areal.utils import logging, stats_tracker
-from areal.utils.hf_utils import apply_chat_template
+from areal.utils.hf_utils import apply_chat_template, tokenizer_stop_token_ids
 
 from prompts import ANSWER, SYSTEM_PROMPT, TORL_PROMPT  # isort: skip
 from tool_manager import ToolCallStatus, ToolManager  # isort: skip
@@ -65,7 +65,9 @@ class TIRWorkflow(RolloutWorkflow):
 
             reward_fn = import_from_string(reward_fn)
         self.reward_fn = reward_fn
-        self.gconfig = gconfig.new_with_stop_and_pad_token_ids(tokenizer)
+        self.gconfig = gconfig.new_with_stop_token_ids(
+            tokenizer_stop_token_ids(tokenizer)
+        )
         self.tokenizer = tokenizer
         self.tool_timeout = tir_config.tool_timeout
         self.enable_tools = tir_config.enable_tools

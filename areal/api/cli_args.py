@@ -27,6 +27,7 @@ from areal.utils.constants import (
     PROX_LOGP_METHOD_RECOMPUTE,
     PROX_LOGP_METHODS_ALL,
 )
+from areal.utils.hf_utils import tokenizer_stop_token_ids
 from areal.utils.seqpack import PACKING_ALGORITHMS
 
 if TYPE_CHECKING:
@@ -239,14 +240,17 @@ class GenerationHyperparameters:
         args.update(kwargs)
         return GenerationHyperparameters(**args)
 
-    def new_with_stop_and_pad_token_ids(self, tokenizer: "PreTrainedTokenizerFast"):
-        """Create a new generation hyperparameters with stop and pad token ids added."""
+    def new_with_stop_token_ids(self, stop_token_ids: list[int]):
+        """Return a copy with additional stop token ids."""
         new_stop_token_ids = self.stop_token_ids.copy()
-        if tokenizer.pad_token_id not in new_stop_token_ids:
-            new_stop_token_ids.append(tokenizer.pad_token_id)
-        if tokenizer.eos_token_id not in new_stop_token_ids:
-            new_stop_token_ids.append(tokenizer.eos_token_id)
+        for token_id in stop_token_ids:
+            if token_id not in new_stop_token_ids:
+                new_stop_token_ids.append(token_id)
         return self.new(stop_token_ids=new_stop_token_ids)
+
+    def new_with_stop_and_pad_token_ids(self, tokenizer: "PreTrainedTokenizerFast"):
+        """Return a copy with tokenizer stop token ids added."""
+        return self.new_with_stop_token_ids(tokenizer_stop_token_ids(tokenizer))
 
     def to_openai_completions_args_dict(
         self, exclude_args: list[str] | None = None

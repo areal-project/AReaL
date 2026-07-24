@@ -57,7 +57,10 @@ from areal.experimental.openai.cache import InteractionCache
 from areal.experimental.openai.tool_call_parser import process_tool_calls
 from areal.experimental.openai.types import InteractionWithTokenLogpReward
 from areal.utils import logging
-from areal.utils.hf_utils import apply_chat_template
+from areal.utils.hf_utils import (
+    apply_chat_template,
+    tokenizer_stop_token_ids,
+)
 
 if TYPE_CHECKING:
     from transformers.tokenization_utils_fast import PreTrainedTokenizerFast
@@ -783,10 +786,7 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
             greedy=temp == 0,
             frequency_penalty=frequency_penalty,
             lora_name=self.lora_name,
-            stop_token_ids=list(
-                set([self.tokenizer.eos_token_id, self.tokenizer.pad_token_id])
-            ),
-        )
+        ).new_with_stop_token_ids(tokenizer_stop_token_ids(self.tokenizer))
 
         model_request = ModelRequest(
             input_ids=prompt_token_ids,
@@ -1182,10 +1182,7 @@ class AsyncResponsesWithReward(BaseAsyncResponses):
             greedy=temp == 0,
             frequency_penalty=frequency_penalty,
             lora_name=self.lora_name,
-            stop_token_ids=list(
-                set([self.tokenizer.eos_token_id, self.tokenizer.pad_token_id])
-            ),
-        )
+        ).new_with_stop_token_ids(tokenizer_stop_token_ids(self.tokenizer))
 
         model_request = ModelRequest(
             input_ids=prompt_token_ids,
