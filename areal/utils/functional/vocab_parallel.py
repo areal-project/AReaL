@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import functools
+import math
+import os
 from collections.abc import Callable
 from typing import TypeVar
 
@@ -59,6 +61,25 @@ def _chunked_apply(
         num_outputs = len(results[0])
         return tuple(torch.cat([r[i] for r in results]) for i in range(num_outputs))
     return torch.cat(results)
+
+
+def _resolve_chunk_size(chunk_size: int) -> int:
+    env_chunk_size = os.getenv("AREAL_LOGPROBS_CHUNK_SIZE")
+    if env_chunk_size is None:
+        return chunk_size
+    try:
+        resolved = int(env_chunk_size)
+    except ValueError as e:
+        raise ValueError(
+            "AREAL_LOGPROBS_CHUNK_SIZE must be a positive integer, "
+            f"got {env_chunk_size!r}"
+        ) from e
+    if resolved <= 0:
+        raise ValueError(
+            "AREAL_LOGPROBS_CHUNK_SIZE must be a positive integer, "
+            f"got {env_chunk_size!r}"
+        )
+    return resolved
 
 
 def _chunked_gather_logprobs(
@@ -292,11 +313,12 @@ class _VocabParallelLogProbsEntropy(torch.autograd.Function):
         predicted_logits[labels_mask] = 0.0
         dist.all_reduce(predicted_logits, op=dist.ReduceOp.SUM, group=tp_group)
 
-        # Step 5: For entropy - compute sum(softmax * logits)
-        # Note: vocab_parallel_logits is the original (un-normalized) logits
-        sum_softmax_times_logits = (softmax * vocab_parallel_logits).sum(
-            dim=-1, keepdim=True
-        )
+        # Step 5: For entropy - compute sum(softmax * logits).
+        # vecdot performs the multiply-reduce without materializing another
+        # [*, vocab/tp] tensor, which matters when profiling near memory limits.
+        sum_softmax_times_logits = torch.linalg.vecdot(
+            softmax, vocab_parallel_logits, dim=-1
+        ).unsqueeze(-1)
         dist.all_reduce(sum_softmax_times_logits, op=dist.ReduceOp.SUM, group=tp_group)
 
         # Step 6: Compute final results
@@ -360,8 +382,8 @@ class _VocabParallelLogProbsEntropy(torch.autograd.Function):
         # Step 2: Add logprobs gradient contribution
         # grad_logprobs_contrib = grad_logprobs * (one_hot(labels) - softmax)
         #                      = -grad_logprobs * softmax + grad_logprobs * one_hot
-        # Add -softmax * grad_logprobs term
-        grad_input.sub_(softmax * grad_logprobs.unsqueeze(-1))
+        # Add -softmax * grad_logprobs term without materializing the product.
+        grad_input.addcmul_(softmax, grad_logprobs.unsqueeze(-1), value=-1)
 
         # Add one_hot * grad_logprobs at labels positions (only for labels in this partition)
         grad_2d = grad_input.view(-1, partition_vocab_size)
@@ -370,6 +392,153 @@ class _VocabParallelLogProbsEntropy(torch.autograd.Function):
         grad_2d[arange_1d, masked_labels_1d] += update_mask * grad_logprobs.view(-1)
 
         return grad_input, None, None
+
+
+def _all_reduce_if_needed(
+    tensor: torch.Tensor,
+    op: dist.ReduceOp.RedOpType,
+    tp_group: dist.ProcessGroup | None,
+) -> None:
+    if tp_group is not None and dist.get_world_size(tp_group) > 1:
+        dist.all_reduce(tensor, op=op, group=tp_group)
+
+
+class _InplaceVocabParallelLogProbsEntropy(torch.autograd.Function):
+    """Megatron-compatible destructive logprob and entropy computation.
+
+    The input must be a contiguous CUDA FP32 tensor dedicated to loss computation.
+    Forward overwrites logits with softmax probabilities, and backward overwrites the
+    same storage with dlogits. Chunking happens inside this autograd node so it cannot
+    create full-size SliceBackward buffers.
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        vocab_parallel_logits: torch.Tensor,
+        labels: torch.Tensor,
+        tp_group: dist.ProcessGroup | None,
+        temperature: float,
+        chunk_size: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        from areal.utils.functional.vocab_parallel_kernels import (
+            fused_exp_sum_inplace,
+            fused_normalize_inplace,
+            vocab_tile_count,
+        )
+
+        if not math.isfinite(temperature) or temperature <= 0:
+            raise ValueError(f"temperature must be positive, got {temperature}")
+
+        partition_vocab_size = vocab_parallel_logits.size(-1)
+        logits_2d = vocab_parallel_logits.view(-1, partition_vocab_size)
+        labels_1d = labels.reshape(-1)
+        if logits_2d.size(0) != labels_1d.numel():
+            raise ValueError(
+                "logits leading dimensions must match labels: "
+                f"got {tuple(vocab_parallel_logits.shape)} and {tuple(labels.shape)}"
+            )
+
+        tp_rank = dist.get_rank(tp_group) if tp_group is not None else 0
+        vocab_start_index = tp_rank * partition_vocab_size
+        local_targets = labels_1d - vocab_start_index
+        target_mask = (local_targets < 0) | (local_targets >= partition_vocab_size)
+        local_targets.masked_fill_(target_mask, -1)
+
+        num_tokens = logits_2d.size(0)
+        logprobs = torch.empty(num_tokens, dtype=torch.float32, device=logits_2d.device)
+        entropy = torch.empty_like(logprobs)
+        workspace_rows = min(chunk_size, num_tokens)
+        partial_reduction = torch.empty(
+            (2, workspace_rows, vocab_tile_count(partition_vocab_size)),
+            dtype=torch.float32,
+            device=logits_2d.device,
+        )
+        reduced_values = torch.empty(
+            (3, workspace_rows), dtype=torch.float32, device=logits_2d.device
+        )
+        inv_temperature = 1.0 / temperature
+
+        for start in range(0, num_tokens, chunk_size):
+            end = min(start + chunk_size, num_tokens)
+            rows = end - start
+            chunk_logits = logits_2d[start:end]
+            chunk_targets = local_targets[start:end]
+
+            logits_max = chunk_logits.max(dim=-1).values
+            _all_reduce_if_needed(logits_max, dist.ReduceOp.MAX, tp_group)
+
+            row_indices = torch.arange(rows, device=logits_2d.device)
+            predicted_logits = chunk_logits[
+                row_indices, chunk_targets.clamp_min(0)
+            ].masked_fill_(chunk_targets < 0, 0.0)
+            predicted_logits.sub_(logits_max).mul_(inv_temperature)
+            predicted_logits.masked_fill_(chunk_targets < 0, 0.0)
+
+            partial_sums = partial_reduction[0, :rows]
+            partial_weighted_sums = partial_reduction[1, :rows]
+            fused_exp_sum_inplace(
+                chunk_logits,
+                logits_max,
+                partial_sums,
+                partial_weighted_sums,
+                inv_temperature,
+            )
+            reduced = reduced_values[:, :rows]
+            reduced[0].copy_(predicted_logits)
+            reduced[1].copy_(partial_sums.sum(dim=-1))
+            reduced[2].copy_(partial_weighted_sums.sum(dim=-1))
+            if rows < workspace_rows:
+                reduced_values[:, rows:].zero_()
+            _all_reduce_if_needed(reduced_values, dist.ReduceOp.SUM, tp_group)
+
+            sum_exp = reduced[1]
+            log_sum_exp = sum_exp.log()
+            logprobs[start:end] = reduced[0] - log_sum_exp
+            entropy[start:end] = log_sum_exp - reduced[2] / sum_exp
+            fused_normalize_inplace(chunk_logits, sum_exp)
+
+        logprobs_output = logprobs.view_as(labels)
+        entropy_output = entropy.view_as(labels)
+        ctx.set_materialize_grads(False)
+        ctx.mark_non_differentiable(entropy_output)
+        torch.autograd.graph.increment_version(vocab_parallel_logits)
+        ctx.save_for_backward(vocab_parallel_logits, local_targets)
+        ctx.temperature = temperature
+        ctx.chunk_size = chunk_size
+        return logprobs_output, entropy_output
+
+    @staticmethod
+    def backward(
+        ctx,
+        grad_logprobs: torch.Tensor | None,
+        grad_entropy: torch.Tensor | None,
+    ) -> tuple:
+        from areal.utils.functional.vocab_parallel_kernels import (
+            fused_softmax_backward_inplace,
+        )
+
+        del grad_entropy
+        softmax, local_targets = ctx.saved_tensors
+        partition_vocab_size = softmax.size(-1)
+        softmax_2d = softmax.view(-1, partition_vocab_size)
+        grad_logprobs_1d = (
+            grad_logprobs.reshape(-1).contiguous()
+            if grad_logprobs is not None
+            else None
+        )
+        num_tokens = softmax_2d.size(0)
+        for start in range(0, num_tokens, ctx.chunk_size):
+            end = min(start + ctx.chunk_size, num_tokens)
+            fused_softmax_backward_inplace(
+                softmax_2d[start:end],
+                local_targets[start:end],
+                grad_logprobs_1d[start:end] if grad_logprobs_1d is not None else None,
+                1.0 / ctx.temperature,
+            )
+
+        torch.autograd.graph.increment_version(softmax)
+        return softmax, None, None, None, None
 
 
 def _vocab_parallel_logprobs(
@@ -398,6 +567,20 @@ def _vocab_parallel_logprobs_entropy(
     return _VocabParallelLogProbsEntropy.apply(logits, labels, tp_group)
 
 
+def _inplace_vocab_parallel_logprobs_entropy(
+    vocab_parallel_logits: torch.Tensor,
+    labels: torch.Tensor,
+    tp_group: dist.ProcessGroup | None,
+    temperature: float = 1.0,
+    chunk_size: int = 1024,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Destructively reuse CUDA FP32 logits as softmax and dlogits storage."""
+    logprobs, entropy = _InplaceVocabParallelLogProbsEntropy.apply(
+        vocab_parallel_logits, labels, tp_group, temperature, chunk_size
+    )
+    return logprobs, entropy
+
+
 def gather_logprobs(
     logits: torch.Tensor,
     labels: torch.Tensor,
@@ -420,6 +603,7 @@ def gather_logprobs(
     Returns:
         Log probabilities at the label positions with shape [...].
     """
+    chunk_size = _resolve_chunk_size(chunk_size)
     if tp_group is not None and dist.get_world_size(tp_group) > 1:
         fn = functools.partial(
             _vocab_parallel_logprobs,
@@ -437,6 +621,7 @@ def gather_logprobs_entropy(
     temperature: float = 1.0,
     tp_group: dist.ProcessGroup | None = None,
     chunk_size: int = 1024,
+    reuse_logits: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute log probabilities and entropy with optional vocab parallelism for FSDP.
 
@@ -452,12 +637,31 @@ def gather_logprobs_entropy(
             to avoid gathering the full vocab dimension across TP ranks.
         chunk_size: Chunk size for memory-efficient processing along the sequence
             dimension. Default is 1024.
+        reuse_logits: Destructively reuse contiguous CUDA FP32 logits as the softmax
+            and dlogits buffer. Intended for Megatron training after all other logits
+            consumers have run. Entropy is non-differentiable on this path. Other
+            devices and dtypes fall back to the regular path.
 
     Returns:
         A tuple of (logprobs, entropy):
             - logprobs: Log probabilities at the label positions with shape [...].
             - entropy: Entropy of the probability distribution with shape [...].
     """
+    chunk_size = _resolve_chunk_size(chunk_size)
+    if reuse_logits:
+        from areal.utils.functional.vocab_parallel_kernels import (
+            reusable_vocab_parallel_logits,
+        )
+
+        workspace = reusable_vocab_parallel_logits(logits)
+        if workspace is not None:
+            return _inplace_vocab_parallel_logprobs_entropy(
+                workspace,
+                labels,
+                tp_group=tp_group,
+                temperature=temperature,
+                chunk_size=chunk_size,
+            )
     if tp_group is not None and dist.get_world_size(tp_group) > 1:
         fn = functools.partial(
             _vocab_parallel_logprobs_entropy,

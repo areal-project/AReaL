@@ -947,11 +947,29 @@ class MegatronEngineConfig:
     )
 
     # Precision & Loss
+    use_areal_lm_head: bool = field(
+        default=True,
+        metadata={
+            "help": "Use AReaL's vocab-parallel LM Head operator. Disable to "
+            "fall back to Megatron's native output layer."
+        },
+    )
+    lm_head_loss_chunk_size: int = field(
+        default=0,
+        metadata={
+            "help": "Sequence chunk size for AReaL's chunked LM Head loss. "
+            "A positive value computes LM Head logits and their backward one chunk "
+            "at a time; 0 keeps the default full-logits fused path. The chunked "
+            "path currently supports packed text actor models without MTP."
+        },
+    )
     enable_fp32_lm_head: bool = field(
         default=False,
         metadata={
-            "help": "Cast lm_head output to FP32 before loss computation for "
-            "numerical stability."
+            "help": "Deprecated. This option is ignored when use_areal_lm_head=True; "
+            "AReaL's fused LM Head always produces FP32 logits. When "
+            "use_areal_lm_head=False, preserve the legacy behavior of forwarding "
+            "the option to supported mbridge model configurations."
         },
     )
     cross_entropy_loss_fusion: bool = field(
@@ -1007,6 +1025,17 @@ class MegatronEngineConfig:
             "(bridge_type=megatron-bridge only). Default False drops it.",
         },
     )
+
+    def __post_init__(self) -> None:
+        if self.lm_head_loss_chunk_size < 0:
+            raise ValueError(
+                "lm_head_loss_chunk_size must be non-negative, got "
+                f"{self.lm_head_loss_chunk_size}"
+            )
+        if self.lm_head_loss_chunk_size > 0 and not self.use_areal_lm_head:
+            raise ValueError("lm_head_loss_chunk_size requires use_areal_lm_head=True")
+        if self.lm_head_loss_chunk_size > 0 and self.enable_mtp:
+            raise ValueError("lm_head_loss_chunk_size does not support enable_mtp=True")
 
 
 class SchedulingStrategyType(str, Enum):

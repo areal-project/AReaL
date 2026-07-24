@@ -1,0 +1,143 @@
+experiment_name: qwen3-30b-a3b-sft-profile
+trial_name: fake128k-profile
+
+seed: 1
+enable_offload: false
+total_train_epochs: 1
+total_train_steps: 2
+tokenizer_path: ${actor.path}
+allocation_mode: "megatron:(attn:d1p2t2c2|ffn:d1p2e4)"
+
+cluster:
+  n_nodes: 1
+  n_gpus_per_node: 8
+  fileroot: /tmp/areal/experiments
+  name_resolve:
+    type: nfs
+    nfs_record_root: /tmp/areal/name_resolve/qwen3_30b_a3b_sft_profile
+
+scheduler:
+  type: local
+
+actor:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  backend: "megatron:(attn:d1p2t2c2|ffn:d1p2e4)"
+  path: Qwen/Qwen3-30B-A3B
+  init_from_scratch: false
+  disable_dropout: true
+  gradient_checkpointing: true
+  dtype: bfloat16
+  grad_reduce_dtype: float32
+  mb_spec:
+    n_mbs: 4
+    granularity: 1
+    max_tokens_per_mb: 131072
+    n_mbs_divisor: 4
+  optimizer:
+    type: adam
+    lr: 3.0e-6
+    weight_decay: 0.01
+    beta1: 0.9
+    beta2: 0.999
+    eps: 1.0e-8
+    lr_scheduler_type: constant
+    gradient_clipping: 1.0
+    warmup_steps_proportion: 0.001
+  megatron:
+    wrap_with_ddp: true
+    bridge_type: megatron-bridge
+    use_precision_aware_optimizer: true
+    main_grads_dtype: bfloat16
+    main_params_dtype: float32
+    exp_avg_dtype: float32
+    exp_avg_sq_dtype: float32
+    ddp:
+      grad_reduce_in_fp32: false
+      overlap_grad_reduce: true
+      overlap_param_gather: false
+      use_distributed_optimizer: true
+    use_deterministic_algorithms: true
+    lm_head_loss_chunk_size: 0
+    enable_fp32_lm_head: true
+    cross_entropy_loss_fusion: false
+    recompute_granularity: full
+    recompute_method: uniform
+    recompute_num_layers: 1
+    moe_router_dtype: fp32
+    moe_token_dispatcher_type: alltoall
+    moe_router_bias_update_rate: 0.0
+  scheduling_spec:
+    - task_type: worker
+      port_count: 2
+      gpu: 1
+      cpu: 4
+      mem: 64
+      cmd: python3 -m areal.infra.rpc.rpc_server
+      env_vars:
+        NCCL_DEBUG: "WARN"
+        NCCL_ASYNC_ERROR_HANDLING: "1"
+        PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+
+profile:
+  fake_seq_len: 131072
+  fake_dataset_size: 8
+  fake_loss_start_ratio: 0.5
+
+train_dataset:
+  batch_size: 4
+  shuffle: false
+  pin_memory: true
+  num_workers: 0
+  drop_last: true
+  path: fake://profile/qwen3-30b-a3b-128k
+  type: sft
+  max_length: 131072
+
+valid_dataset: null
+
+saver:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: null
+  freq_steps: null
+  freq_secs: null
+
+recover:
+  mode: disabled
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: null
+  freq_steps: null
+  freq_secs: null
+  no_save_optim: true
+  no_load_optim: true
+
+evaluator:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: null
+  freq_steps: null
+  freq_secs: null
+
+stats_logger:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  wandb:
+    mode: disabled
+
+perf_tracer:
+  enabled: false
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  save_interval: 1
+  profile_steps: null
+
+memory_profiler:
+  profile_steps: []
+  max_entries: 100000
