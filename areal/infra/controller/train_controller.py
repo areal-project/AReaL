@@ -123,32 +123,63 @@ def _dispatch_tensors(
 
 
 def _pad_eval_batch(
-    args: tuple[Any, ...], dp_size: int, group_size: int = 1
-) -> tuple[Any, ...]:
-    """Pad the first tensor-like arg to a multiple of ``dp_size * group_size``.
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    dp_size: int,
+    group_size: int = 1,
+) -> tuple[tuple[Any, ...], dict[str, Any], int | None]:
+    """Pad all top-level tensor-like inputs to a multiple of ``dp_size * group_size``.
 
-    Called before dispatch for explicit evaluation controller paths so that
-    ``balanced_greedy_partition`` always receives a divisible input.
-    Dummy items have zero attention/loss masks and contribute nothing
-    to metrics or loss.
+    Called before explicit evaluation dispatch so that tensor partitions stay
+    aligned across every top-level tensor-like argument/keyword argument.
+    Dummy items have zero attention/loss masks and contribute nothing to
+    metrics or loss.
     """
-    result = list(args)
-    pad_target = dp_size * group_size
-    for i, arg in enumerate(result):
+    result_args = list(args)
+    result_kwargs = dict(kwargs)
+    tensor_inputs: list[tuple[str, Any, list[Any]]] = []
+
+    for i, arg in enumerate(result_args):
         if isinstance(arg, list) and arg and _is_tensor_like(arg):
-            n = len(arg)
-            pad_count = (-n) % pad_target
-            if pad_count > 0:
-                padded = list(arg)
-                template = arg[0]
-                padded.extend(make_dummy_eval_item(template) for _ in range(pad_count))
-                result[i] = padded
-                logger.info(
-                    f"Eval dispatch: padded {pad_count} dummy items "
-                    f"(total {len(padded)}) for dp_size={dp_size}"
-                )
-            break  # only pad the first tensor-like arg
-    return tuple(result)
+            tensor_inputs.append(("arg", i, arg))
+    for key, value in result_kwargs.items():
+        if isinstance(value, list) and value and _is_tensor_like(value):
+            tensor_inputs.append(("kwarg", key, value))
+
+    if not tensor_inputs:
+        return tuple(result_args), result_kwargs, None
+
+    lengths = {len(items) for _, _, items in tensor_inputs}
+    if len(lengths) != 1:
+        raise ValueError(
+            "All tensor-like eval dispatch inputs must have the same length, "
+            f"got lengths {sorted(lengths)}."
+        )
+    orig_len = lengths.pop()
+    pad_target = dp_size * group_size
+    pad_count = (-orig_len) % pad_target
+    if pad_count == 0:
+        return tuple(result_args), result_kwargs, orig_len
+
+    for location, key, items in tensor_inputs:
+        padded = list(items)
+        template = items[0]
+        padded.extend(make_dummy_eval_item(template) for _ in range(pad_count))
+        if location == "arg":
+            result_args[key] = padded
+        else:
+            result_kwargs[key] = padded
+
+    logger.info(
+        "Eval dispatch: padded %s dummy items for %s tensor-like inputs "
+        "(total %s) for dp_size=%s group_size=%s",
+        pad_count,
+        len(tensor_inputs),
+        orig_len + pad_count,
+        dp_size,
+        group_size,
+    )
+    return tuple(result_args), result_kwargs, orig_len
 
 
 def _merge_tensors(
@@ -476,11 +507,16 @@ class TrainController:
         **kwargs,
     ):
         """Dispatch method call to workers via the appropriate path."""
+        group_size = kwargs.get("group_size", 1)
+        args, kwargs, orig_len = self._pad_eval_dispatch_args(
+            args, kwargs, group_size=group_size
+        )
         dp_args, dp_kwargs, group_indices = self._prepare_dispatch(*args, **kwargs)
         results = run_async_task(
             self._call_workers, method, dp_args, dp_kwargs, rpc_meta=rpc_meta
         )
-        return self._collect_results(results, group_indices)
+        merged_results = self._collect_results(results, group_indices)
+        return self._trim_padded_eval_results(merged_results, orig_len)
 
     async def _async_custom_function_call(
         self,
@@ -490,11 +526,16 @@ class TrainController:
         **kwargs,
     ):
         """Async version of _custom_function_call."""
+        group_size = kwargs.get("group_size", 1)
+        args, kwargs, orig_len = self._pad_eval_dispatch_args(
+            args, kwargs, group_size=group_size
+        )
         dp_args, dp_kwargs, group_indices = self._prepare_dispatch(*args, **kwargs)
         results = await self._call_workers(
             method, dp_args, dp_kwargs, rpc_meta=rpc_meta
         )
-        return self._collect_results(results, group_indices)
+        merged_results = self._collect_results(results, group_indices)
+        return self._trim_padded_eval_results(merged_results, orig_len)
 
     def _pad_eval_dispatch_args(
         self,
@@ -502,13 +543,20 @@ class TrainController:
         kwargs: dict[str, Any],
         *,
         group_size: int,
-    ) -> tuple[tuple[Any, ...], dict[str, Any]]:
+    ) -> tuple[tuple[Any, ...], dict[str, Any], int | None]:
         """Pad eval batches for explicit algorithm-level evaluation dispatch."""
-        kwargs = dict(kwargs)
-        args = _pad_eval_batch(
-            args, self.parallel_strategy.dp_size, group_size=group_size
+        return _pad_eval_batch(
+            args,
+            kwargs,
+            self.parallel_strategy.dp_size,
+            group_size=group_size,
         )
-        return args, kwargs
+
+    def _trim_padded_eval_results(self, results: Any, orig_len: int | None) -> Any:
+        """Drop dummy eval outputs that were added only for even DP partitioning."""
+        if orig_len is None or not isinstance(results, list) or len(results) <= orig_len:
+            return results
+        return results[:orig_len]
 
     def _prepare_dispatch(
         self, *args, **kwargs
