@@ -29,7 +29,7 @@ class RolloutWorkflow(ABC):
     async def arun_episode(
         self, engine: InferenceEngine, data: dict[str, Any]
     ) -> dict[str, Any] | None | dict[str, InteractionWithTokenLogpReward]:
-        """运行单个工作流 episode。"""
+        """使用该工作流运行一个 rollout 任务。"""
         ...
 ```
 
@@ -205,7 +205,7 @@ rollout:
 
 ### 实现
 
-来自 `areal/infra/remote_inf_engine.py`：
+来自 `areal/workflow/wrappers.py`：
 
 ```python
 class GroupedRolloutWorkflow(RolloutWorkflow):

@@ -12,9 +12,8 @@ import uuid
 from collections.abc import Callable
 from concurrent.futures import Future
 from datetime import datetime
-from logging import Logger
 from threading import Lock
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import Any, Protocol
 
 import aiohttp
 import numpy as np
@@ -47,7 +46,6 @@ from areal.infra.utils.http import arequest_with_retry, get_default_connector
 from areal.infra.utils.launcher import wait_llm_server_addrs
 from areal.infra.utils.proc import kill_process_tree
 from areal.utils import logging, name_resolve, names
-from areal.utils.data import concat_padded_tensors
 from areal.utils.dynamic_import import import_from_string
 from areal.utils.network import (
     find_free_ports,
@@ -56,70 +54,13 @@ from areal.utils.network import (
     split_hostport,
 )
 from areal.utils.perf_tracer import trace_perf
+from areal.workflow.wrappers import GroupedRolloutWorkflow
 
 from .workflow_executor import WorkflowExecutor
-
-if TYPE_CHECKING:
-    from areal.experimental.openai import InteractionWithTokenLogpReward
 
 RID_CACHE_SIZE = 128
 
 logger = logging.getLogger("RemoteInfEngine")
-
-
-class GroupedRolloutWorkflow(RolloutWorkflow):
-    def __init__(
-        self,
-        workflow: RolloutWorkflow,
-        group_size: int,
-        logger: Logger,
-    ):
-        if group_size < 1:
-            raise ValueError(f"group_size must be >= 1, got {group_size}")
-        self.workflow = workflow
-        self.group_size = group_size
-        self.logger = logger
-
-    async def arun_episode(
-        self, engine: InferenceEngine, data: dict[str, Any]
-    ) -> dict[str, Any] | None:
-        from areal.experimental.openai import InteractionWithTokenLogpReward
-
-        results = await asyncio.gather(
-            *[self.workflow.arun_episode(engine, data) for _ in range(self.group_size)]
-        )
-
-        valid_results = [r for r in results if r is not None]
-
-        # All results None -> return None
-        if not valid_results:
-            return None
-
-        # Some results None -> warn and continue with valid ones
-        if len(valid_results) < len(results):
-            self.logger.warning(
-                f"GroupedRolloutWorkflow: {len(results) - len(valid_results)}/{len(results)} "
-                "trajectories returned None, using remaining results"
-            )
-
-        # Check if results are InteractionWithTokenLogpReward dicts
-        first = valid_results[0]
-        if (
-            isinstance(first, dict)
-            and first
-            and all(
-                isinstance(v, InteractionWithTokenLogpReward) for v in first.values()
-            )
-        ):
-            # Merge dicts - each result is {completion_id: InteractionWithTokenLogpReward}
-            merged: dict[str, InteractionWithTokenLogpReward] = {}
-            for result in valid_results:
-                merged.update(result)
-            return merged if merged else None
-
-        # Otherwise, tensor dicts - concatenate
-        concatenated = concat_padded_tensors(valid_results)
-        return concatenated if concatenated else None
 
 
 class RemoteInfBackendProtocol(Protocol):
