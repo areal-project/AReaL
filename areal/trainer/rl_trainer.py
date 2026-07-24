@@ -384,6 +384,14 @@ class PPOTrainer:
                     }
                 )
 
+            # Propagate SGLang FP8 config to weight update meta
+            if hasattr(config, "sglang") and config.sglang.quantization:
+                xccl_kwargs["quantization"] = config.sglang.quantization
+                if config.sglang.quantization == "fp8":
+                    xccl_kwargs["quantization_config"] = {
+                        "weight_block_size": [128, 128],
+                    }
+
             if self.actor_alloc.backend == "megatron":
                 self.weight_update_meta = WeightUpdateMeta.from_megatron_xccl(
                     **xccl_kwargs

@@ -1891,6 +1891,12 @@ class MegatronEngine(TrainEngine):
 
     @trace_perf("megatron_engine.update_weights_from_distributed", category="comm")
     def _update_weights_from_distributed(self, meta: WeightUpdateMeta) -> None:
+        if meta.quantization == "fp8":
+            raise NotImplementedError(
+                "FP8 weight update is not yet supported for Megatron engine. "
+                "Use FSDP engine instead."
+            )
+
         # Reset weight weight meta with local info
         meta.nccl_master_address = self.weight_update_master_addr
         meta.nccl_master_port = self.weight_update_master_port

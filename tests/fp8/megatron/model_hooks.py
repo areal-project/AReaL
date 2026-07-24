@@ -9,7 +9,7 @@ from typing import Any
 import torch
 from megatron.core import parallel_state as mpu
 
-from tests.fp8.engine_utils import (
+from tests.fp8.megatron.engine_utils import (
     extract_gemm_kernels,
     print_gemm_profile,
 )

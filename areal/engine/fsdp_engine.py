@@ -128,6 +128,7 @@ from areal.utils.data import (
 )
 from areal.utils.functional import gather_logprobs, gather_logprobs_entropy
 from areal.utils.hf_utils import load_hf_processor_and_tokenizer, load_hf_tokenizer
+from areal.utils.kernel.fp8_kernel import scaled_fp8_blockwise, should_quantize_param
 from areal.utils.network import find_free_ports, format_host_for_url, gethostip
 from areal.utils.offload import is_tms_enabled, torch_memory_saver
 from areal.utils.perf_tracer import trace_perf, trace_scope
@@ -1597,30 +1598,46 @@ class FSDPEngine(TrainEngine):
         named_tensors: list[tuple[str, torch.Tensor]] = []
         pending_bucket: _PendingWeightUpdateBucket | None = None
 
-        if self.config.use_lora:
-            # For LoRA, only iterate over trainable LoRA parameters
-            param_iterator = (
-                (name, param)
-                for name, param in self._get_model_name_parameters(meta)
-                if param.requires_grad
-            )
-        else:
-            # For full model, iterate over all parameters
-            param_iterator = self._get_model_name_parameters(meta)
+        def _materialize_and_maybe_quantize():
+            """Materialize tensors from FSDP parameters and optionally quantize to FP8.
 
-        try:
-            for name, param in param_iterator:
-                # Ranks other than 0 only help to get the full tensor
-                # (DTensor.full_tensor() is a collective; all ranks must
-                # call _get_full_tensor). Only rank 0 broadcasts to the
-                # rollout engine, so casting is main-rank-only by design.
-                tensor = self._get_full_tensor(param)
+            All ranks must call _get_full_tensor() because DTensor.full_tensor()
+            is a collective operation. Only rank 0 yields tensors for broadcast.
+            """
+            _param_iterator = (
+                (
+                    (name, param)
+                    for name, param in self._get_model_name_parameters(meta)
+                    if param.requires_grad
+                )
+                if self.config.use_lora
+                else self._get_model_name_parameters(meta)
+            )
+
+            q_config = (
+                meta.quantization_config or {} if meta.quantization == "fp8" else {}
+            )
+            block_size = q_config.get("weight_block_size", [128, 128])
+
+            for _name, _param in _param_iterator:
+                _tensor = self._get_full_tensor(_param)
                 if not main_rank:
                     continue
-                # Cast fp32 master storage to compute dtype before broadcast.
-                # Rollout engines (SGLang/vLLM) expect compute dtype (bf16).
-                tensor = self._cast_to_compute_dtype(tensor)
+                _tensor = self._cast_to_compute_dtype(_tensor)
 
+                if (
+                    meta.quantization == "fp8"
+                    and _tensor.dim() == 2
+                    and should_quantize_param(_name)
+                ):
+                    fp8_weight, scale = scaled_fp8_blockwise(_tensor, block_size)
+                    yield (_name, fp8_weight)
+                    yield (_name.replace(".weight", ".weight_scale_inv"), scale)
+                else:
+                    yield (_name, _tensor)
+
+        try:
+            for name, tensor in _materialize_and_maybe_quantize():
                 tensor_size = tensor.numel() * tensor.element_size()
                 bucket_overflow = (
                     buffer_size > 0
