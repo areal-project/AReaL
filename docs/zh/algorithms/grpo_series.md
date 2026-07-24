@@ -82,10 +82,13 @@ python3 examples/math/gsm8k_rl.py \
 | `mean_leave1out` | bool        | `true`、`false`              | 使用留一法平均值（排除当前样本）   |
 | `std_unbiased`   | bool        | `true`、`false`              | 使用无偏标准差计算（默认：`true`） |
 | `eps`            | float       | -                            | 避免除零的小常数（默认：`1e-5`）   |
-| `group_size`     | int         | -                            | 分组级归一化的组大小               |
+| `group_size`     | int         | -                            | 分组级归一化的 prompt 组大小       |
 
-"Batch"级在整个全局批次上计算均值/标准差，而"group"级在组内计算（例如，共享相同提示的轨迹）。对于分组级归一化，必须指定 `group_size`。将
-`mean_level` 或 `std_level` 设为 `None` 分别跳过均值减法或标准差缩放。
+"Batch"级在整个全局批次上计算均值/标准差，而"group"级在组内计算（例如，共享相同提示的轨迹）。在 PPO/GRPO actor 的奖励/优势归一化中，`group_size`
+会从 `gconfig.n_samples` 派生，因为它就是同一 prompt 的采样响应数。YAML 示例保留
+`group_size: ${gconfig.n_samples}` 作为显式参考；如果手写的字面值与
+`gconfig.n_samples` 不一致，运行时会发出警告并覆盖该值。将 `mean_level` 或
+`std_level` 设为 `None` 分别跳过均值减法或标准差缩放。
 
 如果整个字段被省略（例如YAML中的 `adv_norm: null`），则不执行归一化。
 
