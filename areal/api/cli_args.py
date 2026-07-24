@@ -23,6 +23,7 @@ from areal.engine.fsdp_utils.attn_impl import (
     is_valid_attn_impl,
 )
 from areal.utils import logging, name_resolve, pkg_version
+from areal.utils.config_utils import redact_sensitive_config
 from areal.utils.constants import (
     PROX_LOGP_METHOD_RECOMPUTE,
     PROX_LOGP_METHODS_ALL,
@@ -3290,7 +3291,7 @@ def save_config(cfg, log_dir):
     os.makedirs(log_dir, exist_ok=True)
     config_save_path = os.path.join(log_dir, "config.yaml")
     with open(config_save_path, "w") as f:
-        config_dict: dict = asdict(cfg)
+        config_dict: dict = redact_sensitive_config(asdict(cfg))
         yaml.dump(
             config_dict,
             f,

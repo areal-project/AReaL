@@ -7,17 +7,22 @@ from dataclasses import asdict
 
 import swanlab
 import torch.distributed as dist
-import trackio
 import wandb
 from tensorboardX import SummaryWriter
 
 from areal.api import FinetuneSpec
 from areal.api.cli_args import BaseExperimentConfig, StatsLoggerConfig
 from areal.utils import logging
+from areal.utils.config_utils import redact_sensitive_config
 from areal.utils.printing import tabulate_stats
 from areal.version import version_info
 
 logger = logging.getLogger("StatsLogger", "system")
+
+# Trackio is optional and older runtime images may not include it. Keep this
+# module-level name so tests and callers can patch it, but import it only when
+# the backend is enabled.
+trackio = None
 
 
 class StatsLogger:
@@ -52,7 +57,7 @@ class StatsLogger:
         if suffix == "timestamp":
             suffix = time.strftime("%Y_%m_%d_%H_%M_%S")
 
-        exp_config_dict = asdict(self.exp_config)
+        exp_config_dict = redact_sensitive_config(asdict(self.exp_config))
         exp_config_dict["version_info"] = {
             "commit_id": version_info.commit,
             "branch": version_info.branch,
@@ -98,6 +103,11 @@ class StatsLogger:
         self._trackio_enabled = False
         trackio_config = self.config.trackio
         if trackio_config.mode != "disabled":
+            global trackio
+            if trackio is None:
+                import trackio as trackio_module
+
+                trackio = trackio_module
             trackio.init(
                 project=trackio_config.project or self.config.experiment_name,
                 name=trackio_config.name or self.config.trial_name,

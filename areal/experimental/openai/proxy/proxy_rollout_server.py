@@ -6,11 +6,12 @@ import argparse
 import asyncio
 import hmac
 import inspect
+import json
 import os
 import secrets
 import threading
 import time
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Iterable, Mapping
 from typing import TYPE_CHECKING, Any
 
 import uvicorn
@@ -554,6 +555,91 @@ def set_reward(
 # =============================================================================
 
 
+def _contains_image_content(value: Any) -> bool:
+    """Return whether a nested content value contains an image block."""
+    if isinstance(value, (list, tuple)):
+        return any(_contains_image_content(item) for item in value)
+    if not isinstance(value, dict):
+        return False
+    if value.get("type") in {"image", "image_url", "input_image"}:
+        return True
+    return any(_contains_image_content(item) for item in value.values())
+
+
+def _content_block_text(value: Any) -> str:
+    """Extract text from nested Claude/OpenAI content blocks."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (list, tuple)):
+        return "\n".join(filter(None, (_content_block_text(item) for item in value)))
+    if not isinstance(value, dict):
+        return str(value)
+
+    text = value.get("text")
+    if isinstance(text, str):
+        return text
+    content = value.get("content")
+    if isinstance(content, (str, list, tuple, dict)):
+        return _content_block_text(content)
+    return json.dumps(value, ensure_ascii=False, sort_keys=True)
+
+
+def _flatten_text_content_lists(messages: list[dict]) -> None:
+    """Flatten text-only content block lists to strings in-place.
+
+    LiteLLM can forward Claude requests through the OpenAI chat-completions
+    endpoint while retaining Anthropic-style text block lists. Preserve
+    multimodal or otherwise structured content for the AReaL client.
+    """
+    for msg in messages:
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+
+        if msg.get("role") == "system" or not _contains_image_content(content):
+            msg["content"] = _content_block_text(content)
+
+
+def _preprocess_messages(messages: list[dict]) -> list[dict]:
+    """Normalize messages shared by OpenAI and Anthropic proxy endpoints."""
+    _flatten_text_content_lists(messages)
+    for preprocessor in _message_preprocessors:
+        messages = preprocessor(messages)
+    return messages
+
+
+def _materialize_iterables(value: Any) -> Any:
+    """Recursively convert Pydantic validator iterators to plain containers."""
+    if isinstance(value, BaseModel):
+        return _materialize_iterables(value.model_dump())
+    if isinstance(value, Mapping):
+        return {key: _materialize_iterables(item) for key, item in value.items()}
+    if isinstance(value, (str, bytes)):
+        return value
+    if isinstance(value, Iterable):
+        return [_materialize_iterables(item) for item in value]
+    return value
+
+
+def _prepare_request_messages(messages: Any) -> Any:
+    """Convert request message iterables to mutable dicts and preprocess them."""
+    if isinstance(messages, (str, bytes, Mapping)) or not isinstance(
+        messages, Iterable
+    ):
+        return messages
+
+    normalized: list[dict] = []
+    for message in messages:
+        if isinstance(message, BaseModel):
+            message = message.model_dump()
+        elif isinstance(message, Mapping):
+            message = dict(message)
+        else:
+            return messages
+        normalized.append(_materialize_iterables(message))
+    return _preprocess_messages(normalized)
+
+
 async def _call_client_create(
     create_fn,
     request: dict[str, Any] | BaseModel,
@@ -587,6 +673,19 @@ async def _call_client_create(
     )
 
     kwargs = request.model_dump() if isinstance(request, BaseModel) else dict(request)
+    messages = kwargs.get("messages")
+    if messages is not None:
+        prepared_messages = _prepare_request_messages(messages)
+        kwargs["messages"] = prepared_messages
+        if isinstance(prepared_messages, list):
+            logger.debug(
+                "Preprocessed request messages: container=%s, content_types=%s",
+                type(messages).__name__,
+                [
+                    type(message.get("content")).__name__
+                    for message in prepared_messages
+                ],
+            )
     dropped_args = []
     for k, v in kwargs.items():
         if k not in areal_client_allowed_args:
@@ -634,6 +733,7 @@ async def _call_client_create(
     except ValueError as e:
         raise HTTPException(status_code=500, detail=str(e))
     except Exception as e:
+        logger.exception("AReaL client request failed")
         raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
 
 
@@ -722,19 +822,6 @@ async def responses(
     )
 
 
-def _flatten_content_lists(messages: list[dict]) -> None:
-    """Flatten Anthropic content block lists to strings in-place."""
-    for msg in messages:
-        if isinstance(msg.get("content"), list):
-            text_parts = []
-            for block in msg["content"]:
-                if isinstance(block, dict) and block.get("type") == "text":
-                    text_parts.append(block.get("text", ""))
-                elif isinstance(block, str):
-                    text_parts.append(block)
-            msg["content"] = "\n".join(text_parts)
-
-
 def _translate_anthropic_to_openai_request(anthropic_request: dict[str, Any]) -> dict:
     """Translate an Anthropic Messages API request to OpenAI format."""
     openai_request = _adapter.translate_completion_input_params(
@@ -743,11 +830,6 @@ def _translate_anthropic_to_openai_request(anthropic_request: dict[str, Any]) ->
     if openai_request is None:
         raise ValueError("Failed to translate request")
     openai_request = dict(openai_request)
-
-    if "messages" in openai_request:
-        _flatten_content_lists(openai_request["messages"])
-        for preprocessor in _message_preprocessors:
-            openai_request["messages"] = preprocessor(openai_request["messages"])
 
     return openai_request
 
