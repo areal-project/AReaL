@@ -8,12 +8,14 @@ import sys
 import threading
 import time
 import traceback
+from contextlib import contextmanager
 from threading import Lock
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 import aiohttp
 
+from areal.api.cli_args import is_colocation_strategy
 from areal.infra.utils.concurrent import get_executor, run_async_task
 from areal.infra.utils.http import create_httpx_client
 from areal.utils import logging
@@ -56,6 +58,7 @@ class GatewayTrainController:
         self._own_process_group = False
         self.rollout: Any | None = None
         self._weight_update_ctrl: Any | None = None
+        self._colocate = False
 
         # Version management
         self._version_lock = Lock()
@@ -249,12 +252,19 @@ class GatewayTrainController:
                     "--log-level",
                     cfg.log_level,
                 ]
+                worker_env = None
+                if is_colocation_strategy(cfg.scheduling_strategy):
+                    # Inference servers use ascending local GPU IDs within each
+                    # node; rank modulo GPUs-per-node selects the identical slot.
+                    local_slot = rank % self.scheduler.n_gpus_per_node
+                    worker_env = {"CUDA_VISIBLE_DEVICES": str(local_slot)}
 
                 host, port = await self._async_fork_on_guard(
                     guard_addr=guard,
                     role="train-worker",
                     worker_index=rank,
                     raw_cmd=worker_cmd,
+                    env=worker_env,
                 )
                 return f"http://{format_hostport(host, port)}"
 
@@ -977,6 +987,14 @@ class GatewayTrainController:
         pair_name = f"{self._role}-rollout"
 
         if meta.type == "awex":
+            colocate = getattr(meta, "colocate", False)
+            self._colocate = colocate
+            if colocate and len(self._worker_addrs) != len(inference_urls):
+                raise ValueError(
+                    "awex colocate requires a 1:1 train/inference worker pairing "
+                    f"(same physical GPUs), got train={len(self._worker_addrs)} "
+                    f"vs inference={len(inference_urls)}"
+                )
             # NCCL rendezvous master must live on the rank-0 process's node.
             # awex assigns rank 0 to inference[0], so allocate on the inference
             # rank-0 guard rather than a train guard.
@@ -993,6 +1011,7 @@ class GatewayTrainController:
                 train_worker_urls=self._worker_addrs,
                 inference_worker_urls=inference_urls,
                 mode="awex",
+                colocate=colocate,
                 nccl_master_addr=port_data["host"],
                 nccl_master_port=port_data["ports"][0],
             )
@@ -1014,6 +1033,68 @@ class GatewayTrainController:
             len(self._worker_addrs),
             len(inference_urls),
         )
+
+    def _broadcast_awex_memory_op(self, op: str, tags: list[str]) -> None:
+        import requests
+
+        def _post(addr: str) -> None:
+            url = f"{addr}/awex/{op}"
+            resp = requests.post(
+                url,
+                json={"tags": tags},
+                timeout=self.config.request_timeout,
+            )
+            if resp.status_code != 200:
+                raise RuntimeError(
+                    f"AWEX memory operation failed on {url}: "
+                    f"HTTP {resp.status_code}: {resp.text}"
+                )
+
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=max(1, len(self._worker_addrs))
+        ) as executor:
+            futures = [executor.submit(_post, addr) for addr in self._worker_addrs]
+            for future in concurrent.futures.as_completed(futures):
+                future.result()
+
+    def enter_train_phase(self) -> None:
+        if not self._colocate:
+            return
+        assert self.rollout is not None
+        self.rollout.pause()
+        self.rollout.pause_generation_sync()
+        self.rollout.offload(tags=["kv_cache"])
+        self.rollout.offload(tags=["weights"])
+        self._broadcast_awex_memory_op("resume_memory", ["weights", "optimizer"])
+
+    def exit_train_phase(self) -> None:
+        if not self._colocate:
+            return
+        assert self.rollout is not None
+        try:
+            self._broadcast_awex_memory_op("release_memory", ["weights", "optimizer"])
+        finally:
+            self.rollout.resume()
+
+    @contextmanager
+    def train_phase(self):
+        """Run a train phase; update_weights() must be called inside the phase.
+
+        The executor's transfer dance restores inference weights and KV cache;
+        phase exit only releases train memory and resumes request serving.
+        """
+        self.enter_train_phase()
+        try:
+            yield
+        finally:
+            self.exit_train_phase()
+
+    def release_train_memory_for_colocate(self) -> None:
+        if not self._colocate:
+            return
+        self._ensure_initialized()
+        # Called between actor init and rollout startup so sglang can claim the GPUs.
+        self._broadcast_awex_memory_op("release_memory", ["weights", "optimizer"])
 
     def update_weights(self, meta: Any) -> None:
         if self._weight_update_ctrl is None or self.rollout is None:

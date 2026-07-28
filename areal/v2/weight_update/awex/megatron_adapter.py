@@ -3,11 +3,8 @@ from __future__ import annotations
 
 import gc
 import os
-import threading
-import time
 from typing import TYPE_CHECKING
 
-import httpx
 import torch
 import torch.distributed as dist
 from awex.meta.weight_meta import (
@@ -28,6 +25,7 @@ from areal.utils import logging
 from areal.v2.weight_update.awex import (
     awex_wu_use_group,
     fetch_kv_metadata,
+    resolve_physical_gpu_id,
 )
 from areal.v2.weight_update.nccl_group import (
     init_weights_update_group,
@@ -41,6 +39,21 @@ if TYPE_CHECKING:
     from areal.engine.megatron_engine import MegatronEngine
 
 logger = logging.getLogger("AwexMegatronAdapter")
+
+
+def awex_colocate_timeout_s(default: float = 1800.0) -> float:
+    value = os.environ.get("AWEX_COLOCATE_TIMEOUT_S", "").strip()
+    if not value:
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        logger.warning(
+            "Invalid AWEX_COLOCATE_TIMEOUT_S=%r; using default %.1fs",
+            value,
+            default,
+        )
+        return default
 
 
 class AwexMegatronAdapter(AwexTrainingAdapter):
@@ -62,13 +75,19 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
         self._transfer_plan: TransferPlan | None = None
         self._weights_update_group = None
         self._transfer_rank: int | None = None
-        self._offloaded_optimizer_states: dict = {}
         self._offloaded_weights: dict[str, torch.Tensor] = {}
         self._released_tags: set[str] = set()
-        self._colocate_lock = threading.Lock()
-        self._colocate_admin_api_key: str = "areal-admin-key"
-        self._colocate_http_client: httpx.Client | None = None
-        self._colocate_timeout_s: float = 120.0
+        self._meta_server_addr: str | None = None
+        self._meta_server_client = None
+        self._weight_converter = None
+        self._initialized = False
+        self._rank_info: RankInfo | None = None
+        self._ip_address: str | None = None
+        self._physical_gpu_id: int | None = None
+        self._infer_world_size: int | None = None
+        self._num_infer_engines: int | None = None
+        self._logical_train_rank: int | None = None
+        self._timeout_s = awex_colocate_timeout_s()
 
     @property
     def parallelism_strategy(self) -> dict:
@@ -224,9 +243,6 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
         self._weights_update_group = None
         self._transfer_plan = None
         self._transfer_rank = None
-        if self._colocate_http_client is not None:
-            self._colocate_http_client.close()
-            self._colocate_http_client = None
 
     def _build_rank_info(self) -> RankInfo:
         from megatron.core import parallel_state as mpu
@@ -314,122 +330,285 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
 
     def init_colocate_weight_update(
         self,
-        pair_name: str,
-        kv_store_url: str,
-        transfer_rank: int,
-        infer_world_size: int,
-        train_world_size: int,
-        num_engines: int,
-        master_port: int,
-        admin_api_key: str = "areal-admin-key",
-        timeout_s: float = 120.0,
+        meta_server_addr: str | None = None,
+        pair_name: str = "default",
+        transfer_rank: int = 0,
+        timeout_s: float | None = None,
+        **kwargs,
     ) -> None:
+        """Connect to the colocate MetaServer.
+
+        Extra gateway fields are accepted for wire compatibility; colocate
+        metadata and runtime coordination are resolved through MetaServer.
+        """
+        from awex.meta.meta_server import MetaServerClient
+
+        del kwargs
+        if not meta_server_addr:
+            meta_server_addr = os.environ.get("AWEX_META_SERVER_ADDR", "")
+        if not meta_server_addr:
+            raise ValueError("meta_server_addr is required for colocate weight update")
+
+        host, port = meta_server_addr.rsplit(":", 1)
+        self._meta_server_client = MetaServerClient(host, int(port))
+        self._meta_server_addr = meta_server_addr
         self._colocate_pair_name = pair_name
-        self._colocate_kv_store_url = kv_store_url
-        self._colocate_transfer_rank = transfer_rank
-        self._colocate_infer_world_size = infer_world_size
-        self._colocate_admin_api_key = admin_api_key
-        self._colocate_timeout_s = timeout_s
-        if self._colocate_http_client is None:
-            self._colocate_http_client = httpx.Client()
+        self._transfer_rank = transfer_rank
+        self._timeout_s = awex_colocate_timeout_s() if timeout_s is None else timeout_s
+
+        if dist.get_rank() == 0:
+            self._meta_server_client.put_object(
+                "awex_train_info", {"train_world_size": dist.get_world_size()}
+            )
         logger.info(
-            "Initialized colocate weight update for pair '%s', transfer_rank=%d",
+            "Initialized colocate weight update for pair %r at %s, transfer_rank=%d",
             pair_name,
+            meta_server_addr,
             transfer_rank,
         )
 
-    def execute_colocate_weight_update(self, version: int) -> None:
-        with self._colocate_lock:
-            self._execute_colocate_weight_update_locked(version)
+    def _lazy_initialize(self) -> None:
+        """Initialize metadata and conversion after live weights are available."""
+        if self._initialized:
+            return
+        if self._meta_server_client is None:
+            raise RuntimeError("init_colocate_weight_update must be called first")
 
-    def _execute_colocate_weight_update_locked(self, version: int) -> None:
-        kv_store_url = self._colocate_kv_store_url
-        pair_name = self._colocate_pair_name
-        transfer_rank = self._colocate_transfer_rank
-        assert self._colocate_http_client is not None, (
-            "init_colocate_weight_update must be called first"
+        from awex.meta.train_meta_resolver import McoreParamMetaResolver
+        from awex.models.registry import get_train_weights_converter
+        from awex.sharding.param_sharding import get_rank_info_extractor
+        from awex.util.common import get_ip_address
+
+        class _EngineShim:
+            def __init__(self, engine):
+                self.model = engine.model
+                if not isinstance(self.model, (list, tuple)):
+                    self.model = [self.model]
+                self.hf_config = engine.hf_config
+                self.enable_debug_mode = False
+                self.enable_colocate_mode = False
+                self.engine_name = "mcore"
+                self.config = {}
+                self.meta_server_addr = ""
+
+            def release_memory_occupation(self, tags=None):
+                pass
+
+            def resume_memory_occupation(self, tags=None):
+                pass
+
+        self._rank_info = get_rank_info_extractor("mcore")()
+        self._ip_address = get_ip_address()
+        self._physical_gpu_id = resolve_physical_gpu_id()
+
+        infer_conf = self._meta_server_client.get_object(
+            "infer_conf", timeout=self._timeout_s
         )
-        client = self._colocate_http_client
-        auth_headers = {"Authorization": f"Bearer {self._colocate_admin_api_key}"}
-        timeout_s = self._colocate_timeout_s
+        logger.info("Got infer_conf from MetaServer: %s", infer_conf)
+        if isinstance(infer_conf.get("hf_config"), dict):
+            from types import SimpleNamespace
 
-        weights_offloaded = "weights" in self._released_tags
-        if weights_offloaded:
-            self.resume_memory(tags=["weights"])
+            infer_conf["hf_config"] = SimpleNamespace(**infer_conf["hf_config"])
 
-        params = self.get_local_shard_parameters()
-        tensors = list(params.values())
-        names = list(params.keys())
+        shim = _EngineShim(self._engine)
+        meta_resolver = McoreParamMetaResolver(shim, self._engine.hf_config, infer_conf)
+        parameters_meta = meta_resolver.get_parameters_meta()
+        if dist.get_rank() == 0:
+            self._meta_server_client.put_object("training_params_meta", parameters_meta)
 
-        group_tensors, metadata = group_tensors_by_shape_and_dtype(tensors)
-        torch.cuda.synchronize()
-
-        del tensors
-
-        group_shared = [t.share_memory_() for t in group_tensors]
-        serialized_weights = cuda_ipc_serialize((group_shared, metadata, names))
-        torch.cuda.synchronize()
-
-        kv_key = f"colocate_weights_rank{transfer_rank}_{version}"
-
-        client.put(
-            f"{kv_store_url}/weight_meta/{pair_name}/{kv_key}",
-            json={"value": serialized_weights.hex()},
-            headers=auth_headers,
-            timeout=timeout_s,
+        self._infer_world_size = infer_conf["infer_world_size"]
+        if self._transfer_rank is None:
+            raise RuntimeError("Transfer rank is not initialized")
+        self._logical_train_rank = self._transfer_rank
+        self._meta_server_client.add_object_to_set(
+            "training_device_rank_entries",
+            (self._ip_address, self._physical_gpu_id, self._logical_train_rank),
+        )
+        self._num_infer_engines = self._meta_server_client.get_object(
+            "num_infer_engines", timeout=self._timeout_s
         )
 
+        # Passing infer_conf through preserves the reader's router dtype. A
+        # float32 gate payload paired with lower-precision metadata can wedge
+        # the transfer because sender and receiver disagree on byte counts.
+        self._weight_converter = get_train_weights_converter(
+            "mcore",
+            self._engine.hf_config.architectures[0],
+            self._engine.hf_config,
+            self._rank_info,
+            {
+                **infer_conf,
+                "train_pp_stage_layer_id_map": (
+                    meta_resolver.get_pp_stage_layer_id_map()
+                ),
+            },
+            tf_config=_get_tf_config(self._engine.model),
+        )
+        self._initialized = True
         logger.info(
-            "Serialized %d params (%d groups) for colocate transfer v%d, rank %d",
-            len(names),
-            len(group_shared),
-            version,
-            transfer_rank,
+            "Colocate train side initialized: logical_train_rank=%d, "
+            "infer_world_size=%d, train_world_size=%d",
+            self._logical_train_rank,
+            self._infer_world_size,
+            self._rank_info.world_size,
         )
 
-        done_key = f"colocate_done_rank{transfer_rank}_{version}"
-        deadline = time.monotonic() + timeout_s
-        poll_count = 0
-        last_status = -1
-        while time.monotonic() < deadline:
-            resp = client.get(
-                f"{kv_store_url}/weight_meta/{pair_name}/{done_key}",
-                timeout=5.0,
-            )
-            last_status = resp.status_code
-            if resp.status_code == 200:
-                break
-            poll_count += 1
-            time.sleep(0.1)
-        else:
-            raise TimeoutError(
-                f"Inference did not signal completion within {timeout_s}s "
-                f"(waiting_key={done_key}, put_key={kv_key}, "
-                f"polls={poll_count}, last_status={last_status})"
-            )
+    def _release_grad_memory(self) -> None:
+        """Release DDP gradient buffers while preserving sizes for reload."""
+        from megatron.core.distributed import DistributedDataParallel as DDP
 
-        del group_shared, group_tensors, serialized_weights
-        torch.cuda.synchronize()
-        gc.collect()
-        torch.cuda.empty_cache()
+        model = self._engine.model
+        if model is None:
+            return
+        if not isinstance(model, (list, tuple)):
+            model = [model]
+        count = 0
+        for chunk in model:
+            if isinstance(chunk, DDP):
+                for buffers in [chunk.buffers, chunk.expert_parallel_buffers]:
+                    for buf in buffers:
+                        if buf.grad_data.storage().size() > 0:
+                            buf.grad_data_size = buf.grad_data.storage().size()
+                            buf.grad_data.storage().resize_(0)
+                            count += 1
+        if count:
+            torch.cuda.synchronize()
+            gc.collect()
+            torch.cuda.empty_cache()
+        logger.info("Released %d grad buffers", count)
 
-        if weights_offloaded:
+    @torch.no_grad()
+    def execute_colocate_weight_update(self, version: int) -> None:
+        """Publish local parameter shards to colocated inference via CUDA IPC."""
+        from awex.util.tensor_util import release_tensors
+
+        if self._meta_server_client is None:
+            raise RuntimeError("init_colocate_weight_update must be called first")
+
+        weights_were_offloaded = "weights" in self._released_tags
+        torch.cuda.ipc_collect()
+        try:
+            # Optimizer and gradient buffers must leave the GPU before weights
+            # are restored because inference is already resident on the same GPU.
+            self.release_memory(tags=["optimizer"])
+            self._release_grad_memory()
+            if weights_were_offloaded:
+                self.resume_memory(tags=["weights"])
+
+            dist.barrier()
+            if dist.get_rank() == 0:
+                self._meta_server_client.add_object_to_set(
+                    "all_training_offloaded_optimizers", dist.get_rank()
+                )
+
+            # The resolver converts live parameters. It must run after resume;
+            # resize_(0)-ed parameter storages are not valid conversion inputs.
+            self._lazy_initialize()
+            parameters = self._convert_parameters()
+            tensors = list(parameters.values())
+            names = list(parameters.keys())
+            group_tensors, metadata = group_tensors_by_shape_and_dtype(tensors)
+            torch.cuda.synchronize()
+
+            live_storages = set()
+            model = self._engine.model
+            for chunk in model if isinstance(model, (list, tuple)) else [model]:
+                for _, parameter in chunk.named_parameters():
+                    live_storages.add(parameter.untyped_storage().data_ptr())
+                for _, buffer in chunk.named_buffers():
+                    live_storages.add(buffer.untyped_storage().data_ptr())
+            owned = [
+                tensor
+                for tensor in tensors
+                if tensor.untyped_storage().data_ptr() not in live_storages
+            ]
+            release_tensors(owned)
+            del tensors, owned
+            parameters.clear()
+
             self.release_memory(tags=["weights"])
+            if (
+                self._ip_address is None
+                or self._physical_gpu_id is None
+                or self._logical_train_rank is None
+                or self._rank_info is None
+            ):
+                raise RuntimeError("Colocate metadata is not initialized")
+
+            key_suffix = f"_{self._ip_address}_{self._physical_gpu_id}_{version}"
+            group_shared = [tensor.share_memory_() for tensor in group_tensors]
+            serialized_weights = cuda_ipc_serialize((group_shared, metadata, names))
+            torch.cuda.synchronize()
+
+            writer_version_key = (
+                f"awex_writer_version_{self._ip_address}_{self._physical_gpu_id}"
+            )
+            self._meta_server_client.put_object(writer_version_key, version)
+            serialized_weights_key = f"training_serialized_weights{key_suffix}"
+            self._meta_server_client.put_object(
+                serialized_weights_key,
+                (self._logical_train_rank, self._rank_info, serialized_weights),
+            )
+            self._meta_server_client.add_object_to_set(
+                "all_training_offloaded_weights", self._logical_train_rank
+            )
+
+            update_finished_key = f"weights_update_finished{key_suffix}"
+            try:
+                try:
+                    self._meta_server_client.get_object(
+                        update_finished_key, timeout=self._timeout_s
+                    )
+                except Exception as exc:
+                    raise RuntimeError(
+                        "Inference did not finish the colocate weight update "
+                        f"within {self._timeout_s}s; missing key "
+                        f"{update_finished_key!r}"
+                    ) from exc
+                self._meta_server_client.delete_if_exists(update_finished_key)
+                self._meta_server_client.delete_if_exists(serialized_weights_key)
+            finally:
+                release_tensors(group_tensors)
+                release_tensors(group_shared)
+                del group_tensors, group_shared
+                torch.cuda.synchronize()
+                gc.collect()
+                torch.cuda.ipc_collect()
+                torch.cuda.empty_cache()
+
+            write_finished_key = f"write_finished{key_suffix}"
+            self._meta_server_client.put_object(write_finished_key, True)
+            logger.info("Colocate weight update completed: version=%d", version)
+        finally:
+            torch.cuda.ipc_collect()
+            if weights_were_offloaded and "weights" not in self._released_tags:
+                self.release_memory(tags=["weights"])
+
+    def finish_colocate_weight_update(self, training_world_size: int) -> None:
+        """Wait for all inference engines, then clear handshake state."""
+        del training_world_size
+        if self._meta_server_client is None or self._num_infer_engines is None:
+            raise RuntimeError("Colocate weight update is not initialized")
+
+        self._meta_server_client.wait_set_until_size(
+            "finished_weights_update_engines",
+            self._num_infer_engines,
+            timeout=self._timeout_s,
+        )
+        dist.barrier(group=self._engine.cpu_group)
+        if dist.get_rank() == 0:
+            for key in (
+                "finished_weights_update_engines",
+                "all_training_offloaded_optimizers",
+                "all_training_offloaded_weights",
+            ):
+                self._meta_server_client.delete_if_exists(key)
 
     def release_memory(self, tags: list[str] | None = None) -> None:
-        """Release GPU memory for specified tags by offloading to CPU.
-
-        Supported tags:
-            - "optimizer": Offload optimizer state tensors (exp_avg, exp_avg_sq, etc.)
-            - "weights": Offload model parameters
-        """
         tags = tags or ["optimizer", "weights"]
         tags_to_release = [t for t in tags if t not in self._released_tags]
         if not tags_to_release:
-            logger.info("release_memory: tags=%s already released, skipping", tags)
             return
-
-        logger.info("release_memory: offloading tags=%s", tags_to_release)
 
         if "optimizer" in tags_to_release:
             self._offload_optimizer_states()
@@ -442,25 +621,16 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
         torch.cuda.synchronize()
         gc.collect()
         torch.cuda.empty_cache()
-        logger.info("release_memory: done for tags=%s", tags_to_release)
+        logger.info("release_memory done: tags=%s", tags_to_release)
 
     def resume_memory(self, tags: list[str] | None = None) -> None:
-        """Resume GPU memory for specified tags by reloading from CPU.
-
-        Supported tags:
-            - "optimizer": Reload optimizer state tensors to GPU
-            - "weights": Reload model parameters to GPU
-        """
         tags = tags or ["optimizer", "weights"]
         tags_to_resume = [t for t in tags if t in self._released_tags]
         if not tags_to_resume:
-            logger.info("resume_memory: tags=%s not released, skipping", tags)
             return
 
-        logger.info("resume_memory: reloading tags=%s", tags_to_resume)
-
         if "weights" in tags_to_resume:
-            self._reload_model_weights()
+            self._reload_model_weights(load_grad=False)
             self._released_tags.discard("weights")
 
         if "optimizer" in tags_to_resume:
@@ -468,91 +638,248 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
             self._released_tags.discard("optimizer")
 
         torch.cuda.synchronize()
-        logger.info("resume_memory: done for tags=%s", tags_to_resume)
+        logger.info("resume_memory done: tags=%s", tags_to_resume)
 
-    def _offload_optimizer_states(self) -> None:
-        """Move optimizer state tensors to CPU, keeping references for reload."""
-        optimizer = self._engine.optimizer
-        if optimizer is None:
-            logger.warning("No optimizer found, skipping optimizer offload")
-            return
+    @torch.no_grad()
+    def _convert_parameters(self) -> dict[str, torch.Tensor]:
+        """Convert every virtual-pipeline stage to Hugging Face names."""
+        from awex.converter.mcore_converter import get_mcore_model_parameters
 
-        # Megatron's ChainedOptimizer wraps per-model-chunk optimizers;
-        # each in turn wraps a base torch optimizer holding the state dict.
-        if hasattr(optimizer, "optimizers"):
-            inner_optimizers = optimizer.optimizers
-        else:
-            inner_optimizers = [optimizer]
-            logger.warning(
-                "Optimizer does not have 'optimizers' attribute. "
-                "Treating it as a single optimizer; offload may be incomplete "
-                "for non-standard Megatron optimizer structures."
-            )
-        for opt in inner_optimizers:
-            base_opt = getattr(opt, "optimizer", opt)
-            for param, state in base_opt.state.items():
-                cpu_state: dict[str, torch.Tensor] = {}
-                for key, val in state.items():
-                    if isinstance(val, torch.Tensor) and val.is_cuda:
-                        cpu_state[key] = val.detach().to("cpu", non_blocking=True)
-                        state[key] = torch.empty(0, device="cpu")
-                if cpu_state:
-                    self._offloaded_optimizer_states[param] = cpu_state
+        model = self._engine.model
+        if not isinstance(model, (list, tuple)):
+            model = [model]
 
-        logger.info(
-            "Offloaded optimizer states for %d params",
-            len(self._offloaded_optimizer_states),
-        )
+        converted = {}
+        for vp_stage, chunk in enumerate(model):
+            for name, param in get_mcore_model_parameters(chunk).items():
+                for hf_name, hf_param in self._weight_converter.convert_param(
+                    name, param.detach(), vp_stage=vp_stage
+                ):
+                    converted[hf_name] = hf_param
 
-    def _reload_optimizer_states(self) -> None:
-        """Restore optimizer state tensors from CPU back to GPU."""
-        if not self._offloaded_optimizer_states:
-            return
-
-        optimizer = self._engine.optimizer
-        if optimizer is None:
-            return
-
-        inner_optimizers = getattr(optimizer, "optimizers", [optimizer])
-        for opt in inner_optimizers:
-            base_opt = getattr(opt, "optimizer", opt)
-            for param, state in base_opt.state.items():
-                if param in self._offloaded_optimizer_states:
-                    cpu_state = self._offloaded_optimizer_states[param]
-                    for key, val in cpu_state.items():
-                        state[key] = val.to(param.device, non_blocking=True)
-
-        self._offloaded_optimizer_states.clear()
-        logger.info("Reloaded optimizer states to GPU")
+        hf_config = self._engine.hf_config
+        if (
+            getattr(hf_config, "tie_word_embeddings", False)
+            and self._rank_info.pp_rank == self._rank_info.pp_size - 1
+            and "lm_head.weight" not in converted
+            and "model.embed_tokens.weight" in converted
+        ):
+            converted["lm_head.weight"] = converted["model.embed_tokens.weight"]
+        return converted
 
     def _offload_model_weights(self) -> None:
-        """Move model parameters to CPU, keeping references for reload."""
-        if self._engine.model is None:
+        """Offload complete Megatron DDP buffers rather than parameter views."""
+        from megatron.core.distributed import DistributedDataParallel as DDP
+
+        model = self._engine.model
+        if model is None:
+            return
+        if not isinstance(model, (list, tuple)):
+            model = [model]
+        count = 0
+        for chunk in model:
+            if isinstance(chunk, DDP):
+                for buffers in [chunk.buffers, chunk.expert_parallel_buffers]:
+                    for buf in buffers:
+                        if hasattr(buf, "offload_to_cpu"):
+                            buf.offload_to_cpu()
+                            count += 1
+                            continue
+                        if buf.param_data.storage().size() > 0:
+                            if not hasattr(buf.param_data, "cpu_data"):
+                                buf.param_data.cpu_data = torch.zeros(
+                                    buf.param_data.data.shape,
+                                    dtype=buf.param_data.data.dtype,
+                                    pin_memory=True,
+                                    device="cpu",
+                                )
+                            buf.param_data.cpu_data.copy_(buf.param_data.data)
+                            buf.param_data_size = buf.param_data.storage().size()
+                            buf.param_data.storage().resize_(0)
+                            count += 1
+                        if buf.grad_data.storage().size() > 0:
+                            buf.grad_data_size = buf.grad_data.storage().size()
+                            buf.grad_data.storage().resize_(0)
+            else:
+                for name, param in chunk.named_parameters():
+                    if param.data.is_cuda:
+                        self._offloaded_weights[name] = param.data.detach().to(
+                            "cpu", non_blocking=True
+                        )
+                        param.data = torch.empty(0, device="cpu")
+                        count += 1
+        torch.cuda.synchronize()
+        logger.info("Offloaded %d weight buffers to CPU", count)
+
+    def _reload_model_weights(self, load_grad: bool = False) -> None:
+        from megatron.core.distributed import DistributedDataParallel as DDP
+
+        model = self._engine.model
+        if model is None:
+            return
+        if not isinstance(model, (list, tuple)):
+            model = [model]
+        device = self._engine.device
+        for chunk in model:
+            if isinstance(chunk, DDP):
+                for buffers in [chunk.buffers, chunk.expert_parallel_buffers]:
+                    for buf in buffers:
+                        if hasattr(buf, "reload_from_cpu"):
+                            buf.reload_from_cpu(move_grads=load_grad)
+                            continue
+                        if buf.param_data.storage().size() == 0:
+                            buf.param_data.storage().resize_(buf.param_data_size)
+                        buf.param_data.copy_(buf.param_data.cpu_data, non_blocking=True)
+                        if (
+                            load_grad
+                            and hasattr(buf, "grad_data_size")
+                            and buf.grad_data.storage().size() == 0
+                        ):
+                            buf.grad_data.storage().resize_(buf.grad_data_size)
+                            buf.grad_data.zero_()
+            else:
+                for name, param in chunk.named_parameters():
+                    if name in self._offloaded_weights:
+                        param.data = self._offloaded_weights[name].to(
+                            device, non_blocking=True
+                        )
+        self._offloaded_weights.clear()
+        torch.cuda.synchronize()
+        logger.info("Reloaded model weights to GPU (load_grad=%s)", load_grad)
+
+    def ensure_grad_buffers(self) -> None:
+        """Restore gradient storage before the next backward pass."""
+        from megatron.core.distributed import DistributedDataParallel as DDP
+
+        model = self._engine.model
+        if model is None:
+            return
+        if not isinstance(model, (list, tuple)):
+            model = [model]
+        count = 0
+        for chunk in model:
+            if isinstance(chunk, DDP):
+                for buffers in [chunk.buffers, chunk.expert_parallel_buffers]:
+                    for buf in buffers:
+                        if (
+                            hasattr(buf, "grad_data_size")
+                            and buf.grad_data.storage().size() == 0
+                        ):
+                            buf.grad_data.storage().resize_(buf.grad_data_size)
+                            buf.grad_data.zero_()
+                            count += 1
+        if count:
+            torch.cuda.synchronize()
+            logger.info("Allocated %d grad buffers for training", count)
+
+    def _get_inner_optimizers(self):
+        optimizer = self._engine.optimizer
+        if optimizer is None:
+            return []
+        if hasattr(optimizer, "chained_optimizers"):
+            return optimizer.chained_optimizers
+        if hasattr(optimizer, "optimizers"):
+            return optimizer.optimizers
+        return [optimizer]
+
+    def _offload_optimizer_states(self) -> None:
+        optimizer = self._engine.optimizer
+        if optimizer is None:
             return
 
-        for name, param in self._engine.model.named_parameters():
-            if param.is_cuda:
-                self._offloaded_weights[name] = param.data.detach().to(
-                    "cpu", non_blocking=True
-                )
-                param.data = torch.empty(0, device="cpu")
-
-        logger.info(
-            "Offloaded %d model weight tensors to CPU",
-            len(self._offloaded_weights),
-        )
-
-    def _reload_model_weights(self) -> None:
-        """Restore model parameters from CPU back to GPU."""
-        if not self._offloaded_weights:
+        if os.environ.get("AWEX_OPT_OFFLOAD_VIA_HDO", "").strip() == "1" and hasattr(
+            optimizer, "offload_to_cpu"
+        ):
+            optimizer.offload_to_cpu()
+            logger.info("Offloaded optimizer via offload_to_cpu()")
             return
-        if self._engine.model is None:
+
+        count = 0
+        for opt in self._get_inner_optimizers():
+            if hasattr(opt, "shard_fp32_from_float16_groups"):
+                for group in opt.shard_fp32_from_float16_groups:
+                    if isinstance(group, list):
+                        for tensor in group:
+                            if tensor is not None and tensor.data.is_cuda:
+                                tensor.data = tensor.data.to("cpu", non_blocking=True)
+                                count += 1
+                    elif group is not None and group.data.is_cuda:
+                        group.data = group.data.to("cpu", non_blocking=True)
+                        count += 1
+
+            base_opt = getattr(opt, "optimizer", opt)
+            if not hasattr(base_opt, "state") or base_opt.state is None:
+                continue
+            for state in base_opt.state.values():
+                for key in ("exp_avg", "exp_avg_sq"):
+                    if (
+                        key in state
+                        and isinstance(state[key], torch.Tensor)
+                        and state[key].is_cuda
+                    ):
+                        state[key] = state[key].to("cpu", non_blocking=True)
+                        count += 1
+
+        try:
+            from transformer_engine.pytorch.module.base import _dummy_wgrads
+
+            purged = len(_dummy_wgrads)
+            for key in list(_dummy_wgrads):
+                del _dummy_wgrads[key]
+            if purged:
+                logger.info("Purged %d TE _dummy_wgrads cache entries", purged)
+        except ImportError:
+            pass
+        torch.cuda.synchronize()
+        logger.info("Offloaded %d optimizer state tensors to CPU", count)
+
+    def _reload_optimizer_states(self) -> None:
+        optimizer = self._engine.optimizer
+        if optimizer is None:
+            return
+        if os.environ.get("AWEX_OPT_OFFLOAD_VIA_HDO", "").strip() == "1" and hasattr(
+            optimizer, "restore_from_cpu"
+        ):
+            optimizer.restore_from_cpu()
+            logger.info("Reloaded optimizer via restore_from_cpu()")
             return
 
         device = self._engine.device
-        for name, param in self._engine.model.named_parameters():
-            if name in self._offloaded_weights:
-                param.data = self._offloaded_weights[name].to(device, non_blocking=True)
+        count = 0
+        for opt in self._get_inner_optimizers():
+            if hasattr(opt, "shard_fp32_from_float16_groups"):
+                for group in opt.shard_fp32_from_float16_groups:
+                    if isinstance(group, list):
+                        for tensor in group:
+                            if tensor is not None and not tensor.data.is_cuda:
+                                tensor.data = tensor.data.to(device, non_blocking=True)
+                                count += 1
+                    elif group is not None and not group.data.is_cuda:
+                        group.data = group.data.to(device, non_blocking=True)
+                        count += 1
 
-        self._offloaded_weights.clear()
-        logger.info("Reloaded model weights to GPU")
+            base_opt = getattr(opt, "optimizer", opt)
+            if not hasattr(base_opt, "state") or base_opt.state is None:
+                continue
+            for state in base_opt.state.values():
+                for key in ("exp_avg", "exp_avg_sq"):
+                    if (
+                        key in state
+                        and isinstance(state[key], torch.Tensor)
+                        and not state[key].is_cuda
+                    ):
+                        state[key] = state[key].to(device, non_blocking=True)
+                        count += 1
+        torch.cuda.synchronize()
+        logger.info("Reloaded %d optimizer state tensors to GPU", count)
+
+
+def _get_tf_config(models):
+    if not isinstance(models, (list, tuple)):
+        models = [models]
+    for model in models:
+        for attr in ("transformer_config", "config"):
+            config = getattr(model, attr, None)
+            if config is not None:
+                return config
+    return None

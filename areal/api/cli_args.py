@@ -1066,6 +1066,14 @@ class SchedulingStrategy:
     )
 
 
+def is_colocation_strategy(strategy: SchedulingStrategy | None) -> bool:
+    """Return whether a scheduling strategy requests colocation."""
+    return (
+        strategy is not None
+        and strategy.type == SchedulingStrategyType.colocation.value
+    )
+
+
 @dataclass
 class SchedulingSpec:
     cpu: int = field(

@@ -2,11 +2,17 @@
 from __future__ import annotations
 
 import threading
+from dataclasses import dataclass, field
 
 from areal.utils import logging
-from areal.v2.weight_update.gateway.config import PairInfo
+from areal.v2.weight_update.gateway.config import PairInfo as BasePairInfo
 
 logger = logging.getLogger("PairRegistry")
+
+
+@dataclass
+class PairInfo(BasePairInfo):
+    pairing_table: list[dict[str, str | int]] = field(default_factory=list)
 
 
 class PairRegistry:

@@ -27,6 +27,7 @@ from areal.api.cli_args import (
     NameResolveConfig,
     SchedulingSpec,
     SchedulingStrategyType,
+    is_colocation_strategy,
 )
 from areal.infra.rpc.serialization import deserialize_value, serialize_value
 from areal.infra.scheduler.exceptions import (
@@ -1476,6 +1477,11 @@ class RayScheduler(Scheduler):
             f"Creating {num_workers} workers for role '{role}' "
             f"(strategy: {strategy_type}, colocate_with: {colocate_role})"
         )
+
+        if is_colocation_strategy(strategy) and role.endswith("-guard"):
+            raise NotImplementedError(
+                "ray colocation for v2 guard jobs is not yet supported"
+            )
 
         # Determine node allocation and handle colocation
         if strategy_type == SchedulingStrategyType.colocation:

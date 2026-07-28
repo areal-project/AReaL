@@ -2,48 +2,134 @@
 # pyright: reportMissingImports=false
 from __future__ import annotations
 
-import gc
 import math
 import os
-import time
 from typing import Any
 
-import httpx
 import torch
 import torch.distributed as dist
-from awex.meta.weight_meta import (
+
+
+def _patch_tms_hook_mode() -> None:
+    """Ignore late torch-memory-saver hook changes after initialization.
+
+    Importing the Megatron converter can assign ``hook_mode`` after SGLang has
+    initialized the memory-saver singleton and removed its constructor state.
+    That assignment is unsupported and would prevent AWEX model converters from
+    registering, so make only the late assignment a no-op.
+    """
+    try:
+        import torch_memory_saver as _tms
+    except Exception:
+        return
+    instance = getattr(_tms, "torch_memory_saver", None)
+    if instance is None:
+        return
+    cls = type(instance)
+    prop = cls.hook_mode
+    if getattr(prop.fset, "_awex_safe", False):
+        return
+
+    def _safe_setter(self, value):
+        if not hasattr(self, "_impl_ctor_kwargs"):
+            return
+        prop.fset(self, value)
+
+    _safe_setter._awex_safe = True
+    cls.hook_mode = property(prop.fget, _safe_setter)
+
+
+# This must run before AWEX imports trigger model-registry auto-discovery.
+_patch_tms_hook_mode()
+
+from awex.meta.infer_meta_resolver import InferParamMetaResolver  # noqa: E402
+from awex.meta.meta_resolver import ParamMetaResolver  # noqa: E402
+from awex.meta.weight_meta import (  # noqa: E402
     ParameterMeta,
     ParameterReplicaMeta,
     ParameterShardMeta,
 )
-from awex.sharding.param_sharding import ShardingType
-from awex.sharding.rank_info import RankInfo
-from awex.sharding.sglang_sharding import (
+from awex.reader.nccl_reader import NCCLWorkerWeightsReader  # noqa: E402
+from awex.sharding import get_sharding_strategy_builder  # noqa: E402
+from awex.sharding.param_sharding import ShardingType  # noqa: E402
+from awex.sharding.rank_info import RankInfo  # noqa: E402
+from awex.sharding.sglang_sharding import (  # noqa: E402
     get_sglang_rank_info,
     get_sglang_sharding_strategy,
 )
-from awex.transfer.nccl_comm import batch_send_recv, nccl_build_recv_ops
-from awex.transfer.nccl_stream_batch import NcclColocateStreamBatchTransport
-from awex.transfer.transfer_plan import TransferPlan, TransferPlanBuilder
-from awex.util.tensor_util import (
-    cuda_ipc_deserialize,
-    reconstruct_tensors_from_groups,
-)
+from awex.transfer.nccl_comm import batch_send_recv, nccl_build_recv_ops  # noqa: E402
+from awex.transfer.transfer_plan import TransferPlan, TransferPlanBuilder  # noqa: E402
+from awex.util.common import simple_hf_config  # noqa: E402
+from awex.util.process_group import init_weights_update_group  # noqa: E402
 
-from areal.utils import logging
-from areal.v2.weight_update.awex import (
+from areal.utils import logging  # noqa: E402
+from areal.v2.weight_update.awex import (  # noqa: E402
     awex_wu_use_group,
     fetch_kv_metadata,
 )
-from areal.v2.weight_update.inference_adapter import (
+from areal.v2.weight_update.inference_adapter import (  # noqa: E402
     AwexInferenceAdapter,
 )
-from areal.v2.weight_update.nccl_group import (
-    init_weights_update_group,
-    setup_batch_isend_irecv,
-)
+from areal.v2.weight_update.nccl_group import setup_batch_isend_irecv  # noqa: E402
 
 logger = logging.getLogger("AwexSGLangAdapter")
+
+
+def _ensure_awex_models_registered() -> None:
+    """Rebuild the AWEX registry if an earlier auto-import was incomplete."""
+    try:
+        from awex.models import registry as registry
+
+        registry.import_model_configs.cache_clear()
+        registry.ModelRegistry.models = registry.import_model_configs()
+        missing = [
+            model_name
+            for model_name in ("BailingMoeV2_5ForCausalLM", "BailingMoeV2ForCausalLM")
+            if model_name not in registry.ModelRegistry.models
+        ]
+        if missing:
+            logger.warning("AWEX model registry is missing converters: %s", missing)
+    except Exception as exc:  # pragma: no cover - diagnostic guard
+        logger.warning("Failed to rebuild AWEX model registry: %s", exc)
+
+
+_ensure_awex_models_registered()
+
+
+class _SingleInstanceMetaResolver(ParamMetaResolver):
+    """Aggregate raw metadata for one inference engine instance."""
+
+    def __init__(self, hf_config, engine_name, infer_engine_config, raw_meta_list):
+        super().__init__(hf_config)
+        self._raw_meta_list = raw_meta_list
+        rank0 = self._select_rank0(raw_meta_list)
+        self._model_arch_name = rank0["model_arch_name"]
+        self._sharding_strategy = get_sharding_strategy_builder(engine_name)(
+            self._model_arch_name,
+            infer_engine_config,
+            rank0["rank_info"],
+        )
+
+    @staticmethod
+    def _select_rank0(raw_meta_list):
+        for info in raw_meta_list:
+            if info["rank_info"].global_rank == 0:
+                return info
+        return raw_meta_list[0]
+
+    def get_model_arch_name(self) -> str:
+        return self._model_arch_name
+
+    def get_parameters_meta(self):
+        return self._build_params_meta()
+
+    def _get_params_raw_meta(self):
+        return self._raw_meta_list
+
+    def _get_sharding_info(self, name, rank_info, param_meta):
+        return self._sharding_strategy.get_sharding_strategy(
+            name, rank_info=rank_info, param_meta=param_meta
+        )
 
 
 class AwexSGLangAdapter(AwexInferenceAdapter):
@@ -57,12 +143,19 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
         self._rank_info: RankInfo | None = None
         self._parameters: dict[str, torch.Tensor] | None = None
         self._released_tags: set[str] = set()
-        self._colocate_admin_api_key: str = "areal-admin-key"
-        self._colocate_http_client: httpx.Client | None = None
-        self._colocate_timeout_s: float = 120.0
-        self._colocate_transport = None
-        self._train_to_infer_device_mapping: dict | None = None
-        self._infer_to_train_device_mapping: dict | None = None
+        self._meta_server_client = None
+        self._reader: NCCLWorkerWeightsReader | None = None
+        self._meta_server_addr: str | None = None
+        self._infer_world_size: int | None = None
+        self._train_world_size: int | None = None
+        self._infer_instance_world_size: int | None = None
+        self._num_infer_engines: int | None = None
+        self._engine_rank: int | None = None
+        self._instance_local_rank: int | None = None
+        self._infer_params_meta = None
+        self._infer_conf: dict[str, Any] | None = None
+        self._colocate_timeout_s = 300.0
+        self._colocate_initialized = False
 
     def _get_model(self) -> torch.nn.Module:
         return self._scheduler.tp_worker.model_runner.model
@@ -105,6 +198,34 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
                     getattr(self._scheduler, "tp_rank", 0),
                 )
             ),
+            "attn_tp_size": int(getattr(self._scheduler, "attn_tp_size", tp_size)),
+            "attn_dp_rank": int(getattr(self._scheduler, "attn_dp_rank", 0)),
+        }
+
+    def _get_colocate_model_context(self) -> dict[str, Any]:
+        """Build the AWEX context for one inference engine instance."""
+        server_args = self._scheduler.server_args
+        tp_size = int(getattr(server_args, "tp_size", 1))
+        pp_size = int(getattr(server_args, "pp_size", 1))
+        tp_rank = int(getattr(self._scheduler, "tp_rank", 0))
+        instance_world = self._infer_instance_world_size or tp_size * pp_size
+        instance_local_rank = (
+            self._instance_local_rank
+            if self._instance_local_rank is not None
+            else tp_rank
+        )
+        return {
+            "scheduler": self._scheduler,
+            "infer_engine_config": server_args,
+            "tp_rank": tp_rank,
+            "tp_size": tp_size,
+            "pp_rank": int(getattr(self._scheduler, "pp_rank", 0)),
+            "pp_size": pp_size,
+            "dp_size": int(getattr(server_args, "dp_size", 1)),
+            "world_size": instance_world,
+            "global_rank": instance_local_rank,
+            "local_rank": tp_rank,
+            "attn_tp_rank": int(getattr(self._scheduler, "attn_tp_rank", tp_rank)),
             "attn_tp_size": int(getattr(self._scheduler, "attn_tp_size", tp_size)),
             "attn_dp_rank": int(getattr(self._scheduler, "attn_dp_rank", 0)),
         }
@@ -441,178 +562,205 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
         self._transfer_rank = None
         self._rank_info = None
         self._parameters = None
-        if self._colocate_http_client is not None:
-            self._colocate_http_client.close()
-            self._colocate_http_client = None
-        self._colocate_transport = None
-        self._train_to_infer_device_mapping = None
-        self._infer_to_train_device_mapping = None
+        self._reader = None
+        self._meta_server_client = None
+        self._colocate_initialized = False
 
     # ── Colocated weight transfer methods ─────────────────────────────────
 
+    def _compute_local_raw_meta(self) -> dict:
+        """Compute this rank's metadata with AWEX's SGLang converter."""
+        return InferParamMetaResolver._get_model_param_info(
+            "sglang",
+            self._scheduler.server_args,
+            convert_params=True,
+            engine_rank=self._engine_rank or 0,
+            model=self._get_model(),
+            model_context=self._get_colocate_model_context(),
+        )
+
+    def _build_instance_params_meta(self):
+        """Exchange one instance's raw metadata through the MetaServer.
+
+        Do not gather over SGLang's ``tp_cpu_group``. The scheduler MainThread
+        uses that group to broadcast requests, while this method can run on a
+        different thread; concurrent collectives on the shared, non-thread-safe
+        group can race and deadlock. MetaServer exchange avoids process-group
+        collectives and isolates keys by inference-engine rank.
+        """
+        local_raw = self._compute_local_raw_meta()
+        instance_world = self._infer_instance_world_size or 1
+        if instance_world > 1:
+            client = self._meta_server_client
+            prefix = f"infer_instance_raw_meta_{self._engine_rank}"
+            client.put_object(f"{prefix}_{self._instance_local_rank}", local_raw)
+            raw_meta_list = [
+                client.get_object(f"{prefix}_{rank}", timeout=300.0)
+                for rank in range(instance_world)
+            ]
+        else:
+            raw_meta_list = [local_raw]
+
+        for info in raw_meta_list:
+            rank_info = info.get("rank_info")
+            if isinstance(rank_info, dict):
+                info["rank_info"] = RankInfo(**rank_info)
+
+        resolver = _SingleInstanceMetaResolver(
+            self._get_model().config,
+            "sglang",
+            self._scheduler.server_args,
+            raw_meta_list,
+        )
+        return resolver.get_parameters_meta()
+
+    def _ensure_reader(self) -> NCCLWorkerWeightsReader:
+        if self._reader is not None:
+            return self._reader
+        if not self._colocate_initialized:
+            raise RuntimeError("Colocate weight update is not initialized")
+
+        training_params_meta = self._meta_server_client.get_object(
+            "training_params_meta", timeout=10000.0
+        )
+        reader = NCCLWorkerWeightsReader(
+            engine_name="sglang",
+            model=self._get_model(),
+            model_context=self._get_colocate_model_context(),
+            infer_conf=self._infer_conf,
+            engine_rank=self._engine_rank,
+            num_engines=self._num_infer_engines,
+            meta_server_addr=self._meta_server_addr,
+            parameters_meta=self._infer_params_meta,
+            training_params_meta=training_params_meta,
+            enable_colocate_mode=True,
+            ipc_backend="cuda",
+            enable_debug_mode=False,
+        )
+        reader.initialize()
+        self._reader = reader
+        logger.info(
+            "Constructed NCCLWorkerWeightsReader for transfer rank %d",
+            reader.transfer_rank,
+        )
+        return reader
+
     def init_colocate_weight_update(
         self,
-        pair_name: str,
-        kv_store_url: str,
+        meta_server_addr: str,
         transfer_rank: int,
         infer_world_size: int,
         train_world_size: int,
         num_engines: int,
         master_port: int,
-        admin_api_key: str = "areal-admin-key",
-        timeout_s: float = 120.0,
+        timeout_s: float = 300.0,
+        **kwargs: Any,
     ) -> None:
+        """Publish inference metadata without waiting for training-side data.
+
+        The native reader is intentionally constructed on the first update,
+        after training has published ``training_params_meta``.
+        """
+        del master_port, num_engines, kwargs
         if infer_world_size != train_world_size:
             raise ValueError(
-                f"Colocate mode requires infer_world_size == train_world_size. "
-                f"Got infer_world_size={infer_world_size}, "
-                f"train_world_size={train_world_size}"
+                "Colocate mode requires equal inference and training rank counts; "
+                f"got infer={infer_world_size}, train={train_world_size}"
             )
-        self._colocate_pair_name = pair_name
-        self._colocate_kv_store_url = kv_store_url
+
+        from awex.meta.meta_server import MetaServerClient
+
         self._transfer_rank = transfer_rank
-        self._colocate_infer_world_size = infer_world_size
-        self._colocate_train_world_size = train_world_size
-        self._colocate_admin_api_key = admin_api_key
+        self._infer_world_size = infer_world_size
+        self._train_world_size = train_world_size
+        self._meta_server_addr = meta_server_addr
         self._colocate_timeout_s = timeout_s
-        if self._colocate_http_client is None:
-            self._colocate_http_client = httpx.Client()
 
-        infer_meta, train_meta = fetch_kv_metadata(kv_store_url, pair_name)
+        server_args = self._scheduler.server_args
+        tp_size = int(getattr(server_args, "tp_size", 1))
+        pp_size = int(getattr(server_args, "pp_size", 1))
+        instance_world = max(1, tp_size * pp_size)
+        if infer_world_size % instance_world != 0:
+            raise ValueError(
+                f"infer_world_size ({infer_world_size}) must be divisible by "
+                f"tp_size * pp_size ({instance_world})"
+            )
+        self._infer_instance_world_size = instance_world
+        self._num_infer_engines = infer_world_size // instance_world
+        self._engine_rank = transfer_rank // instance_world
+        self._instance_local_rank = transfer_rank % instance_world
 
-        builder = TransferPlanBuilder(
-            infer_world_size=infer_world_size,
-            train_world_size=train_world_size,
-            num_infer_engines=num_engines,
-        )
+        host, port = meta_server_addr.rsplit(":", 1)
+        self._meta_server_client = MetaServerClient(host, int(port))
+        self._infer_params_meta = self._build_instance_params_meta()
 
-        train_to_infer = {}
-        infer_to_train = {}
-        for i in range(min(infer_world_size, train_world_size)):
-            train_rank = infer_world_size + i
-            train_to_infer[train_rank] = i
-            infer_to_train[i] = train_rank
-        self._train_to_infer_device_mapping = train_to_infer
-        self._infer_to_train_device_mapping = infer_to_train
+        infer_conf = {
+            "engine_name": "sglang",
+            "infer_atten_tp_size": tp_size,
+            "infer_world_size": infer_world_size,
+            "hf_config": simple_hf_config(self._get_model().config),
+            # Preserve the inference router dtype. Falling back to bf16 for an
+            # fp32 gate changes message sizes and can wedge the transfer.
+            "router_dtype": getattr(self._get_model().config, "router_dtype", "bf16"),
+        }
+        self._infer_conf = infer_conf
 
-        self._send_transfer_plan = builder.build_local_transfer_plan(
-            infer_meta,
-            train_meta,
-            global_transfer_rank=infer_to_train[transfer_rank],
-        )
-        self._recv_transfer_plan = builder.build_local_transfer_plan(
-            infer_meta,
-            train_meta,
-            global_transfer_rank=transfer_rank,
-        )
+        if transfer_rank == 0:
+            self._meta_server_client.put_object("infer_conf", infer_conf)
+            self._meta_server_client.put_object(
+                "num_infer_engines", self._num_infer_engines
+            )
+            self._meta_server_client.put_object(
+                "infer_params_meta", self._infer_params_meta
+            )
 
-        os.environ["TORCHELASTIC_USE_AGENT_STORE"] = str(False)
-        self._weights_update_group = init_weights_update_group(
-            master_address="127.0.0.1",
-            master_port=master_port,
-            rank=transfer_rank,
-            world_size=infer_world_size,
-            group_name=f"awex_colocate_{pair_name}",
-            role="inference",
-        )
-
-        self._colocate_transport = NcclColocateStreamBatchTransport(
-            transfer_rank, infer_world_size
-        )
+        self._colocate_initialized = True
 
         logger.info(
-            "Initialized colocate weight update for pair '%s', "
-            "transfer_rank=%d, infer_world_size=%d",
-            pair_name,
+            "Initialized colocate reader metadata for transfer_rank=%d, "
+            "engine_rank=%d, instance_local_rank=%d",
             transfer_rank,
-            infer_world_size,
+            self._engine_rank,
+            self._instance_local_rank,
         )
 
     def execute_colocate_weight_update(self, version: int) -> None:
-        kv_store_url = self._colocate_kv_store_url
-        pair_name = self._colocate_pair_name
-        transfer_rank = self._transfer_rank
-        assert self._colocate_http_client is not None, (
-            "init_colocate_weight_update must be called first"
+        self.wait_for_training_offloaded(version)
+        reader = self._ensure_reader()
+        reader.update_weights(step_id=version)
+        self._rebuild_derived_weights()
+        logger.info("Colocate weight update completed for version %d", version)
+
+    def wait_for_training_offloaded(self, version: int) -> None:
+        """Wait until every training rank has offloaded model weights."""
+        del version
+        if not self._colocate_initialized:
+            raise RuntimeError("Colocate weight update is not initialized")
+        self._meta_server_client.wait_set_until_size(
+            "all_training_offloaded_weights",
+            self._train_world_size,
+            timeout=self._colocate_timeout_s,
         )
-        assert self._infer_to_train_device_mapping is not None
-        client = self._colocate_http_client
-        auth_headers = {"Authorization": f"Bearer {self._colocate_admin_api_key}"}
-        timeout_s = self._colocate_timeout_s
 
-        paired_train_rank = self._infer_to_train_device_mapping[transfer_rank]
-        kv_key = f"colocate_weights_rank{paired_train_rank}_{version}"
+    def _rebuild_derived_weights(self) -> None:
+        """Rebuild non-parameter MLA tensors after every in-place transfer.
 
-        deadline = time.monotonic() + timeout_s
-        serialized_hex = None
-        poll_count = 0
-        last_status = -1
-        while time.monotonic() < deadline:
-            resp = client.get(
-                f"{kv_store_url}/weight_meta/{pair_name}/{kv_key}",
-                timeout=5.0,
-            )
-            last_status = resp.status_code
-            if resp.status_code == 200:
-                serialized_hex = resp.json()["value"]
-                break
-            poll_count += 1
-            time.sleep(0.1)
-        if serialized_hex is None:
-            raise TimeoutError(
-                f"Training did not put colocate weights within {timeout_s}s "
-                f"(waiting_key={kv_key}, polls={poll_count}, "
-                f"last_status={last_status})"
-            )
-
-        serialized_weights = bytes.fromhex(serialized_hex)
-        group_shared, metadata, names = cuda_ipc_deserialize(serialized_weights)
+        SGLang derives absorbed-path ``w_kc`` and ``w_vc`` tensors from model
+        parameters during ``post_load_weights`` and stores them outside
+        ``named_parameters``. A memory-saver release/resume remaps their pages,
+        while AWEX writes named parameters with in-place ``copy_`` and bypasses
+        normal model loading. Rebuild on every transfer because source weights
+        change each version.
+        """
+        post_load_weights = getattr(self._get_model(), "post_load_weights", None)
+        if post_load_weights is None:
+            return
+        post_load_weights()
         torch.cuda.synchronize()
-        tensors = reconstruct_tensors_from_groups(group_shared, metadata)
-        torch.cuda.synchronize()
-        deserialized_weights = dict(zip(names, tensors))
-
-        recv_parameters = self.get_local_shard_parameters()
-
-        rank_info = self._build_rank_info()
-        rank_coordinate = f"infer_{rank_info.global_rank}"
-
-        assert self._colocate_transport is not None
-        self._colocate_transport.update_weights_in_colocate_mode(
-            self._train_to_infer_device_mapping,
-            self._infer_to_train_device_mapping,
-            transfer_rank,
-            rank_coordinate,
-            self._colocate_infer_world_size,
-            self._send_transfer_plan,
-            self._recv_transfer_plan,
-            self._weights_update_group,
-            deserialized_weights,
-            recv_parameters,
-            step_id=version,
-        )
-
-        done_key = f"colocate_done_rank{paired_train_rank}_{version}"
-        client.put(
-            f"{kv_store_url}/weight_meta/{pair_name}/{done_key}",
-            json={"value": True},
-            headers=auth_headers,
-            timeout=10.0,
-        )
-
-        del deserialized_weights, group_shared, tensors, serialized_weights
-        torch.cuda.synchronize()
-        gc.collect()
-        torch.cuda.empty_cache()
-
-        logger.info(
-            "Colocate weight update completed for v%d, rank %d",
-            version,
-            transfer_rank,
-        )
+        logger.info("Rebuilt derived model weights with post_load_weights()")
 
     # Tags understood by SGLang's native release/resume_memory_occupation.
-    _SGLANG_MEMORY_TAGS = {"kv_cache"}
+    _SGLANG_MEMORY_TAGS = {"kv_cache", "weights"}
 
     def release_memory(self, tags: list[str] | None = None) -> None:
         from sglang.srt.managers.io_struct import ReleaseMemoryOccupationReqInput

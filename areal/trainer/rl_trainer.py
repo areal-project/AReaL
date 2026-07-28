@@ -5,6 +5,7 @@ from __future__ import annotations
 import functools
 import os
 from collections.abc import Callable
+from contextlib import nullcontext
 from copy import deepcopy
 from typing import TYPE_CHECKING, Any, cast
 
@@ -32,6 +33,7 @@ from areal.api.cli_args import (
     SGLangConfig,
     TrainDatasetConfig,
     ValidDatasetConfig,
+    is_colocation_strategy,
     vLLMConfig,
 )
 from areal.engine import RemoteSGLangEngine, RemotevLLMEngine
@@ -144,6 +146,14 @@ class PPOTrainer:
         self._should_offload_teacher = (
             config.teacher is not None and config.teacher.offload
         )
+        self._is_v2_awex_colocate = (
+            config.actor._version == "v2"
+            and not config.actor.use_lora
+            and self._is_actor_rollout_colocated(config)
+        )
+        if config.actor.weight_update_mode == "awex" or self._is_v2_awex_colocate:
+            self._should_offload_rollout = False
+            self._should_offload_actor = False
 
         # Validate config before proceeding with weight initialization
         self._validate_cfg()
@@ -305,6 +315,12 @@ class PPOTrainer:
         # Save initial LoRA weights if enabled (for inference server pre-loading)
         initial_lora_path = self._save_initial_lora_weights()
 
+        if self._is_v2_awex_colocate:
+            self.actor._colocate = True
+            self.actor._ensure_initialized()
+            # Train memory must be released before SGLang forks and claims the GPU.
+            self.actor.release_train_memory_for_colocate()
+
         # Offload actor before rollout init so sglang can use the GPU memory
         if self._should_offload_actor:
             self._offload_model(self.actor, role="actor")
@@ -351,7 +367,9 @@ class PPOTrainer:
                 }
                 self.weight_update_meta = WeightUpdateMeta.from_disk(**disk_kwargs)
             else:
-                self.weight_update_meta = WeightUpdateMeta.from_awex()
+                self.weight_update_meta = WeightUpdateMeta.from_awex(
+                    colocate=self._is_actor_rollout_colocated(config)
+                )
         elif self.config.actor.weight_update_mode == "disk":
             disk_kwargs = {
                 "experiment_name": config.experiment_name,
@@ -439,13 +457,7 @@ class PPOTrainer:
 
     @staticmethod
     def _is_colocation(strategy: SchedulingStrategy | None) -> bool:
-        if strategy is None:
-            return False
-        return strategy.type in (
-            SchedulingStrategyType.colocation,
-            SchedulingStrategyType.colocation.value,
-            "colocation",
-        )
+        return is_colocation_strategy(strategy)
 
     def _is_actor_rollout_colocated(self, config: PPOConfig) -> bool:
         actor_s = config.actor.scheduling_strategy
@@ -694,106 +706,113 @@ class PPOTrainer:
                 if self._should_offload_teacher:
                     self._offload_model(self.teacher, role="teacher")
 
-            if self._should_offload_actor:
-                self._onload_model(self.actor, role="actor")
-            if config.actor.should_compute_prox_logp():
+            train_phase = (
+                self.actor.train_phase()
+                if config.actor._version == "v2"
+                else nullcontext()
+            )
+            with train_phase:
+                if self._should_offload_actor:
+                    self._onload_model(self.actor, role="actor")
+                if config.actor.should_compute_prox_logp():
+                    with (
+                        stats_tracker.record_timing("recompute_logp"),
+                        perf_tracer.trace_scope(
+                            "train.recompute_logp",
+                            category=Category.COMPUTE,
+                            args={"global_step": global_step},
+                        ),
+                    ):
+                        prox_logps = self.actor.compute_logp(rollout_batch)
+                        for traj, logp in zip(rollout_batch, prox_logps):
+                            traj["prox_logp"] = logp
+                        self.actor.get_device_stats().log("recompute logp")
+
                 with (
-                    stats_tracker.record_timing("recompute_logp"),
+                    stats_tracker.record_timing("compute_advantage"),
                     perf_tracer.trace_scope(
-                        "train.recompute_logp",
+                        "train.compute_advantage",
                         category=Category.COMPUTE,
                         args={"global_step": global_step},
                     ),
                 ):
-                    prox_logps = self.actor.compute_logp(rollout_batch)
-                    for traj, logp in zip(rollout_batch, prox_logps):
-                        traj["prox_logp"] = logp
-                    self.actor.get_device_stats().log("recompute logp")
+                    adv_batch = self.actor.compute_advantages(rollout_batch)
+                    self.actor.get_device_stats().log("compute advantages")
 
-            with (
-                stats_tracker.record_timing("compute_advantage"),
-                perf_tracer.trace_scope(
-                    "train.compute_advantage",
-                    category=Category.COMPUTE,
-                    args={"global_step": global_step},
-                ),
-            ):
-                adv_batch = self.actor.compute_advantages(rollout_batch)
-                self.actor.get_device_stats().log("compute advantages")
+                # Wait for async checkpoint staging to complete before modifying parameters
+                self.saver.maybe_wait_for_staging()
 
-            # Wait for async checkpoint staging to complete before modifying parameters
-            self.saver.maybe_wait_for_staging()
+                if (
+                    config.memory_profiler is not None
+                    and global_step in config.memory_profiler.profile_steps
+                ):
+                    self.actor.start_memory_profile(config.memory_profiler.max_entries)
 
-            if (
-                config.memory_profiler is not None
-                and global_step in config.memory_profiler.profile_steps
-            ):
-                self.actor.start_memory_profile(config.memory_profiler.max_entries)
-
-            with (
-                stats_tracker.record_timing("train_step"),
-                perf_tracer.trace_scope(
-                    "train.ppo_update",
-                    category=Category.COMPUTE,
-                    args={"global_step": global_step},
-                ),
-            ):
-                self.actor.ppo_update(adv_batch)
-                self.actor.step_lr_scheduler()
-                self.actor.get_device_stats().log("ppo update")
-
-            if (
-                config.memory_profiler is not None
-                and global_step in config.memory_profiler.profile_steps
-            ):
-                log_dir = StatsLogger.get_log_path(config.stats_logger)
-                snapshot_dir = os.path.join(
-                    log_dir, "memory_snapshots", f"step_{global_step}"
-                )
-                os.makedirs(snapshot_dir, exist_ok=True)
-                self.actor.stop_memory_profile(snapshot_dir)
-                logger.info(f"Memory snapshots saved to {snapshot_dir}")
-
-            if self.critic is not None:
                 with (
-                    stats_tracker.record_timing("critic_train_step"),
+                    stats_tracker.record_timing("train_step"),
                     perf_tracer.trace_scope(
-                        "train.critic_ppo_update",
+                        "train.ppo_update",
                         category=Category.COMPUTE,
                         args={"global_step": global_step},
                     ),
                 ):
-                    self.critic.ppo_update(adv_batch)
-                    self.critic.step_lr_scheduler()
-                    self.critic.get_device_stats().log("ppo critic update")
-                if self._should_offload_critic:
-                    self._offload_model(self.critic, role="critic")
+                    self.actor.ppo_update(adv_batch)
+                    self.actor.step_lr_scheduler()
+                    self.actor.get_device_stats().log("ppo update")
 
-            # pause inference for updating weights, save, and evaluation
-            self.rollout.pause()
+                if (
+                    config.memory_profiler is not None
+                    and global_step in config.memory_profiler.profile_steps
+                ):
+                    log_dir = StatsLogger.get_log_path(config.stats_logger)
+                    snapshot_dir = os.path.join(
+                        log_dir, "memory_snapshots", f"step_{global_step}"
+                    )
+                    os.makedirs(snapshot_dir, exist_ok=True)
+                    self.actor.stop_memory_profile(snapshot_dir)
+                    logger.info(f"Memory snapshots saved to {snapshot_dir}")
 
-            # Actor already onloaded; engine-internal _offload_aware_context
-            # calls in update_weights/save are no-ops.
-
-            with (
-                stats_tracker.record_timing("update_weights"),
-                perf_tracer.trace_scope(
-                    "train.update_weights",
-                    category=Category.COMM,
-                    args={"global_step": global_step},
-                ),
-            ):
-                # Use versioned path for weight updates
-                new_version = global_step + 1
-                versioned_meta = self.weight_update_meta.with_version(new_version)
-                self.actor.update_weights(versioned_meta)
-
-                self.actor.set_version(new_version)
                 if self.critic is not None:
-                    self.critic.set_version(new_version)
-                self.rollout.set_version(new_version)
-                if self.eval_rollout is not None:
-                    self.eval_rollout.set_version(new_version)
+                    with (
+                        stats_tracker.record_timing("critic_train_step"),
+                        perf_tracer.trace_scope(
+                            "train.critic_ppo_update",
+                            category=Category.COMPUTE,
+                            args={"global_step": global_step},
+                        ),
+                    ):
+                        self.critic.ppo_update(adv_batch)
+                        self.critic.step_lr_scheduler()
+                        self.critic.get_device_stats().log("ppo critic update")
+                    if self._should_offload_critic:
+                        self._offload_model(self.critic, role="critic")
+
+                # Colocate v2 phase entry owns the pause; other paths keep it here.
+                if not self._is_v2_awex_colocate:
+                    self.rollout.pause()
+
+                # Actor already onloaded; engine-internal _offload_aware_context
+                # calls in update_weights/save are no-ops.
+
+                with (
+                    stats_tracker.record_timing("update_weights"),
+                    perf_tracer.trace_scope(
+                        "train.update_weights",
+                        category=Category.COMM,
+                        args={"global_step": global_step},
+                    ),
+                ):
+                    # Use versioned path for weight updates
+                    new_version = global_step + 1
+                    versioned_meta = self.weight_update_meta.with_version(new_version)
+                    self.actor.update_weights(versioned_meta)
+
+                    self.actor.set_version(new_version)
+                    if self.critic is not None:
+                        self.critic.set_version(new_version)
+                    self.rollout.set_version(new_version)
+                    if self.eval_rollout is not None:
+                        self.eval_rollout.set_version(new_version)
 
             with (
                 stats_tracker.record_timing("save"),
@@ -874,8 +893,9 @@ class PPOTrainer:
                     epoch=epoch, epoch_step=step, global_step=global_step
                 )
 
-            # Resume rollout
-            self.rollout.resume()
+            # Colocate v2 phase exit resumes rollout; other paths keep it here.
+            if not self._is_v2_awex_colocate:
+                self.rollout.resume()
 
             self._save_perf_tracer(step=global_step)
 

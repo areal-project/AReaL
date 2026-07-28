@@ -5,7 +5,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 import pytest
 
-from areal.api.cli_args import SchedulingSpec, TrainEngineConfig
+from areal.api.cli_args import (
+    SchedulingSpec,
+    SchedulingStrategy,
+    TrainEngineConfig,
+)
 from areal.v2.training_service.controller.controller import (
     GatewayTrainController,
 )
@@ -21,7 +25,10 @@ def _make_response(method: str, url: str, *, json=None) -> httpx.Response:
     )
 
 
-def _make_controller(scheduler: MagicMock | None = None) -> GatewayTrainController:
+def _make_controller(
+    scheduler: MagicMock | None = None,
+    scheduling_strategy: SchedulingStrategy | None = None,
+) -> GatewayTrainController:
     return GatewayTrainController(
         train_engine="areal.engine.FSDPEngine",
         scheduler=scheduler or MagicMock(),
@@ -29,6 +36,7 @@ def _make_controller(scheduler: MagicMock | None = None) -> GatewayTrainControll
             experiment_name="test-exp",
             trial_name="trial-0",
             backend="fsdp:d2",
+            scheduling_strategy=scheduling_strategy or SchedulingStrategy(),
             scheduling_spec=(
                 SchedulingSpec(
                     cpu=1,
@@ -72,16 +80,32 @@ class _FakeAsyncClient:
 
 
 class TestGatewayTrainControllerInitialization:
+    @pytest.mark.parametrize(
+        ("scheduling_strategy", "expected_worker_envs"),
+        [
+            (SchedulingStrategy(), [None, None]),
+            (
+                SchedulingStrategy(type="colocation", target="rollout"),
+                [
+                    {"CUDA_VISIBLE_DEVICES": "0"},
+                    {"CUDA_VISIBLE_DEVICES": "1"},
+                ],
+            ),
+        ],
+    )
     @pytest.mark.asyncio
-    async def test_async_initialize_offloads_scheduler_and_uses_async_helpers(self):
+    async def test_async_initialize_offloads_scheduler_and_uses_async_helpers(
+        self, scheduling_strategy, expected_worker_envs
+    ):
         worker0 = MagicMock(ip="127.0.0.1", worker_ports=[18000], id="guard-0")
         worker1 = MagicMock(ip="127.0.0.1", worker_ports=[18001], id="guard-1")
 
         scheduler = MagicMock()
+        scheduler.n_gpus_per_node = 2
         scheduler.create_workers.return_value = ["guard-0", "guard-1"]
         scheduler.get_workers.return_value = [worker0, worker1]
 
-        controller = _make_controller(scheduler)
+        controller = _make_controller(scheduler, scheduling_strategy)
         controller._role = "train-role"
 
         port_client = _FakeAsyncClient(
@@ -144,6 +168,9 @@ class TestGatewayTrainControllerInitialization:
 
         mock_set_env.assert_awaited_once()
         assert mock_async_fork.await_count == 5
+        assert [
+            call.kwargs.get("env") for call in mock_async_fork.await_args_list[:2]
+        ] == expected_worker_envs
         mock_sync_fork.assert_not_called()
         assert mock_create_engine.await_count == 2
         assert mock_call_engine.await_count == 4

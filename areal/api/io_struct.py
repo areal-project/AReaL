@@ -202,6 +202,10 @@ class WeightUpdateMeta:
 
     clear_checkpoint_after_load: bool = True
 
+    # awex only: training and inference share the same GPUs (CUDA IPC transfer
+    # instead of NCCL P2P). Derived from scheduling strategies, not user config.
+    colocate: bool = False
+
     version: int | None = None
 
     def with_version(self, version: int) -> "WeightUpdateMeta":
@@ -296,6 +300,7 @@ class WeightUpdateMeta:
         lora_name: str = "",
         lora_int_id: int = 1,
         base_model_name: str = "",
+        colocate: bool = False,
     ):
         return cls(
             type="awex",
@@ -303,6 +308,7 @@ class WeightUpdateMeta:
             lora_name=lora_name,
             lora_int_id=lora_int_id,
             base_model_name=base_model_name,
+            colocate=colocate,
         )
 
 

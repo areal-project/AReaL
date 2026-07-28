@@ -69,6 +69,7 @@ class AwexSchedulerBridge:
         ]
         for name in methods:
             setattr(self._scheduler, name, getattr(self, name))
+        self._install_decode_stats_tracker()
 
     def _require_adapter(self) -> Any:
         if self._adapter is None:
@@ -100,7 +101,13 @@ class AwexSchedulerBridge:
             self._push_result(serialize_value(local_meta))
 
     def awex_report_parallelism(self) -> None:
-        self._push_result(self._require_adapter().parallelism_strategy)
+        from areal.utils.network import gethostip
+        from areal.v2.weight_update.awex import resolve_physical_gpu_id
+
+        result = dict(self._require_adapter().parallelism_strategy)
+        result["ip"] = gethostip()
+        result["device_id"] = resolve_physical_gpu_id()
+        self._push_result(result)
 
     def awex_init_weights_update_group(self, **kwargs: Any) -> None:
         self._require_adapter().init_weight_update_group(**kwargs)
@@ -132,6 +139,91 @@ class AwexSchedulerBridge:
 
     def awex_resume_memory(self, tags: list[str] | None = None) -> None:
         self._require_adapter().resume_memory(tags)
+
+    def _install_decode_stats_tracker(self) -> None:
+        """Keep SGLang decode-stats logging alive across pause/resume cycles.
+
+        Colocate weight updates pause generation and release/resume memory;
+        the native decode-stats logging then goes silent because its
+        ``forward_ct_decode % decode_log_interval`` firing points are missed.
+        Wrapping ``log_decode_stats*`` records the counter at each native log,
+        and the ``process_batch_result`` wrapper re-invokes logging for decode
+        batches whose firing point was skipped. Instance-attribute wraps only
+        (same setattr territory as :meth:`bind`); disable with
+        ``AREAL_AWEX_FORCE_SGLANG_METRICS=0``.
+        """
+        if os.environ.get("AREAL_AWEX_FORCE_SGLANG_METRICS", "1") != "1":
+            return
+        scheduler = self._scheduler
+        orig_log = getattr(scheduler, "log_decode_stats", None)
+        orig_log_iter = getattr(scheduler, "log_decode_stats_every_iteration", None)
+        if orig_log is None or orig_log_iter is None:
+            raise AttributeError(
+                "sglang Scheduler.log_decode_stats(_every_iteration) not found; "
+                "incompatible sglang version for AWEX decode-stats tracking"
+            )
+
+        def _tracked_log_decode_stats(*args, **kwargs):
+            scheduler._areal_awex_last_decode_stats_ct = getattr(
+                scheduler, "forward_ct_decode", None
+            )
+            return orig_log(*args, **kwargs)
+
+        def _tracked_log_decode_stats_every_iteration(*args, **kwargs):
+            scheduler._areal_awex_last_decode_stats_every_iter_ct = getattr(
+                scheduler, "forward_ct_decode", None
+            )
+            return orig_log_iter(*args, **kwargs)
+
+        scheduler.log_decode_stats = _tracked_log_decode_stats
+        scheduler.log_decode_stats_every_iteration = (
+            _tracked_log_decode_stats_every_iteration
+        )
+
+        orig_process = scheduler.process_batch_result
+
+        def _tracked_process_batch_result(batch, result, *args, **kwargs):
+            out = orig_process(batch, result, *args, **kwargs)
+            self._maybe_restore_decode_metrics(batch, result)
+            return out
+
+        scheduler.process_batch_result = _tracked_process_batch_result
+
+    def _maybe_restore_decode_metrics(self, batch: Any, result: Any) -> None:
+        if os.environ.get("AREAL_AWEX_FORCE_SGLANG_METRICS", "1") != "1":
+            return
+        if batch is None:
+            return
+        scheduler = self._scheduler
+        mode = getattr(getattr(batch, "forward_mode", None), "name", None)
+        if mode != "DECODE":
+            return
+        if not getattr(scheduler, "current_scheduler_metrics_enabled", False):
+            return
+
+        current_ct = getattr(scheduler, "forward_ct_decode", None)
+        interval = (
+            getattr(getattr(scheduler, "server_args", None), "decode_log_interval", 1)
+            or 1
+        )
+        should_log_decode = current_ct is not None and current_ct % interval == 0
+
+        if (
+            should_log_decode
+            and getattr(scheduler, "_areal_awex_last_decode_stats_ct", None)
+            != current_ct
+        ):
+            can_run_cuda_graph = getattr(result, "can_run_cuda_graph", False)
+            scheduler.log_decode_stats(can_run_cuda_graph, running_batch=batch)
+
+        if (
+            getattr(scheduler, "_areal_awex_last_decode_stats_every_iter_ct", None)
+            != current_ct
+        ):
+            scheduler.log_decode_stats_every_iteration(
+                batch,
+                num_accepted_tokens=getattr(result, "num_accepted_tokens", 0),
+            )
 
 
 # ---------------------------------------------------------------------------

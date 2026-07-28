@@ -41,8 +41,14 @@ def create_awex_blueprint(
     @bp.route("/report_parallelism", methods=["GET"])
     def report_parallelism():
         try:
+            from areal.utils.network import gethostip
+            from areal.v2.weight_update.awex import resolve_physical_gpu_id
+
             adapter = _require_adapter()
-            return flask_module.jsonify(adapter.parallelism_strategy)
+            info = dict(adapter.parallelism_strategy)
+            info["ip"] = gethostip()
+            info["device_id"] = resolve_physical_gpu_id()
+            return flask_module.jsonify(info)
         except RuntimeError as e:
             return flask_module.jsonify({"error": str(e)}), 400
 

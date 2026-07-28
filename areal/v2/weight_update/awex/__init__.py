@@ -14,6 +14,37 @@ from areal.utils import logging
 logger = logging.getLogger("AwexHTTP")
 
 
+def resolve_physical_gpu_id(device_index: int | None = None) -> int:
+    """Map a process-local CUDA device index to its physical GPU id.
+
+    ``CUDA_VISIBLE_DEVICES`` remaps device indices: with ``CVD="2,3"``, the
+    process-local device 1 is physical GPU 3. Colocate pairing keys on
+    ``(ip, physical_gpu)``, and co-resident processes may see different CVD
+    mappings, so CVD is the ground truth here (under slurm-style isolation
+    ``torch.cuda.current_device()`` may simply return 0).
+
+    Falls back to the process-local index when CVD is unset or unparsable
+    (e.g. GPU UUID entries).
+    """
+    import torch
+
+    idx = device_index if device_index is not None else torch.cuda.current_device()
+    cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+    if not cvd:
+        return idx
+    try:
+        entries = [e.strip() for e in cvd.split(",") if e.strip()]
+        return int(entries[idx])
+    except (IndexError, ValueError):
+        logger.warning(
+            "Cannot map device index %d through CUDA_VISIBLE_DEVICES=%r; "
+            "falling back to the process-local index.",
+            idx,
+            cvd,
+        )
+        return idx
+
+
 def awex_wu_use_group() -> bool:
     """Resolve whether ``batch_send_recv`` should use ``use_group=True``.
 

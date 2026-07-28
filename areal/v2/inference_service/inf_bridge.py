@@ -105,9 +105,11 @@ class InfBridge:
         await self.pause_state.set_paused(False)
         logger.info("Resume request sent to %s", self.backend_addr)
 
-    async def offload(self) -> None:
+    async def offload(self, tags: list[str] | None = None) -> None:
         """Offload model memory on the backend inference server."""
         http_req = self.backend.get_offload_request()
+        if tags is not None:
+            http_req.payload["tags"] = tags
         await self._send_request(http_req, timeout=30.0)
         logger.info("Offload request sent to %s", self.backend_addr)
 

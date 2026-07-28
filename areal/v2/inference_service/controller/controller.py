@@ -1380,19 +1380,20 @@ class RolloutControllerV2:
         assert self._workflow_executor is not None
         self._workflow_executor.resume()
 
-    def offload(self) -> None:
+    def offload(self, tags: list[str] | None = None) -> None:
         """Offload model memory on all inference workers."""
         from areal.infra.utils.concurrent import run_async_task
 
         self._ensure_initialized()
-        run_async_task(self._async_offload)
+        run_async_task(self._async_offload, tags)
 
-    async def _async_offload(self) -> None:
+    async def _async_offload(self, tags: list[str] | None = None) -> None:
         if not self._data_proxy_addrs:
             return
+        payload: dict = {"tags": tags} if tags is not None else {}
         results = await asyncio.gather(
             *(
-                self._async_data_proxy_post(addr, "/release_memory_occupation", {})
+                self._async_data_proxy_post(addr, "/release_memory_occupation", payload)
                 for addr in self._data_proxy_addrs
             ),
             return_exceptions=True,
@@ -1449,6 +1450,19 @@ class RolloutControllerV2:
             logger.error("Failed to pause generation on a worker: %s", r)
         if failed and len(failed) == len(results):
             raise RuntimeError(f"pause_generation failed on ALL {len(failed)} workers")
+
+    def pause_generation_sync(self, drain_timeout: float = 60.0) -> None:
+        """Pause generation on all workers, then wait for in-flight requests to drain."""
+        self.pause_generation()
+        # The pause HTTP request may require some time to be scheduled and
+        # executed on the inference servers. Mirror the v1 RemoteInfEngine
+        # semantics: wait a fixed grace period until in-flight requests are
+        # indeed dropped before the caller proceeds (e.g. offload).
+        logger.info(
+            "Waiting %.1fs after pause_generation for in-flight requests to drop",
+            drain_timeout,
+        )
+        time.sleep(drain_timeout)
 
     def continue_generation(self) -> None:
         """Continue generation on all workers."""
