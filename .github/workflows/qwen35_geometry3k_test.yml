@@ -1,4 +1,4 @@
-name: Inspect A3 Runner
+name: AReaL Kubernetes Permission Probe
 
 on:
   workflow_dispatch:
@@ -7,48 +7,61 @@ on:
       - ci/vlm-npu-nightly
 
 jobs:
-  inspect:
+  probe:
     runs-on: linux-aarch64-a3-16
 
     steps:
-      - name: Inspect runner environment
+      - name: Check Kubernetes permissions
         shell: bash
         run: |
-          set -euxo pipefail
+          set -Eeuo pipefail
 
-          echo "=== Identity ==="
-          id
-          hostname
-          uname -a
+          SA_DIR=/var/run/secrets/kubernetes.io/serviceaccount
+          TOKEN="$(cat "${SA_DIR}/token")"
+          NAMESPACE="$(cat "${SA_DIR}/namespace")"
+          CA="${SA_DIR}/ca.crt"
+          API="https://${KUBERNETES_SERVICE_HOST}:${KUBERNETES_SERVICE_PORT_HTTPS}"
 
-          echo "=== PID 1 ==="
-          ps -p 1 -o pid,comm,args
+          echo "Namespace: ${NAMESPACE}"
+          echo "Runner pod: $(hostname)"
 
-          echo "=== Container detection ==="
-          cat /proc/1/cgroup || true
-          test -f /.dockerenv && echo "Runner is inside Docker" || true
+          check_permission() {
+            local verb="$1"
+            local resource="$2"
+            local subresource="${3:-}"
 
-          echo "=== Container runtimes ==="
-          command -v docker || true
-          command -v dockerd || true
-          command -v podman || true
-          command -v containerd || true
-          command -v nerdctl || true
-          command -v kubectl || true
+            cat > /tmp/review.json <<EOF
+          {
+            "apiVersion": "authorization.k8s.io/v1",
+            "kind": "SelfSubjectAccessReview",
+            "spec": {
+              "resourceAttributes": {
+                "namespace": "${NAMESPACE}",
+                "verb": "${verb}",
+                "group": "",
+                "resource": "${resource}",
+                "subresource": "${subresource}"
+              }
+            }
+          }
+          EOF
 
-          echo "=== Docker endpoint ==="
-          echo "DOCKER_HOST=${DOCKER_HOST:-unset}"
-          ls -la /var/run/docker.sock || true
-          ls -la /run/docker.sock || true
-          ls -la /run/user/"$(id -u)"/docker.sock || true
+            echo "=== ${verb} ${resource}${subresource:+/${subresource}} ==="
 
-          echo "=== Systemd ==="
-          systemctl is-system-running || true
-          systemctl status docker.service --no-pager || true
+            curl --fail-with-body \
+              --silent \
+              --show-error \
+              --cacert "${CA}" \
+              -H "Authorization: Bearer ${TOKEN}" \
+              -H "Content-Type: application/json" \
+              -X POST \
+              --data-binary @/tmp/review.json \
+              "${API}/apis/authorization.k8s.io/v1/selfsubjectaccessreviews"
 
-          echo "=== Runner hook variables ==="
-          env | grep -E 'ACTIONS_RUNNER_CONTAINER|KUBERNETES|PODMAN' || true
+            echo
+          }
 
-          echo "=== NPU ==="
-          npu-smi info || true
-          ls -l /dev/davinci* /dev/davinci_manager /dev/devmm_svm 2>/dev/null || true
+          check_permission create pods
+          check_permission get pods
+          check_permission delete pods
+          check_permission get pods log
