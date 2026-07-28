@@ -1,7 +1,10 @@
 name: Probe Ascend A3 Runner
 
 on:
-  workflow_dispatch:
+  push:
+    branches:
+      - ci/vlm-npu-nightly
+
 
 jobs:
   probe:
