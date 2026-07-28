@@ -1,0 +1,137 @@
+name: Qwen3.5-2B Geometry3K GRPO Test
+
+on:
+  push:
+    branches:
+      - ci/vlm-npu-nightly
+
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: qwen35-geometry3k-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  geometry3k-grpo:
+    runs-on: linux-aarch64-a3-16
+    timeout-minutes: 720
+
+    container:
+      image: ghcr.io/hwvanici/areal_npu:v1.0.4-a3
+      options: >-
+        --shm-size 720g
+
+    env:
+      HF_HUB_ENABLE_HF_TRANSFER: "0"
+      USE_OPTIMIZED_MODEL: "0"
+
+      # Optional when direct Hugging Face access is unavailable.
+      # HF_ENDPOINT: "https://hf-mirror.com"
+
+      CI_OUTPUT_ROOT: /tmp/areal-ci/${{ github.run_id }}-${{ github.run_attempt }}
+
+    steps:
+      - name: Check NPU and CANN environment
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          echo "=== Host architecture ==="
+          uname -a
+
+          echo "=== CANN installation ==="
+          cat /usr/local/Ascend/ascend-toolkit/latest/"$(uname -i)"-linux/ascend_toolkit_install.info \
+            || true
+
+          echo "=== NPU status ==="
+          npu-smi info
+
+          echo "=== NPU device count ==="
+          python - <<'PY'
+          import torch
+          import torch_npu
+
+          count = torch.npu.device_count()
+          print(f"NPU count: {count}")
+          assert count == 16, f"Expected 16 NPUs, found {count}"
+          PY
+
+      - name: Check out AReaL test revision
+        uses: actions/checkout@v4
+        with:
+          ref: e402ff947e52f4d48c625eb47a38870dde13e4e5
+          fetch-depth: 0
+          clean: true
+
+      - name: Install checked-out AReaL
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          git log -1 --oneline
+          pip install --no-deps -e .
+
+          python - <<'PY'
+          import areal
+          print("AReaL import succeeded")
+          PY
+
+      - name: Check model and dataset access
+        shell: bash
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          set -Eeuo pipefail
+
+          python - <<'PY'
+          from huggingface_hub import model_info, dataset_info
+
+          model = model_info("Qwen/Qwen3-VL-2B-Instruct")
+          dataset = dataset_info("hiyouga/geometry3k")
+
+          print("Model:", model.id)
+          print("Dataset:", dataset.id)
+          PY
+
+      - name: Run Geometry3K GRPO
+        shell: bash
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          set -Eeuo pipefail
+
+          ray stop --force || true
+
+          rm -rf "${CI_OUTPUT_ROOT}"
+          mkdir -p \
+            "${CI_OUTPUT_ROOT}/experiments" \
+            "${CI_OUTPUT_ROOT}/name_resolve"
+
+          python examples/vlm/geometry3k_grpo.py \
+            --config examples/vlm_npu/qwen3_5_2b_geometry3k_grpo.yaml \
+            total_train_epochs=1 \
+            trial_name="ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            cluster.fileroot="${CI_OUTPUT_ROOT}/experiments" \
+            cluster.name_resolve.nfs_record_root="${CI_OUTPUT_ROOT}/name_resolve"
+
+      - name: Show generated files
+        if: always()
+        shell: bash
+        run: |
+          find "${CI_OUTPUT_ROOT}" \
+            -maxdepth 5 \
+            -type f \
+            -printf '%p %k KB\n' \
+            2>/dev/null | sort | tail -200 || true
+
+      - name: Clean up processes
+        if: always()
+        shell: bash
+        run: |
+          ray stop --force || true
+
+          pkill -f areal.infra.rpc.rpc_server || true
+          pkill -f vllm || true
