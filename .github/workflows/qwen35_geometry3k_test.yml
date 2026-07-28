@@ -29,66 +29,275 @@ jobs:
     timeout-minutes: 10
 
     steps:
-      - name: Show NPU resource names and capacities
+      - name: Probe NPU resource names
         shell: bash
         run: |
           set -Eeuo pipefail
 
           SA=/var/run/secrets/kubernetes.io/serviceaccount
           TOKEN="$(cat "${SA}/token")"
+          NAMESPACE="$(cat "${SA}/namespace")"
           CA="${SA}/ca.crt"
 
           API="https://${KUBERNETES_SERVICE_HOST}:${KUBERNETES_SERVICE_PORT_HTTPS}"
+          RUNNER_POD="$(hostname)"
 
           command -v curl >/dev/null
           command -v jq >/dev/null
 
-          curl \
-            --fail-with-body \
-            --silent \
-            --show-error \
-            --cacert "${CA}" \
-            -H "Authorization: Bearer ${TOKEN}" \
-            "${API}/api/v1/nodes" \
-            > /tmp/nodes.json
+          api_get() {
+            local url="$1"
+            local output="$2"
 
-          echo "=== NPU resources by node ==="
+            curl \
+              --silent \
+              --show-error \
+              --cacert "${CA}" \
+              -H "Authorization: Bearer ${TOKEN}" \
+              -o "${output}" \
+              -w "%{http_code}" \
+              "${url}"
+          }
 
-          jq -r '
-            ["NODE", "RESOURCE", "CAPACITY", "ALLOCATABLE"],
-            (
-              .items[] as $node
-              | ($node.status.capacity // {})
-              | to_entries[]
-              | select(
-                  .key
-                  | test("huawei|ascend|npu"; "i")
-                )
-              | [
-                  $node.metadata.name,
-                  .key,
-                  .value,
-                  (
-                    $node.status.allocatable[.key]
-                    // "0"
-                  )
-                ]
-            )
-            | @tsv
-          ' /tmp/nodes.json |
+          print_table() {
             if command -v column >/dev/null; then
               column -t -s $'\t'
             else
               cat
             fi
+          }
+
+          echo "Namespace: ${NAMESPACE}"
+          echo "Runner pod: ${RUNNER_POD}"
+          echo
+
+          # ----------------------------------------------------------
+          # Read the current runner pod to discover its Kubernetes node.
+          # ----------------------------------------------------------
+
+          runner_url="${API}/api/v1/namespaces/${NAMESPACE}/pods/${RUNNER_POD}"
+          runner_code="$(api_get "${runner_url}" /tmp/runner-pod.json)"
+
+          if [[ "${runner_code}" != "200" ]]; then
+            echo "Failed to read runner pod: HTTP ${runner_code}"
+            cat /tmp/runner-pod.json
+            exit 1
+          fi
+
+          NODE_NAME="$(
+            jq -r '.spec.nodeName // empty' /tmp/runner-pod.json
+          )"
+
+          echo "Runner node: ${NODE_NAME:-unknown}"
 
           echo
-          echo "=== Unique NPU resource names ==="
+          echo "=== Runner scheduling configuration ==="
 
-          jq -r '
-            .items[]
-            | (.status.capacity // {})
-            | keys[]
-            | select(test("huawei|ascend|npu"; "i"))
-          ' /tmp/nodes.json |
-            sort -u
+          jq '{
+            nodeName: .spec.nodeName,
+            nodeSelector: .spec.nodeSelector,
+            tolerations: .spec.tolerations,
+            runtimeClassName: .spec.runtimeClassName,
+            schedulerName: .spec.schedulerName,
+            resources: [
+              .spec.containers[]?
+              | {
+                  name: .name,
+                  requests: .resources.requests,
+                  limits: .resources.limits
+                }
+            ]
+          }' /tmp/runner-pod.json
+
+          # ----------------------------------------------------------
+          # Try GET on the exact node. This may be allowed even though
+          # LIST /api/v1/nodes returned 403.
+          # ----------------------------------------------------------
+
+          echo
+          echo "=== Resources on runner node ==="
+
+          if [[ -n "${NODE_NAME}" ]]; then
+            node_url="${API}/api/v1/nodes/${NODE_NAME}"
+            node_code="$(api_get "${node_url}" /tmp/node.json)"
+
+            if [[ "${node_code}" == "200" ]]; then
+              jq -r '
+                ["RESOURCE", "CAPACITY", "ALLOCATABLE"],
+                (
+                  (
+                    (
+                      (.status.capacity // {}) |
+                      keys
+                    )
+                    +
+                    (
+                      (.status.allocatable // {}) |
+                      keys
+                    )
+                  )
+                  | unique[]
+                  | select(test("huawei|ascend|npu"; "i"))
+                  | [
+                      .,
+                      (. as $key |
+                       $ARGS.named.doc.status.capacity[$key] // "0"),
+                      (. as $key |
+                       $ARGS.named.doc.status.allocatable[$key] // "0")
+                    ]
+                )
+                | @tsv
+              ' \
+                --argjson doc "$(cat /tmp/node.json)" \
+                /tmp/node.json |
+                print_table
+
+              echo
+              echo "=== Unique resource names on runner node ==="
+
+              jq -r '
+                (
+                  (
+                    (.status.capacity // {}) |
+                    keys
+                  )
+                  +
+                  (
+                    (.status.allocatable // {}) |
+                    keys
+                  )
+                )
+                | unique[]
+                | select(test("huawei|ascend|npu"; "i"))
+              ' /tmp/node.json
+
+            else
+              echo "Cannot read node ${NODE_NAME}: HTTP ${node_code}"
+              cat /tmp/node.json
+            fi
+          fi
+
+          # ----------------------------------------------------------
+          # Fallback: scan pods visible in the current namespace.
+          # Existing NPU workloads reveal the resource key they use.
+          # ----------------------------------------------------------
+
+          echo
+          echo "=== NPU resources requested by namespace pods ==="
+
+          pods_url="${API}/api/v1/namespaces/${NAMESPACE}/pods"
+          pods_code="$(api_get "${pods_url}" /tmp/pods.json)"
+
+          if [[ "${pods_code}" == "200" ]]; then
+            pod_resources="$(
+              jq -r '
+                .items[] as $pod
+                |
+                (
+                  ($pod.spec.initContainers // [])
+                  +
+                  ($pod.spec.containers // [])
+                )[]
+                as $container
+                |
+                (
+                  ($container.resources.requests // {})
+                  +
+                  ($container.resources.limits // {})
+                )
+                | to_entries[]
+                | select(.key | test("huawei|ascend|npu"; "i"))
+                | [
+                    $pod.metadata.name,
+                    ($pod.spec.nodeName // "Pending"),
+                    $container.name,
+                    .key,
+                    .value
+                  ]
+                | @tsv
+              ' /tmp/pods.json
+            )"
+
+            if [[ -n "${pod_resources}" ]]; then
+              {
+                printf 'POD\tNODE\tCONTAINER\tRESOURCE\tQUANTITY\n'
+                printf '%s\n' "${pod_resources}"
+              } | print_table
+            else
+              echo "No visible pod requests an NPU resource."
+            fi
+
+            echo
+            echo "=== Unique NPU resource names from pods ==="
+
+            jq -r '
+              .items[]
+              |
+              (
+                (.spec.initContainers // [])
+                +
+                (.spec.containers // [])
+              )[]
+              |
+              (
+                (.resources.requests // {})
+                +
+                (.resources.limits // {})
+              )
+              | keys[]
+              | select(test("huawei|ascend|npu"; "i"))
+            ' /tmp/pods.json |
+              sort -u
+
+          else
+            echo "Cannot list namespace pods: HTTP ${pods_code}"
+            cat /tmp/pods.json
+          fi
+
+          # ----------------------------------------------------------
+          # Scheduler events can also contain extended-resource names.
+          # ----------------------------------------------------------
+
+          echo
+          echo "=== Recent NPU-related namespace events ==="
+
+          events_url="${API}/api/v1/namespaces/${NAMESPACE}/events"
+          events_code="$(api_get "${events_url}" /tmp/events.json)"
+
+          if [[ "${events_code}" == "200" ]]; then
+            jq -r '
+              .items
+              | sort_by(
+                  .lastTimestamp
+                  // .eventTime
+                  // .metadata.creationTimestamp
+                  // ""
+                )
+              | reverse[]
+              | select(
+                  (
+                    (.message // "")
+                    + " "
+                    + (.reason // "")
+                  )
+                  | test("huawei|ascend|npu"; "i")
+                )
+              | [
+                  (
+                    .lastTimestamp
+                    // .eventTime
+                    // .metadata.creationTimestamp
+                    // ""
+                  ),
+                  (.involvedObject.name // ""),
+                  (.reason // ""),
+                  (.message // "")
+                ]
+              | @tsv
+            ' /tmp/events.json |
+              head -50 |
+              print_table
+          else
+            echo "Cannot list namespace events: HTTP ${events_code}"
+            cat /tmp/events.json
+          fi
