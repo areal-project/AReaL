@@ -9,7 +9,7 @@ on:
 
 jobs:
   probe:
-    runs-on: linux-aarch64-a3-16
+    runs-on: linux-aarch64-a3-8
     container:
       image: ascendai/cann:latest
 
