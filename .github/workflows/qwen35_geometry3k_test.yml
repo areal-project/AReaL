@@ -1,10 +1,11 @@
-name: Probe Ascend A3 Runner
+name: Qwen3.5-2B Geometry3K GRPO Test
 
 on:
+  workflow_dispatch:
+
   push:
     branches:
       - ci/vlm-npu-nightly
-
 
 jobs:
   probe:
@@ -12,7 +13,7 @@ jobs:
     timeout-minutes: 20
 
     container:
-      image: swr.cn-southwest-2.myhuaweicloud.com/modelfoundry/ascend-ci/verl/verl:verl-9.0.0-a3-ubuntu22.04-py3.11-latest
+      image: quay.io/ascend/verl:v0.8.0-cann9.0.0-torch2.9.0post2-a3-ubuntu22.04-py3.11-vllm
 
     steps:
       - name: Show NPU information
