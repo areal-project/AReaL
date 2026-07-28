@@ -1,26 +1,54 @@
-name: Qwen3.5-2B Geometry3K GRPO Test
+name: Inspect A3 Runner
 
 on:
+  workflow_dispatch:
   push:
     branches:
       - ci/vlm-npu-nightly
 
-  workflow_dispatch:
-
-permissions:
-  contents: read
-
-concurrency:
-  group: qwen35-geometry3k-${{ github.ref }}
-  cancel-in-progress: true
-
 jobs:
-  probe:
+  inspect:
     runs-on: linux-aarch64-a3-16
 
     steps:
-      - name: Test host Docker
+      - name: Inspect runner environment
+        shell: bash
         run: |
           set -euxo pipefail
-          docker version
-          docker run --rm ubuntu:22.04 uname -a
+
+          echo "=== Identity ==="
+          id
+          hostname
+          uname -a
+
+          echo "=== PID 1 ==="
+          ps -p 1 -o pid,comm,args
+
+          echo "=== Container detection ==="
+          cat /proc/1/cgroup || true
+          test -f /.dockerenv && echo "Runner is inside Docker" || true
+
+          echo "=== Container runtimes ==="
+          command -v docker || true
+          command -v dockerd || true
+          command -v podman || true
+          command -v containerd || true
+          command -v nerdctl || true
+          command -v kubectl || true
+
+          echo "=== Docker endpoint ==="
+          echo "DOCKER_HOST=${DOCKER_HOST:-unset}"
+          ls -la /var/run/docker.sock || true
+          ls -la /run/docker.sock || true
+          ls -la /run/user/"$(id -u)"/docker.sock || true
+
+          echo "=== Systemd ==="
+          systemctl is-system-running || true
+          systemctl status docker.service --no-pager || true
+
+          echo "=== Runner hook variables ==="
+          env | grep -E 'ACTIONS_RUNNER_CONTAINER|KUBERNETES|PODMAN' || true
+
+          echo "=== NPU ==="
+          npu-smi info || true
+          ls -l /dev/davinci* /dev/davinci_manager /dev/devmm_svm 2>/dev/null || true
