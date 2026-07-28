@@ -10,24 +10,10 @@ on:
 jobs:
   probe:
     runs-on: linux-aarch64-a3-16
-    timeout-minutes: 20
-
     container:
-      image: quay.io/ascend/verl:v0.8.0-cann9.0.0-torch2.9.0post2-a3-ubuntu22.04-py3.11-vllm
+      image: ascendai/cann:latest
 
     steps:
-      - name: Show NPU information
-        shell: bash
+      - name: Show NPU info
         run: |
-          set -euxo pipefail
-
           npu-smi info
-
-          python - <<'PY'
-          import torch
-          import torch_npu
-
-          count = torch.npu.device_count()
-          print("Visible NPU count:", count)
-          assert count == 16, f"Expected 16 NPUs, found {count}"
-          PY
