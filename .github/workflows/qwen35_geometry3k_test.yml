@@ -24,438 +24,71 @@ env:
   NPU_COUNT: "16"
 
 jobs:
-  geometry3k:
+  probe-npu-resources:
     runs-on: linux-aarch64-a3-16
-    timeout-minutes: 720
+    timeout-minutes: 10
 
     steps:
-      - name: Create and run AReaL pod
+      - name: Show NPU resource names and capacities
         shell: bash
-        env:
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
           set -Eeuo pipefail
 
-          export POD_NAME="areal-geometry3k-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          SA=/var/run/secrets/kubernetes.io/serviceaccount
+          TOKEN="$(cat "${SA}/token")"
+          CA="${SA}/ca.crt"
 
-          python3 - <<'PY'
-          import json
-          import os
-          import ssl
-          import sys
-          import textwrap
-          import time
-          import urllib.error
-          import urllib.parse
-          import urllib.request
+          API="https://${KUBERNETES_SERVICE_HOST}:${KUBERNETES_SERVICE_PORT_HTTPS}"
 
+          command -v curl >/dev/null
+          command -v jq >/dev/null
 
-          SA_DIR = "/var/run/secrets/kubernetes.io/serviceaccount"
+          curl \
+            --fail-with-body \
+            --silent \
+            --show-error \
+            --cacert "${CA}" \
+            -H "Authorization: Bearer ${TOKEN}" \
+            "${API}/api/v1/nodes" \
+            > /tmp/nodes.json
 
-          with open(f"{SA_DIR}/token", encoding="utf-8") as f:
-              TOKEN = f.read().strip()
+          echo "=== NPU resources by node ==="
 
-          with open(f"{SA_DIR}/namespace", encoding="utf-8") as f:
-              NAMESPACE = f.read().strip()
-
-          API = (
-              f"https://{os.environ['KUBERNETES_SERVICE_HOST']}:"
-              f"{os.environ['KUBERNETES_SERVICE_PORT_HTTPS']}"
-          )
-
-          SSL_CONTEXT = ssl.create_default_context(
-              cafile=f"{SA_DIR}/ca.crt"
-          )
-
-          POD_NAME = os.environ["POD_NAME"]
-          RUNNER_POD_NAME = os.uname().nodename
-          IMAGE = os.environ["AREAL_IMAGE"]
-          AREAL_REF = os.environ["AREAL_REF"]
-          NPU_RESOURCE = os.environ["NPU_RESOURCE"]
-          NPU_COUNT = os.environ["NPU_COUNT"]
-          HF_TOKEN = os.environ.get("HF_TOKEN", "")
-
-          PODS_PATH = f"/api/v1/namespaces/{NAMESPACE}/pods"
-          POD_PATH = f"{PODS_PATH}/{POD_NAME}"
-
-
-          def request(method, path, body=None, timeout=60):
-              headers = {
-                  "Authorization": f"Bearer {TOKEN}",
-                  "Accept": "application/json",
-              }
-
-              data = None
-              if body is not None:
-                  headers["Content-Type"] = "application/json"
-                  data = json.dumps(body).encode("utf-8")
-
-              req = urllib.request.Request(
-                  API + path,
-                  data=data,
-                  headers=headers,
-                  method=method,
-              )
-
-              try:
-                  return urllib.request.urlopen(
-                      req,
-                      context=SSL_CONTEXT,
-                      timeout=timeout,
+          jq -r '
+            ["NODE", "RESOURCE", "CAPACITY", "ALLOCATABLE"],
+            (
+              .items[] as $node
+              | ($node.status.capacity // {})
+              | to_entries[]
+              | select(
+                  .key
+                  | test("huawei|ascend|npu"; "i")
+                )
+              | [
+                  $node.metadata.name,
+                  .key,
+                  .value,
+                  (
+                    $node.status.allocatable[.key]
+                    // "0"
                   )
-              except urllib.error.HTTPError as exc:
-                  message = exc.read().decode(
-                      "utf-8",
-                      errors="replace",
-                  )
-                  raise RuntimeError(
-                      f"{method} {path} returned HTTP "
-                      f"{exc.code}:\n{message}"
-                  ) from exc
+                ]
+            )
+            | @tsv
+          ' /tmp/nodes.json |
+            if command -v column >/dev/null; then
+              column -t -s $'\t'
+            else
+              cat
+            fi
 
+          echo
+          echo "=== Unique NPU resource names ==="
 
-          def get_json(path):
-              with request("GET", path) as response:
-                  return json.load(response)
-
-
-          def print_status(status):
-              phase = status.get("phase", "Unknown")
-              print(f"Pod phase: {phase}", flush=True)
-
-              for condition in status.get("conditions", []):
-                  message = condition.get("message")
-                  if message:
-                      print(
-                          f"  {condition.get('type')}: {message}",
-                          flush=True,
-                      )
-
-              for item in status.get("containerStatuses", []):
-                  state = item.get("state", {})
-                  waiting = state.get("waiting")
-
-                  if waiting:
-                      print(
-                          "  Waiting: "
-                          f"{waiting.get('reason')}: "
-                          f"{waiting.get('message', '')}",
-                          flush=True,
-                      )
-
-
-          print(
-              f"Reading runner pod {NAMESPACE}/{RUNNER_POD_NAME}",
-              flush=True,
-          )
-
-          runner_pod = get_json(
-              f"{PODS_PATH}/{RUNNER_POD_NAME}"
-          )
-          runner_spec = runner_pod["spec"]
-
-          print(
-              "Runner node:",
-              runner_spec.get("nodeName"),
-              flush=True,
-          )
-          print(
-              "Runner nodeSelector:",
-              json.dumps(
-                  runner_spec.get("nodeSelector", {}),
-                  sort_keys=True,
-              ),
-              flush=True,
-          )
-          print(
-              "Runner imagePullSecrets:",
-              json.dumps(
-                  runner_spec.get("imagePullSecrets", []),
-                  sort_keys=True,
-              ),
-              flush=True,
-          )
-
-          run_id = os.environ["GITHUB_RUN_ID"]
-          run_attempt = os.environ["GITHUB_RUN_ATTEMPT"]
-
-          command = textwrap.dedent(
-              f"""
-              set -Eeuo pipefail
-
-              echo "=== Environment ==="
-              uname -a
-              python --version
-
-              echo "=== NPU status ==="
-              npu-smi info
-
-              echo "=== PyTorch NPU check ==="
-              python - <<'INNER_PY'
-              import torch
-              import torch_npu
-
-              count = torch.npu.device_count()
-              print("NPU count:", count)
-              assert count == 16, (
-                  "Expected 16 NPUs, found %s" % count
-              )
-              INNER_PY
-
-              echo "=== Clone AReaL ==="
-              rm -rf /workspace/AReaL
-
-              git clone \
-                https://github.com/areal-project/AReaL.git \
-                /workspace/AReaL
-
-              cd /workspace/AReaL
-              git checkout {AREAL_REF}
-
-              echo "=== Tested revision ==="
-              git log -1 --oneline
-
-              echo "=== Install checked-out AReaL ==="
-              pip install --no-deps -e .
-
-              echo "=== Clean stale local processes ==="
-              ray stop --force || true
-
-              export USE_OPTIMIZED_MODEL=0
-
-              echo "=== Run Geometry3K GRPO ==="
-              python examples/vlm/geometry3k_grpo.py \
-                --config \
-                examples/vlm_npu/qwen3_5_2b_geometry3k_grpo.yaml \
-                total_train_epochs=1 \
-                trial_name=ci-{run_id}-{run_attempt} \
-                cluster.fileroot=/workspace/outputs \
-                cluster.name_resolve.nfs_record_root=/workspace/name_resolve
-              """
-          )
-
-          container_env = [
-              {
-                  "name": "USE_OPTIMIZED_MODEL",
-                  "value": "0",
-              },
-              {
-                  "name": "PYTORCH_NPU_ALLOC_CONF",
-                  "value": "expandable_segments:True",
-              },
-              {
-                  "name": "HF_HOME",
-                  "value": "/workspace/hf-cache",
-              },
-          ]
-
-          if HF_TOKEN:
-              container_env.append(
-                  {
-                      "name": "HF_TOKEN",
-                      "value": HF_TOKEN,
-                  }
-              )
-
-          pod_spec = {
-              "restartPolicy": "Never",
-              "terminationGracePeriodSeconds": 30,
-              "containers": [
-                  {
-                      "name": "areal",
-                      "image": IMAGE,
-                      "imagePullPolicy": "IfNotPresent",
-                      "command": [
-                          "/bin/bash",
-                          "-lc",
-                          command,
-                      ],
-                      "env": container_env,
-                      "resources": {
-                          "requests": {
-                              NPU_RESOURCE: NPU_COUNT,
-                          },
-                          "limits": {
-                              NPU_RESOURCE: NPU_COUNT,
-                          },
-                      },
-                      "volumeMounts": [
-                          {
-                              "name": "workspace",
-                              "mountPath": "/workspace",
-                          },
-                          {
-                              "name": "dshm",
-                              "mountPath": "/dev/shm",
-                          },
-                      ],
-                  }
-              ],
-              "volumes": [
-                  {
-                      "name": "workspace",
-                      "emptyDir": {},
-                  },
-                  {
-                      "name": "dshm",
-                      "emptyDir": {
-                          "medium": "Memory",
-                          "sizeLimit": "64Gi",
-                      },
-                  },
-              ],
-          }
-
-          # Reuse scheduling and image-authentication settings from
-          # the current runner pod.
-          for key in (
-              "nodeSelector",
-              "tolerations",
-              "imagePullSecrets",
-              "runtimeClassName",
-              "schedulerName",
-              "priorityClassName",
-          ):
-              value = runner_spec.get(key)
-              if value:
-                  pod_spec[key] = value
-
-          service_account = runner_spec.get(
-              "serviceAccountName"
-          )
-          if service_account:
-              pod_spec["serviceAccountName"] = service_account
-
-          pod = {
-              "apiVersion": "v1",
-              "kind": "Pod",
-              "metadata": {
-                  "name": POD_NAME,
-                  "namespace": NAMESPACE,
-                  "labels": {
-                      "app": "areal-ci",
-                      "github-run-id": run_id,
-                  },
-              },
-              "spec": pod_spec,
-          }
-
-          print(
-              f"Creating {NAMESPACE}/{POD_NAME} with "
-              f"{NPU_RESOURCE}={NPU_COUNT}",
-              flush=True,
-          )
-
-          try:
-              with request(
-                  "POST",
-                  PODS_PATH,
-                  pod,
-              ) as response:
-                  created = json.load(response)
-
-              print(
-                  "Created pod:",
-                  created["metadata"]["name"],
-                  flush=True,
-              )
-
-              startup_deadline = time.time() + 900
-              phase = "Pending"
-
-              while True:
-                  current = get_json(POD_PATH)
-                  status = current.get("status", {})
-                  phase = status.get("phase", "Unknown")
-
-                  print_status(status)
-
-                  if phase in {
-                      "Running",
-                      "Succeeded",
-                      "Failed",
-                  }:
-                      break
-
-                  if time.time() >= startup_deadline:
-                      raise TimeoutError(
-                          "AReaL pod did not start within "
-                          "15 minutes"
-                      )
-
-                  time.sleep(15)
-
-              if phase == "Running":
-                  params = urllib.parse.urlencode(
-                      {
-                          "container": "areal",
-                          "follow": "true",
-                          "timestamps": "true",
-                      }
-                  )
-
-                  try:
-                      with request(
-                          "GET",
-                          f"{POD_PATH}/log?{params}",
-                          timeout=12 * 60 * 60,
-                      ) as response:
-                          for line in response:
-                              sys.stdout.buffer.write(line)
-                              sys.stdout.buffer.flush()
-                  except Exception as exc:
-                      print(
-                          f"Log stream ended: {exc}",
-                          flush=True,
-                      )
-
-              while True:
-                  current = get_json(POD_PATH)
-                  status = current.get("status", {})
-                  phase = status.get("phase", "Unknown")
-
-                  if phase in {"Succeeded", "Failed"}:
-                      break
-
-                  time.sleep(5)
-
-              print_status(status)
-
-              statuses = status.get(
-                  "containerStatuses",
-                  [],
-              )
-
-              print(
-                  json.dumps(statuses, indent=2),
-                  flush=True,
-              )
-
-              if phase != "Succeeded":
-                  raise RuntimeError(
-                      f"AReaL pod finished with phase {phase}"
-                  )
-
-          finally:
-              print(
-                  f"Deleting pod {NAMESPACE}/{POD_NAME}",
-                  flush=True,
-              )
-
-              try:
-                  with request(
-                      "DELETE",
-                      POD_PATH,
-                      {
-                          "apiVersion": "v1",
-                          "kind": "DeleteOptions",
-                          "gracePeriodSeconds": 0,
-                      },
-                  ):
-                      pass
-              except Exception as exc:
-                  print(
-                      f"Cleanup failed: {exc}",
-                      file=sys.stderr,
-                  )
-          PY
+          jq -r '
+            .items[]
+            | (.status.capacity // {})
+            | keys[]
+            | select(test("huawei|ascend|npu"; "i"))
+          ' /tmp/nodes.json |
+            sort -u
