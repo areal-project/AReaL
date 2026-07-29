@@ -25,6 +25,7 @@ from areal.experimental.models.archon.activation_checkpoint import (
     ActivationCheckpointConfig,
 )
 from areal.experimental.models.archon.utils import is_moe_model_config
+from areal.utils.lr_scheduler import get_num_warmup_steps
 
 if TYPE_CHECKING:
     from areal.api.cli_args import (
@@ -76,7 +77,7 @@ def create_lr_scheduler(
     total_train_steps: int,
 ) -> torch.optim.lr_scheduler.LRScheduler:
     """Create LR scheduler from config."""
-    num_warmup_steps = int(optimizer_config.warmup_steps_proportion * total_train_steps)
+    num_warmup_steps = get_num_warmup_steps(optimizer_config, total_train_steps)
 
     if optimizer_config.lr_scheduler_type == "cosine":
         return get_cosine_schedule_with_warmup(

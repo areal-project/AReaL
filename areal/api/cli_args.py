@@ -369,6 +369,8 @@ class GenerationHyperparameters:
 class OptimizerConfig:
     """Configuration for model optimization during training."""
 
+    DEFAULT_WARMUP_STEPS_PROPORTION: ClassVar[float] = 0.001
+
     type: str = field(
         default="adam",
         metadata={
@@ -412,9 +414,21 @@ class OptimizerConfig:
         },
     )
     warmup_steps_proportion: float = field(
-        default=0.001,
+        default=DEFAULT_WARMUP_STEPS_PROPORTION,
         metadata={
-            "help": "Proportion of training steps for warmup",
+            "help": "Non-negative proportion of training steps for warmup. "
+            "Ignored when warmup_steps is set. For Megatron, the resolved "
+            "warmup steps must be less than the total training steps.",
+        },
+    )
+    warmup_steps: int | None = field(
+        default=None,
+        metadata={
+            "help": "Fixed number of learning-rate scheduler steps for warmup. "
+            "Must be non-negative. For Megatron, it must also be less than the "
+            "total training steps. "
+            "When both options are explicitly configured, warmup_steps takes "
+            "precedence over warmup_steps_proportion and a warning is emitted.",
         },
     )
     initial_loss_scale: float = field(
@@ -432,6 +446,18 @@ class OptimizerConfig:
     gradient_clipping: float = field(
         default=1.0, metadata={"help": "Gradient clipping threshold"}
     )
+
+    def __post_init__(self) -> None:
+        if (
+            self.warmup_steps is not None
+            and self.warmup_steps_proportion != self.DEFAULT_WARMUP_STEPS_PROPORTION
+        ):
+            warnings.warn(
+                "Both warmup_steps and warmup_steps_proportion are configured; "
+                "warmup_steps takes precedence and warmup_steps_proportion is ignored.",
+                UserWarning,
+                stacklevel=2,
+            )
 
 
 @dataclass

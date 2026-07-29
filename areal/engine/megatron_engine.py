@@ -132,6 +132,7 @@ from areal.utils.data import (
 from areal.utils.functional import gather_logprobs, gather_logprobs_entropy
 from areal.utils.hf_utils import load_hf_processor_and_tokenizer, load_hf_tokenizer
 from areal.utils.lock import DistributedLock
+from areal.utils.lr_scheduler import get_num_warmup_steps
 from areal.utils.network import find_free_ports, format_host_for_url, gethostip
 from areal.utils.offload import is_tms_enabled, torch_memory_saver
 from areal.utils.perf_tracer import trace_perf, trace_scope
@@ -1811,6 +1812,25 @@ class MegatronEngine(TrainEngine):
                 "Using the 'sgd' optimizer with Megatron may be less stable. Consider using the 'adam' (AdamW) optimizer for improved stability."
             )
 
+        total_train_steps = ft_spec.total_train_steps
+        warmup_steps = get_num_warmup_steps(
+            self.optimizer_config,
+            total_train_steps,
+        )
+        if total_train_steps <= 0:
+            raise ValueError(
+                "Megatron Core OptimizerParamScheduler requires "
+                "total_train_steps to be positive, "
+                f"got {total_train_steps}"
+            )
+        if warmup_steps >= total_train_steps:
+            raise ValueError(
+                "Megatron Core OptimizerParamScheduler requires warmup steps "
+                "to be less than total_train_steps, "
+                f"got {warmup_steps} warmup steps and "
+                f"total_train_steps={total_train_steps}"
+            )
+
         # Make megatron optimizer config
         mcore_opt_config = MCoreOptimizerConfig(
             optimizer=self.optimizer_config.type,
@@ -1840,11 +1860,12 @@ class MegatronEngine(TrainEngine):
 
         self.optimizer = get_megatron_optimizer(mcore_opt_config, self.model)
 
-        warmup_steps_proportion = self.optimizer_config.warmup_steps_proportion
-        warmup_steps = int(warmup_steps_proportion * ft_spec.total_train_steps)
         lr_scheduler = OptimizerParamScheduler(
             self.optimizer,
-            init_lr=0.0 if warmup_steps_proportion > 0 else self.optimizer_config.lr,
+            # Keep this independent of the current warmup configuration because
+            # Megatron checkpoints restore lr_warmup_steps but not init_lr.
+            # Zero-warmup schedules never read init_lr.
+            init_lr=0.0,
             max_lr=self.optimizer_config.lr,
             min_lr=self.optimizer_config.min_lr_ratio * self.optimizer_config.lr,
             lr_warmup_steps=warmup_steps,
@@ -1857,11 +1878,11 @@ class MegatronEngine(TrainEngine):
             # for a 220-step run). Pass the raw total so cosine spans
             # [warmup_steps, total_train_steps], matching HF's
             # get_cosine_schedule_with_warmup used by the FSDP engine.
-            lr_decay_steps=ft_spec.total_train_steps,
+            lr_decay_steps=total_train_steps,
             lr_decay_style=self.optimizer_config.lr_scheduler_type,
             start_wd=self.optimizer_config.weight_decay,
             end_wd=self.optimizer_config.weight_decay,
-            wd_incr_steps=ft_spec.total_train_steps,
+            wd_incr_steps=total_train_steps,
             wd_incr_style="constant",
         )
         self.lr_scheduler = lr_scheduler
