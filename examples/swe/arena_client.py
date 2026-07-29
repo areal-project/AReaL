@@ -75,7 +75,7 @@ def _extract_reward(value: Any) -> float | None:
 
 
 def infer_llm_protocol(stream: Mapping[str, Any]) -> LLMProtocol:
-    """Select the native LLM protocol from a Stream's default Harness."""
+    """Select the client protocol used by a Stream's default Harness."""
     harness_ref = stream.get("default_harness_ref")
     harness_key = ""
     if isinstance(harness_ref, Mapping):
@@ -97,15 +97,13 @@ def _llm_registration_payload(
     deployment_id: str,
     protocol: LLMProtocol,
 ) -> dict[str, Any]:
-    if protocol == "anthropic":
-        inbound_proto = "messages"
-    elif protocol == "responses":
-        inbound_proto = "responses"
-    elif protocol == "chat_completions":
-        inbound_proto = "chat"
-    else:
+    if protocol not in ("anthropic", "responses", "chat_completions"):
         raise ValueError(f"Unsupported Arena LLM protocol: {protocol!r}")
 
+    # ``protocol`` describes the Arena Harness client. The AReaL rollout
+    # proxy itself exposes an OpenAI-compatible Chat Completions endpoint, so
+    # advertise only that native upstream capability. Arena converts Messages
+    # or Responses requests to Chat before forwarding them to this endpoint.
     return {
         "model_name": model_name,
         "endpoints": [
@@ -114,7 +112,7 @@ def _llm_registration_payload(
                 "upstream_model": model_name,
                 "base_url": upstream_base_url.rstrip("/"),
                 "api_key": upstream_api_key,
-                "inbound_protos": [inbound_proto],
+                "inbound_protos": ["chat"],
                 "enabled": True,
             }
         ],
@@ -163,9 +161,7 @@ class ArenaOpenAPIClient:
     @property
     def _llm_headers(self) -> dict[str, str]:
         if not self.llm_api_key:
-            raise ValueError(
-                "ARENA_LLM_API_KEY is required for LLM gateway traffic"
-            )
+            raise ValueError("ARENA_LLM_API_KEY is required for LLM gateway traffic")
         return {"Authorization": f"Bearer {self.llm_api_key}"}
 
     def list_streams(
@@ -302,7 +298,7 @@ class ArenaOpenAPIClient:
         protocol: LLMProtocol = "chat_completions",
         client: httpx.Client | None = None,
     ) -> tuple[str, str]:
-        """Register one AReaL proxy and return its external URL and model alias."""
+        """Register an AReaL OpenAI proxy and return its URL and model alias."""
         if not model_name.startswith("stream-areal-"):
             raise ValueError("Arena model_name must start with 'stream-areal-'")
         if not upstream_base_url:

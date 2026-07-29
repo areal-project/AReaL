@@ -27,13 +27,14 @@ initial implementation intentionally rejects Streams with more than the API's
 single-request limit of 1000 rows; it does not paginate or shard the dataset.
 
 For every rollout, `ArenaStreamAgentWorkflow` registers the current AReaL proxy through
-`/llm/model/new`, then posts the returned model id and the row's `data_id` to
-`launch_one_task`. The task environment receives the managed `MODEL_NAME`, `BASE_URL`,
-and `API_KEY` variables plus values configured in `econfig.arena_task_envs`; the
-workflow polls the returned task id until it is terminal and returns its numeric score
-as the reward. Model registrations are deleted in a `finally` block. Credentials are
-read only from environment variables and are not stored in this repository or experiment
-configs.
+`/openapi/v1/llm/models` as an OpenAI Chat Completions upstream, then posts the returned
+model alias and the row's `data_id` to `launch_one_task`. Arena converts the Harness's
+native protocol to Chat before forwarding requests to AReaL. The task environment
+receives the managed `MODEL_NAME`, `BASE_URL`, and `API_KEY` variables plus values
+configured in `econfig.arena_task_envs`; the workflow polls the returned task id until
+it is terminal and returns its numeric score as the reward. Model registrations are
+deleted in a `finally` block. Credentials are read only from environment variables and
+are not stored in this repository or experiment configs.
 
 The sections below document the original external AReaL-SWEAgent mode, selected with
 `econfig.dataset_source=jsonl`.

@@ -212,40 +212,36 @@ def test_register_and_delete_llm_proxy(monkeypatch):
     monkeypatch.setenv("ARENA_OPENAPI_TOKEN", "arena-token")
     monkeypatch.setenv("ARENA_LLM_API_KEY", "test-llm-key")
     deployment_id = "deployment-1"
-    registered_model_id = "registered-model-1"
     requests: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
-        assert request.headers["Authorization"] == "Bearer test-llm-key"
-        payload = json.loads(request.content)
-        if request.url.path.endswith("/llm/model/new"):
+        assert request.headers["Authorization"] == "Bearer arena-token"
+        if request.method == "POST":
+            assert request.url.path.endswith("/openapi/v1/llm/models")
+            payload = json.loads(request.content)
             assert payload == {
                 "model_name": "stream-areal-test-1",
-                "litellm_params": {
-                    "model": "openai/stream-areal-test-1",
-                    "api_base": "http://rollout-proxy",
-                    "api_key": "session-key",
-                    "custom_llm_provider": "openai",
-                },
-                "model_info": {
-                    "id": deployment_id,
-                    "mode": "chat",
-                    "disable_background_health_check": True,
-                },
+                "endpoints": [
+                    {
+                        "endpoint_id": deployment_id,
+                        "upstream_model": "stream-areal-test-1",
+                        "base_url": "http://rollout-proxy",
+                        "api_key": "session-key",
+                        "inbound_protos": ["chat"],
+                        "enabled": True,
+                    }
+                ],
+                "enabled": True,
+                "metadata": {"deployment_id": deployment_id},
             }
             return httpx.Response(
                 200,
-                json={
-                    "model_id": registered_model_id,
-                    "model_name": "stream-areal-test-1",
-                    "litellm_params": {},
-                    "model_info": {"id": deployment_id},
-                },
+                json={"model_name": "stream-areal-test-1"},
             )
-        assert request.url.path.endswith("/llm/model/delete")
-        assert payload == {"id": registered_model_id}
-        return httpx.Response(200, json="deleted")
+        assert request.method == "DELETE"
+        assert request.url.path.endswith("/openapi/v1/llm/models/stream-areal-test-1")
+        return httpx.Response(204)
 
     client = ArenaOpenAPIClient(base_url="https://arena.example")
     with httpx.Client(transport=httpx.MockTransport(handler)) as http_client:
@@ -258,41 +254,24 @@ def test_register_and_delete_llm_proxy(monkeypatch):
         )
         client.delete_llm_proxy(returned_id, client=http_client)
 
-    assert registered_url == "https://arena.example/llm"
-    assert returned_id == registered_model_id
+    assert registered_url == "https://arena.example/api"
+    assert returned_id == "stream-areal-test-1"
     assert len(requests) == 2
 
 
 @pytest.mark.parametrize(
-    ("protocol", "expected_model", "expected_provider", "expected_mode"),
-    [
-        (
-            "anthropic",
-            "anthropic/stream-areal-test-1",
-            "anthropic",
-            "chat",
-        ),
-        ("responses", "openai/stream-areal-test-1", "openai", "responses"),
-    ],
+    "protocol",
+    ["anthropic", "responses", "chat_completions"],
 )
-def test_register_llm_proxy_selects_native_protocol(
-    monkeypatch,
-    protocol,
-    expected_model,
-    expected_provider,
-    expected_mode,
-):
-    """Registration should route Claude and Codex Harnesses natively."""
+def test_register_llm_proxy_always_advertises_openai_chat(monkeypatch, protocol):
+    """All Harness protocols should use the AReaL proxy's native Chat API."""
     monkeypatch.setenv("ARENA_OPENAPI_TOKEN", "arena-token")
     monkeypatch.setenv("ARENA_LLM_API_KEY", "test-llm-key")
 
     def handler(request: httpx.Request) -> httpx.Response:
         payload = json.loads(request.content)
-        assert payload["litellm_params"]["model"] == expected_model
-        assert payload["litellm_params"]["custom_llm_provider"] == expected_provider
-        assert payload["model_info"]["mode"] == expected_mode
-        assert payload["model_info"]["disable_background_health_check"] is True
-        return httpx.Response(200, json="https://arena.example/llm")
+        assert payload["endpoints"][0]["inbound_protos"] == ["chat"]
+        return httpx.Response(200, json={"model_name": payload["model_name"]})
 
     client = ArenaOpenAPIClient(base_url="https://arena.example")
     with httpx.Client(transport=httpx.MockTransport(handler)) as http_client:
@@ -316,38 +295,31 @@ def test_agent_launches_task_through_proxy_and_returns_reward(monkeypatch):
 
     def handler(request: httpx.Request) -> httpx.Response:
         nonlocal deployment_id, result_polls
-        if request.url.path.endswith("/llm/model/new"):
-            assert request.headers["Authorization"] == "Bearer test-llm-key"
+        if request.method == "POST" and request.url.path.endswith(
+            "/openapi/v1/llm/models"
+        ):
+            assert request.headers["Authorization"] == "Bearer arena-token"
             payload = json.loads(request.content)
             assert payload["model_name"].startswith("stream-areal-")
-            assert payload["litellm_params"] == {
-                "model": f"anthropic/{payload['model_name']}",
-                "api_base": "http://rollout-proxy",
-                "api_key": "session-key",
-                "custom_llm_provider": "anthropic",
-            }
-            assert payload["model_info"]["mode"] == "chat"
-            assert payload["model_info"]["disable_background_health_check"] is True
-            deployment_id = payload["model_info"]["id"]
+            assert payload["endpoints"][0]["upstream_model"] == payload["model_name"]
+            assert payload["endpoints"][0]["base_url"] == "http://rollout-proxy"
+            assert payload["endpoints"][0]["api_key"] == "session-key"
+            assert payload["endpoints"][0]["inbound_protos"] == ["chat"]
+            deployment_id = payload["model_name"]
             return httpx.Response(
                 200,
-                json={
-                    "model_id": deployment_id,
-                    "model_name": payload["model_name"],
-                    "litellm_params": {},
-                    "model_info": {"id": deployment_id},
-                },
+                json={"model_name": payload["model_name"]},
             )
         if request.url.path.endswith("/streams/stream-1/launch_one_task"):
             assert request.headers["Authorization"] == "Bearer arena-token"
             assert json.loads(request.content) == {
                 "data_id": "data-1",
                 "model_name": deployment_id,
-                "base_url": "https://arena.example/llm",
+                "base_url": "https://arena.example/api",
                 "api_key": "test-llm-key",
                 "envs": {
                     "MODEL_NAME": deployment_id,
-                    "BASE_URL": "https://arena.example/llm",
+                    "BASE_URL": "https://arena.example/api",
                     "API_KEY": "test-llm-key",
                     "CLAUDE_CODE_DISABLE_TERMINAL_TITLE": "1",
                 },
@@ -356,10 +328,11 @@ def test_agent_launches_task_through_proxy_and_returns_reward(monkeypatch):
                 202,
                 json={"accepted": True, "task_id": "task-1", "status": "PENDING"},
             )
-        if request.url.path.endswith("/llm/model/delete"):
-            assert request.headers["Authorization"] == "Bearer test-llm-key"
-            assert json.loads(request.content) == {"id": deployment_id}
-            return httpx.Response(200, json="deleted")
+        if request.method == "DELETE" and request.url.path.endswith(
+            f"/openapi/v1/llm/models/{deployment_id}"
+        ):
+            assert request.headers["Authorization"] == "Bearer arena-token"
+            return httpx.Response(204)
         assert request.headers["Authorization"] == "Bearer arena-token"
         assert request.url.path.endswith("/tasks/task-1/result")
         result_polls += 1
