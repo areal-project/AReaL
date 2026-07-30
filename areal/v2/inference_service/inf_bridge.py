@@ -75,7 +75,13 @@ class InfBridge:
         self.max_resubmit_retries = max_resubmit_retries
         self.resubmit_wait = resubmit_wait
         self._version = version
-        self._client = httpx.AsyncClient(timeout=request_timeout)
+        # Generous pool: in-flight streaming generations can otherwise occupy
+        # every connection and starve control requests (pause/resume) into
+        # PoolTimeout during phase transitions.
+        self._client = httpx.AsyncClient(
+            timeout=request_timeout,
+            limits=httpx.Limits(max_connections=2048, max_keepalive_connections=256),
+        )
 
     async def aclose(self) -> None:
         """Close the underlying HTTP client."""
