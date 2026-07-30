@@ -86,17 +86,66 @@ jobs:
               f"{torch.npu.device_count()} are visible"
           )
           PY
+      - name: Pre-download model and dataset
+        shell: bash
+        run: |
+          set -euo pipefail
 
+          MODEL_DIR="${GITHUB_WORKSPACE}/models/Qwen3.5-2B"
+          DATASET_DIR="${GITHUB_WORKSPACE}/data/geometry3k"
+
+          mkdir -p "${MODEL_DIR}" "${DATASET_DIR}"
+
+          download_with_retry() {
+            local attempt
+            for attempt in 1 2 3 4 5; do
+              if "$@"; then
+                return 0
+              fi
+
+              echo "Download attempt ${attempt} failed"
+              sleep $((attempt * 30))
+            done
+
+            echo "Download failed after 5 attempts"
+            return 1
+          }
+
+          download_with_retry \
+            huggingface-cli download \
+            Qwen/Qwen3.5-2B \
+            --local-dir "${MODEL_DIR}"
+
+          download_with_retry \
+            huggingface-cli download \
+            hiyouga/geometry3k \
+            --repo-type dataset \
+            --local-dir "${DATASET_DIR}"
+
+          test -f "${MODEL_DIR}/config.json"
+          find "${MODEL_DIR}" -maxdepth 1 -type f -printf '%f\n' | sort
+          find "${DATASET_DIR}" -maxdepth 2 -type f | head -50
       - name: Run Qwen3.5-2B Geometry3K GRPO
         run: |
-          set -euxo pipefail
+          set -euo pipefail
 
-          # Remove state left by a previous run on a reused self-hosted runner.
+          MODEL_DIR="${GITHUB_WORKSPACE}/models/Qwen3.5-2B"
+          DATASET_DIR="${GITHUB_WORKSPACE}/data/geometry3k"
+
           rm -rf /tmp/areal/experiments
           rm -rf /tmp/areal/name_resolve
 
+          # Prevent workers from issuing Hub metadata requests after the
+          # model and dataset have been downloaded.
+          export HF_HUB_OFFLINE=1
+          export TRANSFORMERS_OFFLINE=1
+          export HF_DATASETS_OFFLINE=1
+
           python examples/vlm/geometry3k_grpo.py \
-            --config examples/vlm_npu/qwen3_5_2b_geometry3k_grpo.yaml actor.path=Qwen/Qwen3.5-2B
+            --config examples/vlm_npu/qwen3_5_2b_geometry3k_grpo.yaml \
+            actor.path="${MODEL_DIR}" \
+            train_dataset.path="${DATASET_DIR}" \
+            valid_dataset.path="${DATASET_DIR}"
 
       - name: Collect final diagnostics
         if: always()
