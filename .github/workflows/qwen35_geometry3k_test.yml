@@ -11,7 +11,7 @@ jobs:
   probe:
     runs-on: linux-aarch64-a3-8
     container:
-      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:9.0.0-a3-ubuntu22.04-py3.11
+      image: ghcr.io/hwvanici/areal_npu:v1.0.4-a3
 
     steps:
       - name: Show NPU info
