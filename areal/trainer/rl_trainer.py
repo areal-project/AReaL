@@ -151,6 +151,11 @@ class PPOTrainer:
             and not config.actor.use_lora
             and self._is_actor_rollout_colocated(config)
         )
+        if self._is_v2_awex_colocate:
+            logger.info(
+                "v2 awex colocation enabled: actor and rollout share GPUs; "
+                "AWEX adapters manage memory (trainer offload suppressed)"
+            )
         if config.actor.weight_update_mode == "awex" or self._is_v2_awex_colocate:
             self._should_offload_rollout = False
             self._should_offload_actor = False
@@ -317,9 +322,6 @@ class PPOTrainer:
 
         if self._is_v2_awex_colocate:
             self.actor._colocate = True
-            self.actor._ensure_initialized()
-            # Train memory must be released before SGLang forks and claims the GPU.
-            self.actor.release_train_memory_for_colocate()
 
         # Offload actor before rollout init so sglang can use the GPU memory
         if self._should_offload_actor:
@@ -330,8 +332,23 @@ class PPOTrainer:
             config.rollout, is_eval=False, lora_path=initial_lora_path
         )
 
+        if self._is_v2_awex_colocate:
+            # v2 colocation forks train guards from the rollout allocation, so
+            # actor initialization can only complete after rollout is up; the
+            # train memory release must follow it before generation starts.
+            self.actor._ensure_initialized()
+            self.actor.release_train_memory_for_colocate()
+
         self.eval_rollout = None
-        if not self._online_mode:
+        evaluator_scheduled = config.evaluator is not None and any(
+            freq is not None
+            for freq in (
+                config.evaluator.freq_epochs,
+                config.evaluator.freq_steps,
+                config.evaluator.freq_secs,
+            )
+        )
+        if not self._online_mode and evaluator_scheduled:
             self.eval_rollout = self._init_rollout(
                 config.rollout, is_eval=True, lora_path=initial_lora_path
             )
@@ -1147,6 +1164,7 @@ class PPOTrainer:
             controller = RolloutControllerV2(
                 config=config, scheduler=cast(Scheduler, self.scheduler)
             )
+            controller.awex_colocate = self._is_v2_awex_colocate
         else:
             controller = engine_cls.as_controller(config, self.scheduler)
         init_kwargs = dict(
@@ -1381,9 +1399,11 @@ class PPOTrainer:
         if (
             self._is_actor_rollout_colocated(self.config)
             and self.config.actor.weight_update_mode != "disk"
+            and not self._is_v2_awex_colocate
         ):
             raise ValueError(
-                "weight_update_mode must be 'disk' when colocation scheduling is enabled. "
+                "weight_update_mode must be 'disk' when colocation scheduling is enabled "
+                "(v2 controllers additionally support weight_update_mode=awex). "
                 "Please set actor.weight_update_mode=disk."
             )
 
