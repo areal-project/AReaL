@@ -96,7 +96,7 @@ jobs:
           rm -rf /tmp/areal/name_resolve
 
           python examples/vlm/geometry3k_grpo.py \
-            --config examples/vlm_npu/qwen3_5_2b_geometry3k_grpo.yaml
+            --config examples/vlm_npu/qwen3_5_2b_geometry3k_grpo.yaml actor.path=Qwen/Qwen3.5-2B
 
       - name: Collect final diagnostics
         if: always()
