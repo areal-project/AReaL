@@ -87,7 +87,6 @@ jobs:
           )
           PY
       - name: Pre-download model and dataset
-        shell: bash
         run: |
           set -euo pipefail
 
@@ -96,15 +95,23 @@ jobs:
 
           mkdir -p "${MODEL_DIR}" "${DATASET_DIR}"
 
+          hf --version
+          hf download --help >/dev/null
+
           download_with_retry() {
             local attempt
+            local delay
+
             for attempt in 1 2 3 4 5; do
               if "$@"; then
                 return 0
               fi
 
-              echo "Download attempt ${attempt} failed"
-              sleep $((attempt * 30))
+              if [[ "${attempt}" -lt 5 ]]; then
+                delay=$((attempt * 30))
+                echo "Download attempt ${attempt} failed; retrying in ${delay}s"
+                sleep "${delay}"
+              fi
             done
 
             echo "Download failed after 5 attempts"
@@ -112,19 +119,25 @@ jobs:
           }
 
           download_with_retry \
-            huggingface-cli download \
+            hf download \
             Qwen/Qwen3.5-2B \
-            --local-dir "${MODEL_DIR}"
+            --local-dir "${MODEL_DIR}" \
+            --max-workers 1
 
           download_with_retry \
-            huggingface-cli download \
+            hf download \
             hiyouga/geometry3k \
             --repo-type dataset \
-            --local-dir "${DATASET_DIR}"
+            --local-dir "${DATASET_DIR}" \
+            --max-workers 1
 
           test -f "${MODEL_DIR}/config.json"
+
+          echo "Model files:"
           find "${MODEL_DIR}" -maxdepth 1 -type f -printf '%f\n' | sort
-          find "${DATASET_DIR}" -maxdepth 2 -type f | head -50
+
+          echo "Dataset files:"
+          find "${DATASET_DIR}" -maxdepth 2 -type f | sed -n '1,50p'
       - name: Run Qwen3.5-2B Geometry3K GRPO
         run: |
           set -euo pipefail
