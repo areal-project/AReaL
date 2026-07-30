@@ -16,4 +16,5 @@ jobs:
     steps:
       - name: Show NPU info
         run: |
+          sleep 3600
           npu-smi info
