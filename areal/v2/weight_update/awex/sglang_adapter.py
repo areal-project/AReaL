@@ -738,10 +738,22 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
     def execute_colocate_weight_update(self, version: int) -> None:
         self.wait_for_training_offloaded(version)
         self.resume_memory(["weights"])
+        self._quiesce_scheduler_streams()
         reader = self._ensure_reader()
         reader.update_weights(step_id=version)
         self._rebuild_derived_weights()
         logger.info("Colocate weight update completed for version %d", version)
+
+    def _quiesce_scheduler_streams(self) -> None:
+        """Drain in-flight device work before the NCCL transfer starts.
+
+        The donor ran transfers from a fully paused scheduler loop; v2 runs
+        them from an RPC handler while the overlap loop's forward thread and
+        its dedicated stream stay alive. NCCL P2P racing that residual device
+        work (or pending TMS remaps from the weights resume) corrupts memory,
+        so synchronize the whole device before touching the wire.
+        """
+        torch.cuda.synchronize()
 
     def wait_for_training_offloaded(self, version: int) -> None:
         """Wait until every training rank has offloaded model weights."""

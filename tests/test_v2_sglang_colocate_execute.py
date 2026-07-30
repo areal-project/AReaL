@@ -22,12 +22,14 @@ def test_execute_colocate_update_resumes_weights_before_reader():
 
     adapter._ensure_reader = ensure_reader
 
-    with mock.patch("areal.v2.weight_update.awex.sglang_adapter.torch"):
+    with mock.patch("areal.v2.weight_update.awex.sglang_adapter.torch") as torch_mock:
+        torch_mock.cuda.synchronize.side_effect = lambda: events.append("quiesce")
         AwexSGLangAdapter.execute_colocate_weight_update(adapter, version=3)
 
     assert events == [
         "wait",
         ("resume", ("weights",)),
+        "quiesce",
         "build_reader",
         ("transfer", 3),
         "post_load",
