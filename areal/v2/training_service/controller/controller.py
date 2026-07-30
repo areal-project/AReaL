@@ -1068,6 +1068,8 @@ class GatewayTrainController:
         self.rollout.pause_generation_sync()
         logger.info("[train-phase] enter: rollout drained; offloading kv_cache")
         self.rollout.offload(tags=["kv_cache"])
+        logger.info("[train-phase] enter: offloading inference cuda_graph")
+        self.rollout.offload(tags=["cuda_graph"])
         logger.info("[train-phase] enter: offloading inference weights")
         self.rollout.offload(tags=["weights"])
         logger.info("[train-phase] enter: resuming train memory (weights+optimizer)")
@@ -1082,6 +1084,10 @@ class GatewayTrainController:
             logger.info("[train-phase] exit: releasing train memory")
             self._broadcast_awex_memory_op("release_memory", ["weights", "optimizer"])
         finally:
+            logger.info("[train-phase] exit: restoring inference cuda_graph")
+            self.rollout.onload(tags=["cuda_graph"])
+            logger.info("[train-phase] exit: restoring inference kv_cache")
+            self.rollout.onload(tags=["kv_cache"])
             self.rollout.resume()
             logger.info("[train-phase] exit complete: rollout resumed")
 

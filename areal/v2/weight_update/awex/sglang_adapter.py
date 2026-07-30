@@ -784,7 +784,7 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
         logger.info("Rebuilt derived model weights with post_load_weights()")
 
     # Tags understood by SGLang's native release/resume_memory_occupation.
-    _SGLANG_MEMORY_TAGS = {"kv_cache", "weights"}
+    _SGLANG_MEMORY_TAGS = {"kv_cache", "weights", "cuda_graph"}
 
     def release_memory(self, tags: list[str] | None = None) -> None:
         from sglang.srt.managers.io_struct import ReleaseMemoryOccupationReqInput
