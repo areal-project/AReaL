@@ -72,6 +72,7 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
 
     def __init__(self, engine: MegatronEngine):
         self._engine = engine
+        engine._awex_adapter = self
         self._transfer_plan: TransferPlan | None = None
         self._weights_update_group = None
         self._transfer_rank: int | None = None
@@ -87,6 +88,7 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
         self._infer_world_size: int | None = None
         self._num_infer_engines: int | None = None
         self._logical_train_rank: int | None = None
+        self._weight_metadata_cache: list[ParameterMeta] | None = None
         self._timeout_s = awex_colocate_timeout_s()
 
     @property
@@ -105,6 +107,8 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
         }
 
     def get_weight_metadata(self) -> list[ParameterMeta]:
+        if self._weight_metadata_cache is not None:
+            return self._weight_metadata_cache
         rank_info = self._build_rank_info()
         metadata: list[ParameterMeta] = []
 
@@ -144,6 +148,7 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
                 )
             )
 
+        self._weight_metadata_cache = metadata
         return metadata
 
     def get_local_shard_parameters(
@@ -417,9 +422,11 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
             self._meta_server_client.put_object("training_params_meta", parameters_meta)
 
         self._infer_world_size = infer_conf["infer_world_size"]
-        if self._transfer_rank is None:
-            raise RuntimeError("Transfer rank is not initialized")
-        self._logical_train_rank = self._transfer_rank
+        # The transfer plan annotates shard ownership with Megatron's own
+        # global rank, so the wire identity must be derived from it. The
+        # gateway's (ip,gpu)-sorted transfer_rank may order nodes differently
+        # and would pair readers with the wrong pp/dp stage.
+        self._logical_train_rank = self._infer_world_size + self._rank_info.global_rank
         self._meta_server_client.add_object_to_set(
             "training_device_rank_entries",
             (self._ip_address, self._physical_gpu_id, self._logical_train_rank),
@@ -609,6 +616,13 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
         tags_to_release = [t for t in tags if t not in self._released_tags]
         if not tags_to_release:
             return
+
+        if "weights" in tags_to_release and self._weight_metadata_cache is None:
+            # Metadata extraction all-gathers parameters over the TP group,
+            # which is illegal once the DDP bucket storages are resized to 0.
+            # Snapshot it while weights are still resident so /connect can be
+            # served after the initial colocate release.
+            self.get_weight_metadata()
 
         if "optimizer" in tags_to_release:
             self._offload_optimizer_states()

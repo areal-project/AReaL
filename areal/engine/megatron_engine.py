@@ -1010,6 +1010,9 @@ class MegatronEngine(TrainEngine):
         loss_weight_fn: Callable[[dict[str, Any]], torch.Tensor],
     ) -> dict[str, float]:
         self._ensure_ready()
+        awex_adapter = getattr(self, "_awex_adapter", None)
+        if awex_adapter is not None:
+            awex_adapter.ensure_grad_buffers()
         self.optimizer_zero_grad()
 
         input_batched, _ = self._normalize_batch_input(input_)
