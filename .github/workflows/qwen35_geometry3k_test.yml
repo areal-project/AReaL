@@ -6,6 +6,7 @@ on:
   push:
     branches:
       - ci/vlm-npu-nightly
+      - ascend
 
 defaults:
   run:
@@ -144,6 +145,8 @@ jobs:
 
           MODEL_DIR="${GITHUB_WORKSPACE}/models/Qwen3.5-2B"
           DATASET_DIR="${GITHUB_WORKSPACE}/data/geometry3k"
+          ARTIFACT_DIR="${GITHUB_WORKSPACE}/training-artifacts"
+          mkdir -p "${ARTIFACT_DIR}"
 
           rm -rf /tmp/areal/experiments
           rm -rf /tmp/areal/name_resolve
@@ -158,8 +161,18 @@ jobs:
             --config examples/vlm_npu/qwen3_5_2b_geometry3k_grpo.yaml \
             actor.path="${MODEL_DIR}" \
             train_dataset.path="${DATASET_DIR}" \
-            valid_dataset.path="${DATASET_DIR}"
-
+            valid_dataset.path="${DATASET_DIR}" \
+            2>&1 | tee "${ARTIFACT_DIR}/training.log"
+      - name: Upload training results
+        if: always()
+        id: training-results
+        uses: actions/upload-artifact@v4
+        with:
+          name: geometry3k-results-${{ github.run_number }}
+          path: |
+            training-artifacts/training.log
+          if-no-files-found: warn
+          retention-days: 30
       - name: Collect final diagnostics
         if: always()
         run: |
