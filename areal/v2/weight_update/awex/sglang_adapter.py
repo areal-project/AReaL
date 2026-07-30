@@ -670,7 +670,6 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
 
         from awex.meta.meta_server import MetaServerClient
 
-        self._transfer_rank = transfer_rank
         self._infer_world_size = infer_world_size
         self._train_world_size = train_world_size
         self._meta_server_addr = meta_server_addr
@@ -685,10 +684,22 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
                 f"infer_world_size ({infer_world_size}) must be divisible by "
                 f"tp_size * pp_size ({instance_world})"
             )
+        # The gateway sends ONE init per server carrying the engine-base rank;
+        # the RPC is broadcast to every scheduler process of the server, so
+        # each derives its own global rank from its tp/pp coordinates.
+        if transfer_rank % instance_world != 0:
+            raise ValueError(
+                f"expected an engine-base transfer_rank (multiple of "
+                f"{instance_world}), got {transfer_rank}"
+            )
+        local_rank = int(getattr(self._scheduler, "pp_rank", 0) or 0) * tp_size + int(
+            getattr(self._scheduler, "tp_rank", 0) or 0
+        )
+        self._transfer_rank = transfer_rank + local_rank
         self._infer_instance_world_size = instance_world
         self._num_infer_engines = infer_world_size // instance_world
         self._engine_rank = transfer_rank // instance_world
-        self._instance_local_rank = transfer_rank % instance_world
+        self._instance_local_rank = local_rank
 
         host, port = meta_server_addr.rsplit(":", 1)
         self._meta_server_client = MetaServerClient(host, int(port))
@@ -705,7 +716,7 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
         }
         self._infer_conf = infer_conf
 
-        if transfer_rank == 0:
+        if self._transfer_rank == 0:
             self._meta_server_client.put_object("infer_conf", infer_conf)
             self._meta_server_client.put_object(
                 "num_infer_engines", self._num_infer_engines
@@ -726,6 +737,7 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
 
     def execute_colocate_weight_update(self, version: int) -> None:
         self.wait_for_training_offloaded(version)
+        self.resume_memory(["weights"])
         reader = self._ensure_reader()
         reader.update_weights(step_id=version)
         self._rebuild_derived_weights()
