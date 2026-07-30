@@ -57,6 +57,28 @@ from areal.utils.offload import get_tms_env_vars
 logger = logging.getLogger("SlurmScheduler")
 
 
+_TMS_ENV_OFF = {
+    "LD_PRELOAD": "",
+    "TMS_INIT_ENABLE": "0",
+    "TMS_INIT_ENABLE_CPU_BACKUP": "0",
+}
+
+
+def colocated_train_guard_fork_env(
+    base_env: dict[str, str], gpu_slot: int
+) -> dict[str, str]:
+    """Build the env for a train guard forked from a rollout guard.
+
+    The rollout guard runs with the torch-memory-saver LD_PRELOAD hook so
+    SGLang can pause/resume its regions, but Megatron workers manage memory
+    through their own DDP-buffer offload. Inheriting the hook would route
+    every actor allocation (including CUDA-IPC-exported transfer tensors)
+    through TMS's cuMemMap pools, which cudaIpc handles do not support, so
+    the fork must explicitly switch TMS off alongside pinning the GPU.
+    """
+    return {**base_env, **_TMS_ENV_OFF, "CUDA_VISIBLE_DEVICES": str(gpu_slot)}
+
+
 @dataclass
 class SlurmWorkerInfo:
     """Slurm worker information."""
@@ -1064,7 +1086,7 @@ class SlurmScheduler(Scheduler):
                 for offset in range(target_gpu_count):
                     parent_workers.append(target_worker)
                     fork_envs.append(
-                        {**base_env, "CUDA_VISIBLE_DEVICES": str(base + offset)}
+                        colocated_train_guard_fork_env(base_env, base + offset)
                     )
                 host_base[host_ip] = base + target_gpu_count
 
