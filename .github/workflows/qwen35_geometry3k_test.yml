@@ -7,8 +7,12 @@ on:
     branches:
       - ci/vlm-npu-nightly
 
+defaults:
+  run:
+    shell: bash
+
 jobs:
-  probe:
+  train:
     runs-on: linux-aarch64-a3-16
     container:
       image: ghcr.io/hwvanici/areal_npu:v1.0.4-a3
@@ -26,7 +30,7 @@ jobs:
     steps:
       - name: Check NPU and CANN information
         run: |
-          set -euxo pipefail
+          set -euo pipefail
 
           INSTALL_INFO="/usr/local/Ascend/ascend-toolkit/latest/$(uname -i)-linux/ascend_toolkit_install.info"
 
