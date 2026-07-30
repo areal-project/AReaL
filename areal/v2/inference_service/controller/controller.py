@@ -123,6 +123,7 @@ class RolloutControllerV2:
             else:
                 nnodes_per_instance = total_gpus // n_gpus_per_node
         self._nnodes_per_instance = nnodes_per_instance
+        self.awex_colocate = False
 
         # Worker management
         self.workers: list[Worker] = []
@@ -615,6 +616,8 @@ class RolloutControllerV2:
                     "worker_index": group_idx * nnodes_per_instance + node_rank,
                     "raw_cmd": cmd,
                 }
+                if getattr(self, "awex_colocate", False) and inf_backend == "sglang":
+                    fork_payload["env"] = {"AREAL_AWEX_COLOCATE": "1"}
                 if inf_backend == "vllm":
                     from areal.infra.utils.launcher import (
                         TRITON_CACHE_PATH as _TRITON_CACHE,
@@ -1385,6 +1388,7 @@ class RolloutControllerV2:
         from areal.infra.utils.concurrent import run_async_task
 
         self._ensure_initialized()
+        logger.info("Offloading inference memory (tags=%s)", tags or "all")
         run_async_task(self._async_offload, tags)
 
     async def _async_offload(self, tags: list[str] | None = None) -> None:
