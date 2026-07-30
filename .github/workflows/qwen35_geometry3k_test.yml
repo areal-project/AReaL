@@ -1,0 +1,189 @@
+name: Qwen3.5-2B Geometry3K GRPO Test
+
+on:
+  workflow_dispatch:
+
+  push:
+    branches:
+      - ci/vlm-npu-nightly
+      - ascend
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  train:
+    runs-on: linux-aarch64-a3-16
+    container:
+      image: ghcr.io/hwvanici/areal_npu:v1.0.4-a3
+
+    env:
+      # Required by the AReaL VLM NPU guide.
+      USE_OPTIMIZED_MODEL: "0"
+
+      # Use the Hugging Face mirror when downloading the model and dataset.
+      HF_ENDPOINT: "https://hf-mirror.com"
+      HF_HUB_DISABLE_XET: "1"
+
+      PYTHONUNBUFFERED: "1"
+
+    steps:
+      - name: Check NPU and CANN information
+        run: |
+          set -euo pipefail
+
+          INSTALL_INFO="/usr/local/Ascend/ascend-toolkit/latest/$(uname -i)-linux/ascend_toolkit_install.info"
+
+          if [[ -f "${INSTALL_INFO}" ]]; then
+            cat "${INSTALL_INFO}"
+          else
+            echo "CANN install information not found at ${INSTALL_INFO}"
+          fi
+
+          npu-smi info
+
+      - name: Check initial environment
+        run: |
+          set -euxo pipefail
+
+          python --version
+          pip --version
+          pip list
+
+      - name: Checkout AReaL ascend branch
+        uses: actions/checkout@v4
+        with:
+          ref: ascend
+          fetch-depth: 0
+          clean: true
+
+      - name: Install current AReaL repository
+        run: |
+          set -euxo pipefail
+
+          # The image contains the NPU-specific dependencies.
+          # Install only the checked-out AReaL source.
+          pip install -e . --no-deps
+
+      - name: Verify runtime
+        run: |
+          set -euxo pipefail
+
+          python - <<'PY'
+          import torch
+          import torch_npu
+          import areal
+
+          print("torch:", torch.__version__)
+          print("torch_npu:", torch_npu.__version__)
+          print("AReaL:", areal.__file__)
+          print("NPU available:", torch.npu.is_available())
+          print("NPU count:", torch.npu.device_count())
+
+          assert torch.npu.is_available(), "No Ascend NPU is available"
+          assert torch.npu.device_count() >= 16, (
+              f"The config requires 16 NPUs, but only "
+              f"{torch.npu.device_count()} are visible"
+          )
+          PY
+      - name: Pre-download model and dataset
+        run: |
+          set -euo pipefail
+
+          MODEL_DIR="${GITHUB_WORKSPACE}/models/Qwen3.5-2B"
+          DATASET_DIR="${GITHUB_WORKSPACE}/data/geometry3k"
+
+          mkdir -p "${MODEL_DIR}" "${DATASET_DIR}"
+
+          hf --version
+          hf download --help >/dev/null
+
+          download_with_retry() {
+            local attempt
+            local delay
+
+            for attempt in 1 2 3 4 5; do
+              if "$@"; then
+                return 0
+              fi
+
+              if [[ "${attempt}" -lt 5 ]]; then
+                delay=$((attempt * 30))
+                echo "Download attempt ${attempt} failed; retrying in ${delay}s"
+                sleep "${delay}"
+              fi
+            done
+
+            echo "Download failed after 5 attempts"
+            return 1
+          }
+
+          download_with_retry \
+            hf download \
+            Qwen/Qwen3.5-2B \
+            --local-dir "${MODEL_DIR}" \
+            --max-workers 1
+
+          download_with_retry \
+            hf download \
+            hiyouga/geometry3k \
+            --repo-type dataset \
+            --local-dir "${DATASET_DIR}" \
+            --max-workers 1
+
+          test -f "${MODEL_DIR}/config.json"
+
+          echo "Model files:"
+          find "${MODEL_DIR}" -maxdepth 1 -type f -printf '%f\n' | sort
+
+          echo "Dataset files:"
+          find "${DATASET_DIR}" -maxdepth 2 -type f | sed -n '1,50p'
+      - name: Run Qwen3.5-2B Geometry3K GRPO
+        run: |
+          set -euo pipefail
+
+          MODEL_DIR="${GITHUB_WORKSPACE}/models/Qwen3.5-2B"
+          DATASET_DIR="${GITHUB_WORKSPACE}/data/geometry3k"
+          ARTIFACT_DIR="${GITHUB_WORKSPACE}/training-artifacts"
+          mkdir -p "${ARTIFACT_DIR}"
+
+          rm -rf /tmp/areal/experiments
+          rm -rf /tmp/areal/name_resolve
+
+          # Prevent workers from issuing Hub metadata requests after the
+          # model and dataset have been downloaded.
+          export HF_HUB_OFFLINE=1
+          export TRANSFORMERS_OFFLINE=1
+          export HF_DATASETS_OFFLINE=1
+
+          python examples/vlm/geometry3k_grpo.py \
+            --config examples/vlm_npu/qwen3_5_2b_geometry3k_grpo.yaml \
+            actor.path="${MODEL_DIR}" \
+            train_dataset.path="${DATASET_DIR}" \
+            valid_dataset.path="${DATASET_DIR}" \
+            2>&1 | tee "${ARTIFACT_DIR}/training.log"
+      - name: Upload training results
+        if: always()
+        id: training-results
+        uses: actions/upload-artifact@v4
+        with:
+          name: geometry3k-results-${{ github.run_number }}
+          path: |
+            training-artifacts/training.log
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Collect final diagnostics
+        if: always()
+        run: |
+          echo "Final NPU status:"
+          npu-smi info || true
+
+          echo "Shared-memory usage:"
+          df -h /dev/shm || true
+
+          echo "Disk usage:"
+          df -h || true
+
+          echo "AReaL output files:"
+          find /tmp/areal -maxdepth 4 -type f 2>/dev/null | head -200 || true
