@@ -1009,22 +1009,64 @@ class SlurmScheduler(Scheduler):
                     "Invalid strategy",
                     "Colocation strategy requires target role to be specified",
                 )
-            target_role = f"{colocate_role}-inf"
-            if target_role not in self._workers:
+            # v2 services register workers under derived role names: the
+            # inference service uses "<role>-inf" and the training service
+            # uses "<role>-guard". Resolve whichever the target published.
+            # The train controller initializes in a background pipeline that
+            # may reach this point before the rollout stack has registered
+            # its workers, so poll instead of failing immediately.
+            target_candidates = [
+                f"{colocate_role}-inf",
+                f"{colocate_role}-guard",
+                colocate_role,
+            ]
+            target_role = None
+            wait_deadline = time.monotonic() + 600.0
+            while time.monotonic() < wait_deadline:
+                target_role = next(
+                    (r for r in target_candidates if r in self._workers), None
+                )
+                if target_role is not None:
+                    break
+                logger.info(
+                    "v2 guard colocation: waiting for target role "
+                    f"(one of {target_candidates}) to register workers..."
+                )
+                time.sleep(5.0)
+            if target_role is None:
                 raise WorkerNotFoundError(
-                    f"Cannot colocate v2 guards with role '{target_role}' - role not found"
+                    f"Cannot colocate v2 guards with role '{colocate_role}' - "
+                    f"none of {target_candidates} appeared within 600s"
                 )
 
+            # get_workers blocks until the target guards are fully ready
+            # (ports registered); forking earlier hits empty worker_ports.
+            self.get_workers(role=target_role, timeout=600.0)
             target_workers = self._workers[target_role]
             target_gpus_by_host: dict[str, int] = {}
             parent_workers: list[SlurmWorkerInfo] = []
+            fork_envs: list[dict[str, str]] = []
+            base_env = dict(schedulings[0].env_vars or {})
+            # A target guard fronts spec.gpu GPUs. Expand one forked worker
+            # per GPU and pin each to its node-local physical slot: guards on
+            # a host are laid out contiguously in worker order (the same
+            # base-gpu ordering the inference servers were forked with), so
+            # slot = host-running-base + within-guard offset. rank%N guessing
+            # breaks whenever guard count != GPU count (e.g. tp>1 servers).
+            host_base: dict[str, int] = {}
             for target_worker in target_workers:
                 target_gpu_count = target_worker.spec.gpu if target_worker.spec else 0
-                target_gpus_by_host[target_worker.worker.ip] = (
-                    target_gpus_by_host.get(target_worker.worker.ip, 0)
-                    + target_gpu_count
+                host_ip = target_worker.worker.ip
+                target_gpus_by_host[host_ip] = (
+                    target_gpus_by_host.get(host_ip, 0) + target_gpu_count
                 )
-                parent_workers.extend([target_worker] * target_gpu_count)
+                base = host_base.get(host_ip, 0)
+                for offset in range(target_gpu_count):
+                    parent_workers.append(target_worker)
+                    fork_envs.append(
+                        {**base_env, "CUDA_VISIBLE_DEVICES": str(base + offset)}
+                    )
+                host_base[host_ip] = base + target_gpu_count
 
             if (
                 any(
@@ -1060,7 +1102,7 @@ class SlurmScheduler(Scheduler):
                     target_role,
                     parent_workers,
                     module,
-                    [spec.env_vars for spec in schedulings],
+                    fork_envs,
                 )
             except Exception:
                 created_workers = self._workers.pop(role, [])
