@@ -9,11 +9,102 @@ on:
 
 jobs:
   probe:
-    runs-on: linux-aarch64-a3-8
+    runs-on: linux-aarch64-a3-16
     container:
       image: ghcr.io/hwvanici/areal_npu:v1.0.4-a3
 
+    env:
+      # Required by the AReaL VLM NPU guide.
+      USE_OPTIMIZED_MODEL: "0"
+
+      # Use the Hugging Face mirror when downloading the model and dataset.
+      HF_ENDPOINT: "https://hf-mirror.com"
+      HF_HUB_ENABLE_HF_TRANSFER: "0"
+
+      PYTHONUNBUFFERED: "1"
+
     steps:
-      - name: Show NPU info
+      - name: Check NPU and CANN information
         run: |
+          set -euxo pipefail
+
+          INSTALL_INFO="/usr/local/Ascend/ascend-toolkit/latest/$(uname -i)-linux/ascend_toolkit_install.info"
+
+          if [[ -f "${INSTALL_INFO}" ]]; then
+            cat "${INSTALL_INFO}"
+          else
+            echo "CANN install information not found at ${INSTALL_INFO}"
+          fi
+
           npu-smi info
+
+      - name: Check initial environment
+        run: |
+          set -euxo pipefail
+
+          python --version
+          pip --version
+          pip list
+
+      - name: Checkout AReaL ascend branch
+        uses: actions/checkout@v4
+        with:
+          ref: ascend
+          fetch-depth: 0
+          clean: true
+
+      - name: Install current AReaL repository
+        run: |
+          set -euxo pipefail
+
+          # The image contains the NPU-specific dependencies.
+          # Install only the checked-out AReaL source.
+          pip install -e . --no-deps
+
+      - name: Verify runtime
+        run: |
+          set -euxo pipefail
+
+          python - <<'PY'
+          import torch
+          import torch_npu
+          import areal
+
+          print("torch:", torch.__version__)
+          print("torch_npu:", torch_npu.__version__)
+          print("AReaL:", areal.__file__)
+          print("NPU available:", torch.npu.is_available())
+          print("NPU count:", torch.npu.device_count())
+
+          assert torch.npu.is_available(), "No Ascend NPU is available"
+          assert torch.npu.device_count() >= 16, (
+              f"The config requires 16 NPUs, but only "
+              f"{torch.npu.device_count()} are visible"
+          )
+          PY
+
+      - name: Run Qwen3.5-2B Geometry3K GRPO
+        run: |
+          set -euxo pipefail
+
+          # Remove state left by a previous run on a reused self-hosted runner.
+          rm -rf /tmp/areal/experiments
+          rm -rf /tmp/areal/name_resolve
+
+          python examples/vlm/geometry3k_grpo.py \
+            --config examples/vlm_npu/qwen3_5_2b_geometry3k_grpo.yaml
+
+      - name: Collect final diagnostics
+        if: always()
+        run: |
+          echo "Final NPU status:"
+          npu-smi info || true
+
+          echo "Shared-memory usage:"
+          df -h /dev/shm || true
+
+          echo "Disk usage:"
+          df -h || true
+
+          echo "AReaL output files:"
+          find /tmp/areal -maxdepth 4 -type f 2>/dev/null | head -200 || true
