@@ -122,6 +122,17 @@ async def _post(
         resp.raise_for_status()
 
 
+async def _post_once(
+    session: aiohttp.ClientSession,
+    url: str,
+    timeout_s: float,
+    json_data: Any = None,
+) -> None:
+    timeout = aiohttp.ClientTimeout(total=timeout_s)
+    async with session.post(url, json=json_data, timeout=timeout) as resp:
+        resp.raise_for_status()
+
+
 def _get_own_ip() -> str:
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
@@ -471,10 +482,41 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
                 duplicates,
             )
 
+        def _expand_inference_coverage(
+            urls: list[str], reports: list[dict]
+        ) -> tuple[dict[tuple[str, int], tuple[str, int, int]], list[dict[str, Any]]]:
+            # One inference URL fronts tp_size*pp_size scheduler processes, one
+            # per GPU, but its report carries only rank-0's device id. Expand to
+            # per-GPU coverage assuming the contiguous node-local assignment
+            # used when the servers were forked (base_gpu_id ordering). Each
+            # device maps to (url, engine_base_offset=local rank within the
+            # server, instance_world).
+            coverage: dict[tuple[str, int], list[tuple[str, int, int]]] = {}
+            for url, report in zip(urls, reports, strict=True):
+                ip = str(report["ip"])
+                base_dev = int(report["device_id"])
+                instance_world = max(
+                    1,
+                    int(report.get("tp_size", 1)) * int(report.get("pp_size", 1)),
+                )
+                for local in range(instance_world):
+                    coverage.setdefault((ip, base_dev + local), []).append(
+                        (url, local, instance_world)
+                    )
+            duplicates = [
+                {"ip": ip, "device_id": dev, "urls": [c[0] for c in covers]}
+                for (ip, dev), covers in sorted(coverage.items())
+                if len(covers) > 1
+            ]
+            return (
+                {device: covers[0] for device, covers in coverage.items()},
+                duplicates,
+            )
+
         train_by_device, train_duplicates = _index_workers_by_device(
             train_urls, train_parallelism
         )
-        infer_by_device, infer_duplicates = _index_workers_by_device(
+        infer_by_device, infer_duplicates = _expand_inference_coverage(
             inference_urls, infer_parallelism
         )
         if train_duplicates or infer_duplicates:
@@ -516,18 +558,63 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
         train_world_size = paired_world_size
         infer_world_size = paired_world_size
         num_engines = len(inference_urls)
-        pairing_table = [
+
+        # Engine-major rank layout: servers sorted by (ip, base_gpu) get
+        # engine index e; rank of (server e, local k) = e*instance_world + k.
+        # With contiguous per-server coverage this must equal the globally
+        # sorted (ip, gpu) position - verified below so a violated contiguity
+        # assumption fails loudly instead of corrupting the IPC pairing.
+        server_base: dict[str, tuple[int, int]] = {}
+        server_infos = sorted(
             {
-                "ip": ip,
-                "device_id": device_id,
-                "train_url": train_by_device[(ip, device_id)],
-                "infer_url": infer_by_device[(ip, device_id)],
-                # The N-rank offset is the awex colocate donor/reader convention.
-                "train_rank": paired_world_size + rank,
-                "infer_rank": rank,
+                (str(r["ip"]), int(r["device_id"]), url, iw)
+                for url, r, iw in (
+                    (
+                        u,
+                        rep,
+                        max(
+                            1,
+                            int(rep.get("tp_size", 1)) * int(rep.get("pp_size", 1)),
+                        ),
+                    )
+                    for u, rep in zip(inference_urls, infer_parallelism, strict=True)
+                )
             }
-            for rank, (ip, device_id) in enumerate(paired_devices)
-        ]
+        )
+        next_base = 0
+        for _ip, _dev, url, iw in server_infos:
+            server_base[url] = (next_base, iw)
+            next_base += iw
+
+        pairing_table = []
+        for rank, (ip, device_id) in enumerate(paired_devices):
+            infer_url, infer_local, _iw = infer_by_device[(ip, device_id)]
+            base_rank, _ = server_base[infer_url]
+            if base_rank + infer_local != rank:
+                return JSONResponse(
+                    status_code=422,
+                    content={
+                        "error": (
+                            "Inference server GPU coverage is not contiguous in "
+                            "(ip, gpu) order; colocate rank layout would be "
+                            "inconsistent"
+                        ),
+                        "device": {"ip": ip, "device_id": device_id},
+                        "expected_rank": base_rank + infer_local,
+                        "sorted_rank": rank,
+                    },
+                )
+            pairing_table.append(
+                {
+                    "ip": ip,
+                    "device_id": device_id,
+                    "train_url": train_by_device[(ip, device_id)],
+                    "infer_url": infer_url,
+                    # The N-rank offset is the awex colocate donor/reader convention.
+                    "train_rank": paired_world_size + rank,
+                    "infer_rank": rank,
+                }
+            )
 
         train_meta_resps, infer_meta_resps = await asyncio.gather(
             asyncio.gather(
@@ -581,18 +668,22 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
         }
 
         init_tasks = []
-        for pair in pairing_table:
+        # Inference init goes once per SERVER with its engine-base rank: the
+        # request is broadcast to every scheduler process behind the URL, and
+        # each derives its own rank as base + its tp/pp local rank.
+        for url, (base_rank, _iw) in server_base.items():
             init_tasks.append(
                 _post(
                     session,
-                    f"{pair['infer_url']}/awex/init_colocate_weight_update",
+                    f"{url}/awex/init_colocate_weight_update",
                     init_timeout_s,
                     json_data={
                         **init_payload_base,
-                        "transfer_rank": pair["infer_rank"],
+                        "transfer_rank": base_rank,
                     },
                 )
             )
+        for pair in pairing_table:
             init_tasks.append(
                 _post(
                     session,
@@ -617,7 +708,22 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
         )
         registry.register(pair_info)
 
-        logger.info("Connected colocate pair '%s'", pair_name)
+        for pair in pairing_table:
+            logger.info(
+                "[colocate-pairing] (ip=%s, gpu=%s): infer_rank=%s <- train_rank=%s",
+                pair["ip"],
+                pair["device_id"],
+                pair["infer_rank"],
+                pair["train_rank"],
+            )
+        logger.info(
+            "Connected colocate pair '%s' (%d device pairs, meta_server=%s, "
+            "master_port=%s)",
+            pair_name,
+            len(pairing_table),
+            meta_server_addr,
+            master_port,
+        )
         return ConnectResponse(pair_name=pair_name)
 
     async def _colocate_execute_weight_update(
@@ -631,10 +737,19 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
         # handoff among themselves via the MetaServer, and only return 200
         # once their side of the update has completed. The gateway just
         # dispatches to everyone concurrently, exactly like the awex
-        # separation path.
+        # separation path. Single-shot POST: reader/writer NCCL group init
+        # is not reentrant, so a blind HTTP retry would fail with
+        # "group name has already been created".
+        logger.info(
+            "[colocate-update] v%d: dispatching execute to %d train + %d "
+            "inference workers",
+            version,
+            len(pair_info.train_worker_urls),
+            len(pair_info.inference_worker_urls),
+        )
         await asyncio.gather(
             *[
-                _post(
+                _post_once(
                     session,
                     f"{url}/awex/execute_colocate_weight_update",
                     timeout_s,
@@ -643,6 +758,7 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
                 for url in pair_info.train_worker_urls + pair_info.inference_worker_urls
             ]
         )
+        logger.info("[colocate-update] v%d: all workers completed", version)
 
     async def _awex_transfer_weights(
         pair_info: PairInfo,

@@ -14,6 +14,8 @@ from sglang.srt.server_args import PortArgs, ServerArgs
 
 from areal.infra.rpc.serialization import serialize_value
 
+logger = logging.getLogger("AwexSchedulerBridge")
+
 RESULT_IPC_ENV = "AREAL_AWEX_RESULT_IPC"
 
 
@@ -158,10 +160,14 @@ class AwexSchedulerBridge:
         orig_log = getattr(scheduler, "log_decode_stats", None)
         orig_log_iter = getattr(scheduler, "log_decode_stats_every_iteration", None)
         if orig_log is None or orig_log_iter is None:
-            raise AttributeError(
+            # sglang >= 0.5.10 reworked decode-stats logging and removed these
+            # hooks; the tracker only restores metrics silenced by pause/resume
+            # cycles, so skip it rather than block server startup.
+            logger.warning(
                 "sglang Scheduler.log_decode_stats(_every_iteration) not found; "
-                "incompatible sglang version for AWEX decode-stats tracking"
+                "skipping AWEX decode-stats tracking for this sglang version"
             )
+            return
 
         def _tracked_log_decode_stats(*args, **kwargs):
             scheduler._areal_awex_last_decode_stats_ct = getattr(
