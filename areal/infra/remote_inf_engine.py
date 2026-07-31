@@ -937,11 +937,17 @@ class RemoteInfEngine(InferenceEngine):
             while self.workflow_executor.is_paused():
                 await asyncio.sleep(0.5)
 
+            # Pin the version that serves this request. A trajectory may span
+            # several weight versions, so each segment must be attributed to the
+            # version that actually generated it rather than to whichever
+            # version is current once the response arrives.
+            request_version = self.get_version()
+
             # Build request using backend
             http_req = self.backend.build_generation_request(
                 req,
                 with_lora=self.config.use_lora,
-                version=self.get_version(),
+                version=request_version,
             )
 
             # Loop until the generation is complete
@@ -980,7 +986,7 @@ class RemoteInfEngine(InferenceEngine):
             accumulated_output_tokens.extend(gen_result.output_tokens)
             accumulated_output_logprobs.extend(gen_result.output_logprobs)
             accumulated_versions.extend(
-                [self.get_version()] * len(gen_result.output_tokens)
+                [request_version] * len(gen_result.output_tokens)
             )
             # Accumulate routed_experts for MoE models
             if gen_result.routed_experts is not None:
