@@ -39,6 +39,7 @@ class InteractionWithTokenLogpReward:
     # Common
     model_response: ModelResponse | None = None
     reward: float | None = None
+    original_reward: float | None = None
     parent: InteractionWithTokenLogpReward | None = None
     chat_template_type: str = "hf"
     _cache: dict[str, torch.Tensor] | None = None
@@ -192,6 +193,9 @@ class InteractionWithTokenLogpReward:
             loss_mask = [0] * resp.input_len + [1] * resp.output_len
             versions = [-1] * resp.input_len + resp.output_versions
         reward = self.reward if self.reward is not None else 0.0
+        original_reward = (
+            self.original_reward if self.original_reward is not None else reward
+        )
         result = dict(
             # unsqueeze to add an additional batch dimension
             input_ids=torch.tensor(seq).unsqueeze(0),
@@ -201,6 +205,7 @@ class InteractionWithTokenLogpReward:
             attention_mask=torch.ones(len(seq), dtype=torch.bool).unsqueeze(0),
             # reward
             rewards=torch.tensor([float(reward)]),
+            original_rewards=torch.tensor([float(original_reward)]),
         )
         self._cache = result
         return result
