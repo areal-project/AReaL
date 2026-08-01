@@ -9,6 +9,7 @@ import signal
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -98,6 +99,7 @@ def run_with_streaming_logs(
     env: dict[str, str] | None = None,
     env_vars_in_cmd: dict[str, str] | None = None,
     stdout: IO | None = None,
+    isolate_process_group: bool = False,
 ) -> subprocess.Popen:
     """Run a command with streaming output to stdout and log files.
 
@@ -117,6 +119,10 @@ def run_with_streaming_logs(
         Environment variables to prefix in the shell command (KEY=VALUE format)
     stdout : IO | None
         File object for stdout. Defaults to sys.stdout
+    isolate_process_group : bool
+        Create the shell pipeline as the leader of a new process group.  This
+        keeps the existing session while giving callers a stable boundary for
+        terminating descendants after the shell leader exits. POSIX only.
 
     Returns
     -------
@@ -127,6 +133,10 @@ def run_with_streaming_logs(
         cmd, str(log_file), str(merged_log), role, env_vars=env_vars_in_cmd
     )
 
+    if isolate_process_group and os.name != "posix":
+        raise RuntimeError("Process-group isolation is only supported on POSIX")
+
+    popen_kwargs = {"process_group": 0} if isolate_process_group else {}
     return subprocess.Popen(
         shell_cmd,
         shell=True,
@@ -134,7 +144,84 @@ def run_with_streaming_logs(
         env=env,
         stdout=stdout or sys.stdout,
         stderr=stdout or sys.stdout,
+        **popen_kwargs,
     )
+
+
+def _get_process_group_members(pgid: int) -> list[psutil.Process]:
+    """Return live, non-zombie processes that currently belong to ``pgid``."""
+    members: list[psutil.Process] = []
+    for process in psutil.process_iter(["pid", "status"]):
+        try:
+            if os.getpgid(process.pid) != pgid:
+                continue
+            if process.info["status"] == psutil.STATUS_ZOMBIE:
+                continue
+            members.append(process)
+        except (ProcessLookupError, PermissionError, psutil.Error):
+            continue
+    return members
+
+
+def _wait_for_process_group_exit(pgid: int, timeout: float) -> list[int]:
+    deadline = time.monotonic() + timeout
+    while True:
+        members = _get_process_group_members(pgid)
+        if not members:
+            return []
+        if time.monotonic() >= deadline:
+            return sorted(process.pid for process in members)
+        time.sleep(0.05)
+
+
+def kill_process_group(
+    pgid: int,
+    timeout: float = 5,
+    graceful: bool = True,
+) -> None:
+    """Terminate and verify an isolated POSIX process group.
+
+    Unlike :func:`kill_process_tree`, this remains effective after the tracked
+    shell leader exits and descendants are reparented.  It must only be used
+    for groups explicitly created with ``isolate_process_group=True``.
+    """
+    if os.name != "posix":
+        raise RuntimeError("Process-group termination is only supported on POSIX")
+    if pgid <= 0:
+        raise ValueError(f"Invalid process group id: {pgid}")
+    if pgid == os.getpgrp():
+        raise RuntimeError(f"Refusing to terminate the current process group {pgid}")
+
+    members = _get_process_group_members(pgid)
+    if not members:
+        logger.info(f"Process group {pgid} already terminated")
+        return
+
+    initial_pids = sorted(process.pid for process in members)
+    first_signal = signal.SIGTERM if graceful else signal.SIGKILL
+    logger.info(f"Sending {first_signal.name} to process group {pgid}: {initial_pids}")
+    try:
+        os.killpg(pgid, first_signal)
+    except ProcessLookupError:
+        return
+
+    remaining = _wait_for_process_group_exit(pgid, timeout if graceful else 1)
+    if remaining and graceful:
+        logger.warning(
+            f"Force killing process group {pgid}; remaining PIDs: {remaining}"
+        )
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            return
+        remaining = _wait_for_process_group_exit(pgid, 1)
+
+    if remaining:
+        raise RuntimeError(
+            f"Process group {pgid} still has live members after termination: "
+            f"{remaining}"
+        )
+    logger.info(f"Successfully cleaned up process group {pgid}")
 
 
 def kill_process_tree(

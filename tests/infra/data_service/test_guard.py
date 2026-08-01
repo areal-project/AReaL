@@ -76,9 +76,10 @@ def test_fork_raw_command_success(mock_run, client, state: GuardState):
     assert data["host"] == "10.0.0.1"
     assert data["pid"] == 42
     assert ("worker", 1) in state.forked_children_map
+    assert mock_run.call_args.kwargs["isolate_process_group"] is True
 
 
-@patch("areal.infra.rpc.guard.app.kill_process_tree")
+@patch("areal.infra.rpc.guard.app.kill_process_group")
 def test_kill_known_worker(mock_kill, client, state: GuardState):
     mock_proc = _make_mock_process(pid=123)
     state.forked_children.append(mock_proc)
@@ -90,7 +91,7 @@ def test_kill_known_worker(mock_kill, client, state: GuardState):
     mock_kill.assert_called_once_with(123, timeout=3, graceful=True)
 
 
-@patch("areal.infra.rpc.guard.app.kill_process_tree")
+@patch("areal.infra.rpc.guard.app.kill_process_group")
 def test_cleanup_kills_all_running_children(mock_kill, state: GuardState):
     proc1 = _make_mock_process(pid=100)
     proc2 = _make_mock_process(pid=200)
@@ -102,3 +103,18 @@ def test_cleanup_kills_all_running_children(mock_kill, state: GuardState):
     assert mock_kill.call_count == 2
     assert state.forked_children == []
     assert state.forked_children_map == {}
+
+
+@patch("areal.infra.rpc.guard.app.kill_process_group")
+def test_kill_failure_keeps_worker_tracked(mock_kill, client, state: GuardState):
+    mock_proc = _make_mock_process(pid=123)
+    state.forked_children.append(mock_proc)
+    state.forked_children_map[("test", 0)] = mock_proc
+    mock_kill.side_effect = RuntimeError("group still alive")
+
+    resp = client.post("/kill_forked_worker", json={"role": "test", "worker_index": 0})
+
+    assert resp.status_code == 500
+    assert resp.get_json()["pgid"] == 123
+    assert mock_proc in state.forked_children
+    assert state.forked_children_map[("test", 0)] is mock_proc

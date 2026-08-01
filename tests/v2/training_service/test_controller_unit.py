@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import threading
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
@@ -8,6 +10,8 @@ import pytest
 from areal.api.cli_args import SchedulingSpec, TrainEngineConfig
 from areal.v2.training_service.controller.controller import (
     GatewayTrainController,
+    TeardownCallResult,
+    TeardownReport,
 )
 
 MODULE = "areal.v2.training_service.controller.controller"
@@ -69,6 +73,42 @@ class _FakeAsyncClient:
         if isinstance(next_item, Exception):
             raise next_item
         return next_item
+
+
+class _FakeAiohttpRequest:
+    def __init__(self, url: str, events: list[str], failures: set[str]) -> None:
+        self._url = url
+        self._events = events
+        self._failures = failures
+
+    async def __aenter__(self):
+        self._events.append(f"start:{self._url}")
+        await asyncio.sleep(0)
+        if self._url in self._failures:
+            self._events.append(f"fail:{self._url}")
+            raise RuntimeError(f"failed: {self._url}")
+        return self
+
+    async def __aexit__(self, *_args):
+        self._events.append(f"done:{self._url}")
+
+    def raise_for_status(self) -> None:
+        return None
+
+
+class _FakeAiohttpSession:
+    def __init__(self, events: list[str], failures: set[str] | None = None) -> None:
+        self._events = events
+        self._failures = failures or set()
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_args):
+        return None
+
+    def post(self, url: str, **_kwargs) -> _FakeAiohttpRequest:
+        return _FakeAiohttpRequest(url, self._events, self._failures)
 
 
 class TestGatewayTrainControllerInitialization:
@@ -162,3 +202,188 @@ class TestGatewayTrainControllerInitialization:
         assert controller._gateway_addr == "http://127.0.0.1:18080"
         assert controller.api_key is not None
         assert controller.api_key.startswith("ak-train-role-")
+
+
+class TestGatewayTrainControllerTeardown:
+    def test_worker_shutdown_is_global_two_phase(self):
+        controller = _make_controller()
+        controller._worker_addrs = ["http://worker-0", "http://worker-1"]
+        events: list[str] = []
+        session = _FakeAiohttpSession(events)
+
+        timeout = MagicMock()
+        with (
+            patch(
+                f"{MODULE}.aiohttp.ClientTimeout", return_value=timeout
+            ) as timeout_cls,
+            patch(
+                f"{MODULE}.aiohttp.ClientSession", return_value=session
+            ) as session_cls,
+        ):
+            report = controller._graceful_shutdown_workers()
+
+        assert report.successful
+        timeout_cls.assert_called_once_with(total=controller.config.request_timeout)
+        session_cls.assert_called_once_with(timeout=timeout)
+        last_awex = max(
+            index
+            for index, event in enumerate(events)
+            if event.startswith("done:") and event.endswith("/awex/teardown")
+        )
+        first_engine = min(
+            index
+            for index, event in enumerate(events)
+            if event.startswith("start:") and event.endswith("/destroy_engine")
+        )
+        assert last_awex < first_engine
+
+    def test_forked_service_cleanup_orders_ingress_and_parallelizes_workers(self):
+        controller = _make_controller()
+        controller._forked_services = [
+            ("http://guard-0", "train-worker", 0),
+            ("http://guard-1", "train-worker", 1),
+            ("http://guard-0", "router", 0),
+            ("http://guard-0", "data-proxy", 0),
+            ("http://guard-0", "gateway", 0),
+        ]
+        calls: list[tuple[str, int]] = []
+        calls_lock = threading.Lock()
+        workers_started = threading.Barrier(2, timeout=1)
+
+        def _kill(_guard_addr: str, role: str, worker_index: int):
+            with calls_lock:
+                calls.append((role, worker_index))
+            if role == "train-worker":
+                workers_started.wait()
+            return TeardownCallResult("forked-service", role, True)
+
+        with patch.object(controller, "_kill_forked_service", side_effect=_kill):
+            results = controller._cleanup_forked_services()
+
+        assert calls[:3] == [("gateway", 0), ("data-proxy", 0), ("router", 0)]
+        assert set(calls[3:]) == {("train-worker", 0), ("train-worker", 1)}
+        assert len(results) == 5
+        assert all(result.success for result in results)
+
+    def test_awex_failure_still_destroys_all_engines_without_false_success_log(self):
+        controller = _make_controller()
+        controller._worker_addrs = ["http://worker-0", "http://worker-1"]
+        failed_url = "http://worker-0/awex/teardown"
+        events: list[str] = []
+        session = _FakeAiohttpSession(events, failures={failed_url})
+
+        with (
+            patch(f"{MODULE}.aiohttp.ClientSession", return_value=session),
+            patch(f"{MODULE}.logger") as logger,
+        ):
+            report = controller._graceful_shutdown_workers()
+
+        assert [(result.phase, result.target) for result in report.failures] == [
+            ("awex", "http://worker-0")
+        ]
+        assert sum(event.endswith("/destroy_engine") for event in events) == 4
+        assert not any(
+            "destroyed gracefully" in str(call) for call in logger.info.call_args_list
+        )
+        logger.error.assert_called_once()
+
+    def test_worker_shutdown_orchestration_failure_returns_report(self):
+        controller = _make_controller()
+        controller._worker_addrs = ["http://worker-0", "http://worker-1"]
+
+        with patch(
+            f"{MODULE}.aiohttp.ClientSession",
+            side_effect=RuntimeError("session failed"),
+        ):
+            report = controller._graceful_shutdown_workers()
+
+        assert len(report.awex_results) == 2
+        assert len(report.engine_results) == 2
+        assert not report.successful
+        assert all(
+            "session failed" in (result.error or "") for result in report.results
+        )
+
+    def test_destroy_reports_failures_after_scheduler_fallback(self):
+        scheduler = MagicMock()
+        controller = _make_controller(scheduler)
+        controller._worker_addrs = ["http://worker-0"]
+        controller._guard_addrs = ["http://guard-0"]
+        controller._forked_services = [("http://guard-0", "train-worker", 0)]
+        controller._service_roles = ["actor-guard"]
+        worker_report = TeardownReport(
+            engine_results=(
+                TeardownCallResult("engine", "http://worker-0", False, "disconnected"),
+            )
+        )
+        fork_result = TeardownCallResult(
+            "forked-service", "train-worker/0", False, "kill failed"
+        )
+
+        with (
+            patch.object(
+                controller,
+                "_graceful_shutdown_workers",
+                return_value=worker_report,
+            ),
+            patch.object(
+                controller,
+                "_cleanup_forked_services",
+                return_value=(fork_result,),
+            ),
+            patch.object(
+                controller,
+                "_verify_guard_cleanup",
+                return_value=TeardownCallResult(
+                    "guard-drain", "http://guard-0", False, "one child"
+                ),
+            ),
+        ):
+            controller.destroy()
+
+        report = controller._last_teardown_report
+        assert report is not None
+        assert not report.successful
+        assert {result.phase for result in report.failures} == {
+            "engine",
+            "forked-service",
+            "guard-drain",
+        }
+        scheduler.delete_workers.assert_called_once_with(
+            role="actor-guard", reverse_order=True
+        )
+
+    def test_destroy_preserves_failure_report_when_called_again(self):
+        controller = _make_controller()
+        failure = TeardownReport(
+            engine_results=(
+                TeardownCallResult("engine", "http://worker-0", False, "failed"),
+            )
+        )
+        controller._last_teardown_report = failure
+
+        with patch.object(controller, "_cleanup_runtime_state") as cleanup:
+            controller.destroy()
+
+        cleanup.assert_not_called()
+        assert controller._last_teardown_report is failure
+
+    def test_destroy_reports_process_group_failure_and_keeps_ownership(self):
+        controller = _make_controller()
+        controller._own_process_group = True
+
+        with (
+            patch("torch.distributed.is_initialized", return_value=True),
+            patch(
+                "torch.distributed.destroy_process_group",
+                side_effect=RuntimeError("group teardown failed"),
+            ),
+        ):
+            controller.destroy()
+
+        report = controller._last_teardown_report
+        assert report is not None
+        assert [(result.phase, result.error) for result in report.failures] == [
+            ("controller-process-group", "group teardown failed")
+        ]
+        assert controller._own_process_group is True

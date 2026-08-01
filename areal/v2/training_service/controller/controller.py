@@ -8,6 +8,7 @@ import sys
 import threading
 import time
 import traceback
+from dataclasses import dataclass
 from threading import Lock
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
@@ -26,6 +27,47 @@ if TYPE_CHECKING:
     from areal.api.scheduler_api import Scheduler, Worker
 
 logger = logging.getLogger("GatewayTrainController")
+
+
+@dataclass(frozen=True)
+class TeardownCallResult:
+    """Outcome of one bounded controller teardown operation."""
+
+    phase: str
+    target: str
+    success: bool
+    error: str | None = None
+
+
+@dataclass(frozen=True)
+class TeardownReport:
+    """Immutable aggregate of graceful and forced teardown outcomes."""
+
+    awex_results: tuple[TeardownCallResult, ...] = ()
+    engine_results: tuple[TeardownCallResult, ...] = ()
+    forked_service_results: tuple[TeardownCallResult, ...] = ()
+    guard_results: tuple[TeardownCallResult, ...] = ()
+    scheduler_results: tuple[TeardownCallResult, ...] = ()
+    controller_results: tuple[TeardownCallResult, ...] = ()
+
+    @property
+    def results(self) -> tuple[TeardownCallResult, ...]:
+        return (
+            self.awex_results
+            + self.engine_results
+            + self.forked_service_results
+            + self.guard_results
+            + self.scheduler_results
+            + self.controller_results
+        )
+
+    @property
+    def failures(self) -> tuple[TeardownCallResult, ...]:
+        return tuple(result for result in self.results if not result.success)
+
+    @property
+    def successful(self) -> bool:
+        return not self.failures
 
 
 class GatewayTrainController:
@@ -70,6 +112,7 @@ class GatewayTrainController:
         self._init_lock = threading.Lock()
         self._workers_ready = threading.Event()
         self._shutdown_requested = threading.Event()
+        self._last_teardown_report: TeardownReport | None = None
 
     # -- Initialize --------------------------------------------------------
 
@@ -583,9 +626,10 @@ class GatewayTrainController:
 
     def _kill_forked_service(
         self, guard_addr: str, role: str, worker_index: int
-    ) -> None:
+    ) -> TeardownCallResult:
         import requests
 
+        target = f"{guard_addr} {role}/{worker_index}"
         try:
             resp = requests.post(
                 f"{guard_addr}/kill_forked_worker",
@@ -594,12 +638,63 @@ class GatewayTrainController:
             )
             if resp.status_code == 200:
                 logger.info("Killed forked service %s/%d", role, worker_index)
-            else:
-                logger.warning(
-                    "Failed to kill %s/%d: %s", role, worker_index, resp.text
+                return TeardownCallResult("forked-service", target, True)
+            if resp.status_code == 404:
+                logger.info(
+                    "Forked service %s/%d was already absent", role, worker_index
                 )
+                return TeardownCallResult("forked-service", target, True)
+
+            error = f"HTTP {resp.status_code}: {resp.text}"
+            logger.warning("Failed to kill %s/%d: %s", role, worker_index, error)
+            return TeardownCallResult("forked-service", target, False, error)
         except Exception as exc:
             logger.error("Error killing %s/%d: %s", role, worker_index, exc)
+            return TeardownCallResult("forked-service", target, False, str(exc))
+
+    def _verify_guard_cleanup(self, guard_addr: str) -> TeardownCallResult:
+        import requests
+
+        try:
+            resp = requests.get(f"{guard_addr}/health", timeout=5)
+            resp.raise_for_status()
+            child_count = resp.json().get("forked_children")
+            if child_count != 0:
+                error = f"guard still tracks {child_count!r} forked children"
+                return TeardownCallResult("guard-drain", guard_addr, False, error)
+            return TeardownCallResult("guard-drain", guard_addr, True)
+        except Exception as exc:
+            return TeardownCallResult("guard-drain", guard_addr, False, str(exc))
+
+    def _cleanup_forked_services(self) -> tuple[TeardownCallResult, ...]:
+        services = list(reversed(self._forked_services))
+        ingress_services = [item for item in services if item[1] != "train-worker"]
+        training_workers = [item for item in services if item[1] == "train-worker"]
+
+        results = [self._kill_forked_service(*item) for item in ingress_services]
+        if training_workers:
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=min(len(training_workers), 32),
+                thread_name_prefix="ctrl_teardown",
+            ) as executor:
+                futures = [
+                    (item, executor.submit(self._kill_forked_service, *item))
+                    for item in training_workers
+                ]
+                for item, future in futures:
+                    try:
+                        results.append(future.result())
+                    except Exception as exc:  # pragma: no cover - defensive
+                        guard_addr, role, worker_index = item
+                        results.append(
+                            TeardownCallResult(
+                                "forked-service",
+                                f"{guard_addr} {role}/{worker_index}",
+                                False,
+                                str(exc),
+                            )
+                        )
+        return tuple(results)
 
     # -- Health checks -----------------------------------------------------
 
@@ -1100,7 +1195,7 @@ class GatewayTrainController:
 
     # -- Destroy -----------------------------------------------------------
 
-    def _graceful_shutdown_workers(self) -> None:
+    def _graceful_shutdown_workers(self) -> TeardownReport:
         """Destroy engines on all training workers before killing processes.
 
         ``dist.destroy_process_group()`` is a local operation
@@ -1110,40 +1205,78 @@ class GatewayTrainController:
         ``recvValue failed`` warning from the now-dead TCPStore.
         """
         if not self._worker_addrs:
-            return
+            return TeardownReport()
 
-        async def _shutdown_all() -> None:
-            timeout = aiohttp.ClientTimeout(total=30)
+        async def _shutdown_phase(
+            session: aiohttp.ClientSession,
+            phase: str,
+            path: str,
+            *,
+            payload: dict[str, Any] | None = None,
+        ) -> tuple[TeardownCallResult, ...]:
+            async def _shutdown_one(addr: str) -> TeardownCallResult:
+                try:
+                    kwargs = {"json": payload} if payload is not None else {}
+                    async with session.post(f"{addr}{path}", **kwargs) as resp:
+                        resp.raise_for_status()
+                    return TeardownCallResult(phase, addr, True)
+                except Exception as exc:
+                    return TeardownCallResult(phase, addr, False, str(exc))
+
+            return tuple(
+                await asyncio.gather(
+                    *[_shutdown_one(addr) for addr in self._worker_addrs]
+                )
+            )
+
+        async def _shutdown_all() -> TeardownReport:
+            timeout = aiohttp.ClientTimeout(total=self.config.request_timeout)
             async with aiohttp.ClientSession(timeout=timeout) as session:
-                tasks = []
-                for addr in self._worker_addrs:
-                    tasks.append(_shutdown_one(session, addr))
-                await asyncio.gather(*tasks, return_exceptions=True)
-
-        async def _shutdown_one(session: aiohttp.ClientSession, addr: str) -> None:
-            try:
-                async with session.post(f"{addr}/awex/teardown") as resp:
-                    resp.raise_for_status()
-            except Exception as e:
-                logger.warning(
-                    "Graceful shutdown: failed to call /awex/teardown on %s: %s",
-                    addr,
-                    e,
+                # This is intentionally global two-phase teardown.  No rank
+                # starts destroying its engine/process groups until every rank
+                # has completed (or failed) AWEX teardown.
+                awex_results = await _shutdown_phase(session, "awex", "/awex/teardown")
+                engine_results = await _shutdown_phase(
+                    session, "engine", "/destroy_engine", payload={}
                 )
-            try:
-                async with session.post(f"{addr}/destroy_engine", json={}) as resp:
-                    resp.raise_for_status()
-            except Exception as e:
-                logger.warning(
-                    "Graceful shutdown: failed to call /destroy_engine on %s: %s",
-                    addr,
-                    e,
+                return TeardownReport(
+                    awex_results=awex_results,
+                    engine_results=engine_results,
                 )
 
-        run_async_task(_shutdown_all)
-        logger.info("All training worker engines destroyed gracefully")
+        try:
+            report = run_async_task(_shutdown_all)
+        except Exception as exc:
+            # A session/event-loop failure must not prevent the guard and
+            # scheduler fallbacks below from draining worker processes.
+            error = f"teardown orchestration failed: {exc}"
+            report = TeardownReport(
+                awex_results=tuple(
+                    TeardownCallResult("awex", addr, False, error)
+                    for addr in self._worker_addrs
+                ),
+                engine_results=tuple(
+                    TeardownCallResult("engine", addr, False, error)
+                    for addr in self._worker_addrs
+                ),
+            )
+        if report.successful:
+            logger.info("All training worker engines destroyed gracefully")
+        else:
+            for failure in report.failures:
+                logger.warning(
+                    "Training worker teardown failed during %s on %s: %s",
+                    failure.phase,
+                    failure.target,
+                    failure.error,
+                )
+            logger.error(
+                "Training worker graceful teardown incomplete: %d operation(s) failed",
+                len(report.failures),
+            )
+        return report
 
-    def _cleanup_runtime_state(self) -> None:
+    def _cleanup_runtime_state(self) -> TeardownReport:
         if self._router_addr and self._model_addr:
             try:
                 import requests
@@ -1157,30 +1290,43 @@ class GatewayTrainController:
             except Exception:
                 logger.error("Failed to unregister model: %s", traceback.format_exc())
 
-        self._graceful_shutdown_workers()
+        worker_report = self._graceful_shutdown_workers()
 
-        for guard_addr, role, worker_index in reversed(self._forked_services):
-            try:
-                self._kill_forked_service(guard_addr, role, worker_index)
-            except Exception:
-                logger.error(
-                    "Error killing %s/%d: %s",
-                    role,
-                    worker_index,
-                    traceback.format_exc(),
+        forked_service_results = self._cleanup_forked_services()
+        guard_addrs = list(dict.fromkeys(self._guard_addrs))
+        if guard_addrs:
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=min(len(guard_addrs), 32),
+                thread_name_prefix="guard_verify",
+            ) as executor:
+                guard_results = tuple(
+                    executor.map(self._verify_guard_cleanup, guard_addrs)
                 )
+        else:
+            guard_results = ()
         self._forked_services.clear()
 
+        scheduler_results: list[TeardownCallResult] = []
+        failed_scheduler_roles: set[str] = set()
         for role in reversed(self._service_roles):
             try:
-                self.scheduler.delete_workers(role=role)
+                self.scheduler.delete_workers(role=role, reverse_order=True)
                 logger.info("Workers deleted for role: %s", role)
-            except Exception:
+                scheduler_results.append(TeardownCallResult("scheduler", role, True))
+            except Exception as exc:
+                failed_scheduler_roles.add(role)
                 logger.error(
                     "Error deleting workers for %s: %s", role, traceback.format_exc()
                 )
-        self._service_roles.clear()
+                scheduler_results.append(
+                    TeardownCallResult("scheduler", role, False, str(exc))
+                )
+        self._service_roles = [
+            role for role in self._service_roles if role in failed_scheduler_roles
+        ]
         self._worker_addrs.clear()
+        if not failed_scheduler_roles:
+            self._guard_addrs.clear()
         self._router_addr = ""
         self._gateway_addr = ""
         self._model_addr = ""
@@ -1196,16 +1342,55 @@ class GatewayTrainController:
 
         import torch.distributed as dist
 
+        controller_results: list[TeardownCallResult] = []
         if self._own_process_group:
             try:
                 if dist.is_initialized():
                     dist.destroy_process_group()
-            except Exception:
+                controller_results.append(
+                    TeardownCallResult(
+                        "controller-process-group",
+                        "default",
+                        True,
+                    )
+                )
+                self._own_process_group = False
+            except Exception as exc:
                 logger.error(
                     "Failed to destroy process group: %s", traceback.format_exc()
                 )
-            finally:
-                self._own_process_group = False
+                controller_results.append(
+                    TeardownCallResult(
+                        "controller-process-group",
+                        "default",
+                        False,
+                        str(exc),
+                    )
+                )
+
+        report = TeardownReport(
+            awex_results=worker_report.awex_results,
+            engine_results=worker_report.engine_results,
+            forked_service_results=forked_service_results,
+            guard_results=guard_results,
+            scheduler_results=tuple(scheduler_results),
+            controller_results=tuple(controller_results),
+        )
+        self._last_teardown_report = report
+        for failure in (
+            report.forked_service_results
+            + report.guard_results
+            + report.scheduler_results
+            + report.controller_results
+        ):
+            if not failure.success:
+                logger.error(
+                    "Controller teardown failed during %s on %s: %s",
+                    failure.phase,
+                    failure.target,
+                    failure.error,
+                )
+        return report
 
     def destroy(self) -> None:
         self._shutdown_requested.set()
@@ -1214,4 +1399,23 @@ class GatewayTrainController:
         if future is not None:
             future.cancel()
 
+        # Do not replace a prior failure report with an empty success report
+        # when cleanup hooks call destroy() again after all targets are gone.
+        has_runtime_state = bool(
+            self._worker_addrs
+            or self._forked_services
+            or self._guard_addrs
+            or self._service_roles
+            or self._router_addr
+            or self._gateway_addr
+            or self._model_addr
+            or self._async_client is not None
+            or self._own_process_group
+        )
+        if not has_runtime_state and self._last_teardown_report is not None:
+            return
+
+        # Preserve the historical best-effort public API.  Callers destroy
+        # multiple controllers sequentially, so raising here would skip later
+        # cleanup.  Failures remain visible in logs and the immutable report.
         self._cleanup_runtime_state()
