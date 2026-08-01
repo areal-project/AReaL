@@ -1,378 +1,532 @@
-import asyncio
-import time
-from unittest.mock import Mock, patch
+# SPDX-License-Identifier: Apache-2.0
+
+import gc
+import sys
 
 import pytest
-from ray.util.state import summarize_actors
+import ray
 
+import areal.infra.scheduler.ray as ray_scheduler
 from areal.api import Job, Worker
-from areal.api.cli_args import BaseExperimentConfig, SchedulingSpec, SchedulingStrategy
-from areal.infra.scheduler.ray import RayScheduler, RayWorkerInfo, ray_resource_type
-from areal.infra.utils.ray_placement_group import _create_bundle_specs_split
-
-pytestmark = pytest.mark.skip(
-    reason=(
-        "Ray scheduler tests will only run if ray environment is explicitly initialized\n"
-        "To run this test:\n"
-        "1. Set up the ray cluster with `ray start --head` and ensure that there are enough resources;\n"
-        "2. Comment this skip mark."
-    ),
+from areal.api.cli_args import (
+    NameResolveConfig,
+    SchedulingSpec,
+    SchedulingStrategy,
+    SchedulingStrategyType,
 )
+from areal.infra.scheduler.exceptions import (
+    WorkerCreationError,
+    WorkerNotFoundError,
+)
+from areal.infra.scheduler.ray import RayScheduler, RayWorkerInfo
 
 
-class TestRaySchedulerInitialization:
-    def test_init(self):
-        scheduler = RayScheduler(
-            startup_timeout=60.0, exp_config=BaseExperimentConfig()
+def _scheduler(tmp_path, n_gpus_per_node: int = 8) -> RayScheduler:
+    scheduler = object.__new__(RayScheduler)
+    scheduler._n_gpus_per_node = n_gpus_per_node
+    scheduler.experiment_name = "test_ray_scheduler"
+    scheduler.trial_name = "trial"
+    scheduler.fileroot = str(tmp_path)
+    scheduler.enable_tms_offload = False
+    scheduler.ray_device_resource = "GPU"
+    scheduler.device_control_env_var = "CUDA_VISIBLE_DEVICES"
+    scheduler.name_resolve_config = NameResolveConfig(
+        type="nfs",
+        nfs_record_root=str(tmp_path / "name_resolve"),
+        etcd3_addr="localhost:2379",
+    )
+    scheduler.startup_timeout = 30.0
+    scheduler.health_check_interval = 0.1
+    scheduler.exp_config = None
+    scheduler._workers = {}
+    scheduler._launchers = {}
+    scheduler._placement_groups = {}
+    scheduler._multi_node_rollout = None
+    scheduler._colocated_roles = {}
+    return scheduler
+
+
+def _worker_info(worker_id: str, role: str = "actor") -> RayWorkerInfo:
+    return RayWorkerInfo(
+        worker=Worker(
+            id=worker_id,
+            ip="127.0.0.1",
+            worker_ports=["10000"],
+            engine_ports=[],
+        ),
+        role=role,
+        task_index=int(worker_id.rsplit("/", 1)[1]),
+        launchers=[],
+        spec=SchedulingSpec(cpu=1, gpu=1, mem=1),
+    )
+
+
+def _sleep_cmd(seconds: int = 60) -> str:
+    return f'{sys.executable} -c "import time; time.sleep({seconds})"'
+
+
+@pytest.fixture(autouse=True)
+def _disable_scheduler_destructor(monkeypatch):
+    monkeypatch.setattr(RayScheduler, "__del__", lambda self: None)
+    yield
+    gc.collect()
+
+
+@pytest.fixture(scope="module")
+def local_ray_cluster():
+    ray.shutdown()
+    try:
+        ray.init(
+            address="local",
+            num_cpus=16,
+            num_gpus=8,
+            include_dashboard=False,
+            ignore_reinit_error=True,
         )
-        assert scheduler.startup_timeout == 60.0
+    except Exception as e:
+        pytest.skip(f"Unable to start local Ray cluster: {e}")
+    yield
+    ray.shutdown()
 
 
-class TestWorkerCreationAndDeletion:
-    def test_create_delete_workers(self):
-        config = BaseExperimentConfig()
+def test_ray_scheduler_rejects_cpu_only_cluster(monkeypatch):
+    """Test that RayScheduler fails clearly on CPU-only clusters."""
+    monkeypatch.setattr(ray_scheduler.ray, "is_initialized", lambda: True)
+    monkeypatch.setattr(ray_scheduler, "ray_resource_type", lambda: "CPU")
 
-        scheduler = RayScheduler(startup_timeout=60.0, exp_config=config)
+    with pytest.raises(RuntimeError, match="does not support CPU-only clusters"):
+        RayScheduler(experiment_name="test-exp", trial_name="test-trial")
 
-        job = Job(
-            replicas=2,
-            role="train",
-            tasks=[
-                SchedulingSpec(cpu=1, mem=1, gpu=1, ray_placement_strategy="shared"),
-                SchedulingSpec(cpu=1, mem=1, gpu=1, ray_placement_strategy="shared"),
-            ],
+
+def test_prepare_worker_specs_expands_single_spec(tmp_path):
+    """Test that a single scheduling spec expands to all replicas."""
+    scheduler = _scheduler(tmp_path)
+    spec = SchedulingSpec(cpu=1, gpu=1, mem=1)
+
+    schedulings = scheduler._prepare_worker_specs("actor", 2, [spec])
+
+    assert schedulings == [spec, spec]
+
+
+def test_empty_scheduling_spec_fails(tmp_path):
+    """Test that job with no scheduling specs fails."""
+    scheduler = _scheduler(tmp_path)
+
+    with pytest.raises(ValueError, match="No scheduling specs"):
+        scheduler.create_workers(Job(role="empty_spec", replicas=2, tasks=[]))
+
+
+def test_mismatched_spec_count_fails(tmp_path):
+    """Test that mismatched spec count fails."""
+    scheduler = _scheduler(tmp_path)
+    job = Job(
+        role="mismatched",
+        replicas=3,
+        tasks=[
+            SchedulingSpec(cpu=1, gpu=1, mem=1),
+            SchedulingSpec(cpu=2, gpu=1, mem=2),
+        ],
+    )
+
+    with pytest.raises(ValueError, match="must be 1 or match"):
+        scheduler.create_workers(job)
+
+
+def test_zero_replicas_fails(tmp_path):
+    """Test that zero replicas fails."""
+    scheduler = _scheduler(tmp_path)
+    job = Job(role="zero_replicas", replicas=0, tasks=[SchedulingSpec()])
+
+    with pytest.raises(WorkerCreationError, match="replicas must be greater than 0"):
+        scheduler.create_workers(job)
+
+
+def test_additional_bash_cmds_fails(tmp_path):
+    """Test that Ray rejects Slurm-style additional bash commands."""
+    scheduler = _scheduler(tmp_path)
+    job = Job(
+        role="bash_cmd",
+        replicas=1,
+        tasks=[SchedulingSpec(additional_bash_cmds=["echo should-not-run"])],
+    )
+
+    with pytest.raises(ValueError, match="additional_bash_cmds"):
+        scheduler.create_workers(job)
+
+
+def test_build_node_plan_large_training_keeps_contiguous_node_groups(tmp_path):
+    """Test full-node training creates contiguous node-sized bundles."""
+    scheduler = _scheduler(tmp_path, n_gpus_per_node=8)
+    spec = SchedulingSpec(cpu=1, gpu=1, mem=1)
+
+    bundles, plan, nodes_per_worker = scheduler._build_node_plan(replicas=32, spec=spec)
+
+    assert nodes_per_worker == 1
+    assert [int(bundle["GPU"]) for bundle in bundles] == [8, 8, 8, 8]
+    assert [item["workers"] for item in plan] == [8, 8, 8, 8]
+
+
+def test_build_node_plan_partial_single_node_role(tmp_path):
+    """Test partial-node Ray allocation builds one partial bundle."""
+    scheduler = _scheduler(tmp_path, n_gpus_per_node=8)
+    spec = SchedulingSpec(cpu=2, gpu=1, mem=3)
+
+    bundles, plan, nodes_per_worker = scheduler._build_node_plan(replicas=6, spec=spec)
+
+    assert nodes_per_worker == 1
+    assert len(bundles) == 1
+    assert int(bundles[0]["GPU"]) == 6
+    assert bundles[0]["CPU"] == 12
+    assert plan == [
+        {"bundle_index": 0, "node_rank": 0, "workers": 6, "gpus_on_node": 6}
+    ]
+
+
+def test_build_node_plan_multi_node_instance_uses_head_and_worker_nodes(tmp_path):
+    """Test multi-node workers reserve all nodes but start only the head worker."""
+    scheduler = _scheduler(tmp_path, n_gpus_per_node=8)
+    spec = SchedulingSpec(cpu=16, gpu=16, mem=32)
+
+    bundles, plan, nodes_per_worker = scheduler._build_node_plan(replicas=2, spec=spec)
+
+    assert nodes_per_worker == 2
+    assert [int(bundle["GPU"]) for bundle in bundles] == [8, 8, 8, 8]
+    assert [
+        (item["worker_idx"], item["node_rank"], item["workers"]) for item in plan
+    ] == [
+        (0, 0, 1),
+        (0, 1, 0),
+        (1, 0, 1),
+        (1, 1, 0),
+    ]
+
+
+def test_build_node_plan_multi_node_requires_even_cpu_mem_split(tmp_path):
+    """Test multi-node workers require CPU and memory to split across nodes."""
+    scheduler = _scheduler(tmp_path, n_gpus_per_node=8)
+    spec = SchedulingSpec(cpu=15, gpu=16, mem=32)
+
+    with pytest.raises(ValueError, match="evenly split CPU and memory"):
+        scheduler._build_node_plan(replicas=1, spec=spec)
+
+
+def test_launcher_worker_spec_defaults_to_rpc_server_and_auto_port():
+    """Test launcher worker command defaults to rpc_server with port zero."""
+    launcher_cls = (
+        ray_scheduler.RayWorkerProcessLauncher.__ray_metadata__.modified_class
+    )
+    launcher = object.__new__(launcher_cls)
+    launcher.env_vars = {"EXTRA_ENV": "1"}
+    launcher.device_control_env_var = "CUDA_VISIBLE_DEVICES"
+
+    worker = launcher._build_worker_spec(
+        role="actor",
+        worker_index=0,
+        gpu_devices=["2", "3"],
+        cmd=None,
+        experiment_name="exp",
+        trial_name="trial",
+        name_resolve_type="nfs",
+        nfs_record_root="/tmp/name_resolve",
+        etcd3_addr="localhost:2379",
+        fileroot=None,
+    )
+
+    assert worker["worker_id"] == "actor/0"
+    assert worker["cmd"][:3] == [
+        sys.executable,
+        "-m",
+        "areal.infra.rpc.rpc_server",
+    ]
+    assert "--port" in worker["cmd"]
+    assert worker["cmd"][worker["cmd"].index("--port") + 1] == "0"
+    assert worker["env"]["EXTRA_ENV"] == "1"
+    assert worker["env"]["CUDA_VISIBLE_DEVICES"] == "2,3"
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "python -m areal.infra.rpc.rpc_server --port 1234",
+        "python -m areal.infra.rpc.rpc_server --port=1234",
+    ],
+)
+def test_launcher_worker_spec_rejects_custom_port_argument(cmd):
+    """Test that custom commands cannot override scheduler-managed ports."""
+    launcher_cls = (
+        ray_scheduler.RayWorkerProcessLauncher.__ray_metadata__.modified_class
+    )
+    launcher = object.__new__(launcher_cls)
+    launcher.env_vars = {}
+    launcher.device_control_env_var = "CUDA_VISIBLE_DEVICES"
+
+    with pytest.raises(RuntimeError, match="should not include --port"):
+        launcher._build_worker_spec(
+            role="actor",
+            worker_index=0,
+            gpu_devices=["0"],
+            cmd=cmd,
+            experiment_name="exp",
+            trial_name="trial",
+            name_resolve_type="nfs",
+            nfs_record_root="/tmp/name_resolve",
+            etcd3_addr="localhost:2379",
+            fileroot=None,
         )
 
-        # create workers
+
+def test_launcher_actor_starts_and_stops_worker_processes(tmp_path, local_ray_cluster):
+    """Test RayWorkerProcessLauncher as a real Ray actor."""
+    launcher = ray_scheduler.RayWorkerProcessLauncher.options(
+        num_cpus=1,
+        num_gpus=2,
+    ).remote(
+        "actor",
+        str(tmp_path / "actor.log"),
+        str(tmp_path / "merged.log"),
+        "GPU",
+        "CUDA_VISIBLE_DEVICES",
+        {},
+    )
+    node_info = ray.get(launcher.get_node_info.remote(), timeout=30)
+    assert len(node_info["visible_devices"]) == 2
+
+    ray.get(
+        launcher.start_workers.remote(
+            [
+                dict(
+                    role="actor",
+                    worker_index=0,
+                    gpu_devices=node_info["visible_devices"][:1],
+                    cmd=_sleep_cmd(),
+                    experiment_name="test_ray_scheduler",
+                    trial_name="trial",
+                    name_resolve_type="nfs",
+                    nfs_record_root=str(tmp_path / "name_resolve"),
+                    etcd3_addr="localhost:2379",
+                    fileroot=str(tmp_path),
+                ),
+                dict(
+                    role="actor",
+                    worker_index=1,
+                    gpu_devices=node_info["visible_devices"][1:],
+                    cmd=_sleep_cmd(),
+                    experiment_name="test_ray_scheduler",
+                    trial_name="trial",
+                    name_resolve_type="nfs",
+                    nfs_record_root=str(tmp_path / "name_resolve"),
+                    etcd3_addr="localhost:2379",
+                    fileroot=str(tmp_path),
+                ),
+            ]
+        ),
+        timeout=30,
+    )
+    statuses = ray.get(
+        launcher.worker_statuses.remote(["actor/0", "actor/1"]), timeout=30
+    )
+    assert statuses == {
+        "actor/0": {"exists": True, "returncode": None},
+        "actor/1": {"exists": True, "returncode": None},
+    }
+
+    ray.get(launcher.stop_all_processes.remote(), timeout=30)
+    stopped = ray.get(
+        launcher.worker_statuses.remote(["actor/0", "actor/1"]), timeout=30
+    )
+    assert stopped == {
+        "actor/0": {"exists": False, "returncode": None},
+        "actor/1": {"exists": False, "returncode": None},
+    }
+    ray.kill(launcher, no_restart=True)
+
+
+def test_create_workers_uses_real_ray_launchers_and_tracks_state(
+    tmp_path, local_ray_cluster
+):
+    """Test worker creation records real Ray launchers and worker metadata."""
+    scheduler = _scheduler(tmp_path, n_gpus_per_node=8)
+    scheduler._destroy_engines_on_workers = lambda workers: None
+
+    job = Job(
+        role="actor",
+        replicas=2,
+        tasks=[SchedulingSpec(cpu=2, gpu=1, mem=1, cmd=_sleep_cmd())],
+    )
+
+    try:
         worker_ids = scheduler.create_workers(job)
-        assert len(worker_ids) == 2
-        assert len(scheduler._workers["train"]) == 2
-
-        actor_summary = summarize_actors()
-
-        assert (
-            actor_summary["cluster"]["summary"]["RayRPCServer"]["state_counts"]["ALIVE"]
-            == 2
-        )
-        assert len(scheduler.get_workers("train")) == 2
-
-        scheduler._ping_workers("train")
-
-        # delete workers
-        scheduler.delete_workers()
-        assert len(scheduler._workers["train"]) == 0
-
-        actor_summary = summarize_actors()
-        assert (
-            actor_summary["cluster"]["summary"]["RayRPCServer"]["state_counts"]["DEAD"]
-            == 2
-        )
-
-
-class TestWorkerCallEngine:
-    def test_create_call_engine(self):
-        # to simulate an awaitable None
-        async def async_none(*args, **kwargs):
-            return None
-
-        def sync_none(*args, **kwargs):
-            return None
-
-        config = BaseExperimentConfig()
-
-        scheduler = RayScheduler(startup_timeout=60.0, exp_config=config)
-        ray_actor_handle = Mock()
-        ray_actor_handle.create_engine.remote = async_none
-
-        worker = RayWorkerInfo(
-            worker=Worker(id="test/0", ip="0.0.0.0"),
-            actor=ray_actor_handle,
-            role="test",
-            placement_group=None,
-            bundle_index=0,
-            created_at=0,
-        )
-
-        scheduler._workers["test"] = [worker]
-        scheduler._worker_info_by_id[worker.worker.id] = worker
-
-        # create engine
-        result = asyncio.run(
-            scheduler.create_engine(
-                worker.worker.id, "test_engines.DummyEngine", name="TestEngine"
-            )
-        )
-        assert result is None
-
-        # sync
-        ray_actor_handle.call.remote = sync_none
-        with patch("areal.infra.scheduler.ray.ray.get", return_value=None):
-            result = scheduler.call_engine(
-                worker.worker.id, "test_fn", engine_name="test/0"
-            )
-        assert result is None
-
-        # async
-        ray_actor_handle.call.remote = async_none
-        result = asyncio.run(
-            scheduler.async_call_engine(
-                worker.worker.id, "test_fn", engine_name="test/0"
-            )
-        )
-        assert result is None
-
-
-class TestUtilityFunctions:
-    def test_utilities(self):
-        _num_gpu_per_node = 16
-        config = BaseExperimentConfig()
-
-        config.cluster.n_gpus_per_node = _num_gpu_per_node
-
-        scheduler = RayScheduler(startup_timeout=60.0, exp_config=config)
-
-        schedulings = [
-            SchedulingSpec(
-                cpu=1,
-                mem=1,
-                gpu=1,
-            ),
-            SchedulingSpec(
-                cpu=1,
-                mem=1,
-                gpu=1,
-            ),
+        assert worker_ids == ["actor/0", "actor/1"]
+        assert len(scheduler._launchers["actor"]) == 1
+        assert [
+            worker_info.worker.id for worker_info in scheduler._workers["actor"]
+        ] == [
+            "actor/0",
+            "actor/1",
         ]
 
-        new_schedulings = scheduler._prepare_worker_specs("train", 2, schedulings)
-        assert len(new_schedulings) == 2
-        for spec in new_schedulings:
-            assert spec.cpu == 1
-            assert spec.mem == 1
-            assert spec.gpu == 1
+        launcher = scheduler._launchers["actor"][0]
+        statuses = ray.get(launcher.worker_statuses.remote(worker_ids), timeout=30)
+        assert statuses == {
+            "actor/0": {"exists": True, "returncode": None},
+            "actor/1": {"exists": True, "returncode": None},
+        }
+    finally:
+        if "actor" in scheduler._workers:
+            scheduler.delete_workers("actor")
 
-        # case where only 1 spec is passed but multiple workers
-        new_schedulings = scheduler._prepare_worker_specs("train", 2, schedulings[0:])
-        assert len(new_schedulings) == 2
-        for spec in new_schedulings:
-            assert spec.cpu == 1
-            assert spec.mem == 1
-            assert spec.gpu == 1
-
-        bundle_list = _create_bundle_specs_split(16, 1, 24, 1024)
-        assert len(bundle_list) == 2
-        for bundle in bundle_list:
-            assert bundle[ray_resource_type()] <= _num_gpu_per_node
+    assert "actor" not in scheduler._workers
+    assert "actor" not in scheduler._launchers
+    assert "actor" not in scheduler._placement_groups
 
 
-class TestForkColocation:
-    """Tests for fork-based colocation in RayScheduler."""
+def test_create_workers_multi_node_only_starts_head_launcher(
+    tmp_path, local_ray_cluster
+):
+    """Test multi-node worker creation starts only the head launcher process."""
+    scheduler = _scheduler(tmp_path, n_gpus_per_node=4)
+    scheduler._destroy_engines_on_workers = lambda workers: None
 
-    def test_fork_creates_workers_on_same_placement_group(self):
-        """Test that forked workers are created on the same placement group."""
-        config = BaseExperimentConfig()
+    job = Job(
+        role="rollout",
+        replicas=1,
+        tasks=[SchedulingSpec(cpu=8, gpu=8, mem=2, cmd=_sleep_cmd())],
+    )
 
-        scheduler = RayScheduler(startup_timeout=60.0, exp_config=config)
+    try:
+        worker_ids = scheduler.create_workers(job)
+        assert worker_ids == ["rollout/0"]
+        worker_info = scheduler._workers["rollout"][0]
+        assert len(worker_info.launchers) == 2
 
-        # First create target workers (each gets its own PG with bundle_index=0)
-        actor_job = Job(
-            replicas=2,
-            role="actor",
-            tasks=[
-                SchedulingSpec(cpu=1, mem=1, gpu=1),
-                SchedulingSpec(cpu=1, mem=1, gpu=1),
-            ],
+        head_status = ray.get(
+            worker_info.launchers[0].worker_statuses.remote(["rollout/0"]),
+            timeout=30,
         )
-
-        # Create actor workers
-        actor_worker_ids = scheduler.create_workers(actor_job)
-        assert len(actor_worker_ids) == 2
-        assert len(scheduler._workers["actor"]) == 2
-
-        # Create forked ref workers
-        ref_job = Job(
-            replicas=2,
-            role="ref",
-            tasks=[SchedulingSpec(cpu=1, mem=1, gpu=1)],
-            scheduling_strategy=SchedulingStrategy(
-                type="colocation", target="actor", fork=True
-            ),
+        non_head_status = ray.get(
+            worker_info.launchers[1].worker_statuses.remote(["rollout/0"]),
+            timeout=30,
         )
+        assert head_status == {"rollout/0": {"exists": True, "returncode": None}}
+        assert non_head_status == {"rollout/0": {"exists": False, "returncode": None}}
+    finally:
+        if "rollout" in scheduler._workers:
+            scheduler.delete_workers("rollout")
 
-        ref_worker_ids = scheduler.create_workers(ref_job)
+    assert "rollout" not in scheduler._workers
+    assert "rollout" not in scheduler._launchers
+    assert "rollout" not in scheduler._placement_groups
 
-        # Verify forked workers were created
-        assert len(ref_worker_ids) == 2
-        assert "ref" in scheduler._workers
-        assert len(scheduler._workers["ref"]) == 2
 
-        # Verify forked workers use same placement groups
-        for i in range(2):
-            actor_pg = scheduler._workers["actor"][i].placement_group
-            ref_pg = scheduler._workers["ref"][i].placement_group
-            assert actor_pg == ref_pg, "Forked worker should use same placement group"
-            # Verify both have the same bundle index as their parent
-            assert (
-                scheduler._workers["actor"][i].bundle_index
-                == scheduler._workers["ref"][i].bundle_index
-            )
+def test_delete_all_workers_removes_multiple_roles(tmp_path, local_ray_cluster):
+    """Test deleting all Ray workers clears every owned role."""
+    scheduler = _scheduler(tmp_path, n_gpus_per_node=8)
+    scheduler._destroy_engines_on_workers = lambda workers: None
 
-        # Verify ref role is tracked as colocated
-        assert "ref" in scheduler._colocated_roles
-        assert scheduler._colocated_roles["ref"] == "actor"
-
-        # Verify actors summary shows 4 actors (2 actor + 2 ref)
-        actor_summary = summarize_actors()
-        assert (
-            actor_summary["cluster"]["summary"]["RayRPCServer"]["state_counts"]["ALIVE"]
-            == 4
+    scheduler.create_workers(
+        Job(
+            role="role1",
+            replicas=1,
+            tasks=[SchedulingSpec(cpu=1, gpu=1, mem=1, cmd=_sleep_cmd())],
         )
-
-        # Clean up
-        scheduler.delete_workers()
-
-    def test_fork_get_workers_returns_forked_workers(self):
-        """Test that get_workers returns forked workers directly."""
-        config = BaseExperimentConfig()
-        scheduler = RayScheduler(startup_timeout=60.0, exp_config=config)
-
-        # Create target workers
-        actor_job = Job(
-            replicas=2,
-            role="actor",
-            tasks=[SchedulingSpec(cpu=1, mem=1, gpu=1)],
+    )
+    scheduler.create_workers(
+        Job(
+            role="role2",
+            replicas=1,
+            tasks=[SchedulingSpec(cpu=1, gpu=1, mem=1, cmd=_sleep_cmd())],
         )
-        scheduler.create_workers(actor_job)
+    )
 
-        # Create forked workers
-        ref_job = Job(
-            replicas=2,
-            role="ref",
-            tasks=[SchedulingSpec(cpu=1, mem=1, gpu=1)],
-            scheduling_strategy=SchedulingStrategy(
-                type="colocation", target="actor", fork=True
-            ),
-        )
-        scheduler.create_workers(ref_job)
+    scheduler.delete_workers()
 
-        # Get workers for ref role should return ref workers, not actor workers
-        ref_workers = scheduler.get_workers("ref")
-        assert len(ref_workers) == 2
-        assert all(w.id.startswith("ref/") for w in ref_workers)
+    assert scheduler._workers == {}
+    assert scheduler._launchers == {}
+    assert scheduler._placement_groups == {}
 
-        # Clean up
-        scheduler.delete_workers()
 
-    def test_fork_delete_cleans_up_forked_actors(self):
-        """Test that deleting forked role cleans up its actors."""
-        config = BaseExperimentConfig()
-        scheduler = RayScheduler(startup_timeout=60.0, exp_config=config)
+def test_create_workers_with_non_fork_colocation_reuses_target_workers(tmp_path):
+    """Test non-fork colocation reuses existing target workers."""
+    scheduler = _scheduler(tmp_path)
+    scheduler._workers["actor"] = [
+        _worker_info("actor/0", role="actor"),
+        _worker_info("actor/1", role="actor"),
+    ]
+    job = Job(
+        role="ref",
+        replicas=2,
+        tasks=[SchedulingSpec(cpu=1, gpu=1, mem=1)],
+        scheduling_strategy=SchedulingStrategy(
+            type=SchedulingStrategyType.colocation, target="actor", fork=False
+        ),
+    )
 
-        # Create target workers
-        actor_job = Job(
-            replicas=2,
-            role="actor",
-            tasks=[SchedulingSpec(cpu=1, mem=1, gpu=1)],
-        )
-        scheduler.create_workers(actor_job)
+    worker_ids = scheduler.create_workers(job)
 
-        # Create forked workers
-        ref_job = Job(
-            replicas=2,
-            role="ref",
-            tasks=[SchedulingSpec(cpu=1, mem=1, gpu=1)],
-            scheduling_strategy=SchedulingStrategy(
-                type="colocation", target="actor", fork=True
-            ),
-        )
-        scheduler.create_workers(ref_job)
+    assert worker_ids == ["actor/0", "actor/1"]
+    assert "ref" not in scheduler._workers
+    assert scheduler._colocated_roles["ref"] == "actor"
 
-        # Verify we have 4 actors total
-        actor_summary = summarize_actors()
-        assert (
-            actor_summary["cluster"]["summary"]["RayRPCServer"]["state_counts"]["ALIVE"]
-            == 4
-        )
 
-        # Delete only the ref role
-        scheduler.delete_workers("ref")
+def test_create_workers_with_fork_colocation_delegates_to_fork_workers(
+    tmp_path, monkeypatch
+):
+    """Test fork colocation delegates worker creation to fork_workers."""
+    scheduler = _scheduler(tmp_path)
+    scheduler._workers["actor"] = [
+        _worker_info("actor/0", role="actor"),
+        _worker_info("actor/1", role="actor"),
+    ]
+    called = []
 
-        # Verify ref role is cleaned up
-        assert "ref" not in scheduler._workers
-        assert "ref" not in scheduler._colocated_roles
+    def fake_fork_workers(role: str, target_role: str):
+        called.append((role, target_role))
+        return ["ref/0", "ref/1"]
 
-        # Verify actor workers still exist
-        assert "actor" in scheduler._workers
-        assert len(scheduler._workers["actor"]) == 2
+    monkeypatch.setattr(scheduler, "fork_workers", fake_fork_workers)
+    job = Job(
+        role="ref",
+        replicas=2,
+        tasks=[SchedulingSpec(cpu=1, gpu=1, mem=1)],
+        scheduling_strategy=SchedulingStrategy(
+            type=SchedulingStrategyType.colocation, target="actor", fork=True
+        ),
+    )
 
-        # Verify only 2 actors remain alive
-        # Wait for actors to be terminated (actor.destroy.remote() is async)
+    worker_ids = scheduler.create_workers(job)
 
-        deadline = time.time() + 10
-        while time.time() < deadline:
-            actor_summary = summarize_actors()
-            alive_count = (
-                actor_summary["cluster"]["summary"]
-                .get("RayRPCServer", {})
-                .get("state_counts", {})
-                .get("ALIVE", 0)
-            )
-            if alive_count == 2:
-                break
-            time.sleep(1)
+    assert worker_ids == ["ref/0", "ref/1"]
+    assert called == [("ref", "actor")]
 
-        actor_summary = summarize_actors()
-        assert (
-            actor_summary["cluster"]["summary"]["RayRPCServer"]["state_counts"]["ALIVE"]
-            == 2
-        )
 
-        # Clean up
-        scheduler.delete_workers()
+def test_colocation_replica_mismatch_raises_error(tmp_path):
+    """Test that colocation fails if replica count does not match target."""
+    scheduler = _scheduler(tmp_path)
+    scheduler._workers["actor"] = [_worker_info("actor/0", role="actor")]
+    job = Job(
+        role="ref",
+        replicas=2,
+        tasks=[SchedulingSpec(cpu=1, gpu=1, mem=1)],
+        scheduling_strategy=SchedulingStrategy(
+            type=SchedulingStrategyType.colocation, target="actor"
+        ),
+    )
 
-    def test_non_fork_colocation_reuses_workers(self):
-        """Test that non-fork colocation reuses target workers."""
-        config = BaseExperimentConfig()
-        scheduler = RayScheduler(startup_timeout=60.0, exp_config=config)
+    with pytest.raises(WorkerCreationError, match="Replica count mismatch"):
+        scheduler.create_workers(job)
 
-        # Create target workers
-        actor_job = Job(
-            replicas=2,
-            role="actor",
-            tasks=[SchedulingSpec(cpu=1, mem=1, gpu=1)],
-        )
-        scheduler.create_workers(actor_job)
 
-        # Create colocated workers without fork
-        ref_job = Job(
-            replicas=2,
-            role="ref",
-            tasks=[SchedulingSpec(cpu=1, mem=1, gpu=1)],
-            scheduling_strategy=SchedulingStrategy(
-                type="colocation", target="actor", fork=False
-            ),
-        )
-        ref_worker_ids = scheduler.create_workers(ref_job)
+def test_colocation_target_not_found_raises_error(tmp_path):
+    """Test that colocation fails if target role does not exist."""
+    scheduler = _scheduler(tmp_path)
+    job = Job(
+        role="ref",
+        replicas=2,
+        tasks=[SchedulingSpec(cpu=1, gpu=1, mem=1)],
+        scheduling_strategy=SchedulingStrategy(
+            type=SchedulingStrategyType.colocation, target="missing"
+        ),
+    )
 
-        # Ref should reuse actor worker IDs
-        assert all(w.startswith("actor/") for w in ref_worker_ids)
-
-        # Ref role should NOT have its own workers
-        assert "ref" not in scheduler._workers
-
-        # But ref should be tracked as colocated
-        assert "ref" in scheduler._colocated_roles
-
-        # get_workers for ref should return actor workers
-        ref_workers = scheduler.get_workers("ref")
-        assert all(w.id.startswith("actor/") for w in ref_workers)
-
-        # Only 2 actors total (no new actors for ref)
-        actor_summary = summarize_actors()
-        assert (
-            actor_summary["cluster"]["summary"]["RayRPCServer"]["state_counts"]["ALIVE"]
-            == 2
-        )
-
-        # Clean up
-        scheduler.delete_workers()
+    with pytest.raises(WorkerNotFoundError):
+        scheduler.create_workers(job)

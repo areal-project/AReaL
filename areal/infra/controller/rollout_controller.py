@@ -61,6 +61,8 @@ class _RemoteRolloutTaskInput:
     is_eval: bool = False
     group_size: int = 1
     proxy_addr: str | None = None
+    reward_normalization: bool = False
+    drop_incomplete_group: bool = False
 
 
 @dataclass
@@ -183,13 +185,6 @@ class RolloutController:
         sch_spec.mem *= instance_size
         if sch_spec.gpu > 0:
             sch_spec.gpu = instance_size
-
-        if sch_spec.ray_placement_strategy == "shared":
-            # do not support shared placement for rollout
-            logger.warning(
-                "Placement strategy 'shared' is not supported for rollouts. Forcing to 'separate' strategy"
-            )
-            sch_spec.ray_placement_strategy = "separate"
 
         job = Job(
             replicas=dp_size,
@@ -818,6 +813,8 @@ class RolloutController:
                     task_id=task_id,
                     callback_addr=f"http://{self.callback_addr}/callback/rollout_complete",
                     proxy_addr=proxy_addr,
+                    reward_normalization=pending_task.reward_normalization,
+                    drop_incomplete_group=pending_task.drop_incomplete_group,
                 )
 
                 assert task_id == engine_task_id, (task_id, engine_task_id)
@@ -880,6 +877,8 @@ class RolloutController:
         is_eval: bool = False,
         group_size: int = 1,
         proxy_addr: str | None = None,
+        reward_normalization: bool = False,
+        drop_incomplete_group: bool = False,
     ) -> int:
         workflow_str = self._resolve_workflow_str(workflow)
         should_accept_fn = self._resolve_should_accept_fn(should_accept_fn)
@@ -900,6 +899,8 @@ class RolloutController:
             is_eval=is_eval,
             group_size=group_size,
             proxy_addr=proxy_addr,
+            reward_normalization=reward_normalization,
+            drop_incomplete_group=drop_incomplete_group,
         )
 
         # Delegate to dispatcher
@@ -925,6 +926,8 @@ class RolloutController:
         workflow_kwargs: dict[str, Any] | None = None,
         should_accept_fn: str | None = None,
         group_size: int = 1,
+        reward_normalization: bool = False,
+        drop_incomplete_group: bool = False,
     ) -> list[dict[str, Any]]:
         perf_tracer.instant(
             "rollout_controller.rollout_batch",
@@ -938,6 +941,8 @@ class RolloutController:
                 workflow_kwargs=workflow_kwargs,
                 should_accept_fn=should_accept_fn,
                 group_size=group_size,
+                reward_normalization=reward_normalization,
+                drop_incomplete_group=drop_incomplete_group,
             )
         results = self.wait(count=len(data))
         # Return list of trajectories
@@ -952,6 +957,8 @@ class RolloutController:
         should_accept_fn: str | None = None,
         group_size: int = 1,
         dynamic_bs: bool = False,
+        reward_normalization: bool = False,
+        drop_incomplete_group: bool = False,
     ) -> list[dict[str, Any]]:
         """Prepare a batch with controlled staleness.
 
@@ -975,6 +982,8 @@ class RolloutController:
                         should_accept_fn=should_accept_fn,
                         task_id=self._task_id_generator.next(),
                         group_size=group_size,
+                        reward_normalization=reward_normalization,
+                        drop_incomplete_group=drop_incomplete_group,
                     )
 
         if not hasattr(self, "data_generator"):

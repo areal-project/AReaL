@@ -300,12 +300,21 @@ def packed_context_parallel_forward(
     tree_triton_data = input_.get("tree_triton_data", None)
     packed_seq_params = None
 
-    is_vision = is_vision_model and any(key in input_ for key in _VLM_FORWARD_KEYS)
-    # Architectures whose attention/SSM kernels reject packed sequences (e.g.
-    # Qwen3.5 GDN) must run on [B, S] padded input. The reconstruction logic
-    # below is shared with the VLM path; the difference is downstream
-    # (attention_mask and position_ids are passed through for text-only).
-    needs_padded_form = is_vision or use_padded_seq
+    # Whether this particular microbatch carries vision tensors. Gates only
+    # the vision kwargs and the dense-mask exception below — never the
+    # padded-vs-packed routing.
+    has_vision_inputs = is_vision_model and any(
+        key in input_ for key in _VLM_FORWARD_KEYS
+    )
+    # Padded-vs-packed routing is keyed on the MODEL type:
+    # - VLM models cannot consume the wrapper-packed [1, total_len] layout
+    #   (their internal packing needs a per-sequence 2D mask — mbridge
+    #   crashes on the missing mask and megatron-bridge silently corrupts
+    #   positions/packing), so image-free microbatches take the padded
+    #   branch too.
+    # - Architectures whose attention/SSM kernels reject packed sequences
+    #   (use_padded_seq, e.g. Qwen3.5 GDN) must run on [B, S] padded input.
+    needs_padded_form = is_vision_model or use_padded_seq
 
     # Track shape metadata so the output can be repacked back to packed
     # [total_len, ...] form on the last PP stage.
@@ -345,14 +354,16 @@ def packed_context_parallel_forward(
             input_ids = input_ids_2d
             padded_repack_info = (cu_seqlens, seq_lens, max_seqlen)
 
-    # VLM path: attention_mask=None — model's get_rope_index uses the 2D mask
-    # internally for mRoPE positions. Each batch slot holds one sequence with
-    # trailing padding, so causal attention yields correct outputs at
-    # non-padding positions; padding outputs are discarded during repack.
-    #
-    # BSHD text-only path (use_padded_seq): pass our built attention_mask so
-    # the model's attention layers skip padding.
-    if is_vision:
+    # Every VLM forward is mask-free (attention_mask=None): the model
+    # computes (m)RoPE positions internally, each batch slot holds one
+    # sequence with trailing padding so causal attention yields correct
+    # outputs at non-padding positions, and padding outputs are discarded
+    # during repack. The one exception is the padded BSHD text forward of
+    # use_padded_seq models, which consumes the dense 2D mask so attention
+    # layers skip padding. The wrapper-packed path carries no mask either
+    # way (enforced above); tree data passes through untouched.
+    dense_mask_text_forward = use_padded_seq and not has_vision_inputs
+    if is_vision_model and not dense_mask_text_forward:
         final_attention_mask = None
     else:
         final_attention_mask = (
@@ -362,7 +373,7 @@ def packed_context_parallel_forward(
     # VLM: pass vision inputs through to model forward. The VLM model computes
     # mRoPE position_ids internally, so position_ids remains None for VLM.
     vlm_kwargs: dict[str, Any] = {}
-    if is_vision:
+    if has_vision_inputs:
         for key in _VLM_FORWARD_KEYS:
             if key in input_:
                 vlm_kwargs[key] = input_[key]
@@ -371,7 +382,7 @@ def packed_context_parallel_forward(
     # length total_len) — they don't match the 2D [B, S] input. Let mcore
     # compute the default torch.arange positions per row; padding positions
     # are masked out by attention_mask.
-    if use_padded_seq and not is_vision:
+    if dense_mask_text_forward:
         position_ids = None
 
     try:

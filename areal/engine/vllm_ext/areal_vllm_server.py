@@ -397,4 +397,11 @@ if __name__ == "__main__":
     args = parser.parse_args()
     validate_parsed_serve_args(args)
 
-    uvloop.run(run_server(args))
+    if getattr(args, "headless", False):
+        from vllm.entrypoints.cli.serve import run_headless
+
+        if getattr(args, "api_server_count", None) is None:
+            args.api_server_count = 0
+        run_headless(args)
+    else:
+        uvloop.run(run_server(args))

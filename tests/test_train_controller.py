@@ -602,6 +602,8 @@ class TestTrainControllerRolloutIntegration:
             should_accept_fn=None,
             dynamic_bs=False,
             group_size=1,
+            reward_normalization=False,
+            drop_incomplete_group=False,
         )
 
     def test_rollout_batch_delegates_to_rollout(self, train_controller, ft_spec):
@@ -629,6 +631,8 @@ class TestTrainControllerRolloutIntegration:
             workflow_kwargs={"key": "value"},
             should_accept_fn=None,
             group_size=1,
+            reward_normalization=False,
+            drop_incomplete_group=False,
         )
 
 

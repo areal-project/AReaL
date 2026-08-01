@@ -18,7 +18,6 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 import aiohttp
 import numpy as np
-import ray
 import requests
 import torch
 import torch.distributed as dist
@@ -74,12 +73,16 @@ class GroupedRolloutWorkflow(RolloutWorkflow):
         workflow: RolloutWorkflow,
         group_size: int,
         logger: Logger,
+        reward_normalization: bool = False,
+        drop_incomplete_group: bool = False,
     ):
         if group_size < 1:
             raise ValueError(f"group_size must be >= 1, got {group_size}")
         self.workflow = workflow
         self.group_size = group_size
         self.logger = logger
+        self.reward_normalization = reward_normalization
+        self.drop_incomplete_group = drop_incomplete_group
 
     async def arun_episode(
         self, engine: InferenceEngine, data: dict[str, Any]
@@ -96,12 +99,23 @@ class GroupedRolloutWorkflow(RolloutWorkflow):
         if not valid_results:
             return None
 
-        # Some results None -> warn and continue with valid ones
+        # Some results None -> drop entire group if requested. Reward
+        # normalization also requires a complete group and will log/drop below.
         if len(valid_results) < len(results):
-            self.logger.warning(
-                f"GroupedRolloutWorkflow: {len(results) - len(valid_results)}/{len(results)} "
-                "trajectories returned None, using remaining results"
-            )
+            n_failed = len(results) - len(valid_results)
+            if self.drop_incomplete_group:
+                self.logger.warning(
+                    f"GroupedRolloutWorkflow: {n_failed}/{len(results)} "
+                    "trajectories returned None, dropping entire group "
+                    "(drop_incomplete_group=True). prepare_batch will retry "
+                    "with a new prompt from the dataloader."
+                )
+                return None
+            if not self.reward_normalization:
+                self.logger.warning(
+                    f"GroupedRolloutWorkflow: {n_failed}/{len(results)} "
+                    "trajectories returned None, using remaining results"
+                )
 
         # Check if results are InteractionWithTokenLogpReward dicts
         first = valid_results[0]
@@ -112,6 +126,9 @@ class GroupedRolloutWorkflow(RolloutWorkflow):
                 isinstance(v, InteractionWithTokenLogpReward) for v in first.values()
             )
         ):
+            if self.reward_normalization and self.group_size > 1:
+                if not self._normalize_group_rewards(results):
+                    return None
             # Merge dicts - each result is {completion_id: InteractionWithTokenLogpReward}
             merged: dict[str, InteractionWithTokenLogpReward] = {}
             for result in valid_results:
@@ -121,6 +138,56 @@ class GroupedRolloutWorkflow(RolloutWorkflow):
         # Otherwise, tensor dicts - concatenate
         concatenated = concat_padded_tensors(valid_results)
         return concatenated if concatenated else None
+
+    def _normalize_group_rewards(
+        self,
+        results: list[dict[str, InteractionWithTokenLogpReward] | None],
+    ) -> bool:
+        """Apply per-prompt reward normalization across the n_samples rollouts.
+
+        One scalar reward per rollout is taken from the last interaction in
+        each result. If any rollout failed or has no reward, the whole group is
+        dropped so the normalization base always matches the configured group
+        size.
+        """
+        import torch
+
+        reward_per_result: list[float | None] = []
+        for result in results:
+            if not result:
+                reward_per_result.append(None)
+                continue
+            last_id = next(reversed(result))
+            reward_per_result.append(result[last_id].reward)
+
+        none_count = sum(1 for reward in reward_per_result if reward is None)
+        if none_count > 0:
+            self.logger.warning(
+                f"reward_normalization: dropping group ({none_count}/"
+                f"{self.group_size} rollouts have None reward)"
+            )
+            return False
+
+        rewards = torch.tensor(reward_per_result, dtype=torch.float32)
+        mean = rewards.mean()
+        std = rewards.std(unbiased=False) if rewards.numel() > 1 else torch.tensor(1.0)
+        normalized = ((rewards - mean) / (std + 1e-8)).tolist()
+
+        for result, norm_reward in zip(results, normalized):
+            if not result:
+                continue
+            for interaction in result.values():
+                if interaction.reward is not None:
+                    interaction.original_reward = interaction.reward
+                    interaction.reward = norm_reward
+                    if interaction._cache is not None:
+                        interaction._cache["rewards"] = torch.tensor(
+                            [float(norm_reward)]
+                        )
+                        interaction._cache["original_rewards"] = torch.tensor(
+                            [float(interaction.original_reward)]
+                        )
+        return True
 
 
 class RemoteInfBackendProtocol(Protocol):
@@ -598,6 +665,7 @@ class RemoteInfEngine(InferenceEngine):
             export_style=agent_cfg.export_style,
             subproc_max_workers=agent_cfg.subproc_max_workers,
             proxy_gateway_addr=self._proxy_gateway_addr,
+            drop_retry_orphans=agent_cfg.drop_retry_orphans,
         )
 
     def _resolve_workflow(
@@ -606,6 +674,8 @@ class RemoteInfEngine(InferenceEngine):
         workflow_kwargs: dict[str, Any] | None,
         group_size: int = 1,
         proxy_addr: str | None = None,
+        reward_normalization: bool = False,
+        drop_incomplete_group: bool = False,
     ) -> RolloutWorkflow:
         resolved: RolloutWorkflow
 
@@ -621,7 +691,13 @@ class RemoteInfEngine(InferenceEngine):
                 raise ValueError("proxy_addr is required for online mode")
             resolved = self._wrap_openai_agent(None, proxy_addr=proxy_addr)
             if group_size > 1:
-                resolved = GroupedRolloutWorkflow(resolved, group_size, self.logger)
+                resolved = GroupedRolloutWorkflow(
+                    resolved,
+                    group_size,
+                    self.logger,
+                    reward_normalization=reward_normalization,
+                    drop_incomplete_group=drop_incomplete_group,
+                )
             return resolved
 
         # 1. Already a RolloutWorkflow instance
@@ -712,7 +788,13 @@ class RemoteInfEngine(InferenceEngine):
 
         # Wrap with GroupedRolloutWorkflow if group_size > 1
         if group_size > 1:
-            resolved = GroupedRolloutWorkflow(resolved, group_size, self.logger)
+            resolved = GroupedRolloutWorkflow(
+                resolved,
+                group_size,
+                self.logger,
+                reward_normalization=reward_normalization,
+                drop_incomplete_group=drop_incomplete_group,
+            )
 
         return resolved
 
@@ -855,11 +937,17 @@ class RemoteInfEngine(InferenceEngine):
             while self.workflow_executor.is_paused():
                 await asyncio.sleep(0.5)
 
+            # Pin the version that serves this request. A trajectory may span
+            # several weight versions, so each segment must be attributed to the
+            # version that actually generated it rather than to whichever
+            # version is current once the response arrives.
+            request_version = self.get_version()
+
             # Build request using backend
             http_req = self.backend.build_generation_request(
                 req,
                 with_lora=self.config.use_lora,
-                version=self.get_version(),
+                version=request_version,
             )
 
             # Loop until the generation is complete
@@ -898,7 +986,7 @@ class RemoteInfEngine(InferenceEngine):
             accumulated_output_tokens.extend(gen_result.output_tokens)
             accumulated_output_logprobs.extend(gen_result.output_logprobs)
             accumulated_versions.extend(
-                [self.get_version()] * len(gen_result.output_tokens)
+                [request_version] * len(gen_result.output_tokens)
             )
             # Accumulate routed_experts for MoE models
             if gen_result.routed_experts is not None:
@@ -1093,6 +1181,8 @@ class RemoteInfEngine(InferenceEngine):
         callback_addr: str | None = None,
         is_eval: bool = False,
         proxy_addr: str | None = None,
+        reward_normalization: bool = False,
+        drop_incomplete_group: bool = False,
     ) -> int:
         """Submit a request to the inference engine and return immediately.
 
@@ -1129,7 +1219,12 @@ class RemoteInfEngine(InferenceEngine):
 
         # Resolve workflow to a RolloutWorkflow instance
         resolved_workflow = self._resolve_workflow(
-            workflow, workflow_kwargs, group_size, proxy_addr=proxy_addr
+            workflow,
+            workflow_kwargs,
+            group_size,
+            proxy_addr=proxy_addr,
+            reward_normalization=reward_normalization,
+            drop_incomplete_group=drop_incomplete_group,
         )
         resolved_should_accept_fn = self._resolve_should_accept_fn(should_accept_fn)
 
@@ -1177,6 +1272,8 @@ class RemoteInfEngine(InferenceEngine):
         workflow: WorkflowLike,
         workflow_kwargs: dict[str, Any] | None = None,
         group_size: int = 1,
+        reward_normalization: bool = False,
+        drop_incomplete_group: bool = False,
     ) -> list[dict[str, Any]]:
         """Submit a batch of requests and wait for results.
 
@@ -1206,7 +1303,11 @@ class RemoteInfEngine(InferenceEngine):
 
         # Resolve workflow to a RolloutWorkflow instance
         resolved_workflow = self._resolve_workflow(
-            workflow, workflow_kwargs, group_size
+            workflow,
+            workflow_kwargs,
+            group_size,
+            reward_normalization=reward_normalization,
+            drop_incomplete_group=drop_incomplete_group,
         )
 
         return self.workflow_executor.rollout_batch(
@@ -1222,6 +1323,8 @@ class RemoteInfEngine(InferenceEngine):
         should_accept_fn: Callable[[dict[str, Any]], bool] | str | None = None,
         group_size: int = 1,
         dynamic_bs: bool = False,
+        reward_normalization: bool = False,
+        drop_incomplete_group: bool = False,
     ) -> list[dict[str, Any]]:
         """Asynchronously submit and wait until a full batch is ready.
 
@@ -1252,7 +1355,11 @@ class RemoteInfEngine(InferenceEngine):
 
         # Resolve workflow to a RolloutWorkflow instance
         resolved_workflow = self._resolve_workflow(
-            workflow, workflow_kwargs, group_size
+            workflow,
+            workflow_kwargs,
+            group_size,
+            reward_normalization=reward_normalization,
+            drop_incomplete_group=drop_incomplete_group,
         )
         resolved_should_accept_fn = self._resolve_should_accept_fn(should_accept_fn)
 
@@ -1337,13 +1444,6 @@ class RemoteInfEngine(InferenceEngine):
         try:
             self._wait_for_server(address, process=process)
             self.local_server_processes.append(server_info)
-            if ray.is_initialized():
-                # do not return with process for ray as it is not picklable
-                return LocalInfServerInfo(
-                    host=server_args["host"],
-                    port=server_args["port"],
-                    process=None,
-                )
             return server_info
         except TimeoutError:
             logger.warning(

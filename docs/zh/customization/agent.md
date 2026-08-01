@@ -5,7 +5,7 @@
 
 **注意**：
 
-1. Agent Workflow 仅在 `local` 和 `slurm` 调度器上受支持。`ray` 调度器与 HTTP 代理架构不兼容。
+1. Agent Workflow 在 `local`、`slurm` 和 `ray` 调度器上均受支持。
 
 1. 有关内部架构详情，请参阅 [Agent Workflow 参考文档](../reference/agent_workflow.md)。
 

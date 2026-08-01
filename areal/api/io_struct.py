@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import copy
+import math
 import os
 import subprocess
 import uuid
@@ -325,6 +326,28 @@ class HttpGenerationResult:
     output_logprobs: list[float]
     stop_reason: str
     routed_experts: np.ndarray | None = None
+
+    def __post_init__(self) -> None:
+        if len(self.output_tokens) != len(self.output_logprobs):
+            raise ValueError(
+                "Malformed generation result: received "
+                f"{len(self.output_tokens)} output tokens but "
+                f"{len(self.output_logprobs)} output logprobs; every sampled "
+                "output token requires exactly one sampling logprob."
+            )
+
+        for index, logprob in enumerate(self.output_logprobs):
+            is_finite = (
+                isinstance(logprob, (int, float))
+                and not isinstance(logprob, bool)
+                and math.isfinite(logprob)
+            )
+            if not is_finite:
+                raise ValueError(
+                    "Malformed generation result: "
+                    f"output_logprobs[{index}] must be a real, finite number, "
+                    f"got {logprob!r}."
+                )
 
 
 @dataclass

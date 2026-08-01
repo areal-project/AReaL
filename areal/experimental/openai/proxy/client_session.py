@@ -137,6 +137,7 @@ class OpenAIProxyClient:
         self,
         discount: float = 1.0,
         style: str = "individual",
+        drop_retry_orphans: bool = False,
     ) -> dict[str, InteractionWithTokenLogpReward]:
         """Export interactions for this session via HTTP.
 
@@ -156,6 +157,12 @@ class OpenAIProxyClient:
             Discount factor for reward propagation
         style : str
             Export style ("individual" or "merged")
+        drop_retry_orphans : bool
+            If True, instruct the server to drop completions that look like
+            orphaned outputs from agent-side retries before reward discounting
+            and export. Useful when the upstream Agent SDK times out and
+            retries the same request, leaving the proxy with two completions
+            for the same input messages.
 
         Returns
         -------
@@ -175,6 +182,7 @@ class OpenAIProxyClient:
             "session_id": self.session_id,
             "discount": discount,
             "style": style,
+            "drop_retry_orphans": drop_retry_orphans,
         }
         headers = self._admin_auth_headers()
         async with self._session.post(url, json=payload, headers=headers) as resp:
