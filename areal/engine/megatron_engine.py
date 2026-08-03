@@ -86,7 +86,7 @@ from areal.engine.megatron_utils.pipeline_parallel import (
     configure_pipeline_layer_splits,
 )
 from areal.infra.dist_rollout import DistRolloutCoordinator
-from areal.infra.platforms import current_platform
+from areal.infra.platforms import current_platform, is_npu_available
 from areal.models.mcore.hf_load import load_weights_from_hf_with_mbridge_fast
 from areal.models.mcore.hf_save import (
     save_critic_value_head,
@@ -175,8 +175,42 @@ def _float16_wrapper_fp32_output(
 
 def _reuse_areal_lm_head_logits(
     use_areal_lm_head: bool,
+    entropy_requires_grad: bool,
 ) -> bool:
-    return use_areal_lm_head
+    # Storage reuse makes entropy non-differentiable, so only enable it when
+    # entropy gradients are disabled.
+    return use_areal_lm_head and not entropy_requires_grad
+
+
+def _warn_if_areal_lm_head_entropy_is_nondifferentiable(
+    logger: Any,
+    *,
+    global_rank: int,
+    is_critic: bool,
+    use_areal_lm_head: bool,
+    entropy_requires_grad: bool,
+) -> None:
+    if global_rank != 0 or is_critic or not use_areal_lm_head or entropy_requires_grad:
+        return
+    logger.warning(
+        "AReaL LM Head destructive logits-storage reuse is enabled; entropy is "
+        "non-differentiable and will not contribute gradients. Set "
+        "megatron.entropy_requires_grad=true to use the differentiable fallback."
+    )
+
+
+def _validate_areal_lm_head_compatibility(
+    use_areal_lm_head: bool,
+    *,
+    enable_tree_training: bool,
+    npu_available: bool,
+) -> None:
+    if not use_areal_lm_head:
+        return
+    if npu_available:
+        raise NotImplementedError("AReaL LM Head does not support NPU training")
+    if enable_tree_training:
+        raise NotImplementedError("AReaL LM Head does not support tree training")
 
 
 def _map_chunked_lm_head_output(
@@ -252,6 +286,11 @@ class MegatronEngine(TrainEngine):
         self.is_offload: bool = False
         self._offload_depth: int = 0
         self.enable_tree_training: bool = self.config.enable_tree_training
+        _validate_areal_lm_head_compatibility(
+            self.mcore_config.use_areal_lm_head,
+            enable_tree_training=self.enable_tree_training,
+            npu_available=is_npu_available,
+        )
         # FP8 configuration
         self.fp8_config = self.mcore_config.fp8_config
         self.enable_fp8: bool = self.fp8_config is not None
@@ -476,6 +515,13 @@ class MegatronEngine(TrainEngine):
                 )
 
         self.model = _MegatronModelList(models)
+        _warn_if_areal_lm_head_entropy_is_nondifferentiable(
+            self.logger,
+            global_rank=self.rank,
+            is_critic=self.config.is_critic,
+            use_areal_lm_head=self.mcore_config.use_areal_lm_head,
+            entropy_requires_grad=self.mcore_config.entropy_requires_grad,
+        )
 
         if self.config.use_lora:
             self._apply_megatron_bridge_lora()
@@ -2579,6 +2625,7 @@ class MegatronEngine(TrainEngine):
                         else None,
                         reuse_logits=_reuse_areal_lm_head_logits(
                             self.mcore_config.use_areal_lm_head,
+                            self.mcore_config.entropy_requires_grad,
                         ),
                     )
                 if cp_padded_cu_seqlens is not None:

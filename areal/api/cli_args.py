@@ -981,19 +981,30 @@ class MegatronEngineConfig:
 
     # Precision & Loss
     use_areal_lm_head: bool = field(
-        default=True,
+        default=False,
         metadata={
-            "help": "Use AReaL's vocab-parallel LM Head operator. Disable to "
-            "fall back to Megatron's native output layer."
+            "help": "Use AReaL's CUDA-only vocab-parallel LM Head operator. "
+            "NPU and tree training are unsupported. Disabled by default to "
+            "preserve Megatron's native output layer."
+        },
+    )
+    entropy_requires_grad: bool = field(
+        default=False,
+        metadata={
+            "help": "Whether the training loss requires entropy gradients. "
+            "Defaults to False. With AReaL LM Head enabled, False permits "
+            "destructive logits-storage reuse, so entropy is non-differentiable. "
+            "Set True to use the differentiable fallback."
         },
     )
     lm_head_loss_chunk_size: int = field(
         default=0,
         metadata={
-            "help": "Sequence chunk size for AReaL's chunked LM Head loss. "
-            "A positive value computes LM Head logits and their backward one chunk "
-            "at a time; 0 keeps the default full-logits fused path. The chunked "
-            "path currently supports packed text actor models without MTP."
+            "help": "Sequence chunk size for AReaL's chunked LM Head loss. A "
+            "positive value requires use_areal_lm_head=True and "
+            "entropy_requires_grad=False, and computes LM Head logits and their "
+            "backward one chunk at a time. The chunked path only supports packed "
+            "text actor models without MTP; 0 disables it."
         },
     )
     enable_fp32_lm_head: bool = field(
@@ -1067,6 +1078,10 @@ class MegatronEngineConfig:
             )
         if self.lm_head_loss_chunk_size > 0 and not self.use_areal_lm_head:
             raise ValueError("lm_head_loss_chunk_size requires use_areal_lm_head=True")
+        if self.lm_head_loss_chunk_size > 0 and self.entropy_requires_grad:
+            raise ValueError(
+                "lm_head_loss_chunk_size requires entropy_requires_grad=False"
+            )
         if self.lm_head_loss_chunk_size > 0 and self.enable_mtp:
             raise ValueError("lm_head_loss_chunk_size does not support enable_mtp=True")
 

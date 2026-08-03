@@ -299,15 +299,18 @@ class TestPackedContextParallelForward:
         )
 
     @pytest.mark.parametrize(
-        ("use_areal_lm_head", "expected"),
+        ("use_areal_lm_head", "entropy_requires_grad", "expected"),
         [
-            (False, False),
-            (True, True),
+            (False, True, False),
+            (False, False, False),
+            (True, True, False),
+            (True, False, True),
         ],
     )
-    def test_logits_reuse_follows_areal_lm_head(
+    def test_logits_reuse_respects_entropy_gradient_setting(
         self,
         use_areal_lm_head,
+        entropy_requires_grad,
         expected,
     ):
         from areal.engine.megatron_engine import _reuse_areal_lm_head_logits
@@ -315,9 +318,93 @@ class TestPackedContextParallelForward:
         assert (
             _reuse_areal_lm_head_logits(
                 use_areal_lm_head,
+                entropy_requires_grad,
             )
             is expected
         )
+
+    @pytest.mark.parametrize(
+        (
+            "global_rank",
+            "is_critic",
+            "use_areal_lm_head",
+            "entropy_requires_grad",
+            "warns",
+        ),
+        [
+            (0, False, True, False, True),
+            (1, False, True, False, False),
+            (0, True, True, False, False),
+            (0, False, False, False, False),
+            (0, False, True, True, False),
+        ],
+    )
+    def test_areal_lm_head_warns_when_entropy_is_nondifferentiable(
+        self,
+        global_rank,
+        is_critic,
+        use_areal_lm_head,
+        entropy_requires_grad,
+        warns,
+    ):
+        from areal.engine.megatron_engine import (
+            _warn_if_areal_lm_head_entropy_is_nondifferentiable,
+        )
+
+        logger = MagicMock()
+        _warn_if_areal_lm_head_entropy_is_nondifferentiable(
+            logger,
+            global_rank=global_rank,
+            is_critic=is_critic,
+            use_areal_lm_head=use_areal_lm_head,
+            entropy_requires_grad=entropy_requires_grad,
+        )
+
+        if warns:
+            logger.warning.assert_called_once()
+            assert "entropy is non-differentiable" in logger.warning.call_args.args[0]
+        else:
+            logger.warning.assert_not_called()
+
+    @pytest.mark.parametrize(
+        (
+            "use_areal_lm_head",
+            "enable_tree_training",
+            "npu_available",
+            "error_match",
+        ),
+        [
+            (False, True, True, None),
+            (True, False, False, None),
+            (True, True, False, "tree training"),
+            (True, False, True, "NPU training"),
+        ],
+    )
+    def test_areal_lm_head_rejects_unsupported_training_modes(
+        self,
+        use_areal_lm_head,
+        enable_tree_training,
+        npu_available,
+        error_match,
+    ):
+        from areal.engine.megatron_engine import (
+            _validate_areal_lm_head_compatibility,
+        )
+
+        if error_match is None:
+            _validate_areal_lm_head_compatibility(
+                use_areal_lm_head,
+                enable_tree_training=enable_tree_training,
+                npu_available=npu_available,
+            )
+            return
+
+        with pytest.raises(NotImplementedError, match=error_match):
+            _validate_areal_lm_head_compatibility(
+                use_areal_lm_head,
+                enable_tree_training=enable_tree_training,
+                npu_available=npu_available,
+            )
 
     @pytest.mark.parametrize("fp32_output", [False, True])
     def test_forwards_explicit_fp32_output(self, monkeypatch, fp32_output):

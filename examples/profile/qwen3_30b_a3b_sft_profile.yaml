@@ -58,8 +58,9 @@ actor:
       overlap_param_gather: false
       use_distributed_optimizer: true
     use_deterministic_algorithms: true
+    use_areal_lm_head: true
+    entropy_requires_grad: false
     lm_head_loss_chunk_size: 0
-    enable_fp32_lm_head: true
     cross_entropy_loss_fusion: false
     recompute_granularity: full
     recompute_method: uniform

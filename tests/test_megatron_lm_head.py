@@ -50,13 +50,17 @@ def _make_uninitialized_head() -> mcore_layers.ColumnParallelLinear:
     return head
 
 
-def test_areal_lm_head_is_enabled_by_default():
+def test_areal_lm_head_and_entropy_gradient_defaults_are_disabled():
     config = MegatronEngineConfig()
     config_fields = {field.name: field for field in fields(MegatronEngineConfig)}
 
-    assert config.use_areal_lm_head is True
+    assert config.use_areal_lm_head is False
+    assert config.entropy_requires_grad is False
     assert config.lm_head_loss_chunk_size == 0
     assert config.enable_fp32_lm_head is False
+    assert (
+        "Defaults to False" in config_fields["entropy_requires_grad"].metadata["help"]
+    )
     assert "Deprecated" in config_fields["enable_fp32_lm_head"].metadata["help"]
 
 
@@ -66,13 +70,29 @@ def test_chunked_lm_head_config_validation():
     with pytest.raises(ValueError, match="requires use_areal_lm_head"):
         MegatronEngineConfig(
             use_areal_lm_head=False,
+            entropy_requires_grad=False,
+            lm_head_loss_chunk_size=128,
+        )
+    with pytest.raises(ValueError, match="requires entropy_requires_grad=False"):
+        MegatronEngineConfig(
+            use_areal_lm_head=True,
+            entropy_requires_grad=True,
             lm_head_loss_chunk_size=128,
         )
     with pytest.raises(ValueError, match="does not support enable_mtp"):
         MegatronEngineConfig(
+            use_areal_lm_head=True,
+            entropy_requires_grad=False,
             lm_head_loss_chunk_size=128,
             enable_mtp=True,
         )
+
+    config = MegatronEngineConfig(
+        use_areal_lm_head=True,
+        entropy_requires_grad=False,
+        lm_head_loss_chunk_size=128,
+    )
+    assert config.lm_head_loss_chunk_size == 128
 
 
 @pytest.mark.parametrize("enabled", [False, True])

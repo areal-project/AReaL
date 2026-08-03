@@ -359,7 +359,9 @@ def make_mcore_model(
             _replace_actor_output_layers(
                 [model],
                 enabled=(
-                    mcore_config.use_areal_lm_head if mcore_config is not None else True
+                    mcore_config.use_areal_lm_head
+                    if mcore_config is not None
+                    else False
                 ),
             )
 

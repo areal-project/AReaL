@@ -36,6 +36,27 @@ def _autograd_node_names(output: torch.Tensor) -> set[str]:
     return names
 
 
+def test_regular_entropy_path_remains_differentiable():
+    """The safe fallback must preserve entropy-only loss gradients."""
+    torch.manual_seed(456)
+    logits = torch.randn(7, 31, dtype=torch.float32, requires_grad=True)
+    labels = torch.randint(0, logits.size(-1), (7,))
+    reference_logits = logits.detach().clone().requires_grad_(True)
+
+    _, entropy = gather_logprobs_entropy(logits, labels, reuse_logits=False)
+    _, reference_entropy = _reference(reference_logits, labels, temperature=1.0)
+
+    assert entropy.requires_grad
+    entropy.sum().backward()
+    reference_entropy.sum().backward()
+    torch.testing.assert_close(
+        logits.grad,
+        reference_logits.grad,
+        rtol=1e-5,
+        atol=1e-6,
+    )
+
+
 @pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA is required for Triton kernels")
 @pytest.mark.parametrize("temperature", [0.7, 1.0, 1.5])
 def test_inplace_vocab_parallel_matches_reference_and_reuses_storage(
