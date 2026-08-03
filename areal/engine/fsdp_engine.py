@@ -180,6 +180,19 @@ class _PendingWeightUpdateBucket:
 _MULTIMODAL_FORWARD_KEYS = ("image_grid_thw", "pixel_values", "video_grid_thw")
 
 
+def _normalize_lora_adapter_state_key(
+    name: str,
+    adapter_name: str = "default",
+) -> str:
+    """Convert an internal PEFT parameter name to its saved adapter key."""
+    name = name.removeprefix("base_model.model.")
+    for lora_component in ("lora_A", "lora_B"):
+        internal_suffix = f".{lora_component}.{adapter_name}.weight"
+        if name.endswith(internal_suffix):
+            return f"{name.removesuffix(internal_suffix)}.{lora_component}.weight"
+    return name
+
+
 def _is_multimodal_payload_key(key: str) -> bool:
     return is_multi_modal_key(key) or key in _MULTIMODAL_FORWARD_KEYS
 
@@ -907,14 +920,12 @@ class FSDPEngine(TrainEngine):
 
     def get_lora_adapter_info(self) -> dict[str, list[int]]:
         """Return adapter parameter names and shapes (for generating synthetic checkpoints)."""
-        import re
-
         if not self.config.use_lora or self.model is None:
             return {}
         result = {}
         for name, param in self.model.named_parameters():
             if param.requires_grad and "lora_" in name:
-                clean_name = re.sub(r"^base_model\.model\.", "", name)
+                clean_name = _normalize_lora_adapter_state_key(name)
                 result[clean_name] = list(param.shape)
         return result
 
@@ -1743,8 +1754,6 @@ class FSDPEngine(TrainEngine):
         Iterates adapter parameters and unshards them individually to avoid
         allocating the full base model state dict (which would OOM).
         """
-        import re
-
         from safetensors.torch import save_file
         from torch.distributed.tensor import DTensor
 
@@ -1762,7 +1771,7 @@ class FSDPEngine(TrainEngine):
                 full_param = param.data
 
             if dist.get_rank() == 0:
-                clean_name = re.sub(r"^base_model\.model\.", "", name)
+                clean_name = _normalize_lora_adapter_state_key(name)
                 adapter_state[clean_name] = (
                     self._cast_to_compute_dtype(full_param.cpu())
                     if full_param.is_floating_point()
