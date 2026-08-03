@@ -392,6 +392,14 @@ def local_main(config, run_id: int = 0):
             # Required by NCCL weight update group.
             _env_vars["NCCL_CUMEM_ENABLE"] = "0"
             _env_vars["NCCL_NVLS_ENABLE"] = "0"
+        if (
+            any(a.backend == "megatron" for a in alloc_mode.allocations)
+            and config.actor.megatron.use_deterministic_algorithms
+        ):
+            # TransformerEngine snapshots this env var at import or attention
+            # module construction depending on version; exporting it before
+            # the trainer process starts is safe for all of them.
+            _env_vars["NVTE_ALLOW_NONDETERMINISTIC_ALGO"] = "0"
         # All experiment configs should have the `actor` field.
         actor_spec = get_scheduling_spec(config.actor)
         actor_env_vars = actor_spec.env_vars
