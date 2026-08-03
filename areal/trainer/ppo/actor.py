@@ -42,6 +42,21 @@ from areal.v2.training_service.controller.controller import (
 logger = logging.getLogger("PPOActor")
 
 
+def _infer_prompt_lens(
+    attention_mask: torch.Tensor, loss_mask: torch.Tensor
+) -> torch.Tensor:
+    """Return the index of the first generated token for each trajectory.
+
+    ``loss_mask`` arrives rolled left by one (see ``_compute_advantages``), so it
+    marks the position that *predicts* each generated token. Undo the roll before
+    locating the first one, otherwise every prompt length comes out one short.
+    """
+    loss_mask_long = torch.roll(loss_mask.long(), shifts=1, dims=-1)
+    first_gen_idx = loss_mask_long.argmax(dim=-1)
+    has_gen = loss_mask_long.any(dim=-1)
+    return torch.where(has_gen, first_gen_idx, attention_mask.long().sum(-1))
+
+
 class PPOActor:
     def __init__(self, config: PPOActorConfig, engine: TrainEngine):
         self.config = config
@@ -312,7 +327,7 @@ class PPOActor:
         )
         stats_tracker.stat(**stats, denominator="n_valid_tokens")
 
-        prompt_lens = data["attention_mask"].sum(-1) - data["loss_mask"].sum(-1)
+        prompt_lens = _infer_prompt_lens(data["attention_mask"], data["loss_mask"])
         seq_stats = dict(
             no_eos_ratios=(seqlens == attn_mask.shape[-1]).float(),
             task_reward=task_reward,
@@ -570,6 +585,7 @@ def grpo_loss_fn(
             denominator="n_valid_tokens",
         )
 
+    logp_diff = (old_logp - logprobs.detach()) * loss_mask
     stats_tracker.stat(
         importance_weight=stat["importance_weight"],
         approx_kl=stat["approx_kl"],
@@ -579,14 +595,30 @@ def grpo_loss_fn(
         actor_loss=stat["loss"],
         clip_ratio=stat["clip_mask"].float(),
         dual_clip_ratio=stat["dual_clip_mask"].float(),
+        logp_diff=logp_diff,
+        logp_abs_diff=logp_diff.abs(),
         denominator="n_valid_tokens",
     )
+
     if "behave_imp_weight" in stat:
         stats_tracker.denominator(unclipped_behave_tokens=stat["behave_mask"])
         stats_tracker.stat(
             behave_imp_weight=stat["behave_imp_weight"],
             behave_approx_kl=stat["behave_approx_kl"],
             denominator="unclipped_behave_tokens",
+        )
+        behave_filtered_mask = loss_mask & ~stat["behave_mask"]
+        stats_tracker.stat(
+            behave_filtered_ratio=behave_filtered_mask.float(),
+            denominator="n_valid_tokens",
+        )
+
+    if "n_valid_tokens" in stat:
+        stats_tracker.scalar(
+            n_total_tokens=stat["n_total_tokens"],
+            n_valid_tokens_in_loss=stat["n_valid_tokens"],
+            n_masked_tokens=stat["n_masked_tokens"],
+            masked_token_ratio=stat["masked_token_ratio"],
         )
     if "filtered_fraction" in stat:
         stats_tracker.scalar(rs_filtered_fraction=stat["filtered_fraction"])
