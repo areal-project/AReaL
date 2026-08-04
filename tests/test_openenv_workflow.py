@@ -394,7 +394,12 @@ async def test_episode_runs_until_done_and_records_step_rewards(
     result = await workflow.arun_episode(engine=None, data={"seed": 42})
 
     assert env.reset_calls == [{"seed": 42}]
-    assert len(env.step_actions) == 2
+    # The workflow forwards parsed actions verbatim to env.step, so we can
+    # assert on payload shape to catch silent build_action regressions.
+    assert env.step_actions == [
+        {"tool_name": "echo", "arguments": {"message": "step1"}},
+        {"tool_name": "echo", "arguments": {"message": "step2"}},
+    ]
     inst = _FakeArealOpenAI.last_instance
     assert inst is not None
     assert inst.rewards == {"cmpl-1": 0.4, "cmpl-2": 0.7}
@@ -475,6 +480,187 @@ async def test_parse_failure_breaks_and_records_zero(monkeypatch, _stats_tracker
     assert inst is not None
     assert inst.rewards == {"cmpl-1": 0.0}
     assert env.step_actions == []
+
+
+@pytest.mark.asyncio
+async def test_terminal_reward_only_survives_late_parse_failure(
+    monkeypatch, _stats_tracker_stub
+):
+    """A parse fail after real env steps must NOT overwrite the terminal reward.
+
+    Regresses the bug where parse-failure would append a 0.0 sentinel to
+    step_rewards and terminal_reward_only would then treat 0.0 as the episode
+    reward, zeroing every prior real turn.
+    """
+    _FakeArealOpenAI.pending_scripts = [
+        '{"a": 1}',
+        '{"a": 2}',
+        "GARBAGE — parser returns None",
+    ]
+    env = _FakeEnvClient(
+        script=[
+            _FakeStepResult(observation=_FakeObservation(1), reward=0.3, done=False),
+            _FakeStepResult(observation=_FakeObservation(2), reward=1.0, done=False),
+        ]
+    )
+    cfg = OpenEnvConfig(
+        env_client_class="stub.NotUsed",
+        base_url="ws://stub",
+        max_turns=5,
+        terminal_reward_only=True,
+    )
+    workflow = _make_workflow(cfg, env, monkeypatch)
+
+    await workflow.arun_episode(engine=None, data={})
+
+    inst = _FakeArealOpenAI.last_instance
+    assert inst is not None
+    # cmpl-3 = parse-failure (0.0). cmpl-2 = real terminal, kept at 1.0.
+    # cmpl-1 = intermediate real step, zeroed by terminal_reward_only.
+    assert inst.rewards == {"cmpl-1": 0.0, "cmpl-2": 1.0, "cmpl-3": 0.0}
+
+
+@pytest.mark.asyncio
+async def test_terminal_reward_only_skips_discount(monkeypatch, _stats_tracker_stub):
+    """apply_reward_discount is skipped when terminal_reward_only is set.
+
+    Prevents credit from being smeared back onto the 'discarded' intermediate
+    turns, which would contradict the terminal_reward_only doc-promise.
+    """
+    _FakeArealOpenAI.pending_scripts = ['{"a":1}', '{"a":2}']
+    env = _FakeEnvClient(
+        script=[
+            _FakeStepResult(observation=_FakeObservation(1), reward=0.5, done=False),
+            _FakeStepResult(observation=_FakeObservation(2), reward=1.0, done=True),
+        ]
+    )
+    cfg = OpenEnvConfig(
+        env_client_class="stub.NotUsed",
+        base_url="ws://stub",
+        max_turns=3,
+        terminal_reward_only=True,
+        step_discount=0.9,
+    )
+    workflow = _make_workflow(cfg, env, monkeypatch)
+
+    await workflow.arun_episode(engine=None, data={})
+
+    inst = _FakeArealOpenAI.last_instance
+    assert inst is not None
+    assert inst.discount_calls == []
+    assert inst.rewards == {"cmpl-1": 0.0, "cmpl-2": 1.0}
+
+
+@pytest.mark.asyncio
+async def test_data_seed_overrides_workflow_default(monkeypatch, _stats_tracker_stub):
+    """Per-episode data['seed'] takes precedence over config.reset_kwargs['seed']."""
+    _FakeArealOpenAI.pending_scripts = ['{"a":1}']
+    env = _FakeEnvClient(
+        script=[_FakeStepResult(observation=_FakeObservation(1), reward=0.0, done=True)]
+    )
+    cfg = OpenEnvConfig(
+        env_client_class="stub.NotUsed",
+        base_url="ws://stub",
+        max_turns=1,
+        reset_kwargs={"seed": 0, "task": "eval"},
+    )
+    workflow = _make_workflow(cfg, env, monkeypatch)
+
+    await workflow.arun_episode(engine=None, data={"seed": 42})
+
+    # seed overridden by data['seed']; other reset_kwargs kept.
+    assert env.reset_calls == [{"seed": 42, "task": "eval"}]
+
+
+@pytest.mark.asyncio
+async def test_empty_system_prompt_override_is_ignored(
+    monkeypatch, _stats_tracker_stub
+):
+    """data['system_prompt']='' should NOT force an empty system message.
+
+    Falls through to the workflow default (or no system message when
+    config.system_prompt is also empty).
+    """
+    _FakeArealOpenAI.pending_scripts = ['{"a":1}']
+    env = _FakeEnvClient(
+        script=[_FakeStepResult(observation=_FakeObservation(1), reward=0.0, done=True)]
+    )
+    cfg = OpenEnvConfig(
+        env_client_class="stub.NotUsed",
+        base_url="ws://stub",
+        max_turns=1,
+        system_prompt="workflow-default",
+    )
+    workflow = _make_workflow(cfg, env, monkeypatch)
+
+    await workflow.arun_episode(engine=None, data={"system_prompt": ""})
+
+    # Nothing to assert on chat completion args directly since we didn't
+    # capture them, but the workflow must not have raised, and the fake
+    # generation must have been consumed once (one turn).
+    inst = _FakeArealOpenAI.last_instance
+    assert inst is not None
+    assert set(inst.rewards.keys()) == {"cmpl-1"}
+
+
+@pytest.mark.asyncio
+async def test_reward_shaping_fn_overrides_env_reward(monkeypatch, _stats_tracker_stub):
+    """reward_shaping_fn(step_result, step, data) replaces the raw env reward."""
+    _FakeArealOpenAI.pending_scripts = ['{"a":1}', '{"a":2}']
+    env = _FakeEnvClient(
+        script=[
+            _FakeStepResult(observation=_FakeObservation(1), reward=0.5, done=False),
+            _FakeStepResult(observation=_FakeObservation(2), reward=1.0, done=True),
+        ]
+    )
+    calls: list[tuple[float, int]] = []
+
+    def shape(step_result: Any, step: int, episode_data: dict) -> float:
+        calls.append((float(step_result.reward or 0.0), step))
+        # Apply a hand-crafted penalty proportional to the step index.
+        return -0.1 * step
+
+    cfg = OpenEnvConfig(
+        env_client_class="stub.NotUsed", base_url="ws://stub", max_turns=3
+    )
+    from areal.workflow import openenv as workflow_mod
+    from areal.workflow.openenv import OpenEnvWorkflow
+
+    monkeypatch.setattr(workflow_mod, "_instantiate_env_client", lambda _cfg: env)
+    workflow = OpenEnvWorkflow(
+        config=cfg,
+        gconfig=_FakeGenerationHyperparameters(),
+        tokenizer=object(),
+        reward_shaping_fn=shape,
+    )
+    await workflow.arun_episode(engine=None, data={})
+
+    assert calls == [(0.5, 0), (1.0, 1)]
+    inst = _FakeArealOpenAI.last_instance
+    assert inst is not None
+    assert inst.rewards == {"cmpl-1": 0.0, "cmpl-2": -0.1}
+
+
+@pytest.mark.asyncio
+async def test_done_on_first_step_terminates_immediately(
+    monkeypatch, _stats_tracker_stub
+):
+    """result.done=True on the very first step must terminate before turn 2."""
+    _FakeArealOpenAI.pending_scripts = ['{"a":1}', '{"a":2}']
+    env = _FakeEnvClient(
+        script=[_FakeStepResult(observation=_FakeObservation(1), reward=1.0, done=True)]
+    )
+    cfg = OpenEnvConfig(
+        env_client_class="stub.NotUsed", base_url="ws://stub", max_turns=5
+    )
+    workflow = _make_workflow(cfg, env, monkeypatch)
+
+    await workflow.arun_episode(engine=None, data={})
+
+    inst = _FakeArealOpenAI.last_instance
+    assert inst is not None
+    assert inst.rewards == {"cmpl-1": 1.0}
+    assert len(env.step_actions) == 1
 
 
 @pytest.mark.asyncio

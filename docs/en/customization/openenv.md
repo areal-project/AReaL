@@ -24,9 +24,11 @@ Environments come from their own packages. Two common paths:
 
 ```yaml
 openenv:
-  env_client_class: echo_env.EchoEnv           # dotted path to EnvClient subclass
-  base_url: https://openenv-echo-env.hf.space  # or use provider/project_path
-  action_class: echo_env.CallToolAction        # optional: coerce parsed dict -> dataclass
+  # GenericEnvClient speaks the OpenEnv protocol by URL alone, so no
+  # env-specific Python package is required. Point it at any running
+  # OpenEnv-compatible server (a public HF Space here).
+  env_client_class: openenv.core.generic_client.GenericEnvClient
+  base_url: https://openenv-echo-env.hf.space  # xor: use provider/project_path below
   action_parser: json                          # json | tag | passthrough | dotted.path
   obs_formatter: auto                          # auto | dotted.path
   system_prompt: |
@@ -35,6 +37,10 @@ openenv:
   step_discount: 1.0                           # discount for step rewards; 1.0 disables
   terminal_reward_only: false                  # true = only keep last step's reward
 ```
+
+Point `env_client_class` at an env-specific subclass (e.g. `echo_env.EchoEnv`)
+only when you need the extra typing / action-class helpers it ships; that
+subclass must be `pip install`-able in the workflow's environment.
 
 A ready-to-run example lives at `examples/openenv/echo_smoke.yaml`.
 

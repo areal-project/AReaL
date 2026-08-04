@@ -11,10 +11,9 @@ target arbitrary OpenEnv environments without new code.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Literal, Protocol
 
 
-@runtime_checkable
 class ObservationFormatter(Protocol):
     """Convert an OpenEnv observation into a chat message dict.
 
@@ -27,7 +26,6 @@ class ObservationFormatter(Protocol):
         ...
 
 
-@runtime_checkable
 class ActionParser(Protocol):
     """Convert an LLM completion string into an OpenEnv action object.
 
@@ -78,7 +76,7 @@ class OpenEnvConfig:
 
     env_client_class: str
     base_url: str | None = None
-    provider: str | None = None
+    provider: Literal["uv", "docker"] | None = None
     project_path: str | None = None
     docker_image: str | None = None
     action_class: str | None = None

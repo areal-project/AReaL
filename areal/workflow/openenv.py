@@ -147,43 +147,50 @@ class OpenEnvWorkflow(RolloutWorkflow):
 
         ``data`` is forwarded verbatim to the tokenizer; recognized keys:
 
-        * ``seed``: passed to ``env.reset(seed=...)`` when set.
-        * ``system_prompt``: overrides ``config.system_prompt`` for this episode.
+        * ``seed``: passed to ``env.reset(seed=...)``. Overrides any
+          ``seed`` inside ``config.reset_kwargs``.
+        * ``system_prompt``: overrides ``config.system_prompt`` for this
+          episode. Empty strings are ignored (workflow default is kept).
         """
         openai_client = ArealOpenAI(engine=engine, tokenizer=self.tokenizer)
         env_client = _instantiate_env_client(self.config)
 
+        # Per-episode data.seed is authoritative over the workflow-level
+        # default; otherwise the entire batch would share the same env init.
         reset_kwargs = dict(self.config.reset_kwargs)
-        if "seed" in data and "seed" not in reset_kwargs:
+        if "seed" in data:
             reset_kwargs["seed"] = data["seed"]
 
         step_rewards: list[float] = []
         completion_ids: list[str] = []
         terminal_done = False
+        parse_failed = False
 
         async with env_client as env:
             result = await env.reset(**reset_kwargs)
             messages = self._initial_messages(result.observation)
-            if "system_prompt" in data:
+            if data.get("system_prompt"):
                 # Replace any existing system message with the per-episode override.
+                # Empty strings fall through so the workflow default is preserved.
                 messages = [m for m in messages if m.get("role") != "system"]
                 messages.insert(0, {"role": "system", "content": data["system_prompt"]})
 
             for step in range(self.config.max_turns):
                 completion = await self._generate_step(openai_client, messages)
                 assistant_text = completion.choices[0].message.content or ""
-                completion_ids.append(completion.id)
 
                 parsed = self._action_parser(assistant_text, result.observation)
                 if parsed is None:
                     logger.debug(
                         f"Action parser returned None on step {step}; "
-                        "treating as no-op with zero reward."
+                        "recording the completion with zero reward and ending "
+                        "the episode."
                     )
-                    step_reward = 0.0
-                    step_rewards.append(step_reward)
-                    openai_client.set_reward(completion.id, step_reward)
-                    # No env.step: unparsed action can't produce a valid observation.
+                    parse_failed = True
+                    # Record the completion with zero reward but keep it OUT of
+                    # step_rewards / completion_ids so the trajectory bookkeeping
+                    # below sees only real environment interactions.
+                    openai_client.set_reward(completion.id, 0.0)
                     break
 
                 action = build_action(parsed, self.config.action_class)
@@ -193,6 +200,7 @@ class OpenEnvWorkflow(RolloutWorkflow):
                     step_reward = float(self.reward_shaping_fn(result, step, data))
                 else:
                     step_reward = float(result.reward or 0.0)
+                completion_ids.append(completion.id)
                 step_rewards.append(step_reward)
                 openai_client.set_reward(completion.id, step_reward)
 
@@ -211,23 +219,27 @@ class OpenEnvWorkflow(RolloutWorkflow):
         # Trajectory-level bookkeeping.
         if self.config.terminal_reward_only and completion_ids:
             # Zero out intermediate rewards; keep the last one as episode reward.
+            # Skipping the discount below is intentional: back-propagating from
+            # a lone terminal reward would smear non-zero credit onto the
+            # 'discarded' intermediate turns, contradicting the doc-promise.
             terminal_reward = step_rewards[-1] if step_rewards else 0.0
             for cid in completion_ids[:-1]:
                 openai_client.set_reward(cid, 0.0)
             openai_client.set_reward(completion_ids[-1], terminal_reward)
-
-        # Apply per-step discount by backward propagation. When step_discount
-        # == 1.0 this is an identity operation (rewards already summed
-        # implicitly via GRPO grouping); the discount reshapes credit for
-        # earlier turns.
-        if self.config.step_discount < 1.0:
+        elif self.config.step_discount < 1.0:
+            # Apply per-step discount by backward propagation. Gated off when
+            # terminal_reward_only is set, per the semantic conflict above.
             openai_client.apply_reward_discount(self.config.step_discount)
 
+        # Log the raw environment reward; the trainer sees whatever the cache
+        # holds after the terminal/discount rewrites above, but for
+        # observability the un-shaped sum is more actionable.
         episode_reward = float(sum(step_rewards))
         stats_tracker.get(workflow_context.stat_scope()).scalar(
             reward=episode_reward,
             num_turns=len(step_rewards),
             terminated=float(terminal_done),
+            parse_failed=float(parse_failed),
         )
         return openai_client.export_interactions("individual")
 

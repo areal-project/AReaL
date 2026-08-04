@@ -15,10 +15,12 @@ total_train_epochs: 5
 tokenizer_path: ${actor.path}
 
 openenv:
-  env_client_class: openspiel_env.OpenSpielEnv
+  # GenericEnvClient talks the OpenEnv protocol by URL alone, so the workflow
+  # process needs zero env-specific packages installed. UVProvider launches
+  # the OpenSpiel env server locally via `uv run` (no Docker).
+  env_client_class: openenv.core.generic_client.GenericEnvClient
   provider: uv
   project_path: git+https://huggingface.co/spaces/openenv/openspiel_env
-  action_class: openspiel_env.OpenSpielAction
   action_parser: tag
   obs_formatter: auto
   system_prompt: |
@@ -29,7 +31,7 @@ openenv:
       1 = STAND (end your turn)
     Only output the <action> tag; no other text.
   max_turns: 6
-  step_discount: 0.95
+  step_discount: 1.0
   terminal_reward_only: true
 
 initial_user_prompt: ""

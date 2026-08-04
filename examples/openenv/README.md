@@ -49,21 +49,24 @@ policy learns "stand on 17+".
 
 ## Wire in a new environment
 
-1. Find the environment's `EnvClient` subclass and Action dataclass (see the
-   [OpenEnv envs directory](https://github.com/huggingface/OpenEnv/tree/main/envs)).
-1. Duplicate one of the YAML files and edit the `openenv:` block:
+1. Find the target environment in the
+   [OpenEnv envs directory](https://github.com/huggingface/OpenEnv/tree/main/envs).
+1. Duplicate one of the YAML files and edit the `openenv:` block. The default
+   client works for any OpenEnv env:
    ```yaml
    openenv:
-     env_client_class: coding_env.PythonCodeActEnv
+     env_client_class: openenv.core.generic_client.GenericEnvClient
      provider: uv
      project_path: git+https://huggingface.co/spaces/openenv/coding_env
-     action_class: coding_env.CodeAction
      action_parser: tag          # json | tag | passthrough | dotted.path
      obs_formatter: auto         # auto | dotted.path
      system_prompt: |
        ...
      max_turns: 10
    ```
+   Use an env-specific subclass (`coding_env.PythonCodeActEnv` + `action_class:
+   coding_env.CodeAction`) only when you `pip install` that env's package and
+   want its typed action helpers.
 1. Adjust `system_prompt` / `action_parser` so your model's outputs match the Action
    schema.
 
