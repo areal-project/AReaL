@@ -186,7 +186,7 @@ sandbox = [
 # Optional: HuggingFace OpenEnv adapter for agentic RL environments.
 # See examples/openenv/ for usage.
 openenv = [
-    "openenv>=0.1",
+    "openenv>=0.4",
 ]
 cli = [
     "click>=8.1",

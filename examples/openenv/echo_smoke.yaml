@@ -12,10 +12,12 @@ total_train_epochs: 1
 tokenizer_path: ${actor.path}
 
 # --- OpenEnv adapter ---------------------------------------------------------
+# GenericEnvClient talks the OpenEnv protocol by URL alone -- no env-specific
+# Python package needs to be installed. The echo Space accepts a plain-dict
+# action of the form {"tool_name": ..., "arguments": {...}}.
 openenv:
-  env_client_class: echo_env.EchoEnv
+  env_client_class: openenv.core.generic_client.GenericEnvClient
   base_url: https://openenv-echo-env.hf.space
-  action_class: echo_env.CallToolAction
   action_parser: json
   obs_formatter: auto
   system_prompt: |
