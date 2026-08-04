@@ -12,13 +12,25 @@ only YAML.
 uv sync --extra cuda --extra openenv
 ```
 
-Environments come from their own packages. Two common paths:
+Environments come from their own packages. Four common paths, from most-online
+to fully-offline:
 
-- **Remote HuggingFace Space** (zero local install): point `openenv.base_url` at the
-  Space's public URL.
-- **Local UV process** (no Docker): set `openenv.provider: uv` and
-  `openenv.project_path` to a `git+https://...` spec or a local path.
+- **Remote HuggingFace Space** (zero local install, **data goes to HF**): point
+  `openenv.base_url` at the Space's public URL. Good for smoke tests only.
+- **Local UV process** (no Docker, data stays local): set `openenv.provider: uv`
+  and `openenv.project_path` to a `git+https://...` spec or a local path. The
+  server is launched via `uv run` on the training node.
 - **Local Docker**: set `openenv.provider: docker` and `openenv.docker_image`.
+- **In-process file-path env** (fully offline, no HTTP, no server): set
+  `openenv.env_client_class` to `"/abs/path/to/my_env.py:MyEnv"`. Your class
+  must implement the OpenEnv async surface (`__aenter__/__aexit__`, `reset`,
+  `step`). See `examples/openenv/local_envs/blackjack_env.py` for a minimal
+  template. This path has zero network at runtime.
+
+For production training or anything with sensitive data, use one of the last
+three. The HF Space route sends every observation and action across the public
+internet to HuggingFace's servers -- fine for a demo, not fine for internal
+data.
 
 ## Minimum config
 

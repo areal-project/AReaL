@@ -301,6 +301,25 @@ def test_resolve_action_parser_alias_and_import(tmp_path, monkeypatch):
     assert isinstance(resolve_action_parser("passthrough"), PassthroughActionParser)
 
 
+def test_import_from_string_supports_filesystem_path(tmp_path):
+    """`_import_from_string` loads `/abs/file.py:Cls` for offline env classes."""
+    from areal.workflow.openenv_utils import _import_from_string
+
+    src = tmp_path / "my_env.py"
+    src.write_text("class MyEnv:\n    x = 42\n")
+    cls = _import_from_string(f"{src}:MyEnv")
+    assert cls.x == 42
+
+
+def test_import_from_string_rejects_missing_file(tmp_path):
+    """Absolute paths that don't exist raise ImportError, not silent success."""
+    from areal.workflow.openenv_utils import _import_from_string
+
+    bogus = tmp_path / "does_not_exist.py"
+    with pytest.raises(ImportError, match="not found on disk"):
+        _import_from_string(f"{bogus}:MyEnv")
+
+
 # ---------------------------------------------------------------------------
 # Observation formatting
 # ---------------------------------------------------------------------------

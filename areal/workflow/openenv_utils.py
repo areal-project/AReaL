@@ -10,8 +10,11 @@ from __future__ import annotations
 
 import dataclasses
 import importlib
+import importlib.util
 import json
+import os
 import re
+import sys
 from collections.abc import Callable
 from dataclasses import is_dataclass
 from typing import Any
@@ -23,20 +26,54 @@ logger = logging.getLogger("OpenEnvWorkflow")
 
 
 def _import_from_string(path: str) -> Any:
-    """Import ``module.submodule:attr`` or ``module.submodule.attr``."""
+    """Import an attribute from a module path or a filesystem path.
+
+    Accepted forms:
+      * ``pkg.mod.Cls`` -- standard dotted import
+      * ``pkg.mod:Cls`` -- explicit module/attr separator
+      * ``/abs/path/to/file.py:Cls`` -- filesystem path (must be absolute
+        and end in ``.py``). Useful for offline setups where the env class
+        ships alongside the config rather than as an installed package;
+        avoids sys.path fragility across spawned rollout workers.
+    """
+    # File-path form. Detect by ".py:" — bare colons in module paths are
+    # already handled by the module-path branch below.
     if ":" in path:
-        module_path, _, attr = path.rpartition(":")
+        left, _, attr = path.rpartition(":")
+        if left.endswith(".py") and os.path.isabs(left):
+            if not os.path.exists(left):
+                raise ImportError(
+                    f"env class file {left!r} not found on disk. Absolute "
+                    f"file paths must be reachable from every rollout worker."
+                )
+            mod_name = f"_openenv_local_{abs(hash(left))}"
+            spec = importlib.util.spec_from_file_location(mod_name, left)
+            if spec is None or spec.loader is None:
+                raise ImportError(f"Could not load spec for {left!r}.")
+            module = importlib.util.module_from_spec(spec)
+            # Register before exec_module so dataclass/typing utilities can
+            # look up the module via sys.modules[cls.__module__].
+            sys.modules[mod_name] = module
+            try:
+                spec.loader.exec_module(module)
+            except Exception:
+                sys.modules.pop(mod_name, None)
+                raise
+        else:
+            module = importlib.import_module(left)
     else:
         module_path, _, attr = path.rpartition(".")
-    if not module_path:
-        raise ValueError(
-            f"Import path {path!r} must include a module (e.g. 'pkg.mod.Cls')."
-        )
-    module = importlib.import_module(module_path)
+        if not module_path:
+            raise ValueError(
+                f"Import path {path!r} must include a module (e.g. 'pkg.mod.Cls')."
+            )
+        module = importlib.import_module(module_path)
     try:
         return getattr(module, attr)
     except AttributeError as e:
-        raise ImportError(f"Module {module_path!r} has no attribute {attr!r}.") from e
+        raise ImportError(
+            f"Loaded module has no attribute {attr!r} (source: {path!r})."
+        ) from e
 
 
 def _observation_to_text(observation: Any) -> str:
