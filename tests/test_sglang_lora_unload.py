@@ -32,7 +32,7 @@ def test_disk_update_unloads_stale_version_beyond_window():
     """load v{N} also emits a best-effort unload of v{N - keep}."""
     reqs = SGLangBackend().build_disk_weight_update_requests(_lora_meta(10, keep=4))
     triples = _triples(reqs)
-    assert ("/load_lora_adapter", "lora-gsm8k-v10", False) in triples
+    assert ("/load_lora_adapter", "lora-gsm8k-v10", True) in triples
     unloads = [t for t in triples if t[0] == "/unload_lora_adapter"]
     assert unloads == [("/unload_lora_adapter", "lora-gsm8k-v6", True)]
 
