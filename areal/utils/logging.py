@@ -136,6 +136,8 @@ LOGGER_PATTERNS = [
     ("MegatronEngine", "light_cyan"),
     ("RemoteInfEngine", "light_cyan"),
     ("MCore", "light_cyan"),
+    # Model bridges - cyan (compute backends)
+    ("BailingMoe", "light_cyan"),
     # HF utilities - white
     ("HF", "white"),
     # Tests - white

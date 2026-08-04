@@ -1,6 +1,5 @@
 import os
 
-import mbridge
 import pytest
 import torch
 import torch.distributed as dist
@@ -13,6 +12,8 @@ from areal.engine.megatron_utils.pipeline_parallel import (
 )
 from areal.models.mcore.registry import make_hf_and_mcore_config
 from areal.utils.network import find_free_ports
+
+mbridge = pytest.importorskip("mbridge")
 
 
 @pytest.mark.parametrize(

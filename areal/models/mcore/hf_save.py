@@ -10,8 +10,6 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 import torch.distributed as dist
-from mbridge.core import Bridge
-from mbridge.core.util import unwrap_model
 from megatron.core import parallel_state as mpu
 from megatron.core.fp8_utils import is_float8tensor
 from safetensors.torch import save_file
@@ -26,6 +24,14 @@ from areal.engine.megatron_utils.fp8 import (
 from areal.infra.platforms import current_platform
 from areal.models.mcore.registry import unwrap_to_gpt_model
 from areal.utils import logging
+
+
+def _unwrap_model(model):
+    """Unwrap DDP / FSDP wrappers down to the bare module."""
+    while hasattr(model, "module"):
+        model = model.module
+    return model
+
 
 logger = logging.getLogger("HFSaver")
 
@@ -181,7 +187,7 @@ def _patch_saved_config(base_model_path, saved_path):
         logger.info(f"Patched config.json: {', '.join(patched_fields)}")
 
 
-def _bridge_uses_stacked_experts(bridge: Bridge) -> bool:
+def _bridge_uses_stacked_experts(bridge) -> bool:
     """Detect bridges whose HF format keeps experts grouped under a single
     stacked tensor (e.g., Qwen3-VL-MoE ``mlp.experts.gate_up_proj`` shape
     ``[E, hidden, 2*expert_dim]``) rather than per-expert flat keys.
@@ -251,7 +257,7 @@ class McoreDistributedWeightSpec:
 
 
 def _emit_stacked_moe_expert_sd(
-    bridge: Bridge,
+    bridge,
     expert_specs: list["McoreDistributedWeightSpec"],
     *,
     all_gather_outputs: dict,
@@ -397,7 +403,7 @@ def _emit_stacked_moe_expert_sd(
 
 
 def _emit_per_expert_flat_expert_sd(
-    bridge: Bridge,
+    bridge,
     expert_specs: list["McoreDistributedWeightSpec"],
     *,
     all_gather_outputs: dict,
@@ -441,7 +447,7 @@ def _emit_per_expert_flat_expert_sd(
 
 
 def save_weights_to_hf_with_mbridge_fast(
-    bridge: Bridge,
+    bridge,
     models: list,
     weights_path: str,
     base_model_path: str | None = None,
@@ -450,7 +456,7 @@ def save_weights_to_hf_with_mbridge_fast(
     fp8_direct_convert: bool = False,
 ):
     # 1. Prepare some global metadata required for saving the model.
-    models = [unwrap_model(model) for model in models]
+    models = [_unwrap_model(model) for model in models]
     pp_size = mpu.get_pipeline_model_parallel_world_size()
     pp_rank = mpu.get_pipeline_model_parallel_rank()
     pp_group = mpu.get_pipeline_model_parallel_group()

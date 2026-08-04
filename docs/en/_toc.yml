@@ -26,6 +26,7 @@ parts:
     - file: best_practices/debugging
     - file: best_practices/handling_oom
     - file: best_practices/perf_profiling
+    - file: best_practices/migrate_to_megatron_bridge
   - caption: Customization
     chapters:
     - file: customization/dataset
