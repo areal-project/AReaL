@@ -18,7 +18,7 @@ from areal.api import (
 from areal.api.cli_args import GenerationHyperparameters
 from areal.utils import logging, stats_tracker
 from areal.utils.dynamic_import import import_from_string
-from areal.utils.hf_utils import apply_chat_template
+from areal.utils.hf_utils import apply_chat_template, tokenizer_stop_token_ids
 from areal.utils.perf_tracer import (
     atrace_session_phase,
     session_context,
@@ -67,7 +67,9 @@ class RLVRWorkflow(RolloutWorkflow):
 
             tokenizer = load_hf_tokenizer(self.tokenizer)
             self.tokenizer = tokenizer
-        self.gconfig = gconfig.new_with_stop_and_pad_token_ids(self.tokenizer)
+        self.gconfig = gconfig.new_with_stop_token_ids(
+            tokenizer_stop_token_ids(self.tokenizer)
+        )
         self.enable_thinking = enable_thinking
         if not isinstance(reward_fn, str):
             self.async_reward_fn = AsyncRewardWrapper(reward_fn)

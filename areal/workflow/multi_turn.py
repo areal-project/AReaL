@@ -11,7 +11,7 @@ from areal import workflow_context
 from areal.api import AsyncRewardWrapper, InferenceEngine, ModelRequest, RolloutWorkflow
 from areal.api.cli_args import GenerationHyperparameters
 from areal.utils import logging, stats_tracker
-from areal.utils.hf_utils import apply_chat_template
+from areal.utils.hf_utils import apply_chat_template, tokenizer_stop_token_ids
 
 logger = logging.getLogger("MultiTurnWorkflow")
 
@@ -33,7 +33,9 @@ class MultiTurnWorkflow(RolloutWorkflow):
             raise ValueError("turn_discount must be in (0, 1].")
 
         self.reward_fn = reward_fn
-        self.gconfig = gconfig.new_with_stop_and_pad_token_ids(tokenizer)
+        self.gconfig = gconfig.new_with_stop_token_ids(
+            tokenizer_stop_token_ids(tokenizer)
+        )
         self.tokenizer = tokenizer
         self.max_turns = max_turns
         self.turn_discount = turn_discount

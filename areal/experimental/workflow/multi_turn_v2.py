@@ -10,6 +10,7 @@ from areal.api import AsyncRewardWrapper, InferenceEngine, RolloutWorkflow
 from areal.api.cli_args import GenerationHyperparameters
 from areal.experimental.openai import ArealOpenAI
 from areal.utils import logging, stats_tracker
+from areal.utils.hf_utils import tokenizer_stop_token_ids
 
 logger = logging.getLogger("MultiTurnV2Workflow")
 
@@ -25,9 +26,9 @@ class MultiTurnWorkflow(RolloutWorkflow):
     ):
         self.reward_fn = reward_fn
         # Enforce n_samples=1; grouping is handled by GroupedRolloutWorkflow
-        self.gconfig = gconfig.new_with_stop_and_pad_token_ids(tokenizer).new(
-            n_samples=1
-        )
+        self.gconfig = gconfig.new_with_stop_token_ids(
+            tokenizer_stop_token_ids(tokenizer)
+        ).new(n_samples=1)
         self.tokenizer = tokenizer
         self.max_turns = max_turns
         self.turn_discount = turn_discount

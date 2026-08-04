@@ -11,7 +11,7 @@ from areal.experimental.camel.openai_model import AReaLOpenAICompatibleModel
 from areal.experimental.openai import ArealOpenAI
 from areal.reward import get_math_verify_worker
 from areal.utils import stats_tracker
-from areal.utils.hf_utils import load_hf_tokenizer
+from areal.utils.hf_utils import load_hf_tokenizer, tokenizer_stop_token_ids
 
 
 @dataclass
@@ -76,7 +76,9 @@ class CamelRLVRWorkflow(RolloutWorkflow):
             from areal.utils.hf_utils import load_hf_tokenizer
 
             tokenizer = load_hf_tokenizer(tokenizer)
-        self.gconfig = gconfig.new_with_stop_and_pad_token_ids(tokenizer)
+        self.gconfig = gconfig.new_with_stop_token_ids(
+            tokenizer_stop_token_ids(tokenizer)
+        )
         self.gconfig.n_samples = 1
         self.tokenizer = tokenizer
         self.max_tokens = max_tokens

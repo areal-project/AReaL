@@ -13,6 +13,22 @@ from areal.utils import pkg_version
 logger = logging.getLogger("HFUtils")
 
 
+def tokenizer_stop_token_ids(
+    tokenizer: transformers.PreTrainedTokenizerFast,
+) -> list[int]:
+    token_ids: list[int] = []
+    for candidate in (tokenizer.pad_token_id, tokenizer.eos_token_id):
+        if candidate is None:
+            continue
+        ids = candidate if isinstance(candidate, (list, tuple)) else [candidate]
+        for token_id in ids:
+            if token_id is None:
+                continue
+            if token_id not in token_ids:
+                token_ids.append(token_id)
+    return token_ids
+
+
 @overload
 def apply_chat_template(
     tokenizer: transformers.PreTrainedTokenizerFast,

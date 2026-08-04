@@ -12,7 +12,7 @@ from areal.dataset import get_custom_dataset
 from areal.experimental.openai import ArealOpenAI
 from areal.utils import stats_tracker
 from areal.utils.dynamic_import import import_from_string
-from areal.utils.hf_utils import load_hf_tokenizer
+from areal.utils.hf_utils import load_hf_tokenizer, tokenizer_stop_token_ids
 
 
 class OpenAIAgentWrapper:
@@ -73,7 +73,9 @@ class OpenAIAgentWorkflow(RolloutWorkflow):
             from areal.utils.hf_utils import load_hf_tokenizer
 
             tokenizer = load_hf_tokenizer(tokenizer)
-        self.gconfig = gconfig.new_with_stop_and_pad_token_ids(tokenizer)
+        self.gconfig = gconfig.new_with_stop_token_ids(
+            tokenizer_stop_token_ids(tokenizer)
+        )
         self.tokenizer = tokenizer
 
         # Search hyper-parameters
