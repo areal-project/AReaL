@@ -152,15 +152,122 @@ python3 examples/math/gsm8k_rl.py \
   trial_name=trial0
 ```
 
-## Result
+## KDRL Result
 
 On-policy knowledge distillation + RL reward plot for Qwen2.5-14B-Instruct (teacher) and
 Qwen3-0.6B (student), trained using FSDP and vLLM.
 
 ![alt text](reward_curve.png)
 
+### Cross-Tokenizer Distillation
+
+By default, on-policy distillation assumes that the teacher and student share the same tokenizer. This works well for models within the same family, where teacher log-probabilities can be directly aligned with the student’s generated tokens.
+
+However, this assumption breaks when distilling across model families (e.g., LLaMA, Qwen, DeepSeek, Gemma). In practice:
+
+- Different tokenizers segment the same text differently
+- Token boundaries do not align
+- Vocabulary sizes and merge rules differ significantly
+- Identical strings produce different token sequences
+
+As a result, the teacher cannot directly supervise the student at the token level.
+
+Cross-tokenizer distillation is therefore important for:
+- Cross-family knowledge transfer
+- Better reuse of strong teacher models
+- Improved performance for smaller or heterogeneous student models
+
+To address this, AReaL provides an optional `teacher.cross_tokenizer` mode based on [2]. During training:
+
+---
+
+#### 1. Student rollout (on-policy generation)
+
+- Prompt: \( q \)
+- Student policy: \( $\pi_\theta$ \)
+- Teacher policy: \( $\pi_T$ \)
+- Tokenizers: \( $\tau_s$, $\tau_T$ \)
+
+$o_s \sim \pi_\theta(\cdot \mid q)$
+
+---
+
+#### 2. Decode student output to text
+
+$\text{text} = \text{Decode}_{\tau_s}(o_s)$
+
+This creates a tokenizer-independent representation.
+
+---
+
+#### 3. Re-tokenize using teacher tokenizer
+
+$o_T = \text{Encode}_{\tau_T}(\text{text})$
+
+Now both models represent the same text with different tokenizations.
+
+---
+
+#### 4. Chunk-level alignment
+
+Both token sequences are mapped to character offsets in the shared text.
+
+Tokens are grouped into **chunks**, where each chunk corresponds to the same text span:
+
+- Student chunks: \( $C_1^s, C_2^s, \dots$ \)
+- Teacher chunks: \( $C_1^T, C_2^T, \dots$ \)
+
+Each pair \( (C_i^s, C_i^T) \) covers the same substring of text, even if token boundaries differ.
+
+---
+
+#### 5. Teacher log-probability aggregation and mapping
+
+Compute teacher log-probabilities:
+
+$\log \pi_T(o_T)$
+
+Aggregate per teacher chunk:
+
+$R_i = \sum_{t \in C_i^T} \log \pi_T(t)$
+
+Since chunks correspond across tokenizers:
+
+$C_i^T \leftrightarrow C_i^s$
+
+The teacher signal is redistributed onto student tokens:
+
+$\log \pi_T(x_j^s) \leftarrow \frac{R_i}{|C_i^s|}$
+
+---
+
+#### 6. On-policy distillation objective
+
+The student is trained using the standard reverse-KL OPD objective, but with aligned teacher signals instead of token-aligned supervision.
+
+## Cross-tokenizer KDRL Result
+
+Results on the [Knight and Knave dataset](https://huggingface.co/datasets/K-and-K/knights-and-knaves), using the first 200 examples from both the train and test splits.
+
+The following plots show the reward curves for on-policy knowledge distillation + RL with Qwen3-0.6B as the student, trained with FSDP and vLLM.
+
+
+**Teacher**: Qwen3.6-27B, **Student**: Qwen3-0.6B
+
+![alt text](kk_curve.png)
+
+
+
+**Teacher**: Llama-3.1-8B-Instruct, **Student**: Qwen3-0.6B
+
+![alt text](kk_curve_llama.png)
+
+
+
 ## References
 
 [1] Xu H, Zhu Q, Deng H, Li J, Hou L, Wang Y, Shang L, Xu R, Mi F. Kdrl: Post-training
 reasoning llms via unified knowledge distillation and reinforcement learning.
 [KDRL paper link](https://arxiv.org/pdf/2506.02208)
+
+[2] Niu, Y., Xiao, H., Liu, D., Wang, Z., Gong, D., Wang, Y., & Li, J. Breaking the Tokenizer Barrier: On-Policy Distillation across Model Families. [Paper link](https://arxiv.org/pdf/2606.09456)
