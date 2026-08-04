@@ -5,6 +5,12 @@ on:
     # 00:00 Beijing time (UTC+8) = 16:00 UTC
     - cron: '0 16 * * *'
   workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Branch, tag, or SHA to checkout (default: main)'
+        required: false
+        type: string
+        default: 'main'
 
 concurrency:
   group: nightly-ci
@@ -125,33 +131,99 @@ jobs:
   nightly-tests:
     name: Run nightly tests
     needs: start-runner
+    environment: nightly
     runs-on:
       - self-hosted
       - areal-nightly
     timeout-minutes: 480
+    env:
+      IMAGE_REPO: ghcr.io/inclusionai/areal-runtime
     steps:
+      - name: Clean workspace
+        run: sudo rm -rf "${{ github.workspace }}"/* 2>/dev/null || true
+
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref || github.sha }}
 
-      - name: System info
-        run: |
-          echo "=== GPU info ==="
-          nvidia-smi
-          echo ""
-          echo "=== Python ==="
-          python --version || python3 --version
-          echo ""
-          echo "=== Disk ==="
-          df -h
-          echo ""
-          echo "=== Memory ==="
-          free -h
+      - name: Log in to GitHub Container Registry
+        run: echo "${{ secrets.GHCR_TOKEN }}" | docker login ghcr.io -u inclusionai --password-stdin
 
-      - name: Dummy test (placeholder)
+      - name: Pull latest runtime images
         run: |
-          echo "Nightly CI running on $(hostname) at $(date -u)"
-          echo "TODO: Replace with actual long-running tests"
-          sleep 10
-          echo "Dummy test completed successfully."
+          docker pull "$IMAGE_REPO:dev-sglang"
+          docker pull "$IMAGE_REPO:dev-vllm"
+
+      - name: Determine run parameters
+        id: params
+        run: |
+          BACKENDS=("fsdp" "megatron" "archon")
+          BACKEND_SHORT=("f" "m" "a")
+          DAY_OF_YEAR=$(date -u +%j)
+          BACKEND_INDEX=$(( (10#$DAY_OF_YEAR - 1) % 3 ))
+          echo "experiment_name=nightly-gsm8k-$(date -u +%Y-%m)" >> "$GITHUB_OUTPUT"
+          echo "trial_date=$(date -u +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
+          echo "train_backend=${BACKENDS[$BACKEND_INDEX]}" >> "$GITHUB_OUTPUT"
+          echo "train_backend_short=${BACKEND_SHORT[$BACKEND_INDEX]}" >> "$GITHUB_OUTPUT"
+
+      - name: Run training (sglang + vllm)
+        env:
+          EXPERIMENT_NAME: ${{ steps.params.outputs.experiment_name }}
+          TRIAL_DATE: ${{ steps.params.outputs.trial_date }}
+          TRAIN_BACKEND: ${{ steps.params.outputs.train_backend }}
+          TRAIN_BACKEND_SHORT: ${{ steps.params.outputs.train_backend_short }}
+          WANDB_API_KEY: ${{ secrets.WANDB_API_KEY }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          WORKSPACE: ${{ github.workspace }}
+          MODEL_NAME: Qwen/Qwen3-0.6B
+        run: |
+          MODEL_CACHE=/opt/hf_cache
+
+          declare -A VARIANT_SHORT=( [sglang]=s [vllm]=v )
+
+          run_variant() {
+            local variant=$1
+            local trial_name="${TRAIN_BACKEND_SHORT}.${VARIANT_SHORT[$variant]}-${TRIAL_DATE}"
+            echo "=== Running variant: $variant (trial: $trial_name) ==="
+            docker run --rm \
+              --runtime=nvidia --gpus all \
+              --net=host \
+              --shm-size=500g \
+              --ulimit nofile=1048576:1048576 \
+              --cap-add=SYS_ADMIN \
+              --device=/dev/fuse \
+              --security-opt=apparmor:unconfined \
+              -e HF_TOKEN="$HF_TOKEN" \
+              -e HF_HOME=/model_cache \
+              -e WANDB_API_KEY="$WANDB_API_KEY" \
+              -e TOKENIZERS_PARALLELISM=false \
+              -v "$WORKSPACE:/workspace" \
+              -v "$MODEL_CACHE:/model_cache" \
+              -w /workspace \
+              "$IMAGE_REPO:dev-$variant" \
+              bash -lc '
+                export PATH=/opt/.venv/bin:$PATH
+                huggingface-cli download '"$MODEL_NAME"'
+                uv pip install -e . --no-deps
+                python3 examples/math/gsm8k_rl.py --config examples/math/gsm8k_grpo.yaml \
+                  experiment_name='"$EXPERIMENT_NAME"' trial_name='"$trial_name"' \
+                  stats_logger.wandb.mode=online \
+                  rollout.backend='"$variant"':d1 actor.backend='"$TRAIN_BACKEND"':d1 \
+                  cluster.n_nodes=1 cluster.n_gpus_per_node=2 \
+                  actor.path='"$MODEL_NAME"' \
+                  scheduler.type=local train_dataset.batch_size=64
+              '
+            sudo find "$WORKSPACE" -not -user "$(id -u)" -delete 2>/dev/null || true
+          }
+
+          run_variant sglang
+          run_variant vllm
+
+      - name: Cleanup
+        if: always()
+        run: |
+          docker logout ghcr.io 2>/dev/null || true
+          sudo find "${{ github.workspace }}" -not -user "$(id -u)" -delete 2>/dev/null || true
 
   stop-runner:
     name: Stop areal-nightly instance
