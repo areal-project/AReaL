@@ -88,19 +88,23 @@ actor:
       env_vars: {}
 
 teacher:
-  backend: "fsdp:d1p1t4"
+  teachers:
+    - engine_type: train
+      weight: 1.0
+      train:
+        backend: fsdp:d1p1t4
+        experiment_name: ${experiment_name}
+        trial_name: ${trial_name}
+        path: Qwen/Qwen2.5-14B-Instruct
+        init_from_scratch: false
+        disable_dropout: true
+        dtype: ${actor.dtype}
+        mb_spec:
+          max_tokens_per_mb: 10240
+        optimizer: null
+        scheduling_spec: ${actor.scheduling_spec}
   rl_loss_weight: 1.0
   distill_loss_weight: 0.005
-  experiment_name: ${experiment_name}
-  trial_name: ${trial_name}
-  path: Qwen/Qwen2.5-14B-Instruct
-  init_from_scratch: false
-  disable_dropout: true
-  dtype: ${actor.dtype}
-  mb_spec:
-    max_tokens_per_mb: 10240
-  optimizer: null
-  scheduling_spec: ${actor.scheduling_spec}
 
 ref:
   backend: ${actor.backend}
