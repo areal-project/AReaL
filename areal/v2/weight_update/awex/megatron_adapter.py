@@ -293,8 +293,8 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
             gathered = all_gather_param(
                 mcore_name,
                 param,
-                fp8_direct_convert=False,
-                quantization_config=None,
+                fp8_direct_convert=self._engine.fp8_direct_convert,
+                quantization_config=self._engine.quantization_config,
                 duplicated_param_names=self._engine._duplicated_param_names,
             )
             if not isinstance(gathered, torch.Tensor):
@@ -305,6 +305,9 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
                 model_name,
                 mcore_name,
                 gathered,
+                fp8_direct_convert=self._engine.fp8_direct_convert,
+                quantization_config=self._engine.quantization_config,
+                hf_config=self._engine.hf_config,
             ):
                 if tie_word_embeddings and hf_name == "lm_head.weight":
                     continue
@@ -527,11 +530,20 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
 
     def _offload_model_weights(self) -> None:
         """Move model parameters to CPU, keeping references for reload."""
+        from transformer_engine.pytorch.quantized_tensor import QuantizedTensor
+
         if self._engine.model is None:
             return
 
         for name, param in self._engine.model.named_parameters():
-            if param.is_cuda:
+            if isinstance(param, QuantizedTensor):
+                tensors, _ = param.prepare_for_saving()
+                self._offloaded_weights[name] = [
+                    t.detach().to("cpu", non_blocking=True) if t is not None else None
+                    for t in tensors
+                ]
+                param.clear()
+            elif param.is_cuda:
                 self._offloaded_weights[name] = param.data.detach().to(
                     "cpu", non_blocking=True
                 )
@@ -551,8 +563,17 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
 
         device = self._engine.device
         for name, param in self._engine.model.named_parameters():
-            if name in self._offloaded_weights:
-                param.data = self._offloaded_weights[name].to(device, non_blocking=True)
+            if name not in self._offloaded_weights:
+                continue
+            saved = self._offloaded_weights[name]
+            if isinstance(saved, list):
+                tensors_gpu = [
+                    t.to(device, non_blocking=True) if t is not None else None
+                    for t in saved
+                ]
+                param.restore_from_saved(tensors_gpu)
+            else:
+                param.data = saved.to(device, non_blocking=True)
 
         self._offloaded_weights.clear()
         logger.info("Reloaded model weights to GPU")
