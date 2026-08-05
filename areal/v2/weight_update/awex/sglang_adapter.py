@@ -744,6 +744,7 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
         self._rebuild_derived_weights()
         logger.info("Colocate weight update completed for version %d", version)
 
+
     def _quiesce_scheduler_streams(self) -> None:
         """Drain in-flight device work before the NCCL transfer starts.
 
@@ -811,14 +812,11 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
     def resume_memory(self, tags: list[str] | None = None) -> None:
         from sglang.srt.managers.io_struct import ResumeMemoryOccupationReqInput
 
+        # Not gated on locally-tracked released tags: the colocate handover
+        # releases inference memory through the rollout controller, so this
+        # adapter never observes that release. SGLang's resume is idempotent.
         native_tags = (
-            [
-                t
-                for t in tags
-                if t in self._SGLANG_MEMORY_TAGS and t in self._released_tags
-            ]
-            if tags
-            else None
+            [t for t in tags if t in self._SGLANG_MEMORY_TAGS] if tags else None
         )
         unsupported = (
             [t for t in tags if t not in self._SGLANG_MEMORY_TAGS] if tags else []
@@ -830,8 +828,10 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
                 unsupported,
                 self._SGLANG_MEMORY_TAGS,
             )
-        if native_tags:
-            req = ResumeMemoryOccupationReqInput(tags=native_tags)
-            self._scheduler.resume_memory_occupation(req)
-            self._released_tags.difference_update(native_tags)
-        logger.info("resume_memory completed with tags=%s", tags)
+        if not native_tags:
+            logger.warning("resume_memory: nothing to resume for tags=%s", tags)
+            return
+        req = ResumeMemoryOccupationReqInput(tags=native_tags)
+        self._scheduler.resume_memory_occupation(req)
+        self._released_tags.difference_update(native_tags)
+        logger.info("resume_memory resumed tags=%s", native_tags)

@@ -42,3 +42,38 @@ def test_execute_colocate_update_resumes_weights_before_reader():
         ("transfer", 3),
         "post_load",
     ]
+
+
+class TestResumeMemoryIgnoresLocallyTrackedTags:
+    """The colocate handover releases inference memory outside this adapter."""
+
+    @staticmethod
+    def _adapter():
+        adapter = AwexSGLangAdapter.__new__(AwexSGLangAdapter)
+        adapter._released_tags = set()
+        adapter._scheduler = mock.Mock()
+        return adapter
+
+    def test_resume_issues_request_when_release_was_not_observed(self):
+        adapter = self._adapter()
+
+        AwexSGLangAdapter.resume_memory(adapter, ["weights"])
+
+        adapter._scheduler.resume_memory_occupation.assert_called_once()
+        req = adapter._scheduler.resume_memory_occupation.call_args.args[0]
+        assert req.tags == ["weights"]
+
+    def test_resume_skips_only_tags_sglang_cannot_serve(self):
+        adapter = self._adapter()
+
+        AwexSGLangAdapter.resume_memory(adapter, ["optimizer"])
+
+        adapter._scheduler.resume_memory_occupation.assert_not_called()
+
+    def test_resume_passes_through_every_supported_tag(self):
+        adapter = self._adapter()
+
+        AwexSGLangAdapter.resume_memory(adapter, ["weights", "kv_cache", "cuda_graph"])
+
+        req = adapter._scheduler.resume_memory_occupation.call_args.args[0]
+        assert set(req.tags) == AwexSGLangAdapter._SGLANG_MEMORY_TAGS
