@@ -471,21 +471,26 @@ def call_engine_method():
                 )
                 if should_broadcast:
                     logger.debug(f"Broadcasting RPC payload for method: {method_name}")
-                    args_bcast = tensor_container_to(
-                        args, current_platform.current_device()
-                    )
+                    # While the engine is offloaded, param storages are
+                    # released and NCCL collectives cannot run; broadcast over
+                    # the gloo mirror group on CPU instead.
+                    if getattr(engine, "is_offload", False):
+                        bcast_group = engine.cpu_model_parallel_group
+                        bcast_device = "cpu"
+                    else:
+                        bcast_group = engine.context_and_model_parallel_group
+                        bcast_device = current_platform.current_device()
+                    args_bcast = tensor_container_to(args, bcast_device)
                     args_bcast = broadcast_tensor_container(
                         args_bcast,
                         src_rank=engine.current_data_parallel_head(),
-                        group=engine.context_and_model_parallel_group,
+                        group=bcast_group,
                     )
-                    kwargs_bcast = tensor_container_to(
-                        kwargs, current_platform.current_device()
-                    )
+                    kwargs_bcast = tensor_container_to(kwargs, bcast_device)
                     kwargs_bcast = broadcast_tensor_container(
                         kwargs_bcast,
                         src_rank=engine.current_data_parallel_head(),
-                        group=engine.context_and_model_parallel_group,
+                        group=bcast_group,
                     )
                     logger.debug("Broadcasting RPC payload done.")
 

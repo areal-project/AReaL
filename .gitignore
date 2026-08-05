@@ -7,6 +7,7 @@
 .claude/settings.local.json
 .claude/sessions/
 .agent/
+.areal_weight_meta/
 
 # Codex repo-local skills live in `.agents/skills/`.
 

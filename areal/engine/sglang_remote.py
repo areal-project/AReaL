@@ -3,6 +3,8 @@
 import os
 import subprocess
 import sys
+import threading
+import time
 import uuid
 from collections.abc import Callable, Mapping
 from concurrent.futures import Future
@@ -34,8 +36,158 @@ from areal.api.io_struct import (
 from areal.infra import RemoteInfEngine, RolloutController, WorkflowExecutor
 from areal.infra.platforms import current_platform
 from areal.infra.utils.launcher import TRITON_CACHE_PATH
+from areal.utils import logging as areal_logging
 from areal.utils import perf_tracer, stats_tracker
 from areal.utils.network import format_host_for_url
+
+logger = areal_logging.getLogger("SGLangBackend")
+
+
+def _gpu_memory_snapshot() -> str:
+    try:
+        result = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=index,memory.used,memory.total,utilization.gpu",
+                "--format=csv,noheader,nounits",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except Exception as exc:
+        return f"<unavailable: {exc}>"
+    if result.returncode != 0:
+        return f"<nvidia-smi rc={result.returncode}: {result.stderr.strip()}>"
+    return result.stdout.strip().replace("\n", " | ")
+
+
+def _float_env(name: str, default: float) -> float:
+    value = os.environ.get(name, "")
+    if not value:
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        logger.warning("Invalid %s=%r; using %.3f", name, value, default)
+        return default
+
+
+def _read_text(path: str, limit: int = 4096) -> str:
+    try:
+        with open(path) as f:
+            return f.read(limit).strip()
+    except OSError as exc:
+        return f"<unavailable: {exc}>"
+
+
+def _cgroup_memory_snapshot(pid: int) -> str:
+    cgroup_file = f"/proc/{pid}/cgroup"
+    try:
+        with open(cgroup_file) as f:
+            entries = [line.strip().split(":", 2) for line in f if line.strip()]
+    except OSError as exc:
+        return f"<cgroup unavailable: {exc}>"
+
+    paths = []
+    for entry in entries:
+        if len(entry) != 3:
+            continue
+        controllers = entry[1].split(",")
+        rel_path = entry[2].lstrip("/")
+        if entry[1] == "" or "memory" in controllers:
+            paths.append(os.path.join("/sys/fs/cgroup", rel_path))
+
+    seen = set()
+    parts = []
+    for path in paths:
+        if path in seen:
+            continue
+        seen.add(path)
+        fields = []
+        for name in ("memory.current", "memory.peak", "memory.max", "memory.events"):
+            value = _read_text(os.path.join(path, name), limit=2048)
+            if value.startswith("<unavailable"):
+                continue
+            fields.append(f"{name}={value.replace(chr(10), ',')}")
+        if fields:
+            parts.append(f"{path}: " + " ".join(fields))
+    return " | ".join(parts) if parts else "<no memory cgroup files>"
+
+
+def _process_tree_memory_snapshot(pid: int) -> str:
+    try:
+        import psutil
+    except Exception as exc:
+        return (
+            f"<psutil unavailable: {exc}; status={_read_text(f'/proc/{pid}/status')}>"
+        )
+
+    try:
+        root = psutil.Process(pid)
+        procs = [root] + root.children(recursive=True)
+    except psutil.Error as exc:
+        return f"<process unavailable: {exc}>"
+
+    total_rss = 0
+    total_vms = 0
+    rows = []
+    for proc in procs:
+        try:
+            mem = proc.memory_info()
+            total_rss += mem.rss
+            total_vms += mem.vms
+            cmdline = " ".join(proc.cmdline())[:120]
+            rows.append(
+                f"pid={proc.pid} name={proc.name()} status={proc.status()} "
+                f"rss_mb={mem.rss / 1024 / 1024:.1f} "
+                f"vms_mb={mem.vms / 1024 / 1024:.1f} cmd={cmdline!r}"
+            )
+        except psutil.Error:
+            continue
+    return (
+        f"total_rss_mb={total_rss / 1024 / 1024:.1f} "
+        f"total_vms_mb={total_vms / 1024 / 1024:.1f}; " + " | ".join(rows)
+    )
+
+
+def _start_process_monitor(process: subprocess.Popen, interval_s: float) -> None:
+    if interval_s <= 0:
+        return
+
+    def _monitor() -> None:
+        pid = process.pid
+        while True:
+            returncode = process.poll()
+            logger.info(
+                "SGLang child monitor: pid=%s returncode=%s process_memory=%s "
+                "cgroup_memory=%s gpu_memory=%s",
+                pid,
+                returncode,
+                _process_tree_memory_snapshot(pid),
+                _cgroup_memory_snapshot(pid),
+                _gpu_memory_snapshot(),
+            )
+            if returncode is not None:
+                return
+            time.sleep(interval_s)
+
+    threading.Thread(
+        target=_monitor,
+        name=f"sglang-child-monitor-{process.pid}",
+        daemon=True,
+    ).start()
+
+
+_SGLANG_TOP_K_ALL_THRESHOLD = 1_000_000
+
+
+def _normalize_sglang_top_k(top_k: int) -> int:
+    """Translate AReaL's large "all vocab" top-k sentinel to SGLang's -1."""
+    if top_k >= _SGLANG_TOP_K_ALL_THRESHOLD:
+        return -1
+    return top_k
 
 
 class SGLangBackend:
@@ -63,7 +215,7 @@ class SGLangBackend:
 
         sample_params = {
             "top_p": gconfig.top_p,
-            "top_k": gconfig.top_k,
+            "top_k": _normalize_sglang_top_k(gconfig.top_k),
             "max_new_tokens": gconfig.max_new_tokens,
             "temperature": 0.0 if gconfig.greedy else gconfig.temperature,
             "stop_token_ids": stop_token_ids,
@@ -332,20 +484,43 @@ class SGLangBackend:
         return HttpRequest(endpoint="/init_weights_update_group", payload=payload)
 
     def get_pause_request(self) -> HttpRequest:
-        """Get SGLang pause request."""
-        return HttpRequest(endpoint="/pause_generation", payload={})
+        """Get SGLang pause request.
+
+        Use ``mode="retract"`` instead of the default ``"abort"``. In abort
+        mode the tokenizer manager only kills in-flight requests and never
+        forwards the pause to the scheduler, so ``scheduler._engine_paused``
+        stays False and the scheduler keeps decoding whatever reaches its
+        queue. During AWEX colocate weight updates that decode races the
+        NCCL weight transfer on the same GPUs and desyncs the TP collectives
+        (observed as 6/8 ranks stuck in different forward collectives and
+        2/8 parked at the recv_requests broadcast). Retract mode pauses the
+        scheduler event loop, moves running requests back to the waiting
+        queue (KV is released, so kv_cache offload stays valid), and lets
+        them recompute with the new weights after continue_generation.
+        """
+        return HttpRequest(endpoint="/pause_generation", payload={"mode": "retract"})
 
     def get_resume_request(self) -> HttpRequest:
         """Get SGLang resume request."""
         return HttpRequest(endpoint="/continue_generation", payload={})
 
-    def get_health_check_request(self) -> HttpRequest:
-        """Get SGLang health check request."""
-        return HttpRequest(endpoint="/health", payload={}, method="GET")
+    def get_abort_all_request(self) -> HttpRequest:
+        """Get SGLang abort all requests."""
+        return HttpRequest(endpoint="/abort_request", payload={"abort_all": True})
 
-    def get_offload_request(self) -> HttpRequest:
+    def get_health_check_request(self) -> HttpRequest:
+        """Get SGLang readiness check request."""
+        # SGLang's /health is a functional 1-token generation probe in recent
+        # versions. During AWEX colocated startup, generation can legitimately
+        # wait for the first train-side weight publication, so using /health for
+        # launch readiness deadlocks rollout initialization. /model_info only
+        # requires the HTTP server and model metadata to be ready.
+        return HttpRequest(endpoint="/model_info", payload={}, method="GET")
+
+    def get_offload_request(self, tags: list[str] | None = None) -> HttpRequest:
         """Get SGLang offload request."""
-        return HttpRequest(endpoint="/release_memory_occupation", payload={})
+        payload = {"tags": tags} if tags is not None else {}
+        return HttpRequest(endpoint="/release_memory_occupation", payload=payload)
 
     def get_onload_request(self, tags: list[str] | None = None) -> HttpRequest:
         """Get SGLang onload request.
@@ -360,15 +535,154 @@ class SGLangBackend:
 
     def launch_server(self, server_args: dict[str, Any]) -> subprocess.Popen:
         """Launch SGLang server subprocess."""
+        awex_meta_addr = server_args.pop("awex_meta_server_addr", None)
+        awex_colocate = server_args.pop("awex_colocate_mode", False)
+        awex_gpus_per_server = server_args.pop("_awex_gpus_per_server", None)
+        awex_physical_base_gpu_id = None
+        export_physical_base = False
+        if awex_gpus_per_server is not None:
+            slurm_localid = os.environ.get("SLURM_LOCALID")
+            if slurm_localid is not None:
+                awex_physical_base_gpu_id = int(slurm_localid) * int(
+                    awex_gpus_per_server
+                )
+                visible_devices = [
+                    d.strip()
+                    for d in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",")
+                    if d.strip()
+                ]
+                # Whether AREAL_AWEX_PHYSICAL_BASE_GPU_ID must be exported for
+                # the plugin: only when CUDA remaps device ordinals (per-worker
+                # CVD isolation). In the other two branches the plugin's own
+                # CVD lookup / logical id already yields the physical id, and
+                # exporting a base would double-count it.
+                if visible_devices and len(visible_devices) <= int(
+                    awex_gpus_per_server
+                ):
+                    # Slurm isolates colocated workers via CUDA_VISIBLE_DEVICES.
+                    # CUDA remaps those physical devices to process-local ordinals,
+                    # so SGLang must use runtime base_gpu_id=0. AWEX still pairs
+                    # train/infer by the physical GPU id carried in CVD.
+                    server_args["base_gpu_id"] = 0
+                    first_visible = visible_devices[0]
+                    if first_visible.isdigit():
+                        awex_physical_base_gpu_id = int(first_visible)
+                    export_physical_base = True
+                elif visible_devices:
+                    # Node-wide CVD shared by all colocated servers: offset the
+                    # runtime ordinal by SLURM_LOCALID so servers do not collide
+                    # (Problem 33). The plugin maps logical -> physical via its
+                    # own CVD lookup, so no base env var is needed.
+                    server_args["base_gpu_id"] = awex_physical_base_gpu_id
+                    base_visible = (
+                        visible_devices[awex_physical_base_gpu_id]
+                        if awex_physical_base_gpu_id < len(visible_devices)
+                        else None
+                    )
+                    if base_visible is not None and base_visible.isdigit():
+                        awex_physical_base_gpu_id = int(base_visible)
+                else:
+                    # No CVD: SGLang's logical gpu ids (base + tp_rank) ARE the
+                    # physical ids already; exporting the base again would make
+                    # the plugin compute 2*base + tp_rank (double count).
+                    server_args["base_gpu_id"] = awex_physical_base_gpu_id
+                logger.info(
+                    "AWEX colocate GPU mapping: SLURM_LOCALID=%s, "
+                    "gpus_per_server=%s, CUDA_VISIBLE_DEVICES=%s -> "
+                    "runtime base_gpu_id=%s, physical_base_gpu_id=%s",
+                    slurm_localid,
+                    awex_gpus_per_server,
+                    os.environ.get("CUDA_VISIBLE_DEVICES"),
+                    server_args["base_gpu_id"],
+                    awex_physical_base_gpu_id,
+                )
         cmd = SGLangConfig.build_cmd_from_args(server_args)
-        _env = self.build_server_env(os.environ)
+        _env = os.environ.copy()
+        triton_cache_path = _env.get("TRITON_CACHE_PATH", TRITON_CACHE_PATH)
+        _env["TRITON_CACHE_PATH"] = os.path.join(triton_cache_path, str(uuid.uuid4()))
+        _env.setdefault("PYTHONFAULTHANDLER", "1")
 
-        return subprocess.Popen(
+        drop_ld_preload_default = "1" if (awex_colocate or awex_meta_addr) else "0"
+        if _env.get(
+            "AREAL_SGLANG_DROP_LD_PRELOAD", drop_ld_preload_default
+        ).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "y",
+            "on",
+        }:
+            dropped = _env.pop("LD_PRELOAD", "")
+            logger.info("Dropping LD_PRELOAD for SGLang child: %s", dropped)
+
+        if not awex_meta_addr:
+            awex_meta_addr = os.environ.get("AWEX_META_SERVER_ADDR")
+        if awex_colocate or awex_meta_addr:
+            launch_module = _env.get(
+                "AREAL_SGLANG_FORCE_LAUNCH_MODULE",
+                "areal.engine.awex_sglang_plugin",
+            ).strip()
+            if not launch_module:
+                launch_module = "areal.engine.awex_sglang_plugin"
+            # gh launches SGLang via its v2 wrapper module; the internal
+            # stack launches via sglang.launch_server. Swap either for the
+            # AWEX plugin entry (which itself execs sglang.launch_server
+            # semantics with the colocate patches applied).
+            _sglang_entries = (
+                "sglang.launch_server",
+                "areal.v2.inference_service.sglang.launch_server",
+            )
+            cmd = [launch_module if c in _sglang_entries else c for c in cmd]
+            if awex_meta_addr:
+                _env["AWEX_META_SERVER_ADDR"] = awex_meta_addr
+            if awex_physical_base_gpu_id is not None and export_physical_base:
+                _env["AREAL_AWEX_PHYSICAL_BASE_GPU_ID"] = str(awex_physical_base_gpu_id)
+            logger.info(
+                "AWEX mode: using SGLang launch module %s, cmd=%s",
+                launch_module,
+                cmd[:4],
+            )
+
+        stagger_s = float(_env.get("AREAL_SGLANG_LAUNCH_STAGGER_SECONDS", "0") or 0)
+        if stagger_s > 0:
+            slurm_localid = int(_env.get("SLURM_LOCALID", "0") or 0)
+            delay = slurm_localid * stagger_s
+            if delay > 0:
+                logger.info(
+                    "Staggering SGLang launch by %.1fs "
+                    "(SLURM_LOCALID=%d, stagger=%.1fs)",
+                    delay,
+                    slurm_localid,
+                    stagger_s,
+                )
+                time.sleep(delay)
+
+        logger.info(
+            "Launching SGLang server: CUDA_VISIBLE_DEVICES=%s, "
+            "AWEX_META_SERVER_ADDR=%s, AREAL_AWEX_PHYSICAL_BASE_GPU_ID=%s, "
+            "LD_PRELOAD=%s, gpu_memory=%s, cmd=%s",
+            _env.get("CUDA_VISIBLE_DEVICES"),
+            _env.get("AWEX_META_SERVER_ADDR", ""),
+            _env.get("AREAL_AWEX_PHYSICAL_BASE_GPU_ID", ""),
+            _env.get("LD_PRELOAD", ""),
+            _gpu_memory_snapshot(),
+            cmd,
+        )
+        process = subprocess.Popen(
             cmd,
             env=_env,
             stdout=sys.stdout,
             stderr=sys.stdout,
         )
+        logger.info("Launched SGLang child process pid=%s", process.pid)
+        _start_process_monitor(
+            process,
+            interval_s=_float_env(
+                "AREAL_SGLANG_PROCESS_MONITOR_INTERVAL_SECONDS",
+                0.0,
+            ),
+        )
+        return process
 
 
 class RemoteSGLangEngine(InferenceEngine):
@@ -499,6 +813,7 @@ class RemoteSGLangEngine(InferenceEngine):
         proxy_addr: str | None = None,
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
+        keep_partial_group_on_error: bool = False,
     ) -> int:
         """Submit a request to the inference engine."""
         return self._engine.submit(
@@ -513,6 +828,7 @@ class RemoteSGLangEngine(InferenceEngine):
             proxy_addr=proxy_addr,
             reward_normalization=reward_normalization,
             drop_incomplete_group=drop_incomplete_group,
+            keep_partial_group_on_error=keep_partial_group_on_error,
         )
 
     def wait(
@@ -594,8 +910,14 @@ class RemoteSGLangEngine(InferenceEngine):
     def teardown_server(self):
         return self._engine.teardown_server()
 
-    def offload(self):
-        return self._engine.offload()
+    def offload(self, tags: list[str] | None = None):
+        logger.info("RemoteSGLangEngine.offload(tags=%s) called", tags)
+        result = self._engine.offload(tags=tags)
+        logger.info("RemoteSGLangEngine.offload(tags=%s) done", tags)
+        return result
+
+    def abort_all_requests(self):
+        return self._engine.abort_all_requests()
 
     def onload(self, tags: list[str] | None = None):
         return self._engine.onload(tags=tags)

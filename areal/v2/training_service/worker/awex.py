@@ -48,13 +48,39 @@ def create_awex_blueprint(
 
     @bp.route("/report_weight_meta", methods=["POST"])
     def report_weight_meta():
+        data = flask_module.request.get_json(silent=True) or {}
+        infer_conf = data.get("infer_conf")
+
         def action():
             adapter = _require_adapter()
+            if infer_conf is not None:
+                return adapter.get_weight_metadata(infer_conf=infer_conf)
             return adapter.get_weight_metadata()
 
         return run_endpoint(
             "report_weight_meta",
             lambda: submit_to_engine_thread("report_weight_meta", action),
+        )
+
+    @bp.route("/init_adapter", methods=["POST"])
+    def init_adapter():
+        data = flask_module.request.get_json(silent=True) or {}
+
+        def action():
+            engine = get_engine()
+            if engine is None:
+                raise RuntimeError("Engine not initialized")
+            init_fn = getattr(engine, "init_awex_adapter", None)
+            if not callable(init_fn):
+                raise RuntimeError(
+                    "Engine does not implement method 'init_awex_adapter'"
+                )
+            init_fn(meta_server_addr=data.get("meta_server_addr"))
+
+        return run_endpoint(
+            "init_adapter",
+            lambda: submit_to_engine_thread("init_adapter", action),
+            return_result=False,
         )
 
     @bp.route("/init_weights_update_group", methods=["POST"])
@@ -139,6 +165,38 @@ def create_awex_blueprint(
         return run_endpoint(
             "execute_colocate_weight_update",
             lambda: submit_to_engine_thread("execute_colocate_weight_update", action),
+            return_result=False,
+        )
+
+    @bp.route("/precompute_delta_masks", methods=["POST"])
+    def precompute_delta_masks():
+        data = flask_module.request.get_json(force=True)
+        version = data.get("version", 0)
+
+        def action():
+            adapter = _require_adapter()
+            fn = getattr(adapter, "precompute_delta_masks", None)
+            if fn is None:
+                return {"precomputed": False}
+            return {"precomputed": bool(fn(version))}
+
+        return run_endpoint(
+            "precompute_delta_masks",
+            lambda: submit_to_engine_thread("precompute_delta_masks", action),
+        )
+
+    @bp.route("/seed_delta_base", methods=["POST"])
+    def seed_delta_base():
+        data = flask_module.request.get_json(force=True)
+        version = data.get("version", 0)
+
+        def action():
+            adapter = _require_adapter()
+            adapter.seed_delta_base(version)
+
+        return run_endpoint(
+            "seed_delta_base",
+            lambda: submit_to_engine_thread("seed_delta_base", action),
             return_result=False,
         )
 

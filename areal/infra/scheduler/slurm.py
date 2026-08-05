@@ -2,10 +2,10 @@
 
 import asyncio
 import getpass
+import os
 import re
 import shlex
 import subprocess
-import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -43,15 +43,17 @@ from areal.infra.utils.launcher import (
     get_thread_env_vars,
 )
 from areal.infra.utils.proc import build_streaming_log_cmd
+from areal.infra.utils.python import get_python_executable
 from areal.infra.utils.slurm import (
     cancel_jobs,
     parse_slurm_nodelist,
     query_jobs,
+    query_terminal_state_sacct,
 )
 from areal.utils import logging, name_resolve, names
 from areal.utils.fs import validate_shared_path
 from areal.utils.network import format_hostport, split_hostport
-from areal.utils.offload import get_tms_env_vars
+from areal.utils.offload import apply_tms_env_vars
 
 logger = logging.getLogger("SlurmScheduler")
 
@@ -136,6 +138,11 @@ class SlurmScheduler(Scheduler):
         self.container_mounts = container_mounts
         self.srun_additional_args = srun_additional_args
         self.startup_timeout = startup_timeout
+        # Use setup_timeout from rollout config if available (covers slurm queue wait)
+        if exp_config is not None and hasattr(exp_config, "rollout"):
+            rollout_cfg = exp_config.rollout
+            if hasattr(rollout_cfg, "setup_timeout") and rollout_cfg.setup_timeout > 0:
+                self.startup_timeout = rollout_cfg.setup_timeout
         self.health_check_interval = health_check_interval
         self.exp_config = exp_config
 
@@ -230,7 +237,7 @@ class SlurmScheduler(Scheduler):
         if job_id in self._job_status_cache:
             cached_state, cached_time = self._job_status_cache[job_id]
             if current_time - cached_time < self._status_cache_ttl:
-                if cached_state in [JobState.FAILED, JobState.CANCELLED]:
+                if not cached_state.active():
                     logs = self._read_log_tail(role)
                     raise WorkerFailedError(
                         f"{role}/*", -1, f"Job {job_id} {cached_state}. Logs:\n{logs}"
@@ -248,12 +255,30 @@ class SlurmScheduler(Scheduler):
             state = job_infos[0].state
             self._job_status_cache[job_id] = (state, current_time)
 
-            if state in [JobState.FAILED, JobState.CANCELLED]:
+            # Workers are long-lived rpc_server processes: any terminal state
+            # (FAILED, CANCELLED, but also COMPLETED — e.g. the batch script
+            # exiting 0 after a container FATAL) means they are gone.
+            if not state.active():
                 logs = self._read_log_tail(role)
                 raise WorkerFailedError(
                     f"{role}/*", -1, f"Job {job_id} {state}. Logs:\n{logs}"
                 )
         except subprocess.CalledProcessError as e:
+            # squeue exits non-zero once a job leaves the queue (e.g.
+            # "Invalid job id specified" right after COMPLETED), which is
+            # indistinguishable from a transient slurmctld error here. Ask
+            # sacct: a terminal state means the workers are gone — raise
+            # instead of warning until startup_timeout (P83: an 8-node run
+            # silently polled a COMPLETED actor job for the full hour).
+            sacct_state = query_terminal_state_sacct(job_id)
+            if sacct_state is not None and not sacct_state.active():
+                self._job_status_cache[job_id] = (sacct_state, current_time)
+                logs = self._read_log_tail(role)
+                raise WorkerFailedError(
+                    f"{role}/*",
+                    -1,
+                    f"Job {job_id} {sacct_state} (via sacct). Logs:\n{logs}",
+                )
             logger.warning(f"Failed to query job status: {e}")
 
     def _verify_worker_alive(self, worker_id: str) -> SlurmWorkerInfo:
@@ -390,15 +415,21 @@ class SlurmScheduler(Scheduler):
 
         # Amend environment variables
         for sch in schedulings:
+            # Save user-specified env vars so they take precedence over system defaults
+            user_env = dict(sch.env_vars)
+
             # AReaL env var forwarding
             if self.enable_tms_offload:
-                sch.env_vars.update(get_tms_env_vars())
+                apply_tms_env_vars(sch.env_vars)
             sch.env_vars.update(get_env_vars())
             thread_env = get_thread_env_vars(
                 cpus_per_task=sch.cpu,
                 existing_env_vars=sch.env_vars,
             )
             sch.env_vars.update(thread_env)
+
+            # Re-apply user env vars to allow explicit overrides
+            sch.env_vars.update(user_env)
 
         if len(schedulings) == 1:
             # Expand single spec to all workers
@@ -500,7 +531,7 @@ class SlurmScheduler(Scheduler):
             # 2. Build the full raw command
             module_path = command or "areal.infra.rpc.rpc_server"
             raw_cmd = [
-                sys.executable,
+                get_python_executable(),
                 "-m",
                 module_path,
                 "--host",
@@ -830,12 +861,16 @@ class SlurmScheduler(Scheduler):
             f"--cpus-per-task={cpus_per_task}",
             f"--mem={mem_per_task * ntasks_per_node}M",
         ]
-        if total_gpus > 0:
+        if total_gpus > 0 and spec.request_gpu_gres:
             sbatch_options.append(f"--gres=gpu:{self.n_gpus_per_node}")
         if nodelist:
             sbatch_options.append(f"--nodelist={nodelist}")
         if exclude:
             sbatch_options.append(f"--exclude={exclude}")
+        if spec.reservation:
+            sbatch_options.append(f"--reservation={spec.reservation}")
+        if spec.exclusive:
+            sbatch_options.append("--exclusive")
 
         sbatch_options_str = "\n".join([f"#SBATCH {opt}" for opt in sbatch_options])
 
@@ -898,12 +933,26 @@ class SlurmScheduler(Scheduler):
         if self.container_type == "apptainer":
             # For apptainer, pass env vars to singularity
             env_string = " ".join(f"--env {k}={v}" for k, v in env_vars_dict.items())
-            final_cmd = "singularity exec --no-home --writable-tmpfs --nv"
+            # --unsquash extracts the SIF to a tmpfs sandbox before running,
+            # avoiding one loop device per rank. Flash colocation launches many
+            # ranks on each node and otherwise hits the node loop-device cap.
+            final_cmd = "singularity exec --no-home --writable-tmpfs --unsquash --nv"
             if self.container_mounts:
                 final_cmd += f" --bind {self.container_mounts}"
             final_cmd += f" {env_string}"
             final_cmd += f" {spec.image}"
             final_cmd += f" {cmd}"
+            # Stagger container creation across each node's tasks: 8 concurrent
+            # singularity mounts per node race for the kernel's loop devices and
+            # intermittently die with "failed to find loop device" (jobs
+            # 931326/931353). AREAL_APPTAINER_STAGGER_SECONDS had been exported
+            # by launch scripts for a while but nothing consumed it. srun does
+            # not go through a shell, so wrap in bash -c for the sleep.
+            stagger = int(os.environ.get("AREAL_APPTAINER_STAGGER_SECONDS", "0"))
+            if stagger > 0:
+                final_cmd = "bash -c " + shlex.quote(
+                    f"sleep $((SLURM_LOCALID * {stagger})); exec {final_cmd}"
+                )
         else:  # native
             final_cmd = cmd
 
@@ -913,7 +962,7 @@ class SlurmScheduler(Scheduler):
             f"--cpus-per-task={cpus_per_task}",
             f"--mem-per-cpu={mem_per_cpu}M",
         ]
-        if total_gpus > 0:
+        if total_gpus > 0 and spec.request_gpu_gres:
             srun_flags.append(f"--gres=gpu:{self.n_gpus_per_node}")
 
         # Log files and prefix for merged log
@@ -924,7 +973,16 @@ class SlurmScheduler(Scheduler):
         srun_cmd = (
             f"srun {self.srun_additional_args} {' '.join(srun_flags)} {final_cmd}"
         )
-        log_pipeline = build_streaming_log_cmd(srun_cmd, role_log, merged_log, role)
+        log_pipeline = build_streaming_log_cmd(
+            srun_cmd,
+            role_log,
+            merged_log,
+            role,
+            use_stdbuf=not (
+                bool(env_vars_dict.get("LD_PRELOAD"))
+                or env_vars_dict.get("TMS_INIT_ENABLE") == "1"
+            ),
+        )
 
         # Complete sbatch script with single srun command
         sbatch_script = f"""#!/bin/bash
@@ -995,56 +1053,79 @@ class SlurmScheduler(Scheduler):
                 )
 
             target_workers = self._workers[colocate_role]
-            if num_workers != len(target_workers):
-                raise WorkerCreationError(
-                    role,
-                    "Replica count mismatch",
-                    f"Colocated role must have same replica count as target "
-                    f"({num_workers} != {len(target_workers)})",
+            if num_workers == len(target_workers):
+                # Check if fork mode is enabled
+                if strategy.fork:
+                    # Fork mode: spawn new processes on same nodes via /fork endpoint
+                    return self.fork_workers(role, colocate_role)
+
+                # Reuse existing workers - no new Slurm job submitted
+                worker_ids = [w.worker.id for w in target_workers]
+                self._colocated_roles[role] = colocate_role
+
+                logger.info(
+                    f"Role '{role}' colocated with '{colocate_role}': "
+                    f"reusing workers {worker_ids}"
                 )
+                return worker_ids
 
-            # Check if fork mode is enabled
-            if strategy.fork:
-                # Fork mode: spawn new processes on same nodes via /fork endpoint
-                return self.fork_workers(role, colocate_role)
-
-            # Reuse existing workers - no new Slurm job submitted
-            worker_ids = [w.worker.id for w in target_workers]
-            self._colocated_roles[role] = colocate_role
+            # Different worker counts: submit new job on the same nodes
+            # (e.g., AWEX colocation where rollout has TP-grouped instances)
+            target_job_id = self._jobs[colocate_role]
+            job_infos = query_jobs(slurm_ids=[target_job_id])
+            if not job_infos:
+                raise WorkerCreationError(
+                    role, f"Target job {target_job_id} not found in queue"
+                )
+            colocation_nodelist = job_infos[0].host
+            spec = schedulings[0]
+            total_gpus = spec.gpu * replicas
+            nodes = max(
+                1,
+                (total_gpus + self.n_gpus_per_node - 1) // self.n_gpus_per_node,
+            )
+            cpus_per_task = spec.cpu
+            mem_per_task = spec.mem * 1024
+            logger.info(
+                f"Creating {replicas} workers for role '{role}' colocated with "
+                f"'{colocate_role}' on nodes {colocation_nodelist}: "
+                f"nodes={nodes}, cpus={cpus_per_task}, mem={mem_per_task}MB"
+            )
+            nodelist = colocation_nodelist
+        elif strategy_type == SchedulingStrategyType.separation:
+            # Non-colocated: calculate nodes needed and submit new Slurm job
+            spec = schedulings[0]
+            total_gpus = spec.gpu * replicas
+            nodes = max(
+                1, (total_gpus + self.n_gpus_per_node - 1) // self.n_gpus_per_node
+            )
+            nodelist = spec.nodelist
+            cpus_per_task = spec.cpu
+            mem_per_task = spec.mem * 1024  # Convert GB to MB
 
             logger.info(
-                f"Role '{role}' colocated with '{colocate_role}': "
-                f"reusing workers {worker_ids}"
+                f"Creating {replicas} workers for role '{role}': "
+                f"nodes={nodes}, gpus_per_node={self.n_gpus_per_node}, "
+                f"cpus={cpus_per_task}, mem={mem_per_task}MB"
             )
-            return worker_ids
-
-        if strategy_type != SchedulingStrategyType.separation:
+        else:
             raise ValueError(f"Unknown scheduling strategy type: {strategy_type}")
-        # Non-colocated: calculate nodes needed and submit new Slurm job
-        spec = schedulings[0]
-        total_gpus = spec.gpu * replicas
-        nodes = max(1, (total_gpus + self.n_gpus_per_node - 1) // self.n_gpus_per_node)
-        nodelist = spec.nodelist
-
-        # Calculate resource requirements
-        n_gpus_per_node = min(
-            self.n_gpus_per_node, (spec.gpu * replicas + nodes - 1) // nodes
-        )
-        cpus_per_task = spec.cpu
-        mem_per_task = spec.mem * 1024  # Convert GB to MB
-
-        logger.info(
-            f"Creating {replicas} workers for role '{role}': "
-            f"nodes={nodes}, gpus_per_node={n_gpus_per_node}, "
-            f"cpus={cpus_per_task}, mem={mem_per_task}MB"
-        )
 
         # Generate sbatch script
+        # Colocated roles must not request GPU gres: the target role's job
+        # already holds the nodes' GPUs, so a second gres request would
+        # deadlock in the queue. Colocated workers address GPUs directly
+        # via base_gpu_id / CUDA_VISIBLE_DEVICES instead.
+        request_gpus = (
+            0
+            if strategy_type == SchedulingStrategyType.colocation
+            else spec.gpu * replicas
+        )
         sbatch_script = self._generate_sbatch_script(
             role=role,
             replicas=replicas,
             nodes=nodes,
-            total_gpus=spec.gpu * replicas,
+            total_gpus=request_gpus,
             cpus_per_task=cpus_per_task,
             mem_per_task=mem_per_task,
             schedulings=schedulings,

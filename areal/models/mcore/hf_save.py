@@ -416,7 +416,7 @@ def _emit_per_expert_flat_expert_sd(
     for s in expert_specs:
         param = s.param
         if etp_size > 1:
-            params = all_gather_outputs[s.global_name].chunk(etp_size, dim=0)
+            params = all_gather_outputs.pop(s.global_name).chunk(etp_size, dim=0)
         else:
             params = [param]
 
@@ -436,7 +436,7 @@ def _emit_per_expert_flat_expert_sd(
         )
         for n, p in zip(converted_names, converted_params):
             assert n not in expert_sd, n
-            expert_sd[n] = p
+            expert_sd[n] = p.cpu()
     return expert_sd
 
 
@@ -613,6 +613,10 @@ def save_weights_to_hf_with_mbridge_fast(
     # all-gather weights across the TP group and converts to HF format
     # Optimized via a single `all_gather_into_tensor_coalesced` call, which should be
     # faster than plain all_gather.
+    #
+    # Converted tensors are stashed on CPU and each gather buffer is popped as
+    # it is consumed, so the save never holds the gather transient plus the
+    # full HF state dict on GPU (OOMs memory-tight, e.g. colocated, setups).
     non_expert_sd = {}
     _all_gather_specs = []
     all_gather_outputs = {}
@@ -629,6 +633,7 @@ def save_weights_to_hf_with_mbridge_fast(
         )
         for s, gathered_param in zip(_all_gather_specs, _all_gather_outputs):
             all_gather_outputs[s.global_name] = gathered_param
+        del _all_gather_outputs
     for s in non_expert_specs:
         param = s.param
 
@@ -637,7 +642,7 @@ def save_weights_to_hf_with_mbridge_fast(
             if mpu.get_tensor_model_parallel_world_size() <= 1:
                 infer_params = [param]
             else:
-                infer_params = all_gather_outputs[s.global_name].chunk(
+                infer_params = all_gather_outputs.pop(s.global_name).chunk(
                     mpu.get_tensor_model_parallel_world_size(), dim=0
                 )
             # Convert TE FP8 -> torch bf16 -> torch FP8 and finally save the native torch FP8 model
@@ -666,7 +671,8 @@ def save_weights_to_hf_with_mbridge_fast(
         )
         for n, p in zip(converted_names, converted_params):
             assert n not in non_expert_sd, n
-            non_expert_sd[n] = p
+            non_expert_sd[n] = p.cpu()
+    torch.cuda.empty_cache()
     # Split the state dict into shards and save the process's own shard.
     shards = split_state_dict_into_shards(non_expert_sd, n_shards)
 
@@ -757,6 +763,7 @@ def save_weights_to_hf_with_mbridge_fast(
             )
             for s, gathered_param in zip(_all_gather_specs, _all_gather_outputs):
                 all_gather_outputs[s.global_name] = gathered_param
+            del _all_gather_outputs
         if stacked_experts and ep_size > 1:
             expert_sd = _emit_stacked_moe_expert_sd(
                 bridge,
@@ -817,6 +824,10 @@ def save_weights_to_hf_with_mbridge_fast(
             shard_idx = shard_offset + i
             for k in shard:
                 weight_map[k] = output_filename.format(shard=shard_idx + 1)
+        # Free per-rank tensors before the NCCL metadata gather: comm setup
+        # for ep_pp_group needs scratch GPU memory.
+        del shards, expert_sd, all_gather_outputs
+        torch.cuda.empty_cache()
         ep_pp_group = mpu.get_expert_tensor_model_pipeline_parallel_group()
         weight_map_list = [None for _ in range(dist.get_world_size(ep_pp_group))]
         dist.all_gather_object(

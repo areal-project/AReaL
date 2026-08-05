@@ -20,9 +20,12 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import json
 import os
 import signal
 import subprocess
+import tempfile
+import time
 import traceback
 from collections.abc import Callable
 from pathlib import Path
@@ -36,6 +39,66 @@ from areal.utils import logging
 from areal.utils.network import find_free_ports, format_hostport
 
 logger = logging.getLogger("Guard")
+
+_PORT_RESERVATION_TTL_S = 3600.0
+
+
+def _port_registry_path() -> Path:
+    return Path(
+        os.environ.get(
+            "AREAL_GUARD_PORT_REGISTRY",
+            f"/tmp/areal_guard_ports_{os.getuid()}.json",
+        )
+    )
+
+
+def _reserve_free_ports(count: int, exclude_ports: set[int]) -> list[int]:
+    """Reserve free ports across all guard processes on the same node."""
+    import fcntl
+
+    registry_path = _port_registry_path()
+    registry_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = registry_path.with_suffix(registry_path.suffix + ".lock")
+    now = time.time()
+
+    with open(lock_path, "a+") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            try:
+                with open(registry_path) as f:
+                    raw_registry = json.load(f)
+            except (FileNotFoundError, json.JSONDecodeError):
+                raw_registry = {}
+
+            registry = {
+                str(port): float(ts)
+                for port, ts in raw_registry.items()
+                if now - float(ts) < _PORT_RESERVATION_TTL_S
+            }
+            reserved_ports = {int(port) for port in registry}
+            ports = find_free_ports(
+                count, exclude_ports=set(exclude_ports) | reserved_ports
+            )
+
+            for port in ports:
+                registry[str(port)] = now
+
+            fd, tmp_path = tempfile.mkstemp(
+                prefix=registry_path.name + ".",
+                suffix=".tmp",
+                dir=registry_path.parent,
+            )
+            try:
+                with os.fdopen(fd, "w") as f:
+                    json.dump(registry, f, sort_keys=True)
+                os.replace(tmp_path, registry_path)
+            finally:
+                if os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
+
+            return ports
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 class GuardState:
@@ -215,7 +278,7 @@ def create_app(state: GuardState) -> Flask:
 
             s = get_state()
             with s.allocated_ports_lock:
-                ports = find_free_ports(count, exclude_ports=s.allocated_ports)
+                ports = _reserve_free_ports(count, exclude_ports=s.allocated_ports)
                 s.allocated_ports.update(ports)
 
             return jsonify({"status": "success", "ports": ports, "host": s.server_host})
@@ -290,7 +353,7 @@ def create_app(state: GuardState) -> Flask:
                 / (s.trial_name or "default")
             )
             log_dir.mkdir(parents=True, exist_ok=True)
-            log_file = log_dir / f"{role}.log"
+            log_file = log_dir / f"{role}-{worker_index}.log"
             merged_log = log_dir / "merged.log"
 
             logger.info(f"Forked worker logs will be written to: {log_file}")

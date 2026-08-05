@@ -72,6 +72,18 @@ class _FakeAsyncClient:
 
 
 class TestGatewayTrainControllerInitialization:
+    def test_init_awex_adapter_forwards_meta_server_address(self):
+        controller = _make_controller()
+        controller._worker_addrs = ["http://worker-0:18000", "http://worker-1:18000"]
+
+        with patch("requests.post") as mock_post:
+            controller.init_awex_adapter("127.0.0.1:12345")
+
+        assert mock_post.call_count == 2
+        for call in mock_post.call_args_list:
+            assert call.args[0].endswith("/awex/init_adapter")
+            assert call.kwargs["json"] == {"meta_server_addr": "127.0.0.1:12345"}
+
     @pytest.mark.asyncio
     async def test_async_initialize_offloads_scheduler_and_uses_async_helpers(self):
         worker0 = MagicMock(ip="127.0.0.1", worker_ports=[18000], id="guard-0")
@@ -162,3 +174,30 @@ class TestGatewayTrainControllerInitialization:
         assert controller._gateway_addr == "http://127.0.0.1:18080"
         assert controller.api_key is not None
         assert controller.api_key.startswith("ak-train-role-")
+
+
+def test_prepare_batch_forwards_partial_group_error_policy():
+    controller = _make_controller()
+    controller.rollout = MagicMock()
+    expected = [object()]
+    controller.rollout.prepare_batch.return_value = expected
+
+    result = controller.prepare_batch(
+        dataloader=object(),
+        workflow=object(),
+        workflow_kwargs={"key": "value"},
+        keep_partial_group_on_error=True,
+    )
+
+    assert result is expected
+    controller.rollout.prepare_batch.assert_called_once_with(
+        dataloader=controller.rollout.prepare_batch.call_args.kwargs["dataloader"],
+        workflow=controller.rollout.prepare_batch.call_args.kwargs["workflow"],
+        workflow_kwargs={"key": "value"},
+        should_accept_fn=None,
+        group_size=1,
+        dynamic_bs=False,
+        reward_normalization=False,
+        drop_incomplete_group=False,
+        keep_partial_group_on_error=True,
+    )

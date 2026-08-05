@@ -137,7 +137,6 @@ def find_free_ports(
 
     min_port, max_port = port_range
     free_ports = []
-    attempted_ports = set()
 
     # Calculate available port range. Only excluded ports that fall within
     # [min_port, max_port] reduce availability; out-of-range entries do not.
@@ -150,24 +149,20 @@ def find_free_ports(
             f"Only {available_range} ports available."
         )
 
-    max_attempts = count * 10  # Reasonable limit to avoid infinite loops
-    attempts = 0
+    # A small request must still probe enough of a busy node's port range.
+    # ``count * 10`` gives a single-port request only ten random chances and
+    # can fail spuriously when many services are colocated on the node.
+    candidates = [
+        port for port in range(min_port, max_port + 1) if port not in exclude_ports
+    ]
+    random.shuffle(candidates)
+    max_attempts = min(len(candidates), max(count * 10, 1024))
 
-    while len(free_ports) < count and attempts < max_attempts:
-        # Generate random port within range
-        port = random.randint(min_port, max_port)
-
-        # Skip if port already attempted or excluded
-        if port in attempted_ports or port in exclude_ports:
-            attempts += 1
-            continue
-
-        attempted_ports.add(port)
-
+    for port in candidates[:max_attempts]:
         if is_port_free(port):
             free_ports.append(port)
-
-        attempts += 1
+            if len(free_ports) == count:
+                break
 
     if len(free_ports) < count:
         raise ValueError(

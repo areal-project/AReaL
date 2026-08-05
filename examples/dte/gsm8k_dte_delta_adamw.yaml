@@ -1,0 +1,13 @@
+defaults:
+  - gsm8k_dte_base@_global_
+  - _self_
+
+experiment_name: gsm8k-dte-delta-adamw
+
+actor:
+  dte:
+    enabled: true
+    transfer: delta
+    delta_method: adamw
+    anchor_interval: 0
+    verify_snapshot: false

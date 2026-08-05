@@ -96,3 +96,11 @@ def test_find_free_ports_ignores_out_of_range_excludes():
         count=6, port_range=(10000, 10005), exclude_ports={50000}
     )
     assert len(ports) == 6
+
+
+def test_find_free_ports_checks_unique_candidates(monkeypatch):
+    network = _load_network_module()
+    monkeypatch.setattr(network.random, "shuffle", lambda candidates: None)
+    monkeypatch.setattr(network, "is_port_free", lambda port: port == 20010)
+
+    assert network.find_free_ports(1, port_range=(20000, 22000)) == [20010]

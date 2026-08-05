@@ -10,6 +10,7 @@ from typing import Any
 import httpx
 
 from areal.infra.utils.proc import kill_process_tree
+from areal.infra.utils.python import get_python_executable
 from areal.utils import logging
 from areal.utils.network import find_free_ports
 from areal.v2.weight_update.controller.config import (
@@ -45,7 +46,7 @@ class WeightUpdateController:
             port = find_free_ports(1)[0]
 
         cmd = [
-            sys.executable,
+            get_python_executable(),
             "-m",
             "areal.v2.weight_update.gateway",
             "--host",
@@ -68,7 +69,8 @@ class WeightUpdateController:
             stderr=sys.stdout,
         )
 
-        self._gateway_url = f"http://{cfg.host}:{port}"
+        client_host = "127.0.0.1" if cfg.host in ("0.0.0.0", "::") else cfg.host
+        self._gateway_url = f"http://{client_host}:{port}"
         self._session = httpx.Client()
         self._session.headers["Authorization"] = f"Bearer {cfg.admin_api_key}"
         self._wait_for_health()
@@ -155,12 +157,17 @@ class WeightUpdateController:
         )
         resp.raise_for_status()
         data = resp.json()
-        return WeightUpdateResult(
+        result = WeightUpdateResult(
             status=data["status"],
             version=data["version"],
             duration_ms=data["duration_ms"],
             error=data.get("error"),
         )
+        if result.status != "ok":
+            raise RuntimeError(
+                f"Weight update v{result.version} failed: {result.error or result.status}"
+            )
+        return result
 
     def disconnect(self) -> None:
         if self._pair_name is None:

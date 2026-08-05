@@ -256,7 +256,39 @@ class GenerationHyperparameters:
             )
         },
     )
+    keep_partial_group_on_error: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "If True, an exception raised by one of the n_samples rollouts "
+                "inside GroupedRolloutWorkflow is treated as a failed trajectory "
+                "(None) instead of failing the whole group, so the remaining "
+                "valid trajectories are kept. If False (default), the exception "
+                "propagates and the entire group is dropped. Mutually exclusive "
+                "with drop_incomplete_group. Note: the rollout-time "
+                "reward_normalization path still drops the whole group on any "
+                "failure regardless of this flag."
+            )
+        },
+    )
     # NOTE: to add new parameters, please correctly handle them in the `to_openai_args_dict` method.
+
+    def __post_init__(self):
+        if self.keep_partial_group_on_error and self.drop_incomplete_group:
+            raise ValueError(
+                "keep_partial_group_on_error and drop_incomplete_group are "
+                "mutually exclusive: the former keeps valid trajectories of a "
+                "partially-failed group while the latter drops the whole group."
+            )
+        if self.keep_partial_group_on_error:
+            from areal.utils.environ import is_single_controller
+
+            if not is_single_controller():
+                logger.warning(
+                    "keep_partial_group_on_error is not supported in SPMD mode "
+                    "(AREAL_SPMD_MODE=true) and will be disabled."
+                )
+                self.keep_partial_group_on_error = False
 
     def new(self, **kwargs):
         args = asdict(self)
@@ -310,6 +342,7 @@ class GenerationHyperparameters:
     _WORKFLOW_ONLY_ARGS: ClassVar[set[str]] = {
         "reward_normalization",
         "drop_incomplete_group",
+        "keep_partial_group_on_error",
     }
 
     def to_openai_args_dict(
@@ -936,11 +969,12 @@ class MegatronEngineConfig:
 
     # MoE
     moe_router_dtype: str | None = "fp32"
-    moe_shared_expert_overlap: bool = field(
-        default=False,
+    moe_shared_expert_overlap: bool | None = field(
+        default=None,
         metadata={
             "help": "Enable overlapping between shared expert computations and dispatcher communications. "
-            "Without this, the shared experts execute after the routed experts."
+            "Without this, the shared experts execute after the routed experts. "
+            "None keeps the model bridge's own default."
         },
     )
     moe_enable_deepep: bool = False
@@ -961,13 +995,14 @@ class MegatronEngineConfig:
             "Requires TransformerEngine >= 2.7.0.",
         },
     )
-    moe_router_bias_update_rate: float = field(
-        default=0.0,
+    moe_router_bias_update_rate: float | None = field(
+        default=None,
         metadata={
             "help": "Update rate for auxiliary-loss-free MoE load balancing "
             "(DeepSeek V3 style). Controls how fast expert_bias adjusts. "
-            "Default 0.0 disables bias updates; set a positive value such as "
-            "1e-3 to enable.",
+            "None keeps the model bridge's own default (AReaL bridges "
+            "disable it or derive it from the checkpoint). Set 0.0 to "
+            "disable explicitly; 1e-3 matches DeepSeek V3.",
         },
     )
     moe_z_loss_coeff: float | None = field(
@@ -1106,6 +1141,14 @@ class SchedulingSpec:
         },
     )
     # Slurm specific options
+    request_gpu_gres: bool = field(
+        default=True,
+        metadata={
+            "help": "Whether Slurm should request GPU GRES for this worker job. "
+            "Disable only for colocated jobs that share an existing GPU "
+            "allocation."
+        },
+    )
     srun_additional_args: str = field(
         default="--unbuffered --mpi=pmi2 -K --chdir $PWD",
         metadata={
@@ -1135,6 +1178,16 @@ class SchedulingSpec:
     exclude: str | None = field(
         default=None, metadata={"help": "sbatch/srun's `--exclude` option for slurm."}
     )
+    reservation: str | None = field(
+        default=None,
+        metadata={"help": "sbatch's `--reservation` option for slurm."},
+    )
+    exclusive: bool = field(
+        default=False,
+        metadata={
+            "help": "sbatch's `--exclusive` option for slurm. Ensures nodes are not shared with other jobs."
+        },
+    )
     ray_placement_strategy: str | None = field(
         default=None,
         metadata={
@@ -1152,6 +1205,94 @@ class SchedulingSpec:
                 DeprecationWarning,
                 stacklevel=2,
             )
+
+
+@dataclass
+class DTEConfig:
+    """Configuration for DTE-backed colocated weight updates."""
+
+    enabled: bool | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Enable DTE colocated weight update. None keeps backward "
+                "compatibility with environment variables."
+            )
+        },
+    )
+    transfer: str | None = field(
+        default="full",
+        metadata={
+            "help": (
+                "Weight transfer type: 'full' sends full weights every update; "
+                "'delta' sends a full first update, then DTE deltas."
+            ),
+            "choices": ["full", "delta", None],
+        },
+    )
+    delta_method: str | None = field(
+        default=None,
+        metadata={
+            "help": "How DTE delta mode finds changed weights.",
+            "choices": ["snapshot", "adamw", None],
+        },
+    )
+    anchor_interval: int | None = field(
+        default=0,
+        metadata={"help": "Force a full sync every N deltas. 0 means never."},
+    )
+    bytes_ratio: float | None = field(
+        default=None,
+        metadata={"help": "Per-tensor sparse-vs-dense fallback ratio."},
+    )
+    verify_snapshot: bool | None = field(
+        default=False,
+        metadata={
+            "help": (
+                "Debug only: keep a CPU snapshot and compare it with DTE "
+                "inversion masks."
+            )
+        },
+    )
+    release_train_weights_after_update: bool | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Release training weights after a colocated update so rollout can "
+                "reuse the shared GPU memory."
+            )
+        },
+    )
+    release_initial_rollout_weights: bool | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Release rollout weights during trainer startup. None disables this "
+                "for DTE/AWEX colocation because no weight-update payload has rebuilt "
+                "the rollout weights yet: a released server would generate the whole "
+                "step-1 batch from blank memory (uniform logits)."
+            )
+        },
+    )
+    sync_model_params_before_payload: bool | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Refresh Megatron model-visible params from optimizer main params "
+                "before building the DTE payload."
+            )
+        },
+    )
+    inversion_debug: bool | None = field(
+        default=None,
+        metadata={"help": "Enable verbose DTE inversion debug logging."},
+    )
+    inversion_bf16_margin_rel: float | None = field(
+        default=None,
+        metadata={
+            "help": "Relative BF16 rounding-boundary margin for inversion masks."
+        },
+    )
 
 
 @dataclass
@@ -1237,8 +1378,12 @@ class TrainEngineConfig:
 
     weight_update_mode: str = field(
         default="xccl",
-        metadata={"help": "Weight update backend type.", "choices": ["disk", "xccl"]},
+        metadata={
+            "help": "Weight update backend type.",
+            "choices": ["disk", "xccl", "awex"],
+        },
     )
+    dte: DTEConfig = field(default_factory=DTEConfig)
     fsdp: FSDPEngineConfig = field(default_factory=FSDPEngineConfig)
     archon: ArchonEngineConfig = field(default_factory=ArchonEngineConfig)
     megatron: MegatronEngineConfig = field(default_factory=MegatronEngineConfig)
@@ -1482,7 +1627,7 @@ class RejectionSamplingConfig:
 
         _VALID_LEVELS = ("token", "sequence")
         _VALID_ACTIONS = ("mask", "clamp")
-        _VALID_METRICS = ("ratio", "kl_k1", "kl_k2", "kl_k3")
+        _VALID_METRICS = ("ratio", "kl_k1", "kl_k2", "kl_k3", "binary_kl")
         _VALID_AGGS = ("sum", "mean", "max")
 
         # Validate enum-like fields.
@@ -1997,7 +2142,22 @@ class SGLangConfig:
     triton_attention_reduce_in_fp32: bool = False
     triton_attention_num_kv_splits: int = 8
     num_continuous_decode_steps: int = 1
+    load_format: str = "auto"
     enable_memory_saver: bool = False
+    # Back the memory-saver "weights" region with a host copy: pause offloads
+    # the weights to CPU and resume restores them. Required for DTE delta
+    # transfer in colocation — the receiver patches weights in place, so the
+    # pre-update contents (the delta BASE) must survive the release/resume
+    # cycle. FULL transfers rebuild every param and do not need this.
+    enable_weights_cpu_backup: bool = False
+    # "model" (sglang default) seeds per-request sampling defaults from the
+    # checkpoint's generation_config.json; models that ship opinionated
+    # defaults (Qwen3: temperature 0.6/top_k 20/top_p 0.95) then silently
+    # sharpen sampling for any field the request leaves unset, and the served
+    # behavior logprobs no longer match a neutral replay of the same tokens
+    # (observed +0.6 nats vs HF/megatron on Qwen3-30B). "openai" keeps
+    # neutral defaults so RL rollouts sample exactly what gconfig asks for.
+    sampling_defaults: str = "openai"
     allow_auto_truncate: bool = False
     attention_backend: str | None = "fa3"
     enable_multimodal: bool = False
@@ -2036,11 +2196,56 @@ class SGLangConfig:
     # NOTE: These arguments will be parsed into a dict json-string
     # and passed as `model_loader_extra_config` to SGLang.
     enable_multithread_load: bool = False
+    # Optional JSON string merged into the HuggingFace config before SGLang
+    # picks the model class.
+    json_model_override_args: str = "{}"
+    mamba_full_memory_ratio: float = 0.9
 
     # Internal field, not exposed to users.
     enable_return_routed_experts: bool = False
 
     # Use staticmethod to make OmegaConf happy.
+    @staticmethod
+    def _ensure_supported_sglang_args(args: dict[str, Any]) -> None:
+        target_version = "0.5.10.post1"
+        try:
+            if pkg_version.is_version_greater_or_equal("sglang", target_version):
+                return
+        except Exception:
+            pass
+
+        try:
+            from sglang.srt.server_args import ServerArgs
+        except Exception as exc:
+            raise RuntimeError(
+                f"Needs sglang>={target_version} to run the code."
+            ) from exc
+
+        server_fields = getattr(ServerArgs, "__dataclass_fields__", {})
+
+        def will_emit_arg(value: Any) -> bool:
+            return not (
+                value is None
+                or value is False
+                or value == ""
+                or (isinstance(value, list) and not value)
+            )
+
+        missing = sorted(
+            k for k, v in args.items() if k not in server_fields and will_emit_arg(v)
+        )
+        if missing:
+            raise RuntimeError(
+                f"Needs sglang>={target_version} to run the code; "
+                f"current sglang ServerArgs is missing: {missing}"
+            )
+
+        logger.warning(
+            "Installed sglang package version is below %s, but imported ServerArgs "
+            "supports the required launch fields; continuing with patched sglang.",
+            target_version,
+        )
+
     @staticmethod
     def build_cmd(
         sglang_config: "SGLangConfig",
@@ -2085,6 +2290,7 @@ class SGLangConfig:
     ):
         # Map "all-linear" to "all"
         args: dict = conf_as_dict(sglang_config)
+        load_format = args.pop("load_format", "auto")
         if sglang_config.enable_multithread_load:
             model_loader_extra_config = dict(
                 enable_multithread_load=sglang_config.enable_multithread_load,
@@ -2098,7 +2304,7 @@ class SGLangConfig:
             # Model and tokenizer
             tokenizer_path=sglang_config.model_path,
             tokenizer_mode="auto",
-            load_format="auto",
+            load_format=load_format,
             trust_remote_code=True,
             is_embedding=False,
             # Other runtime options
@@ -2117,8 +2323,7 @@ class SGLangConfig:
             args["host"] = host
         if port is not None:
             args["port"] = port
-        if not pkg_version.is_version_greater_or_equal("sglang", "0.5.10.post1"):
-            raise RuntimeError("Needs sglang>=0.5.10.post1 to run the code.")
+        SGLangConfig._ensure_supported_sglang_args(args)
         return args
 
 
@@ -2182,6 +2387,36 @@ class AgentConfig:
     reasoning_parser: str = field(
         default="qwen3",
         metadata={"help": "Parser for reasoning content (<think> tags)."},
+    )
+    chat_template_kwargs: dict = field(
+        default_factory=dict,
+        metadata={
+            "help": "Default kwargs forwarded to tokenizer.apply_chat_template "
+            "for every request (session metadata and per-request "
+            "extra_body.chat_template_kwargs override). E.g. "
+            "{'thinking_option': 'auto'} for Bailing v3 templates."
+        },
+    )
+    think_mode: str = field(
+        default="",
+        metadata={
+            "help": "Per-GRPO-group thinking switch sampled at session start: "
+            "'' (disabled), 'on', 'off', 'auto', or 'fusion' (coin flip "
+            "between on/off with think_prob). Dataset rows may override via "
+            "a 'think_mode' field. Requires an adaptive-thinking chat "
+            "template (Bailing v3 midtrain). The sampled mode is locked for "
+            "the whole session (requests cannot override thinking keys) and "
+            "is stamped on exported interactions. Not supported with "
+            "mode='online' (workflow does not start those sessions).",
+            "choices": ["", "on", "off", "auto", "fusion"],
+        },
+    )
+    think_prob: float = field(
+        default=0.5,
+        metadata={
+            "help": "P(thinking on) for think_mode='fusion'; sampled once "
+            "per GRPO group so same-group rollouts share one prompt."
+        },
     )
     chat_template_type: str = field(
         default="hf",
@@ -2276,6 +2511,19 @@ class AgentConfig:
             raise ValueError(
                 "set_reward_finish_timeout must be non-negative, "
                 f"got {self.set_reward_finish_timeout}"
+            )
+        valid_think_modes = ("", "on", "off", "auto", "fusion")
+        if self.think_mode not in valid_think_modes:
+            raise ValueError(
+                f"think_mode must be one of {valid_think_modes}, "
+                f"got {self.think_mode!r}"
+            )
+        if not 0.0 <= self.think_prob <= 1.0:
+            raise ValueError(f"think_prob must be in [0, 1], got {self.think_prob}")
+        if self.think_mode and self.mode == "online":
+            raise ValueError(
+                "think_mode is not supported with mode='online': external "
+                "user sessions are not started by the rollout workflow."
             )
 
 
@@ -2836,6 +3084,25 @@ class ClusterSpecConfig:
         default=8,
         metadata={"help": "Number of GPUs per node (physical)."},
     )
+    ray_port: int = field(
+        default=6379,
+        metadata={
+            "help": "Port of the Ray head (GCS). Used by the in-package Ray "
+            "bootstrap of the Ray launcher when assembling a multi-node "
+            "cluster inside a platform job."
+        },
+    )
+    ray_dashboard_port: int = field(
+        default=8265,
+        metadata={"help": "Port of the Ray dashboard on the head node."},
+    )
+    ray_bootstrap_timeout_seconds: int = field(
+        default=900,
+        metadata={
+            "help": "How long the Ray bootstrap head waits for all "
+            "cluster.n_nodes nodes to join before failing."
+        },
+    )
 
 
 @dataclass
@@ -3204,6 +3471,20 @@ class PPOConfig(BaseExperimentConfig):
             "This results in variable-sized batches of valid data."
         },
     )
+    # NOTE: not annotated as Literal["rollout", "post_batch"] because the
+    # pinned OmegaConf version rejects Literal annotations in structured
+    # configs. Validated in __post_init__ instead.
+    dynamic_filter_mode: str = field(
+        default="rollout",
+        metadata={
+            "help": "When to apply the dynamic filter (dynamic_filter_fn passed to "
+            "PPOTrainer.train). 'rollout' (default): filter each group at rollout time "
+            "on workers; with a fixed batch size, rejected groups are replaced by "
+            "re-sampling new prompts. 'post_batch': filter in the trainer process after "
+            "the whole batch has been collected; rejected groups are dropped without "
+            "re-sampling, so the batch may shrink (same contract as dynamic_bs=True)."
+        },
+    )
 
     def __post_init__(self):
         """Validate the eval generation config."""
@@ -3221,6 +3502,11 @@ class PPOConfig(BaseExperimentConfig):
         # the engine config. Single source of truth: gconfig.lora_name.
         if self.rollout.use_lora and not self.rollout.lora_name:
             self.rollout.lora_name = self.gconfig.lora_name
+        if self.dynamic_filter_mode not in ("rollout", "post_batch"):
+            raise ValueError(
+                f"dynamic_filter_mode must be 'rollout' or 'post_batch', "
+                f"got {self.dynamic_filter_mode!r}"
+            )
         super().__post_init__()
 
 

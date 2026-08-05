@@ -180,6 +180,12 @@ def create_engine_module(
                 kwargs,
                 require_broadcast=True,
             )
+            engine = require_engine()
+            if engine.initialized and not engine.is_data_parallel_head():
+                # DataProxy only consumes DP-head results. Non-head ranks still
+                # execute the method for collectives, but remotizing their large
+                # tensor results stores unreachable shards in local _storage.
+                return None
             return RTensor.remotize(result, node_addr=get_node_addr())
 
         ep_name = (
@@ -261,6 +267,7 @@ def create_engine_module(
     _register_engine_route("/load", "load")
     _register_engine_route("/offload", "offload")
     _register_engine_route("/onload", "onload")
+    _register_engine_route("/init_awex_adapter", "init_awex_adapter")
     _register_engine_route("/optimizer_zero_grad", "optimizer_zero_grad")
     _register_engine_route("/optimizer_step", "optimizer_step")
     _register_engine_route("/step_lr_scheduler", "step_lr_scheduler")

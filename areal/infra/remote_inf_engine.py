@@ -14,7 +14,7 @@ from concurrent.futures import Future
 from datetime import datetime
 from logging import Logger
 from threading import Lock
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
 import aiohttp
 import numpy as np
@@ -67,6 +67,26 @@ RID_CACHE_SIZE = 128
 logger = logging.getLogger("RemoteInfEngine")
 
 
+def _gpu_memory_snapshot() -> str:
+    try:
+        result = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=index,memory.used,memory.total,utilization.gpu",
+                "--format=csv,noheader,nounits",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except Exception as exc:
+        return f"<unavailable: {exc}>"
+    if result.returncode != 0:
+        return f"<nvidia-smi rc={result.returncode}: {result.stderr.strip()}>"
+    return result.stdout.strip().replace("\n", " | ")
+
+
 class GroupedRolloutWorkflow(RolloutWorkflow):
     def __init__(
         self,
@@ -75,23 +95,55 @@ class GroupedRolloutWorkflow(RolloutWorkflow):
         logger: Logger,
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
+        keep_partial_group_on_error: bool = False,
     ):
         if group_size < 1:
             raise ValueError(f"group_size must be >= 1, got {group_size}")
+        if keep_partial_group_on_error and drop_incomplete_group:
+            raise ValueError(
+                "keep_partial_group_on_error and drop_incomplete_group are "
+                "mutually exclusive: the former keeps valid trajectories of a "
+                "partially-failed group while the latter drops the whole group."
+            )
         self.workflow = workflow
         self.group_size = group_size
         self.logger = logger
         self.reward_normalization = reward_normalization
         self.drop_incomplete_group = drop_incomplete_group
+        self.keep_partial_group_on_error = keep_partial_group_on_error
 
     async def arun_episode(
         self, engine: InferenceEngine, data: dict[str, Any]
     ) -> dict[str, Any] | None:
         from areal.experimental.openai import InteractionWithTokenLogpReward
 
-        results = await asyncio.gather(
-            *[self.workflow.arun_episode(engine, data) for _ in range(self.group_size)]
+        raw_results = await asyncio.gather(
+            *[self.workflow.arun_episode(engine, data) for _ in range(self.group_size)],
+            return_exceptions=self.keep_partial_group_on_error,
         )
+
+        results: list[dict[str, Any] | None] = []
+        if self.keep_partial_group_on_error:
+            # Exceptions from individual rollouts are treated as failed
+            # trajectories (None) so the remaining valid ones are kept.
+            # CancelledError must keep propagating to preserve abort/shutdown
+            # semantics; other BaseExceptions (e.g. KeyboardInterrupt) are
+            # not swallowed either.
+            for i, r in enumerate(raw_results):
+                if isinstance(r, BaseException):
+                    if not isinstance(r, Exception):
+                        raise r
+                    self.logger.warning(
+                        f"GroupedRolloutWorkflow: rollout {i} raised "
+                        f"{type(r).__name__}: {r}. Treating it as a failed "
+                        "trajectory (keep_partial_group_on_error=True).",
+                        exc_info=r,
+                    )
+                    results.append(None)
+                else:
+                    results.append(r)
+        else:
+            results = cast("list[dict[str, Any] | None]", list(raw_results))
 
         valid_results = [r for r in results if r is not None]
 
@@ -353,7 +405,11 @@ class RemoteInfBackendProtocol(Protocol):
         """
         ...
 
-    def get_offload_request(self) -> HttpRequest:
+    def get_abort_all_request(self) -> HttpRequest:
+        """Get request to abort all in-flight requests."""
+        ...
+
+    def get_offload_request(self, tags: list[str] | None = None) -> HttpRequest:
         """Get request to offload model memory.
 
         Returns
@@ -452,11 +508,40 @@ class RemoteInfEngine(InferenceEngine):
         except ValueError:
             base_url = f"http://{address}"
         tik = time.time()
+        last_report = tik
         while time.time() - tik < self.config.setup_timeout:
+            if process is not None and process.poll() is not None:
+                raise RuntimeError(
+                    f"Inference server process (pid={process.pid}) exited with "
+                    f"code {process.returncode} before becoming healthy at "
+                    f"{address}. Search the worker log above for the server "
+                    "traceback (e.g. scheduler init errors, port EADDRINUSE)."
+                )
             if self.check_health(base_url):
                 return
+            if process is not None and process.poll() is not None:
+                raise RuntimeError(
+                    "server process exited before becoming healthy: "
+                    f"address={address}, returncode={process.returncode}, "
+                    f"gpu_memory={_gpu_memory_snapshot()}, "
+                    f"cmd={process.args!r}"
+                )
+            now = time.time()
+            if now - last_report >= 60:
+                logger.info(
+                    "Still waiting for inference server at %s to become "
+                    "healthy (%.0fs elapsed, timeout %.0fs, process alive=%s)",
+                    address,
+                    now - tik,
+                    self.config.setup_timeout,
+                    process is not None and process.poll() is None,
+                )
+                last_report = now
             time.sleep(1)
-        raise TimeoutError("server launch failed")
+        raise TimeoutError(
+            f"Inference server at {address} failed to become healthy within "
+            f"{self.config.setup_timeout}s"
+        )
 
     def check_health(self, base_url):
         """Check if server is healthy."""
@@ -665,7 +750,9 @@ class RemoteInfEngine(InferenceEngine):
             export_style=agent_cfg.export_style,
             subproc_max_workers=agent_cfg.subproc_max_workers,
             proxy_gateway_addr=self._proxy_gateway_addr,
-            drop_retry_orphans=agent_cfg.drop_retry_orphans,
+            drop_retry_orphans=getattr(agent_cfg, "drop_retry_orphans", False),
+            think_mode=getattr(agent_cfg, "think_mode", ""),
+            think_prob=getattr(agent_cfg, "think_prob", 0.5),
         )
 
     def _resolve_workflow(
@@ -676,6 +763,7 @@ class RemoteInfEngine(InferenceEngine):
         proxy_addr: str | None = None,
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
+        keep_partial_group_on_error: bool = False,
     ) -> RolloutWorkflow:
         resolved: RolloutWorkflow
 
@@ -697,6 +785,7 @@ class RemoteInfEngine(InferenceEngine):
                     self.logger,
                     reward_normalization=reward_normalization,
                     drop_incomplete_group=drop_incomplete_group,
+                    keep_partial_group_on_error=keep_partial_group_on_error,
                 )
             return resolved
 
@@ -794,6 +883,7 @@ class RemoteInfEngine(InferenceEngine):
                 self.logger,
                 reward_normalization=reward_normalization,
                 drop_incomplete_group=drop_incomplete_group,
+                keep_partial_group_on_error=keep_partial_group_on_error,
             )
 
         return resolved
@@ -928,6 +1018,18 @@ class RemoteInfEngine(InferenceEngine):
         # Deal with rollout interruption
         stop_reason = None
         ori_max_new_tokens = gconfig.max_new_tokens
+        # Debug tracing for slow/hanging generations: SWE CC episodes were
+        # timing out at the client side (240s) with zero output while the
+        # proxy showed no log lines after prompt construction, leaving it
+        # ambiguous whether the request ever reached SGLang or decoding was
+        # simply slower than the client timeout. Log one line per round trip.
+        logger.debug(
+            "agenerate start: rid=%s server=%s prompt_len=%d max_new_tokens=%d",
+            req.rid,
+            server_addr,
+            len(req.input_ids),
+            ori_max_new_tokens,
+        )
         while (
             stop_reason not in ["stop", "tool_calls", "length"]
             and len(accumulated_output_tokens) < ori_max_new_tokens
@@ -951,6 +1053,7 @@ class RemoteInfEngine(InferenceEngine):
             )
 
             # Loop until the generation is complete
+            round_start = time.perf_counter()
             result = await arequest_with_retry(
                 session=session,
                 addr=server_addr,
@@ -970,6 +1073,15 @@ class RemoteInfEngine(InferenceEngine):
             # Parse response using backend
             gen_result = self.backend.parse_generation_response(result)
             stop_reason = gen_result.stop_reason
+            logger.info(
+                "agenerate round done: rid=%s round_elapsed=%.1fs "
+                "round_tokens=%d total_tokens=%d stop_reason=%s",
+                req.rid,
+                time.perf_counter() - round_start,
+                len(gen_result.output_tokens),
+                len(accumulated_output_tokens) + len(gen_result.output_tokens),
+                stop_reason,
+            )
 
             if (
                 req.metadata.get("return_routed_experts", False)
@@ -1009,6 +1121,13 @@ class RemoteInfEngine(InferenceEngine):
             stop_reason = "length"
 
         latency = time.perf_counter() - start_time
+        logger.info(
+            "agenerate done: rid=%s elapsed=%.1fs output_tokens=%d stop_reason=%s",
+            req.rid,
+            latency,
+            len(accumulated_output_tokens),
+            stop_reason,
+        )
 
         accumulated_routed_experts = (
             np.concatenate(accumulated_routed_experts)
@@ -1183,6 +1302,7 @@ class RemoteInfEngine(InferenceEngine):
         proxy_addr: str | None = None,
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
+        keep_partial_group_on_error: bool = False,
     ) -> int:
         """Submit a request to the inference engine and return immediately.
 
@@ -1225,6 +1345,7 @@ class RemoteInfEngine(InferenceEngine):
             proxy_addr=proxy_addr,
             reward_normalization=reward_normalization,
             drop_incomplete_group=drop_incomplete_group,
+            keep_partial_group_on_error=keep_partial_group_on_error,
         )
         resolved_should_accept_fn = self._resolve_should_accept_fn(should_accept_fn)
 
@@ -1274,6 +1395,7 @@ class RemoteInfEngine(InferenceEngine):
         group_size: int = 1,
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
+        keep_partial_group_on_error: bool = False,
     ) -> list[dict[str, Any]]:
         """Submit a batch of requests and wait for results.
 
@@ -1308,6 +1430,7 @@ class RemoteInfEngine(InferenceEngine):
             group_size,
             reward_normalization=reward_normalization,
             drop_incomplete_group=drop_incomplete_group,
+            keep_partial_group_on_error=keep_partial_group_on_error,
         )
 
         return self.workflow_executor.rollout_batch(
@@ -1325,6 +1448,7 @@ class RemoteInfEngine(InferenceEngine):
         dynamic_bs: bool = False,
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
+        keep_partial_group_on_error: bool = False,
     ) -> list[dict[str, Any]]:
         """Asynchronously submit and wait until a full batch is ready.
 
@@ -1360,6 +1484,7 @@ class RemoteInfEngine(InferenceEngine):
             group_size,
             reward_normalization=reward_normalization,
             drop_incomplete_group=drop_incomplete_group,
+            keep_partial_group_on_error=keep_partial_group_on_error,
         )
         resolved_should_accept_fn = self._resolve_should_accept_fn(should_accept_fn)
 
@@ -1378,7 +1503,12 @@ class RemoteInfEngine(InferenceEngine):
 
         # The above http request may require some time to be scheduled and executed.
         # The following line waits until all requests are indeed dropped.
-        time.sleep(self.config.pause_grace_period)
+        if self.config.pause_grace_period > 0:
+            self.logger.info(
+                "Waiting %.1fs after pause_generation for in-flight requests to drop",
+                self.config.pause_grace_period,
+            )
+            time.sleep(self.config.pause_grace_period)
 
     @trace_perf("remote_inf_engine.continue_generation", category="misc")
     def continue_generation(self):
@@ -1396,10 +1526,22 @@ class RemoteInfEngine(InferenceEngine):
         """Resume request submission for async rollout."""
         return self.workflow_executor.resume()
 
-    def offload(self) -> None:
+    def offload(self, tags: list[str] | None = None) -> None:
         """Offload model memory on all servers."""
-        offload_req = self.backend.get_offload_request()
+        offload_req = self.backend.get_offload_request(tags=tags)
+        self.logger.info(
+            "RemoteInfEngine.offload(tags=%s) sending to %s: endpoint=%s",
+            tags,
+            self.addresses,
+            offload_req.endpoint,
+        )
         self._run_request_on_all_servers(offload_req)
+        self.logger.info("RemoteInfEngine.offload(tags=%s) completed", tags)
+
+    def abort_all_requests(self) -> None:
+        """Abort all in-flight requests on all servers."""
+        abort_req = self.backend.get_abort_all_request()
+        self._run_request_on_all_servers(abort_req)
 
     def onload(self, tags: list[str] | None = None) -> None:
         """Onload model memory on all servers."""
@@ -1432,8 +1574,10 @@ class RemoteInfEngine(InferenceEngine):
 
     def launch_server(self, server_args: dict[str, Any]) -> LocalInfServerInfo:
         """Launch a local inference server."""
-        server_args["host"] = gethostip()
-        server_args["port"] = find_free_ports(1)[0]
+        if "host" not in server_args:
+            server_args["host"] = gethostip()
+        if "port" not in server_args:
+            server_args["port"] = find_free_ports(1)[0]
         process = self.backend.launch_server(server_args)
         address = format_hostport(server_args["host"], server_args["port"])
         server_info = LocalInfServerInfo(
@@ -1449,6 +1593,9 @@ class RemoteInfEngine(InferenceEngine):
             logger.warning(
                 f"Launch local server timeouted at {address} after {self.config.setup_timeout}s."
             )
+            self._shutdown_one_server(server_info)
+            raise
+        except RuntimeError:
             self._shutdown_one_server(server_info)
             raise
 

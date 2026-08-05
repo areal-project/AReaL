@@ -34,6 +34,7 @@ from areal.api.cli_args import (
     InferenceEngineConfig,
     PerfTracerConfig,
     SchedulingSpec,
+    SchedulingStrategyType,
 )
 from areal.infra.rpc.serialization import deserialize_value
 from areal.infra.utils.concurrent import run_async_task
@@ -63,6 +64,7 @@ class _RemoteRolloutTaskInput:
     proxy_addr: str | None = None
     reward_normalization: bool = False
     drop_incomplete_group: bool = False
+    keep_partial_group_on_error: bool = False
 
 
 @dataclass
@@ -89,6 +91,7 @@ class RolloutController:
         self.workers: list[Worker] = []  # List of Worker objects from scheduler
         self.server_infos: list[LocalInfServerInfo] = []
         self._worker_role: str
+        self._gpus_per_server: int = 1
 
         # Round-robin scheduling
         self._current_worker_idx = 0
@@ -174,6 +177,7 @@ class RolloutController:
             self.rollout_alloc.parallel.tp_size * self.rollout_alloc.parallel.pp_size
         )
         dp_size = self.rollout_alloc.parallel.dp_size
+        self._gpus_per_server = instance_size
 
         # The first element of `self.config.scheduling_spec` is the resource spec
         # of workers, aka the RPC server process. Since a worker exactly matches
@@ -183,6 +187,13 @@ class RolloutController:
         sch_spec = SchedulingSpec(**asdict(self.config.scheduling_spec[0]))
         sch_spec.cpu *= instance_size
         sch_spec.mem *= instance_size
+        if (
+            self.config.scheduling_strategy.type
+            == SchedulingStrategyType.colocation.value
+        ):
+            # Colocated rollout jobs share the actor's GPU-allocated nodes:
+            # request no second GRES allocation so Slurm packs them.
+            sch_spec.request_gpu_gres = False
         if sch_spec.gpu > 0:
             sch_spec.gpu = instance_size
 
@@ -292,7 +303,73 @@ class RolloutController:
                 )
             ]
             await asyncio.gather(*tasks)
+        elif (
+            self.config.scheduling_strategy.type
+            == SchedulingStrategyType.colocation.value
+        ):
+            # Colocation (AWEX) path: multiple servers share a node, so SLURM does
+            # NOT isolate GPUs per worker. We must compute base_gpu_id explicitly and
+            # inject `_awex_gpus_per_server` so the worker recomputes base_gpu_id from
+            # its own SLURM_LOCALID at runtime (the only value guaranteed unique per
+            # node-slot). See SGLangBackend.launch_server.
+            #
+            # NOTE: this assumes a server fits within one node
+            # (gpus_per_server <= n_gpus_per_node). Cross-node TP servers would
+            # collapse slots_per_node to 1 and collide; only the SLURM_LOCALID
+            # path is collision-safe in that case.
+            slots_per_node = max(
+                1,
+                getattr(self.scheduler, "n_gpus_per_node", 8) // self._gpus_per_server,
+            )
+            launch_tasks = []
+            for rank, worker in enumerate(self.workers):
+                per_worker_args = {
+                    **server_args,
+                    "base_gpu_id": (rank % slots_per_node) * self._gpus_per_server,
+                    "_awex_gpus_per_server": self._gpus_per_server,
+                }
+                if len(worker.worker_ports) > 1:
+                    dist_init_port = int(worker.worker_ports[1])
+                    per_worker_args.setdefault(
+                        "dist_init_addr", f"localhost:{dist_init_port}"
+                    )
+                    per_worker_args.setdefault("nccl_port", dist_init_port)
+                else:
+                    logger.warning(
+                        "Colocated rollout worker %s has no extra allocated port "
+                        "for SGLang dist_init_addr; falling back to SGLang dynamic port",
+                        worker.id,
+                    )
+                launch_tasks.append(
+                    self.scheduler.async_call_engine(
+                        worker_id=worker.id,
+                        method="launch_server",
+                        engine_name=self._engine_name(rank),
+                        server_args=per_worker_args,
+                    )
+                )
+            self.server_infos = await asyncio.gather(*launch_tasks)
+            tasks = [
+                self.scheduler.async_call_engine(
+                    worker_id=worker.id,
+                    method="initialize",
+                    engine_name=self._engine_name(rank),
+                    engine_id=str(rank),
+                    addr=f"{info.host}:{info.port}",
+                    *args,
+                    **kwargs,
+                )
+                for rank, (worker, info) in enumerate(
+                    zip(self.workers, self.server_infos)
+                )
+            ]
+            await asyncio.gather(*tasks)
         else:
+            # Separation path: each rollout server gets its own SLURM-isolated GPUs,
+            # so we must NOT override base_gpu_id (SLURM already sets
+            # CUDA_VISIBLE_DEVICES per worker). Use the collective launch + addr-less
+            # initialize that the verified disaggregated baseline relies on; the
+            # worker discovers its server address via name_resolve.
             self.server_infos = await self._collective_rpc_async(
                 "launch_server", server_args=server_args
             )
@@ -301,7 +378,6 @@ class RolloutController:
                     worker_id=worker.id,
                     method="initialize",
                     engine_name=self._engine_name(rank),
-                    # args in `engine_api`
                     engine_id=str(rank),
                     *args,
                     **kwargs,
@@ -319,6 +395,12 @@ class RolloutController:
 
         self._stop_callback_server()
 
+        # Agent proxy workers can keep streaming requests to rollout engines.
+        # Stop them before tearing down SGLang/vLLM workers, otherwise in-flight
+        # proxy requests retry against already-closed /generate endpoints and
+        # spam teardown logs with connection errors.
+        self._destroy_proxy_workers()
+
         self._collective_rpc("destroy", http_timeout=60.0)
 
         # Delete workers via scheduler
@@ -330,7 +412,14 @@ class RolloutController:
             except Exception:
                 logger.error(f"Error deleting workers: {traceback.format_exc()}")
 
-        # Delete proxy workers if initialized
+        with self._futures_lock:
+            self._pending_futures.clear()
+
+    def _destroy_proxy_workers(self):
+        # Shutdown proxy gateway if initialized so it stops routing new traffic.
+        self._stop_proxy_gateway()
+
+        # Delete proxy workers if initialized.
         if self._proxy_started:
             try:
                 self.scheduler.delete_workers(role=self._proxy_role)
@@ -340,11 +429,6 @@ class RolloutController:
                 logger.info("Proxy workers deleted")
             except Exception:
                 logger.error(f"Error deleting proxy workers: {traceback.format_exc()}")
-
-        # Shutdown proxy gateway if initialized
-        self._stop_proxy_gateway()
-        with self._futures_lock:
-            self._pending_futures.clear()
 
     def start_proxy(self) -> None:
         """Initialize proxy workers for AgentWorkflow support.
@@ -588,6 +672,20 @@ class RolloutController:
             self._callback_loop.run_until_complete(self.continue_generation())
             return jsonify({"status": "ok"})
 
+        @app.route("/callback/onload", methods=["POST"])
+        def onload():
+            payload = request.get_json() or {}
+            tags = payload.get("tags")
+            self.onload(tags=tags)
+            return jsonify({"status": "ok"})
+
+        @app.route("/callback/offload", methods=["POST"])
+        def offload():
+            payload = request.get_json() or {}
+            tags = payload.get("tags")
+            self.offload(tags=tags)
+            return jsonify({"status": "ok"})
+
         @app.route("/callback/rollout_complete", methods=["POST"])
         def rollout_complete():
             payload = request.get_json() or {}
@@ -815,6 +913,7 @@ class RolloutController:
                     proxy_addr=proxy_addr,
                     reward_normalization=pending_task.reward_normalization,
                     drop_incomplete_group=pending_task.drop_incomplete_group,
+                    keep_partial_group_on_error=pending_task.keep_partial_group_on_error,
                 )
 
                 assert task_id == engine_task_id, (task_id, engine_task_id)
@@ -879,6 +978,7 @@ class RolloutController:
         proxy_addr: str | None = None,
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
+        keep_partial_group_on_error: bool = False,
     ) -> int:
         workflow_str = self._resolve_workflow_str(workflow)
         should_accept_fn = self._resolve_should_accept_fn(should_accept_fn)
@@ -898,9 +998,10 @@ class RolloutController:
             task_id=task_id,
             is_eval=is_eval,
             group_size=group_size,
-            proxy_addr=proxy_addr,
             reward_normalization=reward_normalization,
             drop_incomplete_group=drop_incomplete_group,
+            keep_partial_group_on_error=keep_partial_group_on_error,
+            proxy_addr=proxy_addr,
         )
 
         # Delegate to dispatcher
@@ -928,6 +1029,7 @@ class RolloutController:
         group_size: int = 1,
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
+        keep_partial_group_on_error: bool = False,
     ) -> list[dict[str, Any]]:
         perf_tracer.instant(
             "rollout_controller.rollout_batch",
@@ -939,10 +1041,11 @@ class RolloutController:
                 data=item,
                 workflow=workflow,
                 workflow_kwargs=workflow_kwargs,
-                should_accept_fn=should_accept_fn,
-                group_size=group_size,
                 reward_normalization=reward_normalization,
                 drop_incomplete_group=drop_incomplete_group,
+                keep_partial_group_on_error=keep_partial_group_on_error,
+                should_accept_fn=should_accept_fn,
+                group_size=group_size,
             )
         results = self.wait(count=len(data))
         # Return list of trajectories
@@ -959,6 +1062,7 @@ class RolloutController:
         dynamic_bs: bool = False,
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
+        keep_partial_group_on_error: bool = False,
     ) -> list[dict[str, Any]]:
         """Prepare a batch with controlled staleness.
 
@@ -984,6 +1088,7 @@ class RolloutController:
                         group_size=group_size,
                         reward_normalization=reward_normalization,
                         drop_incomplete_group=drop_incomplete_group,
+                        keep_partial_group_on_error=keep_partial_group_on_error,
                     )
 
         if not hasattr(self, "data_generator"):
@@ -1094,16 +1199,17 @@ class RolloutController:
     async def pause_generation(self):
         await self._collective_rpc_async("pause_generation")
 
+    def pause_generation_sync(self):
+        pause_grace_period = float(
+            getattr(self.config, "pause_grace_period", 0.0) or 0.0
+        )
+        self._collective_rpc(
+            "pause_generation",
+            http_timeout=max(120.0, pause_grace_period + 120.0),
+        )
+
     async def continue_generation(self):
         await self._collective_rpc_async("continue_generation")
-
-    def offload(self) -> None:
-        """Offload rollout model memory on all inference workers."""
-        self._collective_rpc("offload")
-
-    def onload(self, tags: list[str] | None = None) -> None:
-        """Onload rollout model memory on all inference workers."""
-        self._collective_rpc("onload", tags=tags)
 
     def set_version(self, version: int) -> None:
         with self._version_lock:
@@ -1126,21 +1232,67 @@ class RolloutController:
         self._collective_rpc("resume", http_timeout=60.0)
         self.dispatcher.resume()
 
+    def offload(self, tags: list[str] | None = None):
+        logger.info(
+            f"[AWEX] RolloutController.offload(tags={tags}) dispatching to workers"
+        )
+        pause_grace_period = float(
+            getattr(self.config, "pause_grace_period", 0.0) or 0.0
+        )
+        self._collective_rpc(
+            "offload",
+            tags=tags,
+            http_timeout=max(120.0, pause_grace_period + 120.0),
+        )
+        logger.info(f"[AWEX] RolloutController.offload(tags={tags}) completed")
+
+    def abort_all_requests(self):
+        self._collective_rpc("abort_all_requests", http_timeout=60.0)
+
+    def onload(self, tags: list[str] | None = None):
+        self._collective_rpc("onload", tags=tags, http_timeout=120.0)
+
     def export_stats(self) -> dict[str, float]:
+        """Merge per-worker stats_tracker exports into a single dict.
+
+        Two kinds of values appear in the raw per-worker dicts:
+
+        - ``SCALAR``-typed keys (``stats_tracker.scalar``): exported as a
+          local mean alongside a ``<key>__count`` companion. To merge across
+          workers we re-weight (``value * count``) before averaging by the
+          total count.
+        - ``SUM``-typed keys (``stats_tracker.denominator``): exported as
+          a local sum with no ``__count`` companion. To merge we simply
+          add them across workers.
+
+        Previously SUM keys silently disappeared from the output because the
+        merge unconditionally divided by ``__count`` and dropped keys with
+        no count. That meant per-agent rollout counters never reached WandB.
+        """
         all_raw_stats = self._collective_rpc(method="export_stats", http_timeout=60.0)
         stats = defaultdict(float)
         counts = defaultdict(int)
+        sum_keys = set()  # keys that have no __count companion -> treat as SUM
 
         for raw_stats in all_raw_stats:
             for k, v in raw_stats.items():
                 if k.endswith("__count"):
                     counts[k] += v
+                    continue
+                count_key = k + "__count"
+                if count_key in raw_stats:
+                    # SCALAR mean: weighted contribution (divided later).
+                    stats[k] += v * raw_stats[count_key]
                 else:
-                    stats[k] += v * raw_stats.get(k + "__count", 0)
+                    # SUM-typed: accumulate directly.
+                    stats[k] += v
+                    sum_keys.add(k)
 
-        # Average non-count stats
-        final_stats = {}
+        final_stats: dict[str, float] = {}
         for k, v in stats.items():
+            if k in sum_keys:
+                final_stats[k] = v
+                continue
             count_key = k + "__count"
             if count_key in counts and counts[count_key] > 0:
                 final_stats[k] = v / counts[count_key]

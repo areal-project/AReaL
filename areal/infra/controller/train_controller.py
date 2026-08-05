@@ -565,6 +565,17 @@ class TrainController:
         """Send dispatched inputs to workers. DP heads get slices, others empty."""
         tasks = []
         dp_idx = 0
+        # P97: save/load are long blocking ops — the HF saver's TP coalesced
+        # all-gather can occupy a worker for tens of seconds, during which its
+        # RPC server may briefly refuse connections (ClientConnectorError). The
+        # default 3-retry/~3s budget then misjudges a busy worker as dead and
+        # tears down the whole step (932256 step20: actor/34 killed mid-save).
+        # Widen the connection-retry budget for these ops so a busy-but-alive
+        # worker is given time to finish; a genuinely dead worker still fails
+        # after the (larger) retry budget is exhausted, so this does not mask
+        # real crashes.
+        long_op = method in ("save", "load")
+        retry_kw = dict(max_retries=8, retry_delay=2.0) if long_op else {}
         for idx, worker in enumerate(self.workers):
             if self.workers_is_dp_head[idx]:
                 worker_args = [splits[dp_idx] for splits in dp_split_args]
@@ -583,6 +594,7 @@ class TrainController:
                     self._engine_name(idx),
                     *worker_args,
                     rpc_meta=rpc_meta,
+                    **retry_kw,
                     **worker_kwargs,
                 )
             )
@@ -707,6 +719,16 @@ class TrainController:
         """
         self._custom_function_call("load", meta)
 
+    def warmup_communicators(self):
+        """Eagerly build train-step NCCL communicators on all workers."""
+        self._custom_function_call("warmup_communicators")
+
+    def init_awex_adapter(self, meta_server_addr: str | None = None):
+        """Create awex adapter early for selective memory management."""
+        self._custom_function_call(
+            "init_awex_adapter", meta_server_addr=meta_server_addr
+        )
+
     def step_lr_scheduler(self):
         """Step the learning rate scheduler.
 
@@ -767,6 +789,7 @@ class TrainController:
         dynamic_bs: bool = False,
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
+        keep_partial_group_on_error: bool = False,
     ) -> list[dict[str, Any]]:
         return self.rollout.prepare_batch(
             dataloader=dataloader,
@@ -777,6 +800,7 @@ class TrainController:
             dynamic_bs=dynamic_bs,
             reward_normalization=reward_normalization,
             drop_incomplete_group=drop_incomplete_group,
+            keep_partial_group_on_error=keep_partial_group_on_error,
         )
 
     def rollout_batch(
@@ -788,6 +812,7 @@ class TrainController:
         group_size: int = 1,
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
+        keep_partial_group_on_error: bool = False,
     ) -> list[dict[str, Any]]:
         return self.rollout.rollout_batch(
             data=data,
@@ -797,6 +822,7 @@ class TrainController:
             group_size=group_size,
             reward_normalization=reward_normalization,
             drop_incomplete_group=drop_incomplete_group,
+            keep_partial_group_on_error=keep_partial_group_on_error,
         )
 
     def _check_rollout_engine_connected(self):

@@ -129,7 +129,11 @@ from areal.utils.data import (
 from areal.utils.functional import gather_logprobs, gather_logprobs_entropy
 from areal.utils.hf_utils import load_hf_processor_and_tokenizer, load_hf_tokenizer
 from areal.utils.network import find_free_ports, format_host_for_url, gethostip
-from areal.utils.offload import is_tms_enabled, torch_memory_saver
+from areal.utils.offload import (
+    is_tms_enabled,
+    normalize_tms_ld_preload,
+    torch_memory_saver,
+)
 from areal.utils.perf_tracer import trace_perf, trace_scope
 from areal.utils.save_load import get_state_dict_from_repo_id_or_path
 
@@ -938,6 +942,7 @@ class FSDPEngine(TrainEngine):
 
         # Use torch_memory_saver to pause CUDA memory
         current_platform.clear_memory()
+        normalize_tms_ld_preload()
         torch_memory_saver.pause()
 
         current_platform.synchronize()

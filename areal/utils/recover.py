@@ -8,6 +8,7 @@ import pickle
 from typing import TYPE_CHECKING, Any
 
 import torch.distributed as dist
+from torch.utils.data import DistributedSampler
 from transformers import PreTrainedTokenizerFast
 
 if TYPE_CHECKING:
@@ -149,6 +150,8 @@ class RecoverInfo:
 
 
 class RecoverHandler:
+    _SAMPLER_EPOCH_KEY = "_areal_distributed_sampler_epoch"
+
     def __init__(self, config: RecoverConfig, ft_spec: FinetuneSpec):
         self.config = config
         self.ft_spec = ft_spec
@@ -253,12 +256,17 @@ class RecoverHandler:
             )
 
         self.last_step_info = step_info
+        dataloader_info = dataloader.state_dict()
+        sampler = getattr(dataloader, "sampler", None)
+        if isinstance(sampler, DistributedSampler):
+            dataloader_info[self._SAMPLER_EPOCH_KEY] = sampler.epoch
+
         recover_info = RecoverInfo(
             last_step_info=self.last_step_info,
             saver_info=saver.state_dict(),
             evaluator_info=evaluator.state_dict(),
             stats_logger_info=stats_logger.state_dict(),
-            dataloader_info=dataloader.state_dict(),
+            dataloader_info=dataloader_info,
             checkpoint_info=self.freq_ctl.state_dict(),
         )
 
@@ -307,21 +315,60 @@ class RecoverHandler:
             self.freq_ctl.load_state_dict(recover_info.checkpoint_info)
             evaluator.load_state_dict(recover_info.evaluator_info)
             stats_logger.load_state_dict(recover_info.stats_logger_info)
-            dataloader.load_state_dict(recover_info.dataloader_info)
+            dataloader_info = recover_info.dataloader_info.copy()
+            sampler_epoch = dataloader_info.pop(self._SAMPLER_EPOCH_KEY, None)
+            dataloader.load_state_dict(dataloader_info)
+            sampler = getattr(dataloader, "sampler", None)
+            if sampler_epoch is not None and isinstance(sampler, DistributedSampler):
+                sampler.set_epoch(sampler_epoch)
 
-            for name, engine_ in normalized_engine.items():
-                self._load_checkpoint(engine_, name=name)
             global_step = recover_info.last_step_info.global_step
+            recovery_version = global_step + 1
+
+            is_awex_colocate = (
+                inference_engine is not None
+                and getattr(weight_update_meta, "type", None) == "awex"
+            )
+
+            if not is_awex_colocate:
+                for name, engine_ in normalized_engine.items():
+                    self._load_checkpoint(engine_, name=name)
+
+            self._warmup_communicators(normalized_engine)
 
             if inference_engine is not None:
                 assert weight_update_meta is not None
                 update_engine = normalized_engine[inference_engine_update_from]
-                recovery_version = global_step + 1
                 versioned_meta = weight_update_meta.with_version(recovery_version)
                 update_engine.connect_engine(inference_engine, versioned_meta)
                 inference_engine.pause()
-                update_engine.update_weights(versioned_meta)
-                inference_engine.resume()
+                try:
+                    # P92: AWEX colocate transfer requires the full engine-level
+                    # pause/offload protocol, not just the controller pause. The
+                    # sglang plugin's patched event loop only drains the weight-
+                    # update queue while scheduler._engine_paused is True (set by
+                    # pause_generation), and the reader-side protocol expects the
+                    # engine's kv/weights released before the writer publishes.
+                    # Without this the recover-path transfer deadlocks: reader
+                    # never consumes the queued version marker, writer blocks on
+                    # weights_update_finished forever.
+                    # Mirror of the trainer's pre-update sequence; the reverse
+                    # side (kv_cache onload) happens inside update_weights.
+                    if is_awex_colocate:
+                        inference_engine.pause_generation_sync()
+                        inference_engine.offload(tags=["kv_cache"])
+                        inference_engine.offload(tags=["weights"])
+                        # Load the actor checkpoint only after the colocated
+                        # rollout engine has released its GPU memory; loading
+                        # first would stack DCP weights/optimizer on top of the
+                        # still-resident sglang allocation and risk OOM.
+                        for name, engine_ in normalized_engine.items():
+                            self._load_checkpoint(engine_, name=name)
+                    update_engine.update_weights(versioned_meta)
+                finally:
+                    # Always resume: leaving rollout paused after a failed
+                    # checkpoint load or transfer would hang every later step.
+                    inference_engine.resume()
                 update_engine.set_version(recovery_version)
                 inference_engine.set_version(recovery_version)
             return recover_info
@@ -357,6 +404,24 @@ class RecoverHandler:
         )
         engine.save(meta)
         logger.info(f"Saved recover checkpoint to {path} (with_optim={with_optim})")
+
+    @staticmethod
+    def _warmup_communicators(
+        normalized_engine: dict[str, TrainEngine | TrainController],
+    ) -> None:
+        for name, engine_ in normalized_engine.items():
+            warmup = getattr(engine_, "warmup_communicators", None)
+            if warmup is None:
+                continue
+            try:
+                warmup()
+            except Exception:
+                logger.warning(
+                    "Communicator warmup failed for engine %s; the first "
+                    "train step will connect lazily instead.",
+                    name,
+                    exc_info=True,
+                )
 
     def _load_checkpoint(
         self,

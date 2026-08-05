@@ -385,12 +385,19 @@ class DistributedStatsTracker:
             # `.get`: a rank may learn about this key via key/metadata sync
             # without holding any local values for it.
             stats = self.stats.get(key, [])
-            value = self._placeholder_scalar(
-                fill=float(sum(stats)), group=effective_group
-            )
-            cnt = self._placeholder_scalar(
-                fill=float(len(stats)), group=effective_group
-            )
+            # Only place tensors on the accelerator when a collective actually
+            # needs them; a GPU-side allocation here can OOM colocated setups
+            # whose device is fully budgeted by training + inference engines.
+            if effective_group is not None:
+                value = self._placeholder_scalar(
+                    fill=float(sum(stats)), group=effective_group
+                )
+                cnt = self._placeholder_scalar(
+                    fill=float(len(stats)), group=effective_group
+                )
+            else:
+                value = torch.tensor(float(sum(stats)), dtype=torch.float32)
+                cnt = torch.tensor(float(len(stats)), dtype=torch.float32)
             if effective_group is not None:
                 dist.all_reduce(value, group=effective_group)
                 dist.all_reduce(cnt, group=effective_group)

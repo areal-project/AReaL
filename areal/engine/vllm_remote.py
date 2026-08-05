@@ -257,11 +257,23 @@ class VLLMBackend:
         """Get vLLM health check request."""
         return HttpRequest(endpoint="/health", payload={}, method="GET")
 
-    def get_offload_request(self) -> HttpRequest:
+    def get_abort_all_request(self) -> HttpRequest:
+        raise NotImplementedError("vLLM does not support abort_all_requests")
+
+    def get_offload_request(self, tags: list[str] | None = None) -> HttpRequest:
         """Get vLLM offload request.
+
+        ``tags`` is accepted for interface parity with the SGLang backend and
+        ignored (vLLM /sleep has no tag granularity).
 
         Uses vLLM's /sleep endpoint to offload model memory to CPU.
         Default level is 1.
+
+        Parameters
+        ----------
+        tags : list[str], optional
+            Accepted for RemoteInfEngine API compatibility. vLLM sleep does not
+            support component-specific tags, so this value is ignored.
         """
         return HttpRequest(endpoint="/sleep", payload={}, method="POST")
 
@@ -427,6 +439,7 @@ class RemotevLLMEngine(InferenceEngine):
         proxy_addr: str | None = None,
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
+        keep_partial_group_on_error: bool = False,
     ) -> int:
         """Submit a request to the inference engine."""
         return self._engine.submit(
@@ -441,6 +454,7 @@ class RemotevLLMEngine(InferenceEngine):
             proxy_addr=proxy_addr,
             reward_normalization=reward_normalization,
             drop_incomplete_group=drop_incomplete_group,
+            keep_partial_group_on_error=keep_partial_group_on_error,
         )
 
     def wait(
@@ -522,8 +536,11 @@ class RemotevLLMEngine(InferenceEngine):
     def teardown_server(self):
         return self._engine.teardown_server()
 
-    def offload(self):
-        return self._engine.offload()
+    def offload(self, tags: list[str] | None = None):
+        return self._engine.offload(tags=tags)
+
+    def abort_all_requests(self):
+        return self._engine.abort_all_requests()
 
     def onload(self, tags: list[str] | None = None):
         return self._engine.onload(tags=tags)

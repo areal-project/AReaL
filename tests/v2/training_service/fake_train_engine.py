@@ -34,7 +34,9 @@ class FakeTrainEngine(TrainEngine):
         self._lr_step_calls = 0
         self._last_saved_meta: Any = None
         self._last_loaded_meta: Any = None
+        self._last_awex_meta_server_addr: str | None = None
         self._init_kwargs = dict(kwargs)
+        self._is_dp_head = bool(kwargs.get("is_dp_head", True))
 
     def create_process_group(self, parallel_strategy=None):
         return None
@@ -59,7 +61,7 @@ class FakeTrainEngine(TrainEngine):
         return 0
 
     def is_data_parallel_head(self) -> bool:
-        return True
+        return self._is_dp_head
 
     @property
     def context_and_model_parallel_group(self):
@@ -196,6 +198,9 @@ class FakeTrainEngine(TrainEngine):
 
     def offload(self) -> None:
         self._offloaded = True
+
+    def init_awex_adapter(self, meta_server_addr: str | None = None) -> None:
+        self._last_awex_meta_server_addr = meta_server_addr
 
     def get_device_stats(self):
         return {"device": "cpu"}
