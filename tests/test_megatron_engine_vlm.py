@@ -227,9 +227,39 @@ class TestPackedContextParallelForward:
         assert model.seen_post_process is False
         assert model.post_process is True
 
+    def test_padded_lm_head_labels_and_outputs_preserve_sequence_order(self):
+        from areal.engine.megatron_engine import (
+            _padded_lm_head_labels,
+            _repack_padded_lm_head_output,
+        )
+
+        input_ids = torch.tensor([10, 11, 12, 20, 21])
+        cu_seqlens = torch.tensor([0, 3, 5], dtype=torch.int32)
+
+        labels = _padded_lm_head_labels(input_ids, cu_seqlens, max_seqlen=3)
+        assert labels.tolist() == [[11, 21], [12, 0], [10, 20]]
+
+        # Chunked LM Head flattens [S, B] token outputs. Repacking must remove
+        # the padded slot and restore sequence-major packed order.
+        padded_outputs = torch.tensor([100, 200, 101, 201, 102, 0])
+        repacked = _repack_padded_lm_head_output(
+            padded_outputs, cu_seqlens, max_seqlen=3
+        )
+        assert repacked.tolist() == [100, 101, 102, 200, 201]
+
+    def test_repack_padded_lm_head_output_rejects_wrong_token_count(self):
+        from areal.engine.megatron_engine import _repack_padded_lm_head_output
+
+        with pytest.raises(ValueError, match="does not match the BSHD token layout"):
+            _repack_padded_lm_head_output(
+                torch.ones(5),
+                torch.tensor([0, 3, 5], dtype=torch.int32),
+                max_seqlen=3,
+            )
+
     @pytest.mark.parametrize(
         (
-            "use_areal_lm_head",
+            "enable_chunked_logits",
             "model_dtype",
             "expected",
         ),
@@ -242,7 +272,7 @@ class TestPackedContextParallelForward:
     )
     def test_float16_wrapper_override_follows_areal_lm_head(
         self,
-        use_areal_lm_head,
+        enable_chunked_logits,
         model_dtype,
         expected,
     ):
@@ -250,7 +280,7 @@ class TestPackedContextParallelForward:
 
         assert (
             _float16_wrapper_fp32_output(
-                use_areal_lm_head,
+                enable_chunked_logits,
                 model_dtype,
             )
             is expected
@@ -258,7 +288,7 @@ class TestPackedContextParallelForward:
 
     @pytest.mark.parametrize(
         (
-            "use_areal_lm_head",
+            "enable_chunked_logits",
             "enable_fp32_lm_head",
             "cross_entropy_loss_fusion",
             "expected",
@@ -282,7 +312,7 @@ class TestPackedContextParallelForward:
     )
     def test_mbridge_precision_args_preserve_native_fallback(
         self,
-        use_areal_lm_head,
+        enable_chunked_logits,
         enable_fp32_lm_head,
         cross_entropy_loss_fusion,
         expected,
@@ -291,7 +321,7 @@ class TestPackedContextParallelForward:
 
         assert (
             _mbridge_precision_args(
-                use_areal_lm_head,
+                enable_chunked_logits,
                 enable_fp32_lm_head,
                 cross_entropy_loss_fusion,
             )
@@ -299,7 +329,7 @@ class TestPackedContextParallelForward:
         )
 
     @pytest.mark.parametrize(
-        ("use_areal_lm_head", "entropy_requires_grad", "expected"),
+        ("enable_chunked_logits", "entropy_requires_grad", "expected"),
         [
             (False, True, False),
             (False, False, False),
@@ -309,15 +339,15 @@ class TestPackedContextParallelForward:
     )
     def test_logits_reuse_respects_entropy_gradient_setting(
         self,
-        use_areal_lm_head,
+        enable_chunked_logits,
         entropy_requires_grad,
         expected,
     ):
-        from areal.engine.megatron_engine import _reuse_areal_lm_head_logits
+        from areal.engine.megatron_engine import _reuse_chunked_logits_storage
 
         assert (
-            _reuse_areal_lm_head_logits(
-                use_areal_lm_head,
+            _reuse_chunked_logits_storage(
+                enable_chunked_logits,
                 entropy_requires_grad,
             )
             is expected
@@ -327,7 +357,7 @@ class TestPackedContextParallelForward:
         (
             "global_rank",
             "is_critic",
-            "use_areal_lm_head",
+            "enable_chunked_logits",
             "entropy_requires_grad",
             "warns",
         ),
@@ -343,7 +373,7 @@ class TestPackedContextParallelForward:
         self,
         global_rank,
         is_critic,
-        use_areal_lm_head,
+        enable_chunked_logits,
         entropy_requires_grad,
         warns,
     ):
@@ -356,7 +386,7 @@ class TestPackedContextParallelForward:
             logger,
             global_rank=global_rank,
             is_critic=is_critic,
-            use_areal_lm_head=use_areal_lm_head,
+            enable_chunked_logits=enable_chunked_logits,
             entropy_requires_grad=entropy_requires_grad,
         )
 
@@ -368,7 +398,7 @@ class TestPackedContextParallelForward:
 
     @pytest.mark.parametrize(
         (
-            "use_areal_lm_head",
+            "enable_chunked_logits",
             "enable_tree_training",
             "npu_available",
             "error_match",
@@ -382,7 +412,7 @@ class TestPackedContextParallelForward:
     )
     def test_areal_lm_head_rejects_unsupported_training_modes(
         self,
-        use_areal_lm_head,
+        enable_chunked_logits,
         enable_tree_training,
         npu_available,
         error_match,
@@ -393,7 +423,7 @@ class TestPackedContextParallelForward:
 
         if error_match is None:
             _validate_areal_lm_head_compatibility(
-                use_areal_lm_head,
+                enable_chunked_logits,
                 enable_tree_training=enable_tree_training,
                 npu_available=npu_available,
             )
@@ -401,7 +431,7 @@ class TestPackedContextParallelForward:
 
         with pytest.raises(NotImplementedError, match=error_match):
             _validate_areal_lm_head_compatibility(
-                use_areal_lm_head,
+                enable_chunked_logits,
                 enable_tree_training=enable_tree_training,
                 npu_available=npu_available,
             )

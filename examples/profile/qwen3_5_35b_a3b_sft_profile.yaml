@@ -1,12 +1,12 @@
-experiment_name: qwen3-30b-a3b-sft-profile
-trial_name: fake128k-profile
+experiment_name: qwen3-5-35b-a3b-sft-profile
+trial_name: fake32k-d4t2-e8-profile
 
 seed: 1
 enable_offload: false
 total_train_epochs: 1
 total_train_steps: 2
 tokenizer_path: ${actor.path}
-allocation_mode: "megatron:(attn:d2c4|ffn:d1e8)"
+allocation_mode: "megatron:(attn:d4t2|ffn:d1e8)"
 
 cluster:
   n_nodes: 1
@@ -14,7 +14,7 @@ cluster:
   fileroot: /tmp/areal/experiments
   name_resolve:
     type: nfs
-    nfs_record_root: /tmp/areal/name_resolve/qwen3_30b_a3b_sft_profile
+    nfs_record_root: /tmp/areal/name_resolve/qwen3_5_35b_a3b_sft_profile
 
 scheduler:
   type: local
@@ -22,8 +22,8 @@ scheduler:
 actor:
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
-  backend: "megatron:(attn:d2c4|ffn:d1e8)"
-  path: Qwen/Qwen3-30B-A3B
+  backend: "megatron:(attn:d4t2|ffn:d1e8)"
+  path: Qwen/Qwen3.5-35B-A3B
   init_from_scratch: false
   disable_dropout: true
   gradient_checkpointing: true
@@ -32,7 +32,7 @@ actor:
   mb_spec:
     n_mbs: 2
     granularity: 1
-    max_tokens_per_mb: 131072
+    max_tokens_per_mb: 32768
     n_mbs_divisor: 2
   optimizer:
     type: adam
@@ -60,11 +60,12 @@ actor:
     use_deterministic_algorithms: false
     enable_chunked_logits: true
     entropy_requires_grad: false
-    lm_head_loss_chunk_size: 0
+    lm_head_loss_chunk_size: 128
     cross_entropy_loss_fusion: false
     recompute_granularity: full
     recompute_method: uniform
     recompute_num_layers: 1
+    recompute_modules: null
     moe_router_dtype: fp32
     moe_token_dispatcher_type: alltoall
     moe_router_bias_update_rate: 0.0
@@ -81,19 +82,19 @@ actor:
         PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
 
 profile:
-  fake_seq_len: 131072
-  fake_dataset_size: 8
+  fake_seq_len: 32768
+  fake_dataset_size: 16
   fake_loss_start_ratio: 0.5
 
 train_dataset:
-  batch_size: 4
+  batch_size: 8
   shuffle: false
   pin_memory: true
   num_workers: 0
   drop_last: true
-  path: fake://profile/qwen3-30b-a3b-128k
+  path: fake://profile/qwen3-5-35b-a3b-32k
   type: sft
-  max_length: 131072
+  max_length: 32768
 
 valid_dataset: null
 
@@ -140,5 +141,5 @@ perf_tracer:
   profile_steps: null
 
 memory_profiler:
-  profile_steps: []
-  max_entries: 100000
+  profile_steps: [1]
+  max_entries: 1000000

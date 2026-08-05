@@ -10,19 +10,21 @@ CONFIG=${CONFIG:-examples/profile/qwen3_30b_a3b_sft_profile.yaml}
 EXPERIMENT_NAME=${EXPERIMENT_NAME:-qwen3-30b-a3b-sft-profile}
 FILEROOT=${FILEROOT:-/tmp/areal/experiments}
 MODEL_PATH=${MODEL_PATH:-Qwen/Qwen3-30B-A3B}
-PROFILE_STEPS=${PROFILE_STEPS:-${PROFILE_STEP:-0,1}}
+PROFILE_STEPS=${PROFILE_STEPS:-${PROFILE_STEP:-1}}
 TOTAL_STEPS=${TOTAL_STEPS:-}
 PROFILE_KINDS=${PROFILE_KINDS:-kernel,memory}
 N_GPUS_PER_NODE=${N_GPUS_PER_NODE:-8}
 TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-4}
-PROFILE_N_MBS=${PROFILE_N_MBS:-4}
+PROFILE_N_MBS=${PROFILE_N_MBS:-2}
 PROFILE_FAKE_SEQ_LEN=${PROFILE_FAKE_SEQ_LEN:-131072}
 PROFILE_FAKE_DATASET_SIZE=${PROFILE_FAKE_DATASET_SIZE:-8}
 PROFILE_FAKE_LOSS_START_RATIO=${PROFILE_FAKE_LOSS_START_RATIO:-0.5}
+MEMORY_MAX_ENTRIES=${MEMORY_MAX_ENTRIES:-1000000}
 AREAL_LOGPROBS_CHUNK_SIZE=${AREAL_LOGPROBS_CHUNK_SIZE:-128}
 LM_HEAD_LOSS_CHUNK_SIZE=${LM_HEAD_LOSS_CHUNK_SIZE:-0}
 USE_PRECISION_AWARE_OPTIMIZER=${USE_PRECISION_AWARE_OPTIMIZER:-true}
 MAIN_GRADS_DTYPE=${MAIN_GRADS_DTYPE:-bfloat16}
+USE_DETERMINISTIC_ALGORITHMS=${USE_DETERMINISTIC_ALGORITHMS:-false}
 STOP_ON_FAILURE=${STOP_ON_FAILURE:-1}
 RUN_ROOT=${RUN_ROOT:-${ROOT_DIR}/examples/profile/profile_data/${STAMP}_qwen3-30b-a3b_fake128k_sft_profile}
 AREAL_LOG_USER=${AREAL_LOG_USER:-$(python -c 'import getpass; print(getpass.getuser())')}
@@ -118,7 +120,7 @@ run_case() {
       memory_ranks="$RESOLVED_PROFILE_RANKS"
       profile_args=(
         memory_profiler.profile_steps="[${profile_step}]"
-        memory_profiler.max_entries=200000
+        memory_profiler.max_entries="${MEMORY_MAX_ENTRIES}"
       )
       ;;
     *)
@@ -149,6 +151,7 @@ run_case() {
     actor.megatron.lm_head_loss_chunk_size="${LM_HEAD_LOSS_CHUNK_SIZE}" \
     actor.megatron.use_precision_aware_optimizer="${USE_PRECISION_AWARE_OPTIMIZER}" \
     actor.megatron.main_grads_dtype="${MAIN_GRADS_DTYPE}" \
+    actor.megatron.use_deterministic_algorithms="${USE_DETERMINISTIC_ALGORITHMS}" \
     profile.fake_seq_len="${PROFILE_FAKE_SEQ_LEN}" \
     profile.fake_dataset_size="${PROFILE_FAKE_DATASET_SIZE}" \
     profile.fake_loss_start_ratio="${PROFILE_FAKE_LOSS_START_RATIO}" \
@@ -199,9 +202,11 @@ echo "Model: ${MODEL_PATH}" | tee -a "${RUN_ROOT}/profile_settings.log"
 echo "Profile steps: ${PROFILE_STEPS}" | tee -a "${RUN_ROOT}/profile_settings.log"
 echo "Profile ranks: ${PROFILE_RANKS} -> ${RESOLVED_PROFILE_RANKS}" | tee -a "${RUN_ROOT}/profile_settings.log"
 echo "Fake data: seq_len=${PROFILE_FAKE_SEQ_LEN}, dataset_size=${PROFILE_FAKE_DATASET_SIZE}, loss_start_ratio=${PROFILE_FAKE_LOSS_START_RATIO}, batch_size=${TRAIN_BATCH_SIZE}, n_mbs=${PROFILE_N_MBS}" | tee -a "${RUN_ROOT}/profile_settings.log"
+echo "Memory profiler max entries: ${MEMORY_MAX_ENTRIES}" | tee -a "${RUN_ROOT}/profile_settings.log"
 echo "Logprobs chunk size: ${AREAL_LOGPROBS_CHUNK_SIZE}" | tee -a "${RUN_ROOT}/profile_settings.log"
 echo "LM Head loss chunk size: ${LM_HEAD_LOSS_CHUNK_SIZE}" | tee -a "${RUN_ROOT}/profile_settings.log"
 echo "Precision-aware optimizer: ${USE_PRECISION_AWARE_OPTIMIZER}, main grads dtype: ${MAIN_GRADS_DTYPE}" | tee -a "${RUN_ROOT}/profile_settings.log"
+echo "Deterministic algorithms: ${USE_DETERMINISTIC_ALGORITHMS}" | tee -a "${RUN_ROOT}/profile_settings.log"
 
 overall_status=0
 IFS="," read -ra profile_steps <<< "$PROFILE_STEPS"

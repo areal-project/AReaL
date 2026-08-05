@@ -980,12 +980,12 @@ class MegatronEngineConfig:
     )
 
     # Precision & Loss
-    use_areal_lm_head: bool = field(
+    enable_chunked_logits: bool = field(
         default=False,
         metadata={
-            "help": "Use AReaL's CUDA-only vocab-parallel LM Head operator. "
-            "NPU and tree training are unsupported. Disabled by default to "
-            "preserve Megatron's native output layer."
+            "help": "Enable AReaL's CUDA-only chunked-logits path by replacing "
+            "Megatron's native output layer with the vocab-parallel LM Head. "
+            "NPU and tree training are unsupported."
         },
     )
     entropy_requires_grad: bool = field(
@@ -1001,7 +1001,7 @@ class MegatronEngineConfig:
         default=0,
         metadata={
             "help": "Sequence chunk size for AReaL's chunked LM Head loss. A "
-            "positive value requires use_areal_lm_head=True and "
+            "positive value requires enable_chunked_logits=True and "
             "entropy_requires_grad=False, and computes LM Head logits and their "
             "backward one chunk at a time. The chunked path only supports packed "
             "text actor models without MTP; 0 disables it."
@@ -1010,9 +1010,9 @@ class MegatronEngineConfig:
     enable_fp32_lm_head: bool = field(
         default=False,
         metadata={
-            "help": "Deprecated. This option is ignored when use_areal_lm_head=True; "
+            "help": "Deprecated. This option is ignored when enable_chunked_logits=True; "
             "AReaL's fused LM Head always produces FP32 logits. When "
-            "use_areal_lm_head=False, preserve the legacy behavior of forwarding "
+            "enable_chunked_logits=False, preserve the legacy behavior of forwarding "
             "the option to supported mbridge model configurations."
         },
     )
@@ -1076,8 +1076,10 @@ class MegatronEngineConfig:
                 "lm_head_loss_chunk_size must be non-negative, got "
                 f"{self.lm_head_loss_chunk_size}"
             )
-        if self.lm_head_loss_chunk_size > 0 and not self.use_areal_lm_head:
-            raise ValueError("lm_head_loss_chunk_size requires use_areal_lm_head=True")
+        if self.lm_head_loss_chunk_size > 0 and not self.enable_chunked_logits:
+            raise ValueError(
+                "lm_head_loss_chunk_size requires enable_chunked_logits=True"
+            )
         if self.lm_head_loss_chunk_size > 0 and self.entropy_requires_grad:
             raise ValueError(
                 "lm_head_loss_chunk_size requires entropy_requires_grad=False"

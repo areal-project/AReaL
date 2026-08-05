@@ -159,10 +159,10 @@ def _normalize_glu_param_name(name: str) -> str:
 
 
 def _float16_wrapper_fp32_output(
-    use_areal_lm_head: bool,
+    enable_chunked_logits: bool,
     model_dtype: torch.dtype,
 ) -> bool | None:
-    if use_areal_lm_head and model_dtype in (
+    if enable_chunked_logits and model_dtype in (
         torch.float16,
         torch.bfloat16,
     ):
@@ -173,13 +173,13 @@ def _float16_wrapper_fp32_output(
     return None
 
 
-def _reuse_areal_lm_head_logits(
-    use_areal_lm_head: bool,
+def _reuse_chunked_logits_storage(
+    enable_chunked_logits: bool,
     entropy_requires_grad: bool,
 ) -> bool:
     # Storage reuse makes entropy non-differentiable, so only enable it when
     # entropy gradients are disabled.
-    return use_areal_lm_head and not entropy_requires_grad
+    return enable_chunked_logits and not entropy_requires_grad
 
 
 def _warn_if_areal_lm_head_entropy_is_nondifferentiable(
@@ -187,10 +187,15 @@ def _warn_if_areal_lm_head_entropy_is_nondifferentiable(
     *,
     global_rank: int,
     is_critic: bool,
-    use_areal_lm_head: bool,
+    enable_chunked_logits: bool,
     entropy_requires_grad: bool,
 ) -> None:
-    if global_rank != 0 or is_critic or not use_areal_lm_head or entropy_requires_grad:
+    if (
+        global_rank != 0
+        or is_critic
+        or not enable_chunked_logits
+        or entropy_requires_grad
+    ):
         return
     logger.warning(
         "AReaL LM Head destructive logits-storage reuse is enabled; entropy is "
@@ -200,12 +205,12 @@ def _warn_if_areal_lm_head_entropy_is_nondifferentiable(
 
 
 def _validate_areal_lm_head_compatibility(
-    use_areal_lm_head: bool,
+    enable_chunked_logits: bool,
     *,
     enable_tree_training: bool,
     npu_available: bool,
 ) -> None:
-    if not use_areal_lm_head:
+    if not enable_chunked_logits:
         return
     if npu_available:
         raise NotImplementedError("AReaL LM Head does not support NPU training")
@@ -220,13 +225,57 @@ def _map_chunked_lm_head_output(
     return ChunkedLMHeadOutput(*(fn(tensor) for tensor in output))
 
 
+def _padded_lm_head_labels(
+    input_ids: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    max_seqlen: int,
+) -> torch.Tensor:
+    """Build next-token labels matching Megatron's padded ``[S, B, H]`` layout."""
+    if input_ids.ndim != 1:
+        raise ValueError(
+            "padded LM Head expects packed 1D input_ids before BSHD reconstruction, "
+            f"got shape {tuple(input_ids.shape)}"
+        )
+    seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+    mask = (
+        torch.arange(max_seqlen, device=input_ids.device)[None, :] < seq_lens[:, None]
+    )
+    padded_ids = torch.zeros(
+        (seq_lens.numel(), max_seqlen),
+        dtype=input_ids.dtype,
+        device=input_ids.device,
+    )
+    padded_ids[mask] = input_ids
+    return torch.roll(padded_ids, shifts=-1, dims=-1).transpose(0, 1).contiguous()
+
+
+def _repack_padded_lm_head_output(
+    tensor: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    max_seqlen: int,
+) -> torch.Tensor:
+    """Restore flattened padded LM Head values to packed sequence order."""
+    seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+    batch_size = seq_lens.numel()
+    expected_tokens = batch_size * max_seqlen
+    if tensor.shape[0] != expected_tokens:
+        raise ValueError(
+            "padded LM Head output does not match the BSHD token layout: "
+            f"got shape {tuple(tensor.shape)}, expected first dimension "
+            f"{batch_size} * {max_seqlen} = {expected_tokens}"
+        )
+    mask = torch.arange(max_seqlen, device=tensor.device)[None, :] < seq_lens[:, None]
+    padded = tensor.reshape(max_seqlen, batch_size, *tensor.shape[1:])
+    return padded.transpose(0, 1)[mask]
+
+
 def _mbridge_precision_args(
-    use_areal_lm_head: bool,
+    enable_chunked_logits: bool,
     enable_fp32_lm_head: bool,
     cross_entropy_loss_fusion: bool,
 ) -> dict[str, bool]:
     args = {}
-    if not use_areal_lm_head and enable_fp32_lm_head:
+    if not enable_chunked_logits and enable_fp32_lm_head:
         args["enable_fp32_lm_head"] = True
     if cross_entropy_loss_fusion:
         args["cross_entropy_loss_fusion"] = True
@@ -287,7 +336,7 @@ class MegatronEngine(TrainEngine):
         self._offload_depth: int = 0
         self.enable_tree_training: bool = self.config.enable_tree_training
         _validate_areal_lm_head_compatibility(
-            self.mcore_config.use_areal_lm_head,
+            self.mcore_config.enable_chunked_logits,
             enable_tree_training=self.enable_tree_training,
             npu_available=is_npu_available,
         )
@@ -336,16 +385,16 @@ class MegatronEngine(TrainEngine):
             self.own_global_group = True
         self.logger = logging.getLogger(f"[MegatronEngine Rank {dist.get_rank()}]")
         if self.mcore_config.enable_fp32_lm_head and dist.get_rank() == 0:
-            if self.mcore_config.use_areal_lm_head:
+            if self.mcore_config.enable_chunked_logits:
                 self.logger.warning(
                     "megatron.enable_fp32_lm_head is deprecated and ignored when "
-                    "use_areal_lm_head=True; the fused AReaL LM Head always produces "
+                    "enable_chunked_logits=True; the fused AReaL LM Head always produces "
                     "FP32 logits."
                 )
             else:
                 self.logger.warning(
                     "megatron.enable_fp32_lm_head is deprecated; preserving its "
-                    "legacy mbridge behavior because use_areal_lm_head=False."
+                    "legacy mbridge behavior because enable_chunked_logits=False."
                 )
         self._context_and_model_parallel_group = None
         self._init_context_and_model_parallel_group()
@@ -526,7 +575,7 @@ class MegatronEngine(TrainEngine):
             self.logger,
             global_rank=self.rank,
             is_critic=self.config.is_critic,
-            use_areal_lm_head=self.mcore_config.use_areal_lm_head,
+            enable_chunked_logits=self.mcore_config.enable_chunked_logits,
             entropy_requires_grad=self.mcore_config.entropy_requires_grad,
         )
 
@@ -700,7 +749,7 @@ class MegatronEngine(TrainEngine):
             # AReaL handles FP32 output itself when its LM Head is enabled.
             # Otherwise, preserve mbridge's native FP32 LM Head option.
             precision_args = _mbridge_precision_args(
-                self.mcore_config.use_areal_lm_head,
+                self.mcore_config.enable_chunked_logits,
                 self.mcore_config.enable_fp32_lm_head,
                 self.mcore_config.cross_entropy_loss_fusion,
             )
@@ -1056,14 +1105,20 @@ class MegatronEngine(TrainEngine):
             )
             use_chunked_lm_head = (
                 self.mcore_config.lm_head_loss_chunk_size > 0
-                and self.mcore_config.use_areal_lm_head
+                and self.mcore_config.enable_chunked_logits
                 and not self.config.is_critic
                 and not self.enable_tree_training
                 and is_pipeline_last_stage
             )
-            if use_chunked_lm_head and (self.is_vision_model or self.use_padded_seq):
+            has_vision_inputs = any(
+                _is_multi_modal_payload_key(key) for key in mb_input.padded_mb
+            )
+            if use_chunked_lm_head and (
+                has_vision_inputs or (self.is_vision_model and not self.use_padded_seq)
+            ):
                 raise NotImplementedError(
-                    "chunked LM Head loss currently supports packed text models only"
+                    "chunked LM Head loss does not support vision inputs; padded "
+                    "BSHD is supported only for text-only models such as Qwen3.5"
                 )
 
             output = packed_context_parallel_forward(
@@ -1073,23 +1128,31 @@ class MegatronEngine(TrainEngine):
                 is_vision_model=self.is_vision_model,
                 use_padded_seq=self.use_padded_seq,
                 fp32_output=_float16_wrapper_fp32_output(
-                    self.mcore_config.use_areal_lm_head,
+                    self.mcore_config.enable_chunked_logits,
                     self.dtype,
                 ),
                 return_hidden_states=use_chunked_lm_head,
             )
 
             if use_chunked_lm_head:
-                rolled_ids = torch.roll(
-                    mb_input.padded_mb["input_ids"], shifts=-1, dims=-1
-                )
-                if cp_size > 1 and cu_seqlens is not None:
+                padded_lm_head = self.use_padded_seq and cu_seqlens is not None
+                if padded_lm_head:
+                    labels = _padded_lm_head_labels(
+                        mb_input.padded_mb["input_ids"],
+                        cu_seqlens,
+                        mb_input.padded_mb["max_seqlen"],
+                    )
+                else:
+                    rolled_ids = torch.roll(
+                        mb_input.padded_mb["input_ids"], shifts=-1, dims=-1
+                    )
+                if not padded_lm_head and cp_size > 1 and cu_seqlens is not None:
                     labels = split_packed_seqs_for_context_parallel(
                         rolled_ids, mb_input.padded_mb["cu_seqlens"]
                     )
-                elif rolled_ids.ndim == 2:
+                elif not padded_lm_head and rolled_ids.ndim == 2:
                     labels = rolled_ids.transpose(0, 1).contiguous()
-                else:
+                elif not padded_lm_head:
                     labels = rolled_ids
 
                 gpt_model = unwrap_to_gpt_model(model)
@@ -1113,6 +1176,15 @@ class MegatronEngine(TrainEngine):
                     logit_scale=logit_scale,
                 )
 
+                if padded_lm_head:
+                    output = _map_chunked_lm_head_output(
+                        output,
+                        lambda tensor: _repack_padded_lm_head_output(
+                            tensor,
+                            cu_seqlens,
+                            mb_input.padded_mb["max_seqlen"],
+                        ),
+                    )
                 if cp_size > 1 and cu_seqlens is not None and not cp_local:
                     padded_cu_seqlens = mb_input.padded_mb["cu_seqlens"]
                     output = _map_chunked_lm_head_output(
@@ -2630,8 +2702,8 @@ class MegatronEngine(TrainEngine):
                         tp_group=mpu.get_tensor_model_parallel_group()
                         if mpu.get_tensor_model_parallel_world_size() > 1
                         else None,
-                        reuse_logits=_reuse_areal_lm_head_logits(
-                            self.mcore_config.use_areal_lm_head,
+                        reuse_logits=_reuse_chunked_logits_storage(
+                            self.mcore_config.enable_chunked_logits,
                             self.mcore_config.entropy_requires_grad,
                         ),
                     )

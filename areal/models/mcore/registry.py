@@ -214,7 +214,7 @@ def make_mcore_model(
         else:
             _replace_actor_output_layers(
                 models,
-                enabled=mcore_config.use_areal_lm_head,
+                enabled=mcore_config.enable_chunked_logits,
             )
 
         return models
@@ -313,7 +313,7 @@ def make_mcore_model(
         else:
             _replace_actor_output_layers(
                 models,
-                enabled=mcore_config.use_areal_lm_head,
+                enabled=mcore_config.enable_chunked_logits,
             )
 
         return models
@@ -359,7 +359,7 @@ def make_mcore_model(
             _replace_actor_output_layers(
                 [model],
                 enabled=(
-                    mcore_config.use_areal_lm_head
+                    mcore_config.enable_chunked_logits
                     if mcore_config is not None
                     else False
                 ),

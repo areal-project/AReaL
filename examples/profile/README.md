@@ -7,8 +7,8 @@ profile 与 memory profile。
 
 - `train_sft_profile.py`: SFT 入口。它不读取外部 JSONL，而是用真实 tokenizer 编码一段结构化 SWE/代码修复对话，再重复截断到
   131072 token。
-- `qwen3_30b_a3b_sft_profile.yaml`: 1 节点 8 GPU 的 Megatron MoE profile 配置， 默认使用
-  `megatron:(attn:d1p2t2c2|ffn:d1p2e4)`。
+- `qwen3_30b_a3b_sft_profile.yaml`: 1 节点 8 GPU 的 Megatron MoE profile 配置，默认使用
+  `megatron:(attn:d2c4|ffn:d1e8)`，即 attention 使用 DP=2、CP=4，MoE FFN 使用 EP=8。
 - `run_qwen3_30b_a3b_sft_profile.sh`: 一键运行 kernel/memory 两类 profile。
 - `postprocess_profile.py`: 生成 kernel Chrome trace 视图和 profile summary。
 
@@ -39,11 +39,12 @@ PROFILE_FAKE_SEQ_LEN=131072
 PROFILE_FAKE_DATASET_SIZE=8
 PROFILE_FAKE_LOSS_START_RATIO=0.5
 TRAIN_BATCH_SIZE=4
-PROFILE_N_MBS=4
+PROFILE_N_MBS=2
 AREAL_LOGPROBS_CHUNK_SIZE=128
 LM_HEAD_LOSS_CHUNK_SIZE=0
 USE_PRECISION_AWARE_OPTIMIZER=true
 MAIN_GRADS_DTYPE=bfloat16
+USE_DETERMINISTIC_ALGORITHMS=false
 STOP_ON_FAILURE=1
 ```
 
@@ -65,7 +66,7 @@ bash examples/profile/run_qwen3_30b_a3b_sft_profile.sh
 ```
 
 未设置 `PROFILE_RANKS` 时，脚本会根据 `actor.backend` 动态计算每个 pipeline stage 的 rank0；当前默认
-`megatron:(attn:d1p2t2c2|ffn:d1p2e4)` 会解析为 `0,4`。显式设置 `PROFILE_RANKS`
+`megatron:(attn:d2c4|ffn:d1e8)` 的 PP=1，会解析为 `0`。显式设置 `PROFILE_RANKS`
 会覆盖该脚本默认值；设为空字符串表示采集全部 rank。
 
 ## Fake 128K 数据
@@ -146,9 +147,10 @@ traces-r0.cuda_api_only.chrome.json
 ```
 
 用 Chrome `chrome://tracing` 或 Perfetto 打开这些 `.chrome.json` 文件即可查看。默认未设置 `PROFILE_RANKS`
-时，PP=2 会生成 rank 0 和 rank 4 两套文件，例如 `traces-r0.*.chrome.json` 与
-`traces-r4.*.chrome.json`，memory snapshot 也会分别包含 `snapshot_rank00_p0...pickle` 和
-`snapshot_rank04_p1...pickle`。
+时，当前 PP=1 配置只采集 rank 0。若要比较 DP、CP 和 EP 各 rank 的显存，可显式设置 `PROFILE_RANKS=` 采集全部 rank。
+
+当前 DP=2、CP=4 的 128K 配置默认关闭 deterministic algorithms；可通过
+`USE_DETERMINISTIC_ALGORITHMS=true` 显式开启。
 
 ## 单独后处理
 
