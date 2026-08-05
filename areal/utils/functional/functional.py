@@ -10,6 +10,9 @@ import torch.distributed as dist
 
 from areal.api.cli_args import RejectionSamplingConfig
 from areal.utils.data import KLEstimator
+from areal.utils.functional.loss_aggregation import (
+    PolicyGradientReduction,
+)
 
 
 @torch.no_grad()
@@ -461,6 +464,9 @@ def ppo_actor_loss_fn(
     rejection_sampling: RejectionSamplingConfig | None = None,
     importance_sampling_level: str = "token",
     cu_seqlens: torch.Tensor | None = None,
+    group_sizes: list[int] | None = None,
+    pg_reduction: PolicyGradientReduction | None = None,
+    denominator_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict]:
     """PPO actor loss function with optional rejection sampling.
 
@@ -499,11 +505,8 @@ def ppo_actor_loss_fn(
             Shape: [batch_size + 1], where cu_seqlens[i] marks the start of sequence i.
             Not needed for 2D padded inputs (sequences identified by batch dimension).
     """
-    # Save original count BEFORE rejection sampling may modify loss_mask.
-    # This keeps the denominator consistent with loss_weight_fn in actor.py,
-    # which always uses the original loss_mask from input_data. Without this,
-    # mask mode would inflate per-token gradients by N_original / N_kept.
-    loss_mask_count = loss_mask.count_nonzero() or 1
+    # Rejection masking narrows the numerator but keeps the original denominator.
+    orig_loss_mask = loss_mask if denominator_mask is None else denominator_mask
 
     # === Apply rejection sampling (replaces old compute_behave_imp_weight) ===
     if rejection_sampling is not None:
@@ -562,7 +565,14 @@ def ppo_actor_loss_fn(
         pg_loss = pg_loss * behave_imp_weight
 
     logging_loss = pg_loss.detach()
-    pg_loss = torch.where(loss_mask, pg_loss, 0).sum() / loss_mask_count
+    reduction = pg_reduction or PolicyGradientReduction()
+    pg_loss = reduction.aggregate(
+        pg_loss,
+        loss_mask,
+        denominator_mask=orig_loss_mask,
+        cu_seqlens=cu_seqlens,
+        group_sizes=group_sizes,
+    )
     clip_mask.logical_and_(loss_mask)
     dual_clip_mask.logical_and_(loss_mask)
     stat = dict(
@@ -592,6 +602,9 @@ def sapo_loss_fn(
     loss_mask: torch.Tensor,
     importance_sampling_level: str = "token",
     cu_seqlens: torch.Tensor | None = None,
+    group_sizes: list[int] | None = None,
+    pg_reduction: PolicyGradientReduction | None = None,
+    denominator_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict]:
     """SAPO (Soft Adaptive Policy Optimization) loss with asymmetric sigmoid gates.
 
@@ -613,7 +626,6 @@ def sapo_loss_fn(
     """
     if tau_pos <= 0 or tau_neg <= 0:
         raise ValueError("SAPO temperatures (tau_pos, tau_neg) must be positive.")
-    loss_mask_count = loss_mask.count_nonzero() or 1
     advantages = advantages.detach()
     log_ratio = logprobs - old_logprobs
 
@@ -644,7 +656,14 @@ def sapo_loss_fn(
     # Compute loss
     pg_loss = -soft_gate * advantages
     logging_loss = pg_loss.detach()
-    pg_loss = torch.where(loss_mask, pg_loss, 0).sum() / loss_mask_count
+    reduction = pg_reduction or PolicyGradientReduction()
+    pg_loss = reduction.aggregate(
+        pg_loss,
+        loss_mask,
+        denominator_mask=denominator_mask,
+        cu_seqlens=cu_seqlens,
+        group_sizes=group_sizes,
+    )
 
     # Return stat dict compatible with PPO (fake clip_mask for logging compatibility)
     stat = dict(
@@ -672,6 +691,9 @@ def cispo_loss_fn(
     old_logprobs: torch.Tensor | None = None,
     rejection_sampling: RejectionSamplingConfig | None = None,
     cu_seqlens: torch.Tensor | None = None,
+    group_sizes: list[int] | None = None,
+    pg_reduction: PolicyGradientReduction | None = None,
+    denominator_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict]:
     """CISPO (Clipped IS-weight Policy Optimization) loss from MiniMax-M1.
 
@@ -691,8 +713,8 @@ def cispo_loss_fn(
     Advantages are never clipped. The clip bounds reuse the same delta-from-1
     convention as :func:`ppo_actor_loss_fn`. CISPO is canonically single-sided:
     pass ``eps_clip=1.0`` (lower bound 0) with ``eps_clip_higher=4.0`` for the
-    wide MiniMax-M1 range. Token level only -- the geometric-mean sequence ratio
-    of GSPO is not part of the MiniMax-M1 surrogate.
+    wide MiniMax-M1 range. CISPO uses token-level importance weights; the
+    policy-gradient loss can still be reduced with any supported aggregation.
 
     Decoupled loss: when ``rejection_sampling`` is set, the detached
     ``pi_proximal/pi_behave`` weight (from ``old_logprobs``) rescales each token's
@@ -727,8 +749,7 @@ def cispo_loss_fn(
             "CISPO requires a positive eps_clip_higher; the asymmetric upper "
             f"clip is the defining knob (MiniMax-M1 Eq. 4-5). Got {eps_clip_higher!r}."
         )
-    # Pre-rejection token count, so the denominator matches loss_weight_fn.
-    loss_mask_count = loss_mask.count_nonzero() or 1
+    orig_loss_mask = loss_mask if denominator_mask is None else denominator_mask
 
     # Decoupled off-policy correction: the pi_proximal/pi_behave weight.
     if rejection_sampling is not None:
@@ -759,7 +780,14 @@ def cispo_loss_fn(
         pg_loss = pg_loss * behave_imp_weight
 
     logging_loss = pg_loss.detach()
-    pg_loss = torch.where(loss_mask, pg_loss, 0).sum() / loss_mask_count
+    reduction = pg_reduction or PolicyGradientReduction()
+    pg_loss = reduction.aggregate(
+        pg_loss,
+        loss_mask,
+        denominator_mask=orig_loss_mask,
+        cu_seqlens=cu_seqlens,
+        group_sizes=group_sizes,
+    )
 
     clip_mask = (ratio_clipped != ratio).logical_and(loss_mask)
     stat = dict(
