@@ -292,20 +292,22 @@ class RecoverHandler:
                 update_engine = normalized_engine[inference_engine_update_from]
                 versioned_meta = weight_update_meta.with_version(recovery_version)
                 update_engine.connect_engine(inference_engine, versioned_meta)
-                inference_engine.pause()
-                try:
-                    if is_awex_colocate:
-                        inference_engine.pause_generation_sync()
-                        inference_engine.offload(tags=["kv_cache"])
-                        inference_engine.offload(tags=["weights"])
-                        # Loading first would stack checkpoint state on the
-                        # resident rollout allocation and risk GPU OOM.
+                if is_awex_colocate:
+                    # Reuse the trainer's handover instead of mirroring it here:
+                    # entering releases the rollout allocation so checkpoint
+                    # state does not stack on it, and exiting maps kv_cache back
+                    # before generation reopens.
+                    with update_engine.train_phase():
                         for name, engine_ in normalized_engine.items():
                             self._load_checkpoint(engine_, name=name)
                         self._warmup_communicators(normalized_engine)
-                    update_engine.update_weights(versioned_meta)
-                finally:
-                    inference_engine.resume()
+                        update_engine.update_weights(versioned_meta)
+                else:
+                    inference_engine.pause()
+                    try:
+                        update_engine.update_weights(versioned_meta)
+                    finally:
+                        inference_engine.resume()
                 update_engine.set_version(recovery_version)
                 inference_engine.set_version(recovery_version)
             return recover_info
