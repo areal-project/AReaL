@@ -1,22 +1,23 @@
 # SPDX-License-Identifier: Apache-2.0
 
+from __future__ import annotations
+
 import uuid
 from collections.abc import Callable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 from transformers import PreTrainedTokenizerFast
 
-from areal import workflow_context
 from areal.api import (
     AsyncRewardWrapper,
-    InferenceEngine,
     ModelRequest,
-    ModelResponse,
+    RewardResult,
     RolloutWorkflow,
+    normalize_reward_result,
 )
 from areal.api.cli_args import GenerationHyperparameters
-from areal.utils import logging, stats_tracker
+from areal.utils import logging
 from areal.utils.dynamic_import import import_from_string
 from areal.utils.hf_utils import apply_chat_template
 from areal.utils.perf_tracer import (
@@ -24,6 +25,10 @@ from areal.utils.perf_tracer import (
     session_context,
     trace_session,
 )
+
+if TYPE_CHECKING:
+    from areal.api.engine_api import InferenceEngine
+    from areal.api.io_struct import ModelResponse
 
 logger = logging.getLogger("RLVRWorkflow")
 
@@ -86,7 +91,7 @@ class RLVRWorkflow(RolloutWorkflow):
         resp: ModelResponse,
         prompt_str: str,
         task_data: dict[str, Any],
-    ) -> float:
+    ) -> RewardResult:
         """Decode completion and compute reward.
 
         Traces reward phase execution for SessionTracer. Decodes output tokens
@@ -94,8 +99,8 @@ class RLVRWorkflow(RolloutWorkflow):
 
         Returns
         -------
-        float
-            Reward value.
+        RewardResult
+            Reward payload.
         """
         completions_str = self.tokenizer.decode(resp.output_tokens)
         reward = await self.async_reward_fn(
@@ -106,7 +111,7 @@ class RLVRWorkflow(RolloutWorkflow):
             **task_data,
         )
 
-        return reward
+        return normalize_reward_result(reward)
 
     @session_context()
     async def _collect_samples(
@@ -115,7 +120,7 @@ class RLVRWorkflow(RolloutWorkflow):
         req: ModelRequest,
         prompt_str: str,
         task_data: dict[str, Any],
-    ) -> tuple[ModelResponse, float]:
+    ) -> tuple[ModelResponse, RewardResult]:
         """Generate one sample and compute its reward.
 
         Registers a new session for this sample, calls engine.agenerate,
@@ -124,17 +129,72 @@ class RLVRWorkflow(RolloutWorkflow):
 
         Returns
         -------
-        tuple[ModelResponse, float]
-            Model response and reward value.
+        tuple[ModelResponse, RewardResult]
+            Model response and reward payload.
         """
         async with atrace_session_phase("generate"):
             resp = await engine.agenerate(req)
 
         reward = await self._compute_rewards(resp, prompt_str, task_data)
 
-        stats_tracker.get(workflow_context.stat_scope()).scalar(reward=reward)
+        from areal.infra import workflow_context
+        from areal.utils import stats_tracker
+
+        tracker = stats_tracker.get(workflow_context.stat_scope())
+        tracker.scalar(reward=reward.final_reward)
+        if reward.step_rewards is not None:
+            tracker.scalar(
+                step_reward_count=len(reward.step_rewards),
+                step_reward_sum=float(sum(reward.step_rewards)),
+            )
 
         return resp, reward
+
+    def _build_stepwise_reward_tensors(
+        self,
+        reward: RewardResult,
+        resp: ModelResponse,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Convert stepwise rewards into completion-aligned tensors.
+
+        Returns tensors of shape ``[seqlen]`` aligned to the full prompt +
+        completion sequence. Reward values are injected at the PPO reward
+        timesteps that correspond to predicting the completion token indicated
+        by ``reward.step_ends``.
+        """
+
+        seq_len = resp.input_len + resp.output_len
+        step_rewards = torch.zeros(seq_len, dtype=torch.float32)
+        step_reward_mask = torch.zeros(seq_len, dtype=torch.bool)
+
+        if reward.step_rewards is None and reward.step_ends is None:
+            return step_rewards, step_reward_mask
+        if reward.step_rewards is None or reward.step_ends is None:
+            raise ValueError(
+                "step_rewards and step_ends must either both be provided or both be None"
+            )
+        if len(reward.step_rewards) != len(reward.step_ends):
+            raise ValueError(
+                "step_rewards and step_ends must have the same length, got "
+                f"{len(reward.step_rewards)} and {len(reward.step_ends)}"
+            )
+
+        completion_len = resp.output_len
+        for step_reward, step_end in zip(reward.step_rewards, reward.step_ends):
+            if step_end <= 0 or step_end > completion_len:
+                raise ValueError(
+                    f"Invalid step_end={step_end}; expected 1 <= step_end <= {completion_len}"
+                )
+            seq_index = resp.input_len + step_end - 2
+            if seq_index < 0:
+                raise ValueError(
+                    f"Invalid aligned step index for step_end={step_end}; "
+                    "reward injection requires at least one conditioning token"
+                )
+            step_rewards[seq_index] += float(step_reward)
+            step_reward_mask[seq_index] = True
+
+        return step_rewards, step_reward_mask
 
     async def arun_episode(
         self, engine: InferenceEngine, data: dict[str, Any]
@@ -166,13 +226,17 @@ class RLVRWorkflow(RolloutWorkflow):
         logprobs = [0.0] * resp.input_len + resp.output_logprobs
         loss_mask = [0] * resp.input_len + [1] * resp.output_len
         versions = [-1] * resp.input_len + resp.output_versions
-
+        step_rewards, step_reward_mask = self._build_stepwise_reward_tensors(
+            reward, resp
+        )
         res = {
             "input_ids": torch.tensor(seq, dtype=torch.int32),
             "loss_mask": torch.tensor(loss_mask, dtype=torch.int32),
             "logprobs": torch.tensor(logprobs, dtype=torch.float32),
             "versions": torch.tensor(versions, dtype=torch.int32),
             "attention_mask": torch.ones(len(seq), dtype=torch.bool),
-            "rewards": torch.tensor(reward, dtype=torch.float32),
+            "rewards": torch.tensor(reward.final_reward, dtype=torch.float32),
+            "step_rewards": step_rewards,
+            "step_reward_mask": step_reward_mask,
         }
         return {k: v.unsqueeze(0) for k, v in res.items()}
