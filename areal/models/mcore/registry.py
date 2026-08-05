@@ -99,6 +99,13 @@ def _is_lm_head_module_name(name: str) -> bool:
     )
 
 
+def _call_with_optional_group(fn, tensor: torch.Tensor, group: Any | None):
+    try:
+        return fn(tensor, group=group)
+    except TypeError:
+        return fn(tensor)
+
+
 def _fp32_lm_head_forward_impl(
     *,
     input: torch.Tensor,
@@ -108,6 +115,26 @@ def _fp32_lm_head_forward_impl(
     tp_group: Any | None = None,
     **_: Any,
 ) -> torch.Tensor:
+    """Run the lm-head projection in fp32.
+
+    A bf16 head keeps the ``[tokens, vocab]`` logits and their gradient in bf16,
+    which is the dominant rounding error in the loss for large vocabularies.
+    Casting the operands here keeps the matmul and the bias add in fp32 while
+    leaving the rest of the model in its configured dtype.
+
+    Mirrors ``ColumnParallelLinear`` from megatron-core, verified against 0.17.0.
+    The collective helpers gained a ``group`` keyword in newer releases, so the
+    calls fall back to the positional form when it is absent.
+
+    Upgrade considerations: this replaces the fused ``_forward_impl`` with a
+    plain matmul, so the dgrad all-reduce comes from
+    ``copy_to_tensor_model_parallel_region`` instead of the fused kernel -
+    equivalent, not fused. If megatron-core changes the forward short-circuit
+    conditions or the collective signatures, this reimplementation drifts
+    silently; ``_enable_fp32_lm_head_forward`` therefore steps aside when the
+    installed megatron-core exposes a native ``ColumnParallelLinearFP32``
+    (absent as of 0.17.0).
+    """
     if sequence_parallel:
         try:
             total_input = tensor_parallel.gather_from_sequence_parallel_region(
@@ -145,6 +172,7 @@ def _fp32_lm_head_forward(
         )
 
     bias = self.bias if not getattr(self, "skip_bias_add", False) else None
+    tp_group = getattr(self, "tp_group", None)
 
     if (
         getattr(self, "async_tensor_model_parallel_allreduce", False)
@@ -153,14 +181,16 @@ def _fp32_lm_head_forward(
     ):
         input_parallel = input_
     else:
-        input_parallel = tensor_parallel.copy_to_tensor_model_parallel_region(input_)
+        input_parallel = _call_with_optional_group(
+            tensor_parallel.copy_to_tensor_model_parallel_region, input_, tp_group
+        )
 
     output_parallel = _fp32_lm_head_forward_impl(
         input=input_parallel,
         weight=weight,
         bias=bias,
         sequence_parallel=getattr(self, "sequence_parallel", False),
-        tp_group=getattr(self, "tp_group", None),
+        tp_group=tp_group,
     )
 
     runtime_gather_output = kwargs.get("runtime_gather_output", runtime_gather_output)
@@ -170,8 +200,10 @@ def _fp32_lm_head_forward(
         else runtime_gather_output
     )
     if gather_output:
-        output = tensor_parallel.gather_from_tensor_model_parallel_region(
-            output_parallel
+        output = _call_with_optional_group(
+            tensor_parallel.gather_from_tensor_model_parallel_region,
+            output_parallel,
+            tp_group,
         )
     else:
         output = output_parallel
