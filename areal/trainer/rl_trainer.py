@@ -164,7 +164,7 @@ class PPOTrainer:
         # In colocate (awex) mode the GPU switch between rollout and training
         # is managed by the AWEX adapter (manual offload/onload + tagged SGLang
         # release), not by the TMS-based offload machinery below.
-        if config.actor.weight_update_mode == "awex":
+        if self._is_v1_awex_colocate(config):
             self._should_offload_rollout = False
             self._should_offload_actor = False
 
@@ -336,7 +336,7 @@ class PPOTrainer:
         # so that GPU memory is available for inference engine allocation.
         # Uses adapter-based manual offload (not TMS), so enable_offload is not required.
         self._awex_meta_server_addr: str | None = None
-        if config.actor.weight_update_mode == "awex":
+        if self._is_v1_awex_colocate(config):
             from awex.meta.meta_server import start_meta_server
 
             from areal.utils.network import gethostip
@@ -502,6 +502,20 @@ class PPOTrainer:
         rollout_s = config.rollout.scheduling_strategy
         return (self._is_colocation(actor_s) and actor_s.target == "rollout") or (
             self._is_colocation(rollout_s) and rollout_s.target == "actor"
+        )
+
+    def _is_v1_awex_colocate(self, config: PPOConfig) -> bool:
+        """Whether this run is the v1 AWEX colocated actor-rollout setup.
+
+        ``weight_update_mode`` alone is not enough to identify it. Controller v2
+        picks AWEX from ``use_lora`` and never reads that field, so a v2
+        separation run may legitimately carry ``weight_update_mode="awex"``;
+        gating on it alone would apply the v1 colocation handover to v2.
+        """
+        return (
+            config.actor._version == "v1"
+            and config.actor.weight_update_mode == "awex"
+            and self._is_actor_rollout_colocated(config)
         )
 
     def _onload_model(self, engine, role: str) -> None:
@@ -746,7 +760,7 @@ class PPOTrainer:
 
             # In colocate (awex) mode: switch GPU from inference to training.
             # Release SGLang KV cache + weights to free GPU for actor.
-            if self.config.actor.weight_update_mode == "awex":
+            if self._is_v1_awex_colocate(self.config):
                 logger.info("[AWEX] colocate: pausing rollout...")
                 self.rollout.pause()
                 logger.info("[AWEX] colocate: pause_generation_sync...")
@@ -842,7 +856,7 @@ class PPOTrainer:
             # needed) and MegatronEngine.save() drops the dead fp32 grad
             # buffers to fund the transient. Weights are identical on both
             # sides of the transfer, so the checkpoint content is unchanged.
-            if config.actor.weight_update_mode == "awex":
+            if self._is_v1_awex_colocate(config):
                 self._save_training_state(
                     epoch=epoch,
                     epoch_step=step,
@@ -875,7 +889,7 @@ class PPOTrainer:
                 if self.eval_rollout is not None:
                     self.eval_rollout.set_version(new_version)
 
-            if config.actor.weight_update_mode != "awex":
+            if not self._is_v1_awex_colocate(config):
                 self._save_training_state(
                     epoch=epoch,
                     epoch_step=step,
@@ -1212,7 +1226,7 @@ class PPOTrainer:
                 pp_size=self.rollout_alloc.parallel.pp_size,
                 base_gpu_id=0,
             )
-            if self.config.actor.weight_update_mode == "awex":
+            if self._is_v1_awex_colocate(self.config):
                 server_args["awex_colocate_mode"] = True
                 server_args["awex_meta_server_addr"] = self._awex_meta_server_addr
         elif rollout_backend == "vllm":
@@ -1489,7 +1503,7 @@ class PPOTrainer:
                 "to one of them."
             )
 
-        if self.config.actor.weight_update_mode == "awex":
+        if self._is_v1_awex_colocate(self.config):
             if actor_backend != "megatron":
                 raise ValueError(
                     "weight_update_mode='awex' requires Megatron actor training "
