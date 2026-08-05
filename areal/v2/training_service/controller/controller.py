@@ -1088,6 +1088,7 @@ class GatewayTrainController:
             self.rollout.onload(tags=["cuda_graph"])
             logger.info("[train-phase] exit: restoring inference kv_cache")
             self.rollout.onload(tags=["kv_cache"])
+            self.rollout.continue_generation()
             self.rollout.resume()
             logger.info("[train-phase] exit complete: rollout resumed")
 
@@ -1127,7 +1128,11 @@ class GatewayTrainController:
             f"meta.version must be a positive integer, got {meta.version}"
         )
         result = self._weight_update_ctrl.update_weights(version=meta.version)
-        self.rollout.continue_generation()
+        if not self._colocate:
+            # Under colocation the surrounding train phase owns generation
+            # lifecycle: inference kv_cache is still released here, so letting
+            # the scheduler prefill now dies in a Triton kernel on freed pages.
+            self.rollout.continue_generation()
         logger.info(
             "Weight update v%d completed (%s, %.0fms)",
             meta.version,
