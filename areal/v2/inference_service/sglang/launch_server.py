@@ -15,11 +15,11 @@ import sys
 
 
 def areal_launch_server(server_args) -> None:
-    from sglang.srt.entrypoints.engine import Engine, init_tokenizer_manager
+    from sglang.srt.entrypoints.engine import init_tokenizer_manager
     from sglang.srt.entrypoints.http_server import (
         _execute_server_warmup,
-        _setup_and_run_http_server,
         app,
+        launch_server,
     )
     from sglang.srt.managers.detokenizer_manager import run_detokenizer_process
 
@@ -36,46 +36,33 @@ def areal_launch_server(server_args) -> None:
 
     # ---- BEGIN AREAL ----
     result_ipc = create_result_ipc()
-    # ---- END AREAL ----
-
-    (
-        tokenizer_manager,
-        template_manager,
-        port_args,
-        scheduler_init_result,
-        subprocess_watchdog,
-    ) = Engine._launch_subprocesses(
-        server_args=server_args,
-        init_tokenizer_manager_func=init_tokenizer_manager,
-        # ---- BEGIN AREAL ----
-        run_scheduler_process_func=areal_run_scheduler_process,
-        # ---- END AREAL ----
-        run_detokenizer_process_func=run_detokenizer_process,
-    )
-
-    # ---- BEGIN AREAL ----
-    if tokenizer_manager is None:
-        return
+    rpc_proxies = []
     # ---- END AREAL ----
 
     # ---- BEGIN AREAL ----
-    rpc_proxy = RpcProxy(port_args, result_ipc)
-    register_awex_endpoints(app, rpc_proxy)
+    def areal_init_tokenizer_manager(server_args, port_args):
+        tokenizer_manager, template_manager = init_tokenizer_manager(
+            server_args, port_args
+        )
+        rpc_proxy = RpcProxy(port_args, result_ipc)
+        register_awex_endpoints(app, rpc_proxy)
+        rpc_proxies.append(rpc_proxy)
+        return tokenizer_manager, template_manager
+
     # ---- END AREAL ----
 
     try:
-        _setup_and_run_http_server(
+        launch_server(
             server_args,
-            tokenizer_manager,
-            template_manager,
-            port_args,
-            scheduler_init_result.scheduler_infos,
-            subprocess_watchdog,
+            init_tokenizer_manager_func=areal_init_tokenizer_manager,
+            run_scheduler_process_func=areal_run_scheduler_process,
+            run_detokenizer_process_func=run_detokenizer_process,
             execute_warmup_func=_execute_server_warmup,
         )
     finally:
         # ---- BEGIN AREAL ----
-        rpc_proxy.close()
+        for rpc_proxy in rpc_proxies:
+            rpc_proxy.close()
         # ---- END AREAL ----
 
 

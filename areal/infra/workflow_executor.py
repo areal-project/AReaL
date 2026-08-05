@@ -346,14 +346,24 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
 
         def post():
             try:
+                self.logger.info(
+                    f"[ROLLOUT-CB] send callback task_id={task_id} addr={addr} "
+                    f"result_is_none={result is None}"
+                )
                 resp = requests.post(
                     addr,
                     json={"task_id": task_id},
                     timeout=30,
                 )
                 resp.raise_for_status()
+                self.logger.info(
+                    f"[ROLLOUT-CB] callback ok task_id={task_id} "
+                    f"addr={addr} status={resp.status_code}"
+                )
             except requests.RequestException as e:
-                self.logger.error(f"Callback to {addr} failed: {e}")
+                self.logger.error(
+                    f"[ROLLOUT-CB] callback failed task_id={task_id} addr={addr}: {e}"
+                )
 
         get_executor().submit(post)
 
@@ -417,6 +427,12 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
                         self._pending_results[result.task_id] = result
                         # Trigger callback if registered
                         cb_addr = self._task_callbacks.pop(result.task_id, None)
+                        self.logger.info(
+                            f"[ROLLOUT-CB] fetch result task_id={result.task_id} "
+                            f"has_callback={cb_addr is not None} "
+                            f"result_is_none={result.data is None} "
+                            f"pending_results={len(self._pending_results)}"
+                        )
                         if cb_addr:
                             self._send_callback(cb_addr, result.task_id, result.data)
                     self._result_cv.notify_all()

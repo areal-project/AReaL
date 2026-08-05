@@ -107,6 +107,34 @@ class TestWorkerEndpoints:
         assert isinstance(result, dict)
         assert "total" in result
 
+    def test_init_awex_adapter_after_create_engine(self, client):
+        create_resp = client.post(
+            "/create_engine",
+            json={
+                "engine_class": "tests.v2.training_service.fake_train_engine.FakeTrainEngine",
+                "init_args": serialize_value([]),
+                "init_kwargs": serialize_value({"world_size": 1}),
+            },
+        )
+        assert create_resp.status_code == 200
+
+        init_resp = client.post(
+            "/init_awex_adapter",
+            json={
+                "args": serialize_value([]),
+                "kwargs": serialize_value({"meta_server_addr": "127.0.0.1:12345"}),
+            },
+        )
+
+        assert init_resp.status_code == 200
+        assert deserialize_value(init_resp.get_json()["result"]) is None
+
+        awex_resp = client.post(
+            "/awex/init_adapter",
+            json={"meta_server_addr": "127.0.0.1:12345"},
+        )
+        assert awex_resp.status_code == 200
+
     def test_topology_after_create_engine(self, client):
         create_resp = client.post(
             "/create_engine",
@@ -191,6 +219,38 @@ class TestWorkerEndpoints:
         result = deserialize_value(forward_resp.get_json()["result"])
         assert isinstance(result, dict)
         assert result["output_seqlens"] == [3]
+
+    def test_compute_route_skips_non_dp_head_result_after_initialize(self, client):
+        create_resp = client.post(
+            "/create_engine",
+            json={
+                "engine_class": "tests.v2.training_service.fake_train_engine.FakeTrainEngine",
+                "init_args": serialize_value([]),
+                "init_kwargs": serialize_value({"is_dp_head": False}),
+            },
+        )
+        assert create_resp.status_code == 200
+
+        init_resp = client.post(
+            "/initialize",
+            json={
+                "args": serialize_value([]),
+                "kwargs": serialize_value({"addr": None, "ft_spec": None}),
+            },
+        )
+        assert init_resp.status_code == 200
+
+        train_resp = client.post(
+            "/train_batch",
+            json={
+                "args": serialize_value(
+                    [{"token_ids": [1, 2, 3], "metadata": {"weight": 2.0}}]
+                ),
+                "kwargs": serialize_value({}),
+            },
+        )
+        assert train_resp.status_code == 200
+        assert deserialize_value(train_resp.get_json()["result"]) is None
 
     def test_sft_route_succeeds_without_distributed_group_for_single_worker(
         self, client

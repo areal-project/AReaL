@@ -7,7 +7,6 @@ from dataclasses import asdict
 
 import swanlab
 import torch.distributed as dist
-import trackio
 import wandb
 from tensorboardX import SummaryWriter
 
@@ -18,6 +17,16 @@ from areal.utils.printing import tabulate_stats
 from areal.version import version_info
 
 logger = logging.getLogger("StatsLogger", "system")
+trackio = None
+
+
+def _get_trackio():
+    global trackio
+    if trackio is None:
+        import trackio as trackio_module
+
+        trackio = trackio_module
+    return trackio
 
 
 class StatsLogger:
@@ -98,7 +107,8 @@ class StatsLogger:
         self._trackio_enabled = False
         trackio_config = self.config.trackio
         if trackio_config.mode != "disabled":
-            trackio.init(
+            trackio_module = _get_trackio()
+            trackio_module.init(
                 project=trackio_config.project or self.config.experiment_name,
                 name=trackio_config.name or self.config.trial_name,
                 config=exp_config_dict,
@@ -128,7 +138,7 @@ class StatsLogger:
         wandb.finish()
         swanlab.finish()
         if getattr(self, "_trackio_enabled", False):
-            trackio.finish()
+            _get_trackio().finish()
         if self.summary_writer is not None:
             self.summary_writer.close()
 
@@ -152,7 +162,7 @@ class StatsLogger:
             wandb.log(item, step=log_step + i)
             swanlab.log(item, step=log_step + i)
             if getattr(self, "_trackio_enabled", False):
-                trackio.log(item, step=log_step + i)
+                _get_trackio().log(item, step=log_step + i)
             if self.summary_writer is not None:
                 for key, val in item.items():
                     self.summary_writer.add_scalar(f"{key}", val, log_step + i)

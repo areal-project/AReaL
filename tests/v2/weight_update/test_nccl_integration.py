@@ -348,6 +348,45 @@ def _validate_weight_update_correctness_megatron(
     )
 
 
+def _resume_awex_memory(
+    train_worker_urls: list[str], tags: list[str], timeout: float = 120.0
+) -> None:
+    for url in train_worker_urls:
+        resp = httpx.post(
+            f"{url}/awex/resume_memory",
+            json={"tags": tags},
+            timeout=timeout,
+        )
+        assert resp.status_code == 200, (
+            f"resume_memory({tags}) failed on {url}: {resp.text}"
+        )
+
+
+def _run_minimal_sft_train_step(train_ctrl) -> None:
+    """Run one real Megatron optimizer step through the training service."""
+    from areal.infra.rpc.serialization import serialize_value
+
+    batch: list[dict[str, torch.Tensor]] = []
+    seq_len = 16
+    for i in range(4):
+        input_ids = (torch.arange(seq_len, dtype=torch.long).unsqueeze(0) + i) % 100
+        batch.append(
+            {
+                "input_ids": input_ids,
+                "attention_mask": torch.ones((1, seq_len), dtype=torch.bool),
+                "loss_mask": torch.ones((1, seq_len), dtype=torch.bool),
+            }
+        )
+
+    payload = {
+        "args": serialize_value([batch]),
+        "kwargs": serialize_value({}),
+    }
+    print("[inversion-smoke] Running one SFT train step before version 2 ...")
+    train_ctrl._gateway_post_result("/sft/train", payload)
+    print("[inversion-smoke] SFT train step completed; AdamW state should exist")
+
+
 @pytest.mark.multi_gpu
 @pytest.mark.slow
 @pytest.mark.sglang
@@ -983,6 +1022,7 @@ def _run_megatron_colocate_e2e(
         inf_ctrl.initialize(
             role="rollout",
             server_args={"model_path": model_path, "mem_fraction_static": 0.7},
+            wait=True,
         )
         inf_worker_urls = list(inf_ctrl._inf_addrs)
 
@@ -997,6 +1037,7 @@ def _run_megatron_colocate_e2e(
             ft_spec=FinetuneSpec(
                 total_train_epochs=1, dataset_size=100, train_batch_size=2
             ),
+            wait=True,
         )
         train_worker_urls = list(train_ctrl._worker_addrs)
 
@@ -1079,8 +1120,8 @@ def test_awex_megatron_colocate_dp_multi_version_e2e(tmp_path_factory):
     """Colocated weight update with multiple sequential versions.
 
     Verifies that the colocated IPC path correctly handles version
-    sequencing: version 1 → version 2.  The KV store keys include
-    the version number, so each round must produce fresh IPC handles.
+    sequencing: version 1 → train step → version 2. The train step creates
+    AdamW moment state so inversion mode can exercise the real mask path.
     """
     n_gpus = 2
     if current_platform.device_count() < n_gpus:
@@ -1152,6 +1193,7 @@ def test_awex_megatron_colocate_dp_multi_version_e2e(tmp_path_factory):
         inf_ctrl.initialize(
             role="rollout",
             server_args={"model_path": model_path, "mem_fraction_static": 0.7},
+            wait=True,
         )
         inf_worker_urls = list(inf_ctrl._inf_addrs)
 
@@ -1164,6 +1206,7 @@ def test_awex_megatron_colocate_dp_multi_version_e2e(tmp_path_factory):
             ft_spec=FinetuneSpec(
                 total_train_epochs=1, dataset_size=100, train_batch_size=2
             ),
+            wait=True,
         )
         train_worker_urls = list(train_ctrl._worker_addrs)
 
@@ -1184,6 +1227,11 @@ def test_awex_megatron_colocate_dp_multi_version_e2e(tmp_path_factory):
         result1 = wu_ctrl.update_weights(version=1)
         assert result1.status == "ok"
         assert result1.version == 1
+
+        # Create real post-v1 optimizer state before v2. The v1 colocate
+        # transfer offloads train weights at the end, so bring them back first.
+        _resume_awex_memory(train_worker_urls, ["weights", "optimizer"])
+        _run_minimal_sft_train_step(train_ctrl)
 
         # Version 2
         result2 = wu_ctrl.update_weights(version=2)

@@ -37,7 +37,7 @@ from areal.infra.utils.launcher import (
 )
 from areal.utils import logging, name_resolve, names
 from areal.utils.network import find_free_ports
-from areal.utils.offload import get_tms_env_vars
+from areal.utils.offload import apply_tms_env_vars
 from areal.utils.recover import check_if_recover
 
 logger = logging.getLogger("LocalLauncher")
@@ -378,10 +378,7 @@ def local_main(config, run_id: int = 0):
                 run_post_exit_hook(config)
             raise e
 
-    if config.get("enable_offload", False):
-        tms_env_vars = get_tms_env_vars()
-    else:
-        tms_env_vars = {}
+    enable_tms_offload = config.get("enable_offload", False)
     # Launch trainer entrypoint
     if alloc_mode.type_ != AllocationType.LLM_SERVER_ONLY:
         gpu = nprocs = alloc_mode.train.world_size
@@ -408,18 +405,20 @@ def local_main(config, run_id: int = 0):
             cpus_per_task=actor_cpus_per_task,
             existing_env_vars=actor_env_vars,
         )
+        env_vars = {
+            **BASE_ENVIRONS,
+            **thread_env,
+            **actor_env_vars,
+            **_env_vars,
+            "AREAL_SPMD_MODE": "1",
+        }
+        if enable_tms_offload:
+            apply_tms_env_vars(env_vars)
         launcher.submit(
             job_name="trainer",
             cmd=f"torchrun --nnodes 1 --nproc-per-node {nprocs} --master-addr localhost --master-port {find_free_ports(1, (10000, 32767))[0]} {' '.join(sys.argv[1:])}",
             gpu=gpu,
-            env_vars={
-                **BASE_ENVIRONS,
-                **thread_env,
-                **actor_env_vars,
-                **_env_vars,
-                **tms_env_vars,
-                "AREAL_SPMD_MODE": "1",
-            },
+            env_vars=env_vars,
         )
 
     try:

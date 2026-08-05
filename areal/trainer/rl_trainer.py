@@ -132,6 +132,7 @@ class PPOTrainer:
             logging.setup_file_logging(StatsLogger.get_log_path(config.stats_logger))
 
         self.config = config
+        self._apply_dte_config_envvars()
         self.processor, self.tokenizer = load_hf_processor_and_tokenizer(
             config.tokenizer_path
         )
@@ -150,9 +151,29 @@ class PPOTrainer:
         self.rollout_alloc = ModelAllocation.from_str(
             config.rollout.backend, name="rollout"
         )
-        self._should_offload_rollout = self._is_actor_rollout_colocated(config)
-        self._should_offload_actor = (
-            self._should_offload_rollout or config.actor.offload
+        (
+            self._should_offload_rollout,
+            self._should_offload_actor,
+        ) = self._resolve_actor_rollout_offload(config)
+        self._release_initial_rollout_weights = (
+            self._resolve_release_initial_rollout_weights(config)
+        )
+        # Delta transfer patches the receiver in place, so the rollout weights
+        # are the delta BASE and must survive every train-phase offload. A
+        # plain release drops them and the next DELTA payload only rewrites
+        # the changed slice: observed 0706 long run — v2 [inversion] changed
+        # 0.03%, every post-v2 rollout was uniform-logit token soup. FULL
+        # payloads mask this by rebuilding everything. Preferred base home is
+        # the sglang weights CPU backup (release stays cheap on GPU; measured
+        # resident cost is the full TP-sharded replica, 48.5GB/GPU at d16t4p1,
+        # which does not fit next to the train peak). Only fall back to GPU
+        # residency when the backup is off.
+        dte_cfg = getattr(config.actor, "dte", None)
+        sglang_cfg = getattr(config, "sglang", None)
+        self._keep_rollout_weights_resident = bool(
+            getattr(dte_cfg, "enabled", False)
+            and getattr(dte_cfg, "transfer", None) == "delta"
+            and not getattr(sglang_cfg, "enable_weights_cpu_backup", False)
         )
         self._should_offload_critic = (
             config.critic is not None and config.critic.offload
@@ -328,15 +349,11 @@ class PPOTrainer:
         # Save initial LoRA weights if enabled (for inference server pre-loading)
         initial_lora_path = self._save_initial_lora_weights()
 
-        # Offload actor before rollout init so sglang can use the GPU memory
-        if self._should_offload_actor:
-            self._offload_model(self.actor, role="actor")
-
         # In colocate (awex) mode, offload training weights before SGLang starts
         # so that GPU memory is available for inference engine allocation.
         # Uses adapter-based manual offload (not TMS), so enable_offload is not required.
         self._awex_meta_server_addr: str | None = None
-        if self._is_v1_awex_colocate(config):
+        if self._uses_awex_weight_update(config):
             from awex.meta.meta_server import start_meta_server
 
             from areal.utils.network import gethostip
@@ -351,6 +368,9 @@ class PPOTrainer:
             )
             self.actor.init_awex_adapter(meta_server_addr=self._awex_meta_server_addr)
             self.actor.offload()
+        elif self._should_offload_actor:
+            # Offload actor before rollout init so sglang can use the GPU memory.
+            self._offload_model(self.actor, role="actor")
 
         # Initialize inference with LoRA path
         self.rollout = self._init_rollout(
@@ -358,7 +378,7 @@ class PPOTrainer:
         )
 
         self.eval_rollout = None
-        if not self._online_mode:
+        if not self._online_mode and self._is_eval_enabled(config):
             self.eval_rollout = self._init_rollout(
                 config.rollout, is_eval=True, lora_path=initial_lora_path
             )
@@ -394,7 +414,9 @@ class PPOTrainer:
                 }
                 self.weight_update_meta = WeightUpdateMeta.from_disk(**disk_kwargs)
             else:
-                self.weight_update_meta = WeightUpdateMeta.from_awex()
+                self.weight_update_meta = WeightUpdateMeta.from_awex(
+                    meta_server_addr=self._awex_meta_server_addr,
+                )
         elif self.config.actor.weight_update_mode == "disk":
             disk_kwargs = {
                 "experiment_name": config.experiment_name,
@@ -504,6 +526,23 @@ class PPOTrainer:
             self._is_colocation(rollout_s) and rollout_s.target == "actor"
         )
 
+    def _resolve_actor_rollout_offload(self, config: PPOConfig) -> tuple[bool, bool]:
+        offload_rollout = self._is_actor_rollout_colocated(config)
+        return offload_rollout, offload_rollout or config.actor.offload
+
+    def _resolve_release_initial_rollout_weights(self, config: PPOConfig) -> bool:
+        dte_cfg = getattr(config.actor, "dte", None)
+        configured = getattr(dte_cfg, "release_initial_rollout_weights", None)
+        if configured is not None:
+            return bool(configured)
+
+        dte_awex_colocate = (
+            self._should_offload_rollout
+            and self._uses_awex_weight_update(config)
+            and getattr(dte_cfg, "enabled", None) is True
+        )
+        return not dte_awex_colocate
+
     def _is_v1_awex_colocate(self, config: PPOConfig) -> bool:
         """Whether this run is the v1 AWEX colocated actor-rollout setup.
 
@@ -522,6 +561,14 @@ class PPOTrainer:
         return (
             config.actor._version == "v1" and config.actor.weight_update_mode == "awex"
         )
+
+    def _uses_awex_weight_update(self, config: PPOConfig) -> bool:
+        if config.actor._version == "v2":
+            return not config.actor.use_lora
+        return self._is_v1_awex_colocate(config)
+
+    def _should_save_before_weight_update(self, config: PPOConfig) -> bool:
+        return self._uses_awex_weight_update(config)
 
     def _onload_model(self, engine, role: str) -> None:
         with (
@@ -543,7 +590,7 @@ class PPOTrainer:
         ):
             engine.offload()
 
-    def _offload_rollout(self, is_eval: bool = False):
+    def _offload_rollout(self, is_eval: bool = False, *, release_weights: bool = True):
         rollout = self.rollout if not is_eval else self.eval_rollout
         if rollout is None:
             return
@@ -573,7 +620,19 @@ class PPOTrainer:
                 category=Category.IO,
             ),
         ):
-            rollout.offload()
+            if isinstance(rollout, RolloutControllerV2):
+                logger.info("colocate: offloading rollout kv_cache")
+                rollout.offload(tags=["kv_cache"])
+                if release_weights:
+                    logger.info("colocate: offloading rollout weights")
+                    rollout.offload(tags=["weights"])
+                else:
+                    logger.info(
+                        "colocate: keeping rollout weights resident "
+                        "(DTE delta base must survive the offload cycle)"
+                    )
+            else:
+                rollout.offload()
 
     def _onload_rollout(self, is_eval: bool = False) -> None:
         cleanup_error: Exception | None = None
@@ -590,7 +649,13 @@ class PPOTrainer:
                     category=Category.IO,
                 ),
             ):
-                rollout.onload()
+                if isinstance(rollout, RolloutControllerV2):
+                    logger.info("colocate: onloading rollout weights")
+                    rollout.onload(tags=["weights"])
+                    logger.info("colocate: onloading rollout kv_cache")
+                    rollout.onload(tags=["kv_cache"])
+                else:
+                    rollout.onload()
         except Exception as exc:  # noqa: BLE001
             cleanup_error = exc
 
@@ -625,7 +690,12 @@ class PPOTrainer:
 
     def _apply_initial_offload_policy(self) -> None:
         if self._should_offload_rollout:
-            self._offload_rollout()
+            self._offload_rollout(release_weights=self._release_initial_rollout_weights)
+            if self.eval_rollout is not None:
+                self._offload_rollout(
+                    is_eval=True,
+                    release_weights=self._release_initial_rollout_weights,
+                )
         if self._should_offload_ref:
             self._offload_model(self.ref, role="ref")
         if self._should_offload_critic:
@@ -645,6 +715,7 @@ class PPOTrainer:
         total_epochs: int | None = None,
     ):
         config = self.config
+        dynamic_filter_mode = config.dynamic_filter_mode
         start_step = (
             self.recover_info.last_step_info.next().global_step
             if self.recover_info is not None
@@ -657,6 +728,16 @@ class PPOTrainer:
             raise ValueError(f"Total epochs must be positive: {total_epochs}")
         steps_per_epoch = len(self.train_dataloader)
         max_steps = total_epochs * steps_per_epoch
+
+        # SPMD engines' prepare_batch does not accept this workflow-only
+        # kwarg; only pass it on the single-controller path. In SPMD mode the
+        # option is already disabled with a warning by
+        # GenerationHyperparameters.__post_init__.
+        keep_partial_kwargs = (
+            {"keep_partial_group_on_error": config.gconfig.keep_partial_group_on_error}
+            if is_single_controller()
+            else {}
+        )
 
         # Initialize proxy workers if not using RolloutWorkflow
         if workflow is None:
@@ -698,14 +779,26 @@ class PPOTrainer:
                     self.train_dataloader,
                     workflow=workflow,
                     workflow_kwargs=workflow_kwargs,
-                    should_accept_fn=dynamic_filter_fn,
+                    # In "post_batch" mode filtering is applied below,
+                    # after the whole batch has been collected.
+                    should_accept_fn=(
+                        dynamic_filter_fn if dynamic_filter_mode == "rollout" else None
+                    ),
                     group_size=config.gconfig.n_samples,
                     dynamic_bs=self.config.dynamic_bs,
                     reward_normalization=config.gconfig.reward_normalization,
                     drop_incomplete_group=config.gconfig.drop_incomplete_group,
+                    **keep_partial_kwargs,
                 )
             if self._should_offload_rollout:
-                self._offload_rollout()
+                self._offload_rollout(
+                    release_weights=not self._keep_rollout_weights_resident
+                )
+
+            if dynamic_filter_mode == "post_batch" and dynamic_filter_fn is not None:
+                rollout_batch = self._post_batch_dynamic_filter(
+                    rollout_batch, dynamic_filter_fn
+                )
 
             if self.critic is not None:
                 if self._should_offload_critic:
@@ -861,7 +954,7 @@ class PPOTrainer:
             # needed) and MegatronEngine.save() drops the dead fp32 grad
             # buffers to fund the transient. Weights are identical on both
             # sides of the transfer, so the checkpoint content is unchanged.
-            if self._is_v1_awex_colocate(config):
+            if self._should_save_before_weight_update(config):
                 self._save_training_state(
                     epoch=epoch,
                     epoch_step=step,
@@ -870,9 +963,6 @@ class PPOTrainer:
 
             # pause inference for updating weights, save, and evaluation
             self.rollout.pause()
-
-            # Actor already onloaded; engine-internal _offload_aware_context
-            # calls in update_weights/save are no-ops.
 
             with (
                 stats_tracker.record_timing("update_weights"),
@@ -894,7 +984,7 @@ class PPOTrainer:
                 if self.eval_rollout is not None:
                     self.eval_rollout.set_version(new_version)
 
-            if not self._is_v1_awex_colocate(config):
+            if not self._should_save_before_weight_update(config):
                 self._save_training_state(
                     epoch=epoch,
                     epoch_step=step,
@@ -958,8 +1048,26 @@ class PPOTrainer:
                     epoch=epoch, epoch_step=step, global_step=global_step
                 )
 
-            # Resume rollout
-            self.rollout.resume()
+            # Resume rollout only when another train step will consume it.
+            #
+            # The dispatcher may have queued overlap rollouts while producing
+            # the current batch. Resuming it after the final step lets those
+            # stale tasks hit the inference server while close() is already
+            # tearing workers down, producing noisy ConnectionRefused errors.
+            if not self._is_final_train_step(
+                global_step=global_step, max_steps=max_steps
+            ):
+                # In colocated offload mode, keep rollout paused until the
+                # next _onload_rollout() restores weights/kv_cache and resumes
+                # dispatch.
+                if not self._should_offload_rollout:
+                    self.rollout.resume()
+            else:
+                logger.info(
+                    "Skipping rollout resume after final training step "
+                    "(global_step=%s)",
+                    global_step,
+                )
 
             self._save_perf_tracer(step=global_step)
 
@@ -995,24 +1103,47 @@ class PPOTrainer:
             )
 
     def close(self):
-        self.saver.finalize()
-        if hasattr(self, "_train_rdataset") and self._train_rdataset is not None:
-            self._train_rdataset.close()
-        if hasattr(self, "_valid_rdataset") and self._valid_rdataset is not None:
-            self._valid_rdataset.close()
-        if hasattr(self, "data_controller") and self.data_controller is not None:
-            self.data_controller.destroy()
-        self.stats_logger.close()
-        if self.eval_rollout is not None:
-            self.eval_rollout.destroy()
-        self.rollout.destroy()
-        if self.teacher is not None:
-            self.teacher.destroy()
-        if self.ref is not None:
-            self.ref.destroy()
-        if self.critic is not None:
-            self.critic.destroy()
-        self.actor.destroy()
+        # P87: must tolerate a partially-constructed trainer (called from
+        # __init__'s failure path), and one engine's destroy() failure must
+        # not keep the remaining workers alive.
+        saver = getattr(self, "saver", None)
+        if saver is not None:
+            try:
+                saver.finalize()
+            except Exception:
+                logger.warning("saver.finalize() failed during close", exc_info=True)
+        for attr in ("_train_rdataset", "_valid_rdataset"):
+            rdataset = getattr(self, attr, None)
+            if rdataset is not None:
+                try:
+                    rdataset.close()
+                except Exception:
+                    logger.warning(f"{attr}.close() failed during close", exc_info=True)
+        data_controller = getattr(self, "data_controller", None)
+        if data_controller is not None:
+            try:
+                data_controller.destroy()
+            except Exception:
+                logger.warning(
+                    "data_controller.destroy() failed during close", exc_info=True
+                )
+        stats_logger = getattr(self, "stats_logger", None)
+        if stats_logger is not None:
+            try:
+                stats_logger.close()
+            except Exception:
+                logger.warning(
+                    "stats_logger.close() failed during close", exc_info=True
+                )
+        for attr in ("eval_rollout", "rollout", "teacher", "ref", "critic", "actor"):
+            engine = getattr(self, attr, None)
+            if engine is not None:
+                try:
+                    engine.destroy()
+                except Exception:
+                    logger.warning(
+                        f"{attr}.destroy() failed during close", exc_info=True
+                    )
         perf_tracer.save(force=True)
 
     def _config_perf_tracer(self):
@@ -1055,6 +1186,109 @@ class PPOTrainer:
         elif cfg.type == "slurm":
             return SlurmScheduler(exp_config=self.config)
         raise NotImplementedError(f"Unknown scheduler type: {cfg.type}")
+
+    def _apply_dte_config_envvars(self) -> None:
+        """Export actor.dte.* config to worker-visible runtime switches.
+
+        The public control surface is now CLI/config (``actor.dte.*``). The
+        train and rollout workers are separate processes, so the selected values
+        still need to be inherited through the environment until the AWEX adapter
+        APIs grow an explicit config payload. Old AWEX_* variables remain a
+        fallback in the readers; values set here use the DTE_* names and take
+        precedence.
+        """
+        dte_cfg = getattr(self.config.actor, "dte", None)
+        if dte_cfg is None:
+            return
+
+        exported_env: dict[str, str] = {}
+
+        def set_env(name: str, value: Any) -> None:
+            if value is None:
+                return
+            if isinstance(value, bool):
+                env_value = "1" if value else "0"
+            else:
+                env_value = str(value)
+            os.environ[name] = env_value
+            exported_env[name] = env_value
+
+        transfer = dte_cfg.transfer
+        delta_transfer = None
+        if transfer is not None:
+            transfer = transfer.strip().lower()
+            if transfer not in {"full", "delta"}:
+                raise ValueError(
+                    "actor.dte.transfer must be 'full' or 'delta', "
+                    f"got {dte_cfg.transfer!r}"
+                )
+            delta_transfer = transfer == "delta"
+
+        delta_method = dte_cfg.delta_method
+        detector = None
+        if delta_method is not None:
+            delta_method = delta_method.strip().lower()
+            if delta_method == "adamw":
+                detector = "inversion"
+            elif delta_method == "snapshot":
+                detector = "snapshot"
+            else:
+                raise ValueError(
+                    "actor.dte.delta_method must be 'snapshot' or 'adamw', "
+                    f"got {dte_cfg.delta_method!r}"
+                )
+        elif delta_transfer:
+            detector = "inversion"
+
+        enabled = dte_cfg.enabled
+        if enabled is False and delta_transfer:
+            raise ValueError(
+                "actor.dte.enabled=false conflicts with actor.dte.transfer='delta'. "
+                "Use actor.dte.enabled=true for delta transfer, or set "
+                "actor.dte.transfer=full."
+            )
+        if enabled is None and delta_transfer:
+            enabled = True
+        set_env("DTE_COLOCATE_WEIGHT_UPDATE", enabled)
+
+        config_controls_dte = enabled is not None
+        if config_controls_dte:
+            set_env("DTE_DELTA_TRANSFER", delta_transfer)
+            set_env("DTE_DELTA_DETECTOR", detector)
+            set_env("DTE_DELTA_ANCHOR_INTERVAL", dte_cfg.anchor_interval)
+            set_env("DTE_DELTA_BYTES_RATIO", dte_cfg.bytes_ratio)
+            set_env("DTE_DELTA_VERIFY_SNAPSHOT", dte_cfg.verify_snapshot)
+        set_env(
+            "DTE_RELEASE_TRAIN_WEIGHTS_AFTER_UPDATE",
+            dte_cfg.release_train_weights_after_update,
+        )
+        set_env(
+            "DTE_SYNC_MODEL_PARAMS_BEFORE_PAYLOAD",
+            dte_cfg.sync_model_params_before_payload,
+        )
+        set_env("DTE_DELTA_INVERSION_DEBUG", dte_cfg.inversion_debug)
+        set_env(
+            "DTE_DELTA_INVERSION_BF16_MARGIN_REL",
+            dte_cfg.inversion_bf16_margin_rel,
+        )
+
+        if exported_env:
+            for cfg_part in (
+                getattr(self.config, "actor", None),
+                getattr(self.config, "rollout", None),
+            ):
+                specs = getattr(cfg_part, "scheduling_spec", None)
+                if not specs:
+                    continue
+                for spec in specs:
+                    if isinstance(spec, dict):
+                        spec.setdefault("env_vars", {}).update(exported_env)
+                        continue
+                    env_vars = getattr(spec, "env_vars", None)
+                    if env_vars is None:
+                        env_vars = {}
+                        setattr(spec, "env_vars", env_vars)
+                    env_vars.update(exported_env)
 
     def _create_dataloader(
         self,
@@ -1191,6 +1425,20 @@ class PPOTrainer:
             )
             for spec in config.scheduling_spec:
                 spec.gpu = 0
+        if config._version == "v2" and self._is_colocation(config.scheduling_strategy):
+            target = config.scheduling_strategy.target
+            if target == "actor" and self.config.actor._version == "v2":
+                config.scheduling_strategy = SchedulingStrategy(
+                    type=config.scheduling_strategy.type,
+                    target="actor-guard",
+                    fork=config.scheduling_strategy.fork,
+                )
+            elif target == "rollout":
+                config.scheduling_strategy = SchedulingStrategy(
+                    type=config.scheduling_strategy.type,
+                    target="rollout-inf",
+                    fork=config.scheduling_strategy.fork,
+                )
 
         # Determine engine class and server args based on backend
         rollout_backend = self.rollout_alloc.backend
@@ -1565,6 +1813,72 @@ class PPOTrainer:
 
         # Everything else requires proxy workers
         return True
+
+    @staticmethod
+    def _post_batch_dynamic_filter(
+        rollout_batch: list[dict[str, Any]],
+        dynamic_filter_fn: Callable[[dict[str, Any]], bool] | str,
+    ) -> list[dict[str, Any]]:
+        """Apply dynamic filtering after the whole batch has been collected.
+
+        Runs ``dynamic_filter_fn`` on each collected group trajectory and
+        keeps only the accepted ones. Semantics of the filter function are
+        identical to rollout-time filtering (``dynamic_filter_mode="rollout"``);
+        only the execution point differs: the decision is made in the trainer
+        process once the entire batch is ready. Rejected groups are dropped
+        without re-sampling, so the batch may shrink (same contract as
+        ``dynamic_bs=True``).
+        """
+        from areal.infra.rpc.rtensor import RTensor
+        from areal.utils.dynamic_import import import_from_string
+
+        if isinstance(dynamic_filter_fn, str):
+            dynamic_filter_fn = import_from_string(dynamic_filter_fn)
+
+        accepted: list[dict[str, Any]] = []
+        n_rejected = 0
+        tracker = stats_tracker.get("rollout")
+        for group_traj in rollout_batch:
+            # Localize only the small reward tensors the filter relies on.
+            # In single-controller mode trajectory values may be RTensor
+            # handles; large tensors (input_ids, logprobs, ...) are
+            # intentionally left remote to avoid fetching the whole batch.
+            filter_view = dict(group_traj)
+            for key in ("rewards", "original_rewards"):
+                if key in filter_view:
+                    filter_view[key] = RTensor.localize(filter_view[key])
+            accept = bool(dynamic_filter_fn(filter_view))
+            # Track rejection statistics with the same metric names and
+            # per-group 0/1 semantics as rollout-time filtering (see
+            # areal/examples/filter_function.py). Note that the denominator
+            # differs: rollout-time filtering also evaluates re-sampled
+            # groups, while here exactly the collected batch is evaluated.
+            if not accept:
+                tracker.scalar(rejected_by_failed_or_perfect=1)
+                rewards = filter_view.get(
+                    "original_rewards", filter_view.get("rewards")
+                )
+                if rewards is not None:
+                    # Distinguish all-correct vs all-wrong
+                    all_positive = bool(all(r > 0 for r in rewards))
+                    tracker.scalar(rejected_by_all_correct=int(all_positive))
+                    tracker.scalar(rejected_by_all_wrong=int(not all_positive))
+            else:
+                tracker.scalar(rejected_by_failed_or_perfect=0)
+                tracker.scalar(rejected_by_all_correct=0)
+                tracker.scalar(rejected_by_all_wrong=0)
+            if accept:
+                accepted.append(group_traj)
+            else:
+                n_rejected += 1
+
+        if n_rejected > 0:
+            logger.warning(
+                f"Post-batch dynamic filter rejected {n_rejected}/"
+                f"{len(rollout_batch)} groups; continuing with "
+                f"{len(accepted)} groups."
+            )
+        return accepted
 
     def _ensure_proxy_started(self) -> None:
         """Lazily initialize proxy workers when agent workflows are used.

@@ -47,5 +47,33 @@ def get_tms_env_vars() -> dict[str, str]:
     return env_vars
 
 
+def apply_tms_env_vars(env_vars: dict[str, str]) -> None:
+    """Add default TMS env vars without overriding explicit user settings."""
+    tms_init = env_vars.get("TMS_INIT_ENABLE")
+    ld_preload = env_vars.get("LD_PRELOAD")
+
+    if tms_init is not None and tms_init != "1":
+        return
+    if ld_preload == "":
+        return
+
+    for key, value in get_tms_env_vars().items():
+        env_vars.setdefault(key, value)
+
+
 def is_tms_enabled() -> bool:
     return os.environ.get("TMS_INIT_ENABLE", "0") == "1"
+
+
+def normalize_tms_ld_preload() -> None:
+    """Keep only the TMS preload library in LD_PRELOAD before TMS initializes."""
+    ld_preload = os.environ.get("LD_PRELOAD")
+    if not ld_preload or ":" not in ld_preload:
+        return
+
+    for path in ld_preload.split(":"):
+        if os.path.basename(path) == "torch_memory_saver_hook_mode_preload.abi3.so":
+            # torch_memory_saver loads this value with ctypes.CDLL(), which
+            # cannot parse a colon-separated LD_PRELOAD list.
+            os.environ["LD_PRELOAD"] = path
+            return

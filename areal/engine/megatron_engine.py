@@ -10,6 +10,7 @@ import math
 import os
 import re
 import struct
+import time
 from collections.abc import Callable, Iterator
 from concurrent.futures import Future
 from contextlib import contextmanager
@@ -133,7 +134,11 @@ from areal.utils.functional import gather_logprobs, gather_logprobs_entropy
 from areal.utils.hf_utils import load_hf_processor_and_tokenizer, load_hf_tokenizer
 from areal.utils.lock import DistributedLock
 from areal.utils.network import find_free_ports, format_host_for_url, gethostip
-from areal.utils.offload import is_tms_enabled, torch_memory_saver
+from areal.utils.offload import (
+    is_tms_enabled,
+    normalize_tms_ld_preload,
+    torch_memory_saver,
+)
 from areal.utils.perf_tracer import trace_perf, trace_scope
 from areal.utils.seeding import get_seed
 
@@ -319,6 +324,7 @@ class MegatronEngine(TrainEngine):
         self._initialized = False
         self.rollout_engine: InferenceEngine | None = None
         self.rollout_coordinator: DistRolloutCoordinator | None = None
+        self._awex_adapter = None  # AwexMegatronAdapter for colocate mode
         self.weight_update_group_initialized: bool = False
         self.weight_update_group_name: str
         self.weight_update_master_addr: str
@@ -506,6 +512,14 @@ class MegatronEngine(TrainEngine):
             # such as loss fusions.
             if self.mcore_config.use_deterministic_algorithms:
                 set_deterministic_algorithms(self.tf_config, prebuild=True)
+
+            # Precision-alignment dumps (AReaL-friend tools/precision-alignment):
+            # when AREAL_DUMP_ROUTING is set, enable megatron RouterReplay
+            # recording so MoE expert indices can be captured during forward.
+            if os.environ.get("AREAL_DUMP_ROUTING", "") and hasattr(
+                self.tf_config, "moe_enable_routing_replay"
+            ):
+                self.tf_config.moe_enable_routing_replay = True
 
             self.is_vision_model = is_valid_vision_model(self.hf_config.model_type)
             # GDN/SSM models (e.g. Qwen3.5) reject packed THD input and must run
@@ -712,8 +726,24 @@ class MegatronEngine(TrainEngine):
                     glu_fc1_names.add(_normalize_glu_param_name(full_name))
         return glu_fc1_names
 
+    @staticmethod
+    def _ensure_hf_rope_compat(hf_config) -> None:
+        # transformers v5 moved rope_theta into rope_parameters, but mbridge
+        # still reads hf_config.rope_theta directly (llm_bridge.py). Custom
+        # configs (bailing) keep the attribute, stock ones (Qwen3Moe) do not:
+        # materialize it back so the bridge sees a v4-shaped config.
+        if hf_config is None or "rope_theta" in hf_config.__dict__:
+            return
+        rope_params = getattr(hf_config, "rope_parameters", None) or {}
+        if "rope_theta" in rope_params:
+            hf_config.rope_theta = rope_params["rope_theta"]
+
     def _build_hf_mcore_bridge(self):
         if self.bridge_cls == "mbridge":
+            hf_config = PretrainedConfig.from_pretrained(
+                self.config.path, trust_remote_code=True
+            )
+            self._ensure_hf_rope_compat(hf_config)
             self.bridge = mbridge.AutoBridge.from_pretrained(
                 self.config.path, trust_remote_code=True
             )
@@ -728,13 +758,23 @@ class MegatronEngine(TrainEngine):
                 )
 
             # Set MoE configuration overrides (aux-loss-free balancing, z-loss).
+            # mbridge extra_args override per-model bridge kwargs, so fields
+            # whose cli default may disagree with a bridge's deliberate
+            # default are forwarded only when explicitly configured
+            # (None = keep the bridge default).
             moe_extra_args: dict = {
                 "moe_token_dispatcher_type": self.mcore_config.moe_token_dispatcher_type,
                 "moe_permute_fusion": self.mcore_config.moe_permute_fusion,
                 "moe_router_fusion": self.mcore_config.moe_router_fusion,
-                "moe_shared_expert_overlap": self.mcore_config.moe_shared_expert_overlap,
-                "moe_router_bias_update_rate": self.mcore_config.moe_router_bias_update_rate,
             }
+            if self.mcore_config.moe_shared_expert_overlap is not None:
+                moe_extra_args["moe_shared_expert_overlap"] = (
+                    self.mcore_config.moe_shared_expert_overlap
+                )
+            if self.mcore_config.moe_router_bias_update_rate is not None:
+                moe_extra_args["moe_router_bias_update_rate"] = (
+                    self.mcore_config.moe_router_bias_update_rate
+                )
             if self.mcore_config.moe_router_dtype is not None:
                 moe_extra_args["moe_router_dtype"] = self.mcore_config.moe_router_dtype
             if self.mcore_config.moe_z_loss_coeff is not None:
@@ -1020,6 +1060,11 @@ class MegatronEngine(TrainEngine):
                     raise ValueError(
                         "HF format does not support optimizer state saving, please use DCP format instead."
                     )
+                # HF export all-gathers full tensors across TP; reclaim allocator
+                # headroom first. Kept out of the dcp/recover path, which is
+                # frequency-driven and should not pay a full-heap GC per save.
+                gc.collect()
+                current_platform.empty_cache()
                 self._save_model_to_hf(
                     meta.path,
                     tokenizer=meta.tokenizer,
@@ -1088,17 +1133,50 @@ class MegatronEngine(TrainEngine):
             model.zero_grad_buffer()
 
     def optimizer_step(self):
+        step_dirty_stats: dict[str, float] = {}
+        awex_adapter = getattr(self, "_awex_weight_update_adapter", None)
+        before_optimizer_step = getattr(awex_adapter, "before_optimizer_step", None)
+        if before_optimizer_step is not None:
+            try:
+                step_dirty_stats.update(before_optimizer_step())
+            except Exception:
+                self.logger.exception("AWEX step-dirty dry-run pre-hook failed")
+
+        step_start = time.perf_counter()
         with trace_scope("megatron_engine.step"):
             update_successful, grad_norm, _ = self.optimizer.step()
+        step_time = time.perf_counter() - step_start
+        after_optimizer_step = getattr(awex_adapter, "after_optimizer_step", None)
+        if after_optimizer_step is not None:
+            try:
+                step_dirty_stats.update(
+                    after_optimizer_step(bool(update_successful), grad_norm=grad_norm)
+                )
+            except Exception:
+                self.logger.exception("AWEX step-dirty dry-run post-hook failed")
+        # AdamW inversion needs the LR that produced this just-finished update.
+        # RL trainers may step the LR scheduler before the weight-transfer hook
+        # runs, so keep a copy on each param group before the scheduler mutates
+        # ``lr`` for the next optimizer step.
+        for group in self.optimizer.param_groups:
+            group["_areal_last_step_lr"] = float(group["lr"])
         current_lr = self.optimizer.param_groups[0]["lr"]
 
-        return dict(
+        stats = dict(
             update_successful=float(update_successful),
             grad_norm=float(grad_norm) if grad_norm is not None else float("nan"),
             lr=current_lr,
+            **{"perf/optimizer_step_time": step_time},
         )
+        stats.update(step_dirty_stats)
+        return stats
 
     def lr_scheduler_step(self):
+        if os.environ.get("AREAL_DUMP_ROUTING", "") or os.environ.get(
+            "AREAL_DUMP_LOGP", ""
+        ):
+            # Precision-alignment forward-only mode: no optimizer/scheduler.
+            return
         assert self.lr_scheduler is not None, "LR Scheduler is not initialized."
         self.lr_scheduler.step(1)
 
@@ -1355,9 +1433,13 @@ class MegatronEngine(TrainEngine):
         # that extra division would shrink every gradient (and thus grad_norm and the
         # effective optimizer step) by `num_microbatches`.
         loss_multiplier = (
-            mpu.get_data_parallel_world_size()
-            * self.optimizer.get_loss_scale().item()
-            * len(mb_list)
+            float(mpu.get_data_parallel_world_size())
+            if _fwd_only
+            else (
+                mpu.get_data_parallel_world_size()
+                * self.optimizer.get_loss_scale().item()
+                * len(mb_list)
+            )
         )
 
         def process_output(
@@ -1375,8 +1457,11 @@ class MegatronEngine(TrainEngine):
         self.forward_backward_batch(
             mb_list,
             process_output,
-            forward_only=False,
+            forward_only=_fwd_only,
         )
+
+        if _fwd_only:
+            return {"num_micro_batches": len(mb_list.mbs)}
 
         # Step 4: Optimizer step
         stats = self.optimizer_step()
@@ -1576,6 +1661,7 @@ class MegatronEngine(TrainEngine):
                 m.offload_grad_buffers(synchronize=False, empty_cache=False)
 
         current_platform.clear_memory()
+        normalize_tms_ld_preload()
         torch_memory_saver.pause()
 
         # TODO: NCCL offload
@@ -1721,6 +1807,103 @@ class MegatronEngine(TrainEngine):
     def get_device_stats(self) -> DeviceRuntimeInfo:
         return DeviceRuntimeInfo.get_current()
 
+    def warmup_communicators(self) -> None:
+        """Eagerly build every NCCL communicator the train step needs.
+
+        PyTorch creates 2-rank communicators for unbatched pipeline
+        send/recv lazily, and NCCL connects transport buffers per
+        protocol on first use. After a recover restart those connects
+        would otherwise happen inside the first ppo_update, when the
+        device is already at peak occupancy, and the ~10MB transport
+        calloc fails on the PP-last-stage ranks. Exercising each group
+        and message-size class here, while memory is still light, makes
+        those allocations happen up front; the buffers persist across
+        offload/onload for the lifetime of the process.
+        """
+        if os.environ.get("AREAL_SKIP_COMM_WARMUP", "").strip() == "1":
+            return
+        if not dist.is_initialized():
+            return
+        device = torch.cuda.current_device()
+        small = torch.ones(1024, dtype=torch.bfloat16, device=device)
+        large = torch.ones(16 * 1024 * 1024, dtype=torch.bfloat16, device=device)
+        # Sweep every registered NCCL group (attention DP/TP, expert
+        # EP/expert-DP, model-parallel variants, ...) instead of naming
+        # them: a hand-written enumeration misses groups created by other
+        # components (e.g. the MoE expert grad-bucket reduction), and any
+        # missed group still connects lazily at peak memory.
+        # pg_map insertion order is the collective creation order, so all
+        # member ranks reach shared groups in the same relative order.
+        from torch.distributed.distributed_c10d import _world
+
+        for group in list(_world.pg_map):
+            try:
+                if "nccl" not in str(dist.get_backend(group)).lower():
+                    continue
+                ws = dist.get_world_size(group=group)
+                if ws <= 1:
+                    continue
+                dist.all_reduce(small.clone(), group=group)
+                dist.all_reduce(large.clone(), group=group)
+                chunk = 4096
+                a2a_in = torch.ones(chunk * ws, dtype=torch.bfloat16, device=device)
+                dist.all_to_all_single(torch.empty_like(a2a_in), a2a_in, group=group)
+                big_chunk = (4 * 1024 * 1024 // ws) * ws
+                a2a_big = torch.ones(big_chunk, dtype=torch.bfloat16, device=device)
+                dist.all_to_all_single(torch.empty_like(a2a_big), a2a_big, group=group)
+            except Exception:
+                self.logger.warning(
+                    "communicator warmup skipped one group", exc_info=True
+                )
+        dp_group = mpu.get_data_parallel_group(with_context_parallel=True)
+        dp_size = dist.get_world_size(group=dp_group)
+        if dp_size > 1:
+            shard = torch.empty(
+                large.numel() // dp_size, dtype=large.dtype, device=device
+            )
+            dist.reduce_scatter_tensor(shard, large, group=dp_group)
+            dist.all_gather_into_tensor(large, shard, group=dp_group)
+        pp_size = mpu.get_pipeline_model_parallel_world_size()
+        if pp_size > 1:
+            pp_rank = mpu.get_pipeline_model_parallel_rank()
+            nxt = mpu.get_pipeline_model_parallel_next_rank()
+            prv = mpu.get_pipeline_model_parallel_prev_rank()
+            is_first = mpu.is_pipeline_first_stage(ignore_virtual=True)
+            is_last = mpu.is_pipeline_last_stage(ignore_virtual=True)
+            for buf in (small, large):
+                send_buf = buf.clone()
+                recv_buf = torch.empty_like(buf)
+                # Unbatched pair comms, both directions; even ranks send
+                # first so the chain cannot deadlock.
+                for send_peer, recv_peer, do_send, do_recv in (
+                    (nxt, prv, not is_last, not is_first),
+                    (prv, nxt, not is_first, not is_last),
+                ):
+                    if pp_rank % 2 == 0:
+                        if do_send:
+                            dist.send(send_buf, send_peer)
+                        if do_recv:
+                            dist.recv(recv_buf, recv_peer)
+                    else:
+                        if do_recv:
+                            dist.recv(recv_buf, recv_peer)
+                        if do_send:
+                            dist.send(send_buf, send_peer)
+                ops = []
+                if not is_last:
+                    ops.append(dist.P2POp(dist.isend, send_buf, nxt))
+                if not is_first:
+                    ops.append(dist.P2POp(dist.irecv, recv_buf, prv))
+                if ops:
+                    for work in dist.batch_isend_irecv(ops):
+                        work.wait()
+        del small, large
+        torch.cuda.synchronize()
+        dist.barrier(group=self.cpu_group)
+        self.logger.info(
+            "[COMM-WARMUP rank %s] communicator warmup complete", dist.get_rank()
+        )
+
     def start_memory_profile(self, max_entries: int = 100000) -> None:
         torch.cuda.memory._record_memory_history(max_entries=max_entries)
 
@@ -1793,6 +1976,14 @@ class MegatronEngine(TrainEngine):
 
     def _create_optimizer(self, ft_spec: FinetuneSpec) -> None:
         if self.optimizer_config is None:
+            return
+        if os.environ.get("AREAL_DUMP_ROUTING", "") or os.environ.get(
+            "AREAL_DUMP_LOGP", ""
+        ):
+            self.logger.info(
+                "[MegatronEngine] AREAL_DUMP_ROUTING/LOGP set, skipping optimizer "
+                "creation to save GPU memory (precision-alignment forward-only mode)."
+            )
             return
         assert self.model is not None and len(self.model) > 0
 
@@ -2892,6 +3083,33 @@ class MegatronEngine(TrainEngine):
                     inputs = {
                         k: v for k, v in inputs.items() if not k.startswith("_cp_")
                     }
+
+            # Precision-alignment logp dump: save final per-token logprobs for
+            # the first microbatch (last PP stage only; this branch already is).
+            _logp_dump_path = os.environ.get("AREAL_DUMP_LOGP", "")
+            if _logp_dump_path and not getattr(self, "_logp_dumped", False):
+                pp_rank = mpu.get_pipeline_model_parallel_rank()
+                cp_rank = mpu.get_context_parallel_rank()
+                if (
+                    mpu.get_data_parallel_rank() == 0
+                    and mpu.get_tensor_model_parallel_rank() == 0
+                ):
+                    save_data = {
+                        "logprobs": logprobs.detach().cpu(),
+                        "input_ids": inputs["input_ids"].detach().cpu(),
+                        "pp_rank": pp_rank,
+                        "cp_rank": cp_rank,
+                    }
+                    if "loss_mask" in inputs:
+                        save_data["loss_mask"] = inputs["loss_mask"].detach().cpu()
+                    out_file = f"{_logp_dump_path}.pp{pp_rank}.cp{cp_rank}.pt"
+                    torch.save(save_data, out_file)
+                    self.logger.info(
+                        f"[LOGP-DUMP] pp={pp_rank} cp={cp_rank} "
+                        f"logprobs={list(logprobs.shape)} -> {out_file}"
+                    )
+                self._logp_dumped = True
+
             loss = loss_fn(
                 logprobs,
                 entropy,
@@ -2902,6 +3120,14 @@ class MegatronEngine(TrainEngine):
                 vocab_norm_logits=vocab_norm_logits,
             )
         else:
+            if inputs.get("_cp_padded_cu_seqlens") is not None:
+                # The CP reassembly/unpad path lives in the actor branch
+                # above; here `output` would be the padded zigzag CP-local
+                # shard while `inputs` carries full-order loss_mask —
+                # silently mismatched shapes. Fail fast instead.
+                raise NotImplementedError(
+                    "Critic training with context parallelism > 1 is not supported yet."
+                )
             values = output.squeeze(-1)
             loss = loss_fn(values, inputs)
 

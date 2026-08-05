@@ -99,7 +99,8 @@ class VLLMBridgeBackend:
     def get_resume_request(self) -> HttpRequest:
         return HttpRequest(endpoint="/areal_continue_generation", payload={})
 
-    def get_offload_request(self) -> HttpRequest:
+    def get_offload_request(self, tags: list[str] | None = None) -> HttpRequest:
+        del tags
         return HttpRequest(endpoint="/sleep", payload={}, method="POST")
 
     def get_onload_request(self, tags: list[str] | None = None) -> HttpRequest:

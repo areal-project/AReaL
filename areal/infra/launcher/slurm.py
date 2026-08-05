@@ -41,7 +41,7 @@ from areal.infra.utils.slurm import (
     query_jobs,
 )
 from areal.utils import name_resolve, names
-from areal.utils.offload import get_tms_env_vars
+from areal.utils.offload import apply_tms_env_vars
 from areal.utils.recover import check_if_recover
 
 logger = logging.getLogger("SlurmLauncher")
@@ -619,10 +619,7 @@ def slurm_main(config, run_id: int = 0):
             logger.warning("No trainer commands")
         return trainer_cmds
 
-    if config.get("enable_offload", False):
-        tms_env_vars = get_tms_env_vars()
-    else:
-        tms_env_vars = {}
+    enable_tms_offload = config.get("enable_offload", False)
 
     if allocation_mode.type_ != AllocationType.LLM_SERVER_ONLY:
         # launch trainers
@@ -650,6 +647,15 @@ def slurm_main(config, run_id: int = 0):
             cpus_per_task=actor_spec.cpu,
             existing_env_vars=actor_spec.env_vars,
         )
+        env_vars = {
+            **BASE_ENVIRONS,
+            **thread_env,
+            **actor_spec.env_vars,
+            **_env_vars,
+            "AREAL_SPMD_MODE": "1",
+        }
+        if enable_tms_offload:
+            apply_tms_env_vars(env_vars)
         launcher.submit_array(
             job_name="trainer",
             cmd=_build_trainer_cmds(
@@ -665,14 +671,7 @@ def slurm_main(config, run_id: int = 0):
             container_image=actor_spec.image,
             srun_additional_args=actor_spec.srun_additional_args,
             container_mounts=actor_spec.mount,
-            env_vars={
-                **BASE_ENVIRONS,
-                **thread_env,
-                **actor_spec.env_vars,
-                **_env_vars,
-                **tms_env_vars,
-                "AREAL_SPMD_MODE": "1",
-            },
+            env_vars=env_vars,
         )
 
     try:

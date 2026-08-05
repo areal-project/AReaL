@@ -77,6 +77,10 @@ def register_engine_routes(
             use_admin_auth_for_upstream=True,
         )
 
+    @app.post("/init_awex_adapter")
+    async def init_awex_adapter(request: Request):
+        return await _forward_post(request, "/init_awex_adapter", config)
+
     @app.post("/step_lr_scheduler")
     async def step_lr_scheduler(request: Request):
         return await _forward_post(request, "/step_lr_scheduler", config)
