@@ -744,15 +744,13 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
         self._rebuild_derived_weights()
         logger.info("Colocate weight update completed for version %d", version)
 
-
     def _quiesce_scheduler_streams(self) -> None:
         """Drain in-flight device work before the NCCL transfer starts.
 
-        The donor ran transfers from a fully paused scheduler loop; v2 runs
-        them from an RPC handler while the overlap loop's forward thread and
-        its dedicated stream stay alive. NCCL P2P racing that residual device
-        work (or pending TMS remaps from the weights resume) corrupts memory,
-        so synchronize the whole device before touching the wire.
+        The preceding resume_memory remaps the weight pages through the memory
+        saver, and those remaps are asynchronous device work. NCCL P2P must not
+        race them, so synchronize the device before the peers write through
+        those pointers.
         """
         torch.cuda.synchronize()
 
@@ -814,7 +812,8 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
 
         # Not gated on locally-tracked released tags: the colocate handover
         # releases inference memory through the rollout controller, so this
-        # adapter never observes that release. SGLang's resume is idempotent.
+        # adapter never observes that release. Resume is not idempotent on the
+        # SGLang side, so it must be issued exactly once per released tag.
         native_tags = (
             [t for t in tags if t in self._SGLANG_MEMORY_TAGS] if tags else None
         )

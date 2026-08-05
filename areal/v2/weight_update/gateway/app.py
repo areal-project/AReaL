@@ -570,13 +570,13 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
         infer_world_size = paired_world_size
         num_engines = len(inference_urls)
 
-        # Engine-major rank layout: servers sorted by (ip, base_gpu) get
-        # engine index e; rank of (server e, local k) = e*instance_world + k.
-        # With contiguous per-server coverage this must equal the globally
-        # sorted (ip, gpu) position - verified below so a violated contiguity
-        # assumption fails loudly instead of corrupting the IPC pairing.
+        # Engine-major rank layout: rank of (server e, local k) is
+        # e*instance_world + k. Servers are ordered by the same primary key as
+        # paired_devices above (base_gpu, then ip) so the two orders cannot
+        # drift apart; the check below fails loudly if per-server GPU coverage
+        # is not contiguous, rather than corrupting the IPC pairing.
         server_base: dict[str, tuple[int, int]] = {}
-        server_infos = sorted(
+        server_infos = list(
             {
                 (str(r["ip"]), int(r["device_id"]), url, iw)
                 for url, r, iw in (
@@ -608,8 +608,8 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
                     content={
                         "error": (
                             "Inference server GPU coverage is not contiguous in "
-                            "(ip, gpu) order; colocate rank layout would be "
-                            "inconsistent"
+                            "(base_gpu, ip) order; colocate rank layout would "
+                            "be inconsistent"
                         ),
                         "device": {"ip": ip, "device_id": device_id},
                         "expected_rank": base_rank + infer_local,
