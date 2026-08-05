@@ -44,7 +44,15 @@ from areal.utils.network import find_free_ports, format_hostport, gethostip
 from areal.utils.perf_tracer import trace_perf
 
 from ..staleness_manager import StalenessManager
-from ..workflow_executor import BatchTaskDispatcher, TaskIdGenerator
+from ..workflow_executor import (
+    BatchTaskDispatcher,
+    TaskIdGenerator,
+    WorkflowContractFailure,
+    WorkflowTaskResult,
+    get_workflow_result_error,
+    unwrap_workflow_result,
+    validate_rollout_group_sizes,
+)
 
 logger = logging.getLogger("RolloutController")
 
@@ -60,15 +68,10 @@ class _RemoteRolloutTaskInput:
     should_accept_fn: str | None
     is_eval: bool = False
     group_size: int = 1
+    min_usable_group_size: int = 1
     proxy_addr: str | None = None
     reward_normalization: bool = False
     drop_incomplete_group: bool = False
-
-
-@dataclass
-class _RemoteRolloutResult:
-    task_id: int
-    trajectory: dict[str, Any]
 
 
 class RolloutController:
@@ -105,7 +108,7 @@ class RolloutController:
 
         # Dispatcher will be initialized in initialize() after staleness_manager is ready
         self._dispatcher: (
-            BatchTaskDispatcher[_RemoteRolloutTaskInput, _RemoteRolloutResult] | None
+            BatchTaskDispatcher[_RemoteRolloutTaskInput, WorkflowTaskResult] | None
         ) = None
 
         # HTTP callback server
@@ -213,12 +216,13 @@ class RolloutController:
         # Create and initialize the dispatcher
         qsize = self.config.queue_size or max_concurrent_rollouts * 16
         self._dispatcher = BatchTaskDispatcher[
-            _RemoteRolloutTaskInput, _RemoteRolloutResult
+            _RemoteRolloutTaskInput, WorkflowTaskResult
         ](
             max_queue_size=qsize,
             task_factory=self._create_submit_callback,
             staleness_manager=self._staleness_manager,
             enable_tracing=self.config.enable_rollout_tracing,
+            terminal_error_fn=get_workflow_result_error,
         )
         # Initialize the dispatcher's async task runner
         self._dispatcher.initialize(logger=logger)
@@ -778,7 +782,7 @@ class RolloutController:
         )
 
     def _create_submit_callback(self, pending_task: _RemoteRolloutTaskInput):
-        async def _submit_then_wait() -> _RemoteRolloutResult | None:
+        async def _submit_then_wait() -> WorkflowTaskResult | None:
             # Choose worker via round-robin
             worker, rank = self._choose_worker()
             engine_name = self._engine_name(rank)
@@ -810,6 +814,7 @@ class RolloutController:
                     http_timeout=self.config.request_timeout,
                     is_eval=pending_task.is_eval,
                     group_size=pending_task.group_size,
+                    min_usable_group_size=pending_task.min_usable_group_size,
                     task_id=task_id,
                     callback_addr=f"http://{self.callback_addr}/callback/rollout_complete",
                     proxy_addr=proxy_addr,
@@ -825,7 +830,7 @@ class RolloutController:
                 # Fetch the result
                 result = await self.scheduler.async_call_engine(
                     worker.id,
-                    "wait_for_task",
+                    "_wait_for_task_result",
                     engine_name=engine_name,
                     task_id=engine_task_id,
                     timeout=0.1,  # A short time to prevent blocking other requests
@@ -833,14 +838,19 @@ class RolloutController:
                     http_timeout=self.config.request_timeout,
                 )
 
-                traj = result
+                if isinstance(result, WorkflowContractFailure):
+                    manager.on_rollout_rejected()
+                    return result
+
+                traj = result.trajectory if result is not None else None
                 if traj is not None:
                     manager.on_rollout_accepted()
                     if self.config.enable_rollout_tracing:
                         logger.info(
                             f"Finish and accept rollout. {self._rollout_stats()}"
                         )
-                    return _RemoteRolloutResult(task_id=task_id, trajectory=traj)
+                    assert result is not None
+                    return result
 
                 manager.on_rollout_rejected()
                 if self.config.enable_rollout_tracing:
@@ -879,7 +889,9 @@ class RolloutController:
         proxy_addr: str | None = None,
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
+        min_usable_group_size: int = 1,
     ) -> int:
+        validate_rollout_group_sizes(group_size, min_usable_group_size)
         workflow_str = self._resolve_workflow_str(workflow)
         should_accept_fn = self._resolve_should_accept_fn(should_accept_fn)
         if workflow_kwargs is None:
@@ -898,6 +910,7 @@ class RolloutController:
             task_id=task_id,
             is_eval=is_eval,
             group_size=group_size,
+            min_usable_group_size=min_usable_group_size,
             proxy_addr=proxy_addr,
             reward_normalization=reward_normalization,
             drop_incomplete_group=drop_incomplete_group,
@@ -911,7 +924,10 @@ class RolloutController:
         self, count: int, timeout: float | None = None, raise_timeout: bool = True
     ) -> list[dict[str, Any] | None]:
         # Delegate to dispatcher and extract trajectories
-        results = self.dispatcher.wait_results(count, timeout, raise_timeout)
+        results = [
+            unwrap_workflow_result(result)
+            for result in self.dispatcher.wait_results(count, timeout, raise_timeout)
+        ]
         # Log and trace
         if self.config.enable_rollout_tracing:
             logger.info("Rollout results are ready!")
@@ -928,6 +944,7 @@ class RolloutController:
         group_size: int = 1,
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
+        min_usable_group_size: int = 1,
     ) -> list[dict[str, Any]]:
         perf_tracer.instant(
             "rollout_controller.rollout_batch",
@@ -941,6 +958,7 @@ class RolloutController:
                 workflow_kwargs=workflow_kwargs,
                 should_accept_fn=should_accept_fn,
                 group_size=group_size,
+                min_usable_group_size=min_usable_group_size,
                 reward_normalization=reward_normalization,
                 drop_incomplete_group=drop_incomplete_group,
             )
@@ -959,6 +977,7 @@ class RolloutController:
         dynamic_bs: bool = False,
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
+        min_usable_group_size: int = 1,
     ) -> list[dict[str, Any]]:
         """Prepare a batch with controlled staleness.
 
@@ -968,6 +987,7 @@ class RolloutController:
         See :meth:`~areal.api.engine_api.InferenceEngine.prepare_batch` for parameters.
         """
 
+        validate_rollout_group_sizes(group_size, min_usable_group_size)
         workflow_str = self._resolve_workflow_str(workflow)
         if workflow_kwargs is None:
             workflow_kwargs = {}
@@ -982,6 +1002,7 @@ class RolloutController:
                         should_accept_fn=should_accept_fn,
                         task_id=self._task_id_generator.next(),
                         group_size=group_size,
+                        min_usable_group_size=min_usable_group_size,
                         reward_normalization=reward_normalization,
                         drop_incomplete_group=drop_incomplete_group,
                     )
@@ -991,9 +1012,14 @@ class RolloutController:
 
         # Delegate to dispatcher
         assert dataloader.batch_size is not None
-        results = self.dispatcher.active_submit_and_wait(
-            self.data_generator, batch_size=dataloader.batch_size, dynamic_bs=dynamic_bs
-        )
+        results = [
+            unwrap_workflow_result(result)
+            for result in self.dispatcher.active_submit_and_wait(
+                self.data_generator,
+                batch_size=dataloader.batch_size,
+                dynamic_bs=dynamic_bs,
+            )
+        ]
 
         # Return list of trajectories
         trajectories = [r.trajectory if r is not None else None for r in results]
@@ -1173,7 +1199,7 @@ class RolloutController:
     @property
     def dispatcher(
         self,
-    ) -> BatchTaskDispatcher[_RemoteRolloutTaskInput, _RemoteRolloutResult]:
+    ) -> BatchTaskDispatcher[_RemoteRolloutTaskInput, WorkflowTaskResult]:
         """Get the task dispatcher, ensuring initialization has been called."""
         if self._dispatcher is None:
             raise RuntimeError(

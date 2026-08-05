@@ -238,10 +238,51 @@ class _RolloutTaskInput:
     is_eval: bool = False
 
 
-@dataclass
+@dataclass(frozen=True)
 class _RolloutResult:
     task_id: int
     trajectory: dict[str, Any]
+
+
+class WorkflowContractError(ValueError):
+    """Raised when a workflow violates a non-retryable output contract."""
+
+
+def validate_rollout_group_sizes(group_size: int, min_usable_group_size: int) -> None:
+    if group_size < 1:
+        raise ValueError(f"group_size must be >= 1, got {group_size}")
+    if not 1 <= min_usable_group_size <= group_size:
+        raise ValueError(
+            "min_usable_group_size must be between 1 and group_size "
+            f"({group_size}), got {min_usable_group_size}"
+        )
+
+
+@dataclass(frozen=True)
+class WorkflowContractFailure:
+    message: str
+
+
+WorkflowTaskResult = _RolloutResult | WorkflowContractFailure
+
+
+def get_workflow_result_error(
+    result: WorkflowTaskResult,
+) -> WorkflowContractError | None:
+    if isinstance(result, WorkflowContractFailure):
+        return WorkflowContractError(result.message)
+    return None
+
+
+def unwrap_workflow_result(
+    result: WorkflowTaskResult | None,
+) -> _RolloutResult | None:
+    if result is None:
+        return None
+    error = get_workflow_result_error(result)
+    if error is not None:
+        raise error
+    return result
 
 
 # Batch size for fetching from the async task runner
@@ -279,6 +320,7 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
         task_factory: Callable[[TInput], Callable[[], Awaitable[TResult | None]]],
         staleness_manager: StalenessManager,
         enable_tracing: bool = False,
+        terminal_error_fn: Callable[[TResult], Exception | None] | None = None,
     ):
         self.runner = AsyncTaskRunner(
             max_queue_size=max_queue_size,
@@ -287,6 +329,7 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
         self.task_factory = task_factory
         self.staleness_manager = staleness_manager
         self.enable_tracing = enable_tracing
+        self.terminal_error_fn = terminal_error_fn
         self.logger: Logger
 
         # Unbounded deques for producer/consumer pattern
@@ -571,7 +614,12 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
             timeout = _DEFAULT_WAIT_TIMEOUT_SECONDS
 
         with self._result_cv:
-            while len(self._pending_results) < count:
+            while True:
+                terminal_error = self._pop_terminal_error_locked()
+                if terminal_error is not None:
+                    raise terminal_error
+                if len(self._pending_results) >= count:
+                    break
                 self._check_thread_exception()
 
                 elapsed = time.perf_counter() - start_time
@@ -604,7 +652,11 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
         return [r.data for r in selected]
 
     def wait_for_task(
-        self, task_id: int, timeout: float | None = None, raise_timeout: bool = True
+        self,
+        task_id: int,
+        timeout: float | None = None,
+        raise_timeout: bool = True,
+        raise_terminal_error: bool = True,
     ) -> TResult | None:
         """Wait for a specific task result by task_id."""
         start_time = time.perf_counter()
@@ -615,7 +667,13 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
             if task_id not in self._active_task_ids:
                 raise ValueError(f"Task {task_id} is never submitted.")
 
-            while task_id not in self._pending_results:
+            while True:
+                if raise_terminal_error:
+                    terminal_error = self._pop_terminal_error_locked(task_id)
+                    if terminal_error is not None:
+                        raise terminal_error
+                if task_id in self._pending_results:
+                    break
                 self._check_thread_exception()
 
                 elapsed = time.perf_counter() - start_time
@@ -631,6 +689,27 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
             self._active_task_ids.remove(task_id)
             self._result_cv.notify_all()
             return found_result.data
+
+    def _pop_terminal_error_locked(
+        self, task_id: int | None = None
+    ) -> Exception | None:
+        if self.terminal_error_fn is None:
+            return None
+        task_ids = (
+            [task_id] if task_id is not None else list(self._pending_results.keys())
+        )
+        for pending_task_id in task_ids:
+            result = self._pending_results.get(pending_task_id)
+            if result is None or result.data is None:
+                continue
+            error = self.terminal_error_fn(result.data)
+            if error is None:
+                continue
+            self._pending_results.pop(pending_task_id)
+            self._active_task_ids.discard(pending_task_id)
+            self._result_cv.notify_all()
+            return error
+        return None
 
     def active_submit_and_wait(
         self,
@@ -776,7 +855,7 @@ class WorkflowExecutor:
 
         # Dispatcher will be initialized in initialize() after staleness_manager is ready
         self._dispatcher: (
-            BatchTaskDispatcher[_RolloutTaskInput, _RolloutResult] | None
+            BatchTaskDispatcher[_RolloutTaskInput, WorkflowTaskResult] | None
         ) = None
 
         self._task_id_generator = TaskIdGenerator()
@@ -1061,11 +1140,12 @@ class WorkflowExecutor:
 
         # Create and initialize the dispatcher
         qsize = self.config.queue_size or self.max_concurrent_rollouts * 16
-        self._dispatcher = BatchTaskDispatcher[_RolloutTaskInput, _RolloutResult](
+        self._dispatcher = BatchTaskDispatcher[_RolloutTaskInput, WorkflowTaskResult](
             max_queue_size=qsize,
             task_factory=self._create_workflow_task,
             staleness_manager=self._staleness_manager,
             enable_tracing=self.config.enable_rollout_tracing,
+            terminal_error_fn=get_workflow_result_error,
         )
 
         # Initialize the dispatcher's async task runner
@@ -1107,7 +1187,7 @@ class WorkflowExecutor:
 
     def _create_workflow_task(
         self, pending_task: _RolloutTaskInput
-    ) -> Callable[[], Awaitable[_RolloutResult | None]]:
+    ) -> Callable[[], Awaitable[WorkflowTaskResult | None]]:
         """Wrapper to create an async function that will be executed by AsyncTaskRunner.
 
         This is a synchronous function that returns an async function, which allows
@@ -1125,7 +1205,7 @@ class WorkflowExecutor:
             filtering/validation.
         """
 
-        async def _execute_workflow() -> _RolloutResult | None:
+        async def _execute_workflow() -> WorkflowTaskResult | None:
             """Execute workflow.arun_episode and apply AReaL-specific logic."""
             task_id = pending_task.task_id
 
@@ -1231,6 +1311,20 @@ class WorkflowExecutor:
                     )
                 return None
 
+            except WorkflowContractError as exc:
+                manager.on_rollout_rejected()
+                stats_tracker.get("rollout").scalar(rejected=1)
+                trace_session_event(
+                    "mark_finalized",
+                    task_id=task_id,
+                    status="failed",
+                    reason="workflow_contract_error",
+                )
+                if self.logger is not None:
+                    self.logger.error(
+                        "Workflow contract violation: %s", exc, exc_info=True
+                    )
+                return WorkflowContractFailure(message=str(exc))
             except Exception as exc:  # pragma: no cover - workflow execution errors
                 manager.on_rollout_rejected()
                 stats_tracker.get("rollout").scalar(rejected=1)
@@ -1289,7 +1383,10 @@ class WorkflowExecutor:
         See :meth:`~areal.api.engine_api.InferenceEngine.wait` for parameters.
         """
         # Delegate to dispatcher and extract trajectories
-        results = self.dispatcher.wait_results(count, timeout, raise_timeout)
+        results = [
+            unwrap_workflow_result(result)
+            for result in self.dispatcher.wait_results(count, timeout, raise_timeout)
+        ]
         # Log and trace
         if self.config.enable_rollout_tracing:
             self.logger.info("Rollout results are ready!")
@@ -1322,11 +1419,24 @@ class WorkflowExecutor:
         --------
         :meth:`~areal.api.engine_api.InferenceEngine.wait_for_task`
         """
-        result = self.dispatcher.wait_for_task(task_id, timeout, raise_timeout)
+        result = unwrap_workflow_result(
+            self.dispatcher.wait_for_task(task_id, timeout, raise_timeout)
+        )
 
         if result is not None and self.config.enable_rollout_tracing:
             self.logger.info(f"Task {task_id} completed successfully")
         return result.trajectory if result is not None else None
+
+    def _wait_for_task_result(
+        self, task_id: int, timeout: float | None = None, raise_timeout: bool = True
+    ) -> WorkflowTaskResult | None:
+        """Return the raw task result for controller-to-worker transport."""
+        return self.dispatcher.wait_for_task(
+            task_id,
+            timeout,
+            raise_timeout,
+            raise_terminal_error=False,
+        )
 
     @trace_perf("workflow_executor.rollout_batch", category="scheduler")
     def rollout_batch(
@@ -1416,9 +1526,14 @@ class WorkflowExecutor:
 
         # Delegate to dispatcher
         assert dataloader.batch_size is not None
-        results = self.dispatcher.active_submit_and_wait(
-            self.data_generator, batch_size=dataloader.batch_size, dynamic_bs=dynamic_bs
-        )
+        results = [
+            unwrap_workflow_result(result)
+            for result in self.dispatcher.active_submit_and_wait(
+                self.data_generator,
+                batch_size=dataloader.batch_size,
+                dynamic_bs=dynamic_bs,
+            )
+        ]
 
         # Return list of trajectory dicts (filter out None)
         return [r.trajectory for r in results if r is not None]
@@ -1452,7 +1567,9 @@ class WorkflowExecutor:
         return manager
 
     @property
-    def dispatcher(self) -> BatchTaskDispatcher[_RolloutTaskInput, _RolloutResult]:
+    def dispatcher(
+        self,
+    ) -> BatchTaskDispatcher[_RolloutTaskInput, WorkflowTaskResult]:
         """Get the task dispatcher, ensuring initialization has been called."""
         if self._dispatcher is None:
             raise RuntimeError(

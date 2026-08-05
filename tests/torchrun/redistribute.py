@@ -6,18 +6,77 @@ import random
 import torch
 import torch.distributed as dist
 
-from areal.infra.dist_rollout import redistribute_trajectories
+from areal.infra.dist_rollout import DistRolloutCoordinator, redistribute_trajectories
 from areal.infra.platforms import current_platform
 from areal.utils.data import tensor_container_to
 
 
-def main(args):
-    dist.init_process_group("nccl")
-    rank = int(os.environ["LOCAL_RANK"])
-    current_platform.set_device(rank)
-    device = f"{current_platform.device_type}:{rank}"
+class _HybridTrainEngine:
+    def __init__(self, rank, dp_group, model_group):
+        self.rank = rank
+        self.data_parallel_group = dp_group
+        self.context_and_model_parallel_group = model_group
 
-    bs = 16
+    def is_data_parallel_head(self):
+        return self.rank % 2 == 0
+
+    def current_data_parallel_head(self):
+        return self.rank - self.rank % 2
+
+
+class _HybridRolloutEngine:
+    def __init__(self, rank):
+        self.rank = rank
+
+    def prepare_batch(self, *args, **kwargs):
+        if self.rank == 0:
+            raise ValueError("rank-local preparation failure")
+        return []
+
+
+def _test_hybrid_error(rank):
+    head_dp_group = dist.new_group([0, 2])
+    non_head_dp_group = dist.new_group([1, 3])
+    first_model_group = dist.new_group([0, 1])
+    second_model_group = dist.new_group([2, 3])
+    train_engine = _HybridTrainEngine(
+        rank,
+        head_dp_group if rank % 2 == 0 else non_head_dp_group,
+        first_model_group if rank < 2 else second_model_group,
+    )
+    coordinator = DistRolloutCoordinator(_HybridRolloutEngine(rank), train_engine)
+
+    try:
+        coordinator.prepare_batch(object(), object())
+    except RuntimeError as exc:
+        assert "rank-local preparation failure" in str(exc)
+    else:
+        raise AssertionError("Expected coordinated rank-local preparation failure")
+    dist.barrier()
+
+    trajectories = [] if train_engine.is_data_parallel_head() else None
+    try:
+        coordinator._broadcast_and_redistribute_trajectories(trajectories)
+    except RuntimeError as exc:
+        assert "Cannot redistribute 0 trainable trajectory groups" in str(exc)
+    else:
+        raise AssertionError("Expected coordinated rollout preparation failure")
+    dist.barrier()
+
+
+def main(args):
+    dist.init_process_group(args.backend)
+    rank = int(os.environ["LOCAL_RANK"])
+    if args.hybrid_error:
+        _test_hybrid_error(rank)
+        return
+    if args.backend == "nccl":
+        current_platform.set_device(rank)
+        device = f"{current_platform.device_type}:{rank}"
+    else:
+        device = "cpu"
+
+    bs = rank + 1 if args.ragged else 16
     prompt_lens = [random.randint(1, 10) for _ in range(bs)]
     ans_lens = [random.randint(1, 10) for _ in range(bs)]
     seqlens = [x + y for x, y in zip(prompt_lens, ans_lens)]
@@ -59,5 +118,8 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--dump-path", type=str)
+    parser.add_argument("--backend", choices=["gloo", "nccl"], default="nccl")
+    parser.add_argument("--ragged", action="store_true")
+    parser.add_argument("--hybrid-error", action="store_true")
     args = parser.parse_args()
     main(args)

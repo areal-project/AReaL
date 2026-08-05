@@ -6,14 +6,14 @@ from typing import Any
 import torch
 
 from areal.api import TrainEngine
-from areal.api.cli_args import MicroBatchSpec, PPOCriticConfig
+from areal.api.cli_args import PPOCriticConfig
 from areal.infra import TrainController
 from areal.infra.rpc.serialization import serialize_value
 from areal.trainer.ppo.stats import infer_token_denominator
 from areal.utils import stats_tracker
 from areal.utils.data import (
     batched_call,
-    split_padded_tensor_dict_into_mb_list,
+    split_training_batch_into_microbatches,
 )
 from areal.utils.functional import ppo_critic_loss_fn
 from areal.utils.perf_tracer import trace_perf
@@ -58,11 +58,12 @@ class PPOCritic:
 
         # NOTE: calling engine.train() is critical to enabling gradient checkpointing
         self.engine.train()
-        mb_inputs = split_padded_tensor_dict_into_mb_list(
+        mb_inputs = split_training_batch_into_microbatches(
             data,
-            mb_spec=MicroBatchSpec(n_mbs=self.config.ppo_n_minibatches),
+            n_mbs=self.config.ppo_n_minibatches,
+            group=self.engine.data_parallel_group,
         )
-        for mb in mb_inputs.mbs:
+        for mb in mb_inputs:
             train_stat = self.engine.train_batch(
                 mb,
                 loss_fn=functools.partial(

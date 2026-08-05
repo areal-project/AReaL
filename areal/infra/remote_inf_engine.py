@@ -46,8 +46,8 @@ from areal.infra.utils.concurrent import get_executor
 from areal.infra.utils.http import arequest_with_retry, get_default_connector
 from areal.infra.utils.launcher import wait_llm_server_addrs
 from areal.infra.utils.proc import kill_process_tree
-from areal.utils import logging, name_resolve, names
-from areal.utils.data import concat_padded_tensors
+from areal.utils import logging, name_resolve, names, stats_tracker
+from areal.utils.data import concat_padded_tensors, get_batch_size
 from areal.utils.dynamic_import import import_from_string
 from areal.utils.network import (
     find_free_ports,
@@ -57,7 +57,12 @@ from areal.utils.network import (
 )
 from areal.utils.perf_tracer import trace_perf
 
-from .workflow_executor import WorkflowExecutor
+from .workflow_executor import (
+    WorkflowContractError,
+    WorkflowExecutor,
+    WorkflowTaskResult,
+    validate_rollout_group_sizes,
+)
 
 if TYPE_CHECKING:
     from areal.experimental.openai import InteractionWithTokenLogpReward
@@ -75,14 +80,35 @@ class GroupedRolloutWorkflow(RolloutWorkflow):
         logger: Logger,
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
+        min_usable_group_size: int = 1,
     ):
-        if group_size < 1:
-            raise ValueError(f"group_size must be >= 1, got {group_size}")
+        validate_rollout_group_sizes(group_size, min_usable_group_size)
         self.workflow = workflow
         self.group_size = group_size
+        self.min_usable_group_size = min_usable_group_size
         self.logger = logger
         self.reward_normalization = reward_normalization
         self.drop_incomplete_group = drop_incomplete_group
+
+    def _record_group_stats(self, usable_slot_count: int, *, trainable: bool) -> None:
+        trainable_slot_count = usable_slot_count if trainable else 0
+        stats_tracker.get(workflow_context.stat_scope()).scalar(
+            target_slot_count=self.group_size,
+            usable_slot_count=usable_slot_count,
+            trainable_slot_count=trainable_slot_count,
+            fully_masked_group=usable_slot_count == 0,
+            singleton_slot_group=usable_slot_count == 1,
+            pre_filter_usable_slot_yield=usable_slot_count / self.group_size,
+            pre_filter_trainable_slot_yield=trainable_slot_count / self.group_size,
+        )
+
+    def _validate_slot_cardinality(self, slot_sizes: list[int]) -> None:
+        if self.min_usable_group_size > 1 and any(size != 1 for size in slot_sizes):
+            raise WorkflowContractError(
+                "Group-relative normalization requires each logical rollout slot "
+                "to produce exactly one physical training member; got slot sizes "
+                f"{slot_sizes}."
+            )
 
     async def arun_episode(
         self, engine: InferenceEngine, data: dict[str, Any]
@@ -94,9 +120,10 @@ class GroupedRolloutWorkflow(RolloutWorkflow):
         )
 
         valid_results = [r for r in results if r is not None]
+        usable_slot_count = len(valid_results)
 
-        # All results None -> return None
         if not valid_results:
+            self._record_group_stats(usable_slot_count, trainable=False)
             return None
 
         # Some results None -> drop entire group if requested. Reward
@@ -110,12 +137,22 @@ class GroupedRolloutWorkflow(RolloutWorkflow):
                     "(drop_incomplete_group=True). prepare_batch will retry "
                     "with a new prompt from the dataloader."
                 )
+                self._record_group_stats(usable_slot_count, trainable=False)
                 return None
             if not self.reward_normalization:
+                action = (
+                    "dropping group below min_usable_group_size"
+                    if usable_slot_count < self.min_usable_group_size
+                    else "using remaining results"
+                )
                 self.logger.warning(
                     f"GroupedRolloutWorkflow: {n_failed}/{len(results)} "
-                    "trajectories returned None, using remaining results"
+                    f"trajectories returned None, {action}"
                 )
+
+        if usable_slot_count < self.min_usable_group_size:
+            self._record_group_stats(usable_slot_count, trainable=False)
+            return None
 
         # Check if results are InteractionWithTokenLogpReward dicts
         first = valid_results[0]
@@ -126,17 +163,24 @@ class GroupedRolloutWorkflow(RolloutWorkflow):
                 isinstance(v, InteractionWithTokenLogpReward) for v in first.values()
             )
         ):
+            self._validate_slot_cardinality([len(result) for result in valid_results])
             if self.reward_normalization and self.group_size > 1:
                 if not self._normalize_group_rewards(results):
+                    self._record_group_stats(usable_slot_count, trainable=False)
                     return None
             # Merge dicts - each result is {completion_id: InteractionWithTokenLogpReward}
             merged: dict[str, InteractionWithTokenLogpReward] = {}
             for result in valid_results:
                 merged.update(result)
+            self._record_group_stats(usable_slot_count, trainable=bool(merged))
             return merged if merged else None
 
         # Otherwise, tensor dicts - concatenate
+        self._validate_slot_cardinality(
+            [get_batch_size(result) for result in valid_results]
+        )
         concatenated = concat_padded_tensors(valid_results)
+        self._record_group_stats(usable_slot_count, trainable=bool(concatenated))
         return concatenated if concatenated else None
 
     def _normalize_group_rewards(
@@ -676,7 +720,9 @@ class RemoteInfEngine(InferenceEngine):
         proxy_addr: str | None = None,
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
+        min_usable_group_size: int = 1,
     ) -> RolloutWorkflow:
+        validate_rollout_group_sizes(group_size, min_usable_group_size)
         resolved: RolloutWorkflow
 
         # 0. None workflow = online mode (config-driven)
@@ -697,6 +743,7 @@ class RemoteInfEngine(InferenceEngine):
                     self.logger,
                     reward_normalization=reward_normalization,
                     drop_incomplete_group=drop_incomplete_group,
+                    min_usable_group_size=min_usable_group_size,
                 )
             return resolved
 
@@ -794,6 +841,7 @@ class RemoteInfEngine(InferenceEngine):
                 self.logger,
                 reward_normalization=reward_normalization,
                 drop_incomplete_group=drop_incomplete_group,
+                min_usable_group_size=min_usable_group_size,
             )
 
         return resolved
@@ -1183,6 +1231,7 @@ class RemoteInfEngine(InferenceEngine):
         proxy_addr: str | None = None,
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
+        min_usable_group_size: int = 1,
     ) -> int:
         """Submit a request to the inference engine and return immediately.
 
@@ -1199,6 +1248,9 @@ class RemoteInfEngine(InferenceEngine):
         group_size : int
             Number of times to run the workflow per input and concatenate results.
             Default is 1 (no grouping).
+        min_usable_group_size : int
+            Estimator-owned minimum number of usable logical rollout slots. Must be
+            between 1 and ``group_size``. Default is 1.
         task_id : int, optional
             The task ID to use. If None, a new task ID will be generated internally.
         is_eval : bool, optional
@@ -1222,6 +1274,7 @@ class RemoteInfEngine(InferenceEngine):
             workflow,
             workflow_kwargs,
             group_size,
+            min_usable_group_size=min_usable_group_size,
             proxy_addr=proxy_addr,
             reward_normalization=reward_normalization,
             drop_incomplete_group=drop_incomplete_group,
@@ -1266,6 +1319,13 @@ class RemoteInfEngine(InferenceEngine):
         """Wait for a specific submitted task to complete."""
         return self.workflow_executor.wait_for_task(task_id, timeout, raise_timeout)
 
+    def _wait_for_task_result(
+        self, task_id: int, timeout: float | None = None, raise_timeout: bool = True
+    ) -> WorkflowTaskResult | None:
+        return self.workflow_executor._wait_for_task_result(
+            task_id, timeout, raise_timeout
+        )
+
     def rollout_batch(
         self,
         data: list[dict[str, Any]],
@@ -1274,6 +1334,7 @@ class RemoteInfEngine(InferenceEngine):
         group_size: int = 1,
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
+        min_usable_group_size: int = 1,
     ) -> list[dict[str, Any]]:
         """Submit a batch of requests and wait for results.
 
@@ -1306,6 +1367,7 @@ class RemoteInfEngine(InferenceEngine):
             workflow,
             workflow_kwargs,
             group_size,
+            min_usable_group_size=min_usable_group_size,
             reward_normalization=reward_normalization,
             drop_incomplete_group=drop_incomplete_group,
         )
@@ -1325,6 +1387,7 @@ class RemoteInfEngine(InferenceEngine):
         dynamic_bs: bool = False,
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
+        min_usable_group_size: int = 1,
     ) -> list[dict[str, Any]]:
         """Asynchronously submit and wait until a full batch is ready.
 
@@ -1343,6 +1406,9 @@ class RemoteInfEngine(InferenceEngine):
             Default is 1 (no grouping).
         dynamic_bs : bool, optional
             If True, enables dynamic batch sizing. Default is False.
+        min_usable_group_size : int
+            Estimator-owned minimum number of usable logical rollout slots. Must be
+            between 1 and ``group_size``. Default is 1.
 
         Returns
         -------
@@ -1358,6 +1424,7 @@ class RemoteInfEngine(InferenceEngine):
             workflow,
             workflow_kwargs,
             group_size,
+            min_usable_group_size=min_usable_group_size,
             reward_normalization=reward_normalization,
             drop_incomplete_group=drop_incomplete_group,
         )

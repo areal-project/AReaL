@@ -128,7 +128,7 @@ def test_dist_rollout_coordinator_forwards_reward_group_flags(monkeypatch):
     monkeypatch.setattr(
         coordinator,
         "_broadcast_and_redistribute_trajectories",
-        lambda trajectories: trajectories,
+        lambda trajectories, preparation_error=None: trajectories,
     )
     monkeypatch.setattr(dist_rollout.current_platform, "current_device", lambda: "cpu")
     monkeypatch.setattr(dist_rollout, "tensor_container_to", lambda data, device: data)
@@ -142,6 +142,7 @@ def test_dist_rollout_coordinator_forwards_reward_group_flags(monkeypatch):
     coordinator.rollout_batch(
         data=[{}],
         workflow=object(),
+        min_usable_group_size=2,
         reward_normalization=True,
         drop_incomplete_group=True,
     )
@@ -150,3 +151,32 @@ def test_dist_rollout_coordinator_forwards_reward_group_flags(monkeypatch):
     assert rollout_engine.prepare_kwargs["drop_incomplete_group"] is True
     assert rollout_engine.rollout_kwargs["reward_normalization"] is True
     assert rollout_engine.rollout_kwargs["drop_incomplete_group"] is True
+    assert rollout_engine.rollout_kwargs["min_usable_group_size"] == 2
+
+
+def test_ragged_trajectory_gather_uses_source_lengths(monkeypatch):
+    group = object()
+    remote_items = iter([{"rank": 1, "item": 0}, {"rank": 1, "item": 1}])
+    monkeypatch.setattr(dist_rollout.dist, "get_world_size", lambda _: 2)
+    monkeypatch.setattr(dist_rollout.dist, "get_rank", lambda group=None: 0)
+    monkeypatch.setattr(
+        dist_rollout.dist,
+        "all_gather_object",
+        lambda output, value, group=None: output.__setitem__(slice(None), [1, 2]),
+    )
+    monkeypatch.setattr(dist_rollout.dist, "get_process_group_ranks", lambda _: [4, 7])
+
+    def _broadcast(item, src_rank, group=None):
+        del group
+        return item if src_rank == 4 else next(remote_items)
+
+    monkeypatch.setattr(dist_rollout, "broadcast_tensor_container", _broadcast)
+
+    gathered = dist_rollout._all_gather_ragged_trajectory_lists(
+        [{"rank": 0, "item": 0}], group=group
+    )
+
+    assert gathered == [
+        [{"rank": 0, "item": 0}],
+        [{"rank": 1, "item": 0}, {"rank": 1, "item": 1}],
+    ]

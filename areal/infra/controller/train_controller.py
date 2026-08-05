@@ -94,6 +94,10 @@ def _dispatch_tensors(
 
     token_weights = [_item_weight(d) for d in item_list]
     n_groups = n // group_size
+    if n_groups < dp_size:
+        raise ValueError(
+            f"item group count ({n_groups}) must be at least dp_size ({dp_size})"
+        )
 
     group_weights = [
         sum(token_weights[g * group_size + k] for k in range(group_size))
@@ -767,6 +771,7 @@ class TrainController:
         dynamic_bs: bool = False,
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
+        min_usable_group_size: int = 1,
     ) -> list[dict[str, Any]]:
         return self.rollout.prepare_batch(
             dataloader=dataloader,
@@ -774,6 +779,7 @@ class TrainController:
             workflow_kwargs=workflow_kwargs,
             should_accept_fn=should_accept_fn,
             group_size=group_size,
+            min_usable_group_size=min_usable_group_size,
             dynamic_bs=dynamic_bs,
             reward_normalization=reward_normalization,
             drop_incomplete_group=drop_incomplete_group,
@@ -788,6 +794,7 @@ class TrainController:
         group_size: int = 1,
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
+        min_usable_group_size: int = 1,
     ) -> list[dict[str, Any]]:
         return self.rollout.rollout_batch(
             data=data,
@@ -795,6 +802,7 @@ class TrainController:
             workflow_kwargs=workflow_kwargs,
             should_accept_fn=should_accept_fn,
             group_size=group_size,
+            min_usable_group_size=min_usable_group_size,
             reward_normalization=reward_normalization,
             drop_incomplete_group=drop_incomplete_group,
         )

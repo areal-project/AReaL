@@ -26,7 +26,7 @@ from areal.models.tree_attn.triton_kernel import (
     precompute_tree_attention_data,
 )
 from areal.utils import logging, stats_tracker
-from areal.utils.data import MicroBatchList
+from areal.utils.data import TRANSPORT_DUMMY_KEY, MicroBatchList
 from areal.utils.perf_tracer import trace_perf, trace_scope
 
 logger = logging.getLogger("TreeAttentionCore")
@@ -404,6 +404,7 @@ def build_packed_tree_batch(
 
     # Build packed outputs for each tree
     mbs: list[dict[str, Any]] = []
+    padded_mbs: list[dict[str, Any]] = []
     padding_lengths: list[int] = []
     padded_to_lengths: list[int] = []
 
@@ -448,13 +449,17 @@ def build_packed_tree_batch(
                 non_packable_keys,
             )
 
-        mb = {
+        padded_mb = {
             "input_ids": input_ids,
             "position_ids": position_ids,
             "trie_node": trie,
             **extra_data,
         }
+        mb = dict(padded_mb)
+        if not trie.all_sequence_ids:
+            mb[TRANSPORT_DUMMY_KEY] = True
         mbs.append(mb)
+        padded_mbs.append(padded_mb)
         padding_lengths.append(padded_size - num_tokens)
         padded_to_lengths.append(padded_size)
 
@@ -465,7 +470,7 @@ def build_packed_tree_batch(
         mb_spec=mb_spec,
         mbs=mbs,
         group_lens=[num for num in num_tokens_list],
-        padded_mbs=mbs,
+        padded_mbs=padded_mbs,
         padding_lengths=padding_lengths,
         padded_to_lengths=padded_to_lengths,
         _max_seqlen=max(padded_to_lengths),

@@ -21,6 +21,10 @@ from areal.api.cli_args import (
 )
 from areal.infra import RolloutController
 from areal.infra.scheduler.local import LocalScheduler
+from areal.infra.workflow_executor import (
+    WorkflowContractError,
+    WorkflowContractFailure,
+)
 from areal.utils.hf_utils import load_hf_tokenizer
 
 
@@ -47,6 +51,7 @@ class MockScheduler:
         self.engine_calls = []
         self._pending_results = {}  # worker_id -> dict[task_id -> result]
         self._task_counter = 0
+        self.workflow_contract_error = None
 
     def create_workers(self, job, *args, **kwargs):
         """Create workers based on Job specification."""
@@ -100,15 +105,19 @@ class MockScheduler:
             resp = requests.post(callback_addr, json=dict(task_id=task_id))
             resp.raise_for_status()
             return task_id
-        # Handle wait_for_task method
-        elif method == "wait_for_task":
+        # Handle controller-safe task result retrieval
+        elif method == "_wait_for_task_result":
             task_id = kwargs.get("task_id")
+            if self.workflow_contract_error is not None:
+                return WorkflowContractFailure(message=self.workflow_contract_error)
             if (
                 worker_id in self._pending_results
                 and task_id in self._pending_results[worker_id]
             ):
                 result = self._pending_results[worker_id].pop(task_id)
-                return result
+                from areal.infra.workflow_executor import _RolloutResult
+
+                return _RolloutResult(task_id=task_id, trajectory=result)
             return None
         elif method == "wait":
             # Return a result from pending results if available
@@ -175,6 +184,13 @@ class MockInferenceEngine:
     @classmethod
     def __name__(cls):
         return "MockInferenceEngine"
+
+
+class _CyclingDataLoader:
+    batch_size = 4
+
+    def __iter__(self):
+        return iter([[{"id": 0}]])
 
 
 class TestRolloutControllerInitialization:
@@ -486,6 +502,38 @@ class TestRolloutControllerSubmitAndWait:
 
 
 class TestRolloutControllerBatchOperations:
+    @pytest.mark.parametrize("dynamic_bs", [False, True])
+    def test_prepare_batch_propagates_workflow_contract_error(self, dynamic_bs):
+        config = create_test_config(
+            backend="sglang:d1",
+            consumer_batch_size=1,
+            max_concurrent_rollouts=1,
+        )
+        scheduler = MockScheduler()
+        scheduler.workflow_contract_error = "logical slot produced two members"
+        controller = RolloutController(
+            inf_engine=MockInferenceEngine,
+            config=config,
+            scheduler=scheduler,
+        )
+        controller.initialize(role="rollout", server_args={})
+
+        try:
+            with pytest.raises(
+                WorkflowContractError, match="logical slot produced two members"
+            ):
+                controller.prepare_batch(
+                    _CyclingDataLoader(),
+                    workflow="tests.utils.TestWorkflow",
+                    workflow_kwargs={},
+                    dynamic_bs=dynamic_bs,
+                )
+        finally:
+            controller.destroy()
+
+        submit_calls = [call for call in scheduler.engine_calls if call[1] == "submit"]
+        assert len(submit_calls) == 1
+
     def test_rollout_batch_returns_list_of_dicts(self):
         """Verify RolloutController returns list of regular dicts, NOT RTensors.
 

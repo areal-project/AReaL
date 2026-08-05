@@ -75,6 +75,76 @@ if TYPE_CHECKING:
 logger = logging.getLogger("RLTrainer")
 
 
+def _minimum_usable_group_size(
+    actor_config: PPOActorConfig, target_group_size: int
+) -> int:
+    """Return the minimum group size required by the configured estimator."""
+    uses_group_statistics = False
+    for normalization in (actor_config.reward_norm, actor_config.adv_norm):
+        if normalization is None:
+            continue
+        if hasattr(normalization, "get"):
+            mean_level = normalization.get("mean_level")
+            std_level = normalization.get("std_level")
+        else:
+            mean_level = getattr(normalization, "mean_level", None)
+            std_level = getattr(normalization, "std_level", None)
+        uses_group_statistics |= mean_level == "group" or std_level == "group"
+
+    if uses_group_statistics and target_group_size < 2:
+        raise ValueError(
+            "Group-relative reward or advantage normalization requires at least "
+            f"two rollout slots; got target_group_size={target_group_size}."
+        )
+    return 2 if uses_group_statistics else 1
+
+
+def _collect_trainable_rollout_batch(
+    prepare_batch: Callable[[], list[dict[str, Any]]],
+    *,
+    dynamic_bs: bool,
+    min_batch_size: int = 1,
+) -> list[dict[str, Any]]:
+    """Collect until every local DP consumer can receive a trajectory group.
+
+    Dynamic collection remains open-ended because ``None`` is an objective-level
+    rejection, not failure evidence. Non-retryable workflow contract errors propagate
+    through ``prepare_batch`` instead of reaching this loop.
+    """
+    if min_batch_size < 1:
+        raise ValueError(f"min_batch_size must be positive, got {min_batch_size}")
+
+    batch: list[dict[str, Any]] = []
+    while len(batch) < min_batch_size:
+        batch.extend(prepare_batch())
+        if len(batch) >= min_batch_size:
+            break
+        if not dynamic_bs:
+            raise RuntimeError(
+                "Fixed rollout preparation produced only "
+                f"{len(batch)} trainable groups; at least {min_batch_size} are required"
+            )
+        logger.warning(
+            "Dynamic rollout batch has %d/%d trainable groups; collecting from "
+            "the ready queue again",
+            len(batch),
+            min_batch_size,
+        )
+    return batch
+
+
+def _minimum_consumer_batch_size(*consumers: Any | None) -> int:
+    """Return the largest DP degree among train engines consuming a rollout."""
+    return max(
+        (
+            consumer.parallel_strategy.dp_size
+            for consumer in consumers
+            if consumer is not None
+        ),
+        default=1,
+    )
+
+
 class _EmptyDataLoader:
     """Minimal dataloader for online mode that yields empty dicts.
 
@@ -576,6 +646,24 @@ class PPOTrainer:
         total_epochs: int | None = None,
     ):
         config = self.config
+        is_v1_rollout = config.rollout._version == "v1"
+        min_usable_group_size = (
+            _minimum_usable_group_size(config.actor, config.gconfig.n_samples)
+            if is_v1_rollout
+            else 1
+        )
+        train_teacher = (
+            self.teacher
+            if config.teacher is not None and config.teacher.engine_type == "train"
+            else None
+        )
+        min_consumer_batch_size = (
+            _minimum_consumer_batch_size(
+                self.actor, self.critic, self.ref, train_teacher
+            )
+            if is_single_controller()
+            else 1
+        )
         start_step = (
             self.recover_info.last_step_info.next().global_step
             if self.recover_info is not None
@@ -625,15 +713,25 @@ class PPOTrainer:
                     },
                 ),
             ):
-                rollout_batch = self.actor.prepare_batch(
-                    self.train_dataloader,
+                prepare_kwargs = dict(
                     workflow=workflow,
                     workflow_kwargs=workflow_kwargs,
                     should_accept_fn=dynamic_filter_fn,
                     group_size=config.gconfig.n_samples,
-                    dynamic_bs=self.config.dynamic_bs,
+                    dynamic_bs=config.dynamic_bs,
                     reward_normalization=config.gconfig.reward_normalization,
                     drop_incomplete_group=config.gconfig.drop_incomplete_group,
+                )
+                if is_v1_rollout:
+                    prepare_kwargs["min_usable_group_size"] = min_usable_group_size
+                rollout_batch = _collect_trainable_rollout_batch(
+                    functools.partial(
+                        self.actor.prepare_batch,
+                        self.train_dataloader,
+                        **prepare_kwargs,
+                    ),
+                    dynamic_bs=config.dynamic_bs,
+                    min_batch_size=min_consumer_batch_size,
                 )
             if self._should_offload_rollout:
                 self._offload_rollout()
