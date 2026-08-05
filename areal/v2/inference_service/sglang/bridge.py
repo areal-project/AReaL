@@ -144,9 +144,7 @@ class SGLangBridgeBackend:
         return HttpRequest(endpoint="/abort_request", payload={"abort_all": True})
 
     def get_load_request(self) -> HttpRequest:
-        return HttpRequest(
-            endpoint="/v1/loads?include=core", payload={}, method="GET"
-        )
+        return HttpRequest(endpoint="/v1/loads?include=core", payload={}, method="GET")
 
     @staticmethod
     def parse_in_flight(body: Any) -> int:
@@ -177,8 +175,9 @@ class SGLangBridgeBackend:
             total += int(running or 0) + int(waiting or 0)
         return total
 
-    def get_offload_request(self) -> HttpRequest:
-        return HttpRequest(endpoint="/release_memory_occupation", payload={})
+    def get_offload_request(self, tags: list[str] | None = None) -> HttpRequest:
+        payload = {"tags": tags} if tags is not None else {}
+        return HttpRequest(endpoint="/release_memory_occupation", payload=payload)
 
     def get_onload_request(self, tags: list[str] | None = None) -> HttpRequest:
         payload = {"tags": tags} if tags is not None else {}
