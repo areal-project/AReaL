@@ -1455,18 +1455,76 @@ class RolloutControllerV2:
         if failed and len(failed) == len(results):
             raise RuntimeError(f"pause_generation failed on ALL {len(failed)} workers")
 
-    def pause_generation_sync(self, drain_timeout: float = 60.0) -> None:
-        """Pause generation on all workers, then wait for in-flight requests to drain."""
+    def pause_generation_sync(
+        self, drain_timeout: float = 60.0, poll_interval: float = 0.2
+    ) -> None:
+        """Pause generation, then block until the engines report zero requests.
+
+        Draining has to be observed rather than assumed: offload asserts a
+        fully idle scheduler and takes the process down when a request is still
+        queued, so a timeout raises instead of letting the caller proceed.
+        """
         self.pause_generation()
-        # The pause HTTP request may require some time to be scheduled and
-        # executed on the inference servers. Mirror the v1 RemoteInfEngine
-        # semantics: wait a fixed grace period until in-flight requests are
-        # indeed dropped before the caller proceeds (e.g. offload).
-        logger.info(
-            "Waiting %.1fs after pause_generation for in-flight requests to drop",
-            drain_timeout,
+        deadline = time.monotonic() + drain_timeout
+        while True:
+            remaining = self._poll_in_flight()
+            if remaining <= 0:
+                return
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    f"Inference engines failed to drain within {drain_timeout:.1f}s: "
+                    f"{remaining} request(s) still in flight"
+                )
+            self._nudge_abort()
+            if poll_interval > 0:
+                time.sleep(poll_interval)
+
+    def _poll_in_flight(self) -> int:
+        from areal.infra.utils.concurrent import run_async_task
+
+        return run_async_task(self._async_poll_in_flight)
+
+    async def _async_poll_in_flight(self) -> int:
+        addrs = self._data_proxy_addrs
+        results = await asyncio.gather(
+            *(self._async_data_proxy_get(a, "/in_flight") for a in addrs),
+            return_exceptions=True,
         )
-        time.sleep(drain_timeout)
+        total = 0
+        for addr, res in zip(addrs, results, strict=True):
+            if isinstance(res, BaseException):
+                logger.warning("in_flight probe failed for %s: %s", addr, res)
+                total += 1
+                continue
+            total += int(res.get("in_flight", 1))
+        return total
+
+    def _nudge_abort(self) -> None:
+        from areal.infra.utils.concurrent import run_async_task
+
+        run_async_task(self._async_nudge_abort)
+
+    async def _async_nudge_abort(self) -> None:
+        await asyncio.gather(
+            *(
+                self._async_data_proxy_post(a, "/abort_all", {})
+                for a in self._data_proxy_addrs
+            ),
+            return_exceptions=True,
+        )
+
+    async def _async_data_proxy_get(self, addr: str, endpoint: str) -> dict[str, Any]:
+        url = f"{addr}{endpoint}"
+        try:
+            client = await self._get_async_client()
+            resp = await client.get(url)
+            if resp.status_code >= 400:
+                raise RuntimeError(
+                    f"Data proxy {url} returned {resp.status_code}: {resp.text}"
+                )
+            return resp.json()
+        except httpx.HTTPError as exc:
+            raise RuntimeError(f"Failed to GET {url}: {exc}") from exc
 
     def continue_generation(self) -> None:
         """Continue generation on all workers."""

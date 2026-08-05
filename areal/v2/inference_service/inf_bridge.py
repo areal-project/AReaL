@@ -97,12 +97,26 @@ class InfBridge:
 
     # -- pause / resume -----------------------------------------------------
 
-    async def pause(self) -> None:
+    async def pause(self, timeout: float = 10.0) -> None:
         """Pause generation by setting pause_state and calling the backend."""
         await self.pause_state.set_paused(True)
         http_req = self.backend.get_pause_request()
-        await self._send_request(http_req, timeout=10.0)
+        await self._send_request(http_req, timeout=timeout)
         logger.info("Pause request sent to %s", self.backend_addr)
+
+    async def in_flight(self) -> int:
+        get_load = getattr(self.backend, "get_load_request", None)
+        parse = getattr(self.backend, "parse_in_flight", None)
+        if get_load is None or parse is None:
+            return 0
+        body = await self._send_request(get_load(), timeout=10.0)
+        return parse(body)
+
+    async def abort_all(self) -> None:
+        abort = getattr(self.backend, "get_abort_all_request", None)
+        if abort is None:
+            return
+        await self._send_request(abort(), timeout=10.0)
 
     async def resume(self) -> None:
         """Resume generation by calling the backend and clearing pause_state."""
