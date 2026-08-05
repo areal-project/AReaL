@@ -553,7 +553,18 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
             )
 
         # Physical device pairing prevents URL ordering from crossing CUDA IPC peers.
-        paired_devices = sorted(train_devices)
+        # AWEX pairs training replica (engine_rank % num_train_replicas) with each
+        # engine, so engine index parity decides which DP replica feeds an engine.
+        # Ordering engines node-major puts same-node engines in adjacent indices,
+        # which hands them different replicas and sends half the weights across the
+        # network. Keying on (base_gpu, ip) instead makes the node the fast-varying
+        # dimension, so same-node engines share a parity and a DP replica.
+        def _device_sort_key(device: tuple[str, int]) -> tuple[int, str, int]:
+            ip, device_id = device
+            _url, local, _iw = infer_by_device[device]
+            return (device_id - local, ip, local)
+
+        paired_devices = sorted(train_devices, key=_device_sort_key)
         paired_world_size = len(paired_devices)
         train_world_size = paired_world_size
         infer_world_size = paired_world_size
@@ -581,6 +592,7 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
                 )
             }
         )
+        server_infos = sorted(server_infos, key=lambda e: (e[1], e[0], e[2]))
         next_base = 0
         for _ip, _dev, url, iw in server_infos:
             server_base[url] = (next_base, iw)
