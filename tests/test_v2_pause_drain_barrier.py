@@ -66,9 +66,7 @@ class TestDrainBarrier:
         ctrl = mock.Mock(spec=RolloutControllerV2)
         ctrl.pause_generation = lambda: calls.__setitem__("pause", calls["pause"] + 1)
         ctrl._poll_in_flight = _poll
-        ctrl._nudge_abort = lambda: calls.__setitem__(
-            "nudges", calls["nudges"] + 1
-        )
+        ctrl._nudge_abort = lambda: calls.__setitem__("nudges", calls["nudges"] + 1)
         ctrl._calls = calls
         return ctrl, calls
 

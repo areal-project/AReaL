@@ -72,9 +72,7 @@ def test_slurm_v2_guard_colocation_forks_inside_target_allocation(tmp_path):
                 cmd="python -m areal.v2.training_service.guard",
             )
         ],
-        scheduling_strategy=SchedulingStrategy(
-            type="colocation", target="rollout"
-        ),
+        scheduling_strategy=SchedulingStrategy(type="colocation", target="rollout"),
     )
 
     with (
@@ -116,9 +114,7 @@ def test_slurm_v2_guard_colocation_requires_full_node_topology(tmp_path):
                 cmd="python -m areal.v2.training_service.guard",
             )
         ],
-        scheduling_strategy=SchedulingStrategy(
-            type="colocation", target="rollout"
-        ),
+        scheduling_strategy=SchedulingStrategy(type="colocation", target="rollout"),
     )
 
     with pytest.raises(WorkerCreationError, match="full-node target allocation"):
@@ -134,9 +130,7 @@ def test_ray_v2_guard_colocation_fails_clearly(tmp_path):
         role="actor-guard",
         replicas=1,
         tasks=[SchedulingSpec(cpu=1, gpu=1, mem=1)],
-        scheduling_strategy=SchedulingStrategy(
-            type="colocation", target="rollout"
-        ),
+        scheduling_strategy=SchedulingStrategy(type="colocation", target="rollout"),
     )
 
     with pytest.raises(

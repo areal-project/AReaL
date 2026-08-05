@@ -17,7 +17,10 @@ def _assign(devices, infer_by_device, node_minor):
     for ip, device_id in devices:
         url, local, iw = infer_by_device[(ip, device_id)]
         servers[url] = (ip, device_id - local, iw)
-    order = sorted(servers.items(), key=lambda kv: (kv[1][1], kv[1][0]) if node_minor else (kv[1][0], kv[1][1]))
+    order = sorted(
+        servers.items(),
+        key=lambda kv: (kv[1][1], kv[1][0]) if node_minor else (kv[1][0], kv[1][1]),
+    )
     base = {}
     nxt = 0
     for url, (_ip, _base_gpu, iw) in order:

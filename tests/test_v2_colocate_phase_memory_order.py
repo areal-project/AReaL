@@ -50,15 +50,11 @@ def _update_weights_events(colocate):
         _colocate=colocate,
         rollout=rollout,
         _weight_update_ctrl=SimpleNamespace(
-            update_weights=lambda version: SimpleNamespace(
-                status="ok", duration_ms=1.0
-            )
+            update_weights=lambda version: SimpleNamespace(status="ok", duration_ms=1.0)
         ),
     )
 
-    GatewayTrainController.update_weights(
-        controller, SimpleNamespace(version=1)
-    )
+    GatewayTrainController.update_weights(controller, SimpleNamespace(version=1))
     return events
 
 
