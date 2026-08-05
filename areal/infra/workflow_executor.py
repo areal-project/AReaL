@@ -952,64 +952,61 @@ class WorkflowExecutor:
             else:
                 all_versions = traj["versions"]
 
-            global_tail = (
-                all_versions.max().item()
-                if all_versions is not None
-                else default_version
-            )
-            # Directory is named by batch-global max version (global_tail).
-            # Individual records may have tail_version <= global_tail.
-            version_dir = os.path.join(dump_dir, str(global_tail))
-            await aiofiles.os.makedirs(version_dir, exist_ok=True)
-
-            # Handle batched trajectories
             batch_size = input_ids.shape[0]
+            records_by_version: dict[int, list[dict[str, Any]]] = {}
 
-            file_path = os.path.join(version_dir, f"{task_id}.jsonl")
-            async with aiofiles.open(file_path, "a") as f:
-                for i in range(batch_size):
-                    seqlen = attention_mask[i].sum().item()
-                    if seqlen == 0:
-                        continue
-                    ids = input_ids[i, :seqlen].tolist()
-                    mask = loss_mask[i, :seqlen].tolist()
-                    # Skip samples with empty completions
-                    if mask[-1] != 1:
-                        continue
+            for i in range(batch_size):
+                seqlen = attention_mask[i].sum().item()
+                if seqlen == 0:
+                    continue
+                ids = input_ids[i, :seqlen].tolist()
+                mask = loss_mask[i, :seqlen].tolist()
+                # Skip samples with empty completions
+                if mask[-1] != 1:
+                    continue
 
-                    if all_versions is not None:
-                        sample_versions = all_versions[i, :seqlen].tolist()
-                        head_version, tail_version, version_rle = (
-                            self._compute_output_versions(sample_versions, mask)
-                        )
-                    else:
-                        head_version = tail_version = default_version
-                        version_rle = [[default_version, sum(mask)]]
+                if all_versions is not None:
+                    sample_versions = all_versions[i, :seqlen].tolist()
+                    head_version, tail_version, version_rle = (
+                        self._compute_output_versions(sample_versions, mask)
+                    )
+                else:
+                    head_version = tail_version = default_version
+                    version_rle = [[default_version, sum(mask)]]
 
-                    split = self._split_trajectory_for_dump(ids, mask, tokenizer)
+                split = self._split_trajectory_for_dump(ids, mask, tokenizer)
 
-                    reward = rewards[i].item()
+                reward = rewards[i].item()
 
-                    record = {
-                        "task_id": task_id,
-                        "sample_idx": i,
-                        "seqlen": seqlen,
-                        "prompt_len": split["prompt_end"],
-                        "head_version": head_version,
-                        "tail_version": tail_version,
-                        "version_rle": version_rle,
-                        "reward": reward,
-                        "prompt": split["prompt_text"],
-                        "completion": split["completion_text"],
-                    }
-                    if split["segments"] is not None:
-                        record["segments"] = split["segments"]
+                record = {
+                    "task_id": task_id,
+                    "sample_idx": i,
+                    "seqlen": seqlen,
+                    "prompt_len": split["prompt_end"],
+                    "head_version": head_version,
+                    "tail_version": tail_version,
+                    "version_rle": version_rle,
+                    "reward": reward,
+                    "prompt": split["prompt_text"],
+                    "completion": split["completion_text"],
+                }
+                if split["segments"] is not None:
+                    record["segments"] = split["segments"]
 
-                    original_rewards = traj.get("original_rewards")
-                    if original_rewards is not None:
-                        record["original_reward"] = original_rewards[i].item()
+                original_rewards = traj.get("original_rewards")
+                if original_rewards is not None:
+                    record["original_reward"] = original_rewards[i].item()
 
-                    await f.write(json.dumps(record) + "\n")
+                records_by_version.setdefault(tail_version, []).append(record)
+
+            # Invariant: every record in dir N has tail_version == N.
+            for version, records in records_by_version.items():
+                version_dir = os.path.join(dump_dir, str(version))
+                await aiofiles.os.makedirs(version_dir, exist_ok=True)
+                file_path = os.path.join(version_dir, f"{task_id}.jsonl")
+                async with aiofiles.open(file_path, "a") as f:
+                    for record in records:
+                        await f.write(json.dumps(record) + "\n")
             return True, ""
         except Exception as e:
             return False, f"dump failed: {e}"
