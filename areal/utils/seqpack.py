@@ -553,14 +553,15 @@ def balanced_greedy_partition(nums: list[int], K: int) -> list[list[int]]:
         List of K lists, where each inner list contains the indices assigned to that group
 
     Raises:
-        ValueError: If len(nums) is not divisible by K or if len(nums) < K
+        ValueError: If K <= 0
     """
+    if K <= 0:
+        raise ValueError(f"K must be positive, got {K}.")
+
     n = len(nums)
-    if n < K:
-        raise ValueError(f"Number of items ({n}) must be >= K ({K}).")
-    if n % K != 0:
-        raise ValueError("The length of nums must be divisible by K.")
-    m = n // K
+    base = n // K
+    remainder = n % K
+    capacities = [base + (1 if i < remainder else 0) for i in range(K)]
 
     # Sort indices by value in descending order
     sorted_indices = sorted(range(n), key=lambda i: -nums[i])
@@ -575,10 +576,14 @@ def balanced_greedy_partition(nums: list[int], K: int) -> list[list[int]]:
         chosen_group = -1
         min_sum = float("inf")
         for i in range(K):
-            if counts[i] < m and sums[i] < min_sum:
+            if counts[i] < capacities[i] and sums[i] < min_sum:
                 min_sum = sums[i]
                 chosen_group = i
 
+        if chosen_group == -1:
+            raise RuntimeError(
+                f"Cannot assign item idx={idx} with capacities={capacities}, counts={counts}"
+            )
         groups[chosen_group].append(idx)
         sums[chosen_group] += num
         counts[chosen_group] += 1
