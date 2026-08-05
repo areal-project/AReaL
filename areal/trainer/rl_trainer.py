@@ -804,12 +804,38 @@ class PPOTrainer:
                     if self._should_offload_critic:
                         self._offload_model(self.critic, role="critic")
 
+                # Checkpoint before publishing weights: the AWEX colocate
+                # transfer releases the training weights, optimizer and grad
+                # buffers, so afterwards there is nothing resident to save.
+                with (
+                    stats_tracker.record_timing("save"),
+                    perf_tracer.trace_scope(
+                        "train.save",
+                        category=Category.IO,
+                        args={"global_step": global_step},
+                    ),
+                ):
+                    self._save_hf(epoch=epoch, epoch_step=step, global_step=global_step)
+
+                with (
+                    stats_tracker.record_timing("checkpoint_for_recover"),
+                    perf_tracer.trace_scope(
+                        "train.checkpoint",
+                        category=Category.IO,
+                        args={"global_step": global_step},
+                    ),
+                ):
+                    self._save_recover_checkpoint(
+                        epoch=epoch, epoch_step=step, global_step=global_step
+                    )
+
                 # Colocate v2 phase entry owns the pause; other paths keep it here.
                 if not self._is_v2_awex_colocate:
                     self.rollout.pause()
 
-                # Actor already onloaded; engine-internal _offload_aware_context
-                # calls in update_weights/save are no-ops.
+                # Actor memory is resident for the whole phase, so the
+                # engine-internal _offload_aware_context calls in
+                # update_weights/save are no-ops.
 
                 with (
                     stats_tracker.record_timing("update_weights"),
@@ -830,28 +856,6 @@ class PPOTrainer:
                     self.rollout.set_version(new_version)
                     if self.eval_rollout is not None:
                         self.eval_rollout.set_version(new_version)
-
-            with (
-                stats_tracker.record_timing("save"),
-                perf_tracer.trace_scope(
-                    "train.save",
-                    category=Category.IO,
-                    args={"global_step": global_step},
-                ),
-            ):
-                self._save_hf(epoch=epoch, epoch_step=step, global_step=global_step)
-
-            with (
-                stats_tracker.record_timing("checkpoint_for_recover"),
-                perf_tracer.trace_scope(
-                    "train.checkpoint",
-                    category=Category.IO,
-                    args={"global_step": global_step},
-                ),
-            ):
-                self._save_recover_checkpoint(
-                    epoch=epoch, epoch_step=step, global_step=global_step
-                )
 
             # Offload actor before eval
             if self._should_offload_actor:
