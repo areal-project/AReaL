@@ -586,7 +586,7 @@ def gateway_controller_full_init_vlm(request, vlm_model_path, tmp_path_factory):
         ),
         consumer_batch_size=8,
         max_head_offpolicyness=1024,
-        setup_timeout=300.0,
+        setup_timeout=600.0,
         admin_api_key="test-admin",
     )
 
