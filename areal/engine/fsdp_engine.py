@@ -1754,6 +1754,8 @@ class FSDPEngine(TrainEngine):
         Iterates adapter parameters and unshards them individually to avoid
         allocating the full base model state dict (which would OOM).
         """
+        import re
+
         from safetensors.torch import save_file
         from torch.distributed.tensor import DTensor
 
@@ -1771,7 +1773,9 @@ class FSDPEngine(TrainEngine):
                 full_param = param.data
 
             if dist.get_rank() == 0:
-                clean_name = _normalize_lora_adapter_state_key(name)
+                # Emit PEFT-serving-standard keys. Drop the active-adapter
+                # segment (".default") while retaining PEFT's base-model prefix.
+                clean_name = re.sub(r"\.default\.(weight|bias)$", r".\1", name)
                 adapter_state[clean_name] = (
                     self._cast_to_compute_dtype(full_param.cpu())
                     if full_param.is_floating_point()
