@@ -201,5 +201,7 @@ api_key.json
 .vscode/
 wandb/
 outputs/
+rl_logs/
+.arena-rollout.env
 sympy/
 !/docs/figures/*
