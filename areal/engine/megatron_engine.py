@@ -1512,12 +1512,18 @@ class MegatronEngine(TrainEngine):
             )
             if dp_rank == mpu.get_data_parallel_rank():
                 self._context_and_model_parallel_group = group
-        for dp_rank, ranks in enumerate(context_and_model_parallel_ranks):
-            cpu_group = dist.new_group(
-                ranks, timeout=DIST_GROUP_DEFAULT_TIMEOUT, backend="gloo"
-            )
-            if dp_rank == mpu.get_data_parallel_rank():
-                self._cpu_model_parallel_group = cpu_group
+        # The gloo mirror is only read once an offloaded engine has handed the
+        # accelerator to rollout and device collectives are unusable (see
+        # resolve_broadcast_target). Building it otherwise costs one collective
+        # per data-parallel group at startup for a group nothing ever uses;
+        # resolve_broadcast_target falls back to the device group when it is None.
+        if self.config.offload:
+            for dp_rank, ranks in enumerate(context_and_model_parallel_ranks):
+                cpu_group = dist.new_group(
+                    ranks, timeout=DIST_GROUP_DEFAULT_TIMEOUT, backend="gloo"
+                )
+                if dp_rank == mpu.get_data_parallel_rank():
+                    self._cpu_model_parallel_group = cpu_group
 
     def _create_optimizer(self, ft_spec: FinetuneSpec) -> None:
         if self.optimizer_config is None:
