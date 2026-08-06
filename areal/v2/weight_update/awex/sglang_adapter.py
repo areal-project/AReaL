@@ -43,7 +43,6 @@ def _patch_tms_hook_mode() -> None:
 # This must run before AWEX imports trigger model-registry auto-discovery.
 _patch_tms_hook_mode()
 
-from awex.meta.infer_meta_resolver import InferParamMetaResolver  # noqa: E402
 from awex.meta.meta_resolver import ParamMetaResolver  # noqa: E402
 from awex.meta.weight_meta import (  # noqa: E402
     ParameterMeta,
@@ -776,15 +775,29 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
     # ── Colocated weight transfer methods ─────────────────────────────────
 
     def _compute_local_raw_meta(self) -> dict:
-        """Compute this rank's metadata with AWEX's SGLang converter."""
-        return InferParamMetaResolver._get_model_param_info(
-            "sglang",
-            self._scheduler.server_args,
-            convert_params=True,
+        """Compute this rank's colocate metadata with AReaL HF names."""
+        model = self._get_model()
+        rank_info = get_sglang_rank_info(
+            self._get_colocate_model_context(),
             engine_rank=self._engine_rank or 0,
-            model=self._get_model(),
-            model_context=self._get_colocate_model_context(),
         )
+        raw_meta = {
+            "rank_info": rank_info,
+            "params_meta": [],
+            "model_arch_name": type(model).__name__,
+        }
+        for name, param in model.named_parameters():
+            tensor = param.data if hasattr(param, "data") else param
+            for hf_name, hf_tensor in self._unfuse_params(name, tensor):
+                raw_meta["params_meta"].append(
+                    {
+                        "name": hf_name,
+                        "numel": int(hf_tensor.numel()),
+                        "shape": tuple(hf_tensor.shape),
+                        "dtype": hf_tensor.dtype,
+                    }
+                )
+        return raw_meta
 
     def _build_instance_params_meta(self):
         """Exchange one instance's raw metadata through the MetaServer.

@@ -155,6 +155,77 @@ def test_colocate_full_payload_uses_areal_hf_names(monkeypatch):
     assert all("attention." not in name for name in converted)
 
 
+def test_sglang_colocate_raw_meta_uses_unfused_areal_names(monkeypatch):
+    """Colocate infer metadata must match AReaL receiver parameter names."""
+    mod = common._load_sglang_adapter(monkeypatch)
+
+    class _Config:
+        num_attention_heads = 4
+        num_key_value_heads = 2
+
+    class _Model:
+        config = _Config()
+
+        def named_parameters(self):
+            yield (
+                "model.layers.0.self_attn.qkv_proj.weight",
+                torch.nn.Parameter(torch.arange(32, dtype=torch.float32).view(8, 4)),
+            )
+            yield (
+                "model.layers.0.self_attn.o_proj.weight",
+                torch.nn.Parameter(torch.ones(4, 4)),
+            )
+            yield (
+                "model.layers.0.self_attn.q_norm.weight",
+                torch.nn.Parameter(torch.ones(2)),
+            )
+
+    monkeypatch.setattr(
+        mod,
+        "get_sglang_rank_info",
+        lambda context, engine_rank: mod.RankInfo(
+            tp_rank=0,
+            tp_size=1,
+            pp_rank=0,
+            pp_size=1,
+            dp_size=1,
+            dp_rank=0,
+            ep_rank=0,
+            ep_size=1,
+            ep_tp_rank=0,
+            ep_tp_size=1,
+            attn_tp_rank=0,
+            attn_tp_size=1,
+            attn_dp_rank=0,
+            world_size=1,
+            global_rank=0,
+            local_rank=0,
+            engine_rank=engine_rank,
+            is_infer=True,
+        ),
+    )
+
+    adapter = object.__new__(mod.AwexSGLangAdapter)
+    adapter._engine_rank = 0
+    adapter._get_model = lambda: _Model()
+    adapter._get_colocate_model_context = lambda: {}
+
+    raw_meta = adapter._compute_local_raw_meta()
+
+    params = {item["name"]: item for item in raw_meta["params_meta"]}
+    assert set(params) == {
+        "model.layers.0.self_attn.q_proj.weight",
+        "model.layers.0.self_attn.k_proj.weight",
+        "model.layers.0.self_attn.v_proj.weight",
+        "model.layers.0.self_attn.o_proj.weight",
+        "model.layers.0.self_attn.q_norm.weight",
+    }
+    assert params["model.layers.0.self_attn.q_proj.weight"]["shape"] == (4, 4)
+    assert params["model.layers.0.self_attn.k_proj.weight"]["shape"] == (2, 4)
+    assert params["model.layers.0.self_attn.v_proj.weight"]["shape"] == (2, 4)
+    assert "model.layers.0.self_attn.qkv_proj.weight" not in params
+
+
 def test_colocate_delta_timeout_preserves_payload_keys(monkeypatch):
     """A failed DTE reader ack should leave payload metadata for diagnosis."""
     mod = common._load_megatron_adapter(monkeypatch)
