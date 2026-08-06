@@ -1,17 +1,26 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Qwen3-0.6B colocated DTE smoke test.
+# Qwen3-0.6B DTE smoke test for colocated or separated weight updates.
 #
-# Defaults match the validated run from 2026-08-06:
+# The default colocation mode matches the validated run from 2026-08-06:
+#   TOPOLOGY=colocation
 #   actor.backend=megatron:d2p1t1
 #   rollout.backend=sglang:d2p1t1
-#   rollout.scheduling_strategy.type=colocation
+#
+# The separation mode keeps the same model but uses one GPU for training and
+# one GPU for inference by default:
+#   TOPOLOGY=separation
+#   actor.backend=megatron:d1p1t1
+#   rollout.backend=sglang:d1t1p1
+#
+# Both modes enable:
 #   actor.dte.enabled=true, actor.dte.transfer=delta
 #
 # Useful overrides:
-#   NODELIST=slurmd-21 SUBMIT=1 ./examples/dte/run_qwen3_0_6b_colocation_dte_smoke.sh
-#   SUBMIT=0 ./examples/dte/run_qwen3_0_6b_colocation_dte_smoke.sh
+#   TOPOLOGY=colocation NODELIST=slurmd-21 ./examples/dte/run_qwen3_0_6b_dte_smoke.sh
+#   TOPOLOGY=separation NODELIST=slurmd-21 ./examples/dte/run_qwen3_0_6b_dte_smoke.sh
+#   SUBMIT=0 TOPOLOGY=separation ./examples/dte/run_qwen3_0_6b_dte_smoke.sh
 
 SCRIPT_PATH=$(readlink -f "${BASH_SOURCE[0]}")
 SCRIPT_DIR=$(cd "$(dirname "${SCRIPT_PATH}")" && pwd)
@@ -24,10 +33,16 @@ DTE_AWEX_SRC=${DTE_AWEX_SRC:-/storage/openpsi/users/pengzai.pyq/asystem-awex}
 DATASET_PATH=${DATASET_PATH:-/storage/openpsi/data/gsm8k}
 CONFIG_PATH=${CONFIG_PATH:-examples/math/gsm8k_grpo_megatron.yaml}
 
+TOPOLOGY=${TOPOLOGY:-colocation}
+if [[ "${TOPOLOGY}" != "colocation" && "${TOPOLOGY}" != "separation" ]]; then
+  echo "TOPOLOGY must be colocation or separation, got ${TOPOLOGY}" >&2
+  exit 2
+fi
+
 EXP_NAME=${EXP_NAME:-pyq-areal-port-dte-smoke}
 TRIAL_SUFFIX=${TRIAL_SUFFIX:-$(date +%m%d_%H%M%S)}
-TRIAL_NAME=${TRIAL_NAME:-colocation_dte_qwen3_0_6b_${TRIAL_SUFFIX}}
-JOB_NAME=${JOB_NAME:-pyq-dte-q3-0p6b-col}
+TRIAL_NAME=${TRIAL_NAME:-${TOPOLOGY}_dte_qwen3_0_6b_${TRIAL_SUFFIX}}
+JOB_NAME=${JOB_NAME:-pyq-dte-q3-0p6b-${TOPOLOGY}}
 NODELIST=${NODELIST:-}
 RESERVATION=${RESERVATION:-}
 SUBMIT=${SUBMIT:-1}
@@ -42,11 +57,19 @@ SBATCH_PATH=${SBATCH_PATH:-${LAUNCH_DIR}/job.sbatch}
 JOB_LOG=${JOB_LOG:-${LAUNCH_DIR}/job.log}
 
 MODEL_PATH=${MODEL_PATH:-/storage/openpsi/models/Qwen__Qwen3-0.6B}
-ACTOR_BACKEND=${ACTOR_BACKEND:-megatron:d2p1t1}
-ROLLOUT_BACKEND=${ROLLOUT_BACKEND:-sglang:d2p1t1}
-CLUSTER_GPUS=${CLUSTER_GPUS:-2}
-SBATCH_GPUS=${SBATCH_GPUS:-2}
-SCHED_TARGET=${SCHED_TARGET:-actor}
+if [[ "${TOPOLOGY}" == "colocation" ]]; then
+  ACTOR_BACKEND=${ACTOR_BACKEND:-megatron:d2p1t1}
+  ROLLOUT_BACKEND=${ROLLOUT_BACKEND:-sglang:d2p1t1}
+  CLUSTER_GPUS=${CLUSTER_GPUS:-2}
+  SBATCH_GPUS=${SBATCH_GPUS:-2}
+  SCHED_TARGET=${SCHED_TARGET:-actor}
+else
+  ACTOR_BACKEND=${ACTOR_BACKEND:-megatron:d1p1t1}
+  ROLLOUT_BACKEND=${ROLLOUT_BACKEND:-sglang:d1t1p1}
+  CLUSTER_GPUS=${CLUSTER_GPUS:-2}
+  SBATCH_GPUS=${SBATCH_GPUS:-2}
+  SCHED_TARGET=${SCHED_TARGET:-actor}
+fi
 
 TOTAL_TRAIN_STEPS=${TOTAL_TRAIN_STEPS:-3}
 SAVE_FREQ_STEPS=${SAVE_FREQ_STEPS:-null}
@@ -154,7 +177,7 @@ PY
     +rollout._version=v2 \
     ++actor.backend="${ACTOR_BACKEND}" \
     ++rollout.backend="${ROLLOUT_BACKEND}" \
-    ++rollout.scheduling_strategy.type=colocation \
+    ++rollout.scheduling_strategy.type="${TOPOLOGY}" \
     ++rollout.scheduling_strategy.target="${SCHED_TARGET}" \
     ++rollout.scheduling_strategy.fork=true \
     ++actor.path="${MODEL_PATH}" \
@@ -208,7 +231,7 @@ PY
 check_smoke_logs() {
   local run_log_dir=$1
   local job_log=$2
-  python3 - "${run_log_dir}" "${job_log}" "${TOTAL_TRAIN_STEPS}" <<'PY'
+  python3 - "${run_log_dir}" "${job_log}" "${TOTAL_TRAIN_STEPS}" "${TOPOLOGY}" <<'PY'
 import os
 import re
 import sys
@@ -217,6 +240,7 @@ from pathlib import Path
 run_dir = Path(sys.argv[1])
 job_log = Path(sys.argv[2])
 required_steps = int(sys.argv[3])
+topology = sys.argv[4]
 paths = []
 if job_log.exists():
     paths.append(job_log)
@@ -241,14 +265,23 @@ elif max(train_steps) < required_steps:
     failures.append(f"train_step {max(train_steps)} < {required_steps}")
 if len(updates) < required_steps:
     failures.append(f"weight updates {updates} < {required_steps} versions")
-required = [
-    r"WeightUpdateController connected .*colocate=True",
-    r"colocate delta enabled \(sender\); DTE components ready",
-    r"colocate delta enabled \(receiver\); DTE DeltaEngine ready",
-    r"colocate delta v1: FULL sync",
-    r"colocate delta v\d+ \[.*\]: changed",
-    r"Colocate DTE weight update completed",
-]
+if topology == "colocation":
+    required = [
+        r"WeightUpdateController connected .*colocate=True",
+        r"colocate delta enabled \(sender\); DTE components ready",
+        r"colocate delta enabled \(receiver\); DTE DeltaEngine ready",
+        r"colocate delta v1: FULL sync",
+        r"colocate delta v\d+ \[.*\]: changed",
+        r"Colocate DTE weight update completed",
+    ]
+else:
+    required = [
+        r"WeightUpdateController connected .*colocate=False",
+        r"separation delta v1: FULL sync",
+        r"separation delta v\d+: sparse path",
+        r"separation delta v\d+ sent \d+ payload ops",
+        r"separation delta v\d+ received \d+ ops",
+    ]
 for pat in required:
     if re.search(pat, clean) is None:
         failures.append(f"missing log pattern: {pat}")
@@ -259,7 +292,7 @@ for pat in [
 ]:
     if pat in clean:
         failures.append(f"unexpected log pattern: {pat}")
-print("DTE_SMOKE_TOPOLOGY=colocation")
+print(f"DTE_SMOKE_TOPOLOGY={topology}")
 print(f"DTE_SMOKE_TRAIN_STEP_MAX={max(train_steps) if train_steps else 0}")
 print(f"DTE_SMOKE_WEIGHT_UPDATE_VERSIONS={updates}")
 if failures:
@@ -331,6 +364,7 @@ exec srun --mpi=pmi2 --ntasks=1 --cpus-per-task="\${SLURM_CPUS_PER_TASK:-64}" \\
   --env DTE_AWEX_SRC=${DTE_AWEX_SRC} \\
   --env DATASET_PATH=${DATASET_PATH} \\
   --env CONFIG_PATH=${CONFIG_PATH} \\
+  --env TOPOLOGY=${TOPOLOGY} \\
   --env EXP_NAME=${EXP_NAME} \\
   --env TRIAL_NAME=${TRIAL_NAME} \\
   --env FILEROOT=${FILEROOT} \\
@@ -370,7 +404,7 @@ exec srun --mpi=pmi2 --ntasks=1 --cpus-per-task="\${SLURM_CPUS_PER_TASK:-64}" \\
   bash "${SCRIPT_PATH}"
 EOF
 
-echo "==> topology: colocation"
+echo "==> topology: ${TOPOLOGY}"
 echo "==> model: ${MODEL_PATH}"
 echo "==> actor backend: ${ACTOR_BACKEND}"
 echo "==> rollout backend: ${ROLLOUT_BACKEND}"
