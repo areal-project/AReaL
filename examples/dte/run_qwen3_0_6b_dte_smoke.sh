@@ -46,6 +46,7 @@ JOB_NAME=${JOB_NAME:-pyq-dte-q3-0p6b-${TOPOLOGY}}
 NODELIST=${NODELIST:-}
 RESERVATION=${RESERVATION:-}
 SUBMIT=${SUBMIT:-1}
+SBATCH_EXCLUSIVE=${SBATCH_EXCLUSIVE:-0}
 
 FILEROOT=${FILEROOT:-/storage/openpsi/users/pengzai.pyq/areal_port_dte_smoke/fileroot}
 NFS_ROOT=${NFS_ROOT:-${FILEROOT}/name_resolve/${EXP_NAME}/${TRIAL_NAME}}
@@ -282,6 +283,29 @@ else:
         r"separation delta v\d+ sent \d+ payload ops",
         r"separation delta v\d+ received \d+ ops",
     ]
+    train_cvd = re.findall(
+        r"init custom process group for training: .*CUDA_VISIBLE_DEVICES ([^\s]+)",
+        clean,
+    )
+    infer_cvd = re.findall(
+        r"init custom process group for inference: .*CUDA_VISIBLE_DEVICES ([^\s]+)",
+        clean,
+    )
+    if not train_cvd or not infer_cvd:
+        failures.append("missing separation CUDA_VISIBLE_DEVICES split logs")
+    else:
+        train_visible = {x.strip() for x in train_cvd if x.strip()}
+        infer_visible = {x.strip() for x in infer_cvd if x.strip()}
+        if any("," in x for x in train_visible | infer_visible):
+            failures.append(
+                "separation worker saw multi-GPU CUDA_VISIBLE_DEVICES: "
+                f"train={sorted(train_visible)} infer={sorted(infer_visible)}"
+            )
+        if train_visible & infer_visible:
+            failures.append(
+                "separation train/infer CUDA_VISIBLE_DEVICES overlap: "
+                f"train={sorted(train_visible)} infer={sorted(infer_visible)}"
+            )
 for pat in required:
     if re.search(pat, clean) is None:
         failures.append(f"missing log pattern: {pat}")
@@ -317,6 +341,11 @@ SBATCH_RESERVATION_LINE=
 if [[ -n "${RESERVATION}" ]]; then
   SBATCH_RESERVATION_LINE="#SBATCH --reservation=${RESERVATION}"
 fi
+if [[ "${SBATCH_EXCLUSIVE}" == "1" ]]; then
+  SBATCH_SHARE_LINE="#SBATCH --exclusive"
+else
+  SBATCH_SHARE_LINE="#SBATCH --oversubscribe"
+fi
 
 cat > "${SBATCH_PATH}" <<EOF
 #!/usr/bin/env bash
@@ -329,7 +358,7 @@ cat > "${SBATCH_PATH}" <<EOF
 #SBATCH --time=03:00:00
 ${SBATCH_NODELIST_LINE}
 ${SBATCH_RESERVATION_LINE}
-#SBATCH --exclusive
+${SBATCH_SHARE_LINE}
 #SBATCH --no-requeue
 #SBATCH --chdir=${AREAL_SRC}
 #SBATCH --output=${JOB_LOG}
@@ -338,7 +367,8 @@ ${SBATCH_RESERVATION_LINE}
 set -euo pipefail
 echo "==> sbatch job: \${SLURM_JOB_ID:-unknown}"
 echo "==> nodelist: \${SLURM_JOB_NODELIST:-unknown}"
-echo "==> CUDA_VISIBLE_DEVICES=\${CUDA_VISIBLE_DEVICES:-unset}"
+echo "==> batch CUDA_VISIBLE_DEVICES=\${CUDA_VISIBLE_DEVICES:-unset}"
+echo "==> batch SLURM_JOB_GPUS=\${SLURM_JOB_GPUS:-unset}"
 nvidia-smi --query-gpu=index,name,memory.used,memory.free,utilization.gpu --format=csv || true
 df -h /dev/shm || true
 
@@ -375,6 +405,7 @@ exec srun --mpi=pmi2 --ntasks=1 --cpus-per-task="\${SLURM_CPUS_PER_TASK:-64}" \\
   --env ACTOR_BACKEND=${ACTOR_BACKEND} \\
   --env ROLLOUT_BACKEND=${ROLLOUT_BACKEND} \\
   --env CLUSTER_GPUS=${CLUSTER_GPUS} \\
+  --env SBATCH_EXCLUSIVE=${SBATCH_EXCLUSIVE} \\
   --env SCHED_TARGET=${SCHED_TARGET} \\
   --env TOTAL_TRAIN_STEPS=${TOTAL_TRAIN_STEPS} \\
   --env SAVE_FREQ_STEPS=${SAVE_FREQ_STEPS} \\
