@@ -32,8 +32,30 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-from areal.utils import pkg_version
-from areal.utils.logging import getLogger
+
+def assert_alloc_conf_supports_memory_saver(conf: str) -> None:
+    """Reject allocator configs that silently disable SGLang's memory saver.
+
+    torch_memory_saver disables itself when it sees expandable_segments, so
+    release/resume becomes a no-op: the rollout never hands its GPU back and
+    weight pages stay mapped, which surfaces much later as a colocate OOM or an
+    invalid CUDA IPC target. Colocated roles must therefore carry their own
+    scheduling_spec env_vars rather than share the actor's.
+    """
+    if "expandable_segments:true" in conf.lower().replace(" ", ""):
+        raise RuntimeError(
+            "SGLang's memory saver cannot unmap/remap expandable segments, so "
+            f"it would disable itself (PYTORCH_CUDA_ALLOC_CONF={conf!r}). Give "
+            "the rollout role its own scheduling_spec env_vars without "
+            "expandable_segments instead of sharing the actor's."
+        )
+
+
+assert_alloc_conf_supports_memory_saver(os.environ.get("PYTORCH_CUDA_ALLOC_CONF", ""))
+
+
+from areal.utils import pkg_version  # noqa: E402
+from areal.utils.logging import getLogger  # noqa: E402
 
 logger = getLogger("AwexSGLangPlugin")
 
@@ -714,24 +736,6 @@ def awex_run_scheduler_process(*args, **kwargs):
 if __name__ == "__main__":
     import os
     import sys
-
-    # The actor-side env may ship expandable_segments:True (fragmentation
-    # fix, aligned with the AWEX reference), and the colocated rollout worker inherits
-    # the same scheduling_spec env. SGLang's memory saver (and CUDA graph
-    # pools) cannot run on expandable segments, so flip it to False for
-    # this process tree BEFORE any CUDA initialization — mirror of
-    # the AWEX reference _normalize_cuda_alloc_conf_for_memory_saver.
-    # Only touch the env when expandable_segments is explicitly set:
-    # leaving "" untouched keeps the legacy (validated) behavior bit-exact.
-    _conf = os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "")
-    if "expandable_segments" in _conf.lower():
-        _tokens = [
-            t.strip()
-            for t in _conf.split(",")
-            if t.strip() and not t.strip().lower().startswith("expandable_segments")
-        ]
-        _tokens.append("expandable_segments:False")
-        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = ",".join(_tokens)
 
     logger.info("[AWEX] awex_sglang_plugin __main__ starting")
 

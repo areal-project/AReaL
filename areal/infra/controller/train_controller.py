@@ -565,17 +565,6 @@ class TrainController:
         """Send dispatched inputs to workers. DP heads get slices, others empty."""
         tasks = []
         dp_idx = 0
-        # Save/load are long blocking ops — the HF saver's TP coalesced
-        # all-gather can occupy a worker for tens of seconds, during which its
-        # RPC server may briefly refuse connections (ClientConnectorError). The
-        # default 3-retry/~3s budget would misjudge such a busy worker as dead
-        # and tear down the whole step.
-        # Widen the connection-retry budget for these ops so a busy-but-alive
-        # worker is given time to finish; a genuinely dead worker still fails
-        # after the (larger) retry budget is exhausted, so this does not mask
-        # real crashes.
-        long_op = method in ("save", "load")
-        retry_kw = dict(max_retries=8, retry_delay=2.0) if long_op else {}
         for idx, worker in enumerate(self.workers):
             if self.workers_is_dp_head[idx]:
                 worker_args = [splits[dp_idx] for splits in dp_split_args]
@@ -594,7 +583,6 @@ class TrainController:
                     self._engine_name(idx),
                     *worker_args,
                     rpc_meta=rpc_meta,
-                    **retry_kw,
                     **worker_kwargs,
                 )
             )

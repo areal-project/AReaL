@@ -2,7 +2,6 @@
 
 import asyncio
 import getpass
-import os
 import re
 import shlex
 import subprocess
@@ -48,7 +47,6 @@ from areal.infra.utils.slurm import (
     cancel_jobs,
     parse_slurm_nodelist,
     query_jobs,
-    query_terminal_state_sacct,
 )
 from areal.utils import logging, name_resolve, names
 from areal.utils.fs import validate_shared_path
@@ -232,7 +230,7 @@ class SlurmScheduler(Scheduler):
         if job_id in self._job_status_cache:
             cached_state, cached_time = self._job_status_cache[job_id]
             if current_time - cached_time < self._status_cache_ttl:
-                if not cached_state.active():
+                if cached_state in [JobState.FAILED, JobState.CANCELLED]:
                     logs = self._read_log_tail(role)
                     raise WorkerFailedError(
                         f"{role}/*", -1, f"Job {job_id} {cached_state}. Logs:\n{logs}"
@@ -250,30 +248,12 @@ class SlurmScheduler(Scheduler):
             state = job_infos[0].state
             self._job_status_cache[job_id] = (state, current_time)
 
-            # Workers are long-lived rpc_server processes: any terminal state
-            # (FAILED, CANCELLED, but also COMPLETED — e.g. the batch script
-            # exiting 0 after a container FATAL) means they are gone.
-            if not state.active():
+            if state in [JobState.FAILED, JobState.CANCELLED]:
                 logs = self._read_log_tail(role)
                 raise WorkerFailedError(
                     f"{role}/*", -1, f"Job {job_id} {state}. Logs:\n{logs}"
                 )
         except subprocess.CalledProcessError as e:
-            # squeue exits non-zero once a job leaves the queue (e.g.
-            # "Invalid job id specified" right after COMPLETED), which is
-            # indistinguishable from a transient slurmctld error here. Ask
-            # sacct: a terminal state means the workers are gone — raise
-            # instead of warning until startup_timeout; otherwise a dead job
-            # would be polled silently for the whole startup window.
-            sacct_state = query_terminal_state_sacct(job_id)
-            if sacct_state is not None and not sacct_state.active():
-                self._job_status_cache[job_id] = (sacct_state, current_time)
-                logs = self._read_log_tail(role)
-                raise WorkerFailedError(
-                    f"{role}/*",
-                    -1,
-                    f"Job {job_id} {sacct_state} (via sacct). Logs:\n{logs}",
-                )
             logger.warning(f"Failed to query job status: {e}")
 
     def _verify_worker_alive(self, worker_id: str) -> SlurmWorkerInfo:
@@ -410,9 +390,6 @@ class SlurmScheduler(Scheduler):
 
         # Amend environment variables
         for sch in schedulings:
-            # Save user-specified env vars so they take precedence over system defaults
-            user_env = dict(sch.env_vars)
-
             # AReaL env var forwarding
             if self.enable_tms_offload:
                 sch.env_vars.update(get_tms_env_vars())
@@ -422,9 +399,6 @@ class SlurmScheduler(Scheduler):
                 existing_env_vars=sch.env_vars,
             )
             sch.env_vars.update(thread_env)
-
-            # Re-apply user env vars to allow explicit overrides
-            sch.env_vars.update(user_env)
 
         if len(schedulings) == 1:
             # Expand single spec to all workers
@@ -862,10 +836,6 @@ class SlurmScheduler(Scheduler):
             sbatch_options.append(f"--nodelist={nodelist}")
         if exclude:
             sbatch_options.append(f"--exclude={exclude}")
-        if spec.reservation:
-            sbatch_options.append(f"--reservation={spec.reservation}")
-        if spec.exclusive:
-            sbatch_options.append("--exclusive")
 
         sbatch_options_str = "\n".join([f"#SBATCH {opt}" for opt in sbatch_options])
 
@@ -934,17 +904,6 @@ class SlurmScheduler(Scheduler):
             final_cmd += f" {env_string}"
             final_cmd += f" {spec.image}"
             final_cmd += f" {cmd}"
-            # Stagger container creation across each node's tasks: 8 concurrent
-            # singularity mounts per node race for the kernel's loop devices and
-            # intermittently die with "failed to find loop device" (jobs
-            # 931326/931353). AREAL_APPTAINER_STAGGER_SECONDS had been exported
-            # by launch scripts for a while but nothing consumed it. srun does
-            # not go through a shell, so wrap in bash -c for the sleep.
-            stagger = int(os.environ.get("AREAL_APPTAINER_STAGGER_SECONDS", "0"))
-            if stagger > 0:
-                final_cmd = "bash -c " + shlex.quote(
-                    f"sleep $((SLURM_LOCALID * {stagger})); exec {final_cmd}"
-                )
         else:  # native
             final_cmd = cmd
 

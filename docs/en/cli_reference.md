@@ -1230,8 +1230,6 @@ Configuration class: SchedulingSpec
 | `mount`                  | string                 | `"/storage:/storage"`                        | Mount path for slurm.                                                                                                          |
 | `nodelist`               | string \| None         | `None`                                       | sbatch/srun's `--nodelist` option for slurm.                                                                                   |
 | `exclude`                | string \| None         | `None`                                       | sbatch/srun's `--exclude` option for slurm.                                                                                    |
-| `reservation`            | string \| None         | `None`                                       | sbatch's `--reservation` option for slurm.                                                                                     |
-| `exclusive`              | boolean                | `False`                                      | sbatch's `--exclusive` option for slurm. Ensures nodes are not shared with other jobs.                                         |
 | `ray_placement_strategy` | string \| None         | `None`                                       | Deprecated compatibility field for the legacy Ray scheduler. It is ignored by the current Ray scheduler.                       |
 
 (section-scheduling-strategy)=

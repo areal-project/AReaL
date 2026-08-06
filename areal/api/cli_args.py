@@ -1135,16 +1135,6 @@ class SchedulingSpec:
     exclude: str | None = field(
         default=None, metadata={"help": "sbatch/srun's `--exclude` option for slurm."}
     )
-    reservation: str | None = field(
-        default=None,
-        metadata={"help": "sbatch's `--reservation` option for slurm."},
-    )
-    exclusive: bool = field(
-        default=False,
-        metadata={
-            "help": "sbatch's `--exclusive` option for slurm. Ensures nodes are not shared with other jobs."
-        },
-    )
     ray_placement_strategy: str | None = field(
         default=None,
         metadata={
