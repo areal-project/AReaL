@@ -40,6 +40,7 @@ parts:
     - file: algorithms/prox_approx
   - caption: 参考
     chapters:
+    - file: reference/optimizer
     - file: reference/checkpointing
     - file: reference/metrics_tracking
     - file: reference/alloc_mode
