@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Colocate-specific CUDA-IPC payload tests for AWEX delta transfer."""
 
+import pytest
+
 from tests import test_awex_delta_common as common
 
 torch = common.torch
@@ -82,3 +84,71 @@ def test_sglang_decoded_delta_empty_detection(monkeypatch):
     decoded.sparse = {}
     decoded.dense = {"w": torch.ones(1)}
     assert not mod.AwexSGLangAdapter._decoded_delta_is_empty(decoded)
+
+
+def test_colocate_delta_timeout_preserves_payload_keys(monkeypatch):
+    """A failed DTE reader ack should leave payload metadata for diagnosis."""
+    mod = common._load_megatron_adapter(monkeypatch)
+
+    monkeypatch.setattr(mod, "cuda_ipc_serialize", lambda payload: payload)
+    monkeypatch.setattr(
+        mod,
+        "group_tensors_by_shape_and_dtype",
+        lambda tensors: (list(tensors), [{"group_index": 0} for _ in tensors]),
+    )
+    monkeypatch.setattr(mod.torch.cuda, "synchronize", lambda: None)
+    monkeypatch.setattr(mod.torch.cuda, "ipc_collect", lambda: None)
+    monkeypatch.setattr(mod.torch.cuda, "empty_cache", lambda: None)
+
+    import awex.util.tensor_util as tensor_util
+
+    monkeypatch.setattr(tensor_util, "release_tensors", lambda tensors: None)
+
+    class _TimeoutMetaClient:
+        def __init__(self):
+            self.deleted = []
+
+        def put_object(self, *args, **kwargs):
+            del args, kwargs
+
+        def add_object_to_set(self, *args, **kwargs):
+            del args, kwargs
+
+        def get_object(self, *args, **kwargs):
+            del args, kwargs
+            raise TimeoutError("missing ack")
+
+        def delete_if_exists(self, key):
+            self.deleted.append(key)
+
+    adapter = object.__new__(mod.AwexMegatronAdapter)
+    adapter._meta_server_client = _TimeoutMetaClient()
+    adapter._timeout_s = 0.01
+    adapter._ip_address = "127.0.0.1"
+    adapter._physical_gpu_id = 0
+    adapter._logical_train_rank = 3
+    adapter._rank_info = object()
+    adapter._transfer_rank = 0
+    adapter._released_tags = set()
+    adapter._lazy_initialize = lambda: None
+    adapter._needs_external_detector_sync_before_payload = lambda version: False
+    adapter.get_local_shard_parameters = lambda: {"w": torch.ones(2)}
+    adapter._delta_encode = lambda params, version: (
+        list(params),
+        list(params.values()),
+        False,
+    )
+    adapter._pop_precomputed_synced_state = lambda version: object()
+    adapter._delta_mark_synced = lambda version, state: None
+    adapter.release_memory = lambda tags: None
+    adapter.resume_memory = lambda tags: None
+    adapter._release_grad_memory = lambda: None
+    adapter._release_owned_payload_tensors = lambda tensors: None
+
+    with pytest.raises(RuntimeError, match="colocate DTE weight update"):
+        adapter._execute_colocate_delta_weight_update(
+            7,
+            weights_were_offloaded=False,
+        )
+
+    assert adapter._meta_server_client.deleted == []

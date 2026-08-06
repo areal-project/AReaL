@@ -1063,9 +1063,8 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
                     f"within {self._timeout_s}s; missing key "
                     f"{update_finished_key!r}"
                 ) from exc
-            finally:
-                self._meta_server_client.delete_if_exists(update_finished_key)
-                self._meta_server_client.delete_if_exists(serialized_weights_key)
+            self._meta_server_client.delete_if_exists(update_finished_key)
+            self._meta_server_client.delete_if_exists(serialized_weights_key)
 
             self._delta_mark_synced(version, delta_synced_state)
             write_finished_key = f"write_finished{key_suffix}"
