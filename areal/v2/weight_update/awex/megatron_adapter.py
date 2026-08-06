@@ -76,6 +76,50 @@ def awex_colocate_timeout_s(default: float = 1800.0) -> float:
         return default
 
 
+def _copy_parameter_meta(meta: ParameterMeta) -> ParameterMeta:
+    replicas = [
+        ParameterReplicaMeta(shards=list(replica.shards)) for replica in meta.replicas
+    ]
+    return ParameterMeta(
+        name=meta.name,
+        global_numel=meta.global_numel,
+        global_shape=meta.global_shape,
+        dtype=meta.dtype,
+        shards=list(meta.shards),
+        replicas=replicas,
+    )
+
+
+def _merge_colocate_training_metadata(
+    meta_batches: list[list[ParameterMeta]],
+) -> list[ParameterMeta]:
+    """Merge per-rank AReaL metadata into AWEX's colocate replica contract."""
+    merged: dict[str, ParameterMeta] = {}
+    for batch in meta_batches:
+        for meta in batch:
+            existing = merged.get(meta.name)
+            if existing is None:
+                merged[meta.name] = _copy_parameter_meta(meta)
+                continue
+            if (
+                existing.global_numel != meta.global_numel
+                or existing.global_shape != meta.global_shape
+                or existing.dtype != meta.dtype
+            ):
+                raise ValueError(
+                    "Colocate training metadata mismatch for "
+                    f"{meta.name}: existing_shape={existing.global_shape}, "
+                    f"new_shape={meta.global_shape}, existing_dtype={existing.dtype}, "
+                    f"new_dtype={meta.dtype}"
+                )
+            existing.shards.extend(meta.shards)
+            existing.replicas.extend(
+                ParameterReplicaMeta(shards=list(replica.shards))
+                for replica in meta.replicas
+            )
+    return list(merged.values())
+
+
 class AwexMegatronAdapter(AwexTrainingAdapter):
     """Awex training adapter for MegatronEngine supporting DP, TP, and PP.
 
@@ -103,7 +147,6 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
         self._released_tags: set[str] = set()
         self._meta_server_addr: str | None = None
         self._meta_server_client = None
-        self._weight_converter = None
         self._initialized = False
         self._rank_info: RankInfo | None = None
         self._ip_address: str | None = None
@@ -749,28 +792,8 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
         if self._meta_server_client is None:
             raise RuntimeError("init_colocate_weight_update must be called first")
 
-        from awex.meta.train_meta_resolver import McoreParamMetaResolver
-        from awex.models.registry import get_train_weights_converter
         from awex.sharding.param_sharding import get_rank_info_extractor
         from awex.util.common import get_ip_address
-
-        class _EngineShim:
-            def __init__(self, engine):
-                self.model = engine.model
-                if not isinstance(self.model, (list, tuple)):
-                    self.model = [self.model]
-                self.hf_config = engine.hf_config
-                self.enable_debug_mode = False
-                self.enable_colocate_mode = False
-                self.engine_name = "mcore"
-                self.config = {}
-                self.meta_server_addr = ""
-
-            def release_memory_occupation(self, tags=None):
-                pass
-
-            def resume_memory_occupation(self, tags=None):
-                pass
 
         self._rank_info = get_rank_info_extractor("mcore")()
         self._ip_address = get_ip_address()
@@ -785,9 +808,7 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
 
             infer_conf["hf_config"] = SimpleNamespace(**infer_conf["hf_config"])
 
-        shim = _EngineShim(self._engine)
-        meta_resolver = McoreParamMetaResolver(shim, self._engine.hf_config, infer_conf)
-        parameters_meta = meta_resolver.get_parameters_meta()
+        parameters_meta = self._collect_colocate_training_metadata()
         if dist.get_rank() == 0:
             self._meta_server_client.put_object("training_params_meta", parameters_meta)
 
@@ -804,23 +825,6 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
         self._num_infer_engines = self._meta_server_client.get_object(
             "num_infer_engines", timeout=self._timeout_s
         )
-
-        # Passing infer_conf through preserves the reader's router dtype. A
-        # float32 gate payload paired with lower-precision metadata can wedge
-        # the transfer because sender and receiver disagree on byte counts.
-        self._weight_converter = get_train_weights_converter(
-            "mcore",
-            self._engine.hf_config.architectures[0],
-            self._engine.hf_config,
-            self._rank_info,
-            {
-                **infer_conf,
-                "train_pp_stage_layer_id_map": (
-                    meta_resolver.get_pp_stage_layer_id_map()
-                ),
-            },
-            tf_config=_get_tf_config(self._engine.model),
-        )
         self._initialized = True
         logger.info(
             "Colocate train side initialized: logical_train_rank=%d, "
@@ -828,6 +832,19 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
             self._logical_train_rank,
             self._infer_world_size,
             self._rank_info.world_size,
+        )
+
+    def _collect_colocate_training_metadata(self) -> list[ParameterMeta]:
+        """Gather AReaL HF metadata across train ranks for colocate AWEX."""
+        local_meta = self.get_weight_metadata()
+        if not dist.is_available() or not dist.is_initialized():
+            return _merge_colocate_training_metadata([local_meta])
+
+        world_size = dist.get_world_size()
+        gathered: list[list[ParameterMeta] | None] = [None] * world_size
+        dist.all_gather_object(gathered, local_meta)
+        return _merge_colocate_training_metadata(
+            [batch for batch in gathered if batch is not None]
         )
 
     def _release_grad_memory(self) -> None:
@@ -1903,30 +1920,8 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
 
     @torch.no_grad()
     def _convert_parameters(self) -> dict[str, torch.Tensor]:
-        """Convert every virtual-pipeline stage to Hugging Face names."""
-        from awex.converter.mcore_converter import get_mcore_model_parameters
-
-        model = self._engine.model
-        if not isinstance(model, (list, tuple)):
-            model = [model]
-
-        converted = {}
-        for vp_stage, chunk in enumerate(model):
-            for name, param in get_mcore_model_parameters(chunk).items():
-                for hf_name, hf_param in self._weight_converter.convert_param(
-                    name, param.detach(), vp_stage=vp_stage
-                ):
-                    converted[hf_name] = hf_param
-
-        hf_config = self._engine.hf_config
-        if (
-            getattr(hf_config, "tie_word_embeddings", False)
-            and self._rank_info.pp_rank == self._rank_info.pp_size - 1
-            and "lm_head.weight" not in converted
-            and "model.embed_tokens.weight" in converted
-        ):
-            converted["lm_head.weight"] = converted["model.embed_tokens.weight"]
-        return converted
+        """Convert local shards with the same names as colocate metadata."""
+        return self.get_local_shard_parameters()
 
     def _offload_model_weights(self) -> None:
         """Offload complete Megatron DDP buffers rather than parameter views."""
@@ -2133,14 +2128,3 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
                         count += 1
         torch.cuda.synchronize()
         logger.info("Reloaded %d optimizer state tensors to GPU", count)
-
-
-def _get_tf_config(models):
-    if not isinstance(models, (list, tuple)):
-        models = [models]
-    for model in models:
-        for attr in ("transformer_config", "config"):
-            config = getattr(model, attr, None)
-            if config is not None:
-                return config
-    return None

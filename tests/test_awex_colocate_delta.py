@@ -86,6 +86,75 @@ def test_sglang_decoded_delta_empty_detection(monkeypatch):
     assert not mod.AwexSGLangAdapter._decoded_delta_is_empty(decoded)
 
 
+def _single_replica_meta(mod, name: str, rank: int, shape=(2, 2)):
+    shard = mod.ParameterShardMeta(
+        tp_rank=0,
+        attn_tp_rank=0,
+        pp_rank=0,
+        ep_rank=0,
+        ep_tp_rank=0,
+        global_rank=rank,
+        world_size=2,
+        engine_rank=0,
+        name=name,
+        shape=shape,
+        numel=4,
+        dtype=torch.float32,
+        global_offset=tuple(0 for _ in shape),
+        sharding_type=mod.ShardingType.NO_SHARDING,
+        num_shards=1,
+        sharding_dim=0,
+    )
+    replica = mod.ParameterReplicaMeta(shards=[shard])
+    return mod.ParameterMeta(
+        name=name,
+        global_numel=4,
+        global_shape=shape,
+        dtype=torch.float32,
+        shards=[shard],
+        replicas=[replica],
+    )
+
+
+def test_colocate_training_metadata_keeps_areal_hf_names(monkeypatch):
+    """Colocate metadata must use the same HF keys as AReaL payloads."""
+    mod = common._load_megatron_adapter(monkeypatch)
+
+    qkv = "model.layers.0.self_attn.qkv_proj.weight"
+    dense = "model.layers.0.self_attn.o_proj.weight"
+    merged = mod._merge_colocate_training_metadata(
+        [
+            [_single_replica_meta(mod, qkv, 0), _single_replica_meta(mod, dense, 0)],
+            [_single_replica_meta(mod, qkv, 1), _single_replica_meta(mod, dense, 1)],
+        ]
+    )
+
+    by_name = {meta.name: meta for meta in merged}
+    assert set(by_name) == {qkv, dense}
+    assert all("attention." not in name for name in by_name)
+    assert [shard.global_rank for shard in by_name[qkv].shards] == [0, 1]
+    assert len(by_name[qkv].replicas) == 2
+
+
+def test_colocate_full_payload_uses_areal_hf_names(monkeypatch):
+    """Dense colocate full sync must match the metadata naming source."""
+    mod = common._load_megatron_adapter(monkeypatch)
+    adapter = object.__new__(mod.AwexMegatronAdapter)
+
+    payload = {
+        "model.layers.0.self_attn.qkv_proj.weight": torch.ones(2, 2),
+        "model.layers.0.self_attn.o_proj.weight": torch.ones(2, 2),
+        "model.embed_tokens.weight": torch.ones(2, 2),
+    }
+    adapter.get_local_shard_parameters = lambda required_names=None: dict(payload)
+
+    converted = adapter._convert_parameters()
+
+    assert converted == payload
+    assert "lm_head.weight" not in converted
+    assert all("attention." not in name for name in converted)
+
+
 def test_colocate_delta_timeout_preserves_payload_keys(monkeypatch):
     """A failed DTE reader ack should leave payload metadata for diagnosis."""
     mod = common._load_megatron_adapter(monkeypatch)
