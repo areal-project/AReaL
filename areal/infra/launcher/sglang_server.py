@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -256,8 +257,21 @@ def launch_sglang_server(argv):
 
 
 def main(argv):
+    # SIGTERM terminates Python without running finally blocks, orphaning the
+    # sglang child tree (its multiprocessing scheduler and detokenizer workers)
+    # and leaving the node occupied. Convert SIGTERM/SIGINT into SystemExit so
+    # the finally-block kill_process_tree below reaps the whole tree.
+    def _term_handler(signum, _frame):
+        logger.warning(f"sglang launcher received signal {signum}, cleaning up...")
+        raise SystemExit(128 + signum)
+
+    signal.signal(signal.SIGTERM, _term_handler)
+    signal.signal(signal.SIGINT, _term_handler)
+
     try:
         launch_sglang_server(argv)
+    except SystemExit:
+        raise
     except Exception:
         logger.error(traceback.format_exc())
         sys.exit(1)
