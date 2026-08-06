@@ -56,6 +56,7 @@ from areal.utils.evaluator import Evaluator
 from areal.utils.hf_utils import load_hf_processor_and_tokenizer
 from areal.utils.perf_tracer import Category
 from areal.utils.recover import RecoverHandler
+from areal.utils.rollout_fingerprint import log_event as log_rollout_fingerprint_event
 from areal.utils.saver import Saver
 from areal.utils.stats_logger import StatsLogger
 from areal.v2.inference_service.controller.controller import (
@@ -76,6 +77,55 @@ if TYPE_CHECKING:
     from areal.trainer.ppo.critic import PPOCriticController
 
 logger = logging.getLogger("RLTrainer")
+
+
+def _dte_seed_config(config: PPOConfig) -> dict[str, Any]:
+    rollout_cfg = getattr(config, "rollout", None)
+    sglang_cfg = getattr(config, "sglang", None)
+    return {
+        "seed": getattr(config, "seed", None),
+        "rollout_sampling_seed": getattr(rollout_cfg, "sampling_seed", None),
+        "sglang_random_seed": getattr(sglang_cfg, "random_seed", None),
+        "PYTHONHASHSEED": os.environ.get("PYTHONHASHSEED", ""),
+        "AREAL_DETERMINISTIC_SAMPLING": os.environ.get(
+            "AREAL_DETERMINISTIC_SAMPLING", ""
+        ),
+        "AREAL_DETERMINISTIC_PREBUILD": os.environ.get(
+            "AREAL_DETERMINISTIC_PREBUILD", ""
+        ),
+        "NVTE_ALLOW_NONDETERMINISTIC_ALGO": os.environ.get(
+            "NVTE_ALLOW_NONDETERMINISTIC_ALGO", ""
+        ),
+    }
+
+
+def _dte_rollout_batch_summary(rollout_batch: list[dict[str, Any]]) -> dict[str, Any]:
+    keys = sorted({key for traj in rollout_batch for key in traj})
+    shapes: dict[str, list[int] | str] = {}
+    for key in keys:
+        value = next((traj.get(key) for traj in rollout_batch if key in traj), None)
+        shape = getattr(value, "shape", None)
+        shapes[key] = list(shape) if shape is not None else type(value).__name__
+    return {
+        "num_trajectories": len(rollout_batch),
+        "trajectory_keys": keys,
+        "sample_shapes": shapes,
+    }
+
+
+def _raise_dte_step_end_mismatch(train_step: int) -> None:
+    try:
+        from areal.v2.weight_update.awex.weight_digest import (
+            raise_if_step_end_mismatch,
+        )
+    except Exception:
+        if (
+            os.environ.get("AREAL_DTE_WEIGHT_DIGEST_STOP_MODE", "").lower()
+            == "step_end"
+        ):
+            raise
+        return
+    raise_if_step_end_mismatch(step=train_step)
 
 
 class _EmptyDataLoader:
@@ -916,11 +966,28 @@ class PPOTrainer:
                     epoch=epoch, epoch_step=step, global_step=global_step
                 )
 
+            self._save_perf_tracer(step=global_step)
+            log_rollout_fingerprint_event(
+                logger,
+                "train_step_manifest",
+                epoch=epoch,
+                epoch_step=step,
+                global_step=global_step,
+                train_step=global_step + 1,
+                version=global_step + 1,
+                seed_config=_dte_seed_config(config),
+                rollout_batch=_dte_rollout_batch_summary(rollout_batch),
+                weight_digest_stop_mode=os.environ.get(
+                    "AREAL_DTE_WEIGHT_DIGEST_STOP_MODE", ""
+                ),
+                checkpoint_saved=True,
+                recover_checkpoint_saved=True,
+            )
+            _raise_dte_step_end_mismatch(train_step=global_step + 1)
+
             # Colocate v2 phase exit resumes rollout; other paths keep it here.
             if not self._is_v2_awex_colocate:
                 self.rollout.resume()
-
-            self._save_perf_tracer(step=global_step)
 
     def close(self):
         self.saver.finalize()

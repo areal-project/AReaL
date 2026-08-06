@@ -20,6 +20,10 @@ from areal.api.cli_args import (
     to_structured_cfg,
     vLLMConfig,
 )
+from areal.infra.launcher.dte_recover import (
+    archive_mismatch_flag,
+    load_mismatch_flag,
+)
 from areal.infra.platforms import current_platform
 from areal.infra.utils.exp_metadata import save_experiment_metadata
 from areal.infra.utils.launcher import (
@@ -690,12 +694,48 @@ def slurm_main(config, run_id: int = 0):
         run_post_exit_hook(config)
         recover_states = [JobState.FAILED, JobState.NOT_FOUND]
         if isinstance(e, JobException):
+            mismatch_flag = load_mismatch_flag(actor_spec.env_vars)
             recover_this = (
                 e.reason in recover_states
                 and run_id < config.recover.retries
                 and config.recover.mode in ("on", "auto")
             )
+            if recover_this and mismatch_flag is not None:
+                if mismatch_flag.recoverable:
+                    logger.warning(
+                        "Recovering Slurm run after DTE weight digest flag "
+                        "reason=%s path=%s",
+                        mismatch_flag.reason,
+                        mismatch_flag.path,
+                    )
+                else:
+                    logger.error(
+                        "Not auto-recovering Slurm run because DTE weight "
+                        "digest flag is not recoverable: reason=%s path=%s",
+                        mismatch_flag.reason,
+                        mismatch_flag.path,
+                    )
+                    recover_this = False
             if recover_this:
+                if mismatch_flag is not None:
+                    try:
+                        archived_path = archive_mismatch_flag(
+                            mismatch_flag.path,
+                            run_id=run_id,
+                        )
+                        logger.warning(
+                            "Archived DTE weight digest mismatch flag before "
+                            "recovery: %s -> %s",
+                            mismatch_flag.path,
+                            archived_path,
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Failed to archive DTE weight digest mismatch "
+                            "flag before recovery: %s",
+                            mismatch_flag.path,
+                        )
+                        raise e
                 time.sleep(RECOVER_TIME_INTERVAL)
                 slurm_main(config, run_id=run_id + 1)
             else:

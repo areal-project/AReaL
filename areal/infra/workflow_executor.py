@@ -39,6 +39,7 @@ from areal.utils import logging, perf_tracer, stats_tracker
 from areal.infra.utils.concurrent import get_executor
 from areal.utils.data import concat_padded_tensors, cycle_dataloader
 from areal.utils.perf_tracer import trace_perf, trace_session_event
+from areal.utils.rollout_fingerprint import log_event as log_rollout_fingerprint_event
 from logging import Logger
 
 if TYPE_CHECKING:
@@ -1416,9 +1417,19 @@ class WorkflowExecutor:
         results = self.dispatcher.active_submit_and_wait(
             self.data_generator, batch_size=dataloader.batch_size, dynamic_bs=dynamic_bs
         )
+        accepted_results = [r for r in results if r is not None]
+        log_rollout_fingerprint_event(
+            self.logger,
+            "rollout_batch_selected",
+            task_ids=[int(r.task_id) for r in accepted_results],
+            accepted=len(accepted_results),
+            returned=len(results),
+            batch_size=dataloader.batch_size,
+            dynamic_bs=dynamic_bs,
+        )
 
         # Return list of trajectory dicts (filter out None)
-        return [r.trajectory for r in results if r is not None]
+        return [r.trajectory for r in accepted_results]
 
     def pause(self):
         """Pause request submission for async rollout.
