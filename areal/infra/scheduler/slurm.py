@@ -47,6 +47,7 @@ from areal.infra.utils.slurm import (
     cancel_jobs,
     parse_slurm_nodelist,
     query_jobs,
+    query_terminal_state_sacct,
 )
 from areal.utils import logging, name_resolve, names
 from areal.utils.fs import validate_shared_path
@@ -230,7 +231,7 @@ class SlurmScheduler(Scheduler):
         if job_id in self._job_status_cache:
             cached_state, cached_time = self._job_status_cache[job_id]
             if current_time - cached_time < self._status_cache_ttl:
-                if cached_state in [JobState.FAILED, JobState.CANCELLED]:
+                if not cached_state.active():
                     logs = self._read_log_tail(role)
                     raise WorkerFailedError(
                         f"{role}/*", -1, f"Job {job_id} {cached_state}. Logs:\n{logs}"
@@ -248,12 +249,30 @@ class SlurmScheduler(Scheduler):
             state = job_infos[0].state
             self._job_status_cache[job_id] = (state, current_time)
 
-            if state in [JobState.FAILED, JobState.CANCELLED]:
+            # Workers are long-lived rpc_server processes: any terminal state
+            # (FAILED, CANCELLED, but also COMPLETED — e.g. the batch script
+            # exiting 0 after a container FATAL) means they are gone.
+            if not state.active():
                 logs = self._read_log_tail(role)
                 raise WorkerFailedError(
                     f"{role}/*", -1, f"Job {job_id} {state}. Logs:\n{logs}"
                 )
         except subprocess.CalledProcessError as e:
+            # squeue exits non-zero once a job leaves the queue (e.g.
+            # "Invalid job id specified" right after COMPLETED), which is
+            # indistinguishable from a transient slurmctld error here. Ask
+            # sacct: a terminal state means the workers are gone — raise
+            # instead of warning until startup_timeout; otherwise a dead job
+            # would be polled silently for the whole startup window.
+            sacct_state = query_terminal_state_sacct(job_id)
+            if sacct_state is not None and not sacct_state.active():
+                self._job_status_cache[job_id] = (sacct_state, current_time)
+                logs = self._read_log_tail(role)
+                raise WorkerFailedError(
+                    f"{role}/*",
+                    -1,
+                    f"Job {job_id} {sacct_state} (via sacct). Logs:\n{logs}",
+                )
             logger.warning(f"Failed to query job status: {e}")
 
     def _verify_worker_alive(self, worker_id: str) -> SlurmWorkerInfo:
