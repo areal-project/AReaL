@@ -1075,6 +1075,93 @@ def is_colocation_strategy(strategy: SchedulingStrategy | None) -> bool:
 
 
 @dataclass
+class DTEConfig:
+    """Configuration for DTE-backed AWEX weight updates."""
+
+    enabled: bool | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Enable DTE-backed AWEX weight updates. None keeps backward "
+                "compatibility with runtime environment variables."
+            )
+        },
+    )
+    transfer: str | None = field(
+        default="full",
+        metadata={
+            "help": (
+                "Weight transfer type: 'full' sends full weights every update; "
+                "'delta' sends a full first update, then DTE deltas."
+            ),
+            "choices": ["full", "delta", None],
+        },
+    )
+    delta_method: str | None = field(
+        default=None,
+        metadata={
+            "help": "How DTE delta mode finds changed weights.",
+            "choices": ["snapshot", "adamw", None],
+        },
+    )
+    anchor_interval: int | None = field(
+        default=0,
+        metadata={"help": "Force a full sync every N deltas. 0 means never."},
+    )
+    bytes_ratio: float | None = field(
+        default=None,
+        metadata={"help": "Per-tensor sparse-vs-dense fallback ratio."},
+    )
+    verify_snapshot: bool | None = field(
+        default=False,
+        metadata={
+            "help": (
+                "Debug only: keep a CPU snapshot and compare it with DTE "
+                "inversion masks."
+            )
+        },
+    )
+    release_train_weights_after_update: bool | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Release training weights after a colocated update so rollout can "
+                "reuse the shared GPU memory."
+            )
+        },
+    )
+    release_initial_rollout_weights: bool | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Release rollout weights during trainer startup. None disables this "
+                "for DTE/AWEX colocation because no weight-update payload has rebuilt "
+                "the rollout weights yet."
+            )
+        },
+    )
+    sync_model_params_before_payload: bool | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Refresh Megatron model-visible params from optimizer main params "
+                "before building the DTE payload."
+            )
+        },
+    )
+    inversion_debug: bool | None = field(
+        default=None,
+        metadata={"help": "Enable verbose DTE inversion debug logging."},
+    )
+    inversion_bf16_margin_rel: float | None = field(
+        default=None,
+        metadata={
+            "help": "Relative BF16 rounding-boundary margin for inversion masks."
+        },
+    )
+
+
+@dataclass
 class SchedulingSpec:
     cpu: int = field(
         default=8, metadata={"help": "Number of CPU cores required per GPU"}
@@ -1556,6 +1643,8 @@ class RejectionSamplingConfig:
 @dataclass
 class PPOActorConfig(TrainEngineConfig):
     """Configuration for PPO actor model, a subclass of a TrainEngine."""
+
+    dte: DTEConfig = field(default_factory=DTEConfig)
 
     # Core PPO/GRPO Parameters
     ppo_n_minibatches: int = field(
