@@ -1380,19 +1380,20 @@ class RolloutControllerV2:
         assert self._workflow_executor is not None
         self._workflow_executor.resume()
 
-    def offload(self) -> None:
+    def offload(self, tags: list[str] | None = None) -> None:
         """Offload model memory on all inference workers."""
         from areal.infra.utils.concurrent import run_async_task
 
         self._ensure_initialized()
-        run_async_task(self._async_offload)
+        run_async_task(self._async_offload, tags)
 
-    async def _async_offload(self) -> None:
+    async def _async_offload(self, tags: list[str] | None = None) -> None:
         if not self._data_proxy_addrs:
             return
+        payload: dict = {"tags": tags} if tags is not None else {}
         results = await asyncio.gather(
             *(
-                self._async_data_proxy_post(addr, "/release_memory_occupation", {})
+                self._async_data_proxy_post(addr, "/release_memory_occupation", payload)
                 for addr in self._data_proxy_addrs
             ),
             return_exceptions=True,

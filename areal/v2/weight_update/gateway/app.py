@@ -565,17 +565,29 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
             ],
         )
 
-        await asyncio.gather(
-            *[
-                _post(
-                    session,
-                    f"{url}/awex/release_memory",
-                    timeout_s,
-                    json_data={"tags": ["weights"]},
-                )
-                for url in pair_info.train_worker_urls
-            ]
-        )
+        release_env = os.environ.get("DTE_RELEASE_TRAIN_WEIGHTS_AFTER_UPDATE")
+        if release_env is None or release_env.strip() == "":
+            release_env = os.environ.get(
+                "AWEX_COLOCATE_RELEASE_TRAIN_WEIGHTS_AFTER_UPDATE", "1"
+            )
+        release_train_weights = release_env.strip().lower() not in {
+            "0",
+            "false",
+            "no",
+            "off",
+        }
+        if release_train_weights:
+            await asyncio.gather(
+                *[
+                    _post(
+                        session,
+                        f"{url}/awex/release_memory",
+                        timeout_s,
+                        json_data={"tags": ["weights"]},
+                    )
+                    for url in pair_info.train_worker_urls
+                ]
+            )
 
         await asyncio.gather(
             *[

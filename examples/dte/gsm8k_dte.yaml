@@ -1,0 +1,66 @@
+defaults:
+  - ../math/gsm8k_grpo_megatron@_global_
+  - _self_
+
+experiment_name: gsm8k-dte
+trial_name: trial0
+total_train_steps: null
+
+cluster:
+  n_gpus_per_node: 2
+
+scheduler:
+  type: local
+
+gconfig:
+  n_samples: 4
+  max_new_tokens: 256
+  max_tokens: 1024
+
+rollout:
+  _version: v2
+  backend: sglang:d2p1t1
+  max_concurrent_rollouts: 32
+  queue_size: 32
+  consumer_batch_size: ${train_dataset.batch_size}
+  max_head_offpolicyness: 1000000
+
+actor:
+  _version: v2
+  backend: megatron:d2p1t1
+  weight_update_mode: awex
+  dte:
+    enabled: true
+    transfer: delta
+    delta_method: adamw
+    anchor_interval: 0
+    verify_snapshot: false
+  optimizer:
+    lr: 8e-7
+    warmup_steps_proportion: 0
+  reward_norm: null
+  adv_norm: null
+
+sglang:
+  mem_fraction_static: 0.35
+
+train_dataset:
+  batch_size: 8
+  num_workers: 1
+
+valid_dataset:
+  batch_size: 8
+  num_workers: 1
+
+saver:
+  freq_epochs: null
+  freq_steps: null
+  freq_secs: null
+
+recover:
+  mode: disabled
+
+evaluator:
+  freq_epochs: null
+  freq_steps: null
+  freq_secs: null

@@ -2561,6 +2561,9 @@ class MegatronPPOActor(MegatronEngine):
         return self.actor.compute_advantages(*args, **kwargs)
 
     def ppo_update(self, *args, **kwargs) -> None:
+        awex_adapter = getattr(self, "_awex_weight_update_adapter", None)
+        if awex_adapter is not None:
+            awex_adapter.ensure_grad_buffers()
         self.actor.ppo_update(*args, **kwargs)
 
     @classmethod

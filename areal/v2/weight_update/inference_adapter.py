@@ -77,6 +77,10 @@ class AwexInferenceAdapter(Protocol):
         """Fetch IPC weights from KV store and apply via colocate transport."""
         ...
 
+    def seed_delta_base(self, version: int = 0) -> None:
+        """Seed colocate delta state from the current local weights."""
+        ...
+
     def release_memory(self, tags: list[str] | None = None) -> None:
         """Release GPU memory (KV cache/weights) for colocated mode."""
         ...

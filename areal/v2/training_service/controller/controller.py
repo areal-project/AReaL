@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import os
 import sys
 import threading
 import time
@@ -56,6 +57,7 @@ class GatewayTrainController:
         self._own_process_group = False
         self.rollout: Any | None = None
         self._weight_update_ctrl: Any | None = None
+        self._colocate_weight_update = False
 
         # Version management
         self._version_lock = Lock()
@@ -975,6 +977,16 @@ class GatewayTrainController:
 
         inference_urls: list[str] = rollout.inference_worker_urls
         pair_name = f"{self._role}-rollout"
+        colocate_env = os.environ.get("DTE_COLOCATE_WEIGHT_UPDATE")
+        if colocate_env is None or colocate_env.strip() == "":
+            colocate_env = os.environ.get("AWEX_COLOCATE_WEIGHT_UPDATE", "0")
+        colocate_enabled = colocate_env.strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        self._colocate_weight_update = meta.type == "awex" and colocate_enabled
 
         if meta.type == "awex":
             # NCCL rendezvous master must live on the rank-0 process's node.
@@ -995,6 +1007,7 @@ class GatewayTrainController:
                 mode="awex",
                 nccl_master_addr=port_data["host"],
                 nccl_master_port=port_data["ports"][0],
+                colocate=self._colocate_weight_update,
             )
         else:  # disk
             ctrl.connect(
@@ -1009,10 +1022,12 @@ class GatewayTrainController:
             )
         self._weight_update_ctrl = ctrl
         logger.info(
-            "WeightUpdateController connected (pair=%s, train=%d, inf=%d)",
+            "WeightUpdateController connected (pair=%s, mode=%s, train=%d, inf=%d, colocate=%s)",
             pair_name,
+            meta.type,
             len(self._worker_addrs),
             len(inference_urls),
+            self._colocate_weight_update,
         )
 
     def update_weights(self, meta: Any) -> None:
@@ -1025,6 +1040,16 @@ class GatewayTrainController:
             f"meta.version must be a positive integer, got {meta.version}"
         )
         result = self._weight_update_ctrl.update_weights(version=meta.version)
+        if self._colocate_weight_update:
+            import requests
+
+            for url in self._worker_addrs:
+                resp = requests.post(
+                    f"{url}/awex/resume_memory",
+                    json={"tags": ["weights", "optimizer"]},
+                    timeout=120,
+                )
+                resp.raise_for_status()
         self.rollout.continue_generation()
         logger.info(
             "Weight update v%d completed (%s, %.0fms)",
@@ -1032,6 +1057,48 @@ class GatewayTrainController:
             result.status,
             result.duration_ms,
         )
+
+    async def _async_seed_delta_base(self, version: int) -> None:
+        if self.rollout is None:
+            raise RuntimeError(
+                "connect_engine() must be called before seed_delta_base()"
+            )
+        timeout = max(float(self.config.request_timeout), 120.0)
+        client = await self._get_async_client()
+        inference_urls: list[str] = self.rollout.inference_worker_urls
+
+        async def _post_seed(url: str) -> None:
+            resp = await client.post(
+                f"{url}/awex/seed_delta_base",
+                json={"version": version},
+                timeout=timeout,
+            )
+            if resp.status_code >= 400:
+                raise RuntimeError(
+                    f"{url}/awex/seed_delta_base returned "
+                    f"{resp.status_code}: {resp.text}"
+                )
+
+        await asyncio.gather(
+            *[_post_seed(url) for url in self._worker_addrs],
+            *[_post_seed(url) for url in inference_urls],
+        )
+
+    def seed_delta_base(self, version: int = 0) -> None:
+        if self._weight_update_ctrl is None or self.rollout is None:
+            raise RuntimeError(
+                "connect_engine() must be called before seed_delta_base()"
+            )
+        if not self._colocate_weight_update:
+            logger.info("seed_delta_base skipped: colocate weight update disabled")
+            return
+
+        self.rollout.pause_generation()
+        try:
+            run_async_task(self._async_seed_delta_base, version)
+        finally:
+            self.rollout.continue_generation()
+        logger.info("Colocate delta base seeded at version %d", version)
 
     def prepare_batch(
         self,
@@ -1156,6 +1223,17 @@ class GatewayTrainController:
                 )
             except Exception:
                 logger.error("Failed to unregister model: %s", traceback.format_exc())
+
+        if self._weight_update_ctrl is not None:
+            try:
+                self._weight_update_ctrl.destroy()
+            except Exception:
+                logger.error(
+                    "Failed to destroy weight update controller: %s",
+                    traceback.format_exc(),
+                )
+            finally:
+                self._weight_update_ctrl = None
 
         self._graceful_shutdown_workers()
 

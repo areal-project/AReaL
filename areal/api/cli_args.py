@@ -1155,6 +1155,83 @@ class SchedulingSpec:
 
 
 @dataclass
+class DTEConfig:
+    """Configuration for DTE-backed colocated weight updates."""
+
+    enabled: bool | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Enable DTE colocated weight update. None keeps backward "
+                "compatibility with environment variables."
+            )
+        },
+    )
+    transfer: str | None = field(
+        default="full",
+        metadata={
+            "help": (
+                "Weight transfer type: 'full' sends full weights every update; "
+                "'delta' sends a full first update, then DTE deltas."
+            ),
+            "choices": ["full", "delta", None],
+        },
+    )
+    delta_method: str | None = field(
+        default=None,
+        metadata={
+            "help": "How DTE delta mode finds changed weights.",
+            "choices": ["snapshot", "adamw", None],
+        },
+    )
+    anchor_interval: int | None = field(
+        default=0,
+        metadata={"help": "Force a full sync every N deltas. 0 means never."},
+    )
+    bytes_ratio: float | None = field(
+        default=None,
+        metadata={"help": "Per-tensor sparse-vs-dense fallback ratio."},
+    )
+    verify_snapshot: bool | None = field(
+        default=False,
+        metadata={
+            "help": (
+                "Debug only: keep a CPU snapshot and compare it with DTE "
+                "inversion masks."
+            )
+        },
+    )
+    release_train_weights_after_update: bool | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Release training weights after a colocated update so rollout can "
+                "reuse the shared GPU memory."
+            )
+        },
+    )
+    sync_model_params_before_payload: bool | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Refresh Megatron model-visible params from optimizer main params "
+                "before building the DTE payload."
+            )
+        },
+    )
+    inversion_debug: bool | None = field(
+        default=None,
+        metadata={"help": "Enable verbose DTE inversion debug logging."},
+    )
+    inversion_bf16_margin_rel: float | None = field(
+        default=None,
+        metadata={
+            "help": "Relative BF16 rounding-boundary margin for inversion masks."
+        },
+    )
+
+
+@dataclass
 class TrainEngineConfig:
     """Core configuration for model training, including optimization and backend settings."""
 
@@ -1239,6 +1316,7 @@ class TrainEngineConfig:
         default="xccl",
         metadata={"help": "Weight update backend type.", "choices": ["disk", "xccl"]},
     )
+    dte: DTEConfig = field(default_factory=DTEConfig)
     fsdp: FSDPEngineConfig = field(default_factory=FSDPEngineConfig)
     archon: ArchonEngineConfig = field(default_factory=ArchonEngineConfig)
     megatron: MegatronEngineConfig = field(default_factory=MegatronEngineConfig)

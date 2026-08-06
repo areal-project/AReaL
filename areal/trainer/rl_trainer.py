@@ -115,6 +115,7 @@ class PPOTrainer:
             logging.setup_file_logging(StatsLogger.get_log_path(config.stats_logger))
 
         self.config = config
+        self._apply_dte_config_envvars()
         self.processor, self.tokenizer = load_hf_processor_and_tokenizer(
             config.tokenizer_path
         )
@@ -136,6 +137,11 @@ class PPOTrainer:
         self._should_offload_rollout = self._is_actor_rollout_colocated(config)
         self._should_offload_actor = (
             self._should_offload_rollout or config.actor.offload
+        )
+        dte_cfg = getattr(config.actor, "dte", None)
+        self._keep_rollout_weights_resident = bool(
+            config.actor.weight_update_mode == "awex"
+            and str(getattr(dte_cfg, "transfer", "")).lower() == "delta"
         )
         self._should_offload_critic = (
             config.critic is not None and config.critic.offload
@@ -504,7 +510,12 @@ class PPOTrainer:
                 category=Category.IO,
             ),
         ):
-            rollout.offload()
+            if self._keep_rollout_weights_resident and isinstance(
+                rollout, RolloutControllerV2
+            ):
+                rollout.offload(tags=["kv_cache"])
+            else:
+                rollout.offload()
 
     def _onload_rollout(self, is_eval: bool = False) -> None:
         cleanup_error: Exception | None = None
@@ -521,7 +532,12 @@ class PPOTrainer:
                     category=Category.IO,
                 ),
             ):
-                rollout.onload()
+                if self._keep_rollout_weights_resident and isinstance(
+                    rollout, RolloutControllerV2
+                ):
+                    rollout.onload(tags=["kv_cache"])
+                else:
+                    rollout.onload()
         except Exception as exc:  # noqa: BLE001
             cleanup_error = exc
 
@@ -941,6 +957,109 @@ class PPOTrainer:
             return SlurmScheduler(exp_config=self.config)
         raise NotImplementedError(f"Unknown scheduler type: {cfg.type}")
 
+    def _apply_dte_config_envvars(self) -> None:
+        """Export actor.dte.* config to worker-visible runtime switches.
+
+        The public control surface is now CLI/config (``actor.dte.*``). The
+        train and rollout workers are separate processes, so the selected values
+        still need to be inherited through the environment until the AWEX adapter
+        APIs grow an explicit config payload. Old AWEX_* variables remain a
+        fallback in the readers; values set here use the DTE_* names and take
+        precedence.
+        """
+        dte_cfg = getattr(self.config.actor, "dte", None)
+        if dte_cfg is None:
+            return
+
+        exported_env: dict[str, str] = {}
+
+        def set_env(name: str, value: Any) -> None:
+            if value is None:
+                return
+            if isinstance(value, bool):
+                env_value = "1" if value else "0"
+            else:
+                env_value = str(value)
+            os.environ[name] = env_value
+            exported_env[name] = env_value
+
+        transfer = dte_cfg.transfer
+        delta_transfer = None
+        if transfer is not None:
+            transfer = transfer.strip().lower()
+            if transfer not in {"full", "delta"}:
+                raise ValueError(
+                    "actor.dte.transfer must be 'full' or 'delta', "
+                    f"got {dte_cfg.transfer!r}"
+                )
+            delta_transfer = transfer == "delta"
+
+        delta_method = dte_cfg.delta_method
+        detector = None
+        if delta_method is not None:
+            delta_method = delta_method.strip().lower()
+            if delta_method == "adamw":
+                detector = "inversion"
+            elif delta_method == "snapshot":
+                detector = "snapshot"
+            else:
+                raise ValueError(
+                    "actor.dte.delta_method must be 'snapshot' or 'adamw', "
+                    f"got {dte_cfg.delta_method!r}"
+                )
+        elif delta_transfer:
+            detector = "inversion"
+
+        enabled = dte_cfg.enabled
+        if enabled is False and delta_transfer:
+            raise ValueError(
+                "actor.dte.enabled=false conflicts with actor.dte.transfer='delta'. "
+                "Use actor.dte.enabled=true for delta transfer, or set "
+                "actor.dte.transfer=full."
+            )
+        if enabled is None and delta_transfer:
+            enabled = True
+        set_env("DTE_COLOCATE_WEIGHT_UPDATE", enabled)
+
+        config_controls_dte = enabled is not None
+        if config_controls_dte:
+            set_env("DTE_DELTA_TRANSFER", delta_transfer)
+            set_env("DTE_DELTA_DETECTOR", detector)
+            set_env("DTE_DELTA_ANCHOR_INTERVAL", dte_cfg.anchor_interval)
+            set_env("DTE_DELTA_BYTES_RATIO", dte_cfg.bytes_ratio)
+            set_env("DTE_DELTA_VERIFY_SNAPSHOT", dte_cfg.verify_snapshot)
+        set_env(
+            "DTE_RELEASE_TRAIN_WEIGHTS_AFTER_UPDATE",
+            dte_cfg.release_train_weights_after_update,
+        )
+        set_env(
+            "DTE_SYNC_MODEL_PARAMS_BEFORE_PAYLOAD",
+            dte_cfg.sync_model_params_before_payload,
+        )
+        set_env("DTE_DELTA_INVERSION_DEBUG", dte_cfg.inversion_debug)
+        set_env(
+            "DTE_DELTA_INVERSION_BF16_MARGIN_REL",
+            dte_cfg.inversion_bf16_margin_rel,
+        )
+
+        if exported_env:
+            for cfg_part in (
+                getattr(self.config, "actor", None),
+                getattr(self.config, "rollout", None),
+            ):
+                specs = getattr(cfg_part, "scheduling_spec", None)
+                if not specs:
+                    continue
+                for spec in specs:
+                    if isinstance(spec, dict):
+                        spec.setdefault("env_vars", {}).update(exported_env)
+                        continue
+                    env_vars = getattr(spec, "env_vars", None)
+                    if env_vars is None:
+                        env_vars = {}
+                        setattr(spec, "env_vars", env_vars)
+                    env_vars.update(exported_env)
+
     def _create_dataloader(
         self,
         dataset: Dataset,
@@ -1358,14 +1477,25 @@ class PPOTrainer:
                 "offload is enabled. Please set enable_offload=True."
             )
 
-        if (
-            self._is_actor_rollout_colocated(self.config)
-            and self.config.actor.weight_update_mode != "disk"
-        ):
+        if self._is_actor_rollout_colocated(
+            self.config
+        ) and self.config.actor.weight_update_mode not in {"disk", "awex"}:
             raise ValueError(
-                "weight_update_mode must be 'disk' when colocation scheduling is enabled. "
-                "Please set actor.weight_update_mode=disk."
+                "weight_update_mode must be 'disk' or 'awex' when colocation "
+                "scheduling is enabled."
             )
+
+        if self.config.actor.weight_update_mode == "awex":
+            if actor_backend != "megatron":
+                raise ValueError(
+                    "weight_update_mode='awex' requires Megatron actor training "
+                    f"backend, got {actor_backend!r}."
+                )
+            if rollout_backend != "sglang":
+                raise ValueError(
+                    "weight_update_mode='awex' requires SGLang rollout backend, "
+                    f"got {rollout_backend!r}."
+                )
 
         if rollout_backend == "vllm" and self.config.rollout.return_routed_experts:
             raise ValueError(

@@ -35,6 +35,11 @@ from areal.v2.weight_update.awex import (
     awex_wu_use_group,
     fetch_kv_metadata,
 )
+from areal.v2.weight_update.awex.delta_config import (
+    delta_transfer_enabled,
+    make_delta_engine,
+    payload_carries_delta,
+)
 from areal.v2.weight_update.inference_adapter import (
     AwexInferenceAdapter,
 )
@@ -63,6 +68,7 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
         self._colocate_transport = None
         self._train_to_infer_device_mapping: dict | None = None
         self._infer_to_train_device_mapping: dict | None = None
+        self._delta_engine = None
 
     def _get_model(self) -> torch.nn.Module:
         return self._scheduler.tp_worker.model_runner.model
@@ -571,6 +577,14 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
         tensors = reconstruct_tensors_from_groups(group_shared, metadata)
         torch.cuda.synchronize()
         deserialized_weights = dict(zip(names, tensors))
+        # Reconstruct when delta is enabled locally OR the payload itself carries
+        # a delta header. The latter defends against the trainer enabling delta
+        # while this worker's DTE_DELTA_TRANSFER did not propagate: without it,
+        # the sparse header/@delta_idx names would flow straight into the apply.
+        if delta_transfer_enabled() or payload_carries_delta(names):
+            deserialized_weights = self._delta_reconstruct(
+                deserialized_weights, version
+            )
 
         recv_parameters = self.get_local_shard_parameters()
 
@@ -610,6 +624,94 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
             version,
             transfer_rank,
         )
+
+    def seed_delta_base(self, version: int = 0) -> None:
+        """Seed receiver-side delta base from the currently loaded weights.
+
+        The actor and SGLang workers start from the same checkpoint.  In delta
+        mode we can therefore seed the DTE chain at v0 locally on the receiver
+        instead of receiving a real full-weight v1 payload before training.
+        """
+        if not delta_transfer_enabled():
+            logger.info("seed_delta_base skipped: delta transfer disabled")
+            return
+        if self._delta_engine is None:
+            self._delta_engine = make_delta_engine(
+                f"cuda:{torch.cuda.current_device()}"
+            )
+        params = self.get_local_shard_parameters()
+        self._delta_engine.reconstruct(params, version)
+        logger.info(
+            "colocate delta receiver virtual seed v%d with %d params",
+            version,
+            len(params),
+        )
+
+    def _delta_reconstruct(
+        self, named_tensors: dict[str, torch.Tensor], version: int
+    ) -> dict[str, torch.Tensor]:
+        """Reconstruct full weights from a dte delta/full payload (receiver side).
+
+        The bytes already arrived via cuda-IPC, so we use dte's transport-free
+        ``DeltaEngine.reconstruct``: it verifies the version chain, decodes the
+        sparse patch against the CPU base, refreshes that base, and returns the
+        full ``{name: tensor}``. Full weights then flow into
+        ``update_weights_in_colocate_mode`` unchanged, so the cross-rank NCCL
+        reshard never sees a delta payload. The per-param change masks dte also
+        returns are unused for now (first cut applies full weights).
+        """
+        if self._delta_engine is None:
+            self._delta_engine = make_delta_engine(
+                f"cuda:{torch.cuda.current_device()}"
+            )
+        full_params, _masks = self._delta_engine.reconstruct(named_tensors, version)
+        return full_params
+
+    def _verify_delta_agreement(
+        self,
+        pair_name: str,
+        kv_store_url: str,
+        transfer_rank: int,
+        admin_api_key: str,
+        timeout_s: float,
+    ) -> None:
+        """Fail fast if the paired training rank disagrees on delta on/off.
+
+        The trainer publishes its ``DTE_DELTA_TRANSFER`` state per rank at init;
+        we poll the paired rank's flag and compare. A mismatch means the env var
+        did not propagate consistently — without this guard a delta-mode trainer
+        would ship a header-less full-sync frame this (delta-off) worker skips,
+        leaving no base, and the next delta frame raises ``DeltaChainBroken``.
+        """
+        assert self._infer_to_train_device_mapping is not None
+        assert self._colocate_http_client is not None
+        paired_train_rank = self._infer_to_train_device_mapping[transfer_rank]
+        key = f"colocate_delta_enabled_rank{paired_train_rank}"
+        client = self._colocate_http_client
+        deadline = time.monotonic() + timeout_s
+        train_delta = None
+        while time.monotonic() < deadline:
+            resp = client.get(
+                f"{kv_store_url}/weight_meta/{pair_name}/{key}", timeout=5.0
+            )
+            if resp.status_code == 200:
+                train_delta = bool(resp.json()["value"])
+                break
+            time.sleep(0.1)
+        if train_delta is None:
+            raise TimeoutError(
+                f"Training rank {paired_train_rank} did not publish its delta "
+                f"flag within {timeout_s}s (key={key})"
+            )
+        local_delta = delta_transfer_enabled()
+        if train_delta != local_delta:
+            raise ValueError(
+                f"Colocate delta mismatch: training rank {paired_train_rank} "
+                f"delta_enabled={train_delta}, inference rank {transfer_rank} "
+                f"delta_enabled={local_delta}. Set DTE_DELTA_TRANSFER "
+                f"consistently on BOTH training and inference workers."
+            )
+        logger.info("colocate delta agreement OK (delta_enabled=%s)", local_delta)
 
     # Tags understood by SGLang's native release/resume_memory_occupation.
     _SGLANG_MEMORY_TAGS = {"kv_cache"}
