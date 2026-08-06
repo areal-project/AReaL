@@ -265,6 +265,9 @@ def _load_sglang_adapter(monkeypatch):
     _stub_areal_packages(monkeypatch)
 
     delta_config_mod = types.ModuleType("areal.v2.weight_update.awex.delta_config")
+    delta_config_mod.delta_transfer_enabled = lambda: False
+    delta_config_mod.make_delta_engine = lambda *args, **kwargs: None
+    delta_config_mod.payload_carries_delta = lambda names: False
     delta_config_mod.separation_delta_transfer_enabled = lambda: False
     monkeypatch.setitem(
         sys.modules,
@@ -340,6 +343,9 @@ def _load_megatron_adapter(monkeypatch):
     delta_detect_mod = types.ModuleType("areal.v2.weight_update.awex.delta_detect")
     delta_detect_mod.build_detector = lambda *args, **kwargs: None
     delta_detect_mod.delta_detector_mode = lambda: "inversion"
+    delta_detect_mod.external_delta_detector_enabled = lambda mode=None: (
+        mode or delta_detect_mod.delta_detector_mode()
+    ) in {"inversion", "dirty_bit", "dirty-bit", "bitset", "fused_dirty_bit"}
     monkeypatch.setitem(
         sys.modules,
         "areal.v2.weight_update.awex.delta_detect",

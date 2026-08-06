@@ -2,6 +2,7 @@
 # pyright: reportMissingImports=false
 from __future__ import annotations
 
+import gc
 import math
 import os
 from typing import Any
@@ -74,6 +75,9 @@ from areal.v2.weight_update.awex import (  # noqa: E402
     fetch_kv_metadata,
 )
 from areal.v2.weight_update.awex.delta_config import (  # noqa: E402
+    delta_transfer_enabled,
+    make_delta_engine,
+    payload_carries_delta,
     separation_delta_transfer_enabled,
 )
 from areal.v2.weight_update.awex.separation_verify import (  # noqa: E402
@@ -176,6 +180,7 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
         self._infer_conf: dict[str, Any] | None = None
         self._colocate_timeout_s = 300.0
         self._colocate_initialized = False
+        self._delta_engine = None
 
     def _get_model(self) -> torch.nn.Module:
         return self._scheduler.tp_worker.model_runner.model
@@ -863,6 +868,7 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
         The native reader is intentionally constructed on the first update,
         after training has published ``training_params_meta``.
         """
+        expected_delta_enabled = kwargs.pop("expected_delta_enabled", None)
         del master_port, num_engines, kwargs
         if infer_world_size != train_world_size:
             raise ValueError(
@@ -936,8 +942,27 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
             self._engine_rank,
             self._instance_local_rank,
         )
+        local_delta = delta_transfer_enabled()
+        if (
+            expected_delta_enabled is not None
+            and bool(expected_delta_enabled) != local_delta
+        ):
+            raise ValueError(
+                "Colocate delta config mismatch on inference rank "
+                f"{self._transfer_rank}: expected={expected_delta_enabled}, "
+                f"local={local_delta}. Check DTE_DELTA_TRANSFER propagation."
+            )
+        if local_delta and self._delta_engine is None:
+            self._delta_engine = make_delta_engine(
+                f"cuda:{torch.cuda.current_device()}"
+            )
+            logger.info("colocate delta enabled (receiver); DTE DeltaEngine ready")
 
     def execute_colocate_weight_update(self, version: int) -> None:
+        if delta_transfer_enabled():
+            self._execute_colocate_delta_weight_update(version)
+            return
+
         self.wait_for_training_offloaded(version)
         self.resume_memory(["weights"])
         self._quiesce_scheduler_streams()
@@ -945,6 +970,190 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
         reader.update_weights(step_id=version)
         self._rebuild_derived_weights()
         logger.info("Colocate weight update completed for version %d", version)
+
+    def _execute_colocate_delta_weight_update(self, version: int) -> None:
+        self.wait_for_training_offloaded(version)
+        reader = self._ensure_reader()
+        reader.collect_training_weights(step_id=version)
+        deserialized_weights = reader.deserialized_weights
+        names = list(deserialized_weights.keys())
+        carries_delta = payload_carries_delta(names)
+        decoded_delta = None
+        if carries_delta:
+            decoded_delta = self._delta_decode_for_live_apply(
+                deserialized_weights, version
+            )
+        else:
+            self._delta_mark_full_sync(deserialized_weights, version)
+
+        resumed_weights = False
+        update_succeeded = False
+        try:
+            if self._decoded_delta_is_empty(decoded_delta):
+                self._delta_engine.commit_live_apply(decoded_delta)
+                self._finish_reader_colocate_update(reader, version)
+                update_succeeded = True
+                return
+
+            self.resume_memory(["weights"])
+            resumed_weights = True
+            self._quiesce_scheduler_streams()
+            recv_parameters = self.get_local_shard_parameters()
+            transfer_path = (
+                "colocate_delta" if decoded_delta is not None else "colocate_full"
+            )
+            log_tensor_digest(
+                recv_parameters.items(),
+                role="infer",
+                phase="pre_apply",
+                version=version,
+                extra={
+                    "transfer_path": transfer_path,
+                    "transfer_rank": reader.transfer_rank,
+                    "payload_manifest": "receiver_params",
+                },
+            )
+
+            if decoded_delta is not None:
+                from dte.core.colocate_protocol import apply_decoded_delta_colocate
+
+                apply_decoded_delta_colocate(
+                    transfer_rank=reader.transfer_rank,
+                    world_size=reader.infer_world_size,
+                    send_plan=reader.send_transfer_plan,
+                    recv_plan=reader.transfer_plan,
+                    train_to_infer_device_mapping=reader.train_to_infer_device_mapping,
+                    infer_to_train_device_mapping=reader.infer_to_train_device_mapping,
+                    weights_update_group=reader.weights_update_group,
+                    decoded=decoded_delta,
+                    recv_params=recv_parameters,
+                    device=torch.device(f"cuda:{torch.cuda.current_device()}"),
+                    schedule_fn=reader.colocate_transport.execute_recursive_partition_stream_transfer,
+                    slice_fn=slice_tensor,
+                    rank_coordinate=reader.rank_coordinate,
+                    step_id=version,
+                )
+            else:
+                reader.colocate_transport.update_weights_in_colocate_mode(
+                    reader.train_to_infer_device_mapping,
+                    reader.infer_to_train_device_mapping,
+                    reader.transfer_rank,
+                    reader.rank_coordinate,
+                    reader.infer_world_size,
+                    reader.send_transfer_plan,
+                    reader.transfer_plan,
+                    reader.weights_update_group,
+                    deserialized_weights,
+                    recv_parameters,
+                    step_id=version,
+                )
+
+            self._rebuild_derived_weights()
+            if decoded_delta is not None:
+                self._delta_engine.commit_live_apply(decoded_delta)
+            log_tensor_digest(
+                recv_parameters.items(),
+                role="infer",
+                phase="post_apply",
+                version=version,
+                extra={
+                    "transfer_path": transfer_path,
+                    "transfer_rank": reader.transfer_rank,
+                    "payload_manifest": "receiver_params",
+                },
+            )
+            self._finish_reader_colocate_update(reader, version)
+            update_succeeded = True
+        finally:
+            reader.deserialized_weights = None
+            torch.cuda.synchronize()
+            gc.collect()
+            torch.cuda.empty_cache()
+            if resumed_weights and not update_succeeded:
+                self.release_memory(["weights"])
+
+        logger.info("Colocate DTE weight update completed for version %d", version)
+
+    @staticmethod
+    def _decoded_delta_is_empty(decoded_delta) -> bool:
+        if decoded_delta is None:
+            return False
+        sparse = getattr(decoded_delta, "sparse", {}) or {}
+        dense = getattr(decoded_delta, "dense", {}) or {}
+        sparse_nnz = sum(int(indices.numel()) for indices, _values in sparse.values())
+        dense_numel = sum(int(tensor.numel()) for tensor in dense.values())
+        return sparse_nnz == 0 and dense_numel == 0
+
+    def _finish_reader_colocate_update(
+        self,
+        reader: NCCLWorkerWeightsReader,
+        version: int,
+    ) -> None:
+        from awex.util import device as device_util
+        from awex.util.common import get_ip_address
+
+        ip_address = get_ip_address()
+        device_id = device_util.current_device()
+        key_suffix = f"_{ip_address}_{device_id}_{version}"
+        update_finished_key = f"weights_update_finished{key_suffix}"
+        reader.meta_server_client.put_object(update_finished_key, True)
+        dist.barrier(
+            group=reader.weights_update_group,
+            device_ids=[device_util.current_device()],
+        )
+        write_finished_key = f"write_finished{key_suffix}"
+        reader.meta_server_client.get_object_then_delete(write_finished_key)
+
+    def seed_delta_base(self, version: int = 0) -> None:
+        """Skip virtual delta seeding; the first real update is the full base."""
+        if not delta_transfer_enabled():
+            logger.info("seed_delta_base skipped: delta transfer disabled")
+            return
+        logger.info(
+            "seed_delta_base skipped for DTE delta transfer at v%d; "
+            "the first real payload will be a full sync base",
+            version,
+        )
+
+    def _delta_mark_full_sync(
+        self,
+        named_tensors: dict[str, torch.Tensor],
+        version: int,
+    ) -> None:
+        if self._delta_engine is None:
+            self._delta_engine = make_delta_engine(
+                f"cuda:{torch.cuda.current_device()}"
+            )
+        decoded = self._delta_engine.decode_for_live_apply(named_tensors, version)
+        if decoded is not None:
+            raise RuntimeError("Expected a full-sync payload, got a delta payload")
+        logger.info("DTE receiver full base advanced to v%d", version)
+
+    def _delta_decode_for_live_apply(
+        self,
+        named_tensors: dict[str, torch.Tensor],
+        version: int,
+    ):
+        if self._delta_engine is None:
+            self._delta_engine = make_delta_engine(
+                f"cuda:{torch.cuda.current_device()}"
+            )
+        decoded = self._delta_engine.decode_for_live_apply(named_tensors, version)
+        if decoded is None:
+            raise RuntimeError("Expected a delta payload, got a full-sync payload")
+        sparse_nnz = sum(int(indices.numel()) for indices, _ in decoded.sparse.values())
+        dense_numel = sum(int(tensor.numel()) for tensor in decoded.dense.values())
+        logger.info(
+            "[dte-perf][infer-delta] v%d sparse_params=%d sparse_nnz=%d "
+            "dense_params=%d dense_numel=%d payload_tensors=%d",
+            version,
+            len(decoded.sparse),
+            sparse_nnz,
+            len(decoded.dense),
+            dense_numel,
+            len(named_tensors),
+        )
+        return decoded
 
     def _quiesce_scheduler_streams(self) -> None:
         """Drain in-flight device work before the NCCL transfer starts.

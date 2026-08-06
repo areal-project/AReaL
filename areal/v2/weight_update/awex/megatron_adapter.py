@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import gc
 import os
+import threading
+import time
 from typing import TYPE_CHECKING
 
 import torch
@@ -37,6 +39,7 @@ from areal.v2.weight_update.awex.delta_config import (
 from areal.v2.weight_update.awex.delta_detect import (
     build_detector,
     delta_detector_mode,
+    external_delta_detector_enabled,
 )
 from areal.v2.weight_update.awex.separation_verify import (
     separation_post_apply_verify_enabled,
@@ -55,6 +58,7 @@ if TYPE_CHECKING:
     from areal.engine.megatron_engine import MegatronEngine
 
 logger = logging.getLogger("AwexMegatronAdapter")
+_CAPTURE_MISS = object()
 
 
 def awex_colocate_timeout_s(default: float = 1800.0) -> float:
@@ -111,6 +115,9 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
         self._timeout_s = awex_colocate_timeout_s()
         self._delta_tracker = None
         self._delta_detector = None
+        self._colocate_lock = threading.Lock()
+        self._precompute_param_synced_version: int | None = None
+        self._precomputed_synced_state: tuple[int, object] | None = None
 
     @property
     def parallelism_strategy(self) -> dict:
@@ -697,6 +704,7 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
         """
         from awex.meta.meta_server import MetaServerClient
 
+        expected_delta_enabled = kwargs.pop("expected_delta_enabled", None)
         del kwargs
         if not meta_server_addr:
             meta_server_addr = os.environ.get("AWEX_META_SERVER_ADDR", "")
@@ -720,6 +728,19 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
             meta_server_addr,
             transfer_rank,
         )
+        local_delta = delta_transfer_enabled()
+        if (
+            expected_delta_enabled is not None
+            and bool(expected_delta_enabled) != local_delta
+        ):
+            raise ValueError(
+                "Colocate delta config mismatch on training rank "
+                f"{transfer_rank}: expected={expected_delta_enabled}, "
+                f"local={local_delta}. Check DTE_DELTA_TRANSFER propagation."
+            )
+        if local_delta:
+            self._ensure_delta_components()
+            logger.info("colocate delta enabled (sender); DTE components ready")
 
     def _lazy_initialize(self) -> None:
         """Initialize metadata and conversion after live weights are available."""
@@ -836,6 +857,10 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
     @torch.no_grad()
     def execute_colocate_weight_update(self, version: int) -> None:
         """Publish local parameter shards to colocated inference via CUDA IPC."""
+        with self._colocate_lock:
+            self._execute_colocate_weight_update_locked(version)
+
+    def _execute_colocate_weight_update_locked(self, version: int) -> None:
         from awex.util.tensor_util import release_tensors
 
         if self._meta_server_client is None:
@@ -844,6 +869,13 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
         weights_were_offloaded = "weights" in self._released_tags
         torch.cuda.ipc_collect()
         try:
+            if delta_transfer_enabled():
+                self._execute_colocate_delta_weight_update(
+                    version,
+                    weights_were_offloaded=weights_were_offloaded,
+                )
+                return
+
             # Optimizer and gradient buffers must leave the GPU before weights
             # are restored because inference is already resident on the same GPU.
             self.release_memory(tags=["optimizer"])
@@ -940,6 +972,114 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
             if weights_were_offloaded and "weights" not in self._released_tags:
                 self.release_memory(tags=["weights"])
 
+    @torch.no_grad()
+    def _execute_colocate_delta_weight_update(
+        self,
+        version: int,
+        *,
+        weights_were_offloaded: bool,
+    ) -> None:
+        """Publish a DTE delta/full payload through the MetaServer IPC path."""
+        from awex.util.tensor_util import release_tensors
+
+        if self._meta_server_client is None:
+            raise RuntimeError("init_colocate_weight_update must be called first")
+
+        if weights_were_offloaded:
+            self.resume_memory(tags=["weights"])
+
+        # The resolver/converter needs live model weights and stores the
+        # MetaServer device-rank entries used by the SGLang reader.
+        self._lazy_initialize()
+
+        sync_before_payload = self._needs_external_detector_sync_before_payload(version)
+        if sync_before_payload and not self._precompute_param_sync_covers(version):
+            self._sync_model_params_from_optimizer()
+
+        params = self.get_local_shard_parameters()
+        log_tensor_digest(
+            params.items(),
+            role="train",
+            phase="pre_send",
+            version=version,
+            extra={
+                "transfer_path": "colocate_delta_or_full",
+                "transfer_rank": self._transfer_rank,
+                "payload_manifest": "source_params",
+            },
+        )
+        names, tensors, zero_copy_full_payload = self._delta_encode(params, version)
+        delta_synced_state = self._pop_precomputed_synced_state(version)
+        if delta_synced_state is _CAPTURE_MISS:
+            delta_synced_state = self._delta_capture_synced_state(params)
+
+        self.release_memory(tags=["optimizer"])
+        self._release_grad_memory()
+
+        if zero_copy_full_payload:
+            group_tensors, metadata = self._full_tensors_for_ipc(tensors, names)
+        else:
+            group_tensors, metadata = group_tensors_by_shape_and_dtype(tensors)
+            self._release_owned_payload_tensors(tensors)
+        del tensors, params
+
+        self.release_memory(tags=["weights"])
+        if (
+            self._ip_address is None
+            or self._physical_gpu_id is None
+            or self._logical_train_rank is None
+            or self._rank_info is None
+        ):
+            raise RuntimeError("Colocate metadata is not initialized")
+
+        key_suffix = f"_{self._ip_address}_{self._physical_gpu_id}_{version}"
+        group_shared: list[torch.Tensor] = []
+        try:
+            group_shared = [tensor.share_memory_() for tensor in group_tensors]
+            serialized_weights = cuda_ipc_serialize((group_shared, metadata, names))
+            torch.cuda.synchronize()
+
+            writer_version_key = (
+                f"awex_writer_version_{self._ip_address}_{self._physical_gpu_id}"
+            )
+            self._meta_server_client.put_object(writer_version_key, version)
+            serialized_weights_key = f"training_serialized_weights{key_suffix}"
+            self._meta_server_client.put_object(
+                serialized_weights_key,
+                (self._logical_train_rank, self._rank_info, serialized_weights),
+            )
+            self._meta_server_client.add_object_to_set(
+                "all_training_offloaded_weights", self._logical_train_rank
+            )
+
+            update_finished_key = f"weights_update_finished{key_suffix}"
+            try:
+                self._meta_server_client.get_object(
+                    update_finished_key, timeout=self._timeout_s
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    "Inference did not finish the colocate DTE weight update "
+                    f"within {self._timeout_s}s; missing key "
+                    f"{update_finished_key!r}"
+                ) from exc
+            finally:
+                self._meta_server_client.delete_if_exists(update_finished_key)
+                self._meta_server_client.delete_if_exists(serialized_weights_key)
+
+            self._delta_mark_synced(version, delta_synced_state)
+            write_finished_key = f"write_finished{key_suffix}"
+            self._meta_server_client.put_object(write_finished_key, True)
+            logger.info("Colocate DTE weight update completed: version=%d", version)
+        finally:
+            release_tensors(group_tensors)
+            if group_shared:
+                release_tensors(group_shared)
+            torch.cuda.synchronize()
+            gc.collect()
+            torch.cuda.ipc_collect()
+            torch.cuda.empty_cache()
+
     def finish_colocate_weight_update(self, training_world_size: int) -> None:
         """Wait for all inference engines, then clear handshake state."""
         del training_world_size
@@ -959,6 +1099,345 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
                 "all_training_offloaded_weights",
             ):
                 self._meta_server_client.delete_if_exists(key)
+
+    def precompute_delta_masks(self, version: int) -> bool:
+        """Precompute external detector masks before optimizer offload."""
+        if not delta_transfer_enabled():
+            return False
+        with self._colocate_lock:
+            return self._precompute_delta_masks_locked(version)
+
+    def _precompute_delta_masks_locked(self, version: int) -> bool:
+        self._ensure_delta_components()
+        detector = self._delta_detector
+        precompute = getattr(detector, "precompute_masks", None)
+        if precompute is None:
+            return False
+
+        reason: str | None = None
+        if "weights" in self._released_tags:
+            reason = "weights_offloaded"
+        if reason is None:
+            reason = self._delta_tracker.full_sync_reason(version)
+        if reason is None:
+            has_watermark = getattr(detector, "has_synced_watermark", lambda: False)
+            if not has_watermark():
+                reason = "initial_full"
+        reason = self._delta_sync_full_reason(reason, version)
+        if reason is not None:
+            logger.info(
+                "precompute_delta_masks v%d: full sync pending (%s), skipping",
+                version,
+                reason,
+            )
+            return False
+
+        self._sync_model_params_from_optimizer()
+        self._precompute_param_synced_version = int(version)
+        params = self.get_local_shard_parameters()
+        t0 = time.monotonic()
+        feasible = precompute(list(params.keys()), list(params.values()), version)
+        captured = self._delta_capture_synced_state(params)
+        self._precomputed_synced_state = (int(version), captured)
+        logger.info(
+            "precompute_delta_masks v%d: feasible=%s elapsed_ms=%.1f",
+            version,
+            feasible,
+            (time.monotonic() - t0) * 1000,
+        )
+        return bool(feasible)
+
+    def _needs_external_detector_sync_before_payload(self, version: int) -> bool:
+        if not delta_transfer_enabled():
+            return False
+        if not external_delta_detector_enabled(delta_detector_mode()):
+            return False
+        self._ensure_delta_components()
+        reason = self._delta_tracker.full_sync_reason(version)
+        if reason is not None:
+            logger.info(
+                "Skipping Megatron optimizer param sync before payload v%d: "
+                "delta full sync is required (%s)",
+                version,
+                reason,
+            )
+            return False
+        has_watermark = getattr(
+            self._delta_detector, "has_synced_watermark", lambda: False
+        )
+        if not has_watermark():
+            logger.info(
+                "Skipping Megatron optimizer param sync before payload v%d: "
+                "detector watermark missing; first payload will be full sync",
+                version,
+            )
+            return False
+        return True
+
+    def _precompute_param_sync_covers(self, version: int) -> bool:
+        local = self._precompute_param_synced_version == int(version)
+        self._precompute_param_synced_version = None
+        if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+            device = (
+                torch.device("cuda", torch.cuda.current_device())
+                if torch.cuda.is_available()
+                else torch.device("cpu")
+            )
+            flag = torch.tensor([1 if local else 0], dtype=torch.int32, device=device)
+            dist.all_reduce(flag, op=dist.ReduceOp.MIN)
+            if int(flag.item()) == 0:
+                if local:
+                    logger.warning(
+                        "v%d: redoing param sync on all ranks; another rank "
+                        "missed its precompute param-sync marker",
+                        version,
+                    )
+                return False
+        return local
+
+    @staticmethod
+    def _colocate_full_group_max_bytes() -> int:
+        raw = os.environ.get("DTE_COLOCATE_FULL_GROUP_MAX_BYTES")
+        if raw is None or raw.strip() == "":
+            raw = os.environ.get("AWEX_COLOCATE_FULL_GROUP_MAX_BYTES")
+        if raw is None or raw.strip() == "":
+            return 512 * 1024 * 1024
+        try:
+            return max(int(raw), 1)
+        except ValueError as exc:
+            raise ValueError(
+                "DTE_COLOCATE_FULL_GROUP_MAX_BYTES must be an integer byte count"
+            ) from exc
+
+    def _live_module_storage_ptrs(self) -> set[int]:
+        live_storages: set[int] = set()
+        model = self._engine.model
+        chunks = model if isinstance(model, (list, tuple)) else [model]
+        for chunk in chunks:
+            for _, param in chunk.named_parameters():
+                live_storages.add(param.untyped_storage().data_ptr())
+            for _, buf in chunk.named_buffers():
+                live_storages.add(buf.untyped_storage().data_ptr())
+        return live_storages
+
+    def _release_owned_payload_tensors(self, tensors: list[torch.Tensor]) -> None:
+        from awex.util.tensor_util import release_tensors
+
+        live_storages = self._live_module_storage_ptrs()
+        owned = [
+            tensor
+            for tensor in tensors
+            if tensor.untyped_storage().data_ptr() not in live_storages
+        ]
+        if owned:
+            release_tensors(owned)
+
+    def _full_tensors_for_ipc(
+        self,
+        tensors: list[torch.Tensor],
+        names: list[str] | None = None,
+    ) -> tuple[list[torch.Tensor], list[dict]]:
+        """Build bounded exporter-owned groups for full-sync CUDA IPC."""
+        if names is not None and len(names) != len(tensors):
+            raise ValueError(
+                "names must match tensors when building colocate IPC payload"
+            )
+
+        max_group_bytes = self._colocate_full_group_max_bytes()
+        live_storages = self._live_module_storage_ptrs()
+        group_tensors: list[torch.Tensor] = []
+        metadata: list[dict] = []
+        buckets: dict[torch.dtype, list[int]] = {}
+
+        def append_zero_group(original_index: int, source: torch.Tensor) -> None:
+            group_index = len(group_tensors)
+            group_tensors.append(
+                torch.empty((1,), dtype=source.dtype, device=source.device)
+            )
+            metadata.append(
+                {
+                    "original_index": original_index,
+                    "shape": source.shape,
+                    "dtype": source.dtype,
+                    "group_index": group_index,
+                    "offset": 0,
+                    "size": 0,
+                }
+            )
+
+        for original_index, tensor in enumerate(tensors):
+            source = tensor.detach()
+            if source.numel() == 0:
+                append_zero_group(original_index, source)
+                continue
+            buckets.setdefault(source.dtype, []).append(original_index)
+
+        def finalize_group(
+            current: list[tuple[int, torch.Tensor, torch.Size, torch.dtype, int]],
+        ) -> None:
+            if not current:
+                return
+            group_index = len(group_tensors)
+            group_tensor = torch.cat(
+                [entry[1].reshape(-1) for entry in current]
+            ).clone()
+            group_tensors.append(group_tensor)
+            offset = 0
+            for original_index, _flat, shape, dtype, size in current:
+                metadata.append(
+                    {
+                        "original_index": original_index,
+                        "shape": shape,
+                        "dtype": dtype,
+                        "group_index": group_index,
+                        "offset": offset,
+                        "size": size,
+                    }
+                )
+                offset += size
+
+        for indices in buckets.values():
+            current: list[tuple[int, torch.Tensor, torch.Size, torch.dtype, int]] = []
+            current_bytes = 0
+            for original_index in indices:
+                source = tensors[original_index].detach()
+                tensor_bytes = source.numel() * source.element_size()
+                if current and current_bytes + tensor_bytes > max_group_bytes:
+                    finalize_group(current)
+                    current = []
+                    current_bytes = 0
+                compact = source.contiguous()
+                if compact.untyped_storage().data_ptr() in live_storages:
+                    compact = compact.clone(memory_format=torch.contiguous_format)
+                current.append(
+                    (
+                        original_index,
+                        compact,
+                        source.shape,
+                        source.dtype,
+                        source.numel(),
+                    )
+                )
+                current_bytes += tensor_bytes
+            finalize_group(current)
+
+        logger.info(
+            "Built bounded colocate full IPC payload: params=%d, groups=%d, "
+            "max_group_bytes=%d",
+            len(tensors),
+            len(group_tensors),
+            max_group_bytes,
+        )
+        return group_tensors, metadata
+
+    @torch.no_grad()
+    def _sync_model_params_from_optimizer(self) -> None:
+        copied = 0
+        gathered = 0
+        for opt in self._get_inner_optimizers():
+            copy_fn = getattr(opt, "_copy_main_params_to_model_params", None)
+            if copy_fn is None:
+                copy_fn = getattr(opt, "_copy_main_params_to_param_buffer", None)
+            if copy_fn is not None:
+                copy_fn()
+                copied += 1
+
+            gather_fn = getattr(
+                opt, "_reset_metadata_and_sync_gather_all_model_params", None
+            )
+            if gather_fn is not None:
+                gather_fn(force_sync=True)
+                gathered += 1
+
+        synced = 0
+        if gathered == 0:
+            model = self._engine.model
+            chunks = model if isinstance(model, (list, tuple)) else [model]
+            for chunk in chunks:
+                start_param_sync = getattr(chunk, "start_param_sync", None)
+                if start_param_sync is not None:
+                    start_param_sync(force_sync=True)
+                    synced += 1
+
+        if copied or gathered or synced:
+            torch.cuda.synchronize()
+            logger.info(
+                "Synced Megatron optimizer main params before AWEX payload read "
+                "(copied=%d, optimizer_gather=%d, param_sync=%d)",
+                copied,
+                gathered,
+                synced,
+            )
+
+    def _pop_precomputed_synced_state(self, version: int):
+        cached = self._precomputed_synced_state
+        self._precomputed_synced_state = None
+        if cached is not None and cached[0] == int(version):
+            return cached[1]
+        return _CAPTURE_MISS
+
+    def _delta_encode(
+        self,
+        params: dict[str, torch.Tensor],
+        version: int,
+    ) -> tuple[list[str], list[torch.Tensor], bool]:
+        """Encode colocate payload as DTE sparse delta or dense full sync."""
+        self._ensure_delta_components()
+        detector_name = self._delta_detector.name
+        external_detector = detector_name != "snapshot"
+        verify_snapshot = external_detector and self._delta_verify_snapshot_enabled()
+        names = list(params.keys())
+        tensors = list(params.values())
+        params_list = list(params.items())
+
+        reason = self._delta_tracker.full_sync_reason(version)
+        masks = None
+        if external_detector and reason is None:
+            has_watermark = getattr(
+                self._delta_detector, "has_synced_watermark", lambda: False
+            )
+            if not has_watermark():
+                reason = "initial_full"
+        reason = self._delta_sync_full_reason(reason, version)
+        if external_detector and reason is None:
+            masks = self._delta_detector.compute_masks(names, tensors, version)
+            if masks is None:
+                reason = f"{detector_name}_infeasible"
+            elif verify_snapshot and not self._delta_verify_masks_against_snapshot(
+                params_list, masks, version
+            ):
+                reason = f"{detector_name}_snapshot_mismatch"
+
+        reason = self._delta_sync_full_reason(reason, version)
+        if reason is not None:
+            self._delta_tracker.seed(
+                params_list,
+                version,
+                store_snapshot=(not external_detector or verify_snapshot),
+            )
+            if verify_snapshot:
+                self._delta_mark_snapshot_names(params_list)
+            logger.info("colocate delta v%d: FULL sync (%s)", version, reason)
+            return names, tensors, True
+
+        encoded = self._delta_tracker.encode(params_list, version, masks=masks)
+        if verify_snapshot:
+            self._delta_refresh_verification_snapshot(params_list)
+        logger.info(
+            "colocate delta v%d [%s]: changed %d/%d (%.2f%%) "
+            "sparse=%d dense_fallback=%d unchanged=%d payload=%.1fMB vs dense=%.1fMB",
+            version,
+            self._delta_detector.name,
+            encoded.changed_elements,
+            encoded.total_elements,
+            100.0 * encoded.changed_elements / max(encoded.total_elements, 1),
+            encoded.num_sparse,
+            encoded.num_dense_fallback,
+            encoded.num_unchanged,
+            encoded.payload_bytes / 1e6,
+            encoded.dense_bytes / 1e6,
+        )
+        return encoded.names, encoded.tensors, False
 
     def _ensure_delta_components(self) -> None:
         if self._delta_tracker is None:

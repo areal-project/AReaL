@@ -3,9 +3,12 @@ from __future__ import annotations
 
 import asyncio
 import os
+import pickle
 import socket
+import tempfile
 import time
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any
 
 import aiohttp  # pyright: ignore[reportMissingImports]
@@ -16,6 +19,7 @@ from pydantic import BaseModel  # pyright: ignore[reportMissingImports]
 from areal.infra.utils.http import async_http_retry
 from areal.utils import logging
 from areal.utils.network import find_free_ports
+from areal.v2.weight_update.awex.delta_config import delta_transfer_enabled
 from areal.v2.weight_update.gateway.auth import require_admin_key
 from areal.v2.weight_update.gateway.config import (
     WeightUpdateConfig,
@@ -162,6 +166,56 @@ def _ensure_meta_server(app: FastAPI) -> str:
     app.state.meta_server_addr = f"{host}:{port}"
     logger.info("Started awex MetaServer at %s", app.state.meta_server_addr)
     return app.state.meta_server_addr
+
+
+def _safe_file_component(value: str) -> str:
+    return "".join(c if c.isalnum() or c in "._-" else "_" for c in value)
+
+
+def _colocate_metadata_dir() -> Path:
+    root = (
+        os.environ.get("DTE_WEIGHT_META_DIR")
+        or os.environ.get("AREAL_WEIGHT_META_DIR")
+        or os.environ.get("AREAL_STORAGE")
+        or os.getcwd()
+    )
+    return Path(root).expanduser().resolve() / ".areal_weight_meta"
+
+
+def _write_colocate_metadata_file(
+    pair_name: str,
+    infer_params_meta: list[Any],
+    training_params_meta: list[Any],
+) -> str:
+    metadata_dir = _colocate_metadata_dir()
+    metadata_dir.mkdir(parents=True, exist_ok=True)
+    safe_pair = _safe_file_component(pair_name)
+    final_path = metadata_dir / (
+        f"{safe_pair}.{os.getpid()}.{int(time.time() * 1000)}.pkl"
+    )
+    fd, tmp_path = tempfile.mkstemp(
+        prefix=f".{safe_pair}.",
+        suffix=".tmp",
+        dir=metadata_dir,
+    )
+    try:
+        with os.fdopen(fd, "wb") as f:
+            pickle.dump(
+                {
+                    "infer_params_meta": infer_params_meta,
+                    "training_params_meta": training_params_meta,
+                },
+                f,
+                protocol=pickle.HIGHEST_PROTOCOL,
+            )
+        os.replace(tmp_path, final_path)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+    return str(final_path)
 
 
 def _merge_training_meta_by_name(meta_list: list[dict]) -> list[dict]:
@@ -666,6 +720,26 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
 
         kv_store.put(pair_name, "training_params_meta", training_params_meta)
         kv_store.put(pair_name, "infer_params_meta", infer_params_meta)
+        try:
+            metadata_path = _write_colocate_metadata_file(
+                pair_name,
+                infer_params_meta,
+                training_params_meta,
+            )
+            kv_store.put(pair_name, "metadata_path", metadata_path)
+            logger.info(
+                "Wrote colocate metadata file for pair '%s': %s",
+                pair_name,
+                metadata_path,
+            )
+        except Exception:
+            metadata_path = ""
+            logger.warning(
+                "Failed to write colocate metadata file for pair '%s'; "
+                "falling back to gateway/MetaServer metadata",
+                pair_name,
+                exc_info=True,
+            )
 
         [master_port] = find_free_ports(1)
 
@@ -677,6 +751,8 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
             "num_engines": num_engines,
             "master_port": master_port,
             "admin_api_key": config.admin_api_key,
+            "expected_delta_enabled": delta_transfer_enabled(),
+            "metadata_path": metadata_path,
         }
 
         init_tasks = []
@@ -759,6 +835,26 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
             len(pair_info.train_worker_urls),
             len(pair_info.inference_worker_urls),
         )
+        if delta_transfer_enabled():
+            try:
+                await asyncio.gather(
+                    *[
+                        _post(
+                            session,
+                            f"{url}/awex/precompute_delta_masks",
+                            timeout_s,
+                            json_data={"version": version},
+                        )
+                        for url in pair_info.train_worker_urls
+                    ]
+                )
+            except Exception:
+                logger.warning(
+                    "Colocate v%d: precompute_delta_masks failed; "
+                    "masks will be computed during the sync",
+                    version,
+                    exc_info=True,
+                )
         await asyncio.gather(
             *[
                 _post_once(
@@ -942,6 +1038,19 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
                 status_code=404,
                 content={"error": f"Pair '{body.pair_name}' not found"},
             )
+
+        metadata_path = kv_store.get(pair_info.pair_name, "metadata_path")
+        if isinstance(metadata_path, str) and metadata_path:
+            try:
+                os.unlink(metadata_path)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                logger.warning(
+                    "Failed to remove colocate metadata file: %s",
+                    metadata_path,
+                    exc_info=True,
+                )
 
         registry.unregister(pair_info.pair_name)
         kv_store.clear_pair(pair_info.pair_name)
