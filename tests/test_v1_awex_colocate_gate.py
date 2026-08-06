@@ -33,20 +33,38 @@ class TestV1AwexColocateGate:
         "version,mode,colocated,expected",
         [
             ("v1", "awex", True, True),
+            ("v1", "awex", False, True),
             ("v2", "awex", True, False),
-            ("v1", "awex", False, False),
+            ("v2", "awex", False, False),
             ("v1", "xccl", True, False),
             ("v1", "disk", True, False),
-            ("v2", "awex", False, False),
         ],
     )
-    def test_gate_requires_v1_awex_and_colocation(
+    def test_gate_selects_v1_awex_whatever_the_strategy(
         self, version, mode, colocated, expected
     ):
         trainer = object.__new__(PPOTrainer)
         cfg = _config(version, mode, colocated)
 
         assert PPOTrainer._is_v1_awex_colocate(trainer, cfg) is expected
+
+    def test_the_default_separation_strategy_still_selects_v1_awex(self):
+        """AWEX runs opt in with weight_update_mode, not with a strategy.
+
+        examples/math/gsm8k_grpo.yaml leaves actor and rollout on the dataclass
+        default, so requiring colocation here skips the meta-server handoff and
+        every worker starts its own; the run then waits on 'infer_conf' forever.
+        """
+        trainer = object.__new__(PPOTrainer)
+        default = SchedulingStrategy()
+
+        assert default.type == "separation"
+        assert (
+            PPOTrainer._is_v1_awex_colocate(
+                trainer, _config("v1", "awex", colocated=False)
+            )
+            is True
+        )
 
 
 class TestNoUngatedAwexChecks:

@@ -507,15 +507,20 @@ class PPOTrainer:
     def _is_v1_awex_colocate(self, config: PPOConfig) -> bool:
         """Whether this run is the v1 AWEX colocated actor-rollout setup.
 
-        ``weight_update_mode`` alone is not enough to identify it. Controller v2
-        picks AWEX from ``use_lora`` and never reads that field, so a v2
-        separation run may legitimately carry ``weight_update_mode="awex"``;
-        gating on it alone would apply the v1 colocation handover to v2.
+        ``weight_update_mode`` alone is not enough: controller v2 selects AWEX
+        from ``use_lora`` and never reads that field, so a v2 separation run may
+        legitimately carry ``weight_update_mode="awex"`` and would otherwise
+        take the v1 colocation handover.
+
+        The scheduling strategy is deliberately not part of this check. v1 AWEX
+        only exists colocated and runs opt in through ``weight_update_mode``
+        while leaving actor and rollout on the default (separation) strategy;
+        requiring colocation here skips the meta-server handoff, every training
+        worker then starts its own server, and the run waits on ``infer_conf``
+        forever.
         """
         return (
-            config.actor._version == "v1"
-            and config.actor.weight_update_mode == "awex"
-            and self._is_actor_rollout_colocated(config)
+            config.actor._version == "v1" and config.actor.weight_update_mode == "awex"
         )
 
     def _onload_model(self, engine, role: str) -> None:
