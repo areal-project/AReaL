@@ -1360,10 +1360,8 @@ class RemoteInfEngine(InferenceEngine):
             self._wait_for_server(address, process=process)
             self.local_server_processes.append(server_info)
             return server_info
-        except TimeoutError:
-            logger.warning(
-                f"Launch local server timeouted at {address} after {self.config.setup_timeout}s."
-            )
+        except (TimeoutError, RuntimeError) as e:
+            logger.warning(f"Launch local server failed at {address}: {e}")
             self._shutdown_one_server(server_info)
             raise
 
