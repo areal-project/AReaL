@@ -148,6 +148,38 @@ def create_awex_blueprint(
             return_result=False,
         )
 
+    @bp.route("/precompute_delta_masks", methods=["POST"])
+    def precompute_delta_masks():
+        data = flask_module.request.get_json(force=True)
+        version = data.get("version", 0)
+
+        def action():
+            adapter = _require_adapter()
+            fn = getattr(adapter, "precompute_delta_masks", None)
+            if fn is None:
+                return {"precomputed": False}
+            return {"precomputed": bool(fn(version))}
+
+        return run_endpoint(
+            "precompute_delta_masks",
+            lambda: submit_to_engine_thread("precompute_delta_masks", action),
+        )
+
+    @bp.route("/seed_delta_base", methods=["POST"])
+    def seed_delta_base():
+        data = flask_module.request.get_json(force=True)
+        version = data.get("version", 0)
+
+        def action():
+            adapter = _require_adapter()
+            adapter.seed_delta_base(version)
+
+        return run_endpoint(
+            "seed_delta_base",
+            lambda: submit_to_engine_thread("seed_delta_base", action),
+            return_result=False,
+        )
+
     @bp.route("/release_memory", methods=["POST"])
     def release_memory():
         data = flask_module.request.get_json(force=True)

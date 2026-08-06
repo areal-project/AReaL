@@ -987,6 +987,7 @@ class GatewayTrainController:
 
         inference_urls: list[str] = rollout.inference_worker_urls
         pair_name = f"{self._role}-rollout"
+        self._colocate = False
 
         if meta.type == "awex":
             colocate = getattr(meta, "colocate", False)
@@ -1030,10 +1031,13 @@ class GatewayTrainController:
             )
         self._weight_update_ctrl = ctrl
         logger.info(
-            "WeightUpdateController connected (pair=%s, train=%d, inf=%d)",
+            "WeightUpdateController connected "
+            "(pair=%s, mode=%s, train=%d, inf=%d, colocate=%s)",
             pair_name,
+            meta.type,
             len(self._worker_addrs),
             len(inference_urls),
+            self._colocate,
         )
 
     def _broadcast_awex_memory_op(self, op: str, tags: list[str]) -> None:
@@ -1139,6 +1143,48 @@ class GatewayTrainController:
             result.status,
             result.duration_ms,
         )
+
+    async def _async_seed_delta_base(self, version: int) -> None:
+        if self.rollout is None:
+            raise RuntimeError(
+                "connect_engine() must be called before seed_delta_base()"
+            )
+        timeout = max(float(self.config.request_timeout), 120.0)
+        client = await self._get_async_client()
+        inference_urls: list[str] = self.rollout.inference_worker_urls
+
+        async def _post_seed(url: str) -> None:
+            resp = await client.post(
+                f"{url}/awex/seed_delta_base",
+                json={"version": version},
+                timeout=timeout,
+            )
+            if resp.status_code >= 400:
+                raise RuntimeError(
+                    f"{url}/awex/seed_delta_base returned "
+                    f"{resp.status_code}: {resp.text}"
+                )
+
+        await asyncio.gather(
+            *[_post_seed(url) for url in self._worker_addrs],
+            *[_post_seed(url) for url in inference_urls],
+        )
+
+    def seed_delta_base(self, version: int = 0) -> None:
+        if self._weight_update_ctrl is None or self.rollout is None:
+            raise RuntimeError(
+                "connect_engine() must be called before seed_delta_base()"
+            )
+        if not self._colocate:
+            logger.info("seed_delta_base skipped: colocate weight update disabled")
+            return
+
+        self.rollout.pause_generation()
+        try:
+            run_async_task(self._async_seed_delta_base, version)
+        finally:
+            self.rollout.continue_generation()
+        logger.info("Colocate delta base seeded at version %d", version)
 
     def prepare_batch(
         self,

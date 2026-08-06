@@ -204,6 +204,13 @@ class AwexFSDPAdapter(AwexTrainingAdapter):
         self._transfer_plan = None
         self._transfer_rank = None
 
+    def precompute_delta_masks(self, version: int) -> bool:
+        del version
+        return False
+
+    def seed_delta_base(self, version: int = 0) -> None:
+        del version
+
     def _to_hf_name(self, name: str) -> str:
         if self._engine.is_vision_model and is_qwen_vl_model(
             self._engine.model_config.model_type

@@ -77,6 +77,17 @@ class AwexTrainingAdapter(Protocol):
         """Serialize weights via IPC and put to KV store."""
         ...
 
+    def precompute_delta_masks(self, version: int) -> bool:
+        """Precompute delta masks before optimizer memory is released.
+
+        Optional DTE fast path. Non-DTE adapters should return False.
+        """
+        ...
+
+    def seed_delta_base(self, version: int = 0) -> None:
+        """Seed colocate delta state from the current local weights."""
+        ...
+
     def release_memory(self, tags: list[str] | None = None) -> None:
         """Release GPU memory (optimizer/weights) for colocated mode."""
         ...
