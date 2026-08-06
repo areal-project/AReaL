@@ -6,7 +6,7 @@ from __future__ import annotations
 import os
 from collections.abc import MutableMapping
 from enum import Enum
-from typing import Any
+from typing import Any, Literal
 
 
 def dte_weight_update_topology_gates(
@@ -20,6 +20,23 @@ def dte_weight_update_topology_gates(
         bool(enabled) and topology_value == "colocation",
         bool(enabled) and topology_value == "separation",
     )
+
+
+def dte_verification_snapshot_commit_action(
+    detector_name: str | None,
+    verify_enabled: bool,
+    *,
+    has_masks: bool,
+    prepare_failed: bool,
+) -> Literal["none", "apply_masks", "refresh"]:
+    """Select the post-transfer verification snapshot action."""
+    if detector_name in {None, "snapshot"} or not verify_enabled:
+        return "none"
+    if has_masks:
+        return "apply_masks"
+    if prepare_failed:
+        return "refresh"
+    return "none"
 
 
 def apply_dte_config_envvars(

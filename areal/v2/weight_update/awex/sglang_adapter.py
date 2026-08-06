@@ -58,19 +58,36 @@ from awex.sharding.sglang_sharding import (  # noqa: E402
     get_sglang_sharding_strategy,
 )
 from awex.transfer.nccl_comm import batch_send_recv, nccl_build_recv_ops  # noqa: E402
-from awex.transfer.transfer_plan import TransferPlan, TransferPlanBuilder  # noqa: E402
+from awex.transfer.nccl_stream_batch import (  # noqa: E402
+    NcclColocateStreamBatchTransport,
+)
+from awex.transfer.transfer_plan import (  # noqa: E402
+    TransferPlan,
+    TransferPlanBuilder,
+    slice_tensor,
+)
 from awex.util.common import simple_hf_config  # noqa: E402
-from awex.util.process_group import init_weights_update_group  # noqa: E402
 
 from areal.utils import logging  # noqa: E402
 from areal.v2.weight_update.awex import (  # noqa: E402
     awex_wu_use_group,
     fetch_kv_metadata,
 )
+from areal.v2.weight_update.awex.delta_config import (  # noqa: E402
+    separation_delta_transfer_enabled,
+)
+from areal.v2.weight_update.awex.separation_verify import (  # noqa: E402
+    separation_post_apply_verify_enabled,
+    verify_separation_post_apply,
+)
+from areal.v2.weight_update.awex.weight_digest import log_tensor_digest  # noqa: E402
 from areal.v2.weight_update.inference_adapter import (  # noqa: E402
     AwexInferenceAdapter,
 )
-from areal.v2.weight_update.nccl_group import setup_batch_isend_irecv  # noqa: E402
+from areal.v2.weight_update.nccl_group import (  # noqa: E402
+    init_weights_update_group,
+    setup_batch_isend_irecv,
+)
 
 logger = logging.getLogger("AwexSGLangAdapter")
 
@@ -139,6 +156,9 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
         self._scheduler = scheduler
         self._transfer_plan: TransferPlan | None = None
         self._weights_update_group = None
+        self._weights_update_group_gloo = None
+        self._world_size: int | None = None
+        self._separation_delta_transport: NcclColocateStreamBatchTransport | None = None
         self._transfer_rank: int | None = None
         self._rank_info: RankInfo | None = None
         self._parameters: dict[str, torch.Tensor] | None = None
@@ -498,6 +518,7 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
         engine_local_rank = pp_rank * tp_size + tp_rank
         global_rank = transfer_rank * per_engine_world + engine_local_rank
         self._transfer_rank = global_rank
+        self._world_size = world_size
 
         infer_meta, train_meta = fetch_kv_metadata(kv_store_url, pair_name)
 
@@ -519,15 +540,40 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
             group_name=f"awex_{pair_name}",
             role="inference",
         )
+        self._weights_update_group_gloo = init_weights_update_group(
+            master_address=master_addr,
+            master_port=master_port,
+            rank=global_rank,
+            world_size=world_size,
+            group_name=f"awex_{pair_name}_gloo",
+            backend="gloo",
+            role="inference",
+        )
 
     def execute_weight_update(self, version: int) -> None:
-        del version
+        if separation_delta_transfer_enabled():
+            self._execute_separation_weight_update(version)
+            return
+
         if self._transfer_plan is None:
             raise RuntimeError("Transfer plan is not initialized")
         if self._weights_update_group is None:
             raise RuntimeError("Weight update group is not initialized")
+        if self._weights_update_group_gloo is None:
+            raise RuntimeError("Weight update control group is not initialized")
 
         params = self.get_local_shard_parameters()
+        log_tensor_digest(
+            params.items(),
+            role="infer",
+            phase="pre_apply",
+            version=version,
+            extra={
+                "transfer_path": "separation_full",
+                "transfer_rank": self._transfer_rank,
+                "payload_manifest": "receiver_params",
+            },
+        )
         recv_ops, non_contiguous_pairs, _ = nccl_build_recv_ops(
             params,
             self._transfer_plan,
@@ -543,7 +589,157 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
         for original, contiguous in non_contiguous_pairs:
             original.copy_(contiguous)
 
-        dist.barrier(group=self._weights_update_group)
+        log_tensor_digest(
+            params.items(),
+            role="infer",
+            phase="post_apply",
+            version=version,
+            extra={
+                "transfer_path": "separation_full",
+                "transfer_rank": self._transfer_rank,
+                "payload_manifest": "receiver_params",
+            },
+        )
+        dist.barrier(group=self._weights_update_group_gloo)
+        if separation_post_apply_verify_enabled():
+            verify_separation_post_apply(
+                params,
+                self._transfer_plan,
+                self._weights_update_group_gloo,
+                role="infer",
+                version=version,
+                mode="full",
+            )
+
+    def _execute_separation_weight_update(self, version: int) -> None:
+        """Receive a sparse separated-card update, with dense fallback."""
+        if self._transfer_plan is None:
+            raise RuntimeError("Transfer plan is not initialized")
+        if self._weights_update_group is None:
+            raise RuntimeError("Weight update group is not initialized")
+        if self._weights_update_group_gloo is None:
+            raise RuntimeError("Separation control group is not initialized")
+
+        decision = torch.tensor([1], dtype=torch.int64)
+        dist.all_reduce(
+            decision, op=dist.ReduceOp.MIN, group=self._weights_update_group_gloo
+        )
+        use_delta = bool(decision.item())
+        params = self.get_local_shard_parameters()
+        log_tensor_digest(
+            params.items(),
+            role="infer",
+            phase="pre_apply",
+            version=version,
+            extra={
+                "transfer_path": "separation_delta" if use_delta else "separation_full",
+                "transfer_rank": self._transfer_rank,
+                "payload_manifest": "receiver_params",
+            },
+        )
+
+        if use_delta:
+            self._execute_separation_delta_recv(params, version)
+        else:
+            recv_ops, non_contiguous_pairs, _ = nccl_build_recv_ops(
+                params,
+                self._transfer_plan,
+                self._weights_update_group,
+            )
+            batch_send_recv(
+                send_ops=[],
+                recv_ops=recv_ops,
+                blocking=True,
+                use_group=awex_wu_use_group(),
+            )
+            for original, contiguous in non_contiguous_pairs:
+                original.copy_(contiguous)
+
+        log_tensor_digest(
+            params.items(),
+            role="infer",
+            phase="post_apply",
+            version=version,
+            extra={
+                "transfer_path": "separation_delta" if use_delta else "separation_full",
+                "transfer_rank": self._transfer_rank,
+                "payload_manifest": "receiver_params",
+            },
+        )
+        dist.barrier(group=self._weights_update_group_gloo)
+        if separation_post_apply_verify_enabled():
+            verify_separation_post_apply(
+                params,
+                self._transfer_plan,
+                self._weights_update_group_gloo,
+                role="infer",
+                version=version,
+                mode="delta" if use_delta else "full",
+            )
+
+    def _execute_separation_delta_recv(
+        self,
+        recv_params: dict[str, torch.Tensor],
+        version: int,
+    ) -> None:
+        """Apply sparse parameter shards through DTE's two-round P2P protocol."""
+        from dte.core.colocate_protocol import (
+            _filter_plan_by_dtype,
+            _ops_by_recv_dtype,
+            _PlanView,
+            two_round_delta_exchange,
+        )
+
+        if self._transfer_plan is None:
+            raise RuntimeError("Transfer plan is not initialized")
+        if self._weights_update_group is None:
+            raise RuntimeError("Weight update group is not initialized")
+        if self._transfer_rank is None or self._world_size is None:
+            raise RuntimeError("Transfer rank/world size is not initialized")
+
+        operations = [
+            op for ops in self._transfer_plan.operations.values() for op in ops
+        ]
+        operations_by_dtype = _ops_by_recv_dtype(operations)
+        identity_mapping = {rank: rank for rank in range(self._world_size)}
+        empty_plan = _PlanView({})
+        device = torch.device(f"cuda:{torch.cuda.current_device()}")
+
+        if self._separation_delta_transport is None:
+            self._separation_delta_transport = NcclColocateStreamBatchTransport(
+                self._transfer_rank, self._world_size
+            )
+        schedule_fn = (
+            self._separation_delta_transport.execute_recursive_partition_stream_transfer
+        )
+
+        operation_count = 0
+        for dtype, ops in operations_by_dtype.items():
+            recv_plan = _filter_plan_by_dtype(self._transfer_plan, dtype, is_send=False)
+            two_round_delta_exchange(
+                transfer_rank=self._transfer_rank,
+                world_size=self._world_size,
+                send_plan=empty_plan,
+                recv_plan=recv_plan,
+                train_to_infer_device_mapping=identity_mapping,
+                weights_update_group=self._weights_update_group,
+                send_payloads_by_op={},
+                recv_params=recv_params,
+                value_dtype=dtype,
+                device=device,
+                schedule_fn=schedule_fn,
+                slice_fn=slice_tensor,
+                rank_coordinate=f"infer-{self._transfer_rank}",
+                step_id=version,
+            )
+            operation_count += len(ops)
+
+        logger.info(
+            "separation delta v%d received %d ops across %d dtypes",
+            version,
+            operation_count,
+            len(operations_by_dtype),
+        )
 
     def batch_isend_irecv(self, **kwargs) -> None:
         setup_kwargs = {k: v for k, v in kwargs.items() if k != "world_size"}
@@ -551,15 +747,21 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
             self._weights_update_group,
             self._transfer_rank,
             kwargs.get("world_size", 0),
+            barrier_group=self._weights_update_group_gloo,
             **setup_kwargs,
         )
 
     def teardown_weight_update_group(self) -> None:
         if self._weights_update_group is not None and dist.is_initialized():
             dist.destroy_process_group(self._weights_update_group)
+        if self._weights_update_group_gloo is not None and dist.is_initialized():
+            dist.destroy_process_group(self._weights_update_group_gloo)
         self._weights_update_group = None
+        self._weights_update_group_gloo = None
         self._transfer_plan = None
         self._transfer_rank = None
+        self._world_size = None
+        self._separation_delta_transport = None
         self._rank_info = None
         self._parameters = None
         self._reader = None

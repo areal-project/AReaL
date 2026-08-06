@@ -136,7 +136,12 @@ def init_weights_update_group(
 
 
 def setup_batch_isend_irecv(
-    process_group, rank, world_size, tensor_size=10 * 10, dtype=torch.float32
+    process_group,
+    rank,
+    world_size,
+    tensor_size=10 * 10,
+    dtype=torch.float32,
+    barrier_group=None,
 ):
     """
     Perform a simple communication using batch_isend_irecv to avoid the hang for later sub-ranks.
@@ -201,7 +206,12 @@ def setup_batch_isend_irecv(
 
     # Synchronize
     current_platform.synchronize()
-    dist.barrier(group=process_group, device_ids=[current_platform.current_device()])
+    if barrier_group is None:
+        dist.barrier(
+            group=process_group, device_ids=[current_platform.current_device()]
+        )
+    else:
+        dist.barrier(group=barrier_group)
 
     logger.info(
         f"Simple communication completed for process group of size {world_size}"

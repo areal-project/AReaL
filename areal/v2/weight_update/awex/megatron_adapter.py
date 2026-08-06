@@ -15,18 +15,34 @@ from awex.meta.weight_meta import (
 from awex.sharding.param_sharding import ShardingType
 from awex.sharding.rank_info import RankInfo
 from awex.transfer.nccl_comm import batch_send_recv, nccl_build_send_ops
-from awex.transfer.transfer_plan import TransferPlan, TransferPlanBuilder
+from awex.transfer.nccl_stream_batch import NcclColocateStreamBatchTransport
+from awex.transfer.transfer_plan import TransferPlan, TransferPlanBuilder, slice_tensor
 from awex.util.tensor_util import (
     cuda_ipc_serialize,
     group_tensors_by_shape_and_dtype,
 )
 
 from areal.utils import logging
+from areal.utils.dte import dte_verification_snapshot_commit_action
 from areal.v2.weight_update.awex import (
     awex_wu_use_group,
     fetch_kv_metadata,
     resolve_physical_gpu_id,
 )
+from areal.v2.weight_update.awex.delta_config import (
+    delta_transfer_enabled,
+    make_delta_tracker,
+    separation_delta_transfer_enabled,
+)
+from areal.v2.weight_update.awex.delta_detect import (
+    build_detector,
+    delta_detector_mode,
+)
+from areal.v2.weight_update.awex.separation_verify import (
+    separation_post_apply_verify_enabled,
+    verify_separation_post_apply,
+)
+from areal.v2.weight_update.awex.weight_digest import log_tensor_digest
 from areal.v2.weight_update.nccl_group import (
     init_weights_update_group,
     setup_batch_isend_irecv,
@@ -75,6 +91,9 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
         engine._awex_adapter = self
         self._transfer_plan: TransferPlan | None = None
         self._weights_update_group = None
+        self._weights_update_group_gloo = None
+        self._world_size: int | None = None
+        self._separation_delta_transport: NcclColocateStreamBatchTransport | None = None
         self._transfer_rank: int | None = None
         self._offloaded_weights: dict[str, torch.Tensor] = {}
         self._released_tags: set[str] = set()
@@ -90,6 +109,8 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
         self._logical_train_rank: int | None = None
         self._weight_metadata_cache: list[ParameterMeta] | None = None
         self._timeout_s = awex_colocate_timeout_s()
+        self._delta_tracker = None
+        self._delta_detector = None
 
     @property
     def parallelism_strategy(self) -> dict:
@@ -187,6 +208,7 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
         num_engines: int,
     ) -> None:
         self._transfer_rank = transfer_rank
+        self._world_size = world_size
 
         infer_meta, train_meta = fetch_kv_metadata(kv_store_url, pair_name)
 
@@ -208,17 +230,47 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
             group_name=f"awex_{pair_name}",
             role="training",
         )
+        self._weights_update_group_gloo = init_weights_update_group(
+            master_address=master_addr,
+            master_port=master_port,
+            rank=transfer_rank,
+            world_size=world_size,
+            group_name=f"awex_{pair_name}_gloo",
+            backend="gloo",
+            role="training",
+        )
 
     def execute_weight_update(self, version: int) -> None:
-        del version
+        if separation_delta_transfer_enabled():
+            self._release_grad_buffers_for_separation_sync()
+            try:
+                self._execute_separation_weight_update(version)
+            finally:
+                self._restore_grad_buffers_after_separation_sync()
+            return
+
         if self._transfer_plan is None:
             raise RuntimeError("Transfer plan is not initialized")
         if self._weights_update_group is None:
             raise RuntimeError("Weight update group is not initialized")
+        if self._weights_update_group_gloo is None:
+            raise RuntimeError("Weight update control group is not initialized")
         if self._transfer_rank is None:
             raise RuntimeError("Transfer rank is not initialized")
 
         params = self.get_local_shard_parameters()
+        log_tensor_digest(
+            params.items(),
+            role="train",
+            phase="pre_send",
+            version=version,
+            extra={
+                "transfer_path": "separation_full",
+                "transfer_rank": self._transfer_rank,
+                "transfer_world_size": self._world_size,
+                "payload_manifest": "source_params",
+            },
+        )
         send_ops, _, _ = nccl_build_send_ops(
             params,
             self._transfer_plan,
@@ -231,7 +283,252 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
             blocking=True,
             use_group=awex_wu_use_group(),
         )
-        dist.barrier(group=self._weights_update_group)
+        dist.barrier(group=self._weights_update_group_gloo)
+        if separation_post_apply_verify_enabled():
+            verify_separation_post_apply(
+                params,
+                self._transfer_plan,
+                self._weights_update_group_gloo,
+                role="train",
+                version=version,
+                mode="full",
+            )
+
+    def _release_grad_buffers_for_separation_sync(self) -> None:
+        """Temporarily release Megatron DDP grad buffers during transfer."""
+        model = getattr(self._engine, "model", None)
+        if model is None:
+            return
+        modules = model if isinstance(model, (list, tuple)) else [model]
+        for module in modules:
+            release = getattr(module, "offload_grad_buffers", None)
+            if release is not None:
+                release(synchronize=False, empty_cache=False)
+
+    def _restore_grad_buffers_after_separation_sync(self) -> None:
+        """Restore Megatron DDP grad buffers even when transfer fails."""
+        model = getattr(self._engine, "model", None)
+        if model is None:
+            return
+        modules = model if isinstance(model, (list, tuple)) else [model]
+        for module in modules:
+            restore = getattr(module, "restore_grad_buffers", None)
+            if restore is not None:
+                restore(synchronize=False)
+
+    def _execute_separation_weight_update(self, version: int) -> None:
+        """Send a sparse separated-card update, with dense fallback."""
+        if self._transfer_plan is None:
+            raise RuntimeError("Transfer plan is not initialized")
+        if self._weights_update_group is None:
+            raise RuntimeError("Weight update group is not initialized")
+        if self._weights_update_group_gloo is None:
+            raise RuntimeError("Separation control group is not initialized")
+        if self._transfer_rank is None or self._world_size is None:
+            raise RuntimeError("Transfer rank/world size is not initialized")
+
+        params = self.get_local_shard_parameters()
+        log_tensor_digest(
+            params.items(),
+            role="train",
+            phase="pre_send",
+            version=version,
+            extra={
+                "transfer_path": "separation_delta_or_full",
+                "transfer_rank": self._transfer_rank,
+                "transfer_world_size": self._world_size,
+                "payload_manifest": "source_params",
+            },
+        )
+        self._ensure_delta_components()
+        synced_state = self._delta_capture_synced_state(params)
+        masks: dict[str, torch.Tensor] | None = None
+        prepare_failed = False
+        try:
+            masks, local_is_delta = self._delta_prepare_masks_for_separation(
+                params, version
+            )
+        except Exception:
+            logger.exception(
+                "separation delta v%d: mask preparation failed; using dense",
+                version,
+            )
+            local_is_delta = False
+            prepare_failed = True
+
+        decision = torch.tensor([int(local_is_delta)], dtype=torch.int64)
+        dist.all_reduce(
+            decision, op=dist.ReduceOp.MIN, group=self._weights_update_group_gloo
+        )
+        use_delta = bool(decision.item()) and masks is not None
+
+        if use_delta:
+            self._execute_separation_delta_send(params, masks, version)
+        else:
+            send_ops, _, _ = nccl_build_send_ops(
+                params,
+                self._transfer_plan,
+                self._weights_update_group,
+                copy_rank=self._transfer_rank,
+            )
+            batch_send_recv(
+                send_ops=send_ops,
+                recv_ops=[],
+                blocking=True,
+                use_group=awex_wu_use_group(),
+            )
+
+        dist.barrier(group=self._weights_update_group_gloo)
+        if separation_post_apply_verify_enabled():
+            verify_separation_post_apply(
+                params,
+                self._transfer_plan,
+                self._weights_update_group_gloo,
+                role="train",
+                version=version,
+                mode="delta" if use_delta else "full",
+            )
+        if use_delta:
+            self._delta_tracker.mark_delta_committed(version)
+        self._delta_commit_separation_verification_snapshot(
+            params,
+            masks,
+            version,
+            prepare_failed=prepare_failed,
+            use_delta=use_delta,
+        )
+        self._delta_mark_synced(version, synced_state)
+
+    def _delta_prepare_masks_for_separation(
+        self,
+        params: dict[str, torch.Tensor],
+        version: int,
+    ) -> tuple[dict[str, torch.Tensor] | None, bool]:
+        """Choose sparse separation only when a detector provides safe masks."""
+        self._ensure_delta_components()
+        detector_name = self._delta_detector.name
+        external_detector = detector_name != "snapshot"
+        verify_snapshot = self._delta_verify_snapshot_enabled()
+        names = list(params)
+        tensors = list(params.values())
+        params_list = list(params.items())
+
+        reason = self._delta_tracker.full_sync_reason(version)
+        if external_detector and reason is None:
+            has_watermark = getattr(
+                self._delta_detector, "has_synced_watermark", lambda: False
+            )
+            if not has_watermark():
+                reason = "initial_full"
+
+        reason = self._delta_sync_full_reason(reason, version)
+        masks = None
+        if external_detector and reason is None:
+            masks = self._delta_detector.compute_masks(names, tensors, version)
+            if masks is None:
+                reason = f"{detector_name}_infeasible"
+            elif verify_snapshot and not self._delta_verify_masks_against_snapshot(
+                params_list, masks, version
+            ):
+                reason = f"{detector_name}_snapshot_mismatch"
+        elif not external_detector and reason is None:
+            masks, reason = self._delta_snapshot_masks_for_separation(
+                params_list, version
+            )
+            if masks is not None and verify_snapshot:
+                if not self._delta_verify_masks_against_snapshot(
+                    params_list, masks, version
+                ):
+                    reason = f"{detector_name}_snapshot_mismatch"
+
+        reason = self._delta_sync_full_reason(reason, version)
+        if reason is not None:
+            self._delta_tracker.seed(
+                params_list,
+                version,
+                store_snapshot=(not external_detector or verify_snapshot),
+            )
+            if verify_snapshot:
+                self._delta_mark_snapshot_names(params_list)
+            logger.info(
+                "separation delta v%d: FULL sync fallback (%s)", version, reason
+            )
+            return None, False
+
+        logger.info(
+            "separation delta v%d: sparse path (%s detector, %d params)",
+            version,
+            detector_name,
+            len(params),
+        )
+        return masks, True
+
+    def _execute_separation_delta_send(
+        self,
+        params: dict[str, torch.Tensor],
+        masks: dict[str, torch.Tensor],
+        version: int,
+    ) -> None:
+        """Send sparse parameter shards through DTE's two-round P2P protocol."""
+        from dte.core.colocate_protocol import (
+            _filter_plan_by_dtype,
+            _ops_by_recv_dtype,
+            _PlanView,
+            two_round_delta_exchange,
+        )
+        from dte.core.delta_p2p import build_send_payloads_by_op
+
+        if self._transfer_plan is None:
+            raise RuntimeError("Transfer plan is not initialized")
+        if self._weights_update_group is None:
+            raise RuntimeError("Weight update group is not initialized")
+        if self._transfer_rank is None or self._world_size is None:
+            raise RuntimeError("Transfer rank/world size is not initialized")
+
+        operations = [
+            op for ops in self._transfer_plan.operations.values() for op in ops
+        ]
+        operations_by_dtype = _ops_by_recv_dtype(operations)
+        identity_mapping = {rank: rank for rank in range(self._world_size)}
+        empty_plan = _PlanView({})
+        device = torch.device(f"cuda:{torch.cuda.current_device()}")
+
+        if self._separation_delta_transport is None:
+            self._separation_delta_transport = NcclColocateStreamBatchTransport(
+                self._transfer_rank, self._world_size
+            )
+        schedule_fn = (
+            self._separation_delta_transport.execute_recursive_partition_stream_transfer
+        )
+
+        payload_count = 0
+        for dtype, ops in operations_by_dtype.items():
+            payloads = build_send_payloads_by_op(ops, masks, params)
+            send_plan = _filter_plan_by_dtype(self._transfer_plan, dtype, is_send=True)
+            two_round_delta_exchange(
+                transfer_rank=self._transfer_rank,
+                world_size=self._world_size,
+                send_plan=send_plan,
+                recv_plan=empty_plan,
+                train_to_infer_device_mapping=identity_mapping,
+                weights_update_group=self._weights_update_group,
+                send_payloads_by_op=payloads,
+                recv_params={},
+                value_dtype=dtype,
+                device=device,
+                schedule_fn=schedule_fn,
+                slice_fn=slice_tensor,
+                rank_coordinate=f"train-{self._transfer_rank}",
+                step_id=version,
+            )
+            payload_count += len(payloads)
+
+        logger.info(
+            "separation delta v%d sent %d payload ops across %d dtypes",
+            version,
+            payload_count,
+            len(operations_by_dtype),
+        )
 
     def batch_isend_irecv(self, **kwargs) -> None:
         setup_kwargs = {k: v for k, v in kwargs.items() if k != "world_size"}
@@ -239,15 +536,21 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
             self._weights_update_group,
             self._transfer_rank,
             kwargs.get("world_size", 0),
+            barrier_group=self._weights_update_group_gloo,
             **setup_kwargs,
         )
 
     def teardown_weight_update_group(self) -> None:
         if self._weights_update_group is not None and dist.is_initialized():
             dist.destroy_process_group(self._weights_update_group)
+        if self._weights_update_group_gloo is not None and dist.is_initialized():
+            dist.destroy_process_group(self._weights_update_group_gloo)
         self._weights_update_group = None
+        self._weights_update_group_gloo = None
         self._transfer_plan = None
         self._transfer_rank = None
+        self._world_size = None
+        self._separation_delta_transport = None
 
     def _build_rank_info(self) -> RankInfo:
         from megatron.core import parallel_state as mpu
@@ -288,13 +591,21 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
             cp_mode="ring" if cp_size > 1 else "none",
         )
 
-    def _iter_hf_params(self):
+    def _iter_hf_params(
+        self,
+        theta_by_id: dict[int, torch.Tensor] | None = None,
+        consume_overrides: bool = False,
+    ):
         """Yield (hf_name, tensor) for every parameter on this rank.
 
         Uses get_named_parameters + all_gather_param + convert_to_hf to produce
         HF-style per-expert names (e.g. experts.0.gate_proj.weight). The SGLang
         adapter's _unfuse_params converts SGLang's fused w13/w2 format to the
         same per-expert names, so both sides match for the transfer plan.
+
+        ``theta_by_id`` maps ``id(model_param)`` to a replacement tensor. The
+        AdamW inversion detector uses it to convert reconstructed pre-step
+        mcore weights through the exact live all-gather + HF conversion path.
         """
         from areal.engine.megatron_utils.megatron import (
             all_gather_param,
@@ -307,13 +618,23 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
         tie_word_embeddings = getattr(
             self._engine.hf_config, "tie_word_embeddings", False
         )
+        overrides = theta_by_id if theta_by_id is not None else {}
 
         for mcore_name, param in get_named_parameters(
             self._engine.model, num_moe_experts
         ):
+            src = overrides.get(id(param), param)
+            if src is not param:
+                for attr in (
+                    "tensor_model_parallel",
+                    "partition_dim",
+                    "partition_stride",
+                ):
+                    if hasattr(param, attr):
+                        setattr(src, attr, getattr(param, attr))
             gathered = all_gather_param(
                 mcore_name,
-                param,
+                src,
                 fp8_direct_convert=False,
                 quantization_config=None,
                 duplicated_param_names=self._engine._duplicated_param_names,
@@ -330,6 +651,34 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
                 if tie_word_embeddings and hf_name == "lm_head.weight":
                     continue
                 yield hf_name, tensor.detach()
+            if consume_overrides:
+                overrides.pop(id(param), None)
+
+    def _iter_model_params_for_delta(self):
+        """Yield model tensors in the same order used by the payload converter."""
+        from areal.engine.megatron_utils.megatron import get_named_parameters
+
+        num_moe_experts = getattr(self._engine.tf_config, "num_moe_experts", None)
+        seen: set[int] = set()
+        for _mcore_name, param in get_named_parameters(
+            self._engine.model, num_moe_experts
+        ):
+            pid = id(param)
+            if pid in seen:
+                continue
+            seen.add(pid)
+            yield param
+
+    def _convert_hf_with_overrides(
+        self, theta_by_id: dict[int, torch.Tensor]
+    ) -> dict[str, torch.Tensor]:
+        """Convert mcore params to HF with reconstructed pre-step overrides."""
+        return dict(self._iter_hf_params(theta_by_id))
+
+    @torch.no_grad()
+    def _iter_hf_with_overrides(self, theta_by_id: dict[int, torch.Tensor]):
+        """Yield HF params with reconstructed overrides without materializing all."""
+        yield from self._iter_hf_params(theta_by_id, consume_overrides=True)
 
     # ── Colocated weight transfer methods ─────────────────────────────────
 
@@ -610,6 +959,426 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
                 "all_training_offloaded_weights",
             ):
                 self._meta_server_client.delete_if_exists(key)
+
+    def _ensure_delta_components(self) -> None:
+        if self._delta_tracker is None:
+            self._delta_tracker = make_delta_tracker()
+        if self._delta_detector is None:
+            self._delta_detector = build_detector(delta_detector_mode(), self)
+
+    def seed_delta_base(self, version: int = 0) -> None:
+        """Skip virtual delta seeding; the first real update is the full base."""
+        if not delta_transfer_enabled():
+            logger.info("seed_delta_base skipped: delta transfer disabled")
+            return
+        logger.info(
+            "seed_delta_base skipped for DTE delta transfer at v%d; "
+            "the first real payload will be a full sync base",
+            version,
+        )
+
+    def _delta_capture_synced_state(
+        self, payload_params: dict[str, torch.Tensor] | None = None
+    ):
+        """Capture detector watermarks after a payload-compatible state."""
+        if not delta_transfer_enabled() or self._delta_detector is None:
+            return None
+        capture = getattr(self._delta_detector, "capture_synced_state", None)
+        if capture is None:
+            return None
+        return capture(payload_params)
+
+    def _delta_mark_synced(self, version: int, captured_state=None) -> None:
+        """Let an external delta detector record post-sync watermarks."""
+        if not delta_transfer_enabled() or self._delta_detector is None:
+            return
+        mark_synced = getattr(self._delta_detector, "mark_synced", None)
+        if mark_synced is not None:
+            mark_synced(version, captured_state)
+
+    def _delta_sync_full_reason(self, reason: str | None, version: int) -> str | None:
+        """Promote rank-local full-sync decisions to all training ranks."""
+        if not dist.is_available() or not dist.is_initialized():
+            return reason
+        try:
+            world_size = dist.get_world_size()
+        except RuntimeError:
+            return reason
+        if world_size <= 1:
+            return reason
+
+        device = (
+            torch.device("cuda", torch.cuda.current_device())
+            if torch.cuda.is_available()
+            else torch.device("cpu")
+        )
+        needs_full = torch.tensor(
+            [1 if reason is not None else 0], dtype=torch.int32, device=device
+        )
+        dist.all_reduce(needs_full, op=dist.ReduceOp.MAX)
+        if int(needs_full.item()) == 0:
+            return None
+        if reason is not None:
+            return reason
+
+        logger.warning(
+            "separation delta v%d: FULL sync (global_full_sync from peer rank)",
+            version,
+        )
+        return "global_full_sync"
+
+    @staticmethod
+    def _delta_verify_snapshot_enabled() -> bool:
+        env = os.environ.get("DTE_DELTA_VERIFY_SNAPSHOT")
+        if env is None or env.strip() == "":
+            env = os.environ.get("AWEX_DELTA_VERIFY_SNAPSHOT", "")
+        return env.strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+
+    def _delta_mark_snapshot_names(
+        self, params_list: list[tuple[str, torch.Tensor]]
+    ) -> None:
+        names = getattr(self._delta_tracker, "_snapshot_names", None)
+        if names is not None:
+            names.update(name for name, _ in params_list)
+
+    @torch.no_grad()
+    def _delta_snapshot_masks_for_separation(
+        self,
+        params_list: list[tuple[str, torch.Tensor]],
+        version: int,
+    ) -> tuple[dict[str, torch.Tensor] | None, str | None]:
+        """Build sparse-index masks by comparing current params to snapshot."""
+        from dte.core import bitwise_changed_mask
+
+        snapshot = getattr(self._delta_tracker, "_snapshot", None)
+        if not snapshot:
+            return None, "snapshot_baseline_missing"
+
+        masks: dict[str, torch.Tensor] = {}
+        total = 0
+        changed_total = 0
+        for name, current in params_list:
+            cur = current.detach().contiguous()
+            baseline = snapshot.get(name)
+            if (
+                baseline is None
+                or baseline.dtype != cur.dtype
+                or baseline.shape != cur.shape
+            ):
+                return None, f"snapshot_baseline_mismatch:{name}"
+
+            mask = bitwise_changed_mask(
+                cur, baseline.to(cur.device, non_blocking=False)
+            ).reshape(-1)
+            indices = mask.nonzero(as_tuple=False).squeeze(1).to(torch.int32)
+            masks[name] = indices
+            total += cur.numel()
+            changed_total += int(indices.numel())
+
+        logger.info(
+            "separation delta v%d: snapshot masks changed %d/%d values",
+            version,
+            changed_total,
+            total,
+        )
+        return masks, None
+
+    @torch.no_grad()
+    def _delta_apply_snapshot_mask_updates(
+        self,
+        params: dict[str, torch.Tensor],
+        masks: dict[str, torch.Tensor],
+        version: int,
+        *,
+        log_label: str,
+    ) -> None:
+        """Advance a tracker snapshot after a committed separation update."""
+        snapshot = getattr(self._delta_tracker, "_snapshot", None)
+        names = getattr(self._delta_tracker, "_snapshot_names", None)
+        if snapshot is None or names is None:
+            raise RuntimeError("Snapshot storage is unavailable")
+
+        updated_values = 0
+        for name, current in params.items():
+            baseline = snapshot.get(name)
+            mask = masks.get(name)
+            numel = current.numel()
+            if (
+                baseline is None
+                or baseline.dtype != current.dtype
+                or baseline.numel() != numel
+                or mask is None
+            ):
+                raise RuntimeError(f"Verification snapshot mismatch for {name}")
+
+            if mask.dtype == torch.bool:
+                if mask.numel() != numel:
+                    raise RuntimeError(f"Verification mask size mismatch for {name}")
+                indices = (
+                    mask.to(current.device, non_blocking=False)
+                    .reshape(-1)
+                    .nonzero(as_tuple=False)
+                    .squeeze(1)
+                )
+            elif mask.dtype in {torch.int32, torch.int64}:
+                indices = mask.to(
+                    current.device, dtype=torch.long, non_blocking=False
+                ).reshape(-1)
+                if indices.numel() > numel or (
+                    indices.numel()
+                    and bool(((indices < 0) | (indices >= numel)).any().item())
+                ):
+                    raise RuntimeError(
+                        f"Verification mask index out of range for {name}"
+                    )
+            else:
+                raise RuntimeError(
+                    f"Unsupported verification mask dtype for {name}: {mask.dtype}"
+                )
+
+            names.add(name)
+            if indices.numel() == 0:
+                continue
+            flat_current = current.detach().contiguous().reshape(-1)
+            cpu_indices = indices.to("cpu")
+            baseline.reshape(-1)[cpu_indices] = flat_current[indices].to(
+                "cpu", non_blocking=False
+            )
+            updated_values += indices.numel()
+
+        logger.info(
+            "separation delta v%d %s committed: %d values",
+            version,
+            log_label,
+            updated_values,
+        )
+
+    @torch.no_grad()
+    def _delta_apply_separation_verification_updates(
+        self,
+        params: dict[str, torch.Tensor],
+        masks: dict[str, torch.Tensor],
+        version: int,
+    ) -> None:
+        """Advance the debug snapshot after a committed separation update."""
+        self._delta_apply_snapshot_mask_updates(
+            params,
+            masks,
+            version,
+            log_label="verification snapshot",
+        )
+
+    def _delta_commit_separation_verification_snapshot(
+        self,
+        params: dict[str, torch.Tensor],
+        masks: dict[str, torch.Tensor] | None,
+        version: int,
+        *,
+        prepare_failed: bool,
+        use_delta: bool = False,
+    ) -> None:
+        """Commit verification state only after transfer completion."""
+        detector = getattr(self, "_delta_detector", None)
+        detector_name = getattr(detector, "name", None)
+        if detector_name == "snapshot":
+            if use_delta:
+                if masks is None:
+                    raise RuntimeError(
+                        "Snapshot delta committed without separation masks"
+                    )
+                self._delta_apply_snapshot_mask_updates(
+                    params,
+                    masks,
+                    version,
+                    log_label="snapshot baseline",
+                )
+            return
+
+        action = dte_verification_snapshot_commit_action(
+            detector_name,
+            self._delta_verify_snapshot_enabled(),
+            has_masks=masks is not None,
+            prepare_failed=prepare_failed,
+        )
+        if action == "apply_masks":
+            assert masks is not None
+            self._delta_apply_separation_verification_updates(params, masks, version)
+        elif action == "refresh":
+            logger.warning(
+                "separation delta v%d: refreshing verification snapshot after "
+                "mask preparation failure",
+                version,
+            )
+            self._delta_refresh_verification_snapshot(list(params.items()))
+
+    @torch.no_grad()
+    def _delta_refresh_verification_snapshot(
+        self, params_list: list[tuple[str, torch.Tensor]]
+    ) -> None:
+        """Refresh the debug snapshot without resetting delta version counters."""
+        snapshot = getattr(self._delta_tracker, "_snapshot", None)
+        names = getattr(self._delta_tracker, "_snapshot_names", None)
+        if snapshot is None or names is None:
+            return
+
+        snapshot.clear()
+        names.clear()
+        by_storage: dict[tuple[int, int], torch.Tensor] = {}
+        pin = torch.cuda.is_available()
+        for name, param in params_list:
+            data = param.detach().contiguous()
+            key = (data.data_ptr(), data.numel())
+            cpu_tensor = by_storage.get(key)
+            if cpu_tensor is None:
+                cpu_tensor = data.cpu().clone()
+                if pin:
+                    cpu_tensor = cpu_tensor.pin_memory()
+                by_storage[key] = cpu_tensor
+            snapshot[name] = cpu_tensor
+            names.add(name)
+
+    @torch.no_grad()
+    def _delta_verify_masks_against_snapshot(
+        self,
+        params_list: list[tuple[str, torch.Tensor]],
+        masks: dict[str, torch.Tensor],
+        version: int,
+    ) -> bool:
+        """Compare external detector masks against a resident snapshot baseline."""
+        from dte.core import bitwise_changed_mask
+
+        snapshot = getattr(self._delta_tracker, "_snapshot", None)
+        if not snapshot:
+            logger.error(
+                "separation delta v%d verify snapshot-vs-%s FAILED: "
+                "snapshot baseline is missing",
+                version,
+                self._delta_detector.name,
+            )
+            return False
+
+        total = 0
+        snapshot_changed = 0
+        detector_changed = 0
+        false_negative = 0
+        false_positive = 0
+        unverifiable = 0
+        fn_examples: list[str] = []
+        fp_examples: list[str] = []
+        bad_examples: list[str] = []
+
+        for name, cur in params_list:
+            cur = cur.detach().contiguous()
+            numel = cur.numel()
+            total += numel
+            snap = snapshot.get(name)
+            det_mask = masks.get(name)
+            bad_mask = snap is None or snap.dtype != cur.dtype or snap.numel() != numel
+            det_indices = None
+            if det_mask is not None and not bad_mask:
+                if det_mask.dtype == torch.bool:
+                    bad_mask = det_mask.numel() != numel
+                elif det_mask.dtype in {torch.int32, torch.int64}:
+                    det_indices = det_mask.to(cur.device).reshape(-1).long()
+                    if det_indices.numel() > 0:
+                        bad_mask = bool(
+                            det_indices.min().item() < 0
+                            or det_indices.max().item() >= numel
+                        )
+                else:
+                    bad_mask = True
+
+            if bad_mask:
+                unverifiable += 1
+                if len(bad_examples) < 5:
+                    bad_examples.append(f"{name}:missing_or_bad_mask")
+                continue
+
+            snap_mask = bitwise_changed_mask(
+                cur, snap.to(cur.device, non_blocking=False)
+            ).reshape(-1)
+            if det_mask is None:
+                det_count = numel
+                fn_count = 0
+                fp_count = numel - int(snap_mask.sum().item())
+            elif det_indices is None:
+                det_mask = (
+                    det_mask.to(cur.device, non_blocking=False).reshape(-1).bool()
+                )
+                det_count = int(det_mask.sum().item())
+                fn_count = int((snap_mask & ~det_mask).sum().item())
+                fp_count = int((det_mask & ~snap_mask).sum().item())
+            else:
+                det_mask = torch.zeros(numel, dtype=torch.bool, device=cur.device)
+                if det_indices.numel() > 0:
+                    det_mask[det_indices] = True
+                det_count = int(det_mask.sum().item())
+                fn_count = int((snap_mask & ~det_mask).sum().item())
+                fp_count = int((det_mask & ~snap_mask).sum().item())
+
+            snap_count = int(snap_mask.sum().item())
+            snapshot_changed += snap_count
+            detector_changed += det_count
+            false_negative += fn_count
+            false_positive += fp_count
+            if fn_count and len(fn_examples) < 5:
+                fn_examples.append(
+                    f"{name}:snapshot={snap_count},detector={det_count},"
+                    f"fn={fn_count},fp={fp_count}"
+                )
+            elif fp_count and len(fp_examples) < 5:
+                fp_examples.append(
+                    f"{name}:snapshot={snap_count},detector={det_count},"
+                    f"fn={fn_count},fp={fp_count}"
+                )
+
+        examples = (fn_examples + bad_examples + fp_examples)[:5]
+        if false_negative or unverifiable:
+            logger.error(
+                "separation delta v%d verify snapshot-vs-%s MISMATCH: "
+                "snapshot_changed=%d detector_changed=%d total=%d "
+                "false_negative=%d false_positive=%d unverifiable_params=%d "
+                "examples=%s",
+                version,
+                self._delta_detector.name,
+                snapshot_changed,
+                detector_changed,
+                total,
+                false_negative,
+                false_positive,
+                unverifiable,
+                examples,
+            )
+            return False
+
+        if false_positive:
+            logger.warning(
+                "separation delta v%d verify snapshot-vs-%s OK conservative: "
+                "snapshot_changed=%d detector_changed=%d total=%d "
+                "false_positive=%d examples=%s",
+                version,
+                self._delta_detector.name,
+                snapshot_changed,
+                detector_changed,
+                total,
+                false_positive,
+                examples,
+            )
+            return True
+
+        logger.info(
+            "separation delta v%d verify snapshot-vs-%s OK: changed=%d/%d",
+            version,
+            self._delta_detector.name,
+            detector_changed,
+            total,
+        )
+        return True
 
     def release_memory(self, tags: list[str] | None = None) -> None:
         tags = tags or ["optimizer", "weights"]
