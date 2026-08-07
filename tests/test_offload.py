@@ -5,6 +5,7 @@ import os
 import time
 import traceback
 from contextlib import contextmanager
+from queue import Empty
 
 import pytest
 import torch.distributed as dist
@@ -14,7 +15,7 @@ from tests.utils import get_model_path
 from areal.api import FinetuneSpec
 from areal.api.alloc_mode import ModelAllocation
 from areal.api.cli_args import MegatronEngineConfig, OptimizerConfig, TrainEngineConfig
-from areal.engine import FSDPEngine, MegatronEngine
+from areal.engine import FSDPEngine
 from areal.infra.platforms import current_platform
 from areal.utils.network import find_free_ports
 from areal.utils.offload import get_tms_env_vars
@@ -22,6 +23,8 @@ from areal.utils.offload import get_tms_env_vars
 MODEL_PATH = get_model_path(
     "/storage/openpsi/models/Qwen__Qwen3-0.6B/", "Qwen/Qwen3-0.6B"
 )
+_SUBPROCESS_TIMEOUT_SECONDS = 300
+_SUBPROCESS_TERMINATE_GRACE_SECONDS = 5
 
 
 def _create_engine(engine_type: str):
@@ -41,6 +44,7 @@ def _create_engine(engine_type: str):
         experiment_name="test_offload",
         trial_name=f"{engine_type}_tms",
         path=MODEL_PATH,
+        attn_impl="sdpa",
         optimizer=OptimizerConfig(),
         megatron=MegatronEngineConfig(),
     )
@@ -51,6 +55,8 @@ def _create_engine(engine_type: str):
     if engine_type == "FSDP":
         engine = FSDPEngine(config)
     elif engine_type == "Megatron":
+        from areal.engine import MegatronEngine
+
         engine = MegatronEngine(config)
     else:
         raise ValueError(f"Unknown engine type: {engine_type}")
@@ -83,12 +89,16 @@ def _run_test(
                 memory_tolerance=memory_tolerance,
                 warmup_rounds=warmup_rounds,
             )
-            if output_queue:
-                output_queue.put(True)
         finally:
             engine.destroy()
             if dist.is_initialized():
                 dist.destroy_process_group()
+
+        # Report success only after teardown completed.  TMS failures can exit
+        # the subprocess from engine.destroy(), so publishing earlier masks the
+        # exact lifecycle regression this test is intended to catch.
+        if output_queue:
+            output_queue.put(True)
 
     except Exception as e:
         print(f"[Subprocess] Error: {e}")
@@ -106,33 +116,74 @@ def _run_test(
 @contextmanager
 def _tms_env_context():
     tms_env = get_tms_env_vars()
-    os.environ.update(tms_env)
-    yield
+    previous = {key: os.environ.get(key) for key in tms_env}
+    try:
+        os.environ.update(tms_env)
+        yield
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
 
 def _run_in_subprocess(target, kwargs):
     """Run function in a subprocess with TMS environment configured."""
     ctx = multiprocessing.get_context("spawn")
     output_queue = ctx.Queue()
-    kwargs["output_queue"] = output_queue
+    process_kwargs = {**kwargs, "output_queue": output_queue}
+    p = ctx.Process(target=target, kwargs=process_kwargs)
 
-    # Set env vars in parent process before spawning
-    # Spawned process will inherit these variables
-    with _tms_env_context():
-        p = ctx.Process(target=target, kwargs=kwargs)
-        p.start()
-        p.join()
+    try:
+        # Set env vars in parent process before spawning. Spawned processes
+        # inherit them, while the context restores the pytest parent afterward.
+        with _tms_env_context():
+            p.start()
+            p.join(timeout=_SUBPROCESS_TIMEOUT_SECONDS)
 
-    # Check results
-    if not output_queue.empty():
-        success = output_queue.get()
-        if not success:
-            pytest.fail("Test failed in subprocess")
-    else:
+        if p.is_alive():
+            p.terminate()
+            p.join(timeout=_SUBPROCESS_TERMINATE_GRACE_SECONDS)
+            if p.is_alive():
+                p.kill()
+                p.join(timeout=_SUBPROCESS_TERMINATE_GRACE_SECONDS)
+            pytest.fail(
+                f"Subprocess timed out after {_SUBPROCESS_TIMEOUT_SECONDS} seconds"
+            )
+
         if p.exitcode != 0:
             pytest.fail(f"Subprocess crashed with exit code {p.exitcode}")
-        else:
+
+        try:
+            success = output_queue.get(timeout=1)
+        except Empty:
             pytest.fail("Subprocess finished but returned no result")
+        if not success:
+            pytest.fail("Test failed in subprocess")
+    finally:
+        output_queue.close()
+        output_queue.join_thread()
+
+
+def _run_offload_then_destroy(engine_type: str, output_queue=None):
+    """Leave an engine paused and verify its native teardown completes."""
+    try:
+        engine = _create_engine(engine_type)
+        try:
+            engine.offload()
+        finally:
+            engine.destroy()
+            if dist.is_initialized():
+                dist.destroy_process_group()
+
+        if output_queue:
+            output_queue.put(True)
+    except Exception:
+        traceback.print_exc()
+        if output_queue:
+            output_queue.put(False)
+        raise
 
 
 def get_gpu_memory_allocated_gb() -> float:
@@ -237,4 +288,13 @@ def test_engine_offload_and_onload(engine_type):
             "memory_tolerance": 0.1,
             "warmup_rounds": 3,
         },
+    )
+
+
+@pytest.mark.slow
+def test_fsdp_destroy_while_offloaded():
+    """Destroying a paused FSDP engine must not double-free TMS mappings."""
+    _run_in_subprocess(
+        target=_run_offload_then_destroy,
+        kwargs={"engine_type": "FSDP"},
     )

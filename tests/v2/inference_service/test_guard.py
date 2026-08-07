@@ -146,11 +146,13 @@ class TestFork:
         assert data["status"] == "success"
         assert data["host"] == "10.0.0.1"
         assert data["pid"] == 55
+        assert data["pgid"] == 55
         assert "port" not in data
 
         call_args = mock_run.call_args
         cmd = call_args[0][0]
         assert cmd == raw
+        assert call_args.kwargs["isolate_process_group"] is True
 
     @patch(f"{GUARD_APP}.run_with_streaming_logs")
     def test_fork_tracks_child(self, mock_run, client):
@@ -222,7 +224,7 @@ class TestForkErrorHandling:
 
 
 class TestKillForkedWorker:
-    @patch(f"{GUARD_APP}.kill_process_tree")
+    @patch(f"{GUARD_APP}.kill_process_group")
     def test_kill_known_worker(self, mock_kill, client):
         mock_proc = _make_mock_process(pid=123)
         guard_module._state.forked_children.append(mock_proc)
@@ -250,7 +252,7 @@ class TestKillForkedWorker:
         assert resp.status_code == 404
         assert "not found" in resp.get_json()["error"].lower()
 
-    @patch(f"{GUARD_APP}.kill_process_tree")
+    @patch(f"{GUARD_APP}.kill_process_group")
     def test_kill_already_exited_worker(self, mock_kill, client):
         mock_proc = _make_mock_process(pid=456, running=False)
         guard_module._state.forked_children.append(mock_proc)
@@ -261,7 +263,7 @@ class TestKillForkedWorker:
             json={"role": "done", "worker_index": 0},
         )
         assert resp.status_code == 200
-        mock_kill.assert_not_called()
+        mock_kill.assert_called_once_with(456, timeout=3, graceful=True)
 
     def test_kill_missing_role(self, client):
         resp = client.post("/kill_forked_worker", json={"worker_index": 0})
@@ -273,7 +275,7 @@ class TestKillForkedWorker:
         assert resp.status_code == 400
         assert "worker_index" in resp.get_json()["error"].lower()
 
-    @patch(f"{GUARD_APP}.kill_process_tree")
+    @patch(f"{GUARD_APP}.kill_process_group")
     def test_kill_then_kill_again_returns_404(self, mock_kill, client):
         mock_proc = _make_mock_process(pid=789)
         guard_module._state.forked_children.append(mock_proc)
@@ -293,7 +295,7 @@ class TestKillForkedWorker:
 
 
 class TestCleanup:
-    @patch(f"{GUARD_APP}.kill_process_tree")
+    @patch(f"{GUARD_APP}.kill_process_group")
     def test_cleanup_kills_all_running_children(self, mock_kill):
         proc1 = _make_mock_process(pid=100)
         proc2 = _make_mock_process(pid=200)
@@ -312,8 +314,8 @@ class TestCleanup:
         assert guard_module._state.forked_children == []
         assert guard_module._state.forked_children_map == {}
 
-    @patch(f"{GUARD_APP}.kill_process_tree")
-    def test_cleanup_skips_already_exited(self, mock_kill):
+    @patch(f"{GUARD_APP}.kill_process_group")
+    def test_cleanup_kills_group_when_leader_already_exited(self, mock_kill):
         running = _make_mock_process(pid=100, running=True)
         exited = _make_mock_process(pid=200, running=False)
         guard_module._state.forked_children = [running, exited]
@@ -324,17 +326,17 @@ class TestCleanup:
 
         cleanup_forked_children()
 
-        mock_kill.assert_called_once_with(100, timeout=3, graceful=True)
+        assert [call.args[0] for call in mock_kill.call_args_list] == [100, 200]
 
         assert guard_module._state.forked_children == []
         assert guard_module._state.forked_children_map == {}
 
-    @patch(f"{GUARD_APP}.kill_process_tree")
+    @patch(f"{GUARD_APP}.kill_process_group")
     def test_cleanup_no_children_is_noop(self, mock_kill):
         cleanup_forked_children()
         mock_kill.assert_not_called()
 
-    @patch(f"{GUARD_APP}.kill_process_tree")
+    @patch(f"{GUARD_APP}.kill_process_group")
     def test_cleanup_tolerates_kill_exception(self, mock_kill):
         proc1 = _make_mock_process(pid=100)
         proc2 = _make_mock_process(pid=200)
@@ -349,5 +351,5 @@ class TestCleanup:
         cleanup_forked_children()
 
         assert mock_kill.call_count == 2
-        assert guard_module._state.forked_children == []
-        assert guard_module._state.forked_children_map == {}
+        assert guard_module._state.forked_children == [proc1]
+        assert guard_module._state.forked_children_map == {("a", 0): proc1}
