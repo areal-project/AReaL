@@ -10,6 +10,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+import areal.infra.controller.train_controller as train_controller_module
 from areal.api import (
     FinetuneSpec,
     ParallelStrategy,
@@ -487,6 +488,44 @@ class TestTrainControllerEdgeCases:
 
         # parallel_strategy should be set by constructor (from backend="fsdp:d4t2")
         assert train_controller.parallel_strategy is not None
+
+    def test_create_process_group_retries_port_in_use(
+        self, monkeypatch, train_controller, parallel_strategy
+    ):
+        ports = iter([12345, 12346])
+        init_methods = []
+
+        def fake_find_free_ports(count, exclude_ports=None):
+            assert count == 1
+            return [next(ports)]
+
+        def fake_init_process_group(*, backend, init_method, rank, world_size):
+            del backend, rank, world_size
+            init_methods.append(init_method)
+            if len(init_methods) == 1:
+                raise RuntimeError("EADDRINUSE: address already in use")
+
+        monkeypatch.setattr(
+            train_controller_module.dist, "is_initialized", lambda: False
+        )
+        monkeypatch.setattr(
+            train_controller_module.dist,
+            "init_process_group",
+            fake_init_process_group,
+        )
+        monkeypatch.setattr(
+            train_controller_module,
+            "find_free_ports",
+            fake_find_free_ports,
+        )
+
+        train_controller.create_process_group(parallel_strategy)
+
+        assert init_methods == [
+            "tcp://localhost:12345",
+            "tcp://localhost:12346",
+        ]
+        assert train_controller._own_process_group is True
 
     def test_method_chaining(self, train_controller, ft_spec):
         """Test that train() and eval() support method chaining."""

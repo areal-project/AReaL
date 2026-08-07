@@ -106,7 +106,11 @@ from areal.utils.data import (
 from areal.utils.functional import gather_logprobs, gather_logprobs_entropy
 from areal.utils.hf_utils import load_hf_tokenizer
 from areal.utils.lock import DistributedLock
-from areal.utils.offload import is_tms_enabled, torch_memory_saver
+from areal.utils.offload import (
+    is_tms_enabled,
+    normalize_tms_ld_preload,
+    torch_memory_saver,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -824,6 +828,7 @@ class ArchonEngine(TrainEngine):
         self.get_device_stats().log("before offload model")
 
         current_platform.clear_memory()
+        normalize_tms_ld_preload()
         torch_memory_saver.pause()
 
         current_platform.synchronize()

@@ -23,6 +23,12 @@ if TYPE_CHECKING:
     from typing import IO
 
 
+def _env_has_preload_runtime(env: dict[str, str] | None) -> bool:
+    if env is None:
+        env = os.environ
+    return bool(env.get("LD_PRELOAD")) or env.get("TMS_INIT_ENABLE") == "1"
+
+
 def build_streaming_log_cmd(
     cmd: str | list[str],
     log_file: str | Path,
@@ -30,6 +36,7 @@ def build_streaming_log_cmd(
     role: str,
     *,
     env_vars: dict[str, str] | None = None,
+    use_stdbuf: bool = True,
 ) -> str:
     """Build a shell command that streams output to stdout and log files.
 
@@ -50,6 +57,8 @@ def build_streaming_log_cmd(
         Role name for log prefix (e.g., "actor", "master")
     env_vars : dict[str, str] | None
         Optional environment variables to prefix the command with KEY=VALUE
+    use_stdbuf : bool
+        Whether to wrap the command with stdbuf for line-buffered output.
 
     Returns
     -------
@@ -63,7 +72,7 @@ def build_streaming_log_cmd(
         cmd_str = cmd
 
     # Check if stdbuf is available (not present on macOS by default)
-    _has_stdbuf = shutil.which("stdbuf") is not None
+    _has_stdbuf = use_stdbuf and shutil.which("stdbuf") is not None
 
     # Build prefix with env vars if provided
     prefix_parts = []
@@ -123,8 +132,20 @@ def run_with_streaming_logs(
     subprocess.Popen
         The spawned process
     """
+    if env_vars_in_cmd is not None and _env_has_preload_runtime(env_vars_in_cmd):
+        use_stdbuf = False
+    elif env is not None:
+        use_stdbuf = not _env_has_preload_runtime(env)
+    else:
+        use_stdbuf = not _env_has_preload_runtime(None)
+
     shell_cmd = build_streaming_log_cmd(
-        cmd, str(log_file), str(merged_log), role, env_vars=env_vars_in_cmd
+        cmd,
+        str(log_file),
+        str(merged_log),
+        role,
+        env_vars=env_vars_in_cmd,
+        use_stdbuf=use_stdbuf,
     )
 
     return subprocess.Popen(

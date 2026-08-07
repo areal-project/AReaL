@@ -18,7 +18,7 @@ class AwexTrainingAdapter(Protocol):
         """
         ...
 
-    def get_weight_metadata(self) -> list:
+    def get_weight_metadata(self, infer_conf: dict | None = None) -> list:
         """Extract this worker's parameter shard metadata in awex format.
 
         Returns list[ParameterMeta].
@@ -66,15 +66,31 @@ class AwexTrainingAdapter(Protocol):
         infer_world_size: int,
         train_world_size: int,
         num_engines: int,
+        master_addr: str,
         master_port: int,
         admin_api_key: str = "areal-admin-key",
         timeout_s: float = 120.0,
+        expected_delta_enabled: bool | None = None,
+        metadata_path: str = "",
+        infer_conf: dict | None = None,
     ) -> None:
         """Register device info in KV store for colocated weight transfer."""
         ...
 
     def execute_colocate_weight_update(self, version: int) -> None:
         """Serialize weights via IPC and put to KV store."""
+        ...
+
+    def precompute_delta_masks(self, version: int) -> bool:
+        """Precompute delta masks while optimizer state is still GPU-resident.
+
+        Optional fast path called before ``release_memory(["optimizer"])``;
+        returns False when skipped so the sync computes masks in-band.
+        """
+        ...
+
+    def seed_delta_base(self, version: int = 0) -> None:
+        """Seed colocate delta state from the current local weights."""
         ...
 
     def release_memory(self, tags: list[str] | None = None) -> None:

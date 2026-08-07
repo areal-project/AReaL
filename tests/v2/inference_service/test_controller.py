@@ -12,6 +12,8 @@ from areal.api.cli_args import AgentConfig, InferenceEngineConfig
 from areal.utils import stats_tracker
 from areal.v2.inference_service.controller.controller import (
     RolloutControllerV2,
+    _get_inference_base_gpu_id,
+    _prepare_inference_server_args,
 )
 from areal.v2.inference_service.controller.workflow import (
     InferenceServiceWorkflow,
@@ -78,6 +80,45 @@ class TestInferenceEngineConfigForInferenceService:
 
 
 # =============================================================================
+# RolloutControllerV2 — backend launch arguments
+
+
+def test_prepare_inference_server_args_strips_private_awex_sglang_controls():
+    args = _prepare_inference_server_args(
+        {
+            "model_path": "/tmp/model",
+            "awex_colocate_mode": True,
+            "awex_meta_server_addr": "127.0.0.1:12345",
+        },
+        "sglang",
+    )
+
+    assert args == {"model_path": "/tmp/model"}
+
+
+def test_prepare_inference_server_args_preserves_backend_specific_controls():
+    args = _prepare_inference_server_args(
+        {"awex_colocate_mode": True, "custom_flag": "value"},
+        "vllm",
+    )
+
+    assert args == {"awex_colocate_mode": True, "custom_flag": "value"}
+
+
+def test_inference_base_gpu_id_uses_worker_slot_on_each_node():
+    workers = [
+        MagicMock(ip="node-a"),
+        MagicMock(ip="node-a"),
+        MagicMock(ip="node-b"),
+        MagicMock(ip="node-b"),
+    ]
+
+    assert [
+        _get_inference_base_gpu_id(workers, index, gpus_per_worker=4)
+        for index in range(len(workers))
+    ] == [0, 4, 0, 4]
+
+
 # RolloutControllerV2 — workflow resolution helpers
 # =============================================================================
 

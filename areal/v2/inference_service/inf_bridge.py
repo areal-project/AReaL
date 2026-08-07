@@ -105,11 +105,11 @@ class InfBridge:
         await self.pause_state.set_paused(False)
         logger.info("Resume request sent to %s", self.backend_addr)
 
-    async def offload(self) -> None:
+    async def offload(self, tags: list[str] | None = None) -> None:
         """Offload model memory on the backend inference server."""
-        http_req = self.backend.get_offload_request()
+        http_req = self.backend.get_offload_request(tags=tags)
         await self._send_request(http_req, timeout=30.0)
-        logger.info("Offload request sent to %s", self.backend_addr)
+        logger.info("Offload request sent to %s with tags=%s", self.backend_addr, tags)
 
     async def onload(self, tags: list[str] | None = None) -> None:
         """Reload model memory on the backend inference server."""
@@ -172,15 +172,15 @@ class InfBridge:
                 f"InfBridge only supports n_samples=1, got {req.gconfig.n_samples}"
             )
 
-        # Build the initial HTTP request via the backend
-        http_req = self.backend.build_generation_request(
+        # Extract effective max_new_tokens from the payload the backend built.
+        # The actual request is rebuilt per attempt below so the version used for
+        # LoRA routing and token stamping is fixed at send time.
+        initial_req = self.backend.build_generation_request(
             req,
             with_lora=False,
-            version=self._version,
+            version=self.get_version(),
         )
-
-        # Extract effective max_new_tokens from the payload the backend built
-        ori_max_new_tokens = self.backend.get_generation_max_new_tokens(http_req)
+        ori_max_new_tokens = self.backend.get_generation_max_new_tokens(initial_req)
         if ori_max_new_tokens <= 0:
             raise ValueError(
                 f"max_new_tokens must be > 0, got {ori_max_new_tokens} "
@@ -208,6 +208,13 @@ class InfBridge:
                 stop_reason = "length"
                 break
 
+            attempt_version = self.get_version()
+            http_req = self.backend.build_generation_request(
+                req,
+                with_lora=False,
+                version=attempt_version,
+            )
+
             # Patch the payload for this iteration (extend input, shrink budget)
             self.backend.patch_generation_request(
                 http_req,
@@ -221,7 +228,7 @@ class InfBridge:
 
             accumulated_tokens.extend(result.output_tokens)
             accumulated_logprobs.extend(result.output_logprobs)
-            accumulated_versions.extend([self._version] * len(result.output_tokens))
+            accumulated_versions.extend([attempt_version] * len(result.output_tokens))
             stop_reason = cast(_StopReason, result.stop_reason)
 
             if result.routed_experts is not None:

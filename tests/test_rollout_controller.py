@@ -17,6 +17,7 @@ from areal.api.cli_args import (
     GenerationHyperparameters,
     InferenceEngineConfig,
     SchedulingSpec,
+    SchedulingStrategy,
     SGLangConfig,
 )
 from areal.infra import RolloutController
@@ -43,6 +44,7 @@ def create_test_config(backend="sglang:d2", **kwargs):
 class MockScheduler:
     def __init__(self):
         self.workers = []
+        self.jobs = []
         self.call_count = 0
         self.engine_calls = []
         self._pending_results = {}  # worker_id -> dict[task_id -> result]
@@ -50,6 +52,7 @@ class MockScheduler:
 
     def create_workers(self, job, *args, **kwargs):
         """Create workers based on Job specification."""
+        self.jobs.append(job)
         role = job.role
         replicas = job.replicas
         worker_ids = [f"{role}/{i}" for i in range(replicas)]
@@ -76,7 +79,9 @@ class MockScheduler:
     async def async_call_engine(self, worker_id, method, *args, **kwargs):
         self.engine_calls.append((worker_id, method, args, kwargs))
         self.call_count += 1
-        if method == "agenerate":
+        if method == "launch_server":
+            return Mock(host="127.0.0.1", port=8000)
+        elif method == "agenerate":
             return Mock()
         # Handle submit method - return a task_id and store the result
         elif method == "submit":
@@ -213,6 +218,27 @@ class TestRolloutControllerInitialization:
 
         assert len(controller.workers) == 2
         assert controller.staleness_manager is not None
+
+        controller.destroy()
+
+    def test_initialize_colocated_rollout_skips_second_gpu_gres_request(self):
+        config = create_test_config(
+            backend="sglang:d2",
+            scheduling_strategy=SchedulingStrategy(
+                type="colocation",
+                target="actor",
+            ),
+        )
+        scheduler = MockScheduler()
+        controller = RolloutController(
+            inf_engine=MockInferenceEngine,
+            config=config,
+            scheduler=scheduler,
+        )
+
+        controller.initialize(role="rollout", server_args={})
+
+        assert scheduler.jobs[0].tasks[0].request_gpu_gres is False
 
         controller.destroy()
 

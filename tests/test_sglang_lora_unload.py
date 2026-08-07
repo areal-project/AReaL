@@ -6,8 +6,15 @@ never unloads old versions, so sglang accumulates adapters until it hangs
 version that falls outside the retention window (kept for off-policy rollouts).
 """
 
-from areal.api.io_struct import WeightUpdateMeta
+from areal.api.cli_args import GenerationHyperparameters
+from areal.api.io_struct import ModelRequest, WeightUpdateMeta
 from areal.engine.sglang_remote import SGLangBackend
+
+
+def _request(top_k):
+    gconfig = GenerationHyperparameters()
+    gconfig.top_k = top_k
+    return ModelRequest(input_ids=[1, 2, 3], gconfig=gconfig)
 
 
 def _lora_meta(version, keep, lora_name="lora-gsm8k", path="/tmp/wu"):
@@ -63,3 +70,22 @@ def test_disk_update_full_model_unchanged():
     meta = WeightUpdateMeta(type="disk", path="/tmp/wu", use_lora=False)
     reqs = SGLangBackend().build_disk_weight_update_requests(meta)
     assert [r.endpoint for r in reqs.requests] == ["/update_weights_from_disk"]
+
+
+def test_generation_request_large_top_k_maps_to_all_vocab_sentinel():
+    """AReaL's large top_k sentinel maps to SGLang's -1 all-vocab value."""
+    backend = SGLangBackend()
+
+    http_req = backend.build_generation_request(
+        _request(top_k=100_000_000),
+        with_lora=False,
+        version=0,
+    )
+    assert http_req.payload["sampling_params"]["top_k"] == -1
+
+    http_req = backend.build_generation_request(
+        _request(top_k=128),
+        with_lora=False,
+        version=0,
+    )
+    assert http_req.payload["sampling_params"]["top_k"] == 128

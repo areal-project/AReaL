@@ -3,9 +3,12 @@ from __future__ import annotations
 
 import asyncio
 import os
+import pickle
 import socket
+import tempfile
 import time
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any
 
 import aiohttp  # pyright: ignore[reportMissingImports]
@@ -15,7 +18,7 @@ from pydantic import BaseModel  # pyright: ignore[reportMissingImports]
 
 from areal.infra.utils.http import async_http_retry
 from areal.utils import logging
-from areal.utils.network import find_free_ports
+from areal.v2.weight_update.awex.delta_config import delta_transfer_enabled
 from areal.v2.weight_update.gateway.auth import require_admin_key
 from areal.v2.weight_update.gateway.config import (
     PairInfo,
@@ -131,21 +134,67 @@ def _get_own_ip() -> str:
         return "127.0.0.1"
 
 
-def _merge_training_meta_by_name(meta_list: list[dict]) -> list[dict]:
-    """Merge serialized training ParameterMeta entries by parameter name.
+def _serialized_data(value: Any) -> Any:
+    return value.get("data", value) if isinstance(value, dict) else value
 
-    Each FSDP worker reports metadata for its own local shard only.
-    With ``dp_size > 1`` the same parameter name appears once per worker,
-    each carrying a single shard.  The ``TransferPlanBuilder`` indexes
-    parameters with ``{meta.name: meta}``, so duplicates silently shadow
-    earlier entries.  We merge them here so the builder sees one
-    ``ParameterMeta`` per name with all shards in a single replica.
+
+def _field(value: Any, name: str, default: Any = None) -> Any:
+    data = _serialized_data(value)
+    if isinstance(data, dict):
+        return data.get(name, default)
+    return getattr(data, name, default)
+
+
+def _freeze(value: Any) -> Any:
+    if isinstance(value, dict):
+        return tuple((k, _freeze(v)) for k, v in sorted(value.items()))
+    if isinstance(value, list | tuple):
+        return tuple(_freeze(v) for v in value)
+    return value
+
+
+def _shard_signature(shard: Any) -> tuple[Any, ...]:
+    data = _serialized_data(shard)
+    return (
+        _field(data, "name"),
+        _field(data, "global_rank"),
+        _freeze(_field(data, "global_offset")),
+        _freeze(_field(data, "shape")),
+        _freeze(_field(data, "dtype")),
+        _freeze(_field(data, "sharding_type")),
+        _field(data, "sharding_dim"),
+        _field(data, "num_shards"),
+    )
+
+
+def _extend_unique_shards(target: list[Any], source: list[Any]) -> int:
+    seen = {_shard_signature(shard) for shard in target}
+    added = 0
+    for shard in source:
+        sig = _shard_signature(shard)
+        if sig in seen:
+            continue
+        target.append(shard)
+        seen.add(sig)
+        added += 1
+    return added
+
+
+def _merge_meta_by_name(meta_list: list[Any], label: str) -> list[Any]:
+    """Merge serialized ParameterMeta entries by parameter name.
+
+    Training and SGLang inference workers can report one ``ParameterMeta`` per
+    local shard.  ``TransferPlanBuilder`` indexes parameters as
+    ``{meta.name: meta}``, so duplicates would otherwise shadow earlier shards.
+    SGLang also reports the same per-engine TP metadata from every engine; shard
+    de-duplication keeps one logical engine, which the builder then expands via
+    ``num_infer_engines``.
     """
-    by_name: dict[str, dict] = {}
-    overflow: list[dict] = []
+    by_name: dict[str, Any] = {}
+    overflow: list[Any] = []
     for pm in meta_list:
-        data = pm.get("data", pm) if isinstance(pm, dict) else pm
-        name = data.get("name") if isinstance(data, dict) else None
+        data = _serialized_data(pm)
+        name = _field(data, "name")
         if name is None:
             logger.warning("Found parameter metadata with no name: %s", pm)
             overflow.append(pm)
@@ -154,17 +203,78 @@ def _merge_training_meta_by_name(meta_list: list[dict]) -> list[dict]:
         if name not in by_name:
             by_name[name] = pm
         else:
-            existing_data = by_name[name].get("data", by_name[name])
-            existing_data.setdefault("shards", []).extend(data.get("shards", []))
+            existing_data = _serialized_data(by_name[name])
+            existing_shards = existing_data.setdefault("shards", [])
+            _extend_unique_shards(existing_shards, data.get("shards", []))
+
             ex_replicas = existing_data.get("replicas", [])
             new_replicas = data.get("replicas", [])
             if ex_replicas and new_replicas:
-                ex_rep_data = ex_replicas[0].get("data", ex_replicas[0])
-                new_rep_data = new_replicas[0].get("data", new_replicas[0])
-                ex_rep_data.setdefault("shards", []).extend(
-                    new_rep_data.get("shards", [])
+                ex_rep_data = _serialized_data(ex_replicas[0])
+                new_rep_data = _serialized_data(new_replicas[0])
+                _extend_unique_shards(
+                    ex_rep_data.setdefault("shards", []),
+                    new_rep_data.get("shards", []),
                 )
-    return list(by_name.values()) + overflow
+    merged = list(by_name.values()) + overflow
+    if len(merged) != len(meta_list):
+        logger.info(
+            "Merged %s parameter metadata by name: %d -> %d",
+            label,
+            len(meta_list),
+            len(merged),
+        )
+    return merged
+
+
+def _safe_file_component(value: str) -> str:
+    return "".join(c if c.isalnum() or c in "._-" else "_" for c in value)
+
+
+def _colocate_metadata_dir() -> Path:
+    root = (
+        os.environ.get("DTE_WEIGHT_META_DIR")
+        or os.environ.get("AREAL_WEIGHT_META_DIR")
+        or os.environ.get("AREAL_STORAGE")
+        or os.getcwd()
+    )
+    return Path(root).expanduser().resolve() / ".areal_weight_meta"
+
+
+def _write_colocate_metadata_file(
+    pair_name: str,
+    infer_params_meta: list[Any],
+    training_params_meta: list[Any],
+) -> str:
+    metadata_dir = _colocate_metadata_dir()
+    metadata_dir.mkdir(parents=True, exist_ok=True)
+    safe_pair = _safe_file_component(pair_name)
+    final_path = metadata_dir / (
+        f"{safe_pair}.{os.getpid()}.{int(time.time() * 1000)}.pkl"
+    )
+    fd, tmp_path = tempfile.mkstemp(
+        prefix=f".{safe_pair}.",
+        suffix=".tmp",
+        dir=metadata_dir,
+    )
+    try:
+        with os.fdopen(fd, "wb") as f:
+            pickle.dump(
+                {
+                    "infer_params_meta": infer_params_meta,
+                    "training_params_meta": training_params_meta,
+                },
+                f,
+                protocol=pickle.HIGHEST_PROTOCOL,
+            )
+        os.replace(tmp_path, final_path)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+    return str(final_path)
 
 
 def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
@@ -200,8 +310,23 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
         inference_urls = body.inference_worker_urls
 
         if body.colocate:
+            if not body.nccl_master_addr or body.nccl_master_port <= 0:
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "error": (
+                            "nccl_master_addr and nccl_master_port are required "
+                            "when colocate=True"
+                        )
+                    },
+                )
             return await _connect_colocate(
-                request, pair_name, train_urls, inference_urls
+                request,
+                pair_name,
+                train_urls,
+                inference_urls,
+                body.nccl_master_addr,
+                body.nccl_master_port,
             )
 
         if body.mode == "disk":
@@ -311,7 +436,7 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
                 training_params_meta.extend(meta)
             else:
                 training_params_meta.append(meta)
-        training_params_meta = _merge_training_meta_by_name(training_params_meta)
+        training_params_meta = _merge_meta_by_name(training_params_meta, "training")
 
         infer_params_meta = []
         for result in infer_meta_resps:
@@ -320,6 +445,7 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
                 infer_params_meta.extend(meta)
             else:
                 infer_params_meta.append(meta)
+        infer_params_meta = _merge_meta_by_name(infer_params_meta, "inference")
 
         kv_store.put(pair_name, "training_params_meta", training_params_meta)
         kv_store.put(pair_name, "infer_params_meta", infer_params_meta)
@@ -398,6 +524,8 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
         pair_name: str,
         train_urls: list[str],
         inference_urls: list[str],
+        nccl_master_addr: str,
+        nccl_master_port: int,
     ) -> ConnectResponse:
         session = request.app.state.http_session
         init_timeout_s = config.init_timeout_s
@@ -420,12 +548,19 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
         # report_parallelism returns per-instance world_size (e.g. TP size).
         # The total inference world for colocate NCCL groups spans all engines.
         infer_world_size = infer_par["world_size"] * num_engines
+        infer_conf = dict(
+            infer_par.get("awex_infer_conf") or infer_par.get("infer_conf") or {}
+        )
+        infer_conf["infer_world_size"] = infer_world_size
 
         train_meta_resps, infer_meta_resps = await asyncio.gather(
             asyncio.gather(
                 *[
                     _post_json(
-                        session, f"{url}/awex/report_weight_meta", init_timeout_s
+                        session,
+                        f"{url}/awex/report_weight_meta",
+                        init_timeout_s,
+                        json_data={"infer_conf": infer_conf},
                     )
                     for url in train_urls
                 ]
@@ -447,7 +582,7 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
                 training_params_meta.extend(meta)
             else:
                 training_params_meta.append(meta)
-        training_params_meta = _merge_training_meta_by_name(training_params_meta)
+        training_params_meta = _merge_meta_by_name(training_params_meta, "training")
 
         infer_params_meta = []
         for result in infer_meta_resps:
@@ -456,16 +591,36 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
                 infer_params_meta.extend(meta)
             else:
                 infer_params_meta.append(meta)
+        infer_params_meta = _merge_meta_by_name(infer_params_meta, "inference")
 
         kv_store.put(pair_name, "training_params_meta", training_params_meta)
         kv_store.put(pair_name, "infer_params_meta", infer_params_meta)
+        try:
+            metadata_path = _write_colocate_metadata_file(
+                pair_name, infer_params_meta, training_params_meta
+            )
+            kv_store.put(pair_name, "metadata_path", metadata_path)
+            logger.info(
+                "Wrote colocate metadata file for pair '%s': %s",
+                pair_name,
+                metadata_path,
+            )
+        except Exception:
+            metadata_path = ""
+            logger.warning(
+                "Failed to write colocate metadata file for pair '%s'; "
+                "falling back to gateway KV metadata fetch",
+                pair_name,
+                exc_info=True,
+            )
 
         gateway_addr = (
             _get_own_ip() if config.host in ("0.0.0.0", "::") else config.host
         )
         kv_store_url = f"http://{gateway_addr}:{config.gateway_port}"
 
-        [master_port] = find_free_ports(1)
+        master_addr = nccl_master_addr
+        master_port = nccl_master_port
 
         init_payload_base = {
             "pair_name": pair_name,
@@ -473,8 +628,12 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
             "infer_world_size": infer_world_size,
             "train_world_size": train_world_size,
             "num_engines": num_engines,
+            "master_addr": master_addr,
             "master_port": master_port,
             "admin_api_key": config.admin_api_key,
+            "timeout_s": init_timeout_s,
+            "expected_delta_enabled": delta_transfer_enabled(),
+            "metadata_path": metadata_path,
         }
 
         init_tasks = []
@@ -496,6 +655,7 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
                     json_data={
                         **init_payload_base,
                         "transfer_rank": infer_world_size + i,
+                        "infer_conf": infer_conf,
                     },
                 )
             )
@@ -507,11 +667,19 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
             inference_worker_urls=inference_urls,
             train_world_size=train_world_size,
             inference_world_size=infer_world_size,
+            master_addr=master_addr,
+            master_port=master_port,
             colocate=True,
         )
         registry.register(pair_info)
 
-        logger.info("Connected colocate pair '%s'", pair_name)
+        logger.info(
+            "Connected colocate pair '%s' (kv_store=%s, master=%s:%d)",
+            pair_name,
+            kv_store_url,
+            master_addr,
+            master_port,
+        )
         return ConnectResponse(pair_name=pair_name)
 
     async def _colocate_transfer_weights(
@@ -520,6 +688,38 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
         session: aiohttp.ClientSession,
         timeout_s: float,
     ) -> None:
+        logger.info(
+            "Colocate v%d: inference memory transition is owned by rollout "
+            "pause/offload; skip duplicate gateway release",
+            version,
+        )
+
+        # Precompute delta change masks while the optimizer (fp32 main shards
+        # + AdamW moments) is still GPU-resident; the release below moves it
+        # to CPU and would otherwise force the inversion detector to stage
+        # 30+GB back during the sync critical path. All train workers must be
+        # posted together (the mask computation runs training collectives).
+        # Failure is non-fatal: the sync computes masks in-band instead.
+        try:
+            await asyncio.gather(
+                *[
+                    _post(
+                        session,
+                        f"{url}/awex/precompute_delta_masks",
+                        timeout_s,
+                        json_data={"version": version},
+                    )
+                    for url in pair_info.train_worker_urls
+                ]
+            )
+        except Exception:
+            logger.warning(
+                "Colocate v%d: precompute_delta_masks failed; "
+                "masks will be computed during the sync",
+                version,
+                exc_info=True,
+            )
+
         await asyncio.gather(
             *[
                 _post(
@@ -536,18 +736,6 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
             *[
                 _post(
                     session,
-                    f"{url}/awex/resume_memory",
-                    timeout_s,
-                    json_data={"tags": ["weights"]},
-                )
-                for url in pair_info.inference_worker_urls
-            ]
-        )
-
-        await asyncio.gather(
-            *[
-                _post(
-                    session,
                     f"{url}/awex/execute_colocate_weight_update",
                     timeout_s,
                     json_data={"version": version},
@@ -565,29 +753,29 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
             ],
         )
 
-        await asyncio.gather(
-            *[
-                _post(
-                    session,
-                    f"{url}/awex/release_memory",
-                    timeout_s,
-                    json_data={"tags": ["weights"]},
-                )
-                for url in pair_info.train_worker_urls
-            ]
-        )
-
-        await asyncio.gather(
-            *[
-                _post(
-                    session,
-                    f"{url}/awex/resume_memory",
-                    timeout_s,
-                    json_data={"tags": ["kv_cache"]},
-                )
-                for url in pair_info.inference_worker_urls
-            ]
-        )
+        release_env = os.environ.get("DTE_RELEASE_TRAIN_WEIGHTS_AFTER_UPDATE")
+        if release_env is None or release_env.strip() == "":
+            release_env = os.environ.get(
+                "AWEX_COLOCATE_RELEASE_TRAIN_WEIGHTS_AFTER_UPDATE", "1"
+            )
+        release_train_weights = release_env.strip().lower() not in {
+            "0",
+            "false",
+            "no",
+            "off",
+        }
+        if release_train_weights:
+            await asyncio.gather(
+                *[
+                    _post(
+                        session,
+                        f"{url}/awex/release_memory",
+                        timeout_s,
+                        json_data={"tags": ["weights"]},
+                    )
+                    for url in pair_info.train_worker_urls
+                ]
+            )
 
         # Flush colocate KV keys for this version to prevent accumulation
         infer_world_size = pair_info.inference_world_size
@@ -596,8 +784,12 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
             transfer_rank = infer_world_size + i
             weight_key = f"colocate_weights_rank{transfer_rank}_{version}"
             done_key = f"colocate_done_rank{transfer_rank}_{version}"
+            offloaded_key = (
+                f"colocate_train_weights_offloaded_rank{transfer_rank}_{version}"
+            )
             kv_store.delete(pair_info.pair_name, weight_key)
             kv_store.delete(pair_info.pair_name, done_key)
+            kv_store.delete(pair_info.pair_name, offloaded_key)
 
     async def _awex_transfer_weights(
         pair_info: PairInfo,
@@ -769,6 +961,19 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
                 status_code=404,
                 content={"error": f"Pair '{body.pair_name}' not found"},
             )
+
+        metadata_path = kv_store.get(pair_info.pair_name, "metadata_path")
+        if isinstance(metadata_path, str) and metadata_path:
+            try:
+                os.unlink(metadata_path)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                logger.warning(
+                    "Failed to remove colocate metadata file: %s",
+                    metadata_path,
+                    exc_info=True,
+                )
 
         registry.unregister(pair_info.pair_name)
         kv_store.clear_pair(pair_info.pair_name)

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
-import sys
+import os
 import threading
 import time
 import traceback
@@ -16,6 +16,7 @@ import aiohttp
 
 from areal.infra.utils.concurrent import get_executor, run_async_task
 from areal.infra.utils.http import create_httpx_client
+from areal.infra.utils.python import get_python_executable
 from areal.utils import logging
 from areal.utils.network import format_hostport, gethostip
 
@@ -56,6 +57,7 @@ class GatewayTrainController:
         self._own_process_group = False
         self.rollout: Any | None = None
         self._weight_update_ctrl: Any | None = None
+        self._colocate_weight_update = False
 
         # Version management
         self._version_lock = Lock()
@@ -241,7 +243,7 @@ class GatewayTrainController:
             async def _fork_worker(rank: int) -> str:
                 guard = _guard_addr(guard_workers[rank])
                 worker_cmd = [
-                    sys.executable,
+                    get_python_executable(),
                     "-m",
                     "areal.v2.training_service.worker",
                     "--admin-api-key",
@@ -325,7 +327,7 @@ class GatewayTrainController:
             # Step 4: Fork Router on guard 0
             # ==============================================================
             router_cmd = [
-                sys.executable,
+                get_python_executable(),
                 "-m",
                 "areal.v2.training_service.router",
                 "--admin-api-key",
@@ -349,7 +351,7 @@ class GatewayTrainController:
             # Step 5: Fork Data Proxy on a guard
             # ==============================================================
             data_proxy_cmd = [
-                sys.executable,
+                get_python_executable(),
                 "-m",
                 "areal.v2.training_service.data_proxy",
                 "--worker-addrs",
@@ -375,7 +377,7 @@ class GatewayTrainController:
             # Step 6: Fork Gateway on guard 0
             # ==============================================================
             gw_cmd = [
-                sys.executable,
+                get_python_executable(),
                 "-m",
                 "areal.v2.training_service.gateway",
                 "--admin-api-key",
@@ -819,6 +821,67 @@ class GatewayTrainController:
     def onload(self) -> None:
         self._gateway_post("/onload")
 
+    def init_awex_adapter(self, meta_server_addr: str | None = None) -> None:
+        """Initialize the engine's AWEX adapter before colocated offload."""
+        self._ensure_initialized()
+        import requests
+
+        payload = {"meta_server_addr": meta_server_addr}
+
+        def post(url: str) -> None:
+            resp = requests.post(
+                f"{url}/awex/init_adapter",
+                json=payload,
+                timeout=max(float(self.config.request_timeout), 120.0),
+            )
+            resp.raise_for_status()
+
+        max_workers = min(len(self._worker_addrs), 64)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            list(executor.map(post, self._worker_addrs))
+        logger.info(
+            "Initialized AWEX adapter on %d train workers (meta_server=%s)",
+            len(self._worker_addrs),
+            meta_server_addr,
+        )
+
+    def _awex_memory_transition(
+        self, endpoint: str, tags: list[str] | None = None
+    ) -> None:
+        self._ensure_initialized()
+        import requests
+
+        urls = list(self._worker_addrs)
+        if not urls:
+            return
+
+        timeout = max(float(self.config.request_timeout), 120.0)
+        payload = {"tags": tags}
+
+        def post(url: str) -> None:
+            resp = requests.post(
+                f"{url}/awex/{endpoint}",
+                json=payload,
+                timeout=timeout,
+            )
+            resp.raise_for_status()
+
+        max_workers = min(len(urls), 64)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            list(executor.map(post, urls))
+        logger.info(
+            "AWEX %s completed on %d train workers (tags=%s)",
+            endpoint,
+            len(urls),
+            tags,
+        )
+
+    def awex_release_memory(self, tags: list[str] | None = None) -> None:
+        self._awex_memory_transition("release_memory", tags)
+
+    def awex_resume_memory(self, tags: list[str] | None = None) -> None:
+        self._awex_memory_transition("resume_memory", tags)
+
     def step_lr_scheduler(self) -> None:
         self._gateway_post("/step_lr_scheduler")
 
@@ -961,6 +1024,10 @@ class GatewayTrainController:
                 f"updates, got '{meta.type}'"
             )
 
+        weight_update_timeout = max(
+            float(self.config.request_timeout),
+            float(self.config.setup_timeout),
+        )
         ctrl = WeightUpdateController(
             WeightUpdateControllerConfig(
                 # Bind gateway to this node's outbound IP so cross-host
@@ -969,12 +1036,26 @@ class GatewayTrainController:
                 host=gethostip(),
                 admin_api_key=self.config.admin_api_key,
                 log_level=self.config.log_level,
+                setup_timeout=float(self.config.setup_timeout),
+                request_timeout=weight_update_timeout,
+                init_timeout_s=weight_update_timeout,
+                update_timeout_s=weight_update_timeout,
             )
         )
         ctrl.initialize()
 
         inference_urls: list[str] = rollout.inference_worker_urls
         pair_name = f"{self._role}-rollout"
+        colocate_env = os.environ.get("DTE_COLOCATE_WEIGHT_UPDATE")
+        if colocate_env is None or colocate_env.strip() == "":
+            colocate_env = os.environ.get("AWEX_COLOCATE_WEIGHT_UPDATE", "0")
+        colocate_enabled = colocate_env.strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        self._colocate_weight_update = meta.type == "awex" and colocate_enabled
 
         if meta.type == "awex":
             # NCCL rendezvous master must live on the rank-0 process's node.
@@ -995,6 +1076,7 @@ class GatewayTrainController:
                 mode="awex",
                 nccl_master_addr=port_data["host"],
                 nccl_master_port=port_data["ports"][0],
+                colocate=self._colocate_weight_update,
             )
         else:  # disk
             ctrl.connect(
@@ -1009,10 +1091,12 @@ class GatewayTrainController:
             )
         self._weight_update_ctrl = ctrl
         logger.info(
-            "WeightUpdateController connected (pair=%s, train=%d, inf=%d)",
+            "WeightUpdateController connected (pair=%s, mode=%s, train=%d, inf=%d, colocate=%s)",
             pair_name,
+            meta.type,
             len(self._worker_addrs),
             len(inference_urls),
+            self._colocate_weight_update,
         )
 
     def update_weights(self, meta: Any) -> None:
@@ -1024,14 +1108,70 @@ class GatewayTrainController:
         assert meta.version is not None and meta.version > 0, (
             f"meta.version must be a positive integer, got {meta.version}"
         )
-        result = self._weight_update_ctrl.update_weights(version=meta.version)
-        self.rollout.continue_generation()
+        try:
+            result = self._weight_update_ctrl.update_weights(version=meta.version)
+        finally:
+            if self._colocate_weight_update:
+                import requests
+
+                for url in self._worker_addrs:
+                    resp = requests.post(
+                        f"{url}/awex/resume_memory",
+                        json={"tags": ["weights", "optimizer"]},
+                        timeout=120,
+                    )
+                    resp.raise_for_status()
+            # Colocated RL owns rollout onload/resume ordering in the trainer.
+            if not self._colocate_weight_update:
+                self.rollout.continue_generation()
         logger.info(
             "Weight update v%d completed (%s, %.0fms)",
             meta.version,
             result.status,
             result.duration_ms,
         )
+
+    async def _async_seed_delta_base(self, version: int) -> None:
+        if self.rollout is None:
+            raise RuntimeError(
+                "connect_engine() must be called before seed_delta_base()"
+            )
+        timeout = max(float(self.config.request_timeout), 120.0)
+        client = await self._get_async_client()
+        inference_urls: list[str] = self.rollout.inference_worker_urls
+
+        async def _post_seed(url: str) -> None:
+            resp = await client.post(
+                f"{url}/awex/seed_delta_base",
+                json={"version": version},
+                timeout=timeout,
+            )
+            if resp.status_code >= 400:
+                raise RuntimeError(
+                    f"{url}/awex/seed_delta_base returned "
+                    f"{resp.status_code}: {resp.text}"
+                )
+
+        await asyncio.gather(
+            *[_post_seed(url) for url in self._worker_addrs],
+            *[_post_seed(url) for url in inference_urls],
+        )
+
+    def seed_delta_base(self, version: int = 0) -> None:
+        if self._weight_update_ctrl is None or self.rollout is None:
+            raise RuntimeError(
+                "connect_engine() must be called before seed_delta_base()"
+            )
+        if not self._colocate_weight_update:
+            logger.info("seed_delta_base skipped: colocate weight update disabled")
+            return
+
+        self.rollout.pause_generation()
+        try:
+            run_async_task(self._async_seed_delta_base, version)
+        finally:
+            self.rollout.continue_generation()
+        logger.info("Colocate delta base seeded at version %d", version)
 
     def prepare_batch(
         self,
@@ -1043,6 +1183,7 @@ class GatewayTrainController:
         dynamic_bs: bool = False,
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
+        keep_partial_group_on_error: bool = False,
     ) -> list[dict[str, Any]]:
         if self.rollout is None:
             raise RuntimeError("connect_engine() must be called before prepare_batch()")
@@ -1055,6 +1196,7 @@ class GatewayTrainController:
             dynamic_bs=dynamic_bs,
             reward_normalization=reward_normalization,
             drop_incomplete_group=drop_incomplete_group,
+            keep_partial_group_on_error=keep_partial_group_on_error,
         )
 
     def rollout_batch(
@@ -1066,6 +1208,7 @@ class GatewayTrainController:
         group_size: int = 1,
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
+        keep_partial_group_on_error: bool = False,
     ) -> list[dict[str, Any]]:
         if self.rollout is None:
             raise RuntimeError("connect_engine() must be called before rollout_batch()")
@@ -1077,6 +1220,7 @@ class GatewayTrainController:
             group_size=group_size,
             reward_normalization=reward_normalization,
             drop_incomplete_group=drop_incomplete_group,
+            keep_partial_group_on_error=keep_partial_group_on_error,
         )
 
     def create_process_group(self, parallel_strategy: ParallelStrategy | None = None):
@@ -1156,6 +1300,17 @@ class GatewayTrainController:
                 )
             except Exception:
                 logger.error("Failed to unregister model: %s", traceback.format_exc())
+
+        if self._weight_update_ctrl is not None:
+            try:
+                self._weight_update_ctrl.destroy()
+            except Exception:
+                logger.error(
+                    "Failed to destroy weight update controller: %s",
+                    traceback.format_exc(),
+                )
+            finally:
+                self._weight_update_ctrl = None
 
         self._graceful_shutdown_workers()
 

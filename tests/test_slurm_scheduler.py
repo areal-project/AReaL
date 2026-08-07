@@ -351,6 +351,47 @@ def test_scheduler_no_config_no_gpus_fails():
         SlurmScheduler()
 
 
+@pytest.mark.parametrize(
+    ("request_gpu_gres", "expects_gres"),
+    [(True, True), (False, False)],
+)
+def test_generate_sbatch_script_respects_gpu_gres_request(
+    tmp_path, request_gpu_gres, expects_gres
+):
+    name_resolve_root = tmp_path / "name_resolve"
+    name_resolve_root.mkdir()
+    config = BaseExperimentConfig(
+        experiment_name="test_gpu_gres_request",
+        trial_name="test_generate_script",
+    )
+    config.cluster.n_gpus_per_node = 8
+    config.cluster.fileroot = str(tmp_path)
+    config.cluster.name_resolve.nfs_record_root = str(name_resolve_root)
+    scheduler = SlurmScheduler(exp_config=config)
+
+    spec = SchedulingSpec(
+        cpu=4,
+        gpu=1,
+        mem=1024,
+        request_gpu_gres=request_gpu_gres,
+    )
+
+    script = scheduler._generate_sbatch_script(
+        role="gpu_gres_test",
+        replicas=8,
+        nodes=1,
+        total_gpus=8,
+        cpus_per_task=4,
+        mem_per_task=1024,
+        schedulings=[spec],
+        nodelist=None,
+        exclude=None,
+    )
+
+    assert ("#SBATCH --gres=gpu:8" in script) is expects_gres
+    assert ("--gres=gpu:8" in script.split("srun", maxsplit=1)[1]) is expects_gres
+
+
 # ============================================================================
 # Colocation Tests
 # ============================================================================

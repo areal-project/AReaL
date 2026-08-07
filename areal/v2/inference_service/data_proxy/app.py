@@ -410,14 +410,18 @@ def create_app(config: DataProxyConfig) -> FastAPI:
         return PauseGenerationResponse(status="ok", paused=False)
 
     @app.post("/release_memory_occupation")
-    async def release_memory_occupation():
+    async def release_memory_occupation(request: Request):
         inf_bridge: InfBridge | None = app.state.inf_bridge
         if inf_bridge is None:
             raise HTTPException(
                 status_code=503,
                 detail="No inference backend configured (external model mode).",
             )
-        await inf_bridge.offload()
+        body = await request.json() if await request.body() else {}
+        tags = body.get("tags")
+        if tags is not None and not isinstance(tags, list):
+            raise HTTPException(status_code=400, detail="'tags' must be a list")
+        await inf_bridge.offload(tags=tags)
         return {"status": "ok"}
 
     @app.post("/resume_memory_occupation")

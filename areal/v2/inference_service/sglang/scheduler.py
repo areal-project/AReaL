@@ -15,6 +15,7 @@ from sglang.srt.server_args import PortArgs, ServerArgs
 from areal.infra.rpc.serialization import serialize_value
 
 RESULT_IPC_ENV = "AREAL_AWEX_RESULT_IPC"
+logger = logging.getLogger(__name__)
 
 
 class AwexSchedulerBridge:
@@ -64,6 +65,7 @@ class AwexSchedulerBridge:
             "awex_randomize_parameters",
             "awex_init_colocate_weight_update",
             "awex_execute_colocate_weight_update",
+            "awex_seed_delta_base",
             "awex_release_memory",
             "awex_resume_memory",
         ]
@@ -122,10 +124,17 @@ class AwexSchedulerBridge:
         self._require_adapter().randomize_parameters()
 
     def awex_init_colocate_weight_update(self, **kwargs: Any) -> None:
-        self._require_adapter().init_colocate_weight_update(**kwargs)
+        try:
+            self._require_adapter().init_colocate_weight_update(**kwargs)
+        except Exception:
+            logger.exception("awex_init_colocate_weight_update failed")
+            raise
 
     def awex_execute_colocate_weight_update(self, version: int = 0) -> None:
         self._require_adapter().execute_colocate_weight_update(version)
+
+    def awex_seed_delta_base(self, version: int = 0) -> None:
+        self._require_adapter().seed_delta_base(version)
 
     def awex_release_memory(self, tags: list[str] | None = None) -> None:
         self._require_adapter().release_memory(tags)

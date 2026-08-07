@@ -118,6 +118,17 @@ def register_awex_endpoints(app: FastAPI, rpc_proxy: RpcProxy) -> None:
             logger.error("Failed to execute colocate weight update: %s", e)
             return JSONResponse(status_code=500, content={"error": str(e)})
 
+    @app.post("/awex/seed_delta_base")
+    async def seed_delta_base(request: Request) -> JSONResponse:
+        try:
+            data = await request.json()
+            version = data.get("version", 0)
+            rpc_proxy.collective_rpc("awex_seed_delta_base", version=version)
+            return JSONResponse(content={"status": "ok", "version": version})
+        except Exception as e:
+            logger.error("Failed to seed delta base: %s", e)
+            return JSONResponse(status_code=500, content={"error": str(e)})
+
     @app.post("/awex/release_memory")
     async def release_memory(request: Request) -> JSONResponse:
         try:

@@ -66,15 +66,22 @@ class AwexInferenceAdapter(Protocol):
         infer_world_size: int,
         train_world_size: int,
         num_engines: int,
+        master_addr: str,
         master_port: int,
         admin_api_key: str = "areal-admin-key",
         timeout_s: float = 120.0,
+        expected_delta_enabled: bool | None = None,
+        metadata_path: str = "",
     ) -> None:
         """Build device mapping, inference-only NCCL group, and colocate transport."""
         ...
 
     def execute_colocate_weight_update(self, version: int) -> None:
         """Fetch IPC weights from KV store and apply via colocate transport."""
+        ...
+
+    def seed_delta_base(self, version: int = 0) -> None:
+        """Seed colocate delta state from the current local weights."""
         ...
 
     def release_memory(self, tags: list[str] | None = None) -> None:

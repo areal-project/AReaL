@@ -926,11 +926,16 @@ class RayScheduler(Scheduler):
                 existing_env_vars=sch.env_vars,
             )
             sch.env_vars.update(thread_env)
+            # Ray worker launchers are device-owning workers, not controllers, and
+            # they carry no --role in argv. Mark them so areal/__init__.py does not
+            # hide the devices Ray assigned if the controller opt-in env is inherited.
+            sch.env_vars.setdefault("AREAL_ROLE_WORKER", "1")
 
         if len(schedulings) == 1:
             # Expand single spec to all workers
             return [schedulings[0]] * num_workers
-        elif len(schedulings) == num_workers:
+
+        if len(schedulings) == num_workers:
             return list(schedulings)
         else:
             raise ValueError(
@@ -1549,6 +1554,7 @@ class RayScheduler(Scheduler):
                 options = create_resource_spec(
                     self.ray_device_resource, cpu_count, gpu_count, mem_gb * 1024**3
                 )
+                options["runtime_env"] = {"env_vars": {"AREAL_ROLE_WORKER": "1"}}
                 options["scheduling_strategy"] = PlacementGroupSchedulingStrategy(
                     placement_group=pg,
                     placement_group_bundle_index=item["bundle_index"],

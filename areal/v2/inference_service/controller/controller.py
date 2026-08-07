@@ -13,7 +13,6 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import os
-import sys
 import threading
 import time
 import traceback
@@ -28,6 +27,7 @@ import httpx
 from openai.types.chat import ChatCompletion, ChatCompletionChunk
 
 from areal.infra.utils.http import async_http_retry, create_httpx_client
+from areal.infra.utils.python import get_python_executable
 
 if TYPE_CHECKING:
     from areal.api.scheduler_api import Scheduler, Worker
@@ -38,6 +38,33 @@ from areal.utils import logging, stats_tracker
 from areal.utils.network import format_hostport
 
 logger = logging.getLogger("RolloutControllerV2")
+
+
+def _prepare_inference_server_args(
+    server_args: dict[str, Any] | None, backend: str
+) -> dict[str, Any]:
+    """Prepare backend CLI args without leaking AReaL-private controls.
+
+    The trainer uses these fields to select the AWEX colocated path for the
+    legacy remote engine.  The v2 SGLang launcher installs its own AWEX
+    scheduler bridge and does not define corresponding SGLang CLI options.
+    Keep the controls in the controller layer instead of serializing them as
+    ``--awex-*`` flags to ``prepare_server_args``.
+    """
+    args = dict(server_args or {})
+    if backend == "sglang":
+        args.pop("awex_colocate_mode", None)
+        args.pop("awex_meta_server_addr", None)
+    return args
+
+
+def _get_inference_base_gpu_id(
+    workers: list[Any], worker_index: int, gpus_per_worker: int
+) -> int:
+    worker_ip = workers[worker_index].ip
+    local_slot = sum(1 for worker in workers[:worker_index] if worker.ip == worker_ip)
+    return local_slot * gpus_per_worker
+
 
 _MAX_COMPLETED_ONLINE_RESULTS = 1024
 _DEFAULT_SERVICE_LOG_LEVEL = "warning"
@@ -314,7 +341,7 @@ class RolloutControllerV2:
     ) -> None:
         from dataclasses import asdict
 
-        from areal.api.cli_args import SchedulingSpec, SchedulingStrategy
+        from areal.api.cli_args import SchedulingSpec
         from areal.api.scheduler_api import Job
 
         cfg = self.config
@@ -363,7 +390,7 @@ class RolloutControllerV2:
         inf_job = Job(
             replicas=total_workers,
             tasks=[inf_spec for _ in range(total_workers)],
-            scheduling_strategy=SchedulingStrategy(),
+            scheduling_strategy=cfg.scheduling_strategy,
             role=inf_role,
         )
 
@@ -390,7 +417,7 @@ class RolloutControllerV2:
         # Router does not depend on inference servers.
         # ==================================================================
         router_cmd = [
-            sys.executable,
+            get_python_executable(),
             "-m",
             "areal.v2.inference_service.router",
             "--admin-api-key",
@@ -449,7 +476,7 @@ class RolloutControllerV2:
         # Data Proxies need _inf_addrs (ready); Gateway needs _router_addr (ready).
         # ==================================================================
         data_proxy_base_cmd = [
-            sys.executable,
+            get_python_executable(),
             "-m",
             "areal.v2.inference_service.data_proxy",
             "--tokenizer-path",
@@ -505,7 +532,7 @@ class RolloutControllerV2:
             return host, port, guard_addr
 
         gw_cmd = [
-            sys.executable,
+            get_python_executable(),
             "-m",
             "areal.v2.inference_service.gateway",
             "--admin-api-key",
@@ -551,6 +578,11 @@ class RolloutControllerV2:
         nnodes_per_instance: int,
         server_args: dict[str, Any] | None,
     ) -> None:
+        instance_size = int(getattr(alloc.parallel, "tp_size", 1)) * int(
+            getattr(alloc.parallel, "pp_size", 1)
+        )
+        gpus_per_worker = instance_size // nnodes_per_instance
+
         if inf_backend == "sglang":
             from areal.api.cli_args import SGLangConfig
 
@@ -573,7 +605,13 @@ class RolloutControllerV2:
             client = await self._get_async_client()
 
             dist_init_addr = None
-            if nnodes_per_instance > 1:
+            parallel_size = int(getattr(alloc.parallel, "tp_size", 1)) * int(
+                getattr(alloc.parallel, "pp_size", 1)
+            )
+            needs_dist_init = nnodes_per_instance > 1 or (
+                inf_backend == "sglang" and parallel_size > 1
+            )
+            if needs_dist_init:
                 resp = await client.post(
                     f"{head_guard_addr}/alloc_ports",
                     json={"count": 1},
@@ -601,12 +639,17 @@ class RolloutControllerV2:
                 inf_port: int = port_data["ports"][0]
 
                 local_args = {
-                    **(server_args or {}),
+                    **_prepare_inference_server_args(server_args, inf_backend),
                     "host": inf_host,
                     "port": inf_port,
                     "nnodes": nnodes_per_instance,
                     "node_rank": node_rank,
                     "dist_init_addr": dist_init_addr,
+                    "base_gpu_id": _get_inference_base_gpu_id(
+                        inf_workers,
+                        group_idx * nnodes_per_instance + node_rank,
+                        gpus_per_worker,
+                    ),
                 }
                 cmd = _build_launch_cmd(local_args)
 
@@ -1120,6 +1163,7 @@ class RolloutControllerV2:
         batch_size: int | None = None,
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
+        keep_partial_group_on_error: bool = False,
     ) -> list[dict[str, Any]]:
         """Submit a batch of data items and wait for all results.
 
@@ -1152,10 +1196,10 @@ class RolloutControllerV2:
             A list of trajectory dicts (one per completed rollout).
         """
         self._ensure_initialized()
-        if reward_normalization or drop_incomplete_group:
+        if reward_normalization or drop_incomplete_group or keep_partial_group_on_error:
             raise ValueError(
-                "RolloutControllerV2 does not support reward_normalization or "
-                "drop_incomplete_group yet."
+                "RolloutControllerV2 does not support reward_normalization, "
+                "drop_incomplete_group, or keep_partial_group_on_error yet."
             )
         if not self._gateway_addr:
             raise RuntimeError("RolloutControllerV2.initialize() must be called first")
@@ -1196,6 +1240,7 @@ class RolloutControllerV2:
         batch_size: int | None = None,
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
+        keep_partial_group_on_error: bool = False,
     ) -> list[dict[str, Any]]:
         """Prepare a full training batch by consuming data from a dataloader.
 
@@ -1229,10 +1274,10 @@ class RolloutControllerV2:
             A list of trajectory dicts (matching ``RolloutController`` API).
         """
         self._ensure_initialized()
-        if reward_normalization or drop_incomplete_group:
+        if reward_normalization or drop_incomplete_group or keep_partial_group_on_error:
             raise ValueError(
-                "RolloutControllerV2 does not support reward_normalization or "
-                "drop_incomplete_group yet."
+                "RolloutControllerV2 does not support reward_normalization, "
+                "drop_incomplete_group, or keep_partial_group_on_error yet."
             )
         if not self._gateway_addr:
             raise RuntimeError("RolloutControllerV2.initialize() must be called first")
@@ -1380,19 +1425,20 @@ class RolloutControllerV2:
         assert self._workflow_executor is not None
         self._workflow_executor.resume()
 
-    def offload(self) -> None:
+    def offload(self, tags: list[str] | None = None) -> None:
         """Offload model memory on all inference workers."""
         from areal.infra.utils.concurrent import run_async_task
 
         self._ensure_initialized()
-        run_async_task(self._async_offload)
+        run_async_task(self._async_offload, tags)
 
-    async def _async_offload(self) -> None:
+    async def _async_offload(self, tags: list[str] | None = None) -> None:
         if not self._data_proxy_addrs:
             return
+        payload: dict = {"tags": tags} if tags is not None else {}
         results = await asyncio.gather(
             *(
-                self._async_data_proxy_post(addr, "/release_memory_occupation", {})
+                self._async_data_proxy_post(addr, "/release_memory_occupation", payload)
                 for addr in self._data_proxy_addrs
             ),
             return_exceptions=True,
@@ -1434,6 +1480,10 @@ class RolloutControllerV2:
         self._ensure_initialized()
         run_async_task(self._async_pause_generation)
 
+    def pause_generation_sync(self) -> None:
+        """Compatibility alias for controllers whose pause API is asynchronous."""
+        self.pause_generation()
+
     async def _async_pause_generation(self) -> None:
         if not self._data_proxy_addrs:
             return
@@ -1449,6 +1499,12 @@ class RolloutControllerV2:
             logger.error("Failed to pause generation on a worker: %s", r)
         if failed and len(failed) == len(results):
             raise RuntimeError(f"pause_generation failed on ALL {len(failed)} workers")
+        if self.config.pause_grace_period > 0:
+            logger.info(
+                "Waiting %.1fs after pause_generation for in-flight requests to drain",
+                self.config.pause_grace_period,
+            )
+            await asyncio.sleep(self.config.pause_grace_period)
 
     def continue_generation(self) -> None:
         """Continue generation on all workers."""

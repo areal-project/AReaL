@@ -12,6 +12,9 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+pytest.importorskip("torchdata")
+
+from areal.infra.rpc.guard import app as base_guard_app
 from areal.v2.inference_service.guard import app as guard_module
 from areal.v2.inference_service.guard.app import app, cleanup_forked_children
 
@@ -102,6 +105,26 @@ class TestAllocPorts:
             9005,
         }
 
+    @patch(f"{GUARD_APP}.find_free_ports")
+    def test_alloc_ports_uses_node_wide_reservations(
+        self, mock_find, client, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv(
+            "AREAL_GUARD_PORT_REGISTRY", str(tmp_path / "guard_ports.json")
+        )
+        mock_find.side_effect = [[9101], [9102]]
+
+        resp = client.post("/alloc_ports", json={"count": 1})
+        assert resp.status_code == 200
+
+        guard_module._state.allocated_ports = set()
+        resp = client.post("/alloc_ports", json={"count": 1})
+        assert resp.status_code == 200
+
+        _, kwargs = mock_find.call_args
+        assert 9101 in kwargs.get("exclude_ports", set())
+        assert base_guard_app._port_registry_path().name == "guard_ports.json"
+
     def test_alloc_ports_missing_count(self, client):
         resp = client.post("/alloc_ports", json={})
         assert resp.status_code == 400
@@ -188,6 +211,24 @@ class TestFork:
         call_kwargs = mock_run.call_args
         child_env = call_kwargs[1]["env"]
         assert child_env["MY_VAR"] == "my_value"
+
+    @patch(f"{GUARD_APP}.run_with_streaming_logs")
+    def test_fork_uses_worker_specific_log_file(self, mock_run, client, tmp_path):
+        mock_run.return_value = _make_mock_process()
+        guard_module._state.fileroot = str(tmp_path)
+
+        resp = client.post(
+            "/fork",
+            json={
+                "role": "train-worker",
+                "worker_index": 3,
+                "raw_cmd": ["echo", "hello"],
+            },
+        )
+
+        assert resp.status_code == 200
+        log_file = mock_run.call_args.args[1]
+        assert log_file.name == "train-worker-3.log"
 
 
 class TestForkErrorHandling:

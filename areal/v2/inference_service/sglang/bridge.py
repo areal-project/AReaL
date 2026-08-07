@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -13,9 +14,24 @@ from areal.api.io_struct import (
     HttpRequest,
     get_versioned_lora_name,
 )
+from areal.utils import logging
 
 if TYPE_CHECKING:
     from areal.api.io_struct import ModelRequest
+
+logger = logging.getLogger("SGLangBridge")
+
+# Probe switch for the qwen3 behav-logp investigation: log what the server
+# actually returned at the parse point, before any downstream aggregation.
+_DEBUG_LOGPROBS = os.environ.get("AREAL_DEBUG_BRIDGE_LOGPROBS", "0") == "1"
+_SGLANG_TOP_K_ALL_THRESHOLD = 1_000_000
+
+
+def _normalize_sglang_top_k(top_k: int) -> int:
+    """Translate AReaL's large "all vocab" top-k sentinel to SGLang's -1."""
+    if top_k >= _SGLANG_TOP_K_ALL_THRESHOLD:
+        return -1
+    return top_k
 
 
 class SGLangBridgeBackend:
@@ -24,6 +40,19 @@ class SGLangBridgeBackend:
     Mirrors the relevant subset of
     :class:`areal.engine.sglang_remote.SGLangBackend`.
     """
+
+    def __init__(self, use_awex_memory_endpoints: bool | None = None) -> None:
+        if use_awex_memory_endpoints is None:
+            raw = os.environ.get("DTE_USE_AWEX_MEMORY_ENDPOINTS")
+            if raw is None or raw.strip() == "":
+                raw = os.environ.get("AWEX_USE_MEMORY_ENDPOINTS", "0")
+            use_awex_memory_endpoints = raw.strip().lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }
+        self.use_awex_memory_endpoints = use_awex_memory_endpoints
 
     # -- generation ---------------------------------------------------------
 
@@ -49,7 +78,7 @@ class SGLangBridgeBackend:
 
         sampling_params: dict[str, Any] = {
             "top_p": gconfig.top_p,
-            "top_k": gconfig.top_k,
+            "top_k": _normalize_sglang_top_k(gconfig.top_k),
             "max_new_tokens": max_new_tokens,
             "temperature": 0.0 if gconfig.greedy else gconfig.temperature,
             "stop_token_ids": gconfig.stop_token_ids,
@@ -67,6 +96,13 @@ class SGLangBridgeBackend:
             "return_logprob": True,
             "stream": False,
         }
+
+        if _DEBUG_LOGPROBS:
+            logger.info(
+                "bridge request: input_len=%d sampling_params=%s",
+                len(req.input_ids),
+                sampling_params,
+            )
 
         if req.metadata.get("return_routed_experts", False):
             payload["return_routed_experts"] = True
@@ -125,6 +161,15 @@ class SGLangBridgeBackend:
         output_tokens = [x[1] for x in output_token_logprobs]
         output_logprobs = [x[0] for x in output_token_logprobs]
 
+        if _DEBUG_LOGPROBS and output_logprobs:
+            logger.info(
+                "bridge parse: n=%d mean_logp=%.4f first5=%s stop=%s",
+                len(output_logprobs),
+                sum(output_logprobs) / len(output_logprobs),
+                [round(x, 4) for x in output_logprobs[:5]],
+                stop_reason,
+            )
+
         return HttpGenerationResult(
             output_tokens=output_tokens,
             output_logprobs=output_logprobs,
@@ -140,11 +185,16 @@ class SGLangBridgeBackend:
     def get_resume_request(self) -> HttpRequest:
         return HttpRequest(endpoint="/continue_generation", payload={})
 
-    def get_offload_request(self) -> HttpRequest:
-        return HttpRequest(endpoint="/release_memory_occupation", payload={})
+    def get_offload_request(self, tags: list[str] | None = None) -> HttpRequest:
+        payload = {"tags": tags} if tags is not None else {}
+        if self.use_awex_memory_endpoints:
+            return HttpRequest(endpoint="/awex/release_memory", payload=payload)
+        return HttpRequest(endpoint="/release_memory_occupation", payload=payload)
 
     def get_onload_request(self, tags: list[str] | None = None) -> HttpRequest:
         payload = {"tags": tags} if tags is not None else {}
+        if self.use_awex_memory_endpoints:
+            return HttpRequest(endpoint="/awex/resume_memory", payload=payload)
         return HttpRequest(endpoint="/resume_memory_occupation", payload=payload)
 
     def get_generation_max_new_tokens(self, http_req: HttpRequest) -> int:

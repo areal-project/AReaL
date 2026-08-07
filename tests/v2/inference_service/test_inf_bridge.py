@@ -67,6 +67,7 @@ def _make_request(
     n_samples: int = 1,
     greedy: bool = False,
     temperature: float = 1.0,
+    top_k: int | None = None,
     metadata: dict[str, Any] | None = None,
     lora_name: str | None = None,
 ) -> ModelRequest:
@@ -80,6 +81,8 @@ def _make_request(
         greedy=greedy,
         temperature=temperature,
     )
+    if top_k is not None:
+        gconfig.top_k = top_k
     if lora_name is not None:
         gconfig.lora_name = lora_name
     return ModelRequest(
@@ -340,6 +343,24 @@ class TestInfBridge:
 
         assert resp.output_versions == [7]
 
+    @pytest.mark.asyncio
+    async def test_output_versions_use_send_time_version(self):
+        """A response is stamped with the version used to send that request."""
+        sglang_resp = _make_sglang_response([(-0.5, 100)], "stop")
+
+        bridge = _make_bridge(version=7)
+
+        async def _send_and_advance(*_args, **_kwargs):
+            bridge.set_version(8)
+            return sglang_resp
+
+        bridge._send_request = AsyncMock(side_effect=_send_and_advance)
+
+        req = _make_request(input_ids=[1, 2, 3])
+        resp = await bridge.agenerate(req)
+
+        assert resp.output_versions == [7]
+
     # -- 10. n_samples validation ------------------------------------------------
 
     @pytest.mark.asyncio
@@ -413,7 +434,21 @@ class TestInfBridge:
 
         assert calls[0]["params"]["temperature"] == 0.0
 
-    # -- 14. length stop reason passthrough --------------------------------------
+    # -- 14. SGLang top_k all-vocab sentinel ------------------------------------
+
+    def test_sglang_large_top_k_maps_to_all_vocab_sentinel(self):
+        """AReaL's large top_k sentinel maps to SGLang's -1 all-vocab value."""
+        backend = SGLangBridgeBackend()
+
+        req = _make_request(input_ids=[1, 2, 3], top_k=100_000_000)
+        http_req = backend.build_generation_request(req, with_lora=False, version=0)
+        assert http_req.payload["sampling_params"]["top_k"] == -1
+
+        req = _make_request(input_ids=[1, 2, 3], top_k=128)
+        http_req = backend.build_generation_request(req, with_lora=False, version=0)
+        assert http_req.payload["sampling_params"]["top_k"] == 128
+
+    # -- 15. length stop reason passthrough --------------------------------------
 
     @pytest.mark.asyncio
     async def test_length_stop_reason_passthrough(self):

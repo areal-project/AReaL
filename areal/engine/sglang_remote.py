@@ -3,6 +3,8 @@
 import os
 import subprocess
 import sys
+import threading
+import time
 import uuid
 from collections.abc import Callable, Mapping
 from concurrent.futures import Future
@@ -34,6 +36,7 @@ from areal.api.io_struct import (
 from areal.infra import RemoteInfEngine, RolloutController, WorkflowExecutor
 from areal.infra.platforms import current_platform
 from areal.infra.utils.launcher import TRITON_CACHE_PATH
+from areal.utils import logging as areal_logging
 from areal.utils import perf_tracer, stats_tracker
 from areal.utils.logging import getLogger
 from areal.utils.network import format_host_for_url
@@ -66,7 +69,7 @@ class SGLangBackend:
 
         sample_params = {
             "top_p": gconfig.top_p,
-            "top_k": gconfig.top_k,
+            "top_k": _normalize_sglang_top_k(gconfig.top_k),
             "max_new_tokens": gconfig.max_new_tokens,
             "temperature": 0.0 if gconfig.greedy else gconfig.temperature,
             "stop_token_ids": stop_token_ids,
@@ -370,8 +373,13 @@ class SGLangBackend:
         return HttpRequest(endpoint="/abort_request", payload={"abort_all": True})
 
     def get_health_check_request(self) -> HttpRequest:
-        """Get SGLang health check request."""
-        return HttpRequest(endpoint="/health", payload={}, method="GET")
+        """Get SGLang readiness check request."""
+        # SGLang's /health is a functional 1-token generation probe in recent
+        # versions. During AWEX colocated startup, generation can legitimately
+        # wait for the first train-side weight publication, so using /health for
+        # launch readiness deadlocks rollout initialization. /model_info only
+        # requires the HTTP server and model metadata to be ready.
+        return HttpRequest(endpoint="/model_info", payload={}, method="GET")
 
     def get_offload_request(self, tags: list[str] | None = None) -> HttpRequest:
         """Get SGLang offload request."""
@@ -416,7 +424,51 @@ class SGLangBackend:
                     base_gpu_id,
                 )
         cmd = SGLangConfig.build_cmd_from_args(server_args)
-        _env = self.build_server_env(os.environ)
+        _env = os.environ.copy()
+        triton_cache_path = _env.get("TRITON_CACHE_PATH", TRITON_CACHE_PATH)
+        _env["TRITON_CACHE_PATH"] = os.path.join(triton_cache_path, str(uuid.uuid4()))
+        _env.setdefault("PYTHONFAULTHANDLER", "1")
+
+        drop_ld_preload_default = "1" if (awex_colocate or awex_meta_addr) else "0"
+        if _env.get(
+            "AREAL_SGLANG_DROP_LD_PRELOAD", drop_ld_preload_default
+        ).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "y",
+            "on",
+        }:
+            dropped = _env.pop("LD_PRELOAD", "")
+            logger.info("Dropping LD_PRELOAD for SGLang child: %s", dropped)
+
+        if not awex_meta_addr:
+            awex_meta_addr = os.environ.get("AWEX_META_SERVER_ADDR")
+        if awex_colocate or awex_meta_addr:
+            launch_module = _env.get(
+                "AREAL_SGLANG_FORCE_LAUNCH_MODULE",
+                "areal.engine.awex_sglang_plugin",
+            ).strip()
+            if not launch_module:
+                launch_module = "areal.engine.awex_sglang_plugin"
+            # gh launches SGLang via its v2 wrapper module; the internal
+            # stack launches via sglang.launch_server. Swap either for the
+            # AWEX plugin entry (which itself execs sglang.launch_server
+            # semantics with the colocate patches applied).
+            _sglang_entries = (
+                "sglang.launch_server",
+                "areal.v2.inference_service.sglang.launch_server",
+            )
+            cmd = [launch_module if c in _sglang_entries else c for c in cmd]
+            if awex_meta_addr:
+                _env["AWEX_META_SERVER_ADDR"] = awex_meta_addr
+            if awex_physical_base_gpu_id is not None and export_physical_base:
+                _env["AREAL_AWEX_PHYSICAL_BASE_GPU_ID"] = str(awex_physical_base_gpu_id)
+            logger.info(
+                "AWEX mode: using SGLang launch module %s, cmd=%s",
+                launch_module,
+                cmd[:4],
+            )
 
         if not awex_meta_addr:
             awex_meta_addr = os.environ.get("AWEX_META_SERVER_ADDR")
@@ -439,6 +491,15 @@ class SGLangBackend:
             stdout=sys.stdout,
             stderr=sys.stdout,
         )
+        logger.info("Launched SGLang child process pid=%s", process.pid)
+        _start_process_monitor(
+            process,
+            interval_s=_float_env(
+                "AREAL_SGLANG_PROCESS_MONITOR_INTERVAL_SECONDS",
+                0.0,
+            ),
+        )
+        return process
 
 
 class RemoteSGLangEngine(InferenceEngine):
@@ -569,6 +630,7 @@ class RemoteSGLangEngine(InferenceEngine):
         proxy_addr: str | None = None,
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
+        keep_partial_group_on_error: bool = False,
     ) -> int:
         """Submit a request to the inference engine."""
         return self._engine.submit(
@@ -583,6 +645,7 @@ class RemoteSGLangEngine(InferenceEngine):
             proxy_addr=proxy_addr,
             reward_normalization=reward_normalization,
             drop_incomplete_group=drop_incomplete_group,
+            keep_partial_group_on_error=keep_partial_group_on_error,
         )
 
     def wait(

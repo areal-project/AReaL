@@ -255,6 +255,34 @@ class TestGatewayRoutingAndForwarding:
         assert resp.json()["status"] == "success"
 
     @pytest.mark.asyncio
+    @patch(f"{MODULE}.streaming.forward_request", new_callable=AsyncMock)
+    @patch(f"{MODULE}.streaming.query_router", new_callable=AsyncMock)
+    async def test_init_awex_adapter_forwards_response(
+        self,
+        mock_query_router,
+        mock_forward_request,
+        client,
+    ):
+        mock_query_router.return_value = WORKER_ADDR
+        mock_forward_request.return_value = httpx.Response(
+            200,
+            json={"status": "success", "result": None},
+        )
+
+        resp = await client.post(
+            "/init_awex_adapter",
+            json={"args": [], "kwargs": {"meta_server_addr": "127.0.0.1:12345"}},
+            headers={"Authorization": f"Bearer {SESSION_KEY}"},
+        )
+
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "success"
+        mock_forward_request.assert_awaited_once()
+        assert mock_forward_request.await_args.args[0] == (
+            f"{WORKER_ADDR}/init_awex_adapter"
+        )
+
+    @pytest.mark.asyncio
     @patch(f"{MODULE}.streaming.query_router", new_callable=AsyncMock)
     async def test_get_version_uses_shared_clients(
         self,
