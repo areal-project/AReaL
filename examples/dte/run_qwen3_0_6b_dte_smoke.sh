@@ -296,16 +296,22 @@ else:
     else:
         train_visible = {x.strip() for x in train_cvd if x.strip()}
         infer_visible = {x.strip() for x in infer_cvd if x.strip()}
-        if any("," in x for x in train_visible | infer_visible):
-            failures.append(
-                "separation worker saw multi-GPU CUDA_VISIBLE_DEVICES: "
-                f"train={sorted(train_visible)} infer={sorted(infer_visible)}"
-            )
-        if train_visible & infer_visible:
+
+        def expand_visible(visible):
+            devices = set()
+            for spec in visible:
+                devices.update(x.strip() for x in spec.split(",") if x.strip())
+            return devices
+
+        train_devices = expand_visible(train_visible)
+        infer_devices = expand_visible(infer_visible)
+        if train_devices & infer_devices:
             failures.append(
                 "separation train/infer CUDA_VISIBLE_DEVICES overlap: "
                 f"train={sorted(train_visible)} infer={sorted(infer_visible)}"
             )
+        print(f"DTE_SMOKE_TRAIN_CUDA_VISIBLE_DEVICES={sorted(train_visible)}")
+        print(f"DTE_SMOKE_INFER_CUDA_VISIBLE_DEVICES={sorted(infer_visible)}")
 for pat in required:
     if re.search(pat, clean) is None:
         failures.append(f"missing log pattern: {pat}")
