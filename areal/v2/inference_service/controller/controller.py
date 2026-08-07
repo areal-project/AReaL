@@ -370,7 +370,9 @@ class RolloutControllerV2:
 
         self.scheduler.create_workers(job=inf_job)
         self._service_roles.append(inf_role)
-        inf_workers = self.scheduler.get_workers(role=inf_role)
+        inf_workers = self.scheduler.get_workers(
+            role=inf_role, timeout=self.config.workers_ready_timeout
+        )
         if len(inf_workers) != total_workers:
             raise RuntimeError(
                 f"Expected {total_workers} workers for role {inf_role!r}, "
