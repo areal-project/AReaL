@@ -207,7 +207,9 @@ run_inside_container() {
   DTE_WORKER_CACHE_ROOT=${DTE_WORKER_CACHE_ROOT:-${DTE_WORKER_TMPDIR}/areal_worker_cache/${TRIAL_NAME}}
   DTE_WORKER_CACHE_SUFFIX=${DTE_WORKER_CACHE_SUFFIX:-$(hostname 2>/dev/null || echo node)}
   DTE_WORKER_CACHE_SUFFIX=${DTE_WORKER_CACHE_SUFFIX//[^A-Za-z0-9_.-]/_}
-  LOCAL_TMP_ROOT=${LOCAL_TMP_ROOT:-${DTE_WORKER_TMPDIR}/driver_tmp/${TRIAL_NAME}}
+  # SGLang/AWEX result channels use ZMQ ipc:// sockets under TMPDIR.
+  # Keep this path short enough for Unix-domain socket limits.
+  LOCAL_TMP_ROOT=${LOCAL_TMP_ROOT:-${DTE_WORKER_TMPDIR}/rt}
 
   export AREAL_SRC IMAGE DTE_SRC DTE_AWEX_SRC DTE_WORKER_TMPDIR DTE_WORKER_CACHE_ROOT
   export DTE_IMAGE_CACHE_TAG DTE_WORKER_CACHE_SUFFIX DTE_DELTA_P2P_COALESCE
