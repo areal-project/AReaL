@@ -176,7 +176,7 @@ actor:
         NCCL_IB_TIMEOUT: "22"
         NCCL_IB_RETRY_CNT: "7"
         NCCL_IB_QPS_PER_CONNECTION: "8"
-        NCCL_SOCKET_IFNAME: "^lo,docker"
+        NCCL_SOCKET_IFNAME: "^lo"
         NCCL_P2P_PXN_LEVEL: "0"
         AWEX_WU_USE_GROUP: ${oc.env:AWEX_WU_USE_GROUP,"0"}
         DTE_DELTA_P2P_COALESCE: ${oc.env:DTE_DELTA_P2P_COALESCE,"1"}
