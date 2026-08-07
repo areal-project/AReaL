@@ -1152,6 +1152,99 @@ def test_non_trivial_loss_mask_batch_normalization():
     assert torch.abs(non_masked_values.std() - 1.0) < 1e-5
 
 
+def test_masked_invalid_values_do_not_poison_batch_normalization():
+    config = NormConfig(mean_level="batch", std_level="batch", group_size=1)
+    adv_norm = Normalization(config)
+
+    advantages = torch.tensor(
+        [[1.0, float("nan")], [3.0, 5.0]],
+        dtype=torch.float32,
+    )
+    loss_mask = torch.tensor([[1.0, 0.0], [1.0, 1.0]], dtype=torch.float32)
+
+    normalized = adv_norm(advantages, loss_mask)
+
+    expected_valid = torch.tensor(
+        [-1.0, 0.0, 1.0],
+        dtype=torch.float32,
+    )
+    assert torch.isfinite(normalized).all()
+    assert torch.allclose(normalized[loss_mask.bool()], expected_valid, atol=1e-6)
+    assert normalized[0, 1].item() == 0.0
+
+
+def test_masked_invalid_values_emit_warning():
+    config = NormConfig(mean_level="batch", std_level="batch", group_size=1)
+    adv_norm = Normalization(config)
+
+    advantages = torch.tensor(
+        [[1.0, float("nan")], [3.0, 5.0]],
+        dtype=torch.float32,
+    )
+    loss_mask = torch.tensor([[1.0, 0.0], [1.0, 1.0]], dtype=torch.float32)
+
+    with patch("areal.utils.data.logger.warning") as warning:
+        normalized = adv_norm(advantages, loss_mask)
+
+    warning.assert_called_once()
+    assert "non-finite values at masked positions" in warning.call_args.args[0]
+    assert torch.isfinite(normalized).all()
+
+
+def test_masked_invalid_values_do_not_poison_group_normalization():
+    config = NormConfig(mean_level="group", std_level="group", group_size=2)
+    adv_norm = Normalization(config)
+
+    advantages = torch.tensor(
+        [[1.0, float("inf")], [3.0, 5.0]],
+        dtype=torch.float32,
+    )
+    loss_mask = torch.tensor([[1.0, 0.0], [1.0, 1.0]], dtype=torch.float32)
+
+    normalized = adv_norm(advantages, loss_mask)
+
+    expected_valid = torch.tensor(
+        [-1.0, 0.0, 1.0],
+        dtype=torch.float32,
+    )
+    assert torch.isfinite(normalized).all()
+    assert torch.allclose(normalized[loss_mask.bool()], expected_valid, atol=1e-6)
+    assert normalized[0, 1].item() == 0.0
+
+
+def test_unmasked_invalid_values_are_not_sanitized():
+    config = NormConfig(mean_level="batch", std_level=None, group_size=1)
+    adv_norm = Normalization(config)
+
+    advantages = torch.tensor(
+        [[1.0, float("nan")], [3.0, 5.0]],
+        dtype=torch.float32,
+    )
+    loss_mask = torch.ones_like(advantages)
+
+    normalized = adv_norm(advantages, loss_mask)
+
+    assert torch.isnan(normalized).any()
+
+
+def test_unmasked_invalid_values_emit_warning_and_are_not_sanitized():
+    config = NormConfig(mean_level="batch", std_level=None, group_size=1)
+    adv_norm = Normalization(config)
+
+    advantages = torch.tensor(
+        [[1.0, float("nan")], [3.0, 5.0]],
+        dtype=torch.float32,
+    )
+    loss_mask = torch.ones_like(advantages)
+
+    with patch("areal.utils.data.logger.warning") as warning:
+        normalized = adv_norm(advantages, loss_mask)
+
+    warning.assert_called_once()
+    assert "non-finite values at active positions" in warning.call_args.args[0]
+    assert torch.isnan(normalized).any()
+
+
 def test_non_trivial_loss_mask_leave_one_out():
     """Test leave-one-out normalization with non-trivial loss mask and verify expected values."""
     config = NormConfig(
