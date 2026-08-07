@@ -1742,9 +1742,9 @@ class MegatronEngine(TrainEngine):
         """
         if os.environ.get("AREAL_COMM_WARMUP", "0").strip() != "1":
             return
-        if not dist.is_initialized():
+        if not dist.is_initialized() or current_platform.device_type == "cpu":
             return
-        device = torch.cuda.current_device()
+        device = self.device
         # The two probe sizes do not model training tensor shapes. They sit
         # clearly on each side of NCCL's message-size protocol thresholds
         # (LL/LL128 vs Simple; 2KB vs 32MB payloads in bf16), and NCCL
@@ -1836,7 +1836,7 @@ class MegatronEngine(TrainEngine):
                     for work in dist.batch_isend_irecv(ops):
                         work.wait()
         del small, large
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         dist.barrier(group=self.cpu_group)
         self.logger.info(
             "[COMM-WARMUP rank %s] communicator warmup complete", dist.get_rank()
