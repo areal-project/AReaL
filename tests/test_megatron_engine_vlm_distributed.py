@@ -15,6 +15,7 @@ import os
 import pathlib
 import subprocess
 import sys
+from collections.abc import Mapping
 
 import pytest
 import torch
@@ -111,15 +112,15 @@ def _run_vlm_test(
 
 _VLM_MODELS = [
     pytest.param(
-        {"VLM_MODEL_PATH": DENSE_MODEL_PATHS["qwen2_5_vl"]},
+        (DENSE_MODEL_PATHS, "qwen2_5_vl"),
         id="qwen25_vl",
     ),
     pytest.param(
-        {"VLM_MODEL_PATH": DENSE_MODEL_PATHS["qwen3_vl"]},
+        (DENSE_MODEL_PATHS, "qwen3_vl"),
         id="qwen3_vl",
     ),
     pytest.param(
-        {"VLM_MODEL_PATH": MOE_MODEL_PATHS["qwen3_vl_moe"]},
+        (MOE_MODEL_PATHS, "qwen3_vl_moe"),
         id="qwen3_vl_moe",
         marks=pytest.mark.skipif(
             torch.cuda.device_count() < 8,
@@ -129,10 +130,17 @@ _VLM_MODELS = [
 ]
 
 
+@pytest.fixture
+def model_env(request: pytest.FixtureRequest) -> dict[str, str]:
+    model_paths, model_key = request.param
+    assert isinstance(model_paths, Mapping)
+    return {"VLM_MODEL_PATH": model_paths[model_key]}
+
+
 @pytest.mark.gpu
 @pytest.mark.slow
 @pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA not available")
-@pytest.mark.parametrize("model_env", _VLM_MODELS)
+@pytest.mark.parametrize("model_env", _VLM_MODELS, indirect=True)
 def test_engine_initializes(model_env, tmp_path_factory):
     """Verify VLM engine detects vision model and loads processor."""
     output = str(tmp_path_factory.mktemp("vlm_test") / "init.out")
@@ -142,7 +150,7 @@ def test_engine_initializes(model_env, tmp_path_factory):
 @pytest.mark.gpu
 @pytest.mark.slow
 @pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA not available")
-@pytest.mark.parametrize("model_env", _VLM_MODELS)
+@pytest.mark.parametrize("model_env", _VLM_MODELS, indirect=True)
 def test_simple_forward(model_env, tmp_path_factory):
     """Verify forward pass with VLM inputs completes."""
     output = str(tmp_path_factory.mktemp("vlm_test") / "forward.out")
@@ -152,7 +160,7 @@ def test_simple_forward(model_env, tmp_path_factory):
 @pytest.mark.gpu
 @pytest.mark.slow
 @pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA not available")
-@pytest.mark.parametrize("model_env", _VLM_MODELS)
+@pytest.mark.parametrize("model_env", _VLM_MODELS, indirect=True)
 def test_hf_save_load_weights(model_env, tmp_path_factory):
     """Verify save/load preserves VLM weights and saves processor."""
     save_dir = str(tmp_path_factory.mktemp("vlm_save"))
@@ -169,7 +177,7 @@ def test_hf_save_load_weights(model_env, tmp_path_factory):
 @pytest.mark.multi_gpu
 @pytest.mark.slow
 @pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA not available")
-@pytest.mark.parametrize("model_env", _VLM_MODELS)
+@pytest.mark.parametrize("model_env", _VLM_MODELS, indirect=True)
 def test_train_tensor_parallel(model_env, tmp_path_factory):
     """VLM training with TP=2 to avoid single-device OOM."""
     if torch.cuda.device_count() < 2:
