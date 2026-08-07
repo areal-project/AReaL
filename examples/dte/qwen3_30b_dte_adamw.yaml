@@ -204,6 +204,8 @@ sglang:
   dtype: ${actor.dtype}
   context_length: 32768
   mem_fraction_static: 0.65
+  cuda_graph_max_bs: 16
+  disable_custom_all_reduce: true
 
 train_dataset:
   batch_size: 8
