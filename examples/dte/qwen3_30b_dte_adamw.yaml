@@ -147,24 +147,24 @@ actor:
         DTE_SRC: ${oc.env:DTE_SRC,"/storage/openpsi/users/pengzai.pyq/delta-transfer-engine-pyq-perf-sparse-p2p/src"}
         DTE_AWEX_SRC: ${oc.env:DTE_AWEX_SRC,"/storage/openpsi/users/pengzai.pyq/asystem-awex"}
         PYTHONPATH: ${oc.env:DTE_SRC,"/storage/openpsi/users/pengzai.pyq/delta-transfer-engine-pyq-perf-sparse-p2p/src"}:${oc.env:DTE_AWEX_SRC,"/storage/openpsi/users/pengzai.pyq/asystem-awex"}:${oc.env:AREAL_SRC,"/storage/openpsi/users/pengzai.pyq/github_areal/AReaL"}
-        AREAL_CACHE_DIR: ${oc.env:DTE_WORKER_CACHE_ROOT,"/tmp/dte-pyq-local/areal_worker_cache/qwen3_30b"}/areal/$HOSTNAME
-        AREAL_GUARD_PORT_REGISTRY: ${oc.env:DTE_WORKER_TMPDIR,"/tmp/dte-pyq-local"}/guard_ports/$HOSTNAME.json
+        AREAL_CACHE_DIR: ${oc.env:DTE_WORKER_CACHE_ROOT,"/tmp/dte-pyq-local/areal_worker_cache/qwen3_30b"}/areal/${oc.env:DTE_WORKER_CACHE_SUFFIX,"node"}
+        AREAL_GUARD_PORT_REGISTRY: ${oc.env:DTE_WORKER_TMPDIR,"/tmp/dte-pyq-local"}/guard_ports/${oc.env:DTE_WORKER_CACHE_SUFFIX,"node"}.json
         HOME: ${oc.env:DTE_WORKER_CACHE_ROOT,"/tmp/dte-pyq-local/areal_worker_cache/qwen3_30b"}/home
         HF_HOME: ${oc.env:DTE_WORKER_CACHE_ROOT,"/tmp/dte-pyq-local/areal_worker_cache/qwen3_30b"}/hf
         HF_DATASETS_CACHE: ${oc.env:DTE_WORKER_CACHE_ROOT,"/tmp/dte-pyq-local/areal_worker_cache/qwen3_30b"}/hf/datasets
         TRANSFORMERS_CACHE: ${oc.env:DTE_WORKER_CACHE_ROOT,"/tmp/dte-pyq-local/areal_worker_cache/qwen3_30b"}/hf/transformers
         XDG_CACHE_HOME: ${oc.env:DTE_WORKER_CACHE_ROOT,"/tmp/dte-pyq-local/areal_worker_cache/qwen3_30b"}/xdg
-        FLASHINFER_WORKSPACE_BASE: ${oc.env:DTE_WORKER_CACHE_ROOT,"/tmp/dte-pyq-local/areal_worker_cache/qwen3_30b"}/jit/${oc.env:DTE_IMAGE_CACHE_TAG,"areal-dev-20260508"}/flashinfer_base/$HOSTNAME
-        FLASHINFER_WORKSPACE_DIR: ${oc.env:DTE_WORKER_CACHE_ROOT,"/tmp/dte-pyq-local/areal_worker_cache/qwen3_30b"}/jit/${oc.env:DTE_IMAGE_CACHE_TAG,"areal-dev-20260508"}/flashinfer/$HOSTNAME
-        CUTE_DSL_CACHE_DIR: ${oc.env:DTE_WORKER_CACHE_ROOT,"/tmp/dte-pyq-local/areal_worker_cache/qwen3_30b"}/jit/${oc.env:DTE_IMAGE_CACHE_TAG,"areal-dev-20260508"}/cutlass/$HOSTNAME
-        TRITON_CACHE_DIR: ${oc.env:DTE_WORKER_CACHE_ROOT,"/tmp/dte-pyq-local/areal_worker_cache/qwen3_30b"}/jit/${oc.env:DTE_IMAGE_CACHE_TAG,"areal-dev-20260508"}/triton/$HOSTNAME
-        TRITON_CACHE_PATH: ${oc.env:DTE_WORKER_CACHE_ROOT,"/tmp/dte-pyq-local/areal_worker_cache/qwen3_30b"}/jit/${oc.env:DTE_IMAGE_CACHE_TAG,"areal-dev-20260508"}/triton_path/$HOSTNAME
-        PYTORCH_KERNEL_CACHE_PATH: ${oc.env:DTE_WORKER_CACHE_ROOT,"/tmp/dte-pyq-local/areal_worker_cache/qwen3_30b"}/jit/${oc.env:DTE_IMAGE_CACHE_TAG,"areal-dev-20260508"}/torch_kernel/$HOSTNAME
-        TORCHINDUCTOR_CACHE_DIR: ${oc.env:DTE_WORKER_CACHE_ROOT,"/tmp/dte-pyq-local/areal_worker_cache/qwen3_30b"}/jit/${oc.env:DTE_IMAGE_CACHE_TAG,"areal-dev-20260508"}/torchinductor/$HOSTNAME
-        TORCH_EXTENSIONS_DIR: ${oc.env:DTE_WORKER_CACHE_ROOT,"/tmp/dte-pyq-local/areal_worker_cache/qwen3_30b"}/jit/${oc.env:DTE_IMAGE_CACHE_TAG,"areal-dev-20260508"}/torch_extensions/$HOSTNAME
-        TVM_FFI_CACHE_DIR: ${oc.env:DTE_WORKER_CACHE_ROOT,"/tmp/dte-pyq-local/areal_worker_cache/qwen3_30b"}/jit/${oc.env:DTE_IMAGE_CACHE_TAG,"areal-dev-20260508"}/tvm_ffi/$HOSTNAME
-        VLLM_CACHE_ROOT: ${oc.env:DTE_WORKER_CACHE_ROOT,"/tmp/dte-pyq-local/areal_worker_cache/qwen3_30b"}/jit/${oc.env:DTE_IMAGE_CACHE_TAG,"areal-dev-20260508"}/vllm/$HOSTNAME
-        SGLANG_DG_CACHE_DIR: ${oc.env:DTE_WORKER_CACHE_ROOT,"/tmp/dte-pyq-local/areal_worker_cache/qwen3_30b"}/jit/${oc.env:DTE_IMAGE_CACHE_TAG,"areal-dev-20260508"}/deep_gemm/$HOSTNAME
+        FLASHINFER_WORKSPACE_BASE: ${oc.env:DTE_WORKER_CACHE_ROOT,"/tmp/dte-pyq-local/areal_worker_cache/qwen3_30b"}/jit/${oc.env:DTE_IMAGE_CACHE_TAG,"areal-dev-20260508"}/flashinfer_base/${oc.env:DTE_WORKER_CACHE_SUFFIX,"node"}
+        FLASHINFER_WORKSPACE_DIR: ${oc.env:DTE_WORKER_CACHE_ROOT,"/tmp/dte-pyq-local/areal_worker_cache/qwen3_30b"}/jit/${oc.env:DTE_IMAGE_CACHE_TAG,"areal-dev-20260508"}/flashinfer/${oc.env:DTE_WORKER_CACHE_SUFFIX,"node"}
+        CUTE_DSL_CACHE_DIR: ${oc.env:DTE_WORKER_CACHE_ROOT,"/tmp/dte-pyq-local/areal_worker_cache/qwen3_30b"}/jit/${oc.env:DTE_IMAGE_CACHE_TAG,"areal-dev-20260508"}/cutlass/${oc.env:DTE_WORKER_CACHE_SUFFIX,"node"}
+        TRITON_CACHE_DIR: ${oc.env:DTE_WORKER_CACHE_ROOT,"/tmp/dte-pyq-local/areal_worker_cache/qwen3_30b"}/jit/${oc.env:DTE_IMAGE_CACHE_TAG,"areal-dev-20260508"}/triton/${oc.env:DTE_WORKER_CACHE_SUFFIX,"node"}
+        TRITON_CACHE_PATH: ${oc.env:DTE_WORKER_CACHE_ROOT,"/tmp/dte-pyq-local/areal_worker_cache/qwen3_30b"}/jit/${oc.env:DTE_IMAGE_CACHE_TAG,"areal-dev-20260508"}/triton_path/${oc.env:DTE_WORKER_CACHE_SUFFIX,"node"}
+        PYTORCH_KERNEL_CACHE_PATH: ${oc.env:DTE_WORKER_CACHE_ROOT,"/tmp/dte-pyq-local/areal_worker_cache/qwen3_30b"}/jit/${oc.env:DTE_IMAGE_CACHE_TAG,"areal-dev-20260508"}/torch_kernel/${oc.env:DTE_WORKER_CACHE_SUFFIX,"node"}
+        TORCHINDUCTOR_CACHE_DIR: ${oc.env:DTE_WORKER_CACHE_ROOT,"/tmp/dte-pyq-local/areal_worker_cache/qwen3_30b"}/jit/${oc.env:DTE_IMAGE_CACHE_TAG,"areal-dev-20260508"}/torchinductor/${oc.env:DTE_WORKER_CACHE_SUFFIX,"node"}
+        TORCH_EXTENSIONS_DIR: ${oc.env:DTE_WORKER_CACHE_ROOT,"/tmp/dte-pyq-local/areal_worker_cache/qwen3_30b"}/jit/${oc.env:DTE_IMAGE_CACHE_TAG,"areal-dev-20260508"}/torch_extensions/${oc.env:DTE_WORKER_CACHE_SUFFIX,"node"}
+        TVM_FFI_CACHE_DIR: ${oc.env:DTE_WORKER_CACHE_ROOT,"/tmp/dte-pyq-local/areal_worker_cache/qwen3_30b"}/jit/${oc.env:DTE_IMAGE_CACHE_TAG,"areal-dev-20260508"}/tvm_ffi/${oc.env:DTE_WORKER_CACHE_SUFFIX,"node"}
+        VLLM_CACHE_ROOT: ${oc.env:DTE_WORKER_CACHE_ROOT,"/tmp/dte-pyq-local/areal_worker_cache/qwen3_30b"}/jit/${oc.env:DTE_IMAGE_CACHE_TAG,"areal-dev-20260508"}/vllm/${oc.env:DTE_WORKER_CACHE_SUFFIX,"node"}
+        SGLANG_DG_CACHE_DIR: ${oc.env:DTE_WORKER_CACHE_ROOT,"/tmp/dte-pyq-local/areal_worker_cache/qwen3_30b"}/jit/${oc.env:DTE_IMAGE_CACHE_TAG,"areal-dev-20260508"}/deep_gemm/${oc.env:DTE_WORKER_CACHE_SUFFIX,"node"}
         NCCL_CUMEM_ENABLE: "0"
         NCCL_NVLS_ENABLE: "0"
         NCCL_IB_DISABLE: "0"
