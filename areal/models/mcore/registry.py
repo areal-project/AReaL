@@ -36,6 +36,9 @@ from areal.models.mcore.qwen3 import (
     hf_to_mcore_config_qwen3_dense,
     make_mcore_layer_specs_qwen3_dense,
 )
+from areal.models.mcore.vocab_parallel_head import (
+    replace_output_layer_with_areal_lm_head,
+)
 from areal.utils import logging
 
 logger = logging.getLogger("MCoreRegistry")
@@ -308,6 +311,36 @@ def unwrap_to_gpt_model(model: torch.nn.Module) -> GPTModel:
     raise TypeError(f"Model could not be unwrapped to GPTModel. Got {type(_model)}")
 
 
+def _replace_actor_output_layers(
+    models: list[GPTModel | DDP],
+    *,
+    enabled: bool,
+) -> None:
+    if not enabled:
+        return
+    for model in models:
+        gpt_model = unwrap_to_gpt_model(model)
+        replace_output_layer_with_areal_lm_head(
+            gpt_model,
+            fp32_output=True,
+        )
+
+
+def _configure_actor_output_layers(
+    models: list[GPTModel | DDP],
+    mcore_config: MegatronEngineConfig | None,
+) -> None:
+    if mcore_config is None:
+        return
+    if mcore_config.enable_chunked_logits:
+        _replace_actor_output_layers(models, enabled=True)
+    else:
+        _enable_fp32_lm_head_forward(
+            models,
+            enabled=mcore_config.enable_fp32_lm_head,
+        )
+
+
 # Model registry for different architectures
 def make_hf_and_mcore_config(
     hf_path: str,
@@ -562,12 +595,7 @@ def make_mcore_model(
                 _model = unwrap_to_gpt_model(model)
                 _replace_output_layer_with_value_head(_model, tf_config)
         else:
-            _enable_fp32_lm_head_forward(
-                models,
-                enabled=bool(
-                    mcore_config is not None and mcore_config.enable_fp32_lm_head
-                ),
-            )
+            _configure_actor_output_layers(models, mcore_config)
 
         return models
 
@@ -803,12 +831,7 @@ def make_mcore_model(
                 _model = unwrap_to_gpt_model(model)
                 _replace_output_layer_with_value_head(_model, tf_config)
         else:
-            _enable_fp32_lm_head_forward(
-                models,
-                enabled=bool(
-                    mcore_config is not None and mcore_config.enable_fp32_lm_head
-                ),
-            )
+            _configure_actor_output_layers(models, mcore_config)
 
         return models
 
@@ -873,12 +896,7 @@ def make_mcore_model(
         if is_critic:
             _replace_output_layer_with_value_head(model, tf_config)
         else:
-            _enable_fp32_lm_head_forward(
-                [model],
-                enabled=bool(
-                    mcore_config is not None and mcore_config.enable_fp32_lm_head
-                ),
-            )
+            _configure_actor_output_layers([model], mcore_config)
 
         if mcore_config.wrap_with_ddp:
             ddp_config = MCoreDDPConfig(**dataclasses.asdict(mcore_config.ddp))

@@ -26,6 +26,12 @@ __pycache__/
 *$py.class
 trace_result/
 profile_result/
+profile_artifacts/
+profile_data/
+profile_inputs/
+traces-r*.jsonl
+traces-r*.chrome.json
+chrome_trace.png
 
 slurm_outs
 _data

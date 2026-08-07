@@ -254,7 +254,9 @@ def test_forward_result_reassembles_cp_local_logprobs():
         pytest.skip("MegatronEngine dependencies are unavailable")
 
     engine = object.__new__(megatron_engine_module.MegatronEngine)
-    engine.config = SimpleNamespace(is_critic=False, temperature=1.0)
+    engine.config = SimpleNamespace(
+        is_critic=False, temperature=1.0, logprobs_chunk_size=1024
+    )
     engine.enable_tree_training = False
 
     output = torch.randn(4, 8)

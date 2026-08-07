@@ -293,6 +293,7 @@ def test_bridge_model_honors_mindspeed_aux_settings_before_finalize(
             ),
             "MCoreDDPConfig": SimpleNamespace,
             "MindSpeedEngineConfig": MindSpeedEngineConfig,
+            "_configure_actor_output_layers": lambda models, config: None,
             "logger": SimpleNamespace(warning=warning),
         },
     )
@@ -455,6 +456,9 @@ def test_mbridge_fusion_override_is_independent_of_checkpointing(
         "_build_hf_mcore_bridge",
         {
             "dataclasses": dataclasses,
+            "_mbridge_precision_args": _load_function(
+                "areal/engine/megatron_engine.py", "_mbridge_precision_args", {}
+            ),
             "mbridge": SimpleNamespace(
                 AutoBridge=SimpleNamespace(from_pretrained=lambda *a, **kw: bridge)
             ),
@@ -509,7 +513,15 @@ def test_npu_bridge_rejects_dispatcher_before_initialization(
     initialize = _load_function(
         "areal/engine/megatron_engine.py",
         "__init__",
-        {"torch": SimpleNamespace(bfloat16="bf16"), "is_npu_available": True},
+        {
+            "torch": SimpleNamespace(bfloat16="bf16"),
+            "is_npu_available": True,
+            "_validate_areal_lm_head_compatibility": _load_function(
+                "areal/engine/megatron_engine.py",
+                "_validate_areal_lm_head_compatibility",
+                {},
+            ),
+        },
     )
     with pytest.raises(ValueError, match="NPU requires.*alltoall"):
         initialize(SimpleNamespace(), config)
@@ -532,6 +544,11 @@ def test_engine_resolves_dispatcher_from_platform_config(bridge_type, is_npu):
         {
             "torch": SimpleNamespace(bfloat16="bf16"),
             "is_npu_available": is_npu,
+            "_validate_areal_lm_head_compatibility": _load_function(
+                "areal/engine/megatron_engine.py",
+                "_validate_areal_lm_head_compatibility",
+                {},
+            ),
             "logger": SimpleNamespace(warning=warning),
             "importlib": SimpleNamespace(
                 util=SimpleNamespace(find_spec=lambda name: True)
@@ -581,6 +598,11 @@ def test_npu_engine_warns_when_megatron_fusion_setting_is_ignored(bridge_type, f
         {
             "torch": SimpleNamespace(bfloat16="bf16"),
             "is_npu_available": True,
+            "_validate_areal_lm_head_compatibility": _load_function(
+                "areal/engine/megatron_engine.py",
+                "_validate_areal_lm_head_compatibility",
+                {},
+            ),
             "logger": SimpleNamespace(warning=warning),
             "importlib": SimpleNamespace(
                 util=SimpleNamespace(find_spec=lambda name: True)
@@ -725,6 +747,9 @@ def test_cuda_mbridge_passes_selected_dispatcher(dispatcher):
         "_build_hf_mcore_bridge",
         {
             "dataclasses": dataclasses,
+            "_mbridge_precision_args": _load_function(
+                "areal/engine/megatron_engine.py", "_mbridge_precision_args", {}
+            ),
             "is_npu_available": False,
             "mbridge": SimpleNamespace(
                 AutoBridge=SimpleNamespace(from_pretrained=lambda *a, **kw: bridge)
