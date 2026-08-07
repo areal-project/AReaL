@@ -24,10 +24,7 @@ from areal.infra.rpc.guard.app import (
     run_server,
 )
 from areal.infra.rpc.guard.data_blueprint import data_bp
-from areal.infra.rpc.guard.engine_blueprint import (
-    engine_bp,
-    register_engine_hooks,
-)
+from areal.infra.rpc.guard.engine_blueprint import engine_bp, register_engine_hooks
 from areal.utils import logging, perf_tracer
 
 logger = logging.getLogger("SyncRPCServer")
