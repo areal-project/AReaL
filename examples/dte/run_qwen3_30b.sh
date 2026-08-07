@@ -16,7 +16,7 @@ Usage:
 Environment:
   TOPOLOGY=colocation|separation  Select colocated or separated DTE update mode.
   SUBMIT=0                         Generate sbatch without submitting.
-  RESERVATION=shanghai             Optional Slurm reservation for controller sbatch.
+  RESERVATION=shanghai             Optional Slurm reservation for controller and child worker sbatch jobs.
   CONTROLLER_NODELIST=slurmd-13     Optional node for the controller sbatch.
   DTE_NODELIST=slurmd-[63-64]       Optional worker nodelist for separation child jobs.
   TRIAL_NAME=qwen3_30b_manual       Set the trial name.
@@ -27,7 +27,9 @@ Defaults:
   actor.backend: megatron:(attn:d2p1t4|ffn:d1p1e8)
   rollout.backend: sglang:d2t4p1
   delta method: adamw
-  train steps: 3
+  train steps: 20
+  batch size: 4
+  n samples: 4
 USAGE
 }
 
@@ -64,7 +66,7 @@ ROLLOUT_BACKEND=${ROLLOUT_BACKEND:-"sglang:d2t4p1"}
 
 EXP_NAME=${EXP_NAME:-pyq-areal-port-dte-qwen3-30b}
 TRIAL_SUFFIX=${TRIAL_SUFFIX:-$(date +%m%d_%H%M%S)}
-TRIAL_NAME=${TRIAL_NAME:-qwen3_30b_${TOPOLOGY}_adamw_3step_bs8_ns2_${TRIAL_SUFFIX}}
+TRIAL_NAME=${TRIAL_NAME:-qwen3_30b_${TOPOLOGY}_adamw_20step_bs4_ns4_${TRIAL_SUFFIX}}
 JOB_NAME=${JOB_NAME:-pyq-dte-q3-30b-${TOPOLOGY}}
 SUBMIT=${SUBMIT:-1}
 SBATCH_EXCLUSIVE=${SBATCH_EXCLUSIVE:-0}
@@ -85,10 +87,10 @@ LOCAL_TMP_ROOT=${LOCAL_TMP_ROOT:-}
 SBATCH_PATH=${SBATCH_PATH:-${LAUNCH_DIR}/job.sbatch}
 JOB_LOG=${JOB_LOG:-${LAUNCH_DIR}/job.log}
 
-TOTAL_TRAIN_STEPS=${TOTAL_TRAIN_STEPS:-3}
+TOTAL_TRAIN_STEPS=${TOTAL_TRAIN_STEPS:-20}
 SAVE_FREQ_STEPS=${SAVE_FREQ_STEPS:-null}
-TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-8}
-N_SAMPLES=${N_SAMPLES:-2}
+TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-4}
+N_SAMPLES=${N_SAMPLES:-4}
 MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-2048}
 MAX_TOKENS=${MAX_TOKENS:-3072}
 MAX_CONCURRENT_ROLLOUTS=${MAX_CONCURRENT_ROLLOUTS:-64}
@@ -309,6 +311,8 @@ PY
     ++saver.freq_steps="${SAVE_FREQ_STEPS}" \
     "++train_dataset.path=$(hydra_quote "${DATASET_PATH}")" \
     "++valid_dataset.path=$(hydra_quote "${DATASET_PATH}")" \
+    "++train_dataset.scheduling_spec.image=$(hydra_quote "${IMAGE}")" \
+    "++valid_dataset.scheduling_spec.image=$(hydra_quote "${IMAGE}")" \
     ++train_dataset.batch_size="${TRAIN_BATCH_SIZE}" \
     ++valid_dataset.batch_size="${TRAIN_BATCH_SIZE}" \
     ++rollout.consumer_batch_size="${TRAIN_BATCH_SIZE}" \
@@ -366,9 +370,20 @@ ${SBATCH_SHARE_LINE}
 #SBATCH --open-mode=append
 
 set -euo pipefail
+if [[ -n "${RESERVATION}" ]]; then
+  # Slurm consumes SBATCH_* environment variables for nested sbatch calls. The
+  # controller's #SBATCH line only applies to the controller job, so keep the
+  # reservation exported for SlurmScheduler-created data/actor/rollout jobs.
+  export SBATCH_RESERVATION="${RESERVATION}"
+fi
+SINGULARITY_RESERVATION_ENV=()
+if [[ -n "\${SBATCH_RESERVATION:-}" ]]; then
+  SINGULARITY_RESERVATION_ENV=(--env "SBATCH_RESERVATION=\${SBATCH_RESERVATION}")
+fi
 echo "==> sbatch job: \${SLURM_JOB_ID:-unknown}"
 echo "==> nodelist: \${SLURM_JOB_NODELIST:-unknown}"
 echo "==> topology: ${TOPOLOGY}"
+echo "==> child sbatch reservation: \${SBATCH_RESERVATION:-unset}"
 echo "==> batch CUDA_VISIBLE_DEVICES=\${CUDA_VISIBLE_DEVICES:-unset}"
 echo "==> batch SLURM_JOB_GPUS=\${SLURM_JOB_GPUS:-unset}"
 nvidia-smi --query-gpu=index,name,memory.used,memory.free,utilization.gpu --format=csv || true
@@ -389,6 +404,7 @@ exec srun --mpi=pmi2 --ntasks=1 --cpus-per-task="\${SLURM_CPUS_PER_TASK:-64}" \\
   --bind /usr/bin/scancel:/usr/bin/scancel \\
   --bind /usr/bin/scontrol:/usr/bin/scontrol \\
   --bind /usr/lib64/slurm:/usr/lib64/slurm \\
+  "\${SINGULARITY_RESERVATION_ENV[@]}" \\
   --env "INSIDE_QWEN3_30B_DTE_CONTAINER=1" \\
   --env "AREAL_SRC=${AREAL_SRC}" \\
   --env "IMAGE=${IMAGE}" \\
