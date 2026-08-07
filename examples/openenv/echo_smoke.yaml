@@ -1,0 +1,157 @@
+# Smoke config for OpenEnvWorkflow against the public echo environment
+# hosted on HuggingFace Spaces. Requires only network access; no Docker or
+# local environment install needed. Good for a 1-step end-to-end sanity check
+# on any single GPU.
+
+experiment_name: openenv-echo-smoke
+trial_name: trial0
+
+seed: 1
+enable_offload: false
+total_train_epochs: 1
+tokenizer_path: ${actor.path}
+
+# --- OpenEnv adapter ---------------------------------------------------------
+# GenericEnvClient talks the OpenEnv protocol by URL alone -- no env-specific
+# Python package needs to be installed. The echo Space accepts a plain-dict
+# action of the form {"tool_name": ..., "arguments": {...}}.
+openenv:
+  env_client_class: openenv.core.generic_client.GenericEnvClient
+  base_url: https://openenv-echo-env.hf.space
+  action_parser: json
+  obs_formatter: auto
+  system_prompt: |
+    You are an agent talking to an echo environment. To echo a message, output
+    a single JSON object with keys "tool_name" and "arguments".
+    Example: {"tool_name": "echo_message", "arguments": {"message": "hi"}}.
+  max_turns: 2
+  step_discount: 1.0
+  terminal_reward_only: false
+
+initial_user_prompt: |
+  Please echo the message "hello".
+dataset_size: 32
+eval_dataset_size: 8
+
+cluster:
+  n_nodes: 1
+  n_gpus_per_node: 1
+  fileroot: /tmp/areal/experiments
+  name_resolve:
+    type: nfs
+    nfs_record_root: /tmp/areal/name_resolve
+
+scheduler:
+  type: null
+
+rollout:
+  backend: sglang:d1p1t1
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  tokenizer_path: ${tokenizer_path}
+  max_concurrent_rollouts: 8
+  consumer_batch_size: ${train_dataset.batch_size}
+  max_head_offpolicyness: 2
+  agent:
+    mode: inline
+    tool_call_parser: qwen25
+    reasoning_parser: qwen3
+    export_style: individual
+    turn_discount: 1.0
+
+gconfig:
+  n_samples: 2
+  min_new_tokens: 0
+  max_new_tokens: 128
+  max_tokens: 512
+  greedy: false
+  temperature: 1.0
+
+actor:
+  backend: fsdp:d1p1t1
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  path: Qwen/Qwen2.5-0.5B-Instruct
+  init_from_scratch: false
+  disable_dropout: true
+  gradient_checkpointing: true
+  dtype: bfloat16
+  mb_spec:
+    max_tokens_per_mb: 4096
+  optimizer:
+    type: adam
+    lr: 1.0e-5
+    weight_decay: 0.01
+    beta1: 0.9
+    beta2: 0.999
+    eps: 1.0e-8
+    lr_scheduler_type: constant
+    gradient_clipping: 1.0
+    warmup_steps_proportion: 0.001
+  eps_clip: 0.2
+  temperature: ${gconfig.temperature}
+  reward_scaling: 1.0
+  reward_bias: 0.0
+  kl_ctl: 0.0
+  ppo_n_minibatches: 1
+  recompute_logprob: true
+  use_decoupled_loss: true
+  reward_norm: null
+  adv_norm:
+    mean_level: batch
+    std_level: batch
+  weight_update_mode: xccl
+  max_new_tokens: ${gconfig.max_new_tokens}
+
+train_dataset:
+  batch_size: 8
+  shuffle: true
+  pin_memory: true
+  num_workers: 1
+  path: openenv-inline
+  type: rl
+
+valid_dataset:
+  batch_size: 8
+  pin_memory: true
+  num_workers: 1
+  path: openenv-inline
+  type: rl
+
+saver:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: 1
+  freq_steps: null
+  freq_secs: null
+
+recover:
+  mode: disabled
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: 1
+  freq_secs: 3600
+
+evaluator:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: 1
+
+stats_logger:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  wandb:
+    mode: disabled
+
+perf_tracer:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  enabled: false
+  session_tracer:
+    enabled: false

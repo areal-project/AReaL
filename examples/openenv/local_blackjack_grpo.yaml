@@ -1,0 +1,164 @@
+# Fully-offline GRPO training on a local Qwen model against an in-process
+# BlackJack environment. Zero HF cloud contact at runtime: no HF Space, no
+# Docker, no `git+` pull.
+#
+# Prereqs:
+#   uv sync --extra cuda --extra openenv --group dev
+#   Local model at ${actor.path}
+#
+# Run:
+#   uv run python examples/openenv/train.py --config \
+#       examples/openenv/local_blackjack_grpo.yaml
+
+experiment_name: openenv-local-blackjack
+trial_name: trial0
+
+seed: 1
+enable_offload: false
+total_train_epochs: 5
+tokenizer_path: ${actor.path}
+
+# --- OpenEnv adapter (fully in-process, zero network) -----------------------
+# The env class lives next to this YAML. The workflow's _import_from_string
+# accepts an absolute-file-path form (`/abs/path.py:ClassName`) so this works
+# in spawned rollout workers without any sys.path plumbing.
+# Change ${AREAL_ROOT} below to your actual checkout path, or replace with a
+# module dotted-path if you've `pip install`-ed the env as a package.
+openenv:
+  env_client_class: /group/40173/zionyfeng/AReaL/.claude/worktrees/feat-openenv-adapter/examples/openenv/local_envs/blackjack_env.py:LocalBlackjackEnv
+  base_url: local  # sentinel; the local env ignores it
+  action_parser: json
+  obs_formatter: auto
+  system_prompt: |
+    You are an expert Blackjack player. Each turn you receive the current
+    hand state. Reply with ONLY a JSON object like {"action_id": 0} or
+    {"action_id": 1}. 0 = HIT (draw one more), 1 = STAND (end your turn).
+    STAND when your total is 17 or higher.
+  max_turns: 6
+  step_discount: 1.0
+  terminal_reward_only: true
+
+initial_user_prompt: ""
+dataset_size: 512
+eval_dataset_size: 64
+
+cluster:
+  n_nodes: 1
+  n_gpus_per_node: 1
+  fileroot: /tmp/areal/experiments
+  name_resolve:
+    type: nfs
+    nfs_record_root: /tmp/areal/name_resolve
+
+scheduler:
+  type: null
+
+rollout:
+  backend: sglang:d1p1t1
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  tokenizer_path: ${tokenizer_path}
+  max_concurrent_rollouts: 32
+  consumer_batch_size: ${train_dataset.batch_size}
+  max_head_offpolicyness: 2
+  agent:
+    mode: inline
+    tool_call_parser: qwen25
+    reasoning_parser: qwen3
+    export_style: individual
+    turn_discount: 1.0
+
+gconfig:
+  n_samples: 8            # GRPO group size per prompt
+  min_new_tokens: 0
+  max_new_tokens: 64
+  max_tokens: 512
+  greedy: false
+  temperature: 1.0
+
+actor:
+  backend: fsdp:d1p1t1
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  path: /workspace/user_code/40173/models/Qwen/Qwen3-0.6B-Base
+  init_from_scratch: false
+  disable_dropout: true
+  gradient_checkpointing: true
+  dtype: bfloat16
+  mb_spec:
+    max_tokens_per_mb: 4096
+  optimizer:
+    type: adam
+    lr: 5.0e-6
+    weight_decay: 0.01
+    beta1: 0.9
+    beta2: 0.999
+    eps: 1.0e-8
+    lr_scheduler_type: constant
+    gradient_clipping: 1.0
+    warmup_steps_proportion: 0.001
+  eps_clip: 0.2
+  temperature: ${gconfig.temperature}
+  reward_scaling: 1.0
+  reward_bias: 0.0
+  kl_ctl: 0.0
+  ppo_n_minibatches: 1
+  recompute_logprob: true
+  use_decoupled_loss: true
+  reward_norm: null
+  adv_norm:
+    mean_level: batch
+    std_level: batch
+  weight_update_mode: xccl
+  max_new_tokens: ${gconfig.max_new_tokens}
+
+train_dataset:
+  batch_size: 32
+  shuffle: true
+  pin_memory: true
+  num_workers: 2
+  path: openenv-inline
+  type: rl
+
+valid_dataset:
+  batch_size: 16
+  pin_memory: true
+  num_workers: 1
+  path: openenv-inline
+  type: rl
+
+saver:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: 1
+
+recover:
+  mode: disabled
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: 1
+  freq_secs: 3600
+
+evaluator:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: 1
+
+stats_logger:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  wandb:
+    mode: disabled
+
+perf_tracer:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  enabled: false
+  session_tracer:
+    enabled: false
