@@ -192,6 +192,13 @@ print("DTE_SMOKE_CHECK_OK=1")
 PY
 }
 
+hydra_quote() {
+  local value=$1
+  value=${value//\\/\\\\}
+  value=${value//\"/\\\"}
+  printf '"%s"' "${value}"
+}
+
 run_inside_container() {
   cd "${AREAL_SRC}"
 
@@ -271,31 +278,31 @@ PY
 
   python3 -u examples/math/gsm8k_rl.py \
     --config "${CONFIG_PATH}" \
-    ++scheduler.type="${SCHEDULER_TYPE}" \
-    ++experiment_name="${EXP_NAME}" \
-    ++trial_name="${TRIAL_NAME}" \
+    "++scheduler.type=$(hydra_quote "${SCHEDULER_TYPE}")" \
+    "++experiment_name=$(hydra_quote "${EXP_NAME}")" \
+    "++trial_name=$(hydra_quote "${TRIAL_NAME}")" \
     ++cluster.n_nodes="${CLUSTER_NODES}" \
     ++cluster.n_gpus_per_node="${CLUSTER_GPUS_PER_NODE}" \
-    ++cluster.fileroot="${FILEROOT}" \
-    ++cluster.name_resolve.nfs_record_root="${NFS_ROOT}" \
-    ++actor.backend="${ACTOR_BACKEND}" \
-    ++rollout.backend="${ROLLOUT_BACKEND}" \
-    ++rollout.scheduling_strategy.type="${TOPOLOGY}" \
-    ++actor.path="${MODEL_PATH}" \
-    ++ref.path="${MODEL_PATH}" \
-    ++sglang.model_path="${MODEL_PATH}" \
-    ++tokenizer_path="${MODEL_PATH}" \
+    "++cluster.fileroot=$(hydra_quote "${FILEROOT}")" \
+    "++cluster.name_resolve.nfs_record_root=$(hydra_quote "${NFS_ROOT}")" \
+    "++actor.backend=$(hydra_quote "${ACTOR_BACKEND}")" \
+    "++rollout.backend=$(hydra_quote "${ROLLOUT_BACKEND}")" \
+    "++rollout.scheduling_strategy.type=$(hydra_quote "${TOPOLOGY}")" \
+    "++actor.path=$(hydra_quote "${MODEL_PATH}")" \
+    "++ref.path=$(hydra_quote "${MODEL_PATH}")" \
+    "++sglang.model_path=$(hydra_quote "${MODEL_PATH}")" \
+    "++tokenizer_path=$(hydra_quote "${MODEL_PATH}")" \
     ++actor.mb_spec.max_tokens_per_mb="${ACTOR_MAX_TOKENS_PER_MB}" \
     ++actor.setup_timeout="${WORKER_SETUP_TIMEOUT}" \
     ++actor.workers_ready_timeout="${WORKERS_READY_TIMEOUT}" \
     ++rollout.setup_timeout="${WORKER_SETUP_TIMEOUT}" \
     ++rollout.workers_ready_timeout="${WORKERS_READY_TIMEOUT}" \
-    ++actor.dte.delta_method="${DTE_DELTA_METHOD}" \
+    "++actor.dte.delta_method=$(hydra_quote "${DTE_DELTA_METHOD}")" \
     ++actor.dte.verify_snapshot="${DTE_VERIFY_SNAPSHOT}" \
     ++total_train_steps="${TOTAL_TRAIN_STEPS}" \
     ++saver.freq_steps="${SAVE_FREQ_STEPS}" \
-    ++train_dataset.path="${DATASET_PATH}" \
-    ++valid_dataset.path="${DATASET_PATH}" \
+    "++train_dataset.path=$(hydra_quote "${DATASET_PATH}")" \
+    "++valid_dataset.path=$(hydra_quote "${DATASET_PATH}")" \
     ++train_dataset.batch_size="${TRAIN_BATCH_SIZE}" \
     ++valid_dataset.batch_size="${TRAIN_BATCH_SIZE}" \
     ++rollout.consumer_batch_size="${TRAIN_BATCH_SIZE}" \
@@ -306,8 +313,8 @@ PY
     ++gconfig.max_tokens="${MAX_TOKENS}" \
     ++sglang.context_length="${SGLANG_CONTEXT_LENGTH}" \
     ++sglang.mem_fraction_static="${SGLANG_MEM_FRACTION}" \
-    ++actor.scheduling_spec.0.image="${IMAGE}" \
-    ++actor.scheduling_spec.0.nodelist="${DTE_NODELIST}"
+    "++actor.scheduling_spec.0.image=$(hydra_quote "${IMAGE}")" \
+    "++actor.scheduling_spec.0.nodelist=$(hydra_quote "${DTE_NODELIST}")"
 
   echo "==> training finished: $(date -Is)"
   echo "==> rendered config: ${RUN_LOG_DIR}/config.yaml"
