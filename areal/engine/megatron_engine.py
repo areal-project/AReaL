@@ -51,6 +51,7 @@ from areal.api.cli_args import MicroBatchSpec, PerfTracerConfig, TrainEngineConf
 from areal.api.io_struct import DeviceRuntimeInfo
 from areal.engine.core import (
     aggregate_eval_losses,
+    compute_microbatch_loss_weight,
     compute_total_loss_weight,
     reorder_and_pad_outputs,
 )
@@ -1334,7 +1335,9 @@ class MegatronEngine(TrainEngine):
         input_batched, _ = self._normalize_batch_input(input_)
 
         # Step 1: Prepare micro-batches
-        mb_list = self._prepare_mb_list(input_batched).to(self.device)
+        mb_list = self._prepare_mb_list(input_batched, allow_transport_padding=True).to(
+            self.device
+        )
 
         # Step 2: Compute total loss weight.
         # Use DP+CP group: after CP all-gather each rank computes the full-sequence
@@ -1395,7 +1398,9 @@ class MegatronEngine(TrainEngine):
         input_batched, _ = self._normalize_batch_input(input_)
 
         # Step 1: Prepare micro-batches
-        mb_list = self._prepare_mb_list(input_batched).to(self.device)
+        mb_list = self._prepare_mb_list(input_batched, allow_transport_padding=True).to(
+            self.device
+        )
 
         # Step 2: Compute total loss weight (DP+CP, see train_batch comment).
         total_loss_weight = compute_total_loss_weight(
@@ -1454,7 +1459,9 @@ class MegatronEngine(TrainEngine):
         batch_size = len(output_seqlens)
 
         # Step 2: Prepare micro-batches
-        mb_list = self._prepare_mb_list(input_batched).to(self.device)
+        mb_list = self._prepare_mb_list(input_batched, allow_transport_padding=True).to(
+            self.device
+        )
 
         # Step 3: Forward using Megatron's pipeline function, collecting results
         outputs: list[torch.Tensor] = []
@@ -2640,7 +2647,12 @@ class MegatronEngine(TrainEngine):
                 fp8_direct_convert=self.fp8_direct_convert,
             )
 
-    def _prepare_mb_list(self, input_: dict[str, Any]) -> MicroBatchList:
+    def _prepare_mb_list(
+        self,
+        input_: dict[str, Any],
+        *,
+        allow_transport_padding: bool = False,
+    ) -> MicroBatchList:
         assert "attention_mask" in input_ and "input_ids" in input_
         # Parallel sizes
         pp_size = self.parallel_strategy.pipeline_parallel_size
@@ -2691,6 +2703,7 @@ class MegatronEngine(TrainEngine):
             input_,
             mb_spec,
             group=mpu.get_data_parallel_group(),
+            allow_transport_padding=allow_transport_padding,
         )
         mb_list.mbs = [pack_tensor_dict(mb) for mb in mb_list.mbs]
         # NOTE: Pad micro-batches to:
@@ -2752,7 +2765,7 @@ class MegatronEngine(TrainEngine):
         total_loss_weight: torch.Tensor,
         loss_multiplier: float = 1.0,
     ) -> torch.Tensor:
-        local_weight = loss_weight_fn(inputs)
+        local_weight = compute_microbatch_loss_weight(inputs, loss_weight_fn)
         if local_weight == 0:
             connected_output = (
                 output.logprobs if isinstance(output, ChunkedLMHeadOutput) else output
