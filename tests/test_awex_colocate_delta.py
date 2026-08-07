@@ -284,3 +284,87 @@ def test_colocate_delta_timeout_preserves_payload_keys(monkeypatch):
         )
 
     assert adapter._meta_server_client.deleted == []
+
+
+def test_colocate_full_fallback_uses_awex_grouping(monkeypatch):
+    """DTE v1 full fallback should reuse the native AWEX full IPC grouping."""
+    mod = common._load_megatron_adapter(monkeypatch)
+
+    group_calls = []
+    mark_synced = []
+
+    def _fake_group_tensors(tensors):
+        group_calls.append(list(tensors))
+        return list(tensors), [
+            {
+                "original_index": idx,
+                "shape": tensor.shape,
+                "dtype": tensor.dtype,
+                "group_index": idx,
+                "offset": 0,
+                "size": tensor.numel(),
+            }
+            for idx, tensor in enumerate(tensors)
+        ]
+
+    monkeypatch.setattr(mod, "cuda_ipc_serialize", lambda payload: payload)
+    monkeypatch.setattr(mod, "group_tensors_by_shape_and_dtype", _fake_group_tensors)
+    monkeypatch.setattr(mod.torch.cuda, "synchronize", lambda: None)
+    monkeypatch.setattr(mod.torch.cuda, "ipc_collect", lambda: None)
+    monkeypatch.setattr(mod.torch.cuda, "empty_cache", lambda: None)
+
+    import awex.util.tensor_util as tensor_util
+
+    monkeypatch.setattr(tensor_util, "release_tensors", lambda tensors: None)
+
+    class _AckMetaClient:
+        def __init__(self):
+            self.deleted = []
+
+        def put_object(self, *args, **kwargs):
+            del args, kwargs
+
+        def add_object_to_set(self, *args, **kwargs):
+            del args, kwargs
+
+        def get_object(self, *args, **kwargs):
+            del args, kwargs
+            return True
+
+        def delete_if_exists(self, key):
+            self.deleted.append(key)
+
+    adapter = object.__new__(mod.AwexMegatronAdapter)
+    adapter._meta_server_client = _AckMetaClient()
+    adapter._timeout_s = 0.01
+    adapter._ip_address = "127.0.0.1"
+    adapter._physical_gpu_id = 0
+    adapter._logical_train_rank = 3
+    adapter._rank_info = object()
+    adapter._transfer_rank = 0
+    adapter._released_tags = set()
+    adapter._lazy_initialize = lambda: None
+    adapter._needs_external_detector_sync_before_payload = lambda version: False
+    adapter.get_local_shard_parameters = lambda: {"w": torch.ones(2)}
+    adapter._delta_encode = lambda params, version: (
+        list(params),
+        list(params.values()),
+        True,
+    )
+    adapter._pop_precomputed_synced_state = lambda version: object()
+    adapter._delta_mark_synced = lambda version, state: mark_synced.append(version)
+    adapter.release_memory = lambda tags: None
+    adapter.resume_memory = lambda tags: None
+    adapter._release_grad_memory = lambda: None
+    adapter._release_owned_payload_tensors = lambda tensors: None
+    adapter._full_tensors_for_ipc = lambda tensors, names: pytest.fail(
+        "non-empty full fallback should not use bounded IPC fallback"
+    )
+
+    adapter._execute_colocate_delta_weight_update(
+        8,
+        weights_were_offloaded=False,
+    )
+
+    assert len(group_calls) == 1
+    assert mark_synced == [8]

@@ -1025,7 +1025,7 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
                 "payload_manifest": "source_params",
             },
         )
-        names, tensors, zero_copy_full_payload = self._delta_encode(params, version)
+        names, tensors, full_payload = self._delta_encode(params, version)
         delta_synced_state = self._pop_precomputed_synced_state(version)
         if delta_synced_state is _CAPTURE_MISS:
             delta_synced_state = self._delta_capture_synced_state(params)
@@ -1033,8 +1033,14 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
         self.release_memory(tags=["optimizer"])
         self._release_grad_memory()
 
-        if zero_copy_full_payload:
+        if full_payload and any(tensor.numel() == 0 for tensor in tensors):
+            logger.info(
+                "colocate full payload v%d contains empty tensors; "
+                "using bounded IPC fallback",
+                version,
+            )
             group_tensors, metadata = self._full_tensors_for_ipc(tensors, names)
+            self._release_owned_payload_tensors(tensors)
         else:
             group_tensors, metadata = group_tensors_by_shape_and_dtype(tensors)
             self._release_owned_payload_tensors(tensors)
