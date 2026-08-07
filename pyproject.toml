@@ -187,6 +187,11 @@ cli = [
     "click>=8.1",
     "colorlog",
 ]
+# Incremental colocated weight transfer. The AWEX adapters import `dte`
+# lazily, so default installs do not need this optional dependency.
+delta = [
+    "delta-transfer-engine @ git+https://github.com/areal-project/AReaL-DTE.git@6b2bc13e2b626d2677e9997f159b5a3269c97e3e",
+]
 
 [project.scripts]
 areal = "areal.v2.cli.main:cli"

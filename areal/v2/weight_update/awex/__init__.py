@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import pickle
 from typing import Any
 
 import aiohttp  # pyright: ignore[reportMissingImports]
@@ -27,6 +28,7 @@ def awex_wu_use_group() -> bool:
 async def _fetch_kv_metadata(
     kv_store_url: str,
     pair_name: str,
+    timeout_s: float = 120.0,
 ) -> tuple[Any, Any]:
     """Fetch infer and training parameter metadata from the gateway KV store.
 
@@ -41,7 +43,8 @@ async def _fetch_kv_metadata(
     infer_url = f"{kv_store_url}/weight_meta/{pair_name}/infer_params_meta"
     train_url = f"{kv_store_url}/weight_meta/{pair_name}/training_params_meta"
 
-    async with aiohttp.ClientSession() as session:
+    timeout = aiohttp.ClientTimeout(total=timeout_s)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
 
         async def _get(url: str) -> Any:
             async with session.get(url) as resp:
@@ -54,10 +57,28 @@ async def _fetch_kv_metadata(
     return deserialize_value(infer_json), deserialize_value(train_json)
 
 
-def fetch_kv_metadata(kv_store_url: str, pair_name: str) -> tuple[Any, Any]:
+def fetch_kv_metadata(
+    kv_store_url: str,
+    pair_name: str,
+    timeout_s: float = 120.0,
+) -> tuple[Any, Any]:
     """Sync wrapper around :func:`_fetch_kv_metadata`.
 
     Bridges async ``aiohttp`` into the synchronous adapter context using
     :func:`~areal.infra.utils.concurrent.run_async_task`.
     """
-    return run_async_task(_fetch_kv_metadata, kv_store_url, pair_name)
+    return run_async_task(_fetch_kv_metadata, kv_store_url, pair_name, timeout_s)
+
+
+def load_kv_metadata_file(metadata_path: str) -> tuple[Any, Any]:
+    """Load serialized infer/train metadata from a colocate side-channel file."""
+    with open(metadata_path, "rb") as f:
+        payload = pickle.load(f)
+    if not isinstance(payload, dict):
+        raise ValueError(f"Invalid metadata file payload: {type(payload).__name__}")
+    try:
+        infer_json = payload["infer_params_meta"]
+        train_json = payload["training_params_meta"]
+    except KeyError as exc:
+        raise ValueError(f"Metadata file missing key: {exc}") from exc
+    return deserialize_value(infer_json), deserialize_value(train_json)

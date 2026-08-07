@@ -125,6 +125,8 @@ async def app_client(config, mock_tokenizer, mock_areal_client):
 
     inf_bridge.pause = AsyncMock(side_effect=_mock_pause)
     inf_bridge.resume = AsyncMock(side_effect=_mock_resume)
+    inf_bridge.offload = AsyncMock()
+    inf_bridge.onload = AsyncMock()
 
     app.state.tokenizer = mock_tokenizer
     app.state.inf_bridge = inf_bridge
@@ -236,3 +238,25 @@ class TestPauseResumeEndpoints:
         resp = await client.get("/health")
         assert resp.status_code == 200
         assert resp.json()["paused"] is True
+
+    @pytest.mark.asyncio
+    async def test_release_memory_forwards_tags(self, app_client):
+        client, app, _ = app_client
+
+        resp = await client.post(
+            "/release_memory_occupation", json={"tags": ["kv_cache"]}
+        )
+
+        assert resp.status_code == 200
+        app.state.inf_bridge.offload.assert_awaited_once_with(tags=["kv_cache"])
+
+    @pytest.mark.asyncio
+    async def test_release_memory_rejects_non_list_tags(self, app_client):
+        client, app, _ = app_client
+
+        resp = await client.post(
+            "/release_memory_occupation", json={"tags": "kv_cache"}
+        )
+
+        assert resp.status_code == 400
+        app.state.inf_bridge.offload.assert_not_awaited()

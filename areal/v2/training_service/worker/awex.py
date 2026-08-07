@@ -48,8 +48,13 @@ def create_awex_blueprint(
 
     @bp.route("/report_weight_meta", methods=["POST"])
     def report_weight_meta():
+        data = flask_module.request.get_json(silent=True) or {}
+        infer_conf = data.get("infer_conf")
+
         def action():
             adapter = _require_adapter()
+            if infer_conf is not None:
+                return adapter.get_weight_metadata(infer_conf=infer_conf)
             return adapter.get_weight_metadata()
 
         return run_endpoint(
@@ -140,6 +145,23 @@ def create_awex_blueprint(
             "execute_colocate_weight_update",
             lambda: submit_to_engine_thread("execute_colocate_weight_update", action),
             return_result=False,
+        )
+
+    @bp.route("/precompute_delta_masks", methods=["POST"])
+    def precompute_delta_masks():
+        data = flask_module.request.get_json(force=True)
+        version = data.get("version", 0)
+
+        def action():
+            adapter = _require_adapter()
+            fn = getattr(adapter, "precompute_delta_masks", None)
+            if fn is None:
+                return {"precomputed": False}
+            return {"precomputed": bool(fn(version))}
+
+        return run_endpoint(
+            "precompute_delta_masks",
+            lambda: submit_to_engine_thread("precompute_delta_masks", action),
         )
 
     @bp.route("/release_memory", methods=["POST"])

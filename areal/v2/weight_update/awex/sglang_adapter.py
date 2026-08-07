@@ -24,7 +24,7 @@ from awex.sharding.sglang_sharding import (
 )
 from awex.transfer.nccl_comm import batch_send_recv, nccl_build_recv_ops
 from awex.transfer.nccl_stream_batch import NcclColocateStreamBatchTransport
-from awex.transfer.transfer_plan import TransferPlan, TransferPlanBuilder
+from awex.transfer.transfer_plan import TransferPlan, TransferPlanBuilder, slice_tensor
 from awex.util.tensor_util import (
     cuda_ipc_deserialize,
     reconstruct_tensors_from_groups,
@@ -34,6 +34,17 @@ from areal.utils import logging
 from areal.v2.weight_update.awex import (
     awex_wu_use_group,
     fetch_kv_metadata,
+    load_kv_metadata_file,
+)
+from areal.v2.weight_update.awex.colocate_device import (
+    device_mapping_key,
+    get_colocate_ip_address,
+    get_physical_cuda_device_id,
+)
+from areal.v2.weight_update.awex.delta_config import (
+    delta_transfer_enabled,
+    make_delta_engine,
+    payload_carries_delta,
 )
 from areal.v2.weight_update.inference_adapter import (
     AwexInferenceAdapter,
@@ -63,9 +74,84 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
         self._colocate_transport = None
         self._train_to_infer_device_mapping: dict | None = None
         self._infer_to_train_device_mapping: dict | None = None
+        self._colocate_device_ip: str = ""
+        self._colocate_device_id: str = ""
+        # Lazy dte DeltaEngine (receiver side); persists across versions to hold
+        # only the version chain for live delta apply. Created on first
+        # delta-enabled transfer.
+        self._delta_engine = None
+        self._rebuild_derived_weights("adapter init")
 
     def _get_model(self) -> torch.nn.Module:
         return self._scheduler.tp_worker.model_runner.model
+
+    def _derived_weight_abs_sums(self) -> dict[str, float]:
+        sums: dict[str, float] = {}
+        inner = getattr(self._get_model(), "model", None)
+        for i, layer in enumerate(getattr(inner, "layers", []) or []):
+            attn = getattr(layer, "attention", None)
+            for attr in ("w_kc", "w_vc"):
+                t = getattr(attn, attr, None)
+                if isinstance(t, torch.Tensor):
+                    sums[f"layers.{i}.attention.{attr}"] = float(
+                        t.detach().abs().sum().item()
+                    )
+        return sums
+
+    def _check_derived_weight_sanity(self, reason: str, sums: dict[str, float]) -> None:
+        enabled = os.environ.get("DTE_DERIVED_WEIGHT_SANITY", "1").lower()
+        if enabled in {"0", "false", "no", "off"} or not sums:
+            return
+
+        bad = {
+            name: value
+            for name, value in sums.items()
+            if not math.isfinite(value) or value <= 0.0
+        }
+        if not bad:
+            logger.info(
+                "derived weight sanity OK (%s): count=%d min_abs_sum=%.6e max_abs_sum=%.6e",
+                reason,
+                len(sums),
+                min(sums.values()),
+                max(sums.values()),
+            )
+            return
+
+        logger.error(
+            "derived weight sanity FAILED (%s): %d/%d tensors have non-positive "
+            "or non-finite abs_sum; examples=%s",
+            reason,
+            len(bad),
+            len(sums),
+            list(bad.items())[:8],
+        )
+        fail = os.environ.get("DTE_DERIVED_WEIGHT_SANITY_FAIL", "0").lower()
+        if fail in {"1", "true", "yes", "on"}:
+            raise RuntimeError(
+                f"derived weight sanity failed after {reason}: "
+                f"{len(bad)}/{len(sums)} tensors invalid"
+            )
+
+    def _rebuild_derived_weights(self, reason: str) -> None:
+        """Refresh plain tensor attributes derived from model parameters."""
+        model = self._get_model()
+        fn = getattr(model, "post_load_weights", None)
+        if fn is None:
+            return
+        torch.cuda.synchronize()
+        before = self._derived_weight_abs_sums()
+        fn()
+        torch.cuda.synchronize()
+        after = self._derived_weight_abs_sums()
+        logger.info(
+            "post_load_weights rebuilt derived weights (%s): "
+            "derived abs_sum before=%s after=%s",
+            reason,
+            before,
+            after,
+        )
+        self._check_derived_weight_sanity(reason, after)
 
     def _get_model_context(self) -> dict[str, Any]:
         server_args = self._scheduler.server_args
@@ -109,6 +195,52 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
             "attn_dp_rank": int(getattr(self._scheduler, "attn_dp_rank", 0)),
         }
 
+    def _build_awex_infer_conf(self, model_context: dict[str, Any]) -> dict[str, Any]:
+        from awex.util.common import simple_hf_config
+
+        def json_safe(value: Any) -> Any:
+            if value is None or isinstance(value, str | int | float | bool):
+                return value
+            if isinstance(value, dict):
+                return {str(k): json_safe(v) for k, v in value.items()}
+            if isinstance(value, list | tuple):
+                return [json_safe(v) for v in value]
+            return str(value)
+
+        model = self._get_model()
+        hf_config = getattr(model, "config", None)
+        server_args = self._scheduler.server_args
+        infer_engine_config: dict[str, Any] = {}
+        for key in (
+            "device",
+            "device_backend",
+            "device_type",
+            "comm_backend",
+            "tp_size",
+            "pp_size",
+            "dp_size",
+            "ep_size",
+        ):
+            value = getattr(server_args, key, None)
+            if value is None or isinstance(value, str | int | float | bool):
+                infer_engine_config[key] = value
+
+        device_backend = (
+            infer_engine_config.get("device_backend")
+            or infer_engine_config.get("device_type")
+            or ("cuda" if torch.cuda.is_available() else "cpu")
+        )
+        return {
+            "engine_name": "sglang",
+            "infer_atten_tp_size": int(model_context["attn_tp_size"]),
+            "router_dtype": str(getattr(hf_config, "router_dtype", "bf16")),
+            "infer_engine_config": json_safe(infer_engine_config),
+            "hf_config": (
+                json_safe(dict(simple_hf_config(hf_config))) if hf_config else {}
+            ),
+            "device_backend": device_backend,
+        }
+
     @property
     def parallelism_strategy(self) -> dict:
         model_context = self._get_model_context()
@@ -125,6 +257,7 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
             "dp_size": dp_size,
             "ep_size": ep_size,
             "num_engines": 1,
+            "awex_infer_conf": self._build_awex_infer_conf(model_context),
         }
 
     def _unfuse_params(
@@ -137,6 +270,10 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
         into ``experts.w13_weight`` (gate+up) and ``experts.w2_weight`` (down).
         The training side keeps per-expert HF names, so we unfuse here to match.
         """
+        if name == "model.word_embeddings.weight":
+            return [("model.embed_tokens.weight", tensor)]
+        if ".attention.fused_qkv_a_proj_with_mqa." in name:
+            return [(name, tensor)]
         if "qkv_proj" in name:
             cfg = self._get_model().config
             num_heads = cfg.num_attention_heads
@@ -156,6 +293,8 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
                     tensor.narrow(0, q_size + kv_size, kv_size),
                 ),
             ]
+        if ".attention.o_proj." in name:
+            return [(name.replace(".attention.o_proj.", ".attention.dense."), tensor)]
         if "gate_up_proj" in name:
             half = tensor.shape[0] // 2
             return [
@@ -450,6 +589,84 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
 
     # ── Colocated weight transfer methods ─────────────────────────────────
 
+    def _fetch_colocate_metadata(
+        self,
+        kv_store_url: str,
+        pair_name: str,
+        timeout_s: float,
+        metadata_path: str = "",
+    ) -> tuple[Any, Any]:
+        """Fetch colocate metadata once per SGLang engine, then fan out locally."""
+        scheduler = self._scheduler
+        tp_rank = int(getattr(scheduler, "tp_rank", 0))
+        tp_size = int(getattr(scheduler, "tp_size", 1))
+
+        payload: list[Any] = [None]
+        if tp_rank == 0:
+            try:
+                if metadata_path:
+                    try:
+                        logger.info(
+                            "Loading colocate metadata for pair '%s' from %s",
+                            pair_name,
+                            metadata_path,
+                        )
+                        infer_meta, train_meta = load_kv_metadata_file(metadata_path)
+                    except Exception:
+                        logger.warning(
+                            "Failed to load colocate metadata file for pair '%s'; "
+                            "falling back to %s",
+                            pair_name,
+                            kv_store_url,
+                            exc_info=True,
+                        )
+                        infer_meta, train_meta = fetch_kv_metadata(
+                            kv_store_url, pair_name, timeout_s=timeout_s
+                        )
+                else:
+                    logger.info(
+                        "Fetching colocate metadata for pair '%s' from %s",
+                        pair_name,
+                        kv_store_url,
+                    )
+                    infer_meta, train_meta = fetch_kv_metadata(
+                        kv_store_url, pair_name, timeout_s=timeout_s
+                    )
+                payload[0] = ("ok", infer_meta, train_meta)
+                logger.info(
+                    "Fetched colocate metadata for pair '%s': infer_params=%d, "
+                    "train_params=%d",
+                    pair_name,
+                    len(infer_meta) if hasattr(infer_meta, "__len__") else -1,
+                    len(train_meta) if hasattr(train_meta, "__len__") else -1,
+                )
+            except Exception as exc:
+                payload[0] = ("error", repr(exc))
+
+        if dist.is_available() and dist.is_initialized() and tp_size > 1:
+            tp_cpu_group = getattr(scheduler, "tp_cpu_group", None)
+            if tp_cpu_group is None:
+                raise RuntimeError(
+                    "SGLang tp_cpu_group is required for TP metadata broadcast"
+                )
+            try:
+                src_rank = dist.get_global_rank(tp_cpu_group, 0)
+            except Exception:
+                pp_rank = int(getattr(scheduler, "pp_rank", 0))
+                src_rank = pp_rank * tp_size
+            dist.broadcast_object_list(payload, src=src_rank, group=tp_cpu_group)
+
+        status = payload[0]
+        if not status:
+            raise RuntimeError(
+                f"Failed to fetch colocate metadata for pair '{pair_name}'"
+            )
+        if status[0] == "error":
+            raise RuntimeError(
+                f"Failed to fetch colocate metadata for pair '{pair_name}': {status[1]}"
+            )
+        return status[1], status[2]
+
     def init_colocate_weight_update(
         self,
         pair_name: str,
@@ -458,9 +675,12 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
         infer_world_size: int,
         train_world_size: int,
         num_engines: int,
+        master_addr: str,
         master_port: int,
         admin_api_key: str = "areal-admin-key",
         timeout_s: float = 120.0,
+        expected_delta_enabled: bool | None = None,
+        metadata_path: str = "",
     ) -> None:
         if infer_world_size != train_world_size:
             raise ValueError(
@@ -470,7 +690,6 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
             )
         self._colocate_pair_name = pair_name
         self._colocate_kv_store_url = kv_store_url
-        self._transfer_rank = transfer_rank
         self._colocate_infer_world_size = infer_world_size
         self._colocate_train_world_size = train_world_size
         self._colocate_admin_api_key = admin_api_key
@@ -478,7 +697,34 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
         if self._colocate_http_client is None:
             self._colocate_http_client = httpx.Client()
 
-        infer_meta, train_meta = fetch_kv_metadata(kv_store_url, pair_name)
+        per_engine_world = infer_world_size // num_engines
+        ctx = self._get_model_context()
+        tp_size = int(ctx["tp_size"])
+        tp_rank = int(ctx["tp_rank"])
+        pp_size = int(ctx["pp_size"])
+        pp_rank = int(ctx["pp_rank"])
+        if per_engine_world != tp_size * pp_size:
+            raise RuntimeError(
+                "awex colocate per-engine world mismatch: gateway reports "
+                f"infer_world_size={infer_world_size} / num_engines={num_engines} "
+                f"= {per_engine_world}, but local engine has "
+                f"tp_size*pp_size={tp_size * pp_size}"
+            )
+
+        engine_local_rank = pp_rank * tp_size + tp_rank
+        global_rank = transfer_rank * per_engine_world + engine_local_rank
+        self._transfer_rank = global_rank
+
+        train_to_infer, infer_to_train = self._register_and_resolve_device_mapping(
+            global_rank=global_rank,
+            infer_world_size=infer_world_size,
+            train_world_size=train_world_size,
+        )
+
+        infer_meta, train_meta = self._fetch_colocate_metadata(
+            kv_store_url, pair_name, timeout_s, metadata_path
+        )
+        self._rebuild_derived_weights("colocate init")
 
         builder = TransferPlanBuilder(
             infer_world_size=infer_world_size,
@@ -486,47 +732,164 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
             num_infer_engines=num_engines,
         )
 
-        train_to_infer = {}
-        infer_to_train = {}
-        for i in range(min(infer_world_size, train_world_size)):
-            train_rank = infer_world_size + i
-            train_to_infer[train_rank] = i
-            infer_to_train[i] = train_rank
         self._train_to_infer_device_mapping = train_to_infer
         self._infer_to_train_device_mapping = infer_to_train
 
         self._send_transfer_plan = builder.build_local_transfer_plan(
             infer_meta,
             train_meta,
-            global_transfer_rank=infer_to_train[transfer_rank],
+            global_transfer_rank=infer_to_train[global_rank],
         )
         self._recv_transfer_plan = builder.build_local_transfer_plan(
             infer_meta,
             train_meta,
-            global_transfer_rank=transfer_rank,
+            global_transfer_rank=global_rank,
         )
 
         os.environ["TORCHELASTIC_USE_AGENT_STORE"] = str(False)
         self._weights_update_group = init_weights_update_group(
-            master_address="127.0.0.1",
+            master_address=master_addr,
             master_port=master_port,
-            rank=transfer_rank,
+            rank=global_rank,
             world_size=infer_world_size,
             group_name=f"awex_colocate_{pair_name}",
             role="inference",
         )
 
         self._colocate_transport = NcclColocateStreamBatchTransport(
-            transfer_rank, infer_world_size
+            global_rank, infer_world_size
         )
 
         logger.info(
             "Initialized colocate weight update for pair '%s', "
-            "transfer_rank=%d, infer_world_size=%d",
+            "engine_rank=%d, local_rank=%d, global_rank=%d, infer_world_size=%d, "
+            "paired_train_rank=%d, device=%s/%s",
             pair_name,
             transfer_rank,
+            engine_local_rank,
+            global_rank,
             infer_world_size,
+            infer_to_train[global_rank],
+            self._colocate_device_ip,
+            self._colocate_device_id,
         )
+        local_delta = delta_transfer_enabled()
+        if (
+            expected_delta_enabled is not None
+            and bool(expected_delta_enabled) != local_delta
+        ):
+            raise ValueError(
+                "Colocate delta config mismatch on inference rank "
+                f"{global_rank}: expected={expected_delta_enabled}, "
+                f"local={local_delta}. Check DTE_DELTA_TRANSFER propagation."
+            )
+        if local_delta and self._delta_engine is None:
+            # Fail fast: surface a missing dte / bad config at init, not mid-run.
+            self._delta_engine = make_delta_engine(
+                f"cuda:{torch.cuda.current_device()}"
+            )
+            logger.info("colocate delta enabled (receiver); dte DeltaEngine ready")
+
+    def _put_colocate_kv(self, key: str, value: Any) -> None:
+        assert self._colocate_http_client is not None
+        resp = self._colocate_http_client.put(
+            f"{self._colocate_kv_store_url}/weight_meta/"
+            f"{self._colocate_pair_name}/{key}",
+            json={"value": value},
+            headers={"Authorization": f"Bearer {self._colocate_admin_api_key}"},
+            timeout=self._colocate_timeout_s,
+        )
+        resp.raise_for_status()
+
+    def _get_colocate_kv(self, key: str, timeout_s: float, label: str) -> Any:
+        assert self._colocate_http_client is not None
+        deadline = time.monotonic() + timeout_s
+        last_status = -1
+        polls = 0
+        while time.monotonic() < deadline:
+            resp = self._colocate_http_client.get(
+                f"{self._colocate_kv_store_url}/weight_meta/"
+                f"{self._colocate_pair_name}/{key}",
+                timeout=5.0,
+            )
+            last_status = resp.status_code
+            if resp.status_code == 200:
+                return resp.json()["value"]
+            polls += 1
+            time.sleep(0.1)
+        raise TimeoutError(
+            f"Timed out waiting for {label} "
+            f"(key={key}, polls={polls}, last_status={last_status})"
+        )
+
+    def _register_and_resolve_device_mapping(
+        self,
+        *,
+        global_rank: int,
+        infer_world_size: int,
+        train_world_size: int,
+    ) -> tuple[dict[int, int], dict[int, int]]:
+        if infer_world_size != train_world_size:
+            raise ValueError(
+                "Colocate mode requires equal total rank counts "
+                f"(infer={infer_world_size}, train={train_world_size})"
+            )
+
+        ip_address = get_colocate_ip_address()
+        device_id = get_physical_cuda_device_id(int(torch.cuda.current_device()))
+        self._colocate_device_ip = ip_address
+        self._colocate_device_id = device_id
+        device_info = {
+            "ip": ip_address,
+            "device_id": device_id,
+            "infer_rank": global_rank,
+        }
+        self._put_colocate_kv(
+            f"colocate_infer_device_by_rank_{global_rank}", device_info
+        )
+        self._put_colocate_kv(
+            f"colocate_infer_rank_by_device_"
+            f"{device_mapping_key(ip_address, device_id)}",
+            global_rank,
+        )
+
+        infer_to_train: dict[int, int] = {}
+        train_to_infer: dict[int, int] = {}
+        for infer_rank in range(infer_world_size):
+            info = self._get_colocate_kv(
+                f"colocate_infer_device_by_rank_{infer_rank}",
+                self._colocate_timeout_s,
+                f"inference device mapping for rank {infer_rank}",
+            )
+            mapped_device_key = device_mapping_key(
+                str(info["ip"]), str(info["device_id"])
+            )
+            train_rank = int(
+                self._get_colocate_kv(
+                    f"colocate_train_rank_by_device_{mapped_device_key}",
+                    self._colocate_timeout_s,
+                    f"training rank for inference rank {infer_rank}",
+                )
+            )
+            infer_to_train[infer_rank] = train_rank
+            train_to_infer[train_rank] = infer_rank
+
+        mapping_complete = (
+            len(infer_to_train) == infer_world_size
+            and len(train_to_infer) == train_world_size
+        )
+        if not mapping_complete:
+            raise RuntimeError(
+                "Incomplete colocate device mapping: "
+                f"infer_to_train={len(infer_to_train)}/{infer_world_size}, "
+                f"train_to_infer={len(train_to_infer)}/{train_world_size}"
+            )
+        logger.info(
+            "Resolved colocate device mapping for rank %d: paired_train_rank=%d",
+            global_rank,
+            infer_to_train[global_rank],
+        )
+        return train_to_infer, infer_to_train
 
     def execute_colocate_weight_update(self, version: int) -> None:
         kv_store_url = self._colocate_kv_store_url
@@ -542,6 +905,37 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
 
         paired_train_rank = self._infer_to_train_device_mapping[transfer_rank]
         kv_key = f"colocate_weights_rank{paired_train_rank}_{version}"
+        offloaded_key = (
+            f"colocate_train_weights_offloaded_rank{paired_train_rank}_{version}"
+        )
+
+        deadline = time.monotonic() + timeout_s
+        offloaded = False
+        poll_count = 0
+        last_status = -1
+        while time.monotonic() < deadline:
+            resp = client.get(
+                f"{kv_store_url}/weight_meta/{pair_name}/{offloaded_key}",
+                timeout=5.0,
+            )
+            last_status = resp.status_code
+            if resp.status_code == 200:
+                offloaded = True
+                break
+            poll_count += 1
+            time.sleep(0.1)
+        if not offloaded:
+            raise TimeoutError(
+                f"Training did not offload colocate weights within {timeout_s}s "
+                f"(waiting_key={offloaded_key}, polls={poll_count}, "
+                f"last_status={last_status})"
+            )
+
+        logger.info(
+            "Observed colocate train weights offloaded for v%d, paired rank %d",
+            version,
+            paired_train_rank,
+        )
 
         deadline = time.monotonic() + timeout_s
         serialized_hex = None
@@ -571,39 +965,90 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
         tensors = reconstruct_tensors_from_groups(group_shared, metadata)
         torch.cuda.synchronize()
         deserialized_weights = dict(zip(names, tensors))
+        # Reconstruct when delta is enabled locally OR the payload itself carries
+        # a delta header. The latter defends against the trainer enabling delta
+        # while this worker's DTE_DELTA_TRANSFER did not propagate: without it,
+        # the sparse header/@delta_idx names would flow straight into the apply.
+        carries_delta = payload_carries_delta(names)
+        decoded_delta = None
+        if delta_transfer_enabled() or carries_delta:
+            if carries_delta:
+                decoded_delta = self._delta_decode_for_live_apply(
+                    deserialized_weights, version
+                )
+            else:
+                self._delta_mark_full_sync(deserialized_weights, version)
 
-        recv_parameters = self.get_local_shard_parameters()
+        resumed_weights = False
+        update_succeeded = False
+        try:
+            # During colocate update, weights are only made addressable here;
+            # the train payload is applied immediately after.  Rebuilding Flash
+            # derived tensors before the payload sees SGLang's offloaded zero
+            # buffers and can fail sanity checks prematurely.
+            self.resume_memory(tags=["weights"], rebuild_derived=False)
+            resumed_weights = True
+            recv_parameters = self.get_local_shard_parameters()
 
-        rank_info = self._build_rank_info()
-        rank_coordinate = f"infer_{rank_info.global_rank}"
+            rank_info = self._build_rank_info()
+            rank_coordinate = f"infer_{rank_info.global_rank}"
 
-        assert self._colocate_transport is not None
-        self._colocate_transport.update_weights_in_colocate_mode(
-            self._train_to_infer_device_mapping,
-            self._infer_to_train_device_mapping,
-            transfer_rank,
-            rank_coordinate,
-            self._colocate_infer_world_size,
-            self._send_transfer_plan,
-            self._recv_transfer_plan,
-            self._weights_update_group,
-            deserialized_weights,
-            recv_parameters,
-            step_id=version,
-        )
+            assert self._colocate_transport is not None
+            if decoded_delta is not None:
+                from dte.core.colocate_protocol import apply_decoded_delta_colocate
 
-        done_key = f"colocate_done_rank{paired_train_rank}_{version}"
-        client.put(
-            f"{kv_store_url}/weight_meta/{pair_name}/{done_key}",
-            json={"value": True},
-            headers=auth_headers,
-            timeout=10.0,
-        )
+                schedule_fn = (
+                    self._colocate_transport.execute_recursive_partition_stream_transfer
+                )
+                apply_decoded_delta_colocate(
+                    transfer_rank=transfer_rank,
+                    world_size=self._colocate_infer_world_size,
+                    send_plan=self._send_transfer_plan,
+                    recv_plan=self._recv_transfer_plan,
+                    train_to_infer_device_mapping=self._train_to_infer_device_mapping,
+                    infer_to_train_device_mapping=self._infer_to_train_device_mapping,
+                    weights_update_group=self._weights_update_group,
+                    decoded=decoded_delta,
+                    recv_params=recv_parameters,
+                    device=torch.device(f"cuda:{torch.cuda.current_device()}"),
+                    schedule_fn=schedule_fn,
+                    slice_fn=slice_tensor,
+                    rank_coordinate=rank_coordinate,
+                    step_id=version,
+                )
+            else:
+                self._colocate_transport.update_weights_in_colocate_mode(
+                    self._train_to_infer_device_mapping,
+                    self._infer_to_train_device_mapping,
+                    transfer_rank,
+                    rank_coordinate,
+                    self._colocate_infer_world_size,
+                    self._send_transfer_plan,
+                    self._recv_transfer_plan,
+                    self._weights_update_group,
+                    deserialized_weights,
+                    recv_parameters,
+                    step_id=version,
+                )
+            self._rebuild_derived_weights(f"colocate update v{version}")
+            if decoded_delta is not None:
+                self._delta_engine.commit_live_apply(decoded_delta)
 
-        del deserialized_weights, group_shared, tensors, serialized_weights
-        torch.cuda.synchronize()
-        gc.collect()
-        torch.cuda.empty_cache()
+            done_key = f"colocate_done_rank{paired_train_rank}_{version}"
+            client.put(
+                f"{kv_store_url}/weight_meta/{pair_name}/{done_key}",
+                json={"value": True},
+                headers=auth_headers,
+                timeout=10.0,
+            )
+            update_succeeded = True
+        finally:
+            del deserialized_weights, group_shared, tensors, serialized_weights
+            torch.cuda.synchronize()
+            gc.collect()
+            torch.cuda.empty_cache()
+            if resumed_weights and not update_succeeded:
+                self.release_memory(tags=["weights"])
 
         logger.info(
             "Colocate weight update completed for v%d, rank %d",
@@ -611,8 +1056,56 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
             transfer_rank,
         )
 
+    def _delta_reconstruct(
+        self, named_tensors: dict[str, torch.Tensor], version: int
+    ) -> dict[str, torch.Tensor]:
+        """Reconstruct full weights from a dte delta/full payload (receiver side).
+
+        The bytes already arrived via cuda-IPC, so we use dte's transport-free
+        ``DeltaEngine.reconstruct``: it verifies the version chain, decodes the
+        sparse patch against the CPU base, refreshes that base, and returns the
+        full ``{name: tensor}``. Full weights then flow into
+        ``update_weights_in_colocate_mode`` unchanged, so the cross-rank NCCL
+        reshard never sees a delta payload. The per-param change masks dte also
+        returns are unused for now (first cut applies full weights).
+        """
+        if self._delta_engine is None:
+            self._delta_engine = make_delta_engine(
+                f"cuda:{torch.cuda.current_device()}"
+            )
+        full_params, _masks = self._delta_engine.reconstruct(named_tensors, version)
+        return full_params
+
+    def _delta_mark_full_sync(
+        self, named_tensors: dict[str, torch.Tensor], version: int
+    ) -> None:
+        """Record a dense full-sync version without saving a CPU model copy."""
+        if self._delta_engine is None:
+            self._delta_engine = make_delta_engine(
+                f"cuda:{torch.cuda.current_device()}"
+            )
+        decoded = self._delta_engine.decode_for_live_apply(named_tensors, version)
+        if decoded is not None:
+            raise RuntimeError("Expected a full-sync payload, got a delta payload")
+        logger.info(
+            "dte receiver full base advanced to v%d without CPU snapshot", version
+        )
+
+    def _delta_decode_for_live_apply(
+        self, named_tensors: dict[str, torch.Tensor], version: int
+    ):
+        """Decode delta and verify version chain without reconstructing full params."""
+        if self._delta_engine is None:
+            self._delta_engine = make_delta_engine(
+                f"cuda:{torch.cuda.current_device()}"
+            )
+        decoded = self._delta_engine.decode_for_live_apply(named_tensors, version)
+        if decoded is None:
+            raise RuntimeError("Expected a delta payload, got a full-sync payload")
+        return decoded
+
     # Tags understood by SGLang's native release/resume_memory_occupation.
-    _SGLANG_MEMORY_TAGS = {"kv_cache"}
+    _SGLANG_MEMORY_TAGS = {"weights", "kv_cache"}
 
     def release_memory(self, tags: list[str] | None = None) -> None:
         from sglang.srt.managers.io_struct import ReleaseMemoryOccupationReqInput
@@ -630,23 +1123,25 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
                 unsupported,
                 self._SGLANG_MEMORY_TAGS,
             )
-        if native_tags:
-            req = ReleaseMemoryOccupationReqInput(tags=native_tags)
+        requested_tags = list(self._SGLANG_MEMORY_TAGS) if tags is None else native_tags
+        tags_to_release = [t for t in requested_tags if t not in self._released_tags]
+        if tags_to_release:
+            req = ReleaseMemoryOccupationReqInput(tags=tags_to_release)
             self._scheduler.release_memory_occupation(req)
-            self._released_tags.update(native_tags)
-        logger.info("release_memory completed with tags=%s", tags)
+            self._released_tags.update(tags_to_release)
+        logger.info(
+            "release_memory completed with tags=%s released_now=%s",
+            tags,
+            tags_to_release,
+        )
 
-    def resume_memory(self, tags: list[str] | None = None) -> None:
+    def resume_memory(
+        self, tags: list[str] | None = None, *, rebuild_derived: bool = False
+    ) -> None:
         from sglang.srt.managers.io_struct import ResumeMemoryOccupationReqInput
 
         native_tags = (
-            [
-                t
-                for t in tags
-                if t in self._SGLANG_MEMORY_TAGS and t in self._released_tags
-            ]
-            if tags
-            else None
+            [t for t in tags if t in self._SGLANG_MEMORY_TAGS] if tags else None
         )
         unsupported = (
             [t for t in tags if t not in self._SGLANG_MEMORY_TAGS] if tags else []
@@ -658,8 +1153,17 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
                 unsupported,
                 self._SGLANG_MEMORY_TAGS,
             )
-        if native_tags:
-            req = ResumeMemoryOccupationReqInput(tags=native_tags)
+        requested_tags = list(self._SGLANG_MEMORY_TAGS) if tags is None else native_tags
+        tags_to_resume = [t for t in requested_tags if t in self._released_tags]
+        if tags_to_resume:
+            req = ResumeMemoryOccupationReqInput(tags=tags_to_resume)
             self._scheduler.resume_memory_occupation(req)
-            self._released_tags.difference_update(native_tags)
-        logger.info("resume_memory completed with tags=%s", tags)
+            self._released_tags.difference_update(tags_to_resume)
+            if "weights" in tags_to_resume and rebuild_derived:
+                self._rebuild_derived_weights("resume weights")
+        logger.info(
+            "resume_memory completed with tags=%s resumed_now=%s rebuild_derived=%s",
+            tags,
+            tags_to_resume,
+            rebuild_derived,
+        )
