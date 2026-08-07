@@ -11,8 +11,6 @@ from areal.utils.recover import (
     RecoverHandler,
     check_if_auto_recover,
     check_if_recover,
-    require_colocate_rollout_protocol,
-    should_run_awex_colocate_transfer,
 )
 from areal.v2.training_service.controller.controller import (
     GatewayTrainController,
@@ -250,14 +248,14 @@ class TestAwexColocateGate:
         return Mock(type="awex")
 
     def test_awex_transport_without_colocation_is_not_colocate(self):
-        assert not should_run_awex_colocate_transfer(
+        assert not RecoverHandler._should_run_awex_colocate_transfer(
             inference_engine=Mock(),
             weight_update_meta=self._awex_meta(),
             colocated_rollout=False,
         )
 
     def test_awex_transport_with_colocation_is_colocate(self):
-        assert should_run_awex_colocate_transfer(
+        assert RecoverHandler._should_run_awex_colocate_transfer(
             inference_engine=Mock(),
             weight_update_meta=self._awex_meta(),
             colocated_rollout=True,
@@ -265,21 +263,21 @@ class TestAwexColocateGate:
 
     @pytest.mark.parametrize("meta_type", ["disk", "xccl"])
     def test_non_awex_transport_is_never_colocate(self, meta_type):
-        assert not should_run_awex_colocate_transfer(
+        assert not RecoverHandler._should_run_awex_colocate_transfer(
             inference_engine=Mock(),
             weight_update_meta=Mock(type=meta_type),
             colocated_rollout=True,
         )
 
     def test_missing_inference_engine_is_not_colocate(self):
-        assert not should_run_awex_colocate_transfer(
+        assert not RecoverHandler._should_run_awex_colocate_transfer(
             inference_engine=None,
             weight_update_meta=self._awex_meta(),
             colocated_rollout=True,
         )
 
     def test_meta_without_type_attribute_is_not_colocate(self):
-        assert not should_run_awex_colocate_transfer(
+        assert not RecoverHandler._should_run_awex_colocate_transfer(
             inference_engine=Mock(),
             weight_update_meta=None,
             colocated_rollout=True,
@@ -293,14 +291,14 @@ class TestColocateRolloutProtocol:
         engine = Mock(spec=["pause_generation_sync", "offload"])
         engine.offload = lambda tags=None: None
 
-        require_colocate_rollout_protocol(engine)
+        RecoverHandler._require_colocate_rollout_protocol(engine)
 
     def test_engine_without_pause_generation_sync_is_rejected(self):
         engine = Mock(spec=["offload"])
         engine.offload = lambda tags=None: None
 
         with pytest.raises(NotImplementedError) as exc_info:
-            require_colocate_rollout_protocol(engine)
+            RecoverHandler._require_colocate_rollout_protocol(engine)
 
         assert "pause_generation_sync" in str(exc_info.value)
 
@@ -309,6 +307,6 @@ class TestColocateRolloutProtocol:
         engine.offload = lambda: None
 
         with pytest.raises(NotImplementedError) as exc_info:
-            require_colocate_rollout_protocol(engine)
+            RecoverHandler._require_colocate_rollout_protocol(engine)
 
         assert "tags" in str(exc_info.value)

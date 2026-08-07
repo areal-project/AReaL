@@ -149,49 +149,6 @@ class RecoverInfo:
             raise InValidRecoverInfo(f"Invalid recover info in {load_dir}") from e
 
 
-def should_run_awex_colocate_transfer(
-    inference_engine: InferenceEngine | None,
-    weight_update_meta: WeightUpdateMeta | None,
-    colocated_rollout: bool,
-) -> bool:
-    """Whether recovery must drive the AWEX colocate pre-transfer sequence.
-
-    The transport type alone is not enough: v2 selects AWEX for every non-LoRA
-    run regardless of placement, so the caller has to state whether actor and
-    rollout physically share devices.
-    """
-    return (
-        inference_engine is not None
-        and getattr(weight_update_meta, "type", None) == "awex"
-        and colocated_rollout
-    )
-
-
-def require_colocate_rollout_protocol(inference_engine: InferenceEngine) -> None:
-    missing = []
-    if not callable(getattr(inference_engine, "pause_generation_sync", None)):
-        missing.append("pause_generation_sync()")
-
-    offload = getattr(inference_engine, "offload", None)
-    if not callable(offload):
-        missing.append("offload(tags=...)")
-    else:
-        try:
-            accepts_tags = "tags" in inspect.signature(offload).parameters
-        except (TypeError, ValueError):
-            accepts_tags = True
-        if not accepts_tags:
-            missing.append("offload(tags=...)")
-
-    if missing:
-        raise NotImplementedError(
-            "Colocated AWEX recovery needs a rollout engine implementing "
-            f"{', '.join(missing)}, which {type(inference_engine).__name__} does "
-            "not provide. Disable `recover.mode` or run this configuration "
-            "without actor-rollout colocation."
-        )
-
-
 class RecoverHandler:
     def __init__(self, config: RecoverConfig, ft_spec: FinetuneSpec):
         self.config = config
@@ -260,6 +217,51 @@ class RecoverHandler:
         if isinstance(engine, dict):
             return engine
         return {"default": engine}
+
+    @staticmethod
+    def _should_run_awex_colocate_transfer(
+        inference_engine: InferenceEngine | None,
+        weight_update_meta: WeightUpdateMeta | None,
+        colocated_rollout: bool,
+    ) -> bool:
+        """Whether recovery must drive the AWEX colocate pre-transfer sequence.
+
+        The transport type alone is not enough: v2 selects AWEX for every
+        non-LoRA run regardless of placement, so the caller has to state whether
+        actor and rollout physically share devices.
+        """
+        return (
+            inference_engine is not None
+            and getattr(weight_update_meta, "type", None) == "awex"
+            and colocated_rollout
+        )
+
+    @staticmethod
+    def _require_colocate_rollout_protocol(
+        inference_engine: InferenceEngine,
+    ) -> None:
+        missing = []
+        if not callable(getattr(inference_engine, "pause_generation_sync", None)):
+            missing.append("pause_generation_sync()")
+
+        offload = getattr(inference_engine, "offload", None)
+        if not callable(offload):
+            missing.append("offload(tags=...)")
+        else:
+            try:
+                accepts_tags = "tags" in inspect.signature(offload).parameters
+            except (TypeError, ValueError):
+                accepts_tags = True
+            if not accepts_tags:
+                missing.append("offload(tags=...)")
+
+        if missing:
+            raise NotImplementedError(
+                "Colocated AWEX recovery needs a rollout engine implementing "
+                f"{', '.join(missing)}, which {type(inference_engine).__name__} "
+                "does not provide. Disable `recover.mode` or run this "
+                "configuration without actor-rollout colocation."
+            )
 
     def dump(
         self,
@@ -357,13 +359,13 @@ class RecoverHandler:
             global_step = recover_info.last_step_info.global_step
             recovery_version = global_step + 1
 
-            is_awex_colocate = should_run_awex_colocate_transfer(
+            is_awex_colocate = self._should_run_awex_colocate_transfer(
                 inference_engine=inference_engine,
                 weight_update_meta=weight_update_meta,
                 colocated_rollout=colocated_rollout,
             )
             if is_awex_colocate:
-                require_colocate_rollout_protocol(inference_engine)
+                self._require_colocate_rollout_protocol(inference_engine)
 
             if not is_awex_colocate:
                 for name, engine_ in normalized_engine.items():
