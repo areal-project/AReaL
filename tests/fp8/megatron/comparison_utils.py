@@ -10,7 +10,7 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
-from tests.fp8.model_hooks import categorize_op_name
+from tests.fp8.megatron.model_hooks import categorize_op_name
 
 from areal.utils import logging
 
