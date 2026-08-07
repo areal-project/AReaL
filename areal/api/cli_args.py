@@ -1296,6 +1296,10 @@ class TrainEngineConfig:
             "choices": ["disk", "xccl", "awex"],
         },
     )
+    warmup_communicators: bool = field(
+        default=False,
+        metadata={"help": "Pre-connect collective transports after a recover load."},
+    )
     fsdp: FSDPEngineConfig = field(default_factory=FSDPEngineConfig)
     archon: ArchonEngineConfig = field(default_factory=ArchonEngineConfig)
     megatron: MegatronEngineConfig = field(default_factory=MegatronEngineConfig)
