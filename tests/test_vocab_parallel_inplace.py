@@ -3,6 +3,7 @@
 import pytest
 import torch
 
+from areal.utils.functional import vocab_parallel
 from areal.utils.functional.vocab_parallel import (
     _inplace_vocab_parallel_logprobs_entropy,
     gather_logprobs_entropy,
@@ -12,6 +13,39 @@ from areal.utils.functional.vocab_parallel_kernels import (
 )
 
 CUDA_AVAILABLE = torch.cuda.is_available()
+
+
+def test_gather_logprobs_forwards_explicit_chunk_size(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The public helper must honor its explicit chunk-size argument."""
+    captured: dict[str, int] = {}
+    expected = torch.zeros(5)
+
+    def fake_chunked_gather(
+        logits: torch.Tensor,
+        labels: torch.Tensor,
+        temperature: float,
+        chunk_size: int,
+    ) -> torch.Tensor:
+        del logits, labels, temperature
+        captured["chunk_size"] = chunk_size
+        return expected
+
+    monkeypatch.setattr(
+        vocab_parallel,
+        "_chunked_gather_logprobs",
+        fake_chunked_gather,
+    )
+
+    result = vocab_parallel.gather_logprobs(
+        torch.randn(5, 7),
+        torch.arange(5),
+        chunk_size=3,
+    )
+
+    assert result is expected
+    assert captured == {"chunk_size": 3}
 
 
 def _reference(

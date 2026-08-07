@@ -20,7 +20,7 @@ PROFILE_FAKE_SEQ_LEN=${PROFILE_FAKE_SEQ_LEN:-131072}
 PROFILE_FAKE_DATASET_SIZE=${PROFILE_FAKE_DATASET_SIZE:-8}
 PROFILE_FAKE_LOSS_START_RATIO=${PROFILE_FAKE_LOSS_START_RATIO:-0.5}
 MEMORY_MAX_ENTRIES=${MEMORY_MAX_ENTRIES:-1000000}
-AREAL_LOGPROBS_CHUNK_SIZE=${AREAL_LOGPROBS_CHUNK_SIZE:-128}
+LOGPROBS_CHUNK_SIZE=${LOGPROBS_CHUNK_SIZE:-128}
 LM_HEAD_LOSS_CHUNK_SIZE=${LM_HEAD_LOSS_CHUNK_SIZE:-0}
 USE_PRECISION_AWARE_OPTIMIZER=${USE_PRECISION_AWARE_OPTIMIZER:-true}
 MAIN_GRADS_DTYPE=${MAIN_GRADS_DTYPE:-bfloat16}
@@ -136,7 +136,6 @@ run_case() {
   AREAL_PERF_TRACER_RANKS="${perf_ranks}" \
   AREAL_MEMORY_PROFILER_RANKS="${memory_ranks}" \
   AREAL_TORCH_PROFILER_PROFILE_MEMORY="${torch_profiler_profile_memory}" \
-  AREAL_LOGPROBS_CHUNK_SIZE="${AREAL_LOGPROBS_CHUNK_SIZE}" \
   python -m areal.infra.launcher.local examples/profile/train_sft_profile.py \
     --config "$CONFIG" \
     experiment_name="${EXPERIMENT_NAME}" \
@@ -148,6 +147,7 @@ run_case() {
     train_dataset.max_length="${PROFILE_FAKE_SEQ_LEN}" \
     actor.mb_spec.n_mbs="${PROFILE_N_MBS}" \
     actor.mb_spec.n_mbs_divisor="${PROFILE_N_MBS}" \
+    actor.logprobs_chunk_size="${LOGPROBS_CHUNK_SIZE}" \
     actor.megatron.lm_head_loss_chunk_size="${LM_HEAD_LOSS_CHUNK_SIZE}" \
     actor.megatron.use_precision_aware_optimizer="${USE_PRECISION_AWARE_OPTIMIZER}" \
     actor.megatron.main_grads_dtype="${MAIN_GRADS_DTYPE}" \
@@ -203,7 +203,7 @@ echo "Profile steps: ${PROFILE_STEPS}" | tee -a "${RUN_ROOT}/profile_settings.lo
 echo "Profile ranks: ${PROFILE_RANKS} -> ${RESOLVED_PROFILE_RANKS}" | tee -a "${RUN_ROOT}/profile_settings.log"
 echo "Fake data: seq_len=${PROFILE_FAKE_SEQ_LEN}, dataset_size=${PROFILE_FAKE_DATASET_SIZE}, loss_start_ratio=${PROFILE_FAKE_LOSS_START_RATIO}, batch_size=${TRAIN_BATCH_SIZE}, n_mbs=${PROFILE_N_MBS}" | tee -a "${RUN_ROOT}/profile_settings.log"
 echo "Memory profiler max entries: ${MEMORY_MAX_ENTRIES}" | tee -a "${RUN_ROOT}/profile_settings.log"
-echo "Logprobs chunk size: ${AREAL_LOGPROBS_CHUNK_SIZE}" | tee -a "${RUN_ROOT}/profile_settings.log"
+echo "Logprobs chunk size: ${LOGPROBS_CHUNK_SIZE}" | tee -a "${RUN_ROOT}/profile_settings.log"
 echo "LM Head loss chunk size: ${LM_HEAD_LOSS_CHUNK_SIZE}" | tee -a "${RUN_ROOT}/profile_settings.log"
 echo "Precision-aware optimizer: ${USE_PRECISION_AWARE_OPTIMIZER}, main grads dtype: ${MAIN_GRADS_DTYPE}" | tee -a "${RUN_ROOT}/profile_settings.log"
 echo "Deterministic algorithms: ${USE_DETERMINISTIC_ALGORITHMS}" | tee -a "${RUN_ROOT}/profile_settings.log"

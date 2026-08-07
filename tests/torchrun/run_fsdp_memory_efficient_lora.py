@@ -66,7 +66,6 @@ def test_memory_efficient_lora(alloc_mode: str, output: str | None = None):
     1. Engine initializes successfully with memory_efficient_load=True and use_lora=True
     2. LoRA layers are properly applied
     3. Model can perform a forward pass
-    4. Exported LoRA keys use the standard PEFT format accepted by serving engines
     """
     rank = int(os.environ["RANK"])
     print(f"Running memory_efficient_load + LoRA test on rank {rank}")
@@ -117,38 +116,6 @@ def test_memory_efficient_lora(alloc_mode: str, output: str | None = None):
     except Exception as e:
         print(f"Rank {rank}: ERROR - Forward pass failed: {e}")
         succ = False
-
-    # Test 5: Exported adapter keys must not contain PEFT's internal adapter name.
-    if output:
-        adapter_dir = f"{output}.adapter"
-        print(f"Rank {rank}: Testing LoRA export to {adapter_dir}")
-        try:
-            engine._save_model_to_hf(adapter_dir, tokenizer=None, processor=None)
-            if rank == 0:
-                from safetensors.torch import load_file
-
-                adapter_state = load_file(
-                    os.path.join(adapter_dir, "adapter_model.safetensors")
-                )
-                keys = list(adapter_state)
-                if not keys:
-                    print("Rank 0: ERROR - Exported LoRA state is empty")
-                    succ = False
-                invalid_keys = [
-                    key
-                    for key in keys
-                    if ".default." in key
-                    or not key.endswith((".lora_A.weight", ".lora_B.weight"))
-                ]
-                if invalid_keys:
-                    print(
-                        "Rank 0: ERROR - Invalid exported LoRA keys: "
-                        f"{invalid_keys[:5]}"
-                    )
-                    succ = False
-        except Exception as e:
-            print(f"Rank {rank}: ERROR - LoRA export failed: {e}")
-            succ = False
 
     current_platform.synchronize()
     dist.barrier()

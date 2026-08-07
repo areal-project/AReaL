@@ -180,19 +180,6 @@ class _PendingWeightUpdateBucket:
 _MULTIMODAL_FORWARD_KEYS = ("image_grid_thw", "pixel_values", "video_grid_thw")
 
 
-def _normalize_lora_adapter_state_key(
-    name: str,
-    adapter_name: str = "default",
-) -> str:
-    """Convert an internal PEFT parameter name to its saved adapter key."""
-    name = name.removeprefix("base_model.model.")
-    for lora_component in ("lora_A", "lora_B"):
-        internal_suffix = f".{lora_component}.{adapter_name}.weight"
-        if name.endswith(internal_suffix):
-            return f"{name.removesuffix(internal_suffix)}.{lora_component}.weight"
-    return name
-
-
 def _is_multimodal_payload_key(key: str) -> bool:
     return is_multi_modal_key(key) or key in _MULTIMODAL_FORWARD_KEYS
 
@@ -920,12 +907,14 @@ class FSDPEngine(TrainEngine):
 
     def get_lora_adapter_info(self) -> dict[str, list[int]]:
         """Return adapter parameter names and shapes (for generating synthetic checkpoints)."""
+        import re
+
         if not self.config.use_lora or self.model is None:
             return {}
         result = {}
         for name, param in self.model.named_parameters():
             if param.requires_grad and "lora_" in name:
-                clean_name = _normalize_lora_adapter_state_key(name)
+                clean_name = re.sub(r"^base_model\.model\.", "", name)
                 result[clean_name] = list(param.shape)
         return result
 
@@ -1774,7 +1763,11 @@ class FSDPEngine(TrainEngine):
 
             if dist.get_rank() == 0:
                 # Emit PEFT-serving-standard keys. Drop the active-adapter
-                # segment (".default") while retaining PEFT's base-model prefix.
+                # segment (".default") so names match what
+                # PeftModel.save_pretrained produces
+                # (e.g. "...down_proj.lora_A.weight"). Keeping ".default"
+                # makes vLLM's parse_fine_tuned_lora_name reject the adapter
+                # with "unsupported LoRA weight" on disk-mode load.
                 clean_name = re.sub(r"\.default\.(weight|bias)$", r".\1", name)
                 adapter_state[clean_name] = (
                     self._cast_to_compute_dtype(full_param.cpu())
@@ -2097,6 +2090,7 @@ class FSDPEngine(TrainEngine):
             tp_group=self.parallel_helper.tp_group
             if self.parallel_helper.tp_size > 1
             else None,
+            chunk_size=self.config.logprobs_chunk_size,
         )
         if self.parallel_helper.sp_size > 1:
             logprobs = self._sp_all_gather(logprobs)
@@ -2127,6 +2121,7 @@ class FSDPEngine(TrainEngine):
             tp_group=self.parallel_helper.tp_group
             if self.parallel_helper.tp_size > 1
             else None,
+            chunk_size=self.config.logprobs_chunk_size,
         )
         if self.parallel_helper.sp_size > 1:
             logprobs = self._sp_all_gather(logprobs)
@@ -2187,6 +2182,7 @@ class FSDPEngine(TrainEngine):
                     tp_group=self.parallel_helper.tp_group
                     if self.parallel_helper.tp_size > 1
                     else None,
+                    chunk_size=self.config.logprobs_chunk_size,
                 )
             else:
                 logprobs, entropy = self._compute_logprobs_entropy(
@@ -2236,6 +2232,7 @@ class FSDPEngine(TrainEngine):
                     tp_group=self.parallel_helper.tp_group
                     if self.parallel_helper.tp_size > 1
                     else None,
+                    chunk_size=self.config.logprobs_chunk_size,
                 )
                 return result
             result = self._compute_logprobs(

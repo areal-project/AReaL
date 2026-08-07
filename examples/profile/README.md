@@ -1,20 +1,22 @@
 # Qwen3-30B-A3B SFT Profile
 
-这个目录提供一个端到端 SFT profile 样例，用 Qwen3-30B-A3B 和确定性的 fake 128K-token SFT 数据分别采集 kernel
-profile 与 memory profile。
+This directory provides an end-to-end SFT profiling example. It uses Qwen3-30B-A3B and
+deterministic fake 128K-token SFT data to collect kernel and memory profiles separately.
 
-## 文件
+## Files
 
-- `train_sft_profile.py`: SFT 入口。它不读取外部 JSONL，而是用真实 tokenizer 编码一段结构化 SWE/代码修复对话，再重复截断到
-  131072 token。
-- `qwen3_30b_a3b_sft_profile.yaml`: 1 节点 8 GPU 的 Megatron MoE profile 配置，默认使用
-  `megatron:(attn:d2c4|ffn:d1e8)`，即 attention 使用 DP=2、CP=4，MoE FFN 使用 EP=8。
-- `run_qwen3_30b_a3b_sft_profile.sh`: 一键运行 kernel/memory 两类 profile。
-- `postprocess_profile.py`: 生成 kernel Chrome trace 视图和 profile summary。
+- `train_sft_profile.py`: SFT entry point. Instead of reading an external JSONL file, it
+  uses the real tokenizer to encode a structured SWE/code-repair conversation, then
+  repeats and truncates it to 131072 tokens.
+- `qwen3_30b_a3b_sft_profile.yaml`: Megatron MoE profiling configuration for one node
+  with eight GPUs. By default it uses `megatron:(attn:d2c4|ffn:d1e8)`: DP=2 and CP=4 for
+  attention, and EP=8 for the MoE FFN.
+- `run_qwen3_30b_a3b_sft_profile.sh`: Runs kernel and memory profiles.
+- `postprocess_profile.py`: Generates kernel Chrome trace views and profile summaries.
 
-## 快速运行
+## Quick start
 
-在仓库根目录执行：
+Run from the repository root:
 
 ```bash
 MODEL_PATH=/path/to/Qwen3-30B-A3B \
@@ -22,13 +24,15 @@ FILEROOT=/path/to/shared/experiments \
 bash examples/profile/run_qwen3_30b_a3b_sft_profile.sh
 ```
 
-默认会对 step 0 和 step 1 分别运行 profile；如果 `PROFILE_KINDS=kernel,memory`， 总共会运行 4 个 trial：
+By default, the script profiles steps 0 and 1. With `PROFILE_KINDS=kernel,memory`, it
+runs four trials in total:
 
-- `kernel`: 打开 `perf_tracer.profile_steps`，在 SFT train step 中启动 PyTorch profiler，产出
-  CPU/CUDA/GPU kernel trace。
-- `memory`: 打开 `memory_profiler.profile_steps`，产出 PyTorch CUDA allocator snapshot。
+- `kernel`: enables `perf_tracer.profile_steps`, starts the PyTorch profiler in the SFT
+  training step, and produces CPU, CUDA, and GPU kernel traces.
+- `memory`: enables `memory_profiler.profile_steps` and produces PyTorch CUDA allocator
+  snapshots.
 
-默认设置：
+Default settings:
 
 ```bash
 PROFILE_STEPS=0,1
@@ -40,7 +44,7 @@ PROFILE_FAKE_DATASET_SIZE=8
 PROFILE_FAKE_LOSS_START_RATIO=0.5
 TRAIN_BATCH_SIZE=4
 PROFILE_N_MBS=2
-AREAL_LOGPROBS_CHUNK_SIZE=128
+LOGPROBS_CHUNK_SIZE=128
 LM_HEAD_LOSS_CHUNK_SIZE=0
 USE_PRECISION_AWARE_OPTIMIZER=true
 MAIN_GRADS_DTYPE=bfloat16
@@ -48,7 +52,7 @@ USE_DETERMINISTIC_ALGORITHMS=false
 STOP_ON_FAILURE=1
 ```
 
-只跑 kernel profile：
+Run only the kernel profile:
 
 ```bash
 PROFILE_KINDS=kernel \
@@ -56,7 +60,7 @@ MODEL_PATH=/path/to/Qwen3-30B-A3B \
 bash examples/profile/run_qwen3_30b_a3b_sft_profile.sh
 ```
 
-只跑 memory profile，并采集多个 rank：
+Run only the memory profile and collect multiple ranks:
 
 ```bash
 PROFILE_KINDS=memory \
@@ -65,24 +69,29 @@ MODEL_PATH=/path/to/Qwen3-30B-A3B \
 bash examples/profile/run_qwen3_30b_a3b_sft_profile.sh
 ```
 
-未设置 `PROFILE_RANKS` 时，脚本会根据 `actor.backend` 动态计算每个 pipeline stage 的 rank0；当前默认
-`megatron:(attn:d2c4|ffn:d1e8)` 的 PP=1，会解析为 `0`。显式设置 `PROFILE_RANKS`
-会覆盖该脚本默认值；设为空字符串表示采集全部 rank。
+When `PROFILE_RANKS` is unset, the script derives rank 0 of every pipeline stage from
+`actor.backend`. The default `megatron:(attn:d2c4|ffn:d1e8)` configuration has PP=1, so
+it resolves to `0`. An explicit `PROFILE_RANKS` value overrides the computed default;
+set it to an empty string to collect all ranks.
 
-## Fake 128K 数据
+## Fake 128K data
 
-`train_sft_profile.py` 的 fake 数据生成逻辑有三个约束：
+The fake-data generator in `train_sft_profile.py` follows three rules:
 
-1. 使用目标模型 tokenizer 编码结构化对话文本，而不是直接填充同一个 token。
-1. 重复同一段 token 序列直到固定长度 `PROFILE_FAKE_SEQ_LEN=131072`，保证不同 parallel layout 看到完全相同的 token
-   内容。
-1. `loss_mask` 默认从 50% 位置开始为 1，前半段作为 prompt/context，后半段作为 assistant target。
+1. It uses the target model's tokenizer to encode a structured conversation instead of
+   filling the sequence with one token.
+1. It repeats the same token sequence to the fixed `PROFILE_FAKE_SEQ_LEN=131072`,
+   ensuring that every parallel layout sees identical token content.
+1. By default, `loss_mask` is 1 from the 50% position onward. The first half is the
+   prompt/context and the second half is the assistant target.
 
-这样可以避免真实数据 IO 与动态过滤影响 profile，同时保留长上下文、代码块、JSON 片段和自然语言 target 的 tokenizer 分布。
+This avoids profile noise from real-data I/O and dynamic filtering while retaining a
+tokenizer distribution that includes long context, code blocks, JSON fragments, and
+natural-language targets.
 
-## 产物
+## Outputs
 
-脚本默认把运行侧产物放在 `examples/profile/` 下：
+The script stores run-side outputs under `examples/profile/` by default:
 
 ```text
 examples/profile/profile_data/<timestamp>_qwen3-30b-a3b_fake128k_sft_profile/
@@ -126,7 +135,7 @@ examples/profile/profile_data/<timestamp>_qwen3-30b-a3b_fake128k_sft_profile/
       snapshot_*.pickle
 ```
 
-AReaL 原始日志仍在 `FILEROOT` 下：
+The original AReaL logs remain under `FILEROOT`:
 
 ```text
 ${FILEROOT}/logs/<user>/qwen3-30b-a3b-sft-profile/<trial_name>/
@@ -135,8 +144,8 @@ ${FILEROOT}/logs/<user>/qwen3-30b-a3b-sft-profile/<trial_name>/
   memory_snapshots/step_<profile_step>/snapshot_*.pickle
 ```
 
-kernel profile 后处理会在 trace 文件旁生成 Chrome trace 视图，并复制一份到
-`profile_data/.../kernel_traces/<role>/`：
+Kernel-profile postprocessing generates Chrome trace views next to each trace file and
+copies them to `profile_data/.../kernel_traces/<role>/`:
 
 ```text
 traces-r0.chrome.json
@@ -146,15 +155,17 @@ traces-r0.cpu_only.chrome.json
 traces-r0.cuda_api_only.chrome.json
 ```
 
-用 Chrome `chrome://tracing` 或 Perfetto 打开这些 `.chrome.json` 文件即可查看。默认未设置 `PROFILE_RANKS`
-时，当前 PP=1 配置只采集 rank 0。若要比较 DP、CP 和 EP 各 rank 的显存，可显式设置 `PROFILE_RANKS=` 采集全部 rank。
+Open these `.chrome.json` files in Chrome at `chrome://tracing` or in Perfetto. With the
+default unset `PROFILE_RANKS` and PP=1 configuration, only rank 0 is collected. To
+compare GPU memory across DP, CP, and EP ranks, explicitly set `PROFILE_RANKS=` to
+collect all ranks.
 
-当前 DP=2、CP=4 的 128K 配置默认关闭 deterministic algorithms；可通过
-`USE_DETERMINISTIC_ALGORITHMS=true` 显式开启。
+The default 128K configuration with DP=2 and CP=4 disables deterministic algorithms. Set
+`USE_DETERMINISTIC_ALGORITHMS=true` to enable them.
 
-## 单独后处理
+## Standalone postprocessing
 
-如果 profile 已经跑完，只想重新生成 summary 和 kernel trace views：
+To regenerate summaries and kernel trace views for an existing profile:
 
 ```bash
 python examples/profile/postprocess_profile.py \
@@ -166,18 +177,25 @@ python examples/profile/postprocess_profile.py \
   --nvidia-smi-csv /path/to/nvidia_smi.csv
 ```
 
-## 注意事项
+## Notes
 
-- kernel profile 与 memory profile 建议分开跑；torch profiler 的 memory 记录会扰动 kernel 时间线，本样例默认对
-  kernel trial 设置 `AREAL_TORCH_PROFILER_PROFILE_MEMORY=false`。
-- 这个 128K profile 样例默认设置 `actor.megatron.ddp.grad_reduce_in_fp32=false`，用于降低 step 1
-  steady-state 的梯度规约显存占用。
-- `AREAL_LOGPROBS_CHUNK_SIZE` 控制 logprobs/entropy 计算的序列 chunk，默认 128，用来降低 step 1
-  steady-state 的 vocab-parallel 临时显存峰值。
-- 默认启用 Megatron precision-aware optimizer，并让 TE Adam 直接消费 BF16 distributed grad
-  buffer。主参数和两个 Adam moment 仍为 FP32；这避免在 optimizer step 尾部为每个参数额外创建 FP32 grad。设置
-  `USE_PRECISION_AWARE_OPTIMIZER=false MAIN_GRADS_DTYPE=float32` 可恢复原路径。
-- `PROFILE_RANKS` 控制采集 rank。未设置时脚本会按 `actor.backend` 计算每个 PP stage 的 rank0；为空表示全部 rank；
-  `0,2-4` 表示 rank 0、2、3、4。
-- Qwen3-30B-A3B 需要 8 GPU profile 环境；没有对应 GPU/模型权重时只能验证脚本和后处理， 无法实际产出 CUDA trace 或 memory
-  snapshot。
+- Run kernel and memory profiles separately. PyTorch profiler memory recording disturbs
+  the kernel timeline, so kernel trials set `AREAL_TORCH_PROFILER_PROFILE_MEMORY=false`
+  by default.
+- This 128K example sets `actor.megatron.ddp.grad_reduce_in_fp32=false` to reduce the
+  steady-state gradient-reduction memory footprint in step 1.
+- `LOGPROBS_CHUNK_SIZE` sets `actor.logprobs_chunk_size`, which controls the sequence
+  chunk used for logprob and entropy computation. It defaults to 128 to reduce the
+  steady-state temporary memory peak of the vocab-parallel path in step 1.
+- The Megatron precision-aware optimizer is enabled by default, and TE Adam consumes the
+  BF16 distributed gradient buffer directly. Main parameters and both Adam moments
+  remain FP32. This avoids allocating another FP32 gradient for every parameter at the
+  end of the optimizer step. Set
+  `USE_PRECISION_AWARE_OPTIMIZER=false MAIN_GRADS_DTYPE=float32` to restore the original
+  path.
+- `PROFILE_RANKS` controls which ranks are collected. When unset, the script computes
+  rank 0 of every pipeline stage from `actor.backend`; an empty value selects all ranks;
+  `0,2-4` selects ranks 0, 2, 3, and 4.
+- Qwen3-30B-A3B requires an eight-GPU profiling environment. Without suitable GPUs and
+  model weights, only the scripts and postprocessing can be validated; CUDA traces and
+  memory snapshots cannot be produced.

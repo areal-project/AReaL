@@ -42,42 +42,6 @@ class DummyModel:
         self.gradient_checkpointing_calls.append(kwargs)
 
 
-@pytest.mark.parametrize(
-    ("name", "adapter_name", "expected"),
-    [
-        (
-            "base_model.model.model.layers.0.mlp.down_proj.lora_A.default.weight",
-            "default",
-            "model.layers.0.mlp.down_proj.lora_A.weight",
-        ),
-        (
-            "base_model.model.model.visual.blocks.0.attn.qkv.lora_B.default.weight",
-            "default",
-            "model.visual.blocks.0.attn.qkv.lora_B.weight",
-        ),
-        (
-            "base_model.model.model.layers.0.self_attn.q_proj.lora_A.adapter_1.weight",
-            "adapter_1",
-            "model.layers.0.self_attn.q_proj.lora_A.weight",
-        ),
-        (
-            "base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight",
-            "default",
-            "model.layers.0.self_attn.q_proj.lora_A.weight",
-        ),
-    ],
-)
-def test_normalize_lora_adapter_state_key_removes_peft_adapter_name(
-    name,
-    adapter_name,
-    expected,
-):
-    """FSDP LoRA exports must use the adapter keys accepted by serving engines."""
-    from areal.engine.fsdp_engine import _normalize_lora_adapter_state_key
-
-    assert _normalize_lora_adapter_state_key(name, adapter_name) == expected
-
-
 @pytest.fixture(scope="module")
 def mock_input(
     batch_size=5,

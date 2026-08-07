@@ -3,16 +3,12 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-import pytest
-
 from examples.profile.postprocess_profile import postprocess_profile
 from examples.profile.profile_rank_utils import (
     pp_rank0_ranks_from_backend,
     resolve_profile_ranks,
 )
 from examples.profile.train_sft_profile import RepeatedProfileSFTDataset
-
-from areal.utils.functional.vocab_parallel import _resolve_chunk_size
 
 
 class _FakeTokenizer:
@@ -47,16 +43,15 @@ def test_repeated_profile_sft_dataset_builds_fixed_loss_span() -> None:
     assert dataset[0]["input_ids"].data_ptr() != dataset[1]["input_ids"].data_ptr()
 
 
-def test_logprobs_chunk_size_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("AREAL_LOGPROBS_CHUNK_SIZE", raising=False)
-    assert _resolve_chunk_size(1024) == 1024
+def test_profile_launcher_passes_logprobs_chunk_size_as_cli() -> None:
+    """The profile launcher must configure chunking explicitly through the CLI."""
+    script = Path("examples/profile/run_qwen3_30b_a3b_sft_profile.sh").read_text(
+        encoding="utf-8"
+    )
 
-    monkeypatch.setenv("AREAL_LOGPROBS_CHUNK_SIZE", "128")
-    assert _resolve_chunk_size(1024) == 128
-
-    monkeypatch.setenv("AREAL_LOGPROBS_CHUNK_SIZE", "0")
-    with pytest.raises(ValueError, match="positive integer"):
-        _resolve_chunk_size(1024)
+    assert "LOGPROBS_CHUNK_SIZE=${LOGPROBS_CHUNK_SIZE:-128}" in script
+    assert 'actor.logprobs_chunk_size="${LOGPROBS_CHUNK_SIZE}"' in script
+    assert "AREAL_LOGPROBS_CHUNK_SIZE" not in script
 
 
 def test_profile_rank_utils_resolves_pp_rank0(tmp_path: Path) -> None:

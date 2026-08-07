@@ -2669,6 +2669,7 @@ class MegatronEngine(TrainEngine):
                     tp_group=mpu.get_tensor_model_parallel_group()
                     if mpu.get_tensor_model_parallel_world_size() > 1
                     else None,
+                    chunk_size=self.config.logprobs_chunk_size,
                 )
             else:
                 cp_padded_cu_seqlens = inputs.get("_cp_padded_cu_seqlens")
@@ -2702,6 +2703,7 @@ class MegatronEngine(TrainEngine):
                         tp_group=mpu.get_tensor_model_parallel_group()
                         if mpu.get_tensor_model_parallel_world_size() > 1
                         else None,
+                        chunk_size=self.config.logprobs_chunk_size,
                         reuse_logits=_reuse_chunked_logits_storage(
                             self.mcore_config.enable_chunked_logits,
                             self.mcore_config.entropy_requires_grad,
@@ -2804,6 +2806,7 @@ class MegatronEngine(TrainEngine):
                     tp_group=mpu.get_tensor_model_parallel_group()
                     if mpu.get_tensor_model_parallel_world_size() > 1
                     else None,
+                    chunk_size=self.config.logprobs_chunk_size,
                 )
                 return logprobs
             labels = torch.roll(inputs["input_ids"], shifts=-1, dims=-1)
@@ -2814,6 +2817,7 @@ class MegatronEngine(TrainEngine):
                 tp_group=mpu.get_tensor_model_parallel_group()
                 if mpu.get_tensor_model_parallel_world_size() > 1
                 else None,
+                chunk_size=self.config.logprobs_chunk_size,
             )
             return logprobs
         else:

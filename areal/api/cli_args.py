@@ -1232,6 +1232,13 @@ class TrainEngineConfig:
     temperature: float = field(
         default=1.0, metadata={"help": "Temperature during generation."}
     )
+    logprobs_chunk_size: int = field(
+        default=1024,
+        metadata={
+            "help": "Maximum sequence chunk size used to compute log probabilities "
+            "and entropy. Must be positive."
+        },
+    )
     # Runtime microbatch limit
     mb_spec: MicroBatchSpec = field(default_factory=MicroBatchSpec)
     pad_to_maximum: bool = field(
@@ -1384,6 +1391,10 @@ class TrainEngineConfig:
 
     def __post_init__(self):
         """Validate scheduling_spec length and config combinations."""
+        if self.logprobs_chunk_size <= 0:
+            raise ValueError(
+                f"logprobs_chunk_size must be positive, got {self.logprobs_chunk_size}"
+            )
         if len(self.scheduling_spec) not in (1, 2):
             raise ValueError(
                 f"scheduling_spec must contain 1 or 2 SchedulingSpec, "

@@ -119,6 +119,45 @@ def test_actor_output_layer_replacement_uses_fused_fp32_output(enabled, monkeypa
     assert replacements == ([(gpt_model, True)] if enabled else [])
 
 
+@pytest.mark.parametrize(
+    ("enable_chunked_logits", "enable_fp32_lm_head", "expected"),
+    [
+        (True, True, "chunked"),
+        (True, False, "chunked"),
+        (False, True, "fp32"),
+        (False, False, "none"),
+    ],
+)
+def test_configure_actor_output_layers_prioritizes_chunked_logits(
+    enable_chunked_logits: bool,
+    enable_fp32_lm_head: bool,
+    expected: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Chunked logits must win when both LM Head optimizations are requested."""
+    calls: list[str] = []
+    monkeypatch.setattr(
+        mcore_registry,
+        "_replace_actor_output_layers",
+        lambda _models, *, enabled: calls.append("chunked") if enabled else None,
+    )
+    monkeypatch.setattr(
+        mcore_registry,
+        "_enable_fp32_lm_head_forward",
+        lambda _models, *, enabled: calls.append("fp32") if enabled else 0,
+    )
+
+    mcore_registry._configure_actor_output_layers(
+        [object()],
+        MegatronEngineConfig(
+            enable_chunked_logits=enable_chunked_logits,
+            enable_fp32_lm_head=enable_fp32_lm_head,
+        ),
+    )
+
+    assert calls == ([] if expected == "none" else [expected])
+
+
 def _native_megatron_areal_logits(
     input_: torch.Tensor,
     weight: torch.Tensor,

@@ -2,7 +2,6 @@
 
 import functools
 import math
-import os
 from collections.abc import Callable
 from typing import TypeVar
 
@@ -61,25 +60,6 @@ def _chunked_apply(
         num_outputs = len(results[0])
         return tuple(torch.cat([r[i] for r in results]) for i in range(num_outputs))
     return torch.cat(results)
-
-
-def _resolve_chunk_size(chunk_size: int) -> int:
-    env_chunk_size = os.getenv("AREAL_LOGPROBS_CHUNK_SIZE")
-    if env_chunk_size is None:
-        return chunk_size
-    try:
-        resolved = int(env_chunk_size)
-    except ValueError as e:
-        raise ValueError(
-            "AREAL_LOGPROBS_CHUNK_SIZE must be a positive integer, "
-            f"got {env_chunk_size!r}"
-        ) from e
-    if resolved <= 0:
-        raise ValueError(
-            "AREAL_LOGPROBS_CHUNK_SIZE must be a positive integer, "
-            f"got {env_chunk_size!r}"
-        )
-    return resolved
 
 
 def _chunked_gather_logprobs(
@@ -603,7 +583,6 @@ def gather_logprobs(
     Returns:
         Log probabilities at the label positions with shape [...].
     """
-    chunk_size = _resolve_chunk_size(chunk_size)
     if tp_group is not None and dist.get_world_size(tp_group) > 1:
         fn = functools.partial(
             _vocab_parallel_logprobs,
@@ -647,7 +626,6 @@ def gather_logprobs_entropy(
             - logprobs: Log probabilities at the label positions with shape [...].
             - entropy: Entropy of the probability distribution with shape [...].
     """
-    chunk_size = _resolve_chunk_size(chunk_size)
     if reuse_logits:
         from areal.utils.functional.vocab_parallel_kernels import (
             reusable_vocab_parallel_logits,
