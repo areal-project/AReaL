@@ -1319,6 +1319,7 @@ class ArchonEngine(TrainEngine):
                 ctx.mb_input["input_ids"],
                 temperature=self.config.temperature,
                 tp_group=self._tp_group,
+                chunk_size=self.config.logprobs_chunk_size,
             )
             return logprobs, entropy, vocab_min, vocab_max
 
@@ -1328,6 +1329,7 @@ class ArchonEngine(TrainEngine):
             ctx.labels,
             temperature=self.config.temperature,
             tp_group=self._tp_group,
+            chunk_size=self.config.logprobs_chunk_size,
         )
         vocab_min, vocab_max = self._get_vocab_min_max_logits(logits)
 
@@ -1359,6 +1361,7 @@ class ArchonEngine(TrainEngine):
                 ctx.mb_input["input_ids"],
                 temperature=self.config.temperature,
                 tp_group=self._tp_group,
+                chunk_size=self.config.logprobs_chunk_size,
             )
 
         assert ctx.labels is not None
@@ -1367,6 +1370,7 @@ class ArchonEngine(TrainEngine):
             ctx.labels,
             temperature=self.config.temperature,
             tp_group=self._tp_group,
+            chunk_size=self.config.logprobs_chunk_size,
         )
 
         if self._cp_group is not None:

@@ -375,7 +375,9 @@ jobs:
             tests/test_megatron_engine_distributed.py
           collect_base_tests megatron-loss-aggregation \
             tests/test_megatron_loss_aggregation.py
+          collect_base_tests megatron-lm-head tests/test_megatron_lm_head.py
           collect_base_tests mcore-fp32-lm-head tests/test_mcore_fp32_lm_head.py
+          collect_base_tests megatron-optimizer-config tests/test_megatron_optimizer_config.py
           collect_base_tests all-gather-param tests/test_all_gather_param.py
           collect_base_tests grad-norm-tp tests/megatron/test_grad_norm_tp_invariance.py
           collect_base_tests ppo-advantages tests/test_ppo_advantages.py
@@ -470,7 +472,7 @@ jobs:
           pytest -q -p scripts.ci_test_report \
             tests/test_npu_weight_reload_native.py
 
-      - name: Run Megatron single-device tests
+      - name: Run chunked LM-head single-device tests
         env:
           AREAL_TEST_REPORT_DIR: /tmp/current-npu-test-reports
           ASCEND_RT_VISIBLE_DEVICES: "0"
@@ -478,7 +480,9 @@ jobs:
           TRANSFORMERS_OFFLINE: "1"
         run: |
           pytest -q -p scripts.ci_test_report -m npu \
+            tests/test_megatron_lm_head.py \
             tests/test_mcore_fp32_lm_head.py \
+            tests/test_megatron_optimizer_config.py \
             tests/test_all_gather_param.py
 
       - name: Run NPU weight-reload graph regression

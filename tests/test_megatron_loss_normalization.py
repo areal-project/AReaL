@@ -25,6 +25,7 @@ class _MicroBatches(list):
 
 def _bind_per_token_loss_methods(engine, namespace):
     """Bind the scalar normalization helpers on the lightweight engine fixture."""
+    namespace.setdefault("ChunkedLMHeadOutput", type("ChunkedLMHeadOutput", (), {}))
     engine._per_token_count = _load_function(
         ENGINE_SOURCE, "_per_token_count", namespace
     ).__func__
@@ -445,6 +446,9 @@ def test_forward_callback_preserves_loss_contract(with_count):
             "unpad_logits": lambda output, **kw: output,
             "get_forward_backward_func": lambda: schedule,
             "trace_scope": lambda *args: nullcontext(),
+            "_float16_wrapper_fp32_output": _load_function(
+                ENGINE_SOURCE, "_float16_wrapper_fp32_output", {"torch": torch}
+            ),
         },
     )
     engine = SimpleNamespace(
@@ -453,6 +457,11 @@ def test_forward_callback_preserves_loss_contract(with_count):
         is_vision_model=False,
         use_padded_seq=False,
         use_model_packed_seq=False,
+        mcore_config=SimpleNamespace(
+            lm_head_loss_chunk_size=0, enable_chunked_logits=False
+        ),
+        config=SimpleNamespace(is_critic=False),
+        dtype=torch.float32,
         model=[SimpleNamespace()],
     )
     count = torch.tensor(3)
