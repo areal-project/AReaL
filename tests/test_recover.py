@@ -1,14 +1,15 @@
 """Tests for the recovery configuration and functionality."""
 
 import tempfile
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock, call
 
 import pytest
 
 from areal.api.cli_args import RecoverConfig
-from areal.api.io_struct import FinetuneSpec, StepInfo
+from areal.api.io_struct import FinetuneSpec, StepInfo, WeightUpdateMeta
 from areal.utils.recover import (
     RecoverHandler,
+    RecoverInfo,
     check_if_auto_recover,
     check_if_recover,
 )
@@ -197,6 +198,109 @@ class TestRecoverHandler:
     @staticmethod
     def _make_gateway_controller() -> GatewayTrainController:
         return GatewayTrainController.__new__(GatewayTrainController)
+
+    @staticmethod
+    def _prepare_load(handler: RecoverHandler, monkeypatch):
+        recover_info = RecoverInfo(
+            last_step_info=StepInfo(
+                epoch=0,
+                epoch_step=0,
+                global_step=3,
+                steps_per_epoch=handler.ft_spec.steps_per_epoch,
+            ),
+            saver_info={},
+            evaluator_info={},
+            stats_logger_info={},
+            dataloader_info={},
+            checkpoint_info={},
+        )
+        monkeypatch.setattr(RecoverInfo, "load", lambda _: recover_info)
+        handler.freq_ctl = Mock()
+        monkeypatch.setattr(handler, "_load_checkpoint", Mock())
+        monkeypatch.setattr(handler, "_warmup_communicators", Mock())
+
+        engine = Mock()
+        inference_engine = Mock()
+        inference_engine.attach_mock(AsyncMock(), "continue_generation")
+        dataloader = Mock()
+        dataloader.sampler = None
+        dependencies = (Mock(), Mock(), Mock(), dataloader)
+        return recover_info, engine, inference_engine, dependencies
+
+    def test_load_awex_restores_rollout_before_resuming(self, tmp_path, monkeypatch):
+        """AWEX recovery restores generation and KV before accepting new work."""
+        handler = self._make_handler(str(tmp_path), "on")
+        recover_info, engine, inference_engine, dependencies = self._prepare_load(
+            handler, monkeypatch
+        )
+
+        result = handler.load(
+            engine,
+            *dependencies,
+            inference_engine=inference_engine,
+            weight_update_meta=WeightUpdateMeta(type="awex"),
+        )
+
+        assert result is recover_info
+        assert inference_engine.mock_calls == [
+            call.pause(),
+            call.pause_generation_sync(),
+            call.offload(tags=["kv_cache"]),
+            call.offload(tags=["weights"]),
+            call.set_version(4),
+            call.abort_all_requests(),
+            call.onload(tags=["kv_cache"]),
+            call.continue_generation(),
+            call.resume(),
+        ]
+        updated_meta = engine.update_weights.call_args.args[0]
+        assert updated_meta.version == 4
+        engine.set_version.assert_called_once_with(4)
+
+    @pytest.mark.parametrize(
+        "failing_method", ["abort_all_requests", "onload", "continue_generation"]
+    )
+    def test_load_awex_restore_failure_keeps_inference_paused(
+        self, tmp_path, monkeypatch, failing_method
+    ):
+        """AWEX recovery does not admit work after a partial rollout restore."""
+        handler = self._make_handler(str(tmp_path), "on")
+        _, engine, inference_engine, dependencies = self._prepare_load(
+            handler, monkeypatch
+        )
+        getattr(inference_engine, failing_method).side_effect = RuntimeError(
+            f"{failing_method} failed"
+        )
+
+        with pytest.raises(RuntimeError, match=f"{failing_method} failed"):
+            handler.load(
+                engine,
+                *dependencies,
+                inference_engine=inference_engine,
+                weight_update_meta=WeightUpdateMeta(type="awex"),
+            )
+
+        inference_engine.resume.assert_not_called()
+
+    def test_load_non_awex_update_failure_resumes_inference(
+        self, tmp_path, monkeypatch
+    ):
+        """Non-AWEX recovery retains the existing fail-safe resume behavior."""
+        handler = self._make_handler(str(tmp_path), "on")
+        _, engine, inference_engine, dependencies = self._prepare_load(
+            handler, monkeypatch
+        )
+        engine.update_weights.side_effect = RuntimeError("update failed")
+
+        with pytest.raises(RuntimeError, match="update failed"):
+            handler.load(
+                engine,
+                *dependencies,
+                inference_engine=inference_engine,
+                weight_update_meta=WeightUpdateMeta(type="disk"),
+            )
+
+        inference_engine.resume.assert_called_once_with()
 
     @pytest.mark.parametrize("mode", ["on", "auto"])
     def test_load_rejects_gateway_train_controller(self, mode):

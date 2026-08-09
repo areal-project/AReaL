@@ -24,6 +24,7 @@ from areal.api import (
 )
 from areal.api.cli_args import RecoverConfig
 from areal.infra import TrainController
+from areal.infra.utils.concurrent import call_maybe_async
 from areal.utils import logging, timeutil
 from areal.utils.evaluator import Evaluator
 from areal.utils.saver import Saver
@@ -377,6 +378,7 @@ class RecoverHandler:
                 versioned_meta = weight_update_meta.with_version(recovery_version)
                 update_engine.connect_engine(inference_engine, versioned_meta)
                 inference_engine.pause()
+                can_resume_inference = not is_awex_colocate
                 try:
                     # AWEX colocate transfer requires the full engine-level
                     # pause/offload protocol, not just the controller pause. The
@@ -387,8 +389,8 @@ class RecoverHandler:
                     # Without this the recover-path transfer deadlocks: reader
                     # never consumes the queued version marker, writer blocks on
                     # weights_update_finished forever.
-                    # Mirror of the trainer's pre-update sequence; the reverse
-                    # side (kv_cache onload) happens inside update_weights.
+                    # Mirror of the trainer's pre-update sequence; restore the
+                    # rollout below after every actor worker has returned.
                     if is_awex_colocate:
                         inference_engine.pause_generation_sync()
                         inference_engine.offload(tags=["kv_cache"])
@@ -400,12 +402,20 @@ class RecoverHandler:
                         for name, engine_ in normalized_engine.items():
                             self._load_checkpoint(engine_, name=name)
                     update_engine.update_weights(versioned_meta)
+                    update_engine.set_version(recovery_version)
+                    inference_engine.set_version(recovery_version)
+                    if is_awex_colocate:
+                        inference_engine.abort_all_requests()
+                        inference_engine.onload(tags=["kv_cache"])
+                        call_maybe_async(inference_engine.continue_generation)
+                        can_resume_inference = True
                 finally:
-                    # Always resume: leaving rollout paused after a failed
-                    # checkpoint load or transfer would hang every later step.
-                    inference_engine.resume()
-                update_engine.set_version(recovery_version)
-                inference_engine.set_version(recovery_version)
+                    # AWEX can only accept new work after generation and its KV
+                    # cache are fully restored. On failure, keep admission paused
+                    # and propagate the original error instead of sending requests
+                    # to partially restored rollout workers.
+                    if can_resume_inference:
+                        inference_engine.resume()
             return recover_info
         except (FileNotFoundError, InValidRecoverInfo):
             logger.warning(
