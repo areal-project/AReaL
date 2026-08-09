@@ -2039,9 +2039,11 @@ class FSDPEngine(TrainEngine):
                 self.parallel_helper.sp_size,
             )
         else:
-            inputs = mb_item.padded_mb
+            inputs = dict(mb_item.padded_mb)
             trie_node = inputs.pop("trie_node", None)
             ulysses_pad_size = 0
+
+        inputs.pop("turn_ids", None)
 
         ctx = FSDPTrainContext(
             model_inputs=inputs,

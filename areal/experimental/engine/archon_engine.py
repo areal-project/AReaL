@@ -978,6 +978,7 @@ class ArchonEngine(TrainEngine):
 
         # Extract trie_node for tree training (if present)
         trie_node = inputs.pop("trie_node", None)
+        inputs.pop("turn_ids", None)
 
         # Tree training: labels are derived from trie structure, not torch.roll.
         # (Tree input_ids is 1D packed format, so roll would be wrong anyway.)

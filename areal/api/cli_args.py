@@ -1707,6 +1707,18 @@ class PPOActorConfig(TrainEngineConfig):
     gae_lambda: float = field(
         default=1.0, metadata={"help": "Lambda parameter for GAE"}
     )
+    # NOTE: not annotated as Literal["token", "turn"] because the pinned
+    # OmegaConf version rejects Literal annotations in structured configs.
+    # Validated in __post_init__ instead.
+    gae_timestep_unit: str = field(
+        default="token",
+        metadata={
+            "help": "Timestep unit used by GAE. 'token' preserves standard "
+            "token-level GAE; 'turn' applies discount and lambda once per "
+            "generated turn.",
+            "choices": ["token", "turn"],
+        },
+    )
     adv_norm: NormConfig | None = field(
         default=None, metadata={"help": "Normalization configuration for advantages."}
     )
@@ -1817,6 +1829,12 @@ class PPOActorConfig(TrainEngineConfig):
 
     def __post_init__(self):
         """Validate PPO actor configuration."""
+        if self.gae_timestep_unit not in {"token", "turn"}:
+            raise ValueError(
+                "gae_timestep_unit must be 'token' or 'turn', got "
+                f"{self.gae_timestep_unit!r}"
+            )
+
         reward_norm = self.reward_norm
         if isinstance(reward_norm, (dict, DictConfig)):
             reward_mean_level = reward_norm.get("mean_level")

@@ -57,6 +57,160 @@ def _infer_prompt_lens(
     return torch.where(has_gen, first_gen_idx, attention_mask.long().sum(-1))
 
 
+def _compute_token_level_gae(
+    rewards: torch.Tensor,
+    values: torch.Tensor,
+    loss_mask: torch.Tensor,
+    seq_no_eos_mask: torch.Tensor,
+    discount: float,
+    gae_lambda: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute GAE with each generated token treated as one timestep."""
+    bs, max_seqlen = rewards.shape
+    advantages_reversed = [torch.zeros(bs, dtype=torch.float32, device=values.device)]
+    lastgaelam = torch.zeros(bs, dtype=torch.float32, device=values.device)
+    nextvalues = values[:, max_seqlen - 1] * seq_no_eos_mask
+    for t in reversed(range(max_seqlen - 1)):
+        delta = rewards[:, t] + discount * nextvalues - values[:, t]
+        newgaelam = delta + discount * gae_lambda * lastgaelam
+
+        # Skip tokens that do not contribute to the loss.
+        mask = loss_mask[:, t]
+        nextvalues = nextvalues * (1 - mask) + values[:, t] * mask
+        lastgaelam = lastgaelam * (1 - mask) + newgaelam * mask
+        advantages_reversed.append(lastgaelam)
+
+    advantages = torch.stack(advantages_reversed[::-1], dim=1)
+    return advantages, advantages + values
+
+
+def _validate_turn_ids(loss_mask: torch.Tensor, turn_ids: torch.Tensor) -> None:
+    """Validate token-aligned turn IDs without synchronizing GPU hot paths."""
+    if turn_ids.shape != loss_mask.shape:
+        raise ValueError(
+            f"turn_ids must have shape {loss_mask.shape}, got {turn_ids.shape}"
+        )
+    if turn_ids.device != loss_mask.device:
+        raise ValueError(
+            "turn_ids and loss_mask must be on the same device, got "
+            f"{turn_ids.device} and {loss_mask.device}"
+        )
+    integral_dtypes = {
+        torch.uint8,
+        torch.int8,
+        torch.int16,
+        torch.int32,
+        torch.int64,
+    }
+    if turn_ids.dtype not in integral_dtypes:
+        raise ValueError(f"turn_ids must use an integer dtype, got {turn_ids.dtype}")
+
+    valid_token_mask = loss_mask.bool()
+    torch._assert_async(
+        torch.all(~valid_token_mask | (turn_ids >= 0)),
+        "turn_ids must be non-negative at every active loss token",
+    )
+    torch._assert_async(
+        torch.all(~valid_token_mask | (turn_ids < loss_mask.shape[1])),
+        "turn_ids at active loss tokens must be smaller than the sequence length",
+    )
+
+    # Prompt/tool gaps use -1 and do not reset ordering. Comparing each active
+    # ID with the cumulative maximum detects a turn that moves backwards.
+    active_turn_ids = torch.where(
+        valid_token_mask, turn_ids, torch.full_like(turn_ids, -1)
+    )
+    running_max = torch.cummax(active_turn_ids, dim=1).values
+    torch._assert_async(
+        torch.all(~valid_token_mask | (turn_ids >= running_max)),
+        "turn_ids at active loss tokens must be temporally nondecreasing",
+    )
+
+
+def _compute_turn_level_gae(
+    rewards: torch.Tensor,
+    values: torch.Tensor,
+    loss_mask: torch.Tensor,
+    turn_ids: torch.Tensor,
+    seq_no_eos_mask: torch.Tensor,
+    discount: float,
+    gae_lambda: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute GAE with each generated turn treated as one timestep."""
+    _validate_turn_ids(loss_mask, turn_ids)
+    bs, max_seqlen = rewards.shape
+    valid_token_mask = loss_mask.bool()
+    safe_turn_ids = torch.clamp(turn_ids.long(), min=0, max=max_seqlen - 1)
+
+    # Aggregate all reward increments belonging to the same generated turn.
+    turn_rewards = torch.zeros_like(rewards)
+    turn_rewards.scatter_add_(
+        dim=1,
+        index=safe_turn_ids,
+        src=rewards * valid_token_mask.to(rewards.dtype),
+    )
+
+    # Find the first valid action-token position for every turn without a
+    # Python loop over the (potentially very long) token sequence.
+    token_positions = torch.arange(max_seqlen, device=turn_ids.device).expand(bs, -1)
+    first_turn_positions = torch.full_like(safe_turn_ids, max_seqlen)
+    first_turn_positions.scatter_reduce_(
+        dim=1,
+        index=safe_turn_ids,
+        src=torch.where(
+            valid_token_mask,
+            token_positions,
+            torch.full_like(token_positions, max_seqlen),
+        ),
+        reduce="amin",
+        include_self=True,
+    )
+    valid_turn_mask = first_turn_positions < max_seqlen
+
+    # A turn's state value is the value at its first valid action token.
+    turn_values = values.gather(
+        dim=1, index=first_turn_positions.clamp(max=max_seqlen - 1)
+    )
+    turn_values = turn_values * valid_turn_mask.to(values.dtype)
+
+    turn_advantages = torch.zeros(
+        bs, max_seqlen, dtype=torch.float32, device=values.device
+    )
+    lastgaelam = torch.zeros(bs, dtype=torch.float32, device=values.device)
+    nextvalues = values[:, max_seqlen - 1] * seq_no_eos_mask
+    # Advantage calculation normally runs over CPU rollout tensors. Avoid
+    # iterating over every token slot there when trajectories contain only a
+    # handful of turns. On accelerator inputs, retain a static loop bound to
+    # avoid a GPU-to-CPU synchronization in this hot path.
+    num_turn_slots = max_seqlen
+    if turn_ids.device.type == "cpu":
+        max_active_turn = torch.where(
+            valid_token_mask, safe_turn_ids, torch.full_like(safe_turn_ids, -1)
+        ).amax()
+        num_turn_slots = int(max_active_turn.item()) + 1
+
+    for turn_idx in reversed(range(num_turn_slots)):
+        delta = (
+            turn_rewards[:, turn_idx] + discount * nextvalues - turn_values[:, turn_idx]
+        )
+        newgaelam = delta + discount * gae_lambda * lastgaelam
+
+        mask = valid_turn_mask[:, turn_idx]
+        turn_advantages[:, turn_idx] = torch.where(
+            mask, newgaelam, torch.zeros_like(newgaelam)
+        )
+        nextvalues = torch.where(mask, turn_values[:, turn_idx], nextvalues)
+        lastgaelam = torch.where(mask, newgaelam, lastgaelam)
+
+    turn_returns = turn_advantages + turn_values
+    advantages = torch.gather(turn_advantages, dim=1, index=safe_turn_ids)
+    returns = torch.gather(turn_returns, dim=1, index=safe_turn_ids)
+
+    advantages = advantages * loss_mask
+    returns = returns * loss_mask + values * (1 - loss_mask)
+    return advantages, returns
+
+
 class PPOActor:
     def __init__(self, config: PPOActorConfig, engine: TrainEngine):
         self.config = config
@@ -76,6 +230,7 @@ class PPOActor:
 
         self.discount = config.discount
         self.gae_lambda = config.gae_lambda
+        self.gae_timestep_unit = config.gae_timestep_unit
         self.mask_no_eos_with_zero = config.mask_no_eos_with_zero
 
         self.temperature = config.temperature
@@ -140,6 +295,7 @@ class PPOActor:
         logger.info(
             f"  reward_norm: {config.reward_norm if config.reward_norm else 'DISABLED (None)'}"
         )
+        logger.info(f"  gae_timestep_unit: {config.gae_timestep_unit}")
         logger.info(f"  eps_clip: {config.eps_clip}")
         logger.info("=" * 70)
 
@@ -163,7 +319,6 @@ class PPOActor:
         self, data: dict[str, Any], meta: TrajBatchMeta | None = None
     ) -> dict[str, Any]:
         bs = data["input_ids"].shape[0]
-        max_seqlen = data["input_ids"].shape[1]
         batch_indices = torch.arange(
             bs, device=data["input_ids"].device, dtype=torch.long
         )
@@ -198,6 +353,18 @@ class PPOActor:
 
         loss_mask = data["loss_mask"].float()
         loss_mask = torch.roll(loss_mask, shifts=-1, dims=-1)
+
+        # Align structural turn IDs to the same next-token prediction
+        # convention used by loss_mask and log probabilities.
+        turn_ids = data.get("turn_ids")
+        if turn_ids is not None:
+            turn_ids = torch.roll(turn_ids, shifts=-1, dims=-1)
+            turn_ids[:, -1] = -1
+        elif self.gae_timestep_unit == "turn":
+            raise ValueError(
+                "actor.gae_timestep_unit='turn' requires rollout data to "
+                "include 'turn_ids'."
+            )
         # Apply the mask to log probabilities.
         if not self.config.use_decoupled_loss and self.config.recompute_logprob:
             # Overwrite logprobs produced by the inference engine
@@ -227,36 +394,51 @@ class PPOActor:
         kl_rewards = rewards.clone()
         # KL rewards at the next token after eos is zero.
         rewards[batch_indices, seqlens - 1] = 0
+        gae_kl_rewards = rewards.clone()
         indices = torch.clip(seqlens - 2, min=0)
+        gae_outcome_rewards = torch.zeros_like(rewards)
         if self.mask_no_eos_with_zero:
-            rewards[batch_indices, indices] += torch.where(
+            gae_outcome_rewards[batch_indices, indices] = torch.where(
                 seq_no_eos_mask, 0, reward_score
             )
         else:
-            rewards[batch_indices, indices] += reward_score
+            gae_outcome_rewards[batch_indices, indices] = reward_score
+
+        # Turn-level GAE treats each generated turn as a macro timestep. Keep
+        # token KL as a local actor penalty rather than broadcasting a turn's
+        # summed KL into every token and into critic targets.
+        if self.gae_timestep_unit == "turn":
+            rewards = gae_outcome_rewards
+        else:
+            rewards = gae_kl_rewards + gae_outcome_rewards
 
         # Compute GAE.
         if "values" not in data:
             values = torch.zeros_like(rewards)
         else:
             values = data["values"]
-        advantages_reversed = [
-            torch.zeros(bs, dtype=torch.float32, device=values.device)
-        ]
-        lastgaelam = 0
-        nextvalues = values[:, max_seqlen - 1] * seq_no_eos_mask
-        for t in reversed(range(max_seqlen - 1)):
-            delta = rewards[:, t] + self.discount * nextvalues - values[:, t]
-            newgaelam = delta + self.discount * self.gae_lambda * lastgaelam
-
-            # Skip tokens that do not contribute to the loss
-            mask = loss_mask[:, t]
-            nextvalues = nextvalues * (1 - mask) + values[:, t] * mask
-            lastgaelam = lastgaelam * (1 - mask) + newgaelam * mask
-            advantages_reversed.append(lastgaelam)
-
-        advantages = torch.stack(advantages_reversed[::-1], dim=1)
-        data["returns"] = advantages + values
+        if self.gae_timestep_unit == "turn":
+            assert turn_ids is not None
+            advantages, returns = _compute_turn_level_gae(
+                rewards=rewards,
+                values=values,
+                loss_mask=loss_mask,
+                turn_ids=turn_ids,
+                seq_no_eos_mask=seq_no_eos_mask,
+                discount=self.discount,
+                gae_lambda=self.gae_lambda,
+            )
+            advantages = advantages + gae_kl_rewards
+        else:
+            advantages, returns = _compute_token_level_gae(
+                rewards=rewards,
+                values=values,
+                loss_mask=loss_mask,
+                seq_no_eos_mask=seq_no_eos_mask,
+                discount=self.discount,
+                gae_lambda=self.gae_lambda,
+            )
+        data["returns"] = returns
 
         # Optionally perform advantage normalization.
         if self.adv_norm is not None:
@@ -267,7 +449,7 @@ class PPOActor:
         # Store data in the dict.
         data["advantages"] = advantages
         data["kl_rewards"] = kl_rewards
-        data["tot_rewards"] = rewards
+        data["tot_rewards"] = gae_kl_rewards + gae_outcome_rewards
         data["loss_mask"] = loss_mask
         # because we have rolled old_logp by -1
         data["logprobs"] = old_logp
