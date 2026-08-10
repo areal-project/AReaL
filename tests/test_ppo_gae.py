@@ -11,12 +11,24 @@ from areal.trainer.ppo.actor import (
     _compute_token_level_gae,
     _compute_turn_level_gae,
 )
+from areal.trainer.ppo.lambda_fn import (
+    resolve_gae_lambda_fn,
+    vapo_length_adaptive_gae,
+)
 from areal.utils.data import KLEstimator
 
 
-def _make_actor(*, gae_timestep_unit: str = "token", kl_ctl: float = 0.0) -> PPOActor:
+def _make_actor(
+    *,
+    gae_timestep_unit: str = "token",
+    gae_lambda: float | str = 1.0,
+    gae_lambda_kwargs: dict | None = None,
+    kl_ctl: float = 0.0,
+) -> PPOActor:
     config = PPOActorConfig(
         gae_timestep_unit=gae_timestep_unit,
+        gae_lambda=gae_lambda,
+        gae_lambda_kwargs=gae_lambda_kwargs or {},
         kl_ctl=kl_ctl,
     )
     actor = PPOActor.__new__(PPOActor)
@@ -30,7 +42,11 @@ def _make_actor(*, gae_timestep_unit: str = "token", kl_ctl: float = 0.0) -> PPO
     actor.kl_estimator = KLEstimator("k1")
     actor.discount = 1.0
     actor.gae_timestep_unit = gae_timestep_unit
-    actor.gae_lambda = 1.0
+    actor.gae_lambda = gae_lambda
+    actor.gae_lambda_fn, actor._gae_lambda_is_custom = resolve_gae_lambda_fn(gae_lambda)
+    actor.gae_lambda_kwargs = (
+        dict(config.gae_lambda_kwargs) if actor._gae_lambda_is_custom else {}
+    )
     actor.mask_no_eos_with_zero = False
     actor.m2_threshold = None
     return actor
@@ -109,6 +125,31 @@ def test_turn_level_gae_skips_gaps_and_uses_first_value_with_bootstrap():
     )
 
 
+def test_turn_level_gae_applies_one_lambda_per_sample():
+    """Turn recurrence broadcasts each trajectory's own lambda across its turns."""
+    rewards = torch.tensor(
+        [[0.0, 1.0, 0.0, 2.0], [0.0, 1.0, 0.0, 2.0]],
+        dtype=torch.float32,
+    )
+
+    advantages, _ = _compute_turn_level_gae(
+        rewards=rewards,
+        values=torch.zeros_like(rewards),
+        loss_mask=torch.ones_like(rewards),
+        turn_ids=torch.tensor([[0, 0, 1, 1], [0, 0, 1, 1]], dtype=torch.int32),
+        seq_no_eos_mask=torch.tensor([False, False]),
+        discount=1.0,
+        gae_lambda=torch.tensor([0.5, 0.0]),
+    )
+
+    torch.testing.assert_close(
+        advantages,
+        torch.tensor([[2.0, 2.0, 2.0, 2.0], [1.0, 1.0, 2.0, 2.0]]),
+        rtol=0.0,
+        atol=0.0,
+    )
+
+
 def test_token_level_gae_matches_legacy_recurrence():
     """The default token mode remains numerically backward compatible."""
     rewards = torch.tensor(
@@ -149,6 +190,158 @@ def test_token_level_gae_matches_legacy_recurrence():
     torch.testing.assert_close(
         returns, expected_advantages + values, rtol=0.0, atol=0.0
     )
+
+
+def test_token_level_gae_applies_one_lambda_per_sample():
+    """A batch lambda tensor changes recurrence independently per trajectory."""
+    rewards = torch.tensor(
+        [[0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 1.0, 0.0]],
+        dtype=torch.float32,
+    )
+    loss_mask = torch.tensor(
+        [[1.0, 1.0, 1.0, 0.0], [1.0, 1.0, 1.0, 0.0]],
+        dtype=torch.float32,
+    )
+
+    advantages, _ = _compute_token_level_gae(
+        rewards=rewards,
+        values=torch.zeros_like(rewards),
+        loss_mask=loss_mask,
+        seq_no_eos_mask=torch.tensor([False, False]),
+        discount=1.0,
+        gae_lambda=torch.tensor([0.5, 0.0]),
+    )
+
+    torch.testing.assert_close(
+        advantages,
+        torch.tensor([[0.25, 0.5, 1.0, 0.0], [0.0, 0.0, 1.0, 0.0]]),
+        rtol=0.0,
+        atol=0.0,
+    )
+
+
+def test_static_gae_lambda_ignores_kwargs_and_legacy_missing_turn_ids():
+    """A float lambda remains compatible with token workflows lacking turn IDs."""
+    actor = _make_actor(
+        gae_lambda=0.25,
+        gae_lambda_kwargs={"ignored": "value"},
+    )
+    loss_mask = torch.tensor([[1.0, 1.0], [1.0, 0.0]])
+
+    gae_lambda = actor._compute_gae_lambda(loss_mask, turn_ids=None)
+
+    torch.testing.assert_close(
+        gae_lambda,
+        torch.tensor([0.25, 0.25]),
+        rtol=0.0,
+        atol=0.0,
+    )
+
+
+def test_vapo_gae_lambda_uses_selected_token_lengths_per_sample():
+    """Token mode uses canonical generated-token counts for VAPO lambda."""
+    actor = _make_actor(
+        gae_lambda="areal.trainer.ppo.lambda_fn.vapo_length_adaptive_gae",
+        gae_lambda_kwargs={"alpha": 1.0},
+    )
+    loss_mask = torch.tensor(
+        [
+            [1.0, 1.0, 1.0, 1.0, 0.0],
+            [1.0, 1.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 0.0, 0.0],
+        ]
+    )
+    turn_ids = torch.tensor(
+        [
+            [0, 0, 1, 1, -1],
+            [0, 1, -1, -1, -1],
+            [-1, -1, -1, -1, -1],
+        ],
+        dtype=torch.int32,
+    )
+
+    gae_lambda = actor._compute_gae_lambda(loss_mask, turn_ids)
+
+    torch.testing.assert_close(
+        gae_lambda,
+        torch.tensor([0.75, 0.5, 0.0]),
+        rtol=0.0,
+        atol=0.0,
+    )
+
+
+def test_vapo_gae_lambda_uses_selected_turn_counts_per_sample():
+    """Turn mode uses unique active turn counts instead of generated tokens."""
+    actor = _make_actor(
+        gae_timestep_unit="turn",
+        gae_lambda="areal.trainer.ppo.lambda_fn.vapo_length_adaptive_gae",
+        gae_lambda_kwargs={"alpha": 1.0},
+    )
+    loss_mask = torch.tensor(
+        [
+            [1.0, 1.0, 0.0, 1.0, 1.0],
+            [1.0, 1.0, 1.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 0.0, 0.0],
+        ]
+    )
+    turn_ids = torch.tensor(
+        [
+            [0, 0, -1, 2, 2],
+            [0, 0, 0, 0, -1],
+            [-1, -1, -1, -1, -1],
+        ],
+        dtype=torch.int32,
+    )
+
+    gae_lambda = actor._compute_gae_lambda(loss_mask, turn_ids)
+
+    torch.testing.assert_close(
+        gae_lambda,
+        torch.tensor([0.5, 0.0, 0.0]),
+        rtol=0.0,
+        atol=0.0,
+    )
+
+
+def test_custom_gae_lambda_requires_turn_ids():
+    """Custom functions receive complete token and turn length context."""
+    actor = _make_actor(
+        gae_lambda="areal.trainer.ppo.lambda_fn.vapo_length_adaptive_gae",
+        gae_lambda_kwargs={"alpha": 1.0},
+    )
+
+    with pytest.raises(ValueError, match="custom gae_lambda.*turn_ids"):
+        actor._compute_gae_lambda(torch.ones(1, 2), turn_ids=None)
+
+
+def test_custom_gae_lambda_rejects_scalar_output():
+    """A custom function must return one explicit value per local trajectory."""
+    actor = _make_actor()
+
+    def scalar_lambda(context):
+        return torch.tensor(0.5)
+
+    actor._gae_lambda_is_custom = True
+    actor.gae_lambda_fn = scalar_lambda
+    actor.gae_lambda_kwargs = {}
+
+    with pytest.raises(ValueError, match="one value per local trajectory"):
+        actor._compute_gae_lambda(
+            torch.ones(2, 2),
+            torch.zeros(2, 2, dtype=torch.int32),
+        )
+
+
+def test_vapo_gae_lambda_rejects_non_positive_alpha():
+    """VAPO requires a positive scale even when the batch is empty-length."""
+    context = {
+        "effective_token_lengths": torch.tensor([0]),
+        "turn_counts": torch.tensor([0]),
+        "timestep_lengths": torch.tensor([0]),
+    }
+
+    with pytest.raises(ValueError, match="alpha must be a positive number"):
+        vapo_length_adaptive_gae(context, alpha=0.0)
 
 
 @pytest.mark.parametrize(
@@ -226,6 +419,44 @@ def test_turn_level_main_path_keeps_kl_token_local_and_returns_task_only():
     )
 
 
+def test_main_path_lambda_context_counts_shifted_training_tokens_including_eos():
+    """Dynamic lengths use the same canonical mask as GAE and critic training."""
+    actor = _make_actor()
+    captured_context = {}
+
+    def capture_context(context):
+        captured_context.update({key: value.clone() for key, value in context.items()})
+        return torch.ones_like(context["timestep_lengths"], dtype=torch.float32)
+
+    actor._gae_lambda_is_custom = True
+    actor.gae_lambda_fn = capture_context
+    actor.gae_lambda_kwargs = {}
+    batch = {
+        "input_ids": torch.zeros(1, 5, dtype=torch.long),
+        # The three generated tokens include the terminal EOS at position 3.
+        "loss_mask": torch.tensor([[0, 1, 1, 1, 0]], dtype=torch.float32),
+        "turn_ids": torch.tensor([[-1, 0, 0, 0, -1]], dtype=torch.int32),
+        "logprobs": torch.zeros(1, 5, dtype=torch.float32),
+        "attention_mask": torch.tensor([[1, 1, 1, 1, 0]], dtype=torch.bool),
+        "rewards": torch.tensor([1.0]),
+    }
+
+    actor._compute_advantages(batch)
+
+    torch.testing.assert_close(
+        captured_context["effective_token_lengths"],
+        torch.tensor([3]),
+        rtol=0.0,
+        atol=0.0,
+    )
+    torch.testing.assert_close(
+        captured_context["turn_counts"],
+        torch.tensor([1]),
+        rtol=0.0,
+        atol=0.0,
+    )
+
+
 def test_turn_level_main_path_requires_turn_ids():
     """Enabling turn recurrence fails clearly for legacy rollout payloads."""
     actor = _make_actor(gae_timestep_unit="turn")
@@ -252,6 +483,19 @@ def test_ppo_actor_config_is_omegaconf_structured_config_compatible():
     config = OmegaConf.structured(PPOActorConfig())
 
     assert config.gae_timestep_unit == "token"
+
+
+def test_ppo_actor_config_accepts_lambda_function_path_and_kwargs():
+    """OmegaConf preserves the dynamic lambda path and custom parameters."""
+    config = OmegaConf.structured(
+        PPOActorConfig(
+            gae_lambda="areal.trainer.ppo.lambda_fn.vapo_length_adaptive_gae",
+            gae_lambda_kwargs={"alpha": 0.5},
+        )
+    )
+
+    assert config.gae_lambda == ("areal.trainer.ppo.lambda_fn.vapo_length_adaptive_gae")
+    assert config.gae_lambda_kwargs == {"alpha": 0.5}
 
 
 def test_concat_interaction_emits_structured_turn_ids():

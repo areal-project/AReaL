@@ -1704,8 +1704,22 @@ class PPOActorConfig(TrainEngineConfig):
     discount: float = field(
         default=1.0, metadata={"help": "Discount factor for future rewards"}
     )
-    gae_lambda: float = field(
-        default=1.0, metadata={"help": "Lambda parameter for GAE"}
+    gae_lambda: float | str = field(
+        default=1.0,
+        metadata={
+            "help": "Lambda parameter for GAE, either a static float or a dotted "
+            "path to a batch-vectorized per-sample lambda function. The function "
+            "receives a context dict containing effective_token_lengths, "
+            "turn_counts, and timestep_lengths tensors and must return one lambda "
+            "per local trajectory."
+        },
+    )
+    gae_lambda_kwargs: dict[str, Any] = field(
+        default_factory=dict,
+        metadata={
+            "help": "Keyword arguments passed to a custom gae_lambda function. "
+            "Ignored when gae_lambda is a float."
+        },
     )
     # NOTE: not annotated as Literal["token", "turn"] because the pinned
     # OmegaConf version rejects Literal annotations in structured configs.
@@ -1829,6 +1843,16 @@ class PPOActorConfig(TrainEngineConfig):
 
     def __post_init__(self):
         """Validate PPO actor configuration."""
+        if isinstance(self.gae_lambda, bool) or not isinstance(
+            self.gae_lambda, int | float | str
+        ):
+            raise ValueError(
+                "gae_lambda must be a float or dotted function path, got "
+                f"{self.gae_lambda!r}"
+            )
+        if isinstance(self.gae_lambda, str) and not self.gae_lambda:
+            raise ValueError("gae_lambda function path must not be empty")
+
         if self.gae_timestep_unit not in {"token", "turn"}:
             raise ValueError(
                 "gae_timestep_unit must be 'token' or 'turn', got "
