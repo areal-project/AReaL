@@ -432,6 +432,7 @@ class RolloutControllerV2:
                 inf_workers,
                 dp_size,
                 nnodes_per_instance,
+                dict(inf_spec.env_vars),
                 server_args,
             )
         logger.info("Inference servers: %s", self._inf_addrs)
@@ -549,6 +550,7 @@ class RolloutControllerV2:
         inf_workers: list,
         dp_size: int,
         nnodes_per_instance: int,
+        worker_env: dict[str, str],
         server_args: dict[str, Any] | None,
     ) -> None:
         if inf_backend == "sglang":
@@ -615,6 +617,30 @@ class RolloutControllerV2:
                     "worker_index": group_idx * nnodes_per_instance + node_rank,
                     "raw_cmd": cmd,
                 }
+                if inf_backend == "sglang":
+                    from areal.infra.utils.launcher import (
+                        TRITON_CACHE_PATH as _TRITON_CACHE,
+                    )
+
+                    cache_suffix = (
+                        f"inf-server-{fork_payload['worker_index']}-{uuid.uuid4()}"
+                    )
+                    triton_cache_dir = worker_env.get(
+                        "TRITON_CACHE_DIR",
+                        os.environ.get("TRITON_CACHE_DIR", _TRITON_CACHE),
+                    )
+                    triton_cache_path = worker_env.get(
+                        "TRITON_CACHE_PATH",
+                        os.environ.get("TRITON_CACHE_PATH", triton_cache_dir),
+                    )
+                    fork_payload["env"] = {
+                        "TRITON_CACHE_DIR": os.path.join(
+                            triton_cache_dir, cache_suffix
+                        ),
+                        "TRITON_CACHE_PATH": os.path.join(
+                            triton_cache_path, cache_suffix
+                        ),
+                    }
                 if inf_backend == "vllm":
                     from areal.infra.utils.launcher import (
                         TRITON_CACHE_PATH as _TRITON_CACHE,
