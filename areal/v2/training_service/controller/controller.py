@@ -961,6 +961,18 @@ class GatewayTrainController:
                 f"updates, got '{meta.type}'"
             )
 
+        existing_ctrl = self._weight_update_ctrl
+        if existing_ctrl is not None:
+            try:
+                existing_ctrl.destroy()
+            except Exception:
+                logger.warning(
+                    "Failed to destroy previous WeightUpdateController before reconnect",
+                    exc_info=True,
+                )
+            finally:
+                self._weight_update_ctrl = None
+
         ctrl = WeightUpdateController(
             WeightUpdateControllerConfig(
                 # Bind gateway to this node's outbound IP so cross-host
@@ -969,12 +981,19 @@ class GatewayTrainController:
                 host=gethostip(),
                 admin_api_key=self.config.admin_api_key,
                 log_level=self.config.log_level,
+                setup_timeout=self.config.setup_timeout,
+                request_timeout=self.config.request_timeout,
+                init_timeout_s=self.config.request_timeout,
+                update_timeout_s=self.config.request_timeout,
             )
         )
         ctrl.initialize()
 
         inference_urls: list[str] = rollout.inference_worker_urls
-        pair_name = f"{self._role}-rollout"
+        base_pair_name = f"{self._role}-rollout"
+        pair_name = base_pair_name
+        if meta.type == "awex" and getattr(meta, "version", None) is not None:
+            pair_name = f"{base_pair_name}-v{meta.version}"
 
         if meta.type == "awex":
             # NCCL rendezvous master must live on the rank-0 process's node.

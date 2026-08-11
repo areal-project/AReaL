@@ -41,6 +41,7 @@ from areal.infra.utils.concurrent import run_async_task
 from areal.utils import logging, perf_tracer
 from areal.utils.data import cycle_dataloader
 from areal.utils.dynamic_import import import_from_string
+from areal.utils.environ import get_bool_env_var
 from areal.utils.network import find_free_ports, format_hostport, gethostip
 from areal.utils.perf_tracer import trace_perf
 
@@ -1061,13 +1062,40 @@ class RolloutController:
 
         # Delegate to dispatcher
         assert dataloader.batch_size is not None
-        results = self.dispatcher.active_submit_and_wait(
-            self.data_generator, batch_size=dataloader.batch_size, dynamic_bs=dynamic_bs
-        )
+        if get_bool_env_var("AREAL_DETERMINISTIC_SAMPLING"):
+            results = self.dispatcher.checkpoint_safe_submit_and_wait(
+                self.data_generator,
+                batch_size=dataloader.batch_size,
+                dynamic_bs=dynamic_bs,
+            )
+        else:
+            results = self.dispatcher.active_submit_and_wait(
+                self.data_generator,
+                batch_size=dataloader.batch_size,
+                dynamic_bs=dynamic_bs,
+            )
 
         # Return list of trajectories
         trajectories = [r.trajectory if r is not None else None for r in results]
         return [t for t in trajectories if t is not None]
+
+    def recover_state_dict(self) -> dict[str, Any] | None:
+        """Capture task identity for explicitly deterministic rollout recovery."""
+        if not get_bool_env_var("AREAL_DETERMINISTIC_SAMPLING"):
+            return None
+        return {"task_id_generator": self._task_id_generator.state_dict()}
+
+    def load_recover_state_dict(self, state: dict[str, Any] | None) -> None:
+        """Restore deterministic rollout task identity before new submissions."""
+        if not get_bool_env_var("AREAL_DETERMINISTIC_SAMPLING"):
+            return
+        if state is None or state.get("task_id_generator") is None:
+            logger.warning(
+                "Recover checkpoint has no TaskIdGenerator state; task IDs will "
+                "restart from zero and deterministic equivalence is not guaranteed."
+            )
+            return
+        self._task_id_generator.load_state_dict(state["task_id_generator"])
 
     def compute_logp(self, data: list[dict[str, Any]]) -> list[Any]:
         """Compute token log-probabilities for trajectories via remote workers."""
