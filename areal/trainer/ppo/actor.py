@@ -6,9 +6,16 @@ from typing import Any
 import torch
 
 from areal.api import TrainEngine
-from areal.api.cli_args import MicroBatchSpec, PPOActorConfig, RejectionSamplingConfig
+from areal.api.cli_args import (
+    MicroBatchSpec,
+    MOPDLossConfig,
+    PPOActorConfig,
+    RejectionSamplingConfig,
+)
 from areal.infra import TrainController
 from areal.infra.rpc.serialization import serialize_value
+from areal.trainer.mopd.loss import compose_mopd_loss
+from areal.trainer.mopd.targets import aggregate_mopd_targets
 from areal.trainer.ppo.stats import infer_token_denominator
 from areal.utils import logging, stats_tracker
 from areal.utils.constants import (
@@ -28,6 +35,7 @@ from areal.utils.data import (
     batched_call,
     split_padded_tensor_dict_into_mb_list,
 )
+from areal.utils.data_hook import DataHookManager
 from areal.utils.functional import (
     cispo_loss_fn,
     ppo_actor_loss_fn,
@@ -82,8 +90,41 @@ class PPOActor:
 
         self.m2_threshold = config.m2_threshold
 
+        self._data_hook_specs = tuple(getattr(config, "data_hooks", None) or ())
+        self.data_hook_role: str | None = None
+        self.data_hooks: DataHookManager | None = None
+        self._data_hooks_closed = False
+
         # Log critical GSPO/GRPO configuration for reproducibility
         self._log_configuration()
+
+    def setup_data_hooks(self, role: str) -> None:
+        """Set up configured hooks once the worker's algorithm role is known."""
+        if self._data_hooks_closed:
+            raise RuntimeError("Cannot set up data hooks after they were closed")
+        if not isinstance(role, str) or not role:
+            raise ValueError("Data hook role must be a non-empty string")
+        if self.data_hooks is not None:
+            if self.data_hook_role == role or not self._data_hook_specs:
+                self.data_hook_role = role
+                return
+            raise RuntimeError(
+                f"Data hooks are already set up for role {self.data_hook_role!r}, "
+                f"not {role!r}"
+            )
+        self.data_hooks = DataHookManager(self._data_hook_specs, role=role)
+        self.data_hook_role = role
+
+    def _require_data_hooks(self) -> DataHookManager:
+        if self.data_hooks is None:
+            if self._data_hook_specs:
+                raise RuntimeError(
+                    "Configured data hooks were not set up with a worker role"
+                )
+            # Preserve direct unit-level PPOActor usage that has no hook config.
+            self.setup_data_hooks("actor")
+        assert self.data_hooks is not None
+        return self.data_hooks
 
     def _log_configuration(self):
         """Log PPO configuration including how proximal policy is computed."""
@@ -146,7 +187,14 @@ class PPOActor:
     @trace_perf("ppo_actor.compute_logp", category="compute")
     @torch.no_grad()
     def compute_logp(self, data: list[dict[str, Any]]) -> list[torch.Tensor] | None:
-        return batched_call(self._compute_logp, data)
+        data_hooks = self._require_data_hooks()
+        data, hook_state = data_hooks.run_pre(
+            f"{self.data_hook_role}_pre_compute_logp", data
+        )
+        result = batched_call(self._compute_logp, data)
+        return data_hooks.run_post(
+            f"{self.data_hook_role}_post_compute_logp", result, hook_state
+        )
 
     def _compute_logp(self, data: dict[str, Any]) -> torch.Tensor | None:
         self.engine.eval()
@@ -155,9 +203,34 @@ class PPOActor:
             aggregate_fn=lambda xs: torch.cat(xs, dim=-1),
         )
 
+    def aggregate_mopd_targets(
+        self,
+        data: list[dict[str, Any]] | None = None,
+        *,
+        rl_coefficient: float = 0.0,
+        distillation_coefficient: float = 0.0,
+    ) -> list[dict[str, Any]] | None:
+        """Fetch-localized teacher contributions and create actor-owned targets."""
+        return aggregate_mopd_targets(
+            data,
+            rl_coefficient=rl_coefficient,
+            distillation_coefficient=distillation_coefficient,
+        )
+
+    def assert_mopd_runtime_topology(self) -> None:
+        """Validate the live Megatron process groups used for MOPD scoring."""
+        self.engine.assert_mopd_runtime_topology()
+
     @trace_perf("ppo_actor.compute_advantages", category="compute")
     def compute_advantages(self, data: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        return batched_call(self._compute_advantages, data, pass_meta=True)
+        data_hooks = self._require_data_hooks()
+        data, hook_state = data_hooks.run_pre(
+            f"{self.data_hook_role}_pre_compute_advantages", data
+        )
+        result = batched_call(self._compute_advantages, data, pass_meta=True)
+        return data_hooks.run_post(
+            f"{self.data_hook_role}_post_compute_advantages", result, hook_state
+        )
 
     def _compute_advantages(
         self, data: dict[str, Any], meta: TrajBatchMeta | None = None
@@ -277,7 +350,22 @@ class PPOActor:
     @trace_perf("ppo_actor.ppo_update", category="compute")
     @stats_tracker.scope_func_wrapper("ppo_actor")
     def ppo_update(self, data: list[dict[str, Any]]) -> None:
-        batched_call(self._ppo_update, data, unpack=False)
+        data_hooks = self._require_data_hooks()
+        data, hook_state = data_hooks.run_pre(
+            f"{self.data_hook_role}_pre_ppo_update", data
+        )
+        result = batched_call(self._ppo_update, data, unpack=False)
+        data_hooks.run_post(
+            f"{self.data_hook_role}_post_ppo_update", result, hook_state
+        )
+
+    def close_data_hooks(self) -> None:
+        """Release worker-local hook resources."""
+        if self._data_hooks_closed:
+            return
+        self._data_hooks_closed = True
+        if self.data_hooks is not None:
+            self.data_hooks.close()
 
     def _ppo_update(self, data: dict[str, Any]) -> None:
         attn_mask = data["attention_mask"]
@@ -403,9 +491,50 @@ class PPOActorController(TrainController):
             "compute_logp", *args, rpc_meta={"broadcast": True}, **kwargs
         )
 
+    def compute_logp_padded(self, data: list[dict[str, Any]]):
+        """Compute logp with DP/PP padding and retain dummy outputs for drain."""
+        original_size = len(data)
+        pp_size = self.parallel_strategy.pp_size
+        min_microbatches = max(
+            2 * pp_size if pp_size > 1 else 1,
+            self.config.mb_spec.n_mbs,
+        )
+        min_items_per_dp = (
+            ((min_microbatches + pp_size - 1) // pp_size)
+            * pp_size
+            * self.config.mb_spec.granularity
+        )
+        args, kwargs = self._pad_eval_dispatch_args(
+            (data,),
+            {},
+            group_size=1,
+            min_items_per_dp=min_items_per_dp,
+            items_per_dp_divisor=pp_size * self.config.mb_spec.granularity,
+            active_dummies=True,
+        )
+        results = self._custom_function_call(
+            "compute_logp", *args, rpc_meta={"broadcast": True}, **kwargs
+        )
+        if results is None:
+            return None, []
+        return results[:original_size], results[original_size:]
+
     def compute_advantages(self, *args, **kwargs):
         return self._custom_function_call(
             "compute_advantages", *args, rpc_meta={"broadcast": True}, **kwargs
+        )
+
+    def aggregate_mopd_targets(self, *args, **kwargs):
+        return self._custom_function_call(
+            "aggregate_mopd_targets",
+            *args,
+            rpc_meta={"broadcast": False},
+            **kwargs,
+        )
+
+    def assert_mopd_runtime_topology(self) -> None:
+        self._custom_function_call(
+            "assert_mopd_runtime_topology", rpc_meta={"broadcast": False}
         )
 
     def ppo_update(self, *args, **kwargs) -> None:
@@ -435,6 +564,49 @@ class PPOActorControllerV2(GatewayTrainController):
             "kwargs": serialize_value(kwargs),
         }
         self._gateway_post("/ppo/actor/update", payload)
+
+
+def _compose_legacy_teacher_loss(
+    rl_loss: torch.Tensor,
+    *,
+    logprobs: torch.Tensor,
+    old_logprobs: torch.Tensor,
+    teacher_logprobs: torch.Tensor,
+    loss_mask: torch.Tensor,
+    rl_loss_weight: float,
+    distill_loss_weight: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Preserve the deprecated single-teacher loss contract exactly."""
+    mask = loss_mask.bool()
+    teacher = teacher_logprobs.detach()
+    denominator = mask.count_nonzero().clamp_min(1)
+    if rl_loss_weight == 0:
+        safe_log_ratio = torch.where(
+            mask,
+            logprobs - old_logprobs.detach(),
+            torch.zeros_like(logprobs),
+        )
+        reward = torch.where(
+            mask,
+            teacher - logprobs.detach(),
+            torch.zeros_like(logprobs),
+        )
+        weighted_term = torch.exp(safe_log_ratio) * reward
+        return (
+            -distill_loss_weight * weighted_term.sum() / denominator,
+            -weighted_term,
+        )
+
+    penalty_per_token = torch.where(
+        mask,
+        logprobs - teacher,
+        torch.zeros_like(logprobs),
+    )
+    penalty = penalty_per_token.sum() / denominator
+    return (
+        rl_loss_weight * rl_loss + distill_loss_weight * penalty,
+        penalty_per_token,
+    )
 
 
 def grpo_loss_fn(
@@ -539,37 +711,53 @@ def grpo_loss_fn(
             cu_seqlens=input_data.get("cu_seqlens"),
         )
 
-    # Joint Distillation KL Loss
+    # M2 is part of the shared training-validity contract. Behavioral
+    # rejection may narrow the MOPD numerator further, while its denominator
+    # stays at the pre-rejection count to avoid amplifying accepted tokens.
+    mopd_normalization_mask = loss_mask
+    mopd_loss_mask = stat.get("train_loss_mask", loss_mask).bool()
+
+    # Multi-teacher on-policy distillation. The deprecated single-teacher
+    # fields retain their original joint-loss semantics for compatibility.
     teacher_logp = input_data.get("teacher_logp")
+    mopd_teacher_logp_sum = input_data.get("mopd_teacher_logp_sum")
     rkl_stat = None
-    if teacher_logp is not None:
-        # Coefficients for RL and Knowledge Distillation
-        rl_loss_weight = input_data.get("rl_loss_weight", 1.0)
-        distill_loss_weight = input_data.get("distill_loss_weight", 0.005)
-
-        teacher_logp = (
-            teacher_logp.detach()
-        )  # detach to prevent gradient backprop to teacher
-
-        if rl_loss_weight == 0:
-            # Pure KD using reverse KL (importance-sampling)
-            rkl_reward = teacher_logp - logprobs.detach()
-            importance_weight = torch.exp(logprobs - old_logp)
-
-            rkl_weighted_term = importance_weight * rkl_reward * loss_mask
-
-            kd_coef = -1 * distill_loss_weight
-            loss = kd_coef * rkl_weighted_term.sum() / loss_mask.sum().clamp(min=1)
-
-            rkl_stat = -1 * rkl_weighted_term
-        else:
-            # KDRL: Knowledge Distillation + Reinforcement Learning (joint loss)
-            rkl_penalty_per_token = (logprobs - teacher_logp) * loss_mask
-            rkl_penalty = rkl_penalty_per_token.sum() / loss_mask.sum().clamp(min=1)
-
-            loss = rl_loss_weight * loss + distill_loss_weight * rkl_penalty
-
-            rkl_stat = rkl_penalty_per_token
+    mopd_stats = {}
+    if teacher_logp is not None and mopd_teacher_logp_sum is not None:
+        raise ValueError(
+            "teacher_logp and mopd_teacher_logp_sum cannot both be provided"
+        )
+    if mopd_teacher_logp_sum is not None:
+        teacher_weight_sum = input_data.get("mopd_teacher_weight_sum")
+        mopd_config = MOPDLossConfig(
+            rl_coefficient=input_data.get("mopd_rl_coefficient", 0.0),
+            distillation_coefficient=input_data.get(
+                "mopd_distillation_coefficient", 0.005
+            ),
+        )
+        loss, mopd_stats = compose_mopd_loss(
+            loss,
+            config=mopd_config,
+            logprobs=logprobs,
+            old_logprobs=old_logp,
+            teacher_logp_sum=mopd_teacher_logp_sum,
+            teacher_weight_sum=teacher_weight_sum,
+            loss_mask=mopd_loss_mask,
+            normalization_mask=mopd_normalization_mask,
+        )
+        rkl_stat = mopd_stats["reverse_kl"].float()
+    elif teacher_logp is not None:
+        loss, rkl_stat = _compose_legacy_teacher_loss(
+            loss,
+            logprobs=logprobs,
+            old_logprobs=old_logp,
+            teacher_logprobs=teacher_logp,
+            loss_mask=loss_mask,
+            rl_loss_weight=input_data.get("rl_loss_weight", 1.0),
+            distill_loss_weight=input_data.get("distill_loss_weight", 0.005),
+        )
+    else:
+        rkl_stat = None
 
     # Log training statistics
     stats_tracker.denominator(
@@ -580,10 +768,22 @@ def grpo_loss_fn(
     )
 
     if rkl_stat is not None:
-        stats_tracker.stat(
-            rkl_loss=rkl_stat,
-            denominator="n_valid_tokens",
-        )
+        if mopd_stats:
+            stats_tracker.denominator(n_mopd_tokens=mopd_normalization_mask.bool())
+            stats_tracker.stat(
+                rkl_loss=rkl_stat,
+                mopd_loss=mopd_stats["loss_per_token"].float(),
+                mopd_reward=mopd_stats["score_reward"].float(),
+                mopd_importance_weight=mopd_stats["importance_weight"].float(),
+                mopd_teacher_weight_sum=mopd_stats["teacher_weight_sum"].float(),
+                mopd_rkl_estimate=mopd_stats["reverse_kl"].float(),
+                denominator="n_mopd_tokens",
+            )
+        else:
+            stats_tracker.stat(
+                rkl_loss=rkl_stat,
+                denominator="n_valid_tokens",
+            )
 
     logp_diff = (old_logp - logprobs.detach()) * loss_mask
     stats_tracker.stat(

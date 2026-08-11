@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import asyncio
+import math
 from typing import Any
 
+import requests
 import torch
 import torch.distributed as dist
 from torchdata.stateful_dataloader import StatefulDataLoader
@@ -24,7 +26,7 @@ from areal.infra.rpc.rtensor import RTensor, flatten_shard_ids
 from areal.infra.utils.concurrent import run_async_task
 from areal.utils import logging, stats_tracker
 from areal.utils.data import make_dummy_eval_item
-from areal.utils.network import find_free_ports
+from areal.utils.network import find_free_ports, format_hostport
 from areal.utils.seqpack import balanced_greedy_partition
 
 from .rollout_callback import RolloutCallback
@@ -123,29 +125,48 @@ def _dispatch_tensors(
 
 
 def _pad_eval_batch(
-    args: tuple[Any, ...], dp_size: int, group_size: int = 1
+    args: tuple[Any, ...],
+    dp_size: int,
+    group_size: int = 1,
+    *,
+    min_items_per_dp: int = 1,
+    items_per_dp_divisor: int = 1,
+    active_dummies: bool = False,
 ) -> tuple[Any, ...]:
-    """Pad the first tensor-like arg to a multiple of ``dp_size * group_size``.
+    """Pad the first tensor-like arg evenly across all DP replicas.
 
     Called before dispatch for explicit evaluation controller paths so that
     ``balanced_greedy_partition`` always receives a divisible input.
-    Dummy items have zero attention/loss masks and contribute nothing
-    to metrics or loss.
+    ``min_items_per_dp`` can reserve enough inputs for pipeline microbatches.
+    Active dummies contain one attended token, which keeps pipeline forwards
+    valid; their outputs must be discarded by the caller.
     """
+    if min_items_per_dp < 1:
+        raise ValueError("min_items_per_dp must be positive")
+    if items_per_dp_divisor < 1:
+        raise ValueError("items_per_dp_divisor must be positive")
     result = list(args)
-    pad_target = dp_size * group_size
+    per_dp_quantum = math.lcm(group_size, items_per_dp_divisor)
+    pad_quantum = dp_size * per_dp_quantum
+    minimum_size = dp_size * min_items_per_dp
     for i, arg in enumerate(result):
         if isinstance(arg, list) and arg and _is_tensor_like(arg):
             n = len(arg)
-            pad_count = (-n) % pad_target
+            padded_size = max(n, minimum_size)
+            padded_size += (-padded_size) % pad_quantum
+            pad_count = padded_size - n
             if pad_count > 0:
                 padded = list(arg)
                 template = arg[0]
-                padded.extend(make_dummy_eval_item(template) for _ in range(pad_count))
+                padded.extend(
+                    make_dummy_eval_item(template, active_attention=active_dummies)
+                    for _ in range(pad_count)
+                )
                 result[i] = padded
                 logger.info(
                     f"Eval dispatch: padded {pad_count} dummy items "
-                    f"(total {len(padded)}) for dp_size={dp_size}"
+                    f"(total {len(padded)}) for dp_size={dp_size}, "
+                    f"min_items_per_dp={min_items_per_dp}"
                 )
             break  # only pad the first tensor-like arg
     return tuple(result)
@@ -206,6 +227,9 @@ class TrainController:
 
         self._worker_role: str = "default"
         self._own_process_group = False
+        self._worker_identities: dict[str, tuple[int, str]] = {}
+        self._engines_destroyed = False
+        self._owns_worker_role = False
 
         self.rollout: RolloutController = None
 
@@ -222,14 +246,31 @@ class TrainController:
             Parallel strategy configuration (currently unused), by default None
         """
         if not dist.is_initialized():
-            port = find_free_ports(1)[0]
-            dist.init_process_group(
-                backend="gloo",
-                init_method=f"tcp://localhost:{port}",
-                rank=0,
-                world_size=1,
-            )
-            self._own_process_group = True
+            excluded_ports: set[int] = set()
+            for attempt in range(3):
+                port = find_free_ports(1, exclude_ports=excluded_ports)[0]
+                try:
+                    dist.init_process_group(
+                        backend="gloo",
+                        init_method=f"tcp://localhost:{port}",
+                        rank=0,
+                        world_size=1,
+                    )
+                except RuntimeError as exc:
+                    message = str(exc).lower()
+                    port_in_use = "eaddrinuse" in message or (
+                        "address" in message and "in use" in message
+                    )
+                    if not port_in_use or attempt == 2:
+                        raise
+                    excluded_ports.add(port)
+                    logger.warning(
+                        "Controller process-group port %d was claimed; retrying",
+                        port,
+                    )
+                    continue
+                self._own_process_group = True
+                break
 
     @property
     def parallel_strategy(self) -> ParallelStrategy:
@@ -270,6 +311,7 @@ class TrainController:
         """
         # Store configuration
         self._worker_role = role
+        self._engines_destroyed = False
 
         world_size = self.train_alloc.parallel.world_size
 
@@ -286,41 +328,52 @@ class TrainController:
         # Create workers via scheduler
         logger.info("Creating workers via scheduler...")
         worker_ids = self.scheduler.create_workers(job=job)
+        self._owns_worker_role = True
         logger.info(f"Workers created: {worker_ids}")
+        try:
+            # Wait for workers to be ready
+            logger.info("Waiting for workers to be ready...")
+            self.workers = self.scheduler.get_workers(role=job.role)
+            logger.info(f"Workers ready: {[w.id for w in self.workers]}")
 
-        # Wait for workers to be ready
-        logger.info("Waiting for workers to be ready...")
-        self.workers = self.scheduler.get_workers(role=job.role)
-        logger.info(f"Workers ready: {[w.id for w in self.workers]}")
+            # Determine distributed training master address and port from rank 0 worker
+            rank0_worker = self.workers[0]
+            if rank0_worker.engine_ports:
+                self._master_port = int(rank0_worker.engine_ports[1])
+            else:
+                self._master_port = int(rank0_worker.worker_ports[1])
+            self._master_addr = rank0_worker.ip
 
-        # Determine distributed training master address and port from rank 0 worker
-        # These are used for PyTorch distributed initialization across workers
-        # Prefer engine_ports[1] if available, fallback to worker_ports[1]
-        rank0_worker = self.workers[0]
-        if rank0_worker.engine_ports:
-            self._master_port = int(rank0_worker.engine_ports[1])
-        else:
-            self._master_port = int(rank0_worker.worker_ports[1])
-        self._master_addr = rank0_worker.ip
+            logger.info(
+                f"Distributed training: MASTER_ADDR={self._master_addr}, MASTER_PORT={self._master_port}"
+            )
 
-        logger.info(
-            f"Distributed training: MASTER_ADDR={self._master_addr}, MASTER_PORT={self._master_port}"
-        )
+            engine_class = self.train_engine
+            run_async_task(
+                self._async_create_engines,
+                f"{engine_class.__module__}.{engine_class.__name__}",
+            )
+            engine_init_kwargs = dict(kwargs)
+            engine_init_kwargs.setdefault("role", role)
+            engine_init_kwargs.setdefault("data_hook_role", role)
+            run_async_task(
+                self._async_initialize_engines, ft_spec, **engine_init_kwargs
+            )
 
-        # Construct engine class import path for dynamic loading on workers
-        # Workers will import and instantiate the engine class using this path
-        engine_class = self.train_engine
-
-        # Create and initialize engines on workers
-        run_async_task(
-            self._async_create_engines,
-            f"{engine_class.__module__}.{engine_class.__name__}",
-        )
-        run_async_task(self._async_initialize_engines, ft_spec, **kwargs)
-
-        # Identify DP head workers
-        self._identify_dp_heads()
-        logger.info("TrainController initialization complete")
+            self._identify_dp_heads()
+            logger.info("TrainController initialization complete")
+        except BaseException as initialize_error:
+            try:
+                self.scheduler.delete_workers(role=job.role, reverse_order=True)
+            except BaseException as cleanup_error:
+                raise ExceptionGroup(
+                    f"Failed to initialize and roll back worker role {job.role!r}",
+                    [initialize_error, cleanup_error],
+                ) from initialize_error
+            self._owns_worker_role = False
+            self.workers.clear()
+            self.workers_is_dp_head.clear()
+            raise
 
     def _engine_name(self, rank: int) -> str:
         """Generate engine name for a worker rank.
@@ -419,9 +472,10 @@ class TrainController:
            threads poll a store whose TCP listener has already been closed.
         """
         logger.info("Destroying TrainController...")
+        cleanup_errors: list[Exception] = []
 
         # First destroy engines to release GPU memory
-        if self.workers:
+        if self.workers and not self._engines_destroyed:
             logger.info("Destroying engines on all workers...")
             try:
 
@@ -444,29 +498,40 @@ class TrainController:
                             f"Engine destroy on rank {rank} raised "
                             f"{type(res).__name__}: {res}"
                         )
+                        cleanup_errors.append(
+                            RuntimeError(f"Engine destroy failed on rank {rank}: {res}")
+                        )
+                if not cleanup_errors:
+                    self._engines_destroyed = True
                 logger.info("Engines destroyed")
             except Exception as e:
                 logger.error(f"Error destroying engines: {e}")
+                cleanup_errors.append(e)
 
         # Then delete workers via scheduler. Pass reverse_order=True so
         # that rank-0 (TCPStore owner) is killed last. All in-tree
         # Scheduler implementations (Local/Ray/Slurm) accept this kwarg;
         # third-party subclasses that override ``delete_workers`` must
         # adopt the same signature.
-        try:
-            logger.info("Deleting all workers (reverse rank order)...")
-            self.scheduler.delete_workers(role=self._worker_role, reverse_order=True)
-            logger.info("Workers deleted")
-        except Exception as e:
-            logger.error(f"Error deleting workers: {e}")
-
-        # Clear worker lists
-        self.workers.clear()
-        self.workers_is_dp_head.clear()
+        if self._owns_worker_role:
+            try:
+                logger.info("Deleting all workers (reverse rank order)...")
+                self.scheduler.delete_workers(
+                    role=self._worker_role, reverse_order=True
+                )
+                logger.info("Workers deleted")
+                self.workers.clear()
+                self.workers_is_dp_head.clear()
+                self._owns_worker_role = False
+            except Exception as e:
+                logger.error(f"Error deleting workers: {e}")
+                cleanup_errors.append(e)
 
         if dist.is_initialized() and self._own_process_group:
             dist.destroy_process_group()
         logger.info("TrainController destroyed")
+        if cleanup_errors:
+            raise ExceptionGroup("TrainController cleanup failed", cleanup_errors)
 
     def _custom_function_call(
         self,
@@ -481,6 +546,26 @@ class TrainController:
             self._call_workers, method, dp_args, dp_kwargs, rpc_meta=rpc_meta
         )
         return self._collect_results(results, group_indices)
+
+    def _custom_function_call_all_dp_heads(
+        self,
+        method: str,
+        *args,
+        rpc_meta: dict[str, Any] | None = None,
+        **kwargs,
+    ) -> list[Any]:
+        """Call every rank and retain one result for every DP head."""
+        dp_args, dp_kwargs, group_indices = self._prepare_dispatch(*args, **kwargs)
+        if group_indices is not None:
+            raise ValueError("all-DP-head calls only support replicated inputs")
+        results = run_async_task(
+            self._call_workers, method, dp_args, dp_kwargs, rpc_meta=rpc_meta
+        )
+        return [
+            result
+            for result, is_head in zip(results, self.workers_is_dp_head, strict=True)
+            if is_head
+        ]
 
     async def _async_custom_function_call(
         self,
@@ -502,11 +587,19 @@ class TrainController:
         kwargs: dict[str, Any],
         *,
         group_size: int,
+        min_items_per_dp: int = 1,
+        items_per_dp_divisor: int = 1,
+        active_dummies: bool = False,
     ) -> tuple[tuple[Any, ...], dict[str, Any]]:
         """Pad eval batches for explicit algorithm-level evaluation dispatch."""
         kwargs = dict(kwargs)
         args = _pad_eval_batch(
-            args, self.parallel_strategy.dp_size, group_size=group_size
+            args,
+            self.parallel_strategy.dp_size,
+            group_size=group_size,
+            min_items_per_dp=min_items_per_dp,
+            items_per_dp_divisor=items_per_dp_divisor,
+            active_dummies=active_dummies,
         )
         return args, kwargs
 
@@ -713,6 +806,10 @@ class TrainController:
             "init_awex_adapter", meta_server_addr=meta_server_addr
         )
 
+    def init_weight_residency_adapter(self):
+        """Create the Megatron DDP-flat-buffer residency adapter."""
+        self._custom_function_call("init_weight_residency_adapter")
+
     def step_lr_scheduler(self):
         """Step the learning rate scheduler.
 
@@ -728,11 +825,93 @@ class TrainController:
 
     def offload(self) -> None:
         """Offload model parameters to CPU across all train workers."""
-        self._custom_function_call("offload")
+        self._collective_lifecycle_call("offload")
 
     def onload(self) -> None:
         """Onload model parameters to GPU across all train workers."""
-        self._custom_function_call("onload")
+        self._collective_lifecycle_call("onload")
+
+    def _collective_lifecycle_call(self, method: str) -> None:
+        """Wait for every rank once; lifecycle collectives are not retry-safe."""
+
+        async def _call_all_workers():
+            tasks = [
+                self.scheduler.async_call_engine(
+                    worker.id,
+                    method,
+                    self._engine_name(rank),
+                    max_retries=1,
+                )
+                for rank, worker in enumerate(self.workers)
+            ]
+            return await asyncio.gather(*tasks, return_exceptions=True)
+
+        results = run_async_task(_call_all_workers)
+        failures = [
+            RuntimeError(f"{method} failed on rank {rank}: {result}")
+            for rank, result in enumerate(results)
+            if isinstance(result, BaseException)
+        ]
+        if failures:
+            raise ExceptionGroup(f"Train worker collective {method} failed", failures)
+
+    def capture_worker_identity(self) -> None:
+        """Record the exact worker processes owned by this controller."""
+        self._worker_identities = self._query_worker_identities()
+        logger.info(
+            "Captured %s worker identities: %s",
+            self._worker_role,
+            self._worker_identities,
+        )
+
+    def assert_worker_identity(self) -> None:
+        """Reject dead or replaced workers before a collective onload."""
+        if not self._worker_identities:
+            raise RuntimeError("Train worker identity was not captured")
+        actual = self._query_worker_identities()
+        if actual != self._worker_identities:
+            raise RuntimeError(
+                "Train worker identity changed: "
+                f"expected {self._worker_identities}, got {actual}"
+            )
+
+    def _query_worker_identities(self) -> dict[str, tuple[int, str]]:
+        identities: dict[str, tuple[int, str]] = {}
+        for rank, worker in enumerate(self.workers):
+            url = (
+                f"http://{format_hostport(worker.ip, int(worker.worker_ports[0]))}"
+                "/health"
+            )
+            try:
+                response = requests.get(url, timeout=2.0)
+                response.raise_for_status()
+                health = response.json()
+            except (requests.RequestException, ValueError) as exc:
+                raise RuntimeError(
+                    f"MOPD teacher worker {worker.id!r} is not healthy"
+                ) from exc
+            if not isinstance(health, dict):
+                raise RuntimeError(
+                    f"MOPD teacher worker {worker.id!r} returned invalid health: "
+                    f"{health!r}"
+                )
+            expected_engine = self._engine_name(rank)
+            pid = health.get("pid")
+            generation = health.get("generation")
+            if (
+                health.get("role") != self._worker_role
+                or health.get("worker_index") != rank
+                or expected_engine not in health.get("engines", ())
+                or not isinstance(pid, int)
+                or not isinstance(generation, str)
+                or not generation
+            ):
+                raise RuntimeError(
+                    f"MOPD teacher worker {worker.id!r} has unexpected identity: "
+                    f"{health}"
+                )
+            identities[worker.id] = (pid, generation)
+        return identities
 
     def get_device_stats(self):
         return self._custom_function_call("get_device_stats")
@@ -887,3 +1066,59 @@ class TrainController:
                 "clear_batches: _fetch_buffer drained on DP head 0 (role=%s)",
                 self._worker_role,
             )
+
+    def strict_clear_batches(self, *targets: Any) -> dict[str, int | bool]:
+        """Clear teacher shards and prove every actor DP head drained them.
+
+        Unlike :meth:`clear_batches`, any source-delete or actor RPC failure is
+        fatal.  The returned receipt is suitable for the MOPD teacher lifecycle
+        gate; callers must not destroy teacher workers before this succeeds.
+        """
+        shards_by_node = {
+            node_addr: list(dict.fromkeys(shard_ids))
+            for node_addr, shard_ids in RTensor.collect_shards(targets).items()
+        }
+        shard_ids = [
+            shard_id
+            for node_shards in shards_by_node.values()
+            for shard_id in node_shards
+        ]
+        if not shard_ids:
+            return {
+                "complete": True,
+                "source_shards_cleared": 0,
+                "actor_fetch_buffers_cleared": len(
+                    [is_head for is_head in self.workers_is_dp_head if is_head]
+                ),
+            }
+
+        async def _strict_clear_sources() -> None:
+            await asyncio.gather(
+                *[
+                    RTensor.clear_node(node_addr, node_shards)
+                    for node_addr, node_shards in shards_by_node.items()
+                ]
+            )
+
+        run_async_task(_strict_clear_sources)
+        self._custom_function_call_all_dp_heads(
+            "clear_batches", shard_ids, rpc_meta={"broadcast": False}
+        )
+        stats = self._custom_function_call_all_dp_heads(
+            "fetch_buffer_stats", shard_ids, rpc_meta={"broadcast": False}
+        )
+        leaking_heads = [
+            index
+            for index, stat in enumerate(stats)
+            if not isinstance(stat, dict) or stat.get("matching_entries") != 0
+        ]
+        if leaking_heads:
+            raise RuntimeError(
+                "MOPD RTensor drain incomplete on actor DP heads "
+                f"{leaking_heads}: stats={stats}"
+            )
+        return {
+            "complete": True,
+            "source_shards_cleared": len(shard_ids),
+            "actor_fetch_buffers_cleared": len(stats),
+        }

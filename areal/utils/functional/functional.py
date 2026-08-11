@@ -578,6 +578,7 @@ def ppo_actor_loss_fn(
         loss=logging_loss,
         importance_weight=ratio.detach(),
         approx_kl=(logprobs - proximal_logprobs).detach(),
+        train_loss_mask=loss_mask.bool(),
         clip_mask=clip_mask,
         dual_clip_mask=dual_clip_mask,
         n_total_tokens=float(n_stat_total),
@@ -664,6 +665,7 @@ def sapo_loss_fn(
         loss=logging_loss,
         importance_weight=ratio.detach(),
         approx_kl=log_ratio.detach(),
+        train_loss_mask=loss_mask.bool(),
         clip_mask=torch.zeros_like(loss_mask, dtype=torch.bool),  # SAPO doesn't clip
         dual_clip_mask=torch.zeros_like(loss_mask, dtype=torch.bool),
         # SAPO-specific stats (scaled gates for consistency)
@@ -779,6 +781,7 @@ def cispo_loss_fn(
         loss=logging_loss,
         importance_weight=ratio.detach(),
         approx_kl=log_ratio,
+        train_loss_mask=loss_mask.bool(),
         clip_mask=clip_mask,
         # CISPO has no dual clip; zeros keep the stat schema stable.
         dual_clip_mask=torch.zeros_like(loss_mask, dtype=torch.bool),

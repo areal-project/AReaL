@@ -312,6 +312,10 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
 
     # ── Colocated weight transfer methods ─────────────────────────────────
 
+    def preflight_colocate_weight_update(self) -> None:
+        """Reject unsupported model layouts before gateway initialization."""
+        self._require_mcore_ddp_chunks()
+
     def init_colocate_weight_update(
         self,
         pair_name: str,
@@ -324,6 +328,7 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
         admin_api_key: str = "areal-admin-key",
         timeout_s: float = 120.0,
     ) -> None:
+        self.preflight_colocate_weight_update()
         self._colocate_pair_name = pair_name
         self._colocate_kv_store_url = kv_store_url
         self._colocate_transfer_rank = transfer_rank
@@ -337,6 +342,20 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
             pair_name,
             transfer_rank,
         )
+
+    def _require_mcore_ddp_chunks(self) -> list:
+        """Return MCore DDP chunks required by colocated weight residency."""
+        from megatron.core.distributed import DistributedDataParallel as DDP
+
+        model = self._engine.model
+        chunks = model if isinstance(model, (list, tuple)) else [model]
+        if not chunks or any(not isinstance(chunk, DDP) for chunk in chunks):
+            raise RuntimeError(
+                "v2 colocated AWEX requires MCore DDP flat buffers; set "
+                "megatron.wrap_with_ddp=true. Unwrapped chunks, torch FSDP, "
+                "and custom FSDP are not supported."
+            )
+        return list(chunks)
 
     def execute_colocate_weight_update(self, version: int) -> None:
         with self._colocate_lock:
@@ -526,33 +545,43 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
         logger.info("Reloaded optimizer states to GPU")
 
     def _offload_model_weights(self) -> None:
-        """Move model parameters to CPU, keeping references for reload."""
-        if self._engine.model is None:
-            return
-
-        for name, param in self._engine.model.named_parameters():
-            if param.is_cuda:
-                self._offloaded_weights[name] = param.data.detach().to(
-                    "cpu", non_blocking=True
-                )
-                param.data = torch.empty(0, device="cpu")
-
-        logger.info(
-            "Offloaded %d model weight tensors to CPU",
-            len(self._offloaded_weights),
-        )
+        """Offload native MCore flat buffers without replacing Parameter views."""
+        chunks = self._require_mcore_ddp_chunks()
+        count = 0
+        for chunk in chunks:
+            for buffers in (chunk.buffers, chunk.expert_parallel_buffers):
+                for buf in buffers:
+                    if hasattr(buf, "offload_to_cpu"):
+                        buf.offload_to_cpu()
+                    else:
+                        if buf.param_data.storage().size() == 0:
+                            continue
+                        if not hasattr(buf.param_data, "cpu_data"):
+                            buf.param_data.cpu_data = torch.empty_like(
+                                buf.param_data, device="cpu", pin_memory=True
+                            )
+                        buf.param_data.cpu_data.copy_(buf.param_data)
+                        buf.param_data_size = buf.param_data.storage().size()
+                        buf.param_data.storage().resize_(0)
+                    if buf.param_data.storage().size() != 0:
+                        raise RuntimeError("MCore param_data storage was not released")
+                    count += 1
+        logger.info("Offloaded %d MCore flat parameter buffers to CPU", count)
 
     def _reload_model_weights(self) -> None:
-        """Restore model parameters from CPU back to GPU."""
-        if not self._offloaded_weights:
-            return
-        if self._engine.model is None:
-            return
-
-        device = self._engine.device
-        for name, param in self._engine.model.named_parameters():
-            if name in self._offloaded_weights:
-                param.data = self._offloaded_weights[name].to(device, non_blocking=True)
-
-        self._offloaded_weights.clear()
-        logger.info("Reloaded model weights to GPU")
+        """Restore MCore flat buffers while preserving every Parameter alias."""
+        chunks = self._require_mcore_ddp_chunks()
+        count = 0
+        for chunk in chunks:
+            for buffers in (chunk.buffers, chunk.expert_parallel_buffers):
+                for buf in buffers:
+                    if hasattr(buf, "reload_from_cpu"):
+                        buf.reload_from_cpu(move_grads=False)
+                    else:
+                        if buf.param_data.storage().size() == 0:
+                            buf.param_data.storage().resize_(buf.param_data_size)
+                        buf.param_data.copy_(buf.param_data.cpu_data, non_blocking=True)
+                    if buf.param_data.storage().size() == 0:
+                        raise RuntimeError("MCore param_data storage was not restored")
+                    count += 1
+        logger.info("Reloaded %d MCore flat parameter buffers to GPU", count)

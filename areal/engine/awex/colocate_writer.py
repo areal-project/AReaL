@@ -31,6 +31,10 @@ import torch.distributed as dist
 if TYPE_CHECKING:
     from areal.engine.megatron_engine import MegatronEngine
 
+from areal.engine.weight_finite import (
+    check_named_tensors_finite,
+    iter_module_named_tensors,
+)
 from areal.utils.logging import getLogger
 
 logger = getLogger("AwexColocate")
@@ -318,6 +322,14 @@ class AwexMegatronAdapter:
         if weights_were_offloaded:
             self.resume_memory(tags=["weights"])
 
+        check_named_tensors_finite(
+            iter_module_named_tensors(self._engine.model),
+            stage="awex_writer_source",
+            version=version,
+            logger=logger,
+            process_group=self._engine.cpu_group,
+        )
+
         # _lazy_initialize AFTER the weights resume — its meta resolver
         # runs convert_param over live params, which dies with CUDA invalid
         # argument on resize_(0)-ed storages. The recover path is the only
@@ -327,6 +339,13 @@ class AwexMegatronAdapter:
         self._lazy_initialize()
 
         parameters = self._convert_parameters()
+        check_named_tensors_finite(
+            parameters.items(),
+            stage="awex_writer_converted",
+            version=version,
+            logger=logger,
+            process_group=self._engine.cpu_group,
+        )
         tensors = list(parameters.values())
         names = list(parameters.keys())
         logger.info(
@@ -413,7 +432,7 @@ class AwexMegatronAdapter:
         update_finished_key = f"weights_update_finished{key_suffix}"
         try:
             try:
-                self._meta_server_client.get_object(
+                completion = self._meta_server_client.get_object(
                     update_finished_key, timeout=self._timeout_s
                 )
             except Exception:
@@ -426,6 +445,12 @@ class AwexMegatronAdapter:
                     update_finished_key,
                 )
                 raise
+            if isinstance(completion, dict) and not completion.get("ok", True):
+                error = completion.get("error", "unknown inference-side error")
+                raise RuntimeError(
+                    "Inference rejected AWEX weights before IPC release: "
+                    f"version={version}, device={device_id}, error={error}"
+                )
             self._meta_server_client.delete_if_exists(update_finished_key)
             self._meta_server_client.delete_if_exists(serialized_weights_key)
             logger.info("Got done signal from infer side: %s", update_finished_key)
@@ -576,13 +601,10 @@ class AwexMegatronAdapter:
                             buf.grad_data_size = buf.grad_data.storage().size()
                             buf.grad_data.storage().resize_(0)
             else:
-                for name, param in chunk.named_parameters():
-                    if param.data.is_cuda:
-                        self._offloaded_weights[name] = param.data.detach().to(
-                            "cpu", non_blocking=True
-                        )
-                        param.data = torch.empty(0, device="cpu")
-                        count += 1
+                raise RuntimeError(
+                    "AWEX Megatron colocation requires MCore DDP flat buffers; "
+                    "per-parameter weight offload is forbidden"
+                )
         torch.cuda.synchronize()
         logger.info("Offloaded %d weight buffers to CPU", count)
 
@@ -594,7 +616,6 @@ class AwexMegatronAdapter:
             return
         if not isinstance(model, (list, tuple)):
             model = [model]
-        device = self._engine.device
         for chunk in model:
             if isinstance(chunk, DDP):
                 for buffers in [chunk.buffers, chunk.expert_parallel_buffers]:
@@ -613,11 +634,9 @@ class AwexMegatronAdapter:
                             buf.grad_data.storage().resize_(buf.grad_data_size)
                             buf.grad_data.zero_()
             else:
-                for name, param in chunk.named_parameters():
-                    if name in self._offloaded_weights:
-                        param.data = self._offloaded_weights[name].to(
-                            device, non_blocking=True
-                        )
+                raise RuntimeError(
+                    "Cannot reload AWEX Megatron weights without MCore DDP flat buffers"
+                )
         self._offloaded_weights.clear()
         torch.cuda.synchronize()
         logger.info("Reloaded model weights to GPU (load_grad=%s)", load_grad)

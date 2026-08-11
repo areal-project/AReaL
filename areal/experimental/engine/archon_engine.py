@@ -1420,6 +1420,36 @@ class ArchonPPOActor(ArchonEngine):
         super().__init__(config)
         self.actor = PPOActor(config, self)
 
+    def initialize(
+        self,
+        addr: str | None,
+        ft_spec: FinetuneSpec,
+        *args,
+        data_hook_role: str | None = None,
+        role: str | None = None,
+        **kwargs,
+    ) -> None:
+        super().initialize(addr, ft_spec, *args, **kwargs)
+        hook_role = data_hook_role or role
+        if hook_role is None and self.actor._data_hook_specs:
+            raise RuntimeError("Configured data hooks require an explicit worker role")
+        self.actor.setup_data_hooks(hook_role or "actor")
+
+    def destroy(self) -> None:
+        errors: list[BaseException] = []
+        try:
+            super().destroy()
+        except BaseException as exc:
+            errors.append(exc)
+        try:
+            self.actor.close_data_hooks()
+        except BaseException as exc:
+            errors.append(exc)
+        if len(errors) == 1:
+            raise errors[0]
+        if errors:
+            raise BaseExceptionGroup("Archon PPO actor cleanup failed", errors)
+
     @torch.no_grad()
     def compute_logp(self, *args, **kwargs) -> list[torch.Tensor] | None:
         return self.actor.compute_logp(*args, **kwargs)
@@ -1427,6 +1457,9 @@ class ArchonPPOActor(ArchonEngine):
     @torch.no_grad()
     def compute_advantages(self, *args, **kwargs) -> list[dict[str, Any]]:
         return self.actor.compute_advantages(*args, **kwargs)
+
+    def aggregate_mopd_targets(self, *args, **kwargs):
+        return self.actor.aggregate_mopd_targets(*args, **kwargs)
 
     def ppo_update(self, *args, **kwargs) -> None:
         self.actor.ppo_update(*args, **kwargs)

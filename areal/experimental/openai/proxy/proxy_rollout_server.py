@@ -121,6 +121,8 @@ _prefix_matcher = None
 # Server address (set at startup)
 _server_host: str = "0.0.0.0"
 _server_port: int = 8000
+_worker_role: str | None = None
+_worker_index: int | None = None
 
 # Port allocation tracking
 _allocated_ports: set[int] = set()
@@ -135,6 +137,24 @@ _etcd3_addr: str = "localhost:2379"
 
 # Adapter to convert Anthropic request to OpenAI format
 _adapter = AnthropicAdapter()
+
+
+def _resolve_worker_index(cli_worker_index: int) -> int:
+    """Resolve identity without clobbering an explicit scheduler value.
+
+    A local launch can inherit ``SLURM_PROCID`` from its parent login shell.
+    Treating that stale value as an unconditional override makes every local
+    proxy identify as rank 0, so exact fork readiness checks reject ranks
+    1..N. Slurm-only launchers still use the environment fallback when they
+    leave ``--worker-index`` at its sentinel value.
+    """
+    worker_index = cli_worker_index
+    if worker_index == -1 and "SLURM_PROCID" in os.environ:
+        worker_index = int(os.environ["SLURM_PROCID"])
+    if worker_index == -1:
+        raise ValueError("Invalid worker index. Not found from SLURM environ or args.")
+    return worker_index
+
 
 # =============================================================================
 # Request Validation
@@ -224,7 +244,12 @@ app = FastAPI()
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "initialized": _engine is not None}
+    return {
+        "status": "ok",
+        "initialized": _engine is not None,
+        "role": _worker_role,
+        "worker_index": _worker_index,
+    }
 
 
 @app.post("/alloc_ports")
@@ -578,7 +603,11 @@ async def _call_client_create(
     session_data.update_last_access()
 
     sig = inspect.signature(create_fn)
-    areal_client_ignored_args = ["model"] + (extra_ignored_args or [])
+    # Keep the request model when the AReaL client supports it. Anthropic's
+    # LiteLLM response adapter uses this field to select the model family;
+    # dropping it leaves the generated ChatCompletion with no usable model
+    # identity and fails with ``Model type must be specified``.
+    areal_client_ignored_args = extra_ignored_args or []
     areal_client_disallowed_args = ["areal_cache"]
     areal_client_allowed_args = list(
         k
@@ -1002,7 +1031,7 @@ def main():
     args, _ = parser.parse_known_args()
 
     # Set global server address variables
-    global _server_host, _server_port
+    global _server_host, _server_port, _worker_role, _worker_index
     global \
         _experiment_name, \
         _trial_name, \
@@ -1022,13 +1051,9 @@ def main():
 
     # Get worker identity
     worker_role = args.role
-    worker_index = args.worker_index
-
-    if "SLURM_PROCID" in os.environ:
-        # Overwriting with slurm task id
-        worker_index = int(os.environ["SLURM_PROCID"])
-    if worker_index == -1:
-        raise ValueError("Invalid worker index. Not found from SLURM environ or args.")
+    worker_index = _resolve_worker_index(args.worker_index)
+    _worker_role = worker_role
+    _worker_index = worker_index
     worker_id = f"{worker_role}/{worker_index}"
 
     # Determine port

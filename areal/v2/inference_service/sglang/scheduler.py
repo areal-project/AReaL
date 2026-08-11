@@ -60,6 +60,7 @@ class AwexSchedulerBridge:
             "awex_init_weights_update_group",
             "awex_execute_weight_update",
             "awex_batch_isend_irecv",
+            "awex_teardown_weight_update_group",
             "awex_get_parameters",
             "awex_randomize_parameters",
             "awex_init_colocate_weight_update",
@@ -110,6 +111,11 @@ class AwexSchedulerBridge:
 
     def awex_batch_isend_irecv(self, **kwargs: Any) -> None:
         self._require_adapter().batch_isend_irecv(**kwargs)
+
+    def awex_teardown_weight_update_group(self) -> None:
+        if self._adapter is not None:
+            self._adapter.teardown_weight_update_group()
+            self._adapter = None
 
     def awex_get_parameters(
         self, save_path: str, names: list[str] | None = None

@@ -2,7 +2,9 @@
 
 import argparse
 import json
+import math
 import os
+import re
 import warnings
 from dataclasses import MISSING as dataclass_missing
 from dataclasses import asdict, dataclass, field, fields
@@ -1152,6 +1154,14 @@ class SchedulingSpec:
         },
     )
     # Slurm specific options
+    request_gpu_gres: bool = field(
+        default=True,
+        metadata={
+            "help": "Whether Slurm should request GPU GRES for this worker job. "
+            "Disable only for colocated jobs that share an existing GPU "
+            "allocation."
+        },
+    )
     srun_additional_args: str = field(
         default="--unbuffered --mpi=pmi2 -K --chdir $PWD",
         metadata={
@@ -3230,6 +3240,157 @@ class TeacherConfig:
 
 
 @dataclass
+class MOPDTeacherSpec:
+    """Checkpoint specification for one MOPD teacher."""
+
+    path: str = field(
+        default=MISSING,
+        metadata={"help": "Local or shared-filesystem teacher checkpoint path."},
+    )
+
+    def __post_init__(self):
+        if not isinstance(self.path, str) or not self.path.strip():
+            raise ValueError("MOPD teacher path must be a non-empty string")
+
+
+@dataclass
+class MOPDTeacherManagerConfig:
+    """Checkpoint provider configuration for phase-scoped MOPD teachers."""
+
+    type: str = field(
+        default="disk",
+        metadata={
+            "help": "Teacher checkpoint provider.",
+            "choices": ["disk", "local_memory"],
+        },
+    )
+    staging_root: str = field(
+        default="/dev/shm/areal-mopd",
+        metadata={"help": "Node-local staging root for local_memory providers."},
+    )
+    min_free_bytes: int | None = field(
+        default=None,
+        metadata={
+            "help": "Optional minimum free space required after staging a checkpoint."
+        },
+    )
+
+    def __post_init__(self):
+        if self.type not in ("disk", "local_memory"):
+            raise ValueError(
+                "mopd.manager.type must be either 'disk' or 'local_memory', "
+                f"got {self.type!r}"
+            )
+        if not isinstance(self.staging_root, str) or not self.staging_root.strip():
+            raise ValueError("mopd.manager.staging_root must be a non-empty string")
+        if self.min_free_bytes is not None and self.min_free_bytes < 0:
+            raise ValueError(
+                "mopd.manager.min_free_bytes must be non-negative or None, "
+                f"got {self.min_free_bytes}"
+            )
+
+
+@dataclass
+class MOPDLossConfig:
+    """Coefficients for joint RL and multi-teacher distillation training."""
+
+    rl_coefficient: float = field(
+        default=0.0,
+        metadata={"help": "Coefficient applied to the RL objective."},
+    )
+    distillation_coefficient: float = field(
+        default=0.005,
+        metadata={"help": "Coefficient applied to the MOPD objective."},
+    )
+
+    def __post_init__(self):
+        for name in ("rl_coefficient", "distillation_coefficient"):
+            value = getattr(self, name)
+            if not isinstance(value, (int, float)) or isinstance(value, bool):
+                raise ValueError(f"mopd.loss.{name} must be a finite number")
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(
+                    f"mopd.loss.{name} must be finite and non-negative, got {value}"
+                )
+
+
+@dataclass
+class MOPDTeacherEngineConfig(PPOActorConfig):
+    """Forward-only Megatron engine configuration used by MOPD teachers."""
+
+
+@dataclass
+class MOPDConfig:
+    """Configuration for multi-teacher on-policy distillation."""
+
+    task_type_identifier: str = field(
+        default="task_type",
+        metadata={"help": "Source sample field used to select an MOPD route."},
+    )
+    teachers: dict[str, MOPDTeacherSpec] = field(default_factory=dict)
+    routes: dict[str, dict[str, float]] = field(default_factory=dict)
+    teacher_engine: MOPDTeacherEngineConfig = field(
+        default_factory=MOPDTeacherEngineConfig
+    )
+    manager: MOPDTeacherManagerConfig = field(default_factory=MOPDTeacherManagerConfig)
+    loss: MOPDLossConfig = field(default_factory=MOPDLossConfig)
+
+    def __post_init__(self):
+        if (
+            not isinstance(self.task_type_identifier, str)
+            or not self.task_type_identifier.strip()
+        ):
+            raise ValueError("mopd.task_type_identifier must be a non-empty string")
+        if not self.teachers:
+            raise ValueError("mopd.teachers must not be empty")
+        if not self.routes:
+            raise ValueError("mopd.routes must not be empty")
+
+        for teacher_id, teacher in self.teachers.items():
+            if not isinstance(teacher_id, str) or not teacher_id.strip():
+                raise ValueError("mopd teacher ids must be non-empty strings")
+            if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", teacher_id) is None:
+                raise ValueError(
+                    "mopd teacher ids must be filename-safe and match "
+                    "[A-Za-z0-9][A-Za-z0-9_.-]*"
+                )
+            if not isinstance(teacher, MOPDTeacherSpec):
+                raise ValueError(
+                    f"mopd.teachers[{teacher_id!r}] must be an MOPDTeacherSpec"
+                )
+
+        for route, weights in self.routes.items():
+            if not isinstance(route, str) or not route.strip():
+                raise ValueError("mopd route ids must be non-empty strings")
+            if not weights:
+                raise ValueError(f"mopd.routes[{route!r}] must not be empty")
+
+            has_positive_weight = False
+            for teacher_id, weight in weights.items():
+                if teacher_id not in self.teachers:
+                    raise ValueError(
+                        f"mopd.routes[{route!r}] references unknown teacher "
+                        f"{teacher_id!r}"
+                    )
+                if not isinstance(weight, (int, float)) or isinstance(weight, bool):
+                    raise ValueError(
+                        f"mopd.routes[{route!r}][{teacher_id!r}] must be a "
+                        "finite non-negative number"
+                    )
+                if not math.isfinite(weight) or weight < 0:
+                    raise ValueError(
+                        f"mopd.routes[{route!r}][{teacher_id!r}] must be finite "
+                        f"and non-negative, got {weight}"
+                    )
+                has_positive_weight = has_positive_weight or weight > 0
+
+            if not has_positive_weight:
+                raise ValueError(
+                    f"mopd.routes[{route!r}] must contain at least one positive weight"
+                )
+
+
+@dataclass
 class PPOConfig(BaseExperimentConfig):
     """Configuration for Proximal Policy Optimization (PPO) reinforcement learning experiments."""
 
@@ -3257,6 +3418,10 @@ class PPOConfig(BaseExperimentConfig):
             )
         },
     )
+    mopd: MOPDConfig | None = field(
+        default=None,
+        metadata={"help": "Optional multi-teacher on-policy distillation config."},
+    )
     dynamic_bs: bool = field(
         default=False,
         metadata={
@@ -3268,6 +3433,17 @@ class PPOConfig(BaseExperimentConfig):
 
     def __post_init__(self):
         """Validate the eval generation config."""
+        if self.teacher is not None and self.mopd is not None:
+            raise ValueError("teacher and mopd cannot be configured at the same time")
+        if self.teacher is not None:
+            warnings.warn(
+                "The single-teacher `teacher` config is deprecated; migrate to "
+                "`mopd` before the compatibility period ends.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+        if self.mopd is not None:
+            self._validate_mopd_config()
         if self.eval_gconfig is None:
             self.eval_gconfig = self.gconfig.new()
         if self.gconfig.reward_normalization and self.actor.reward_norm is not None:
@@ -3283,6 +3459,77 @@ class PPOConfig(BaseExperimentConfig):
         if self.rollout.use_lora and not self.rollout.lora_name:
             self.rollout.lora_name = self.gconfig.lora_name
         super().__post_init__()
+
+    def _validate_mopd_config(self):
+        """Validate MOPD engine topology before any workers are created."""
+        from areal.api.alloc_mode import ModelAllocation, ParallelStrategy
+
+        assert self.mopd is not None
+        teacher_engine = self.mopd.teacher_engine
+
+        if not self.actor.backend.startswith("megatron:"):
+            raise ValueError("mopd requires a Megatron actor backend")
+        if not teacher_engine.backend.startswith("megatron:"):
+            raise ValueError("mopd.teacher_engine backend must be Megatron")
+        if teacher_engine._version != "v1":
+            raise ValueError("mopd.teacher_engine currently requires _version='v1'")
+        if not self.rollout.backend.startswith("sglang:"):
+            raise ValueError("mopd requires an SGLang rollout backend")
+        if self.actor.weight_update_mode != "awex":
+            raise ValueError("mopd requires actor.weight_update_mode='awex'")
+        if teacher_engine.optimizer is not None:
+            raise ValueError("mopd.teacher_engine.optimizer must be null")
+        if not teacher_engine.disable_dropout:
+            raise ValueError("mopd.teacher_engine.disable_dropout must be true")
+
+        teacher_schedule = teacher_engine.scheduling_strategy
+        if (
+            teacher_schedule.type != SchedulingStrategyType.colocation.value
+            or teacher_schedule.target != "actor"
+            or not teacher_schedule.fork
+        ):
+            raise ValueError(
+                "mopd.teacher_engine must use colocation target='actor' with fork=true"
+            )
+
+        rollout_schedule = self.rollout.scheduling_strategy
+        if (
+            rollout_schedule.type != SchedulingStrategyType.colocation.value
+            or rollout_schedule.target != "actor"
+        ):
+            raise ValueError("mopd rollout must use colocation target='actor'")
+        if not rollout_schedule.fork:
+            # TODO(agent): Give rollout trackers explicit export ownership so
+            # same-process actor/rollout engines cannot drain or overwrite each
+            # other's statistics.
+            logger.warning(
+                "MOPD rollout with fork=false may reuse actor worker processes. "
+                "The shared stats tracker can make rollout metrics inaccurate "
+                "during export_stats; use fork=true when accurate rollout "
+                "telemetry is required."
+            )
+
+        actor_alloc = ModelAllocation.from_str(self.actor.backend, name="actor")
+        teacher_alloc = ModelAllocation.from_str(
+            teacher_engine.backend, name="mopd_teacher"
+        )
+        if not ParallelStrategy.parallelism_eq(
+            actor_alloc.parallel, teacher_alloc.parallel
+        ):
+            raise ValueError(
+                "mopd teacher and actor must use the same parallel strategy"
+            )
+        if self.mopd.manager.type == "local_memory":
+            if self.scheduler.type != "local":
+                raise ValueError(
+                    "mopd local_memory provider requires scheduler.type='local' "
+                    "so controller and teacher workers share the same host"
+                )
+            if actor_alloc.parallel.world_size > self.cluster.n_gpus_per_node:
+                raise ValueError(
+                    "mopd local_memory provider only supports a single node; use "
+                    "disk for multi-node runs"
+                )
 
 
 @dataclass

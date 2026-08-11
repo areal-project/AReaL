@@ -7,7 +7,7 @@ When AWEX_META_SERVER_ADDR env var is set, starts a background thread that
 fetches IPC handles from MetaServer (CPU I/O) and queues them for the
 scheduler's main loop to process (CUDA copy on main thread).
 
-Weight transfer flow (mirrors the AWEX reference colocate mode):
+Weight transfer flow (aligned with Asystem colocate mode):
   1. Training side: convert params → cuda_ipc_serialize → MetaServer put
   2. Background thread: MetaServer get → queue IPC data (CPU only)
   3. Scheduler main loop: release_memory → deserialize + copy → resume_memory
@@ -24,24 +24,19 @@ Usage:
 
 from __future__ import annotations
 
+import importlib
 import os
 import queue
 import threading
 import time
 from collections.abc import Callable
+from copy import copy
 from dataclasses import dataclass, field
 from typing import Any
 
 
 def assert_alloc_conf_supports_memory_saver(conf: str) -> None:
-    """Reject allocator configs that silently disable SGLang's memory saver.
-
-    torch_memory_saver disables itself when it sees expandable_segments, so
-    release/resume becomes a no-op: the rollout never hands its GPU back and
-    weight pages stay mapped, which surfaces much later as a colocate OOM or an
-    invalid CUDA IPC target. Colocated roles must therefore carry their own
-    scheduling_spec env_vars rather than share the actor's.
-    """
+    """Reject allocator configs that silently disable SGLang's memory saver."""
     if "expandable_segments:true" in conf.lower().replace(" ", ""):
         raise RuntimeError(
             "SGLang's memory saver cannot unmap/remap expandable segments, so "
@@ -53,33 +48,54 @@ def assert_alloc_conf_supports_memory_saver(conf: str) -> None:
 
 assert_alloc_conf_supports_memory_saver(os.environ.get("PYTORCH_CUDA_ALLOC_CONF", ""))
 
-
 from areal.utils import pkg_version  # noqa: E402
 from areal.utils.logging import getLogger  # noqa: E402
 
 logger = getLogger("AwexSGLangPlugin")
-
-
 SUPPORTED_SGLANG_VERSIONS = ("0.5.9", "0.5.10.post1")
 
 
 def assert_supported_sglang_version() -> None:
-    """Refuse to patch a SGLang build whose internals were not verified.
-
-    This plugin reaches into scheduler internals: it wraps Scheduler.__init__,
-    replaces both event loops, and backports a model-worker task dispatcher.
-    Those touch points move between releases, so a silent mismatch surfaces as
-    a hang or a corrupt transfer rather than an import error. Fail loudly
-    instead, and extend the tuple only after re-checking the patched surfaces.
-    """
+    """Refuse to patch a SGLang build whose internals were not verified."""
     installed = pkg_version.get_version("sglang")
     if installed not in SUPPORTED_SGLANG_VERSIONS:
         raise RuntimeError(
-            f"AWEX colocate patches SGLang internals and was verified against "
+            "AWEX colocate patches SGLang internals and was verified against "
             f"{', '.join(SUPPORTED_SGLANG_VERSIONS)}, but found {installed}. "
-            f"Re-check Scheduler.__init__, the event loops, and "
-            f"execute_task_in_model_worker before allowing this version."
+            "Re-check Scheduler.__init__, the event loops, and "
+            "execute_task_in_model_worker before allowing this version."
         )
+
+
+def _load_sglang_plugins_if_available() -> bool:
+    """Load SGLang runtime plugins when supported by the installed version.
+
+    ``sglang.srt.plugins`` was added after the 0.5.10 runtime currently pinned
+    by AReaL.  AWEX does not depend on that registry because it injects its
+    scheduler entry point directly through ``launch_server``.  Treat the
+    registry as optional so the same entry module works with both APIs.
+    """
+    try:
+        plugins = importlib.import_module("sglang.srt.plugins")
+    except ModuleNotFoundError as exc:
+        if exc.name != "sglang.srt.plugins":
+            raise
+        logger.info(
+            "[AWEX] SGLang plugin registry is unavailable; using the "
+            "launch_server scheduler hook"
+        )
+        return False
+
+    load_plugins = getattr(plugins, "load_plugins", None)
+    if not callable(load_plugins):
+        logger.info(
+            "[AWEX] SGLang plugin registry has no load_plugins entry point; "
+            "using the launch_server scheduler hook"
+        )
+        return False
+
+    load_plugins()
+    return True
 
 
 def _float_env(name: str, default: float) -> float:
@@ -91,6 +107,341 @@ def _float_env(name: str, default: float) -> float:
     except ValueError:
         logger.warning("Invalid %s=%r; using %.3f", name, value, default)
         return default
+
+
+def _bool_env(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _int_env(name: str, default: int) -> int:
+    value = os.environ.get(name, "")
+    if not value:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        logger.warning("Invalid %s=%r; using %d", name, value, default)
+        return default
+
+
+def _scheduler_int_attr(scheduler: Any, name: str, default: int) -> int:
+    for obj in (
+        scheduler,
+        getattr(scheduler, "ps", None),
+        getattr(scheduler, "server_args", None),
+    ):
+        if obj is None or not hasattr(obj, name):
+            continue
+        value = getattr(obj, name)
+        if value is not None:
+            return int(value)
+    return default
+
+
+def _scheduler_callable(scheduler: Any, name: str) -> Callable:
+    for obj in (scheduler, getattr(scheduler, "weight_updater", None)):
+        if obj is None:
+            continue
+        method = getattr(obj, name, None)
+        if callable(method):
+            return method
+    raise AttributeError(f"Scheduler has no callable {name!r}")
+
+
+def _logical_gpu_id(scheduler: Any) -> int:
+    return _scheduler_int_attr(scheduler, "gpu_id", 0)
+
+
+def _physical_gpu_id(scheduler: Any) -> int:
+    """Return the node-local physical GPU id used by AWEX MetaServer keys."""
+
+    logical_gpu_id = _logical_gpu_id(scheduler)
+    visible_devices = [
+        d.strip()
+        for d in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",")
+        if d.strip()
+    ]
+    if (
+        logical_gpu_id < len(visible_devices)
+        and visible_devices[logical_gpu_id].isdigit()
+    ):
+        return int(visible_devices[logical_gpu_id])
+
+    physical_base = os.environ.get("AREAL_AWEX_PHYSICAL_BASE_GPU_ID", "")
+    if physical_base:
+        try:
+            return int(physical_base) + logical_gpu_id
+        except ValueError:
+            logger.warning(
+                "Invalid AREAL_AWEX_PHYSICAL_BASE_GPU_ID=%r; using logical gpu id %d",
+                physical_base,
+                logical_gpu_id,
+            )
+    return logical_gpu_id
+
+
+def _scheduler_instance_world_size(scheduler: Any) -> int:
+    """Return the number of scheduler GPU processes in one SGLang server."""
+    return _scheduler_int_attr(scheduler, "tp_size", 1) * _scheduler_int_attr(
+        scheduler, "pp_size", 1
+    )
+
+
+def _resolve_transfer_rank(
+    *,
+    infer_world_size: int,
+    gpu_id: int,
+    node_id: int,
+    nnodes: int,
+    instance_world_size: int,
+) -> int:
+    """Resolve the inference rank in AWEX's global transfer world.
+
+    A one-GPU SGLang server can use the colocated actor's inherited global
+    rank when CUDA device isolation remaps its only GPU to device zero. For a
+    multi-GPU server, every TP/PP scheduler inherits the same environment, so
+    its scheduler-local physical GPU identity must be used instead.
+    """
+    explicit_rank = os.environ.get("AWEX_TRANSFER_RANK")
+    if explicit_rank is not None:
+        transfer_rank = int(explicit_rank)
+    else:
+        env_rank = os.environ.get("RANK")
+        env_world_size = os.environ.get("WORLD_SIZE")
+        if (
+            instance_world_size == 1
+            and env_rank is not None
+            and env_world_size is not None
+            and int(env_world_size) == infer_world_size
+        ):
+            transfer_rank = int(env_rank)
+        else:
+            n_gpus_per_node = max(1, infer_world_size // nnodes)
+            transfer_rank = node_id * n_gpus_per_node + gpu_id
+
+    if not 0 <= transfer_rank < infer_world_size:
+        raise ValueError(
+            "AWEX transfer rank must be in "
+            f"[0, {infer_world_size}), got {transfer_rank}"
+        )
+    return transfer_rank
+
+
+def _resolve_physical_gpu_id(
+    *, transfer_rank: int, infer_world_size: int, nnodes: int
+) -> int:
+    """Return the node-physical GPU paired with an AWEX transfer rank."""
+    n_gpus_per_node = max(1, infer_world_size // nnodes)
+    return transfer_rank % n_gpus_per_node
+
+
+def _writer_version_key(ip_address: str, physical_gpu_id: int) -> str:
+    return f"awex_writer_version_{ip_address}_{physical_gpu_id}"
+
+
+def _patch_release_memory_for_retract_pause() -> None:
+    """Allow KV/weights offload while the engine is retract-paused.
+
+    AReaL pauses SGLang with ``/pause_generation {"mode": "retract"}`` before
+    offloading: running requests move to the waiting queue with their KV
+    released, and recompute after ``continue_generation``. The v3 fork gates
+    both ``release_memory_occupation`` (assert) and ``flush_cache`` on
+    ``is_fully_idle()``, which requires an EMPTY waiting queue, so every
+    colocate train step killed all servers with an AssertionError (942388).
+    The v2.5 fork gated both on ``_is_no_request()`` (running requests only),
+    which matches the documented retract semantics ("The KV cache can be
+    flushed in this mode", ``PauseGenerationReqInput``). Restore that
+    behavior, but only when the engine is paused with an empty running
+    batch; any other non-idle state still hits the original assert.
+    """
+    try:
+        from sglang.srt.managers.scheduler_components.weight_updater import (
+            SchedulerWeightUpdaterManager,
+        )
+    except ImportError:
+        # SGLang 0.5.10 (the version pinned by AReaL) implements memory
+        # release directly on Scheduler through SchedulerUpdateWeightsMixin.
+        # Patch that API in place; newer forks moved it to a manager object.
+        from sglang.srt.managers.scheduler import Scheduler
+
+        if getattr(Scheduler, "_areal_retract_pause_release", False):
+            return
+
+        # AReaL's pinned SGLang 0.5.10 uses _is_no_request(), which ignores
+        # the waiting queue and already permits memory release after retract
+        # has emptied the running batches. Only newer forks gate this path on
+        # is_fully_idle() and need the temporary override below.
+        if not callable(getattr(Scheduler, "is_fully_idle", None)):
+            if callable(getattr(Scheduler, "_is_no_request", None)):
+                logger.info(
+                    "[AWEX] direct Scheduler memory release uses legacy "
+                    "_is_no_request gate; retract-pause patch is unnecessary",
+                )
+                return
+            raise RuntimeError(
+                "Scheduler memory release has no supported idle gate "
+                "(expected is_fully_idle or _is_no_request)"
+            )
+
+        orig_release = Scheduler.release_memory_occupation
+
+        def release_memory_occupation(self, recv_req):
+            retract_paused = (
+                getattr(self, "_engine_paused", False)
+                and self.running_batch.is_empty()
+                and not self.is_fully_idle()
+            )
+            if not retract_paused:
+                return orig_release(self, recv_req)
+            logger.info(
+                "[AWEX] release_memory_occupation under retract pause: "
+                "treating scheduler as idle (waiting_queue=%d)",
+                len(self.waiting_queue),
+            )
+            self.is_fully_idle = lambda *args, **kwargs: True
+            try:
+                return orig_release(self, recv_req)
+            finally:
+                del self.is_fully_idle
+
+        Scheduler.release_memory_occupation = release_memory_occupation
+        Scheduler._areal_retract_pause_release = True
+        logger.info(
+            "[AWEX] patched direct Scheduler.release_memory_occupation for "
+            "retract-pause offload",
+        )
+        return
+
+    if getattr(SchedulerWeightUpdaterManager, "_areal_retract_pause_patch", False):
+        return
+
+    orig_release = SchedulerWeightUpdaterManager.release_memory_occupation
+
+    def release_memory_occupation(self, recv_req):
+        scheduler = self.scheduler
+        retract_paused = (
+            scheduler is not None
+            and getattr(scheduler, "_engine_paused", False)
+            and scheduler.running_batch.is_empty()
+            and not self.is_fully_idle()
+        )
+        if not retract_paused:
+            return orig_release(self, recv_req)
+        logger.info(
+            "[AWEX] release_memory_occupation under retract pause: treating "
+            "scheduler as idle (waiting_queue=%d)",
+            len(scheduler.waiting_queue),
+        )
+        # The idle gate is bound in two places: the dataclass field (used by
+        # the assert) and scheduler.is_fully_idle (used inside
+        # scheduler.flush_cache). Shadow both for the duration of the call so
+        # the flush actually resets the radix/KV pools; silently skipping it
+        # would keep stale KV entries alive across the weight update.
+        orig_field = self.is_fully_idle
+        self.is_fully_idle = lambda *args, **kwargs: True
+        scheduler.is_fully_idle = lambda *args, **kwargs: True
+        try:
+            return orig_release(self, recv_req)
+        finally:
+            self.is_fully_idle = orig_field
+            try:
+                del scheduler.is_fully_idle
+            except AttributeError:
+                pass
+
+    SchedulerWeightUpdaterManager.release_memory_occupation = release_memory_occupation
+    SchedulerWeightUpdaterManager._areal_retract_pause_patch = True
+    logger.info(
+        "[AWEX] patched release_memory_occupation for retract-pause offload",
+    )
+
+
+def _patch_flush_cache_for_retract_pause() -> None:
+    """Let flush_cache succeed while the engine is retract-paused.
+
+    The awex reader asserts ``scheduler.flush_cache()`` success right after
+    every weight update (``weights_reader.update_weights``). v3's
+    ``flush_cache`` is gated on ``is_fully_idle()``, which requires an empty
+    waiting queue — but retract-pause parks the in-flight requests exactly
+    there, so on any engine with a pending request the flush returns False
+    and the assert kills the scheduler (942391: 6/8 engines died, the 2
+    with empty queues survived). v2.5 gated the flush on ``_is_no_request()``
+    (running only), which is the validated retract semantics ("The KV cache
+    can be flushed in this mode and will be automatically recomputed after
+    continue_generation"). Restore that: when the engine is paused with an
+    empty running batch, treat the scheduler as idle for the duration of
+    the flush. Retracted requests hold no pool slots, so resetting the
+    radix/KV pools is safe; they re-prefill after continue_generation.
+    """
+    try:
+        from sglang.srt.managers.scheduler import Scheduler
+    except ImportError:
+        logger.warning(
+            "[AWEX] Scheduler import failed; skipping retract-pause flush_cache patch",
+        )
+        return
+
+    if getattr(Scheduler, "_areal_retract_pause_flush", False):
+        return
+
+    if not callable(getattr(Scheduler, "is_fully_idle", None)):
+        if callable(getattr(Scheduler, "_is_no_request", None)):
+            logger.info(
+                "[AWEX] Scheduler.flush_cache uses legacy _is_no_request "
+                "gate; retract-pause patch is unnecessary",
+            )
+            return
+        raise RuntimeError(
+            "Scheduler.flush_cache has no supported idle gate "
+            "(expected is_fully_idle or _is_no_request)"
+        )
+
+    orig_flush = Scheduler.flush_cache
+
+    def flush_cache(self, *args, **kwargs):
+        retract_paused = (
+            getattr(self, "_engine_paused", False)
+            and self.running_batch.is_empty()
+            and not self.is_fully_idle()
+        )
+        if not retract_paused:
+            return orig_flush(self, *args, **kwargs)
+        logger.info(
+            "[AWEX] flush_cache under retract pause: treating scheduler as "
+            "idle (waiting_queue=%d)",
+            len(self.waiting_queue),
+        )
+        self.is_fully_idle = lambda *args_, **kwargs_: True
+        try:
+            return orig_flush(self, *args, **kwargs)
+        finally:
+            try:
+                del self.is_fully_idle
+            except AttributeError:
+                pass
+
+    Scheduler.flush_cache = flush_cache
+    Scheduler._areal_retract_pause_flush = True
+    logger.info("[AWEX] patched flush_cache for retract-pause weight updates")
+
+
+def _try_get_writer_version(
+    meta_server_client: Any,
+    key: str,
+    timeout_s: float,
+) -> int | None:
+    """Return the writer's current version if published, otherwise None."""
+
+    try:
+        wait_key = getattr(meta_server_client, "wait_key", None)
+        if callable(wait_key):
+            wait_key(key, timeout=timeout_s)
+        return int(meta_server_client.get_object(key, timeout=timeout_s))
+    except Exception:
+        return None
 
 
 class AwexSchedulerPlugin:
@@ -109,6 +460,14 @@ class AwexSchedulerPlugin:
         self._paused_poll_interval_s = max(
             0.0, _float_env("AWEX_PAUSED_POLL_INTERVAL_S", 0.01)
         )
+        self._process_queue_when_idle = _bool_env(
+            "AREAL_AWEX_PROCESS_QUEUE_WHEN_IDLE", True
+        )
+        # Idle-poll throttle in *loop iterations*, not wall-clock time: TP
+        # ranks run the scheduler loop in lockstep, so a loop-count gate is
+        # deterministic across ranks (a time-based gate deadlocks, see
+        # _maybe_process_awex_queue_when_idle).
+        self._idle_poll_loops = max(1, _int_env("AWEX_IDLE_POLL_LOOPS", 64))
 
     def bind(self) -> None:
         methods = [
@@ -122,6 +481,7 @@ class AwexSchedulerPlugin:
         ]
         for name in methods:
             setattr(self._scheduler, name, getattr(self, name))
+        self._patch_memory_transitions()
         logger.info(
             f"[AWEX] AwexSchedulerPlugin bound {len(methods)} methods to scheduler",
         )
@@ -137,6 +497,55 @@ class AwexSchedulerPlugin:
 
             self._receiver = AwexColocateReader(self._scheduler)
         return self._receiver
+
+    def _patch_memory_transitions(self) -> None:
+        """Make AWEX release/resume requests idempotent across retries."""
+        scheduler = self._scheduler
+        if getattr(scheduler, "_areal_awex_memory_transitions_patched", False):
+            return
+        original_release = getattr(scheduler, "release_memory_occupation", None)
+        original_resume = getattr(scheduler, "resume_memory_occupation", None)
+        if original_release is None or original_resume is None:
+            return
+
+        def _filtered_request(request: Any, *, release: bool) -> Any | None:
+            tags = getattr(request, "tags", None)
+            offload_tags = getattr(scheduler, "offload_tags", None)
+            if tags is None or offload_tags is None:
+                return request
+            effective_tags = [
+                tag
+                for tag in tags
+                if (tag not in offload_tags if release else tag in offload_tags)
+            ]
+            if not effective_tags:
+                logger.info(
+                    "[AWEX] skipping duplicate %s_memory_occupation(tags=%s)",
+                    "release" if release else "resume",
+                    tags,
+                )
+                return None
+            if effective_tags == list(tags):
+                return request
+            filtered = copy(request)
+            filtered.tags = effective_tags
+            return filtered
+
+        def _release(request: Any, *args: Any, **kwargs: Any) -> Any:
+            filtered = _filtered_request(request, release=True)
+            if filtered is None:
+                return None
+            return original_release(filtered, *args, **kwargs)
+
+        def _resume(request: Any, *args: Any, **kwargs: Any) -> Any:
+            filtered = _filtered_request(request, release=False)
+            if filtered is None:
+                return None
+            return original_resume(filtered, *args, **kwargs)
+
+        scheduler.release_memory_occupation = _release
+        scheduler.resume_memory_occupation = _resume
+        scheduler._areal_awex_memory_transitions_patched = True
 
     def awex_init_receiver(self, **kwargs: Any) -> None:
         self._require_receiver().initialize(**kwargs)
@@ -158,21 +567,24 @@ class AwexSchedulerPlugin:
 
     # ── Main loop hook: process queued weight updates ─────────────────
 
-    def process_awex_queue(self) -> None:
+    def process_awex_queue(self, extra_ready: bool = True) -> None:
         """Called from scheduler main loop. Processes pending weight updates.
 
         This is a TP-collective operation: ALL TP ranks must call it together
         (since it's called between recv_requests() calls which use broadcast_pyobj).
 
-        Uses all_reduce(MIN) to check if all TP ranks have a pending update.
-        Only proceeds when ALL ranks have queued an update, preventing the deadlock
-        where one rank blocks in CUDA ops while others wait in broadcast_pyobj.
+        Uses all_reduce(MIN) to check if all TP ranks are ready to process a
+        pending update. ``extra_ready`` lets callers fold per-rank conditions
+        (e.g. idle state) into the collective decision instead of returning
+        early, which would desynchronize the ranks. Only proceeds when ALL
+        ranks are ready, preventing the deadlock where one rank blocks in CUDA
+        ops while others wait in broadcast_pyobj.
 
-        We act as the awex *driver* layer (the community SGLang scheduler has no
-        ``execute_task_in_model_worker`` driver). The collect-IPC + StreamBatch
-        transport + writer handshake is delegated to the awex-native worker reader
-        (``AwexColocateReader.update_weights`` -> ``NCCLWorkerWeightsReader``). We
-        only own the driver-equivalent steps around it:
+        We act as the awex *driver* layer for the queued colocate update. The
+        collect-IPC + StreamBatch transport + writer handshake is delegated to the
+        awex-native worker reader (``AwexColocateReader.update_weights`` ->
+        ``NCCLWorkerWeightsReader``). We only own the driver-equivalent steps
+        around it:
           1. Wait for all_training_offloaded_weights (= driver _pre_update_weights)
           2. resume_memory_occupation(weights) — re-allocate infer weight buffers
           3. reader.update_weights(version) — awex worker reader does the rest:
@@ -184,9 +596,9 @@ class AwexSchedulerPlugin:
         import torch.distributed
 
         tp_cpu_group = self._scheduler.tp_cpu_group
-        tp_size = self._scheduler.tp_size
+        tp_size = _scheduler_int_attr(self._scheduler, "tp_size", 1)
 
-        has_item = 1 if not self._weight_queue.empty() else 0
+        has_item = 1 if (extra_ready and not self._weight_queue.empty()) else 0
 
         if tp_size > 1:
             has_item_tensor = torch.tensor([has_item], dtype=torch.int32)
@@ -227,7 +639,10 @@ class AwexSchedulerPlugin:
 
         # Step 2: Resume weight memory (memory_saver re-allocates buffers).
         resume_req = ResumeMemoryOccupationReqInput(tags=["weights"])
-        self._scheduler.resume_memory_occupation(resume_req)
+        resume_memory_occupation = _scheduler_callable(
+            self._scheduler, "resume_memory_occupation"
+        )
+        resume_memory_occupation(resume_req)
         logger.info(
             f"[AWEX] main loop: resumed weight memory for v{version} (gpu_id={gpu_id})",
         )
@@ -264,40 +679,56 @@ class AwexSchedulerPlugin:
         scheduler = self._scheduler
         plugin = self
 
-        _decode_hooks_available = hasattr(scheduler, "log_decode_stats") and hasattr(
-            scheduler, "log_decode_stats_every_iteration"
+        decode_stats_name = next(
+            (
+                name
+                for name in ("log_decode_stats", "report_decode_stats")
+                if callable(getattr(scheduler, name, None))
+            ),
+            None,
         )
-        if _decode_hooks_available:
-            _orig_log_decode_stats = scheduler.log_decode_stats
-            _orig_log_decode_stats_every_iteration = (
-                scheduler.log_decode_stats_every_iteration
+        _orig_decode_stats = (
+            getattr(scheduler, decode_stats_name) if decode_stats_name else None
+        )
+        every_iteration_name = "log_decode_stats_every_iteration"
+        _orig_decode_stats_every_iteration = getattr(
+            scheduler, every_iteration_name, None
+        )
+        has_decode_stats = callable(_orig_decode_stats)
+        has_decode_iter_stats = callable(_orig_decode_stats_every_iteration)
+
+        def _tracked_decode_stats(*args, **kwargs):
+            scheduler._areal_awex_last_decode_stats_ct = getattr(
+                scheduler, "forward_ct_decode", None
             )
+            return _orig_decode_stats(*args, **kwargs)
 
-            def _tracked_log_decode_stats(*args, **kwargs):
-                scheduler._areal_awex_last_decode_stats_ct = getattr(
-                    scheduler, "forward_ct_decode", None
-                )
-                return _orig_log_decode_stats(*args, **kwargs)
+        def _tracked_decode_stats_every_iteration(*args, **kwargs):
+            scheduler._areal_awex_last_decode_stats_every_iter_ct = getattr(
+                scheduler, "forward_ct_decode", None
+            )
+            return _orig_decode_stats_every_iteration(*args, **kwargs)
 
-            def _tracked_log_decode_stats_every_iteration(*args, **kwargs):
-                scheduler._areal_awex_last_decode_stats_every_iter_ct = getattr(
-                    scheduler, "forward_ct_decode", None
-                )
-                return _orig_log_decode_stats_every_iteration(*args, **kwargs)
-
-            scheduler.log_decode_stats = _tracked_log_decode_stats
-            scheduler.log_decode_stats_every_iteration = (
-                _tracked_log_decode_stats_every_iteration
+        if has_decode_stats:
+            setattr(scheduler, decode_stats_name, _tracked_decode_stats)
+        else:
+            logger.info(
+                "[AWEX] Scheduler has no decode stats method; "
+                "skipping decode metrics restore hook",
+            )
+        if has_decode_iter_stats:
+            setattr(
+                scheduler,
+                every_iteration_name,
+                _tracked_decode_stats_every_iteration,
             )
         else:
-            logger.warning(
-                "[AWEX] sglang scheduler has no log_decode_stats hooks "
-                "(removed in sglang>=0.5.10); skipping decode-stats tracking"
+            logger.info(
+                "[AWEX] Scheduler has no log_decode_stats_every_iteration; "
+                "skipping per-iteration decode metrics restore hook",
             )
 
         def _maybe_restore_decode_metrics(stage, batch, result):
-            if not _decode_hooks_available:
-                return
             if os.environ.get("AREAL_AWEX_FORCE_SGLANG_METRICS", "1") != "1":
                 return
             if stage != "after_process_batch_result" or batch is None:
@@ -318,26 +749,102 @@ class AwexSchedulerPlugin:
             should_log_decode = current_ct is not None and current_ct % interval == 0
 
             if (
-                should_log_decode
+                has_decode_stats
+                and callable(getattr(scheduler, decode_stats_name, None))
+                and should_log_decode
                 and getattr(scheduler, "_areal_awex_last_decode_stats_ct", None)
                 != current_ct
             ):
                 can_run_cuda_graph = getattr(result, "can_run_cuda_graph", False)
                 logger.debug(
-                    f"[AWEX-METRICS] restoring native log_decode_stats "
+                    f"[AWEX-METRICS] restoring native {decode_stats_name} "
                     f"gpu_id={getattr(scheduler, 'gpu_id', '?')} "
                     f"forward_ct_decode={current_ct}",
                 )
-                scheduler.log_decode_stats(can_run_cuda_graph, running_batch=batch)
+                decode_stats_kwargs = {"running_batch": batch}
+                if decode_stats_name == "report_decode_stats":
+                    decode_stats_kwargs["num_accepted_tokens"] = getattr(
+                        result, "num_accepted_tokens", 0
+                    )
+                getattr(scheduler, decode_stats_name)(
+                    can_run_cuda_graph, **decode_stats_kwargs
+                )
 
             if (
-                getattr(scheduler, "_areal_awex_last_decode_stats_every_iter_ct", None)
+                has_decode_iter_stats
+                and callable(
+                    getattr(scheduler, "log_decode_stats_every_iteration", None)
+                )
+                and getattr(
+                    scheduler, "_areal_awex_last_decode_stats_every_iter_ct", None
+                )
                 != current_ct
             ):
-                scheduler.log_decode_stats_every_iteration(
+                getattr(scheduler, every_iteration_name)(
                     batch,
                     num_accepted_tokens=getattr(result, "num_accepted_tokens", 0),
                 )
+
+        def _recv_requests():
+            if hasattr(scheduler, "recv_requests"):
+                return scheduler.recv_requests()
+            return scheduler.request_receiver.recv_requests()
+
+        def _on_idle():
+            if hasattr(scheduler, "self_check_during_idle"):
+                scheduler.self_check_during_idle()
+            else:
+                scheduler.on_idle()
+
+        def _is_idle_for_awex_update() -> bool:
+            is_fully_idle = getattr(scheduler, "is_fully_idle", None)
+            if callable(is_fully_idle):
+                try:
+                    return bool(is_fully_idle())
+                except TypeError:
+                    return bool(is_fully_idle(for_health_check=False))
+
+            for attr in ("cur_batch", "last_batch"):
+                if getattr(scheduler, attr, None) is not None:
+                    return False
+
+            result_queue = getattr(scheduler, "result_queue", None)
+            if result_queue is not None and len(result_queue) > 0:
+                return False
+
+            running_batch = getattr(scheduler, "running_batch", None)
+            if running_batch is not None:
+                is_empty = getattr(running_batch, "is_empty", None)
+                if callable(is_empty) and not is_empty():
+                    return False
+
+            return True
+
+        def _maybe_process_awex_queue_when_idle(loop_count: int) -> None:
+            if not plugin._process_queue_when_idle:
+                return
+            # DEADLOCK WARNING: everything gating the all_reduce inside
+            # process_awex_queue() MUST be deterministic and identical across
+            # TP ranks. Loop iterations are lockstep (every iteration goes
+            # through the recv_requests broadcast), so a loop-count throttle
+            # is safe. A wall-clock throttle (time.monotonic) is NOT: ranks
+            # hit the window at different times, some skip the all_reduce
+            # while others enter it, and the next recv_requests broadcast
+            # cross-deadlocks against the pending all_reduce (observed as
+            # TP0 stuck in broadcast_pyobj vs TP1-7 stuck in all_reduce).
+            if loop_count % plugin._idle_poll_loops != 0:
+                return
+
+            tp_size = _scheduler_int_attr(scheduler, "tp_size", 1)
+            is_idle = _is_idle_for_awex_update()
+            if tp_size == 1:
+                if is_idle and not plugin._weight_queue.empty():
+                    plugin.process_awex_queue()
+                return
+
+            # Rank-local idle state is folded into the collective vote instead
+            # of gating it, so all ranks always enter the all_reduce together.
+            plugin.process_awex_queue(extra_ready=is_idle)
 
         # Patch event_loop_overlap (the one actually used by SGLang)
         _orig_overlap = scheduler.event_loop_overlap
@@ -362,7 +869,7 @@ class AwexSchedulerPlugin:
             )
 
             while True:
-                recv_reqs = scheduler.recv_requests()
+                recv_reqs = _recv_requests()
                 if recv_reqs:
                     req_types = [type(r).__name__ for r in recv_reqs]
                     has_control = any(
@@ -373,7 +880,7 @@ class AwexSchedulerPlugin:
                         )
                         for t in req_types
                     )
-                    if has_control or _loop_count % 500 == 0:
+                    if has_control:
                         logger.info(
                             f"[AWEX] loop gpu_id={getattr(scheduler, 'gpu_id', '?')}: "
                             f"recv {len(recv_reqs)} reqs, types={req_types[:5]}, "
@@ -419,7 +926,9 @@ class AwexSchedulerPlugin:
                     if not disable_overlap_for_batch:
                         pop_and_process()
                 elif batch is None:
-                    scheduler.self_check_during_idle()
+                    _on_idle()
+
+                _maybe_process_awex_queue_when_idle(_loop_count)
 
                 if scheduler.is_generation:
                     scheduler.launch_batch_sample_if_needed(batch_result)
@@ -435,13 +944,15 @@ class AwexSchedulerPlugin:
             logger.info(
                 f"[AWEX] _patched_normal STARTING (gpu_id={getattr(scheduler, 'gpu_id', '?')})",
             )
+            _loop_count = 0
             while True:
-                recv_reqs = scheduler.recv_requests()
+                recv_reqs = _recv_requests()
                 scheduler.process_input_requests(recv_reqs)
                 if scheduler._engine_paused:
                     plugin.process_awex_queue()
                     time.sleep(plugin._paused_poll_interval_s)
                     continue
+                _loop_count += 1
                 batch = scheduler.get_next_batch_to_run()
                 scheduler.cur_batch = batch
                 if batch:
@@ -451,7 +962,8 @@ class AwexSchedulerPlugin:
                         "after_process_batch_result", batch, result
                     )
                 else:
-                    scheduler.self_check_during_idle()
+                    _on_idle()
+                _maybe_process_awex_queue_when_idle(_loop_count)
                 scheduler.last_batch = batch
 
         scheduler.event_loop_normal = _patched_normal
@@ -468,10 +980,12 @@ class AwexSchedulerPlugin:
             daemon=True,
         )
         self._bg_thread.start()
-        gpu_id = int(getattr(self._scheduler, "gpu_id", -1))
+        gpu_id = _logical_gpu_id(self._scheduler)
+        physical_gpu_id = _physical_gpu_id(self._scheduler)
         logger.info(
             f"[AWEX] Started background worker thread "
-            f"(gpu_id={gpu_id}, meta_server={meta_server_addr})",
+            f"(gpu_id={gpu_id}, physical_gpu_id={physical_gpu_id}, "
+            f"meta_server={meta_server_addr})",
         )
 
     def _background_worker(self, meta_server_addr: str) -> None:
@@ -486,9 +1000,13 @@ class AwexSchedulerPlugin:
         """
         import torch
 
-        gpu_id = int(getattr(self._scheduler, "gpu_id", 0))
+        gpu_id = _logical_gpu_id(self._scheduler)
+        physical_gpu_id = _physical_gpu_id(self._scheduler)
         torch.cuda.set_device(gpu_id)
-        logger.info(f"[AWEX] background worker: set CUDA device to {gpu_id}")
+        logger.info(
+            f"[AWEX] background worker: set CUDA device to {gpu_id} "
+            f"(physical_gpu_id={physical_gpu_id})",
+        )
 
         try:
             self._init_receiver_from_meta_server(meta_server_addr)
@@ -506,21 +1024,36 @@ class AwexSchedulerPlugin:
 
         _host, _port = meta_server_addr.rsplit(":", 1)
         _ver_client = _MSC(_host, int(_port))
-        from areal.engine.awex.colocate_writer import (
-            awex_colocate_timeout_s,
-            resolve_physical_gpu_id,
+        _ver_key = _writer_version_key(_get_ip(), physical_gpu_id)
+        writer_version_poll_timeout_s = max(
+            0.1,
+            _float_env("AWEX_WRITER_VERSION_POLL_TIMEOUT_S", 5.0),
         )
-
-        # Shares a key namespace with the training writer, so it needs the
-        # physical GPU id rather than the mask-relative index.
-        _ver_key = f"awex_writer_version_{_get_ip()}_{resolve_physical_gpu_id(gpu_id)}"
-
-        version = int(
-            _ver_client.get_object(
+        writer_version_log_interval_s = max(
+            writer_version_poll_timeout_s,
+            _float_env("AWEX_WRITER_VERSION_LOG_INTERVAL_S", 60.0),
+        )
+        last_writer_wait_log_s = 0.0
+        version = None
+        while version is None:
+            version = _try_get_writer_version(
+                _ver_client,
                 _ver_key,
-                timeout=awex_colocate_timeout_s(),
+                timeout_s=writer_version_poll_timeout_s,
             )
-        )
+            if version is not None:
+                break
+
+            now = time.monotonic()
+            if now - last_writer_wait_log_s >= writer_version_log_interval_s:
+                logger.info(
+                    "[AWEX] background worker: waiting for first writer version "
+                    "key %s; initial RL rollout can run before actor.update_weights",
+                    _ver_key,
+                )
+                last_writer_wait_log_s = now
+            time.sleep(min(1.0, writer_version_poll_timeout_s))
+
         logger.info(
             f"[AWEX] background worker: writer stream starts at v{version}",
         )
@@ -602,22 +1135,23 @@ class AwexSchedulerPlugin:
 
         receiver = self._require_receiver()
 
-        # `gpu_id` is node-local. Multi-node colocate needs a globally unique
-        # transfer rank that stays physically paired with the training process.
-        gpu_id = int(getattr(self._scheduler, "gpu_id", 0))
+        # `physical_gpu_id` is node-local. Multi-node colocate needs a globally
+        # unique transfer rank that stays physically paired with the training
+        # process. SGLang may run with logical gpu_id=0 under CUDA_VISIBLE_DEVICES
+        # isolation, so do not use scheduler.gpu_id for AWEX keys.
+        gpu_id = _logical_gpu_id(self._scheduler)
+        physical_gpu_id = _physical_gpu_id(self._scheduler)
         node_id = int(os.environ.get("SLURM_NODEID", "0"))
         nnodes = int(os.environ.get("SLURM_NNODES", "1"))
 
         logger.info(
             f"[AWEX] background worker: waiting for awex_train_info "
-            f"(gpu_id={gpu_id}, node_id={node_id}, nnodes={nnodes})",
+            f"(gpu_id={gpu_id}, physical_gpu_id={physical_gpu_id}, "
+            f"node_id={node_id}, nnodes={nnodes})",
         )
         # The driver publishes awex_train_info only after rollout init finishes,
         # so large models need the same timeout budget as the weight path.
-        from areal.engine.awex.colocate_writer import (
-            awex_colocate_timeout_s,
-            resolve_physical_gpu_id,
-        )
+        from areal.engine.awex.colocate_writer import awex_colocate_timeout_s
 
         train_info = client.get_object(
             "awex_train_info",
@@ -632,23 +1166,31 @@ class AwexSchedulerPlugin:
         infer_world_size = train_world_size
 
         n_gpus_per_node = max(1, infer_world_size // nnodes)
-        transfer_rank = node_id * n_gpus_per_node + gpu_id
+        transfer_rank = _resolve_transfer_rank(
+            infer_world_size=infer_world_size,
+            gpu_id=physical_gpu_id,
+            node_id=node_id,
+            nnodes=nnodes,
+            instance_world_size=_scheduler_instance_world_size(self._scheduler),
+        )
+        physical_gpu_id = _resolve_physical_gpu_id(
+            transfer_rank=transfer_rank,
+            infer_world_size=infer_world_size,
+            nnodes=nnodes,
+        )
 
         logger.info(
             f"[AWEX] background worker: got train_world_size={train_world_size}, "
             f"infer_world_size={infer_world_size}, n_gpus_per_node={n_gpus_per_node}, "
-            f"transfer_rank={transfer_rank}",
+            f"transfer_rank={transfer_rank}, physical_gpu_id={physical_gpu_id}",
         )
 
-        # transfer_rank stays a relative index so it lines up with the infer
-        # NCCL world, but the CUDA IPC keys are shared with the training writer
-        # and must therefore use physical GPU ids.
         receiver.initialize(
             meta_server_addr=meta_server_addr,
             transfer_rank=transfer_rank,
             infer_world_size=infer_world_size,
             train_world_size=train_world_size,
-            local_gpu_id=resolve_physical_gpu_id(gpu_id),
+            local_gpu_id=physical_gpu_id,
         )
         logger.info(
             f"[AWEX] background worker: receiver initialized "
@@ -672,15 +1214,37 @@ def register_awex_plugin() -> None:
     start method, which doesn't inherit parent-process monkey-patches.
     """
     assert_supported_sglang_version()
-
     from sglang.srt.managers.scheduler import Scheduler
 
     _orig_init = Scheduler.__init__
 
     def _patched_init(self, *args, **kwargs):
-        _orig_init(self, *args, **kwargs)
-        AwexSchedulerPlugin(self).bind()
-        _patch_execute_task_in_model_worker(self)
+        logger.info(
+            "[AWEX] Scheduler.__init__ entering "
+            "(pid=%s, CUDA_VISIBLE_DEVICES=%s, AWEX_META_SERVER_ADDR=%s)",
+            os.getpid(),
+            os.environ.get("CUDA_VISIBLE_DEVICES", ""),
+            os.environ.get("AWEX_META_SERVER_ADDR", ""),
+        )
+        try:
+            _orig_init(self, *args, **kwargs)
+        except BaseException:
+            logger.exception("[AWEX] Scheduler.__init__ original init failed")
+            raise
+        logger.info(
+            "[AWEX] Scheduler.__init__ original init complete "
+            "(gpu_id=%s, tp_rank=%s, tp_size=%s)",
+            getattr(self, "gpu_id", "?"),
+            getattr(self, "tp_rank", "?"),
+            _scheduler_int_attr(self, "tp_size", 1),
+        )
+        try:
+            AwexSchedulerPlugin(self).bind()
+            _patch_execute_task_in_model_worker(self)
+        except BaseException:
+            logger.exception("[AWEX] Scheduler.__init__ AWEX bind failed")
+            raise
+        logger.info("[AWEX] Scheduler.__init__ AWEX bind complete")
 
     Scheduler.__init__ = _patched_init
     logger.info("[AWEX] Patched Scheduler.__init__ with awex plugin")
@@ -689,10 +1253,19 @@ def register_awex_plugin() -> None:
 def _patch_execute_task_in_model_worker(scheduler) -> None:
     """Add execute_task_in_model_worker to Scheduler (backport from PR #13595)."""
 
-    def execute_task_in_model_worker(task_spec: ModelWorkerTask):
+    if callable(getattr(scheduler, "execute_task_in_model_worker", None)):
+        logger.info(
+            "[AWEX] Scheduler already has native execute_task_in_model_worker; "
+            "skipping legacy backport",
+        )
+        return
+
+    task_cls = _get_model_worker_task_cls()
+
+    def execute_task_in_model_worker(task_spec):
         model_context = dict(
-            tp_rank=scheduler.tp_rank,
-            tp_size=scheduler.tp_size,
+            tp_rank=_scheduler_int_attr(scheduler, "tp_rank", 0),
+            tp_size=_scheduler_int_attr(scheduler, "tp_size", 1),
             server_args=scheduler.server_args,
             scheduler=scheduler,
         )
@@ -705,45 +1278,83 @@ def _patch_execute_task_in_model_worker(scheduler) -> None:
     scheduler.execute_task_in_model_worker = execute_task_in_model_worker
 
     if hasattr(scheduler, "_request_dispatcher"):
-        scheduler._request_dispatcher._mapping[ModelWorkerTask] = (
-            execute_task_in_model_worker
-        )
+        scheduler._request_dispatcher._mapping[task_cls] = execute_task_in_model_worker
         logger.info("[AWEX] Registered execute_task_in_model_worker in dispatcher")
+
+
+def _get_model_worker_task_cls():
+    try:
+        from sglang.srt.managers.io_struct import ModelWorkerTask as SGLangTask
+
+        return SGLangTask
+    except (ImportError, AttributeError):
+        return ModelWorkerTask
 
 
 def awex_run_scheduler_process(*args, **kwargs):
     """Scheduler process entry point that registers awex plugin.
 
     Memory management (pause/resume weights, KV cache, CUDA graphs) is handled
-    at runtime by AWEX's release_memory/resume_memory, matching the AWEX
-    reference integration.
+    at runtime by AWEX's release_memory/resume_memory, matching HybridEngine.
     No init-time memory patching needed.
     """
     import os
 
     meta_addr = os.environ.get("AWEX_META_SERVER_ADDR")
+    logger.info(
+        "[AWEX] awex_run_scheduler_process starting "
+        "(pid=%s, meta_server=%s, CUDA_VISIBLE_DEVICES=%s)",
+        os.getpid(),
+        meta_addr or "",
+        os.environ.get("CUDA_VISIBLE_DEVICES", ""),
+    )
     if meta_addr:
         register_awex_plugin()
+        _patch_release_memory_for_retract_pause()
+        _patch_flush_cache_for_retract_pause()
     else:
         logger.info(
             "[AWEX] No AWEX_META_SERVER_ADDR, skipping plugin registration",
         )
     from sglang.srt.managers.scheduler import run_scheduler_process
 
-    return run_scheduler_process(*args, **kwargs)
+    try:
+        return run_scheduler_process(*args, **kwargs)
+    except BaseException:
+        logger.exception("[AWEX] run_scheduler_process failed")
+        raise
 
 
 if __name__ == "__main__":
     import os
     import sys
 
-    logger.info("[AWEX] awex_sglang_plugin __main__ starting")
+    logger.info(
+        "[AWEX] awex_sglang_plugin __main__ starting "
+        "(pid=%s, CUDA_VISIBLE_DEVICES=%s, AWEX_META_SERVER_ADDR=%s)",
+        os.getpid(),
+        os.environ.get("CUDA_VISIBLE_DEVICES", ""),
+        os.environ.get("AWEX_META_SERVER_ADDR", ""),
+    )
 
     from sglang.srt.entrypoints.http_server import launch_server
     from sglang.srt.server_args import prepare_server_args
     from sglang.srt.utils import kill_process_tree
 
+    _load_sglang_plugins_if_available()
     server_args = prepare_server_args(sys.argv[1:])
+    # In AWEX colocated mode the scheduler may not be able to serve requests
+    # until the first weight sync (actor holds GPUs / writer version not yet
+    # published). SGLang's warmup request would then hang for 600s
+    # (_execute_server_warmup default timeout) and kill_process_tree() the
+    # whole server. Skip the warmup: _wait_and_warmup marks the server Up
+    # directly when skip_server_warmup is set.
+    if not server_args.skip_server_warmup:
+        logger.info(
+            "[AWEX] forcing skip_server_warmup=True to avoid warmup-timeout "
+            "suicide before the first weight sync"
+        )
+        server_args.skip_server_warmup = True
     try:
         launch_server(
             server_args,

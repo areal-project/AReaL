@@ -58,6 +58,10 @@ class AwexTrainingAdapter(Protocol):
         """Destroy NCCL group and clear cached state."""
         ...
 
+    def preflight_colocate_weight_update(self) -> None:
+        """Validate colocated weight update support without mutating state."""
+        ...
+
     def init_colocate_weight_update(
         self,
         pair_name: str,

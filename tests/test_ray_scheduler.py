@@ -275,6 +275,40 @@ def test_launcher_worker_spec_rejects_custom_port_argument(cmd):
         )
 
 
+def test_launcher_stop_failure_retains_process_for_retry(monkeypatch):
+    """A failed Popen termination remains owned until a later stop succeeds."""
+    launcher_cls = (
+        ray_scheduler.RayWorkerProcessLauncher.__ray_metadata__.modified_class
+    )
+    launcher = object.__new__(launcher_cls)
+    launcher.backend_process_manager = None
+
+    class FakeProcess:
+        pid = 1234
+        returncode = None
+
+        def poll(self):
+            return self.returncode
+
+    process = FakeProcess()
+    launcher.worker_processes = {"actor/0": process}
+
+    def fail_kill(*args, **kwargs):
+        raise RuntimeError("kill failed")
+
+    monkeypatch.setattr(ray_scheduler, "kill_process_tree", fail_kill)
+    with pytest.raises(RuntimeError, match="kill failed"):
+        launcher.stop_all_processes()
+    assert launcher.worker_processes == {"actor/0": process}
+
+    def successful_kill(*args, **kwargs):
+        process.returncode = -15
+
+    monkeypatch.setattr(ray_scheduler, "kill_process_tree", successful_kill)
+    launcher.stop_all_processes()
+    assert launcher.worker_processes == {}
+
+
 def test_launcher_actor_starts_and_stops_worker_processes(tmp_path, local_ray_cluster):
     """Test RayWorkerProcessLauncher as a real Ray actor."""
     launcher = ray_scheduler.RayWorkerProcessLauncher.options(

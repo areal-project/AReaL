@@ -52,7 +52,7 @@ class RTensorBackend(Protocol):
         """
         ...
 
-    async def delete(self, node_addr: str, shard_ids: list[Any]) -> None:
+    async def delete(self, node_addr: str, shard_ids: list[Any]) -> int:
         """Delete shards from storage.
 
         Parameters
@@ -265,8 +265,13 @@ class HttpRTensorBackend:
             async with session.delete(
                 f"http://{base}/data/clear", json={"shard_ids": shard_ids}
             ) as resp:
-                if resp.status == 200:
-                    await resp.json()
+                payload = await resp.json()
+                if resp.status != 200 or payload.get("status") != "ok":
+                    raise RuntimeError(
+                        f"Failed to clear RTensor shards on {base}: "
+                        f"status={resp.status}, response={payload}"
+                    )
+                return int(payload.get("cleared_count", 0))
 
 
 _backend: RTensorBackend | None = None
@@ -327,6 +332,16 @@ def fetch_buffer_stats() -> dict[str, int]:
     """Return observability stats for the local client-side fetch buffer."""
     with _fetch_buffer_lock:
         return {"num_entries": len(_fetch_buffer)}
+
+
+def fetch_buffer_matching_stats(shard_ids: Iterable[Any]) -> dict[str, int]:
+    """Return total and requested-shard counts for strict drain verification."""
+    requested = set(shard_ids)
+    with _fetch_buffer_lock:
+        return {
+            "num_entries": len(_fetch_buffer),
+            "matching_entries": sum(sid in _fetch_buffer for sid in requested),
+        }
 
 
 def flatten_shard_ids(obj: Any) -> list[Any]:
@@ -528,7 +543,7 @@ class RTensor:
         return shards_by_node
 
     @staticmethod
-    async def clear_node(node_addr: str, shard_ids: list[Any]) -> None:
+    async def clear_node(node_addr: str, shard_ids: list[Any]) -> int:
         """Clear shards from a node and evict them from the fetch buffer.
 
         Parameters
@@ -541,7 +556,7 @@ class RTensor:
         with _fetch_buffer_lock:
             for sid in shard_ids:
                 _fetch_buffer.pop(sid, None)
-        await get_backend().delete(node_addr, shard_ids)
+        return await get_backend().delete(node_addr, shard_ids)
 
     @property
     def shape(self) -> torch.Size:

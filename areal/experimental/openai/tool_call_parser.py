@@ -46,6 +46,94 @@ _SGLANG_TO_VLLM_TOOL_PARSER: dict[str, str] = {
 }
 
 
+_sglang_missing_warned: set[str] = set()
+
+
+def _warn_sglang_missing(feature: str, detail: str) -> None:
+    if feature not in _sglang_missing_warned:
+        _sglang_missing_warned.add(feature)
+        logger.warning("sglang is not installed; %s. %s", feature, detail)
+
+
+def _split_reasoning_fallback(
+    text: str, force_reasoning: bool | None
+) -> tuple[str, str]:
+    """sglang-free reasoning split with generic <think>/</think> semantics.
+
+    Model-specific detector behaviors (e.g. Ling3 terminating reasoning at
+    <tool_call> without </think>) are unavailable without sglang, so this
+    degrades to the plain tag protocol; byte-exact parity with the sglang
+    detectors is not guaranteed.
+    """
+    _warn_sglang_missing(
+        "reasoning split degrades to generic <think> tags",
+        "Install sglang for model-specific reasoning detectors.",
+    )
+    start_token, end_token = "<think>", "</think>"
+    if force_reasoning:
+        if end_token in text:
+            reasoning_text, normal_text = text.split(end_token, 1)
+            return reasoning_text, normal_text
+        # No terminator at all: mirror the Ling3/GLM detectors'
+        # force_nonempty_content fallback — reasoning-only output is moved
+        # into normal content for client experience.
+        return "", text
+    lead = len(text) - len(text.lstrip("\n"))
+    if text[lead:].startswith(start_token):
+        body = text[lead + len(start_token) :]
+        if end_token in body:
+            reasoning_text, normal_text = body.split(end_token, 1)
+            return reasoning_text, normal_text
+        return body, ""
+    return "", text
+
+
+def split_reasoning(
+    text: str,
+    reasoning_parser: str | None,
+    force_reasoning: bool | None = None,
+) -> tuple[str, str]:
+    """Split raw model output into (reasoning_text, normal_text).
+
+    Uses SGLang's ``ReasoningParser`` so model-specific behaviors are handled
+    (e.g. Ling3 terminating reasoning at ``<tool_call>`` without ``</think>``).
+    ``force_reasoning=True`` must be passed when the chat template pre-filled
+    the ``<think>`` opening tag in the prompt (thinking "on"): the generated
+    text then contains no opening tag and the parser must treat it as
+    reasoning from position zero.
+
+    Neither side is whitespace-stripped: in concat chat-template mode the
+    stored ``reasoning_content``/``content`` are re-rendered through the chat
+    template for prefix alignment against the raw generated tokens, so the
+    split must preserve the emitted text byte-for-byte.
+    """
+    if not reasoning_parser or not text:
+        return "", text
+
+    try:
+        from sglang.srt.parser.reasoning_parser import ReasoningParser
+    except ImportError:
+        return _split_reasoning_fallback(text, force_reasoning)
+
+    parser = ReasoningParser(
+        model_type=reasoning_parser,
+        stream_reasoning=False,
+        force_reasoning=force_reasoning,
+    )
+    # SGLang detectors only strip the opening tag when the text starts with
+    # it exactly. In adaptive ("auto") mode the model emits its own opening
+    # tag preceded by a newline (Bailing v3 renders assistant turns as
+    # "\n<think>..."), which would leave the tag embedded in reasoning_text.
+    # Drop canonical leading newlines before the opening tag; the chat
+    # template re-adds them via its literal "\n<think>" when re-rendering.
+    start_token = getattr(parser.detector, "think_start_token", "<think>")
+    lead = len(text) - len(text.lstrip("\n"))
+    if lead and text[lead:].startswith(start_token):
+        text = text[lead:]
+    reasoning_text, normal_text = parser.parse_non_stream(text)
+    return reasoning_text or "", normal_text or ""
+
+
 def _detect_think_and_return_ori_think(
     text: str, think_start_token: str, think_end_token: str
 ) -> tuple[str, str]:
@@ -258,7 +346,7 @@ def _process_tool_calls_sglang(
     text: str,
     tools: list[Any],
     tool_call_parser: str,
-    reasoning_parser: str,
+    reasoning_parser: str | None,
     finish_reason: str,
     use_responses: bool = False,
 ) -> tuple[
@@ -266,10 +354,19 @@ def _process_tool_calls_sglang(
     str,
     str,
 ]:
-    from sglang.srt.entrypoints.openai.protocol import Function as SglFunction
-    from sglang.srt.entrypoints.openai.protocol import Tool as SglTool
-    from sglang.srt.function_call.function_call_parser import FunctionCallParser
-    from sglang.srt.parser.reasoning_parser import ReasoningParser
+    try:
+        from sglang.srt.entrypoints.openai.protocol import Function as SglFunction
+        from sglang.srt.entrypoints.openai.protocol import Tool as SglTool
+        from sglang.srt.function_call.function_call_parser import (
+            FunctionCallParser,
+        )
+        from sglang.srt.parser.reasoning_parser import ReasoningParser
+    except ImportError:
+        _warn_sglang_missing(
+            "tool-call parsing is disabled",
+            "Responses pass through with raw text; install sglang to parse tool calls.",
+        )
+        return None, text, finish_reason
 
     if use_responses:
         tools = [
@@ -289,14 +386,37 @@ def _process_tool_calls_sglang(
             for tool in tools
         ]
 
-    parser_p = FunctionCallParser(tools, tool_call_parser)
-    reasoning_parser_p = ReasoningParser(reasoning_parser)
+    try:
+        parser_p = FunctionCallParser(tools, tool_call_parser)
+    except (KeyError, ValueError) as e:
+        raise ValueError(
+            "Invalid rollout.openai.tool_call_parser="
+            f"{tool_call_parser!r} for the SGLang backend: {e}. Use a parser "
+            "supported by SGLang (for Qwen3-Coder use 'qwen3_coder')."
+        ) from e
 
-    reasoning_text, content_text = _detect_think_and_return_ori_think(
-        text,
-        reasoning_parser_p.detector.think_start_token,
-        reasoning_parser_p.detector.think_end_token,
-    )
+    # An empty reasoning parser is a supported way to disable reasoning
+    # extraction. Tool-call parsing is independent of reasoning parsing and
+    # must still work on the complete model output in that mode.
+    if reasoning_parser:
+        try:
+            reasoning_parser_p = ReasoningParser(reasoning_parser)
+        except (KeyError, ValueError) as e:
+            raise ValueError(
+                "Invalid rollout.openai.reasoning_parser="
+                f"{reasoning_parser!r} while using tool_call_parser="
+                f"{tool_call_parser!r}: {e}. Use a supported SGLang model type "
+                "such as 'qwen3', or leave reasoning_parser empty to disable "
+                "reasoning extraction."
+            ) from e
+
+        reasoning_text, content_text = _detect_think_and_return_ori_think(
+            text,
+            reasoning_parser_p.detector.think_start_token,
+            reasoning_parser_p.detector.think_end_token,
+        )
+    else:
+        reasoning_text, content_text = "", text
 
     if parser_p.has_tool_call(content_text):
         if finish_reason == "stop":
@@ -341,7 +461,7 @@ def _process_tool_calls_vllm(
     text: str,
     tools: list[Any],
     tool_call_parser: str,
-    reasoning_parser: str,
+    reasoning_parser: str | None,
     finish_reason: str,
     use_responses: bool = False,
     tokenizer: Any = None,
@@ -453,7 +573,7 @@ def process_tool_calls(
     text: str,
     tools: list[Any],
     tool_call_parser: str,
-    reasoning_parser: str,
+    reasoning_parser: str | None,
     finish_reason: str,
     use_responses: bool = False,
     tokenizer: Any = None,

@@ -113,6 +113,18 @@ def create_awex_blueprint(
             return_result=False,
         )
 
+    @bp.route("/preflight_colocate_weight_update", methods=["POST"])
+    def preflight_colocate_weight_update():
+        def action():
+            adapter = _require_adapter()
+            adapter.preflight_colocate_weight_update()
+
+        return run_endpoint(
+            "preflight_colocate_weight_update",
+            lambda: submit_to_engine_thread("preflight_colocate_weight_update", action),
+            return_result=False,
+        )
+
     @bp.route("/init_colocate_weight_update", methods=["POST"])
     def init_colocate_weight_update():
         data = flask_module.request.get_json(force=True)

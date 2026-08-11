@@ -1399,6 +1399,10 @@ class RemoteInfEngine(InferenceEngine):
     @trace_perf("remote_inf_engine.pause_generation", category="misc")
     def pause_generation(self):
         """Pause request submission for async rollout."""
+        # SGLang needs a two-stage pause before colocated memory can be
+        # released: ``abort`` closes admission and waits for in-flight work to
+        # drain, then ``retract`` puts the now-idle scheduler into its paused
+        # state. Other backends keep their existing single-request protocol.
         get_pause_requests = getattr(self.backend, "get_pause_requests", None)
         pause_requests = (
             get_pause_requests()

@@ -242,24 +242,84 @@ class TestTrainControllerDestroy:
         assert len(train_controller.workers_is_dp_head) == 0
         assert "train_worker" in train_controller.scheduler.deleted_roles
 
+    def test_initialize_get_workers_failure_rolls_back_owned_role(
+        self, train_controller, ft_spec, monkeypatch
+    ):
+        """A role is owned immediately after create_workers returns."""
+        monkeypatch.setattr(
+            train_controller.scheduler,
+            "get_workers",
+            lambda role: (_ for _ in ()).throw(RuntimeError("discovery failed")),
+        )
+
+        with pytest.raises(RuntimeError, match="discovery failed"):
+            train_controller.initialize(role="train_worker", ft_spec=ft_spec)
+
+        assert train_controller.scheduler.deleted_roles == ["train_worker"]
+        assert train_controller._owns_worker_role is False
+
+    def test_initialize_rollback_failure_preserves_role_for_destroy_retry(
+        self, train_controller, ft_spec, monkeypatch
+    ):
+        """Failed rollback retains ownership metadata for a later destroy."""
+        scheduler = train_controller.scheduler
+        monkeypatch.setattr(
+            scheduler,
+            "get_workers",
+            lambda role: (_ for _ in ()).throw(RuntimeError("discovery failed")),
+        )
+        original_delete = scheduler.delete_workers
+        monkeypatch.setattr(
+            scheduler,
+            "delete_workers",
+            lambda role, reverse_order=False: (_ for _ in ()).throw(
+                RuntimeError("rollback failed")
+            ),
+        )
+
+        with pytest.raises(ExceptionGroup, match="roll back worker role"):
+            train_controller.initialize(role="train_worker", ft_spec=ft_spec)
+
+        assert train_controller._owns_worker_role is True
+        monkeypatch.setattr(scheduler, "delete_workers", original_delete)
+        train_controller.destroy()
+        assert train_controller._owns_worker_role is False
+
     def test_destroy_handles_errors(self, train_controller, ft_spec):
-        """Test destroy handles errors gracefully."""
+        """Delete failures propagate and retain workers for a cleanup retry."""
         train_controller.initialize(
             role="train_worker",
             ft_spec=ft_spec,
         )
 
         # Make delete_workers raise an exception
-        def raise_error(role):
+        original_delete = train_controller.scheduler.delete_workers
+
+        def raise_error(role, reverse_order=False):  # noqa: ARG001
             raise RuntimeError("Simulated error")
 
         train_controller.scheduler.delete_workers = raise_error
 
-        # Should not raise, just log the error
-        train_controller.destroy()
+        with pytest.raises(ExceptionGroup, match="cleanup failed"):
+            train_controller.destroy()
 
-        # Workers should still be cleared
+        assert len(train_controller.workers) > 0
+        destroy_calls = [
+            call
+            for call in train_controller.scheduler.engine_calls
+            if call[1] == "destroy"
+        ]
+        assert len(destroy_calls) == len(train_controller.workers)
+        train_controller.scheduler.delete_workers = original_delete
+        train_controller.destroy()
         assert len(train_controller.workers) == 0
+        assert len(
+            [
+                call
+                for call in train_controller.scheduler.engine_calls
+                if call[1] == "destroy"
+            ]
+        ) == len(destroy_calls)
 
     def test_destroy_requests_reverse_order(self, train_controller, ft_spec):
         """Workers must be torn down in reverse rank order.

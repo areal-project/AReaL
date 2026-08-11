@@ -76,6 +76,15 @@ def register_awex_endpoints(app: FastAPI, rpc_proxy: RpcProxy) -> None:
             logger.error("Failed batch_isend_irecv: %s", e)
             return JSONResponse(status_code=500, content={"error": str(e)})
 
+    @app.post("/awex/teardown")
+    async def teardown() -> JSONResponse:
+        try:
+            rpc_proxy.collective_rpc("awex_teardown_weight_update_group")
+            return JSONResponse(content={"status": "ok"})
+        except Exception as e:
+            logger.error("Failed to teardown weight update state: %s", e)
+            return JSONResponse(status_code=500, content={"error": str(e)})
+
     @app.post("/awex/debug/get_parameters")
     async def get_parameters(request: Request) -> JSONResponse:
         try:

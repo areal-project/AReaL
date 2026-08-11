@@ -100,6 +100,7 @@ class RolloutController:
         self._version = 0
 
         self._task_id_generator = TaskIdGenerator()
+        self._mopd_route_identifier: str | None = None
 
         # Use provided staleness manager or create a default one
         # The manager will be properly initialized in initialize()
@@ -159,6 +160,51 @@ class RolloutController:
         """
         return f"{self._worker_role}/{rank}"
 
+    def set_mopd_route_identifier(self, identifier: str) -> None:
+        """Configure source-field routing for single-controller MOPD."""
+        if not isinstance(identifier, str) or not identifier.strip():
+            raise ValueError("MOPD route identifier must be a non-empty string")
+        self._mopd_route_identifier = identifier
+
+    def _prepare_mopd_data(self, data: dict[str, Any]) -> dict[str, Any]:
+        """Copy the configured source route into the reserved stable field."""
+        identifier = self._mopd_route_identifier
+        if identifier is None:
+            return data
+        if identifier not in data:
+            raise ValueError(f"MOPD route field {identifier!r} is missing from sample")
+        route = data[identifier]
+        if isinstance(route, bool) or not isinstance(route, (str, int)):
+            raise ValueError(
+                f"MOPD route field {identifier!r} must be a string or integer, "
+                f"got {type(route).__name__}"
+            )
+        route = str(route)
+        existing = data.get("mopd_route")
+        if existing is not None and str(existing) != route:
+            raise ValueError(
+                f"Conflicting mopd_route {existing!r} for source route {route!r}"
+            )
+        prepared = dict(data)
+        prepared["mopd_route"] = route
+        return prepared
+
+    @staticmethod
+    def _propagate_mopd_route(
+        source: dict[str, Any], trajectory: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Attach one source route to every trajectory derived from that source."""
+        route = source.get("mopd_route")
+        if route is None:
+            return trajectory
+        existing = trajectory.get("mopd_route")
+        if existing is not None and str(existing) != route:
+            raise ValueError(
+                f"Workflow changed mopd_route from {route!r} to {existing!r}"
+            )
+        trajectory["mopd_route"] = route
+        return trajectory
+
     def initialize(
         self,
         role: str,
@@ -186,6 +232,12 @@ class RolloutController:
         sch_spec = SchedulingSpec(**asdict(self.config.scheduling_spec[0]))
         sch_spec.cpu *= instance_size
         sch_spec.mem *= instance_size
+        if (
+            self.config.scheduling_strategy.type
+            == SchedulingStrategyType.colocation.value
+        ):
+            # Colocated rollout jobs share the actor's GPU allocation.
+            sch_spec.request_gpu_gres = False
         if sch_spec.gpu > 0:
             sch_spec.gpu = instance_size
 
@@ -320,6 +372,22 @@ class RolloutController:
                     "base_gpu_id": (rank % slots_per_node) * self._gpus_per_server,
                     "_awex_gpus_per_server": self._gpus_per_server,
                 }
+                # A non-forked colocated rollout aliases the actor worker:
+                # [0] is RPC and [1] is the actor rendezvous TCPStore, so
+                # SGLang needs a separately reserved third port. A forked
+                # rollout owns its worker and can use its second port. Always
+                # override the global server argument because replicas on the
+                # same node cannot safely share one explicit NCCL port.
+                port_index = 1 if self.config.scheduling_strategy.fork else 2
+                if len(worker.worker_ports) <= port_index:
+                    required = port_index + 1
+                    raise ValueError(
+                        f"Colocated rollout worker {worker.id!r} needs at least "
+                        f"{required} allocated ports, but has "
+                        f"{len(worker.worker_ports)}. Set SchedulingSpec.port_count="
+                        f"{required} for the colocated target role."
+                    )
+                per_worker_args["nccl_port"] = int(worker.worker_ports[port_index])
                 launch_tasks.append(
                     self.scheduler.async_call_engine(
                         worker_id=worker.id,
@@ -369,33 +437,68 @@ class RolloutController:
         logger.info("All engines are initialized...")
 
     def destroy(self):
-        # Stop background threads and shutdown the async task runner
+        errors: list[str] = []
+
+        # Stop externally reachable/background work before deleting any role.
+        self._stop_proxy_gateway()
         if self._dispatcher is not None:
             self._dispatcher.destroy()
-
         self._stop_callback_server()
 
-        self._collective_rpc("destroy", http_timeout=60.0)
+        # Proxy is a logical leaf of rollout. Destroy its engines and workers
+        # while the rollout alias still resolves to the actual process owner.
+        if self._proxy_started or self.proxy_workers:
+            if self.proxy_workers:
+                try:
+
+                    async def _destroy_proxy_engines():
+                        tasks = [
+                            self.scheduler.async_call_engine(
+                                worker_id=worker.id,
+                                method="destroy",
+                                engine_name=self._proxy_engine_name(rank),
+                            )
+                            for rank, worker in enumerate(self.proxy_workers)
+                        ]
+                        return await asyncio.gather(*tasks, return_exceptions=True)
+
+                    results = run_async_task(_destroy_proxy_engines)
+                    errors.extend(
+                        f"proxy engine {rank}: {result}"
+                        for rank, result in enumerate(results)
+                        if isinstance(result, BaseException)
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    errors.append(f"proxy engine destroy: {exc}")
+            try:
+                self.scheduler.delete_workers(role=self._proxy_role)
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"proxy worker delete: {exc}")
+            else:
+                self.proxy_workers.clear()
+                self.proxy_addrs.clear()
+                self._proxy_started = False
+                logger.info("Proxy workers deleted")
+
+        try:
+            self._collective_rpc("destroy", http_timeout=60.0)
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"rollout engine destroy: {exc}")
 
         # Delete workers via scheduler
         if hasattr(self, "_worker_role"):
             try:
                 self.scheduler.delete_workers(role=self._worker_role)
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"rollout worker delete: {exc}")
+            else:
                 self.workers.clear()
                 logger.info("Workers deleted")
-            except Exception:
-                logger.error(f"Error deleting workers: {traceback.format_exc()}")
 
-        # Delete proxy workers if initialized
-        if self._proxy_started:
-            try:
-                self.scheduler.delete_workers(role=self._proxy_role)
-                self.proxy_workers.clear()
-                self.proxy_addrs.clear()
-                self._proxy_started = False
-                logger.info("Proxy workers deleted")
-            except Exception:
-                logger.error(f"Error deleting proxy workers: {traceback.format_exc()}")
+        with self._futures_lock:
+            self._pending_futures.clear()
+        if errors:
+            raise RuntimeError("RolloutController cleanup failed: " + "; ".join(errors))
 
         # Shutdown proxy gateway if initialized
         self._stop_proxy_gateway()
@@ -419,8 +522,21 @@ class RolloutController:
                 "Call initialize() first."
             )
 
-        run_async_task(self._async_start_proxy)
-        self._proxy_started = True
+        try:
+            run_async_task(self._async_start_proxy)
+        except Exception:
+            try:
+                self.scheduler.delete_workers(role=self._proxy_role)
+            except Exception:  # noqa: BLE001
+                logger.error(
+                    "Failed to rollback partially initialized proxy workers:\n%s",
+                    traceback.format_exc(),
+                )
+            self.proxy_workers.clear()
+            self.proxy_addrs.clear()
+            raise
+        else:
+            self._proxy_started = True
 
     async def _async_start_proxy(self) -> None:
         """Async implementation of proxy worker initialization."""
@@ -905,6 +1021,7 @@ class RolloutController:
 
                 traj = result
                 if traj is not None:
+                    traj = self._propagate_mopd_route(pending_task.data, traj)
                     manager.on_rollout_accepted()
                     if self.config.enable_rollout_tracing:
                         logger.info(
@@ -950,6 +1067,8 @@ class RolloutController:
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
     ) -> int:
+        if not is_eval:
+            data = self._prepare_mopd_data(data)
         workflow_str = self._resolve_workflow_str(workflow)
         should_accept_fn = self._resolve_should_accept_fn(should_accept_fn)
         if workflow_kwargs is None:
@@ -1046,7 +1165,7 @@ class RolloutController:
             for data in cycle_dataloader(dataloader):
                 for item in data:
                     yield _RemoteRolloutTaskInput(
-                        data=item,
+                        data=self._prepare_mopd_data(item),
                         workflow=workflow_str,
                         workflow_kwargs=workflow_kwargs,
                         should_accept_fn=should_accept_fn,

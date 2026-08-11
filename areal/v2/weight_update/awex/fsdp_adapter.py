@@ -126,6 +126,13 @@ class AwexFSDPAdapter(AwexTrainingAdapter):
         cpu_params = {k: v.detach().cpu().clone() for k, v in params.items()}
         torch.save(cpu_params, save_path)
 
+    def preflight_colocate_weight_update(self) -> None:
+        """Fail before gateway state is created for an unsupported backend."""
+        raise RuntimeError(
+            "v2 colocated AWEX does not support FSDPEngine; use Megatron with "
+            "megatron.wrap_with_ddp=true."
+        )
+
     def init_weight_update_group(
         self,
         pair_name: str,

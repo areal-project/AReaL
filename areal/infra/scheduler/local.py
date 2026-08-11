@@ -32,11 +32,27 @@ from areal.infra.scheduler.exceptions import (
     PortAllocationError,
     RPCConnectionError,
     SchedulerError,
+    WorkerCleanupError,
     WorkerConfigurationError,
     WorkerCreationError,
     WorkerFailedError,
     WorkerNotFoundError,
     WorkerTimeoutError,
+)
+from areal.infra.scheduler.fork_utils import (
+    ForkOwnership,
+    ForkRoleState,
+    discard_fork_reservation,
+    discard_provisional_worker,
+    ensure_fork_role_available,
+    ensure_fork_role_queryable,
+    ensure_fork_target_queryable,
+    fork_reservation_indices,
+    mark_fork_role_state,
+    reconcile_fork_response,
+    release_fork_reservation,
+    reserve_fork_ports,
+    retain_fork_reservation,
 )
 from areal.infra.utils.concurrent import run_async_task
 from areal.infra.utils.http import get_default_connector
@@ -175,6 +191,8 @@ class LocalScheduler(Scheduler):
 
         # Colocation tracking: colocated roles reuse workers from target role
         self._colocated_roles: dict[str, str] = {}  # colocated_role -> target_role
+        self._fork_parent_roles: dict[str, str] = {}
+        self._fork_reservations: dict[str, ForkOwnership] = {}
 
         logger.info(
             f"LocalScheduler initialized with GPU devices: {self.gpu_devices}, "
@@ -285,6 +303,8 @@ class LocalScheduler(Scheduler):
         session: aiohttp.ClientSession,
         host: str,
         port: int,
+        expected_role: str | None = None,
+        expected_worker_index: int | None = None,
         timeout: float = 60,
     ) -> bool:
         url = f"http://{format_hostport(host, port)}/health"
@@ -295,7 +315,17 @@ class LocalScheduler(Scheduler):
                     url, timeout=aiohttp.ClientTimeout(total=2)
                 ) as resp:
                     if resp.status == 200:
-                        return True
+                        if expected_role is None and expected_worker_index is None:
+                            return True
+                        try:
+                            health = await resp.json(content_type=None)
+                        except (aiohttp.ClientError, ValueError):
+                            health = {}
+                        if (
+                            health.get("role") == expected_role
+                            and health.get("worker_index") == expected_worker_index
+                        ):
+                            return True
             except (TimeoutError, aiohttp.ClientError):
                 pass
             await asyncio.sleep(0.5)
@@ -319,98 +349,190 @@ class LocalScheduler(Scheduler):
         """
         worker_id = f"{role}/{idx}"
         guard_url = f"http://{format_hostport(target_wi.worker.ip, int(target_wi.worker.worker_ports[0]))}"
+        port_cnt = len(self._workers[target_role][0].worker.worker_ports)
 
         try:
-            # 1. Allocate a port on the target guard
-            async with session.post(
-                f"{guard_url}/alloc_ports",
-                json={"count": 1},
-            ) as alloc_resp:
-                if alloc_resp.status != 200:
-                    error_text = await alloc_resp.text()
-                    raise WorkerCreationError(
-                        role,
-                        f"Port allocation failed for worker {idx}",
-                        f"HTTP {alloc_resp.status}: {error_text}",
-                    )
-                alloc_data = await alloc_resp.json()
-                forked_host = alloc_data["host"]
-                forked_port = alloc_data["ports"][0]
-
-            # 2. Build the full raw command
-            module_path = command or "areal.infra.rpc.rpc_server"
-            raw_cmd = [
-                sys.executable,
-                "-m",
-                module_path,
-                "--host",
-                "0.0.0.0",
-                "--port",
-                str(forked_port),
-                "--experiment-name",
-                str(self.experiment_name),
-                "--trial-name",
-                str(self.trial_name),
-                "--role",
-                role,
-                "--worker-index",
-                str(idx),
-            ]
-            if self.name_resolve_config.type:
-                raw_cmd.extend(["--name-resolve-type", self.name_resolve_config.type])
-            if self.name_resolve_config.nfs_record_root:
-                raw_cmd.extend(
-                    ["--nfs-record-root", self.name_resolve_config.nfs_record_root]
+            if not hasattr(self, "_fork_reservations"):
+                self._fork_reservations = {}
+            max_start_attempts = 3
+            for start_attempt in range(1, max_start_attempts + 1):
+                # Reserve the complete worker port group on its owner Guard.
+                # The Guard keeps this node-wide lease after the temporary
+                # teacher exits, so every later MOPD phase reuses the same
+                # endpoints instead of racing to discover fresh free ports.
+                retain_fork_reservation(
+                    self._fork_reservations,
+                    self._colocated_roles,
+                    self._fork_parent_roles,
+                    role,
+                    target_role,
+                    idx,
                 )
-            if self.name_resolve_config.etcd3_addr:
-                raw_cmd.extend(["--etcd3-addr", self.name_resolve_config.etcd3_addr])
-            if self.fileroot:
-                raw_cmd.extend(["--fileroot", str(self.fileroot)])
+                forked_host, forked_ports = await reserve_fork_ports(
+                    session, guard_url, role, idx, port_cnt
+                )
+                forked_port = forked_ports[0]
 
-            # 3. Fork via raw_cmd
-            payload = {
-                "role": role,
-                "worker_index": idx,
-                "raw_cmd": raw_cmd,
-            }
-            async with session.post(
-                f"{guard_url}/fork",
-                json=payload,
-            ) as response:
-                if response.status != 200:
-                    error_text = await response.text()
-                    raise WorkerCreationError(
-                        role,
-                        f"Fork failed for worker {idx}",
-                        f"HTTP {response.status}: {error_text}",
+                worker_info = WorkerInfo(
+                    worker=Worker(
+                        id=worker_id,
+                        ip=forked_host,
+                        worker_ports=list(map(str, forked_ports)),
+                        engine_ports=[],
+                    ),
+                    process=None,
+                    role=role,
+                    gpu_devices=target_wi.gpu_devices,
+                    created_at=time.time(),
+                    log_file=str(self.log_dir / f"{role}.log"),
+                    env_vars=target_wi.env_vars.copy(),
+                )
+                self._retain_fork_workers(role, target_role, [worker_info])
+
+                # Build the child command with the first reserved port as its
+                # RPC endpoint.  Remaining ports belong to the same worker and
+                # are returned in Worker metadata below.
+                module_path = command or "areal.infra.rpc.rpc_server"
+                raw_cmd = [
+                    sys.executable,
+                    "-m",
+                    module_path,
+                    "--host",
+                    "0.0.0.0",
+                    "--port",
+                    str(forked_port),
+                    "--experiment-name",
+                    str(self.experiment_name),
+                    "--trial-name",
+                    str(self.trial_name),
+                    "--role",
+                    role,
+                    "--worker-index",
+                    str(idx),
+                ]
+                if self.name_resolve_config.type:
+                    raw_cmd.extend(
+                        ["--name-resolve-type", self.name_resolve_config.type]
                     )
-
-                result = await response.json()
-
-                if result.get("status") != "success":
-                    raise WorkerCreationError(
-                        role,
-                        f"Fork failed for worker {idx}",
-                        result.get("error", "Unknown error"),
+                if self.name_resolve_config.nfs_record_root:
+                    raw_cmd.extend(
+                        [
+                            "--nfs-record-root",
+                            self.name_resolve_config.nfs_record_root,
+                        ]
                     )
+                if self.name_resolve_config.etcd3_addr:
+                    raw_cmd.extend(
+                        ["--etcd3-addr", self.name_resolve_config.etcd3_addr]
+                    )
+                if self.fileroot:
+                    raw_cmd.extend(["--fileroot", str(self.fileroot)])
 
-                forked_pid = result.get("pid")
-
-            # 4. Wait for the forked worker to become ready
-            if not await self._wait_for_fork_ready(session, forked_host, forked_port):
-                # Clean up the forked worker on the guard
+                payload = {
+                    "role": role,
+                    "worker_index": idx,
+                    "raw_cmd": raw_cmd,
+                    "allocated_ports": forked_ports,
+                }
                 try:
                     async with session.post(
-                        f"{guard_url}/kill_forked_worker",
-                        json={"role": role, "worker_index": idx},
-                    ):
-                        pass
-                except Exception:
-                    pass
-                raise WorkerCreationError(
+                        f"{guard_url}/fork",
+                        json=payload,
+                    ) as response:
+                        if response.status != 200:
+                            error_text = await response.text()
+                            raise WorkerCreationError(
+                                role,
+                                f"Fork failed for worker {idx}",
+                                f"HTTP {response.status}: {error_text}",
+                            )
+
+                        result = await response.json()
+                        if result.get("status") != "success":
+                            raise WorkerCreationError(
+                                role,
+                                f"Fork failed for worker {idx}",
+                                result.get("error", "Unknown error"),
+                            )
+                        forked_pid = result.get("pid")
+                except Exception as fork_error:  # noqa: BLE001
+                    try:
+                        forked_pid = await reconcile_fork_response(
+                            session,
+                            guard_url,
+                            role,
+                            idx,
+                            forked_ports,
+                        )
+                    except Exception as cleanup_error:  # noqa: BLE001
+                        raise WorkerCleanupError(
+                            role,
+                            [
+                                f"uncertain fork outcome for {worker_id}: "
+                                f"{cleanup_error}"
+                            ],
+                        ) from fork_error
+                    if forked_pid is None:
+                        discard_fork_reservation(self._fork_reservations, role, idx)
+                        discard_provisional_worker(
+                            self._workers,
+                            self._fork_reservations,
+                            self._colocated_roles,
+                            self._fork_parent_roles,
+                            role,
+                            worker_id,
+                        )
+                        if isinstance(fork_error, aiohttp.ClientError):
+                            raise WorkerCreationError(
+                                role,
+                                f"Failed to fork worker {idx} from {target_role}/{idx}",
+                                str(fork_error),
+                            ) from fork_error
+                        raise
+
+                # A plain HTTP 200 can come from an unrelated process that
+                # won a bind race.  Require the exact role/index identity.
+                if await self._wait_for_fork_ready(
+                    session,
+                    forked_host,
+                    forked_port,
+                    expected_role=role,
+                    expected_worker_index=idx,
+                ):
+                    break
+
+                # Release the failed fixed reservation only after the child is
+                # reaped.  The next attempt can then reserve a different port
+                # without leaving a stale process behind on the old endpoint.
+                try:
+                    await release_fork_reservation(session, guard_url, role, idx)
+                except Exception as exc:  # noqa: BLE001
+                    raise WorkerCleanupError(
+                        role,
+                        [f"failed to clean provisional {worker_id}: {exc}"],
+                    ) from exc
+                discard_fork_reservation(self._fork_reservations, role, idx)
+                discard_provisional_worker(
+                    self._workers,
+                    self._fork_reservations,
+                    self._colocated_roles,
+                    self._fork_parent_roles,
                     role,
-                    f"Forked worker {idx} failed to become ready",
-                    f"Readiness timeout at {forked_host}:{forked_port}",
+                    worker_id,
+                )
+
+                if start_attempt == max_start_attempts:
+                    raise WorkerCreationError(
+                        role,
+                        f"Forked worker {idx} failed to become ready",
+                        f"Readiness timeout at {forked_host}:{forked_port} "
+                        f"after {max_start_attempts} attempts",
+                    )
+
+                logger.warning(
+                    f"Forked worker {worker_id} did not become ready at "
+                    f"{forked_host}:{forked_port}; retrying with a new port "
+                    f"({start_attempt + 1}/{max_start_attempts})"
                 )
 
             logger.info(
@@ -418,32 +540,36 @@ class LocalScheduler(Scheduler):
                 f"(pid={forked_pid}) from {target_role}/{idx}"
             )
 
-        except aiohttp.ClientError as e:
-            raise WorkerCreationError(
-                role,
-                f"Failed to fork worker {idx} from {target_role}/{idx}",
-                str(e),
-            ) from e
+        except Exception as e:
+            mark_fork_role_state(
+                self._fork_reservations, role, ForkRoleState.CLEANUP_PENDING
+            )
+            if isinstance(e, aiohttp.ClientError):
+                raise WorkerCreationError(
+                    role,
+                    f"Failed to fork worker {idx} from {target_role}/{idx}",
+                    str(e),
+                ) from e
+            raise
 
-        worker = Worker(
-            id=worker_id,
-            ip=forked_host,
-            worker_ports=[str(forked_port)],
-            engine_ports=[],
-        )
-        port_cnt = len(self._workers[target_role][0].worker.worker_ports)
-        if port_cnt > 1:
-            worker.worker_ports += self._allocate_ports(port_cnt - 1)
+        return worker_info
 
-        return WorkerInfo(
-            worker=worker,
-            process=None,  # Managed by parent worker
-            role=role,
-            gpu_devices=target_wi.gpu_devices,  # Inherited from target
-            created_at=time.time(),
-            log_file=str(self.log_dir / f"{role}.log"),
-            env_vars=target_wi.env_vars.copy(),  # Inherited from target
-        )
+    def _retain_fork_workers(
+        self,
+        role: str,
+        target_role: str,
+        workers: list[WorkerInfo],
+    ) -> None:
+        """Retain provisional fork ownership when rollback cannot complete."""
+        retained = {worker.worker.id: worker for worker in self._workers.get(role, [])}
+        retained.update({worker.worker.id: worker for worker in workers})
+        self._workers[role] = list(retained.values())
+        if not hasattr(self, "_colocated_roles"):
+            self._colocated_roles = {}
+        if not hasattr(self, "_fork_parent_roles"):
+            self._fork_parent_roles = {}
+        self._colocated_roles[role] = target_role
+        self._fork_parent_roles[role] = target_role
 
     async def _kill_forked_worker(
         self,
@@ -455,25 +581,20 @@ class LocalScheduler(Scheduler):
         """Kill a single forked worker via its parent's RPC server."""
         target_url = f"http://{format_hostport(target_wi.worker.ip, int(target_wi.worker.worker_ports[0]))}/kill_forked_worker"
 
-        try:
-            payload = {"role": role, "worker_index": idx}
-            async with session.post(
-                target_url,
-                json=payload,
-            ) as response:
-                if response.status != 200:
-                    error_text = await response.text()
-                    logger.warning(
-                        f"Failed to kill forked worker {role}/{idx}: "
-                        f"HTTP {response.status}: {error_text}"
-                    )
-                else:
-                    result = await response.json()
-                    logger.info(
-                        result.get("message", f"Killed forked worker {role}/{idx}")
-                    )
-        except Exception as e:
-            logger.warning(f"Exception killing forked worker {role}/{idx}: {e}")
+        payload = {"role": role, "worker_index": idx, "release_ports": True}
+        async with session.post(target_url, json=payload) as response:
+            if response.status != 200:
+                error_text = await response.text()
+                raise RuntimeError(
+                    f"Failed to kill forked worker {role}/{idx}: "
+                    f"HTTP {response.status}: {error_text}"
+                )
+            result = await response.json()
+            if result.get("status") != "success":
+                raise RuntimeError(
+                    result.get("error", f"Failed to kill forked worker {role}/{idx}")
+                )
+            logger.info(result.get("message", f"Killed forked worker {role}/{idx}"))
 
     async def _cleanup_forked_workers_async(
         self,
@@ -484,8 +605,8 @@ class LocalScheduler(Scheduler):
         """Cleanup forked workers by calling kill endpoint on parent workers."""
         target_workers = self._workers.get(target_role, [])
         if not target_workers:
-            logger.warning(
-                f"Cannot cleanup forked workers: target role '{target_role}' not found"
+            raise WorkerCleanupError(
+                role, [f"process owner {target_role!r} is unavailable"]
             )
             return
 
@@ -495,15 +616,30 @@ class LocalScheduler(Scheduler):
             connector=get_default_connector(),
         ) as session:
             tasks = []
-            for worker_info in workers:
-                worker_index = int(worker_info.worker.id.split("/")[-1])
+            failures = []
+            worker_indices = {
+                int(worker_info.worker.id.split("/")[-1]) for worker_info in workers
+            }
+            worker_indices.update(
+                fork_reservation_indices(getattr(self, "_fork_reservations", {}), role)
+            )
+            for worker_index in sorted(worker_indices):
                 if worker_index < len(target_workers):
                     tasks.append(
                         self._kill_forked_worker(
                             session, role, worker_index, target_workers[worker_index]
                         )
                     )
-            await asyncio.gather(*tasks, return_exceptions=True)
+                else:
+                    failures.append(
+                        f"rank {worker_index} has no owner worker in {target_role!r}"
+                    )
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            failures.extend(
+                str(result) for result in results if isinstance(result, BaseException)
+            )
+            if failures:
+                raise WorkerCleanupError(role, failures)
 
     async def _create_forked_workers_async(
         self,
@@ -548,15 +684,37 @@ class LocalScheduler(Scheduler):
 
         # If any fork failed, cleanup successful workers and raise
         if failed_indices:
+            mark_fork_role_state(
+                self._fork_reservations, role, ForkRoleState.CLEANUP_PENDING
+            )
             if workers:
+                self._retain_fork_workers(role, target_role, workers)
+            if role in self._workers or role in getattr(self, "_fork_reservations", {}):
                 logger.warning(
-                    f"Cleaning up {len(workers)} successfully forked workers due to partial failure"
+                    "Cleaning up provisional fork workers due to partial failure"
                 )
                 # Kill the forked processes via parent RPC servers
                 try:
-                    await self._cleanup_forked_workers_async(role, target_role, workers)
+                    await self._cleanup_forked_workers_async(
+                        role, target_role, self._workers.get(role, [])
+                    )
                 except Exception as cleanup_error:
-                    logger.error(f"Failed to cleanup forked workers: {cleanup_error}")
+                    raise ExceptionGroup(
+                        f"Fork creation and rollback failed for role {role!r}",
+                        [
+                            WorkerCreationError(
+                                role,
+                                f"Failed to fork {len(failed_indices)} out of "
+                                f"{len(target_workers)} workers",
+                                f"Failed indices: {failed_indices}",
+                            ),
+                            cleanup_error,
+                        ],
+                    ) from cleanup_error
+                self._workers.pop(role, None)
+                getattr(self, "_fork_reservations", {}).pop(role, None)
+                self._colocated_roles.pop(role, None)
+                self._fork_parent_roles.pop(role, None)
 
             raise WorkerCreationError(
                 role,
@@ -578,6 +736,7 @@ class LocalScheduler(Scheduler):
             for worker_rank, worker_info in enumerate(workers):
                 self._configure_worker(worker_info, worker_rank)
 
+        mark_fork_role_state(self._fork_reservations, role, ForkRoleState.ACTIVE)
         return worker_ids
 
     def fork_workers(
@@ -606,24 +765,52 @@ class LocalScheduler(Scheduler):
         list[str]
             List of worker IDs created (e.g., ["proxy/0", "proxy/1"])
         """
-        if target_role not in self._workers:
-            raise WorkerNotFoundError(f"Target role '{target_role}' not found for fork")
-        target_workers = self._workers[target_role]
+        ensure_fork_role_available(
+            self._workers,
+            self._colocated_roles,
+            getattr(self, "_fork_reservations", {}),
+            role,
+        )
+        ensure_fork_target_queryable(
+            self._workers,
+            self._colocated_roles,
+            getattr(self, "_fork_reservations", {}),
+            target_role,
+        )
+        try:
+            owner_role = self._resolve_worker_owner(target_role)
+        except (KeyError, ValueError) as exc:
+            raise WorkerNotFoundError(
+                f"Target role '{target_role}' not found for fork: {exc}"
+            ) from exc
+        target_workers = self._workers[owner_role]
 
         try:
-            return run_async_task(
+            worker_ids = run_async_task(
                 self._create_forked_workers_async,
                 role,
-                target_role,
+                owner_role,
                 target_workers,
                 command,
             )
+            self._colocated_roles[role] = target_role
+            if not hasattr(self, "_fork_parent_roles"):
+                self._fork_parent_roles = {}
+            self._fork_parent_roles[role] = owner_role
+            return worker_ids
         except Exception:
-            # Cleanup on failure
-            if role in self._workers:
-                del self._workers[role]
-            if role in self._colocated_roles:
-                del self._colocated_roles[role]
+            mark_fork_role_state(
+                getattr(self, "_fork_reservations", {}),
+                role,
+                ForkRoleState.CLEANUP_PENDING,
+            )
+            # Preserve provisional ownership when rollback failed so callers
+            # can retry through delete_workers().
+            if role not in self._workers and role not in getattr(
+                self, "_fork_reservations", {}
+            ):
+                self._colocated_roles.pop(role, None)
+                self._fork_parent_roles.pop(role, None)
             raise
 
     def create_workers(self, job: Job, *args, **kwargs) -> list[str]:
@@ -653,12 +840,12 @@ class LocalScheduler(Scheduler):
             If port allocation fails
         """
         role = job.role
-        if role in self._workers:
-            raise WorkerCreationError(
-                role,
-                "Worker group already exists",
-                f"Use delete_workers('{role}') first to remove existing workers",
-            )
+        ensure_fork_role_available(
+            self._workers,
+            self._colocated_roles,
+            getattr(self, "_fork_reservations", {}),
+            role,
+        )
 
         num_workers = job.replicas
         if num_workers == 0:
@@ -684,12 +871,20 @@ class LocalScheduler(Scheduler):
                     "Invalid strategy",
                     "Colocation strategy requires target role to be specified",
                 )
-            if colocate_role not in self._workers:
+            ensure_fork_target_queryable(
+                self._workers,
+                self._colocated_roles,
+                getattr(self, "_fork_reservations", {}),
+                colocate_role,
+            )
+            try:
+                owner_role = self._resolve_worker_owner(colocate_role)
+            except (KeyError, ValueError) as exc:
                 raise WorkerNotFoundError(
-                    f"Cannot colocate with role '{colocate_role}' - role not found"
-                )
+                    f"Cannot colocate with role '{colocate_role}': {exc}"
+                ) from exc
 
-            target_workers = self._workers[colocate_role]
+            target_workers = self._workers[owner_role]
             if num_workers != len(target_workers):
                 raise WorkerCreationError(
                     role,
@@ -938,6 +1133,10 @@ class LocalScheduler(Scheduler):
         WorkerTimeoutError
             If timeout exceeded waiting for workers
         """
+        ensure_fork_role_queryable(
+            self._workers, getattr(self, "_fork_reservations", {}), role
+        )
+
         # Handle colocated/forked roles
         if role in self._colocated_roles:
             # Forked roles have their own workers in _workers
@@ -1099,32 +1298,68 @@ class LocalScheduler(Scheduler):
             ``Scheduler.delete_workers`` for background.
         """
         if role is None:
-            # Delete colocated roles first (they don't own processes)
-            colocated_roles = list(self._colocated_roles.keys())
-            for r in colocated_roles:
-                self.delete_workers(r, reverse_order=reverse_order)
+            failures = []
+            for r in self._colocated_roles_leaf_first():
+                try:
+                    self.delete_workers(r, reverse_order=reverse_order)
+                except Exception as exc:  # noqa: BLE001
+                    failures.append(f"{r}: {exc}")
             # Then delete actual worker roles
             roles = list(self._workers.keys())
             for r in roles:
-                self.delete_workers(r, reverse_order=reverse_order)
+                if r in self._colocated_roles:
+                    continue
+                try:
+                    self.delete_workers(r, reverse_order=reverse_order)
+                except Exception as exc:  # noqa: BLE001
+                    failures.append(f"{r}: {exc}")
+            if failures:
+                raise WorkerCleanupError("<all>", failures)
             return
+
+        descendant_failures = []
+        for descendant in self._colocated_descendants_leaf_first(role):
+            try:
+                self.delete_workers(descendant, reverse_order=reverse_order)
+            except Exception as exc:  # noqa: BLE001
+                descendant_failures.append(f"{descendant}: {exc}")
+        if descendant_failures:
+            raise WorkerCleanupError(role, descendant_failures)
 
         # Handle colocated/forked role
         if role in self._colocated_roles:
             # Forked roles have their own workers that need port cleanup
-            if role in self._workers:
+            if role in self._workers or role in getattr(self, "_fork_reservations", {}):
                 logger.info(f"Removing forked role '{role}' (managed by parent worker)")
-                workers = self._workers[role]
+                mark_fork_role_state(
+                    getattr(self, "_fork_reservations", {}),
+                    role,
+                    ForkRoleState.CLEANUP_PENDING,
+                )
+                workers = self._workers.get(role, [])
+                target_role = getattr(self, "_fork_parent_roles", {}).get(role)
+                if target_role is None:
+                    target_role = self._resolve_worker_owner(
+                        self._colocated_roles[role]
+                    )
+                run_async_task(
+                    self._cleanup_forked_workers_async,
+                    role,
+                    target_role,
+                    workers,
+                )
                 if reverse_order:
                     workers = list(reversed(workers))
                 self._cleanup_workers(
                     workers
                 )  # Release ports, but process=None skips kill
-                del self._workers[role]
+                self._workers.pop(role, None)
+                getattr(self, "_fork_reservations", {}).pop(role, None)
             else:
                 # Colocated roles don't have their own workers
                 logger.info(f"Removing colocated role '{role}' mapping")
             del self._colocated_roles[role]
+            getattr(self, "_fork_parent_roles", {}).pop(role, None)
             return
 
         if role not in self._workers:
@@ -1176,24 +1411,28 @@ class LocalScheduler(Scheduler):
         """
         import threading
 
-        # Phase 1: always release ports, regardless of whether the worker
-        # owns a process (forked workers have ``process is None``).
+        role = workers[0].worker.id.rsplit("/", 1)[0] if workers else "<unknown>"
+        try:
+            reserved_ports = [
+                int(port)
+                for worker_info in workers
+                for port in worker_info.worker.worker_ports
+            ]
+        except (TypeError, ValueError) as exc:
+            raise WorkerCleanupError(role, [f"invalid worker port metadata: {exc}"])
+
+        # Phase 1: identify processes. Port leases are deliberately retained
+        # until every process is confirmed dead so failed cleanup is retryable.
         live_workers: list[WorkerInfo] = []
         for worker_info in workers:
-            try:
-                for port_str in worker_info.worker.worker_ports:
-                    self._allocated_ports.discard(int(port_str))
-            except Exception as e:
-                logger.error(
-                    f"Error releasing ports for worker {worker_info.worker.id}: {e}",
-                    exc_info=True,
-                )
             if worker_info.process is not None:
                 live_workers.append(worker_info)
             else:
                 logger.debug(f"Cleaned up worker {worker_info.worker.id}")
 
         if not live_workers:
+            for port in reserved_ports:
+                self._allocated_ports.discard(port)
             return
 
         # Phase 2: dispatch SIGTERM to every worker concurrently via
@@ -1202,6 +1441,9 @@ class LocalScheduler(Scheduler):
         # thread start order: when the caller requests reverse_order,
         # rank-0 is the last thread to be started, which keeps the
         # "rank-0 dies last" property while staying non-blocking.
+        failures: list[str] = []
+        failures_lock = threading.Lock()
+
         def _finalize(worker_info: WorkerInfo) -> None:
             try:
                 kill_process_tree(worker_info.process.pid, timeout=3, graceful=True)
@@ -1211,6 +1453,8 @@ class LocalScheduler(Scheduler):
                     f"Error cleaning up worker {worker_info.worker.id}: {e}",
                     exc_info=True,
                 )
+                with failures_lock:
+                    failures.append(f"{worker_info.worker.id}: {e}")
 
         threads: list[threading.Thread] = []
         for worker_info in live_workers:
@@ -1231,10 +1475,14 @@ class LocalScheduler(Scheduler):
         for t in threads:
             t.join(timeout=join_timeout)
             if t.is_alive():
-                logger.warning(
-                    f"Cleanup thread {t.name} did not finish within "
-                    f"{join_timeout}s; leaving it as daemon."
+                failures.append(
+                    f"{t.name} did not finish within {join_timeout} seconds"
                 )
+
+        if failures:
+            raise WorkerCleanupError(role, failures)
+        for port in reserved_ports:
+            self._allocated_ports.discard(port)
 
     def _read_log_tail(self, log_file: str, lines: int = 50) -> str:
         try:

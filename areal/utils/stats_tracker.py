@@ -236,6 +236,34 @@ class DistributedStatsTracker:
             device=device,
         )
 
+    def _all_reduce(
+        self,
+        tensor: torch.Tensor,
+        *,
+        group,
+        op: dist.ReduceOp | None = None,
+    ) -> torch.Tensor:
+        """Reduce a scalar on a device supported by the process-group backend."""
+        try:
+            backend = str(dist.get_backend(group)).lower()
+            if backend == "gloo":
+                device = "cpu"
+            elif backend == current_platform.communication_backend:
+                device = current_platform.device_type
+            else:
+                device = None
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            # Unit-test process-group stand-ins and third-party backends may not
+            # expose backend metadata. Preserve the existing tensor in that case.
+            device = None
+        if device is not None and tensor.device.type != device:
+            tensor = tensor.to(device)
+        if op is None:
+            dist.all_reduce(tensor, group=group)
+        else:
+            dist.all_reduce(tensor, group=group, op=op)
+        return tensor
+
     def _local_metadata(self, keys: list[str]) -> dict[str, _StatMetadata]:
         return {
             key: _StatMetadata(
@@ -392,8 +420,8 @@ class DistributedStatsTracker:
                 fill=float(len(stats)), group=effective_group
             )
             if effective_group is not None:
-                dist.all_reduce(value, group=effective_group)
-                dist.all_reduce(cnt, group=effective_group)
+                value = self._all_reduce(value, group=effective_group)
+                cnt = self._all_reduce(cnt, group=effective_group)
             result[key] = float(value / cnt) if float(cnt) > 0 else 0.0
             result[key + "__count"] = int(cnt)
         else:
@@ -418,7 +446,7 @@ class DistributedStatsTracker:
         if not values:
             x = self._placeholder_scalar(group=effective_group)
             if effective_group is not None:
-                dist.all_reduce(x, group=effective_group)
+                x = self._all_reduce(x, group=effective_group)
             return float(x)
 
         metadata = sync_metadata.get(key) if sync_metadata is not None else None
@@ -429,7 +457,7 @@ class DistributedStatsTracker:
         if denominator is None:
             x = sum([x.sum() for x in values], self._placeholder_scalar(like=values[0]))
             if effective_group is not None:
-                dist.all_reduce(x, group=effective_group)
+                x = self._all_reduce(x, group=effective_group)
         else:
             if denominator not in self.stats:
                 raise ValueError(
@@ -440,7 +468,7 @@ class DistributedStatsTracker:
                 xs.append(torch.where(d, v, 0.0).sum())
             x = sum(xs, self._placeholder_scalar(like=values[0]))
             if effective_group is not None:
-                dist.all_reduce(x, group=effective_group)
+                x = self._all_reduce(x, group=effective_group)
         return float(x)
 
     def _denominator_of(
@@ -470,8 +498,8 @@ class DistributedStatsTracker:
             x = self._placeholder_scalar(group=effective_group)
             d = self._placeholder_scalar(group=effective_group)
             if effective_group is not None:
-                dist.all_reduce(x, group=effective_group)
-                dist.all_reduce(d, group=effective_group)
+                x = self._all_reduce(x, group=effective_group)
+                d = self._all_reduce(d, group=effective_group)
             if d == 0:
                 return None
             return x / d
@@ -490,8 +518,8 @@ class DistributedStatsTracker:
             key, reduce_group, sync_metadata, key_sync_group
         )
         if effective_group is not None:
-            dist.all_reduce(x, group=effective_group)
-            dist.all_reduce(d, group=effective_group)
+            x = self._all_reduce(x, group=effective_group)
+            d = self._all_reduce(d, group=effective_group)
         if d == 0:
             return None
         return x / d
@@ -510,7 +538,7 @@ class DistributedStatsTracker:
             )
             x = self._placeholder_scalar(fill=float("inf"), group=effective_group)
             if effective_group is not None:
-                dist.all_reduce(x, group=effective_group, op=dist.ReduceOp.MIN)
+                x = self._all_reduce(x, group=effective_group, op=dist.ReduceOp.MIN)
             if torch.isinf(x):
                 return None
             return float(x)
@@ -526,7 +554,7 @@ class DistributedStatsTracker:
             key, reduce_group, sync_metadata, key_sync_group
         )
         if effective_group is not None:
-            dist.all_reduce(x, group=effective_group, op=dist.ReduceOp.MIN)
+            x = self._all_reduce(x, group=effective_group, op=dist.ReduceOp.MIN)
         if torch.isinf(x):
             return None
         return float(x)
@@ -545,7 +573,7 @@ class DistributedStatsTracker:
             )
             x = self._placeholder_scalar(fill=-float("inf"), group=effective_group)
             if effective_group is not None:
-                dist.all_reduce(x, group=effective_group, op=dist.ReduceOp.MAX)
+                x = self._all_reduce(x, group=effective_group, op=dist.ReduceOp.MAX)
             if torch.isinf(x):
                 return None
             return float(x)
@@ -561,7 +589,7 @@ class DistributedStatsTracker:
             key, reduce_group, sync_metadata, key_sync_group
         )
         if effective_group is not None:
-            dist.all_reduce(x, group=effective_group, op=dist.ReduceOp.MAX)
+            x = self._all_reduce(x, group=effective_group, op=dist.ReduceOp.MAX)
         if torch.isinf(x):
             return None
         return float(x)

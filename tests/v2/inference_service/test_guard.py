@@ -303,6 +303,12 @@ class TestCleanup:
             ("b", 0): proc2,
         }
 
+        def mark_stopped(pid, **kwargs):
+            del kwargs
+            {proc1.pid: proc1, proc2.pid: proc2}[pid].poll.return_value = 0
+
+        mock_kill.side_effect = mark_stopped
+
         cleanup_forked_children()
 
         assert mock_kill.call_count == 2
@@ -321,6 +327,9 @@ class TestCleanup:
             ("a", 0): running,
             ("b", 0): exited,
         }
+        mock_kill.side_effect = lambda *args, **kwargs: setattr(
+            running.poll, "return_value", 0
+        )
 
         cleanup_forked_children()
 
@@ -344,10 +353,16 @@ class TestCleanup:
             ("b", 0): proc2,
         }
 
-        mock_kill.side_effect = [OSError("boom"), None]
+        def stop_or_fail(pid, **kwargs):
+            del kwargs
+            if pid == proc1.pid:
+                raise OSError("boom")
+            proc2.poll.return_value = 0
+
+        mock_kill.side_effect = stop_or_fail
 
         cleanup_forked_children()
 
         assert mock_kill.call_count == 2
-        assert guard_module._state.forked_children == []
-        assert guard_module._state.forked_children_map == {}
+        assert guard_module._state.forked_children == [proc1]
+        assert guard_module._state.forked_children_map == {("a", 0): proc1}

@@ -46,6 +46,15 @@ from areal.infra.data_service import DataController
 from areal.infra.data_service.controller.config import DataServiceConfig
 from areal.infra.data_service.rdataset import RDataset
 from areal.infra.utils.concurrent import call_maybe_async
+from areal.trainer.mopd.compatibility import validate_mopd_model_compatibility
+from areal.trainer.mopd.phase import MOPDPhase, MOPDPhaseMachine
+from areal.trainer.mopd.targets import MOPD_CONTRIBUTIONS_KEY
+from areal.trainer.mopd.teacher_manager import (
+    DrainReceipt,
+    PersistentTeacherManager,
+    TeacherController,
+    TeacherManagerState,
+)
 from areal.utils import logging, perf_tracer, seeding, stats_tracker
 from areal.utils.dataloader import create_dataloader
 from areal.utils.environ import is_single_controller
@@ -305,6 +314,7 @@ class PPOTrainer:
                 * config.train_dataset.batch_size,
                 train_batch_size=config.train_dataset.batch_size,
             )
+        self._ft_spec = ft_spec
 
         # Initialize engines first — the scheduler must know about roles
         # before the data controller can colocate with them.
@@ -367,6 +377,20 @@ class PPOTrainer:
             and self.config.teacher.engine_type == "rollout"
         ):
             self.teacher = self._init_teacher_rollout(self.config.teacher.rollout)
+
+        self.mopd_teacher_manager: PersistentTeacherManager | None = None
+        self._mopd_phase_machine: MOPDPhaseMachine | None = None
+        if self.config.mopd is not None:
+            if self.config.mopd.manager.type == "local_memory" and not isinstance(
+                self.scheduler, LocalScheduler
+            ):
+                raise RuntimeError(
+                    "MOPD local_memory staging requires a same-host LocalScheduler"
+                )
+            self.mopd_teacher_manager = PersistentTeacherManager(
+                self.config.mopd, self._create_mopd_teacher_controller
+            )
+            self._mopd_phase_machine = MOPDPhaseMachine()
 
         # Proxy worker initialization (lazy, for AgentWorkflow support)
         self._proxy_started = False
@@ -542,6 +566,31 @@ class PPOTrainer:
             ),
         ):
             engine.offload()
+
+    def _update_weights_and_publish_version(
+        self, meta: WeightUpdateMeta, new_version: int
+    ) -> None:
+        """Update weights, publish their version, then restore AWEX rollout."""
+        self.actor.update_weights(meta)
+
+        self.actor.set_version(new_version)
+        if self.critic is not None:
+            self.critic.set_version(new_version)
+        self.rollout.set_version(new_version)
+        if self.eval_rollout is not None:
+            self.eval_rollout.set_version(new_version)
+
+        if self.config.actor.weight_update_mode != "awex":
+            return
+
+        # The AWEX reader flushes all old cache entries while installing the
+        # new weights. Reallocate an empty KV pool only after every actor worker
+        # has returned, then let SGLang serve requests again. This must remain a
+        # controller-side call: invoking rollout RPCs from an actor worker creates
+        # a nested controller call while its update_weights collective is active.
+        self.rollout.abort_all_requests()
+        self.rollout.onload(tags=["kv_cache"])
+        call_maybe_async(self.rollout.continue_generation)
 
     def _offload_rollout(self, is_eval: bool = False):
         rollout = self.rollout if not is_eval else self.eval_rollout
@@ -774,8 +823,39 @@ class PPOTrainer:
                 self.rollout.offload(tags=["kv_cache"])
                 logger.info("[AWEX] colocate: offload weights...")
                 self.rollout.offload(tags=["weights"])
-                logger.info("[AWEX] colocate: offload done, onloading actor...")
-                self.actor.onload()
+                try:
+                    if self.config.mopd is not None:
+                        assert self._mopd_phase_machine is not None
+                        self._mopd_phase_machine.transition(MOPDPhase.TEACHER)
+                        rollout_batch = self._run_mopd_teacher_phase(rollout_batch)
+                    logger.info("[AWEX] colocate: offload done, onloading actor...")
+                    self.actor.onload()
+                except BaseException:
+                    logger.error(
+                        "AWEX teacher/train ownership transition failed; "
+                        "restoring rollout owner",
+                        exc_info=True,
+                    )
+                    try:
+                        self.actor.offload()
+                    except Exception:
+                        logger.error(
+                            "Failed to re-offload actor during rollback", exc_info=True
+                        )
+                    try:
+                        self.rollout.onload(tags=["weights"])
+                        self.rollout.onload(tags=["kv_cache"])
+                        call_maybe_async(self.rollout.continue_generation)
+                        self.rollout.resume()
+                        if self._mopd_phase_machine is not None:
+                            self._mopd_phase_machine.abort_to_rollout()
+                    except Exception:
+                        logger.error(
+                            "Failed to restore rollout during AWEX rollback; "
+                            "leaving large owners offloaded",
+                            exc_info=True,
+                        )
+                    raise
 
             if self._should_offload_actor:
                 self._onload_model(self.actor, role="actor")
@@ -885,14 +965,7 @@ class PPOTrainer:
                 # Use versioned path for weight updates
                 new_version = global_step + 1
                 versioned_meta = self.weight_update_meta.with_version(new_version)
-                self.actor.update_weights(versioned_meta)
-
-                self.actor.set_version(new_version)
-                if self.critic is not None:
-                    self.critic.set_version(new_version)
-                self.rollout.set_version(new_version)
-                if self.eval_rollout is not None:
-                    self.eval_rollout.set_version(new_version)
+                self._update_weights_and_publish_version(versioned_meta, new_version)
 
             if not self._is_v1_awex_colocate(config):
                 self._save_training_state(
@@ -958,8 +1031,24 @@ class PPOTrainer:
                     epoch=epoch, epoch_step=step, global_step=global_step
                 )
 
-            # Resume rollout
-            self.rollout.resume()
+            # Resume rollout only when another train step will consume it.
+            #
+            # The dispatcher may have queued overlap rollouts while producing
+            # the current batch. Resuming it after the final step lets those
+            # stale tasks hit the inference server while close() is already
+            # tearing workers down, producing noisy ConnectionRefused errors.
+            if not self._is_final_train_step(
+                global_step=global_step, max_steps=max_steps
+            ):
+                self.rollout.resume()
+            else:
+                logger.info(
+                    "Skipping rollout resume after final training step "
+                    "(global_step=%s)",
+                    global_step,
+                )
+            if self._mopd_phase_machine is not None:
+                self._mopd_phase_machine.transition(MOPDPhase.ROLLOUT)
 
             self._save_perf_tracer(step=global_step)
 
@@ -994,25 +1083,65 @@ class PPOTrainer:
                 global_step=global_step,
             )
 
+    def _is_final_train_step(self, *, global_step: int, max_steps: int) -> bool:
+        next_step = global_step + 1
+        if next_step >= max_steps:
+            return True
+        return (
+            self.config.total_train_steps is not None
+            and next_step >= self.config.total_train_steps
+        )
+
     def close(self):
-        self.saver.finalize()
-        if hasattr(self, "_train_rdataset") and self._train_rdataset is not None:
-            self._train_rdataset.close()
-        if hasattr(self, "_valid_rdataset") and self._valid_rdataset is not None:
-            self._valid_rdataset.close()
-        if hasattr(self, "data_controller") and self.data_controller is not None:
-            self.data_controller.destroy()
-        self.stats_logger.close()
-        if self.eval_rollout is not None:
-            self.eval_rollout.destroy()
-        self.rollout.destroy()
-        if self.teacher is not None:
-            self.teacher.destroy()
-        if self.ref is not None:
-            self.ref.destroy()
-        if self.critic is not None:
-            self.critic.destroy()
-        self.actor.destroy()
+        # P87: must tolerate a partially-constructed trainer (called from
+        # __init__'s failure path), and one engine's destroy() failure must
+        # not keep the remaining workers alive.
+        saver = getattr(self, "saver", None)
+        if saver is not None:
+            try:
+                saver.finalize()
+            except Exception:
+                logger.warning("saver.finalize() failed during close", exc_info=True)
+        for attr in ("_train_rdataset", "_valid_rdataset"):
+            rdataset = getattr(self, attr, None)
+            if rdataset is not None:
+                try:
+                    rdataset.close()
+                except Exception:
+                    logger.warning(f"{attr}.close() failed during close", exc_info=True)
+        data_controller = getattr(self, "data_controller", None)
+        if data_controller is not None:
+            try:
+                data_controller.destroy()
+            except Exception:
+                logger.warning(
+                    "data_controller.destroy() failed during close", exc_info=True
+                )
+        stats_logger = getattr(self, "stats_logger", None)
+        if stats_logger is not None:
+            try:
+                stats_logger.close()
+            except Exception:
+                logger.warning(
+                    "stats_logger.close() failed during close", exc_info=True
+                )
+        mopd_manager = getattr(self, "mopd_teacher_manager", None)
+        if mopd_manager is not None:
+            try:
+                mopd_manager.close()
+            except Exception:
+                logger.warning(
+                    "mopd_teacher_manager.close() failed during close", exc_info=True
+                )
+        for attr in ("eval_rollout", "rollout", "teacher", "ref", "critic", "actor"):
+            engine = getattr(self, attr, None)
+            if engine is not None:
+                try:
+                    engine.destroy()
+                except Exception:
+                    logger.warning(
+                        f"{attr}.destroy() failed during close", exc_info=True
+                    )
         perf_tracer.save(force=True)
 
     def _config_perf_tracer(self):
@@ -1141,6 +1270,195 @@ class PPOTrainer:
         actor.create_process_group(parallel_strategy=alloc.parallel)
         return actor
 
+    def _create_mopd_teacher_controller(self, checkpoint_path: str):
+        """Create one persistent fork teacher from its first checkpoint."""
+        assert self.config.mopd is not None
+        teacher_config = deepcopy(self.config.mopd.teacher_engine)
+        teacher_config.path = checkpoint_path
+        teacher_config.experiment_name = self.config.experiment_name
+        teacher_config.trial_name = self.config.trial_name
+        if teacher_config.optimizer is None and teacher_config.backend.startswith(
+            "megatron:"
+        ):
+            teacher_config.megatron.disable_grad_buffers_cpu_backup = True
+        teacher_alloc = ModelAllocation.from_str(
+            teacher_config.backend, name="mopd-teacher"
+        )
+        controller = self._create_train_engine(teacher_config, teacher_alloc)
+        try:
+            controller.initialize(
+                addr=None,
+                ft_spec=self._ft_spec,
+                role="mopd-teacher",
+                data_hook_role="teacher",
+            )
+            # The scoring-only teacher needs DDP-flat-buffer CPU residency,
+            # without enabling TMS in the AWEX actor processes.
+            if teacher_config.backend.startswith("megatron:"):
+                controller.init_weight_residency_adapter()
+            controller.capture_worker_identity()
+        except BaseException:
+            controller.destroy()
+            raise
+        return controller
+
+    def _run_mopd_teacher_phase(
+        self, rollout_batch: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Score routed subsets, aggregate on actor heads, then strictly drain."""
+        config = self.config.mopd
+        manager = self.mopd_teacher_manager
+        state = self._mopd_phase_machine
+        assert config is not None and manager is not None and state is not None
+
+        routed_weights: list[dict[str, float]] = []
+        for trajectory in rollout_batch:
+            route = trajectory.get("mopd_route")
+            if not isinstance(route, str) or route not in config.routes:
+                raise ValueError(f"Unknown or missing MOPD route {route!r}")
+            routed_weights.append(config.routes[route])
+
+        required_teachers = [
+            teacher_id
+            for teacher_id in config.teachers
+            if any(weights.get(teacher_id, 0.0) > 0 for weights in routed_weights)
+        ]
+        if not required_teachers:
+            raise ValueError("MOPD batch does not require any positive-weight teacher")
+
+        teacher_outputs: list[Any] = []
+        teacher_controllers: list[TeacherController] = []
+        critic_fetch_buffer_drained = self.critic is None
+        teacher_fetch_buffers_drained = False
+        receipt: DrainReceipt | None = None
+
+        def drain_critic_fetch_buffer() -> None:
+            if self.critic is not None:
+                self.critic.strict_clear_batches(rollout_batch)
+
+        def drain_teacher_fetch_buffers() -> None:
+            for teacher_controller in teacher_controllers:
+                teacher_controller.strict_clear_batches(rollout_batch, teacher_outputs)
+
+        try:
+            self.actor.assert_mopd_runtime_topology()
+            manager.pre_fetch(required_teachers[0])
+            for teacher_index, teacher_id in enumerate(required_teachers):
+                was_offloaded = manager.state is TeacherManagerState.OFFLOADED
+                controller = manager.load(teacher_id)
+                if all(existing is not controller for existing in teacher_controllers):
+                    teacher_controllers.append(controller)
+                if was_offloaded:
+                    logger.info("[MOPD] teacher onload complete")
+                controller.assert_mopd_runtime_topology()
+                if teacher_index + 1 < len(required_teachers):
+                    manager.pre_fetch(required_teachers[teacher_index + 1])
+
+                indices = [
+                    index
+                    for index, weights in enumerate(routed_weights)
+                    if weights.get(teacher_id, 0.0) > 0
+                ]
+                # Contributions from earlier teachers are actor-owned RTensor
+                # metadata.  They must not enter a later teacher's eval batch:
+                # RTensor localization can consume the real item's field while
+                # dummy-DP padding retains it, leaving concat_batch with mixed
+                # schemas.  Keep the original trajectories as the aggregation
+                # sink and give every teacher a clean, shallow scoring view.
+                subset = [
+                    {
+                        key: value
+                        for key, value in rollout_batch[index].items()
+                        if key != MOPD_CONTRIBUTIONS_KEY
+                    }
+                    for index in indices
+                ]
+                logps, dummy_logps = controller.compute_logp_padded(subset)
+                if logps is None or len(logps) != len(indices):
+                    raise RuntimeError(
+                        f"MOPD teacher {teacher_id!r} returned an invalid logp batch"
+                    )
+                teacher_outputs.extend(logps)
+                teacher_outputs.extend(dummy_logps)
+                for index, logp in zip(indices, logps, strict=True):
+                    rollout_batch[index].setdefault(MOPD_CONTRIBUTIONS_KEY, {})[
+                        teacher_id
+                    ] = {
+                        "logp": logp,
+                        "weight": routed_weights[index][teacher_id],
+                    }
+
+            state.transition(MOPDPhase.DRAIN)
+            aggregated = self.actor.aggregate_mopd_targets(
+                rollout_batch,
+                rl_coefficient=config.loss.rl_coefficient,
+                distillation_coefficient=config.loss.distillation_coefficient,
+            )
+            # ``aggregate_mopd_targets`` localizes the original rollout shards
+            # on actor heads, then remotizes its result under fresh shard IDs.
+            # Drain the old IDs now: the caller replaces ``rollout_batch`` with
+            # ``aggregated`` and its step-end cleanup can no longer discover
+            # them. Teachers also localized the same rollout shards while
+            # scoring, and a configured critic localized them before this phase,
+            # so every process-local fetch buffer needs an explicit fan-out.
+            drain_critic_fetch_buffer()
+            critic_fetch_buffer_drained = True
+            drain_teacher_fetch_buffers()
+            teacher_fetch_buffers_drained = True
+            receipt = DrainReceipt(
+                **self.actor.strict_clear_batches(rollout_batch, teacher_outputs)
+            )
+            manager.release(receipt)
+            logger.info("[MOPD] teacher offload complete")
+            state.transition(MOPDPhase.TRAIN)
+            return aggregated
+        except BaseException:
+            if not critic_fetch_buffer_drained:
+                try:
+                    drain_critic_fetch_buffer()
+                    critic_fetch_buffer_drained = True
+                except Exception:
+                    logger.error(
+                        "MOPD emergency critic RTensor drain failed; "
+                        "forcing phase teardown",
+                        exc_info=True,
+                    )
+            if not teacher_fetch_buffers_drained:
+                try:
+                    drain_teacher_fetch_buffers()
+                    teacher_fetch_buffers_drained = True
+                except Exception:
+                    logger.error(
+                        "MOPD emergency teacher RTensor drain failed; "
+                        "forcing phase teardown",
+                        exc_info=True,
+                    )
+            if receipt is None:
+                try:
+                    receipt = DrainReceipt(
+                        **self.actor.strict_clear_batches(
+                            rollout_batch, teacher_outputs
+                        )
+                    )
+                except Exception:
+                    logger.error(
+                        "MOPD emergency actor RTensor drain failed; "
+                        "forcing phase teardown",
+                        exc_info=True,
+                    )
+            try:
+                if (
+                    receipt is not None
+                    and critic_fetch_buffer_drained
+                    and teacher_fetch_buffers_drained
+                ):
+                    manager.release(receipt)
+                else:
+                    manager.close()
+            except Exception:
+                logger.error("MOPD teacher phase teardown failed", exc_info=True)
+            raise
+
     def _create_critic(
         self, critic_config: PPOCriticConfig, alloc: ModelAllocation
     ) -> FSDPPPOCritic | MegatronPPOCritic | ArchonPPOCritic | PPOCriticController:
@@ -1211,6 +1529,12 @@ class PPOTrainer:
             if self._is_v1_awex_colocate(self.config):
                 server_args["awex_colocate_mode"] = True
                 server_args["awex_meta_server_addr"] = self._awex_meta_server_addr
+                # SGLang's release/resume endpoints are no-ops unless its
+                # torch-memory-saver regions were enabled at server startup.
+                # AWEX relies on those endpoints to hand the colocated GPU to
+                # teachers and the actor, so this is a correctness requirement
+                # rather than an optional inference tuning flag.
+                server_args["enable_memory_saver"] = True
         elif rollout_backend == "vllm":
             if self.config.rollout.return_routed_experts:
                 raise ValueError(
@@ -1247,6 +1571,8 @@ class PPOTrainer:
             )
         else:
             controller = engine_cls.as_controller(config, self.scheduler)
+        if self.config.mopd is not None and not is_eval:
+            controller.set_mopd_route_identifier(self.config.mopd.task_type_identifier)
         init_kwargs = dict(
             role="rollout",
             server_args=server_args,
@@ -1520,6 +1846,23 @@ class PPOTrainer:
             raise ValueError(
                 f"actor._version ('{actor_version}') and rollout._version "
                 f"('{rollout_version}') must match. Both must be 'v1' or both 'v2'."
+            )
+        if self.config.mopd is not None:
+            if not is_single_controller():
+                raise ValueError("MOPD currently requires single-controller mode")
+            if actor_version != "v1":
+                raise ValueError(
+                    "MOPD currently requires v1 actor and rollout controllers"
+                )
+            validate_mopd_model_compatibility(
+                self.config.actor.path,
+                {
+                    teacher_id: teacher.path
+                    for teacher_id, teacher in self.config.mopd.teachers.items()
+                },
+                actor_tokenizer_path=(
+                    self.config.tokenizer_path or self.config.actor.path
+                ),
             )
 
     def _requires_proxy_workflow(self, workflow: WorkflowLike | None) -> bool:

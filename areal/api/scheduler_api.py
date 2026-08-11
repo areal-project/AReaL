@@ -136,10 +136,80 @@ class Scheduler(abc.ABC):
 
         Notes
         -----
-        This method should gracefully terminate workers and clean up resources.
-        It should not raise an exception if workers have already stopped.
+        Returning successfully is a completion guarantee: the role's engines,
+        process groups, forked children and descendants, allocated ports, and
+        scheduler metadata have been removed. Deletion is idempotent, but a
+        partial cleanup must be reported to the caller instead of being reduced
+        to a warning.
         """
         raise NotImplementedError()
+
+    def _resolve_worker_owner(self, role: str) -> str:
+        """Resolve a logical colocated role to the role that owns processes."""
+        workers = getattr(self, "_workers", {})
+        aliases = getattr(self, "_colocated_roles", {})
+        current = role
+        chain: list[str] = []
+        while current not in workers:
+            if current in chain:
+                cycle = " -> ".join([*chain, current])
+                raise ValueError(f"Colocation role cycle detected: {cycle}")
+            chain.append(current)
+            parent = aliases.get(current)
+            if parent is None:
+                raise KeyError(
+                    f"Logical role {role!r} has no process owner; stopped at "
+                    f"{current!r}"
+                )
+            current = parent
+        return current
+
+    def _colocated_roles_leaf_first(self) -> list[str]:
+        """Return logical colocated roles in dependency-safe deletion order."""
+        aliases = getattr(self, "_colocated_roles", {})
+        children: dict[str, list[str]] = {}
+        for child, parent in aliases.items():
+            children.setdefault(parent, []).append(child)
+
+        ordered: list[str] = []
+        visiting: set[str] = set()
+        visited: set[str] = set()
+
+        def _visit(role: str) -> None:
+            if role in visiting:
+                raise ValueError(f"Colocation role cycle detected at {role!r}")
+            if role in visited:
+                return
+            visiting.add(role)
+            for child in children.get(role, []):
+                _visit(child)
+            visiting.remove(role)
+            visited.add(role)
+            if role in aliases:
+                ordered.append(role)
+
+        for role in aliases:
+            _visit(role)
+        return ordered
+
+    def _colocated_descendants_leaf_first(self, role: str) -> list[str]:
+        """Return logical descendants of *role* in deletion-safe order."""
+        aliases = getattr(self, "_colocated_roles", {})
+        descendants: list[str] = []
+        for candidate in self._colocated_roles_leaf_first():
+            current = candidate
+            seen: set[str] = set()
+            while current in aliases:
+                if current in seen:
+                    raise ValueError(
+                        f"Colocation role cycle detected while resolving {candidate!r}"
+                    )
+                seen.add(current)
+                current = aliases[current]
+                if current == role:
+                    descendants.append(candidate)
+                    break
+        return descendants
 
     @abc.abstractmethod
     def fork_workers(

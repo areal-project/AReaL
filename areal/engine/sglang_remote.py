@@ -370,8 +370,13 @@ class SGLangBackend:
         return HttpRequest(endpoint="/abort_request", payload={"abort_all": True})
 
     def get_health_check_request(self) -> HttpRequest:
-        """Get SGLang health check request."""
-        return HttpRequest(endpoint="/health", payload={}, method="GET")
+        """Get SGLang readiness check request."""
+        # SGLang's /health is a functional 1-token generation probe in recent
+        # versions. During AWEX colocated startup, generation can legitimately
+        # wait for the first train-side weight publication, so using /health for
+        # launch readiness deadlocks rollout initialization. /model_info only
+        # requires the HTTP server and model metadata to be ready.
+        return HttpRequest(endpoint="/model_info", payload={}, method="GET")
 
     def get_offload_request(self, tags: list[str] | None = None) -> HttpRequest:
         """Get SGLang offload request."""
@@ -391,7 +396,9 @@ class SGLangBackend:
 
     def launch_server(self, server_args: dict[str, Any]) -> subprocess.Popen:
         """Launch SGLang server subprocess."""
-        awex_meta_addr = server_args.pop("awex_meta_server_addr", None)
+        awex_meta_addr = server_args.pop(
+            "awex_meta_server_addr", None
+        ) or os.environ.get("AWEX_META_SERVER_ADDR")
         awex_colocate = server_args.pop("awex_colocate_mode", False)
         # Colocate placement: derive base_gpu_id from SLURM_LOCALID so two SGLang
         # servers sharing a node never claim the same GPU range. The controller
@@ -417,9 +424,31 @@ class SGLangBackend:
                 )
         cmd = SGLangConfig.build_cmd_from_args(server_args)
         _env = self.build_server_env(os.environ)
+        _env.setdefault("PYTHONFAULTHANDLER", "1")
 
-        if not awex_meta_addr:
-            awex_meta_addr = os.environ.get("AWEX_META_SERVER_ADDR")
+        drop_ld_preload_default = "1" if (awex_colocate or awex_meta_addr) else "0"
+        if _env.get(
+            "AREAL_SGLANG_DROP_LD_PRELOAD", drop_ld_preload_default
+        ).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "y",
+            "on",
+        }:
+            dropped = _env.pop("LD_PRELOAD", "")
+            dropped_tms = {
+                key: _env.pop(key)
+                for key in ("TMS_INIT_ENABLE", "TMS_INIT_ENABLE_CPU_BACKUP")
+                if key in _env
+            }
+            logger.info(
+                "Dropping training TMS environment for SGLang child: "
+                "LD_PRELOAD=%s, TMS=%s",
+                dropped,
+                dropped_tms,
+            )
+
         if awex_colocate or awex_meta_addr:
             sglang_entrypoints = (
                 "sglang.launch_server",

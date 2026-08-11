@@ -28,6 +28,18 @@ from areal.v2.weight_update.gateway.pair_registry import PairRegistry
 logger = logging.getLogger("WeightUpdateGateway")
 
 
+class RemoteWorkerResponseError(Exception):
+    """An actionable non-success response from a weight-update worker."""
+
+    def __init__(self, url: str, status_code: int, detail: str) -> None:
+        self.url = url
+        self.status_code = status_code
+        self.detail = detail
+        super().__init__(
+            f"Weight-update worker {url} returned HTTP {status_code}: {detail}"
+        )
+
+
 class ConnectRequest(BaseModel):
     pair_name: str
     train_worker_urls: list[str]
@@ -89,11 +101,25 @@ class KVSetSizeResponse(BaseModel):
     size: int
 
 
+async def _raise_for_remote_status(resp: aiohttp.ClientResponse, url: str) -> None:
+    if resp.status < 400:
+        return
+    try:
+        payload = await resp.json(content_type=None)
+    except Exception:
+        payload = await resp.text()
+    if isinstance(payload, dict):
+        detail = str(payload.get("error", payload))
+    else:
+        detail = str(payload)
+    raise RemoteWorkerResponseError(url, resp.status, detail)
+
+
 @async_http_retry
 async def _get_json(session: aiohttp.ClientSession, url: str, timeout_s: float) -> Any:
     timeout = aiohttp.ClientTimeout(total=timeout_s)
     async with session.get(url, timeout=timeout) as resp:
-        resp.raise_for_status()
+        await _raise_for_remote_status(resp, url)
         return await resp.json()
 
 
@@ -106,7 +132,7 @@ async def _post_json(
 ) -> Any:
     timeout = aiohttp.ClientTimeout(total=timeout_s)
     async with session.post(url, json=json_data, timeout=timeout) as resp:
-        resp.raise_for_status()
+        await _raise_for_remote_status(resp, url)
         return await resp.json()
 
 
@@ -119,7 +145,7 @@ async def _post(
 ) -> None:
     timeout = aiohttp.ClientTimeout(total=timeout_s)
     async with session.post(url, json=json_data, timeout=timeout) as resp:
-        resp.raise_for_status()
+        await _raise_for_remote_status(resp, url)
 
 
 def _get_own_ip() -> str:
@@ -196,13 +222,59 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
     async def connect(request: Request, body: ConnectRequest) -> ConnectResponse:
         _auth(request)
         pair_name = body.pair_name
+
+        # Reserve before the first await so overlapping requests cannot both
+        # initialize and then let one attempt roll back the other's resources.
+        if not registry.try_reserve(pair_name):
+            return JSONResponse(
+                status_code=409,
+                content={"error": f"Pair '{pair_name}' is already registered"},
+            )
+        try:
+            return await _connect_reserved(request, body)
+        finally:
+            registry.release_reservation(pair_name)
+
+    async def _connect_reserved(
+        request: Request,
+        body: ConnectRequest,
+    ) -> ConnectResponse:
+        pair_name = body.pair_name
         train_urls = body.train_worker_urls
         inference_urls = body.inference_worker_urls
 
-        if body.colocate:
-            return await _connect_colocate(
-                request, pair_name, train_urls, inference_urls
+        if body.colocate and body.mode != "awex":
+            return JSONResponse(
+                status_code=400,
+                content={"error": "colocate=True requires mode='awex'"},
             )
+
+        # AWEX transfer plans require matching train/infer parameter names;
+        # PEFT LoRA changes that layout. This contract also applies to the
+        # colocated path, so validate it before contacting any worker.
+        if body.mode == "awex" and body.use_lora:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": (
+                        "awex weight update does not support LoRA; set "
+                        "actor.weight_update_mode=disk in your config."
+                    )
+                },
+            )
+
+        if body.colocate:
+            try:
+                return await _connect_colocate(
+                    request, pair_name, train_urls, inference_urls
+                )
+            except RemoteWorkerResponseError as e:
+                logger.error("Colocated AWEX connect failed: %s", e)
+                status_code = 400 if e.status_code < 500 else 502
+                return JSONResponse(
+                    status_code=status_code,
+                    content={"error": str(e)},
+                )
 
         if body.mode == "disk":
             if not body.save_path:
@@ -232,7 +304,7 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
                 lora_name=body.lora_name,
                 lora_keep_versions=body.lora_keep_versions,
             )
-            registry.register(pair_info)
+            registry.register_reserved(pair_info)
             logger.info(
                 "Connected disk pair '%s' (save_path=%s, use_lora=%s, "
                 "lora_keep_versions=%d)",
@@ -242,22 +314,6 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
                 body.lora_keep_versions,
             )
             return ConnectResponse(pair_name=pair_name)
-
-        # awex mode -- LoRA is unsupported because the NCCL P2P transfer plan
-        # assumes train/infer parameter names match the HF layout, but PEFT
-        # exposes ``base_model.model.*.{base_layer,lora_A,lora_B}.weight`` on
-        # the train side. Fail fast with an actionable error rather than
-        # bubbling up a cryptic TransferPlanBuilder key-mismatch at init.
-        if body.use_lora:
-            return JSONResponse(
-                status_code=400,
-                content={
-                    "error": (
-                        "awex weight update does not support LoRA; set "
-                        "actor.weight_update_mode=disk in your config."
-                    )
-                },
-            )
 
         session = request.app.state.http_session
         init_timeout_s = config.init_timeout_s
@@ -388,7 +444,7 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
             master_addr=master_addr,
             master_port=master_port,
         )
-        registry.register(pair_info)
+        registry.register_reserved(pair_info)
 
         logger.info("Connected pair '%s'", pair_name)
         return ConnectResponse(pair_name=pair_name)
@@ -401,6 +457,20 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
     ) -> ConnectResponse:
         session = request.app.state.http_session
         init_timeout_s = config.init_timeout_s
+
+        # This endpoint must not create clients, transfer plans, NCCL groups,
+        # or gateway metadata. All training ranks validate their model layout
+        # before either side starts initialization.
+        await asyncio.gather(
+            *[
+                _post(
+                    session,
+                    f"{url}/awex/preflight_colocate_weight_update",
+                    init_timeout_s,
+                )
+                for url in train_urls
+            ]
+        )
 
         train_par, infer_par = await asyncio.gather(
             _get_json(
@@ -460,56 +530,84 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
         kv_store.put(pair_name, "training_params_meta", training_params_meta)
         kv_store.put(pair_name, "infer_params_meta", infer_params_meta)
 
-        gateway_addr = (
-            _get_own_ip() if config.host in ("0.0.0.0", "::") else config.host
-        )
-        kv_store_url = f"http://{gateway_addr}:{config.gateway_port}"
-
-        [master_port] = find_free_ports(1)
-
-        init_payload_base = {
-            "pair_name": pair_name,
-            "kv_store_url": kv_store_url,
-            "infer_world_size": infer_world_size,
-            "train_world_size": train_world_size,
-            "num_engines": num_engines,
-            "master_port": master_port,
-            "admin_api_key": config.admin_api_key,
-        }
-
-        init_tasks = []
-        for i, url in enumerate(inference_urls):
-            init_tasks.append(
-                _post(
-                    session,
-                    f"{url}/awex/init_colocate_weight_update",
-                    init_timeout_s,
-                    json_data={**init_payload_base, "transfer_rank": i},
-                )
+        try:
+            gateway_addr = (
+                _get_own_ip() if config.host in ("0.0.0.0", "::") else config.host
             )
-        for i, url in enumerate(train_urls):
-            init_tasks.append(
-                _post(
-                    session,
-                    f"{url}/awex/init_colocate_weight_update",
-                    init_timeout_s,
-                    json_data={
-                        **init_payload_base,
-                        "transfer_rank": infer_world_size + i,
-                    },
-                )
-            )
-        await asyncio.gather(*init_tasks)
+            kv_store_url = f"http://{gateway_addr}:{config.gateway_port}"
 
-        pair_info = PairInfo(
-            pair_name=pair_name,
-            train_worker_urls=train_urls,
-            inference_worker_urls=inference_urls,
-            train_world_size=train_world_size,
-            inference_world_size=infer_world_size,
-            colocate=True,
-        )
-        registry.register(pair_info)
+            [master_port] = find_free_ports(1)
+
+            init_payload_base = {
+                "pair_name": pair_name,
+                "kv_store_url": kv_store_url,
+                "infer_world_size": infer_world_size,
+                "train_world_size": train_world_size,
+                "num_engines": num_engines,
+                "master_port": master_port,
+                "admin_api_key": config.admin_api_key,
+            }
+
+            init_tasks = []
+            for i, url in enumerate(inference_urls):
+                init_tasks.append(
+                    _post(
+                        session,
+                        f"{url}/awex/init_colocate_weight_update",
+                        init_timeout_s,
+                        json_data={**init_payload_base, "transfer_rank": i},
+                    )
+                )
+            for i, url in enumerate(train_urls):
+                init_tasks.append(
+                    _post(
+                        session,
+                        f"{url}/awex/init_colocate_weight_update",
+                        init_timeout_s,
+                        json_data={
+                            **init_payload_base,
+                            "transfer_rank": infer_world_size + i,
+                        },
+                    )
+                )
+            init_results = await asyncio.gather(
+                *init_tasks,
+                return_exceptions=True,
+            )
+            init_errors = [
+                result for result in init_results if isinstance(result, Exception)
+            ]
+            if init_errors:
+                raise init_errors[0]
+
+            pair_info = PairInfo(
+                pair_name=pair_name,
+                train_worker_urls=train_urls,
+                inference_worker_urls=inference_urls,
+                train_world_size=train_world_size,
+                inference_world_size=infer_world_size,
+                colocate=True,
+            )
+            registry.register_reserved(pair_info)
+        except Exception:
+            teardown_results = await asyncio.gather(
+                *[
+                    _post(session, f"{url}/awex/teardown", init_timeout_s)
+                    for url in inference_urls + train_urls
+                ],
+                return_exceptions=True,
+            )
+            for url, result in zip(
+                inference_urls + train_urls,
+                teardown_results,
+                strict=True,
+            ):
+                if isinstance(result, Exception):
+                    logger.warning(
+                        "Best-effort AWEX teardown failed on %s: %s", url, result
+                    )
+            kv_store.clear_pair(pair_name)
+            raise
 
         logger.info("Connected colocate pair '%s'", pair_name)
         return ConnectResponse(pair_name=pair_name)

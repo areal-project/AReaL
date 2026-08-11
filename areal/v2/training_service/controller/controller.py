@@ -310,6 +310,8 @@ class GatewayTrainController:
                         kwargs={
                             "addr": kwargs.get("addr"),
                             "ft_spec": ft_spec,
+                            "role": role,
+                            "data_hook_role": kwargs.get("data_hook_role", role),
                         },
                         timeout=self.config.setup_timeout,
                     )

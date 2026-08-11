@@ -28,9 +28,14 @@ signal-finished); see ``awex_sglang_plugin.process_awex_queue``.
 
 from __future__ import annotations
 
+import gc
+import inspect
+import os
+import time
 from typing import Any
 
 import torch
+import torch.distributed as dist
 
 
 def _patch_tms_hook_mode() -> None:
@@ -76,12 +81,726 @@ _patch_tms_hook_mode()
 from awex.meta.infer_meta_resolver import InferParamMetaResolver  # noqa: E402
 from awex.meta.meta_resolver import ParamMetaResolver  # noqa: E402
 from awex.reader.nccl_reader import NCCLWorkerWeightsReader  # noqa: E402
+
+try:
+    from awex.reader.nccl_reader import (  # noqa: E402
+        _wait_colocate_write_finished as _awex_wait_colocate_write_finished,
+    )
+except ImportError:  # AWEX 0.7.0 uses one completion key per physical GPU.
+    _awex_wait_colocate_write_finished = None
 from awex.sharding import get_sharding_strategy_builder  # noqa: E402
+from awex.transfer.nccl_stream_batch import (  # noqa: E402
+    NcclColocateStreamBatchTransport,
+)
 from awex.util.common import simple_hf_config  # noqa: E402
 
+from areal.engine.weight_finite import (  # noqa: E402
+    check_named_tensors_finite,
+    iter_module_named_tensors,
+)
 from areal.utils.logging import getLogger  # noqa: E402
 
 logger = getLogger("AwexColocateReader")
+
+
+def _wait_colocate_write_finished(
+    meta_server_client: Any,
+    write_finished_key: str,
+    weights_update_group: Any,
+    transfer_rank: int,
+) -> None:
+    """Wait for the writer across both deployed AWEX handshake APIs."""
+    if _awex_wait_colocate_write_finished is not None:
+        _awex_wait_colocate_write_finished(
+            meta_server_client,
+            write_finished_key,
+            weights_update_group,
+            transfer_rank,
+        )
+        return
+
+    meta_server_client.get_object_then_delete(write_finished_key)
+
+
+class _BoundedMemoryNcclColocateStreamBatchTransport(NcclColocateStreamBatchTransport):
+    """Run AWEX recursive P2P without retaining every send clone at once.
+
+    Upstream AWEX clones every remote send slice while constructing the transfer
+    plan.  A Qwen3-30B 8-way colocate update consequently retains roughly 7/8
+    of the model (about 53 GiB per GPU) before NCCL starts.  Keep source views
+    in the plan and materialize only one operation per active peer at a time.
+    The temporary clones stay alive until their sends complete, then become
+    reusable by the CUDA allocator before the next operation index.
+    """
+
+    def update_weights_in_colocate_mode(
+        self,
+        train_to_infer_device_mapping,
+        infer_to_train_device_mapping,
+        transfer_rank,
+        rank_coordinate,
+        world_size,
+        send_transfer_plan,
+        recv_transfer_plan,
+        weights_update_group,
+        send_parameters,
+        recv_parameters,
+        *,
+        step_id=-1,
+        async_op=True,
+        **kwargs,
+    ):
+        import os
+        from concurrent.futures import Future
+
+        from awex.transfer.nccl_comm import (
+            detect_hang,
+            execute_tensors_to_copy,
+            validate_rank_mappings,
+        )
+        from awex.transfer.nccl_stream_batch import hang_detector
+        from awex.transfer.transfer_plan import slice_tensor
+        from awex.util import device as device_util
+
+        logger.info(
+            "Using bounded-memory RECURSIVE PARTITION P2P for rank %s",
+            rank_coordinate,
+        )
+        task_id = f"{rank_coordinate}-{step_id}"
+        validate_rank_mappings(
+            train_to_infer_device_mapping, infer_to_train_device_mapping
+        )
+        start_time = time.time()
+
+        send_ops = dict(send_transfer_plan.operations)
+        recv_ops = dict(recv_transfer_plan.operations)
+        num_sends = sum(len(ops) for ops in send_ops.values())
+        num_recvs = sum(len(ops) for ops in recv_ops.values())
+        logger.info(
+            "Start bounded-memory weights update for %s, num_sends=%d, num_recvs=%d",
+            task_id,
+            num_sends,
+            num_recvs,
+        )
+
+        all_send_p2p_ops = {}
+        all_recv_p2p_ops = {}
+        tensors_to_copy = []
+        train_slice_context = {}
+        non_contiguous_tensor_pairs = []
+
+        for peer_rank, ops in send_ops.items():
+            mapped_peer_rank = train_to_infer_device_mapping.get(peer_rank, peer_rank)
+            if mapped_peer_rank == transfer_rank:
+                for op in ops:
+                    send_tensor = send_parameters[op.send_shard_meta.name]
+                    tensor_sliced = slice_tensor(
+                        send_tensor,
+                        op,
+                        True,
+                        slice_context=train_slice_context,
+                    )
+                    tensors_to_copy.append(tensor_sliced)
+                continue
+
+            p2p_ops = []
+            for op in ops:
+                send_tensor = send_parameters[op.send_shard_meta.name]
+                tensor_sliced = slice_tensor(
+                    send_tensor,
+                    op,
+                    True,
+                    slice_context=train_slice_context,
+                )
+                recv_rank = train_to_infer_device_mapping.get(
+                    op.recv_rank, op.recv_rank
+                )
+                # Deliberately retain the source view.  _execute_ops_concurrent
+                # clones a bounded batch immediately before enqueueing sends.
+                p2p_op = dist.P2POp(
+                    dist.isend if async_op else dist.send,
+                    tensor_sliced,
+                    recv_rank,
+                    group=weights_update_group,
+                )
+                p2p_ops.append((op, p2p_op))
+            all_send_p2p_ops[mapped_peer_rank] = p2p_ops
+
+        for send_rank, ops in recv_ops.items():
+            recv_from_rank = train_to_infer_device_mapping[send_rank]
+            if recv_from_rank == transfer_rank:
+                continue
+            p2p_ops = []
+            for op in ops:
+                recv_tensor = recv_parameters[op.recv_shard_meta.name]
+                tensor_sliced = slice_tensor(recv_tensor, op, False)
+                if not tensor_sliced.is_contiguous():
+                    original_tensor = tensor_sliced
+                    tensor_sliced = tensor_sliced.contiguous()
+                    non_contiguous_tensor_pairs.append((original_tensor, tensor_sliced))
+                p2p_op = dist.P2POp(
+                    dist.irecv if async_op else dist.recv,
+                    tensor_sliced,
+                    recv_from_rank,
+                    group=weights_update_group,
+                )
+                p2p_ops.append((op, p2p_op))
+            all_recv_p2p_ops[recv_from_rank] = p2p_ops
+
+        if tensors_to_copy:
+            send_rank = infer_to_train_device_mapping[transfer_rank]
+            execute_tensors_to_copy(
+                tensors_to_copy,
+                recv_transfer_plan.operations[send_rank],
+                recv_parameters,
+                f"tensor copy for {task_id}",
+            )
+        else:
+            logger.info("No tensors to copy for %s", task_id)
+
+        future = Future()
+        total_send_ops = sum(len(ops) for ops in all_send_p2p_ops.values())
+        total_recv_ops = sum(len(ops) for ops in all_recv_p2p_ops.values())
+        message = (
+            f"[{os.getpid()}] execute {total_send_ops} sends "
+            f"{total_recv_ops} recvs with bounded recursive partition for {task_id}"
+        )
+        hang_detector.submit(detect_hang, future, message, [], timeout=60)
+
+        self.execute_recursive_partition_stream_transfer(
+            transfer_rank,
+            world_size,
+            all_send_p2p_ops,
+            all_recv_p2p_ops,
+            weights_update_group,
+            rank_coordinate,
+            step_id,
+        )
+        if non_contiguous_tensor_pairs:
+            with torch.no_grad():
+                for original_tensor, recv_tensor in non_contiguous_tensor_pairs:
+                    original_tensor.copy_(recv_tensor)
+            non_contiguous_tensor_pairs.clear()
+        device_util.synchronize()
+        future.set_result(True)
+        logger.info(
+            "Finished bounded-memory weights update for %s, took %.4f seconds",
+            task_id,
+            time.time() - start_time,
+        )
+
+    def _execute_ops_concurrent(self, ops_dict, peer_ranks):
+        """Execute one tensor per active peer and release send clones promptly."""
+        from awex.util import device as device_util
+
+        peer_ops_with_rank = [
+            (peer_rank, ops_dict[peer_rank])
+            for peer_rank in peer_ranks
+            if peer_rank in ops_dict
+        ]
+        if not peer_ops_with_rank:
+            return 0
+
+        peer_to_stream_idx = {
+            peer_rank: index % len(self._stream_pool)
+            for index, (peer_rank, _) in enumerate(peer_ops_with_rank)
+        }
+        max_ops = max(len(ops) for _, ops in peer_ops_with_rank)
+        total_ops = 0
+
+        for op_idx in range(max_ops):
+            work_handles = []
+            owned_send_tensors = []
+            for peer_rank, ops in peer_ops_with_rank:
+                if op_idx >= len(ops):
+                    continue
+                plan_op, p2p_op = ops[op_idx]
+                is_send = p2p_op.op is dist.isend or p2p_op.op is dist.send
+                stream = self._stream_pool[peer_to_stream_idx[peer_rank]]
+                with device_util.stream(stream):
+                    # Prepare the payload on the same stream that consumes it.
+                    # clone()/to() on the caller's default stream followed by
+                    # isend() on this dedicated stream has no ordering edge;
+                    # NCCL can otherwise read a partially written clone and
+                    # silently deliver sparse NaN/Inf values.
+                    tensor_for_transfer = (
+                        p2p_op.tensor.clone() if is_send else p2p_op.tensor
+                    )
+                    if is_send:
+                        # NCCL send/recv counts are expressed in elements of
+                        # each side's dtype. A dtype mismatch therefore changes
+                        # the wire size. Match the inference shard's dtype.
+                        recv_dtype = getattr(plan_op.recv_shard_meta, "dtype", None)
+                        if (
+                            recv_dtype is not None
+                            and tensor_for_transfer.dtype != recv_dtype
+                        ):
+                            tensor_for_transfer = tensor_for_transfer.to(recv_dtype)
+                        owned_send_tensors.append(tensor_for_transfer)
+                    result = p2p_op.op(
+                        tensor_for_transfer,
+                        p2p_op.peer,
+                        group=p2p_op.group,
+                    )
+                if p2p_op.op is dist.isend or p2p_op.op is dist.irecv:
+                    work_handles.append(result)
+                total_ops += 1
+
+            for work in work_handles:
+                work.wait()
+            # ProcessGroupNCCL Work.wait() only guarantees that the CUDA work
+            # has been enqueued.  The send clones must remain alive until NCCL
+            # has actually consumed them; otherwise the caching allocator can
+            # reuse their storage for the next batch and silently corrupt the
+            # transferred model.  Drain this bounded batch before releasing it.
+            device_util.synchronize()
+            work_handles.clear()
+            owned_send_tensors.clear()
+            tensor_for_transfer = None
+            result = None
+
+        return total_ops
+
+
+class _BailingV3PhysicalKeyNCCLWorkerWeightsReader(NCCLWorkerWeightsReader):
+    """Bailing v3 AWEX reader using physical GPU ids for MetaServer keys.
+
+    This override is intentionally specific to the Bailing v3 colocated
+    Megatron-to-SGLang path. In addition to fixing logical/physical GPU id
+    mapping, it carries Bailing v3 parameter sentinels and transfer workarounds
+    for the model's hybrid attention and MoE sharding. It must not be treated as
+    a generic AWEX reader without validating those assumptions for a new model.
+
+    In AReaL colocate runs each SGLang process is isolated with a single
+    CUDA_VISIBLE_DEVICES entry, so torch/awex see the logical device id as 0.
+    The training writer publishes IPC handles under the node-local physical GPU
+    id. Keep CUDA operations on the logical device, but use the physical id for
+    MetaServer key names and the train/infer device-rank mapping.
+    """
+
+    # Sentinel substrings for post-update data validation (incident 15): after
+    # every weight update, log shape/norm/first-4 values of a few infer-side
+    # tensors. Offline we locate the logged 4-value window inside the
+    # train-side HF checkpoint tensor to see WHICH slice actually landed on
+    # this rank — a mismatch pattern distinguishes shard permutation from
+    # corrupted payloads.
+    _AREAL_SENTINELS = (
+        "word_embeddings",
+        "lm_head",
+        "layers.0.attention.q_proj",
+        "layers.0.attention.k_proj",
+        "layers.0.attention.o_proj",
+        "layers.0.attention.dt_bias",
+        "layers.0.attention.A_log",
+        "layers.0.mlp.gate_proj",
+        "layers.0.mlp.down_proj",
+        "layers.2.mlp.gate.",
+        "layers.2.mlp.experts.0.gate_proj",
+        "layers.2.mlp.experts.0.down_proj",
+        "layers.2.mlp.experts.100.gate_proj",
+        "layers.2.input_layernorm",
+    )
+
+    def __init__(self, *args, physical_gpu_id: int, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._areal_physical_gpu_id = physical_gpu_id
+
+    def update_weights(self, step_id, **kwargs):
+        super().update_weights(step_id, **kwargs)
+        # Opt-in data-validation probe (set AREAL_AWEX_SENTINEL=1): it costs
+        # GPU->CPU syncs per sentinel tensor on every weight update, so it is
+        # OFF by default and should be enabled for bring-up/validation runs
+        # only (~20 log lines per rank per update).
+        if os.environ.get("AREAL_AWEX_SENTINEL", "0") not in ("0", "", "false"):
+            self._areal_log_sentinels(step_id)
+
+    def _areal_log_sentinels(self, step_id) -> None:
+        logged = 0
+        for name, param in getattr(self, "parameters", {}).items():
+            if not any(s in name for s in self._AREAL_SENTINELS):
+                continue
+            try:
+                t = param.detach()
+                flat = t.reshape(-1)[:4].float().tolist()
+                # fp32 accumulation without materializing a full fp32 copy.
+                norm = torch.linalg.vector_norm(t, dtype=torch.float32).item()
+                logger.info(
+                    "[AWEX-SENTINEL] step=%s transfer_rank=%s phys_gpu=%s "
+                    "name=%s shape=%s norm=%.6f first4=%s",
+                    step_id,
+                    self.transfer_rank,
+                    self._areal_physical_gpu_id,
+                    name,
+                    tuple(t.shape),
+                    norm,
+                    [round(v, 8) for v in flat],
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[AWEX-SENTINEL] failed for %s: %s",
+                    name,
+                    exc,
+                )
+            logged += 1
+            if logged >= 20:
+                break
+
+    def _set_device(self):
+        """Pin the reader to the correct logical CUDA device.
+
+        The upstream implementation resolves the device via
+        ``scheduler.gpu_id -> LOCAL_RANK -> 0``. With TP>1 SGLang servers
+        (e.g. flash ``t8``) scheduler processes are NOT isolated via
+        CUDA_VISIBLE_DEVICES and none of those sources are set, so every
+        rank ends up on device 0 -> NCCL "Duplicate GPU detected" at the
+        weights_exchange barrier (942314). Map from the physical GPU id
+        instead: with per-process CVD isolation (tiny ``t1``) device_count
+        is 1 and the logical id is 0; otherwise the logical id equals the
+        node-local physical id.
+        """
+        import torch
+
+        device_count = torch.cuda.device_count() or 1
+        gpu_id = self._areal_physical_gpu_id % device_count
+        prev_device = torch.cuda.current_device()
+        logger.info(
+            "[NCCLWeightsReader] (AReaL override) set device to %d for rank %s "
+            "(physical_gpu_id=%d, device_count=%d, previous device=%d)",
+            gpu_id,
+            self.transfer_rank,
+            self._areal_physical_gpu_id,
+            device_count,
+            prev_device,
+        )
+        torch.cuda.set_device(gpu_id)
+        self.barrier_device = torch.cuda.current_device()
+        self.backend = "nccl"
+        self.ready_tensor = torch.tensor(1).cuda()
+
+    def _init_reader_in_colocate_mode(self):
+        from awex.transfer.transfer_plan import TransferPlanBuilder
+        from awex.util import device as device_util
+        from awex.util.common import get_ip_address
+
+        ip_address = get_ip_address()
+        physical_gpu_id = self._areal_physical_gpu_id
+        self.meta_server_client.add_object_to_set(
+            "inference_device_rank_entries",
+            (ip_address, physical_gpu_id, self.transfer_rank),
+        )
+        self.meta_server_client.wait_set_until_size(
+            "inference_device_rank_entries",
+            self.infer_world_size,
+            timeout=self.timeout,
+        )
+        inference_device_entries = self.meta_server_client.get_set(
+            "inference_device_rank_entries",
+        )
+        self.inference_device_mapping = {
+            (ip_address, device_id): transfer_rank
+            for ip_address, device_id, transfer_rank in inference_device_entries
+        }
+
+        self.meta_server_client.wait_set_until_size(
+            "training_device_rank_entries",
+            self.training_world_size,
+            timeout=self.timeout,
+        )
+        device_rank_entries = self.meta_server_client.get_set(
+            "training_device_rank_entries",
+        )
+        self.training_device_mapping = {
+            (ip_address, device_id): transfer_rank
+            for ip_address, device_id, transfer_rank in device_rank_entries
+        }
+        self.train_to_infer_device_mapping = {}
+        self.infer_to_train_device_mapping = {}
+        for ip_address, device_id, transfer_rank in device_rank_entries:
+            infer_rank = self.inference_device_mapping[(ip_address, device_id)]
+            self.train_to_infer_device_mapping[transfer_rank] = infer_rank
+            self.infer_to_train_device_mapping[infer_rank] = transfer_rank
+
+        plan_builder = TransferPlanBuilder(
+            self.infer_world_size,
+            self.training_world_size,
+            self.num_engines,
+            self.enable_debug_mode,
+        )
+        self.send_transfer_plan = plan_builder.build_local_transfer_plan(
+            self.parameters_meta,
+            self.training_params_meta,
+            self.infer_to_train_device_mapping[self.transfer_rank],
+        )
+        self.colocate_transport = _BoundedMemoryNcclColocateStreamBatchTransport(
+            self.transfer_rank,
+            self.infer_world_size,
+        )
+        logger.info(
+            "Initialized NCCL weights reader for rank %d in colocate mode "
+            "(logical_device=%d, physical_gpu_id=%d)",
+            self.transfer_rank,
+            device_util.current_device(),
+            physical_gpu_id,
+        )
+
+    def collect_training_weights(self, step_id, **kwargs):
+        if not self.enable_colocate_mode:
+            return
+
+        from awex.util import device as device_util
+        from awex.util.common import get_ip_address
+        from awex.util.gpu import get_gpu_status
+        from awex.util.system_util import count_open_fds
+        from awex.util.tensor_util import (
+            cuda_ipc_deserialize,
+            ipc_deserialize,
+            reconstruct_tensors_from_groups,
+        )
+
+        ip_address = get_ip_address()
+        physical_gpu_id = self._areal_physical_gpu_id
+        logical_device_id = device_util.current_device()
+        key = f"training_serialized_weights_{ip_address}_{physical_gpu_id}_{step_id}"
+        logger.info(
+            "Start to get serialized ipc weights %s for rank %s (logical_device=%d)",
+            key,
+            self.rank_coordinate,
+            logical_device_id,
+        )
+        self.send_rank, self.send_rank_info, serialized_weights = (
+            self.meta_server_client.get_object(key, timeout=self.timeout)
+        )
+        logger.info(
+            "Finished getting serialized ipc weights %s for rank %s",
+            key,
+            self.rank_coordinate,
+        )
+        logger.info(
+            "GPU status before deserialization:\n%s for rank %s",
+            get_gpu_status(),
+            self.rank_coordinate,
+        )
+        logger.info("Open fds before deserialization: %d", count_open_fds())
+        if self.ipc_backend in ("cpu", "npu"):
+            group_shared, metadata, names = ipc_deserialize(serialized_weights)
+            group_shared = [t.to(logical_device_id) for t in group_shared]
+        else:
+            group_shared, metadata, names = cuda_ipc_deserialize(serialized_weights)
+        device_util.synchronize(device_id=logical_device_id)
+        tensors = reconstruct_tensors_from_groups(group_shared, metadata)
+        device_util.synchronize(device_id=logical_device_id)
+        self.deserialized_weights = dict(zip(names, tensors))
+        logger.info(
+            "Deserialized %d parameters and %d groups",
+            len(self.deserialized_weights),
+            len(group_shared),
+        )
+        logger.info(
+            "GPU status after deserialization for rank %s:\n%s",
+            self.rank_coordinate,
+            get_gpu_status(),
+        )
+        logger.info("Open fds after deserialization: %d", count_open_fds())
+
+    def _update_weights_in_colocate_mode(self, step_id, **kwargs):
+        import time
+
+        import torch
+        import torch.distributed as dist
+        from awex.util import device as device_util
+        from awex.util.common import compute_statistics, get_ip_address
+        from awex.util.gpu import print_current_gpu_status
+
+        assert self.enable_colocate_mode, "Colocate mode is not enabled"
+        self.collect_training_weights(step_id, **kwargs)
+        logger.info(
+            "Start to update weights using NCCL for step %s from %d ranks(%s) "
+            "for rank %s.",
+            step_id,
+            len(self.transfer_plan.operations),
+            self.send_ranks_sample,
+            self.rank_coordinate,
+        )
+        start_time = time.time()
+        ip_address = get_ip_address()
+        physical_gpu_id = self._areal_physical_gpu_id
+        key_suffix = f"_{ip_address}_{physical_gpu_id}_{step_id}"
+        update_finished_key = f"weights_update_finished{key_suffix}"
+        try:
+            # Check the local CUDA IPC import before any redistribution. This
+            # separates imported-mapping corruption from the subsequent P2P
+            # path in both diagnostics and failure handling.
+            check_named_tensors_finite(
+                self.deserialized_weights.items(),
+                stage="awex_reader_ipc_imported",
+                version=step_id,
+                logger=logger,
+                process_group=self.weights_update_group,
+            )
+            self.colocate_transport.update_weights_in_colocate_mode(
+                self.train_to_infer_device_mapping,
+                self.infer_to_train_device_mapping,
+                self.transfer_rank,
+                self.rank_coordinate,
+                self.infer_world_size,
+                self.send_transfer_plan,
+                self.transfer_plan,
+                self.weights_update_group,
+                self.deserialized_weights,
+                self.parameters,
+                step_id=step_id,
+            )
+            # Validate while the imported CUDA IPC mappings are still alive.
+            # Acknowledging first lets the writer release/reuse their storage,
+            # which both widens the lifetime race and strands the actor if a
+            # later validation rejects the received model.
+            check_named_tensors_finite(
+                self.parameters.items(),
+                stage="awex_reader_pre_ack",
+                version=step_id,
+                logger=logger,
+                process_group=self.weights_update_group,
+            )
+            self._run_pre_ack_callback(step_id)
+            named_tensors_factory = getattr(
+                self, "_areal_pre_ack_named_tensors_factory", None
+            )
+            if named_tensors_factory is not None:
+                check_named_tensors_finite(
+                    named_tensors_factory(),
+                    stage="awex_reader_derived_pre_ack",
+                    version=step_id,
+                    logger=logger,
+                    process_group=self.weights_update_group,
+                )
+        except Exception as exc:
+            # Reuse the versioned completion key as a failure result. Every
+            # writer rank already blocks on its paired physical GPU key, so
+            # this wakes it immediately without a second polling protocol.
+            self.meta_server_client.put_object(
+                update_finished_key,
+                {
+                    "ok": False,
+                    "error": f"{type(exc).__name__}: {exc}",
+                },
+            )
+            logger.exception(
+                "Rejected AWEX weights before writer IPC release: step=%s rank=%s",
+                step_id,
+                self.rank_coordinate,
+            )
+            raise
+        print_current_gpu_status(
+            f"after weights update using NCCL for rank {self.rank_coordinate}",
+        )
+        self.deserialized_weights = None
+        gc.collect()
+        torch.cuda.synchronize()
+        duration = time.time() - start_time
+        compute_statistics(
+            self._history_update_weights_time,
+            step_id,
+            duration,
+            "Receive weights using NCCL",
+        )
+        self.meta_server_client.put_object(update_finished_key, True)
+        dist.barrier(
+            group=self.weights_update_group,
+            device_ids=[device_util.current_device()],
+        )
+        logger.info(
+            "Barrier passed for reader step %s with rank %d",
+            step_id,
+            self.transfer_rank,
+        )
+        gc.collect()
+        if device_util.get_device_type() == "cuda":
+            torch.cuda.empty_cache()
+        write_finished_key = f"write_finished{key_suffix}"
+        _wait_colocate_write_finished(
+            self.meta_server_client,
+            write_finished_key,
+            self.weights_update_group,
+            self.transfer_rank,
+        )
+        logger.info(
+            "Finished updating weights in colocate mode for rank %d",
+            self.transfer_rank,
+        )
+
+    def _run_pre_ack_callback(self, step_id: int) -> None:
+        """Run local derived-weight rebuild and fail every rank consistently."""
+        callback = getattr(self, "_areal_pre_ack_callback", None)
+        if callback is None:
+            return
+
+        local_error: BaseException | None = None
+        try:
+            callback(step_id)
+        except BaseException as exc:  # noqa: BLE001
+            local_error = exc
+
+        any_error = local_error is not None
+        if dist.is_initialized():
+            backend = str(dist.get_backend(self.weights_update_group)).lower()
+            device = (
+                torch.device("cuda", torch.cuda.current_device())
+                if "nccl" in backend
+                else torch.device("cpu")
+            )
+            failed = torch.tensor(int(any_error), dtype=torch.int32, device=device)
+            dist.all_reduce(
+                failed,
+                op=dist.ReduceOp.MAX,
+                group=self.weights_update_group,
+            )
+            any_error = bool(failed.item())
+
+        if not any_error:
+            return
+        if local_error is not None:
+            raise RuntimeError(
+                "AWEX derived-weight rebuild failed before writer ACK: "
+                f"{type(local_error).__name__}: {local_error}"
+            ) from local_error
+        raise RuntimeError(
+            "AWEX derived-weight rebuild failed on another rank before writer ACK"
+        )
+
+
+def _patch_awex_qwen3_attention_names() -> None:
+    """Canonicalize Qwen3 SGLang attention names for the AWEX train reader."""
+    from awex.converter.sglang_converter import SGlangToHFWeightConverter
+
+    original_norm = SGlangToHFWeightConverter._convert_layer_norm_param
+    original_attention = SGlangToHFWeightConverter._convert_attention_param
+    if getattr(original_norm, "_areal_qwen3_attention_names", False):
+        return
+
+    def _convert_layer_norm_param(self, name, parameter, layer_number):
+        mapping = {
+            "self_attn.q_norm.weight": "attention.query_layernorm.weight",
+            "self_attn.k_norm.weight": "attention.key_layernorm.weight",
+        }
+        if name in mapping:
+            return [(mapping[name], parameter)]
+        return original_norm(self, name, parameter, layer_number)
+
+    def _convert_attention_param(self, name, parameter, layer_number):
+        mapping = {
+            "self_attn.qkv_proj.weight": "attention.query_key_value_proj.weight",
+            "self_attn.o_proj.weight": "attention.dense.weight",
+        }
+        if name in mapping:
+            return [(mapping[name], parameter)]
+        return original_attention(self, name, parameter, layer_number)
+
+    _convert_layer_norm_param._areal_qwen3_attention_names = True
+    SGlangToHFWeightConverter._convert_layer_norm_param = _convert_layer_norm_param
+    SGlangToHFWeightConverter._convert_attention_param = _convert_attention_param
+
+
+_patch_awex_qwen3_attention_names()
 
 
 def _ensure_awex_models_registered() -> None:
@@ -248,7 +967,7 @@ class AwexColocateReader:
         """Per-rank raw meta via awex's own staticmethod (HF-converted names)."""
         server_args = self._scheduler.server_args
         model_context = self._build_model_context()
-        return InferParamMetaResolver._get_model_param_info(
+        raw_meta = InferParamMetaResolver._get_model_param_info(
             "sglang",
             server_args,
             convert_params=True,
@@ -256,6 +975,37 @@ class AwexColocateReader:
             model=self._get_model(),
             model_context=model_context,
         )
+
+        # AWEX's worker reader exposes ``lm_head.weight`` as an alias of the
+        # embedding tensor for tied models, and its MCore metadata resolver
+        # publishes the same alias on the training side.  The pinned AWEX
+        # version only mirrors that alias into *vLLM* inference metadata,
+        # leaving SGLang with train=255 / infer=254 and no transfer plan.  Keep
+        # the SGLang metadata aligned with the parameter dictionary that the
+        # native reader constructs during ``initialize()``.
+        hf_config = getattr(self._get_model(), "config", None)
+        pp_rank = int(model_context.get("pp_rank", 0))
+        pp_size = int(model_context.get("pp_size", 1))
+        params_meta = raw_meta.get("params_meta", [])
+        names = {param_meta["name"] for param_meta in params_meta}
+        if (
+            getattr(hf_config, "tie_word_embeddings", False)
+            and pp_rank == pp_size - 1
+            and "lm_head.weight" not in names
+            and "model.embed_tokens.weight" in names
+        ):
+            embedding_meta = next(
+                param_meta
+                for param_meta in params_meta
+                if param_meta["name"] == "model.embed_tokens.weight"
+            )
+            lm_head_meta = dict(embedding_meta)
+            lm_head_meta["name"] = "lm_head.weight"
+            params_meta.append(lm_head_meta)
+            logger.info(
+                "Infer meta: added lm_head.weight alias for tied embeddings in SGLang"
+            )
+        return raw_meta
 
     def _build_instance_params_meta(self):
         """Gather single-instance raw meta via the MetaServer, then aggregate.
@@ -432,7 +1182,7 @@ class AwexColocateReader:
         logger.info("Got training_params_meta from MetaServer")
 
         model_context = self._build_model_context()
-        reader = NCCLWorkerWeightsReader(
+        reader = _BailingV3PhysicalKeyNCCLWorkerWeightsReader(
             engine_name="sglang",
             model=self._get_model(),
             model_context=model_context,
@@ -445,6 +1195,7 @@ class AwexColocateReader:
             enable_colocate_mode=True,
             ipc_backend="cuda",
             enable_debug_mode=False,
+            physical_gpu_id=self._local_gpu_id,
         )
         reader.initialize()
         self._reader = reader
@@ -457,6 +1208,7 @@ class AwexColocateReader:
         )
         return reader
 
+    @torch.no_grad()
     def update_weights(self, version: int) -> None:
         """Run one colocate weight update via the native awex worker reader.
 
@@ -468,9 +1220,64 @@ class AwexColocateReader:
         if not self._initialized:
             raise RuntimeError("AwexColocateReader not initialized")
         reader = self._ensure_reader()
+        self._pre_process_model_weights()
+        models = [model for model, _ in self._iter_model_parts()]
+        reader._areal_pre_ack_callback = (
+            lambda _step_id: self._rebuild_derived_weights()
+        )
+        reader._areal_pre_ack_named_tensors_factory = lambda: iter_module_named_tensors(
+            models,
+            extra_tensor_attrs=(
+                "w_kc",
+                "w_vc",
+                "w_scale",
+                "w_scale_k",
+                "w_scale_v",
+            ),
+        )
         reader.update_weights(step_id=version)
-        self._rebuild_derived_weights()
         logger.info("Colocate weight update completed: version=%d", version)
+
+    def _iter_model_parts(self) -> list[tuple[Any, bool]]:
+        models = self._get_model()
+        if isinstance(models, (list, tuple)):
+            if len(models) == 2:
+                return [(models[0], False), (models[1], True)]
+            return [(model, idx > 0) for idx, model in enumerate(models)]
+        return [(models, False)]
+
+    @staticmethod
+    def _call_model_hook(model: Any, hook_name: str, **kwargs: Any) -> bool:
+        hook = getattr(model, hook_name, None)
+        if hook is None:
+            return False
+
+        try:
+            params = inspect.signature(hook).parameters
+        except (TypeError, ValueError):
+            hook()
+            return True
+
+        if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
+            hook(**kwargs)
+        else:
+            accepted = {
+                name
+                for name, p in params.items()
+                if p.kind
+                in (
+                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                    inspect.Parameter.KEYWORD_ONLY,
+                )
+            }
+            hook(**{k: v for k, v in kwargs.items() if k in accepted})
+        return True
+
+    def _pre_process_model_weights(self) -> None:
+        """Run model-side pre-load hooks before AWEX writes params in-place."""
+        for model, _ in self._iter_model_parts():
+            if self._call_model_hook(model, "pre_process_weights_if_quant"):
+                logger.info("pre_process_weights_if_quant() prepared model weights")
 
     def _rebuild_derived_weights(self) -> None:
         """Re-derive non-parameter tensors after an in-place AWEX weight write.
@@ -490,13 +1297,23 @@ class AwexColocateReader:
         into the existing tensors in place, which keeps captured CUDA-graph
         addresses valid.
         """
-        model = self._get_model()
-        fn = getattr(model, "post_load_weights", None)
-        if fn is None:
-            return
-        fn()
+        did_post_load = False
+        for model, is_nextn in self._iter_model_parts():
+            did_post_load = (
+                self._call_model_hook(
+                    model,
+                    "post_load_weights",
+                    is_nextn=is_nextn,
+                    weight_names=None,
+                )
+                or did_post_load
+            )
+            if self._call_model_hook(model, "post_process_weights_if_quant"):
+                logger.info("post_process_weights_if_quant() finalized model weights")
+
         torch.cuda.synchronize()
-        logger.info("post_load_weights() re-derived absorbed MLA weights")
+        if did_post_load:
+            logger.info("post_load_weights() re-derived absorbed MLA weights")
 
     # ── memory release/resume (delegate to SGLang native) ─────────────
 

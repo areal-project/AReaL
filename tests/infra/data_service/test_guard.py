@@ -81,6 +81,11 @@ def test_fork_raw_command_success(mock_run, client, state: GuardState):
 @patch("areal.infra.rpc.guard.app.kill_process_tree")
 def test_kill_known_worker(mock_kill, client, state: GuardState):
     mock_proc = _make_mock_process(pid=123)
+
+    def mark_stopped(*args, **kwargs):
+        mock_proc.poll.return_value = 0
+
+    mock_kill.side_effect = mark_stopped
     state.forked_children.append(mock_proc)
     state.forked_children_map[("test", 0)] = mock_proc
 
@@ -96,6 +101,12 @@ def test_cleanup_kills_all_running_children(mock_kill, state: GuardState):
     proc2 = _make_mock_process(pid=200)
     state.forked_children = [proc1, proc2]
     state.forked_children_map = {("a", 0): proc1, ("b", 0): proc2}
+
+    def mark_stopped(pid, **kwargs):
+        del kwargs
+        {proc1.pid: proc1, proc2.pid: proc2}[pid].poll.return_value = 0
+
+    mock_kill.side_effect = mark_stopped
 
     cleanup_forked_children(state)
 
