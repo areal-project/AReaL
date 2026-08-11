@@ -748,9 +748,15 @@ def test_chunked_lm_head_matches_full_fused_path(
     )
     assert _relative_l2(chunked_weight.grad, reference_weight.grad) <= 5e-3
     assert _cosine_similarity(chunked_weight.grad, reference_weight.grad) >= 0.99999
-    torch.testing.assert_close(
-        chunked_bias.grad, reference_bias.grad, rtol=1e-5, atol=2e-5
-    )
+    if fp32_operands:
+        torch.testing.assert_close(
+            chunked_bias.grad, reference_bias.grad, rtol=1e-5, atol=2e-5
+        )
+    else:
+        # The low-precision chunked path sums dlogits once per chunk, while the
+        # full reference reduces all tokens at once. Both honor the BF16/FP16
+        # backward contract but have different low-precision reduction order.
+        assert _relative_l2(chunked_bias.grad, reference_bias.grad) <= 5e-3
 
 
 @pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA is required for chunked LM Head")
