@@ -3432,6 +3432,43 @@ class PPOConfig(BaseExperimentConfig):
                 UserWarning,
                 stacklevel=2,
             )
+        # Complementary to the warning above (the two never both fire: that one needs
+        # the flag off, this one needs it on). With deterministic inference ON but no
+        # per-request seed and n_samples > 1, SGLang gives every seedless request the
+        # same default seed (42, see sampling_batch_info.py in sglang); its noise is a
+        # pure function of (seed, position, vocab-index), so a group's same-prompt
+        # rollouts collapse to identical completions and zero out GRPO's advantage.
+        # Raise rather than warn (unlike the seed-ignored case above, which is
+        # harmless): the combination has no working use, and enable_deterministic_
+        # inference is new here and default-off, so failing fast breaks no existing
+        # config -- the same fail-fast this class already applies to sampling_seed on
+        # the vLLM backend. Scoped to stochastic sampling: under greedy or
+        # temperature == 0 the request builders decode with temperature 0.0 (see
+        # "0.0 if gconfig.greedy else gconfig.temperature" in
+        # SGLangBackend.build_generation_request), so the group collapses regardless of
+        # any seed and a per-request seed would not change it. Also scoped to a non-vLLM
+        # backend: enable_deterministic_inference is an SGLang-only flag, so on a vLLM
+        # run it is inert and this SGLang-worded error would misdirect debugging. The
+        # vLLM guard above only fires when a seed is set, so it never covers this
+        # unset-seed case; scope it out here, reusing the rollout_backend parsed above.
+        if (
+            sglang_deterministic
+            and self.gconfig.sampling_seed is None
+            and self.gconfig.n_samples > 1
+            and not self.gconfig.greedy
+            and self.gconfig.temperature > 0
+            and not (
+                isinstance(rollout_backend, str)
+                and rollout_backend.split(":")[0].split("[")[0] == "vllm"
+            )
+        ):
+            raise ValueError(
+                "sglang.enable_deterministic_inference is True with gconfig.n_samples "
+                "> 1 but no gconfig.sampling_seed: SGLang gives every seedless request "
+                "the same default seed, so the group's same-prompt rollouts collapse to "
+                "identical completions. Set distinct per-rollout seeds, use "
+                "n_samples=1, or disable enable_deterministic_inference."
+            )
         super().__post_init__()
 
 

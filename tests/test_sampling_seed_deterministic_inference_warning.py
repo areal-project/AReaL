@@ -126,3 +126,77 @@ def test_ppo_config_does_not_raise_when_rollout_backend_unset():
             trial_name="trial",
             gconfig=GenerationHyperparameters(sampling_seed=42),
         )
+
+
+def test_ppo_config_raises_on_grouped_deterministic_rollouts_without_seed():
+    """With deterministic inference on but no per-request seed, SGLang gives every
+    seedless request the same default seed, so a group's n_samples>1 same-prompt
+    rollouts collapse to identical completions and zero out GRPO's advantage. This
+    combination has no working use and the flag is new and default-off, so fail fast
+    at config time rather than burning a whole training run on a degenerate config."""
+    with pytest.raises(ValueError, match="collapse to identical completions"):
+        PPOConfig(
+            experiment_name="exp",
+            trial_name="trial",
+            gconfig=GenerationHyperparameters(n_samples=8),
+            sglang=SGLangConfig(enable_deterministic_inference=True),
+        )
+
+
+def test_ppo_config_does_not_raise_on_grouped_deterministic_rollouts_with_seed():
+    """A seed IS set, the user's signal they intend distinct per-rollout seeds, so
+    the collapse guard must not fire."""
+    PPOConfig(
+        experiment_name="exp",
+        trial_name="trial",
+        gconfig=GenerationHyperparameters(n_samples=8, sampling_seed=42),
+        sglang=SGLangConfig(enable_deterministic_inference=True),
+    )
+
+
+def test_ppo_config_does_not_raise_on_deterministic_single_sample_without_seed():
+    """n_samples == 1 is not a group, so there is no intra-group diversity to
+    collapse; the guard must not fire (it would otherwise block every non-grouped
+    run that enables deterministic inference)."""
+    PPOConfig(
+        experiment_name="exp",
+        trial_name="trial",
+        gconfig=GenerationHyperparameters(n_samples=1),
+        sglang=SGLangConfig(enable_deterministic_inference=True),
+    )
+
+
+def test_ppo_config_does_not_raise_on_grouped_deterministic_greedy_without_seed():
+    """Under greedy decoding the request builders decode at temperature 0.0, so the
+    group collapses regardless of any seed and a per-request seed would not change
+    it; the seed-focused guard is scoped to stochastic sampling and must not fire."""
+    PPOConfig(
+        experiment_name="exp",
+        trial_name="trial",
+        gconfig=GenerationHyperparameters(n_samples=8, greedy=True),
+        sglang=SGLangConfig(enable_deterministic_inference=True),
+    )
+
+
+def test_ppo_config_does_not_raise_on_grouped_deterministic_temperature_zero():
+    """temperature == 0 is likewise seed-independent argmax decoding; the guard is
+    scoped to temperature > 0 and must not fire."""
+    PPOConfig(
+        experiment_name="exp",
+        trial_name="trial",
+        gconfig=GenerationHyperparameters(n_samples=8, temperature=0.0),
+        sglang=SGLangConfig(enable_deterministic_inference=True),
+    )
+
+
+def test_ppo_config_does_not_raise_on_grouped_deterministic_vllm_backend():
+    """enable_deterministic_inference is an SGLang-only flag and inert on vLLM, so
+    the SGLang-worded collapse guard must not fire for a vLLM backend even when the
+    flag is (pointlessly) set; a vLLM run does not hit SGLang's default-seed path."""
+    PPOConfig(
+        experiment_name="exp",
+        trial_name="trial",
+        gconfig=GenerationHyperparameters(n_samples=8),
+        rollout=InferenceEngineConfig(backend="vllm:d2t4"),
+        sglang=SGLangConfig(enable_deterministic_inference=True),
+    )
