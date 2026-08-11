@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import functools
+import math
 from typing import Any
 
 import torch
@@ -74,14 +75,16 @@ def _compute_token_level_gae(
     advantages_reversed = [torch.zeros(bs, dtype=torch.float32, device=values.device)]
     lastgaelam = torch.zeros(bs, dtype=torch.float32, device=values.device)
     nextvalues = values[:, max_seqlen - 1] * seq_no_eos_mask
+    discounted_lambda = discount * gae_lambda
     for t in reversed(range(max_seqlen - 1)):
         delta = rewards[:, t] + discount * nextvalues - values[:, t]
-        newgaelam = delta + discount * gae_lambda * lastgaelam
+        newgaelam = delta + discounted_lambda * lastgaelam
 
         # Skip tokens that do not contribute to the loss.
         mask = loss_mask[:, t]
-        nextvalues = nextvalues * (1 - mask) + values[:, t] * mask
-        lastgaelam = lastgaelam * (1 - mask) + newgaelam * mask
+        inverse_mask = 1 - mask
+        nextvalues = nextvalues * inverse_mask + values[:, t] * mask
+        lastgaelam = lastgaelam * inverse_mask + newgaelam * mask
         advantages_reversed.append(lastgaelam)
 
     advantages = torch.stack(advantages_reversed[::-1], dim=1)
@@ -181,7 +184,9 @@ def _compute_turn_level_gae(
         bs, max_seqlen, dtype=torch.float32, device=values.device
     )
     lastgaelam = torch.zeros(bs, dtype=torch.float32, device=values.device)
+    zero_advantages = torch.zeros_like(lastgaelam)
     nextvalues = values[:, max_seqlen - 1] * seq_no_eos_mask
+    discounted_lambda = discount * gae_lambda
     # Advantage calculation normally runs over CPU rollout tensors. Avoid
     # iterating over every token slot there when trajectories contain only a
     # handful of turns. On accelerator inputs, retain a static loop bound to
@@ -197,11 +202,11 @@ def _compute_turn_level_gae(
         delta = (
             turn_rewards[:, turn_idx] + discount * nextvalues - turn_values[:, turn_idx]
         )
-        newgaelam = delta + discount * gae_lambda * lastgaelam
+        newgaelam = delta + discounted_lambda * lastgaelam
 
         mask = valid_turn_mask[:, turn_idx]
         turn_advantages[:, turn_idx] = torch.where(
-            mask, newgaelam, torch.zeros_like(newgaelam)
+            mask, newgaelam, zero_advantages
         )
         nextvalues = torch.where(mask, turn_values[:, turn_idx], nextvalues)
         lastgaelam = torch.where(mask, newgaelam, lastgaelam)
@@ -473,7 +478,12 @@ class PPOActor:
             values = torch.zeros_like(rewards)
         else:
             values = data["values"]
-        gae_lambda = self._compute_gae_lambda(loss_mask, turn_ids)
+        if self._gae_lambda_is_custom:
+            gae_lambda = self._compute_gae_lambda(loss_mask, turn_ids)
+        else:
+            gae_lambda = float(self.gae_lambda)
+            if not math.isfinite(gae_lambda):
+                raise ValueError(f"Static gae_lambda must be finite, got {gae_lambda}")
         if self.gae_timestep_unit == "turn":
             assert turn_ids is not None
             advantages, returns = _compute_turn_level_gae(

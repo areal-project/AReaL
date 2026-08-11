@@ -238,6 +238,43 @@ def test_static_gae_lambda_ignores_kwargs_and_legacy_missing_turn_ids():
     )
 
 
+def test_static_gae_lambda_main_path_skips_dynamic_context(monkeypatch):
+    """A static lambda avoids per-batch trajectory length construction."""
+    actor = _make_actor(gae_lambda=0.25)
+
+    def fail_dynamic_resolution(*_args, **_kwargs):
+        raise AssertionError("static lambda should not use dynamic resolution")
+
+    monkeypatch.setattr(actor, "_compute_gae_lambda", fail_dynamic_resolution)
+    batch = {
+        "input_ids": torch.zeros(1, 4, dtype=torch.long),
+        "loss_mask": torch.tensor([[0, 1, 1, 1]], dtype=torch.float32),
+        "logprobs": torch.zeros(1, 4, dtype=torch.float32),
+        "attention_mask": torch.ones(1, 4, dtype=torch.bool),
+        "rewards": torch.tensor([1.0]),
+    }
+
+    result = actor._compute_advantages(batch)
+
+    assert result["advantages"].shape == torch.Size([1, 4])
+
+
+@pytest.mark.parametrize("gae_lambda", [float("nan"), float("inf")])
+def test_static_gae_lambda_main_path_rejects_non_finite_values(gae_lambda):
+    """The static fast path retains the dynamic path's finite-value check."""
+    actor = _make_actor(gae_lambda=gae_lambda)
+    batch = {
+        "input_ids": torch.zeros(1, 3, dtype=torch.long),
+        "loss_mask": torch.tensor([[0, 1, 1]], dtype=torch.float32),
+        "logprobs": torch.zeros(1, 3, dtype=torch.float32),
+        "attention_mask": torch.ones(1, 3, dtype=torch.bool),
+        "rewards": torch.tensor([1.0]),
+    }
+
+    with pytest.raises(ValueError, match="Static gae_lambda must be finite"):
+        actor._compute_advantages(batch)
+
+
 def test_vapo_gae_lambda_uses_selected_token_lengths_per_sample():
     """Token mode uses canonical generated-token counts for VAPO lambda."""
     actor = _make_actor(
