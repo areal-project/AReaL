@@ -115,44 +115,44 @@ def _lm_head_compute_weight(
     return weight.float(), bias.float() if bias is not None else None
 
 
-def _linear_with_fp32_operands(
-    input_: torch.Tensor,
-    weight: torch.Tensor,
-    bias: torch.Tensor | None,
-    *,
-    allreduce_dgrad: bool,
-    sequence_parallel: bool,
-    tp_group: torch.distributed.ProcessGroup | None,
-) -> torch.Tensor:
-    """Project with FP32 operands while retaining PyTorch autograd semantics."""
-    if sequence_parallel:
-        tp_group = mcore_layers.get_tensor_model_parallel_group_if_none(tp_group)
-        total_input = tensor_parallel.gather_from_sequence_parallel_region(
-            input_,
-            tensor_parallel_output_grad=True,
-            group=tp_group,
-        )
-    elif allreduce_dgrad:
-        tp_group = mcore_layers.get_tensor_model_parallel_group_if_none(tp_group)
-        total_input = tensor_parallel.copy_to_tensor_model_parallel_region(
-            input_, group=tp_group
-        )
-    else:
-        total_input = input_
-
-    compute_weight, compute_bias = _lm_head_compute_weight(
-        weight, bias, fp32_operands=True
-    )
-    output = torch.matmul(total_input.float(), compute_weight.t())
-    if compute_bias is not None:
-        output = output + compute_bias
-    return output
-
-
 class _LinearWithNativeOutput(
     mcore_layers.LinearWithGradAccumulationAndAsyncCommunication
 ):
     """AReaL TP linear with the native input/weight output dtype."""
+
+    @staticmethod
+    def _forward_with_fp32_operands(
+        input_: torch.Tensor,
+        weight: torch.Tensor,
+        bias: torch.Tensor | None,
+        *,
+        allreduce_dgrad: bool,
+        sequence_parallel: bool,
+        tp_group: torch.distributed.ProcessGroup | None,
+    ) -> torch.Tensor:
+        """Project with FP32 operands while retaining PyTorch autograd semantics."""
+        if sequence_parallel:
+            tp_group = mcore_layers.get_tensor_model_parallel_group_if_none(tp_group)
+            total_input = tensor_parallel.gather_from_sequence_parallel_region(
+                input_,
+                tensor_parallel_output_grad=True,
+                group=tp_group,
+            )
+        elif allreduce_dgrad:
+            tp_group = mcore_layers.get_tensor_model_parallel_group_if_none(tp_group)
+            total_input = tensor_parallel.copy_to_tensor_model_parallel_region(
+                input_, group=tp_group
+            )
+        else:
+            total_input = input_
+
+        compute_weight, compute_bias = _lm_head_compute_weight(
+            weight, bias, fp32_operands=True
+        )
+        output = torch.matmul(total_input.float(), compute_weight.t())
+        if compute_bias is not None:
+            output = output + compute_bias
+        return output
 
     @staticmethod
     @mcore_layers.custom_fwd
@@ -439,7 +439,7 @@ def linear_with_areal_output(
             raise NotImplementedError(
                 "FP32 lm_head operands do not support deferred embedding wgrad"
             )
-        return _linear_with_fp32_operands(
+        return _LinearWithNativeOutput._forward_with_fp32_operands(
             input_,
             weight,
             bias,
