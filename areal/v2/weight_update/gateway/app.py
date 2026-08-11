@@ -131,8 +131,8 @@ def _get_own_ip() -> str:
         return "127.0.0.1"
 
 
-def _merge_training_meta_by_name(meta_list: list[dict]) -> list[dict]:
-    """Merge serialized training ParameterMeta entries by parameter name.
+def _merge_meta_by_name(meta_list: list[dict]) -> list[dict]:
+    """Merge serialized ParameterMeta entries by parameter name.
 
     Each FSDP worker reports metadata for its own local shard only.
     With ``dp_size > 1`` the same parameter name appears once per worker,
@@ -165,6 +165,10 @@ def _merge_training_meta_by_name(meta_list: list[dict]) -> list[dict]:
                     new_rep_data.get("shards", [])
                 )
     return list(by_name.values()) + overflow
+
+
+# Historical alias; the merge is not training-specific.
+_merge_training_meta_by_name = _merge_meta_by_name
 
 
 def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
@@ -320,6 +324,11 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
                 infer_params_meta.extend(meta)
             else:
                 infer_params_meta.append(meta)
+        # Every inference rank reports the same parameter names, one entry per
+        # (name, rank). The transfer plan indexes by name alone, so without
+        # merging only the last entry per name survives and the other ranks'
+        # shards are dropped.
+        infer_params_meta = _merge_meta_by_name(infer_params_meta)
 
         kv_store.put(pair_name, "training_params_meta", training_params_meta)
         kv_store.put(pair_name, "infer_params_meta", infer_params_meta)
@@ -456,6 +465,11 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
                 infer_params_meta.extend(meta)
             else:
                 infer_params_meta.append(meta)
+        # Every inference rank reports the same parameter names, one entry per
+        # (name, rank). The transfer plan indexes by name alone, so without
+        # merging only the last entry per name survives and the other ranks'
+        # shards are dropped.
+        infer_params_meta = _merge_meta_by_name(infer_params_meta)
 
         kv_store.put(pair_name, "training_params_meta", training_params_meta)
         kv_store.put(pair_name, "infer_params_meta", infer_params_meta)
