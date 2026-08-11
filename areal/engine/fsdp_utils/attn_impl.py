@@ -7,6 +7,9 @@ BUILTIN_ATTN_IMPLS = (
     "sdpa",
     "flash_attention_2",
     "flash_attention_3",
+    # FA4（flash_attn.cute）。transformers 没有这个 backend，由 fa4_attn.py 注册；
+    # 名字不能含 "flash"（否则被 transformers 抢走）。Blackwell(sm100) 上唯一可用的 FA。
+    "fa4",
     "flex_attention",
 )
 

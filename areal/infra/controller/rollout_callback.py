@@ -29,7 +29,15 @@ class RolloutCallback:
     """
 
     controller_addr: str
-    request_timeout: float = 600.0
+    # Raised from 600s (2026-08-02). The LoRA weight-update path fans out
+    # `/load_lora_adapter` to every inference engine, and that request queues behind
+    # in-flight `/generate` work on the SGLang scheduler -- unlike the full-model path,
+    # which passes `abort_all_requests=True`. Under a saturated rollout queue the load
+    # can starve well past 600s; observed on a 32-concurrency agentic RL run where ten
+    # updates succeeded and the eleventh timed out at exactly 600s, killing the job.
+    # A longer ceiling only costs time in the pathological case and never in the happy
+    # path, so prefer it over losing the run.
+    request_timeout: float = 1800.0
 
     def _post(self, endpoint: str, payload: dict[str, Any] | None = None) -> dict:
         """Make synchronous HTTP POST to controller callback endpoint.

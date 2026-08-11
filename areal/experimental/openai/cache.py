@@ -263,6 +263,15 @@ class InteractionCache(OrderedDict[str, InteractionWithTokenLogpReward]):
         value: InteractionWithTokenLogpReward,
     ) -> None:
         """Add a new interaction to the cache, automatically building parent-child relationships."""
+        # ⭐ RAO：把本次请求原始的 `model`（含 `__dN` 深度后缀）钉到 interaction 上。
+        #    proxy 在转发前会丢掉 model 字段，这里是唯一还拿得到它的地方。
+        if getattr(value, "rao_model", None) is None:
+            try:
+                from areal.experimental.openai.types import RAO_REQ_MODEL
+
+                value.rao_model = RAO_REQ_MODEL.get()
+            except Exception:
+                pass
         if value.messages is None:
             raise ValueError(
                 "Interaction messages must be set to find parent relationship."
@@ -467,6 +476,13 @@ class InteractionCache(OrderedDict[str, InteractionWithTokenLogpReward]):
 
         if len(complete_cache) == 0:
             return {}
+
+        # 盖上 session 章：一个 InteractionCache 就是一次 agent 运行（一条 rollout
+        # session）。下游 dump 靠它还原"哪几轮属于同一条会话"——不能靠 parent 链，
+        # 因为 harness 丢弃被截断的回复时，parent_data 不再是 child 的前缀，
+        # 父子关系会断（见本文件 _is_similar_on_last_message 的 Prefix mismatch 告警）。
+        for interaction in complete_cache.values():
+            interaction.session_id = self._session_id
 
         if style == "concat":
             for interaction in complete_cache.values():

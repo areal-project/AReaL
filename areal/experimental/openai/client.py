@@ -357,6 +357,33 @@ def _resolve_max_total_tokens(
     return min(prompt_len + max_new_tokens, cap)
 
 
+def _flatten_text_content_parts(messages: list[dict]) -> list[dict]:
+    """把纯文本的 OpenAI content-parts 列表压回普通字符串。
+
+    有些 harness（如 pi）按 OpenAI 多模态格式发消息，``content`` 是
+    ``[{"type": "text", "text": "..."}]`` 而不是字符串。而不少 chat template
+    对非字符串 content 直接置空 —— Qwen3 的模板就是：
+
+        {%- if message.content is string %}{%- set content = message.content %}
+        {%- else %}{%- set content = '' %}{%- endif %}
+
+    结果是**用户消息被静默渲染成空串**，模型收到一个没有内容的请求，
+    还会一本正经地回"你还没给我任务"。这里在套模板之前压平，只动纯文本的情况；
+    含图片等其它 part 的消息原样保留，交给 _extract_images_from_messages。
+    """
+    out = []
+    for m in messages:
+        c = m.get("content")
+        if (
+            isinstance(c, list)
+            and c
+            and all(isinstance(x, dict) and x.get("type") == "text" for x in c)
+        ):
+            m = {**m, "content": "".join(x.get("text") or "" for x in c)}
+        out.append(m)
+    return out
+
+
 def _parse_tool_call_arguments(messages: list[dict]) -> list[dict]:
     """Return a new message list with tool_call arguments parsed from JSON strings
     to dicts. Some chat templates (e.g. GLM-5.1) iterate over arguments with
@@ -662,6 +689,7 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
         has_images = len(image_data) > 0
 
         tokenizer_messages = messages_for_tokenizer if has_images else messages_list
+        tokenizer_messages = _flatten_text_content_parts(tokenizer_messages)
         tokenizer_messages = _parse_tool_call_arguments(tokenizer_messages)
         if self.chat_template_type == "hf":
             prompt_token_ids = apply_chat_template(
@@ -684,6 +712,10 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
                 )
             else:
                 concat_tok_messages = concat_messages
+            # ★ concat 分支用的是 remaining_messages，绕开了上面那次扁平化，
+            #   这里必须再压一次，否则 pi 这类发 content-parts 的 harness
+            #   会被模板渲染成空消息。
+            concat_tok_messages = _flatten_text_content_parts(concat_tok_messages)
             prompt_token_ids = concat_prompt_token_ids_with_parent(
                 concat_tok_messages,
                 interaction.parent if interaction is not None else None,

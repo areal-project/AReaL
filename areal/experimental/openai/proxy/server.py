@@ -140,11 +140,22 @@ def serialize_interactions(
 
     result = {}
     for key, interaction in interactions.items():
+        # 会话身份必须一起过河：subproc/online 模式下 interaction 要跨进程传回，
+        # 不带上的话下游只能看到一堆扁平的 turn，无法还原"哪几轮属于同一条会话"。
+        identity = {
+            "session_id": interaction.session_id,
+            "parent_interaction_id": (
+                interaction.parent.interaction_id
+                if interaction.parent is not None
+                else interaction.parent_interaction_id
+            ),
+        }
         if interaction.has_tensor_data:
             result[key] = {
                 "tensor_dict": interaction.to_tensor_dict(),
                 "reward": interaction.reward,
                 "interaction_id": interaction.interaction_id,
+                **identity,
             }
         else:
             result[key] = {
@@ -152,6 +163,7 @@ def serialize_interactions(
                 "output_message_list": interaction.output_message_list,
                 "reward": interaction.reward,
                 "interaction_id": interaction.interaction_id,
+                **identity,
             }
     return serialize_value(result)
 
@@ -174,6 +186,8 @@ def deserialize_interactions(
             interaction.output_message_list = item["output_message_list"]
         interaction.reward = item["reward"]
         interaction.interaction_id = item["interaction_id"]
+        interaction.session_id = item.get("session_id")
+        interaction.parent_interaction_id = item.get("parent_interaction_id")
         result[key] = interaction
     return result
 

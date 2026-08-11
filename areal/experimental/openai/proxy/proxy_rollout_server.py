@@ -30,6 +30,7 @@ from pydantic import BaseModel
 
 from areal.api.cli_args import NameResolveConfig
 from areal.experimental.openai.client import ArealOpenAI
+from areal.experimental.openai.types import RAO_REQ_MODEL
 from areal.infra.rpc.serialization import deserialize_value, serialize_value
 from areal.infra.utils.http import validate_admin_api_key
 from areal.utils import name_resolve, names, seeding
@@ -578,6 +579,21 @@ async def _call_client_create(
     session_data.update_last_access()
 
     sig = inspect.signature(create_fn)
+    # ⭐ RAO：`model` 马上就要被丢掉（AReaL 的 client 只服务单一模型、不接受该参数），
+    #    但 harness 把**递归深度**编码在 model id 尾部（`<id>__dN`）。丢掉之后
+    #    深度信息就永久消失了 —— 实测表现是训练数据里每条序列的 rao_depth 都是 0。
+    #    所以在丢弃之前先存进 ContextVar，interaction 落库时抄到 `rao_model` 上。
+    #    用 ContextVar 而非实例属性：同一 session 的多个 sub-agent 是并行请求的。
+    try:
+        _req_model = (
+            request.get("model")
+            if isinstance(request, dict)
+            else getattr(request, "model", None)
+        )
+        if _req_model:
+            RAO_REQ_MODEL.set(str(_req_model))
+    except Exception:
+        pass  # 观测失败绝不能影响请求
     areal_client_ignored_args = ["model"] + (extra_ignored_args or [])
     areal_client_disallowed_args = ["areal_cache"]
     areal_client_allowed_args = list(

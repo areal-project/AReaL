@@ -1033,6 +1033,12 @@ class FSDPEngine(TrainEngine):
 
         self.get_device_stats().log("before model creation/loading")
 
+        # FA4 不是 transformers 自带的 backend，用到时先注册进 ALL_ATTENTION_FUNCTIONS。
+        # Blackwell(sm100) 上 FA2/FA3 都不可用，只有 FA4 能跑。
+        from areal.engine.fsdp_utils.fa4_attn import maybe_register_fa4
+
+        maybe_register_fa4(self.config.attn_impl)
+
         # Note: VLMs often have vision_tower in fp32 already; loading whole
         # model in optimizer_dtype (fp32 default) is consistent.
         if self.is_vision_model:

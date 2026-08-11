@@ -906,11 +906,76 @@ class WorkflowExecutor:
             "segments": segments,
         }
 
+    @staticmethod
+    def _build_interaction_meta(traj: dict[str, Any]) -> list[dict[str, Any]] | None:
+        """为每个 interaction 算出它在会话树里的身份，供 dump 落盘。
+
+        `traj` 是 ``dict[completion_id, InteractionWithTokenLogpReward]``，
+        每个 value 自带 ``parent`` 指针，因此整棵会话树在这里是完整的。但下游
+        ``concat_padded_tensors([v.to_tensor_dict() for v in traj.values()])``
+        只取 values，身份随即丢失 —— 落盘后就再也无法可靠还原"哪几轮属于同一条
+        会话"（实测靠 prompt 前缀反推只有 29% 的任务能还原正确）。
+
+        约定：
+        - ``session_id`` 由 ``InteractionCache.export_interactions`` 盖章，
+          一个 cache = 一次 agent 运行 = 一条 rollout session，形如 ``"2-0"``
+        - ``session_idx`` 按各 session 首次出现的顺序编号（cache 是 OrderedDict，
+          迭代序即真实发起顺序）
+        - ``turn_idx`` = 该 session 内的第几轮（同 session 内的迭代序）
+
+        为什么不用 ``parent`` 链：harness 会把超长被截断的回复整个丢弃，此时
+        ``parent.messages + parent.output_message_list`` 不再是 child 的前缀，
+        父子关系直接断掉（cache 里会打 "Prefix mismatch" 告警）。parent 仍然照常
+        导出，只是当作辅助信息，不作为会话归属的依据。
+        """
+        items = list(traj.values())
+        if not items:
+            return None
+
+        def safe_id(v: Any, fallback: int) -> str:
+            try:
+                return v.interaction_id or f"anon-{fallback}"
+            except Exception:
+                return f"anon-{fallback}"
+
+        def safe_created(v: Any) -> float | None:
+            try:
+                return v.created_at
+            except Exception:
+                return None
+
+        session_order: dict[str, int] = {}
+        turn_counter: dict[str, int] = {}
+        meta = []
+        for i, v in enumerate(items):
+            sid = getattr(v, "session_id", None) or "unknown"
+            if sid not in session_order:
+                session_order[sid] = len(session_order)
+            turn = turn_counter.get(sid, 0)
+            turn_counter[sid] = turn + 1
+            parent = getattr(v, "parent", None)
+            meta.append(
+                {
+                    "interaction_id": safe_id(v, i),
+                    "parent_id": (
+                        safe_id(parent, -1)
+                        if parent is not None
+                        else getattr(v, "parent_interaction_id", None)
+                    ),
+                    "session_id": sid,
+                    "session_idx": session_order[sid],
+                    "turn_idx": turn,
+                    "created_at": safe_created(v),
+                }
+            )
+        return meta
+
     async def _dump_trajectory(
         self,
         traj: dict[str, Any] | None,
         task_id: int,
         is_eval: bool,
+        interaction_meta: list[dict[str, Any]] | None = None,
     ) -> tuple[bool, str]:
         if traj is None:
             return False, "trajectory is None"
@@ -1004,6 +1069,12 @@ class WorkflowExecutor:
                     }
                     if split["segments"] is not None:
                         record["segments"] = split["segments"]
+
+                    # 会话身份：让下游能精确还原"哪几轮属于同一条 session"。
+                    # 每个 interaction 的 to_tensor_dict() 只产生一行，因此
+                    # 批内行号 i 与 traj.values() 的第 i 项严格一一对应。
+                    if interaction_meta is not None and i < len(interaction_meta):
+                        record.update(interaction_meta[i])
 
                     await f.write(json.dumps(record) + "\n")
             return True, ""
@@ -1164,9 +1235,12 @@ class WorkflowExecutor:
                 # External-API interactions have no tensor data; fall back to
                 # concat_string_interactions which produces a plain dict of
                 # request/response strings instead of padded tensors.
+                interaction_meta = None
                 if isinstance(traj, dict) and all(
                     isinstance(v, InteractionWithTokenLogpReward) for v in traj.values()
                 ):
+                    # 拍平之前先把会话树的身份抓出来，之后 .values() 就丢了
+                    interaction_meta = self._build_interaction_meta(traj)
                     if all(v.has_tensor_data for v in traj.values()):
                         traj = concat_padded_tensors(
                             [v.to_tensor_dict() for v in traj.values()]
@@ -1191,7 +1265,7 @@ class WorkflowExecutor:
                 # Dump trajectory to file
                 if self.config.dump_to_file:
                     dump_success, dump_reason = await self._dump_trajectory(
-                        traj, task_id, pending_task.is_eval
+                        traj, task_id, pending_task.is_eval, interaction_meta
                     )
                     if not dump_success:
                         self.logger.warning(
