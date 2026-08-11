@@ -1010,10 +1010,10 @@ class MegatronEngineConfig:
     enable_fp32_lm_head: bool = field(
         default=False,
         metadata={
-            "help": "Deprecated. This option is ignored when enable_chunked_logits=True; "
-            "AReaL's fused LM Head always produces FP32 logits. When "
-            "enable_chunked_logits=False, preserve the legacy behavior of forwarding "
-            "the option to supported mbridge model configurations."
+            "help": "Compute the lm_head projection with FP32 input and weight "
+            "operands for numerical stability. With enable_chunked_logits=True, "
+            "the local vocab-parallel weight is converted once per microbatch "
+            "LM-head forward and reused across sequence chunks."
         },
     )
     cross_entropy_loss_fusion: bool = field(

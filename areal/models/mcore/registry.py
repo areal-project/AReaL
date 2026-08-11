@@ -302,6 +302,7 @@ def _replace_actor_output_layers(
     models: list[GPTModel | DDP],
     *,
     enabled: bool,
+    fp32_operands: bool = False,
 ) -> None:
     if not enabled:
         return
@@ -310,6 +311,7 @@ def _replace_actor_output_layers(
         replace_output_layer_with_areal_lm_head(
             gpt_model,
             fp32_output=True,
+            fp32_operands=fp32_operands,
         )
 
 
@@ -320,7 +322,11 @@ def _configure_actor_output_layers(
     if mcore_config is None:
         return
     if mcore_config.enable_chunked_logits:
-        _replace_actor_output_layers(models, enabled=True)
+        _replace_actor_output_layers(
+            models,
+            enabled=True,
+            fp32_operands=mcore_config.enable_fp32_lm_head,
+        )
     else:
         _enable_fp32_lm_head_forward(
             models,
