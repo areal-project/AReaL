@@ -1542,11 +1542,13 @@ class MegatronEngine(TrainEngine):
         stats = self.get_device_stats()
         rank = dist.get_rank(self.cpu_group)
         self.logger.info(
-            "[Megatron residency] rank=%d phase=%s allocated_gb=%.3f reserved_gb=%.3f",
+            "[Megatron residency] rank=%d phase=%s allocated_gb=%.3f "
+            "reserved_gb=%.3f allocator_conf=%r",
             rank,
             phase,
             stats.mem_allocated,
             stats.mem_reserved,
+            os.environ.get("PYTORCH_CUDA_ALLOC_CONF", ""),
         )
 
     def _eager_publish_awex_train_info(self, meta_server_addr: str | None) -> None:

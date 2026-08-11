@@ -129,6 +129,71 @@ def _fork_test_scheduler(scheduler_type: type[Any]):
     return scheduler, owner
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "scheduler_type", [LocalScheduler, SlurmScheduler, RayScheduler]
+)
+async def test_fork_child_receives_role_environment_overrides(
+    monkeypatch, scheduler_type
+):
+    """Forked roles override the owner environment before importing CUDA users."""
+
+    class FakeResponse:
+        status = 200
+
+        def __init__(self, payload):
+            self.payload = payload
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+        async def json(self, content_type=None):
+            return self.payload
+
+        async def text(self):
+            return str(self.payload)
+
+    class FakeSession:
+        def __init__(self):
+            self.calls = []
+
+        def post(self, url, json):
+            self.calls.append((url, json))
+            if url.endswith("/reserve_worker_ports"):
+                return FakeResponse({"host": "127.0.0.1", "ports": [20001]})
+            if url.endswith("/fork"):
+                return FakeResponse({"status": "success", "pid": 1234})
+            raise AssertionError(f"Unexpected URL: {url}")
+
+    scheduler, owner = _fork_test_scheduler(scheduler_type)
+
+    async def ready(*args, **kwargs):
+        return True
+
+    monkeypatch.setattr(scheduler, "_wait_for_fork_ready", ready)
+    session = FakeSession()
+    env = {"PYTORCH_CUDA_ALLOC_CONF": ""}
+
+    worker = await scheduler._fork_single_worker(
+        session,
+        "rollout",
+        0,
+        owner,
+        "actor",
+        env=env,
+    )
+
+    fork_payload = next(
+        payload for url, payload in session.calls if url.endswith("/fork")
+    )
+    assert fork_payload["env"] == env
+    if scheduler_type is LocalScheduler:
+        assert worker.env_vars["PYTORCH_CUDA_ALLOC_CONF"] == ""
+
+
 @pytest.mark.parametrize(
     "scheduler_type", [LocalScheduler, SlurmScheduler, RayScheduler]
 )
@@ -1181,7 +1246,7 @@ def test_public_fork_failure_preserves_provisional_ownership(
     scheduler._fork_reservations = {}
     _, child = _worker_infos(scheduler_type)
 
-    async def fail_after_retaining(role, target_role, workers, command):
+    async def fail_after_retaining(role, target_role, workers, command, env_vars=None):
         scheduler._retain_fork_workers(role, target_role, [child])
         scheduler._fork_reservations[role] = ForkOwnership(
             owner_role=target_role,
