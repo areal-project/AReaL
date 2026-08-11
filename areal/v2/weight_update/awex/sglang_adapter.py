@@ -30,6 +30,7 @@ from awex.util.tensor_util import (
     reconstruct_tensors_from_groups,
 )
 
+from areal.infra.platforms import current_platform
 from areal.utils import logging
 from areal.v2.weight_update.awex import (
     awex_wu_use_group,
@@ -53,6 +54,7 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
         self._scheduler = scheduler
         self._transfer_plan: TransferPlan | None = None
         self._weights_update_group = None
+        self._weights_update_group_gloo = None
         self._transfer_rank: int | None = None
         self._rank_info: RankInfo | None = None
         self._parameters: dict[str, torch.Tensor] | None = None
@@ -398,6 +400,24 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
             group_name=f"awex_{pair_name}",
             role="inference",
         )
+        self._weights_update_group_gloo = init_weights_update_group(
+            master_address=master_addr,
+            master_port=master_port,
+            rank=global_rank,
+            world_size=world_size,
+            group_name=f"awex_{pair_name}_gloo",
+            backend="gloo",
+            role="inference",
+        )
+        logger.info(
+            "Initialized AWEX weight update groups for pair=%s role=inference "
+            "rank=%s world_size=%s nccl=awex_%s gloo=awex_%s_gloo",
+            pair_name,
+            global_rank,
+            world_size,
+            pair_name,
+            pair_name,
+        )
 
     def execute_weight_update(self, version: int) -> None:
         del version
@@ -405,6 +425,8 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
             raise RuntimeError("Transfer plan is not initialized")
         if self._weights_update_group is None:
             raise RuntimeError("Weight update group is not initialized")
+        if self._weights_update_group_gloo is None:
+            raise RuntimeError("Gloo weight update group is not initialized")
 
         params = self.get_local_shard_parameters()
         recv_ops, non_contiguous_pairs, _ = nccl_build_recv_ops(
@@ -422,21 +444,30 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
         for original, contiguous in non_contiguous_pairs:
             original.copy_(contiguous)
 
-        dist.barrier(group=self._weights_update_group)
+        current_platform.synchronize()
+        dist.barrier(group=self._weights_update_group_gloo)
 
     def batch_isend_irecv(self, **kwargs) -> None:
-        setup_kwargs = {k: v for k, v in kwargs.items() if k != "world_size"}
+        if self._weights_update_group_gloo is None:
+            raise RuntimeError("Gloo weight update group is not initialized")
+        setup_kwargs = {
+            k: v for k, v in kwargs.items() if k not in ("world_size", "barrier_group")
+        }
         setup_batch_isend_irecv(
             self._weights_update_group,
             self._transfer_rank,
             kwargs.get("world_size", 0),
+            barrier_group=self._weights_update_group_gloo,
             **setup_kwargs,
         )
 
     def teardown_weight_update_group(self) -> None:
         if self._weights_update_group is not None and dist.is_initialized():
             dist.destroy_process_group(self._weights_update_group)
+        if self._weights_update_group_gloo is not None and dist.is_initialized():
+            dist.destroy_process_group(self._weights_update_group_gloo)
         self._weights_update_group = None
+        self._weights_update_group_gloo = None
         self._transfer_plan = None
         self._transfer_rank = None
         self._rank_info = None
