@@ -198,6 +198,41 @@ class PPOActor:
 
         loss_mask = data["loss_mask"].float()
         loss_mask = torch.roll(loss_mask, shifts=-1, dims=-1)
+        versions = data.get("versions")
+        if versions is not None:
+            data["versions"] = torch.roll(versions, shifts=-1, dims=-1)
+            if self.config.mask_stale_rollout_tokens:
+                current_version = self.engine.get_version()
+                generated_token_mask = data["versions"] >= 0
+                current_trainable_token_mask = (
+                    generated_token_mask
+                    & (data["versions"] >= current_version)
+                    & loss_mask.bool()
+                )
+                has_current_trainable_suffix = current_trainable_token_mask.any(
+                    dim=-1, keepdim=True
+                )
+                stale_token_mask = (
+                    generated_token_mask
+                    & (data["versions"] < current_version)
+                    & has_current_trainable_suffix
+                )
+                # slime masks the old prefix only after a partial rollout has
+                # appended a new trainable suffix. Preserve that invariant here:
+                # a fully stale trajectory keeps its original mask instead of
+                # turning the entire training batch into a zero-weight update.
+                # NOTE: masking happens before the terminal reward is injected at
+                # position (seqlens - 2) below. If an entire trajectory tail is
+                # stale, its final token is masked out and its reward never
+                # propagates through GAE. In normal partial rollouts the tail is
+                # the newest part of the sequence and remains trainable.
+                loss_mask = loss_mask * (~stale_token_mask).to(loss_mask.dtype)
+        elif self.config.mask_stale_rollout_tokens:
+            logger.warning(
+                "mask_stale_rollout_tokens=True but 'versions' is absent or None "
+                "in the rollout data; stale-token masking is a no-op and training "
+                "will proceed as if stale-prefix masking were disabled."
+            )
         # Apply the mask to log probabilities.
         if not self.config.use_decoupled_loss and self.config.recompute_logprob:
             # Overwrite logprobs produced by the inference engine
@@ -651,21 +686,22 @@ def grpo_loss_fn(
 
     # Log proximal approximation metrics
     compute_logp_mask = stat.get("behave_mask", loss_mask)
+    versions = input_data.get("versions")
     _log_proximal_approximation_stats(
         prox_logp_method=prox_logp_method,
         prox_logp_gt=prox_logp_gt,
         old_logp=old_logp,
         logprobs=logprobs.detach(),
-        versions=input_data.get("versions"),
+        versions=versions,
         current_version=current_version,
         compute_logp_mask=compute_logp_mask,
     )
 
     # Log version staleness metrics
-    if "versions" in input_data and current_version is not None:
+    if versions is not None and current_version is not None:
         version_metrics_mask = stat.get("behave_mask", loss_mask)
         _log_version_staleness_stats(
-            versions=input_data["versions"],
+            versions=versions,
             current_version=current_version,
             version_metrics_mask=version_metrics_mask,
         )

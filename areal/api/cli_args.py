@@ -1721,6 +1721,15 @@ class PPOActorConfig(TrainEngineConfig):
             "help": "Use the decoupled loss. Implicitly enables recompute_logprob."
         },
     )
+    mask_stale_rollout_tokens: bool = field(
+        default=False,
+        metadata={
+            "help": "For mixed-version partial rollouts, mask generated prefix tokens "
+            "whose policy version is older than the current actor before advantage/loss "
+            "computation. Fully stale trajectories without a current-version trainable "
+            "suffix are left unchanged."
+        },
+    )
     rejection_sampling: RejectionSamplingConfig | None = field(
         default=None,
         metadata={
