@@ -82,6 +82,30 @@ def test_awex_sglang_child_drops_training_ld_preload(monkeypatch) -> None:
     assert "TMS_INIT_ENABLE_CPU_BACKUP" not in captured["env"]
 
 
+def test_awex_sglang_child_enables_cuda_graph_memory_saver(monkeypatch) -> None:
+    """AWEX enables graph region capture before the SGLang child starts."""
+    from areal.engine.sglang_remote import SGLangBackend
+
+    backend = SGLangBackend()
+    monkeypatch.setenv("AWEX_META_SERVER_ADDR", "127.0.0.1:1234")
+    monkeypatch.delenv("SGLANG_MEMORY_SAVER_CUDA_GRAPH", raising=False)
+    captured = {}
+
+    def fake_popen(cmd, *, env, stdout, stderr):
+        captured["env"] = env
+        return SimpleNamespace(pid=1, poll=lambda: None)
+
+    monkeypatch.setattr("areal.engine.sglang_remote.subprocess.Popen", fake_popen)
+    monkeypatch.setattr(
+        "areal.engine.sglang_remote.SGLangConfig.build_cmd_from_args",
+        lambda args: ["sglang.launch_server"],
+    )
+
+    backend.launch_server({"model_path": "model", "enable_memory_saver": True})
+
+    assert captured["env"]["SGLANG_MEMORY_SAVER_CUDA_GRAPH"] == "1"
+
+
 def _dummy_reward_fn(*args, **kwargs):
     """Dummy reward function for testing."""
     return 1.0

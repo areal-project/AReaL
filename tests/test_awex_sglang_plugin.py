@@ -13,6 +13,7 @@ from areal.engine.awex.colocate_reader import (
     _BoundedMemoryNcclColocateStreamBatchTransport,
     _patch_awex_qwen3_attention_names,
 )
+from areal.engine.awex.memory_saver import patch_tms_hook_mode
 from areal.engine.awex.sglang_plugin import (
     AwexSchedulerPlugin,
     _load_sglang_plugins_if_available,
@@ -101,6 +102,33 @@ def test_awex_memory_transitions_are_idempotent_across_retries():
         ("resume", ["kv_cache"]),
     ]
     assert scheduler.offload_tags == set()
+
+
+def test_tms_hook_mode_stays_preload_for_pauseable_cuda_graphs(monkeypatch):
+    """Megatron imports cannot switch SGLang graph capture to torch hooks."""
+    import sys
+
+    class _Saver:
+        def __init__(self):
+            self._impl_ctor_kwargs = {}
+
+        @property
+        def hook_mode(self):
+            raise AttributeError
+
+        @hook_mode.setter
+        def hook_mode(self, value):
+            self._impl_ctor_kwargs["hook_mode"] = value
+
+    saver = _Saver()
+    fake_module = SimpleNamespace(torch_memory_saver=saver)
+    monkeypatch.setitem(sys.modules, "torch_memory_saver", fake_module)
+    monkeypatch.setenv("SGLANG_MEMORY_SAVER_CUDA_GRAPH", "1")
+
+    patch_tms_hook_mode()
+    saver.hook_mode = "torch"
+
+    assert saver._impl_ctor_kwargs == {}
 
 
 def test_awex_converter_canonicalizes_qwen3_attention_names():

@@ -37,46 +37,11 @@ from typing import Any
 import torch
 import torch.distributed as dist
 
+from areal.engine.awex.memory_saver import patch_tms_hook_mode  # noqa: E402
 
-def _patch_tms_hook_mode() -> None:
-    """Make ``torch_memory_saver.hook_mode`` setter a no-op once initialized.
-
-    ``megatron.core.inference.contexts.dynamic_context`` (pulled in transitively
-    by ``awex.converter.mcore_converter`` -> ``megatron.core``) runs a
-    module-level ``torch_memory_saver.hook_mode = "torch"``. In the SGLang
-    scheduler process the memory_saver singleton is already initialized (sglang
-    ran ``_ensure_initialized``, which ``del``s ``_impl_ctor_kwargs``), so that
-    late assignment raises ``AttributeError``. awex's model registry swallows the
-    import error, the BailingMoe converter never registers, and weight transfer
-    later dies with ``Unsupported attention parameter name: attention.g_proj``.
-    The singleton's own assert already declares post-init configuration
-    unsupported, so dropping the late set is the intended behavior.
-    """
-    try:
-        import torch_memory_saver as _tms
-    except Exception:
-        return
-    inst = getattr(_tms, "torch_memory_saver", None)
-    if inst is None:
-        return
-    cls = type(inst)
-    prop = cls.hook_mode
-    if getattr(prop.fset, "_awex_safe", False):
-        return
-
-    def _safe_setter(self, value):
-        if not hasattr(self, "_impl_ctor_kwargs"):
-            return  # singleton already initialized; late set is a design no-op
-        prop.fset(self, value)
-
-    _safe_setter._awex_safe = True
-    cls.hook_mode = property(prop.fget, _safe_setter)
-
-
-# Must run before any awex import: awex.models.registry auto-imports model
-# modules at module load, and the BailingMoe module's transitive megatron import
-# trips the hook_mode race above.
-_patch_tms_hook_mode()
+# Keep direct imports of this module safe as well. The rollout entry point calls
+# this helper earlier, before SGLang starts model initialization.
+patch_tms_hook_mode()
 
 from awex.meta.infer_meta_resolver import InferParamMetaResolver  # noqa: E402
 from awex.meta.meta_resolver import ParamMetaResolver  # noqa: E402

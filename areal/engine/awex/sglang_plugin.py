@@ -34,6 +34,13 @@ from copy import copy
 from dataclasses import dataclass, field
 from typing import Any
 
+from areal.engine.awex.memory_saver import patch_tms_hook_mode
+
+# Must run before importing SGLang. Its scheduler may import Megatron while
+# initializing the model, and Megatron otherwise switches torch-memory-saver
+# away from the preload hook required by pauseable CUDA graphs.
+patch_tms_hook_mode()
+
 
 def assert_alloc_conf_supports_memory_saver(conf: str) -> None:
     """Reject allocator configs that silently disable SGLang's memory saver."""

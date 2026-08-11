@@ -389,7 +389,7 @@ class SGLangBackend:
         Parameters:
         ----------
         tags: list[str], optional
-            Available tags for multi-stage resume: weights, kv_cache
+            Available tags for multi-stage resume: weights, kv_cache, cuda_graph
         """
         payload = {"tags": tags} if tags is not None else {}
         return HttpRequest(endpoint="/resume_memory_occupation", payload=payload)
@@ -425,6 +425,15 @@ class SGLangBackend:
         cmd = SGLangConfig.build_cmd_from_args(server_args)
         _env = self.build_server_env(os.environ)
         _env.setdefault("PYTHONFAULTHANDLER", "1")
+
+        awex_graph_memory_saver = bool(
+            (awex_colocate or awex_meta_addr)
+            and server_args.get("enable_memory_saver", False)
+        )
+        if awex_graph_memory_saver:
+            # SGLang 0.5.10 gates CUDA-graph region registration separately
+            # from --enable-memory-saver. This must be set before graph capture.
+            _env.setdefault("SGLANG_MEMORY_SAVER_CUDA_GRAPH", "1")
 
         drop_ld_preload_default = "1" if (awex_colocate or awex_meta_addr) else "0"
         if _env.get(

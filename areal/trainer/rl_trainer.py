@@ -589,6 +589,7 @@ class PPOTrainer:
         # controller-side call: invoking rollout RPCs from an actor worker creates
         # a nested controller call while its update_weights collective is active.
         self.rollout.abort_all_requests()
+        self.rollout.onload(tags=["cuda_graph"])
         self.rollout.onload(tags=["kv_cache"])
         call_maybe_async(self.rollout.continue_generation)
 
@@ -823,6 +824,8 @@ class PPOTrainer:
                 self.rollout.offload(tags=["kv_cache"])
                 logger.info("[AWEX] colocate: offload weights...")
                 self.rollout.offload(tags=["weights"])
+                logger.info("[AWEX] colocate: offload cuda_graph...")
+                self.rollout.offload(tags=["cuda_graph"])
                 try:
                     if self.config.mopd is not None:
                         assert self._mopd_phase_machine is not None
@@ -843,6 +846,7 @@ class PPOTrainer:
                             "Failed to re-offload actor during rollback", exc_info=True
                         )
                     try:
+                        self.rollout.onload(tags=["cuda_graph"])
                         self.rollout.onload(tags=["weights"])
                         self.rollout.onload(tags=["kv_cache"])
                         call_maybe_async(self.rollout.continue_generation)
