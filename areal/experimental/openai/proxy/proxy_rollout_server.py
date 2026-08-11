@@ -34,6 +34,7 @@ from areal.infra.rpc.serialization import deserialize_value, serialize_value
 from areal.infra.utils.http import validate_admin_api_key
 from areal.utils import name_resolve, names, seeding
 from areal.utils.dynamic_import import import_from_string
+from areal.utils.environ import get_bool_env_var
 from areal.utils.hf_utils import load_hf_tokenizer
 from areal.utils.logging import getLogger
 from areal.utils.network import find_free_ports, gethostip
@@ -620,6 +621,16 @@ async def _call_client_create(
     if "top_p" not in kwargs:
         kwargs["top_p"] = 1.0
         _warn_once("top_p not set in request, defaulting to 1.0")
+
+    if (
+        get_bool_env_var("AREAL_DETERMINISTIC_SAMPLING")
+        and kwargs.get("seed") is None
+        and "seed" in areal_client_allowed_args
+    ):
+        kwargs["seed"] = seeding.derive_deterministic_seed(
+            session_id,
+            len(session_data.completions),
+        )
 
     # Strip stream from request body to prevent it from bypassing the explicit
     # `stream` parameter.  Without this, a request with {"stream": true} would

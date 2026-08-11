@@ -49,6 +49,7 @@ from areal.infra.utils.proc import kill_process_tree
 from areal.utils import logging, name_resolve, names
 from areal.utils.data import concat_padded_tensors
 from areal.utils.dynamic_import import import_from_string
+from areal.utils.environ import get_bool_env_var
 from areal.utils.network import (
     find_free_ports,
     format_hostport,
@@ -89,9 +90,31 @@ class GroupedRolloutWorkflow(RolloutWorkflow):
     ) -> dict[str, Any] | None:
         from areal.experimental.openai import InteractionWithTokenLogpReward
 
-        results = await asyncio.gather(
-            *[self.workflow.arun_episode(engine, data) for _ in range(self.group_size)]
-        )
+        async def run_sample(sample_idx: int):
+            parent = workflow_context.get()
+            workflow_context.set(
+                workflow_context.WorkflowContext(
+                    is_eval=parent.is_eval,
+                    task_id=parent.task_id,
+                    sample_idx=sample_idx,
+                )
+            )
+            try:
+                return sample_idx, await self.workflow.arun_episode(engine, data)
+            finally:
+                workflow_context.set(parent)
+
+        deterministic = get_bool_env_var("AREAL_DETERMINISTIC_SAMPLING")
+        if deterministic:
+            indexed_results = []
+            for sample_idx in range(self.group_size):
+                indexed_results.append(await run_sample(sample_idx))
+            indexed_results.sort(key=lambda item: item[0])
+        else:
+            indexed_results = await asyncio.gather(
+                *[run_sample(sample_idx) for sample_idx in range(self.group_size)]
+            )
+        results = [result for _, result in indexed_results]
 
         valid_results = [r for r in results if r is not None]
 

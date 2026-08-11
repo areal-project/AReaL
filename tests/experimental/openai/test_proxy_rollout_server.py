@@ -8,6 +8,7 @@ import pytest
 
 from areal.experimental.openai.proxy import proxy_rollout_server as srv
 from areal.experimental.openai.proxy.server import SessionData
+from areal.utils.seeding import derive_deterministic_seed
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -131,6 +132,52 @@ class TestStartSessionApiKey:
                 json={"task_id": "t", "api_key": "busy-key"},
             )
         assert resp.status_code == 409
+
+
+class TestDeterministicSamplingSeed:
+    @staticmethod
+    async def _call_create(session_id: str, request: dict, monkeypatch) -> dict:
+        session = SessionData(session_id=session_id)
+        monkeypatch.setattr(srv, "_session_cache", {session_id: session})
+        monkeypatch.setattr(srv, "_openai_client", object())
+        captured = {}
+
+        async def create(*, areal_cache, seed=None, temperature=1.0, top_p=1.0):
+            captured.update(seed=seed, areal_cache=areal_cache)
+            return object()
+
+        await srv._call_client_create(create, request, session_id)
+        return captured
+
+    @pytest.mark.asyncio
+    async def test_default_mode_does_not_inject_seed(self, monkeypatch):
+        """Normal proxy requests preserve the existing unseeded behavior."""
+        monkeypatch.delenv("AREAL_DETERMINISTIC_SAMPLING", raising=False)
+
+        captured = await self._call_create("task-0", {}, monkeypatch)
+
+        assert captured["seed"] is None
+
+    @pytest.mark.asyncio
+    async def test_group_sessions_receive_stable_distinct_seeds(self, monkeypatch):
+        """Different sample sessions receive reproducible, distinct seeds."""
+        monkeypatch.setenv("AREAL_DETERMINISTIC_SAMPLING", "1")
+
+        first = await self._call_create("task:0-0", {}, monkeypatch)
+        second = await self._call_create("task:1-0", {}, monkeypatch)
+
+        assert first["seed"] == derive_deterministic_seed("task:0-0", 0)
+        assert second["seed"] == derive_deterministic_seed("task:1-0", 0)
+        assert first["seed"] != second["seed"]
+
+    @pytest.mark.asyncio
+    async def test_explicit_seed_takes_precedence(self, monkeypatch):
+        """A caller-provided seed is never replaced by deterministic mode."""
+        monkeypatch.setenv("AREAL_DETERMINISTIC_SAMPLING", "1")
+
+        captured = await self._call_create("task-0", {"seed": 12345}, monkeypatch)
+
+        assert captured["seed"] == 12345
 
 
 # ---------------------------------------------------------------------------

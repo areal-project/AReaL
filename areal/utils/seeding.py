@@ -19,6 +19,14 @@ def _seed_from_key(key: str) -> int:
     return int(hashlib.sha256(key.encode()).hexdigest(), 16) & 0xFFFFFFFF
 
 
+def derive_deterministic_seed(session_id: str, request_index: int) -> int:
+    """Derive a stable 32-bit sampling seed from request identity."""
+    if request_index < 0:
+        raise ValueError(f"request_index must be non-negative, got {request_index}")
+    digest = hashlib.sha256(f"{session_id}:{request_index}".encode()).digest()
+    return int.from_bytes(digest[:4], byteorder="big", signed=False)
+
+
 def set_random_seed(base_seed: int, key: str) -> None:
     global _SEED, _BASE_SEED
     _BASE_SEED = base_seed

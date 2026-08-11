@@ -30,6 +30,8 @@ from areal.infra.rpc.serialization import serialize_value
 from areal.infra.utils.http import create_httpx_client
 from areal.utils import logging
 from areal.utils.data import concat_padded_tensors
+from areal.utils.environ import get_bool_env_var
+from areal.utils.seeding import derive_deterministic_seed
 from areal.v2.inference_service.data_proxy.config import DataProxyConfig
 from areal.v2.inference_service.data_proxy.pause import PauseState
 from areal.v2.inference_service.data_proxy.session import (
@@ -660,6 +662,16 @@ def create_app(config: DataProxyConfig) -> FastAPI:
             kwargs["temperature"] = 1.0
         if "top_p" not in kwargs:
             kwargs["top_p"] = 1.0
+
+        if (
+            session is not None
+            and get_bool_env_var("AREAL_DETERMINISTIC_SAMPLING")
+            and kwargs.get("seed") is None
+        ):
+            kwargs["seed"] = derive_deterministic_seed(
+                session.session_id,
+                len(session.active_completions),
+            )
 
         create_fn: Any = areal_client.chat.completions.create
 

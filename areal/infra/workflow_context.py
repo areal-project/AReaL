@@ -31,10 +31,13 @@ class WorkflowContext:
         Whether the workflow is running in evaluation mode.
     task_id : int | None
         The task ID assigned by the workflow executor.
+    sample_idx : int | None
+        Stable sample index within a grouped rollout.
     """
 
     is_eval: bool = False
     task_id: int | None = None
+    sample_idx: int | None = None
 
 
 _current_context: ContextVar[WorkflowContext] = ContextVar(
