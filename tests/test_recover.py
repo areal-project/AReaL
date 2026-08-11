@@ -3,7 +3,8 @@
 import dataclasses
 import os
 import tempfile
-from unittest.mock import Mock
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import pytest
 
@@ -11,6 +12,7 @@ from areal.api.cli_args import RecoverConfig
 from areal.api.io_struct import FinetuneSpec, StepInfo
 from areal.utils.recover import (
     RecoverHandler,
+    RecoverInfo,
     check_if_auto_recover,
     check_if_recover,
 )
@@ -238,45 +240,209 @@ class TestRecoverHandler:
         return GatewayTrainController.__new__(GatewayTrainController)
 
     @pytest.mark.parametrize("mode", ["on", "auto"])
-    def test_load_rejects_gateway_train_controller(self, mode):
+    def test_load_accepts_gateway_train_controller(self, mode):
         with tempfile.TemporaryDirectory() as tmpdir:
             handler = self._make_handler(tmpdir, mode)
+            handler.freq_ctl = Mock()
+            controller = self._make_gateway_controller()
+            recover_info = SimpleNamespace(
+                last_step_info=SimpleNamespace(global_step=0, next=lambda: "step-1"),
+                saver_info={},
+                evaluator_info={},
+                stats_logger_info={},
+                dataloader_info={},
+                checkpoint_info={},
+            )
+            saver = Mock()
+            evaluator = Mock()
+            stats_logger = Mock()
+            dataloader = Mock()
+            handler._load_checkpoint = Mock()
 
-            with pytest.raises(NotImplementedError) as exc_info:
-                handler.load(
-                    self._make_gateway_controller(),
-                    Mock(),
-                    Mock(),
-                    Mock(),
-                    Mock(),
+            with patch(
+                "areal.utils.recover.RecoverInfo.load", return_value=recover_info
+            ):
+                result = handler.load(
+                    controller,
+                    saver,
+                    evaluator,
+                    stats_logger,
+                    dataloader,
                 )
 
-            assert "GatewayTrainController" in str(exc_info.value)
-            assert '`_version="v2"`' in str(exc_info.value)
+            assert result is recover_info
+            handler._load_checkpoint.assert_called_once_with(controller, name="default")
+            saver.load_state_dict.assert_called_once_with({})
+            dataloader.load_state_dict.assert_called_once_with({})
 
     @pytest.mark.parametrize("mode", ["on", "auto"])
-    def test_dump_rejects_gateway_train_controller(self, mode):
+    def test_dump_accepts_gateway_train_controller(self, mode):
         with tempfile.TemporaryDirectory() as tmpdir:
             handler = self._make_handler(tmpdir, mode)
+            handler.freq_ctl = Mock()
+            handler.freq_ctl.check.return_value = True
+            handler.freq_ctl.state_dict.return_value = {}
+            controller = self._make_gateway_controller()
             step_info = StepInfo(
                 epoch=0,
                 epoch_step=0,
                 global_step=0,
                 steps_per_epoch=handler.ft_spec.steps_per_epoch,
             )
+            saver = Mock(state_dict=Mock(return_value={}))
+            evaluator = Mock(state_dict=Mock(return_value={}))
+            stats_logger = Mock(state_dict=Mock(return_value={}))
+            dataloader = Mock(state_dict=Mock(return_value={}))
+            handler._save_checkpoint = Mock()
 
-            with pytest.raises(NotImplementedError) as exc_info:
+            with patch("areal.utils.recover.RecoverInfo.dump") as dump_info:
                 handler.dump(
-                    self._make_gateway_controller(),
+                    controller,
                     step_info,
-                    Mock(),
-                    Mock(),
-                    Mock(),
-                    Mock(),
+                    saver,
+                    evaluator,
+                    stats_logger,
+                    dataloader,
                 )
 
-            assert "GatewayTrainController" in str(exc_info.value)
-            assert "recover.mode" in str(exc_info.value)
+            handler._save_checkpoint.assert_called_once_with(
+                controller,
+                name="default",
+                tokenizer=None,
+                processor=None,
+                base_model_path=None,
+            )
+            dump_info.assert_called_once()
+
+    def test_dump_captures_inference_pipeline_state_before_checkpoint(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            handler = self._make_handler(tmpdir, "auto")
+            handler.freq_ctl = Mock()
+            handler.freq_ctl.check.return_value = True
+            handler.freq_ctl.state_dict.return_value = {}
+            controller = self._make_gateway_controller()
+            step_info = StepInfo(
+                epoch=0,
+                epoch_step=0,
+                global_step=0,
+                steps_per_epoch=handler.ft_spec.steps_per_epoch,
+            )
+            saver = Mock(state_dict=Mock(return_value={}))
+            evaluator = Mock(state_dict=Mock(return_value={}))
+            stats_logger = Mock(state_dict=Mock(return_value={}))
+            dataloader = Mock(state_dict=Mock(return_value={"cursor": 1}))
+            inference_engine = Mock()
+            events = []
+            inference_engine.recover_state_dict.side_effect = lambda: (
+                events.append("pipeline"),
+                {"task_id_generator": {"next_task_id": 4}},
+            )[1]
+            handler._save_checkpoint = lambda *args, **kwargs: events.append(
+                "checkpoint"
+            )
+
+            handler.dump(
+                controller,
+                step_info,
+                saver,
+                evaluator,
+                stats_logger,
+                dataloader,
+                inference_engine=inference_engine,
+            )
+
+            assert events == ["pipeline", "checkpoint"]
+            saved_info = RecoverInfo.load(
+                handler.recover_info_path(
+                    handler.config.experiment_name,
+                    handler.config.trial_name,
+                    handler.config.fileroot,
+                )
+            )
+            assert saved_info.pipeline_info == {
+                "task_id_generator": {"next_task_id": 4}
+            }
+
+    def test_load_restores_inference_pipeline_state(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            handler = self._make_handler(tmpdir, "auto")
+            handler.freq_ctl = Mock()
+            handler._load_checkpoint = Mock()
+            controller = self._make_gateway_controller()
+            controller.connect_engine = Mock()
+            controller.update_weights = Mock()
+            controller.set_version = Mock()
+            recover_info = SimpleNamespace(
+                last_step_info=SimpleNamespace(global_step=0, next=lambda: "step-1"),
+                saver_info={},
+                evaluator_info={},
+                stats_logger_info={},
+                dataloader_info={},
+                checkpoint_info={},
+                pipeline_info={"task_id_generator": {"next_task_id": 4}},
+            )
+            saver = Mock()
+            evaluator = Mock()
+            stats_logger = Mock()
+            dataloader = Mock()
+            inference_engine = Mock()
+            weight_update_meta = Mock(type="disk", colocate=False)
+            weight_update_meta.with_version.return_value = Mock(version=1)
+
+            with patch(
+                "areal.utils.recover.RecoverInfo.load", return_value=recover_info
+            ):
+                handler.load(
+                    controller,
+                    saver,
+                    evaluator,
+                    stats_logger,
+                    dataloader,
+                    inference_engine=inference_engine,
+                    weight_update_meta=weight_update_meta,
+                )
+
+            inference_engine.load_recover_state_dict.assert_called_once_with(
+                {"task_id_generator": {"next_task_id": 4}}
+            )
+
+
+class TestRecoverInfoPipelineState:
+    @staticmethod
+    def _make_info() -> RecoverInfo:
+        return RecoverInfo(
+            last_step_info=StepInfo(
+                epoch=0,
+                epoch_step=2,
+                global_step=2,
+                steps_per_epoch=4,
+            ),
+            saver_info={},
+            evaluator_info={},
+            stats_logger_info={},
+            dataloader_info={"cursor": 3},
+            checkpoint_info={},
+            pipeline_info={"task_id_generator": {"next_task_id": 12}},
+        )
+
+    def test_round_trip_preserves_pipeline_state(self):
+        """New recover info preserves the rollout task counter."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self._make_info().dump(tmpdir)
+
+            loaded = RecoverInfo.load(tmpdir)
+
+            assert loaded.pipeline_info == {"task_id_generator": {"next_task_id": 12}}
+
+    def test_legacy_checkpoint_without_pipeline_file_loads(self):
+        """Old recover directories remain loadable without task ID state."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self._make_info().dump(tmpdir)
+            os.unlink(os.path.join(tmpdir, "pipeline_info.pkl"))
+
+            loaded = RecoverInfo.load(tmpdir)
+
+            assert loaded.pipeline_info is None
 
     @pytest.mark.parametrize("no_save_optim", [False, True])
     def test_save_checkpoint_passes_with_optim_from_config(self, no_save_optim):

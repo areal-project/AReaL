@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
@@ -334,3 +335,47 @@ class TestGatewayTrainControllerClearBatches:
             "cancel-node": {"s-cancel": 0},
         }
         mock_gateway_post.assert_not_called()
+class TestGatewayTrainControllerWeightUpdateReconnect:
+    def test_awex_reconnect_destroys_old_controller_and_versions_pair(self):
+        from areal.v2.inference_service.controller.controller import (
+            RolloutControllerV2,
+        )
+
+        controller = _make_controller()
+        controller._role = "actor"
+        controller._worker_addrs = ["http://train-0"]
+
+        rollout = MagicMock(spec=RolloutControllerV2)
+        rollout.inference_worker_urls = ["http://inference-0"]
+        rollout.inference_guard_addrs = ["http://guard-0"]
+
+        first_weight_ctrl = MagicMock()
+        recovered_weight_ctrl = MagicMock()
+        port_response = MagicMock()
+        port_response.json.return_value = {"host": "inference-host", "ports": [12345]}
+
+        with (
+            patch(
+                "areal.v2.weight_update.controller.controller.WeightUpdateController",
+                side_effect=[first_weight_ctrl, recovered_weight_ctrl],
+            ) as weight_ctrl_cls,
+            patch("requests.post", return_value=port_response),
+        ):
+            controller.connect_engine(
+                rollout,
+                SimpleNamespace(type="awex", colocate=False, version=None),
+            )
+            controller.connect_engine(
+                rollout,
+                SimpleNamespace(type="awex", colocate=False, version=1),
+            )
+
+        first_weight_ctrl.destroy.assert_called_once_with()
+        assert recovered_weight_ctrl.connect.call_args.kwargs["pair_name"] == (
+            "actor-rollout-v1"
+        )
+        config = weight_ctrl_cls.call_args.args[0]
+        assert config.setup_timeout == controller.config.setup_timeout
+        assert config.request_timeout == controller.config.request_timeout
+        assert config.init_timeout_s == controller.config.request_timeout
+        assert config.update_timeout_s == controller.config.request_timeout

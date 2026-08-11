@@ -1418,6 +1418,14 @@ class RolloutControllerV2:
         assert self._workflow_executor is not None
         self._workflow_executor.resume()
 
+    def recover_state_dict(self) -> dict[str, Any] | None:
+        """Return checkpointable state owned by the workflow executor."""
+        return self.workflow_executor.recover_state_dict()
+
+    def load_recover_state_dict(self, state: dict[str, Any] | None) -> None:
+        """Restore checkpointable state owned by the workflow executor."""
+        self.workflow_executor.load_recover_state_dict(state)
+
     def offload(self) -> None:
         """Offload model memory on all inference workers."""
         from areal.infra.utils.concurrent import run_async_task

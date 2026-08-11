@@ -1428,6 +1428,14 @@ class RemoteInfEngine(InferenceEngine):
         """Resume request submission for async rollout."""
         return self.workflow_executor.resume()
 
+    def recover_state_dict(self) -> dict[str, Any] | None:
+        """Return checkpointable state owned by the workflow executor."""
+        return self.workflow_executor.recover_state_dict()
+
+    def load_recover_state_dict(self, state: dict[str, Any] | None) -> None:
+        """Restore checkpointable state owned by the workflow executor."""
+        self.workflow_executor.load_recover_state_dict(state)
+
     def offload(self, tags: list[str] | None = None) -> None:
         """Offload model memory on all servers."""
         offload_req = self.backend.get_offload_request(tags=tags)
