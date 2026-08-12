@@ -403,8 +403,8 @@ def test_relative_position_gae_lambda_rejects_invalid_q(q):
         relative_position_gae_lambda(context, q=q)
 
 
-def test_relative_position_gae_lambda_main_path_decays_terminal_outcome_reward():
-    """The GRPO actor path decays a terminal reward from one to q over L steps."""
+def test_relative_position_gae_lambda_main_path_without_turn_ids():
+    """Token workflows need no turn metadata to decay a terminal reward."""
     q = 0.3
     trajectory_length = 10
     actor = _make_actor(
@@ -414,7 +414,6 @@ def test_relative_position_gae_lambda_main_path_decays_terminal_outcome_reward()
     batch = {
         "input_ids": torch.zeros(1, trajectory_length + 1, dtype=torch.long),
         "loss_mask": torch.tensor([[0] + [1] * trajectory_length], dtype=torch.float32),
-        "turn_ids": torch.tensor([[-1] + [0] * trajectory_length], dtype=torch.int32),
         "logprobs": torch.zeros(1, trajectory_length + 1, dtype=torch.float32),
         "attention_mask": torch.ones(1, trajectory_length + 1, dtype=torch.bool),
         "rewards": torch.tensor([1.0]),
@@ -461,15 +460,22 @@ def test_relative_position_gae_lambda_turn_mode_uses_effective_turn_count():
     )
 
 
-def test_custom_gae_lambda_requires_turn_ids():
-    """Custom functions receive complete token and turn length context."""
+def test_custom_token_gae_lambda_uses_lengths_without_turn_ids():
+    """A token-level custom lambda remains compatible with legacy workflows."""
     actor = _make_actor(
         gae_lambda="areal.trainer.ppo.lambda_fn.vapo_length_adaptive_gae",
         gae_lambda_kwargs={"alpha": 1.0},
     )
+    loss_mask = torch.tensor([[1.0, 1.0], [1.0, 0.0]])
 
-    with pytest.raises(ValueError, match="custom gae_lambda.*turn_ids"):
-        actor._compute_gae_lambda(torch.ones(1, 2), turn_ids=None)
+    gae_lambda = actor._compute_gae_lambda(loss_mask, turn_ids=None)
+
+    torch.testing.assert_close(
+        gae_lambda,
+        torch.tensor([0.5, 0.0]),
+        rtol=0.0,
+        atol=0.0,
+    )
 
 
 def test_custom_gae_lambda_rejects_scalar_output():

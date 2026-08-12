@@ -205,9 +205,7 @@ def _compute_turn_level_gae(
         newgaelam = delta + discounted_lambda * lastgaelam
 
         mask = valid_turn_mask[:, turn_idx]
-        turn_advantages[:, turn_idx] = torch.where(
-            mask, newgaelam, zero_advantages
-        )
+        turn_advantages[:, turn_idx] = torch.where(mask, newgaelam, zero_advantages)
         nextvalues = torch.where(mask, turn_values[:, turn_idx], nextvalues)
         lastgaelam = torch.where(mask, newgaelam, lastgaelam)
 
@@ -225,23 +223,18 @@ def _build_gae_lambda_context(
     turn_ids: torch.Tensor | None,
     *,
     gae_timestep_unit: str,
-    require_turn_ids: bool,
 ) -> GAELambdaContext:
-    """Build stable per-sample lengths from the canonical GAE eligibility mask."""
+    """Build stable per-sample lengths from the canonical GAE eligibility mask.
+
+    Token-level custom lambda functions can operate on legacy rollout data that does
+    not carry turn metadata. In that case, ``turn_counts`` is zero-filled because it
+    is not the selected timestep length. Turn-level GAE still requires explicit
+    ``turn_ids``.
+    """
     valid_token_mask = loss_mask.bool()
     effective_token_lengths = valid_token_mask.sum(dim=1)
 
-    needs_turn_counts = require_turn_ids or gae_timestep_unit == "turn"
-    if needs_turn_counts:
-        if turn_ids is None:
-            if require_turn_ids:
-                raise ValueError(
-                    "A custom gae_lambda function requires rollout data to include "
-                    "'turn_ids'."
-                )
-            raise ValueError(
-                "Turn-level GAE requires rollout data to include 'turn_ids'."
-            )
+    if turn_ids is not None:
         _validate_turn_ids(loss_mask, turn_ids)
         max_seqlen = loss_mask.shape[1]
         safe_turn_ids = torch.clamp(turn_ids.long(), min=0, max=max_seqlen - 1)
@@ -251,8 +244,10 @@ def _build_gae_lambda_context(
         )
         turn_counts = (tokens_per_turn > 0).sum(dim=1)
     else:
-        # Static token-level lambda must remain compatible with legacy workflows
-        # that do not carry turn metadata. The constant function ignores this key.
+        if gae_timestep_unit == "turn":
+            raise ValueError(
+                "Turn-level GAE requires rollout data to include 'turn_ids'."
+            )
         turn_counts = torch.zeros_like(effective_token_lengths)
 
     timestep_lengths = (
@@ -533,7 +528,6 @@ class PPOActor:
             loss_mask,
             turn_ids,
             gae_timestep_unit=self.gae_timestep_unit,
-            require_turn_ids=self._gae_lambda_is_custom,
         )
         gae_lambda = self.gae_lambda_fn(context, **self.gae_lambda_kwargs)
         if not isinstance(gae_lambda, torch.Tensor):

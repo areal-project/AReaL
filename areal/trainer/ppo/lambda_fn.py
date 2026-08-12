@@ -115,9 +115,8 @@ def relative_position_gae_lambda(
 def resolve_gae_lambda_fn(gae_lambda: float | str) -> tuple[GAELambdaFn, bool]:
     """Resolve a static value or dotted function path to a worker-local callable.
 
-    Returns the callable and whether it came from a custom import path. The latter
-    lets callers preserve legacy static-lambda workflows that do not carry
-    ``turn_ids`` while requiring complete context for custom functions.
+    Returns the callable and whether it came from a custom import path so callers can
+    keep the static-lambda fast path while resolving custom values per batch.
     """
     if isinstance(gae_lambda, bool):
         raise TypeError("gae_lambda must be a float or dotted function path, not bool")
