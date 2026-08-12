@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import functools
+import math
 from collections.abc import Callable
 from typing import TypedDict
 
@@ -16,6 +17,7 @@ __all__ = [
     "GAELambdaContext",
     "GAELambdaFn",
     "constant_gae_lambda",
+    "relative_position_gae_lambda",
     "resolve_gae_lambda_fn",
     "vapo_length_adaptive_gae",
 ]
@@ -65,6 +67,49 @@ def vapo_length_adaptive_gae(
     adaptive_lambda = 1.0 - 1.0 / (float(alpha) * safe_lengths)
     adaptive_lambda = adaptive_lambda.clamp_min(0.0)
     return torch.where(lengths > 0, adaptive_lambda, torch.zeros_like(adaptive_lambda))
+
+
+def relative_position_gae_lambda(
+    context: GAELambdaContext,
+    *,
+    q: float,
+) -> torch.Tensor:
+    r"""Keep terminal-reward decay invariant at equal relative positions.
+
+    For a trajectory with ``L >= 2`` effective timesteps, this function returns
+    ``lambda = q ** (1 / (L - 1))``. With discount one, a terminal outcome reward
+    therefore retains
+
+    ``lambda ** (L - k) = q ** ((L - k) / (L - 1))``
+
+    at one-based timestep ``k``. The first timestep retains exactly ``q``, the
+    final timestep retains one, and every equal endpoint-normalized position
+    ``(k - 1) / (L - 1)`` has the same retention for every trajectory length.
+
+    ``q`` is the retained fraction, not the fraction removed. A one-timestep
+    trajectory has no transition over which lambda can decay and therefore uses
+    lambda one. An empty trajectory uses lambda zero.
+    """
+    if (
+        isinstance(q, bool)
+        or not isinstance(q, int | float)
+        or not math.isfinite(q)
+        or not 0 < q <= 1
+    ):
+        raise ValueError(f"q must be a finite number in (0, 1], got {q!r}")
+
+    lengths = context["timestep_lengths"]
+    decay_steps = (lengths - 1).clamp_min(1).to(dtype=torch.float32)
+    step_lambdas = torch.exp(math.log(float(q)) / decay_steps)
+    return torch.where(
+        lengths > 1,
+        step_lambdas,
+        torch.where(
+            lengths == 1,
+            torch.ones_like(step_lambdas),
+            torch.zeros_like(step_lambdas),
+        ),
+    )
 
 
 def resolve_gae_lambda_fn(gae_lambda: float | str) -> tuple[GAELambdaFn, bool]:

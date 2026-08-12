@@ -12,6 +12,7 @@ from areal.trainer.ppo.actor import (
     _compute_turn_level_gae,
 )
 from areal.trainer.ppo.lambda_fn import (
+    relative_position_gae_lambda,
     resolve_gae_lambda_fn,
     vapo_length_adaptive_gae,
 )
@@ -337,6 +338,126 @@ def test_vapo_gae_lambda_uses_selected_turn_counts_per_sample():
         torch.tensor([0.5, 0.0, 0.0]),
         rtol=0.0,
         atol=0.0,
+    )
+
+
+def test_relative_position_gae_lambda_preserves_endpoints_and_relative_positions():
+    """Different lengths share decay at equal endpoint-normalized positions."""
+    q = 0.3
+    lengths = torch.tensor([10, 19])
+    context = {
+        "effective_token_lengths": lengths,
+        "turn_counts": lengths,
+        "timestep_lengths": lengths,
+    }
+
+    gae_lambda = relative_position_gae_lambda(context, q=q)
+    first_step_retention = gae_lambda.pow((lengths - 1).float())
+    # Step 5 of 10 and step 9 of 19 are both at relative position 4 / 9.
+    equal_position_retention = gae_lambda.pow(torch.tensor([5.0, 10.0]))
+
+    torch.testing.assert_close(
+        first_step_retention,
+        torch.full((2,), q),
+        rtol=1e-6,
+        atol=1e-7,
+    )
+    torch.testing.assert_close(
+        equal_position_retention,
+        torch.full((2,), q ** (5.0 / 9.0)),
+        rtol=1e-6,
+        atol=1e-7,
+    )
+
+
+def test_relative_position_gae_lambda_handles_empty_and_single_step_trajectories():
+    """Empty rows use zero while a single timestep cannot undergo decay."""
+    lengths = torch.tensor([0, 1, 2])
+    context = {
+        "effective_token_lengths": lengths,
+        "turn_counts": lengths,
+        "timestep_lengths": lengths,
+    }
+
+    gae_lambda = relative_position_gae_lambda(context, q=0.3)
+
+    torch.testing.assert_close(
+        gae_lambda,
+        torch.tensor([0.0, 1.0, 0.3]),
+        rtol=0.0,
+        atol=1e-7,
+    )
+
+
+@pytest.mark.parametrize("q", [True, -0.1, 0.0, 1.1, float("nan"), float("inf")])
+def test_relative_position_gae_lambda_rejects_invalid_q(q):
+    """The retained fraction must be finite and belong to (0, 1]."""
+    lengths = torch.tensor([2])
+    context = {
+        "effective_token_lengths": lengths,
+        "turn_counts": lengths,
+        "timestep_lengths": lengths,
+    }
+
+    with pytest.raises(ValueError, match=r"q must be .* in \(0, 1\]"):
+        relative_position_gae_lambda(context, q=q)
+
+
+def test_relative_position_gae_lambda_main_path_decays_terminal_outcome_reward():
+    """The GRPO actor path decays a terminal reward from one to q over L steps."""
+    q = 0.3
+    trajectory_length = 10
+    actor = _make_actor(
+        gae_lambda=("areal.trainer.ppo.lambda_fn.relative_position_gae_lambda"),
+        gae_lambda_kwargs={"q": q},
+    )
+    batch = {
+        "input_ids": torch.zeros(1, trajectory_length + 1, dtype=torch.long),
+        "loss_mask": torch.tensor([[0] + [1] * trajectory_length], dtype=torch.float32),
+        "turn_ids": torch.tensor([[-1] + [0] * trajectory_length], dtype=torch.int32),
+        "logprobs": torch.zeros(1, trajectory_length + 1, dtype=torch.float32),
+        "attention_mask": torch.ones(1, trajectory_length + 1, dtype=torch.bool),
+        "rewards": torch.tensor([1.0]),
+    }
+    expected_active_advantages = torch.tensor(
+        [
+            q ** ((trajectory_length - step) / (trajectory_length - 1))
+            for step in range(1, trajectory_length + 1)
+        ],
+        dtype=torch.float32,
+    )
+    expected = torch.cat([expected_active_advantages, torch.zeros(1)]).unsqueeze(0)
+
+    result = actor._compute_advantages(batch)
+
+    torch.testing.assert_close(result["advantages"], expected, rtol=1e-6, atol=1e-7)
+    torch.testing.assert_close(result["returns"], expected, rtol=1e-6, atol=1e-7)
+
+
+def test_relative_position_gae_lambda_turn_mode_uses_effective_turn_count():
+    """Turn-level lambda normalizes decay by turns rather than action tokens."""
+    q = 0.3
+    actor = _make_actor(
+        gae_timestep_unit="turn",
+        gae_lambda="areal.trainer.ppo.lambda_fn.relative_position_gae_lambda",
+        gae_lambda_kwargs={"q": q},
+    )
+    loss_mask = torch.ones(2, 6)
+    turn_ids = torch.tensor(
+        [
+            [0, 0, 1, 1, 2, 2],
+            [0, 0, 0, 0, 0, 0],
+        ],
+        dtype=torch.int32,
+    )
+
+    gae_lambda = actor._compute_gae_lambda(loss_mask, turn_ids)
+
+    torch.testing.assert_close(
+        gae_lambda,
+        torch.tensor([q ** (1.0 / 2.0), 1.0]),
+        rtol=1e-6,
+        atol=1e-7,
     )
 
 
