@@ -61,6 +61,7 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
         self._engine = engine
         self._transfer_plan: TransferPlan | None = None
         self._weights_update_group = None
+        self._weights_update_group_gloo = None
         self._transfer_rank: int | None = None
         self._offloaded_optimizer_states: dict = {}
         self._offloaded_weights: dict[str, torch.Tensor] = {}
@@ -184,6 +185,24 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
             group_name=f"awex_{pair_name}",
             role="training",
         )
+        self._weights_update_group_gloo = init_weights_update_group(
+            master_address=master_addr,
+            master_port=master_port,
+            rank=transfer_rank,
+            world_size=world_size,
+            group_name=f"awex_{pair_name}_gloo",
+            backend="gloo",
+            role="training",
+        )
+        logger.info(
+            "Initialized AWEX weight update groups for pair=%s role=training "
+            "rank=%s world_size=%s nccl=awex_%s gloo=awex_%s_gloo",
+            pair_name,
+            transfer_rank,
+            world_size,
+            pair_name,
+            pair_name,
+        )
 
     def execute_weight_update(self, version: int) -> None:
         del version
@@ -191,6 +210,8 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
             raise RuntimeError("Transfer plan is not initialized")
         if self._weights_update_group is None:
             raise RuntimeError("Weight update group is not initialized")
+        if self._weights_update_group_gloo is None:
+            raise RuntimeError("Gloo weight update group is not initialized")
         if self._transfer_rank is None:
             raise RuntimeError("Transfer rank is not initialized")
 
@@ -207,21 +228,29 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
             blocking=True,
             use_group=awex_wu_use_group(),
         )
-        dist.barrier(group=self._weights_update_group)
+        dist.barrier(group=self._weights_update_group_gloo)
 
     def batch_isend_irecv(self, **kwargs) -> None:
-        setup_kwargs = {k: v for k, v in kwargs.items() if k != "world_size"}
+        if self._weights_update_group_gloo is None:
+            raise RuntimeError("Gloo weight update group is not initialized")
+        setup_kwargs = {
+            k: v for k, v in kwargs.items() if k not in ("world_size", "barrier_group")
+        }
         setup_batch_isend_irecv(
             self._weights_update_group,
             self._transfer_rank,
             kwargs.get("world_size", 0),
+            barrier_group=self._weights_update_group_gloo,
             **setup_kwargs,
         )
 
     def teardown_weight_update_group(self) -> None:
         if self._weights_update_group is not None and dist.is_initialized():
             dist.destroy_process_group(self._weights_update_group)
+        if self._weights_update_group_gloo is not None and dist.is_initialized():
+            dist.destroy_process_group(self._weights_update_group_gloo)
         self._weights_update_group = None
+        self._weights_update_group_gloo = None
         self._transfer_plan = None
         self._transfer_rank = None
         if self._colocate_http_client is not None:
