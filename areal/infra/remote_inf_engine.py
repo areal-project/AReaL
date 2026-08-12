@@ -49,7 +49,6 @@ from areal.infra.utils.proc import kill_process_tree
 from areal.utils import logging, name_resolve, names
 from areal.utils.data import concat_padded_tensors
 from areal.utils.dynamic_import import import_from_string
-from areal.utils.environ import get_bool_env_var
 from areal.utils.network import (
     find_free_ports,
     format_hostport,
@@ -76,6 +75,7 @@ class GroupedRolloutWorkflow(RolloutWorkflow):
         logger: Logger,
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
+        deterministic_sampling: bool = False,
     ):
         if group_size < 1:
             raise ValueError(f"group_size must be >= 1, got {group_size}")
@@ -84,6 +84,7 @@ class GroupedRolloutWorkflow(RolloutWorkflow):
         self.logger = logger
         self.reward_normalization = reward_normalization
         self.drop_incomplete_group = drop_incomplete_group
+        self.deterministic_sampling = deterministic_sampling
 
     async def arun_episode(
         self, engine: InferenceEngine, data: dict[str, Any]
@@ -104,8 +105,7 @@ class GroupedRolloutWorkflow(RolloutWorkflow):
             finally:
                 workflow_context.set(parent)
 
-        deterministic = get_bool_env_var("AREAL_DETERMINISTIC_SAMPLING")
-        if deterministic:
+        if self.deterministic_sampling:
             indexed_results = []
             for sample_idx in range(self.group_size):
                 indexed_results.append(await run_sample(sample_idx))
@@ -715,6 +715,7 @@ class RemoteInfEngine(InferenceEngine):
             subproc_max_workers=agent_cfg.subproc_max_workers,
             proxy_gateway_addr=self._proxy_gateway_addr,
             drop_retry_orphans=agent_cfg.drop_retry_orphans,
+            deterministic_sampling=self.config.deterministic_sampling,
         )
 
     def _resolve_workflow(
@@ -746,6 +747,7 @@ class RemoteInfEngine(InferenceEngine):
                     self.logger,
                     reward_normalization=reward_normalization,
                     drop_incomplete_group=drop_incomplete_group,
+                    deterministic_sampling=self.config.deterministic_sampling,
                 )
             return resolved
 
@@ -843,6 +845,7 @@ class RemoteInfEngine(InferenceEngine):
                 self.logger,
                 reward_normalization=reward_normalization,
                 drop_incomplete_group=drop_incomplete_group,
+                deterministic_sampling=self.config.deterministic_sampling,
             )
 
         return resolved

@@ -2379,6 +2379,16 @@ class InferenceEngineConfig:
             "help": "Whether to output verbose tracing messages for each generation request."
         },
     )
+    deterministic_sampling: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Enable reproducible grouped rollout identities, ordering, and "
+                "automatically derived sampling seeds. Explicit request seeds take "
+                "precedence."
+            )
+        },
+    )
     check_trajectory_format: bool = field(
         default=False,
         metadata={

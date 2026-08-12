@@ -358,8 +358,10 @@ class TestRolloutControllerV2Construction:
         controller.save_perf_tracer()
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("deterministic_sampling", [False, True])
     async def test_async_initialize_passes_callback_and_reward_timeout_to_data_proxy(
         self,
+        deterministic_sampling,
     ):
         from areal.api.cli_args import SchedulingSpec
         from areal.api.io_struct import LocalInfServerInfo
@@ -375,6 +377,7 @@ class TestRolloutControllerV2Construction:
             backend="sglang:d1",
             tokenizer_path="mock-tokenizer",
             request_timeout=15.0,
+            deterministic_sampling=deterministic_sampling,
             agent=AgentConfig(
                 agent_cls_path="tests.experimental.openai.utils.SimpleAgent",
                 set_reward_finish_timeout=7.5,
@@ -418,6 +421,7 @@ class TestRolloutControllerV2Construction:
         assert "7.5" in data_proxy_cmd
         assert "--callback-server-addr" in data_proxy_cmd
         assert "http://127.0.0.1:19000" in data_proxy_cmd
+        assert ("--deterministic-sampling" in data_proxy_cmd) is deterministic_sampling
 
 
 class TestOnlineCallbackFlow:

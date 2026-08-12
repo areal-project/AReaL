@@ -14,7 +14,6 @@ import aiohttp
 from areal.api import RolloutWorkflow
 from areal.infra import workflow_context
 from areal.utils import logging, stats_tracker
-from areal.utils.environ import get_bool_env_var
 from areal.utils.perf_tracer import session_context, trace_session
 
 from .client_session import OpenAIProxyClient
@@ -34,12 +33,12 @@ _executor_lock = threading.Lock()
 _executor_max_workers: int | None = None
 
 
-def _proxy_task_id(context: workflow_context.WorkflowContext) -> str:
+def _proxy_task_id(
+    context: workflow_context.WorkflowContext,
+    deterministic_sampling: bool,
+) -> str:
     """Return a sample-stable proxy identity only in deterministic mode."""
-    if (
-        get_bool_env_var("AREAL_DETERMINISTIC_SAMPLING")
-        and context.sample_idx is not None
-    ):
+    if deterministic_sampling and context.sample_idx is not None:
         return f"{context.task_id}:{context.sample_idx}"
     return str(context.task_id)
 
@@ -92,6 +91,7 @@ class OpenAIProxyWorkflow(RolloutWorkflow):
         subproc_max_workers: int = 4,
         proxy_gateway_addr: str | None = None,
         drop_retry_orphans: bool = False,
+        deterministic_sampling: bool = False,
     ):
         if mode not in ("inline", "subproc", "online"):
             raise ValueError(
@@ -130,6 +130,7 @@ class OpenAIProxyWorkflow(RolloutWorkflow):
         self.export_style = export_style
         self.subproc_max_workers = subproc_max_workers
         self.drop_retry_orphans = drop_retry_orphans
+        self.deterministic_sampling = deterministic_sampling
 
     @trace_session("run_agent")
     async def _run_agent(self, session_api_key: str, data: dict):
@@ -177,7 +178,10 @@ class OpenAIProxyWorkflow(RolloutWorkflow):
     async def arun_episode(
         self, engine: TRolloutEngine, data: dict[str, Any]
     ) -> dict[str, InteractionWithTokenLogpReward] | None:
-        proxy_task_id = _proxy_task_id(workflow_context.get())
+        proxy_task_id = _proxy_task_id(
+            workflow_context.get(),
+            deterministic_sampling=self.deterministic_sampling,
+        )
 
         http_session = await workflow_context.get_aiohttp_session()
 

@@ -444,10 +444,10 @@ async def test_chat_completions_passes_sampling_params(client, mock_areal_client
 
 @pytest.mark.asyncio
 async def test_chat_completions_deterministic_seed_distinguishes_group_sessions(
-    client, mock_areal_client, monkeypatch
+    client, config, mock_areal_client
 ):
     """Grouped samples receive stable but distinct deterministic seeds."""
-    monkeypatch.setenv("AREAL_DETERMINISTIC_SAMPLING", "1")
+    config.deterministic_sampling = True
     resp = await client.post(
         "/rl/start_session",
         json={"task_id": "seed-test", "group_size": 2},
@@ -479,10 +479,10 @@ async def test_chat_completions_deterministic_seed_distinguishes_group_sessions(
 
 @pytest.mark.asyncio
 async def test_chat_completions_preserves_explicit_seed(
-    client, mock_areal_client, monkeypatch
+    client, config, mock_areal_client
 ):
     """An explicit caller seed takes precedence over deterministic defaults."""
-    monkeypatch.setenv("AREAL_DETERMINISTIC_SAMPLING", "1")
+    config.deterministic_sampling = True
     resp = await client.post(
         "/rl/start_session",
         json={"task_id": "explicit-seed"},

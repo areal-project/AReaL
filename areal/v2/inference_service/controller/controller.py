@@ -476,6 +476,8 @@ class RolloutControllerV2:
                 "--engine-max-tokens",
                 str(agent_cfg.engine_max_tokens),
             ]
+        if cfg.deterministic_sampling:
+            data_proxy_base_cmd.append("--deterministic-sampling")
 
         async def _fork_data_proxy(group_idx: int) -> tuple[str, int, str]:
             if self.external_mode:

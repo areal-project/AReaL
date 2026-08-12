@@ -25,6 +25,7 @@ def _reset_server_globals(monkeypatch):
     monkeypatch.setattr(srv, "_session_to_api_key", {})
     monkeypatch.setattr(srv, "_capacity", 0)
     monkeypatch.setattr(srv, "_admin_api_key", _ADMIN_KEY)
+    monkeypatch.setattr(srv, "_deterministic_sampling", False)
     monkeypatch.setattr(srv, "_lock", threading.Lock())
     monkeypatch.setattr(srv, "_last_cleanup_time", 0.0)
 
@@ -136,7 +137,12 @@ class TestStartSessionApiKey:
 
 class TestDeterministicSamplingSeed:
     @staticmethod
-    async def _call_create(session_id: str, request: dict, monkeypatch) -> dict:
+    async def _call_create(
+        session_id: str,
+        request: dict,
+        monkeypatch,
+        deterministic_sampling: bool = False,
+    ) -> dict:
         session = SessionData(session_id=session_id)
         monkeypatch.setattr(srv, "_session_cache", {session_id: session})
         monkeypatch.setattr(srv, "_openai_client", object())
@@ -146,14 +152,17 @@ class TestDeterministicSamplingSeed:
             captured.update(seed=seed, areal_cache=areal_cache)
             return object()
 
-        await srv._call_client_create(create, request, session_id)
+        await srv._call_client_create(
+            create,
+            request,
+            session_id,
+            deterministic_sampling=deterministic_sampling,
+        )
         return captured
 
     @pytest.mark.asyncio
     async def test_default_mode_does_not_inject_seed(self, monkeypatch):
         """Normal proxy requests preserve the existing unseeded behavior."""
-        monkeypatch.delenv("AREAL_DETERMINISTIC_SAMPLING", raising=False)
-
         captured = await self._call_create("task-0", {}, monkeypatch)
 
         assert captured["seed"] is None
@@ -161,10 +170,12 @@ class TestDeterministicSamplingSeed:
     @pytest.mark.asyncio
     async def test_group_sessions_receive_stable_distinct_seeds(self, monkeypatch):
         """Different sample sessions receive reproducible, distinct seeds."""
-        monkeypatch.setenv("AREAL_DETERMINISTIC_SAMPLING", "1")
-
-        first = await self._call_create("task:0-0", {}, monkeypatch)
-        second = await self._call_create("task:1-0", {}, monkeypatch)
+        first = await self._call_create(
+            "task:0-0", {}, monkeypatch, deterministic_sampling=True
+        )
+        second = await self._call_create(
+            "task:1-0", {}, monkeypatch, deterministic_sampling=True
+        )
 
         assert first["seed"] == derive_deterministic_seed("task:0-0", 0)
         assert second["seed"] == derive_deterministic_seed("task:1-0", 0)
@@ -173,9 +184,12 @@ class TestDeterministicSamplingSeed:
     @pytest.mark.asyncio
     async def test_explicit_seed_takes_precedence(self, monkeypatch):
         """A caller-provided seed is never replaced by deterministic mode."""
-        monkeypatch.setenv("AREAL_DETERMINISTIC_SAMPLING", "1")
-
-        captured = await self._call_create("task-0", {"seed": 12345}, monkeypatch)
+        captured = await self._call_create(
+            "task-0",
+            {"seed": 12345},
+            monkeypatch,
+            deterministic_sampling=True,
+        )
 
         assert captured["seed"] == 12345
 

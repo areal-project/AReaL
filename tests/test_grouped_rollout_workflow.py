@@ -88,9 +88,8 @@ def _interaction(reward: float) -> InteractionWithTokenLogpReward:
 
 
 @pytest.mark.asyncio
-async def test_grouped_rollout_default_keeps_concurrent_execution(monkeypatch):
-    """Without the deterministic label, grouped samples remain concurrent."""
-    monkeypatch.delenv("AREAL_DETERMINISTIC_SAMPLING", raising=False)
+async def test_grouped_rollout_default_keeps_concurrent_execution():
+    """Without deterministic sampling, grouped samples remain concurrent."""
     inner = _ContextWorkflow()
     workflow = GroupedRolloutWorkflow(inner, group_size=4, logger=_Logger())
     parent = WorkflowContext(task_id=12)
@@ -104,11 +103,15 @@ async def test_grouped_rollout_default_keeps_concurrent_execution(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_grouped_rollout_deterministic_mode_orders_sample_identity(monkeypatch):
+async def test_grouped_rollout_deterministic_mode_orders_sample_identity():
     """Deterministic mode submits and merges samples in stable index order."""
-    monkeypatch.setenv("AREAL_DETERMINISTIC_SAMPLING", "1")
     inner = _ContextWorkflow()
-    workflow = GroupedRolloutWorkflow(inner, group_size=4, logger=_Logger())
+    workflow = GroupedRolloutWorkflow(
+        inner,
+        group_size=4,
+        logger=_Logger(),
+        deterministic_sampling=True,
+    )
     parent = WorkflowContext(task_id=12)
     workflow_context.set(parent)
 
@@ -120,14 +123,11 @@ async def test_grouped_rollout_deterministic_mode_orders_sample_identity(monkeyp
     assert workflow_context.get() == parent
 
 
-def test_proxy_task_identity_changes_only_in_deterministic_mode(monkeypatch):
+def test_proxy_task_identity_changes_only_in_deterministic_mode():
     """Sample indices do not alter the normal proxy task identity."""
     context = WorkflowContext(task_id=12, sample_idx=3)
-    monkeypatch.delenv("AREAL_DETERMINISTIC_SAMPLING", raising=False)
-    assert _proxy_task_id(context) == "12"
-
-    monkeypatch.setenv("AREAL_DETERMINISTIC_SAMPLING", "1")
-    assert _proxy_task_id(context) == "12:3"
+    assert _proxy_task_id(context, deterministic_sampling=False) == "12"
+    assert _proxy_task_id(context, deterministic_sampling=True) == "12:3"
 
 
 @pytest.mark.asyncio

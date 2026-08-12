@@ -12,6 +12,7 @@ class DataProxyConfig:
     tokenizer_path: str = ""
     log_level: str = "warning"
     request_timeout: float = 120.0  # seconds per SGLang call
+    deterministic_sampling: bool = False
     set_reward_finish_timeout: float = 0.0
     max_resubmit_retries: int = 20  # max abort/resubmit cycles before giving up
     resubmit_wait: float = 0.5  # seconds between is_paused polls

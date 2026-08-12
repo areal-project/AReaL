@@ -45,6 +45,10 @@ def main():
         default=120.0,
     )
     parser.add_argument(
+        "--deterministic-sampling",
+        action="store_true",
+    )
+    parser.add_argument(
         "--set-reward-finish-timeout",
         type=float,
         default=0.0,
@@ -94,6 +98,7 @@ def main():
         tokenizer_path=args.tokenizer_path,
         log_level=args.log_level,
         request_timeout=args.request_timeout,
+        deterministic_sampling=args.deterministic_sampling,
         set_reward_finish_timeout=args.set_reward_finish_timeout,
         admin_api_key=args.admin_api_key,
         callback_server_addr=args.callback_server_addr,

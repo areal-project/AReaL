@@ -34,7 +34,6 @@ from areal.infra.rpc.serialization import deserialize_value, serialize_value
 from areal.infra.utils.http import validate_admin_api_key
 from areal.utils import name_resolve, names, seeding
 from areal.utils.dynamic_import import import_from_string
-from areal.utils.environ import get_bool_env_var
 from areal.utils.hf_utils import load_hf_tokenizer
 from areal.utils.logging import getLogger
 from areal.utils.network import find_free_ports, gethostip
@@ -103,6 +102,7 @@ _lock = threading.Lock()
 _capacity = 0
 _last_cleanup_time: float = 0
 _session_timeout_seconds: int = 3600  # Default timeout (overridden by config)
+_deterministic_sampling: bool = False
 
 # API key authentication
 # Initialized to a random value so pre-configuration requests cannot bypass auth.
@@ -271,7 +271,7 @@ async def alloc_ports(raw_request: Request):
 
 def _setup_openai_client():
     global _openai_client, _session_timeout_seconds, _admin_api_key
-    global _message_preprocessors, _prefix_matcher
+    global _message_preprocessors, _prefix_matcher, _deterministic_sampling
     config = _engine.config
     tokenizer = load_hf_tokenizer(config.tokenizer_path)
     agent_cfg = config.agent
@@ -286,6 +286,7 @@ def _setup_openai_client():
     )
     # Set session timeout from config
     _session_timeout_seconds = agent_cfg.session_timeout_seconds
+    _deterministic_sampling = config.deterministic_sampling
     # Validate admin API key BEFORE assigning it to the global, so a
     # failed validation cannot leave the default key live on the server.
     # The default admin key is publicly known; refuse to use it when the
@@ -561,6 +562,7 @@ async def _call_client_create(
     session_id: str,
     extra_ignored_args: list[str] | None = None,
     stream: bool = False,
+    deterministic_sampling: bool = False,
 ) -> ChatCompletion | Response | AsyncGenerator[ChatCompletionChunk, None]:
     """Common logic for chat completions and responses."""
     if _openai_client is None:
@@ -623,7 +625,7 @@ async def _call_client_create(
         _warn_once("top_p not set in request, defaulting to 1.0")
 
     if (
-        get_bool_env_var("AREAL_DETERMINISTIC_SAMPLING")
+        deterministic_sampling
         and kwargs.get("seed") is None
         and "seed" in areal_client_allowed_args
     ):
@@ -679,6 +681,7 @@ async def chat_completions(
                 request=request,
                 session_id=session_id,
                 stream=True,
+                deterministic_sampling=_deterministic_sampling,
             )
 
             # Convert ChatCompletionChunk objects to OpenAI SSE format
@@ -710,6 +713,7 @@ async def chat_completions(
         create_fn=_openai_client.chat.completions.create,
         request=request,
         session_id=session_id,
+        deterministic_sampling=_deterministic_sampling,
     )
 
 
@@ -730,6 +734,7 @@ async def responses(
         create_fn=_openai_client.responses.create,
         request=request,
         session_id=session_id,
+        deterministic_sampling=_deterministic_sampling,
     )
 
 
@@ -849,6 +854,7 @@ async def anthropic_messages(
                 request=openai_request,
                 session_id=session_id,
                 stream=True,
+                deterministic_sampling=_deterministic_sampling,
             )
 
             # Use LiteLLM's adapter to convert to Anthropic SSE format
@@ -885,6 +891,7 @@ async def anthropic_messages(
         request=openai_request,
         session_id=session_id,
         stream=False,
+        deterministic_sampling=_deterministic_sampling,
     )
 
     # Convert OpenAI response to Anthropic format using LiteLLM's adapter

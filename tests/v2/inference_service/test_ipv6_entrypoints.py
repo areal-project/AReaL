@@ -17,6 +17,7 @@ def test_data_proxy_main_formats_ipv6_serving_addr():
         tokenizer_path="mock-tokenizer",
         log_level="info",
         request_timeout=120.0,
+        deterministic_sampling=False,
         set_reward_finish_timeout=0.0,
         admin_api_key="admin-key",
         callback_server_addr="http://[::1]:19000",
