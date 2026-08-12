@@ -53,8 +53,12 @@ def _iter_jsonl_records(path):
     nested (``conversations`` wrapper) vs flat format auto-detection
     via ``_extract_messages``.  Records with empty messages are skipped.
 
-    Warns about multi-user trajectories which break think-tag rendering
-    in templates with ``ns.last_query_index`` logic (e.g. Bailing).
+    Reports multi-user trajectories for visibility.  These are now
+    **handled** in this pipeline: ``_patch_chat_template_for_training``
+    removes the ``ns.last_query_index`` gate at tokenization time, so
+    ``<think>`` renders for every assistant turn regardless of how many
+    user messages precede it.  The count below only matters if the data
+    is tokenized through a pipeline that does NOT apply that patch.
     """
     record_idx = 0
     n_multi_user = 0
@@ -72,19 +76,19 @@ def _iter_jsonl_records(path):
             if n_user > 1:
                 n_multi_user += 1
                 if n_multi_user <= 3:
-                    logger.warning(
-                        "Record %d has %d user messages. Templates with "
-                        "ns.last_query_index logic (e.g. Bailing) will NOT "
-                        "render <think> for assistant turns before the last "
-                        "user message. Consider filtering!",
+                    logger.info(
+                        "Record %d has %d user messages. Handled by "
+                        "_patch_chat_template_for_training (last_query_index "
+                        "gate removed) so all assistant turns render <think>; "
+                        "only an issue if tokenized via an unpatched template.",
                         record_idx,
                         n_user,
                     )
             yield record_idx, messages, record_tools
     if n_multi_user > 0:
-        logger.warning(
-            "Total %d/%d records have multiple user messages. "
-            "These may produce no-think training signal.",
+        logger.info(
+            "Total %d/%d records have multiple user messages "
+            "(handled by the chat-template patch at tokenization time).",
             n_multi_user,
             record_idx,
         )
@@ -159,9 +163,9 @@ def _clean_message(msg, strip_thinking=True, ensure_thinking=False):
         ensure_thinking: If True, inject inline ``<think>\n</think>``
             on assistant turns that lack a thinking block (either
             inline or in ``reasoning_content``).  Requires the
-            patched Bailing template (via
-            ``_patch_chat_template_for_training``) which detects
-            ``had_think_tags`` and preserves empty think blocks.
+            patched template (Bailing / Qwen3 / other ``last_query_index``
+            families, via ``_patch_chat_template_for_training``) which
+            detects ``had_think_tags`` and preserves empty think blocks.
     """
     cleaned = {"role": msg["role"]}
 
@@ -238,8 +242,9 @@ def _clean_message(msg, strip_thinking=True, ensure_thinking=False):
     # ``reasoning_content='\n'`` approach.
     #
     # Requires ``_patch_chat_template_for_training`` to have been called
-    # on the tokenizer, otherwise the stock Bailing template will extract
-    # and discard the empty ``<think>`` block.
+    # on the tokenizer, otherwise the stock template (Bailing / Qwen3 /
+    # other ``last_query_index`` families) will extract and discard the
+    # empty ``<think>`` block.
     if ensure_thinking and msg["role"] == "assistant" and not has_thinking:
         cur_content = cleaned.get("content")
         if cur_content is None or cur_content == "":
@@ -313,13 +318,11 @@ def _is_bare_text_tool_call(msg):
 
 
 def _msg_has_thinking(msg):
-    """True if assistant *msg* has thinking content (inline or reasoning_content)."""
+    """True if assistant *msg* has non-empty thinking content."""
     if msg.get("role") != "assistant":
         return False
-    content = msg.get("content") or ""
-    normalized = _THINK_OPEN_RE.sub("<think>", content)
-    normalized = _THINK_CLOSE_RE.sub("</think>", normalized)
-    if _THINK_RE.search(normalized):
+    normalized = _normalize_thinking_tags(msg.get("content") or "")
+    if any(match.group(1).strip() for match in _THINK_RE.finditer(normalized)):
         return True
     rc = msg.get("reasoning_content") or ""
     return bool(rc.strip())
@@ -381,16 +384,7 @@ def _classify_pair(pair):
     if target.get("role") != "assistant":
         return "pure_text"
 
-    content = target.get("content") or ""
-    rc = target.get("reasoning_content") or ""
-    # Require non-empty think content: pair cleaning runs BEFORE balancing
-    # and (with ensure_thinking) injects an empty <think>\n</think> into
-    # every no-think target, so a bare regex hit would classify everything
-    # as "thinking" and silently disable max_no_thinking_ratio.
-    _m = _THINK_RE.search(content)
-    has_thinking = bool(_m and _m.group(1).strip()) or bool(rc.strip())
-
-    if has_thinking:
+    if _msg_has_thinking(target):
         return "thinking"
     if target.get("tool_calls"):
         return "no_thinking_tool_call"

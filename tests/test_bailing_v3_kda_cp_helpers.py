@@ -183,8 +183,7 @@ def test_out_norm_sharded_state_dict_uses_replicated_wrapper(monkeypatch):
             )
         )
         return {
-            f"{prefix}{name}": _FakeShard(tensor)
-            for name, tensor in state_dict.items()
+            f"{prefix}{name}": _FakeShard(tensor) for name, tensor in state_dict.items()
         }
 
     def fake_default(module, prefix="", sharded_offsets=(), metadata=None):

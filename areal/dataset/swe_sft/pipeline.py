@@ -25,10 +25,10 @@ from .messages import (
 )
 from .tokenization import (
     DATASET_NUM_PROC,
-    _TokenizeAndMask,
     _detect_template_pattern,
     _dump_samples,
     _patch_chat_template_for_training,
+    _TokenizeAndMask,
 )
 
 logger = logging.getLogger("SWESFTDataset")
