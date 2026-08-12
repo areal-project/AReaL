@@ -13,6 +13,14 @@
 #   - tensor_helper.py: FP8 blockwise tensor helper class
 #   - config.py: Configuration utilities for extracting block size from quantization config
 
+try:
+    from areal.utils.kernel.fp8_kernel import (
+        scaled_fp8_blockwise,
+        should_quantize_param,
+    )
+except ImportError:
+    pass
+
 from areal.engine.megatron_utils.fp8.config import get_block_size_from_config
 from areal.engine.megatron_utils.fp8.deepgemm import (
     DEEPGEMM_BLACKWELL,
@@ -44,6 +52,9 @@ __all__ = [
     "quantize_params",
     "dequantize_params",
     "get_block_size_from_config",
+    # Unified shared kernel
+    "scaled_fp8_blockwise",
+    "should_quantize_param",
     # Kernels
     "blockwise_cast_to_fp8_triton",
     "weight_dequant",

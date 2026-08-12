@@ -204,6 +204,9 @@ class WeightUpdateMeta:
 
     version: int | None = None
 
+    quantization: str | None = None
+    quantization_config: dict | None = None
+
     def with_version(self, version: int) -> "WeightUpdateMeta":
         """Return a copy of this meta with versioned path.
 
@@ -258,6 +261,8 @@ class WeightUpdateMeta:
         lora_name: str = "",
         lora_int_id: int = 1,
         base_model_name: str = "",
+        quantization: str | None = None,
+        quantization_config: dict | None = None,
     ):
         return cls(
             type="xccl",
@@ -267,6 +272,8 @@ class WeightUpdateMeta:
             lora_name=lora_name,
             lora_int_id=lora_int_id,
             base_model_name=base_model_name,
+            quantization=quantization,
+            quantization_config=quantization_config,
         )
 
     @classmethod
@@ -278,6 +285,8 @@ class WeightUpdateMeta:
         lora_name: str = "",
         lora_int_id: int = 1,
         base_model_name: str = "",
+        quantization: str | None = None,
+        quantization_config: dict | None = None,
     ):
         return cls(
             type="xccl",
@@ -287,6 +296,8 @@ class WeightUpdateMeta:
             lora_name=lora_name,
             lora_int_id=lora_int_id,
             base_model_name=base_model_name,
+            quantization=quantization,
+            quantization_config=quantization_config,
         )
 
     @classmethod

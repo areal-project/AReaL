@@ -17,15 +17,15 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from transformers import AutoTokenizer
 
-from tests.fp8.comparison_utils import (
-    compare_logits,
-    compare_tensors_dict,
-    log_problematic_operations,
-)
 from tests.fp8.engine_utils import (
     create_engine,
     decode_with_megatron_forward,
     forward_with_logits_and_logprobs,
+)
+from tests.fp8.megatron.comparison_utils import (
+    compare_logits,
+    compare_tensors_dict,
+    log_problematic_operations,
 )
 from tests.fp8.model_hooks import (
     collect_gradients_after_train_batch,
