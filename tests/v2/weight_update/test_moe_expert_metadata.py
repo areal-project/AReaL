@@ -129,7 +129,119 @@ def test_merging_preserves_distinct_names():
     assert len(merged) == 2
 
 
-def test_connect_merges_the_inference_metadata_it_collected():
+def test_inference_instances_keep_one_canonical_replica():
+    from areal.v2.weight_update.gateway import app as gateway_app
+
+    responses = [
+        {
+            "meta": [
+                _entry("model.layers.0.mlp.experts.3.down_proj.weight", rank)
+                for rank in range(2)
+            ]
+        }
+        for _ in range(2)
+    ]
+
+    canonical = gateway_app._canonical_inference_meta(responses)
+
+    assert len(canonical) == 1
+    assert len(canonical[0]["data"]["shards"]) == 2
+    replicas = canonical[0]["data"]["replicas"]
+    assert len(replicas) == 1
+    assert [shard["rank"] for shard in canonical[0]["data"]["shards"]] == [0, 1]
+    assert [shard["rank"] for shard in replicas[0]["data"]["shards"]] == [0, 1]
+
+
+def test_inference_instances_with_different_metadata_fail_fast():
+    from areal.v2.weight_update.gateway import app as gateway_app
+
+    responses = [
+        {"meta": [_entry("a.weight", 0), _entry("a.weight", 1)]},
+        {"meta": [_entry("a.weight", 0)]},
+    ]
+
+    with pytest.raises(
+        ValueError,
+        match="Inference instance 1 reported different weight metadata",
+    ):
+        gateway_app._canonical_inference_meta(responses)
+
+
+def test_canonical_metadata_builds_one_transfer_per_engine_shard():
+    from awex.meta.meta_resolver import (
+        ParameterMeta,
+        ParameterReplicaMeta,
+        ParameterShardMeta,
+    )
+    from awex.sharding.param_sharding import ShardingType
+    from awex.transfer.transfer_plan import TransferPlanBuilder
+
+    from areal.infra.rpc.serialization import deserialize_value, serialize_value
+    from areal.v2.weight_update.gateway import app as gateway_app
+
+    name = "model.layers.0.mlp.experts.3.down_proj.weight"
+
+    def shard(rank, shape, global_offset, world_size):
+        return ParameterShardMeta(
+            tp_rank=rank,
+            attn_tp_rank=rank,
+            pp_rank=0,
+            ep_rank=0,
+            ep_tp_rank=rank,
+            global_rank=rank,
+            world_size=world_size,
+            engine_rank=0,
+            name=name,
+            shape=shape,
+            numel=shape[0],
+            dtype=torch.float32,
+            global_offset=global_offset,
+            sharding_type=ShardingType.TP_SHARDING,
+            num_shards=world_size,
+            sharding_dim=0,
+        )
+
+    def per_rank_meta(rank):
+        infer_shard = shard(rank, shape=(2,), global_offset=(rank * 2,), world_size=2)
+        return ParameterMeta(
+            name=name,
+            global_numel=4,
+            global_shape=(4,),
+            dtype=torch.float32,
+            shards=[infer_shard],
+            replicas=[ParameterReplicaMeta(shards=[infer_shard])],
+        )
+
+    responses = [
+        {"meta": serialize_value([per_rank_meta(0), per_rank_meta(1)])}
+        for _ in range(2)
+    ]
+    canonical = deserialize_value(gateway_app._canonical_inference_meta(responses))
+
+    train_shard = shard(0, shape=(4,), global_offset=(0,), world_size=1)
+    training = [
+        ParameterMeta(
+            name=name,
+            global_numel=4,
+            global_shape=(4,),
+            dtype=torch.float32,
+            shards=[train_shard],
+            replicas=[ParameterReplicaMeta(shards=[train_shard])],
+        )
+    ]
+    builder = TransferPlanBuilder(
+        infer_world_size=4,
+        train_world_size=1,
+        num_infer_engines=2,
+    )
+
+    operations = builder.build_weights_mapping_operations(canonical, training)
+
+    assert len(operations) == 4
+    assert [operation.recv_rank for operation in operations] == [0, 1, 2, 3]
+
+
+def test_connect_canonicalizes_the_inference_metadata_it_collected():
     """Guard the call site, not just the helper.
 
     The helper being correct is useless if /connect forgets to apply it, which
@@ -140,13 +252,13 @@ def test_connect_merges_the_inference_metadata_it_collected():
     from areal.v2.weight_update.gateway import app as gateway_app
 
     source = inspect.getsource(gateway_app)
-    collect_sites = source.count("infer_params_meta.extend(meta)")
-    merge_sites = source.count(
-        "infer_params_meta = _merge_meta_by_name(infer_params_meta)"
+    collect_sites = source.count("infer_meta_resps = await asyncio.gather")
+    canonicalize_sites = source.count(
+        "infer_params_meta = _canonical_inference_meta(infer_meta_resps)"
     )
 
     assert collect_sites > 0
-    assert merge_sites == collect_sites, (
+    assert canonicalize_sites == collect_sites, (
         f"{collect_sites} places collect inference metadata but only "
-        f"{merge_sites} merge it by name"
+        f"{canonicalize_sites} preserve one canonical inference instance"
     )

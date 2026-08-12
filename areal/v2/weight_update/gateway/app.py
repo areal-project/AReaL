@@ -171,6 +171,28 @@ def _merge_meta_by_name(meta_list: list[dict]) -> list[dict]:
 _merge_training_meta_by_name = _merge_meta_by_name
 
 
+def _canonical_inference_meta(meta_responses: list[dict]) -> list[dict]:
+    """Return metadata for one inference instance after validating its replicas.
+
+    AWEX expands one instance's metadata by ``num_infer_engines`` when it builds
+    the transfer plan. Merging metadata across inference instances here would
+    make that expansion count every instance twice.
+    """
+    canonical = None
+    for instance_idx, result in enumerate(meta_responses):
+        meta = result.get("result", result.get("meta", result))
+        instance_meta = meta if isinstance(meta, list) else [meta]
+        instance_meta = _merge_meta_by_name(instance_meta)
+        if canonical is None:
+            canonical = instance_meta
+        elif instance_meta != canonical:
+            raise ValueError(
+                f"Inference instance {instance_idx} reported different weight metadata"
+            )
+
+    return canonical or []
+
+
 def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
     config = config or WeightUpdateConfig()
 
@@ -317,18 +339,7 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
                 training_params_meta.append(meta)
         training_params_meta = _merge_training_meta_by_name(training_params_meta)
 
-        infer_params_meta = []
-        for result in infer_meta_resps:
-            meta = result.get("result", result.get("meta", result))
-            if isinstance(meta, list):
-                infer_params_meta.extend(meta)
-            else:
-                infer_params_meta.append(meta)
-        # Every inference rank reports the same parameter names, one entry per
-        # (name, rank). The transfer plan indexes by name alone, so without
-        # merging only the last entry per name survives and the other ranks'
-        # shards are dropped.
-        infer_params_meta = _merge_meta_by_name(infer_params_meta)
+        infer_params_meta = _canonical_inference_meta(infer_meta_resps)
 
         kv_store.put(pair_name, "training_params_meta", training_params_meta)
         kv_store.put(pair_name, "infer_params_meta", infer_params_meta)
@@ -458,18 +469,7 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
                 training_params_meta.append(meta)
         training_params_meta = _merge_training_meta_by_name(training_params_meta)
 
-        infer_params_meta = []
-        for result in infer_meta_resps:
-            meta = result.get("result", result.get("meta", result))
-            if isinstance(meta, list):
-                infer_params_meta.extend(meta)
-            else:
-                infer_params_meta.append(meta)
-        # Every inference rank reports the same parameter names, one entry per
-        # (name, rank). The transfer plan indexes by name alone, so without
-        # merging only the last entry per name survives and the other ranks'
-        # shards are dropped.
-        infer_params_meta = _merge_meta_by_name(infer_params_meta)
+        infer_params_meta = _canonical_inference_meta(infer_meta_resps)
 
         kv_store.put(pair_name, "training_params_meta", training_params_meta)
         kv_store.put(pair_name, "infer_params_meta", infer_params_meta)
