@@ -707,6 +707,12 @@ class TrainController:
         """
         self._custom_function_call("load", meta)
 
+    def init_awex_adapter(self, meta_server_addr: str | None = None):
+        """Create awex adapter early for selective memory management."""
+        self._custom_function_call(
+            "init_awex_adapter", meta_server_addr=meta_server_addr
+        )
+
     def step_lr_scheduler(self):
         """Step the learning rate scheduler.
 

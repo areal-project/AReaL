@@ -2,11 +2,21 @@ import os
 
 import torch
 import torch.distributed as dist
+from megatron.core import parallel_state
+from megatron.core.tensor_parallel.layers import ColumnParallelLinear
+from megatron.core.transformer import TransformerConfig
 
 from areal.infra.platforms import current_platform
+from areal.models.mcore import vocab_parallel_head as lm_head_module
+from areal.models.mcore.vocab_parallel_head import (
+    chunked_lm_head_logprobs_entropy,
+    replace_output_layer_with_areal_lm_head,
+)
 from areal.utils.functional.vocab_parallel import (
+    _inplace_vocab_parallel_logprobs_entropy,
     _vocab_parallel_logprobs,
     _vocab_parallel_logprobs_entropy,
+    gather_logprobs_entropy,
 )
 
 
@@ -372,6 +382,484 @@ def test_vocab_parallel_different_shapes():
         print("✓ test_vocab_parallel_different_shapes passed")
 
 
+def test_inplace_vocab_parallel_logprobs_entropy():
+    """Test the destructive fused path with real TP collectives."""
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    device = current_platform.current_device()
+    num_tokens, vocab_size = 13, 3072
+    partition_size = vocab_size // world_size
+    temperature = 0.7
+
+    torch.manual_seed(444)
+    full_logits = torch.randn(num_tokens, vocab_size, device=device)
+    labels = torch.randint(0, vocab_size, (num_tokens,), device=device)
+    logprob_weights = torch.randn(num_tokens, device=device)
+    start_idx = rank * partition_size
+    end_idx = start_idx + partition_size
+
+    full_logits_ref = full_logits.clone().requires_grad_(True)
+    ref_logprobs, ref_entropy = reference_logprobs_entropy(
+        full_logits_ref / temperature, labels
+    )
+    (ref_logprobs * logprob_weights).sum().backward()
+
+    local_logits_leaf = (
+        full_logits[..., start_idx:end_idx].clone().contiguous().requires_grad_(True)
+    )
+    local_logits = local_logits_leaf + 0.0
+    storage_ptr = local_logits.data_ptr()
+    all_reduce_calls = 0
+    original_all_reduce = dist.all_reduce
+
+    def counted_all_reduce(*args, **kwargs):
+        nonlocal all_reduce_calls
+        all_reduce_calls += 1
+        return original_all_reduce(*args, **kwargs)
+
+    dist.all_reduce = counted_all_reduce
+    try:
+        logprobs, entropy = _inplace_vocab_parallel_logprobs_entropy(
+            local_logits,
+            labels,
+            get_tp_group(),
+            temperature=temperature,
+            chunk_size=5,
+        )
+    finally:
+        dist.all_reduce = original_all_reduce
+    (logprobs * logprob_weights).sum().backward()
+
+    assert local_logits.data_ptr() == storage_ptr
+    assert all_reduce_calls == 2 * ((num_tokens + 4) // 5)
+    assert not entropy.requires_grad
+    torch.testing.assert_close(logprobs, ref_logprobs, rtol=1e-5, atol=2e-5)
+    torch.testing.assert_close(entropy, ref_entropy, rtol=1e-5, atol=2e-5)
+    torch.testing.assert_close(
+        local_logits_leaf.grad,
+        full_logits_ref.grad[..., start_idx:end_idx],
+        rtol=1e-5,
+        atol=2e-5,
+    )
+
+    if rank == 0:
+        print("✓ test_inplace_vocab_parallel_logprobs_entropy passed")
+
+
+class _HeadContainer(torch.nn.Module):
+    def __init__(self, head):
+        super().__init__()
+        self.output_layer = head
+
+
+def test_areal_lm_head_tensor_and_sequence_parallel():
+    """Test native and FP32 output with TP, SP, and an externally tied weight."""
+    if not parallel_state.is_initialized():
+        parallel_state.initialize_model_parallel(
+            tensor_model_parallel_size=dist.get_world_size()
+        )
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    device = current_platform.current_device()
+    hidden_size = 16
+    local_vocab_size = 32
+    local_sequence = 3
+    tp_group = get_tp_group()
+
+    for sequence_parallel in (False, True):
+        for fp32_output in (False, True):
+            for weight_requires_grad in (False, True):
+                _test_areal_lm_head_tensor_and_sequence_parallel_case(
+                    rank=rank,
+                    world_size=world_size,
+                    device=device,
+                    hidden_size=hidden_size,
+                    local_vocab_size=local_vocab_size,
+                    local_sequence=local_sequence,
+                    tp_group=tp_group,
+                    sequence_parallel=sequence_parallel,
+                    fp32_output=fp32_output,
+                    weight_requires_grad=weight_requires_grad,
+                )
+
+    if rank == 0:
+        print("✓ test_areal_lm_head_tensor_and_sequence_parallel passed")
+
+
+def _test_areal_lm_head_tensor_and_sequence_parallel_case(
+    *,
+    rank: int,
+    world_size: int,
+    device: torch.device,
+    hidden_size: int,
+    local_vocab_size: int,
+    local_sequence: int,
+    tp_group: dist.ProcessGroup,
+    sequence_parallel: bool,
+    fp32_output: bool,
+    weight_requires_grad: bool,
+) -> None:
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=hidden_size,
+        num_attention_heads=4,
+        params_dtype=torch.bfloat16,
+        tensor_model_parallel_size=world_size,
+        sequence_parallel=sequence_parallel,
+        gradient_accumulation_fusion=False,
+    )
+    head = ColumnParallelLinear(
+        hidden_size,
+        local_vocab_size * world_size,
+        config=config,
+        init_method=lambda tensor: tensor,
+        bias=False,
+        gather_output=False,
+        skip_weight_param_allocation=True,
+        tp_group=tp_group,
+    )
+    container = _HeadContainer(head)
+    replace_output_layer_with_areal_lm_head(
+        container,
+        fp32_output=fp32_output,
+    )
+
+    torch.manual_seed(1000 + rank)
+    local_input = torch.randn(
+        local_sequence,
+        1,
+        hidden_size,
+        dtype=torch.bfloat16,
+        device=device,
+        requires_grad=True,
+    )
+    tied_weight = torch.randn(
+        local_vocab_size,
+        hidden_size,
+        dtype=torch.bfloat16,
+        device=device,
+        requires_grad=weight_requires_grad,
+    )
+    output, _ = container.output_layer(local_input, weight=tied_weight)
+
+    if sequence_parallel:
+        gathered_inputs = [torch.empty_like(local_input) for _ in range(world_size)]
+        dist.all_gather(gathered_inputs, local_input.detach(), group=tp_group)
+        total_input = torch.cat(gathered_inputs, dim=0)
+    else:
+        total_input = local_input.detach()
+    if fp32_output:
+        expected_output = torch.mm(
+            total_input.reshape(-1, hidden_size),
+            tied_weight.detach().t(),
+            out_dtype=torch.float32,
+        ).view(*total_input.shape[:-1], local_vocab_size)
+    else:
+        expected_output = torch.matmul(
+            total_input,
+            tied_weight.detach().t(),
+        )
+    torch.testing.assert_close(output, expected_output, rtol=0.0, atol=0.0)
+
+    torch.manual_seed(2000 + rank)
+    grad_output = torch.randn_like(output)
+    output.backward(grad_output)
+    grad_output_bf16 = grad_output.to(torch.bfloat16)
+    expected_full_dgrad = grad_output_bf16.matmul(tied_weight.detach())
+
+    if sequence_parallel:
+        expected_input_grad = torch.empty_like(local_input)
+        dist.reduce_scatter_tensor(
+            expected_input_grad,
+            expected_full_dgrad,
+            group=tp_group,
+        )
+    else:
+        expected_input_grad = expected_full_dgrad
+        dist.all_reduce(expected_input_grad, group=tp_group)
+
+    torch.testing.assert_close(
+        local_input.grad, expected_input_grad, rtol=0.0, atol=0.0
+    )
+    if weight_requires_grad:
+        expected_weight_grad = (
+            grad_output_bf16.reshape(-1, local_vocab_size)
+            .t()
+            .matmul(total_input.reshape(-1, hidden_size))
+        )
+        torch.testing.assert_close(
+            tied_weight.grad, expected_weight_grad, rtol=0.0, atol=0.0
+        )
+    else:
+        assert tied_weight.grad is None
+
+
+def test_areal_lm_head_packed_dlogits_tensor_and_sequence_parallel():
+    """Test fused-loss storage packing through MCore TP/SP backward."""
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    device = current_platform.current_device()
+    hidden_size = 16
+    local_vocab_size = 32
+    local_sequence = 3
+    tp_group = get_tp_group()
+
+    class HeadContainer(torch.nn.Module):
+        def __init__(self, head):
+            super().__init__()
+            self.output_layer = head
+
+    for sequence_parallel in (False, True):
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=hidden_size,
+            num_attention_heads=4,
+            params_dtype=torch.bfloat16,
+            tensor_model_parallel_size=world_size,
+            sequence_parallel=sequence_parallel,
+            gradient_accumulation_fusion=False,
+        )
+        head = ColumnParallelLinear(
+            hidden_size,
+            local_vocab_size * world_size,
+            config=config,
+            init_method=lambda tensor: tensor,
+            bias=False,
+            gather_output=False,
+            skip_weight_param_allocation=True,
+            tp_group=tp_group,
+        )
+        container = HeadContainer(head)
+        replace_output_layer_with_areal_lm_head(container, fp32_output=True)
+
+        torch.manual_seed(3000 + rank)
+        local_input = torch.randn(
+            local_sequence,
+            1,
+            hidden_size,
+            dtype=torch.bfloat16,
+            device=device,
+            requires_grad=True,
+        )
+        tied_weight = torch.randn(
+            local_vocab_size,
+            hidden_size,
+            dtype=torch.bfloat16,
+            device=device,
+            requires_grad=True,
+        )
+        output, _ = container.output_layer(local_input, weight=tied_weight)
+
+        gathered_logits = [torch.empty_like(output) for _ in range(world_size)]
+        dist.all_gather(gathered_logits, output.detach(), group=tp_group)
+        reference_logits = torch.cat(gathered_logits, dim=-1).requires_grad_(True)
+        torch.manual_seed(4000)
+        labels = torch.randint(
+            0,
+            local_vocab_size * world_size,
+            output.shape[:-1],
+            device=device,
+        )
+        loss_weights = torch.randn(output.shape[:-1], device=device)
+        reference_logprobs = (
+            torch.log_softmax(reference_logits, dim=-1)
+            .gather(-1, labels.unsqueeze(-1))
+            .squeeze(-1)
+        )
+        (reference_logprobs * loss_weights).sum().backward()
+
+        pack_calls = 0
+        original_pack = lm_head_module._pack_fp32_to_half_inplace
+
+        def counted_pack(*args, **kwargs):
+            nonlocal pack_calls
+            pack_calls += 1
+            return original_pack(*args, **kwargs)
+
+        lm_head_module._pack_fp32_to_half_inplace = counted_pack
+        try:
+            logprobs, entropy = gather_logprobs_entropy(
+                output,
+                labels,
+                tp_group=tp_group,
+                reuse_logits=True,
+                chunk_size=2,
+            )
+            (logprobs * loss_weights).sum().backward()
+        finally:
+            lm_head_module._pack_fp32_to_half_inplace = original_pack
+
+        assert pack_calls == 1
+        assert not entropy.requires_grad
+        torch.testing.assert_close(logprobs, reference_logprobs, rtol=1e-5, atol=2e-5)
+        local_dlogits = reference_logits.grad[
+            ..., rank * local_vocab_size : (rank + 1) * local_vocab_size
+        ].to(torch.bfloat16)
+        expected_full_dgrad = local_dlogits.matmul(tied_weight.detach())
+
+        if sequence_parallel:
+            expected_input_grad = torch.empty_like(local_input)
+            dist.reduce_scatter_tensor(
+                expected_input_grad,
+                expected_full_dgrad,
+                group=tp_group,
+            )
+            gathered_inputs = [torch.empty_like(local_input) for _ in range(world_size)]
+            dist.all_gather(gathered_inputs, local_input.detach(), group=tp_group)
+            total_input = torch.cat(gathered_inputs, dim=0)
+        else:
+            expected_input_grad = expected_full_dgrad
+            dist.all_reduce(expected_input_grad, group=tp_group)
+            total_input = local_input.detach()
+
+        expected_weight_grad = (
+            local_dlogits.reshape(-1, local_vocab_size)
+            .t()
+            .matmul(total_input.reshape(-1, hidden_size))
+        )
+        torch.testing.assert_close(
+            local_input.grad, expected_input_grad, rtol=1e-5, atol=2e-5
+        )
+        torch.testing.assert_close(
+            tied_weight.grad, expected_weight_grad, rtol=1e-5, atol=2e-5
+        )
+
+    if rank == 0:
+        print("✓ test_areal_lm_head_packed_dlogits_tensor_and_sequence_parallel passed")
+
+
+def test_chunked_lm_head_tensor_and_sequence_parallel():
+    """Compare chunked LM Head logprobs and gradients under TP and SP."""
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    device = current_platform.current_device()
+    hidden_size = 16
+    local_vocab_size = 32
+    local_sequence = 4
+    tp_group = get_tp_group()
+
+    for sequence_parallel in (False, True):
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=hidden_size,
+            num_attention_heads=4,
+            params_dtype=torch.bfloat16,
+            tensor_model_parallel_size=world_size,
+            sequence_parallel=sequence_parallel,
+            gradient_accumulation_fusion=False,
+        )
+        head = ColumnParallelLinear(
+            hidden_size,
+            local_vocab_size * world_size,
+            config=config,
+            init_method=lambda tensor: tensor,
+            bias=False,
+            gather_output=False,
+            skip_weight_param_allocation=True,
+            tp_group=tp_group,
+        )
+        container = _HeadContainer(head)
+        replace_output_layer_with_areal_lm_head(container, fp32_output=True)
+
+        torch.manual_seed(5000 + rank)
+        local_input = torch.randn(
+            local_sequence,
+            1,
+            hidden_size,
+            dtype=torch.bfloat16,
+            device=device,
+            requires_grad=True,
+        )
+        tied_weight = torch.randn(
+            local_vocab_size,
+            hidden_size,
+            dtype=torch.bfloat16,
+            device=device,
+            requires_grad=True,
+        )
+        total_sequence = (
+            local_sequence * world_size if sequence_parallel else local_sequence
+        )
+        torch.manual_seed(6000)
+        labels = torch.randint(
+            local_vocab_size * world_size,
+            (total_sequence, 1),
+            device=device,
+        )
+        loss_weights = torch.randn(total_sequence, device=device)
+
+        output = chunked_lm_head_logprobs_entropy(
+            container.output_layer,
+            local_input,
+            tied_weight,
+            labels,
+            temperature=0.7,
+            chunk_size=3,
+        )
+
+        if sequence_parallel:
+            gathered_inputs = [torch.empty_like(local_input) for _ in range(world_size)]
+            dist.all_gather(gathered_inputs, local_input.detach(), group=tp_group)
+            total_input = torch.cat(gathered_inputs, dim=0)
+        else:
+            total_input = local_input.detach()
+        local_logits = torch.mm(
+            total_input.reshape(-1, hidden_size),
+            tied_weight.detach().t(),
+            out_dtype=torch.float32,
+        )
+        gathered_logits = [torch.empty_like(local_logits) for _ in range(world_size)]
+        dist.all_gather(gathered_logits, local_logits, group=tp_group)
+        reference_logits = torch.cat(gathered_logits, dim=-1).requires_grad_(True)
+        scaled_logits = reference_logits / 0.7
+        reference_logprobs = (
+            torch.log_softmax(scaled_logits, dim=-1)
+            .gather(-1, labels.reshape(-1, 1))
+            .squeeze(-1)
+        )
+        reference_entropy = -torch.sum(
+            torch.softmax(scaled_logits, dim=-1)
+            * torch.log_softmax(scaled_logits, dim=-1),
+            dim=-1,
+        )
+        torch.testing.assert_close(
+            output.logprobs, reference_logprobs, rtol=1e-5, atol=2e-5
+        )
+        torch.testing.assert_close(
+            output.entropy, reference_entropy, rtol=1e-5, atol=2e-5
+        )
+
+        (reference_logprobs * loss_weights).sum().backward()
+        (output.logprobs * loss_weights).sum().backward()
+        local_dlogits = reference_logits.grad[
+            :, rank * local_vocab_size : (rank + 1) * local_vocab_size
+        ].to(torch.bfloat16)
+        expected_full_dgrad = local_dlogits.matmul(tied_weight.detach()).view_as(
+            total_input
+        )
+        if sequence_parallel:
+            expected_input_grad = torch.empty_like(local_input)
+            dist.reduce_scatter_tensor(
+                expected_input_grad, expected_full_dgrad, group=tp_group
+            )
+        else:
+            expected_input_grad = expected_full_dgrad
+            dist.all_reduce(expected_input_grad, group=tp_group)
+        expected_weight_grad = local_dlogits.t().matmul(
+            total_input.reshape(-1, hidden_size)
+        )
+
+        torch.testing.assert_close(
+            local_input.grad, expected_input_grad, rtol=1e-5, atol=2e-5
+        )
+        torch.testing.assert_close(
+            tied_weight.grad, expected_weight_grad, rtol=5e-3, atol=3e-2
+        )
+
+    if rank == 0:
+        print("✓ test_chunked_lm_head_tensor_and_sequence_parallel passed")
+
+
 def run_all_tests():
     """Run all tensor parallel tests."""
     rank = dist.get_rank()
@@ -401,6 +889,18 @@ def run_all_tests():
     dist.barrier()
 
     test_vocab_parallel_different_shapes()
+    dist.barrier()
+
+    test_inplace_vocab_parallel_logprobs_entropy()
+    dist.barrier()
+
+    test_areal_lm_head_tensor_and_sequence_parallel()
+    dist.barrier()
+
+    test_areal_lm_head_packed_dlogits_tensor_and_sequence_parallel()
+    dist.barrier()
+
+    test_chunked_lm_head_tensor_and_sequence_parallel()
     dist.barrier()
 
     if rank == 0:

@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+from contextlib import contextmanager
 from typing import Any
 
 import torch
@@ -9,6 +10,31 @@ from megatron.core import parallel_state as mpu
 from megatron.core.packed_seq_params import PackedSeqParams
 
 from areal.utils.data import is_multi_modal_key
+
+
+def _unwrap_language_model(model: torch.nn.Module) -> torch.nn.Module:
+    current = model
+    while hasattr(current, "module"):
+        current = current.module
+    return getattr(current, "language_model", current)
+
+
+@contextmanager
+def _hidden_states_output(model: torch.nn.Module, enabled: bool):
+    if not enabled:
+        yield
+        return
+    language_model = _unwrap_language_model(model)
+    if not hasattr(language_model, "post_process"):
+        raise TypeError(
+            "chunked LM Head loss requires a model with a post_process attribute"
+        )
+    original = language_model.post_process
+    language_model.post_process = False
+    try:
+        yield
+    finally:
+        language_model.post_process = original
 
 
 def preprocess_packed_seqs_context_parallel(
@@ -289,6 +315,8 @@ def packed_context_parallel_forward(
     gather_cp_output: bool = True,
     is_vision_model: bool = False,
     use_padded_seq: bool = False,
+    fp32_output: bool | None = None,
+    return_hidden_states: bool = False,
 ):
     input_ids = input_["input_ids"]
     position_ids = input_.get("position_ids", None)
@@ -386,18 +414,25 @@ def packed_context_parallel_forward(
         position_ids = None
 
     try:
-        output = model(
-            input_ids=input_ids,
-            attention_mask=final_attention_mask,
-            position_ids=position_ids,
-            packed_seq_params=packed_seq_params,
+        model_kwargs = {
+            "input_ids": input_ids,
+            "attention_mask": final_attention_mask,
+            "position_ids": position_ids,
+            "packed_seq_params": packed_seq_params,
             **vlm_kwargs,
-        )
+        }
+        if fp32_output is not None:
+            model_kwargs["fp32_output"] = fp32_output
+        with _hidden_states_output(model, return_hidden_states):
+            output = model(**model_kwargs)
     except Exception as e:
         raise RuntimeError(
             f"Error occurred in packed context parallel forward pass on model {model} "
             f"with input_ids shape {input_ids.shape} and packed_seq_params {packed_seq_params}."
         ) from e
+
+    if return_hidden_states:
+        return output
 
     model_vp_stage = getattr(model, "vp_stage", None)
     is_pipeline_last_stage = mpu.is_pipeline_last_stage(

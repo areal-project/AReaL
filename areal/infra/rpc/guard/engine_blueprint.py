@@ -89,6 +89,20 @@ def _should_broadcast_payload(
     return broadcast
 
 
+def resolve_broadcast_target(
+    engine: TrainEngine | InferenceEngine, device: Any
+) -> tuple[Any, Any]:
+    """Offloaded engines gave the accelerator to the inference engine, so device
+    collectives are unusable and a gloo mirror is used. The mirror must span the
+    ranks of ``context_and_model_parallel_group`` or the broadcast deadlocks;
+    engines without one keep the pre-offload device broadcast.
+    """
+    cpu_mirror_group = getattr(engine, "cpu_model_parallel_group", None)
+    if getattr(engine, "is_offload", False) and cpu_mirror_group is not None:
+        return cpu_mirror_group, "cpu"
+    return engine.context_and_model_parallel_group, device
+
+
 engine_bp = Blueprint("engine", __name__)
 
 # ---------------------------------------------------------------------------
@@ -471,21 +485,20 @@ def call_engine_method():
                 )
                 if should_broadcast:
                     logger.debug(f"Broadcasting RPC payload for method: {method_name}")
-                    args_bcast = tensor_container_to(
-                        args, current_platform.current_device()
+                    bcast_group, bcast_device = resolve_broadcast_target(
+                        engine, current_platform.current_device()
                     )
+                    args_bcast = tensor_container_to(args, bcast_device)
                     args_bcast = broadcast_tensor_container(
                         args_bcast,
                         src_rank=engine.current_data_parallel_head(),
-                        group=engine.context_and_model_parallel_group,
+                        group=bcast_group,
                     )
-                    kwargs_bcast = tensor_container_to(
-                        kwargs, current_platform.current_device()
-                    )
+                    kwargs_bcast = tensor_container_to(kwargs, bcast_device)
                     kwargs_bcast = broadcast_tensor_container(
                         kwargs_bcast,
                         src_rank=engine.current_data_parallel_head(),
-                        group=engine.context_and_model_parallel_group,
+                        group=bcast_group,
                     )
                     logger.debug("Broadcasting RPC payload done.")
 

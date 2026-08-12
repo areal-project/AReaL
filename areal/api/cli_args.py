@@ -369,6 +369,8 @@ class GenerationHyperparameters:
 class OptimizerConfig:
     """Configuration for model optimization during training."""
 
+    DEFAULT_WARMUP_STEPS_PROPORTION: ClassVar[float] = 0.001
+
     type: str = field(
         default="adam",
         metadata={
@@ -412,9 +414,21 @@ class OptimizerConfig:
         },
     )
     warmup_steps_proportion: float = field(
-        default=0.001,
+        default=DEFAULT_WARMUP_STEPS_PROPORTION,
         metadata={
-            "help": "Proportion of training steps for warmup",
+            "help": "Non-negative proportion of training steps for warmup. "
+            "Ignored when warmup_steps is set. For Megatron, the resolved "
+            "warmup steps must be less than the total training steps.",
+        },
+    )
+    warmup_steps: int | None = field(
+        default=None,
+        metadata={
+            "help": "Fixed number of learning-rate scheduler steps for warmup. "
+            "Must be non-negative. For Megatron, it must also be less than the "
+            "total training steps. "
+            "When both options are explicitly configured, warmup_steps takes "
+            "precedence over warmup_steps_proportion and a warning is emitted.",
         },
     )
     initial_loss_scale: float = field(
@@ -432,6 +446,18 @@ class OptimizerConfig:
     gradient_clipping: float = field(
         default=1.0, metadata={"help": "Gradient clipping threshold"}
     )
+
+    def __post_init__(self) -> None:
+        if (
+            self.warmup_steps is not None
+            and self.warmup_steps_proportion != self.DEFAULT_WARMUP_STEPS_PROPORTION
+        ):
+            warnings.warn(
+                "Both warmup_steps and warmup_steps_proportion are configured; "
+                "warmup_steps takes precedence and warmup_steps_proportion is ignored.",
+                UserWarning,
+                stacklevel=2,
+            )
 
 
 @dataclass
@@ -980,11 +1006,40 @@ class MegatronEngineConfig:
     )
 
     # Precision & Loss
+    enable_chunked_logits: bool = field(
+        default=False,
+        metadata={
+            "help": "Enable AReaL's CUDA-only chunked-logits path by replacing "
+            "Megatron's native output layer with the vocab-parallel LM Head. "
+            "NPU and tree training are unsupported."
+        },
+    )
+    entropy_requires_grad: bool = field(
+        default=False,
+        metadata={
+            "help": "Whether the training loss requires entropy gradients. "
+            "Defaults to False. With AReaL LM Head enabled, False permits "
+            "destructive logits-storage reuse, so entropy is non-differentiable. "
+            "Set True to use the differentiable fallback."
+        },
+    )
+    lm_head_loss_chunk_size: int = field(
+        default=0,
+        metadata={
+            "help": "Sequence chunk size for AReaL's chunked LM Head loss. A "
+            "positive value requires enable_chunked_logits=True and "
+            "entropy_requires_grad=False, and computes LM Head logits and their "
+            "backward one chunk at a time. The chunked path only supports packed "
+            "text actor models without MTP; 0 disables it."
+        },
+    )
     enable_fp32_lm_head: bool = field(
         default=False,
         metadata={
-            "help": "Cast lm_head output to FP32 before loss computation for "
-            "numerical stability."
+            "help": "Deprecated. This option is ignored when enable_chunked_logits=True; "
+            "AReaL's fused LM Head always produces FP32 logits. When "
+            "enable_chunked_logits=False, preserve the legacy behavior of forwarding "
+            "the option to supported mbridge model configurations."
         },
     )
     cross_entropy_loss_fusion: bool = field(
@@ -1040,6 +1095,23 @@ class MegatronEngineConfig:
             "(bridge_type=megatron-bridge only). Default False drops it.",
         },
     )
+
+    def __post_init__(self) -> None:
+        if self.lm_head_loss_chunk_size < 0:
+            raise ValueError(
+                "lm_head_loss_chunk_size must be non-negative, got "
+                f"{self.lm_head_loss_chunk_size}"
+            )
+        if self.lm_head_loss_chunk_size > 0 and not self.enable_chunked_logits:
+            raise ValueError(
+                "lm_head_loss_chunk_size requires enable_chunked_logits=True"
+            )
+        if self.lm_head_loss_chunk_size > 0 and self.entropy_requires_grad:
+            raise ValueError(
+                "lm_head_loss_chunk_size requires entropy_requires_grad=False"
+            )
+        if self.lm_head_loss_chunk_size > 0 and self.enable_mtp:
+            raise ValueError("lm_head_loss_chunk_size does not support enable_mtp=True")
 
 
 class SchedulingStrategyType(str, Enum):
@@ -1132,6 +1204,16 @@ class SchedulingSpec:
     nodelist: str | None = field(
         default=None, metadata={"help": "sbatch/srun's `--nodelist` option for slurm."}
     )
+    reservation: str | None = field(
+        default=None,
+        metadata={"help": "sbatch's `--reservation` option for slurm."},
+    )
+    exclusive: bool = field(
+        default=False,
+        metadata={
+            "help": "sbatch's `--exclusive` option for slurm. Ensures nodes are not shared with other jobs."
+        },
+    )
     exclude: str | None = field(
         default=None, metadata={"help": "sbatch/srun's `--exclude` option for slurm."}
     )
@@ -1186,6 +1268,13 @@ class TrainEngineConfig:
     temperature: float = field(
         default=1.0, metadata={"help": "Temperature during generation."}
     )
+    logprobs_chunk_size: int = field(
+        default=1024,
+        metadata={
+            "help": "Maximum sequence chunk size used to compute log probabilities "
+            "and entropy. Must be positive."
+        },
+    )
     # Runtime microbatch limit
     mb_spec: MicroBatchSpec = field(default_factory=MicroBatchSpec)
     pad_to_maximum: bool = field(
@@ -1237,7 +1326,11 @@ class TrainEngineConfig:
 
     weight_update_mode: str = field(
         default="xccl",
-        metadata={"help": "Weight update backend type.", "choices": ["disk", "xccl"]},
+        metadata={
+            "help": "Weight update backend type. 'awex' requires a Megatron actor "
+            "and an SGLang rollout, and targets colocated actor-rollout setups.",
+            "choices": ["disk", "xccl", "awex"],
+        },
     )
     fsdp: FSDPEngineConfig = field(default_factory=FSDPEngineConfig)
     archon: ArchonEngineConfig = field(default_factory=ArchonEngineConfig)
@@ -1338,6 +1431,10 @@ class TrainEngineConfig:
 
     def __post_init__(self):
         """Validate scheduling_spec length and config combinations."""
+        if self.logprobs_chunk_size <= 0:
+            raise ValueError(
+                f"logprobs_chunk_size must be positive, got {self.logprobs_chunk_size}"
+            )
         if len(self.scheduling_spec) not in (1, 2):
             raise ValueError(
                 f"scheduling_spec must contain 1 or 2 SchedulingSpec, "
@@ -1997,6 +2094,7 @@ class SGLangConfig:
     triton_attention_reduce_in_fp32: bool = False
     triton_attention_num_kv_splits: int = 8
     num_continuous_decode_steps: int = 1
+    load_format: str = "auto"
     enable_memory_saver: bool = False
     allow_auto_truncate: bool = False
     attention_backend: str | None = "fa3"
@@ -2098,7 +2196,6 @@ class SGLangConfig:
             # Model and tokenizer
             tokenizer_path=sglang_config.model_path,
             tokenizer_mode="auto",
-            load_format="auto",
             trust_remote_code=True,
             is_embedding=False,
             # Other runtime options

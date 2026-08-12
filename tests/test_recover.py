@@ -7,7 +7,11 @@ import pytest
 
 from areal.api.cli_args import RecoverConfig
 from areal.api.io_struct import FinetuneSpec, StepInfo
-from areal.utils.recover import RecoverHandler, check_if_auto_recover, check_if_recover
+from areal.utils.recover import (
+    RecoverHandler,
+    check_if_auto_recover,
+    check_if_recover,
+)
 from areal.v2.training_service.controller.controller import (
     GatewayTrainController,
 )
@@ -234,3 +238,75 @@ class TestRecoverHandler:
 
             assert "GatewayTrainController" in str(exc_info.value)
             assert "recover.mode" in str(exc_info.value)
+
+
+class TestAwexColocateGate:
+    """The AWEX pre-transfer sequence must run only for colocated rollouts."""
+
+    @staticmethod
+    def _awex_meta():
+        return Mock(type="awex")
+
+    def test_awex_transport_without_colocation_is_not_colocate(self):
+        assert not RecoverHandler._should_run_awex_colocate_transfer(
+            inference_engine=Mock(),
+            weight_update_meta=self._awex_meta(),
+            colocated_rollout=False,
+        )
+
+    def test_awex_transport_with_colocation_is_colocate(self):
+        assert RecoverHandler._should_run_awex_colocate_transfer(
+            inference_engine=Mock(),
+            weight_update_meta=self._awex_meta(),
+            colocated_rollout=True,
+        )
+
+    @pytest.mark.parametrize("meta_type", ["disk", "xccl"])
+    def test_non_awex_transport_is_never_colocate(self, meta_type):
+        assert not RecoverHandler._should_run_awex_colocate_transfer(
+            inference_engine=Mock(),
+            weight_update_meta=Mock(type=meta_type),
+            colocated_rollout=True,
+        )
+
+    def test_missing_inference_engine_is_not_colocate(self):
+        assert not RecoverHandler._should_run_awex_colocate_transfer(
+            inference_engine=None,
+            weight_update_meta=self._awex_meta(),
+            colocated_rollout=True,
+        )
+
+    def test_meta_without_type_attribute_is_not_colocate(self):
+        assert not RecoverHandler._should_run_awex_colocate_transfer(
+            inference_engine=Mock(),
+            weight_update_meta=None,
+            colocated_rollout=True,
+        )
+
+
+class TestColocateRolloutProtocol:
+    """Engines lacking the colocate protocol must fail before any side effect."""
+
+    def test_engine_with_full_protocol_is_accepted(self):
+        engine = Mock(spec=["pause_generation_sync", "offload"])
+        engine.offload = lambda tags=None: None
+
+        RecoverHandler._require_colocate_rollout_protocol(engine)
+
+    def test_engine_without_pause_generation_sync_is_rejected(self):
+        engine = Mock(spec=["offload"])
+        engine.offload = lambda tags=None: None
+
+        with pytest.raises(NotImplementedError) as exc_info:
+            RecoverHandler._require_colocate_rollout_protocol(engine)
+
+        assert "pause_generation_sync" in str(exc_info.value)
+
+    def test_engine_with_untagged_offload_is_rejected(self):
+        engine = Mock(spec=["pause_generation_sync", "offload"])
+        engine.offload = lambda: None
+
+        with pytest.raises(NotImplementedError) as exc_info:
+            RecoverHandler._require_colocate_rollout_protocol(engine)
+
+        assert "tags" in str(exc_info.value)
