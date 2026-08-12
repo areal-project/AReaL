@@ -22,21 +22,29 @@ def _load_swe_sft_module():
 
     areal_module = types.ModuleType("areal")
     dataset_module = types.ModuleType("areal.dataset")
+    dataset_module.__path__ = []
+    swe_package = types.ModuleType("areal.dataset.swe_sft")
+    swe_package.__path__ = []
     utils_module = types.ModuleType("areal.utils")
     utils_module.logging = logging
     areal_module.dataset = dataset_module
     areal_module.utils = utils_module
     sys.modules["areal"] = areal_module
     sys.modules["areal.dataset"] = dataset_module
+    sys.modules["areal.dataset.swe_sft"] = swe_package
     sys.modules["areal.utils"] = utils_module
 
-    path = Path(__file__).parents[1] / "areal" / "dataset" / "swe_sft.py"
-    spec = importlib.util.spec_from_file_location("areal.dataset.swe_sft", path)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["areal.dataset.swe_sft"] = module
+    package_path = Path(__file__).parents[1] / "areal" / "dataset" / "swe_sft"
     try:
-        spec.loader.exec_module(module)
+        for name in ("messages", "tokenization", "pipeline"):
+            full_name = f"areal.dataset.swe_sft.{name}"
+            spec = importlib.util.spec_from_file_location(
+                full_name, package_path / f"{name}.py"
+            )
+            assert spec is not None and spec.loader is not None
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[full_name] = module
+            spec.loader.exec_module(module)
     finally:
         for name in list(sys.modules):
             if name == "areal" or name.startswith("areal."):
