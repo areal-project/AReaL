@@ -81,9 +81,10 @@ class TestHealth:
 
 
 class TestAllocPorts:
+    @patch(f"{GUARD_APP}.socket.socket")
     @patch(f"{GUARD_APP}.is_port_free", return_value=True)
     @patch(f"{GUARD_APP}.find_free_ports")
-    def test_alloc_ports_success(self, mock_find, _mock_is_free, client):
+    def test_alloc_ports_success(self, mock_find, _mock_is_free, _mock_socket, client):
         mock_find.return_value = [9001, 9002, 9003]
         resp = client.post("/alloc_ports", json={"count": 3})
         assert resp.status_code == 200
@@ -93,9 +94,12 @@ class TestAllocPorts:
         assert data["host"] == "10.0.0.1"
         assert guard_module._state.allocated_ports == {9001, 9002, 9003}
 
+    @patch(f"{GUARD_APP}.socket.socket")
     @patch(f"{GUARD_APP}.is_port_free", return_value=True)
     @patch(f"{GUARD_APP}.find_free_ports")
-    def test_alloc_ports_excludes_previous(self, mock_find, _mock_is_free, client):
+    def test_alloc_ports_excludes_previous(
+        self, mock_find, _mock_is_free, _mock_socket, client
+    ):
         mock_find.return_value = [9001, 9002, 9003]
         client.post("/alloc_ports", json={"count": 3})
 

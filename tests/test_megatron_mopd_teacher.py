@@ -142,7 +142,9 @@ def test_awex_controller_discards_unfinished_requests_before_restoring_kv():
             events.append(("continue", None))
 
     trainer = object.__new__(PPOTrainer)
-    trainer.config = SimpleNamespace(actor=SimpleNamespace(weight_update_mode="awex"))
+    trainer.config = SimpleNamespace(
+        actor=SimpleNamespace(_version="v1", weight_update_mode="awex")
+    )
     trainer.actor = _Actor()
     trainer.rollout = _Rollout()
     trainer.critic = None
@@ -198,7 +200,9 @@ def test_awex_controller_does_not_resume_when_discard_fails():
             raise AssertionError("resumed generation after discard failure")
 
     trainer = object.__new__(PPOTrainer)
-    trainer.config = SimpleNamespace(actor=SimpleNamespace(weight_update_mode="awex"))
+    trainer.config = SimpleNamespace(
+        actor=SimpleNamespace(_version="v1", weight_update_mode="awex")
+    )
     trainer.actor = _Actor()
     trainer.rollout = _Rollout()
     trainer.critic = None
@@ -238,7 +242,9 @@ def test_non_awex_weight_update_does_not_restore_rollout():
             raise AssertionError("unexpected rollout generation resume")
 
     trainer = object.__new__(PPOTrainer)
-    trainer.config = SimpleNamespace(actor=SimpleNamespace(weight_update_mode="disk"))
+    trainer.config = SimpleNamespace(
+        actor=SimpleNamespace(_version="v1", weight_update_mode="disk")
+    )
     trainer.actor = _Actor()
     trainer.rollout = _Rollout()
     trainer.critic = None
