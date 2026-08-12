@@ -128,6 +128,7 @@ from areal.utils.data import (
 )
 from areal.utils.functional import gather_logprobs, gather_logprobs_entropy
 from areal.utils.hf_utils import load_hf_processor_and_tokenizer, load_hf_tokenizer
+from areal.utils.lr_scheduler import get_num_warmup_steps
 from areal.utils.network import find_free_ports, format_host_for_url, gethostip
 from areal.utils.offload import is_tms_enabled, torch_memory_saver
 from areal.utils.perf_tracer import trace_perf, trace_scope
@@ -1217,8 +1218,9 @@ class FSDPEngine(TrainEngine):
                 weight_decay=weight_decay,
             )
         total_train_steps = ft_spec.total_train_steps
-        num_warmup_steps = int(
-            self.optimizer_config.warmup_steps_proportion * total_train_steps
+        num_warmup_steps = get_num_warmup_steps(
+            self.optimizer_config,
+            total_train_steps,
         )
 
         if self.optimizer_config.lr_scheduler_type == "cosine":
