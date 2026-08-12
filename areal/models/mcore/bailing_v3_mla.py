@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 """Gated MLA self-attention for BailingMoeV3 (Ling V3).
 
 v3 enables *head-wise gated attention* on top of standard MLA: a per-head sigmoid gate

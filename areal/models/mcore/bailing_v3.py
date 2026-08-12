@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 """BailingMoeV3ForCausalLM (Ling V3) support for megatron-core.
 
 This module provides:

@@ -23,6 +23,7 @@ from .tokenization import (
     _tokenize_samples,
 )
 
+
 def main():
     import argparse
     import sys
