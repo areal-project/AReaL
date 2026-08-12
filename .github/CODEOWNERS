@@ -5,21 +5,21 @@
 
 # Core package
 /areal/api/                     @garrett4wade @rchardx @sitabulaixizawaluduo
-/areal/engine/                  @rchardx @nuzant @garrett4wade @geshi001
-/areal/v2/inference_service/    @nuzant @guozhihao-224 @TaoZex
-/areal/v2/agent_service/        @CormickKneey @nuzant
-/areal/v2/training_service/     @sitabulaixizawaluduo @garrett4wade
+/areal/engine/                  @rchardx @nuzant @garrett4wade @geshi001 @sitabulaixizawaluduo
+/areal/v2/inference_service/    @nuzant @guozhihao-224 @TaoZex @sitabulaixizawaluduo
+/areal/v2/agent_service/        @CormickKneey @nuzant @sitabulaixizawaluduo
+/areal/v2/training_service/     @sitabulaixizawaluduo @garrett4wade @sitabulaixizawaluduo
 /areal/v2/weight_update/        @TaoZex @garrett4wade @sitabulaixizawaluduo
-/areal/infra/                   @HwVanICI @garrett4wade @guozhihao-224
-/areal/models/                  @rchardx @nuzant @geshi001 @PrometheusComing
-/areal/trainer/                 @garrett4wade @rchardx @fishcrap
+/areal/infra/                   @HwVanICI @garrett4wade @guozhihao-224 @sitabulaixizawaluduo
+/areal/models/                  @rchardx @nuzant @geshi001 @PrometheusComing @sitabulaixizawaluduo
+/areal/trainer/                 @garrett4wade @rchardx @fishcrap @sitabulaixizawaluduo
 
 # Tests & Examples
 /tests/                         @garrett4wade @sitabulaixizawaluduo
-/examples/                      @zhenanf @HwVanICI @CormickKneey @PrometheusComing
+/examples/                      @HwVanICI @CormickKneey @PrometheusComing @sitabulaixizawaluduo
 
 # Documentation
-/docs/                          @garrett4wade @nuzant
+/docs/                          @garrett4wade @nuzant @sitabulaixizawaluduo
 
 # CI/CD & infrastructure
 /.github/                       @garrett4wade @nuzant @sitabulaixizawaluduo
