@@ -580,7 +580,7 @@ class PPOTrainer:
         if self.eval_rollout is not None:
             self.eval_rollout.set_version(new_version)
 
-        if self.config.actor.weight_update_mode != "awex":
+        if not self._is_v1_awex_colocate(self.config):
             return
 
         # The AWEX reader flushes all old cache entries while installing the

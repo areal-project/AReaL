@@ -144,6 +144,7 @@ def test_qwen3_heterogeneous_local_example_has_expected_topology(monkeypatch):
     monkeypatch.setenv("MOPD_TEACHER_MODEL_PATH", "/models/Qwen3-14B")
     monkeypatch.setenv("MOPD_GSM8K_PATH", "/datasets/gsm8k")
     monkeypatch.setenv("AREAL_ADMIN_API_KEY", "test-only-non-default-key")
+    monkeypatch.setenv("AREAL_IMAGE", "areal:test")
     raw = OmegaConf.load("examples/mopd/gsm8k_qwen3_14b_to_0_6b_local.yaml")
 
     config = OmegaConf.to_object(to_structured_cfg(raw, GRPOConfig))
