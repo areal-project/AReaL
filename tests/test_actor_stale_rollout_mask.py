@@ -38,6 +38,12 @@ def test_compute_advantages_masks_stale_rollout_tokens():
     )
     torch.testing.assert_close(
         out["versions"],
+        torch.tensor([[-1, -1, 1, 2, 2]], dtype=torch.int32),
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        out["_aligned_versions"],
         torch.tensor([[-1, 1, 2, 2, -1]], dtype=torch.int32),
         rtol=0,
         atol=0,
@@ -45,7 +51,7 @@ def test_compute_advantages_masks_stale_rollout_tokens():
 
 
 def test_compute_advantages_keeps_stale_rollout_tokens_by_default():
-    """Keep stale rollout tokens when strict on-policy masking is disabled."""
+    """Keep stale rollout tokens and versions when stale masking is disabled."""
     engine = MagicMock()
     engine.get_version.return_value = 2
     actor = PPOActor(PPOActorConfig(kl_ctl=0.0), engine)
@@ -68,10 +74,11 @@ def test_compute_advantages_keeps_stale_rollout_tokens_by_default():
     )
     torch.testing.assert_close(
         out["versions"],
-        torch.tensor([[-1, 1, 2, 2, -1]], dtype=torch.int32),
+        torch.tensor([[-1, -1, 1, 2, 2]], dtype=torch.int32),
         rtol=0,
         atol=0,
     )
+    assert "_aligned_versions" not in out
 
 
 def test_compute_advantages_masking_is_noop_without_versions():
@@ -160,6 +167,47 @@ def test_grpo_loss_skips_staleness_metrics_with_none_versions():
 
     assert torch.isfinite(loss)
     log_staleness.assert_not_called()
+
+
+def test_grpo_loss_uses_aligned_versions_when_available():
+    """Use next-token-aligned versions for proximal loss and version metrics."""
+    raw_versions = torch.tensor([[-1, -1, 1, 2]], dtype=torch.int32)
+    aligned_versions = torch.tensor([[-1, 1, 2, -1]], dtype=torch.int32)
+    input_data = {
+        "input_ids": torch.tensor([[11, 12, 13, 14]], dtype=torch.int64),
+        "logprobs": torch.zeros((1, 4), dtype=torch.float32),
+        "advantages": torch.ones((1, 4), dtype=torch.float32),
+        "loss_mask": torch.tensor([[0, 1, 1, 0]], dtype=torch.bool),
+        "prox_logp": torch.zeros((1, 4), dtype=torch.float32),
+        "versions": raw_versions,
+        "_aligned_versions": aligned_versions,
+    }
+
+    with (
+        patch("areal.trainer.ppo.actor.stats_tracker"),
+        patch(
+            "areal.trainer.ppo.actor._resolve_proximal_logp",
+            return_value=torch.zeros((1, 4), dtype=torch.float32),
+        ) as resolve_proximal_logp,
+        patch(
+            "areal.trainer.ppo.actor._log_proximal_approximation_stats"
+        ) as log_proximal_stats,
+        patch("areal.trainer.ppo.actor._log_version_staleness_stats") as log_staleness,
+    ):
+        loss = grpo_loss_fn(
+            logprobs=torch.zeros((1, 4), dtype=torch.float32),
+            entropy=torch.zeros((1, 4), dtype=torch.float32),
+            input_data=input_data,
+            eps_clip=0.2,
+            eps_clip_higher=None,
+            c_clip=None,
+            current_version=2,
+        )
+
+    assert torch.isfinite(loss)
+    assert resolve_proximal_logp.call_args.kwargs["versions"] is aligned_versions
+    assert log_proximal_stats.call_args.kwargs["versions"] is aligned_versions
+    assert log_staleness.call_args.kwargs["versions"] is aligned_versions
 
 
 def test_compute_advantages_keeps_fully_stale_trajectory_without_fresh_suffix():
