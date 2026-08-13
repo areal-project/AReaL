@@ -6,6 +6,7 @@ from typing import NamedTuple
 
 import torch
 import torch.distributed as dist
+from megatron.core import tensor_parallel
 from megatron.core.tensor_parallel import layers as mcore_layers
 
 
@@ -103,10 +104,55 @@ def _prepare_linear_forward(
     return all_gather_buffer
 
 
+def _lm_head_compute_weight(
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    *,
+    fp32_operands: bool,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    if not fp32_operands:
+        return weight, bias
+    return weight.float(), bias.float() if bias is not None else None
+
+
 class _LinearWithNativeOutput(
     mcore_layers.LinearWithGradAccumulationAndAsyncCommunication
 ):
     """AReaL TP linear with the native input/weight output dtype."""
+
+    @staticmethod
+    def _forward_with_fp32_operands(
+        input_: torch.Tensor,
+        weight: torch.Tensor,
+        bias: torch.Tensor | None,
+        *,
+        allreduce_dgrad: bool,
+        sequence_parallel: bool,
+        tp_group: torch.distributed.ProcessGroup | None,
+    ) -> torch.Tensor:
+        """Project with FP32 operands while retaining PyTorch autograd semantics."""
+        if sequence_parallel:
+            tp_group = mcore_layers.get_tensor_model_parallel_group_if_none(tp_group)
+            total_input = tensor_parallel.gather_from_sequence_parallel_region(
+                input_,
+                tensor_parallel_output_grad=True,
+                group=tp_group,
+            )
+        elif allreduce_dgrad:
+            tp_group = mcore_layers.get_tensor_model_parallel_group_if_none(tp_group)
+            total_input = tensor_parallel.copy_to_tensor_model_parallel_region(
+                input_, group=tp_group
+            )
+        else:
+            total_input = input_
+
+        compute_weight, compute_bias = _lm_head_compute_weight(
+            weight, bias, fp32_operands=True
+        )
+        output = torch.matmul(total_input.float(), compute_weight.t())
+        if compute_bias is not None:
+            output = output + compute_bias
+        return output
 
     @staticmethod
     @mcore_layers.custom_fwd
@@ -312,7 +358,7 @@ def linear_with_fp32_output(
     wgrad_deferral_limit: int | None = 0,
     tp_group: torch.distributed.ProcessGroup | None = None,
 ) -> torch.Tensor:
-    """Run Megatron's TP linear with a direct FP32 CUDA GEMM output."""
+    """Run Megatron's TP linear with an FP32 output."""
     output = _LinearWithFp32Output.apply(
         input_,
         weight,
@@ -385,8 +431,22 @@ def linear_with_areal_output(
     tp_group: torch.distributed.ProcessGroup | None = None,
     *,
     fp32_output: bool,
+    fp32_operands: bool = False,
 ) -> torch.Tensor:
     """Run the AReaL TP linear with native or direct FP32 output."""
+    if fp32_operands:
+        if grad_output_buffer is not None:
+            raise NotImplementedError(
+                "FP32 lm_head operands do not support deferred embedding wgrad"
+            )
+        return _LinearWithNativeOutput._forward_with_fp32_operands(
+            input_,
+            weight,
+            bias,
+            allreduce_dgrad=allreduce_dgrad,
+            sequence_parallel=sequence_parallel,
+            tp_group=tp_group,
+        )
     if not weight.requires_grad:
         return _linear_with_frozen_areal_output(
             input_,
@@ -515,6 +575,7 @@ class _ChunkedVocabParallelLMHead(torch.autograd.Function):
         sequence_parallel: bool,
         tp_group: dist.ProcessGroup | None,
         logit_scale: float,
+        fp32_operands: bool,
     ) -> tuple[torch.Tensor, ...]:
         from areal.utils.functional.vocab_parallel_kernels import (
             fused_exp_sum_inplace,
@@ -539,6 +600,11 @@ class _ChunkedVocabParallelLMHead(torch.autograd.Function):
             else input_
         )
         input_2d = total_input.reshape(-1, total_input.size(-1))
+        compute_weight, compute_bias = _lm_head_compute_weight(
+            weight,
+            bias,
+            fp32_operands=fp32_operands,
+        )
         labels_1d = labels.reshape(-1)
         if input_2d.size(0) != labels_1d.numel():
             raise ValueError(
@@ -575,7 +641,15 @@ class _ChunkedVocabParallelLMHead(torch.autograd.Function):
         for start in range(0, num_tokens, chunk_size):
             end = min(start + chunk_size, num_tokens)
             rows = end - start
-            logits = _linear_chunk_fp32(input_2d[start:end], weight, bias, logit_scale)
+            input_chunk = input_2d[start:end]
+            if fp32_operands:
+                input_chunk = input_chunk.float()
+            logits = _linear_chunk_fp32(
+                input_chunk,
+                compute_weight,
+                compute_bias,
+                logit_scale,
+            )
             chunk_targets = local_targets[start:end]
 
             vocab_min[start:end] = logits.min(dim=-1).values
@@ -622,8 +696,20 @@ class _ChunkedVocabParallelLMHead(torch.autograd.Function):
             if bias is not None
             else torch.empty(0, dtype=weight.dtype, device=weight.device)
         )
+        saved_compute_bias = (
+            compute_bias
+            if compute_bias is not None
+            else torch.empty(0, dtype=compute_weight.dtype, device=weight.device)
+        )
         ctx.save_for_backward(
-            input_, weight, saved_bias, local_targets, row_maxes, sum_exps
+            input_,
+            weight,
+            saved_bias,
+            compute_weight,
+            saved_compute_bias,
+            local_targets,
+            row_maxes,
+            sum_exps,
         )
         ctx.has_bias = bias is not None
         ctx.temperature = temperature
@@ -640,6 +726,7 @@ class _ChunkedVocabParallelLMHead(torch.autograd.Function):
         ctx.sequence_parallel = sequence_parallel
         ctx.tp_group = tp_group
         ctx.logit_scale = logit_scale
+        ctx.fp32_operands = fp32_operands
         ctx.input_shape = input_.shape
         ctx.set_materialize_grads(False)
         ctx.mark_non_differentiable(
@@ -669,10 +756,18 @@ class _ChunkedVocabParallelLMHead(torch.autograd.Function):
             grad_vocab_mean,
             grad_vocab_norm,
         )
-        input_, weight, saved_bias, local_targets, row_maxes, sum_exps = (
-            ctx.saved_tensors
-        )
+        (
+            input_,
+            weight,
+            saved_bias,
+            compute_weight,
+            saved_compute_bias,
+            local_targets,
+            row_maxes,
+            sum_exps,
+        ) = ctx.saved_tensors
         bias = saved_bias if ctx.has_bias else None
+        compute_bias = saved_compute_bias if ctx.has_bias else None
         total_input = (
             _gather_sequence_parallel_input(input_, ctx.tp_group)
             if ctx.sequence_parallel
@@ -688,21 +783,37 @@ class _ChunkedVocabParallelLMHead(torch.autograd.Function):
 
         needs_weight_grad = ctx.needs_input_grad[1]
         grad_weight = (
-            torch.zeros_like(weight)
+            torch.zeros_like(
+                weight,
+                dtype=torch.float32 if ctx.fp32_operands else weight.dtype,
+            )
             if needs_weight_grad and not ctx.use_main_grad
             else None
         )
         grad_bias = (
-            torch.zeros_like(bias)
+            torch.zeros_like(
+                bias,
+                dtype=torch.float32 if ctx.fp32_operands else bias.dtype,
+            )
             if bias is not None and ctx.needs_input_grad[2]
             else None
         )
+        if ctx.use_main_grad:
+            weight.main_grad = ctx.main_grad
 
         num_tokens = input_2d.size(0)
         for start in range(0, num_tokens, ctx.chunk_size):
             end = min(start + ctx.chunk_size, num_tokens)
             input_chunk = input_2d[start:end]
-            logits = _linear_chunk_fp32(input_chunk, weight, bias, ctx.logit_scale)
+            compute_input_chunk = (
+                input_chunk.float() if ctx.fp32_operands else input_chunk
+            )
+            logits = _linear_chunk_fp32(
+                compute_input_chunk,
+                compute_weight,
+                compute_bias,
+                ctx.logit_scale,
+            )
             fused_logits_backward_inplace(
                 logits,
                 row_maxes[start:end],
@@ -712,18 +823,45 @@ class _ChunkedVocabParallelLMHead(torch.autograd.Function):
                 1.0 / ctx.temperature,
                 ctx.logit_scale,
             )
-            dlogits = (
-                _pack_fp32_to_half_inplace(
-                    logits,
-                    target_dtype=weight.dtype,
-                    seed_elements=weight.size(0),
+            if ctx.fp32_operands:
+                grad_input_2d[start:end].copy_(torch.mm(logits, compute_weight))
+                dlogits = logits
+            else:
+                dlogits = (
+                    _pack_fp32_to_half_inplace(
+                        logits,
+                        target_dtype=weight.dtype,
+                        seed_elements=weight.size(0),
+                    )
+                    if weight.dtype in (torch.bfloat16, torch.float16)
+                    else logits
                 )
-                if weight.dtype in (torch.bfloat16, torch.float16)
-                else logits
-            )
-            torch.mm(dlogits, weight, out=grad_input_2d[start:end])
+                torch.mm(dlogits, weight, out=grad_input_2d[start:end])
 
             if needs_weight_grad:
+                if ctx.fp32_operands:
+                    if ctx.use_main_grad:
+                        if ctx.main_grad.dtype != torch.float32:
+                            raise RuntimeError(
+                                "FP32 lm_head operands require an FP32 main_grad "
+                                f"buffer, got {ctx.main_grad.dtype}"
+                            )
+                        torch.addmm(
+                            weight.main_grad,
+                            dlogits.t(),
+                            compute_input_chunk,
+                            out=weight.main_grad,
+                        )
+                    else:
+                        torch.addmm(
+                            grad_weight,
+                            dlogits.t(),
+                            compute_input_chunk,
+                            out=grad_weight,
+                        )
+                    if grad_bias is not None:
+                        grad_bias.add_(dlogits.sum(dim=0))
+                    continue
                 prepared_dlogits, prepared_input = (
                     mcore_layers.prepare_input_tensors_for_wgrad_compute(
                         dlogits, input_chunk
@@ -778,11 +916,17 @@ class _ChunkedVocabParallelLMHead(torch.autograd.Function):
                 weight.grad_added_to_main_grad = True
             else:
                 grad_weight = None
+        elif grad_weight is not None and grad_weight.dtype != weight.dtype:
+            grad_weight = grad_weight.to(dtype=weight.dtype)
+
+        if grad_bias is not None and grad_bias.dtype != bias.dtype:
+            grad_bias = grad_bias.to(dtype=bias.dtype)
 
         return (
             grad_input,
             grad_weight,
             grad_bias,
+            None,
             None,
             None,
             None,
@@ -833,12 +977,14 @@ def chunked_lm_head_logprobs_entropy(
         output_layer.sequence_parallel,
         output_layer.tp_group,
         logit_scale,
+        output_layer.fp32_operands,
     )
     return ChunkedLMHeadOutput(*values)
 
 
 class _AReaLVocabParallelLMHeadMixin:
     fp32_output: bool = False
+    fp32_operands: bool = False
 
     def _forward_impl(self, input, weight, *args, **kwargs):
         return linear_with_areal_output(
@@ -847,6 +993,7 @@ class _AReaLVocabParallelLMHeadMixin:
             *args,
             **kwargs,
             fp32_output=self.fp32_output,
+            fp32_operands=self.fp32_operands,
         )
 
 
@@ -861,6 +1008,7 @@ def replace_output_layer_with_areal_lm_head(
     model: torch.nn.Module,
     *,
     fp32_output: bool,
+    fp32_operands: bool = False,
 ) -> None:
     """Promote an existing MCore LM head without replacing its parameters or hooks."""
     if not hasattr(model, "output_layer"):
@@ -891,6 +1039,7 @@ def replace_output_layer_with_areal_lm_head(
             )
         output_layer.__class__ = areal_class
     output_layer.fp32_output = fp32_output
+    output_layer.fp32_operands = fp32_operands
 
     try:
         from megatron.bridge.models.conversion.param_mapping import AutoMapping
