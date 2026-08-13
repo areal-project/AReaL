@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# ruff: noqa: E402, I001
 
 """AWEX colocate weight reader (native awex worker-reader adapter).
 
@@ -32,53 +33,12 @@ from typing import Any
 
 import torch
 
-
-def _patch_tms_hook_mode() -> None:
-    """Make ``torch_memory_saver.hook_mode`` setter a no-op once initialized.
-
-    ``megatron.core.inference.contexts.dynamic_context`` (pulled in transitively
-    by ``awex.converter.mcore_converter`` -> ``megatron.core``) runs a
-    module-level ``torch_memory_saver.hook_mode = "torch"``. In the SGLang
-    scheduler process the memory_saver singleton is already initialized (sglang
-    ran ``_ensure_initialized``, which ``del``s ``_impl_ctor_kwargs``), so that
-    late assignment raises ``AttributeError``. awex's model registry swallows the
-    import error, the BailingMoe converter never registers, and weight transfer
-    later dies with ``Unsupported attention parameter name: attention.g_proj``.
-    The singleton's own assert already declares post-init configuration
-    unsupported, so dropping the late set is the intended behavior.
-    """
-    try:
-        import torch_memory_saver as _tms
-    except Exception:
-        return
-    inst = getattr(_tms, "torch_memory_saver", None)
-    if inst is None:
-        return
-    cls = type(inst)
-    prop = cls.hook_mode
-    if getattr(prop.fset, "_awex_safe", False):
-        return
-
-    def _safe_setter(self, value):
-        if not hasattr(self, "_impl_ctor_kwargs"):
-            return  # singleton already initialized; late set is a design no-op
-        prop.fset(self, value)
-
-    _safe_setter._awex_safe = True
-    cls.hook_mode = property(prop.fget, _safe_setter)
-
-
-# Must run before any awex import: awex.models.registry auto-imports model
-# modules at module load, and the BailingMoe module's transitive megatron import
-# trips the hook_mode race above.
-_patch_tms_hook_mode()
+# Compatibility must run before importing AWEX model modules.
+from areal.engine.awex.sglang_compat import SingleInstanceMetaResolver
 
 from awex.meta.infer_meta_resolver import InferParamMetaResolver  # noqa: E402
-from awex.meta.meta_resolver import ParamMetaResolver  # noqa: E402
 from awex.reader.nccl_reader import NCCLWorkerWeightsReader  # noqa: E402
-from awex.sharding import get_sharding_strategy_builder  # noqa: E402
 from awex.util.common import simple_hf_config  # noqa: E402
-
 from areal.utils.logging import getLogger  # noqa: E402
 
 logger = getLogger("AwexColocateReader")
@@ -106,84 +66,6 @@ def _get_awex_infer_hf_config(model, model_runner=None):
     if not getattr(serialized_config, "architectures", None):
         serialized_config.architectures = [type(model).__name__]
     return serialized_config
-
-
-def _ensure_awex_models_registered() -> None:
-    """Rebuild awex's model registry in case it cached a failed auto-import.
-
-    ``import_model_configs`` is ``lru_cache``-d and ``ModelRegistry`` is built
-    once at module load. If anything imported the registry before our hook_mode
-    patch took effect, the BailingMoe converter would be silently missing. Clear
-    the cache and rebuild now that the patch is in place.
-    """
-    try:
-        from awex.models import registry as _reg
-
-        _reg.import_model_configs.cache_clear()
-        _reg.ModelRegistry.models = _reg.import_model_configs()
-        missing = [
-            m
-            for m in (
-                "BailingMoeV2_5ForCausalLM",
-                "BailingMoeV2ForCausalLM",
-                "Qwen3VLForConditionalGeneration",
-                "Qwen3VLMoeForConditionalGeneration",
-            )
-            if m not in _reg.ModelRegistry.models
-        ]
-        if missing:
-            logger.warning(f"awex model registry still missing converters: {missing}")
-    except Exception as e:  # pragma: no cover - diagnostics only
-        logger.warning(f"Failed to rebuild awex model registry: {e}")
-
-
-_ensure_awex_models_registered()
-
-
-class _SingleInstanceMetaResolver(ParamMetaResolver):
-    """Aggregate per-rank raw meta of ONE inference instance into ParameterMeta.
-
-    awex's ``InferParamMetaResolver`` normally drives this via
-    ``execute_task_in_model_worker`` (a driver fan-out we do not have). We
-    instead exchange the per-rank raw meta dicts through the MetaServer
-    (see ``_build_instance_params_meta``) and reuse awex's ``_build_params_meta``
-    for the aggregation, plus awex's own sharding strategy builder for
-    ``_get_sharding_info``. This yields the exact same ``parameters_meta`` the
-    native reader expects, with awex converter parameter names (no hand-rolled
-    normalization).
-    """
-
-    def __init__(self, hf_config, engine_name, infer_engine_config, raw_meta_list):
-        super().__init__(hf_config)
-        self._raw_meta_list = raw_meta_list
-        rank0 = self._select_rank0(raw_meta_list)
-        self._model_arch_name = rank0["model_arch_name"]
-        self._sharding_strategy = get_sharding_strategy_builder(engine_name)(
-            self._model_arch_name,
-            infer_engine_config,
-            rank0["rank_info"],
-        )
-
-    @staticmethod
-    def _select_rank0(raw_meta_list):
-        for info in raw_meta_list:
-            if info["rank_info"].global_rank == 0:
-                return info
-        return raw_meta_list[0]
-
-    def get_model_arch_name(self) -> str:
-        return self._model_arch_name
-
-    def get_parameters_meta(self):
-        return self._build_params_meta()
-
-    def _get_params_raw_meta(self):
-        return self._raw_meta_list
-
-    def _get_sharding_info(self, name, rank_info, param_meta):
-        return self._sharding_strategy.get_sharding_strategy(
-            name, rank_info=rank_info, param_meta=param_meta
-        )
 
 
 class AwexColocateReader:
@@ -326,7 +208,7 @@ class AwexColocateReader:
             if isinstance(ri, dict):
                 info["rank_info"] = RankInfo(**ri)
 
-        resolver = _SingleInstanceMetaResolver(
+        resolver = SingleInstanceMetaResolver(
             self._get_model().config,
             "sglang",
             self._scheduler.server_args,

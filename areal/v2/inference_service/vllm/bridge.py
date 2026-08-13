@@ -99,7 +99,12 @@ class VLLMBridgeBackend:
     def get_resume_request(self) -> HttpRequest:
         return HttpRequest(endpoint="/areal_continue_generation", payload={})
 
-    def get_offload_request(self) -> HttpRequest:
+    def get_offload_request(self, tags: list[str] | None = None) -> HttpRequest:
+        if tags is not None:
+            raise NotImplementedError(
+                "vLLM /sleep releases all memory and takes no tags selector; "
+                f"refusing a partial offload for tags={tags}"
+            )
         return HttpRequest(endpoint="/sleep", payload={}, method="POST")
 
     def get_onload_request(self, tags: list[str] | None = None) -> HttpRequest:

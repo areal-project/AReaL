@@ -47,6 +47,7 @@ class AwexFSDPAdapter(AwexTrainingAdapter):
         self._weights_update_group = None
         self._weights_update_group_gloo = None
         self._transfer_rank: int | None = None
+        self._init_fingerprint: tuple | None = None
 
     @property
     def parallelism_strategy(self) -> dict:
@@ -139,37 +140,57 @@ class AwexFSDPAdapter(AwexTrainingAdapter):
         train_world_size: int,
         num_engines: int,
     ) -> None:
-        self._transfer_rank = transfer_rank
+        fingerprint = (
+            pair_name,
+            master_addr,
+            master_port,
+            transfer_rank,
+            world_size,
+            kv_store_url,
+            infer_world_size,
+            train_world_size,
+            num_engines,
+        )
+        if self._init_fingerprint is not None:
+            if self._init_fingerprint == fingerprint:
+                return
+            raise RuntimeError(
+                "AWEX separation group is already initialized with different settings"
+            )
+        try:
+            self._transfer_rank = transfer_rank
+            infer_meta, train_meta = fetch_kv_metadata(kv_store_url, pair_name)
+            builder = TransferPlanBuilder(
+                infer_world_size=infer_world_size,
+                train_world_size=train_world_size,
+                num_infer_engines=num_engines,
+            )
+            self._transfer_plan = builder.build_local_transfer_plan(
+                infer_meta, train_meta, global_transfer_rank=transfer_rank
+            )
 
-        infer_meta, train_meta = fetch_kv_metadata(kv_store_url, pair_name)
-
-        builder = TransferPlanBuilder(
-            infer_world_size=infer_world_size,
-            train_world_size=train_world_size,
-            num_infer_engines=num_engines,
-        )
-        self._transfer_plan = builder.build_local_transfer_plan(
-            infer_meta, train_meta, global_transfer_rank=transfer_rank
-        )
-
-        os.environ["TORCHELASTIC_USE_AGENT_STORE"] = str(False)
-        self._weights_update_group = init_weights_update_group(
-            master_address=master_addr,
-            master_port=master_port,
-            rank=transfer_rank,
-            world_size=world_size,
-            group_name=f"awex_{pair_name}",
-            role="training",
-        )
-        self._weights_update_group_gloo = init_weights_update_group(
-            master_address=master_addr,
-            master_port=master_port,
-            rank=transfer_rank,
-            world_size=world_size,
-            group_name=f"awex_{pair_name}_gloo",
-            backend="gloo",
-            role="training",
-        )
+            os.environ["TORCHELASTIC_USE_AGENT_STORE"] = str(False)
+            self._weights_update_group = init_weights_update_group(
+                master_address=master_addr,
+                master_port=master_port,
+                rank=transfer_rank,
+                world_size=world_size,
+                group_name=f"awex_{pair_name}",
+                role="training",
+            )
+            self._weights_update_group_gloo = init_weights_update_group(
+                master_address=master_addr,
+                master_port=master_port,
+                rank=transfer_rank,
+                world_size=world_size,
+                group_name=f"awex_{pair_name}_gloo",
+                backend="gloo",
+                role="training",
+            )
+        except Exception:
+            self.teardown_weight_update_group()
+            raise
+        self._init_fingerprint = fingerprint
         logger.info(
             "Initialized AWEX weight update groups for pair=%s role=training "
             "rank=%s world_size=%s nccl=awex_%s gloo=awex_%s_gloo",
@@ -235,6 +256,7 @@ class AwexFSDPAdapter(AwexTrainingAdapter):
         self._weights_update_group_gloo = None
         self._transfer_plan = None
         self._transfer_rank = None
+        self._init_fingerprint = None
 
     def _to_hf_name(self, name: str) -> str:
         if self._engine.is_vision_model and is_qwen_vl_model(

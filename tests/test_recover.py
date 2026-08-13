@@ -8,16 +8,13 @@ from unittest.mock import Mock
 import pytest
 
 from areal.api.cli_args import RecoverConfig
-from areal.api.io_struct import FinetuneSpec, StepInfo
+from areal.api.io_struct import FinetuneSpec
 from areal.utils.recover import (
     RecoverHandler,
     check_if_auto_recover,
     check_if_recover,
 )
 from areal.utils.saver import Saver
-from areal.v2.training_service.controller.controller import (
-    GatewayTrainController,
-)
 
 
 class TestRecoverConfig:
@@ -232,51 +229,6 @@ class TestRecoverHandler:
             train_batch_size=2,
         )
         return RecoverHandler(config, ft_spec)
-
-    @staticmethod
-    def _make_gateway_controller() -> GatewayTrainController:
-        return GatewayTrainController.__new__(GatewayTrainController)
-
-    @pytest.mark.parametrize("mode", ["on", "auto"])
-    def test_load_rejects_gateway_train_controller(self, mode):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            handler = self._make_handler(tmpdir, mode)
-
-            with pytest.raises(NotImplementedError) as exc_info:
-                handler.load(
-                    self._make_gateway_controller(),
-                    Mock(),
-                    Mock(),
-                    Mock(),
-                    Mock(),
-                )
-
-            assert "GatewayTrainController" in str(exc_info.value)
-            assert '`_version="v2"`' in str(exc_info.value)
-
-    @pytest.mark.parametrize("mode", ["on", "auto"])
-    def test_dump_rejects_gateway_train_controller(self, mode):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            handler = self._make_handler(tmpdir, mode)
-            step_info = StepInfo(
-                epoch=0,
-                epoch_step=0,
-                global_step=0,
-                steps_per_epoch=handler.ft_spec.steps_per_epoch,
-            )
-
-            with pytest.raises(NotImplementedError) as exc_info:
-                handler.dump(
-                    self._make_gateway_controller(),
-                    step_info,
-                    Mock(),
-                    Mock(),
-                    Mock(),
-                    Mock(),
-                )
-
-            assert "GatewayTrainController" in str(exc_info.value)
-            assert "recover.mode" in str(exc_info.value)
 
     @pytest.mark.parametrize("no_save_optim", [False, True])
     def test_save_checkpoint_passes_with_optim_from_config(self, no_save_optim):

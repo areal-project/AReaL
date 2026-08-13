@@ -123,6 +123,7 @@ class RolloutControllerV2:
             else:
                 nnodes_per_instance = total_gpus // n_gpus_per_node
         self._nnodes_per_instance = nnodes_per_instance
+        self.awex_colocate = False
 
         # Worker management
         self.workers: list[Worker] = []
@@ -184,6 +185,8 @@ class RolloutControllerV2:
         self._init_future: concurrent.futures.Future | None = None
         self._init_lock = threading.Lock()
         self._workers_ready = threading.Event()
+        self._inference_launch_allowed = threading.Event()
+        self._inference_launch_allowed.set()
         self._shutdown_requested = threading.Event()
 
     # -- Initialize --------------------------------------------------------
@@ -208,6 +211,10 @@ class RolloutControllerV2:
         self._start_online_callback_server()
 
         self._workers_ready.clear()
+        if self.awex_colocate and server_infos is None:
+            self._inference_launch_allowed.clear()
+        else:
+            self._inference_launch_allowed.set()
         self._shutdown_requested.clear()
         self._init_future = get_executor("ctrl_init").submit(
             self._guarded_bg_initialize, server_args, server_infos, *args, **kwargs
@@ -380,6 +387,10 @@ class RolloutControllerV2:
 
         self._workers_ready.set()
 
+        if self._shutdown_requested.is_set():
+            return
+
+        await self._wait_for_inference_launch_permission(server_infos)
         if self._shutdown_requested.is_set():
             return
 
@@ -641,6 +652,8 @@ class RolloutControllerV2:
                             triton_cache_path, cache_suffix
                         ),
                     }
+                    if getattr(self, "awex_colocate", False):
+                        fork_payload["env"]["AREAL_AWEX_COLOCATE"] = "1"
                 if inf_backend == "vllm":
                     from areal.infra.utils.launcher import (
                         TRITON_CACHE_PATH as _TRITON_CACHE,
@@ -966,6 +979,7 @@ class RolloutControllerV2:
         self._destroyed = True
 
         self._shutdown_requested.set()
+        self._inference_launch_allowed.set()
         future = self._init_future
         self._init_future = None
         if future is not None:
@@ -1034,6 +1048,21 @@ class RolloutControllerV2:
         self._gateway_addr = ""
         self._staleness_manager = None
 
+    async def _wait_for_inference_launch_permission(
+        self, server_infos: list[LocalInfServerInfo] | None
+    ) -> None:
+        if not self.awex_colocate or server_infos is not None:
+            return
+        launch_allowed = await asyncio.to_thread(
+            self._inference_launch_allowed.wait,
+            self.config.setup_timeout,
+        )
+        if not launch_allowed:
+            raise TimeoutError(
+                "Timed out waiting for the colocated training engine to release "
+                "GPU memory before inference launch"
+            )
+
     # -- Version management ------------------------------------------------
 
     def set_version(self, version: int) -> None:
@@ -1062,10 +1091,7 @@ class RolloutControllerV2:
         failed = [r for r in results if isinstance(r, Exception)]
         for r in failed:
             logger.error("Failed to set version on a worker: %s", r)
-        if failed and len(failed) == len(results):
-            raise RuntimeError(
-                f"set_version({version}) failed on ALL {len(failed)} workers"
-            )
+        self._raise_control_failures(f"set_version({version})", failed, len(results))
 
     def get_version(self) -> int:
         """Return the local version (compatible with VersionProvider protocol)."""
@@ -1394,6 +1420,16 @@ class RolloutControllerV2:
 
     # -- Pause / Resume / Offload -------------------------------------------
 
+    def _raise_control_failures(
+        self, operation: str, failed: list[BaseException], total: int
+    ) -> None:
+        if not failed:
+            return
+        if self.awex_colocate or len(failed) == total:
+            raise RuntimeError(
+                f"{operation} failed on {len(failed)}/{total} inference workers"
+            )
+
     def pause(self) -> None:
         """Pause dispatcher + pause all workers."""
         self._ensure_initialized()
@@ -1406,19 +1442,21 @@ class RolloutControllerV2:
         assert self._workflow_executor is not None
         self._workflow_executor.resume()
 
-    def offload(self) -> None:
+    def offload(self, tags: list[str] | None = None) -> None:
         """Offload model memory on all inference workers."""
         from areal.infra.utils.concurrent import run_async_task
 
         self._ensure_initialized()
-        run_async_task(self._async_offload)
+        logger.info("Offloading inference memory (tags=%s)", tags or "all")
+        run_async_task(self._async_offload, tags)
 
-    async def _async_offload(self) -> None:
+    async def _async_offload(self, tags: list[str] | None = None) -> None:
         if not self._data_proxy_addrs:
             return
+        payload: dict = {"tags": tags} if tags is not None else {}
         results = await asyncio.gather(
             *(
-                self._async_data_proxy_post(addr, "/release_memory_occupation", {})
+                self._async_data_proxy_post(addr, "/release_memory_occupation", payload)
                 for addr in self._data_proxy_addrs
             ),
             return_exceptions=True,
@@ -1426,8 +1464,7 @@ class RolloutControllerV2:
         failed = [r for r in results if isinstance(r, Exception)]
         for r in failed:
             logger.error("Failed to offload a worker: %s", r)
-        if failed and len(failed) == len(results):
-            raise RuntimeError(f"offload failed on ALL {len(failed)} workers")
+        self._raise_control_failures("offload", failed, len(results))
 
     def onload(self, tags: list[str] | None = None) -> None:
         """Reload model memory on all inference workers."""
@@ -1450,8 +1487,7 @@ class RolloutControllerV2:
         failed = [r for r in results if isinstance(r, Exception)]
         for r in failed:
             logger.error("Failed to onload a worker: %s", r)
-        if failed and len(failed) == len(results):
-            raise RuntimeError(f"onload failed on ALL {len(failed)} workers")
+        self._raise_control_failures("onload", failed, len(results))
 
     def pause_generation(self) -> None:
         """Pause generation on all workers."""
@@ -1473,8 +1509,78 @@ class RolloutControllerV2:
         failed = [r for r in results if isinstance(r, Exception)]
         for r in failed:
             logger.error("Failed to pause generation on a worker: %s", r)
-        if failed and len(failed) == len(results):
-            raise RuntimeError(f"pause_generation failed on ALL {len(failed)} workers")
+        self._raise_control_failures("pause_generation", failed, len(results))
+
+    def pause_generation_sync(
+        self, drain_timeout: float = 60.0, poll_interval: float = 0.2
+    ) -> None:
+        """Pause generation, then block until the engines report zero requests.
+
+        Draining has to be observed rather than assumed: offload asserts a
+        fully idle scheduler and takes the process down when a request is still
+        queued, so a timeout raises instead of letting the caller proceed.
+        """
+        self.pause_generation()
+        deadline = time.monotonic() + drain_timeout
+        while True:
+            remaining = self._poll_in_flight()
+            if remaining <= 0:
+                return
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    f"Inference engines failed to drain within {drain_timeout:.1f}s: "
+                    f"{remaining} request(s) still in flight"
+                )
+            self._nudge_abort()
+            if poll_interval > 0:
+                time.sleep(poll_interval)
+
+    def _poll_in_flight(self) -> int:
+        from areal.infra.utils.concurrent import run_async_task
+
+        return run_async_task(self._async_poll_in_flight)
+
+    async def _async_poll_in_flight(self) -> int:
+        addrs = self._data_proxy_addrs
+        results = await asyncio.gather(
+            *(self._async_data_proxy_get(a, "/in_flight") for a in addrs),
+            return_exceptions=True,
+        )
+        total = 0
+        for addr, res in zip(addrs, results, strict=True):
+            if isinstance(res, BaseException):
+                logger.warning("in_flight probe failed for %s: %s", addr, res)
+                total += 1
+                continue
+            total += int(res.get("in_flight", 1))
+        return total
+
+    def _nudge_abort(self) -> None:
+        from areal.infra.utils.concurrent import run_async_task
+
+        run_async_task(self._async_nudge_abort)
+
+    async def _async_nudge_abort(self) -> None:
+        await asyncio.gather(
+            *(
+                self._async_data_proxy_post(a, "/abort_all", {})
+                for a in self._data_proxy_addrs
+            ),
+            return_exceptions=True,
+        )
+
+    async def _async_data_proxy_get(self, addr: str, endpoint: str) -> dict[str, Any]:
+        url = f"{addr}{endpoint}"
+        try:
+            client = await self._get_async_client()
+            resp = await client.get(url)
+            if resp.status_code >= 400:
+                raise RuntimeError(
+                    f"Data proxy {url} returned {resp.status_code}: {resp.text}"
+                )
+            return resp.json()
+        except httpx.HTTPError as exc:
+            raise RuntimeError(f"Failed to GET {url}: {exc}") from exc
 
     def continue_generation(self) -> None:
         """Continue generation on all workers."""
@@ -1482,6 +1588,13 @@ class RolloutControllerV2:
 
         self._ensure_initialized()
         run_async_task(self._async_continue_generation)
+
+    def continue_initialization_after_colocate_handoff(self) -> None:
+        """Launch inference after the colocated actor has released its memory."""
+        if not self.awex_colocate:
+            return
+        self._inference_launch_allowed.set()
+        self._ensure_initialized()
 
     async def _async_continue_generation(self) -> None:
         if not self._data_proxy_addrs:
@@ -1496,10 +1609,7 @@ class RolloutControllerV2:
         failed = [r for r in results if isinstance(r, Exception)]
         for r in failed:
             logger.error("Failed to continue generation on a worker: %s", r)
-        if failed and len(failed) == len(results):
-            raise RuntimeError(
-                f"continue_generation failed on ALL {len(failed)} workers"
-            )
+        self._raise_control_failures("continue_generation", failed, len(results))
 
     # -- Stats -------------------------------------------------------------
 

@@ -58,29 +58,34 @@ class AwexTrainingAdapter(Protocol):
         """Destroy NCCL group and clear cached state."""
         ...
 
+
+@runtime_checkable
+class AwexColocateTrainingAdapter(Protocol):
+    """Training-side lifecycle required by AWEX colocation."""
+
+    @property
+    def parallelism_strategy(self) -> dict: ...
+
+    def enable_colocate_memory_management(self) -> None: ...
+
     def init_colocate_weight_update(
         self,
+        *,
         pair_name: str,
-        kv_store_url: str,
+        meta_server_addr: str,
         transfer_rank: int,
         infer_world_size: int,
         train_world_size: int,
         num_engines: int,
-        master_port: int,
-        admin_api_key: str = "areal-admin-key",
-        timeout_s: float = 120.0,
-    ) -> None:
-        """Register device info in KV store for colocated weight transfer."""
-        ...
+        timeout_s: float,
+    ) -> None: ...
 
-    def execute_colocate_weight_update(self, version: int) -> None:
-        """Serialize weights via IPC and put to KV store."""
-        ...
+    def execute_colocate_weight_update(self, version: int) -> None: ...
 
-    def release_memory(self, tags: list[str] | None = None) -> None:
-        """Release GPU memory (optimizer/weights) for colocated mode."""
-        ...
+    def finish_colocate_weight_update(self, training_world_size: int) -> None: ...
 
-    def resume_memory(self, tags: list[str] | None = None) -> None:
-        """Resume GPU memory occupation."""
-        ...
+    def release_memory(self, tags: list[str] | None = None) -> None: ...
+
+    def resume_memory(self, tags: list[str] | None = None) -> None: ...
+
+    def teardown_colocate_weight_update(self) -> None: ...

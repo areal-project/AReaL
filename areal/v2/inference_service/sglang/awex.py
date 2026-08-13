@@ -33,9 +33,11 @@ def register_awex_endpoints(app: FastAPI, rpc_proxy: RpcProxy) -> None:
             return JSONResponse(status_code=500, content={"error": str(e)})
 
     @app.get("/awex/report_parallelism")
-    async def report_parallelism() -> JSONResponse:
+    async def report_parallelism(include_device: bool = False) -> JSONResponse:
         try:
-            result = rpc_proxy.collective_rpc_with_result("awex_report_parallelism")
+            result = rpc_proxy.collective_rpc_with_result(
+                "awex_report_parallelism", include_device=include_device
+            )
             if not isinstance(result, dict):
                 err_msg = f"Expected dict from awex_report_parallelism, but got {type(result).__name__}"
                 logger.error(err_msg)

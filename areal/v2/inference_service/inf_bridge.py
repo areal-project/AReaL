@@ -76,10 +76,12 @@ class InfBridge:
         self.resubmit_wait = resubmit_wait
         self._version = version
         self._client = httpx.AsyncClient(timeout=request_timeout)
+        # Pause/offload must not queue behind a saturated generation pool.
+        self._control_client = httpx.AsyncClient(timeout=request_timeout)
 
     async def aclose(self) -> None:
         """Close the underlying HTTP client."""
-        await self._client.aclose()
+        await asyncio.gather(self._client.aclose(), self._control_client.aclose())
 
     # -- version tracking ---------------------------------------------------
 
@@ -95,26 +97,42 @@ class InfBridge:
         """Pause generation by setting pause_state and calling the backend."""
         await self.pause_state.set_paused(True)
         http_req = self.backend.get_pause_request()
-        await self._send_request(http_req, timeout=10.0)
+        await self._send_request(http_req, timeout=10.0, control=True)
         logger.info("Pause request sent to %s", self.backend_addr)
+
+    async def in_flight(self) -> int:
+        get_load = getattr(self.backend, "get_load_request", None)
+        parse = getattr(self.backend, "parse_in_flight", None)
+        if get_load is None or parse is None:
+            raise NotImplementedError(
+                f"{type(self.backend).__name__} does not support safe drain probing"
+            )
+        body = await self._send_request(get_load(), timeout=10.0, control=True)
+        return parse(body)
+
+    async def abort_all(self) -> None:
+        abort = getattr(self.backend, "get_abort_all_request", None)
+        if abort is None:
+            return
+        await self._send_request(abort(), timeout=10.0, control=True)
 
     async def resume(self) -> None:
         """Resume generation by calling the backend and clearing pause_state."""
         http_req = self.backend.get_resume_request()
-        await self._send_request(http_req, timeout=10.0)
+        await self._send_request(http_req, timeout=10.0, control=True)
         await self.pause_state.set_paused(False)
         logger.info("Resume request sent to %s", self.backend_addr)
 
-    async def offload(self) -> None:
+    async def offload(self, tags: list[str] | None = None) -> None:
         """Offload model memory on the backend inference server."""
-        http_req = self.backend.get_offload_request()
-        await self._send_request(http_req, timeout=30.0)
+        http_req = self.backend.get_offload_request(tags=tags)
+        await self._send_request(http_req, timeout=30.0, control=True)
         logger.info("Offload request sent to %s", self.backend_addr)
 
     async def onload(self, tags: list[str] | None = None) -> None:
         """Reload model memory on the backend inference server."""
         http_req = self.backend.get_onload_request(tags=tags)
-        await self._send_request(http_req, timeout=30.0)
+        await self._send_request(http_req, timeout=30.0, control=True)
         logger.info("Onload request sent to %s", self.backend_addr)
 
     # -- HTTP transport (shared across all backends) -------------------------
@@ -124,6 +142,7 @@ class InfBridge:
         http_req: HttpRequest,
         *,
         timeout: float | None = None,
+        control: bool = False,
     ) -> dict[str, Any]:
         """Send an :class:`HttpRequest` and return the parsed JSON body.
 
@@ -147,10 +166,11 @@ class InfBridge:
         """
         _timeout = timeout if timeout is not None else self.request_timeout
         url = f"{self.backend_addr}{http_req.endpoint}"
+        client = self._control_client if control else self._client
         if http_req.method == "GET":
-            resp = await self._client.get(url, timeout=_timeout)
+            resp = await client.get(url, timeout=_timeout)
         else:
-            resp = await self._client.post(url, json=http_req.payload, timeout=_timeout)
+            resp = await client.post(url, json=http_req.payload, timeout=_timeout)
         if resp.status_code >= 400:
             body = resp.text[:500]
             logger.error("Backend returned %d for %s: %s", resp.status_code, url, body)

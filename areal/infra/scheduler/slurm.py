@@ -23,6 +23,11 @@ from areal.api.cli_args import (
     SchedulingStrategyType,
 )
 from areal.infra.rpc.serialization import deserialize_value, serialize_value
+from areal.infra.scheduler.colocation import (
+    colocated_gpu_rank_key,
+    colocated_train_guard_fork_env,
+    is_v2_training_guard_colocation,
+)
 from areal.infra.scheduler.exceptions import (
     EngineCallError,
     EngineCreationError,
@@ -151,6 +156,7 @@ class SlurmScheduler(Scheduler):
         # Colocation tracking: colocated roles reuse workers from target role
         # For forked roles, they also track target but have their own workers in _workers
         self._colocated_roles: dict[str, str] = {}  # colocated_role -> target_role
+        self._v2_guard_parents: dict[str, list[SlurmWorkerInfo]] = {}
 
         logger.info(
             f"Initialized SlurmScheduler: exp={self.experiment_name}, "
@@ -494,6 +500,7 @@ class SlurmScheduler(Scheduler):
         target_wi: SlurmWorkerInfo,
         target_role: str,
         command: str | None = None,
+        env: dict[str, str] | None = None,
     ) -> SlurmWorkerInfo:
         """Fork a single worker asynchronously.
 
@@ -558,6 +565,8 @@ class SlurmScheduler(Scheduler):
                 "worker_index": idx,
                 "raw_cmd": raw_cmd,
             }
+            if env:
+                payload["env"] = env
             async with session.post(
                 f"{guard_url}/fork",
                 json=payload,
@@ -676,10 +685,11 @@ class SlurmScheduler(Scheduler):
         role: str,
         target_role: str,
         workers: list[SlurmWorkerInfo],
+        parent_workers: list[SlurmWorkerInfo] | None = None,
     ) -> None:
         """Cleanup forked workers by calling kill endpoint on parent workers."""
-        target_workers = self._workers.get(target_role, [])
-        if not target_workers:
+        cleanup_parents = parent_workers or self._workers.get(target_role, [])
+        if not cleanup_parents:
             logger.warning(
                 f"Cannot cleanup forked workers: target role '{target_role}' not found"
             )
@@ -693,10 +703,13 @@ class SlurmScheduler(Scheduler):
             tasks = []
             for worker_info in workers:
                 worker_index = int(worker_info.worker.id.split("/")[-1])
-                if worker_index < len(target_workers):
+                if worker_index < len(cleanup_parents):
                     tasks.append(
                         self._kill_forked_worker(
-                            session, role, worker_index, target_workers[worker_index]
+                            session,
+                            role,
+                            worker_index,
+                            cleanup_parents[worker_index],
                         )
                     )
             await asyncio.gather(*tasks, return_exceptions=True)
@@ -707,6 +720,7 @@ class SlurmScheduler(Scheduler):
         target_role: str,
         target_workers: list[SlurmWorkerInfo],
         command: str | None = None,
+        env_vars: list[dict[str, str]] | None = None,
     ) -> list[str]:
         """Create forked workers concurrently using async requests.
 
@@ -724,7 +738,13 @@ class SlurmScheduler(Scheduler):
             # Launch all fork requests concurrently with exception handling
             tasks = [
                 self._fork_single_worker(
-                    session, role, idx, target_wi, target_role, command
+                    session,
+                    role,
+                    idx,
+                    target_wi,
+                    target_role,
+                    command,
+                    env_vars[idx] if env_vars else None,
                 )
                 for idx, target_wi in enumerate(target_workers)
             ]
@@ -750,7 +770,9 @@ class SlurmScheduler(Scheduler):
                 )
                 # Kill the forked processes via parent RPC servers
                 try:
-                    await self._cleanup_forked_workers_async(role, target_role, workers)
+                    await self._cleanup_forked_workers_async(
+                        role, target_role, workers, target_workers
+                    )
                 except Exception as cleanup_error:
                     logger.error(f"Failed to cleanup forked workers: {cleanup_error}")
 
@@ -1004,10 +1026,137 @@ class SlurmScheduler(Scheduler):
         strategy = job.scheduling_strategy
         strategy_type = SchedulingStrategyType(strategy.type)
         colocate_role = strategy.target
+        is_v2_guard_colocation = is_v2_training_guard_colocation(
+            role, strategy, schedulings[0].cmd
+        )
         logger.info(
             f"Creating {num_workers} workers for role '{role}' "
             f"(strategy: {strategy_type}, colocate_with: {colocate_role})"
         )
+
+        if is_v2_guard_colocation:
+            if not colocate_role:
+                raise WorkerCreationError(
+                    role,
+                    "Invalid strategy",
+                    "Colocation strategy requires target role to be specified",
+                )
+            # v2 services register workers under derived role names: the
+            # inference service uses "<role>-inf" and the training service
+            # uses "<role>-guard". Resolve whichever the target published.
+            # The train controller initializes in a background pipeline that
+            # may reach this point before the rollout stack has registered
+            # its workers, so poll instead of failing immediately.
+            target_candidates = [
+                f"{colocate_role}-inf",
+                f"{colocate_role}-guard",
+                colocate_role,
+            ]
+            target_role = None
+            wait_deadline = time.monotonic() + 600.0
+            while time.monotonic() < wait_deadline:
+                target_role = next(
+                    (r for r in target_candidates if r in self._workers), None
+                )
+                if target_role is not None:
+                    break
+                logger.info(
+                    "v2 guard colocation: waiting for target role "
+                    f"(one of {target_candidates}) to register workers..."
+                )
+                time.sleep(5.0)
+            if target_role is None:
+                raise WorkerNotFoundError(
+                    f"Cannot colocate v2 guards with role '{colocate_role}' - "
+                    f"none of {target_candidates} appeared within 600s"
+                )
+
+            # get_workers blocks until the target guards are fully ready
+            # (ports registered); forking earlier hits empty worker_ports.
+            self.get_workers(role=target_role, timeout=600.0)
+            target_workers = self._workers[target_role]
+            target_gpus_by_host: dict[str, int] = {}
+            parent_workers: list[SlurmWorkerInfo] = []
+            fork_envs: list[dict[str, str]] = []
+            base_env = dict(schedulings[0].env_vars or {})
+            # A target guard fronts spec.gpu GPUs. Expand one forked worker
+            # per GPU and pin each to its node-local physical slot: guards on
+            # a host are laid out contiguously in worker order (the same
+            # base-gpu ordering the inference servers were forked with), so
+            # slot = host-running-base + within-guard offset. rank%N guessing
+            # breaks whenever guard count != GPU count (e.g. tp>1 servers).
+            host_base: dict[str, int] = {}
+            target_layout: list[tuple[int, str, SlurmWorkerInfo]] = []
+            for target_worker in target_workers:
+                target_gpu_count = target_worker.spec.gpu if target_worker.spec else 0
+                host_ip = target_worker.worker.ip
+                target_gpus_by_host[host_ip] = (
+                    target_gpus_by_host.get(host_ip, 0) + target_gpu_count
+                )
+                base = host_base.get(host_ip, 0)
+                target_layout.append((base, host_ip, target_worker))
+                host_base[host_ip] = base + target_gpu_count
+
+            target_layout.sort(
+                key=lambda item: colocated_gpu_rank_key(item[1], item[0], 0)
+            )
+            for base, _host_ip, target_worker in target_layout:
+                target_gpu_count = target_worker.spec.gpu if target_worker.spec else 0
+                for offset in range(target_gpu_count):
+                    parent_workers.append(target_worker)
+                    fork_envs.append(
+                        colocated_train_guard_fork_env(base_env, base + offset)
+                    )
+
+            if (
+                any(
+                    gpu_count != self.n_gpus_per_node
+                    for gpu_count in target_gpus_by_host.values()
+                )
+                or len(parent_workers) != num_workers
+            ):
+                raise WorkerCreationError(
+                    role,
+                    "Invalid colocation topology",
+                    "V2 guard colocation requires a full-node target allocation "
+                    "with one training guard per GPU",
+                )
+
+            command = schedulings[0].cmd
+            command_parts = shlex.split(command) if command else []
+            if (
+                "-m" not in command_parts
+                or command_parts.index("-m") == len(command_parts) - 1
+            ):
+                raise WorkerCreationError(
+                    role,
+                    "Invalid guard command",
+                    "V2 guard colocation requires a Python module command",
+                )
+            module = command_parts[command_parts.index("-m") + 1]
+            self._v2_guard_parents[role] = parent_workers
+            try:
+                return run_async_task(
+                    self._create_forked_workers_async,
+                    role,
+                    target_role,
+                    parent_workers,
+                    module,
+                    fork_envs,
+                )
+            except Exception:
+                created_workers = self._workers.pop(role, [])
+                if created_workers:
+                    run_async_task(
+                        self._cleanup_forked_workers_async,
+                        role,
+                        target_role,
+                        created_workers,
+                        parent_workers,
+                    )
+                self._colocated_roles.pop(role, None)
+                self._v2_guard_parents.pop(role, None)
+                raise
 
         # Determine node allocation and handle colocation
         if strategy_type == SchedulingStrategyType.colocation:
@@ -1378,6 +1527,15 @@ class SlurmScheduler(Scheduler):
             # Forked roles have their own workers that need cleanup
             if role in self._workers:
                 logger.info(f"Removing forked role '{role}' (managed by parent worker)")
+                parent_workers = self._v2_guard_parents.pop(role, None)
+                if parent_workers is not None:
+                    run_async_task(
+                        self._cleanup_forked_workers_async,
+                        role,
+                        self._colocated_roles[role],
+                        self._workers[role],
+                        parent_workers,
+                    )
                 del self._workers[role]
             else:
                 logger.info(f"Removing colocated role '{role}' mapping")
