@@ -11,7 +11,7 @@ import time
 from collections.abc import Callable, Iterator
 from concurrent.futures import Future
 from contextlib import contextmanager, nullcontext
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -139,6 +139,9 @@ if TYPE_CHECKING:
     from areal.api.cli_args import DPOEngineConfig, PPOActorConfig, PPOCriticConfig
 
 
+_DESTROY_BARRIER_TIMEOUT = timedelta(seconds=10)
+
+
 @dataclasses.dataclass
 class FSDPTrainContext:
     """Context passed through FSDP forward/backward pipeline.
@@ -230,6 +233,7 @@ class FSDPEngine(TrainEngine):
         self._version: int = 0
 
         self._initialized = False
+        self._destroyed = False
         self.own_global_group = False
         self._cpu_group: dist.ProcessGroup
         self.weight_update_group_initialized = False
@@ -319,6 +323,9 @@ class FSDPEngine(TrainEngine):
         return cls(config)
 
     def create_process_group(self, parallel_strategy: ParallelStrategy | None = None):
+        # Starting a new process-group lifecycle makes the engine destroyable
+        # again if callers intentionally reuse the instance.
+        self._destroyed = False
         patch_dist_group_timeout(DIST_GROUP_DEFAULT_TIMEOUT)
 
         backend = current_platform.communication_backend
@@ -378,6 +385,8 @@ class FSDPEngine(TrainEngine):
         assert ft_spec is not None, "FSDPEngine requires FinetuneSpec to initialize."
         if pkg_version.is_version_less("torch", "2.4.0"):
             raise RuntimeError("areal only supports FSDP2, which requires torch>=2.4.0")
+
+        self._destroyed = False
 
         if is_tms_enabled():
             torch_memory_saver.hook_mode = "preload"
@@ -506,6 +515,21 @@ class FSDPEngine(TrainEngine):
         return self._cpu_group
 
     def destroy(self):
+        if getattr(self, "_destroyed", False):
+            return
+
+        # torch-memory-saver 0.0.9 cannot free a paused allocation safely:
+        # pause() has already unmapped it and released the CUDA handle, while
+        # free() repeats those operations.  Normalize the local TMS state before
+        # deleting model objects so their destructors only see active mappings.
+        # Keep this branch collective-free: ranks may observe different local
+        # state, and all ranks join the common CPU barrier below afterwards.
+        # TODO: Remove after torch-memory-saver#92 is fixed in the required release.
+        if self.is_offload:
+            torch_memory_saver.resume()
+            self.is_offload = False
+            current_platform.synchronize()
+
         self._initialized = False
         if hasattr(self, "optimizer"):
             del self.optimizer
@@ -532,7 +556,11 @@ class FSDPEngine(TrainEngine):
             # harmless but produces a noisy stderr backtrace at teardown.
             if getattr(self, "_cpu_group", None) is not None:
                 try:
-                    dist.barrier(group=self._cpu_group)
+                    dist.monitored_barrier(
+                        group=self._cpu_group,
+                        timeout=_DESTROY_BARRIER_TIMEOUT,
+                        wait_all_ranks=True,
+                    )
                 except Exception as e:  # pragma: no cover - best-effort
                     self.logger.warning(
                         f"pre-destroy CPU barrier failed (ignored): {e}"
@@ -542,6 +570,7 @@ class FSDPEngine(TrainEngine):
             # more than once (e.g. via cleanup hooks), the second call
             # must not try to destroy already-destroyed groups.
             self.own_global_group = False
+        self._destroyed = True
 
     @property
     def initialized(self) -> bool:
@@ -940,12 +969,11 @@ class FSDPEngine(TrainEngine):
         # Use torch_memory_saver to pause CUDA memory
         current_platform.clear_memory()
         torch_memory_saver.pause()
+        self.is_offload = True
 
         current_platform.synchronize()
         dist.barrier(group=self.cpu_group)
         self.get_device_stats().log("after offload model")
-
-        self.is_offload = True
 
     def onload(self) -> None:
         """Onload model memory from CPU back to GPU using torch_memory_saver.
@@ -954,12 +982,11 @@ class FSDPEngine(TrainEngine):
         """
 
         torch_memory_saver.resume()
+        self.is_offload = False
 
         current_platform.synchronize()
         dist.barrier(group=self.cpu_group)
         self.get_device_stats().log("after onload model")
-
-        self.is_offload = False
 
     def clear_batches(self, shard_ids: list[str] | None = None) -> None:
         """Drain this worker's client-side RTensor fetch buffer.

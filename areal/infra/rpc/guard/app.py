@@ -31,7 +31,7 @@ from typing import Any
 
 from flask import Flask, current_app, jsonify, request
 
-from areal.infra.utils.proc import kill_process_tree, run_with_streaming_logs
+from areal.infra.utils.proc import kill_process_group, run_with_streaming_logs
 from areal.utils import logging
 from areal.utils.network import find_free_ports, format_hostport
 
@@ -126,26 +126,44 @@ def get_state() -> GuardState:
 
 
 def cleanup_forked_children(state: GuardState) -> None:
-    """Clean up all forked child processes.
+    """Clean up all forked child process groups.
 
-    Copies the child list under the lock, then releases before blocking
-    kills (avoids holding the lock for up to 4s × N children).
+    Records are removed only after their independently tracked process group
+    is verified empty, so a failed shutdown remains retryable.
     """
     with state.forked_children_lock:
-        if not state.forked_children:
+        children_to_kill = list(
+            dict.fromkeys([*state.forked_children, *state.forked_children_map.values()])
+        )
+        if not children_to_kill:
             return
-        children_to_kill = list(state.forked_children)
-        state.forked_children.clear()
-        state.forked_children_map.clear()
 
     logger.info(f"Cleaning up {len(children_to_kill)} forked child processes")
     for child in children_to_kill:
         try:
-            if child.poll() is None:  # Still running
-                kill_process_tree(child.pid, timeout=3, graceful=True)
-                logger.info(f"Killed forked child process {child.pid}")
+            # The shell leader may already have exited while descendants stay
+            # alive. Its PID is also the dedicated PGID created by /fork.
+            kill_process_group(child.pid, timeout=3, graceful=True)
+            try:
+                child.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                logger.warning(f"Timed out reaping forked child leader {child.pid}")
+
+            with state.forked_children_lock:
+                try:
+                    state.forked_children.remove(child)
+                except ValueError:
+                    pass
+                stale_keys = [
+                    key
+                    for key, process in state.forked_children_map.items()
+                    if process is child
+                ]
+                for key in stale_keys:
+                    state.forked_children_map.pop(key, None)
+            logger.info(f"Killed forked child process group {child.pid}")
         except Exception as e:
-            logger.error(f"Error killing forked child {child.pid}: {e}")
+            logger.error(f"Error killing forked child group {child.pid}: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -243,7 +261,7 @@ def create_app(state: GuardState) -> Flask:
 
         Returns::
 
-            {"status": "success", "host": "10.0.0.1", "pid": 42}
+            {"status": "success", "host": "10.0.0.1", "pid": 42, "pgid": 42}
         """
         s = get_state()
 
@@ -304,6 +322,7 @@ def create_app(state: GuardState) -> Flask:
                 merged_log,
                 role,
                 env=child_env,
+                isolate_process_group=True,
             )
 
             with s.forked_children_lock:
@@ -320,6 +339,7 @@ def create_app(state: GuardState) -> Flask:
                     "status": "success",
                     "host": s.server_host,
                     "pid": child_process.pid,
+                    "pgid": child_process.pid,
                 }
             )
 
@@ -358,17 +378,10 @@ def create_app(state: GuardState) -> Flask:
 
             key = (role, worker_index)
 
-            # Remove from tracking structures (hold lock only for dict/list ops)
+            # Keep tracking until the process group is verified empty so a
+            # failed kill remains retryable.
             with s.forked_children_lock:
-                child_process = s.forked_children_map.pop(key, None)
-                if child_process:
-                    try:
-                        s.forked_children.remove(child_process)
-                    except ValueError:
-                        logger.warning(
-                            f"Process for {role}/{worker_index} was in map "
-                            "but not in list"
-                        )
+                child_process = s.forked_children_map.get(key)
 
             if child_process is None:
                 return (
@@ -380,13 +393,13 @@ def create_app(state: GuardState) -> Flask:
 
             pid = child_process.pid
 
-            # Kill process tree (outside lock to avoid blocking)
+            # Kill the stable PGID even if the tracked shell leader exited.
             try:
-                if child_process.poll() is None:  # Still running
-                    kill_process_tree(pid, timeout=3, graceful=True)
-                    logger.info(
-                        f"Killed forked worker {role}/{worker_index} (pid={pid})"
-                    )
+                kill_process_group(pid, timeout=3, graceful=True)
+                try:
+                    child_process.wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    logger.warning(f"Timed out reaping forked child leader {pid}")
             except Exception as e:
                 logger.error(
                     f"Error killing forked worker "
@@ -397,16 +410,32 @@ def create_app(state: GuardState) -> Flask:
                         {
                             "error": f"Failed to kill forked worker: {str(e)}",
                             "pid": pid,
+                            "pgid": pid,
                         }
                     ),
                     500,
                 )
 
+            with s.forked_children_lock:
+                if s.forked_children_map.get(key) is child_process:
+                    s.forked_children_map.pop(key, None)
+                try:
+                    s.forked_children.remove(child_process)
+                except ValueError:
+                    logger.warning(
+                        f"Process for {role}/{worker_index} was in map but not in list"
+                    )
+
+            logger.info(
+                f"Killed forked worker {role}/{worker_index} (pid={pid}, pgid={pid})"
+            )
+
             return jsonify(
                 {
                     "status": "success",
                     "message": (
-                        f"Killed forked worker {role}/{worker_index} (pid={pid})"
+                        f"Killed forked worker {role}/{worker_index} "
+                        f"(pid={pid}, pgid={pid})"
                     ),
                 }
             )
