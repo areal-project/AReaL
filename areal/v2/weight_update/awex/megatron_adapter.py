@@ -18,7 +18,7 @@ from awex.meta.weight_meta import (
 from awex.sharding.param_sharding import ShardingType
 from awex.sharding.rank_info import RankInfo
 from awex.transfer.nccl_comm import batch_send_recv, nccl_build_send_ops
-from awex.transfer.transfer_plan import TransferPlan, TransferPlanBuilder
+from awex.transfer.transfer_plan import TransferPlanBuilder
 from awex.util.tensor_util import (
     cuda_ipc_serialize,
     group_tensors_by_shape_and_dtype,
@@ -28,6 +28,10 @@ from areal.utils import logging
 from areal.v2.weight_update.awex import (
     awex_wu_use_group,
     fetch_kv_metadata,
+)
+from areal.v2.weight_update.awex.state import (
+    AwexPairState,
+    MegatronColocatePairState,
 )
 from areal.v2.weight_update.nccl_group import (
     init_weights_update_group,
@@ -59,16 +63,12 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
 
     def __init__(self, engine: MegatronEngine):
         self._engine = engine
-        self._transfer_plan: TransferPlan | None = None
-        self._weights_update_group = None
-        self._transfer_rank: int | None = None
+        self._pair_states: dict[str, AwexPairState] = {}
+        self._colocate_pair_states: dict[str, MegatronColocatePairState] = {}
         self._offloaded_optimizer_states: dict = {}
         self._offloaded_weights: dict[str, torch.Tensor] = {}
         self._released_tags: set[str] = set()
         self._colocate_lock = threading.Lock()
-        self._colocate_admin_api_key: str = "areal-admin-key"
-        self._colocate_http_client: httpx.Client | None = None
-        self._colocate_timeout_s: float = 120.0
 
     @property
     def parallelism_strategy(self) -> dict:
@@ -162,8 +162,9 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
         train_world_size: int,
         num_engines: int,
     ) -> None:
-        self._transfer_rank = transfer_rank
-
+        if pair_name in self._pair_states:
+            logger.info("AWEX pair '%s' is already initialized", pair_name)
+            return
         infer_meta, train_meta = fetch_kv_metadata(kv_store_url, pair_name)
 
         builder = TransferPlanBuilder(
@@ -171,12 +172,12 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
             train_world_size=train_world_size,
             num_infer_engines=num_engines,
         )
-        self._transfer_plan = builder.build_local_transfer_plan(
+        transfer_plan = builder.build_local_transfer_plan(
             infer_meta, train_meta, global_transfer_rank=transfer_rank
         )
 
         os.environ["TORCHELASTIC_USE_AGENT_STORE"] = str(False)
-        self._weights_update_group = init_weights_update_group(
+        weights_update_group = init_weights_update_group(
             master_address=master_addr,
             master_port=master_port,
             rank=transfer_rank,
@@ -184,22 +185,22 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
             group_name=f"awex_{pair_name}",
             role="training",
         )
+        self._pair_states[pair_name] = AwexPairState(
+            weights_update_group=weights_update_group,
+            transfer_plan=transfer_plan,
+            transfer_rank=transfer_rank,
+        )
 
-    def execute_weight_update(self, version: int) -> None:
+    def execute_weight_update(self, pair_name: str, version: int) -> None:
         del version
-        if self._transfer_plan is None:
-            raise RuntimeError("Transfer plan is not initialized")
-        if self._weights_update_group is None:
-            raise RuntimeError("Weight update group is not initialized")
-        if self._transfer_rank is None:
-            raise RuntimeError("Transfer rank is not initialized")
+        state = self._require_pair_state(pair_name)
 
         params = self.get_local_shard_parameters()
         send_ops, _, _ = nccl_build_send_ops(
             params,
-            self._transfer_plan,
-            self._weights_update_group,
-            copy_rank=self._transfer_rank,
+            state.transfer_plan,
+            state.weights_update_group,
+            copy_rank=state.transfer_rank,
         )
         batch_send_recv(
             send_ops=send_ops,
@@ -207,26 +208,31 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
             blocking=True,
             use_group=awex_wu_use_group(),
         )
-        dist.barrier(group=self._weights_update_group)
+        dist.barrier(group=state.weights_update_group)
 
-    def batch_isend_irecv(self, **kwargs) -> None:
+    def batch_isend_irecv(self, pair_name: str, **kwargs) -> None:
+        state = self._require_pair_state(pair_name)
         setup_kwargs = {k: v for k, v in kwargs.items() if k != "world_size"}
         setup_batch_isend_irecv(
-            self._weights_update_group,
-            self._transfer_rank,
+            state.weights_update_group,
+            state.transfer_rank,
             kwargs.get("world_size", 0),
             **setup_kwargs,
         )
 
-    def teardown_weight_update_group(self) -> None:
-        if self._weights_update_group is not None and dist.is_initialized():
-            dist.destroy_process_group(self._weights_update_group)
-        self._weights_update_group = None
-        self._transfer_plan = None
-        self._transfer_rank = None
-        if self._colocate_http_client is not None:
-            self._colocate_http_client.close()
-            self._colocate_http_client = None
+    def teardown_weight_update_group(self, pair_name: str) -> None:
+        state = self._pair_states.pop(pair_name, None)
+        if state is not None and dist.is_initialized():
+            dist.destroy_process_group(state.weights_update_group)
+        colocate_state = self._colocate_pair_states.pop(pair_name, None)
+        if colocate_state is not None:
+            colocate_state.http_client.close()
+
+    def _require_pair_state(self, pair_name: str) -> AwexPairState:
+        state = self._pair_states.get(pair_name)
+        if state is None:
+            raise RuntimeError(f"AWEX pair {pair_name!r} is not initialized")
+        return state
 
     def _build_rank_info(self) -> RankInfo:
         from megatron.core import parallel_state as mpu
@@ -324,34 +330,38 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
         admin_api_key: str = "areal-admin-key",
         timeout_s: float = 120.0,
     ) -> None:
-        self._colocate_pair_name = pair_name
-        self._colocate_kv_store_url = kv_store_url
-        self._colocate_transfer_rank = transfer_rank
-        self._colocate_infer_world_size = infer_world_size
-        self._colocate_admin_api_key = admin_api_key
-        self._colocate_timeout_s = timeout_s
-        if self._colocate_http_client is None:
-            self._colocate_http_client = httpx.Client()
+        if pair_name in self._colocate_pair_states:
+            logger.info("AWEX colocate pair '%s' is already initialized", pair_name)
+            return
+        self._colocate_pair_states[pair_name] = MegatronColocatePairState(
+            kv_store_url=kv_store_url,
+            transfer_rank=transfer_rank,
+            infer_world_size=infer_world_size,
+            admin_api_key=admin_api_key,
+            timeout_s=timeout_s,
+            http_client=httpx.Client(),
+        )
         logger.info(
             "Initialized colocate weight update for pair '%s', transfer_rank=%d",
             pair_name,
             transfer_rank,
         )
 
-    def execute_colocate_weight_update(self, version: int) -> None:
+    def execute_colocate_weight_update(self, pair_name: str, version: int) -> None:
         with self._colocate_lock:
-            self._execute_colocate_weight_update_locked(version)
+            self._execute_colocate_weight_update_locked(pair_name, version)
 
-    def _execute_colocate_weight_update_locked(self, version: int) -> None:
-        kv_store_url = self._colocate_kv_store_url
-        pair_name = self._colocate_pair_name
-        transfer_rank = self._colocate_transfer_rank
-        assert self._colocate_http_client is not None, (
-            "init_colocate_weight_update must be called first"
-        )
-        client = self._colocate_http_client
-        auth_headers = {"Authorization": f"Bearer {self._colocate_admin_api_key}"}
-        timeout_s = self._colocate_timeout_s
+    def _execute_colocate_weight_update_locked(
+        self, pair_name: str, version: int
+    ) -> None:
+        state = self._colocate_pair_states.get(pair_name)
+        if state is None:
+            raise RuntimeError(f"AWEX colocate pair {pair_name!r} is not initialized")
+        kv_store_url = state.kv_store_url
+        transfer_rank = state.transfer_rank
+        client = state.http_client
+        auth_headers = {"Authorization": f"Bearer {state.admin_api_key}"}
+        timeout_s = state.timeout_s
 
         weights_offloaded = "weights" in self._released_tags
         if weights_offloaded:
