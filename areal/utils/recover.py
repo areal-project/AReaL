@@ -375,33 +375,51 @@ class RecoverHandler:
                 versioned_meta = weight_update_meta.with_version(recovery_version)
                 update_engine.connect_engine(inference_engine, versioned_meta)
                 inference_engine.pause()
+                recovery_error: BaseException | None = None
                 try:
-                    # AWEX colocate transfer requires the full engine-level
-                    # pause/offload protocol, not just the controller pause. The
-                    # sglang plugin's patched event loop only drains the weight-
-                    # update queue while scheduler._engine_paused is True (set by
-                    # pause_generation), and the reader-side protocol expects the
-                    # engine's kv/weights released before the writer publishes.
-                    # Without this the recover-path transfer deadlocks: reader
-                    # never consumes the queued version marker, writer blocks on
-                    # weights_update_finished forever.
-                    # Mirror of the trainer's pre-update sequence; the reverse
-                    # side (kv_cache onload) happens inside update_weights.
-                    if is_awex_colocate:
-                        inference_engine.pause_generation_sync()
-                        inference_engine.offload(tags=["kv_cache"])
-                        inference_engine.offload(tags=["weights"])
-                        # Load the actor checkpoint only after the colocated
-                        # rollout engine has released its GPU memory; loading
-                        # first would stack DCP weights/optimizer on top of the
-                        # still-resident sglang allocation and risk OOM.
-                        for name, engine_ in normalized_engine.items():
-                            self._load_checkpoint(engine_, name=name)
-                    update_engine.update_weights(versioned_meta)
+                    try:
+                        # AWEX colocate transfer requires the full engine-level
+                        # pause/offload protocol, not just the controller pause. The
+                        # sglang plugin's patched event loop only drains the weight-
+                        # update queue while scheduler._engine_paused is True (set by
+                        # pause_generation), and the reader-side protocol expects the
+                        # engine's kv/weights released before the writer publishes.
+                        # Without this the recover-path transfer deadlocks: reader
+                        # never consumes the queued version marker, writer blocks on
+                        # weights_update_finished forever.
+                        # Mirror of the trainer's pre-update sequence; the reverse
+                        # side (kv_cache onload) happens inside update_weights.
+                        if is_awex_colocate:
+                            inference_engine.pause_generation_sync()
+                            inference_engine.offload(tags=["kv_cache"])
+                            inference_engine.offload(tags=["weights"])
+                            # Load the actor checkpoint only after the colocated
+                            # rollout engine has released its GPU memory; loading
+                            # first would stack DCP weights/optimizer on top of the
+                            # still-resident sglang allocation and risk OOM.
+                            for name, engine_ in normalized_engine.items():
+                                self._load_checkpoint(engine_, name=name)
+                        update_engine.update_weights(versioned_meta)
+                    except BaseException as exc:
+                        recovery_error = exc
+                        logger.warning(
+                            "Recovery weight synchronization failed; resuming "
+                            "inference without advancing the model version",
+                            exc_info=True,
+                        )
+                        raise
                 finally:
                     # Always resume: leaving rollout paused after a failed
                     # checkpoint load or transfer would hang every later step.
-                    inference_engine.resume()
+                    try:
+                        inference_engine.resume()
+                    except BaseException:
+                        if recovery_error is None:
+                            raise
+                        logger.exception(
+                            "Failed to resume inference after recovery failed; "
+                            "preserving the original recovery exception"
+                        )
                 update_engine.set_version(recovery_version)
                 inference_engine.set_version(recovery_version)
             return recover_info

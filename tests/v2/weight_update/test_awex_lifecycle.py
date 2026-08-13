@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 from fastapi import FastAPI
 from starlette.testclient import TestClient
@@ -165,10 +165,12 @@ def test_inference_teardown_endpoint_dispatches_collectively():
 def test_adapter_teardown_is_idempotent_and_pair_scoped():
     adapter = AwexFSDPAdapter(MagicMock())
     group_a = object()
+    control_a = object()
     group_b = object()
+    control_b = object()
     adapter._pair_states = {
-        "pair-a": AwexPairState(group_a, MagicMock(), 0),
-        "pair-b": AwexPairState(group_b, MagicMock(), 1),
+        "pair-a": AwexPairState(group_a, control_a, MagicMock(), 0),
+        "pair-b": AwexPairState(group_b, control_b, MagicMock(), 1),
     }
 
     with (
@@ -178,6 +180,6 @@ def test_adapter_teardown_is_idempotent_and_pair_scoped():
         adapter.teardown_weight_update_group("pair-a")
         adapter.teardown_weight_update_group("pair-a")
 
-    destroy_group.assert_called_once_with(group_a)
+    assert destroy_group.call_args_list == [call(group_a), call(control_a)]
     assert "pair-a" not in adapter._pair_states
     assert adapter._pair_states["pair-b"].weights_update_group is group_b

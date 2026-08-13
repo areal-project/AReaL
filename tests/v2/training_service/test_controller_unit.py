@@ -290,7 +290,7 @@ class TestGatewayTrainControllerWeightUpdateReconnect:
         assert pair_name.startswith("actor-rollout-v1-")
         assert pair_name != old_ctrl.pair_name
 
-    def test_old_teardown_failure_rolls_back_candidate_and_preserves_old(self):
+    def test_old_teardown_failure_keeps_candidate_and_tracks_stale_pair(self):
         from areal.v2.inference_service.controller.controller import (
             RolloutControllerV2,
         )
@@ -317,17 +317,31 @@ class TestGatewayTrainControllerWeightUpdateReconnect:
                 return_value=candidate,
             ),
             patch("requests.post", return_value=port_response),
-            pytest.raises(RuntimeError, match="old teardown failed"),
         ):
             controller.connect_engine(
                 new_rollout,
                 SimpleNamespace(type="awex", colocate=False, version=1),
             )
 
-        candidate.destroy.assert_called_once_with()
+        candidate.destroy.assert_not_called()
         old_ctrl.destroy.assert_not_called()
-        assert controller._weight_update_ctrl is old_ctrl
-        assert controller.rollout is old_rollout
+        assert controller._weight_update_ctrl is candidate
+        assert controller.rollout is new_rollout
+        assert controller._stale_weight_update_ctrls == [old_ctrl]
+
+    def test_stale_pair_cleanup_is_retried_and_destroyed_after_success(self):
+        controller = _make_controller()
+        stale = MagicMock()
+        stale.disconnect.side_effect = [RuntimeError("still busy"), None]
+        controller._stale_weight_update_ctrls = [stale]
+
+        controller._retry_stale_weight_update_cleanup(timeout=1.0)
+        assert controller._stale_weight_update_ctrls == [stale]
+        stale.destroy.assert_not_called()
+
+        controller._retry_stale_weight_update_cleanup(timeout=1.0)
+        assert controller._stale_weight_update_ctrls == []
+        stale.destroy.assert_called_once_with()
 
     def test_update_failure_always_continues_generation(self):
         controller = _make_controller()
@@ -342,3 +356,47 @@ class TestGatewayTrainControllerWeightUpdateReconnect:
 
         controller.rollout.pause_generation.assert_called_once_with()
         controller.rollout.continue_generation.assert_called_once_with()
+
+    def test_resume_failure_does_not_mask_weight_update_failure(self):
+        controller = _make_controller()
+        controller.rollout = MagicMock()
+        controller.rollout.continue_generation.side_effect = RuntimeError(
+            "resume failed"
+        )
+        controller._weight_update_ctrl = MagicMock()
+        controller._weight_update_ctrl.update_weights.side_effect = RuntimeError(
+            "transfer failed"
+        )
+
+        with pytest.raises(RuntimeError, match="transfer failed"):
+            controller.update_weights(SimpleNamespace(version=3))
+
+        controller.rollout.continue_generation.assert_called_once_with()
+
+    def test_resume_failure_after_success_is_reported(self):
+        controller = _make_controller()
+        controller.rollout = MagicMock()
+        controller.rollout.continue_generation.side_effect = RuntimeError(
+            "resume failed"
+        )
+        controller._weight_update_ctrl = MagicMock()
+
+        with pytest.raises(RuntimeError, match="resume failed"):
+            controller.update_weights(SimpleNamespace(version=3))
+
+    def test_shutdown_continues_after_weight_controller_destroy_failure(self):
+        controller = _make_controller()
+        current = MagicMock()
+        current.destroy.side_effect = RuntimeError("gateway shutdown failed")
+        stale = MagicMock()
+        controller._weight_update_ctrl = current
+        controller._stale_weight_update_ctrls = [stale]
+
+        with patch.object(controller, "_graceful_shutdown_workers") as shutdown:
+            controller._cleanup_runtime_state()
+
+        current.destroy.assert_called_once_with()
+        stale.destroy.assert_called_once_with()
+        shutdown.assert_called_once_with()
+        assert controller._weight_update_ctrl is None
+        assert controller._stale_weight_update_ctrls == []

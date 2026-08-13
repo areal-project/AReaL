@@ -409,6 +409,9 @@ class SlurmScheduler(Scheduler):
 
         # Amend environment variables
         for sch in schedulings:
+            # Save user-specified env vars so they take precedence over system defaults
+            user_env = dict(sch.env_vars)
+
             # AReaL env var forwarding
             if self.enable_tms_offload:
                 sch.env_vars.update(get_tms_env_vars())
@@ -418,6 +421,9 @@ class SlurmScheduler(Scheduler):
                 existing_env_vars=sch.env_vars,
             )
             sch.env_vars.update(thread_env)
+
+            # Re-apply user env vars to allow explicit overrides
+            sch.env_vars.update(user_env)
 
         if len(schedulings) == 1:
             # Expand single spec to all workers
@@ -855,6 +861,10 @@ class SlurmScheduler(Scheduler):
             sbatch_options.append(f"--nodelist={nodelist}")
         if exclude:
             sbatch_options.append(f"--exclude={exclude}")
+        if spec.reservation:
+            sbatch_options.append(f"--reservation={spec.reservation}")
+        if spec.exclusive:
+            sbatch_options.append("--exclusive")
 
         sbatch_options_str = "\n".join([f"#SBATCH {opt}" for opt in sbatch_options])
 

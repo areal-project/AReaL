@@ -137,9 +137,18 @@ class AwexFSDPAdapter(AwexTrainingAdapter):
         train_world_size: int,
         num_engines: int,
     ) -> None:
-        if pair_name in self._pair_states:
-            logger.info("AWEX pair '%s' is already initialized", pair_name)
-            return
+        existing_state = self._pair_states.get(pair_name)
+        if existing_state is not None:
+            if (
+                existing_state.weights_update_group is not None
+                and existing_state.control_group is not None
+            ):
+                logger.info("AWEX pair '%s' is already initialized", pair_name)
+                return
+            raise RuntimeError(
+                f"AWEX pair {pair_name!r} is only partially initialized; "
+                "teardown must complete before retrying initialization"
+            )
         infer_meta, train_meta = fetch_kv_metadata(kv_store_url, pair_name)
 
         builder = TransferPlanBuilder(
@@ -152,18 +161,72 @@ class AwexFSDPAdapter(AwexTrainingAdapter):
         )
 
         os.environ["TORCHELASTIC_USE_AGENT_STORE"] = str(False)
-        weights_update_group = init_weights_update_group(
-            master_address=master_addr,
-            master_port=master_port,
-            rank=transfer_rank,
-            world_size=world_size,
-            group_name=f"awex_{pair_name}",
-            role="training",
-        )
+        weights_update_group = None
+        control_group = None
+        try:
+            weights_update_group = init_weights_update_group(
+                master_address=master_addr,
+                master_port=master_port,
+                rank=transfer_rank,
+                world_size=world_size,
+                group_name=f"awex_{pair_name}",
+                role="training",
+            )
+            control_group = init_weights_update_group(
+                master_address=master_addr,
+                master_port=master_port,
+                rank=transfer_rank,
+                world_size=world_size,
+                group_name=f"awex_{pair_name}_gloo",
+                backend="gloo",
+                role="training",
+            )
+        except BaseException:
+            if control_group is not None and torch.distributed.is_initialized():
+                try:
+                    torch.distributed.destroy_process_group(control_group)
+                except Exception:
+                    logger.warning(
+                        "Failed to rollback control group for AWEX pair '%s'",
+                        pair_name,
+                        exc_info=True,
+                    )
+                else:
+                    control_group = None
+            if weights_update_group is not None and torch.distributed.is_initialized():
+                try:
+                    torch.distributed.destroy_process_group(weights_update_group)
+                except Exception:
+                    logger.warning(
+                        "Failed to rollback payload group for AWEX pair '%s'",
+                        pair_name,
+                        exc_info=True,
+                    )
+                else:
+                    weights_update_group = None
+            if weights_update_group is not None or control_group is not None:
+                self._pair_states[pair_name] = AwexPairState(
+                    weights_update_group=weights_update_group,
+                    control_group=control_group,
+                    transfer_plan=transfer_plan,
+                    transfer_rank=transfer_rank,
+                )
+            raise
+
         self._pair_states[pair_name] = AwexPairState(
             weights_update_group=weights_update_group,
+            control_group=control_group,
             transfer_plan=transfer_plan,
             transfer_rank=transfer_rank,
+        )
+        logger.info(
+            "Initialized AWEX weight update groups for pair=%s role=training "
+            "rank=%s world_size=%s nccl=awex_%s gloo=awex_%s_gloo",
+            pair_name,
+            transfer_rank,
+            world_size,
+            pair_name,
+            pair_name,
         )
 
     def execute_weight_update(self, pair_name: str, version: int) -> None:
@@ -183,27 +246,60 @@ class AwexFSDPAdapter(AwexTrainingAdapter):
             blocking=True,
             use_group=awex_wu_use_group(),
         )
-        torch.distributed.barrier(group=state.weights_update_group)
+        torch.distributed.barrier(group=state.control_group)
 
     def batch_isend_irecv(self, pair_name: str, **kwargs) -> None:
         state = self._require_pair_state(pair_name)
-        setup_kwargs = {k: v for k, v in kwargs.items() if k != "world_size"}
+        setup_kwargs = {
+            k: v for k, v in kwargs.items() if k not in ("world_size", "barrier_group")
+        }
         setup_batch_isend_irecv(
             state.weights_update_group,
             state.transfer_rank,
             kwargs.get("world_size", 0),
+            barrier_group=state.control_group,
             **setup_kwargs,
         )
 
     def teardown_weight_update_group(self, pair_name: str) -> None:
-        state = self._pair_states.pop(pair_name, None)
-        if state is not None and torch.distributed.is_initialized():
-            torch.distributed.destroy_process_group(state.weights_update_group)
+        state = self._pair_states.get(pair_name)
+        if state is None:
+            return
+        errors: list[Exception] = []
+        if torch.distributed.is_initialized():
+            for attr in ("weights_update_group", "control_group"):
+                group = getattr(state, attr)
+                if group is None:
+                    continue
+                try:
+                    torch.distributed.destroy_process_group(group)
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to teardown %s for AWEX pair '%s'",
+                        attr,
+                        pair_name,
+                        exc_info=True,
+                    )
+                    errors.append(exc)
+                else:
+                    setattr(state, attr, None)
+        else:
+            state.weights_update_group = None
+            state.control_group = None
+
+        if state.weights_update_group is None and state.control_group is None:
+            self._pair_states.pop(pair_name, None)
+        if errors:
+            raise RuntimeError(
+                f"Failed to teardown AWEX pair {pair_name!r} on this rank"
+            ) from errors[0]
 
     def _require_pair_state(self, pair_name: str) -> AwexPairState:
         state = self._pair_states.get(pair_name)
         if state is None:
             raise RuntimeError(f"AWEX pair {pair_name!r} is not initialized")
+        if state.weights_update_group is None or state.control_group is None:
+            raise RuntimeError(f"AWEX pair {pair_name!r} is partially torn down")
         return state
 
     def _to_hf_name(self, name: str) -> str:
