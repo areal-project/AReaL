@@ -93,6 +93,24 @@ def _float_env(name: str, default: float) -> float:
         return default
 
 
+def _resolve_colocate_transfer_rank(
+    gpu_id: int,
+    node_id: int,
+    n_gpus_per_node: int,
+) -> tuple[int, int]:
+    """Resolve SGLang's server-relative GPU id into the global AWEX rank."""
+    from areal.engine.awex.colocate_writer import resolve_physical_gpu_id
+
+    physical_gpu_id = resolve_physical_gpu_id(gpu_id)
+    if not 0 <= physical_gpu_id < n_gpus_per_node:
+        raise ValueError(
+            "Resolved physical GPU id is outside the colocated node-local "
+            f"rank range: physical_gpu_id={physical_gpu_id}, "
+            f"n_gpus_per_node={n_gpus_per_node}, gpu_id={gpu_id}"
+        )
+    return node_id * n_gpus_per_node + physical_gpu_id, physical_gpu_id
+
+
 class AwexSchedulerPlugin:
     """Binds awex weight-receive to a SGLang Scheduler instance.
 
@@ -614,10 +632,7 @@ class AwexSchedulerPlugin:
         )
         # The driver publishes awex_train_info only after rollout init finishes,
         # so large models need the same timeout budget as the weight path.
-        from areal.engine.awex.colocate_writer import (
-            awex_colocate_timeout_s,
-            resolve_physical_gpu_id,
-        )
+        from areal.engine.awex.colocate_writer import awex_colocate_timeout_s
 
         train_info = client.get_object(
             "awex_train_info",
@@ -632,7 +647,17 @@ class AwexSchedulerPlugin:
         infer_world_size = train_world_size
 
         n_gpus_per_node = max(1, infer_world_size // nnodes)
-        transfer_rank = node_id * n_gpus_per_node + gpu_id
+        # ``scheduler.gpu_id`` is relative to each SGLang server's visible
+        # device set. With multiple colocated inference instances every server
+        # therefore reports ranks 0..TP-1. Using it directly gives duplicate
+        # transfer ranks (for example four TP=2 instances all register as 0/1),
+        # and the duplicate rank-0 readers race to publish different NCCL
+        # rendezvous ports.
+        transfer_rank, physical_gpu_id = _resolve_colocate_transfer_rank(
+            gpu_id,
+            node_id,
+            n_gpus_per_node,
+        )
 
         logger.info(
             f"[AWEX] background worker: got train_world_size={train_world_size}, "
@@ -640,15 +665,14 @@ class AwexSchedulerPlugin:
             f"transfer_rank={transfer_rank}",
         )
 
-        # transfer_rank stays a relative index so it lines up with the infer
-        # NCCL world, but the CUDA IPC keys are shared with the training writer
-        # and must therefore use physical GPU ids.
+        # The CUDA IPC keys and global inference NCCL rank use the same physical
+        # node-local GPU identity as the colocated training writer.
         receiver.initialize(
             meta_server_addr=meta_server_addr,
             transfer_rank=transfer_rank,
             infer_world_size=infer_world_size,
             train_world_size=train_world_size,
-            local_gpu_id=resolve_physical_gpu_id(gpu_id),
+            local_gpu_id=physical_gpu_id,
         )
         logger.info(
             f"[AWEX] background worker: receiver initialized "

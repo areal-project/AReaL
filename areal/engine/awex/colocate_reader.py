@@ -28,9 +28,12 @@ signal-finished); see ``awex_sglang_plugin.process_awex_queue``.
 
 from __future__ import annotations
 
+import gc
+import time
 from typing import Any
 
 import torch
+import torch.distributed as dist
 
 
 def _patch_tms_hook_mode() -> None:
@@ -77,11 +80,201 @@ from awex.meta.infer_meta_resolver import InferParamMetaResolver  # noqa: E402
 from awex.meta.meta_resolver import ParamMetaResolver  # noqa: E402
 from awex.reader.nccl_reader import NCCLWorkerWeightsReader  # noqa: E402
 from awex.sharding import get_sharding_strategy_builder  # noqa: E402
-from awex.util.common import simple_hf_config  # noqa: E402
+from awex.transfer.transfer_plan import TransferPlanBuilder  # noqa: E402
+from awex.util import device as device_util  # noqa: E402
+from awex.util.common import (  # noqa: E402
+    compute_statistics,
+    get_ip_address,
+    simple_hf_config,
+)
+from awex.util.gpu import get_gpu_status, print_current_gpu_status  # noqa: E402
+from awex.util.system_util import count_open_fds  # noqa: E402
+from awex.util.tensor_util import reconstruct_ipc_weights  # noqa: E402
 
 from areal.utils.logging import getLogger  # noqa: E402
 
 logger = getLogger("AwexColocateReader")
+
+
+class _PhysicalDeviceNCCLWorkerWeightsReader(NCCLWorkerWeightsReader):
+    """Backport distinct runtime and physical device identities to AWEX 0.8.
+
+    SGLang's runtime device id is relative to each server's CUDA visibility
+    mask, while colocated IPC metadata is keyed by the node-local physical GPU
+    id shared with the training process. Upstream AWEX uses the runtime id for
+    both, which aliases every TP instance onto devices 0..TP-1.
+    """
+
+    def __init__(self, *args, physical_device_id: int, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.physical_device_id = physical_device_id
+
+    def _init_reader_in_colocate_mode(self):
+        self.meta_server_client.add_object_to_set(
+            "inference_device_rank_entries",
+            (get_ip_address(), self.physical_device_id, self.transfer_rank),
+        )
+        self.meta_server_client.wait_set_until_size(
+            "inference_device_rank_entries",
+            self.infer_world_size,
+            timeout=self.timeout,
+        )
+        inference_entries = self.meta_server_client.get_set(
+            "inference_device_rank_entries"
+        )
+        self.inference_device_mapping = {
+            (ip_address, device_id): transfer_rank
+            for ip_address, device_id, transfer_rank in inference_entries
+        }
+
+        self.meta_server_client.wait_set_until_size(
+            "training_device_rank_entries",
+            self.training_world_size,
+            timeout=self.timeout,
+        )
+        training_entries = self.meta_server_client.get_set(
+            "training_device_rank_entries"
+        )
+        self.training_device_mapping = {
+            (ip_address, device_id): transfer_rank
+            for ip_address, device_id, transfer_rank in training_entries
+        }
+        self.train_to_infer_device_mapping = {}
+        self.infer_to_train_device_mapping = {}
+        for ip_address, device_id, train_rank in training_entries:
+            infer_rank = self.inference_device_mapping[(ip_address, device_id)]
+            self.train_to_infer_device_mapping[train_rank] = infer_rank
+            self.infer_to_train_device_mapping[infer_rank] = train_rank
+
+        plan_builder = TransferPlanBuilder(
+            self.infer_world_size,
+            self.training_world_size,
+            self.num_engines,
+            self.enable_debug_mode,
+        )
+        self.send_transfer_plan = plan_builder.build_local_transfer_plan(
+            self.parameters_meta,
+            self.training_params_meta,
+            self.infer_to_train_device_mapping[self.transfer_rank],
+        )
+        from awex.transfer.nccl_stream_batch import NcclColocateStreamBatchTransport
+
+        self.colocate_transport = NcclColocateStreamBatchTransport(
+            self.transfer_rank, self.infer_world_size
+        )
+        logger.info(
+            "Initialized physical-device-aware NCCL reader for transfer rank %d "
+            "on physical GPU %d",
+            self.transfer_rank,
+            self.physical_device_id,
+        )
+
+    def collect_training_weights(self, step_id, **kwargs):
+        if not self.enable_colocate_mode:
+            return
+        ip_address = get_ip_address()
+        runtime_device_id = device_util.current_device()
+        key = (
+            f"training_serialized_weights_{ip_address}_"
+            f"{self.physical_device_id}_{step_id}"
+        )
+        logger.info(
+            "Start to get serialized IPC weights %s for rank %s",
+            key,
+            self.rank_coordinate,
+        )
+        self.send_rank, self.send_rank_info, serialized_weights = (
+            self.meta_server_client.get_object(key, timeout=self.timeout)
+        )
+        logger.info(
+            "Finished getting serialized IPC weights %s for rank %s",
+            key,
+            self.rank_coordinate,
+        )
+        logger.info(
+            "GPU status before deserialization:\n%s for rank %s",
+            get_gpu_status(),
+            self.rank_coordinate,
+        )
+        logger.info("Open fds before deserialization: %d", count_open_fds())
+        self.deserialized_weights, num_groups = reconstruct_ipc_weights(
+            serialized_weights,
+            ipc_backend=self.ipc_backend,
+            device_id=runtime_device_id,
+        )
+        logger.info(
+            "Deserialized %d parameters and %d groups",
+            len(self.deserialized_weights),
+            num_groups,
+        )
+        logger.info(
+            "GPU status after deserialization for rank %s:\n%s",
+            self.rank_coordinate,
+            get_gpu_status(),
+        )
+        logger.info("Open fds after deserialization: %d", count_open_fds())
+
+    def _update_weights_in_colocate_mode(self, step_id, **kwargs):
+        """Run AWEX's native transfer with physical-id MetaServer keys."""
+        assert self.enable_colocate_mode, "Colocate mode is not enabled"
+        self.collect_training_weights(step_id, **kwargs)
+        logger.info(
+            "Start to update weights using NCCL for step %s from %d ranks(%s) "
+            "for rank %s",
+            step_id,
+            len(self.transfer_plan.operations),
+            self.send_ranks_sample,
+            self.rank_coordinate,
+        )
+        start_time = time.time()
+        self.colocate_transport.update_weights_in_colocate_mode(
+            self.train_to_infer_device_mapping,
+            self.infer_to_train_device_mapping,
+            self.transfer_rank,
+            self.rank_coordinate,
+            self.infer_world_size,
+            self.send_transfer_plan,
+            self.transfer_plan,
+            self.weights_update_group,
+            self.deserialized_weights,
+            self.parameters,
+            step_id=step_id,
+        )
+        print_current_gpu_status(
+            f"after weights update using NCCL for rank {self.rank_coordinate}"
+        )
+        self.deserialized_weights = None
+        gc.collect()
+        device_util.synchronize()
+        duration = time.time() - start_time
+        compute_statistics(
+            self._history_update_weights_time,
+            step_id,
+            duration,
+            "Receive weights using NCCL",
+        )
+
+        ip_address = get_ip_address()
+        key_suffix = f"_{ip_address}_{self.physical_device_id}_{step_id}"
+        self.meta_server_client.put_object(f"weights_update_finished{key_suffix}", True)
+        runtime_device_id = device_util.current_device()
+        dist.barrier(
+            group=self.weights_update_group,
+            device_ids=[runtime_device_id],
+        )
+        logger.info(
+            "Barrier passed for reader step %s with rank %d",
+            step_id,
+            self.transfer_rank,
+        )
+        gc.collect()
+        if device_util.get_device_type() == "cuda":
+            torch.cuda.empty_cache()
+        self.meta_server_client.get_object_then_delete(f"write_finished{key_suffix}")
+        logger.info(
+            "Finished updating weights in colocate mode for rank %d",
+            self.transfer_rank,
+        )
 
 
 def _ensure_awex_models_registered() -> None:
@@ -432,7 +625,7 @@ class AwexColocateReader:
         logger.info("Got training_params_meta from MetaServer")
 
         model_context = self._build_model_context()
-        reader = NCCLWorkerWeightsReader(
+        reader = _PhysicalDeviceNCCLWorkerWeightsReader(
             engine_name="sglang",
             model=self._get_model(),
             model_context=model_context,
@@ -445,6 +638,7 @@ class AwexColocateReader:
             enable_colocate_mode=True,
             ipc_backend="cuda",
             enable_debug_mode=False,
+            physical_device_id=self._local_gpu_id,
         )
         reader.initialize()
         self._reader = reader
