@@ -32,7 +32,11 @@ from areal.api.cli_args import (
     SchedulingStrategyType,
 )
 from areal.infra.rpc.serialization import deserialize_value, serialize_value
-from areal.infra.scheduler.colocation import is_v2_training_guard_colocation
+from areal.infra.scheduler.colocation import (
+    canonical_colocated_gpu_slots,
+    colocated_train_guard_fork_env,
+    is_v2_training_guard_colocation,
+)
 from areal.infra.scheduler.exceptions import (
     EngineCallError,
     EngineCreationError,
@@ -411,6 +415,7 @@ class RayWorkerInfo:
     task_index: int
     launchers: list[ActorHandle] = field(default_factory=list)
     spec: SchedulingSpec | None = None
+    gpu_devices: tuple[str, ...] = ()
 
 
 def group_colocated_gpus(
@@ -668,6 +673,7 @@ class RayScheduler(Scheduler):
         # Colocation tracking: colocated roles reuse workers from target role
         # For forked roles, they also track target but have their own workers in _workers
         self._colocated_roles: dict[str, str] = {}  # colocated_role -> target_role
+        self._v2_guard_parents: dict[str, list[RayWorkerInfo]] = {}
 
         logger.info(
             f"Initialized RayScheduler: exp={self.experiment_name}, "
@@ -1004,6 +1010,7 @@ class RayScheduler(Scheduler):
         target_wi: RayWorkerInfo,
         target_role: str,
         command: str | None = None,
+        env: dict[str, str] | None = None,
     ) -> RayWorkerInfo:
         """Fork a single worker asynchronously.
 
@@ -1011,6 +1018,8 @@ class RayScheduler(Scheduler):
         ----------
         command : str, optional
             Custom module path to run instead of the default rpc_server.
+        env : dict[str, str], optional
+            Per-process environment overrides passed to the parent guard.
         """
         worker_id = f"{role}/{idx}"
         guard_url = f"http://{format_hostport(target_wi.worker.ip, int(target_wi.worker.worker_ports[0]))}"
@@ -1068,6 +1077,8 @@ class RayScheduler(Scheduler):
                 "worker_index": idx,
                 "raw_cmd": raw_cmd,
             }
+            if env:
+                payload["env"] = env
             async with session.post(
                 f"{guard_url}/fork",
                 json=payload,
@@ -1109,13 +1120,13 @@ class RayScheduler(Scheduler):
 
             logger.info(
                 f"Forked worker {worker_id} created at {forked_host}:{forked_port} "
-                f"(pid={forked_pid}) from {target_role}/{idx}"
+                f"(pid={forked_pid}) from {target_wi.worker.id}"
             )
 
         except aiohttp.ClientError as e:
             raise WorkerCreationError(
                 role,
-                f"Failed to fork worker {idx} from {target_role}/{idx}",
+                f"Failed to fork worker {idx} from {target_wi.worker.id}",
                 str(e),
             ) from e
 
@@ -1147,6 +1158,13 @@ class RayScheduler(Scheduler):
             task_index=idx,
             launchers=target_wi.launchers,
             spec=target_wi.spec,  # Inherit from target
+            gpu_devices=tuple(
+                device
+                for device in (env or {})
+                .get(self.device_control_env_var, "")
+                .split(",")
+                if device
+            ),
         )
 
     async def _kill_forked_worker(
@@ -1184,6 +1202,7 @@ class RayScheduler(Scheduler):
         role: str,
         target_role: str,
         workers: list[RayWorkerInfo],
+        parent_workers: list[RayWorkerInfo] | None = None,
     ) -> None:
         """Cleanup forked workers by calling kill endpoint on parent workers."""
         target_workers = self._workers.get(target_role, [])
@@ -1199,12 +1218,16 @@ class RayScheduler(Scheduler):
             connector=get_default_connector(),
         ) as session:
             tasks = []
+            cleanup_parents = parent_workers or target_workers
             for worker_info in workers:
                 worker_index = int(worker_info.worker.id.split("/")[-1])
-                if worker_index < len(target_workers):
+                if worker_index < len(cleanup_parents):
                     tasks.append(
                         self._kill_forked_worker(
-                            session, role, worker_index, target_workers[worker_index]
+                            session,
+                            role,
+                            worker_index,
+                            cleanup_parents[worker_index],
                         )
                     )
             await asyncio.gather(*tasks, return_exceptions=True)
@@ -1215,6 +1238,7 @@ class RayScheduler(Scheduler):
         target_role: str,
         target_workers: list[RayWorkerInfo],
         command: str | None = None,
+        env_vars: list[dict[str, str]] | None = None,
     ) -> list[str]:
         """Create forked workers concurrently using async requests.
 
@@ -1223,6 +1247,8 @@ class RayScheduler(Scheduler):
         command : str, optional
             Custom module path to run instead of the default rpc_server.
             If specified, the forked processes run this module.
+        env_vars : list[dict[str, str]], optional
+            Per-worker environment overrides.
         """
         timeout = aiohttp.ClientTimeout(total=120.0)
         async with aiohttp.ClientSession(
@@ -1232,7 +1258,13 @@ class RayScheduler(Scheduler):
             # Launch all fork requests concurrently with exception handling
             tasks = [
                 self._fork_single_worker(
-                    session, role, idx, target_wi, target_role, command
+                    session,
+                    role,
+                    idx,
+                    target_wi,
+                    target_role,
+                    command,
+                    env_vars[idx] if env_vars else None,
                 )
                 for idx, target_wi in enumerate(target_workers)
             ]
@@ -1245,7 +1277,8 @@ class RayScheduler(Scheduler):
             if isinstance(result, Exception):
                 failed_indices.append(idx)
                 logger.error(
-                    f"Failed to fork worker {role}/{idx} from {target_role}/{idx}: {result}"
+                    f"Failed to fork worker {role}/{idx} from "
+                    f"{target_workers[idx].worker.id}: {result}"
                 )
             else:
                 workers.append(result)
@@ -1258,7 +1291,9 @@ class RayScheduler(Scheduler):
                 )
                 # Kill the forked processes via parent RPC servers
                 try:
-                    await self._cleanup_forked_workers_async(role, target_role, workers)
+                    await self._cleanup_forked_workers_async(
+                        role, target_role, workers, target_workers
+                    )
                 except Exception as cleanup_error:
                     logger.error(f"Failed to cleanup forked workers: {cleanup_error}")
 
@@ -1514,10 +1549,133 @@ class RayScheduler(Scheduler):
             f"(strategy: {strategy_type}, colocate_with: {colocate_role})"
         )
 
-        if is_v2_training_guard_colocation(role, strategy, schedulings[0].cmd):
-            raise NotImplementedError(
-                "ray colocation for v2 guard jobs is not yet supported"
-            )
+        is_v2_guard_colocation = is_v2_training_guard_colocation(
+            role, strategy, schedulings[0].cmd
+        )
+        if is_v2_guard_colocation:
+            if not colocate_role:
+                raise WorkerCreationError(
+                    role,
+                    "Invalid strategy",
+                    "Colocation strategy requires target role to be specified",
+                )
+
+            target_candidates = [
+                f"{colocate_role}-inf",
+                f"{colocate_role}-guard",
+                colocate_role,
+            ]
+            target_role = None
+            wait_deadline = time.monotonic() + self.startup_timeout
+            while time.monotonic() < wait_deadline:
+                target_role = next(
+                    (
+                        candidate
+                        for candidate in target_candidates
+                        if candidate in self._workers
+                    ),
+                    None,
+                )
+                if target_role is not None:
+                    break
+                logger.info(
+                    "v2 guard colocation: waiting for target role "
+                    f"(one of {target_candidates}) to register workers..."
+                )
+                time.sleep(min(self.health_check_interval, 5.0))
+            if target_role is None:
+                raise WorkerNotFoundError(
+                    f"Cannot colocate v2 guards with role '{colocate_role}' - "
+                    f"none of {target_candidates} appeared within "
+                    f"{self.startup_timeout}s"
+                )
+
+            self.get_workers(role=target_role, timeout=self.startup_timeout)
+            target_workers = self._workers[target_role]
+            target_groups: list[tuple[str, tuple[str, ...]]] = []
+            base_env = dict(schedulings[0].env_vars or {})
+            for target_worker in target_workers:
+                target_gpu_count = target_worker.spec.gpu if target_worker.spec else 0
+                if len(target_worker.gpu_devices) != target_gpu_count:
+                    raise WorkerCreationError(
+                        role,
+                        "Invalid colocation topology",
+                        f"Target worker {target_worker.worker.id} reports "
+                        f"{len(target_worker.gpu_devices)} assigned GPUs but "
+                        f"declares {target_gpu_count}",
+                    )
+                target_groups.append(
+                    (target_worker.worker.ip, target_worker.gpu_devices)
+                )
+
+            try:
+                target_slots = canonical_colocated_gpu_slots(target_groups)
+            except ValueError as e:
+                raise WorkerCreationError(
+                    role,
+                    "Invalid colocation topology",
+                    str(e),
+                ) from e
+
+            target_devices_by_host: dict[str, set[int]] = {}
+            parent_workers: list[RayWorkerInfo] = []
+            fork_envs: list[dict[str, str]] = []
+            for slot in target_slots:
+                target_devices_by_host.setdefault(slot.host, set()).add(slot.device_id)
+                parent_workers.append(target_workers[slot.group_index])
+                fork_envs.append(
+                    colocated_train_guard_fork_env(base_env, slot.device_id)
+                )
+
+            if (
+                any(
+                    len(devices) != self.n_gpus_per_node
+                    for devices in target_devices_by_host.values()
+                )
+                or len(parent_workers) != num_workers
+            ):
+                raise WorkerCreationError(
+                    role,
+                    "Invalid colocation topology",
+                    "V2 guard colocation requires a full-node target allocation "
+                    "with one training guard per GPU",
+                )
+
+            command = schedulings[0].cmd
+            command_parts = shlex.split(command) if command else []
+            if (
+                "-m" not in command_parts
+                or command_parts.index("-m") == len(command_parts) - 1
+            ):
+                raise WorkerCreationError(
+                    role,
+                    "Invalid guard command",
+                    "V2 guard colocation requires a Python module command",
+                )
+            module = command_parts[command_parts.index("-m") + 1]
+            self._v2_guard_parents[role] = parent_workers
+            try:
+                return run_async_task(
+                    self._create_forked_workers_async,
+                    role,
+                    target_role,
+                    parent_workers,
+                    module,
+                    fork_envs,
+                )
+            except Exception:
+                created_workers = self._workers.pop(role, [])
+                if created_workers:
+                    run_async_task(
+                        self._cleanup_forked_workers_async,
+                        role,
+                        target_role,
+                        created_workers,
+                        parent_workers,
+                    )
+                self._colocated_roles.pop(role, None)
+                self._v2_guard_parents.pop(role, None)
+                raise
 
         # Determine node allocation and handle colocation
         if strategy_type == SchedulingStrategyType.colocation:
@@ -1653,6 +1811,7 @@ class RayScheduler(Scheduler):
                 worker_idx: int,
                 worker_launchers: list[ActorHandle],
                 worker_spec: SchedulingSpec,
+                gpu_devices: list[str],
             ) -> RayWorkerInfo:
                 worker_id = f"{role}/{worker_idx}"
                 worker = Worker(
@@ -1667,6 +1826,7 @@ class RayScheduler(Scheduler):
                     launchers=worker_launchers,
                     task_index=worker_idx,
                     spec=worker_spec,
+                    gpu_devices=tuple(gpu_devices),
                 )
 
             if nodes_per_worker > 1:
@@ -1695,6 +1855,7 @@ class RayScheduler(Scheduler):
                             worker_idx,
                             [launcher for _, launcher, _ in node_group],
                             worker_spec,
+                            [],
                         )
                     )
 
@@ -1715,7 +1876,12 @@ class RayScheduler(Scheduler):
                             build_worker_spec(worker_idx, gpu_devices, worker_spec)
                         )
                         workers.append(
-                            build_worker_info(worker_idx, [launcher], worker_spec)
+                            build_worker_info(
+                                worker_idx,
+                                [launcher],
+                                worker_spec,
+                                gpu_devices,
+                            )
                         )
                     if batch:
                         start_refs.append(launcher.start_workers.remote(batch))
@@ -1854,6 +2020,7 @@ class RayScheduler(Scheduler):
                             launchers=[launcher],
                             task_index=worker_idx,
                             spec=worker_spec,
+                            gpu_devices=tuple(group["gpu_devices"]),
                         )
                     )
                     worker_idx += 1
@@ -2098,12 +2265,14 @@ class RayScheduler(Scheduler):
             # Forked roles have their own workers that need cleanup
             if role in self._workers:
                 logger.info(f"Removing forked role '{role}' (managed by parent worker)")
+                parent_workers = self._v2_guard_parents.pop(role, None)
                 try:
                     run_async_task(
                         self._cleanup_forked_workers_async,
                         role,
                         target_role,
                         self._workers[role],
+                        parent_workers,
                     )
                 except Exception as e:
                     logger.warning(f"Failed to cleanup forked role '{role}': {e}")

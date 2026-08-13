@@ -43,6 +43,7 @@ def _scheduler(tmp_path, n_gpus_per_node: int = 8) -> RayScheduler:
     scheduler._placement_groups = {}
     scheduler._multi_node_rollout = None
     scheduler._colocated_roles = {}
+    scheduler._v2_guard_parents = {}
     return scheduler
 
 
@@ -364,6 +365,11 @@ def test_create_workers_uses_real_ray_launchers_and_tracks_state(
             "actor/0",
             "actor/1",
         ]
+        assigned_devices = [
+            worker_info.gpu_devices for worker_info in scheduler._workers["actor"]
+        ]
+        assert all(len(devices) == 1 for devices in assigned_devices)
+        assert len({device for devices in assigned_devices for device in devices}) == 2
 
         launcher = scheduler._launchers["actor"][0]
         statuses = ray.get(launcher.worker_statuses.remote(worker_ids), timeout=30)
