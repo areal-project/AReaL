@@ -299,8 +299,13 @@ class TestRolloutControllerInitialization:
             call for call in scheduler.engine_calls if call[1] == "launch_server"
         ]
         assert len(launch_calls) == 2
+        base_gpu_ids = []
         for _, _, _, kwargs in launch_calls:
-            assert kwargs["server_args"]["nccl_port"] == 8001
+            server_args = kwargs["server_args"]
+            assert server_args["nccl_port"] == 8001
+            assert server_args["_awex_gpus_per_server"] == 1
+            base_gpu_ids.append(server_args["base_gpu_id"])
+        assert base_gpu_ids == [0, 1]
 
         controller.destroy()
 
