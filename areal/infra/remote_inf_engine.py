@@ -88,6 +88,11 @@ class GroupedRolloutWorkflow(RolloutWorkflow):
         results = await asyncio.gather(
             *[self.workflow.arun_episode(engine, data) for _ in range(self.group_size)]
         )
+        group_processor = getattr(self.workflow, "process_group_results", None)
+        if callable(group_processor):
+            results = group_processor(results)
+            if results is None:
+                return None
 
         valid_results = [r for r in results if r is not None]
 

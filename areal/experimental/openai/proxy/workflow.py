@@ -120,6 +120,10 @@ class OpenAIProxyWorkflow(RolloutWorkflow):
         self.subproc_max_workers = subproc_max_workers
         self.drop_retry_orphans = drop_retry_orphans
 
+    def process_group_results(self, results):
+        processor = getattr(self.agent, "process_group_results", None)
+        return processor(results) if callable(processor) else results
+
     @trace_session("run_agent")
     async def _run_agent(self, session_api_key: str, data: dict):
         if self.mode == "inline":
@@ -236,8 +240,16 @@ class OpenAIProxyWorkflow(RolloutWorkflow):
                 )
                 raise
 
-            # Assign rewards back according to user code output
-            if isinstance(rewards, dict):
+            # Assign rewards back according to user code output. RAO returns a
+            # picklable rollout result with one raw reward per node-final interaction.
+            rollout_result = None
+            if hasattr(rewards, "interaction_rewards") and hasattr(rewards, "root_reward"):
+                rollout_result = rewards
+                if not getattr(rewards, "valid", True):
+                    raise ValueError(f"Invalid RAO rollout: {getattr(rewards, 'error', '')}")
+                for completion_id, reward in rewards.interaction_rewards.items():
+                    await proxy_client.set_reward(completion_id, reward)
+            elif isinstance(rewards, dict):
                 for completion_id, reward in rewards.items():
                     await proxy_client.set_reward(completion_id, reward)
             elif isinstance(rewards, float):
@@ -251,6 +263,36 @@ class OpenAIProxyWorkflow(RolloutWorkflow):
             style=self.export_style,
             drop_retry_orphans=self.drop_retry_orphans,
         )
+        if rollout_result is not None:
+            node_by_interaction = rollout_result.node_by_interaction
+            missing = set(node_by_interaction) - set(interactions)
+            if missing:
+                raise ValueError(
+                    f"RAO node-final interactions missing after export: {sorted(missing)[:4]}"
+                )
+            for interaction_id, interaction in interactions.items():
+                node = node_by_interaction.get(interaction_id)
+                if node is None:
+                    raise ValueError(f"Exported interaction {interaction_id} has no RAO node")
+                interaction.rao_episode_id = rollout_result.episode_id
+                interaction.rao_node_id = node.node_id
+                interaction.rao_node_reward = node.judge.score
+                interaction.rao_root_reward = rollout_result.root_reward
+                interaction.rao_is_root = node.is_root
+                interaction.rao_node_depth = node.depth
+                cache = getattr(interaction, "_cache", None)
+                if cache is not None and "input_ids" in cache:
+                    import torch
+
+                    from areal.experimental.openai.types import rao_iid_hash
+
+                    input_ids = cache["input_ids"]
+                    cache["rao_node_id"] = torch.full_like(
+                        input_ids, rao_iid_hash(node.node_id), dtype=torch.long
+                    )
+                    node_start = torch.zeros_like(input_ids, dtype=torch.float32)
+                    node_start[:, 0] = 1.0
+                    cache["rao_node_start"] = node_start
 
         # Record stats
         last_id = list(interactions.keys())[-1] if interactions else None
