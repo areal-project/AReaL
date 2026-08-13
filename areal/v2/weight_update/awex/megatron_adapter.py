@@ -36,6 +36,10 @@ from areal.v2.weight_update.awex.delta_config import (
     validate_dte_world_size,
 )
 from areal.v2.weight_update.awex.delta_detect import AdamWInversionDetector
+from areal.v2.weight_update.awex.state import (
+    AwexPairState,
+    MegatronColocatePairState,
+)
 from areal.v2.weight_update.nccl_group import (
     init_weights_update_group,
     setup_batch_isend_irecv,
@@ -66,6 +70,9 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
 
     def __init__(self, engine: MegatronEngine):
         self._engine = engine
+        self._pair_states: dict[str, AwexPairState] = {}
+        self._active_pair_name: str | None = None
+        self._colocate_pair_states: dict[str, MegatronColocatePairState] = {}
         self._transfer_plan: TransferPlan | None = None
         self._weights_update_group = None
         self._weights_update_group_gloo = None
@@ -83,6 +90,67 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
         self._dte_config = DTERuntimeConfig.from_env()
         self._delta_tracker = None
         self._delta_detector = None
+
+    def _capture_active_pair_state(self) -> AwexPairState:
+        return AwexPairState(
+            weights_update_group=self._weights_update_group,
+            control_group=self._weights_update_group_gloo,
+            transfer_plan=self._transfer_plan,
+            transfer_rank=self._transfer_rank or 0,
+            runtime_state={
+                "world_size": self._world_size,
+                "separation_delta_transport": self._separation_delta_transport,
+                "separation_wire_dtypes": self._separation_wire_dtypes,
+                "delta_tracker": self._delta_tracker,
+                "delta_detector": self._delta_detector,
+            },
+        )
+
+    def _clear_active_pair_state(self) -> None:
+        self._weights_update_group = None
+        self._weights_update_group_gloo = None
+        self._transfer_plan = None
+        self._transfer_rank = None
+        self._world_size = None
+        self._separation_delta_transport = None
+        self._separation_wire_dtypes = None
+        self._delta_tracker = None
+        self._delta_detector = None
+
+    def _park_active_pair(self) -> None:
+        if self._active_pair_name is not None:
+            self._pair_states[self._active_pair_name] = (
+                self._capture_active_pair_state()
+            )
+        self._active_pair_name = None
+        self._clear_active_pair_state()
+
+    def _activate_pair(self, pair_name: str) -> AwexPairState:
+        if self._active_pair_name == pair_name:
+            state = self._capture_active_pair_state()
+        else:
+            state = self._pair_states.pop(pair_name, None)
+            if state is None:
+                raise RuntimeError(f"AWEX pair {pair_name!r} is not initialized")
+            if state.weights_update_group is None or state.control_group is None:
+                raise RuntimeError(f"AWEX pair {pair_name!r} is partially torn down")
+            self._park_active_pair()
+            runtime = state.runtime_state or {}
+            self._weights_update_group = state.weights_update_group
+            self._weights_update_group_gloo = state.control_group
+            self._transfer_plan = state.transfer_plan
+            self._transfer_rank = state.transfer_rank
+            self._world_size = runtime.get("world_size")
+            self._separation_delta_transport = runtime.get(
+                "separation_delta_transport"
+            )
+            self._separation_wire_dtypes = runtime.get("separation_wire_dtypes")
+            self._delta_tracker = runtime.get("delta_tracker")
+            self._delta_detector = runtime.get("delta_detector")
+            self._active_pair_name = pair_name
+        if state.weights_update_group is None or state.control_group is None:
+            raise RuntimeError(f"AWEX pair {pair_name!r} is partially torn down")
+        return state
 
     @property
     def parallelism_strategy(self) -> dict:
@@ -176,6 +244,16 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
         train_world_size: int,
         num_engines: int,
     ) -> None:
+        if self._active_pair_name == pair_name:
+            logger.info("AWEX pair '%s' is already initialized", pair_name)
+            return
+        if pair_name in self._pair_states:
+            raise RuntimeError(
+                f"AWEX pair {pair_name!r} is still registered; "
+                "teardown must complete before it can be reused"
+            )
+        self._park_active_pair()
+        self._active_pair_name = pair_name
         if self._dte_config.enabled:
             validate_dte_world_size(world_size, infer_world_size, train_world_size)
 
@@ -226,7 +304,8 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
             pair_name,
         )
 
-    def execute_weight_update(self, version: int) -> None:
+    def execute_weight_update(self, pair_name: str, version: int) -> None:
+        self._activate_pair(pair_name)
         if self._dte_config.enabled:
             self._release_grad_buffers_for_separation_sync()
             try:
@@ -460,7 +539,8 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
             len(self._separation_wire_dtypes),
         )
 
-    def batch_isend_irecv(self, **kwargs) -> None:
+    def batch_isend_irecv(self, pair_name: str, **kwargs) -> None:
+        self._activate_pair(pair_name)
         if self._weights_update_group_gloo is None:
             raise RuntimeError("Gloo weight update group is not initialized")
         setup_kwargs = {
@@ -474,23 +554,66 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
             **setup_kwargs,
         )
 
-    def teardown_weight_update_group(self) -> None:
-        if self._weights_update_group is not None and dist.is_initialized():
-            dist.destroy_process_group(self._weights_update_group)
-        if self._weights_update_group_gloo is not None and dist.is_initialized():
-            dist.destroy_process_group(self._weights_update_group_gloo)
-        self._weights_update_group = None
-        self._weights_update_group_gloo = None
-        self._transfer_plan = None
-        self._transfer_rank = None
-        self._world_size = None
-        self._separation_delta_transport = None
-        self._separation_wire_dtypes = None
-        self._delta_tracker = None
-        self._delta_detector = None
-        if self._colocate_http_client is not None:
-            self._colocate_http_client.close()
-            self._colocate_http_client = None
+    def teardown_weight_update_group(self, pair_name: str) -> None:
+        is_active = self._active_pair_name == pair_name
+        if is_active:
+            state = self._capture_active_pair_state()
+        else:
+            state = self._pair_states.get(pair_name)
+
+        errors: list[Exception] = []
+        if state is not None and dist.is_initialized():
+            for attr in ("weights_update_group", "control_group"):
+                group = getattr(state, attr)
+                if group is None:
+                    continue
+                try:
+                    dist.destroy_process_group(group)
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to teardown %s for AWEX pair '%s'",
+                        attr,
+                        pair_name,
+                        exc_info=True,
+                    )
+                    errors.append(exc)
+                else:
+                    setattr(state, attr, None)
+        elif state is not None:
+            state.weights_update_group = None
+            state.control_group = None
+
+        if state is not None and is_active:
+            self._weights_update_group = state.weights_update_group
+            self._weights_update_group_gloo = state.control_group
+            if state.weights_update_group is None and state.control_group is None:
+                self._active_pair_name = None
+                self._clear_active_pair_state()
+        elif (
+            state is not None
+            and state.weights_update_group is None
+            and state.control_group is None
+        ):
+            self._pair_states.pop(pair_name, None)
+
+        colocate_state = self._colocate_pair_states.get(pair_name)
+        if colocate_state is not None:
+            try:
+                colocate_state.http_client.close()
+            except Exception as exc:
+                logger.warning(
+                    "Failed to close colocate client for AWEX pair '%s'",
+                    pair_name,
+                    exc_info=True,
+                )
+                errors.append(exc)
+            else:
+                self._colocate_pair_states.pop(pair_name, None)
+
+        if errors:
+            raise RuntimeError(
+                f"Failed to teardown AWEX pair {pair_name!r} on this rank"
+            ) from errors[0]
 
     def _build_rank_info(self) -> RankInfo:
         from megatron.core import parallel_state as mpu
@@ -643,34 +766,38 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
         admin_api_key: str = "areal-admin-key",
         timeout_s: float = 120.0,
     ) -> None:
-        self._colocate_pair_name = pair_name
-        self._colocate_kv_store_url = kv_store_url
-        self._colocate_transfer_rank = transfer_rank
-        self._colocate_infer_world_size = infer_world_size
-        self._colocate_admin_api_key = admin_api_key
-        self._colocate_timeout_s = timeout_s
-        if self._colocate_http_client is None:
-            self._colocate_http_client = httpx.Client()
+        if pair_name in self._colocate_pair_states:
+            logger.info("AWEX colocate pair '%s' is already initialized", pair_name)
+            return
+        self._colocate_pair_states[pair_name] = MegatronColocatePairState(
+            kv_store_url=kv_store_url,
+            transfer_rank=transfer_rank,
+            infer_world_size=infer_world_size,
+            admin_api_key=admin_api_key,
+            timeout_s=timeout_s,
+            http_client=httpx.Client(),
+        )
         logger.info(
             "Initialized colocate weight update for pair '%s', transfer_rank=%d",
             pair_name,
             transfer_rank,
         )
 
-    def execute_colocate_weight_update(self, version: int) -> None:
+    def execute_colocate_weight_update(self, pair_name: str, version: int) -> None:
         with self._colocate_lock:
-            self._execute_colocate_weight_update_locked(version)
+            self._execute_colocate_weight_update_locked(pair_name, version)
 
-    def _execute_colocate_weight_update_locked(self, version: int) -> None:
-        kv_store_url = self._colocate_kv_store_url
-        pair_name = self._colocate_pair_name
-        transfer_rank = self._colocate_transfer_rank
-        assert self._colocate_http_client is not None, (
-            "init_colocate_weight_update must be called first"
-        )
-        client = self._colocate_http_client
-        auth_headers = {"Authorization": f"Bearer {self._colocate_admin_api_key}"}
-        timeout_s = self._colocate_timeout_s
+    def _execute_colocate_weight_update_locked(
+        self, pair_name: str, version: int
+    ) -> None:
+        state = self._colocate_pair_states.get(pair_name)
+        if state is None:
+            raise RuntimeError(f"AWEX colocate pair {pair_name!r} is not initialized")
+        kv_store_url = state.kv_store_url
+        transfer_rank = state.transfer_rank
+        client = state.http_client
+        auth_headers = {"Authorization": f"Bearer {state.admin_api_key}"}
+        timeout_s = state.timeout_s
 
         weights_offloaded = "weights" in self._released_tags
         if weights_offloaded:

@@ -85,6 +85,8 @@ class TestConnect:
                 "colocate": False,
                 "nccl_master_addr": "",
                 "nccl_master_port": 0,
+                "setup_timeout_s": None,
+                "rollback_timeout_s": 30.0,
             },
             timeout=10.0,
         )
@@ -118,6 +120,8 @@ class TestConnect:
                 "colocate": False,
                 "nccl_master_addr": "",
                 "nccl_master_port": 0,
+                "setup_timeout_s": None,
+                "rollback_timeout_s": 30.0,
             },
             timeout=10.0,
         )
@@ -144,6 +148,21 @@ class TestUpdateWeights:
             timeout=10.0,
         )
 
+    def test_update_weights_raises_on_error_status(self, ctrl):
+        ctrl._pair_name = "pair0"
+        ctrl._session.post.return_value = _mock_response(
+            200,
+            {
+                "status": "error",
+                "version": 5,
+                "duration_ms": 12.0,
+                "error": "collective failed",
+            },
+        )
+
+        with pytest.raises(RuntimeError, match="collective failed"):
+            ctrl.update_weights(version=5)
+
     def test_update_weights_raises_when_not_connected(self, ctrl):
         with pytest.raises(RuntimeError, match="Not connected"):
             ctrl.update_weights(version=1)
@@ -168,6 +187,15 @@ class TestDisconnect:
     def test_disconnect_noop_when_not_connected(self, ctrl):
         ctrl.disconnect()
         assert ctrl._pair_name is None
+
+    def test_disconnect_failure_preserves_state_for_retry(self, ctrl):
+        ctrl._pair_name = "pair0"
+        ctrl._session.post.return_value = _mock_response(500, {"error": "busy"})
+
+        with pytest.raises(requests.HTTPError):
+            ctrl.disconnect()
+
+        assert ctrl._pair_name == "pair0"
 
 
 class TestLifecycle:

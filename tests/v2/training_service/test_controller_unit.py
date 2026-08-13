@@ -336,7 +336,7 @@ class TestGatewayTrainControllerClearBatches:
         }
         mock_gateway_post.assert_not_called()
 class TestGatewayTrainControllerWeightUpdateReconnect:
-    def test_awex_reconnect_destroys_old_controller_and_versions_pair(self):
+    def test_awex_reconnect_commits_candidate_before_destroying_old_gateway(self):
         from areal.v2.inference_service.controller.controller import (
             RolloutControllerV2,
         )
@@ -370,12 +370,145 @@ class TestGatewayTrainControllerWeightUpdateReconnect:
                 SimpleNamespace(type="awex", colocate=False, version=1),
             )
 
+        first_weight_ctrl.disconnect.assert_called_once()
+        assert first_weight_ctrl.disconnect.call_args.kwargs["timeout"] > 0
         first_weight_ctrl.destroy.assert_called_once_with()
         assert recovered_weight_ctrl.connect.call_args.kwargs["pair_name"] == (
             "actor-rollout-v1"
         )
+        assert recovered_weight_ctrl.connect.call_args.kwargs["setup_timeout_s"] > 0
+        assert recovered_weight_ctrl.connect.call_args.kwargs["rollback_timeout_s"] > 0
         config = weight_ctrl_cls.call_args.args[0]
         assert config.setup_timeout == controller.config.setup_timeout
         assert config.request_timeout == controller.config.request_timeout
         assert config.init_timeout_s == controller.config.request_timeout
         assert config.update_timeout_s == controller.config.request_timeout
+
+    def test_failed_candidate_connect_preserves_old_controller(self):
+        from areal.v2.inference_service.controller.controller import (
+            RolloutControllerV2,
+        )
+
+        controller = _make_controller()
+        controller._role = "actor"
+        controller._worker_addrs = ["http://train-0"]
+
+        old_rollout = MagicMock(spec=RolloutControllerV2)
+        old_ctrl = MagicMock()
+        controller.rollout = old_rollout
+        controller._weight_update_ctrl = old_ctrl
+
+        candidate = MagicMock()
+        candidate.connect.side_effect = RuntimeError("candidate init failed")
+        new_rollout = MagicMock(spec=RolloutControllerV2)
+        new_rollout.inference_worker_urls = ["http://inference-0"]
+        new_rollout.inference_guard_addrs = ["http://guard-0"]
+        port_response = MagicMock()
+        port_response.json.return_value = {"host": "inference-host", "ports": [12345]}
+
+        with (
+            patch(
+                "areal.v2.weight_update.controller.controller.WeightUpdateController",
+                return_value=candidate,
+            ),
+            patch("requests.post", return_value=port_response),
+            pytest.raises(RuntimeError, match="candidate init failed"),
+        ):
+            controller.connect_engine(
+                new_rollout,
+                SimpleNamespace(type="awex", colocate=False, version=1),
+            )
+
+        candidate.destroy.assert_called_once_with()
+        old_ctrl.disconnect.assert_not_called()
+        old_ctrl.destroy.assert_not_called()
+        assert controller._weight_update_ctrl is old_ctrl
+        assert controller.rollout is old_rollout
+
+    def test_same_recovery_version_uses_a_unique_candidate_pair_name(self):
+        from areal.v2.inference_service.controller.controller import (
+            RolloutControllerV2,
+        )
+
+        controller = _make_controller()
+        controller._role = "actor"
+        controller._worker_addrs = ["http://train-0"]
+        old_ctrl = MagicMock()
+        old_ctrl.pair_name = "actor-rollout-v1"
+        controller._weight_update_ctrl = old_ctrl
+
+        candidate = MagicMock()
+        rollout = MagicMock(spec=RolloutControllerV2)
+        rollout.inference_worker_urls = ["http://inference-0"]
+        rollout.inference_guard_addrs = ["http://guard-0"]
+        port_response = MagicMock()
+        port_response.json.return_value = {"host": "inference-host", "ports": [12345]}
+
+        with (
+            patch(
+                "areal.v2.weight_update.controller.controller.WeightUpdateController",
+                return_value=candidate,
+            ),
+            patch("requests.post", return_value=port_response),
+        ):
+            controller.connect_engine(
+                rollout,
+                SimpleNamespace(type="awex", colocate=False, version=1),
+            )
+
+        pair_name = candidate.connect.call_args.kwargs["pair_name"]
+        assert pair_name.startswith("actor-rollout-v1-")
+        assert pair_name != old_ctrl.pair_name
+
+    def test_old_teardown_failure_rolls_back_candidate_and_preserves_old(self):
+        from areal.v2.inference_service.controller.controller import (
+            RolloutControllerV2,
+        )
+
+        controller = _make_controller()
+        controller._role = "actor"
+        controller._worker_addrs = ["http://train-0"]
+        old_rollout = MagicMock(spec=RolloutControllerV2)
+        old_ctrl = MagicMock()
+        old_ctrl.disconnect.side_effect = RuntimeError("old teardown failed")
+        controller.rollout = old_rollout
+        controller._weight_update_ctrl = old_ctrl
+
+        candidate = MagicMock()
+        new_rollout = MagicMock(spec=RolloutControllerV2)
+        new_rollout.inference_worker_urls = ["http://inference-0"]
+        new_rollout.inference_guard_addrs = ["http://guard-0"]
+        port_response = MagicMock()
+        port_response.json.return_value = {"host": "inference-host", "ports": [12345]}
+
+        with (
+            patch(
+                "areal.v2.weight_update.controller.controller.WeightUpdateController",
+                return_value=candidate,
+            ),
+            patch("requests.post", return_value=port_response),
+            pytest.raises(RuntimeError, match="old teardown failed"),
+        ):
+            controller.connect_engine(
+                new_rollout,
+                SimpleNamespace(type="awex", colocate=False, version=1),
+            )
+
+        candidate.destroy.assert_called_once_with()
+        old_ctrl.destroy.assert_not_called()
+        assert controller._weight_update_ctrl is old_ctrl
+        assert controller.rollout is old_rollout
+
+    def test_update_failure_always_continues_generation(self):
+        controller = _make_controller()
+        controller.rollout = MagicMock()
+        controller._weight_update_ctrl = MagicMock()
+        controller._weight_update_ctrl.update_weights.side_effect = RuntimeError(
+            "transfer failed"
+        )
+
+        with pytest.raises(RuntimeError, match="transfer failed"):
+            controller.update_weights(SimpleNamespace(version=3))
+
+        controller.rollout.pause_generation.assert_called_once_with()
+        controller.rollout.continue_generation.assert_called_once_with()
