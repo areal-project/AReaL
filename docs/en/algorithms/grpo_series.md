@@ -374,9 +374,104 @@ level rather than at the token level.
 trajectory. The PPO algorithm treats the outcome reward as the reward for the last
 token, with all preceding tokens receiving a reward of 0. AReaL then applies standard
 discounting and TD-error back-propagation via Generalized Advantage Estimation (GAE)
-along the token trajectory to compute the advantage of each token. When the discount
-factor is 1, the advantage values equal the outcome reward and are effectively broadcast
-to every token in the trajectory.
+to compute the advantage of each token. With the default token-level recurrence, the
+terminal outcome reward is effectively broadcast to every generated token when
+`discount=1`, `gae_lambda=1`, critic values are zero, and KL regularization is disabled.
+
+### GAE timestep units
+
+`actor.gae_timestep_unit` selects whether GAE advances over generated tokens or
+generated turns. Prompt, tool, padding, and other masked positions never consume a GAE
+step.
+
+#### Token-level GAE
+
+`token` is the default and preserves the original AReaL behavior. For consecutive active
+generated tokens, AReaL computes
+
+$$
+\delta_t = r_t + \gamma V_{t+1} - V_t, \qquad
+A_t = \delta_t + \gamma \lambda A_{t+1}, \qquad
+G_t = A_t + V_t,
+$$
+
+where $\gamma$ is `actor.discount` and $\lambda$ is the resolved per-trajectory value
+configured by `actor.gae_lambda`. The reward $r_t$ contains the outcome reward increment
+and the token-level KL penalty. EOS-terminated trajectories use zero terminal bootstrap,
+while truncated trajectories without EOS bootstrap from the final value estimate.
+
+#### Turn-level GAE
+
+`turn` treats each non-empty generated turn as one macro timestep. For turn $u$, AReaL
+sums its task reward increments into $r_u^{\mathrm{task}}$ and takes $V_u$ from the first
+active action-token position in that turn. It then computes
+
+$$
+\delta_u^{\mathrm{task}}
+= r_u^{\mathrm{task}} + \gamma V_{u+1} - V_u, \qquad
+A_u^{\mathrm{task}}
+= \delta_u^{\mathrm{task}} + \gamma \lambda A_{u+1}^{\mathrm{task}}.
+$$
+
+The task advantage $A_u^{\mathrm{task}}$ and critic target
+$G_u=A_u^{\mathrm{task}}+V_u$ are broadcast to every active token in the turn.
+Token-level KL is deliberately kept out of the turn recurrence and critic target: before
+optional `actor.adv_norm`, the actor advantage for token $j$ in turn $u$ is
+$A_{u,j}=A_u^{\mathrm{task}}+r_{u,j}^{\mathrm{KL}}$. This avoids summing a turn's KL
+penalties and then broadcasting that sum back to every token.
+
+### Dynamic GAE lambda
+
+`actor.gae_lambda` accepts either a static float or a dotted path to a callable.
+`actor.gae_lambda_kwargs` passes keyword arguments to that callable and is ignored for a
+static float. The callable receives a context containing three tensors of shape `[B]`:
+
+- `effective_token_lengths`: active generated-token counts, including an active EOS;
+- `turn_counts`: non-empty generated-turn counts, or zeros when token mode has no
+  `turn_ids`;
+- `timestep_lengths`: the length $L$ selected by `gae_timestep_unit`.
+
+The callable must return one finite floating-point lambda per local trajectory as a
+tensor of shape `[B]` on the same device. A returned lambda is used for every selected
+timestep in that trajectory.
+
+Two length-aware functions are built in:
+
+| Function path | Kwargs | Definition |
+| --- | --- | --- |
+| `areal.trainer.ppo.lambda_fn.vapo_length_adaptive_gae` | `alpha > 0` | $\lambda=\max(0, 1 - 1/(\alpha L))$ for $L>0$; $L=0$ uses 0. |
+| `areal.trainer.ppo.lambda_fn.relative_position_gae_lambda` | `0 < q <= 1` | $\lambda=q^{1/(L-1)}$ for $L\ge2$; $L=1$ uses 1 and $L=0$ uses 0. Relative-retention interpretation assumes $\gamma=1$. |
+
+For example:
+
+```yaml
+actor:
+  gae_timestep_unit: turn
+  gae_lambda: areal.trainer.ppo.lambda_fn.relative_position_gae_lambda
+  gae_lambda_kwargs:
+    q: 0.5
+```
+
+### `turn_ids` contract for custom workflows
+
+Turn-level GAE requires workflows to return raw, token-aligned `turn_ids`; the actor
+aligns them with its next-token prediction mask internally. The tensor must:
+
+- have the same shape as `input_ids` and `loss_mask` (batched as `[B, S]`);
+- use an integer dtype (a signed integer is recommended for the `-1` sentinel);
+- assign every active generated token an ID in `[0, S)`;
+- keep active IDs temporally nondecreasing and use one ID for all tokens in the same
+  assistant turn;
+- use `-1` for prompt, user, tool, padding, and other non-loss positions.
+
+Numbering gaps are accepted and do not consume a GAE step, although consecutive IDs
+starting from zero are recommended. A custom workflow can construct the field as
+follows; do not roll it in the workflow:
+
+```python
+turn_ids += [-1] * input_len + [turn_idx] * resp.output_len
+result["turn_ids"] = torch.tensor(turn_ids, dtype=torch.int32).unsqueeze(0)
+```
 
 ## AReaL Implementation Notes
 
@@ -388,6 +483,7 @@ original GRPO objective. This aligns with recommendations from
 [Dr.GRPO](https://arxiv.org/abs/2503.20783) and eliminates bias in advantage estimation.
 
 **KL Regularization**: Instead of adding a KL divergence term directly to the objective
-function, AReaL incorporates KL regularization into the advantage estimation
-(PPO-style). The KL penalty is computed via `KLEstimator` and added to the per-token
-rewards before GAE computation, controlled by the `actor.kl_ctl` parameter.
+function, AReaL incorporates KL regularization into actor advantages (PPO-style),
+controlled by `actor.kl_ctl`. In token mode, the `KLEstimator` penalty is added to
+per-token rewards before GAE. In turn mode, it remains a token-local actor penalty and
+is excluded from the turn recurrence and critic targets.
