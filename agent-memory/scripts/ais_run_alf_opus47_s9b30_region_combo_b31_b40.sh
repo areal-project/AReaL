@@ -1,0 +1,9 @@
+#!/bin/bash
+export BRANCH_NAME=alfworld_region_opus47_s9b30_region_combo_b31b40
+export MEMRL_ALFWORLD_STATE_GUARD_PROMPT=0
+export MEMRL_ALFWORLD_PROGRAM_GUIDE=0
+export MEMRL_ALFWORLD_DEFERRED_REPAIR=1
+export MEMRL_ALFWORLD_STOP_AFTER_BATCH=40
+export MEMRL_REGION_RETEMPERATURE=0.03
+export MEMRL_ALFWORLD_EXTRA_ARGS="--no_z_norm --region_retrieve_mode utility_anchor --utility_anchor_count 2 --utility_anchor_topk_regions 1 --utility_anchor_min_count 30"
+exec bash /storage/openpsi/users/yl/agent-memory/MemRL/scripts/ais_run_alf_opus47_s9b20_sharpen3_cap128.sh

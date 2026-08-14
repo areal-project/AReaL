@@ -1,0 +1,16 @@
+# This is a config for E2B sandbox template.
+# You can use template ID (xs3c9i0hy53751xam77h) or template name (bigcodebench_evaluator) to create a sandbox:
+
+# Python SDK
+# from e2b import Sandbox, AsyncSandbox
+# sandbox = Sandbox("bigcodebench_evaluator") # Sync sandbox
+# sandbox = await AsyncSandbox.create("bigcodebench_evaluator") # Async sandbox
+
+# JS SDK
+# import { Sandbox } from 'e2b'
+# const sandbox = await Sandbox.create('bigcodebench_evaluator')
+
+team_id = "f317d0d2-ba02-44c5-8b77-e4a2d7830c7c"
+dockerfile = "e2b.Dockerfile"
+template_name = "bigcodebench_evaluator"
+template_id = "xs3c9i0hy53751xam77h"

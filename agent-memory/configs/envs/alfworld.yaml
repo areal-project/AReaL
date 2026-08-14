@@ -1,0 +1,75 @@
+dataset:
+  data_path: 'data/alfworld/json_2.1.1/train'
+  eval_id_data_path: 'data/alfworld/json_2.1.1/valid_seen'
+  eval_ood_data_path: 'data/alfworld/json_2.1.1/valid_unseen'
+  num_train_games: -1
+  num_eval_games: -1
+
+logic:
+  domain: 'data/alfworld/logic/alfred.pddl'
+  grammar: 'data/alfworld/logic/alfred.twl2'
+
+env:
+  type: 'AlfredTWEnv'
+  domain_randomization: False
+  task_types: [1,2,3,4,5,6]
+  expert_timeout_steps: 150
+  expert_type: "handcoded"
+  goal_desc_human_anns_prob: 0.0
+
+controller:
+  type: 'oracle'
+  debug: False
+  load_receps: True
+
+general:
+  random_seed: 42
+  use_cuda: False              
+  visdom: False
+  task: 'alfred'
+  training_method: 'dagger'
+  save_path: './training/'
+  observation_pool_capacity: 3
+  hide_init_receptacles: False
+
+  training:
+    batch_size: 10
+    max_episode: 50000
+    smoothing_eps: 0.1
+    optimizer:
+      learning_rate: 0.001
+      clip_grad_norm: 5
+
+  evaluate:
+    run_eval: True
+    batch_size: 10
+    env:
+      type: "AlfredTWEnv"
+
+  checkpoint:
+    report_frequency: 1000
+    experiment_tag: 'text_only'
+    load_pretrained: False
+    load_from_tag: ''
+
+dagger:
+  action_space: "generation"
+  max_target_length: 20
+  beam_width: 10
+  generate_top_k: 5
+  training:
+    max_nb_steps_per_episode: 50
+  fraction_assist:
+    fraction_assist_anneal_episodes: 50000
+    fraction_assist_anneal_from: 1.0
+    fraction_assist_anneal_to: 0.01
+  fraction_random:
+    fraction_random_anneal_episodes: 0
+    fraction_random_anneal_from: 0.0
+    fraction_random_anneal_to: 0.0
+  replay:
+    replay_memory_capacity: 500000
+    update_per_k_game_steps: 5
+    replay_batch_size: 64
+    replay_sample_history_length: 4
+    replay_sample_update_from: 2

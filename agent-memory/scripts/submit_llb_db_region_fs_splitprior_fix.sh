@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+set -euo pipefail
+export AISTUDIO_LOGIN_NAME=aistudio
+export AISTUDIO_USERNUMBER=477578
+# Reuse existing submission credential without displaying it.
+if [[ -z "${AISTUDIO_TOKEN:-}" ]]; then
+  token_line=$(grep -m1 '^export AISTUDIO_TOKEN=' /storage/openpsi/users/yl/agent-memory/MemRL/scripts/submit_llb_db_memp_gpt41mini.sh || true)
+  [[ -n "$token_line" ]] || { echo 'ERROR: AISTUDIO_TOKEN unavailable' >&2; exit 1; }
+  eval "$token_line"
+fi
+export WORKER_NUM=0
+export JOB_TAG=''
+export JOB_NAME="yl-llbdb-regionfs-splitpriorfix-gpt41mini-$(date +%m%d-%H%M)"
+export KM_IMAGE='acr-sh-ant-registry-vpc.cn-shanghai.cr.aliyuncs.com/gpu/areal-runtime:dev-sglang-20260401'
+export JOB_COMMAND='bash /storage/openpsi/users/yl/agent-memory/MemRL/scripts/run_llb_db_region_fs_splitprior_fix_aistudio.sh'
+export LAUNCH_CONTAINER_MODE=dev_local
+pip install 'aistudio-common>=0.0.28.75' -i https://pypi.antfin-inc.com/simple/ >/dev/null 2>&1
+pip install aii-pypai -i https://pypi.antfin-inc.com/simple/ >/dev/null 2>&1
+printf '%s\n' "[INFO] Submitting fresh Region split-prior-fix job: $JOB_NAME"
+cd /tmp
+PYTHONPATH=/tmp/yl_pypai:${PYTHONPATH:-} python /storage/openpsi/users/yl/agent-memory/MemRL/scripts/submit_llb_db_memrl_haiku.py

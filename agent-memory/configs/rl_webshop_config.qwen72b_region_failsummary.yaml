@@ -1,0 +1,75 @@
+# WebShop region config for Qwen2.5-72B-Instruct
+# Adapted from ALFWorld region config
+#
+# Data: 4000 train / 1000 val (IN-DIST) + 2000 OOD (different products)
+#   - Products: 4144 IN-DIST, 1669 OOD (zero overlap)
+#   - Goals: human-written from items_human_ins.json
+# Architecture:
+#   - 5 sections, batch_size=16, max_steps=30
+#   - task clustering (--task_cluster_k 8)
+#   - explore_schedule "0,2,1,1,0"
+
+llm:
+  provider: "openai"
+  api_key: "EMPTY"
+  base_url: "http://localhost:8000/v1/"
+  model: "Qwen2.5-72B-Instruct"
+  temperature: 0
+  max_tokens: 2048
+
+embedding:
+  provider: "openai"
+  api_key: "EMPTY"
+  base_url: "http://localhost:8001/v1/"
+  model: "Qwen/Qwen3-Embedding-8B"
+  dimension: 4096
+  max_text_len: 8196
+
+memory:
+  build_strategy: "proceduralization"
+  retrieve_strategy: "query"
+  update_strategy: "adjustment"
+  k_retrieve: 5
+  max_keywords: 5
+  add_similarity_threshold: 0.9
+  memory_budget_tokens: 0
+  sim_norm_mean: 0.5
+  sim_norm_std: 0.12
+
+experiment:
+  random_seed: 42
+  enable_value_driven: true
+  experiment_name: "webshop_region_qwen72b_5section_failsummary"
+  mode: "train"
+  num_sections: 5
+  batch_size: 16
+  dataset_ratio: 1.0
+  output_dir: "/storage/openpsi/experiments/checkpoints/admin/yl-mem-region"
+  max_steps: 30
+  save_trajectories: true
+  save_memories: true
+  valid_interval: 1
+  test_interval: 1
+  val_lambda_max: 0.05
+  file_path: "data/webshop/items_shuffle_indist.json"
+  ood_file_path: "data/webshop/items_shuffle_ood_new.json"
+  split_info_path: "data/webshop/split_info.json"
+  few_shot_path: "data/webshop/webshop_examples.json"
+
+rl_config:
+  epsilon: 0
+  tau: 0.35
+  alpha: 0.3
+  gamma: 0.0
+  q_init_pos: 0
+  q_init_neg: 0
+  success_reward: 1.0
+  failure_reward: -1.0
+  topk: 3
+  novelty_threshold: 0.85
+  recency_boost: 0.0
+  reward_merge_gain: 0.1
+  q_min_threshold: -10
+  sim_threshold: 0.5
+  weight_sim: 0.5
+  weight_q: 0.5

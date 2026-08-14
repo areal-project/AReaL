@@ -1,0 +1,81 @@
+# LLM provider configuration
+llm:
+  provider: "openai"
+  api_key: "sk-REPLACE_ME"
+  base_url: "https://api.openai.com/v1"
+  model: "gemini-3-pro"
+  temperature: 0.6
+  max_tokens: 65536
+
+# Embedding provider configuration  
+embedding:
+  provider: "openai"
+  api_key: "sk-REPLACE_ME"
+  base_url: "https://api.openai.com/v1"
+  model: "text-embedding-3-large"
+  max_text_len: 4096
+
+# Memory system configuration
+memory:
+  # Strategy configuration (main combination from paper)
+  build_strategy: "proceduralization"
+  retrieve_strategy: "query"
+  update_strategy: "adjustment"
+  
+  # Memory parameters
+  k_retrieve: 5
+  max_keywords: 8
+  confidence_threshold: 0.0
+  memory_confidence: 100.0
+  add_similarity_threshold: 0.90 
+  # MemOS configuration
+  mos_config_path: "configs/mos_config_final.json"
+  user_id: "memrl_user"
+  sim_norm_mean: 0.1856827586889267
+  sim_norm_std: 0.09407906234264374
+
+# Environment-specific settings
+environment:
+  # ALFWorld settings
+  alfworld_config_path: "configs/envs/alfworld.yaml"
+  alfworld_env_type: "AlfredTWEnv"
+
+# Experiment configuration
+experiment:
+  random_seed: 42
+  enable_value_driven: true
+  experiment_name: 'hle_memrl'  # Name for Trail.
+  mode: 'train'  # control whether to only test, if set as 'test' won't run on train spilt.
+  num_sections: 10  # Number of sections (re-uses the same training set each section)
+  batch_size: 32  # Number of parallel environments for sampling.
+  dataset_ratio: 1.0  # Proportion of files randomly selected for training (rest used for validation)
+  train_valid_split: 1.0  # Ratio to split training and validation sets
+  ckpt_eval_enabled: false
+  ckpt_eval_path: ""
+  baseline_mode: null   # passk
+  baseline_k: 10
+  # Output settings
+  output_dir: "./results"
+  save_trajectories: true
+  save_memories: true
+  ckpt_resume_enabled: false
+  ckpt_resume_path: ""
+  ckpt_resume_epoch: 0
+
+# RL Configs:
+rl_config:
+  epsilon: 0             # ε-greedy exploration probability
+  tau: 0.25              # unknown detection threshold on similarity
+  alpha: 0.3             # Q-learning step size
+  gamma: 0.0             # discount factor (single-step default)
+  q_init_pos: 0          # optimistic initialization
+  q_init_neg: 0          # negative q init
+  success_reward: 1.0
+  failure_reward: -1.0
+  topk: 3                  # candidate set size for value-aware selection
+  novelty_threshold: 0.85  # similarity to treat as non-novel (merge)
+  recency_boost: 0.0     # optional recency weight
+  reward_merge_gain: 0.1 # gain for attributing success to close memories
+  q_min_threshold: -10
+  weight_sim: 0.5        # weight for similarity in combined score
+  weight_q: 0.5          # weight for Q-value in combined score

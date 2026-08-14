@@ -1,0 +1,47 @@
+# BCB config for DeepSeek-V3 (671B FP8, local SGLang TP=8) — REGION version
+# Aligned with gpt4o reproduce parameters (Table 8) except model/embedding.
+# Key changes vs old config: retrieve_strategy=query, sim_norm=0.31/0.10, tau=0.38
+# Note: tau=0.38 only filters 0.2% on Qwen3-Embedding (sim min=0.35), but we align
+# for consistency. The real effect comes from sim_norm and retrieve_strategy changes.
+
+llm:
+  provider: "openai"
+  api_key: "EMPTY"
+  base_url: "http://localhost:8000/v1/"
+  model: "deepseek-ai/DeepSeek-V3"
+  temperature: 0.0
+  max_tokens: 16384
+
+embedding:
+  provider: "openai"
+  api_key: "EMPTY"
+  base_url: "http://localhost:8001/v1/"
+  model: "Qwen/Qwen3-Embedding-8B"
+  dimension: 4096
+  max_text_len: 8192
+
+memory:
+  build_strategy: "proceduralization"
+  retrieve_strategy: "query"
+  update_strategy: "adjustment"
+  k_retrieve: 10
+  max_keywords: 5
+  add_similarity_threshold: 0.9
+  memory_budget_tokens: 0
+  sim_norm_mean: 0.31
+  sim_norm_std: 0.10
+
+rl_config:
+  alpha: 0.3
+  gamma: 0.0
+  lambda_: 0.5
+  sim_threshold: 0.38
+  tau: 0.38
+  topk: 5
+
+experiment:
+  experiment_name: "bcb_deepseek_v3_local_region_query"
+  output_dir: "/storage/openpsi/experiments/checkpoints/admin/yl-mem-region/bigcodebench"
+  batch_size: 8
+  enable_value_driven: true
+  bcb_run_validation: true

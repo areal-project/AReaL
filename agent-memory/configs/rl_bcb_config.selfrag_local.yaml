@@ -1,0 +1,53 @@
+# BCB Self-RAG baseline: RAG + LLM critique to filter irrelevant memories
+# Stores raw trajectories, retrieves by sim, then uses LLM to judge relevance
+# before injecting into prompt. Reference: Asai et al. 2023; MemRL paper Appendix D.1
+# Run with: --self_rag flag
+
+llm:
+  provider: "openai"
+  api_key: "EMPTY"
+  base_url: "http://localhost:8000/v1/"
+  model: "deepseek-ai/DeepSeek-V3"
+  temperature: 0.0
+  # 8192 (not 16384): self-RAG injects candidate memories + critique prompt into
+  # the input (~18k tokens); with 16384 completion that exceeds SGLang's 32768
+  # context (18578+16384=34962), stalling E1. 8192 keeps input+output < 32768.
+  max_tokens: 8192
+
+embedding:
+  provider: "openai"
+  api_key: "EMPTY"
+  base_url: "http://localhost:8001/v1/"
+  model: "Qwen/Qwen3-Embedding-8B"
+  dimension: 4096
+  max_text_len: 8192
+
+memory:
+  build_strategy: "trajectory"
+  retrieve_strategy: "avefact"
+  update_strategy: "adjustment"
+  k_retrieve: 5
+  max_keywords: 5
+  add_similarity_threshold: 0.9
+  memory_budget_tokens: 0
+  sim_norm_mean: 0.1856827586889267
+  sim_norm_std: 0.09407906234264374
+
+rl_config:
+  alpha: 0.3
+  gamma: 0.0
+  lambda_: 0.5
+  sim_threshold: 0.0
+  tau: 0.0
+  topk: 5
+  weight_sim: 1.0
+  weight_q: 0.0
+
+experiment:
+  experiment_name: "bcb_selfrag_local"
+  output_dir: "/storage/openpsi/experiments/checkpoints/admin/yl-mem-region/bigcodebench"
+  batch_size: 8
+  enable_value_driven: false
+  bcb_run_validation: true
+  self_rag: true
+  self_rag_inject_top_k: 5

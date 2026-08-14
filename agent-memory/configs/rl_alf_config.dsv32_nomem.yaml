@@ -1,0 +1,72 @@
+# ALFWorld no-mem baseline — DeepSeek-V3.2 (local SGLang, thinking).
+# Companion to rl_alf_config.dsv32_memrl.yaml. No memory: k_retrieve=0,
+# enable_value_driven=false, num_sections=1 (single pass, no accumulation).
+llm:
+  provider: "openai"
+  api_key: "EMPTY"
+  base_url: "http://localhost:30000/v1/"
+  model: "deepseek/deepseek-v3.2"
+  temperature: 1.0
+  max_tokens: 8192
+
+embedding:
+  provider: "openai"
+  api_key: "sk-43dd5f664179406d92fec42a9364f8a5"
+  base_url: "https://matrixllm.alipay.com/v1/"
+  api_version: null
+  model: "text-embedding-3-large"
+  max_text_len: 4096
+  dimension: 3072
+
+memory:
+  build_strategy: "proceduralization"
+  retrieve_strategy: "query"
+  update_strategy: "adjustment"
+  k_retrieve: 0
+  max_keywords: 8
+  add_similarity_threshold: 0.90
+  memory_budget_tokens: 0
+  sim_norm_mean: 0.5187
+  sim_norm_std: 0.1203
+
+environment:
+  alfworld_config_path: "configs/envs/alfworld.yaml"
+  alfworld_env_type: "AlfredTWEnv"
+
+experiment:
+  random_seed: 42
+  enable_value_driven: false
+  experiment_name: "alfworld_nomem_dsv32"
+  mode: "train"
+  num_sections: 1
+  batch_size: 32
+  dataset_ratio: 1.0
+  few_shot_path: "data/alfworld/alfworld_examples.json"
+  baseline_mode: null
+  baseline_k: 10
+  output_dir: "/storage/openpsi/experiments/checkpoints/admin/yl-mem-region/alfworld"
+  max_steps: 30
+  save_trajectories: false
+  save_memories: false
+  ckpt_eval_enabled: false
+  ckpt_eval_path: ""
+  ckpt_resume_enabled: false
+  ckpt_resume_path: ""
+  ckpt_resume_epoch: null
+
+rl_config:
+  epsilon: 0
+  tau: 0.62
+  alpha: 0.3
+  gamma: 0.0
+  q_init_pos: 0
+  q_init_neg: 0
+  success_reward: 1.0
+  failure_reward: -1.0
+  topk: 3
+  novelty_threshold: 0.85
+  recency_boost: 0.0
+  reward_merge_gain: 0.1
+  q_min_threshold: -10
+  weight_sim: 0.5
+  weight_q: 0.5

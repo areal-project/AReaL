@@ -1,0 +1,56 @@
+name: "🐛 Report Bad Test Inputs"
+description: Report to us that certain test inputs should be removed.
+title: "🐛 [TestRemoval/TestRepair] - <TASK_ID> <WHY>"
+labels: ["bug"]
+body:
+  - type: input
+    id: version
+    attributes:
+      label: "EvalPlus version"
+      description: What is the version of EvalPlus? You can find it by running `pip show bigcodebench`.
+      placeholder: For example, 0.1.0
+    validations:
+      required: true
+  - type: input
+    id: cache
+    attributes:
+      label: "Output of running `ls ~/.cache/bigcodebench`"
+    validations:
+      required: true
+  - type: input
+    id: task_id
+    attributes:
+      label: "Task ID of the programming task"
+      placeholder: BigCodeBench/[??]
+    validations:
+      required: true
+  - type: textarea
+    id: original
+    attributes:
+      label: "The original test"
+      description: You can run `python -c "from bigcodebench.data import get_bigcodebench print(get_bigcodebench['BigCodeBench/❓']['test'])"`
+      render: python
+    validations:
+      required: true
+  - type: textarea
+    id: new
+    attributes:
+      label: "Your proposed new test"
+      render: python
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: "Description"
+      description: An explicit description of why you think this test should be removed
+      placeholder: Here is a correct solution but it is incorrectly falsified by the test because ...
+    validations:
+      required: true
+  - type: textarea
+    id: other
+    attributes:
+      label: "Other context"
+      description: (Optional) Anything else the maintainer should notice?
+    validations:
+      required: false

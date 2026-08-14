@@ -1,0 +1,57 @@
+# HLE cross-benchmark eval config
+# Uses BCB-trained memory checkpoint, evaluates on HLE
+# DeepSeek-R1-32B + Qwen3-Embedding-8B (local vLLM)
+
+llm:
+  provider: "openai"
+  api_key: "EMPTY"
+  base_url: "http://localhost:8000/v1/"
+  model: "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B"
+  temperature: 0.6
+  max_tokens: 16384
+
+embedding:
+  provider: "openai"
+  api_key: "EMPTY"
+  base_url: "http://localhost:8001/v1/"
+  model: "Qwen/Qwen3-Embedding-8B"
+  max_text_len: 8196
+
+memory:
+  build_strategy: "proceduralization"
+  retrieve_strategy: "avefact"
+  update_strategy: "adjustment"
+  k_retrieve: 5
+  max_keywords: 5
+  add_similarity_threshold: 0.9
+  memory_budget_tokens: 0
+  sim_norm_mean: 0.1856827586889267
+  sim_norm_std: 0.09407906234264374
+  # Cross-benchmark: load BCB memory checkpoint
+  load_from_checkpoint: true
+  checkpoint_path: ""  # Set via sed in sbatch script
+
+rl_config:
+  alpha: 0.3
+  gamma: 0.0
+  lambda_: 0.5
+  sim_threshold: 0.18
+  tau: 0.18
+  topk: 5
+  weight_sim: 0.5
+  weight_q: 0.5
+  success_reward: 1.0
+  failure_reward: -1.0
+
+experiment:
+  experiment_name: "hle_cross_bcb_memory"
+  output_dir: "./results"
+  batch_size: 1
+  enable_value_driven: true
+  mode: "test"
+  num_sections: 1
+  train_valid_split: 1.0
+  dataset_ratio: 1.0
+  random_seed: 42
+  baseline_mode: null
+  baseline_k: 0

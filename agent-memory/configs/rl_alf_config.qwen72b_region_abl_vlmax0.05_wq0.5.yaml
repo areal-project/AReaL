@@ -1,0 +1,86 @@
+# ALFWorld region ablation: eval-only on region 928122 S7 snapshot.
+# Tests (val_lambda_max, weight_q) grid to release the ~35pp region signal lift.
+#
+# Background: 928122 (region s10 soft-explore) at S6 shows:
+#   - 43 regions, mean spread 0.54, cross-subtask corr +0.02 (strong structure)
+#   - Per-subtask best vs 2nd raw SR gap 0.04-0.11 (real signal)
+#   - Oracle lift ~+35pp if each subtask retrieves from best region
+#   - But actual valid_unseen 51.49% vs baseline 57.46% (-5.97pp)
+#
+# Hypothesis (Codex review): z-norm + 0.5/0.5 hybrid + λ_max=0.15 with k=3
+#   confidence gating dilutes region signal too much.
+#
+# This is the BASE config; the sbatch sweeps val_lambda_max via CLI and
+# weight_q via 4 separate config copies. Resume from 928122 S7 snapshot.
+
+llm:
+  provider: "openai"
+  api_key: "EMPTY"
+  base_url: "http://localhost:8000/v1/"
+  model: "Qwen2.5-72B-Instruct"
+  temperature: 0
+  max_tokens: 4096
+
+embedding:
+  provider: "openai"
+  api_key: "EMPTY"
+  base_url: "http://localhost:8001/v1/"
+  model: "Qwen/Qwen3-Embedding-8B"
+  max_text_len: 8196
+
+memory:
+  build_strategy: "proceduralization"
+  retrieve_strategy: "query"
+  update_strategy: "adjustment"
+  k_retrieve: 5
+  max_keywords: 5
+  add_similarity_threshold: 0.9
+  memory_budget_tokens: 0
+  sim_norm_mean: 0.5187
+  sim_norm_std: 0.1203
+
+environment:
+  alfworld_config_path: "configs/envs/alfworld.yaml"
+  alfworld_env_type: "AlfredTWEnv"
+
+experiment:
+  random_seed: 42
+  enable_value_driven: true
+  experiment_name: "alfworld_region_abl_vlmax0.05_wq0.5"  # overridden per-config
+  mode: "test"
+  num_sections: 1
+  batch_size: 32
+  dataset_ratio: 1.0
+  few_shot_path: "data/alfworld/alfworld_examples.json"
+  baseline_mode: null
+  baseline_k: 10
+  output_dir: "/storage/openpsi/experiments/checkpoints/admin/yl-mem-region"
+  max_steps: 30
+  save_trajectories: true
+  save_memories: false
+  bon: 0
+  valid_interval: 2
+  test_interval: 2
+  # Resume from 928122 S7 snapshot (best region state, cum 66.14%).
+  ckpt_resume_enabled: true
+  ckpt_resume_path: "/storage/openpsi/experiments/checkpoints/admin/yl-mem-region/alfworld/exp_alfworld_region_qwen72b_10section_softexplore_20260603-220645/local_cache"
+  ckpt_resume_epoch: 7
+
+# weight_q is the critical knob: q_z contribution in final score = sim_z * w_sim + q_z * w_q.
+# Default 0.5/0.5 split — raising w_q lets region signal (via shrinkage_q → q_z) take more weight.
+rl_config:
+  epsilon: 0
+  tau: 0.62
+  alpha: 0.3
+  gamma: 0.0
+  q_init_pos: 0
+  q_init_neg: 0
+  success_reward: 1.0
+  failure_reward: -1.0
+  topk: 3
+  novelty_threshold: 0.85
+  recency_boost: 0.0
+  reward_merge_gain: 0.1
+  q_min_threshold: -10
+  weight_sim: 0.5
+  weight_q: 0.5

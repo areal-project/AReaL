@@ -1,0 +1,54 @@
+name: "🤗 Model Evaluation Request"
+description: Request BigCodeBench maintainers to evaluate your model independently and update it on our leaderboard.
+title: "🤗 [REQUEST] - <MODEL_NAME>"
+labels: ["model eval"]
+body:
+  - type: textarea
+    id: about
+    attributes:
+      label: "Model introduction"
+      description: Provide a brief introduction to the model.
+      placeholder: The models is created by ... and is used for ...
+    validations:
+      required: true
+  - type: input
+    id: url
+    attributes:
+      label: "Model URL"
+      description: Indicate the URL (e.g., huggingface or other release pages) of the model
+      placeholder: https://huggingface.co/[???]/[???]
+    validations:
+      required: true
+  - type: textarea
+    id: other
+    attributes:
+      label: "Additional instructions (Optional)"
+      description: Special steps indicating how to run the model with preferably scripts/codes.
+      placeholder: What data type precision should be used? What is the minimal hardware requirement? Can it be accelerated by tools such as vLLM?
+    validations:
+      required: false
+  - type: dropdown
+    id: author
+    attributes:
+      label: "Author"
+      description: "Are you (one of) the author(s) of the model?"
+      multiple: false
+      options:
+        - "Yes"
+        - "No"
+    validations:
+      required: true
+  - type: checkboxes
+    id: security
+    attributes:
+      label: "Security"
+      options:
+        - label: "I confirm that the model is safe to run which does not contain any malicious code or content."
+          required: true
+  - type: checkboxes
+    id: integrity
+    attributes:
+      label: "Integrity"
+      options:
+        - label: "I confirm that the model comes from unique and original work and does not contain any plagiarism."
+          required: true

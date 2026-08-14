@@ -1,0 +1,17 @@
+__pycache__
+.idea
+.vscode
+/prompts
+/data
+/debug
+.run
+/outputs
+/temp
+/chat_history_items
+*.out
+*.output
+*.log
+*.png
+*.pdf
+*.docx
+*.doc

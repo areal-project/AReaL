@@ -1,0 +1,80 @@
+# ALFWorld region config for Qwen2.5-72B-Instruct, FULL 10-section run.
+# Tuned explore_schedule for ALFWorld:
+#   - Original "0,4,4,3,3,2,2,1,1,0" was tuned for BCB and aggressive at S2 (80% replacement).
+#     927942 result: S2 cum 52.24% (-4.30pp vs baseline) but valid_seen +0.72pp.
+#     Diagnosis: explore=4/5 at S2 over-perturbs retrieval during the only training
+#     window of the 2-section short run. For 10-section, we have more headroom.
+#   - New: "0,2,2,1,1,1,1,0,0,0" — S2/S3 quota=40%, S4-S7 quota=20%, S8+ pure exploit.
+#     Goal: maintain region utility calibration without crashing per-section train SR.
+#
+# 10-section full run reaches paper budget. Pair with baseline 928012 phase 2 (also s10).
+#
+# val_lambda_max=0.05 chosen from 929089 ablation: vlmax=0.05 gave +4.48pp OOD lift
+# vs current default 0.15 (52.99% vs 48.51% on 928122 S7 snapshot eval).
+
+llm:
+  provider: "openai"
+  api_key: "EMPTY"
+  base_url: "http://localhost:8000/v1/"
+  model: "Qwen2.5-72B-Instruct"
+  temperature: 0
+  max_tokens: 4096
+
+embedding:
+  provider: "openai"
+  api_key: "EMPTY"
+  base_url: "http://localhost:8001/v1/"
+  model: "Qwen/Qwen3-Embedding-8B"
+  max_text_len: 8196
+
+memory:
+  build_strategy: "proceduralization"
+  retrieve_strategy: "query"
+  update_strategy: "adjustment"
+  k_retrieve: 5
+  max_keywords: 5
+  add_similarity_threshold: 0.9
+  memory_budget_tokens: 0
+  sim_norm_mean: 0.5187
+  sim_norm_std: 0.1203
+
+environment:
+  alfworld_config_path: "configs/envs/alfworld.yaml"
+  alfworld_env_type: "AlfredTWEnv"
+
+experiment:
+  random_seed: 42
+  enable_value_driven: true
+  experiment_name: "alfworld_region_qwen72b_10section_softexplore_vlmax005"
+  mode: "train"
+  num_sections: 10
+  batch_size: 32
+  dataset_ratio: 1.0
+  few_shot_path: "data/alfworld/alfworld_examples.json"
+  baseline_mode: null
+  baseline_k: 10
+  output_dir: "/storage/openpsi/experiments/checkpoints/admin/yl-mem-region"
+  max_steps: 30
+  save_trajectories: true
+  save_memories: true
+  bon: 0
+  valid_interval: 2
+  test_interval: 2
+  val_lambda_max: 0.05
+
+rl_config:
+  epsilon: 0
+  tau: 0.62
+  alpha: 0.3
+  gamma: 0.0
+  q_init_pos: 0
+  q_init_neg: 0
+  success_reward: 1.0
+  failure_reward: -1.0
+  topk: 3
+  novelty_threshold: 0.85
+  recency_boost: 0.0
+  reward_merge_gain: 0.1
+  q_min_threshold: -10
+  weight_sim: 0.5
+  weight_q: 0.5

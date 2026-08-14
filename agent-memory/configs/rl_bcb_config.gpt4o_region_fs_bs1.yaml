@@ -1,0 +1,46 @@
+# BCB Region+FS config using REPRODUCE baseline parameters (Table 8).
+# Model: gpt-4o-2024-11-20 via MatrixLLM + text-embedding-3-large (both API).
+# Uses same tau/sim_norm as reproduce experiments for fair comparison.
+# batch_size=1 to match memfix/compact baselines.
+
+llm:
+  provider: "openai"
+  api_key: "sk-43dd5f664179406d92fec42a9364f8a5"
+  base_url: "https://matrixllm.alipay.com/v1/"
+  model: "gpt-4o-2024-11-20"
+  temperature: 0.0
+  max_tokens: 16384
+
+embedding:
+  provider: "openai"
+  api_key: "sk-43dd5f664179406d92fec42a9364f8a5"
+  base_url: "https://matrixllm.alipay.com/v1/"
+  model: "text-embedding-3-large"
+  dimension: 3072
+  max_text_len: 8196
+
+memory:
+  build_strategy: "proceduralization"
+  retrieve_strategy: "avefact"
+  update_strategy: "adjustment"
+  k_retrieve: 10
+  max_keywords: 5
+  add_similarity_threshold: 0.9
+  memory_budget_tokens: 0
+  sim_norm_mean: 0.31
+  sim_norm_std: 0.10
+
+rl_config:
+  alpha: 0.3
+  gamma: 0.0
+  lambda_: 0.5
+  sim_threshold: 0.38
+  tau: 0.38
+  topk: 5
+
+experiment:
+  experiment_name: "bcb_gpt4o_region_fs_bs1"
+  output_dir: "/storage/openpsi/experiments/checkpoints/admin/yl-mem-region/bigcodebench"
+  batch_size: 1
+  enable_value_driven: true
+  bcb_run_validation: true

@@ -1,0 +1,107 @@
+[project]
+name = "memrl"
+version = "0.1.0"
+description = "MemRL: Self-evolving agents via runtime reinforcement learning on episodic memory"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+authors = [
+    {name = "Memp Team", email = "team@memp.dev"}
+]
+keywords = [
+    "memory",
+    "agent",
+    "procedural-memory",
+    "memrl",
+    "ai",
+    "llm"
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+dependencies = [
+    "MemoryOS==1.0.0",
+    "openai>=1.0.0",
+    "pandas>=2.0.0",
+    "pyyaml>=6.0",
+    "click>=8.0",
+    "pydantic>=2.0",
+    "numpy>=1.24.0",
+    "tenacity>=8.0.0",
+    # Benchmark-specific dependencies are installed via `requirements.txt`
+    # (see `requirements/benchmarks.txt`) to keep the core package lightweight.
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    "pytest-asyncio>=0.21.0",
+    "black>=23.0",
+    "ruff>=0.1.0",
+    "mypy>=1.0",
+    "pre-commit>=3.0.0",
+]
+
+[project.scripts]
+memrl = "memrl.cli.main:cli"
+
+[project.urls]
+Homepage = "https://github.com/MemTensor/MemRL"
+Repository = "https://github.com/MemTensor/MemRL.git"
+Documentation = "https://github.com/MemTensor/MemRL"
+"Bug Tracker" = "https://github.com/MemTensor/MemRL/issues"
+
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["memrl*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = [
+    "--cov=memrl",
+    "--cov-report=term-missing",
+    "--cov-report=html",
+    "-v"
+]
+
+[tool.ruff]
+target-version = "py39"
+line-length = 88
+select = [
+    "E",  # pycodestyle errors
+    "W",  # pycodestyle warnings
+    "F",  # pyflakes
+    "I",  # isort
+    "C",  # flake8-comprehensions
+    "B",  # flake8-bugbear
+]
+ignore = [
+    "E501",  # line too long, handled by black
+]
+
+[tool.ruff.per-file-ignores]
+"__init__.py" = ["F401"]
+
+[tool.black]
+line-length = 88
+target-version = ['py39']
+
+[tool.mypy]
+python_version = "3.9"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true

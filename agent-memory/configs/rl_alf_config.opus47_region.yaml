@@ -1,0 +1,79 @@
+# ALFWorld MemRL — gpt-5-mini via matrixllm gateway.
+# Goal: reproduce paper Table SR (~94.9% on train set, in-distribution, full curve).
+# Paper hyperparams: alpha=0.3, weight_q/sim=0.5, tau=0.62, k_retrieve=5, topk=3,
+# q_init=0, max_steps=30 — all matched below.
+# gpt-5-mini is a reasoning model: OpenAILLM auto-uses max_completion_tokens and
+# omits temperature/top_p (see memrl/providers/llm.py _is_reasoning_model).
+llm:
+  provider: "openai"
+  api_key: "sk-43dd5f664179406d92fec42a9364f8a5"
+  base_url: "https://matrixllm.alipay.com/v1/"
+  api_version: null
+  model: "claude-opus-4-7"
+  temperature: 0.0          # ignored for reasoning models; kept for schema
+  max_tokens: 4096          # mapped to max_completion_tokens by provider
+
+embedding:
+  provider: "openai"
+  api_key: "sk-43dd5f664179406d92fec42a9364f8a5"
+  base_url: "https://matrixllm.alipay.com/v1/"
+  api_version: null
+  model: "text-embedding-3-large"
+  max_text_len: 4096
+  dimension: 3072           # text-embedding-3-large output dim (vector_dimension guard)
+
+memory:
+  build_strategy: "proceduralization"
+  retrieve_strategy: "query"
+  update_strategy: "adjustment"
+  k_retrieve: 5
+  max_keywords: 8
+  confidence_threshold: 0.0
+  memory_confidence: 100.0
+  add_similarity_threshold: 0.90
+  mos_config_path: "configs/mos_config_final.json"
+  user_id: "alf_region_opus47_v1"
+  sim_norm_mean: 0.5187
+  sim_norm_std: 0.1203
+
+environment:
+  alfworld_config_path: "configs/envs/alfworld.yaml"
+  alfworld_env_type: "AlfredTWEnv"
+
+experiment:
+  random_seed: 42
+  enable_value_driven: true
+  experiment_name: "alfworld_region_opus47"
+  mode: "train"
+  num_sections: 10
+  batch_size: 32
+  dataset_ratio: 1.0
+  few_shot_path: "data/alfworld/alfworld_examples.json"
+  baseline_mode: null
+  baseline_k: 10
+  output_dir: "/storage/openpsi/experiments/checkpoints/admin/yl-mem-region/alfworld"
+  max_steps: 30
+  save_trajectories: true
+  save_memories: true
+  ckpt_eval_enabled: false
+  ckpt_eval_path: ""
+  ckpt_resume_enabled: true
+  ckpt_resume_path: "/storage/openpsi/experiments/checkpoints/admin/yl-mem-region/alfworld/alfworld/exp_alfworld_region_opus47_20260623-100806/local_cache/snapshot"
+  ckpt_resume_epoch: null
+
+rl_config:
+  epsilon: 0
+  tau: 0.62
+  alpha: 0.3
+  gamma: 0.0
+  q_init_pos: 0
+  q_init_neg: 0
+  success_reward: 1.0
+  failure_reward: -1.0
+  topk: 3
+  novelty_threshold: 0.85
+  recency_boost: 0.0
+  reward_merge_gain: 0.1
+  q_min_threshold: -10
+  weight_sim: 0.5
+  weight_q: 0.5

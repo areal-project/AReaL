@@ -1,0 +1,90 @@
+# Pilot Experiment: Frozen HLE Eval with BCB Memory Pool
+# Purpose: Evaluate BCB-trained memories on HLE tasks without updating Q values
+# This generates cross-domain utility data for the pilot analysis
+# Models: DeepSeek-R1-Distill-Qwen-32B + Qwen3-Embedding-8B (same as BCB training)
+
+llm:
+  provider: "openai"
+  api_key: "EMPTY"
+  base_url: "http://localhost:8000/v1/"
+  model: "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B"
+  temperature: 0.0
+  max_tokens: 16384
+
+embedding:
+  provider: "openai"
+  api_key: "EMPTY"
+  base_url: "http://localhost:8001/v1/"
+  model: "Qwen/Qwen3-Embedding-8B"
+  max_text_len: 8196
+
+memory:
+  # Load BCB checkpoint (frozen - no updates)
+  load_from_checkpoint: true
+  checkpoint_path: "/storage/openpsi/users/yl/agent-memory/MemRL/results/deepseek_region_local_embed_b32/bigcodebench_eval/instruct_full/region/20260509_212923_deepseek-ai_DeepSeek-R1-Distill-Qwen-32B_region/epoch10/snapshot/10"
+
+  # HLE-specific normalization parameters
+  sim_norm_mean: 0.1856827586889267
+  sim_norm_std: 0.09407906234264374
+
+  # Memory retrieval settings
+  build_strategy: "proceduralization"
+  retrieve_strategy: "query"
+  update_strategy: "adjustment"
+  k_retrieve: 5
+  max_keywords: 8
+  confidence_threshold: 0.0
+  memory_confidence: 100.0
+  add_similarity_threshold: 0.90
+  mos_config_path: "configs/mos_config_final.json"
+  user_id: "pilot_hle_frozen_user"
+
+environment:
+  alfworld_config_path: "configs/envs/alfworld.yaml"
+  alfworld_env_type: "AlfredTWEnv"
+
+experiment:
+  random_seed: 42
+  enable_value_driven: true
+  experiment_name: "pilot_hle_frozen_eval"
+  mode: "test"  # FROZEN MODE - no training, no memory updates
+  num_sections: 1
+  batch_size: 2
+  dataset_ratio: 0.2  # Use 20% of HLE for pilot (faster)
+  train_valid_split: 1.0
+  ckpt_eval_enabled: false
+  ckpt_eval_path: ""
+  baseline_mode: null
+  baseline_k: 10
+  output_dir: "./results/pilot_hle_frozen"
+  save_trajectories: true
+  save_memories: false  # Don't save memories in frozen mode
+  ckpt_resume_enabled: false
+  ckpt_resume_path: ""
+  ckpt_resume_epoch: 0
+  ckpt_save_every_n_batches: 999999  # No checkpoints in test mode
+  ckpt_max_keep: 0
+
+rl_config:
+  epsilon: 0.0  # No exploration in frozen eval
+  tau: 0.25
+  alpha: 0.3
+  gamma: 0.0
+  q_init_pos: 0
+  q_init_neg: 0
+  success_reward: 1.0
+  failure_reward: -1.0
+  topk: 3
+  novelty_threshold: 0.85
+  recency_boost: 0.0
+  reward_merge_gain: 0.1
+  q_min_threshold: -10
+  weight_sim: 0.5
+  weight_q: 0.5
+
+# HLE-specific settings
+hle_selection:
+  categories: null  # Use all categories
+  eval_categories: null
+  category_ratio: null
+  max_samples_per_category: null

@@ -1,0 +1,98 @@
+# LLB DB Bench - Region+FS (Our Method)
+# MemRL + region clustering + failure summary injection
+# Same as MemRL config but run with: --region --region_gating_mode additive --failure_summary_n_slots 2 --no_z_norm
+
+llm:
+  provider: "openai"
+  api_key: "sk-43dd5f664179406d92fec42a9364f8a5"
+  base_url: "https://matrixllm.alipay.com/v1/"
+  api_version: null
+  model: "gpt-4.1-mini-2025-04-14"
+  temperature: 0.0
+  max_tokens: 10240
+
+embedding:
+  provider: "openai"
+  api_key: "sk-43dd5f664179406d92fec42a9364f8a5"
+  base_url: "https://matrixllm.alipay.com/v1/"
+  api_version: null
+  model: "text-embedding-3-large"
+  dimension: 3072
+  max_text_len: 8196
+
+memory:
+  build_strategy: "proceduralization"
+  retrieve_strategy: "query"
+  update_strategy: "adjustment"
+  k_retrieve: 10               # Same as MemRL: k1=10 (Phase-A recall)
+  max_keywords: 8
+  confidence_threshold: 0.0
+  memory_confidence: 100.0
+  add_similarity_threshold: 0.99
+  mos_config_path: "configs/mos_config.json"
+  user_id: "llb_db_region_fs_user"
+  sim_norm_mean: 0.2747681439
+  sim_norm_std: 0.1127030626
+
+environment:
+  alfworld_config_path: "configs/base_config.yaml"
+  alfworld_env_type: "AlfredTWEnv"
+
+experiment:
+  experiment_name: "llb_db_region_fs_gpt41mini"
+  trace_jsonl_path: null
+  trace_sample_filter: null
+  llb_use_z_score_normalization: true
+  llb_q_floor: 0.0
+  llb_dedup_by_task_id: false
+  algorithm: "rl"
+  val_before_train: false
+  enable_value_driven: true    # Q-value driven (same as MemRL)
+  random_seed: 42
+  mode: "train"
+  task: "db"
+  split_file: "data/llb/db_train.json"
+  valid_file: "data/llb/db_val.json"
+  num_sections: 10
+  batch_size: 5
+  max_steps: 15
+  valid_interval: 1
+  ckpt_save_every_n_batches: 10
+  ckpt_max_keep: 3
+  test_interval: 1
+  dataset_ratio: 1.0
+  few_shot_path: "data/alfworld/alfworld_examples.json"
+  bon: 0
+  hle_categories: null
+  hle_category_ratio: null
+  ckpt_eval_enabled: false
+  ckpt_eval_path: null
+  ckpt_resume_enabled: false
+  ckpt_resume_path: null
+  ckpt_resume_epoch: null
+  baseline_mode: null
+  baseline_k: 10
+  output_dir: "/storage/openpsi/experiments/checkpoints/admin/yl-mem-region/llb"
+  save_trajectories: true
+  save_memories: true
+  enable_logging: true
+  log_level: "INFO"
+
+rl_config:
+  epsilon: 0.01
+  tau: 0.35
+  alpha: 0.3                   # Paper: α=0.3
+  gamma: 0.0
+  q_init_pos: 0.0
+  q_init_neg: 0.0
+  q_floor: null
+  success_reward: 1.0
+  failure_reward: 0.0
+  sim_threshold: 0.369         # Paper: δ≈0.37 for DB
+  topk: 5                      # Paper: k2=5
+  novelty_threshold: 0.85
+  recency_boost: 0.0
+  reward_merge_gain: 0.1
+  q_min_threshold: -0.8
+  weight_sim: 0.5              # Paper: λ=0.5
+  weight_q: 0.5

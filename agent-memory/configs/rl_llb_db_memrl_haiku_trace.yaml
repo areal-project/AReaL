@@ -1,0 +1,103 @@
+# Trace debug config for LLB DB MemRL (claude-haiku-4-5)
+# Purpose: small run with JSONL tracing to verify Q-values actually
+# influence retrieval ranking during eval. Derived from *_clean.yaml.
+
+llm:
+  provider: "openai"
+  api_key: "sk-43dd5f664179406d92fec42a9364f8a5"
+  base_url: "https://matrixllm.alipay.com/v1/"
+  api_version: null
+  model: "claude-haiku-4-5-20251016"
+  temperature: 0.0
+  max_tokens: 10240
+
+embedding:
+  provider: "openai"
+  api_key: "sk-43dd5f664179406d92fec42a9364f8a5"
+  base_url: "https://matrixllm.alipay.com/v1/"
+  api_version: null
+  model: "text-embedding-3-large"
+  dimension: 3072
+  max_text_len: 8196
+
+memory:
+  build_strategy: "proceduralization"
+  retrieve_strategy: "query"
+  update_strategy: "adjustment"
+  k_retrieve: 10
+  max_keywords: 8
+  confidence_threshold: 0.0
+  memory_confidence: 100.0
+  add_similarity_threshold: 0.99
+  mos_config_path: "configs/mos_config.json"
+  user_id: "llb_db_memrl_haiku_trace_user"
+  load_from_checkpoint: false
+  checkpoint_path: ""
+  sim_norm_mean: 0.2747681439
+  sim_norm_std: 0.1127030626
+
+environment:
+  alfworld_config_path: "configs/base_config.yaml"
+  alfworld_env_type: "AlfredTWEnv"
+
+experiment:
+  experiment_name: "llb_db_memrl_haiku_trace"
+  # Trace every sample's retrieval (q_estimate/similarity/score/selected).
+  trace_jsonl_path: "logs/trace/llb_db_trace.jsonl"
+  trace_sample_filter: null
+  llb_use_z_score_normalization: true
+  llb_q_floor: 0.0
+  llb_dedup_by_task_id: false
+  algorithm: "rl"
+  val_before_train: false
+  enable_value_driven: true
+  random_seed: 42
+  mode: "train"
+  task: "db"
+  split_file: "data/llb/db_train.json"
+  valid_file: "data/llb/db_val.json"
+  # Small & fast: ~29 train samples, 3 epochs so Q accumulates across sections.
+  num_sections: 3
+  batch_size: 5
+  max_steps: 15
+  # Eval only after the final section to keep the run short, but with trace on.
+  valid_interval: 3
+  test_interval: 3
+  eval_runs: 1
+  eval_temperature: 0.0
+  dataset_ratio: 0.08
+  few_shot_path: "data/alfworld/alfworld_examples.json"
+  bon: 0
+  hle_categories: null
+  hle_category_ratio: null
+  ckpt_eval_enabled: false
+  ckpt_eval_path: null
+  ckpt_resume_enabled: false
+  ckpt_resume_path: null
+  ckpt_resume_epoch: null
+  baseline_mode: null
+  baseline_k: 10
+  output_dir: "/storage/openpsi/experiments/checkpoints/admin/yl-mem-region/llb_trace"
+  save_trajectories: true
+  save_memories: true
+  enable_logging: true
+  log_level: "INFO"
+
+rl_config:
+  epsilon: 0.01
+  tau: 0.35
+  alpha: 0.3
+  gamma: 0.0
+  q_init_pos: 0.0
+  q_init_neg: 0.0
+  q_floor: null
+  success_reward: 1.0
+  failure_reward: 0.0
+  sim_threshold: 0.369
+  topk: 5
+  novelty_threshold: 0.85
+  recency_boost: 0.0
+  reward_merge_gain: 0.1
+  q_min_threshold: -0.8
+  weight_sim: 0.5
+  weight_q: 0.5

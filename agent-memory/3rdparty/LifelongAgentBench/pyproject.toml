@@ -1,0 +1,21 @@
+[tool.black]
+line-length = 88
+target-version = ["py311"]
+include = '\.pyi?$'  # only format .py and .pyi files
+
+[tool.mypy]
+python_version = 3.11
+explicit_package_bases = true
+install_types = true
+no_implicit_reexport = false
+strict=true
+exclude = [
+    "^(?!src/).*",
+    "src/main.py",
+    "src/tasks/instance/web_shopping",  # The task is not finished yet
+]
+plugins = ['pydantic.mypy']
+[tool.pydantic-mypy]
+init_forbid_extra = true
+init_typed = true
+warn_required_dynamic_aliases = true

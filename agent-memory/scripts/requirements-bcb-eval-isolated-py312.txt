@@ -1,0 +1,4 @@
+# Evaluator-only overrides. Install with --no-deps: all transitive packages
+# (including numpy==1.26.4) come from the validated persistent BCB cache.
+protobuf==4.25.8
+tensorboard==2.17.1

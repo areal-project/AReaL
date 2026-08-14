@@ -1,0 +1,44 @@
+# BCB config for Qwen2.5-32B-Instruct (non-thinking model, BCB memory experiment)
+# Compare with DeepSeek-R1-Distill-Qwen-32B (thinking model) to test whether
+# memory utility is LLM-architecture-dependent.
+
+llm:
+  provider: "openai"
+  api_key: "EMPTY"
+  base_url: "http://localhost:8000/v1/"
+  model: "Qwen/Qwen2.5-32B-Instruct"
+  temperature: 0.0
+  max_tokens: 16384
+
+embedding:
+  provider: "openai"
+  api_key: "EMPTY"
+  base_url: "http://localhost:8001/v1/"
+  model: "Qwen/Qwen3-Embedding-8B"
+  max_text_len: 8196
+
+memory:
+  build_strategy: "proceduralization"
+  retrieve_strategy: "avefact"
+  update_strategy: "adjustment"
+  k_retrieve: 10
+  max_keywords: 5
+  add_similarity_threshold: 0.9
+  memory_budget_tokens: 0
+  sim_norm_mean: 0.1856827586889267
+  sim_norm_std: 0.09407906234264374
+
+rl_config:
+  alpha: 0.3
+  gamma: 0.0
+  lambda_: 0.5
+  sim_threshold: 0.18
+  tau: 0.18
+  topk: 5
+
+experiment:
+  experiment_name: "bcb_qwen25_32b_instruct"
+  output_dir: "/storage/openpsi/experiments/checkpoints/admin/yl-mem-region/bigcodebench"
+  batch_size: 8
+  enable_value_driven: true
+  bcb_run_validation: true

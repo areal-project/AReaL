@@ -1,0 +1,82 @@
+#!/bin/bash
+# Pick-place Region+FS fresh 10-epoch run: stable Cell-A settings, k=5 retained to match MemRL holdout.
+# GPU0 embed; GPU1-2 Region.
+set -euo pipefail
+MEMRL_DIR=/storage/openpsi/users/yl/agent-memory/MemRL
+MODEL=/storage/openpsi/models/Qwen__Qwen2.5-72B-Instruct
+EMBED=/storage/openpsi/models/Qwen3-Embedding-8B
+TAG="${1:-$(date +%Y%m%d_%H%M%S)}"; SAFE="${TAG//_/-}"
+EP="${EMBED_PORT:-22190}"; RP="${REGION_PORT:-22290}"; NCCL_REGION="${NCCL_REGION:-32690}"
+OUT=/storage/openpsi/experiments/checkpoints/admin/yl-mem-region/alfworld_holdout_qwen72b_pickplace_regionfs_stable_aligned_k5_20260810
+LOG="$MEMRL_DIR/logs/alfworld_holdout_pickplace_qwen72b_regionfs_stable_aligned_k5_$TAG"
+WORK_TMP=/storage/openpsi/users/yl/agent-memory/.tmp/q72b_pickplace_stable_aligned_k5_${TAG}_$$
+mkdir -p "$OUT" "$LOG" "$WORK_TMP"; chmod 700 "$WORK_TMP"; exec > >(tee -a "$LOG/driver.log") 2>&1
+export HF_HOME=/storage/openpsi/users/yl/agent-memory/.cache/huggingface HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 PYTHONDONTWRITEBYTECODE=1
+export PYTHONPATH="$MEMRL_DIR:/storage/openpsi/users/yl/agent-memory/.local/lib/python3.12/site-packages:${PYTHONPATH:-}"
+export MEMRL_ALFWORLD_LLM_CONCURRENCY=16 MEMRL_ALFWORLD_DEFERRED_REPAIR_MAX_GAMES=16
+DEPS_SITE="$WORK_TMP/site-packages"
+mkdir -p "$DEPS_SITE"
+PIP_BIN="$(command -v pip || command -v pip3 || true)"
+if [[ -z "$PIP_BIN" ]]; then
+  echo "[ERROR] neither pip nor pip3 is available in the runtime image"
+  exit 1
+fi
+echo "[DEPS] pip=$PIP_BIN; installing hdbscan==0.8.40 into isolated $DEPS_SITE"
+"$PIP_BIN" install --disable-pip-version-check --no-deps --target "$DEPS_SITE" 'hdbscan==0.8.40' -i https://pypi.antfin-inc.com/simple/
+export PYTHONPATH="$DEPS_SITE:$PYTHONPATH"
+cd "$MEMRL_DIR"
+# Reuse the image/shared read-only environment; avoid CPFS writes from pip.
+python3 - <<'PYDEPS'
+import memrl, memos, textworld, alfworld, pandas, tqdm, hdbscan
+from hdbscan import HDBSCAN
+from torch.utils.tensorboard import SummaryWriter
+print('[OK] dependency preflight:', memrl.__file__)
+print('[OK] hdbscan preflight:', hdbscan.__file__, HDBSCAN)
+assert 'site-packages/hdbscan' in hdbscan.__file__, hdbscan.__file__
+PYDEPS
+unset TMPDIR TMP TEMP
+PIDS=()
+cleanup(){ rc=$?; trap - EXIT INT TERM; ((${#PIDS[@]})) && kill "${PIDS[@]}" 2>/dev/null || true; rm -rf -- "$WORK_TMP"; echo "[CLEANUP] exit=$rc $(date -Is)"; exit "$rc"; }; trap cleanup EXIT INT TERM
+CUDA_VISIBLE_DEVICES=0 python3 -m sglang.launch_server --model-path "$EMBED" --served-model-name Qwen/Qwen3-Embedding-8B --host 127.0.0.1 --port $EP --context-length 8192 --trust-remote-code --is-embedding & PIDS+=("$!")
+CUDA_VISIBLE_DEVICES=1,2 python3 -m sglang.launch_server --model-path "$MODEL" --served-model-name Qwen2.5-72B-Instruct --tp 2 --host 127.0.0.1 --port $RP --context-length 32768 --trust-remote-code --nccl-port "$NCCL_REGION" & PIDS+=("$!")
+wait_server(){ n=$1 p=$2; for i in $(seq 1 1800); do curl -fsS http://127.0.0.1:$p/v1/models 2>/dev/null | grep -q model && { echo "[READY] $n ${i}s"; return; }; sleep 1; done; return 1; }
+wait_server embed $EP; wait_server region $RP
+export TMPDIR="$WORK_TMP" TMP="$WORK_TMP" TEMP="$WORK_TMP"
+write_cfg(){ cfg=$1 exp=$2 port=$3 vd=$4; cat > "$cfg" <<EOF
+llm: {provider: openai, api_key: EMPTY, base_url: "http://localhost:${port}/v1/", model: Qwen2.5-72B-Instruct, temperature: 0, max_tokens: 4096}
+embedding: {provider: openai, api_key: EMPTY, base_url: "http://localhost:${EP}/v1/", model: Qwen/Qwen3-Embedding-8B, max_text_len: 8196, dimension: 4096}
+memory: {build_strategy: trajectory, retrieve_strategy: query, update_strategy: adjustment, k_retrieve: 5, max_keywords: 5, add_similarity_threshold: 0.9, memory_budget_tokens: 0, sim_norm_mean: 0.5187, sim_norm_std: 0.1203}
+environment: {alfworld_config_path: configs/envs/alfworld.yaml, alfworld_env_type: AlfredTWEnv}
+experiment:
+  random_seed: 42
+  enable_value_driven: ${vd}
+  experiment_name: ${exp}
+  mode: train
+  num_sections: 10
+  batch_size: 128
+  dataset_ratio: 1.0
+  few_shot_path: data/alfworld/alfworld_examples.json
+  baseline_mode: null
+  output_dir: ${OUT}
+  max_steps: 30
+  save_trajectories: true
+  save_memories: true
+  valid_interval: 1
+  test_interval: 1
+  holdout_subtask: alf/pick_and_place_simple
+  holdout_eval_pools: train,valid
+  ckpt_resume_enabled: false
+  ckpt_resume_path: ""
+  ckpt_resume_epoch: null
+  batch_checkpoint_interval: 10
+  batch_checkpoint_keep: 1
+  n_eval_runs: 1
+rl_config: {epsilon: 0, tau: 0.60, alpha: 0.3, gamma: 0.0, q_init_pos: 0, q_init_neg: 0, success_reward: 1.0, failure_reward: -1.0, topk: 3, novelty_threshold: 0.85, recency_boost: 0.0, reward_merge_gain: 0.1, q_min_threshold: -10, weight_sim: 0.45, weight_q: 0.55}
+EOF
+}
+write_cfg "$WORK_TMP/region.yaml" "alfworld_holdout_pickplace_qwen72b_regionfs_stable_aligned_k5_${TAG}" $RP true
+run_arm(){ label=$1 cfg=$2 extra=$3; export MEMRL_RUN_ID="qwen72b-pickplace-stable-aligned-k5-${label}-${SAFE}"; echo "[ARM] $label run_id=$MEMRL_RUN_ID"; python3 run/run_alfworld.py --config "$cfg" --holdout_subtask alf/pick_and_place_simple --holdout_eval_pools train,valid --skip_initial_eval $extra 2>&1 | tee -a "$LOG/$label.log"; }
+echo "[STABLE-ALIGNED] k=5 total_slots=5 FS_replaces_up_to=1 tau=0.60 ws/wq=0.45/0.55 val_lambda_max=0.45 no_z_norm=true explore=0,1,1,1,0,0,0,0,0,0"
+run_arm region "$WORK_TMP/region.yaml" "--region --region_gating_mode additive --region_utility_mode beta --region_split_evidence_migration_mode soft_source_conserving --region_cluster_init_step 3000 --region_merge_interval 2763 --region_disable_mid_epoch_topology --region_topology_cooldown_sections 1 --shrinkage_confidence_k 2.5 --propagation_eta 0.03 --val_lambda_max 0.45 --no_z_norm --explore_schedule 0,1,1,1,0,0,0,0,0,0 --failure_summary_n_slots 1" & C=$!
+set +e; wait $C; rc=$?; set -e
+echo "[ALL-DONE] region=$rc"; [[ $rc -eq 0 ]]

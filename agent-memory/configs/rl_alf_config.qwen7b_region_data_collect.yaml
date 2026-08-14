@@ -1,0 +1,74 @@
+# ALFWorld Qwen2.5-7B region+FS — 数据收集(1 section,全量 train)
+# 目的:拿到一轮 region+FS 辅助下的 7B 轨迹 → 给后续 GRPO 训练用
+# LLM: 本地 vLLM (1 GPU), Embedding: matrixllm API (不占 GPU)
+llm:
+  provider: "openai"
+  api_key: "EMPTY"
+  base_url: "http://localhost:8100/v1/"
+  model: "Qwen2.5-7B-Instruct"
+  temperature: 0
+  max_tokens: 4096
+
+embedding:
+  provider: "openai"
+  api_key: "EMPTY"
+  base_url: "http://localhost:8177/v1/"
+  model: "Qwen/Qwen3-Embedding-8B"
+  max_text_len: 8196
+  dimension: 4096
+
+memory:
+  build_strategy: "proceduralization"
+  retrieve_strategy: "query"
+  update_strategy: "adjustment"
+  k_retrieve: 5
+  max_keywords: 8
+  confidence_threshold: 0.0
+  memory_confidence: 100.0
+  add_similarity_threshold: 0.90
+  mos_config_path: "configs/mos_config_final.json"
+  user_id: "alf_region_qwen7b_v1"
+  sim_norm_mean: 0.5187
+  sim_norm_std: 0.1203
+
+environment:
+  alfworld_config_path: "configs/envs/alfworld.yaml"
+  alfworld_env_type: "AlfredTWEnv"
+
+experiment:
+  random_seed: 42
+  enable_value_driven: true
+  experiment_name: "alfworld_region_qwen7b_data_collect"
+  mode: "train"
+  num_sections: 1
+  batch_size: 32
+  dataset_ratio: 1.0
+  few_shot_path: "data/alfworld/alfworld_examples.json"
+  baseline_mode: null
+  baseline_k: 10
+  output_dir: "/storage/openpsi/experiments/checkpoints/admin/yl-mem-region/alfworld"
+  max_steps: 30
+  save_trajectories: true
+  save_memories: true
+  ckpt_eval_enabled: false
+  ckpt_eval_path: ""
+  ckpt_resume_enabled: false
+  ckpt_resume_path: ""
+  ckpt_resume_epoch: null
+
+rl_config:
+  epsilon: 0
+  tau: 0.62
+  alpha: 0.3
+  gamma: 0.0
+  q_init_pos: 0
+  q_init_neg: 0
+  success_reward: 1.0
+  failure_reward: -1.0
+  topk: 3
+  novelty_threshold: 0.85
+  recency_boost: 0.0
+  reward_merge_gain: 0.1
+  q_min_threshold: -10
+  weight_sim: 0.5
+  weight_q: 0.5

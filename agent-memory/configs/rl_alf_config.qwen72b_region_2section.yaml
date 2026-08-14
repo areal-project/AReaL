@@ -1,0 +1,81 @@
+# ALFWorld region config for Qwen2.5-72B-Instruct, SHORT 2-section run.
+# Same as rl_alf_config.qwen72b_region.yaml but num_sections=2 for the
+# baseline-vs-region comparison after all the bug fixes (cross-section
+# global_step, OOM batch checkpoint interval, region prior/evidence
+# separation, 12 ALFWorld code review bugs, 4 pass-2 review bugs).
+#
+# 2 sections = ~10h, hits INITIAL cluster + first eval (valid_interval=2).
+# Pair with rl_alf_config.qwen72b_baseline_2section.yaml at submission.
+
+llm:
+  provider: "openai"
+  api_key: "EMPTY"
+  base_url: "http://localhost:8000/v1/"
+  model: "Qwen2.5-72B-Instruct"
+  temperature: 0
+  max_tokens: 4096
+
+embedding:
+  provider: "openai"
+  api_key: "EMPTY"
+  base_url: "http://localhost:8001/v1/"
+  model: "Qwen/Qwen3-Embedding-8B"
+  max_text_len: 8196
+
+memory:
+  build_strategy: "proceduralization"
+  retrieve_strategy: "query"
+  update_strategy: "adjustment"
+  k_retrieve: 5
+  max_keywords: 5
+  add_similarity_threshold: 0.9
+  memory_budget_tokens: 0
+  sim_norm_mean: 0.5187
+  sim_norm_std: 0.1203
+
+environment:
+  alfworld_config_path: "configs/envs/alfworld.yaml"
+  alfworld_env_type: "AlfredTWEnv"
+
+experiment:
+  random_seed: 42
+  enable_value_driven: true
+  experiment_name: "alfworld_region_qwen72b_2section_confgate"
+  mode: "train"
+  num_sections: 2
+  batch_size: 32
+  dataset_ratio: 1.0
+  few_shot_path: "data/alfworld/alfworld_examples.json"
+  baseline_mode: null
+  baseline_k: 10
+  output_dir: "/storage/openpsi/experiments/checkpoints/admin/yl-mem-region"
+  max_steps: 30
+  save_trajectories: true
+  save_memories: true
+  bon: 0
+  valid_interval: 2
+  test_interval: 2
+  # Region tuning aligned with BCB confgate experiment (commit 3c3b76f).
+  # Compared to old region default (eta=0.03, James-Stein shrinkage):
+  #   - shrinkage_confidence_k=3.0 → smoother lambda ramp-up as memory accumulates
+  #   - propagation_eta=0.12 → faster reward propagation to similar memories
+  #   - val_lambda_max=0.15 → eval phase uses region-utility-dominant retrieval
+  # Also overridable via CLI flags --shrinkage_confidence_k --propagation_eta --val_lambda_max
+  val_lambda_max: 0.15
+
+rl_config:
+  epsilon: 0
+  tau: 0.62
+  alpha: 0.3
+  gamma: 0.0
+  q_init_pos: 0
+  q_init_neg: 0
+  success_reward: 1.0
+  failure_reward: -1.0
+  topk: 3
+  novelty_threshold: 0.85
+  recency_boost: 0.0
+  reward_merge_gain: 0.1
+  q_min_threshold: -10
+  weight_sim: 0.5
+  weight_q: 0.5

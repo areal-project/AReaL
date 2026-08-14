@@ -1,0 +1,15 @@
+Bootstrap: localimage
+From: /storage/openpsi/images/areal-dev-vllm-20260429.sif
+
+%post
+    # Upgrade to torch 2.11.0 + vLLM 0.20.2 (fixes DeepSeek-V3.2 DSA kernel bug).
+    # ant internal pip source for speed.
+    export PIP_INDEX_URL=https://artifacts.antgroup-inc.cn/simple/
+    pip install --break-system-packages --no-cache-dir \
+        torch==2.11.0 torchaudio==2.11.0 torchvision==0.26.0
+    pip install --break-system-packages --no-cache-dir vllm==0.20.2
+    python -c "import torch, vllm; print('BUILD_CHECK torch', torch.__version__, 'vllm', vllm.__version__)"
+
+%labels
+    Description vLLM 0.20.2 + torch 2.11.0 for DeepSeek-V3.2 DSA
+    BaseImage areal-dev-vllm-20260429.sif

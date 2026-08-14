@@ -1,0 +1,42 @@
+# BCB (BigCodeBench) config for DeepSeek-R1-Distill-Qwen-32B via local vLLM
+
+llm:
+  provider: "openai"
+  api_key: "EMPTY"
+  base_url: "http://localhost:8000/v1/"
+  model: "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B"
+  temperature: 0.0
+  max_tokens: 32768
+
+embedding:
+  provider: "openai"
+  api_key: "sk-43dd5f664179406d92fec42a9364f8a5"
+  base_url: "https://matrixllm.alipay.com/v1/"
+  model: "text-embedding-3-large"
+  max_text_len: 8196
+
+memory:
+  build_strategy: "trajectory"
+  retrieve_strategy: "avefact"
+  update_strategy: "adjustment"
+  k_retrieve: 10
+  max_keywords: 5
+  add_similarity_threshold: 0.9
+  memory_budget_tokens: 0
+  sim_norm_mean: 0.1856827586889267
+  sim_norm_std: 0.09407906234264374
+
+rl_config:
+  alpha: 0.3
+  gamma: 0.0
+  lambda_: 0.5
+  sim_threshold: 0.38
+  tau: 0.38
+  topk: 5
+
+experiment:
+  experiment_name: "bcb_deepseek_r1_32b"
+  output_dir: "/storage/openpsi/experiments/checkpoints/admin/yl-mem-region/bigcodebench"
+  batch_size: 4
+  enable_value_driven: true
+  bcb_run_validation: true

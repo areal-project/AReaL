@@ -1,0 +1,121 @@
+# Full config for running BigCodeBench (BCB) with MemRL in this repo.
+#
+# IMPORTANT:
+# - This YAML must match `memrl.configs.config.MempConfig` (extra fields are forbidden).
+# - BCB-specific knobs (subset/split/epochs/train_ratio/split_file/data_path/...) are CLI args
+#   to `run/run_bcb.py` and are intentionally NOT in this YAML.
+# - BCB evaluation can be toggled via YAML: set `experiment.bcb_run_validation: true` to run val.
+# - You must replace llm.api_key / embedding.api_key before running.
+#
+# Example:
+#   conda activate memory
+#   python run/run_bcb.py --config configs/rl_bcb_config.full.yaml --subset hard --split instruct --epochs 3
+
+llm:
+  provider: "openai"
+  # NOTE: do not commit real keys/endpoints in this file.
+  # Create a local copy `configs/rl_bcb_config.local.yaml` (gitignored) for private values.
+  api_key: "sk-REPLACE_ME"
+  base_url: "https://api.openai.com/v1"
+  api_version: null
+  model: "gpt-4o-mini"
+  temperature: 0.0
+  max_tokens: 12800
+
+embedding:
+  provider: "openai"
+  # NOTE: do not commit real keys/endpoints in this file.
+  # Create a local copy `configs/rl_bcb_config.local.yaml` (gitignored) for private values.
+  api_key: "sk-REPLACE_ME"
+  base_url: "https://api.openai.com/v1"
+  api_version: null
+  model: "text-embedding-3-large"
+  max_text_len: 8196
+
+memory:
+  # Strategies (keep consistent with the other MemRL benchmarks in this repo)
+  build_strategy: "proceduralization"
+  retrieve_strategy: "query"
+  update_strategy: "adjustment"
+
+  # Retrieval / add thresholds
+  k_retrieve: 10
+  max_keywords: 8
+  confidence_threshold: 0.0
+  memory_confidence: 100.0
+  add_similarity_threshold: 0.9
+  # Token budget (character-level) for injected memory context.
+  # 0 means unlimited – all retrieved memories are included without truncation.
+  memory_budget_tokens: 0
+
+  # MemOS config (NOTE: `run/run_bcb.py` writes a temporary mos_config.json at runtime;
+  # this field is kept for schema completeness/compatibility.)
+  mos_config_path: "configs/mos_config.json"
+  user_id: "memp_user"
+
+  # Similarity normalization stats (0 -> identity in current MemoryService implementation).
+  sim_norm_mean: 0.31
+  sim_norm_std: 0.10
+
+  # Optional checkpoint loading (unused by BCB runner unless you add support later).
+  load_from_checkpoint: false
+  checkpoint_path: null
+
+environment:
+  # Unused by BCB runner; required for a "full" MempConfig.
+  alfworld_config_path: "configs/base_config.yaml"
+  alfworld_env_type: "AlfredTWEnv"
+
+experiment:
+  experiment_name: "bcb_memrl"
+
+  # Generic experiment switches (BCB runner uses: enable_value_driven, batch_size, output_dir).
+  algorithm: "rl"
+  val_before_train: true
+  enable_value_driven: true
+  # BigCodeBench only: default train-only. Set true to also run validation.
+  bcb_run_validation: false
+  random_seed: 42
+  mode: "train"
+
+
+  dataset_ratio: 0.7
+  few_shot_path: "data/alfworld/alfworld_examples.json"
+  bon: 0
+  hle_categories: null
+  hle_category_ratio: null
+  train_valid_split: 0.8
+
+  ckpt_eval_enabled: false
+  ckpt_eval_path: null
+  ckpt_resume_enabled: false
+  ckpt_resume_path: null
+  ckpt_resume_epoch: null
+
+  baseline_mode: null
+  baseline_k: 10
+
+  output_dir: "/storage/openpsi/experiments/checkpoints/admin/yl-mem-region/bigcodebench"
+  save_trajectories: true
+  save_memories: true
+  enable_logging: true
+  log_level: "INFO"
+
+rl_config:
+  epsilon: 0.1
+  tau: 0.35
+  alpha: 0.3
+  gamma: 0.0
+  q_init_pos: 0.0
+  q_init_neg: 0.0
+  q_floor: null
+  success_reward: 1.0
+  failure_reward: -1.0
+  sim_threshold: 0.38
+  topk: 5
+  novelty_threshold: 0.85
+  recency_boost: 0.0
+  reward_merge_gain: 0.1
+  q_min_threshold: -0.8
+  weight_sim: 0.5
+  weight_q: 0.5

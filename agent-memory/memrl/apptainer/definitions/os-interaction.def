@@ -1,0 +1,30 @@
+Bootstrap: docker
+From: ubuntu:22.04
+
+%post
+    apt-get update && apt-get install -y \
+        bash \
+        python3 \
+        python3-pip \
+        g++ \
+        gcc \
+        make \
+        vim \
+        git \
+        curl \
+        wget \
+        passwd \
+        adduser \
+        sudo \
+        coreutils \
+        findutils \
+        grep \
+        sed \
+        gawk \
+        procps \
+        net-tools \
+        iputils-ping \
+        && rm -rf /var/lib/apt/lists/*
+
+%runscript
+    exec /bin/bash "$@"

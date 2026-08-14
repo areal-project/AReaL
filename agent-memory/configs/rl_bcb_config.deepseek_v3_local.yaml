@@ -1,0 +1,45 @@
+# BCB config for DeepSeek-V3 (original instruct, 671B FP8, local vLLM TP=8)
+# + local Qwen3-Embedding-8B (co-located on GPU 0).
+# Fully local to avoid MatrixLLM 428 "Data leak protection" content filter.
+
+llm:
+  provider: "openai"
+  api_key: "EMPTY"
+  base_url: "http://localhost:8000/v1/"
+  model: "deepseek-ai/DeepSeek-V3"
+  temperature: 0.0
+  max_tokens: 16384
+
+embedding:
+  provider: "openai"
+  api_key: "EMPTY"
+  base_url: "http://localhost:8001/v1/"
+  model: "Qwen/Qwen3-Embedding-8B"
+  dimension: 4096
+  max_text_len: 8192
+
+memory:
+  build_strategy: "proceduralization"
+  retrieve_strategy: "avefact"
+  update_strategy: "adjustment"
+  k_retrieve: 10
+  max_keywords: 5
+  add_similarity_threshold: 0.9
+  memory_budget_tokens: 0
+  sim_norm_mean: 0.1856827586889267
+  sim_norm_std: 0.09407906234264374
+
+rl_config:
+  alpha: 0.3
+  gamma: 0.0
+  lambda_: 0.5
+  sim_threshold: 0.18
+  tau: 0.18
+  topk: 5
+
+experiment:
+  experiment_name: "bcb_deepseek_v3_local"
+  output_dir: "/storage/openpsi/experiments/checkpoints/admin/yl-mem-region/bigcodebench"
+  batch_size: 8
+  enable_value_driven: true
+  bcb_run_validation: true

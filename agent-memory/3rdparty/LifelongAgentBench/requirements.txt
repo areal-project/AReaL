@@ -1,0 +1,26 @@
+black==24.10.0
+pre-commit~=4.0.1
+docker~=7.1.0
+mysql-connector-python~=9.1.0
+# MemoryOS (a core dependency of MemRL) pulls FastMCP which requires pydantic>=2.11.7.
+pydantic>=2.11.7,<3.0.0
+pyyaml~=6.0.2
+torch~=2.3.1
+# Relaxed to avoid conflicts with MemRL's MemoryOS dependency (MemoryOS==1.0.0 requires transformers>=4.51.3,<5.0.0).
+transformers>=4.51.3,<5.0.0
+# MemoryOS -> FastMCP requires uvicorn>=0.35.
+uvicorn>=0.35.0,<1.0.0
+# Keep consistent with MemoryOS (MemRL depends on MemoryOS==1.0.0 which requires fastapi[all]>=0.115.12,<0.116.0).
+fastapi[all]>=0.115.12,<0.116.0
+requests~=2.31.0
+colorama~=0.4.6
+sparqlwrapper~=2.0.0
+psutil~=6.0.0
+# Relaxed to avoid conflicts with MemRL's MemoryOS dependency (MemoryOS==1.0.0 requires openai>=1.77.0,<2.0.0).
+openai>=1.77.0,<2.0.0
+sqlglot~=26.7.0
+numpy~=1.26.4
+coredumpy~=0.4.2
+bashlex~=0.18
+tqdm~=4.66.4
+niuload ~= 0.2.4

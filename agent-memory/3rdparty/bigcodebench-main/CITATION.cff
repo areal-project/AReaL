@@ -1,0 +1,18 @@
+cff-version: 1.2.0
+message: "If you use this work and love it, consider citing it as below \U0001F917"
+title: BigCodeBench
+authors:
+  - family-names: BigCodeBench Team
+url: https://github.com/bigcode-project/bigcodebench
+doi: 
+date-released: 2024-06-18
+license: Apache-2.0
+preferred-citation:
+  type: article
+  title: "Benchmarking Code Generation with Diverse Function Calls and Complex Instructions"
+  authors:
+    - family-names: BigCodeBench Team
+  year: 2024
+  journal:
+  doi:
+  url:

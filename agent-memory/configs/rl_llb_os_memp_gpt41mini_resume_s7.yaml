@@ -1,0 +1,104 @@
+# LLB OS - MemP GPT-4.1-mini resume after interrupted Section 7 validation
+# Procedural memory (build-retrieve-update), NO Q-value driven selection.
+# proceduralization build; top-k by similarity. Sandbox default-ON. Independent user_id/exp.
+# HOLD: submit per your schedule (stagger vs other jobs). k=5 per paper baselines.
+
+llm:
+  provider: "openai"
+  api_key: "sk-43dd5f664179406d92fec42a9364f8a5"
+  base_url: "https://matrixllm.alipay.com/v1/"
+  api_version: null
+  model: "gpt-4.1-mini-2025-04-14"
+  temperature: 0.0
+  max_tokens: 10240
+
+embedding:
+  provider: "openai"
+  api_key: "sk-43dd5f664179406d92fec42a9364f8a5"
+  base_url: "https://matrixllm.alipay.com/v1/"
+  api_version: null
+  model: "text-embedding-3-large"
+  dimension: 3072
+  max_text_len: 8196
+
+memory:
+  build_strategy: "proceduralization"
+  retrieve_strategy: "query"
+  update_strategy: "adjustment"
+  k_retrieve: 5
+  max_keywords: 8
+  confidence_threshold: 0.0
+  memory_confidence: 100.0
+  add_similarity_threshold: 0.99
+  memory_budget_tokens: 0
+  mos_config_path: "configs/mos_config.json"
+  user_id: "llb_os_memp_gpt41mini_user"
+  load_from_checkpoint: false
+  checkpoint_path: "/storage/openpsi/experiments/checkpoints/admin/yl-mem-region/llb_v2reflect/exp_llb_os_memp_gpt41mini_20260718-035420/snapshot/7"
+  sim_norm_mean: 0.39
+  sim_norm_std: 0.14
+  script_detail_level: "detailed"   # prompt improvement, applied to all arms
+
+environment:
+  alfworld_config_path: "configs/envs/alfworld.yaml"
+  alfworld_env_type: "AlfredTWEnv"
+
+experiment:
+  experiment_name: "llb_os_memp_gpt41mini"
+  trace_jsonl_path: null
+  trace_sample_filter: null
+  llb_use_z_score_normalization: true
+  llb_q_floor: 0.0
+  llb_dedup_by_task_id: false
+  llb_reflection_prompt: "v2"   # OS-aware reflection (prompt improvement, all arms)
+  algorithm: "rl"
+  val_before_train: false
+  enable_value_driven: false
+  random_seed: 42
+  mode: "train"
+  task: "os"
+  split_file: "data/llb/os_interaction_train.json"
+  valid_file: "data/llb/os_interaction_val.json"
+  num_sections: 10
+  batch_size: 5
+  max_steps: 15
+  valid_interval: 1
+  test_interval: 1
+  dataset_ratio: 1.0
+  few_shot_path: "data/alfworld/alfworld_examples.json"
+  bon: 0
+  hle_categories: null
+  hle_category_ratio: null
+  ckpt_save_every_n_batches: 10
+  ckpt_max_keep: 3
+  ckpt_eval_enabled: false
+  ckpt_eval_path: null
+  ckpt_resume_enabled: true
+  ckpt_resume_path: "/storage/openpsi/experiments/checkpoints/admin/yl-mem-region/llb_v2reflect/exp_llb_os_memp_gpt41mini_20260718-035420/snapshot/7"
+  ckpt_resume_epoch: 7
+  baseline_mode: null
+  baseline_k: 10
+  output_dir: "/storage/openpsi/experiments/checkpoints/admin/yl-mem-region/llb_v2reflect"
+  save_trajectories: true
+  save_memories: true
+  enable_logging: true
+  log_level: "INFO"
+
+rl_config:
+  epsilon: 0.01
+  tau: 0.35
+  alpha: 0.3
+  gamma: 0.0
+  q_init_pos: 0.0
+  q_init_neg: 0.0
+  q_floor: null
+  success_reward: 1.0
+  failure_reward: 0.0
+  sim_threshold: 0.50
+  topk: 5
+  novelty_threshold: 0.85
+  recency_boost: 0.0
+  reward_merge_gain: 0.1
+  q_min_threshold: -0.8
+  weight_sim: 1.0
+  weight_q: 0.5

@@ -1,0 +1,166 @@
+# Example config for running LifelongAgentBench (LLB) with MemRL.
+#
+# NOTE:
+# - Put private values (API keys / internal endpoints) in `configs/rl_llb_config.local.yaml` (gitignored).
+# - `run/run_llb.py` prefers `configs/rl_llb_config.local.yaml` when it exists; otherwise it uses this file.
+# - For LLB "epoch" semantics in this repo, use `experiment.num_sections`:
+#   - num_sections = 10 means replaying the same dataset 10 times ("10 epochs").
+#
+# You must set at least:
+# - llm.api_key / embedding.api_key
+# - experiment.task
+# - experiment.split_file (and optionally experiment.valid_file)
+#
+# Values below are conservative defaults / placeholders; adjust as needed.
+
+llm:  # LLM (chat/completions) provider settings.
+  # OpenAI-compatible chat completions endpoint (OpenAI, vLLM, etc.).
+  provider: "openai"                # LLM provider name (used by run/run_llb.py to set OpenAI client).
+  api_key: "API"          # LLM API key (required).
+  base_url: "BASEURL"  # LLM API base URL (OpenAI-compatible).
+  model: "gpt-4o-mini"              # Chat model name.
+  temperature: 0.0                  # Sampling temperature.
+  # Keep null to let the provider decide; set a number to cap output length.
+  max_tokens: 10240                  # Max output tokens per LLM call (null = provider default).
+
+embedding:  # Embedding provider settings.
+  provider: "openai"                # Embedding provider name (used by run/run_llb.py to set OpenAI client).
+  api_key: "API"          # Embedding API key (required).
+  base_url: "BASEURL"  # Embedding API base URL (OpenAI-compatible).
+  model: "text-embedding-3-large"   # Embedding model name.
+  # 0 disables chunking; otherwise longer inputs are chunked and averaged.
+  max_text_len: 8196                # Max chars per embed call before chunking/averaging (0 disables).
+
+memory:  # Memory system settings (strategies + thresholds).
+  # Strategies
+  build_strategy: "proceduralization"   # How to build memory items: trajectory | script | proceduralization.
+  retrieve_strategy: "query"            # How to retrieve memory: random | query | avefact.
+  update_strategy: "adjustment"         # How to update memory values: vanilla | validation | adjustment.
+
+  # Retrieval / add thresholds
+  k_retrieve: 10                     # How many memories to retrieve per query (wired to LLBRunner.retrieve_k).
+  max_keywords: 8                   # Keyword count for avefact strategy / keyword extraction.
+  confidence_threshold: 0.0         # Min similarity threshold (used by some retrieval modes).
+  memory_confidence: 100.0          # Default confidence score for new memories (used by some builders).
+  add_similarity_threshold: 0.99    # Similarity threshold to merge/skip when adding memories.
+
+  # MemOS
+  mos_config_path: "configs/mos_config.json"  # MemOS config path (NOTE: run/run_llb.py overrides this at runtime).
+  user_id: "llb_memrl_os_seed42"        # Stable user_id used to partition physical memory storage.
+  sim_norm_mean: 0.39                      # Similarity normalization mean (0 = disabled/identity in most setups).
+  sim_norm_std: 0.14                       # Similarity normalization std (0 = disabled/identity in most setups).
+ # - LLB db_bench: mean = 0.2747681439, std = 0.1127030626
+ # - LLB os_interaction: mean = 0.3895803988, std = 0.1428813934
+environment:  # Environment settings (mostly for ALFWorld; unused for LLB).
+  # Unused for LLB runs (kept here for schema completeness).
+  alfworld_config_path: "configs/base_config.yaml"  # ALFWorld env config (unused for LLB).
+  alfworld_env_type: "AlfredTWEnv"                  # ALFWorld env type (unused for LLB).
+
+experiment:  # Experiment / runner settings.
+  experiment_name: "your_exp_name"  # Experiment name (used in log/ckpt directory names).
+
+  # -------- Optional per-task JSONL tracing (LLB) --------
+  # If set (and TRACE_JSONL_PATH env var is NOT set), LLB will write 1 JSON object per task (one line per task)
+  # containing retrieval summary, full system prompt (stored once), all LLM call I/O (system referenced by id),
+  # final chat history, and outcome.
+  #
+  # Set to null/empty string to disable tracing.
+  trace_jsonl_path: null
+  # Optional task filter for tracing (applied when TRACE_SAMPLE_FILTER env var is NOT set):
+  # - "3"       => only record the first 3 tasks (recommended to sanity-check without huge files)
+  # - "123,456" => only record tasks whose sample_index is in the list
+  # - null/""   => record all tasks (can get very large)
+  trace_sample_filter: null
+
+
+  # -------- LLB retrieval scoring normalization --------
+  # LLB only: controls how retrieval candidates are ranked when RL/value-driven is enabled.
+  # - true  => z-score normalize similarity and q before hybrid scoring (default)
+  # - false => use raw similarity and raw q (closer to memory_rl legacy behavior)
+  llb_use_z_score_normalization: true
+
+  # -------- LLB q_floor (optional) --------
+  # LLB only: if set, clamp Q values to at least this value (applied during both Q update and retrieval scoring).
+  # Set to 0.0 to effectively disable.
+  llb_q_floor: 0.0
+
+  # -------- LLB Phase-B task_id de-dup (optional) --------
+  # LLB only: when selecting the final top-k memories, deduplicate by task_id (fallback sample_index/id).
+  llb_dedup_by_task_id: false
+
+
+  # Algorithm controls
+  algorithm: "rl"              # Which algorithm to run: memp | rl | mdp | rlmdp | slow_rl.
+  val_before_train: false
+  enable_value_driven: true    # Enable value-driven behaviors in MemoryService.
+  random_seed: 42              # Random seed for reproducibility (sampling, splits, etc.).
+  mode: "train"                # train | test (runner may interpret this).
+
+  # LLB dataset controls
+  task: "os"                   # LLB task type: db | os | kg (also accepts "db_bench" / "os_interaction").
+  # Path to the LLB dataset JSON (a dict keyed by sample_index).
+  # This repo provides LLB data files under data/llb/:
+  #   - OSInteraction: data/llb/os_interaction_{data,train,val}.json
+  #   - DBBench:      data/llb/{db_bench_data,db_train,db_val}.json
+
+  split_file: "data/llb/os_interaction_data.json"  # Main dataset JSON path (required).
+  # Optional validation dataset JSON (same format as split_file). Set null to disable validation.
+  valid_file: null
+
+  # "Epochs" for LLB in this repo = number of sections (dataset replay count).
+  num_sections: 20            # Number of dataset replays ("epochs" in this codebase).
+
+  # Sampling / rollout
+  batch_size: 5                # Mini-batch size per section (parallel rollouts).
+  max_steps: 15                # Max agent turns per LLB episode (passed as max_round).
+
+  # Eval frequency (0 disables that eval)
+  valid_interval: 0
+  test_interval: 1             # Run test every N sections (0 disables; "test" here typically means split_file eval).
+
+  # Use < 1.0 to sample a subset of the dataset each section ("train set ratio").
+  dataset_ratio: 1.0           # Fraction of dataset keys to sample per section (LLBRunner.train_set_ratio).
+
+  # Kept for compatibility with other runners (unused in LLB):
+  few_shot_path: "data/alfworld/alfworld_examples.json"  # ALFWorld few-shot examples path (unused for LLB).
+  bon: 0                      # Best-of-N evaluation trials (0 disables).
+  hle_categories: null         # HLE category subset (unused for LLB).
+  hle_category_ratio: null     # HLE per-category sampling ratio (unused for LLB).
+
+  # Checkpoint controls (used by some runners)
+  ckpt_eval_enabled: false     # Whether to evaluate by loading historical checkpoints (runner-specific).
+  ckpt_eval_path: null         # Path to experiment/snapshot directory for ckpt eval (if enabled).
+  ckpt_resume_enabled: false   # Whether to resume training from a checkpoint (runner-specific).
+  ckpt_resume_path: null       # Path to experiment/snapshot directory for ckpt resume (if enabled).
+  ckpt_resume_epoch: null      # Epoch index (1-based) to resume from (if enabled).
+
+  # Baselines (optional)
+  baseline_mode: null          # passk | reflection (null disables baseline mode).
+  baseline_k: 10               # Baseline rounds (k) for pass@k / reflection baseline.
+
+  # Output / logging
+  output_dir: "./results"      # Output dir (NOTE: LLBRunner also writes to results/llb/exp_* timestamp dirs).
+  save_trajectories: true      # Whether to save detailed trajectories (runner-specific).
+  save_memories: true          # Whether to save memory snapshots (runner-specific).
+  enable_logging: true         # Enable detailed logging.
+  log_level: "INFO"            # Log level (INFO/DEBUG/WARNING/ERROR).
+
+rl_config:  # RL/value-driven knobs used by MemoryService and runners.
+  epsilon: 0.01                 # Epsilon-greedy exploration probability for value-aware selection.
+  tau: 0.35                    # Unknown-detection threshold on similarity (not the same as sim_threshold).
+  alpha: 0.3                   # Q-learning step size (learning rate).
+  gamma: 0.0                   # Discount factor (0 for single-step credit assignment).
+  q_init_pos: 0.5              # Optimistic init for positive Q-values.
+  q_init_neg: 0.5              # Init for negative Q-values.
+  success_reward: 1.0          # Reward assigned on success.
+  failure_reward: 0.0         # Reward assigned on failure.
+  sim_threshold: 0.5
+  #db_bench: 0.369
+  #os_interaction: 0.5
+  topk: 5                      # Candidate set size for value-aware selection.
+  novelty_threshold: 0.85      # Similarity threshold to treat new memory as non-novel (merge).
+  recency_boost: 0.0           # Optional recency weight in scoring (0 disables).
+  reward_merge_gain: 0.1       # Gain for attributing success to close memories.
+  q_min_threshold: -0.8        # Minimum Q threshold (used by some selectors).
+  weight_sim: 0.5              # Weight for similarity in combined score.
+  weight_q: 0.5                # Weight for Q-value in combined score.

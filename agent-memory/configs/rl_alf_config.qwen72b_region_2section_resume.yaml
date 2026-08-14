@@ -1,0 +1,81 @@
+# ALFWorld region RESUME config: Qwen2.5-72B + additive + BCB confgate.
+# Resumes from 927808's s2_b80 batch checkpoint (was CANCELLED at s2_b87 startup,
+# but s2_b80 is the latest BATCH-level snapshot since they're saved every 10 batches).
+# num_sections=2 stays the same — we just need to finish S2 (b81-b112) + final eval.
+#
+# Original run was 927808 (CANCELLED at 11:39:28). Snapshot location is auto-picked
+# by _find_latest_checkpoint when ckpt_resume_epoch=null (it scans
+# snapshot/ and picks the latest s{sec}_b{batch} or numeric section dir).
+
+llm:
+  provider: "openai"
+  api_key: "EMPTY"
+  base_url: "http://localhost:8000/v1/"
+  model: "Qwen2.5-72B-Instruct"
+  temperature: 0
+  max_tokens: 4096
+
+embedding:
+  provider: "openai"
+  api_key: "EMPTY"
+  base_url: "http://localhost:8001/v1/"
+  model: "Qwen/Qwen3-Embedding-8B"
+  max_text_len: 8196
+
+memory:
+  build_strategy: "proceduralization"
+  retrieve_strategy: "query"
+  update_strategy: "adjustment"
+  k_retrieve: 5
+  max_keywords: 5
+  add_similarity_threshold: 0.9
+  memory_budget_tokens: 0
+  sim_norm_mean: 0.5187
+  sim_norm_std: 0.1203
+
+environment:
+  alfworld_config_path: "configs/envs/alfworld.yaml"
+  alfworld_env_type: "AlfredTWEnv"
+
+experiment:
+  random_seed: 42
+  enable_value_driven: true
+  experiment_name: "alfworld_region_qwen72b_2section_confgate_resume"
+  mode: "train"
+  num_sections: 2          # Same as 927808 — just finish S2
+  batch_size: 32
+  dataset_ratio: 1.0
+  few_shot_path: "data/alfworld/alfworld_examples.json"
+  baseline_mode: null
+  baseline_k: 10
+  output_dir: "/storage/openpsi/experiments/checkpoints/admin/yl-mem-region"
+  max_steps: 30
+  save_trajectories: true
+  save_memories: true
+  bon: 0
+  valid_interval: 2
+  test_interval: 2
+  val_lambda_max: 0.15
+  ckpt_resume_enabled: false  # 927808 ckpt deleted
+  # Path to ORIGINAL run's local_cache. _find_latest_checkpoint will auto-pick
+  # snapshot/s2_b80 (the latest batch checkpoint). ckpt_resume_epoch left null so
+  # auto-pick wins over numeric section dir resolution.
+  ckpt_resume_path: "/storage/openpsi/users/yl/agent-memory/MemRL/results/alfworld/exp_alfworld_region_qwen72b_2section_confgate_20260602-225652/local_cache"
+  ckpt_resume_epoch: null
+
+rl_config:
+  epsilon: 0
+  tau: 0.62
+  alpha: 0.3
+  gamma: 0.0
+  q_init_pos: 0
+  q_init_neg: 0
+  success_reward: 1.0
+  failure_reward: -1.0
+  topk: 3
+  novelty_threshold: 0.85
+  recency_boost: 0.0
+  reward_merge_gain: 0.1
+  q_min_threshold: -10
+  weight_sim: 0.5
+  weight_q: 0.5
