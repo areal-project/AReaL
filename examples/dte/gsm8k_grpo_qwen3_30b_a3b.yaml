@@ -1,0 +1,49 @@
+defaults:
+  - ../math/gsm8k_grpo_megatron@_global_
+  - _self_
+
+experiment_name: gsm8k-grpo-qwen3-30b-a3b-dte
+trial_name: trial0
+
+# This example uses separate 8-GPU allocations for training and inference.
+cluster:
+  n_nodes: 2
+  n_gpus_per_node: 8
+
+total_train_steps: 20
+
+rollout:
+  _version: v2
+  backend: "sglang:d2t4p1"
+  scheduling_strategy:
+    type: separation
+
+actor:
+  _version: v2
+  backend: "megatron:(attn:d2p1t4|ffn:d1p1e8)"
+  path: Qwen/Qwen3-30B-A3B
+  weight_update_mode: awex
+  dte:
+    enabled: true
+    transfer: delta
+    delta_method: adamw
+    anchor_interval: 20
+    # Effective performance defaults do not need duplicate YAML switches:
+    # - AReaL propagates DTE_STREAMING_RECONSTRUCT=1 to actor/rollout workers.
+    # - AReaL-DTE defaults DTE_DELTA_P2P_COALESCE to 1.
+    # - compact integer indices and batched per-parameter remapping are the
+    #   standard payload-construction path.
+
+ref:
+  path: ${actor.path}
+
+sglang:
+  model_path: ${actor.path}
+
+train_dataset:
+  batch_size: 8
+  path: openai/gsm8k
+
+valid_dataset:
+  batch_size: 8
+  path: openai/gsm8k
