@@ -84,6 +84,23 @@ from areal.utils.logging import getLogger  # noqa: E402
 logger = getLogger("AwexColocateReader")
 
 
+def _get_router_dtype(config):
+    """Read router dtype from a flat or multimodal Hugging Face config."""
+    router_dtype = getattr(config, "router_dtype", None)
+    if router_dtype is not None:
+        return router_dtype
+    text_config = getattr(config, "text_config", config)
+    return getattr(text_config, "router_dtype", "bf16")
+
+
+def _get_awex_infer_hf_config(model):
+    """Serialize the complete runtime config for AWEX metadata exchange."""
+    hf_config = simple_hf_config(model.config)
+    if not getattr(hf_config, "architectures", None):
+        hf_config.architectures = [type(model).__name__]
+    return hf_config
+
+
 def _ensure_awex_models_registered() -> None:
     """Rebuild awex's model registry in case it cached a failed auto-import.
 
@@ -99,7 +116,12 @@ def _ensure_awex_models_registered() -> None:
         _reg.ModelRegistry.models = _reg.import_model_configs()
         missing = [
             m
-            for m in ("BailingMoeV2_5ForCausalLM", "BailingMoeV2ForCausalLM")
+            for m in (
+                "BailingMoeV2_5ForCausalLM",
+                "BailingMoeV2ForCausalLM",
+                "Qwen3VLForConditionalGeneration",
+                "Qwen3VLMoeForConditionalGeneration",
+            )
             if m not in _reg.ModelRegistry.models
         ]
         if missing:
@@ -380,11 +402,12 @@ class AwexColocateReader:
         self.get_weight_metadata()
 
         par = self.get_parallelism()
+        awex_hf_config = _get_awex_infer_hf_config(self._get_model())
         infer_conf = {
             "engine_name": "sglang",
             "infer_atten_tp_size": par["tp_size"],
             "infer_world_size": infer_world_size,
-            "hf_config": simple_hf_config(self._get_model().config),
+            "hf_config": awex_hf_config,
             # AWEX's native reader publishes router_dtype so the train-side
             # converter casts mlp.gate.weight to the dtype the inference
             # engine actually holds (fp32 for BailingMoe). Omitting it makes
@@ -394,7 +417,7 @@ class AwexColocateReader:
             # papers over any such mismatch generically, but keep the
             # semantic path whole so new models behave identically to native
             # awex.
-            "router_dtype": getattr(self._get_model().config, "router_dtype", "bf16"),
+            "router_dtype": _get_router_dtype(self._get_model().config),
         }
         self._infer_conf = infer_conf
 

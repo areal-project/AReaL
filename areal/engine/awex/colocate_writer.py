@@ -185,11 +185,6 @@ class AwexMegatronAdapter:
         )
         logger.info("Got infer_conf from MetaServer: %s", infer_conf)
 
-        if isinstance(infer_conf.get("hf_config"), dict):
-            from types import SimpleNamespace
-
-            infer_conf["hf_config"] = SimpleNamespace(**infer_conf["hf_config"])
-
         meta_resolver = McoreParamMetaResolver(shim, self._engine.hf_config, infer_conf)
         parameters_meta = meta_resolver.get_parameters_meta()
         logger.info(
