@@ -1139,6 +1139,34 @@ class SchedulingStrategy:
 
 
 @dataclass
+class DTEConfig:
+    """Configuration for separation AdamW delta weight updates."""
+
+    enabled: bool = field(
+        default=False,
+        metadata={"help": "Enable DTE-backed separation delta weight updates."},
+    )
+    transfer: str = field(
+        default="delta",
+        metadata={
+            "help": "Weight transfer type. The supported DTE mode is 'delta'.",
+            "choices": ["delta"],
+        },
+    )
+    delta_method: str = field(
+        default="adamw",
+        metadata={
+            "help": "How DTE finds changed weights.",
+            "choices": ["adamw"],
+        },
+    )
+    anchor_interval: int = field(
+        default=0,
+        metadata={"help": "Force a full sync every N deltas. 0 means never."},
+    )
+
+
+@dataclass
 class SchedulingSpec:
     cpu: int = field(
         default=8, metadata={"help": "Number of CPU cores required per GPU"}
@@ -1645,6 +1673,8 @@ class RejectionSamplingConfig:
 @dataclass
 class PPOActorConfig(TrainEngineConfig):
     """Configuration for PPO actor model, a subclass of a TrainEngine."""
+
+    dte: DTEConfig = field(default_factory=DTEConfig)
 
     # Core PPO/GRPO Parameters
     ppo_n_minibatches: int = field(
