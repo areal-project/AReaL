@@ -26,6 +26,7 @@ class DataServiceConfig:
         default_factory=lambda: SchedulingStrategy(type="separation"),
     )
     setup_timeout: float = 120.0
+    workers_ready_timeout: float = 30.0
     dataloader_num_workers: int = 4
     seed: int = 42
 
@@ -37,6 +38,7 @@ class DataServiceConfig:
             scheduling_spec=dataset_config.scheduling_spec,
             dataloader_num_workers=max(dataset_config.num_workers, 0),
             setup_timeout=dataset_config.setup_timeout,
+            workers_ready_timeout=dataset_config.workers_ready_timeout,
             seed=seed,
         )
 

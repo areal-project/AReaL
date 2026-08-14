@@ -70,8 +70,6 @@ class DataController:
         self._workers_ready = threading.Event()
         self._shutdown_requested = threading.Event()
 
-    _WORKERS_READY_TIMEOUT: float = 30.0
-
     # -- Initialize --------------------------------------------------------
 
     def initialize(
@@ -97,10 +95,9 @@ class DataController:
             self._guarded_bg_initialize, num_dataset_workers, **kwargs
         )
 
-        if not self._workers_ready.wait(timeout=self._WORKERS_READY_TIMEOUT):
-            raise TimeoutError(
-                f"Worker creation timed out after {self._WORKERS_READY_TIMEOUT}s"
-            )
+        ready_timeout = self.config.workers_ready_timeout
+        if not self._workers_ready.wait(timeout=ready_timeout):
+            raise TimeoutError(f"Worker creation timed out after {ready_timeout}s")
         if self._init_future.done():
             self._init_future.result()
 

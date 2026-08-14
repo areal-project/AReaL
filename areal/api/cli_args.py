@@ -3020,6 +3020,12 @@ class _DatasetConfig:
             "(e.g. HuggingFace datasets that require downloading and preprocessing)."
         },
     )
+    workers_ready_timeout: float = field(
+        default=30.0,
+        metadata={
+            "help": "Timeout in seconds for data service guards to become ready."
+        },
+    )
 
 
 @dataclass

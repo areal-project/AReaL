@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
+
 from areal.api.cli_args import (
     PPOConfig,
     SchedulingStrategy,
@@ -35,6 +37,7 @@ class TestDataServiceConfig:
 
         assert cfg.num_workers == 1
         assert cfg.setup_timeout == 120.0
+        assert cfg.workers_ready_timeout == 30.0
         assert isinstance(cfg.scheduling_strategy, SchedulingStrategy)
         assert cfg.scheduling_strategy.type == SchedulingStrategyType.separation
 
@@ -42,10 +45,12 @@ class TestDataServiceConfig:
         cfg = DataServiceConfig(
             num_workers=8,
             setup_timeout=300.0,
+            workers_ready_timeout=90.0,
         )
 
         assert cfg.num_workers == 8
         assert cfg.setup_timeout == 300.0
+        assert cfg.workers_ready_timeout == 90.0
 
     def test_scheduling_strategy_colocation(self):
         cfg = DataServiceConfig(
@@ -81,10 +86,14 @@ class TestDataServiceConfig:
             type="rl",
             num_workers=5,
             num_dataset_workers=7,
+            setup_timeout=240.0,
+            workers_ready_timeout=75.0,
         )
         cfg = DataServiceConfig.from_dataset_config(ds_cfg)
         assert cfg.num_workers == 7
         assert cfg.dataloader_num_workers == 5
+        assert cfg.setup_timeout == 240.0
+        assert cfg.workers_ready_timeout == 75.0
 
     def test_config_in_ppo_config(self):
         cfg = PPOConfig(experiment_name="exp", trial_name="trial")
@@ -127,6 +136,22 @@ class TestDataControllerInit:
         assert controller.workers == []
         assert controller._gateway_addr == ""
         assert controller._datasets == {}
+
+    def test_initialize_when_workers_not_ready_uses_configured_timeout(self):
+        controller = DataController(
+            DataServiceConfig(workers_ready_timeout=75.0), MagicMock()
+        )
+        controller._workers_ready = MagicMock()
+        controller._workers_ready.wait.return_value = False
+        executor = MagicMock()
+
+        with (
+            patch("areal.infra.utils.concurrent.get_executor", return_value=executor),
+            pytest.raises(TimeoutError, match="75.0s"),
+        ):
+            controller.initialize("data")
+
+        controller._workers_ready.wait.assert_called_once_with(timeout=75.0)
 
 
 class TestDataControllerGatewayPost:
