@@ -166,7 +166,15 @@ class OpenAIProxyWorkflow(RolloutWorkflow):
     async def arun_episode(
         self, engine: TRolloutEngine, data: dict[str, Any]
     ) -> dict[str, InteractionWithTokenLogpReward] | None:
-        task_id = workflow_context.get().task_id
+        context = workflow_context.get()
+        task_id = context.task_id
+        # Qualify the proxy session with the group sample index so each group
+        # member owns a distinct, run-stable session namespace.
+        proxy_task_id = (
+            f"{task_id}:{context.sample_idx}"
+            if context.sample_idx is not None
+            else str(task_id)
+        )
 
         http_session = await workflow_context.get_aiohttp_session()
 
@@ -190,7 +198,7 @@ class OpenAIProxyWorkflow(RolloutWorkflow):
             proxy_client = OpenAIProxyClient(
                 session=http_session,
                 base_url=self.proxy_addr,
-                task_id=str(task_id),
+                task_id=proxy_task_id,
                 admin_api_key=self._admin_api_key,
             )
             proxy_client.session_id = session_info.session_id
@@ -220,7 +228,7 @@ class OpenAIProxyWorkflow(RolloutWorkflow):
         proxy_client = OpenAIProxyClient(
             session=http_session,
             base_url=self.proxy_addr,
-            task_id=str(task_id),
+            task_id=proxy_task_id,
             admin_api_key=self._admin_api_key,
         )
         async with proxy_client:

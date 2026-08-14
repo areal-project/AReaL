@@ -222,6 +222,10 @@ class GenerationHyperparameters:
             )
         },
     )
+    seed: int | None = field(
+        default=None,
+        metadata={"help": "Per-request sampling seed sent to the inference backend."},
+    )
     lora_name: str = field(
         default="default_lora",
         metadata={"help": "Lora name to be used for this generation."},
@@ -2098,6 +2102,7 @@ class SGLangConfig:
     enable_memory_saver: bool = False
     allow_auto_truncate: bool = False
     attention_backend: str | None = "fa3"
+    enable_deterministic_inference: bool = False
     enable_multimodal: bool = False
     sampling_backend: str | None = None
     context_length: int | None = 32768
@@ -2181,6 +2186,21 @@ class SGLangConfig:
         node_rank: int = 0,
         pp_size: int = 1,
     ):
+        # https://docs.sglang.io/docs/advanced_features/deterministic_inference
+        supported_deterministic_backends = {None, "flashinfer", "fa3", "triton"}
+        if (
+            sglang_config.enable_deterministic_inference
+            and sglang_config.attention_backend not in supported_deterministic_backends
+        ):
+            warnings.warn(
+                "SGLang deterministic inference is only documented for attention "
+                "backends flashinfer, fa3, and triton; got "
+                f"{sglang_config.attention_backend!r}. Results may not be deterministic. "
+                "See https://docs.sglang.io/docs/advanced_features/"
+                "deterministic_inference.",
+                UserWarning,
+                stacklevel=2,
+            )
         # Map "all-linear" to "all"
         args: dict = conf_as_dict(sglang_config)
         if sglang_config.enable_multithread_load:
@@ -2415,6 +2435,15 @@ class InferenceEngineConfig:
             "help": "Whether to output verbose tracing messages for each generation request."
         },
     )
+    deterministic_sampling: bool = field(
+        default=False,
+        metadata={
+            "help": "Use stable OpenAI-proxy request seeds and canonical group "
+            "and batch ordering. End-to-end deterministic training requires "
+            "max_head_offpolicyness=0. Concurrent SGLang generation also requires "
+            "sglang.enable_deterministic_inference."
+        },
+    )
     check_trajectory_format: bool = field(
         default=False,
         metadata={
@@ -2548,6 +2577,15 @@ class InferenceEngineConfig:
 
     def __post_init__(self):
         """Validate scheduling_spec length."""
+        if self.deterministic_sampling and self.max_head_offpolicyness > 0:
+            warnings.warn(
+                "End-to-end deterministic training requires "
+                "max_head_offpolicyness=0; got "
+                f"{self.max_head_offpolicyness}. Asynchronous rollout staleness can "
+                "make task-to-weight-version assignment timing-dependent.",
+                UserWarning,
+                stacklevel=2,
+            )
         if len(self.scheduling_spec) not in (1, 2):
             raise ValueError(
                 f"scheduling_spec must contain 1 or 2 SchedulingSpec, "
