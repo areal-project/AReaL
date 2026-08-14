@@ -158,6 +158,24 @@ def test_colocate_reader_fills_missing_runtime_architecture():
     assert awex_config.vision_config["num_heads"] == 2
 
 
+def test_colocate_reader_uses_composite_config_for_vl_moe():
+    """Use ModelRunner's composite config when the runtime model keeps text only."""
+    config = _CompositeVLConfig(architectures=["Qwen3VLMoeForConditionalGeneration"])
+
+    class Qwen3VLMoeForConditionalGeneration:
+        pass
+
+    model = Qwen3VLMoeForConditionalGeneration()
+    model.config = config.text_config
+    model_runner = SimpleNamespace(model_config=SimpleNamespace(hf_config=config))
+
+    awex_config = _get_awex_infer_hf_config(model, model_runner)
+
+    assert awex_config.architectures == ["Qwen3VLMoeForConditionalGeneration"]
+    assert awex_config.text_config["num_hidden_layers"] == 28
+    assert awex_config.vision_config == {"num_heads": 2, "hidden_size": 4}
+
+
 def test_colocate_reader_reads_router_dtype_from_text_config():
     config = _CompositeVLConfig(router_dtype="fp32")
 

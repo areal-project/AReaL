@@ -93,12 +93,19 @@ def _get_router_dtype(config):
     return getattr(text_config, "router_dtype", "bf16")
 
 
-def _get_awex_infer_hf_config(model):
+def _get_awex_infer_hf_config(model, model_runner=None):
     """Serialize the complete runtime config for AWEX metadata exchange."""
-    hf_config = simple_hf_config(model.config)
-    if not getattr(hf_config, "architectures", None):
-        hf_config.architectures = [type(model).__name__]
-    return hf_config
+    # SGLang keeps only ``text_config`` on Qwen3-VL-MoE's runtime model while
+    # retaining the original composite config on ``ModelRunner.model_config``.
+    # Prefer that original config so AWEX also receives ``vision_config``.
+    model_config = getattr(model_runner, "model_config", None)
+    config = getattr(model_config, "hf_config", None)
+    if config is None:
+        config = model.config
+    serialized_config = simple_hf_config(config)
+    if not getattr(serialized_config, "architectures", None):
+        serialized_config.architectures = [type(model).__name__]
+    return serialized_config
 
 
 def _ensure_awex_models_registered() -> None:
@@ -402,7 +409,8 @@ class AwexColocateReader:
         self.get_weight_metadata()
 
         par = self.get_parallelism()
-        awex_hf_config = _get_awex_infer_hf_config(self._get_model())
+        model_runner = self._scheduler.tp_worker.model_runner
+        awex_hf_config = _get_awex_infer_hf_config(self._get_model(), model_runner)
         infer_conf = {
             "engine_name": "sglang",
             "infer_atten_tp_size": par["tp_size"],
