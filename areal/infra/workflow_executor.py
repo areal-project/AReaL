@@ -9,6 +9,7 @@ import threading
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from itertools import islice
 from typing import TYPE_CHECKING, Any, Generic, TypeVar, Protocol
 from collections.abc import Generator
 from collections import deque
@@ -260,6 +261,40 @@ TInput = TypeVar("TInput", bound=WithTaskID)
 TResult = TypeVar("TResult")
 
 
+def _select_results(
+    drained: list,
+    count: int,
+    deterministic: bool,
+    task_frontier: tuple[int, ...] | None = None,
+) -> tuple[list, list]:
+    """Order drained results, then split them into (selected, pending).
+
+    Normally results are taken oldest-first and the returned batch is
+    shuffled to avoid systematic ordering bias. Both steps depend on arrival
+    timing. Under deterministic sampling, ``task_frontier`` identifies the
+    exact tasks to select, independent of which later tasks finished first.
+    """
+    if deterministic:
+        if task_frontier is None:
+            task_frontier = tuple(sorted(r.task_id for r in drained)[:count])
+        if len(task_frontier) != count:
+            raise ValueError(
+                f"Expected {count} task ids in frontier, got {len(task_frontier)}"
+            )
+        by_task_id = {result.task_id: result for result in drained}
+        missing = [task_id for task_id in task_frontier if task_id not in by_task_id]
+        if missing:
+            raise ValueError(f"Task frontier results are not ready: {missing}")
+        selected = [by_task_id.pop(task_id) for task_id in task_frontier]
+        pending = list(by_task_id.values())
+        return selected, pending
+    else:
+        drained.sort(key=lambda x: x.create_time)
+    selected, pending = drained[:count], drained[count:]
+    random.shuffle(selected)
+    return selected, pending
+
+
 class BatchTaskDispatcher(Generic[TInput, TResult]):
     """Generic dispatcher for asynchronous task execution with staleness control.
 
@@ -279,6 +314,7 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
         task_factory: Callable[[TInput], Callable[[], Awaitable[TResult | None]]],
         staleness_manager: StalenessManager,
         enable_tracing: bool = False,
+        deterministic_order: bool = False,
     ):
         self.runner = AsyncTaskRunner(
             max_queue_size=max_queue_size,
@@ -287,12 +323,13 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
         self.task_factory = task_factory
         self.staleness_manager = staleness_manager
         self.enable_tracing = enable_tracing
+        self.deterministic_order = deterministic_order
         self.logger: Logger
 
         # Unbounded deques for producer/consumer pattern
         self._pending_inputs: deque[TInput] = deque()
         self._pending_results: dict[int, TimedResult[TResult]] = {}
-        self._active_task_ids: set[int] = set()
+        self._active_task_ids: dict[int, None] = {}
 
         # Condition variables for coordination
         self._input_lock = threading.Lock()
@@ -335,11 +372,19 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
 
     def register_callback(self, task_id: int, callback_addr: str):
         """Register a callback address for a task."""
-        self._task_callbacks[task_id] = callback_addr
+        with self._result_cv:
+            if task_id in self._task_callbacks:
+                raise ValueError(f"Callback for task {task_id} is already registered")
+            self._task_callbacks[task_id] = callback_addr
 
-    def cancel_callback(self, task_id: int):
+    def cancel_callback(self, task_id: int, callback_addr: str | None = None):
         """Remove a registered callback for a task (e.g., on timeout)."""
-        self._task_callbacks.pop(task_id, None)
+        with self._result_cv:
+            if (
+                callback_addr is None
+                or self._task_callbacks.get(task_id) == callback_addr
+            ):
+                self._task_callbacks.pop(task_id, None)
 
     def _send_callback(self, addr: str, task_id: int, result: TResult):
         """Send task result to callback address (fire-and-forget)."""
@@ -535,14 +580,28 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
             Task input to be processed.
         """
         self._check_thread_exception()
-        with self._input_cv:
-            self._pending_inputs.append(task_input)
-            self.staleness_manager.on_rollout_enqueued()
-            if self.enable_tracing:
-                self.logger.info(f"Enqueue rollout. {self._rollout_stats()}")
-            self._input_cv.notify()
         with self._result_cv:
-            self._active_task_ids.add(task_input.task_id)
+            if task_input.task_id in self._active_task_ids:
+                raise ValueError(f"Task id {task_input.task_id} is already active")
+            self._active_task_ids[task_input.task_id] = None
+            self._result_cv.notify_all()
+        try:
+            with self._input_cv:
+                self._pending_inputs.append(task_input)
+                try:
+                    self.staleness_manager.on_rollout_enqueued()
+                except Exception:
+                    removed = self._pending_inputs.pop()
+                    assert removed is task_input
+                    raise
+                self._input_cv.notify()
+        except Exception:
+            with self._result_cv:
+                self._active_task_ids.pop(task_input.task_id, None)
+                self._result_cv.notify_all()
+            raise
+        if self.enable_tracing:
+            self.logger.info(f"Enqueue rollout. {self._rollout_stats()}")
 
     def wait_results(
         self, count: int, timeout: float | None = None, raise_timeout: bool = True
@@ -562,6 +621,11 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
         -------
         list[TResult | None]
             List of task results, None for rejected tasks.
+
+        Notes
+        -----
+        Deterministic ordering assumes one batch consumer. A concurrent
+        ``wait_for_task`` call that consumes the frozen frontier fails fast.
         """
         if count <= 0:
             raise ValueError(f"count must be positive, got {count}")
@@ -571,16 +635,46 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
             timeout = _DEFAULT_WAIT_TIMEOUT_SECONDS
 
         with self._result_cv:
-            while len(self._pending_results) < count:
+            task_frontier: tuple[int, ...] | None = None
+            while True:
                 self._check_thread_exception()
+                if self._shutdown_event.is_set():
+                    raise RuntimeError("Task dispatcher is shutting down")
+
+                if self.deterministic_order:
+                    if task_frontier is None and len(self._active_task_ids) >= count:
+                        task_frontier = tuple(islice(self._active_task_ids, count))
+                    consumed = (
+                        []
+                        if task_frontier is None
+                        else [
+                            task_id
+                            for task_id in task_frontier
+                            if task_id not in self._active_task_ids
+                            and task_id not in self._pending_results
+                        ]
+                    )
+                    if consumed:
+                        raise RuntimeError(
+                            f"Task frontier was consumed by another waiter: {consumed}"
+                        )
+                    results_ready = task_frontier is not None and all(
+                        task_id in self._pending_results for task_id in task_frontier
+                    )
+                else:
+                    results_ready = len(self._pending_results) >= count
+
+                if results_ready:
+                    break
 
                 elapsed = time.perf_counter() - start_time
                 remaining = timeout - elapsed
                 if remaining <= 0:
                     if raise_timeout:
                         raise TimeoutError(
-                            f"Timed out waiting for {count} results, "
-                            f"only received {len(self._pending_results)}"
+                            f"Timed out waiting for {count} results; "
+                            f"received {len(self._pending_results)}, "
+                            f"frontier={task_frontier}"
                         )
                     return []
 
@@ -588,18 +682,18 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
 
             drained: list[TimedResult[TResult]] = list(self._pending_results.values())
             self._pending_results.clear()
-
-        drained.sort(key=lambda x: x.create_time)
-        selected, pending = drained[:count], drained[count:]
-        with self._result_cv:
+            selected, pending = _select_results(
+                drained,
+                count,
+                self.deterministic_order,
+                task_frontier=task_frontier,
+            )
             if pending:
                 for result in pending:
                     self._pending_results[result.task_id] = result
-                self._result_cv.notify_all()
             for r in selected:
-                self._active_task_ids.discard(r.task_id)
-
-        random.shuffle(selected)
+                self._active_task_ids.pop(r.task_id, None)
+            self._result_cv.notify_all()
 
         return [r.data for r in selected]
 
@@ -617,6 +711,10 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
 
             while task_id not in self._pending_results:
                 self._check_thread_exception()
+                if self._shutdown_event.is_set():
+                    raise RuntimeError("Task dispatcher is shutting down")
+                if task_id not in self._active_task_ids:
+                    raise RuntimeError(f"Task {task_id} was consumed by another waiter")
 
                 elapsed = time.perf_counter() - start_time
                 remaining = timeout - elapsed
@@ -628,7 +726,7 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
                 self._result_cv.wait(timeout=remaining)
 
             found_result = self._pending_results.pop(task_id)
-            self._active_task_ids.remove(task_id)
+            del self._active_task_ids[task_id]
             self._result_cv.notify_all()
             return found_result.data
 
@@ -700,8 +798,9 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
                             "Input generator exhausted before batch completion. "
                             "Use cycle_dataloader() or provide an infinite generator."
                         ) from None
+            remaining = batch_size - (total_attempts if dynamic_bs else accepted_cnt)
             try:
-                arrived = self.wait_results(count=batch_size - accepted_cnt, timeout=1)
+                arrived = self.wait_results(count=remaining, timeout=1)
             except TimeoutError:
                 arrived = []
 
@@ -742,6 +841,11 @@ class TaskIdGenerator:
             task_id = self._task_cnt
             self._task_cnt += 1
         return task_id
+
+    def reserve_at_least(self, task_id: int) -> None:
+        """Keep future automatic IDs above an explicitly supplied task ID."""
+        with self._lock:
+            self._task_cnt = max(self._task_cnt, task_id + 1)
 
 
 class WorkflowExecutor:
@@ -1066,6 +1170,7 @@ class WorkflowExecutor:
             task_factory=self._create_workflow_task,
             staleness_manager=self._staleness_manager,
             enable_tracing=self.config.enable_rollout_tracing,
+            deterministic_order=getattr(self.config, "deterministic_sampling", False),
         )
 
         # Initialize the dispatcher's async task runner
@@ -1255,6 +1360,7 @@ class WorkflowExecutor:
         should_accept_fn: Callable[[dict[str, Any]], bool] = None,
         task_id: int | None = None,
         is_eval: bool = False,
+        callback_addr: str | None = None,
     ) -> int:
         """Submit a rollout request to the workflow executor.
 
@@ -1265,6 +1371,8 @@ class WorkflowExecutor:
         """
         if task_id is None:
             task_id = self._task_id_generator.next()
+        else:
+            self._task_id_generator.reserve_at_least(task_id)
         perf_tracer.register_task(task_id)
         task_input = _RolloutTaskInput(
             data=data,
@@ -1274,8 +1382,14 @@ class WorkflowExecutor:
             is_eval=is_eval,
         )
 
-        # Delegate to dispatcher
-        self.dispatcher.submit_task_input(task_input)
+        if callback_addr is not None:
+            self.dispatcher.register_callback(task_id, callback_addr)
+        try:
+            self.dispatcher.submit_task_input(task_input)
+        except Exception:
+            if callback_addr is not None:
+                self.dispatcher.cancel_callback(task_id, callback_addr)
+            raise
         return task_id
 
     def wait(

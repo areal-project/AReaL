@@ -222,6 +222,10 @@ class GenerationHyperparameters:
             )
         },
     )
+    seed: int | None = field(
+        default=None,
+        metadata={"help": "Per-request sampling seed sent to the inference backend."},
+    )
     lora_name: str = field(
         default="default_lora",
         metadata={"help": "Lora name to be used for this generation."},
@@ -2098,6 +2102,7 @@ class SGLangConfig:
     enable_memory_saver: bool = False
     allow_auto_truncate: bool = False
     attention_backend: str | None = "fa3"
+    enable_deterministic_inference: bool = False
     enable_multimodal: bool = False
     sampling_backend: str | None = None
     context_length: int | None = 32768
@@ -2413,6 +2418,14 @@ class InferenceEngineConfig:
         default=False,
         metadata={
             "help": "Whether to output verbose tracing messages for each generation request."
+        },
+    )
+    deterministic_sampling: bool = field(
+        default=False,
+        metadata={
+            "help": "Use stable OpenAI-proxy request seeds and canonical group "
+            "and batch ordering. Concurrent SGLang generation also requires "
+            "sglang.enable_deterministic_inference."
         },
     )
     check_trajectory_format: bool = field(

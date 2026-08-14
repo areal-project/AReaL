@@ -67,8 +67,14 @@ class ExportTrajectoriesResponse(BaseModel):
 class SessionData:
     """Data associated with a single RL session."""
 
-    def __init__(self, session_id: str, prefix_matcher=None):
+    def __init__(
+        self,
+        session_id: str,
+        prefix_matcher=None,
+        sampling_seed_identity: str | None = None,
+    ):
         self.session_id = session_id
+        self.sampling_seed_identity = sampling_seed_identity or session_id
 
         self._completed = False
         self._completions = InteractionCache(
@@ -80,6 +86,14 @@ class SessionData:
         self._last_access_time = time.time()
         self._end_time = None
         self._lock = threading.Lock()
+        self._next_sampling_request_index = 0
+
+    def next_sampling_request_index(self) -> int:
+        """Reserve a unique request index without serializing request execution."""
+        with self._lock:
+            request_index = self._next_sampling_request_index
+            self._next_sampling_request_index += 1
+        return request_index
 
     def update_last_access(self):
         """Update the last access time for this session."""
