@@ -36,6 +36,7 @@ from areal.experimental.openai.types import (
     concat_string_interactions,
 )
 from areal.utils import logging, perf_tracer, stats_tracker
+from areal.utils.environ import get_bool_env_var
 from areal.infra.utils.concurrent import get_executor
 from areal.utils.data import concat_padded_tensors, cycle_dataloader
 from areal.utils.perf_tracer import trace_perf, trace_session_event
@@ -731,6 +732,42 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
 
         return results
 
+    def checkpoint_safe_submit_and_wait(
+        self,
+        input_generator: Generator[TInput, None, None],
+        batch_size: int,
+        dynamic_bs: bool = False,
+    ) -> list[TResult]:
+        """Submit one batch without consuming input for the next training step."""
+        if batch_size <= 0:
+            raise ValueError(f"batch_size must be positive, got {batch_size}")
+        if self.runner.max_queue_size < batch_size:
+            raise ValueError(
+                "Inference engine config's queue size is too small: "
+                f"{self.runner.max_queue_size} < batch size {batch_size}."
+            )
+
+        for _ in range(batch_size):
+            try:
+                self.submit_task_input(next(input_generator))
+            except StopIteration:
+                raise RuntimeError(
+                    "Input generator exhausted before batch completion. "
+                    "Use cycle_dataloader() or provide an infinite generator."
+                ) from None
+
+        arrived = self.wait_results(count=batch_size)
+        accepted = [result for result in arrived if result is not None]
+        rejected = batch_size - len(accepted)
+        if rejected and not dynamic_bs:
+            suffix = "s" if rejected != 1 else ""
+            raise RuntimeError(
+                "Checkpoint-safe fixed-batch dispatch rejected "
+                f"{rejected} rollout{suffix}; refusing to consume replacement "
+                "inputs across the recover boundary."
+            )
+        return accepted
+
 
 class TaskIdGenerator:
     def __init__(self):
@@ -742,6 +779,30 @@ class TaskIdGenerator:
             task_id = self._task_cnt
             self._task_cnt += 1
         return task_id
+
+    def state_dict(self) -> dict[str, int]:
+        """Return the next task ID without racing concurrent submissions."""
+        with self._lock:
+            return {"next_task_id": self._task_cnt}
+
+    def load_state_dict(self, state: dict[str, int]) -> None:
+        """Restore the next task ID from a recover checkpoint."""
+        if not isinstance(state, dict) or "next_task_id" not in state:
+            raise ValueError(
+                "TaskIdGenerator state must contain an integer next_task_id"
+            )
+        next_task_id = state["next_task_id"]
+        if (
+            isinstance(next_task_id, bool)
+            or not isinstance(next_task_id, int)
+            or next_task_id < 0
+        ):
+            raise ValueError(
+                "TaskIdGenerator next_task_id must be a non-negative integer, "
+                f"got {next_task_id!r}"
+            )
+        with self._lock:
+            self._task_cnt = next_task_id
 
 
 class WorkflowExecutor:
@@ -1086,6 +1147,24 @@ class WorkflowExecutor:
         if tracer is not None:
             tracer.flush(force=True)
 
+    def recover_state_dict(self) -> dict[str, Any] | None:
+        """Capture task identity for explicitly deterministic rollout recovery."""
+        if not get_bool_env_var("AREAL_DETERMINISTIC_SAMPLING"):
+            return None
+        return {"task_id_generator": self._task_id_generator.state_dict()}
+
+    def load_recover_state_dict(self, state: dict[str, Any] | None) -> None:
+        """Restore deterministic rollout task identity before new submissions."""
+        if not get_bool_env_var("AREAL_DETERMINISTIC_SAMPLING"):
+            return
+        if state is None or state.get("task_id_generator") is None:
+            self.logger.warning(
+                "Recover checkpoint has no TaskIdGenerator state; task IDs will "
+                "restart from zero and deterministic equivalence is not guaranteed."
+            )
+            return
+        self._task_id_generator.load_state_dict(state["task_id_generator"])
+
     def get_capacity(self):
         """Get current available capacity for new rollouts.
 
@@ -1416,9 +1495,18 @@ class WorkflowExecutor:
 
         # Delegate to dispatcher
         assert dataloader.batch_size is not None
-        results = self.dispatcher.active_submit_and_wait(
-            self.data_generator, batch_size=dataloader.batch_size, dynamic_bs=dynamic_bs
-        )
+        if get_bool_env_var("AREAL_DETERMINISTIC_SAMPLING"):
+            results = self.dispatcher.checkpoint_safe_submit_and_wait(
+                self.data_generator,
+                batch_size=dataloader.batch_size,
+                dynamic_bs=dynamic_bs,
+            )
+        else:
+            results = self.dispatcher.active_submit_and_wait(
+                self.data_generator,
+                batch_size=dataloader.batch_size,
+                dynamic_bs=dynamic_bs,
+            )
 
         # Return list of trajectory dicts (filter out None)
         return [r.trajectory for r in results if r is not None]

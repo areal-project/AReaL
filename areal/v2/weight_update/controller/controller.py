@@ -33,12 +33,16 @@ class WeightUpdateController:
         return self._gateway_url
 
     @property
+    def pair_name(self) -> str | None:
+        return self._pair_name
+
+    @property
     def _http(self) -> httpx.Client:
         if self._session is None:
             raise RuntimeError("Controller not initialized. Call initialize() first.")
         return self._session
 
-    def initialize(self) -> None:
+    def initialize(self, timeout: float | None = None) -> None:
         cfg = self.config
         port = cfg.port
         if port == 0:
@@ -62,20 +66,25 @@ class WeightUpdateController:
             cfg.log_level,
         ]
 
-        self._gateway_proc = subprocess.Popen(
-            cmd,
-            stdout=sys.stdout,
-            stderr=sys.stdout,
-        )
+        try:
+            self._gateway_proc = subprocess.Popen(
+                cmd,
+                stdout=sys.stdout,
+                stderr=sys.stdout,
+            )
 
-        self._gateway_url = f"http://{cfg.host}:{port}"
-        self._session = httpx.Client()
-        self._session.headers["Authorization"] = f"Bearer {cfg.admin_api_key}"
-        self._wait_for_health()
-        logger.info("Gateway ready at %s", self._gateway_url)
+            self._gateway_url = f"http://{cfg.host}:{port}"
+            self._session = httpx.Client()
+            self._session.headers["Authorization"] = f"Bearer {cfg.admin_api_key}"
+            self._wait_for_health(timeout=timeout)
+            logger.info("Gateway ready at %s", self._gateway_url)
+        except BaseException:
+            self.destroy()
+            raise
 
-    def _wait_for_health(self) -> None:
-        deadline = time.monotonic() + self.config.setup_timeout
+    def _wait_for_health(self, timeout: float | None = None) -> None:
+        timeout = self.config.setup_timeout if timeout is None else timeout
+        deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             if self._gateway_proc is not None and self._gateway_proc.poll() is not None:
                 raise RuntimeError(
@@ -89,9 +98,7 @@ class WeightUpdateController:
             except (httpx.ConnectError, httpx.TimeoutException):
                 pass
             time.sleep(0.5)
-        raise TimeoutError(
-            f"Gateway did not become healthy within {self.config.setup_timeout}s"
-        )
+        raise TimeoutError(f"Gateway did not become healthy within {timeout}s")
 
     def health_check(self) -> bool:
         try:
@@ -116,8 +123,10 @@ class WeightUpdateController:
         colocate: bool = False,
         nccl_master_addr: str = "",
         nccl_master_port: int = 0,
+        setup_timeout_s: float | None = None,
+        rollback_timeout_s: float = 30.0,
+        request_timeout: float | None = None,
     ) -> None:
-        self._pair_name = pair_name
         payload: dict[str, Any] = {
             "pair_name": pair_name,
             "train_worker_urls": train_worker_urls,
@@ -130,13 +139,16 @@ class WeightUpdateController:
             "colocate": colocate,
             "nccl_master_addr": nccl_master_addr,
             "nccl_master_port": nccl_master_port,
+            "setup_timeout_s": setup_timeout_s,
+            "rollback_timeout_s": rollback_timeout_s,
         }
         resp = self._http.post(
             f"{self._gateway_url}/connect",
             json=payload,
-            timeout=self.config.request_timeout,
+            timeout=request_timeout or self.config.request_timeout,
         )
         resp.raise_for_status()
+        self._pair_name = pair_name
         logger.info(
             "Connected pair '%s' (mode=%s, colocate=%s, use_lora=%s)",
             pair_name,
@@ -155,26 +167,31 @@ class WeightUpdateController:
         )
         resp.raise_for_status()
         data = resp.json()
-        return WeightUpdateResult(
+        result = WeightUpdateResult(
             status=data["status"],
             version=data["version"],
             duration_ms=data["duration_ms"],
             error=data.get("error"),
         )
+        if result.status != "ok":
+            raise RuntimeError(
+                f"Weight update failed for pair {self._pair_name!r}, "
+                f"version={version}: {result.error or 'unknown error'}"
+            )
+        return result
 
-    def disconnect(self) -> None:
+    def disconnect(self, timeout: float | None = None) -> None:
         if self._pair_name is None:
             return
-        try:
-            resp = self._http.post(
-                f"{self._gateway_url}/disconnect",
-                json={"pair_name": self._pair_name},
-                timeout=self.config.request_timeout,
-            )
-            resp.raise_for_status()
-            logger.info("Disconnected pair '%s'", self._pair_name)
-        finally:
-            self._pair_name = None
+        pair_name = self._pair_name
+        resp = self._http.post(
+            f"{self._gateway_url}/disconnect",
+            json={"pair_name": pair_name},
+            timeout=timeout or self.config.request_timeout,
+        )
+        resp.raise_for_status()
+        self._pair_name = None
+        logger.info("Disconnected pair '%s'", pair_name)
 
     def _gateway_get(self, path: str) -> Any:
         resp = self._http.get(
@@ -198,11 +215,13 @@ class WeightUpdateController:
             )
         return resp.json()
 
-    def destroy(self) -> None:
+    def destroy(self, *, raise_on_error: bool = False) -> None:
+        disconnect_error: Exception | None = None
         if self._pair_name is not None:
             try:
                 self.disconnect()
-            except Exception:
+            except Exception as e:
+                disconnect_error = e
                 logger.warning("Failed to disconnect during destroy", exc_info=True)
 
         if self._session is not None:
@@ -217,3 +236,5 @@ class WeightUpdateController:
             self._gateway_proc = None
         self._gateway_url = ""
         logger.info("WeightUpdateController destroyed")
+        if disconnect_error is not None and raise_on_error:
+            raise disconnect_error
