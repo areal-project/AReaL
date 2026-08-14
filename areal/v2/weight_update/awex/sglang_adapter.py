@@ -36,9 +36,7 @@ from areal.v2.weight_update.awex import (
     awex_wu_use_group,
     fetch_kv_metadata,
 )
-from areal.v2.weight_update.awex.delta_config import (
-    separation_delta_transfer_enabled,
-)
+from areal.v2.weight_update.awex.delta_config import DTERuntimeConfig
 from areal.v2.weight_update.inference_adapter import (
     AwexInferenceAdapter,
 )
@@ -70,6 +68,7 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
         self._colocate_transport = None
         self._train_to_infer_device_mapping: dict | None = None
         self._infer_to_train_device_mapping: dict | None = None
+        self._dte_config = DTERuntimeConfig.from_env()
 
     def _get_model(self) -> torch.nn.Module:
         return self._scheduler.tp_worker.model_runner.model
@@ -426,7 +425,7 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
         )
 
     def execute_weight_update(self, version: int) -> None:
-        if separation_delta_transfer_enabled():
+        if self._dte_config.enabled:
             self._execute_separation_weight_update(version)
             return
 

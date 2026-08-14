@@ -79,3 +79,17 @@ def test_dte_rejects_out_of_scope_modes(kwargs, match):
 
     with pytest.raises(ValueError, match=match):
         _load_helpers().apply_dte_config_envvars(config, environ={})
+
+
+def test_dte_requires_one_ppo_minibatch_per_weight_update():
+    pytest.importorskip("httpx")
+    from areal.api.cli_args import DTEConfig, PPOActorConfig
+
+    enabled = DTEConfig(enabled=True)
+    assert PPOActorConfig(dte=enabled, ppo_n_minibatches=1).ppo_n_minibatches == 1
+
+    with pytest.raises(ValueError, match="requires ppo_n_minibatches=1"):
+        PPOActorConfig(dte=enabled, ppo_n_minibatches=2)
+
+    disabled = DTEConfig(enabled=False)
+    assert PPOActorConfig(dte=disabled).ppo_n_minibatches == 4

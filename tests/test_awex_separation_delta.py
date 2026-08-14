@@ -43,9 +43,9 @@ def _capture_weight_update_groups(monkeypatch, mod):
 def test_megatron_full_transfer_initializes_gloo_control_group(monkeypatch):
     """Separated Full sync must not fall back to a NCCL control barrier."""
     mod = common._load_megatron_adapter(monkeypatch)
-    monkeypatch.setattr(mod, "separation_delta_transfer_enabled", lambda: False)
     calls = _capture_weight_update_groups(monkeypatch, mod)
     adapter = object.__new__(mod.AwexMegatronAdapter)
+    adapter._dte_config = SimpleNamespace(enabled=False)
 
     adapter.init_weight_update_group(
         pair_name="pair",
@@ -67,9 +67,9 @@ def test_megatron_full_transfer_initializes_gloo_control_group(monkeypatch):
 def test_sglang_full_transfer_initializes_gloo_control_group(monkeypatch):
     """SGLang Full sync creates the same CPU control group as training."""
     mod = common._load_sglang_adapter(monkeypatch)
-    monkeypatch.setattr(mod, "separation_delta_transfer_enabled", lambda: False)
     calls = _capture_weight_update_groups(monkeypatch, mod)
     adapter = object.__new__(mod.AwexSGLangAdapter)
+    adapter._dte_config = SimpleNamespace(enabled=False)
     adapter._get_model_context = lambda: {
         "tp_size": 4,
         "tp_rank": 0,
@@ -97,7 +97,6 @@ def test_sglang_full_transfer_initializes_gloo_control_group(monkeypatch):
 def test_megatron_full_transfer_uses_gloo_completion_barrier(monkeypatch):
     """Full payload P2P completes through the sideband control group."""
     mod = common._load_megatron_adapter(monkeypatch)
-    monkeypatch.setattr(mod, "separation_delta_transfer_enabled", lambda: False)
     monkeypatch.setattr(
         mod, "nccl_build_send_ops", lambda *args, **kwargs: ([], [], [])
     )
@@ -105,6 +104,7 @@ def test_megatron_full_transfer_uses_gloo_completion_barrier(monkeypatch):
     barriers = []
     monkeypatch.setattr(mod.dist, "barrier", lambda *, group: barriers.append(group))
     adapter = object.__new__(mod.AwexMegatronAdapter)
+    adapter._dte_config = SimpleNamespace(enabled=False)
     adapter._transfer_plan = object()
     adapter._weights_update_group = "nccl"
     adapter._weights_update_group_gloo = "gloo"
@@ -120,7 +120,6 @@ def test_megatron_full_transfer_uses_gloo_completion_barrier(monkeypatch):
 def test_sglang_full_transfer_uses_gloo_completion_barrier(monkeypatch):
     """Receiver Full payload completion avoids the NCCL data group."""
     mod = common._load_sglang_adapter(monkeypatch)
-    monkeypatch.setattr(mod, "separation_delta_transfer_enabled", lambda: False)
     monkeypatch.setattr(
         mod, "nccl_build_recv_ops", lambda *args, **kwargs: ([], [], [])
     )
@@ -128,6 +127,7 @@ def test_sglang_full_transfer_uses_gloo_completion_barrier(monkeypatch):
     barriers = []
     monkeypatch.setattr(mod.dist, "barrier", lambda *, group: barriers.append(group))
     adapter = object.__new__(mod.AwexSGLangAdapter)
+    adapter._dte_config = SimpleNamespace(enabled=False)
     adapter._transfer_plan = object()
     adapter._weights_update_group = "nccl"
     adapter._weights_update_group_gloo = "gloo"

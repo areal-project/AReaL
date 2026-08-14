@@ -116,6 +116,39 @@ def test_scheduler_uses_fixed_warmup_and_resume_safe_initial_lr(
     assert captured["wd_incr_steps"] == 10
 
 
+def test_dte_records_optimizer_step_lr_before_scheduler_advances() -> None:
+    """AdamW inversion must retain the LR consumed by the completed step."""
+    engine = megatron_engine_module.MegatronEngine.__new__(
+        megatron_engine_module.MegatronEngine
+    )
+    param_groups = [{"lr": 3e-6}, {"lr": 4e-6}]
+
+    class _Optimizer:
+        def __init__(self):
+            self.param_groups = param_groups
+
+        def step(self):
+            return True, torch.tensor(1.0), None
+
+    class _Scheduler:
+        def step(self, increment):
+            assert increment == 1
+            param_groups[0]["lr"] = 2e-6
+            param_groups[1]["lr"] = 1e-6
+
+    engine.optimizer = _Optimizer()
+    engine.lr_scheduler = _Scheduler()
+    engine._dte_runtime_config = SimpleNamespace(enabled=True)
+
+    engine.optimizer_step()
+    engine.lr_scheduler_step()
+
+    assert param_groups[0]["lr"] == 2e-6
+    assert param_groups[1]["lr"] == 1e-6
+    assert param_groups[0]["_areal_last_step_lr"] == 3e-6
+    assert param_groups[1]["_areal_last_step_lr"] == 4e-6
+
+
 @pytest.mark.parametrize(
     ("optimizer_config", "ft_spec", "match"),
     [

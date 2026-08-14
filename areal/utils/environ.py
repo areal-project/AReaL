@@ -10,12 +10,52 @@ _warned_bool_env_var_keys = set()
 _warned_rank_env_var_values = set()
 
 
-def get_bool_env_var(name: str, default: str = "false") -> bool:
-    value = os.getenv(name, default)
-    value = value.lower()
+def get_env_var(
+    name: str,
+    default: str | None = None,
+    *,
+    fallback_names: tuple[str, ...] = (),
+    allow_empty: bool = False,
+) -> str | None:
+    """Read an environment variable with ordered fallback names.
 
-    truthy_values = ("true", "1")
-    falsy_values = ("false", "0")
+    Empty values are skipped by default so a legacy name can supply the value.
+    Set ``allow_empty=True`` when an explicitly empty value has domain meaning.
+    """
+    for candidate in (name, *fallback_names):
+        value = os.getenv(candidate)
+        if value is None:
+            continue
+        if allow_empty or value.strip() != "":
+            return value
+    return default
+
+
+def get_bool_env_var(
+    name: str,
+    default: str = "false",
+    *,
+    fallback_names: tuple[str, ...] = (),
+    truthy_values: tuple[str, ...] = ("true", "1"),
+    falsy_values: tuple[str, ...] = ("false", "0"),
+    strip_value: bool = False,
+) -> bool:
+    """Read a boolean environment variable.
+
+    The default accepted values remain backward compatible. Callers that
+    historically accepted additional spellings can opt in through
+    ``truthy_values`` and ``falsy_values``.
+    """
+    value = get_env_var(
+        name,
+        default,
+        fallback_names=fallback_names,
+        # Preserve the original single-name behavior: an explicitly empty
+        # boolean is invalid rather than silently replaced by the default.
+        allow_empty=not fallback_names,
+    )
+    assert value is not None
+    value = (value.strip() if strip_value else value).lower()
 
     if (value not in truthy_values) and (value not in falsy_values):
         if value not in _warned_bool_env_var_keys:

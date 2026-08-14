@@ -61,42 +61,40 @@ the cluster; ``dte.core.invert_adamw`` itself is CPU-unit-tested.
 
 from __future__ import annotations
 
-import os
 import time
 from collections.abc import Iterator
 
 import torch
 
 from areal.utils import logging
-from areal.v2.weight_update.awex.delta_config import cuda_mem_stats_mb
+from areal.utils.environ import get_bool_env_var, get_env_var
 
 logger = logging.getLogger("AwexDeltaDetect")
 
-
-def _env_value(name: str, legacy_name: str, default: str | None = None) -> str | None:
-    value = os.environ.get(name)
-    if value is not None and value.strip() != "":
-        return value
-    value = os.environ.get(legacy_name)
-    if value is not None and value.strip() != "":
-        return value
-    return default
+_DTE_TRUTHY_VALUES = ("1", "true", "yes", "on")
+_DTE_FALSY_VALUES = ("0", "false", "no", "off")
 
 
-def _env_bool(name: str, legacy_name: str, default: bool = False) -> bool:
-    value = _env_value(name, legacy_name)
-    if value is None:
-        return default
-    return value.strip().lower() in {"1", "true", "yes", "on"}
+def _dte_bool_env(name: str, legacy_name: str, default: bool = False) -> bool:
+    return get_bool_env_var(
+        name,
+        "true" if default else "false",
+        fallback_names=(legacy_name,),
+        truthy_values=_DTE_TRUTHY_VALUES,
+        falsy_values=_DTE_FALSY_VALUES,
+        strip_value=True,
+    )
 
 
 def _inversion_debug_enabled() -> bool:
-    return _env_bool("DTE_DELTA_INVERSION_DEBUG", "AWEX_DELTA_INVERSION_DEBUG")
+    return _dte_bool_env("DTE_DELTA_INVERSION_DEBUG", "AWEX_DELTA_INVERSION_DEBUG")
 
 
 def _streaming_reconstruct_enabled() -> bool:
     """Whether to reconstruct pre-step tensors lazily during HF conversion."""
-    return _env_bool("DTE_STREAMING_RECONSTRUCT", "PYQ_STREAMING_RECONSTRUCT", False)
+    return _dte_bool_env(
+        "DTE_STREAMING_RECONSTRUCT", "PYQ_STREAMING_RECONSTRUCT", False
+    )
 
 
 def _inversion_allreduce_window_bytes() -> int:
@@ -107,10 +105,10 @@ def _inversion_allreduce_window_bytes() -> int:
     flight. ``0`` restores the fully synchronous per-param path (A/B knob).
     """
     mb = float(
-        _env_value(
+        get_env_var(
             "DTE_INVERSION_ALLREDUCE_WINDOW_MB",
-            "AWEX_INVERSION_ALLREDUCE_WINDOW_MB",
             "512",
+            fallback_names=("AWEX_INVERSION_ALLREDUCE_WINDOW_MB",),
         )
     )
     return max(int(mb * 1024 * 1024), 0)
@@ -127,17 +125,17 @@ def _inversion_compute_device(flat_t: torch.Tensor) -> torch.device:
     operands there. Set DTE_INVERSION_COMPUTE_ON_CPU=1 to restore the legacy
     behaviour of computing wherever the fp32 main shard lives.
     """
-    if _env_bool("DTE_INVERSION_COMPUTE_ON_CPU", "AWEX_INVERSION_COMPUTE_ON_CPU"):
+    if _dte_bool_env("DTE_INVERSION_COMPUTE_ON_CPU", "AWEX_INVERSION_COMPUTE_ON_CPU"):
         return torch.device("cpu")
     return flat_t.device
 
 
 def _inversion_bf16_margin_rel() -> float:
     return float(
-        _env_value(
+        get_env_var(
             "DTE_DELTA_INVERSION_BF16_MARGIN_REL",
-            "AWEX_DELTA_INVERSION_BF16_MARGIN_REL",
             "1e-4",
+            fallback_names=("AWEX_DELTA_INVERSION_BF16_MARGIN_REL",),
         )
     )
 
@@ -150,13 +148,25 @@ def _inversion_dense_param_suffixes() -> tuple[str, ...]:
     payloads, so sending them dense is the conservative default. Set the env to
     an empty string to disable, or to a comma-separated suffix list to override.
     """
-    if "DTE_DELTA_INVERSION_DENSE_PARAM_SUFFIXES" in os.environ:
-        value = os.environ["DTE_DELTA_INVERSION_DENSE_PARAM_SUFFIXES"]
-    elif "AWEX_DELTA_INVERSION_DENSE_PARAM_SUFFIXES" in os.environ:
-        value = os.environ["AWEX_DELTA_INVERSION_DENSE_PARAM_SUFFIXES"]
-    else:
-        value = ".mlp.gate.weight"
+    value = get_env_var(
+        "DTE_DELTA_INVERSION_DENSE_PARAM_SUFFIXES",
+        ".mlp.gate.weight",
+        fallback_names=("AWEX_DELTA_INVERSION_DENSE_PARAM_SUFFIXES",),
+        allow_empty=True,
+    )
+    assert value is not None
     return tuple(item.strip() for item in value.split(",") if item.strip())
+
+
+def _cuda_mem_stats_mb(reset_peak: bool = True) -> tuple[float, float]:
+    """Return current and peak CUDA allocation, or CPU sentinels."""
+    if not torch.cuda.is_available():
+        return -1.0, -1.0
+    allocated = torch.cuda.memory_allocated() / (1024.0 * 1024.0)
+    peak = torch.cuda.max_memory_allocated() / (1024.0 * 1024.0)
+    if reset_peak:
+        torch.cuda.reset_peak_memory_stats()
+    return allocated, peak
 
 
 def _inversion_force_dense_param(name: str) -> bool:
@@ -181,8 +191,13 @@ def _dist_world_size(group=None) -> int:
         return 1
 
 
-def _adamw_hparams(param_group: dict) -> tuple[float, float, float, float, float]:
+def _adamw_hparams(
+    param_group: dict,
+) -> tuple[float, float, float, float, float] | None:
     """Extract (lr, weight_decay, beta1, beta2, eps) from a torch param_group."""
+    last_step_lr = param_group.get("_areal_last_step_lr")
+    if last_step_lr is None:
+        return None
     betas = param_group.get("betas", (0.9, 0.999))
     beta1 = float(betas[0])
     beta2 = float(betas[1])
@@ -193,7 +208,7 @@ def _adamw_hparams(param_group: dict) -> tuple[float, float, float, float, float
         beta1 = 0.0
         beta2 = 0.0
     return (
-        float(param_group.get("_areal_last_step_lr", param_group["lr"])),
+        float(last_step_lr),
         float(param_group.get("weight_decay", 0.0)),
         beta1,
         beta2,
@@ -311,10 +326,10 @@ def _bf16_rounding_boundary_mask_chunked(
 ) -> torch.Tensor:
     """Bound boundary-check temporaries by processing large tensors in chunks."""
     chunk_elems = int(
-        _env_value(
+        get_env_var(
             "DTE_BOUNDARY_CHUNK_ELEMS",
-            "PYQ_BOUNDARY_CHUNK_ELEMS",
             str(50_000_000),
+            fallback_names=("PYQ_BOUNDARY_CHUNK_ELEMS",),
         )
     )
     if chunk_elems <= 0 or cur_bf16.numel() <= chunk_elems:
@@ -769,6 +784,7 @@ class AdamWInversionDetector:
         skipped_step_unchanged = 0
         skipped_missing_watermark = 0
         skipped_step_jump = 0
+        skipped_missing_last_step_lr = 0
         skipped_missing_fingerprint = 0
         skipped_tracked_unchanged = 0
         skipped_payload_changed_without_step = 0
@@ -1163,50 +1179,53 @@ class AdamWInversionDetector:
                             ):
                                 skipped_bad_state += 1
                             else:
-                                lr, wd, b1, b2, eps = _adamw_hparams(
-                                    base_opt.param_groups[gi]
-                                )
-                                # The fp32 main shard and moments may be
-                                # offloaded to CPU under colocate; stage them on
-                                # the inversion compute device (the visible
-                                # payload's device by default) so invert_adamw
-                                # runs on GPU instead of the CPU. Inversion
-                                # still uses the exact post-step optimizer
-                                # weight, not the bf16 model copy. Keep the
-                                # reconstructed previous value in fp32 until
-                                # mask creation so boundary-near BF16 roundoff
-                                # is handled conservatively.
-                                dev = _inversion_compute_device(flat_t)
-                                theta_t_slice = main_flat.to(
-                                    device=dev, dtype=torch.float32
-                                )
-                                theta_old_slice = invert_adamw(
-                                    theta_t_slice,
-                                    exp_avg.to(device=dev, dtype=torch.float32).reshape(
-                                        -1
-                                    ),
-                                    exp_avg_sq.to(
+                                hparams = _adamw_hparams(base_opt.param_groups[gi])
+                                if hparams is None:
+                                    skipped_missing_last_step_lr += 1
+                                    force_dense = True
+                                else:
+                                    lr, wd, b1, b2, eps = hparams
+                                    # The fp32 main shard and moments may be
+                                    # offloaded to CPU under colocate; stage them on
+                                    # the inversion compute device (the visible
+                                    # payload's device by default) so invert_adamw
+                                    # runs on GPU instead of the CPU. Inversion
+                                    # still uses the exact post-step optimizer
+                                    # weight, not the bf16 model copy. Keep the
+                                    # reconstructed previous value in fp32 until
+                                    # mask creation so boundary-near BF16 roundoff
+                                    # is handled conservatively.
+                                    dev = _inversion_compute_device(flat_t)
+                                    theta_t_slice = main_flat.to(
                                         device=dev, dtype=torch.float32
-                                    ).reshape(-1),
-                                    step,
-                                    lr,
-                                    wd,
-                                    b1,
-                                    b2,
-                                    eps,
-                                )
-                                visible_slice = flat_t[rng.start : rng.end]
-                                visible_fp32 = visible_slice.to(
-                                    device=theta_old_slice.device,
-                                    dtype=torch.float32,
-                                )
-                                correction[rng.start : rng.end] = (
-                                    theta_old_slice - visible_fp32
-                                ).to(
-                                    device=correction.device,
-                                    dtype=correction.dtype,
-                                )
-                                has_local_update = True
+                                    )
+                                    theta_old_slice = invert_adamw(
+                                        theta_t_slice,
+                                        exp_avg.to(
+                                            device=dev, dtype=torch.float32
+                                        ).reshape(-1),
+                                        exp_avg_sq.to(
+                                            device=dev, dtype=torch.float32
+                                        ).reshape(-1),
+                                        step,
+                                        lr,
+                                        wd,
+                                        b1,
+                                        b2,
+                                        eps,
+                                    )
+                                    visible_slice = flat_t[rng.start : rng.end]
+                                    visible_fp32 = visible_slice.to(
+                                        device=theta_old_slice.device,
+                                        dtype=torch.float32,
+                                    )
+                                    correction[rng.start : rng.end] = (
+                                        theta_old_slice - visible_fp32
+                                    ).to(
+                                        device=correction.device,
+                                        dtype=correction.dtype,
+                                    )
+                                    has_local_update = True
 
             owned_numel = (
                 int(rng.end - rng.start) if has_local_update and rng is not None else 0
@@ -1283,13 +1302,15 @@ class AdamWInversionDetector:
         if force_dense:
             logger.warning(
                 "Inversion: optimizer step replay is ambiguous "
-                "(missing_watermark=%d step_jump=%d missing_fingerprint=%d "
+                "(missing_watermark=%d step_jump=%d missing_last_step_lr=%d "
+                "missing_fingerprint=%d "
                 "payload_changed_without_step=%d "
                 "untracked_non_optimizer=%d changed_non_optimizer=%d "
                 "partial_state=%d unkeyed_opt_params=%d) "
                 "-> dense.",
                 skipped_missing_watermark,
                 skipped_step_jump,
+                skipped_missing_last_step_lr,
                 skipped_missing_fingerprint,
                 skipped_payload_changed_without_step,
                 skipped_untracked_non_optimizer,
@@ -1442,7 +1463,7 @@ class AdamWInversionDetector:
             return cached_masks
         perf_start = time.monotonic()
         # Reset the peak counter so peak_mb below covers inversion only.
-        cuda_mem_stats_mb()
+        _cuda_mem_stats_mb()
         adapter = self._adapter
         t_inner = time.monotonic()
         inner = adapter._get_inner_optimizers()
@@ -1624,7 +1645,7 @@ class AdamWInversionDetector:
             forced_dense_params,
             forced_dense_elements,
         )
-        alloc_mb, peak_mb = cuda_mem_stats_mb()
+        alloc_mb, peak_mb = _cuda_mem_stats_mb()
         logger.info(
             "[dte-perf][inversion] v%d result=sparse params=%d "
             "theta_old_params=%d full_changed_masks=%d "
