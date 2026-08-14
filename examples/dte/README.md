@@ -28,17 +28,17 @@ behavior.
 
 ## Effective performance defaults
 
-The example keeps its public YAML surface small. The following optimizations are already
-active without adding site-specific environment overrides:
+The example spells out the portable performance settings in the worker environment; none
+of them depends on a site-specific path or cluster:
 
-| Optimization                    | Effective setting                       | Source                                            |
-| ------------------------------- | --------------------------------------- | ------------------------------------------------- |
-| Streaming AdamW reconstruction  | `DTE_STREAMING_RECONSTRUCT=1`           | Propagated by AReaL when `actor.dte.enabled=true` |
-| Coalesced two-round sparse P2P  | `DTE_DELTA_P2P_COALESCE=1`              | AReaL-DTE default                                 |
-| Pipelined inversion collectives | 512 MiB in-flight window                | AReaL default                                     |
-| Inversion compute device        | Payload device (GPU for this example)   | AReaL default                                     |
-| Compact change indices          | `int32` when the parameter size permits | Standard AReaL detector path                      |
-| Batched operation remapping     | Once per parameter                      | Standard AReaL-DTE payload path                   |
+| Optimization                    | Effective setting                       | Source                                         |
+| ------------------------------- | --------------------------------------- | ---------------------------------------------- |
+| Streaming AdamW reconstruction  | `DTE_STREAMING_RECONSTRUCT=1`           | Explicit; also enforced by `actor.dte.enabled` |
+| Coalesced two-round sparse P2P  | `DTE_DELTA_P2P_COALESCE=1`              | Explicit; also the AReaL-DTE default           |
+| Pipelined inversion collectives | 512 MiB in-flight window                | Explicit AReaL setting                         |
+| Inversion compute device        | Payload device (GPU for this example)   | Explicit AReaL setting                         |
+| Compact change indices          | `int32` when the parameter size permits | Standard AReaL detector path                   |
+| Batched operation remapping     | Once per parameter                      | Standard AReaL-DTE payload path                |
 
 Snapshot verification, weight digests, phase timing, recovery, and deterministic rollout
 diagnostics are intentionally not enabled here because they are validation or experiment
