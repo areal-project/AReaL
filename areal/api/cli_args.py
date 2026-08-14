@@ -1686,7 +1686,11 @@ class PPOActorConfig(TrainEngineConfig):
 
     # Core PPO/GRPO Parameters
     ppo_n_minibatches: int = field(
-        default=4, metadata={"help": "Number of minibatches for each PPO update"}
+        default=4,
+        metadata={
+            "help": "Number of minibatches for each PPO update. Separation DTE "
+            "AdamW delta transfer currently requires 1."
+        },
     )
     eps_clip: float = field(
         default=0.2, metadata={"help": "Clipping factor for policy ratio"}
@@ -1929,6 +1933,13 @@ class PPOActorConfig(TrainEngineConfig):
                 "to a single optimizer step per PPO update."
             )
             self.ppo_n_minibatches = 1
+        if self.dte.enabled and self.ppo_n_minibatches != 1:
+            raise ValueError(
+                "actor.dte.enabled=true currently requires "
+                "ppo_n_minibatches=1 because separation AdamW inversion "
+                "supports exactly one optimizer step between weight updates; "
+                f"got ppo_n_minibatches={self.ppo_n_minibatches}"
+            )
         # Warn if rejection_sampling is configured but use_decoupled_loss is False
         if not self.use_decoupled_loss and self.rejection_sampling is not None:
             logger.warning(

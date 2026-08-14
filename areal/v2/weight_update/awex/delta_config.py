@@ -1,25 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Runtime gates and factories for separation AdamW delta transfer.
+"""Runtime configuration for separation AdamW delta transfer.
 
-The delta algorithm itself lives in the standalone ``dte`` package; this module
-only decides whether the separated-card AWEX adapters invoke it and constructs
-the writer tracker (with a clear error if DTE is not installed). It
-accepts the new ``DTE_*`` runtime environment emitted from ``actor.dte.*`` CLI
-config, while preserving the old ``AWEX_*`` names as a compatibility fallback.
-
-DTE is imported lazily: a default AReaL install does not require it unless the
-separation delta path is explicitly enabled.
-
-Switches:
-    DTE_DELTA_TRANSFER        enable sparse incremental transfer (default off)
-    DTE_SEPARATION_WEIGHT_UPDATE
-                              allow the separation-only sparse P2P path
-    DTE_DELTA_ANCHOR_INTERVAL force a full sync every N deltas (0 = never)
+The delta algorithm itself lives in the standalone ``dte`` package. This
+module snapshots the environment propagated to a GPU worker and lazily creates
+the sender-side tracker only when the opt-in separation path needs it.
 """
 
 from __future__ import annotations
 
-import os
+from dataclasses import dataclass
+
+from areal.utils.environ import get_bool_env_var, get_env_var
 
 _DTE_MISSING_MSG = (
     "DTE separation delta transfer requires the 'dte' package "
@@ -28,76 +19,55 @@ _DTE_MISSING_MSG = (
     "(local dev) or add DTE_SRC to PYTHONPATH."
 )
 
-
-def _env_value(name: str, legacy_name: str, default: str | None = None) -> str | None:
-    value = os.environ.get(name)
-    if value is not None and value.strip() != "":
-        return value
-    value = os.environ.get(legacy_name)
-    if value is not None and value.strip() != "":
-        return value
-    return default
+_DTE_TRUTHY_VALUES = ("1", "true", "yes", "on")
+_DTE_FALSY_VALUES = ("0", "false", "no", "off")
 
 
-def _env_bool(name: str, legacy_name: str, default: bool = False) -> bool:
-    value = _env_value(name, legacy_name)
-    if value is None:
-        return default
-    return value.strip().lower() in {"1", "true", "yes", "on"}
+@dataclass(frozen=True)
+class DTERuntimeConfig:
+    """Worker-local runtime settings for separation delta transfer."""
 
+    delta_transfer: bool
+    separation_weight_update: bool
+    anchor_interval: int
 
-def delta_transfer_enabled() -> bool:
-    """Master switch for sparse incremental transfer."""
-    return _env_bool("DTE_DELTA_TRANSFER", "AWEX_DELTA_TRANSFER")
-
-
-def separation_weight_update_enabled() -> bool:
-    """Whether the configured topology permits separation-only DTE code."""
-    return _env_bool("DTE_SEPARATION_WEIGHT_UPDATE", "AWEX_SEPARATION_WEIGHT_UPDATE")
-
-
-def separation_delta_transfer_enabled() -> bool:
-    """Whether sparse separated-card transfer is explicitly enabled."""
-    return separation_weight_update_enabled() and delta_transfer_enabled()
-
-
-def delta_anchor_interval() -> int:
-    """Force a full sync every N deltas (0 = never; rely on seed + chain-break)."""
-    return int(
-        _env_value(
+    @classmethod
+    def from_env(cls) -> DTERuntimeConfig:
+        """Snapshot DTE runtime settings from the worker environment."""
+        anchor_value = get_env_var(
             "DTE_DELTA_ANCHOR_INTERVAL",
-            "AWEX_DELTA_ANCHOR_INTERVAL",
             "0",
+            fallback_names=("AWEX_DELTA_ANCHOR_INTERVAL",),
         )
-    )
+        assert anchor_value is not None
+        anchor_interval = int(anchor_value)
+        return cls(
+            delta_transfer=get_bool_env_var(
+                "DTE_DELTA_TRANSFER",
+                fallback_names=("AWEX_DELTA_TRANSFER",),
+                truthy_values=_DTE_TRUTHY_VALUES,
+                falsy_values=_DTE_FALSY_VALUES,
+                strip_value=True,
+            ),
+            separation_weight_update=get_bool_env_var(
+                "DTE_SEPARATION_WEIGHT_UPDATE",
+                fallback_names=("AWEX_SEPARATION_WEIGHT_UPDATE",),
+                truthy_values=_DTE_TRUTHY_VALUES,
+                falsy_values=_DTE_FALSY_VALUES,
+                strip_value=True,
+            ),
+            anchor_interval=anchor_interval,
+        )
 
+    @property
+    def enabled(self) -> bool:
+        """Whether sparse separated-card transfer is explicitly enabled."""
+        return self.separation_weight_update and self.delta_transfer
 
-def make_delta_tracker():
-    """Sender-side dte ``DeltaTracker``, configured from env.
-
-    Raises a clear ``ImportError`` if dte is not installed.
-    """
-    try:
-        from dte.core import DeltaTracker
-    except ImportError as e:  # pragma: no cover - exercised only without dte
-        raise ImportError(_DTE_MISSING_MSG) from e
-    return DeltaTracker(anchor_interval=delta_anchor_interval())
-
-
-def cuda_mem_stats_mb(reset_peak: bool = True) -> tuple[float, float]:
-    """Return ``(allocated_mb, peak_mb)`` for the current CUDA device.
-
-    ``peak_mb`` is the high-water mark since the previous call (the peak
-    counter is reset afterwards by default), which lets [dte-perf] stage
-    marks attribute allocation spikes to individual weight-sync stages.
-    Returns ``(-1.0, -1.0)`` when CUDA is unavailable (CPU tests).
-    """
-    import torch
-
-    if not torch.cuda.is_available():
-        return -1.0, -1.0
-    allocated = torch.cuda.memory_allocated() / (1024.0 * 1024.0)
-    peak = torch.cuda.max_memory_allocated() / (1024.0 * 1024.0)
-    if reset_peak:
-        torch.cuda.reset_peak_memory_stats()
-    return allocated, peak
+    def create_delta_tracker(self):
+        """Create the sender-side tracker without making DTE a base dependency."""
+        try:
+            from dte.core import DeltaTracker
+        except ImportError as e:  # pragma: no cover - only without optional DTE
+            raise ImportError(_DTE_MISSING_MSG) from e
+        return DeltaTracker(anchor_interval=self.anchor_interval)

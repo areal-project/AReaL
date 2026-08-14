@@ -139,6 +139,7 @@ from areal.utils.network import find_free_ports, format_host_for_url, gethostip
 from areal.utils.offload import is_tms_enabled, torch_memory_saver
 from areal.utils.perf_tracer import trace_perf, trace_scope
 from areal.utils.seeding import get_seed
+from areal.v2.weight_update.awex.delta_config import DTERuntimeConfig
 
 if TYPE_CHECKING:
     from areal.api import Scheduler
@@ -338,6 +339,7 @@ class MegatronEngine(TrainEngine):
         self.is_offload: bool = False
         self._offload_depth: int = 0
         self._awex_adapter = None  # AwexMegatronAdapter for colocate mode
+        self._dte_runtime_config = DTERuntimeConfig.from_env()
         self.enable_tree_training: bool = self.config.enable_tree_training
         _validate_areal_lm_head_compatibility(
             self.mcore_config.enable_chunked_logits,
@@ -1087,6 +1089,12 @@ class MegatronEngine(TrainEngine):
             model.zero_grad_buffer()
 
     def optimizer_step(self):
+        if self._dte_runtime_config.enabled:
+            # The LR scheduler advances before the subsequent weight update.
+            # Preserve the LR consumed by this optimizer step for AdamW
+            # inversion instead of reading the next-step LR later.
+            for param_group in self.optimizer.param_groups:
+                param_group["_areal_last_step_lr"] = float(param_group["lr"])
         with trace_scope("megatron_engine.step"):
             update_successful, grad_norm, _ = self.optimizer.step()
         current_lr = self.optimizer.param_groups[0]["lr"]

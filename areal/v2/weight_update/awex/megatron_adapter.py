@@ -30,10 +30,7 @@ from areal.v2.weight_update.awex import (
     awex_wu_use_group,
     fetch_kv_metadata,
 )
-from areal.v2.weight_update.awex.delta_config import (
-    make_delta_tracker,
-    separation_delta_transfer_enabled,
-)
+from areal.v2.weight_update.awex.delta_config import DTERuntimeConfig
 from areal.v2.weight_update.awex.delta_detect import AdamWInversionDetector
 from areal.v2.weight_update.nccl_group import (
     init_weights_update_group,
@@ -78,6 +75,7 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
         self._colocate_admin_api_key: str = "areal-admin-key"
         self._colocate_http_client: httpx.Client | None = None
         self._colocate_timeout_s: float = 120.0
+        self._dte_config = DTERuntimeConfig.from_env()
         self._delta_tracker = None
         self._delta_detector = None
 
@@ -216,7 +214,7 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
         )
 
     def execute_weight_update(self, version: int) -> None:
-        if separation_delta_transfer_enabled():
+        if self._dte_config.enabled:
             self._release_grad_buffers_for_separation_sync()
             try:
                 self._execute_separation_weight_update(version)
@@ -600,7 +598,7 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
 
     def _ensure_delta_components(self) -> None:
         if self._delta_tracker is None:
-            self._delta_tracker = make_delta_tracker()
+            self._delta_tracker = self._dte_config.create_delta_tracker()
         if self._delta_detector is None:
             self._delta_detector = AdamWInversionDetector(self)
 

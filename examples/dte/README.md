@@ -26,6 +26,22 @@ AdamW deltas, with a periodic full-weight anchor after every 20 successfully com
 deltas. Set `actor.dte.enabled=false` to return to the existing AWEX full-weight
 behavior.
 
+## Optimizer-step boundary
+
+The current separation AdamW detector reconstructs exactly one optimizer step between
+weight updates. Therefore, enabling DTE requires:
+
+```yaml
+actor:
+  ppo_n_minibatches: 1
+```
+
+Each PPO minibatch performs an optimizer step, while weight synchronization happens only
+after all PPO minibatches finish. Values greater than one would make the optimizer step
+advance by more than the detector can invert and would force a full-weight fallback.
+AReaL rejects that configuration at startup instead of silently running full
+synchronization while DTE appears enabled.
+
 ## Effective performance defaults
 
 The example spells out the portable performance settings in the worker environment; none

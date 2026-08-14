@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import importlib.util
 import logging as stdlib_logging
+import os
 import sys
 import types
 from pathlib import Path
@@ -23,11 +24,53 @@ _ROOT = Path(__file__).resolve().parent.parent
 _DC_PATH = _ROOT / "areal/v2/weight_update/awex/delta_config.py"
 
 
+def _make_environ_stub():
+    environ_mod = types.ModuleType("areal.utils.environ")
+
+    def get_env_var(name, default=None, *, fallback_names=(), allow_empty=False):
+        for candidate in (name, *fallback_names):
+            value = os.environ.get(candidate)
+            if value is not None and (allow_empty or value.strip() != ""):
+                return value
+        return default
+
+    def get_bool_env_var(
+        name,
+        default="false",
+        *,
+        fallback_names=(),
+        truthy_values=("true", "1"),
+        falsy_values=("false", "0"),
+        strip_value=False,
+    ):
+        del falsy_values
+        value = get_env_var(name, default, fallback_names=fallback_names)
+        value = value.strip() if strip_value else value
+        return value.lower() in truthy_values
+
+    environ_mod.get_env_var = get_env_var
+    environ_mod.get_bool_env_var = get_bool_env_var
+    return environ_mod
+
+
 def _load_delta_config():
     spec = importlib.util.spec_from_file_location("awex_delta_config", _DC_PATH)
     mod = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
-    spec.loader.exec_module(mod)
+    module_names = ("areal", "areal.utils", "areal.utils.environ")
+    saved_modules = {name: sys.modules.get(name) for name in module_names}
+    sys.modules["areal"] = types.ModuleType("areal")
+    sys.modules["areal.utils"] = types.ModuleType("areal.utils")
+    sys.modules["areal.utils.environ"] = _make_environ_stub()
+    sys.modules[spec.name] = mod
+    try:
+        spec.loader.exec_module(mod)
+    finally:
+        for name, saved in saved_modules.items():
+            if saved is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = saved
     return mod
 
 
@@ -65,36 +108,41 @@ def test_delta_config_env_gates(dc, monkeypatch):
     """DTE env vars must honor DTE_* overrides over legacy AWEX_* names."""
     monkeypatch.delenv("DTE_DELTA_TRANSFER", raising=False)
     monkeypatch.delenv("AWEX_DELTA_TRANSFER", raising=False)
-    assert dc.delta_transfer_enabled() is False
+    assert dc.DTERuntimeConfig.from_env().delta_transfer is False
     monkeypatch.setenv("AWEX_DELTA_TRANSFER", "1")
-    assert dc.delta_transfer_enabled() is True
+    assert dc.DTERuntimeConfig.from_env().delta_transfer is True
     monkeypatch.setenv("DTE_DELTA_TRANSFER", "0")
-    assert dc.delta_transfer_enabled() is False
+    assert dc.DTERuntimeConfig.from_env().delta_transfer is False
     monkeypatch.setenv("DTE_DELTA_TRANSFER", "1")
-    assert dc.delta_transfer_enabled() is True
+    assert dc.DTERuntimeConfig.from_env().delta_transfer is True
 
     monkeypatch.setenv("AWEX_DELTA_ANCHOR_INTERVAL", "5")
-    assert dc.delta_anchor_interval() == 5
+    assert dc.DTERuntimeConfig.from_env().anchor_interval == 5
     monkeypatch.setenv("DTE_DELTA_ANCHOR_INTERVAL", "7")
-    assert dc.delta_anchor_interval() == 7
+    assert dc.DTERuntimeConfig.from_env().anchor_interval == 7
 
 
-def test_cuda_mem_stats_mb_without_cuda_returns_sentinel(dc):
-    """CPU-only hosts must not fail while reporting DTE memory telemetry."""
-    alloc_mb, peak_mb = dc.cuda_mem_stats_mb()
-    if torch.cuda.is_available():
-        assert alloc_mb >= 0.0
-        assert peak_mb >= 0.0
-    else:
-        assert (alloc_mb, peak_mb) == (-1.0, -1.0)
-        assert dc.cuda_mem_stats_mb(reset_peak=False) == (-1.0, -1.0)
+def test_delta_runtime_config_preserves_legacy_values_and_snapshots(dc, monkeypatch):
+    monkeypatch.setenv("DTE_DELTA_TRANSFER", "")
+    monkeypatch.setenv("AWEX_DELTA_TRANSFER", " yes ")
+    monkeypatch.setenv("DTE_SEPARATION_WEIGHT_UPDATE", "on")
+
+    config = dc.DTERuntimeConfig.from_env()
+
+    assert config.delta_transfer is True
+    assert config.separation_weight_update is True
+    assert config.enabled is True
+
+    monkeypatch.setenv("DTE_DELTA_TRANSFER", "0")
+    assert config.enabled is True
+    assert dc.DTERuntimeConfig.from_env().enabled is False
 
 
 def test_factory_builds_dte_tracker(dc, monkeypatch):
     """The lazy factory should build a DTE tracker when DTE is available."""
     pytest.importorskip("dte")
     monkeypatch.setenv("AWEX_DELTA_ANCHOR_INTERVAL", "0")
-    tracker = dc.make_delta_tracker()
+    tracker = dc.DTERuntimeConfig.from_env().create_delta_tracker()
     assert hasattr(tracker, "encode") and hasattr(tracker, "seed")
 
 
@@ -189,6 +237,7 @@ def _load_delta_detect(monkeypatch):
     monkeypatch.setitem(sys.modules, "areal", types.ModuleType("areal"))
     monkeypatch.setitem(sys.modules, "areal.utils", types.ModuleType("areal.utils"))
     monkeypatch.setitem(sys.modules, "areal.utils.logging", fake)
+    monkeypatch.setitem(sys.modules, "areal.utils.environ", _make_environ_stub())
     for package in (
         "areal.v2",
         "areal.v2.weight_update",
@@ -208,6 +257,71 @@ def _load_delta_detect(monkeypatch):
     return mod
 
 
+def test_cuda_mem_stats_mb_without_cuda_returns_sentinel(monkeypatch):
+    """CPU-only hosts must not fail while reporting DTE memory telemetry."""
+    mod = _load_delta_detect(monkeypatch)
+    alloc_mb, peak_mb = mod._cuda_mem_stats_mb()
+    if torch.cuda.is_available():
+        assert alloc_mb >= 0.0
+        assert peak_mb >= 0.0
+    else:
+        assert (alloc_mb, peak_mb) == (-1.0, -1.0)
+        assert mod._cuda_mem_stats_mb(reset_peak=False) == (-1.0, -1.0)
+
+
+def test_adamw_hparams_require_and_prefer_recorded_step_lr(monkeypatch):
+    """A scheduler's next-step LR cannot silently drive AdamW inversion."""
+    mod = _load_delta_detect(monkeypatch)
+    param_group = {
+        "lr": 2e-6,
+        "_areal_last_step_lr": 3e-6,
+        "weight_decay": 0.1,
+        "betas": (0.9, 0.95),
+        "eps": 1e-8,
+    }
+
+    hparams = mod._adamw_hparams(param_group)
+
+    assert hparams is not None
+    assert hparams[0] == 3e-6
+    del param_group["_areal_last_step_lr"]
+    assert mod._adamw_hparams(param_group) is None
+
+
+def test_missing_recorded_step_lr_forces_dense_reconstruction(monkeypatch):
+    """Missing LR metadata must not fall back to the scheduler's current LR."""
+    mod = _load_delta_detect(monkeypatch)
+    param = torch.nn.Parameter(torch.tensor([1.0, 2.0], dtype=torch.float32))
+    optimizer = torch.optim.AdamW([param], lr=1e-3)
+    before = param.detach().clone()
+
+    inversion = mod.AdamWInversionDetector(
+        SimpleNamespace(_offloaded_optimizer_states={})
+    )
+    _bind_inversion_param_names(inversion, ("w", param))
+    inversion._last_synced_steps = {"w": None}
+    inversion._last_synced_fingerprints = {"w": mod._tensor_fingerprint(before)}
+
+    param.grad = torch.ones_like(param)
+    optimizer.step()
+    assert "_areal_last_step_lr" not in optimizer.param_groups[0]
+
+    class _FakeDistOpt:
+        shard_fp32_from_float16_groups = [[param]]
+        model_float16_groups = [[param]]
+        model_param_group_index_map = None
+        data_parallel_group = None
+
+        def __init__(self):
+            self.optimizer = optimizer
+
+        def _get_model_param_range_map(self, model_param):
+            assert model_param is param
+            return {"param": SimpleNamespace(start=0, end=param.numel())}
+
+    assert inversion._reconstruct_pre_step_mcore([_FakeDistOpt()]) is None
+
+
 def _bind_inversion_param_names(inv, *named_params):
     """Bind fake mcore parameter names for CPU-only inversion tests."""
     id2key = {id(param): name for name, param in named_params}
@@ -222,7 +336,13 @@ def _load_sglang_adapter(monkeypatch):
     _stub_areal_packages(monkeypatch)
 
     delta_config_mod = types.ModuleType("areal.v2.weight_update.awex.delta_config")
-    delta_config_mod.separation_delta_transfer_enabled = lambda: False
+
+    class _DTERuntimeConfig:
+        @classmethod
+        def from_env(cls):
+            return SimpleNamespace(enabled=False)
+
+    delta_config_mod.DTERuntimeConfig = _DTERuntimeConfig
     monkeypatch.setitem(
         sys.modules,
         "areal.v2.weight_update.awex.delta_config",
@@ -268,8 +388,16 @@ def _load_megatron_adapter(monkeypatch):
     _stub_areal_packages(monkeypatch)
 
     delta_config_mod = types.ModuleType("areal.v2.weight_update.awex.delta_config")
-    delta_config_mod.separation_delta_transfer_enabled = lambda: True
-    delta_config_mod.make_delta_tracker = lambda *args, **kwargs: None
+
+    class _DTERuntimeConfig:
+        @classmethod
+        def from_env(cls):
+            return SimpleNamespace(
+                enabled=True,
+                create_delta_tracker=lambda: None,
+            )
+
+    delta_config_mod.DTERuntimeConfig = _DTERuntimeConfig
     monkeypatch.setitem(
         sys.modules,
         "areal.v2.weight_update.awex.delta_config",
