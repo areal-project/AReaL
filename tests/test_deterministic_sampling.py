@@ -6,14 +6,15 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import MagicMock, Mock
 
 import pytest
 import torch
 
-from areal.api import ModelRequest
+from areal.api import ModelRequest, ModelResponse
 from areal.api.cli_args import GenerationHyperparameters, SGLangConfig
 from areal.engine.sglang_remote import SGLangBackend
+from areal.experimental.openai.client import ArealOpenAI
 from areal.experimental.openai.proxy import proxy_rollout_server
 from areal.experimental.openai.proxy.proxy_rollout_server import (
     _deterministic_sampling_seed,
@@ -28,6 +29,8 @@ from areal.infra.workflow_executor import (
     WorkflowExecutor,
     _select_results,
 )
+from areal.v2.inference_service.data_proxy.session import SessionData as V2SessionData
+from areal.v2.inference_service.sglang.bridge import SGLangBridgeBackend
 
 
 def test_sampling_seed_is_stable_across_calls():
@@ -64,6 +67,17 @@ def test_sampling_seed_identity_ignores_physical_session_suffix():
 
 def test_sampling_request_indices_are_unique_under_concurrency():
     session = SessionData("17:3-0", sampling_seed_identity="17:3")
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        indices = list(
+            executor.map(lambda _: session.next_sampling_request_index(), range(32))
+        )
+
+    assert sorted(indices) == list(range(32))
+
+
+def test_v2_sampling_request_indices_are_unique_under_concurrency():
+    session = V2SessionData("17:3-0", sampling_seed_identity="17:3")
 
     with ThreadPoolExecutor(max_workers=8) as executor:
         indices = list(
@@ -179,6 +193,67 @@ def test_sglang_request_omits_sampling_seed_by_default():
     request = SGLangBackend().build_generation_request(req, with_lora=False, version=0)
 
     assert "sampling_seed" not in request.payload["sampling_params"]
+
+
+def test_sglang_v2_request_forwards_sampling_seed_when_set():
+    req = ModelRequest(
+        input_ids=[1, 2, 3],
+        gconfig=GenerationHyperparameters(seed=12345),
+    )
+
+    request = SGLangBridgeBackend().build_generation_request(
+        req, with_lora=False, version=0
+    )
+
+    assert request.payload["sampling_params"]["sampling_seed"] == 12345
+
+
+def test_sglang_v2_request_omits_sampling_seed_by_default():
+    req = ModelRequest(input_ids=[1, 2, 3], gconfig=GenerationHyperparameters())
+
+    request = SGLangBridgeBackend().build_generation_request(
+        req, with_lora=False, version=0
+    )
+
+    assert "sampling_seed" not in request.payload["sampling_params"]
+
+
+@pytest.mark.asyncio
+async def test_areal_openai_forwards_seed_into_model_request(monkeypatch):
+    monkeypatch.setattr(
+        "areal.utils.hf_utils.pkg_version.is_version_greater_or_equal",
+        lambda *_: False,
+    )
+    tokenizer = MagicMock()
+    tokenizer.apply_chat_template.return_value = [10, 11]
+    tokenizer.decode.return_value = "ok"
+    tokenizer.eos_token_id = 2
+    tokenizer.pad_token_id = 0
+
+    class CapturingEngine:
+        async def agenerate(self, req):
+            self.request = req
+            return ModelResponse(
+                input_tokens=req.input_ids,
+                output_tokens=[3],
+                output_logprobs=[-0.1],
+                output_versions=[0],
+                stop_reason="length",
+                tokenizer=tokenizer,
+            )
+
+    engine = CapturingEngine()
+    client = ArealOpenAI(engine=engine, tokenizer=tokenizer, api_key="test")
+    try:
+        await client.chat.completions.create(
+            messages=[{"role": "user", "content": "hi"}],
+            max_completion_tokens=4,
+            seed=12345,
+        )
+    finally:
+        await client.close()
+
+    assert engine.request.gconfig.seed == 12345
 
 
 def test_sglang_server_args_enable_deterministic_inference(monkeypatch):

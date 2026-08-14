@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import hashlib
 import hmac
 import inspect
 import os
@@ -77,8 +76,7 @@ _warn_lock = threading.Lock()
 
 
 def _deterministic_sampling_seed(session_id: str, request_index: int) -> int:
-    digest = hashlib.sha256(f"{session_id}:{request_index}".encode()).digest()
-    return int.from_bytes(digest[:4], "big") & 0x7FFFFFFF
+    return seeding.derive_deterministic_seed(session_id, request_index)
 
 
 def _warn_once(msg: str) -> None:

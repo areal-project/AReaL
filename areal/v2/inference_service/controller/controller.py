@@ -1592,6 +1592,7 @@ class RolloutControllerV2:
             discount=turn_discount,
             export_style=export_style,
             group_size=group_size,
+            serialize_group_samples=self.config.serialize_group_samples,
         )
 
     def _resolve_workflow(

@@ -2428,6 +2428,14 @@ class InferenceEngineConfig:
             "sglang.enable_deterministic_inference."
         },
     )
+    serialize_group_samples: bool = field(
+        default=False,
+        metadata={
+            "help": "Run RolloutControllerV2 samples within each group sequentially "
+            "instead of concurrently. This stabilizes SGLang batching for strict "
+            "reproducibility at the cost of rollout throughput."
+        },
+    )
     check_trajectory_format: bool = field(
         default=False,
         metadata={
