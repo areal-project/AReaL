@@ -34,7 +34,7 @@ from areal.infra.rpc.serialization import deserialize_value, serialize_value
 from areal.infra.utils.http import validate_admin_api_key
 from areal.utils import name_resolve, names, seeding
 from areal.utils.dynamic_import import import_from_string
-from areal.utils.hf_utils import load_hf_tokenizer
+from areal.utils.hf_utils import load_hf_processor_and_tokenizer
 from areal.utils.logging import getLogger
 from areal.utils.network import find_free_ports, gethostip
 
@@ -272,11 +272,14 @@ def _setup_openai_client():
     global _openai_client, _session_timeout_seconds, _admin_api_key
     global _message_preprocessors, _prefix_matcher
     config = _engine.config
-    tokenizer = load_hf_tokenizer(config.tokenizer_path)
+    processor, tokenizer = load_hf_processor_and_tokenizer(config.tokenizer_path)
+    if processor is not None and not hasattr(processor, "image_processor"):
+        processor = None
     agent_cfg = config.agent
     _openai_client = ArealOpenAI(
         engine=_engine,
         tokenizer=tokenizer,
+        processor=processor,
         tool_call_parser=agent_cfg.tool_call_parser,
         reasoning_parser=agent_cfg.reasoning_parser,
         engine_max_tokens=agent_cfg.engine_max_tokens,
