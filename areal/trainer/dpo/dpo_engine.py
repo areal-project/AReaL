@@ -6,6 +6,7 @@ from typing import Any
 import torch
 
 from areal.api import TrainEngine
+from areal.engine.core import stage_batch_for_engine
 from areal.infra import TrainController
 from areal.infra.rpc.serialization import serialize_value
 from areal.utils import logging, stats_tracker
@@ -54,6 +55,7 @@ class DPOEngine:
 
     def _train_dpo(self, data: dict[str, Any]) -> None:
         self.engine.train()
+        stage_batch_for_engine(data, self.engine)
         stats = self.engine.train_batch(
             input_=data,
             loss_fn=functools.partial(
@@ -70,6 +72,7 @@ class DPOEngine:
 
     def _evaluate_dpo(self, data: dict[str, Any]) -> None:
         self.engine.eval()
+        stage_batch_for_engine(data, self.engine)
         self.engine.eval_batch(
             input_=data,
             loss_fn=functools.partial(
@@ -87,6 +90,7 @@ class DPOEngine:
 
     def _compute_logp(self, data: dict[str, Any]) -> torch.Tensor | None:
         self.engine.eval()
+        stage_batch_for_engine(data, self.engine)
         return self.engine.forward(
             input_=data,
             aggregate_fn=lambda xs: torch.cat(xs, dim=-1),

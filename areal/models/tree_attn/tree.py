@@ -352,21 +352,16 @@ def build_packed_tree_batch(
     # Synchronize number of trees across dp_group.
     if dist.is_initialized():
         num_trees = len(tries)
-        input_template: torch.Tensor = data["input_ids"]
-
-        # All-gather tree counts from all ranks
-        local_count = torch.tensor(
-            [num_trees], dtype=torch.int64, device=input_template.device
-        )
         world_size = dist.get_world_size(dp_group)
-        all_counts = [
-            torch.zeros(1, dtype=torch.int64, device=input_template.device)
-            for _ in range(world_size)
-        ]
-        dist.all_gather(all_counts, local_count, group=dp_group)
+        all_counts: list[int | None] = [None for _ in range(world_size)]
+        # Object collectives keep tree construction device-independent. In
+        # particular, Megatron now packs tree batches on CPU while its DP group
+        # normally uses NCCL/HCCL for accelerator tensors.
+        dist.all_gather_object(all_counts, num_trees, group=dp_group)
 
         # Find the maximum tree count across all ranks
-        max_num_trees = max(c.item() for c in all_counts)
+        assert all(count is not None for count in all_counts)
+        max_num_trees = max(int(count) for count in all_counts if count is not None)
 
         # If this rank has fewer trees, append dummy trees
         if num_trees < max_num_trees:

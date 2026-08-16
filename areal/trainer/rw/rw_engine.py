@@ -5,6 +5,7 @@ from typing import Any
 import torch
 
 from areal.api import TrainEngine
+from areal.engine.core import stage_batch_for_engine
 from areal.infra import TrainController
 from areal.infra.rpc.serialization import serialize_value
 from areal.utils import logging, stats_tracker
@@ -52,6 +53,7 @@ class RWEngine:
         if _rw_loss_weight(data) == 0:
             _log_empty_rw_stats(data["cu_seqlens"].device)
         self.engine.train()
+        stage_batch_for_engine(data, self.engine)
         stats = self.engine.train_batch(
             input_=data,
             loss_fn=compute_rw_loss,
@@ -68,6 +70,7 @@ class RWEngine:
         if _rw_loss_weight(data) == 0:
             _log_empty_rw_stats(data["cu_seqlens"].device)
         self.engine.eval()
+        stage_batch_for_engine(data, self.engine)
         self.engine.eval_batch(
             input_=data,
             loss_fn=compute_rw_loss,
