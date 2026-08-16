@@ -225,9 +225,11 @@ class TestEvalBatchPadding:
             mb_list=mb_list,
             loss_weight_fn=lambda _mb: torch.tensor(0.0),
             dp_group=cast(dist.ProcessGroup, object()),
+            device=torch.device("cpu"),
         )
 
         torch.testing.assert_close(total_weight, torch.tensor(3.0), rtol=0.0, atol=0.0)
+        assert total_weight.device.type == "cpu"
 
 
 class TestRWDispatchGrouping:
