@@ -11,6 +11,15 @@ import pytest
 
 
 def _load_swe_modules():
+    saved_modules = {
+        name: module
+        for name, module in sys.modules.items()
+        if name == "areal" or name.startswith("areal.")
+    }
+    for name in list(sys.modules):
+        if name == "areal" or name.startswith("areal."):
+            del sys.modules[name]
+
     areal_module = types.ModuleType("areal")
     dataset_module = types.ModuleType("areal.dataset")
     dataset_module.__path__ = []
@@ -26,16 +35,22 @@ def _load_swe_modules():
 
     package_path = Path(__file__).parents[1] / "areal" / "dataset" / "swe_sft"
     loaded = []
-    for name in ("messages", "tokenization"):
-        full_name = f"areal.dataset.swe_sft.{name}"
-        spec = importlib.util.spec_from_file_location(
-            full_name, package_path / f"{name}.py"
-        )
-        assert spec is not None and spec.loader is not None
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[full_name] = module
-        spec.loader.exec_module(module)
-        loaded.append(module)
+    try:
+        for name in ("messages", "tokenization"):
+            full_name = f"areal.dataset.swe_sft.{name}"
+            spec = importlib.util.spec_from_file_location(
+                full_name, package_path / f"{name}.py"
+            )
+            assert spec is not None and spec.loader is not None
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[full_name] = module
+            spec.loader.exec_module(module)
+            loaded.append(module)
+    finally:
+        for name in list(sys.modules):
+            if name == "areal" or name.startswith("areal."):
+                del sys.modules[name]
+        sys.modules.update(saved_modules)
     return loaded
 
 
