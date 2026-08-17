@@ -527,14 +527,6 @@ class MegatronEngine(TrainEngine):
             if self.mcore_config.use_deterministic_algorithms:
                 set_deterministic_algorithms(self.tf_config, prebuild=True)
 
-            # Precision-alignment dumps (AReaL-friend tools/precision-alignment):
-            # when AREAL_DUMP_ROUTING is set, enable megatron RouterReplay
-            # recording so MoE expert indices can be captured during forward.
-            if os.environ.get("AREAL_DUMP_ROUTING", "") and hasattr(
-                self.tf_config, "moe_enable_routing_replay"
-            ):
-                self.tf_config.moe_enable_routing_replay = True
-
             self.is_vision_model = is_valid_vision_model(self.hf_config.model_type)
             self.sequence_packing_mode = resolve_sequence_packing_mode(
                 self.hf_config.model_type, self.bridge_cls
@@ -1164,11 +1156,6 @@ class MegatronEngine(TrainEngine):
         )
 
     def lr_scheduler_step(self):
-        if os.environ.get("AREAL_DUMP_ROUTING", "") or os.environ.get(
-            "AREAL_DUMP_LOGP", ""
-        ):
-            # Precision-alignment forward-only mode: no optimizer/scheduler.
-            return
         assert self.lr_scheduler is not None, "LR Scheduler is not initialized."
         self.lr_scheduler.step(1)
 
@@ -1248,23 +1235,6 @@ class MegatronEngine(TrainEngine):
                     "chunked LM Head loss does not support vision inputs; padded "
                     "BSHD is supported only for text-only models such as Qwen3.5"
                 )
-
-            # Precision-alignment routing dump: record MoE expert indices for the
-            # first microbatch via megatron RouterReplay (enabled in initialize).
-            _routing_dump_path = os.environ.get("AREAL_DUMP_ROUTING", "")
-            if _routing_dump_path and not getattr(self, "_routing_dumped", False):
-                try:
-                    from megatron.core.transformer.moe.router_replay import (
-                        RouterReplay,
-                        RouterReplayAction,
-                    )
-
-                    RouterReplay.set_global_router_replay_action(
-                        RouterReplayAction.RECORD
-                    )
-                except Exception as e:
-                    self.logger.warning(f"[ROUTING-DUMP] RECORD setup failed: {e}")
-                    _routing_dump_path = ""
 
             output = packed_context_parallel_forward(
                 model,
@@ -1350,76 +1320,6 @@ class MegatronEngine(TrainEngine):
                         ),
                     )
 
-            if _routing_dump_path and not getattr(self, "_routing_dumped", False):
-                try:
-                    from megatron.core.transformer.moe.router_replay import (
-                        RouterReplay,
-                    )
-
-                    recorded = RouterReplay.get_recorded_data()
-                    if recorded and any(r is not None for r in recorded):
-                        pp_rank = mpu.get_pipeline_model_parallel_rank()
-                        cp_rank = mpu.get_context_parallel_rank()
-                        if (
-                            mpu.get_data_parallel_rank() == 0
-                            and mpu.get_tensor_model_parallel_rank() == 0
-                        ):
-                            expert_indices = [
-                                r.detach().cpu() for r in recorded if r is not None
-                            ]
-                            # The router sees the CP-local token shard (zigzag
-                            # split by packed_context_parallel_forward) and,
-                            # with TP>1, the SP-local sub-shard of that.
-                            # Apply the same CP split here; tp_rank 0 then
-                            # holds the first contiguous SP chunk, so the
-                            # row-count prefix slice below stays valid.
-                            ids_src = mb_input.padded_mb["input_ids"]
-                            cu = mb_input.padded_mb.get("cu_seqlens")
-                            pos_src = torch.arange(
-                                ids_src.numel(), device=ids_src.device
-                            )
-                            if cp_size > 1 and cu is not None:
-                                ids_src = split_packed_seqs_for_context_parallel(
-                                    ids_src, cu
-                                )
-                                pos_src = split_packed_seqs_for_context_parallel(
-                                    pos_src, cu
-                                )
-                            ids = ids_src.detach().cpu().reshape(-1)
-                            pos = pos_src.detach().cpu().reshape(-1)
-                            n_rows = expert_indices[0].shape[0]
-                            save_data = {
-                                "expert_indices": expert_indices,
-                                "input_ids": ids[:n_rows],
-                                # Canonical (padded packed-sequence) position
-                                # of each recorded row so the merge tool can
-                                # restore zigzag CP order; without it CP>1
-                                # shards cannot be mapped back.
-                                "positions": pos[:n_rows],
-                                "cp_size": cp_size,
-                                "pp_rank": pp_rank,
-                                "cp_rank": cp_rank,
-                            }
-                            if cu is not None:
-                                save_data["padded_cu_seqlens"] = cu.detach().cpu()
-                            orig_cu = mb_input.orig_mb.get("cu_seqlens")
-                            if orig_cu is not None:
-                                save_data["orig_cu_seqlens"] = orig_cu.detach().cpu()
-                            out_file = (
-                                f"{_routing_dump_path}.pp{pp_rank}.cp{cp_rank}.pt"
-                            )
-                            torch.save(save_data, out_file)
-                            self.logger.info(
-                                f"[ROUTING-DUMP] saved "
-                                f"{len(save_data['expert_indices'])} MoE layers, "
-                                f"pp={pp_rank} cp={cp_rank} -> {out_file}"
-                            )
-                    RouterReplay.clear_global_indices()
-                    RouterReplay.clear_global_router_replay_action()
-                    self._routing_dumped = True
-                except Exception as e:
-                    self.logger.warning(f"[ROUTING-DUMP] failed: {e}")
-
             # Release tree attention metadata after forward pass
             for key in tree_attn_keys:
                 del mb_input.padded_mb[key]
@@ -1495,14 +1395,7 @@ class MegatronEngine(TrainEngine):
         if self._awex_adapter is not None:
             self._awex_adapter.ensure_grad_buffers()
 
-        # Precision-alignment forward-only mode: no optimizer exists (see
-        # _create_optimizer), so skip zero_grad/step and run forward only.
-        _fwd_only = bool(
-            os.environ.get("AREAL_DUMP_ROUTING", "")
-            or os.environ.get("AREAL_DUMP_LOGP", "")
-        )
-        if not _fwd_only:
-            self.optimizer_zero_grad()
+        self.optimizer_zero_grad()
 
         input_batched, _ = self._normalize_batch_input(input_)
 
@@ -1529,13 +1422,9 @@ class MegatronEngine(TrainEngine):
         # that extra division would shrink every gradient (and thus grad_norm and the
         # effective optimizer step) by `num_microbatches`.
         loss_multiplier = (
-            float(mpu.get_data_parallel_world_size())
-            if _fwd_only
-            else (
-                mpu.get_data_parallel_world_size()
-                * self.optimizer.get_loss_scale().item()
-                * len(mb_list)
-            )
+            mpu.get_data_parallel_world_size()
+            * self.optimizer.get_loss_scale().item()
+            * len(mb_list)
         )
 
         def process_output(
@@ -1553,11 +1442,8 @@ class MegatronEngine(TrainEngine):
         self.forward_backward_batch(
             mb_list,
             process_output,
-            forward_only=_fwd_only,
+            forward_only=False,
         )
-
-        if _fwd_only:
-            return {"num_micro_batches": len(mb_list.mbs)}
 
         # Step 4: Optimizer step
         stats = self.optimizer_step()
@@ -1976,14 +1862,6 @@ class MegatronEngine(TrainEngine):
 
     def _create_optimizer(self, ft_spec: FinetuneSpec) -> None:
         if self.optimizer_config is None:
-            return
-        if os.environ.get("AREAL_DUMP_ROUTING", "") or os.environ.get(
-            "AREAL_DUMP_LOGP", ""
-        ):
-            self.logger.info(
-                "[MegatronEngine] AREAL_DUMP_ROUTING/LOGP set, skipping optimizer "
-                "creation to save GPU memory (precision-alignment forward-only mode)."
-            )
             return
         assert self.model is not None and len(self.model) > 0
 
@@ -3120,32 +2998,6 @@ class MegatronEngine(TrainEngine):
                     inputs = {
                         k: v for k, v in inputs.items() if not k.startswith("_cp_")
                     }
-
-            # Precision-alignment logp dump: save final per-token logprobs for
-            # the first microbatch (last PP stage only; this branch already is).
-            _logp_dump_path = os.environ.get("AREAL_DUMP_LOGP", "")
-            if _logp_dump_path and not getattr(self, "_logp_dumped", False):
-                pp_rank = mpu.get_pipeline_model_parallel_rank()
-                cp_rank = mpu.get_context_parallel_rank()
-                if (
-                    mpu.get_data_parallel_rank() == 0
-                    and mpu.get_tensor_model_parallel_rank() == 0
-                ):
-                    save_data = {
-                        "logprobs": logprobs.detach().cpu(),
-                        "input_ids": inputs["input_ids"].detach().cpu(),
-                        "pp_rank": pp_rank,
-                        "cp_rank": cp_rank,
-                    }
-                    if "loss_mask" in inputs:
-                        save_data["loss_mask"] = inputs["loss_mask"].detach().cpu()
-                    out_file = f"{_logp_dump_path}.pp{pp_rank}.cp{cp_rank}.pt"
-                    torch.save(save_data, out_file)
-                    self.logger.info(
-                        f"[LOGP-DUMP] pp={pp_rank} cp={cp_rank} "
-                        f"logprobs={list(logprobs.shape)} -> {out_file}"
-                    )
-                self._logp_dumped = True
 
             loss = loss_fn(
                 logprobs,
