@@ -127,6 +127,9 @@ class InteractionWithTokenLogpReward:
     # 父节点的 id。subproc/online 模式下 interaction 要跨进程传回，`parent`
     # 这个对象引用没法序列化，只能带 id 过来。
     parent_interaction_id: str | None = None
+    # RAO 组 credit 元数据。即使幸存组整体被拒绝，processor 输入里仍保留原因。
+    rao_group_id: str | None = None
+    rao_rejection_reason: str | None = None
 
     @property
     def has_tensor_data(self) -> bool:

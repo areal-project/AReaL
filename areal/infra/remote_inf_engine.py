@@ -85,8 +85,29 @@ class GroupedRolloutWorkflow(RolloutWorkflow):
     ) -> dict[str, Any] | None:
         from areal.experimental.openai import InteractionWithTokenLogpReward
 
+        task_id = workflow_context.get().task_id
+        group_id = str(task_id) if task_id is not None else str(uuid.uuid4())
+
+        async def run_child(index: int):
+            child_data = dict(data)
+            child_data["group_id"] = group_id
+            try:
+                return await self.workflow.arun_episode(engine, child_data)
+            except Exception as exc:
+                if self.logger is not None:
+                    self.logger.warning(
+                        "GroupedRolloutWorkflow: child %d/%d failed (%s: %s); "
+                        "rejecting only this trajectory",
+                        index + 1,
+                        self.group_size,
+                        type(exc).__name__,
+                        exc,
+                        exc_info=True,
+                    )
+                return None
+
         results = await asyncio.gather(
-            *[self.workflow.arun_episode(engine, data) for _ in range(self.group_size)]
+            *[run_child(index) for index in range(self.group_size)]
         )
         group_processor = getattr(self.workflow, "process_group_results", None)
         if callable(group_processor):
@@ -101,7 +122,7 @@ class GroupedRolloutWorkflow(RolloutWorkflow):
             return None
 
         # Some results None -> warn and continue with valid ones
-        if len(valid_results) < len(results):
+        if len(valid_results) < len(results) and self.logger is not None:
             self.logger.warning(
                 f"GroupedRolloutWorkflow: {len(results) - len(valid_results)}/{len(results)} "
                 "trajectories returned None, using remaining results"

@@ -75,6 +75,18 @@ if TYPE_CHECKING:
 logger = logging.getLogger("RLTrainer")
 
 
+def _set_default_agent_engine_max_tokens(
+    config: InferenceEngineConfig, max_tokens: int | None
+) -> None:
+    """Bind an unset Agent proxy ceiling to the role's generation context."""
+    if (
+        config.agent is not None
+        and config.agent.engine_max_tokens is None
+        and max_tokens is not None
+    ):
+        config.agent.engine_max_tokens = max_tokens
+
+
 class _EmptyDataLoader:
     """Minimal dataloader for online mode that yields empty dicts.
 
@@ -1026,8 +1038,11 @@ class PPOTrainer:
                 "Use `python3 train.py scheduler.type=local` instead of "
                 "`python3 -m areal.infra.launcher.local`."
             )
-        # Create a working copy of config
+        # Create a working copy of config. Train and eval share inference servers,
+        # but their proxy workers need independent total-token ceilings.
         config = deepcopy(rollout_config)
+        generation_config = self.config.eval_gconfig if is_eval else self.config.gconfig
+        _set_default_agent_engine_max_tokens(config, generation_config.max_tokens)
         if is_eval:
             # NOTE: eval does not have any offpolicyness control
             config.max_head_offpolicyness = int(1e12)

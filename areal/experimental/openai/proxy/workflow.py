@@ -243,10 +243,22 @@ class OpenAIProxyWorkflow(RolloutWorkflow):
             # Assign rewards back according to user code output. RAO returns a
             # picklable rollout result with one raw reward per node-final interaction.
             rollout_result = None
-            if hasattr(rewards, "interaction_rewards") and hasattr(rewards, "root_reward"):
+            if hasattr(rewards, "interaction_rewards") and hasattr(
+                rewards, "root_reward"
+            ):
                 rollout_result = rewards
                 if not getattr(rewards, "valid", True):
-                    raise ValueError(f"Invalid RAO rollout: {getattr(rewards, 'error', '')}")
+                    rejection_reason = (
+                        getattr(rewards, "rejection_reason", None)
+                        or getattr(rewards, "error", None)
+                        or "invalid_rao_rollout"
+                    )
+                    logger.warning(
+                        "Rejecting invalid RAO rollout group_id=%s: %s",
+                        getattr(rewards, "group_id", None),
+                        rejection_reason,
+                    )
+                    return None
                 for completion_id, reward in rewards.interaction_rewards.items():
                     await proxy_client.set_reward(completion_id, reward)
             elif isinstance(rewards, dict):
@@ -270,11 +282,25 @@ class OpenAIProxyWorkflow(RolloutWorkflow):
                 raise ValueError(
                     f"RAO node-final interactions missing after export: {sorted(missing)[:4]}"
                 )
+            extras = set(interactions) - set(node_by_interaction)
+            if extras:
+                logger.warning(
+                    "Dropping %d exported retry/orphan interactions without RAO nodes: %s",
+                    len(extras),
+                    sorted(extras)[:4],
+                )
+                interactions = {
+                    interaction_id: interaction
+                    for interaction_id, interaction in interactions.items()
+                    if interaction_id in node_by_interaction
+                }
             for interaction_id, interaction in interactions.items():
-                node = node_by_interaction.get(interaction_id)
-                if node is None:
-                    raise ValueError(f"Exported interaction {interaction_id} has no RAO node")
+                node = node_by_interaction[interaction_id]
                 interaction.rao_episode_id = rollout_result.episode_id
+                interaction.rao_group_id = getattr(rollout_result, "group_id", None)
+                interaction.rao_rejection_reason = getattr(
+                    rollout_result, "rejection_reason", None
+                )
                 interaction.rao_node_id = node.node_id
                 interaction.rao_node_reward = node.judge.score
                 interaction.rao_root_reward = rollout_result.root_reward
@@ -290,6 +316,12 @@ class OpenAIProxyWorkflow(RolloutWorkflow):
                     cache["rao_node_id"] = torch.full_like(
                         input_ids, rao_iid_hash(node.node_id), dtype=torch.long
                     )
+                    if rollout_result.group_id is not None:
+                        cache["rao_group_id"] = torch.full_like(
+                            input_ids,
+                            rao_iid_hash(rollout_result.group_id),
+                            dtype=torch.long,
+                        )
                     node_start = torch.zeros_like(input_ids, dtype=torch.float32)
                     node_start[:, 0] = 1.0
                     cache["rao_node_start"] = node_start
