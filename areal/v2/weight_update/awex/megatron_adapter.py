@@ -24,6 +24,16 @@ from awex.util.tensor_util import (
     group_tensors_by_shape_and_dtype,
 )
 
+from areal.engine.megatron_utils.optimizer_chain import (
+    OptimizerLifecyclePlan,
+    OptimizerUndoAction,
+    checkpoint_awex_residency,
+    classify_optimizer_leaves,
+    release_optimizer_lifecycle,
+    resume_optimizer_lifecycle,
+    retry_optimizer_recovery,
+    rollback_optimizer_lifecycle,
+)
 from areal.utils import logging
 from areal.v2.weight_update.awex import (
     awex_wu_use_group,
@@ -66,6 +76,8 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
         self._offloaded_optimizer_states: dict = {}
         self._offloaded_weights: dict[str, torch.Tensor] = {}
         self._released_tags: set[str] = set()
+        self._optimizer_lifecycle_cycle: OptimizerLifecyclePlan | None = None
+        self._optimizer_rollback_recovery: OptimizerLifecyclePlan | None = None
         self._colocate_lock = threading.Lock()
         self._colocate_admin_api_key: str = "areal-admin-key"
         self._colocate_http_client: httpx.Client | None = None
@@ -464,6 +476,15 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
         if weights_offloaded:
             self.release_memory(tags=["weights"])
 
+    def checkpoint_residency(self, *, with_model: bool, with_optimizer: bool):
+        """Temporarily restore only resources required by a checkpoint."""
+        return checkpoint_awex_residency(
+            self,
+            self._engine.optimizer,
+            with_model=with_model,
+            with_optimizer=with_optimizer,
+        )
+
     def release_memory(self, tags: list[str] | None = None) -> None:
         """Release GPU memory for specified tags by offloading to CPU.
 
@@ -479,17 +500,24 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
 
         logger.info("release_memory: offloading tags=%s", tags_to_release)
 
-        if "optimizer" in tags_to_release:
-            self._offload_optimizer_states()
-            self._released_tags.add("optimizer")
+        optimizer_released = False
+        try:
+            if "optimizer" in tags_to_release:
+                self._offload_optimizer_states()
+                optimizer_released = True
 
-        if "weights" in tags_to_release:
-            self._offload_model_weights()
-            self._released_tags.add("weights")
+            if "weights" in tags_to_release:
+                self._offload_model_weights()
 
-        torch.cuda.synchronize()
-        gc.collect()
-        torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+            gc.collect()
+            torch.cuda.empty_cache()
+        except BaseException as original:
+            if optimizer_released:
+                self._rollback_optimizer_release(original)
+            raise
+
+        self._released_tags.update(tags_to_release)
         logger.info("release_memory: done for tags=%s", tags_to_release)
 
     def resume_memory(self, tags: list[str] | None = None) -> None:
@@ -509,44 +537,44 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
 
         if "weights" in tags_to_resume:
             self._reload_model_weights()
-            self._released_tags.discard("weights")
-
         if "optimizer" in tags_to_resume:
             self._reload_optimizer_states()
-            self._released_tags.discard("optimizer")
-
         torch.cuda.synchronize()
+        self._released_tags.difference_update(tags_to_resume)
+        if "optimizer" in tags_to_resume:
+            self._offloaded_optimizer_states.clear()
+            self._optimizer_lifecycle_cycle = None
         logger.info("resume_memory: done for tags=%s", tags_to_resume)
 
     def _offload_optimizer_states(self) -> None:
         """Move optimizer state tensors to CPU, keeping references for reload."""
         optimizer = self._engine.optimizer
-        if optimizer is None:
-            logger.warning("No optimizer found, skipping optimizer offload")
-            return
-
-        # Megatron's ChainedOptimizer wraps per-model-chunk optimizers;
-        # each in turn wraps a base torch optimizer holding the state dict.
-        if hasattr(optimizer, "optimizers"):
-            inner_optimizers = optimizer.optimizers
-        else:
-            inner_optimizers = [optimizer]
-            logger.warning(
-                "Optimizer does not have 'optimizers' attribute. "
-                "Treating it as a single optimizer; offload may be incomplete "
-                "for non-standard Megatron optimizer structures."
+        if self._optimizer_rollback_recovery is not None:
+            raise RuntimeError("optimizer release has unresolved rollback state")
+        use_hdo_lifecycle = (
+            os.environ.get("AWEX_OPT_OFFLOAD_VIA_HDO", "").strip() == "1"
+        )
+        cycle = classify_optimizer_leaves(
+            optimizer,
+            use_hdo_lifecycle=use_hdo_lifecycle,
+            logger=logger,
+        )
+        if self._offloaded_optimizer_states:
+            raise RuntimeError("stale v2 optimizer offload state before release")
+        try:
+            release_optimizer_lifecycle(
+                cycle,
+                self._release_ordinary_optimizer,
+                logger=logger,
             )
-        for opt in inner_optimizers:
-            base_opt = getattr(opt, "optimizer", opt)
-            for param, state in base_opt.state.items():
-                cpu_state: dict[str, torch.Tensor] = {}
-                for key, val in state.items():
-                    if isinstance(val, torch.Tensor) and val.is_cuda:
-                        cpu_state[key] = val.detach().to("cpu", non_blocking=True)
-                        state[key] = torch.empty(0, device="cpu")
-                if cpu_state:
-                    self._offloaded_optimizer_states[param] = cpu_state
+        except BaseException:
+            self._prune_optimizer_state_journals(cycle)
+            if cycle.has_pending_recovery():
+                self._optimizer_rollback_recovery = cycle
+            self._optimizer_lifecycle_cycle = None
+            raise
 
+        self._optimizer_lifecycle_cycle = cycle
         logger.info(
             "Offloaded optimizer states for %d params",
             len(self._offloaded_optimizer_states),
@@ -554,24 +582,68 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
 
     def _reload_optimizer_states(self) -> None:
         """Restore optimizer state tensors from CPU back to GPU."""
-        if not self._offloaded_optimizer_states:
+        cycle = self._optimizer_lifecycle_cycle
+        if cycle is None:
             return
-
-        optimizer = self._engine.optimizer
-        if optimizer is None:
-            return
-
-        inner_optimizers = getattr(optimizer, "optimizers", [optimizer])
-        for opt in inner_optimizers:
-            base_opt = getattr(opt, "optimizer", opt)
-            for param, state in base_opt.state.items():
-                if param in self._offloaded_optimizer_states:
-                    cpu_state = self._offloaded_optimizer_states[param]
-                    for key, val in cpu_state.items():
-                        state[key] = val.to(param.device, non_blocking=True)
-
-        self._offloaded_optimizer_states.clear()
+        for node_type in cycle.cycle_node_types:
+            logger.warning(
+                "Detected optimizer chain cycle at %s; using release-time plan",
+                node_type,
+            )
+        try:
+            resume_optimizer_lifecycle(cycle, logger=logger)
+        finally:
+            self._prune_optimizer_state_journals(cycle)
         logger.info("Reloaded optimizer states to GPU")
+
+    def _rollback_optimizer_release(self, original: BaseException) -> None:
+        cycle = self._optimizer_lifecycle_cycle
+        if cycle is None:
+            return
+        rollback_optimizer_lifecycle(cycle, original, logger=logger)
+        self._prune_optimizer_state_journals(cycle)
+        if cycle.has_pending_recovery():
+            self._optimizer_rollback_recovery = cycle
+        self._optimizer_lifecycle_cycle = None
+
+    def _retry_optimizer_rollback_recovery(self) -> None:
+        cycle = self._optimizer_rollback_recovery
+        if cycle is None:
+            return
+        try:
+            retry_optimizer_recovery(cycle, logger=logger)
+        finally:
+            self._prune_optimizer_state_journals(cycle)
+        if not cycle.has_pending_recovery():
+            self._optimizer_rollback_recovery = None
+
+    def _release_ordinary_optimizer(self, index, lifecycle, journal) -> None:
+        base_opt = lifecycle.base_optimizer
+        if base_opt is None:
+            return
+        self._offloaded_optimizer_states[index] = journal
+        for param, state in base_opt.state.items():
+            for key, val in state.items():
+                if isinstance(val, torch.Tensor) and val.is_cuda:
+                    device = val.device
+                    cpu_value = val.detach().to("cpu", non_blocking=True)
+                    state[key] = torch.empty(0, device="cpu")
+                    journal.actions.append(
+                        OptimizerUndoAction(
+                            restore=lambda state=state,
+                            key=key,
+                            cpu_value=cpu_value,
+                            device=device: state.__setitem__(
+                                key, cpu_value.to(device, non_blocking=True)
+                            ),
+                            description=f"v2 optimizer state {key}",
+                        )
+                    )
+
+    def _prune_optimizer_state_journals(self, cycle: OptimizerLifecyclePlan) -> None:
+        for index, journal in tuple(self._offloaded_optimizer_states.items()):
+            if index >= len(cycle.journals) or not journal.actions:
+                del self._offloaded_optimizer_states[index]
 
     def _offload_model_weights(self) -> None:
         """Offload native MCore flat buffers without replacing Parameter views."""
