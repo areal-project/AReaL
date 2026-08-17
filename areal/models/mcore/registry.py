@@ -15,6 +15,7 @@ from megatron.core.transformer import TransformerConfig
 from transformers import AutoConfig, PretrainedConfig
 
 from areal.api.cli_args import MegatronEngineConfig
+from areal.engine.megatron_utils.deterministic import set_deterministic_algorithms
 from areal.models.mcore.bailing_moe import (
     hf_to_mcore_config_bailing_moe,
     make_mcore_layer_specs_bailing_moe,
@@ -302,6 +303,7 @@ def _replace_actor_output_layers(
     models: list[GPTModel | DDP],
     *,
     enabled: bool,
+    fp32_operands: bool = False,
 ) -> None:
     if not enabled:
         return
@@ -310,6 +312,7 @@ def _replace_actor_output_layers(
         replace_output_layer_with_areal_lm_head(
             gpt_model,
             fp32_output=True,
+            fp32_operands=fp32_operands,
         )
 
 
@@ -320,7 +323,11 @@ def _configure_actor_output_layers(
     if mcore_config is None:
         return
     if mcore_config.enable_chunked_logits:
-        _replace_actor_output_layers(models, enabled=True)
+        _replace_actor_output_layers(
+            models,
+            enabled=True,
+            fp32_operands=mcore_config.enable_fp32_lm_head,
+        )
     else:
         _enable_fp32_lm_head_forward(
             models,
@@ -482,6 +489,13 @@ def make_mcore_model(
         tf_config.moe_token_dispatcher_type = provider.moe_token_dispatcher_type
         tf_config.batch_p2p_comm = provider.batch_p2p_comm
         tf_config.overlap_p2p_comm = provider.overlap_p2p_comm
+
+        # Megatron-Bridge creates a new provider instead of building from
+        # ``tf_config`` directly. Apply the prebuild deterministic settings to
+        # the actual provider so construction-time consumers (TP layers and TE
+        # attention) see the same configuration.
+        if mcore_config.use_deterministic_algorithms:
+            set_deterministic_algorithms(provider, prebuild=True)
 
         provider.finalize()
 

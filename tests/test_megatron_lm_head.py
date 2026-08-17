@@ -28,7 +28,6 @@ from areal.utils.functional.vocab_parallel_kernels import (
 )
 
 CUDA_AVAILABLE = torch.cuda.is_available()
-FUSED_WGRAD_AVAILABLE = getattr(mcore_layers, "_grad_accum_fusion_available", False)
 
 
 class _ModelWithOutputLayer(torch.nn.Module):
@@ -50,7 +49,7 @@ def _make_uninitialized_head() -> mcore_layers.ColumnParallelLinear:
     return head
 
 
-def test_areal_lm_head_and_entropy_gradient_defaults_are_disabled():
+def test_areal_lm_head_config_defaults_and_fp32_help():
     config = MegatronEngineConfig()
     config_fields = {field.name: field for field in fields(MegatronEngineConfig)}
 
@@ -61,7 +60,9 @@ def test_areal_lm_head_and_entropy_gradient_defaults_are_disabled():
     assert (
         "Defaults to False" in config_fields["entropy_requires_grad"].metadata["help"]
     )
-    assert "Deprecated" in config_fields["enable_fp32_lm_head"].metadata["help"]
+    fp32_help = config_fields["enable_fp32_lm_head"].metadata["help"]
+    assert "FP32 input and weight operands" in fp32_help
+    assert "Deprecated" not in fp32_help
 
 
 def test_chunked_lm_head_config_validation():
@@ -96,10 +97,13 @@ def test_chunked_lm_head_config_validation():
 
 
 @pytest.mark.parametrize("enabled", [False, True])
-def test_actor_output_layer_replacement_uses_fused_fp32_output(enabled, monkeypatch):
+@pytest.mark.parametrize("fp32_operands", [False, True])
+def test_actor_output_layer_replacement_configures_fp32_operands(
+    enabled, fp32_operands, monkeypatch
+):
     model = object()
     gpt_model = object()
-    replacements: list[tuple[object, bool]] = []
+    replacements: list[tuple[object, bool, bool]] = []
     monkeypatch.setattr(
         mcore_registry,
         "unwrap_to_gpt_model",
@@ -108,43 +112,49 @@ def test_actor_output_layer_replacement_uses_fused_fp32_output(enabled, monkeypa
     monkeypatch.setattr(
         mcore_registry,
         "replace_output_layer_with_areal_lm_head",
-        lambda candidate, *, fp32_output: replacements.append((candidate, fp32_output)),
+        lambda candidate, *, fp32_output, fp32_operands: replacements.append(
+            (candidate, fp32_output, fp32_operands)
+        ),
     )
 
     mcore_registry._replace_actor_output_layers(
         [model],
         enabled=enabled,
+        fp32_operands=fp32_operands,
     )
 
-    assert replacements == ([(gpt_model, True)] if enabled else [])
+    assert replacements == ([(gpt_model, True, fp32_operands)] if enabled else [])
 
 
 @pytest.mark.parametrize(
     ("enable_chunked_logits", "enable_fp32_lm_head", "expected"),
     [
-        (True, True, "chunked"),
-        (True, False, "chunked"),
-        (False, True, "fp32"),
-        (False, False, "none"),
+        (True, True, [("chunked", True)]),
+        (True, False, [("chunked", False)]),
+        (False, True, [("fp32", True)]),
+        (False, False, []),
     ],
 )
-def test_configure_actor_output_layers_prioritizes_chunked_logits(
+def test_configure_actor_output_layers_supports_all_flag_combinations(
     enable_chunked_logits: bool,
     enable_fp32_lm_head: bool,
-    expected: str,
+    expected: list[tuple[str, bool]],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Chunked logits must win when both LM Head optimizations are requested."""
-    calls: list[str] = []
+    calls: list[tuple[str, bool]] = []
     monkeypatch.setattr(
         mcore_registry,
         "_replace_actor_output_layers",
-        lambda _models, *, enabled: calls.append("chunked") if enabled else None,
+        lambda _models, *, enabled, fp32_operands: calls.append(
+            ("chunked", fp32_operands)
+        )
+        if enabled
+        else None,
     )
     monkeypatch.setattr(
         mcore_registry,
         "_enable_fp32_lm_head_forward",
-        lambda _models, *, enabled: calls.append("fp32") if enabled else 0,
+        lambda _models, *, enabled: calls.append(("fp32", enabled)) if enabled else 0,
     )
 
     mcore_registry._configure_actor_output_layers(
@@ -155,7 +165,7 @@ def test_configure_actor_output_layers_prioritizes_chunked_logits(
         ),
     )
 
-    assert calls == ([] if expected == "none" else [expected])
+    assert calls == expected
 
 
 def _native_megatron_areal_logits(
@@ -198,12 +208,13 @@ def test_replace_output_layer_preserves_module_parameter_and_state_key():
     parameter_id = id(head.weight)
     hook = head.weight.register_hook(lambda grad: grad)
 
-    replace_output_layer_with_areal_lm_head(model, fp32_output=True)
+    replace_output_layer_with_areal_lm_head(model, fp32_output=True, fp32_operands=True)
 
     assert isinstance(model.output_layer, AReaLVocabParallelLMHead)
     assert id(model.output_layer) == module_id
     assert id(model.output_layer.weight) == parameter_id
     assert model.output_layer.fp32_output is True
+    assert model.output_layer.fp32_operands is True
     assert "output_layer.weight" in model.state_dict()
     assert hook.id in model.output_layer.weight._backward_hooks
 
@@ -214,6 +225,82 @@ def test_replace_output_layer_preserves_module_parameter_and_state_key():
     assert (
         AReaLVocabParallelLMHead.__name__ in AutoMapping._MODULE_TYPE_REGISTRY["column"]
     )
+
+
+@pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA is required for FP32 lm_head")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_fp32_operands_match_reference_and_cast_weight_once(
+    dtype: torch.dtype,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cast_calls = 0
+    original_compute_weight = lm_head_module._lm_head_compute_weight
+
+    def tracking_compute_weight(*args, **kwargs):
+        nonlocal cast_calls
+        cast_calls += 1
+        return original_compute_weight(*args, **kwargs)
+
+    monkeypatch.setattr(
+        lm_head_module, "_lm_head_compute_weight", tracking_compute_weight
+    )
+    torch.manual_seed(20260811)
+    base_input = torch.randn(7, 2, 16, dtype=dtype, device="cuda")
+    base_weight = torch.randn(32, 16, dtype=dtype, device="cuda")
+    base_bias = torch.randn(32, dtype=dtype, device="cuda")
+    grad_output = torch.randn(7, 2, 32, dtype=torch.float32, device="cuda")
+
+    input_ = base_input.clone().requires_grad_()
+    weight = base_weight.clone().requires_grad_()
+    bias = base_bias.clone().requires_grad_()
+    output = lm_head_module.linear_with_areal_output(
+        input_,
+        weight,
+        bias,
+        False,
+        False,
+        False,
+        tp_group=None,
+        fp32_output=True,
+        fp32_operands=True,
+    )
+
+    reference_input = base_input.clone().requires_grad_()
+    reference_weight = base_weight.clone().requires_grad_()
+    reference_bias = base_bias.clone().requires_grad_()
+    reference = (
+        torch.matmul(reference_input.float(), reference_weight.float().t())
+        + reference_bias.float()
+    )
+
+    assert cast_calls == 1
+    torch.testing.assert_close(output, reference, rtol=0.0, atol=0.0)
+    output.backward(grad_output)
+    reference.backward(grad_output)
+    assert cast_calls == 1
+    torch.testing.assert_close(input_.grad, reference_input.grad, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(weight.grad, reference_weight.grad, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(bias.grad, reference_bias.grad, rtol=0.0, atol=0.0)
+
+
+def test_fp32_operands_reject_deferred_embedding_wgrad() -> None:
+    input_ = torch.randn(3, 1, 4, requires_grad=True)
+    weight = torch.randn(8, 4, requires_grad=True)
+
+    with pytest.raises(NotImplementedError, match="deferred embedding wgrad"):
+        lm_head_module.linear_with_areal_output(
+            input_,
+            weight,
+            None,
+            True,
+            False,
+            False,
+            grad_output_buffer=[],
+            wgrad_deferral_limit=0,
+            tp_group=None,
+            fp32_output=True,
+            fp32_operands=True,
+        )
 
 
 def test_replace_output_layer_preserves_bridge_subclass_forward():
@@ -557,10 +644,24 @@ def test_direct_fp32_end_to_end_precision_matches_native_megatron_areal():
 @pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA is required for chunked LM Head")
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("temperature", [0.7, 1.0])
+@pytest.mark.parametrize("fp32_operands", [False, True])
 def test_chunked_lm_head_matches_full_fused_path(
     dtype: torch.dtype,
     temperature: float,
+    fp32_operands: bool,
+    monkeypatch: pytest.MonkeyPatch,
 ):
+    compute_weight_calls = 0
+    original_compute_weight = lm_head_module._lm_head_compute_weight
+
+    def tracking_compute_weight(*args, **kwargs):
+        nonlocal compute_weight_calls
+        compute_weight_calls += 1
+        return original_compute_weight(*args, **kwargs)
+
+    monkeypatch.setattr(
+        lm_head_module, "_lm_head_compute_weight", tracking_compute_weight
+    )
     torch.manual_seed(20260721)
     sequence_length, hidden_size, vocab_size = 13, 32, 96
     logit_scale = 0.5
@@ -568,15 +669,17 @@ def test_chunked_lm_head_matches_full_fused_path(
         sequence_length, 1, hidden_size, dtype=dtype, device="cuda"
     )
     base_weight = torch.randn(vocab_size, hidden_size, dtype=dtype, device="cuda")
+    base_bias = torch.randn(vocab_size, dtype=dtype, device="cuda")
     labels = torch.randint(vocab_size, (sequence_length, 1), device="cuda")
     logprob_weights = torch.randn(sequence_length, 1, device="cuda")
 
     chunked_input = base_input.clone().requires_grad_()
     chunked_weight = base_weight.clone().requires_grad_()
+    chunked_bias = base_bias.clone().requires_grad_()
     outputs = _ChunkedVocabParallelLMHead.apply(
         chunked_input,
         chunked_weight,
-        None,
+        chunked_bias,
         labels,
         temperature,
         5,
@@ -585,19 +688,28 @@ def test_chunked_lm_head_matches_full_fused_path(
         False,
         None,
         logit_scale,
+        fp32_operands,
     )
+    assert compute_weight_calls == 1
 
     reference_input = base_input.clone().requires_grad_()
     reference_weight = base_weight.clone().requires_grad_()
-    reference_logits = linear_with_fp32_output(
-        reference_input,
-        reference_weight,
-        None,
-        False,
-        False,
-        False,
-        tp_group=None,
-    )
+    reference_bias = base_bias.clone().requires_grad_()
+    if fp32_operands:
+        reference_logits = (
+            torch.matmul(reference_input.float(), reference_weight.float().t())
+            + reference_bias.float()
+        )
+    else:
+        reference_logits = linear_with_fp32_output(
+            reference_input,
+            reference_weight,
+            reference_bias,
+            False,
+            False,
+            False,
+            tp_group=None,
+        )
     reference_logits.mul_(logit_scale)
     expected_stats = (
         reference_logits.detach().min(dim=-1).values.reshape(-1),
@@ -630,30 +742,54 @@ def test_chunked_lm_head_matches_full_fused_path(
 
     (outputs[0] * logprob_weights.reshape(-1)).sum().backward()
     (reference_logprobs * logprob_weights).sum().backward()
+    assert compute_weight_calls == 1
     torch.testing.assert_close(
         chunked_input.grad, reference_input.grad, rtol=1e-5, atol=2e-5
     )
     assert _relative_l2(chunked_weight.grad, reference_weight.grad) <= 5e-3
     assert _cosine_similarity(chunked_weight.grad, reference_weight.grad) >= 0.99999
+    if fp32_operands:
+        torch.testing.assert_close(
+            chunked_bias.grad, reference_bias.grad, rtol=1e-5, atol=2e-5
+        )
+    else:
+        # The low-precision chunked path sums dlogits once per chunk, while the
+        # full reference reduces all tokens at once. Both honor the BF16/FP16
+        # backward contract but have different low-precision reduction order.
+        assert _relative_l2(chunked_bias.grad, reference_bias.grad) <= 5e-3
 
 
 @pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA is required for chunked LM Head")
-@pytest.mark.skipif(
-    not FUSED_WGRAD_AVAILABLE,
-    reason="Apex fused weight-gradient extension is required",
-)
 def test_chunked_lm_head_accumulates_fp32_main_grad():
     torch.manual_seed(20260721)
-    input_ = torch.randn(
-        11, 1, 16, dtype=torch.bfloat16, device="cuda", requires_grad=True
-    )
-    weight = torch.nn.Parameter(
-        torch.randn(48, 16, dtype=torch.bfloat16, device="cuda")
-    )
-    weight.main_grad = torch.zeros_like(weight, dtype=torch.float32)
+    base_input = torch.randn(11, 1, 16, dtype=torch.bfloat16, device="cuda")
+    base_weight = torch.randn(48, 16, dtype=torch.bfloat16, device="cuda")
+    reference_input = base_input.clone().requires_grad_()
+    reference_weight = base_weight.clone().requires_grad_()
+    input_ = base_input.clone().requires_grad_()
+    weight = torch.nn.Parameter(base_weight.clone())
+    initial_main_grad = torch.ones_like(weight, dtype=torch.float32)
+    captured_main_grad = initial_main_grad.clone()
+    weight.main_grad = captured_main_grad
     weight.grad_added_to_main_grad = False
     weight.zero_out_wgrad = True
     labels = torch.randint(48, (11, 1), device="cuda")
+
+    reference_outputs = _ChunkedVocabParallelLMHead.apply(
+        reference_input,
+        reference_weight,
+        None,
+        labels,
+        1.0,
+        4,
+        False,
+        False,
+        False,
+        None,
+        1.0,
+        True,
+    )
+    reference_outputs[0].sum().backward()
 
     outputs = _ChunkedVocabParallelLMHead.apply(
         input_,
@@ -667,13 +803,52 @@ def test_chunked_lm_head_accumulates_fp32_main_grad():
         False,
         None,
         1.0,
+        True,
     )
+    replacement_main_grad = torch.zeros_like(captured_main_grad)
+    weight.main_grad = replacement_main_grad
     outputs[0].sum().backward()
 
     assert input_.grad is not None
-    assert weight.main_grad.norm() > 0
+    assert weight.main_grad is captured_main_grad
+    torch.testing.assert_close(
+        replacement_main_grad, torch.zeros_like(replacement_main_grad)
+    )
+    torch.testing.assert_close(
+        (captured_main_grad - initial_main_grad).to(torch.bfloat16),
+        reference_weight.grad,
+        rtol=1e-5,
+        atol=2e-5,
+    )
     assert weight.grad_added_to_main_grad
     torch.testing.assert_close(weight.grad, torch.zeros_like(weight.grad))
+
+
+@pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA is required for chunked LM Head")
+def test_chunked_fp32_lm_head_rejects_non_fp32_main_grad():
+    input_ = torch.randn(
+        5, 1, 8, dtype=torch.bfloat16, device="cuda", requires_grad=True
+    )
+    weight = torch.nn.Parameter(torch.randn(16, 8, dtype=torch.bfloat16, device="cuda"))
+    weight.main_grad = torch.zeros_like(weight)
+    labels = torch.randint(16, (5, 1), device="cuda")
+    outputs = _ChunkedVocabParallelLMHead.apply(
+        input_,
+        weight,
+        None,
+        labels,
+        1.0,
+        3,
+        True,
+        False,
+        False,
+        None,
+        1.0,
+        True,
+    )
+
+    with pytest.raises(RuntimeError, match="require an FP32 main_grad"):
+        outputs[0].sum().backward()
 
 
 @pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA is required for direct FP32 mm")

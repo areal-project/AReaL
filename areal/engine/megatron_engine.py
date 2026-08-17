@@ -390,18 +390,6 @@ class MegatronEngine(TrainEngine):
             tensor_parallel.model_parallel_cuda_manual_seed(self.seed)
             self.own_global_group = True
         self.logger = logging.getLogger(f"[MegatronEngine Rank {dist.get_rank()}]")
-        if self.mcore_config.enable_fp32_lm_head and dist.get_rank() == 0:
-            if self.mcore_config.enable_chunked_logits:
-                self.logger.warning(
-                    "megatron.enable_fp32_lm_head is deprecated and ignored when "
-                    "enable_chunked_logits=True; the fused AReaL LM Head always produces "
-                    "FP32 logits."
-                )
-            else:
-                self.logger.warning(
-                    "megatron.enable_fp32_lm_head is deprecated; preserving its "
-                    "legacy mbridge behavior because enable_chunked_logits=False."
-                )
         self._context_and_model_parallel_group = None
         self._cpu_model_parallel_group = None
         self._init_context_and_model_parallel_group()

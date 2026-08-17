@@ -91,8 +91,11 @@ The `NormConfig` dataclass controls how rewards and advantages are normalized:
 | `group_size`     | int         | -                            | Group size for group-level normalization                   |
 
 "Batch" level computes the mean/std across the global batch, while "group" level
-computes them within groups (e.g., trajectories sharing the same prompt). For
-group-level normalization, `group_size` must be specified. Setting `mean_level` or
+computes them within groups (e.g., trajectories sharing the same prompt). Group
+boundaries come from the rollout batch metadata (`TrajBatchMeta.traj_group_sizes`)
+rather than from `group_size`, so groups of unequal size (e.g., when some samples are
+filtered out) are still normalized per prompt; `group_size` applies only as a
+fixed-stride fallback when that metadata is unavailable. Setting `mean_level` or
 `std_level` to `None` skips mean subtraction or standard deviation scaling,
 respectively.
 
