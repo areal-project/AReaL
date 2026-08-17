@@ -961,6 +961,8 @@ class RolloutController:
         # `arun_episode` should return None instead.
         if task_id is None:
             task_id = self._task_id_generator.next()
+        else:
+            self._task_id_generator.reserve_at_least(task_id)
         task_input = _RemoteRolloutTaskInput(
             data=data,
             workflow=workflow_str,

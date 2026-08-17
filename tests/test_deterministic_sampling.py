@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import asyncio
+import threading
 import warnings
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -23,8 +24,14 @@ from areal.experimental.openai.proxy.proxy_rollout_server import (
 )
 from areal.experimental.openai.proxy.server import SessionData
 from areal.infra import workflow_context
+from areal.infra import workflow_executor as workflow_executor_module
 from areal.infra.remote_inf_engine import GroupedRolloutWorkflow
-from areal.infra.workflow_executor import _select_results
+from areal.infra.workflow_executor import (
+    BatchTaskDispatcher,
+    TaskIdGenerator,
+    WorkflowExecutor,
+    _select_results,
+)
 
 
 def test_sampling_seed_is_stable_across_calls():
@@ -288,6 +295,95 @@ def test_select_results_is_creation_ordered_by_default():
     # shuffled, so only membership is asserted here.
     assert {r.task_id for r in selected} == {2, 0}
     assert [r.task_id for r in pending] == [1]
+
+
+def test_callback_registration_rejects_duplicate_task_id():
+    dispatcher = object.__new__(BatchTaskDispatcher)
+    dispatcher._result_cv = threading.Condition()
+    dispatcher._task_callbacks = {}
+
+    dispatcher.register_callback(7, "http://first")
+
+    with pytest.raises(ValueError, match="already registered"):
+        dispatcher.register_callback(7, "http://second")
+    assert dispatcher._task_callbacks == {7: "http://first"}
+
+
+def test_workflow_executor_binds_callback_to_allocated_task_id(monkeypatch):
+    executor = object.__new__(WorkflowExecutor)
+    executor._task_id_generator = TaskIdGenerator()
+    executor._dispatcher = Mock()
+    monkeypatch.setattr(
+        workflow_executor_module.perf_tracer, "register_task", lambda _: None
+    )
+
+    task_id = executor.submit({}, workflow=Mock(), callback_addr="http://callback")
+
+    assert task_id == 0
+    executor.dispatcher.register_callback.assert_called_once_with(0, "http://callback")
+    submitted = executor.dispatcher.submit_task_input.call_args.args[0]
+    assert submitted.task_id == 0
+
+
+def test_workflow_executor_cancels_own_callback_when_submit_fails(monkeypatch):
+    executor = object.__new__(WorkflowExecutor)
+    executor._task_id_generator = TaskIdGenerator()
+    executor._dispatcher = Mock()
+    executor.dispatcher.submit_task_input.side_effect = ValueError("duplicate")
+    monkeypatch.setattr(
+        workflow_executor_module.perf_tracer, "register_task", lambda _: None
+    )
+
+    with pytest.raises(ValueError, match="duplicate"):
+        executor.submit({}, workflow=Mock(), callback_addr="http://callback")
+
+    executor.dispatcher.cancel_callback.assert_called_once_with(0, "http://callback")
+
+
+def test_dynamic_batch_counts_rejections_as_attempts():
+    dispatcher = object.__new__(BatchTaskDispatcher)
+    dispatcher._input_cv = threading.Condition()
+    dispatcher._pending_inputs = []
+    dispatcher.staleness_manager = SimpleNamespace(get_pending_limit=lambda: 0)
+    dispatcher.runner = SimpleNamespace(
+        max_queue_size=4, get_input_queue_size=lambda: 4
+    )
+    dispatcher.enable_tracing = False
+    dispatcher.wait_results = Mock(side_effect=[[None], ["accepted"]])
+
+    results = dispatcher.active_submit_and_wait(iter(()), batch_size=2, dynamic_bs=True)
+
+    assert results == ["accepted"]
+    assert [
+        call.kwargs["count"] for call in dispatcher.wait_results.call_args_list
+    ] == [2, 1]
+
+
+def test_fixed_batch_replaces_rejected_attempts_in_order():
+    dispatcher = object.__new__(BatchTaskDispatcher)
+    dispatcher._input_cv = threading.Condition()
+    dispatcher._pending_inputs = []
+    dispatcher.staleness_manager = SimpleNamespace(get_pending_limit=lambda: 0)
+    dispatcher.runner = SimpleNamespace(
+        max_queue_size=4, get_input_queue_size=lambda: 4
+    )
+    dispatcher.enable_tracing = False
+    dispatcher.wait_results = Mock(side_effect=[[None, "first"], ["replacement"]])
+
+    results = dispatcher.active_submit_and_wait(iter(()), batch_size=2)
+
+    assert results == ["first", "replacement"]
+    assert [
+        call.kwargs["count"] for call in dispatcher.wait_results.call_args_list
+    ] == [2, 1]
+
+
+def test_task_id_generator_advances_past_explicit_id():
+    generator = TaskIdGenerator()
+
+    generator.reserve_at_least(7)
+
+    assert generator.next() == 8
 
 
 def test_responses_and_completions_both_accept_seed():

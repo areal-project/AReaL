@@ -358,11 +358,19 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
 
     def register_callback(self, task_id: int, callback_addr: str):
         """Register a callback address for a task."""
-        self._task_callbacks[task_id] = callback_addr
+        with self._result_cv:
+            if task_id in self._task_callbacks:
+                raise ValueError(f"Callback for task {task_id} is already registered")
+            self._task_callbacks[task_id] = callback_addr
 
-    def cancel_callback(self, task_id: int):
+    def cancel_callback(self, task_id: int, callback_addr: str | None = None):
         """Remove a registered callback for a task (e.g., on timeout)."""
-        self._task_callbacks.pop(task_id, None)
+        with self._result_cv:
+            if (
+                callback_addr is None
+                or self._task_callbacks.get(task_id) == callback_addr
+            ):
+                self._task_callbacks.pop(task_id, None)
 
     def _send_callback(self, addr: str, task_id: int, result: TResult):
         """Send task result to callback address (fire-and-forget)."""
@@ -722,8 +730,9 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
                             "Input generator exhausted before batch completion. "
                             "Use cycle_dataloader() or provide an infinite generator."
                         ) from None
+            remaining = batch_size - (total_attempts if dynamic_bs else accepted_cnt)
             try:
-                arrived = self.wait_results(count=batch_size - accepted_cnt, timeout=1)
+                arrived = self.wait_results(count=remaining, timeout=1)
             except TimeoutError:
                 arrived = []
 
@@ -764,6 +773,11 @@ class TaskIdGenerator:
             task_id = self._task_cnt
             self._task_cnt += 1
         return task_id
+
+    def reserve_at_least(self, task_id: int) -> None:
+        """Keep future automatic IDs above an explicitly supplied task ID."""
+        with self._lock:
+            self._task_cnt = max(self._task_cnt, task_id + 1)
 
 
 class WorkflowExecutor:
@@ -1278,6 +1292,7 @@ class WorkflowExecutor:
         should_accept_fn: Callable[[dict[str, Any]], bool] = None,
         task_id: int | None = None,
         is_eval: bool = False,
+        callback_addr: str | None = None,
     ) -> int:
         """Submit a rollout request to the workflow executor.
 
@@ -1288,6 +1303,8 @@ class WorkflowExecutor:
         """
         if task_id is None:
             task_id = self._task_id_generator.next()
+        else:
+            self._task_id_generator.reserve_at_least(task_id)
         perf_tracer.register_task(task_id)
         task_input = _RolloutTaskInput(
             data=data,
@@ -1297,8 +1314,14 @@ class WorkflowExecutor:
             is_eval=is_eval,
         )
 
-        # Delegate to dispatcher
-        self.dispatcher.submit_task_input(task_input)
+        if callback_addr is not None:
+            self.dispatcher.register_callback(task_id, callback_addr)
+        try:
+            self.dispatcher.submit_task_input(task_input)
+        except Exception:
+            if callback_addr is not None:
+                self.dispatcher.cancel_callback(task_id, callback_addr)
+            raise
         return task_id
 
     def wait(
