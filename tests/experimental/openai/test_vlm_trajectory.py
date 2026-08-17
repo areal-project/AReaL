@@ -11,11 +11,9 @@ import torch
 from PIL import Image
 
 from areal.api import ModelResponse
-from areal.experimental.openai import client as openai_client
 from areal.experimental.openai.client import (
     ArealOpenAI,
     _extract_images_from_messages,
-    _load_inline_image,
     _prepare_prompt,
 )
 from areal.experimental.openai.types import InteractionWithTokenLogpReward
@@ -117,22 +115,6 @@ def test_extract_images_rejects_non_inline_urls(url):
 
     with pytest.raises(ValueError, match="Remote image URLs are not supported"):
         _extract_images_from_messages(messages)
-
-
-def test_load_inline_image_rejects_oversized_bytes(monkeypatch):
-    """Inline image decoding must enforce a bounded byte payload."""
-    monkeypatch.setattr(openai_client, "_MAX_IMAGE_BYTES", 1)
-
-    with pytest.raises(ValueError, match="byte size limit"):
-        _load_inline_image(_png_base64())
-
-
-def test_load_inline_image_rejects_oversized_pixel_count(monkeypatch):
-    """Compressed images must not bypass the decoded pixel limit."""
-    monkeypatch.setattr(openai_client, "_MAX_IMAGE_PIXELS", 1)
-
-    with pytest.raises(ValueError, match="pixel size limit"):
-        _load_inline_image(_png_base64())
 
 
 @pytest.mark.asyncio

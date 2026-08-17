@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import asyncio
-import base64
-import binascii
 import datetime
 import json
 import os
@@ -11,7 +9,6 @@ import uuid
 from collections.abc import AsyncGenerator, Iterable, Mapping
 from copy import deepcopy
 from dataclasses import dataclass
-from io import BytesIO
 from typing import TYPE_CHECKING, Any, Literal, Protocol, TypeVar, cast, overload
 
 import torch
@@ -55,7 +52,6 @@ from openai.types.responses.response_usage import (
 )
 from openai.types.responses.tool_param import ToolParam
 from openai.types.shared_params.metadata import Metadata
-from PIL import Image, UnidentifiedImageError
 from pydantic import BaseModel
 
 from areal.api import ModelRequest, ModelResponse
@@ -84,48 +80,12 @@ os.environ["OPENAI_BASE_URL"] = os.environ.get("OPENAI_BASE_URL", "none")
 
 logger = logging.getLogger("OpenAIClient")
 
-_MAX_IMAGE_BYTES = 20 * 1024 * 1024
-_MAX_IMAGE_PIXELS = 36_000_000
-
 
 @dataclass
 class _PreparedPrompt:
     input_ids: list[int]
     mm_token_type_ids: list[int] | None = None
     multi_modal_input: dict[str, torch.Tensor] | None = None
-
-
-def _load_inline_image(image_data: str) -> Image.Image:
-    """Decode a bounded inline image without accessing local or remote URLs."""
-    max_encoded_chars = 4 * ((_MAX_IMAGE_BYTES + 2) // 3)
-    if len(image_data) > max_encoded_chars:
-        raise ValueError(
-            f"Inline image exceeds the {_MAX_IMAGE_BYTES}-byte size limit."
-        )
-    try:
-        raw_image = base64.b64decode(image_data, validate=True)
-    except (binascii.Error, ValueError) as exc:
-        raise ValueError("Image input must contain valid base64 data.") from exc
-    if not raw_image:
-        raise ValueError("Image input must not be empty.")
-    if len(raw_image) > _MAX_IMAGE_BYTES:
-        raise ValueError(
-            f"Inline image exceeds the {_MAX_IMAGE_BYTES}-byte size limit."
-        )
-
-    try:
-        with Image.open(BytesIO(raw_image)) as image:
-            width, height = image.size
-            if width <= 0 or height <= 0:
-                raise ValueError("Image dimensions must be positive.")
-            if width * height > _MAX_IMAGE_PIXELS:
-                raise ValueError(
-                    f"Image exceeds the {_MAX_IMAGE_PIXELS}-pixel size limit."
-                )
-            image.load()
-            return image.copy()
-    except (OSError, UnidentifiedImageError, Image.DecompressionBombError) as exc:
-        raise ValueError("Image input is not a supported image format.") from exc
 
 
 def _process_multimodal_prompt(
@@ -152,7 +112,7 @@ def _process_multimodal_prompt(
             "The tokenizer chat template must return text before VLM processing."
         )
 
-    images = [load_image(_load_inline_image(image)) for image in image_data]
+    images = [load_image(image) for image in image_data]
     processed = processor(
         text=[prompt_text],
         images=images,
