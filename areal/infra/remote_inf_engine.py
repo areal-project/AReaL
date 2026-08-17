@@ -108,6 +108,12 @@ class GroupedRolloutWorkflow(RolloutWorkflow):
             *[run_sample(sample_idx) for sample_idx in range(self.group_size)]
         )
         indexed_results.sort(key=lambda item: item[0])
+        sample_indices = [sample_idx for sample_idx, _ in indexed_results]
+        if sample_indices != list(range(self.group_size)):
+            raise RuntimeError(
+                "Grouped rollout returned invalid sample indices: "
+                f"expected {list(range(self.group_size))}, got {sample_indices}"
+            )
         results = [result for _, result in indexed_results]
 
         valid_results = [r for r in results if r is not None]
