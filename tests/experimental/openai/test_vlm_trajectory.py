@@ -11,7 +11,13 @@ import torch
 from PIL import Image
 
 from areal.api import ModelResponse
-from areal.experimental.openai.client import ArealOpenAI, _prepare_prompt
+from areal.experimental.openai import client as openai_client
+from areal.experimental.openai.client import (
+    ArealOpenAI,
+    _extract_images_from_messages,
+    _load_inline_image,
+    _prepare_prompt,
+)
 from areal.experimental.openai.types import InteractionWithTokenLogpReward
 
 
@@ -88,6 +94,64 @@ def _response(input_tokens: list[int], output_tokens: list[int]) -> ModelRespons
         output_versions=[0] * len(output_tokens),
         tokenizer=_FakeTokenizer(),
     )
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://169.254.169.254/latest/meta-data/",
+        "https://internal.example/image.png",
+        "file:///etc/passwd",
+    ],
+)
+def test_extract_images_rejects_non_inline_urls(url):
+    """Image messages must not make rollout workers fetch external resources."""
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image_url", "image_url": {"url": url}},
+            ],
+        }
+    ]
+
+    with pytest.raises(ValueError, match="Remote image URLs are not supported"):
+        _extract_images_from_messages(messages)
+
+
+def test_load_inline_image_rejects_oversized_bytes(monkeypatch):
+    """Inline image decoding must enforce a bounded byte payload."""
+    monkeypatch.setattr(openai_client, "_MAX_IMAGE_BYTES", 1)
+
+    with pytest.raises(ValueError, match="byte size limit"):
+        _load_inline_image(_png_base64())
+
+
+def test_load_inline_image_rejects_oversized_pixel_count(monkeypatch):
+    """Compressed images must not bypass the decoded pixel limit."""
+    monkeypatch.setattr(openai_client, "_MAX_IMAGE_PIXELS", 1)
+
+    with pytest.raises(ValueError, match="pixel size limit"):
+        _load_inline_image(_png_base64())
+
+
+@pytest.mark.asyncio
+async def test_prepare_prompt_rejects_image_without_processor():
+    """An image request must not silently export a text-only trajectory."""
+    message = {"role": "user", "content": [{"type": "image"}]}
+
+    with pytest.raises(ValueError, match="require a multimodal processor"):
+        await _prepare_prompt(
+            tokenizer=_FakeTokenizer(),
+            processor=None,
+            tokenizer_messages=[message],
+            concat_messages=[message],
+            image_data=[_png_base64()],
+            parent=None,
+            chat_template_type="hf",
+            tools=None,
+            extra_body={},
+        )
 
 
 @pytest.mark.asyncio
