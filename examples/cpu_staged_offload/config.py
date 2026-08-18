@@ -9,9 +9,8 @@ from __future__ import annotations
 import os
 from collections.abc import Mapping, MutableMapping
 from dataclasses import dataclass, field
-from typing import Any
 
-from areal.api.cli_args import GRPOConfig
+from examples.multi_turn_math.config import MultiTurnGRPOConfig
 
 CPU_STAGED_BUFFER_COUNT_ENV = "AREAL_CPU_STAGED_BUFFER_COUNT"
 CPU_STAGED_BUCKET_SIZE_MB_ENV = "AREAL_CPU_STAGED_BUCKET_SIZE_MB"
@@ -55,17 +54,9 @@ class CPUStagedOffloadSettings:
 
 
 @dataclass
-class CPUStagedGRPOConfig(GRPOConfig):
+class CPUStagedGRPOConfig(MultiTurnGRPOConfig):
     """Multi-turn GRPO configuration with example-local staging settings."""
 
-    agent_run_args: dict[str, Any] = field(
-        default_factory=dict,
-        metadata={"help": "Arguments for running the multi-turn math agent."},
-    )
-    export_style: str = field(
-        default="concat",
-        metadata={"help": "How multi-turn completions are exported for training."},
-    )
     cpu_staged: CPUStagedOffloadSettings = field(
         default_factory=CPUStagedOffloadSettings,
         metadata={"help": "Example-local GPU-staged AdamW settings."},

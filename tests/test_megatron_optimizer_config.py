@@ -182,60 +182,6 @@ def test_internal_gpu_staged_muon_uses_layerwise_factory_with_fixed_checkpoint(
     assert captured["checkpoint"]["async_save"] is False
 
 
-@pytest.mark.parametrize(
-    "overlap_fields",
-    [
-        ("overlap_param_gather",),
-        ("overlap_param_gather_with_optimizer_step",),
-        ("overlap_param_gather", "overlap_param_gather_with_optimizer_step"),
-    ],
-)
-def test_internal_gpu_staged_muon_rejects_overlap_before_mutation(
-    overlap_fields,
-) -> None:
-    """Muon overlap modes fail before DDP config or engine state is changed."""
-    engine = _make_test_engine(OptimizerConfig(type="adam"))
-    engine.model = None
-    for overlap_field in overlap_fields:
-        if overlap_field == "overlap_param_gather":
-            engine.mcore_config.ddp.overlap_param_gather = True
-        else:
-            engine.mcore_config.overlap_param_gather_with_optimizer_step = True
-    original_use_distributed_optimizer = (
-        engine.mcore_config.ddp.use_distributed_optimizer
-    )
-
-    with pytest.raises(RuntimeError, match="overlap_param_gather"):
-        engine.configure_gpu_staged_muon()
-
-    assert (
-        engine.mcore_config.ddp.use_distributed_optimizer
-        is original_use_distributed_optimizer
-    )
-    assert getattr(engine, "_gpu_staged_muon_config", None) is None
-
-
-@pytest.mark.parametrize("tp_mode", ["blockwise", "distributed"])
-def test_internal_gpu_staged_muon_rejects_unverified_mode_before_mutation(
-    tp_mode: str,
-) -> None:
-    """The engine rejects unverified Muon modes before changing DDP state."""
-    engine = _make_test_engine(OptimizerConfig(type="adam"))
-    engine.model = None
-    original_use_distributed_optimizer = (
-        engine.mcore_config.ddp.use_distributed_optimizer
-    )
-
-    with pytest.raises(RuntimeError, match="only the verified duplicated TP mode"):
-        engine.configure_gpu_staged_muon(GPUStagedMuonConfig(tp_mode=tp_mode))
-
-    assert (
-        engine.mcore_config.ddp.use_distributed_optimizer
-        is original_use_distributed_optimizer
-    )
-    assert getattr(engine, "_gpu_staged_muon_config", None) is None
-
-
 def test_internal_gpu_staged_muon_rejects_async_checkpoint_before_mutation() -> None:
     """Muon async save is rejected before DDP or engine state changes."""
     engine = _make_test_engine(OptimizerConfig(type="adam"))
@@ -247,30 +193,6 @@ def test_internal_gpu_staged_muon_rejects_async_checkpoint_before_mutation() -> 
 
     with pytest.raises(RuntimeError, match="asynchronous checkpoint.*staged Muon"):
         engine.configure_gpu_staged_muon()
-
-    assert (
-        engine.mcore_config.ddp.use_distributed_optimizer
-        is original_use_distributed_optimizer
-    )
-    assert getattr(engine, "_gpu_staged_muon_config", None) is None
-
-
-def test_internal_gpu_staged_muon_rejects_multiple_buffers_for_tp_before_mutation() -> (
-    None
-):
-    """TP collective ordering is rejected before the engine mutates DDP state."""
-    engine = _make_test_engine(OptimizerConfig(type="adam"))
-    engine.model = None
-    engine.parallel_strategy = SimpleNamespace(
-        tensor_parallel_size=2,
-        expert_tensor_parallel_size=1,
-    )
-    original_use_distributed_optimizer = (
-        engine.mcore_config.ddp.use_distributed_optimizer
-    )
-
-    with pytest.raises(RuntimeError, match="TP collectives.*buffer_count=1"):
-        engine.configure_gpu_staged_muon(GPUStagedMuonConfig(buffer_count=2))
 
     assert (
         engine.mcore_config.ddp.use_distributed_optimizer

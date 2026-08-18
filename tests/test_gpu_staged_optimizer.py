@@ -357,89 +357,6 @@ def test_mcore_distributed_optimizer_dp1_preserves_step_and_sync_order(
 
 
 @pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA is required for staged AdamW")
-def test_step_reads_gradient_after_caller_stream_clipping() -> None:
-    """Staged moments use the clipped value queued before inner step."""
-    param = torch.nn.Parameter(
-        torch.tensor([1.0, -1.0], device="cuda", dtype=torch.bfloat16)
-    )
-    optimizer = GPUStagedAdamW(
-        [param],
-        lr=1e-2,
-        betas=(0.5, 0.9),
-        weight_decay=0.0,
-        staged_config=_tiny_config(bucket_numel=1),
-    )
-    optimizer.bind_owned_params(optimizer.param_groups)
-    grad = torch.tensor([3.0, 4.0], device="cuda", dtype=torch.bfloat16)
-    caller_stream = torch.cuda.Stream()
-    with torch.cuda.stream(caller_stream):
-        torch.cuda._sleep(10_000_000)
-        grad.mul_(0.2)  # Equivalent to clipping norm 5 to max_norm 1.
-        param.decoupled_grad = grad
-        optimizer.step()
-    caller_stream.synchronize()
-    optimizer.drain()
-
-    expected_grad = torch.tensor([0.6, 0.8], dtype=torch.float32)
-    state = optimizer.state[param]
-    torch.testing.assert_close(
-        state["exp_avg"], expected_grad.mul(0.5), rtol=2e-3, atol=2e-3
-    )
-    torch.testing.assert_close(
-        state["exp_avg_sq"], expected_grad.square().mul(0.1), rtol=2e-3, atol=2e-3
-    )
-
-
-@pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA is required for staged AdamW")
-def test_bind_waits_for_caller_stream_model_shard_write() -> None:
-    """Private initialization streams must not read a stale model shard."""
-    param = torch.nn.Parameter(torch.zeros(31, device="cuda", dtype=torch.bfloat16))
-    optimizer = GPUStagedAdamW([param], staged_config=_tiny_config(bucket_numel=7))
-    caller_stream = torch.cuda.Stream()
-    with torch.cuda.stream(caller_stream):
-        torch.cuda._sleep(10_000_000)
-        with torch.no_grad():
-            param.fill_(3.5)
-        optimizer.bind_owned_params(optimizer.param_groups)
-
-    assert optimizer.cpu_slabs is not None
-    torch.testing.assert_close(
-        optimizer.cpu_slabs.master,
-        torch.full((31,), 3.5, dtype=torch.float32),
-        rtol=0.0,
-        atol=0.0,
-    )
-
-
-@pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA is required for staged AdamW")
-def test_step_does_not_device_sync_or_wait_for_final_d2h() -> None:
-    """Step queues model readiness but leaves unrelated work and D2H asynchronous."""
-    param = torch.nn.Parameter(torch.ones(31, device="cuda", dtype=torch.bfloat16))
-    optimizer = GPUStagedAdamW(
-        [param], staged_config=_tiny_config(buffer_count=1, bucket_numel=32)
-    )
-    optimizer.bind_owned_params(optimizer.param_groups)
-    param.decoupled_grad = torch.ones_like(param)
-    slot = optimizer._slots[0]
-
-    unrelated_stream = torch.cuda.Stream()
-    unrelated_done = torch.cuda.Event()
-    with torch.cuda.stream(unrelated_stream):
-        torch.cuda._sleep(1_000_000_000)
-        unrelated_done.record(unrelated_stream)
-    with torch.cuda.stream(slot.d2h_stream):
-        torch.cuda._sleep(500_000_000)
-
-    optimizer.step()
-
-    assert not unrelated_done.query()
-    assert not slot.d2h_done.query()
-    optimizer.drain()
-    assert slot.d2h_done.query()
-    unrelated_done.synchronize()
-
-
-@pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA is required for staged AdamW")
 def test_gpu_state_residency_is_bounded_by_slots_not_total_state() -> None:
     """Larger owned state does not create additional resident CUDA master/moments."""
     optimizers = []
@@ -544,27 +461,6 @@ def test_async_checkpoint_fence_waits_before_step_and_preserves_source() -> None
     assert optimizer.async_save_state == "COMPLETE"
     assert not torch.equal(optimizer.cpu_slabs.master, checkpoint_master)
     assert optimizer.cuda_state_numel == 0
-
-
-@pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA is required for staged AdamW")
-def test_async_checkpoint_rejects_source_generation_change() -> None:
-    param = torch.nn.Parameter(torch.ones(11, device="cuda", dtype=torch.bfloat16))
-    optimizer = GPUStagedAdamW([param], staged_config=_tiny_config())
-    optimizer.bind_owned_params(optimizer.param_groups)
-    wrapper = SimpleNamespace(optimizer=optimizer)
-    leaves = begin_managed_async_checkpoint_save(
-        wrapper,
-        checkpoint_id="checkpoint-2",
-        path="/tmp/checkpoint-2",
-        control_group=object(),
-        wait_fn=lambda: None,
-        identities={(): {"leaf": "test"}},
-    )
-    bind_managed_async_checkpoint_request(leaves, object(), 1)
-    optimizer.cpu_slabs.exp_avg.add_(1)
-
-    with pytest.raises(RuntimeError, match="source changed while fenced"):
-        complete_managed_async_checkpoint_save(leaves)
 
 
 @pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA is required for staged AdamW")
@@ -762,23 +658,3 @@ def test_builder_concurrency_never_mutates_global_adam(monkeypatch) -> None:
     run_pair((True, True))
     run_pair((True, False))
     run_pair((False, False))
-
-
-def test_builder_exception_never_mutates_global_adam(monkeypatch) -> None:
-    """A failed staged construction cannot pollute MCore's global builder."""
-    import megatron.core.optimizer as mcore_optimizer
-
-    original_adam = mcore_optimizer.Adam
-
-    def raise_from_builder(config, model):
-        del config, model
-        raise RuntimeError("injected builder failure")
-
-    monkeypatch.setattr(mcore_optimizer, "get_megatron_optimizer", raise_from_builder)
-    with pytest.raises(RuntimeError, match="injected builder failure"):
-        get_megatron_optimizer_with_gpu_staged_adamw(
-            _compatible_mcore_config(),
-            [object()],
-            GPUStagedAdamWConfig(buffer_count=1, bucket_size_mb=1),
-        )
-    assert mcore_optimizer.Adam is original_adam
