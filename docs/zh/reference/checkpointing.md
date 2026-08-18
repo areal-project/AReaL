@@ -32,7 +32,8 @@ AReaL 提供两种互补的检查点机制：
 - 跨所有 rank 分片以实现高效的并行 I/O
 - 包含模型权重、优化器状态、RNG 状态等
 - 后端特定：检查点仅与相同并行配置兼容
-- 覆盖之前的检查点以节省磁盘空间
+- 在 single-controller 模式下写入不可变 generation，并通过 `LATEST` 指针原子发布
+- SPMD 模式继续使用原有的覆盖写入布局
 
 ## 架构
 
@@ -178,25 +179,25 @@ RecoverHandler 保存完整训练状态：
 
 ### 输出位置
 
-恢复检查点保存到：
+在 single-controller 模式下，恢复检查点保存为不可变 generation：
 
 ```
 {fileroot}/checkpoints/{user}/{experiment_name}/{trial_name}/
-├── default/
-│   └── recover_checkpoint/     # 模型 + 优化器（DCP 格式）
-│       ├── __0_0.distcp
-│       ├── __1_0.distcp
-│       └── ...
-├── critic/                     # 如果使用 critic
-│   └── recover_checkpoint/
-└── recover_info/               # 元数据
-    ├── step_info.json
-    ├── saver_info.json
-    ├── evaluator_info.json
-    ├── stats_logger_info.json
-    ├── checkpoint_info.json
-    └── dataloader_info.pkl
+├── LATEST                      # 原子 JSON 指针，指向一个完整 generation
+└── checkpoint_generations/
+    └── generation_step00000123/
+        ├── manifest/           # Dataloader 和训练进度元数据
+        └── payloads/
+            ├── default/        # 模型 + 优化器（DCP 格式）
+            └── critic/         # 保存 critic 时存在
 ```
+
+所有同步 payload 保存返回后才更新指针。对于 Megatron 异步保存，发布操作会追加到 MCore 的 finalize callback，在后台 I/O
+完成后执行。进程崩溃可能在磁盘上留下未发布的 generation，但恢复仍使用 `LATEST` 选中的 generation。指针成功切换后才删除上一个已发布
+generation。
+
+为保持兼容性，SPMD trainer 继续使用原有的 `recover_info/` 和 `<engine>/recover_checkpoint/`
+布局。恢复逻辑可以读取两种布局。目前尚不支持对包含多个 训练引擎的检查点进行异步发布。
 
 ### 恢复过程
 
@@ -221,10 +222,12 @@ RecoverHandler 保存完整训练状态：
 ### 磁盘空间注意事项
 
 - **Saver**：每次保存创建新目录。高频率会消耗大量空间。
-- **RecoverHandler**：覆盖之前的检查点。同时只存在一份副本。
+- **RecoverHandler**：通常保留一个已发布 generation，以及可能存在的正在写入或崩溃遗留 generation。SPMD 模式继续覆盖原有路径。
 
 ### 恢复技巧
 
-1. **验证检查点有效性**：检查 `recover_info/step_info.json` 获取最后保存的步数
+1. **验证检查点有效性**：读取 `LATEST`，再检查其选中 generation 的 `manifest/step_info.json`
 1. **需要相同配置**：DCP 检查点需要相同的并行配置、实验名称和试次名称
-1. **干净重启**：删除 `recover_info/` 目录以全新开始
+1. **每个 trial 仅一个 writer**：不要让多个检查点 writer 并发写入同一实验和 trial 目录
+1. **干净重启**：同时删除 `LATEST` 和 `checkpoint_generations/`。对于旧版 SPMD 检查点， 删除 `recover_info/`
+   和每个引擎的 `recover_checkpoint/`

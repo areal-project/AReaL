@@ -24,7 +24,9 @@ from areal.api import (
 )
 from areal.api.cli_args import RecoverConfig
 from areal.infra import TrainController
+from areal.utils import checkpoint_pointer as cp
 from areal.utils import logging, timeutil
+from areal.utils.environ import is_single_controller
 from areal.utils.evaluator import Evaluator
 from areal.utils.saver import Saver
 
@@ -219,6 +221,11 @@ class RecoverHandler:
         return {"default": engine}
 
     @staticmethod
+    def _supports_checkpoint_pointer() -> bool:
+        multi_rank = dist.is_initialized() and dist.get_world_size() > 1
+        return is_single_controller() and not multi_rank
+
+    @staticmethod
     def _should_run_awex_colocate_transfer(
         inference_engine: InferenceEngine | None,
         weight_update_meta: WeightUpdateMeta | None,
@@ -263,6 +270,19 @@ class RecoverHandler:
                 "configuration without actor-rollout colocation."
             )
 
+    @staticmethod
+    def _uses_async_checkpoint(
+        engine: TrainEngine | TrainController,
+    ) -> bool:
+        config = getattr(engine, "config", None)
+        backend = getattr(config, "backend", "")
+        megatron_config = getattr(config, "megatron", None)
+        return (
+            isinstance(backend, str)
+            and backend.split(":", 1)[0] == "megatron"
+            and bool(getattr(megatron_config, "async_save", False))
+        )
+
     def dump(
         self,
         engine: TrainEngine
@@ -289,15 +309,6 @@ class RecoverHandler:
         normalized_engine: dict[str, TrainEngine | TrainController] = (
             self._normalize_recover_engines(engine)
         )
-        for name, engine_ in normalized_engine.items():
-            self._save_checkpoint(
-                engine_,
-                name=name,
-                tokenizer=tokenizer,
-                processor=processor,
-                base_model_path=base_model_path,
-            )
-
         self.last_step_info = step_info
         recover_info = RecoverInfo(
             last_step_info=self.last_step_info,
@@ -307,13 +318,91 @@ class RecoverHandler:
             dataloader_info=dataloader.state_dict(),
             checkpoint_info=self.freq_ctl.state_dict(),
         )
-
-        recover_info_path = self.recover_info_path(
+        save_root = Saver.get_save_root(
             self.config.experiment_name,
             self.config.trial_name,
             self.config.fileroot,
         )
-        recover_info.dump(recover_info_path)
+
+        if not self._supports_checkpoint_pointer():
+            if cp.read_latest(save_root) is not None:
+                raise cp.CheckpointConsistencyError(
+                    "Cannot write a legacy recovery checkpoint while LATEST "
+                    "selects a transactional checkpoint generation"
+                )
+            for name, engine_ in normalized_engine.items():
+                self._save_checkpoint(
+                    engine_,
+                    path=Saver.get_recover_checkpoint_path(
+                        self.config.experiment_name,
+                        self.config.trial_name,
+                        self.config.fileroot,
+                        name=name,
+                    ),
+                    name=name,
+                    tokenizer=tokenizer,
+                    processor=processor,
+                    base_model_path=base_model_path,
+                )
+            recover_info.dump(
+                self.recover_info_path(
+                    self.config.experiment_name,
+                    self.config.trial_name,
+                    self.config.fileroot,
+                )
+            )
+            return
+
+        engine_names = list(normalized_engine)
+        async_engines = [
+            name
+            for name, engine_ in normalized_engine.items()
+            if self._uses_async_checkpoint(engine_)
+        ]
+        # TODO(agent): coordinate per-engine finalize callbacks before allowing
+        # an asynchronous generation containing both actor and critic payloads.
+        if async_engines and len(normalized_engine) != 1:
+            raise NotImplementedError(
+                "Crash-safe asynchronous recovery currently supports one train "
+                "engine. Disable Megatron async_save when saving multiple engines."
+            )
+
+        generation, pointer_record = cp.prepare_generation(
+            save_root, step_info.global_step, engine_names
+        )
+
+        recover_info.dump(cp.manifest_dir(generation))
+
+        pointer_value = pointer_record.to_json()
+        for name, engine_ in normalized_engine.items():
+            self._save_checkpoint(
+                engine_,
+                path=cp.payload_dir(generation, name),
+                name=name,
+                tokenizer=tokenizer,
+                processor=processor,
+                base_model_path=base_model_path,
+                checkpoint_pointer_path=(
+                    cp.latest_path(save_root) if name in async_engines else None
+                ),
+                checkpoint_pointer_value=(
+                    pointer_value if name in async_engines else None
+                ),
+            )
+
+        if async_engines:
+            logger.info(
+                "Checkpoint generation %s will be published after Megatron "
+                "async finalize completes",
+                generation,
+            )
+        else:
+            cp.publish_latest(save_root, pointer_value)
+            logger.info(
+                "Published recovery checkpoint generation %s at step %s",
+                generation,
+                step_info.global_step,
+            )
 
     def load(
         self,
@@ -341,15 +430,25 @@ class RecoverHandler:
             self._normalize_recover_engines(engine)
         )
 
-        recover_info_path = self.recover_info_path(
+        save_root = Saver.get_save_root(
             self.config.experiment_name,
             self.config.trial_name,
             self.config.fileroot,
         )
-        logger.info(f"Loading recover info from {recover_info_path}")
+        source = cp.resolve_checkpoint(save_root, list(normalized_engine))
+        if source is None:
+            logger.warning(
+                f"Resume info not found under {save_root}. "
+                f"This should not be a resumed experiment!"
+            )
+            return None
+        logger.info(f"Loading recover info from {source.manifest}")
         try:
-            recover_info: RecoverInfo = RecoverInfo.load(recover_info_path)
-            logger.info(f"Recovering from {recover_info.last_step_info.next()}.")
+            recover_info: RecoverInfo = RecoverInfo.load(source.manifest)
+            logger.info(
+                f"Recovering from {recover_info.last_step_info.next()} using "
+                f"{source.label}."
+            )
             saver.load_state_dict(recover_info.saver_info)
             self.freq_ctl.load_state_dict(recover_info.checkpoint_info)
             evaluator.load_state_dict(recover_info.evaluator_info)
@@ -369,7 +468,9 @@ class RecoverHandler:
 
             if not is_awex_colocate:
                 for name, engine_ in normalized_engine.items():
-                    self._load_checkpoint(engine_, name=name)
+                    self._load_checkpoint(
+                        engine_, path=source.payloads[name], name=name
+                    )
 
             if inference_engine is not None:
                 assert weight_update_meta is not None
@@ -398,7 +499,9 @@ class RecoverHandler:
                         # first would stack DCP weights/optimizer on top of the
                         # still-resident sglang allocation and risk OOM.
                         for name, engine_ in normalized_engine.items():
-                            self._load_checkpoint(engine_, name=name)
+                            self._load_checkpoint(
+                                engine_, path=source.payloads[name], name=name
+                            )
                     update_engine.update_weights(versioned_meta)
                 finally:
                     # Always resume: leaving rollout paused after a failed
@@ -407,26 +510,27 @@ class RecoverHandler:
                 update_engine.set_version(recovery_version)
                 inference_engine.set_version(recovery_version)
             return recover_info
-        except (FileNotFoundError, InValidRecoverInfo):
+        except (FileNotFoundError, InValidRecoverInfo) as e:
+            if source.transactional:
+                raise cp.CheckpointConsistencyError(
+                    f"Published checkpoint {source.label} is not loadable: {e}"
+                ) from e
             logger.warning(
-                f"Resume info not found at {recover_info_path}. "
+                f"Resume info not found at {source.manifest}. "
                 f"This should not be a resumed experiment!"
             )
 
     def _save_checkpoint(
         self,
         engine: TrainEngine,
+        path: str,
         name: str = "default",
         tokenizer: PreTrainedTokenizerFast | None = None,
         processor: AutoProcessor | None = None,
         base_model_path: str | None = None,
+        checkpoint_pointer_path: str | None = None,
+        checkpoint_pointer_value: str | None = None,
     ):
-        path = Saver.get_recover_checkpoint_path(
-            self.config.experiment_name,
-            self.config.trial_name,
-            self.config.fileroot,
-            name=name,
-        )
         weight_format = "dcp"
         with_optim = not self.config.no_save_optim
         meta = SaveLoadMeta(
@@ -436,6 +540,8 @@ class RecoverHandler:
             tokenizer=tokenizer,
             processor=processor,
             base_model_path=base_model_path,
+            checkpoint_pointer_path=checkpoint_pointer_path,
+            checkpoint_pointer_value=checkpoint_pointer_value,
         )
         engine.save(meta)
         logger.info(f"Saved recover checkpoint to {path} (with_optim={with_optim})")
@@ -443,16 +549,11 @@ class RecoverHandler:
     def _load_checkpoint(
         self,
         engine: TrainEngine | TrainController,
+        path: str,
         name: str = "default",
         tokenizer: PreTrainedTokenizerFast | None = None,
         base_model_path: str | None = None,
     ):
-        path = Saver.get_recover_checkpoint_path(
-            self.config.experiment_name,
-            self.config.trial_name,
-            self.config.fileroot,
-            name=name,
-        )
         if not os.path.exists(path):
             raise FileNotFoundError(f"Checkpoint path {path} does not exist.")
         weight_format = "dcp"
@@ -471,41 +572,30 @@ class RecoverHandler:
 def check_if_auto_recover(config: RecoverConfig) -> bool:
     # This method is called by check_if_recover to check if the experiment should
     # recover from a previous run when recovery is enabled ("on" or "auto" mode).
-    experiment_name = config.experiment_name
-    trial_name = config.trial_name
-    fileroot = config.fileroot
-    recover_info_path = RecoverHandler.recover_info_path(
-        experiment_name, trial_name, fileroot
+    save_root = Saver.get_save_root(
+        config.experiment_name, config.trial_name, config.fileroot
     )
-    logger.info(f"Searching for recover info file in {recover_info_path}.")
-    if os.path.exists(str(recover_info_path)):
-        try:
-            info = RecoverInfo.load(recover_info_path)
-        except Exception as e:
-            logger.warning(f"Failed to load recover info from {recover_info_path}: {e}")
-            return False
-        if info.last_step_info.epoch < 0:
-            msg = (
-                f"Recover checkpoint is not valid. "
-                f"Expected last_step_info.epoch >= 0, "
-                f"but found {info.last_step_info.epoch}"
-            )
-            logger.warning(msg)
-            return False
-
-        save_root = Saver.get_save_root(experiment_name, trial_name, fileroot)
-        for name in os.listdir(save_root):
-            if not os.path.isdir(os.path.join(save_root, name)):
-                continue
-            path = Saver.get_recover_checkpoint_path(
-                experiment_name, trial_name, fileroot, name=name
-            )
-            if not os.path.exists(path):
-                logger.warning(f"Recover checkpoint for model {name} does not exist.")
-                return False
-        return True
-    logger.warning(f"Recover info not found at: {recover_info_path}")
-    return False
+    logger.info(f"Searching for recovery checkpoint under {save_root}.")
+    source = cp.resolve_checkpoint(save_root, None)
+    if source is None:
+        logger.warning(f"Recover info not found under: {save_root}")
+        return False
+    try:
+        info = RecoverInfo.load(source.manifest)
+    except Exception as e:
+        if source.transactional:
+            raise cp.CheckpointConsistencyError(
+                f"Published checkpoint {source.label} is not loadable: {e}"
+            ) from e
+        logger.warning(f"Failed to load recover info from {source.manifest}: {e}")
+        return False
+    if info.last_step_info.epoch < 0:
+        logger.warning(
+            "Recover checkpoint is not valid. Expected last_step_info.epoch "
+            f">= 0, but found {info.last_step_info.epoch}"
+        )
+        return False
+    return True
 
 
 def check_if_recover(config: RecoverConfig, _run_id: int) -> bool:

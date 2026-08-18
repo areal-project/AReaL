@@ -7,6 +7,7 @@ that the manager correctly:
 - skips queue creation when async_save is False
 - routes the AsyncRequest to AsyncCallsQueue.schedule_async_request when True
 - finalizes completed saves non-blockingly on each new save call
+- appends recovery publication after MCore's existing finalize callbacks
 - blocks on load_checkpoint / close
 - treats close as idempotent
 - emits the async-only metric (queue_depth on schedule)
@@ -160,6 +161,71 @@ def test_save_schedules_async_request(patched_checkpointer, tmp_path):
     inspect_fn.assert_called_once_with(fake_request)
     queue.schedule_async_request.assert_called_once_with(fake_request)
     release_fn.assert_called_once_with(tensor_lists)
+
+
+def test_async_save_publishes_only_from_finalize(patched_checkpointer, tmp_path):
+    mod, manager, queue = patched_checkpointer
+    fake_request = MagicMock()
+    publish = MagicMock()
+
+    with (
+        patch.object(manager, "generate_state_dict", return_value={"model": {}}),
+        patch.object(mod, "save_dist_checkpointing", return_value=fake_request),
+        patch("torch.cuda.empty_cache"),
+        patch("torch.distributed.barrier"),
+    ):
+        manager.save_checkpoint(str(tmp_path / "step0"), finalize_fn=publish)
+
+    publish.assert_not_called()
+    fake_request.add_finalize_fn.assert_called_once()
+    queue.schedule_async_request.assert_called_once_with(fake_request)
+
+    appended_finalize = fake_request.add_finalize_fn.call_args.args[0]
+    appended_finalize()
+
+    publish.assert_called_once_with()
+
+
+def test_publication_failure_is_broadcast_before_all_ranks_raise(
+    patched_checkpointer,
+):
+    mod, _, _ = patched_checkpointer
+    publish = MagicMock(side_effect=OSError("disk unavailable"))
+
+    with (
+        patch("torch.distributed.is_initialized", return_value=True),
+        patch("torch.distributed.get_world_size", return_value=2),
+        patch("torch.distributed.broadcast_object_list") as broadcast,
+        pytest.raises(RuntimeError, match="disk unavailable"),
+    ):
+        mod._run_rank0_finalize(0, publish)
+
+    status = broadcast.call_args.args[0]
+    assert status == [("OSError", "disk unavailable")]
+
+
+def test_nonzero_rank_raises_publication_failure_received_from_rank0(
+    patched_checkpointer,
+):
+    mod, _, _ = patched_checkpointer
+    publish = MagicMock()
+
+    def broadcast_rank0_failure(status, src):
+        assert src == 0
+        status[0] = ("OSError", "disk unavailable")
+
+    with (
+        patch("torch.distributed.is_initialized", return_value=True),
+        patch("torch.distributed.get_world_size", return_value=2),
+        patch(
+            "torch.distributed.broadcast_object_list",
+            side_effect=broadcast_rank0_failure,
+        ),
+        pytest.raises(RuntimeError, match="disk unavailable"),
+    ):
+        mod._run_rank0_finalize(1, publish)
+
+    publish.assert_not_called()
 
 
 def test_save_reaps_before_scheduling_next(patched_checkpointer, tmp_path):
