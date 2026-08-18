@@ -7,6 +7,7 @@ from areal.engine.core import stage_batch_for_engine
 from areal.infra.rpc.guard.engine_blueprint import (
     _should_stage_rpc_payload_on_cpu,
 )
+from areal.models.tree_attn import tree as tree_module
 from areal.utils.data import MicroBatchItem, MicroBatchList
 
 
@@ -114,3 +115,16 @@ def test_rpc_payload_cpu_staging_is_limited_to_declared_methods():
     assert _should_stage_rpc_payload_on_cpu(engine, "ppo_update")
     assert not _should_stage_rpc_payload_on_cpu(engine, "compute_advantages")
     assert not _should_stage_rpc_payload_on_cpu(SimpleNamespace(), "ppo_update")
+
+
+def test_tree_count_collective_device_matches_backend(monkeypatch):
+    group = object()
+    monkeypatch.setattr(tree_module.dist, "get_backend", lambda _: "gloo")
+
+    assert tree_module._tree_count_collective_device(group) == torch.device("cpu")
+
+    monkeypatch.setattr(tree_module.dist, "get_backend", lambda _: "nccl")
+    monkeypatch.setattr(tree_module.current_platform, "device_type", "cuda")
+    monkeypatch.setattr(tree_module.current_platform, "current_device", lambda: 3)
+
+    assert tree_module._tree_count_collective_device(group) == torch.device("cuda:3")
