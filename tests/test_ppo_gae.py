@@ -6,8 +6,8 @@ from omegaconf import OmegaConf
 
 from areal.api.cli_args import PPOActorConfig
 from areal.experimental.openai.types import InteractionWithTokenLogpReward
-from areal.trainer.ppo.actor import (
-    PPOActor,
+from areal.trainer.ppo.actor import PPOActor
+from areal.trainer.ppo.gae import (
     _compute_token_level_gae,
     _compute_turn_level_gae,
 )
