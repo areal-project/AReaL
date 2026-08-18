@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import os
 import random
+from collections.abc import Callable
+from functools import partial
 
 import numpy as np
 import torch
@@ -54,6 +56,24 @@ def get_device_name() -> str:
     else:
         device = "cpu"
     return device
+
+
+def _run_rank0_finalize(rank: int, finalize_fn: Callable[[], None]) -> None:
+    """Run a filesystem publication on rank 0 and propagate any failure."""
+    status: list[tuple[str, str] | None] = [None]
+    if rank == 0:
+        try:
+            finalize_fn()
+        except Exception as e:
+            status[0] = (type(e).__name__, str(e))
+
+    if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
+        torch.distributed.broadcast_object_list(status, src=0)
+    if status[0] is not None:
+        error_type, message = status[0]
+        raise RuntimeError(
+            f"Checkpoint publication failed on rank 0: {error_type}: {message}"
+        )
 
 
 def save_dist_checkpointing(
@@ -441,6 +461,7 @@ class MegatronCheckpointManager:
         with_model: bool = True,
         with_optimizer=True,
         with_rng: bool = True,
+        finalize_fn: Callable[[], None] | None = None,
     ):
         dist_checkpoint_path = local_path
 
@@ -470,6 +491,10 @@ class MegatronCheckpointManager:
                 "Megatron returned no AsyncRequest despite async_sharded_save=True."
             )
             assert self._async_queue is not None
+            if finalize_fn is not None:
+                async_save_request.add_finalize_fn(
+                    partial(_run_rank0_finalize, self.rank, finalize_fn)
+                )
             call_idx = self._async_queue.schedule_async_request(async_save_request)
             # By the time schedule_async_request returns, AsyncCallsQueue has
             # already done torch.cuda.synchronize() and forked the background
@@ -496,6 +521,8 @@ class MegatronCheckpointManager:
                 "Async save request should be None when not using async save."
             )
             torch.distributed.barrier()
+            if finalize_fn is not None:
+                _run_rank0_finalize(self.rank, finalize_fn)
 
     def _reap_finished_async_saves(self) -> None:
         """Non-blocking finalize of any background save processes that have finished.

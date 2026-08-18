@@ -1032,9 +1032,39 @@ class MegatronEngine(TrainEngine):
                         "(e.g., LoRA path without distributed optimizer support). "
                         "Please use weight_format='hf' for adapter/full-model export."
                     )
-                self.checkpointer.save_checkpoint(
-                    meta.path, with_optimizer=meta.with_optim
+                pointer_fields = (
+                    meta.checkpoint_pointer_path,
+                    meta.checkpoint_pointer_value,
                 )
+                if (pointer_fields[0] is None) != (pointer_fields[1] is None):
+                    raise ValueError(
+                        "checkpoint_pointer_path and checkpoint_pointer_value "
+                        "must be provided together"
+                    )
+                finalize_fn = None
+                if meta.checkpoint_pointer_path is not None:
+                    from areal.utils.checkpoint_pointer import (
+                        LATEST_FILENAME,
+                        publish_latest,
+                    )
+
+                    if (
+                        os.path.basename(meta.checkpoint_pointer_path)
+                        != LATEST_FILENAME
+                    ):
+                        raise ValueError(
+                            "checkpoint_pointer_path must name the recovery "
+                            f"pointer {LATEST_FILENAME!r}"
+                        )
+                    finalize_fn = functools.partial(
+                        publish_latest,
+                        os.path.dirname(meta.checkpoint_pointer_path),
+                        meta.checkpoint_pointer_value,
+                    )
+                save_kwargs: dict[str, Any] = {"with_optimizer": meta.with_optim}
+                if finalize_fn is not None:
+                    save_kwargs["finalize_fn"] = finalize_fn
+                self.checkpointer.save_checkpoint(meta.path, **save_kwargs)
             else:
                 raise ValueError(f"Unknown weight format {meta.weight_format}. ")
 
