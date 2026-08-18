@@ -1041,6 +1041,8 @@ class GatewayTrainController:
         should_accept_fn: str | None = None,
         group_size: int = 1,
         dynamic_bs: bool = False,
+        reward_normalization: bool = False,
+        drop_incomplete_group: bool = False,
     ) -> list[dict[str, Any]]:
         if self.rollout is None:
             raise RuntimeError("connect_engine() must be called before prepare_batch()")
@@ -1051,6 +1053,8 @@ class GatewayTrainController:
             should_accept_fn=should_accept_fn,
             group_size=group_size,
             dynamic_bs=dynamic_bs,
+            reward_normalization=reward_normalization,
+            drop_incomplete_group=drop_incomplete_group,
         )
 
     def rollout_batch(
@@ -1060,6 +1064,8 @@ class GatewayTrainController:
         workflow_kwargs: dict[str, Any],
         should_accept_fn: str | None = None,
         group_size: int = 1,
+        reward_normalization: bool = False,
+        drop_incomplete_group: bool = False,
     ) -> list[dict[str, Any]]:
         if self.rollout is None:
             raise RuntimeError("connect_engine() must be called before rollout_batch()")
@@ -1069,6 +1075,8 @@ class GatewayTrainController:
             workflow_kwargs=workflow_kwargs,
             should_accept_fn=should_accept_fn,
             group_size=group_size,
+            reward_normalization=reward_normalization,
+            drop_incomplete_group=drop_incomplete_group,
         )
 
     def create_process_group(self, parallel_strategy: ParallelStrategy | None = None):

@@ -62,7 +62,6 @@ LOGGER_COLORS_EXACT = {
     "PerfTracer": "light_green",
     # RPC servers - white
     "SyncRPCServer": "white",
-    "RayRPCServer": "white",
     "RPCSerialization": "white",
     "HttpRTensor": "white",
     # Inference wrappers - white
@@ -127,6 +126,10 @@ LOGGER_COLORS_EXACT = {
     "InferenceRouter": "white",
     "InferenceGateway": "white",
     "RPCGuard": "white",
+    # AWEX weight exchange - cyan (compute backend)
+    "AwexColocate": "light_cyan",
+    "AwexColocateReader": "light_cyan",
+    "AwexSGLangPlugin": "light_cyan",
 }
 
 # Prefix patterns checked in order (first match wins)

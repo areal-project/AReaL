@@ -932,6 +932,7 @@ async def export_trajectories(
     interactions = session_data.export_interactions(
         discount=request.discount,
         style=request.style,
+        drop_retry_orphans=request.drop_retry_orphans,
     )
 
     # Remove session from cache and clean up API key mapping

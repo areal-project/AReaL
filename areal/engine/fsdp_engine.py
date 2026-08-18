@@ -128,6 +128,7 @@ from areal.utils.data import (
 )
 from areal.utils.functional import gather_logprobs, gather_logprobs_entropy
 from areal.utils.hf_utils import load_hf_processor_and_tokenizer, load_hf_tokenizer
+from areal.utils.lr_scheduler import get_num_warmup_steps
 from areal.utils.network import find_free_ports, format_host_for_url, gethostip
 from areal.utils.offload import is_tms_enabled, torch_memory_saver
 from areal.utils.perf_tracer import trace_perf, trace_scope
@@ -580,6 +581,8 @@ class FSDPEngine(TrainEngine):
         workflow: WorkflowLike,
         workflow_kwargs: dict[str, Any] | None = None,
         group_size: int = 1,
+        reward_normalization: bool = False,
+        drop_incomplete_group: bool = False,
     ) -> list[dict[str, Any]]:
         self._check_rollout_engine_connected()
         return self.rollout_coordinator.rollout_batch(
@@ -587,6 +590,8 @@ class FSDPEngine(TrainEngine):
             workflow=workflow,
             workflow_kwargs=workflow_kwargs,
             group_size=group_size,
+            reward_normalization=reward_normalization,
+            drop_incomplete_group=drop_incomplete_group,
         )
 
     def prepare_batch(
@@ -597,6 +602,8 @@ class FSDPEngine(TrainEngine):
         should_accept_fn: Callable[[dict[str, Any]], bool] | str | None = None,
         group_size: int = 1,
         dynamic_bs: bool = False,
+        reward_normalization: bool = False,
+        drop_incomplete_group: bool = False,
     ) -> list[dict[str, Any]]:
         self._check_rollout_engine_connected()
         return self.rollout_coordinator.prepare_batch(
@@ -606,6 +613,8 @@ class FSDPEngine(TrainEngine):
             should_accept_fn=should_accept_fn,
             group_size=group_size,
             dynamic_bs=dynamic_bs,
+            reward_normalization=reward_normalization,
+            drop_incomplete_group=drop_incomplete_group,
         )
 
     def update_weights(self, meta: WeightUpdateMeta):
@@ -678,6 +687,11 @@ class FSDPEngine(TrainEngine):
     def optimizer_zero_grad(self):
         assert self.optimizer is not None
         self.optimizer.zero_grad()
+
+    def set_lr(self, lr: float) -> None:
+        assert self.optimizer is not None
+        for param_group in self.optimizer.param_groups:
+            param_group["lr"] = lr
 
     def optimizer_step(self):
         assert self.optimizer is not None
@@ -891,6 +905,19 @@ class FSDPEngine(TrainEngine):
         if meta is None:
             return result
         return split_batch(result, meta)
+
+    def get_lora_adapter_info(self) -> dict[str, list[int]]:
+        """Return adapter parameter names and shapes (for generating synthetic checkpoints)."""
+        import re
+
+        if not self.config.use_lora or self.model is None:
+            return {}
+        result = {}
+        for name, param in self.model.named_parameters():
+            if param.requires_grad and "lora_" in name:
+                clean_name = re.sub(r"^base_model\.model\.", "", name)
+                result[clean_name] = list(param.shape)
+        return result
 
     def export_stats(self) -> dict[str, float]:
         with self._offload_aware_context():
@@ -1191,8 +1218,9 @@ class FSDPEngine(TrainEngine):
                 weight_decay=weight_decay,
             )
         total_train_steps = ft_spec.total_train_steps
-        num_warmup_steps = int(
-            self.optimizer_config.warmup_steps_proportion * total_train_steps
+        num_warmup_steps = get_num_warmup_steps(
+            self.optimizer_config,
+            total_train_steps,
         )
 
         if self.optimizer_config.lr_scheduler_type == "cosine":
@@ -1681,6 +1709,10 @@ class FSDPEngine(TrainEngine):
                 self.config.trial_name,
                 self.get_version(),
             )
+            try:
+                name_resolve.delete(update_name)
+            except Exception:
+                pass
             name_resolve.add(
                 update_name, str(datetime.now().timestamp()), keepalive_ttl=120
             )
@@ -1702,6 +1734,63 @@ class FSDPEngine(TrainEngine):
             raise RuntimeError("Model not initialized")
         os.makedirs(path, exist_ok=True)
 
+        if self.config.use_lora:
+            self._save_lora_to_hf(path)
+        else:
+            self._save_full_model_to_hf(path, tokenizer, processor)
+
+    def _save_lora_to_hf(self, path: str):
+        """Save only LoRA adapter weights without gathering full model state.
+
+        Iterates adapter parameters and unshards them individually to avoid
+        allocating the full base model state dict (which would OOM).
+        """
+        import re
+
+        from safetensors.torch import save_file
+        from torch.distributed.tensor import DTensor
+
+        if dist.get_rank() == 0:
+            os.makedirs(path, exist_ok=True)
+
+        adapter_state = {}
+        for name, param in self.model.named_parameters():
+            if not param.requires_grad or "lora_" not in name:
+                continue
+
+            if isinstance(param.data, DTensor):
+                full_param = param.data.full_tensor()
+            else:
+                full_param = param.data
+
+            if dist.get_rank() == 0:
+                # Emit PEFT-serving-standard keys. Drop the active-adapter
+                # segment (".default") so names match what
+                # PeftModel.save_pretrained produces
+                # (e.g. "...down_proj.lora_A.weight"). Keeping ".default"
+                # makes vLLM's parse_fine_tuned_lora_name reject the adapter
+                # with "unsupported LoRA weight" on disk-mode load.
+                clean_name = re.sub(r"\.default\.(weight|bias)$", r".\1", name)
+                adapter_state[clean_name] = (
+                    self._cast_to_compute_dtype(full_param.cpu())
+                    if full_param.is_floating_point()
+                    else full_param.cpu()
+                )
+
+        if dist.get_rank() == 0:
+            save_file(adapter_state, os.path.join(path, "adapter_model.safetensors"))
+            # Save adapter config
+            self.model.peft_config["default"].save_pretrained(path)
+
+        dist.barrier(group=self.cpu_group)
+
+    def _save_full_model_to_hf(
+        self,
+        path: str,
+        tokenizer: PreTrainedTokenizerFast | None,
+        processor: ProcessorMixin | None,
+    ):
+        """Save full model weights."""
         # FSDP2 checkpoint saving
         # Get full state dict with FSDP2
         options = StateDictOptions(full_state_dict=True, cpu_offload=True)
@@ -1722,9 +1811,9 @@ class FSDPEngine(TrainEngine):
             os.makedirs(path, exist_ok=True)
             self.model.save_pretrained(path, state_dict=state_dict)
             self.model_config.save_pretrained(path)
-            if tokenizer is not None and not self.config.use_lora:
+            if tokenizer is not None:
                 tokenizer.save_pretrained(path)
-            if processor is not None and not self.config.use_lora:
+            if processor is not None:
                 processor.save_pretrained(path)
         dist.barrier(group=self.cpu_group)
 
@@ -2003,6 +2092,7 @@ class FSDPEngine(TrainEngine):
             tp_group=self.parallel_helper.tp_group
             if self.parallel_helper.tp_size > 1
             else None,
+            chunk_size=self.config.logprobs_chunk_size,
         )
         if self.parallel_helper.sp_size > 1:
             logprobs = self._sp_all_gather(logprobs)
@@ -2033,6 +2123,7 @@ class FSDPEngine(TrainEngine):
             tp_group=self.parallel_helper.tp_group
             if self.parallel_helper.tp_size > 1
             else None,
+            chunk_size=self.config.logprobs_chunk_size,
         )
         if self.parallel_helper.sp_size > 1:
             logprobs = self._sp_all_gather(logprobs)
@@ -2093,6 +2184,7 @@ class FSDPEngine(TrainEngine):
                     tp_group=self.parallel_helper.tp_group
                     if self.parallel_helper.tp_size > 1
                     else None,
+                    chunk_size=self.config.logprobs_chunk_size,
                 )
             else:
                 logprobs, entropy = self._compute_logprobs_entropy(
@@ -2142,6 +2234,7 @@ class FSDPEngine(TrainEngine):
                     tp_group=self.parallel_helper.tp_group
                     if self.parallel_helper.tp_size > 1
                     else None,
+                    chunk_size=self.config.logprobs_chunk_size,
                 )
                 return result
             result = self._compute_logprobs(
@@ -2178,6 +2271,54 @@ class FSDPPPOActor(FSDPEngine):
 
     def ppo_update(self, *args, **kwargs) -> None:
         self.actor.ppo_update(*args, **kwargs)
+
+    def sft_train_batch(self, data: list) -> dict:
+        import torch
+
+        # Convert plain-list inputs (sent without tensors to avoid RPC partitioning)
+        # Engine expects 2D tensors [batch, seqlen]
+        tensor_data = []
+        for item in data:
+            tensor_data.append(
+                {
+                    "input_ids": torch.tensor(
+                        item["input_ids"], dtype=torch.long
+                    ).unsqueeze(0),
+                    "attention_mask": torch.tensor(
+                        item["attention_mask"], dtype=torch.float32
+                    ).unsqueeze(0),
+                    "loss_mask": torch.tensor(
+                        item["loss_mask"], dtype=torch.float32
+                    ).unsqueeze(0),
+                    "cu_seqlens": torch.tensor(item["cu_seqlens"], dtype=torch.int32),
+                }
+            )
+
+        def sft_loss_fn(logprobs, entropy, mb_input, **kwargs):
+            # logprobs[i] = log P(token[i+1] | context), so apply loss_mask shifted left
+            loss_mask = mb_input.get("loss_mask", None)
+            if loss_mask is not None:
+                if loss_mask.ndim == 2:
+                    loss_mask = loss_mask.squeeze(0)
+                # loss_mask[i] marks token i as target; logprobs[i-1] predicts token i
+                mask = loss_mask[1:]
+                lp = logprobs[:-1]
+                return -(lp * mask).sum()
+            return -logprobs[:-1].sum()
+
+        def sft_loss_weight_fn(input_data):
+            loss_mask = input_data.get("loss_mask", None)
+            if loss_mask is not None:
+                if loss_mask.ndim == 2:
+                    loss_mask = loss_mask.squeeze(0)
+                return loss_mask[1:].sum()
+            return torch.tensor(
+                input_data["input_ids"].shape[-1] - 1, dtype=torch.float32
+            )
+
+        return self.train_batch(
+            tensor_data, loss_fn=sft_loss_fn, loss_weight_fn=sft_loss_weight_fn
+        )
 
     @classmethod
     def as_controller(cls, config: PPOActorConfig, scheduler: Scheduler):

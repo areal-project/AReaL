@@ -109,6 +109,23 @@ class PPOTrainer:
         train_dataset: Dataset | None = None,
         valid_dataset: Dataset | None = None,
     ):
+        try:
+            self._init_impl(config, train_dataset, valid_dataset)
+        except Exception:
+            logger.error(
+                "PPOTrainer construction failed; tearing down partially "
+                "created workers",
+                exc_info=True,
+            )
+            self.close()
+            raise
+
+    def _init_impl(
+        self,
+        config: PPOConfig,
+        train_dataset: Dataset | None = None,
+        valid_dataset: Dataset | None = None,
+    ):
         rank = int(os.getenv("RANK", "0"))
         if is_single_controller():
             # Set up file logging for controller process
@@ -144,11 +161,18 @@ class PPOTrainer:
         self._should_offload_teacher = (
             config.teacher is not None and config.teacher.offload
         )
+        # In colocate (awex) mode the GPU switch between rollout and training
+        # is managed by the AWEX adapter (manual offload/onload + tagged SGLang
+        # release), not by the TMS-based offload machinery below.
+        if self._is_v1_awex_colocate(config):
+            self._should_offload_rollout = False
+            self._should_offload_actor = False
 
         # Validate config before proceeding with weight initialization
         self._validate_cfg()
 
         self._amend_xccl_weight_update_envvar()
+        self._amend_deterministic_envvar()
 
         agent_cfg = config.rollout.agent
         self._online_mode = agent_cfg is not None and agent_cfg.mode == "online"
@@ -304,6 +328,30 @@ class PPOTrainer:
         # Save initial LoRA weights if enabled (for inference server pre-loading)
         initial_lora_path = self._save_initial_lora_weights()
 
+        # Offload actor before rollout init so sglang can use the GPU memory
+        if self._should_offload_actor:
+            self._offload_model(self.actor, role="actor")
+
+        # In colocate (awex) mode, offload training weights before SGLang starts
+        # so that GPU memory is available for inference engine allocation.
+        # Uses adapter-based manual offload (not TMS), so enable_offload is not required.
+        self._awex_meta_server_addr: str | None = None
+        if self._is_v1_awex_colocate(config):
+            from awex.meta.meta_server import start_meta_server
+
+            from areal.utils.network import gethostip
+
+            host, port = start_meta_server()
+            if host in ("0.0.0.0", ""):
+                host = gethostip()
+            self._awex_meta_server_addr = f"{host}:{port}"
+            logger.info(
+                "Started MetaServer on controller at %s",
+                self._awex_meta_server_addr,
+            )
+            self.actor.init_awex_adapter(meta_server_addr=self._awex_meta_server_addr)
+            self.actor.offload()
+
         # Initialize inference with LoRA path
         self.rollout = self._init_rollout(
             config.rollout, is_eval=False, lora_path=initial_lora_path
@@ -390,6 +438,10 @@ class PPOTrainer:
                 )
             else:
                 self.weight_update_meta = WeightUpdateMeta.from_fsdp_xccl(**xccl_kwargs)
+        elif self.config.actor.weight_update_mode == "awex":
+            self.weight_update_meta = WeightUpdateMeta.from_awex(
+                meta_server_addr=self._awex_meta_server_addr,
+            )
         else:
             raise ValueError(
                 f"Invalid weight update mode: {self.config.actor.weight_update_mode}"
@@ -416,6 +468,9 @@ class PPOTrainer:
             self.train_dataloader,
             inference_engine=self.rollout,
             weight_update_meta=self.weight_update_meta,
+            # Recompute placement instead of reusing _should_offload_rollout:
+            # AWEX clears that flag because it drives the handover itself.
+            colocated_rollout=self._is_actor_rollout_colocated(config),
         )
 
         # After recovery, sync the staleness manager so its capacity formula
@@ -447,6 +502,25 @@ class PPOTrainer:
         rollout_s = config.rollout.scheduling_strategy
         return (self._is_colocation(actor_s) and actor_s.target == "rollout") or (
             self._is_colocation(rollout_s) and rollout_s.target == "actor"
+        )
+
+    def _is_v1_awex_colocate(self, config: PPOConfig) -> bool:
+        """Whether this run is the v1 AWEX colocated actor-rollout setup.
+
+        ``weight_update_mode`` alone is not enough: controller v2 selects AWEX
+        from ``use_lora`` and never reads that field, so a v2 separation run may
+        legitimately carry ``weight_update_mode="awex"`` and would otherwise
+        take the v1 colocation handover.
+
+        The scheduling strategy is deliberately not part of this check. v1 AWEX
+        only exists colocated and runs opt in through ``weight_update_mode``
+        while leaving actor and rollout on the default (separation) strategy;
+        requiring colocation here skips the meta-server handoff, every training
+        worker then starts its own server, and the run waits on ``infer_conf``
+        forever.
+        """
+        return (
+            config.actor._version == "v1" and config.actor.weight_update_mode == "awex"
         )
 
     def _onload_model(self, engine, role: str) -> None:
@@ -627,6 +701,8 @@ class PPOTrainer:
                     should_accept_fn=dynamic_filter_fn,
                     group_size=config.gconfig.n_samples,
                     dynamic_bs=self.config.dynamic_bs,
+                    reward_normalization=config.gconfig.reward_normalization,
+                    drop_incomplete_group=config.gconfig.drop_incomplete_group,
                 )
             if self._should_offload_rollout:
                 self._offload_rollout()
@@ -686,6 +762,20 @@ class PPOTrainer:
                         )
                 if self._should_offload_teacher:
                     self._offload_model(self.teacher, role="teacher")
+
+            # In colocate (awex) mode: switch GPU from inference to training.
+            # Release SGLang KV cache + weights to free GPU for actor.
+            if self._is_v1_awex_colocate(self.config):
+                logger.info("[AWEX] colocate: pausing rollout...")
+                self.rollout.pause()
+                logger.info("[AWEX] colocate: pause_generation_sync...")
+                self.rollout.pause_generation_sync()
+                logger.info("[AWEX] colocate: offload kv_cache...")
+                self.rollout.offload(tags=["kv_cache"])
+                logger.info("[AWEX] colocate: offload weights...")
+                self.rollout.offload(tags=["weights"])
+                logger.info("[AWEX] colocate: offload done, onloading actor...")
+                self.actor.onload()
 
             if self._should_offload_actor:
                 self._onload_model(self.actor, role="actor")
@@ -762,6 +852,22 @@ class PPOTrainer:
                 if self._should_offload_critic:
                     self._offload_model(self.critic, role="critic")
 
+            # Save BEFORE update_weights. In AWEX colocate mode the
+            # transfer ends with actor weights offloaded, so saving afterwards
+            # would resume weights onto a card already crowded by the
+            # fully-resumed rollout plus transfer staging leftovers and the HF
+            # saver's TP coalesced all-gather transient can OOM. Here the
+            # actor weights are still onloaded from ppo_update (no resume
+            # needed) and MegatronEngine.save() drops the dead fp32 grad
+            # buffers to fund the transient. Weights are identical on both
+            # sides of the transfer, so the checkpoint content is unchanged.
+            if self._is_v1_awex_colocate(config):
+                self._save_training_state(
+                    epoch=epoch,
+                    epoch_step=step,
+                    global_step=global_step,
+                )
+
             # pause inference for updating weights, save, and evaluation
             self.rollout.pause()
 
@@ -788,26 +894,11 @@ class PPOTrainer:
                 if self.eval_rollout is not None:
                     self.eval_rollout.set_version(new_version)
 
-            with (
-                stats_tracker.record_timing("save"),
-                perf_tracer.trace_scope(
-                    "train.save",
-                    category=Category.IO,
-                    args={"global_step": global_step},
-                ),
-            ):
-                self._save_hf(epoch=epoch, epoch_step=step, global_step=global_step)
-
-            with (
-                stats_tracker.record_timing("checkpoint_for_recover"),
-                perf_tracer.trace_scope(
-                    "train.checkpoint",
-                    category=Category.IO,
-                    args={"global_step": global_step},
-                ),
-            ):
-                self._save_recover_checkpoint(
-                    epoch=epoch, epoch_step=step, global_step=global_step
+            if not self._is_v1_awex_colocate(config):
+                self._save_training_state(
+                    epoch=epoch,
+                    epoch_step=step,
+                    global_step=global_step,
                 )
 
             # Offload actor before eval
@@ -871,6 +962,37 @@ class PPOTrainer:
             self.rollout.resume()
 
             self._save_perf_tracer(step=global_step)
+
+    def _save_training_state(
+        self,
+        *,
+        epoch: int,
+        epoch_step: int,
+        global_step: int,
+    ) -> None:
+        with (
+            stats_tracker.record_timing("save"),
+            perf_tracer.trace_scope(
+                "train.save",
+                category=Category.IO,
+                args={"global_step": global_step},
+            ),
+        ):
+            self._save_hf(epoch=epoch, epoch_step=epoch_step, global_step=global_step)
+
+        with (
+            stats_tracker.record_timing("checkpoint_for_recover"),
+            perf_tracer.trace_scope(
+                "train.checkpoint",
+                category=Category.IO,
+                args={"global_step": global_step},
+            ),
+        ):
+            self._save_recover_checkpoint(
+                epoch=epoch,
+                epoch_step=epoch_step,
+                global_step=global_step,
+            )
 
     def close(self):
         self.saver.finalize()
@@ -959,6 +1081,38 @@ class PPOTrainer:
         for spec in self.config.actor.scheduling_spec:
             spec.env_vars["NCCL_CUMEM_ENABLE"] = "0"
             spec.env_vars["NCCL_NVLS_ENABLE"] = "0"
+
+    def _amend_deterministic_envvar(self):
+        if not is_single_controller():
+            # This environ is set by the launcher in the SPMD mode.
+            return
+
+        engine_cfgs = [(self.config.actor, self.actor_alloc)]
+        if self.config.critic is not None:
+            engine_cfgs.append(
+                (
+                    self.config.critic,
+                    ModelAllocation.from_str(self.config.critic.backend, name="critic"),
+                )
+            )
+        if self.config.actor.kl_ctl > 0 and self.config.ref is not None:
+            engine_cfgs.append(
+                (
+                    self.config.ref,
+                    ModelAllocation.from_str(self.config.ref.backend, name="ref"),
+                )
+            )
+
+        for engine_cfg, alloc in engine_cfgs:
+            if alloc.backend != "megatron":
+                continue
+            if not engine_cfg.megatron.use_deterministic_algorithms:
+                continue
+            # TransformerEngine snapshots this env var at import or attention
+            # module construction depending on version; exporting it at worker
+            # launch is the only ordering safe for all of them.
+            for spec in engine_cfg.scheduling_spec:
+                spec.env_vars["NVTE_ALLOW_NONDETERMINISTIC_ALGO"] = "0"
 
     def _create_train_engine(
         self, actor_config: PPOActorConfig, alloc: ModelAllocation
@@ -1054,6 +1208,9 @@ class PPOTrainer:
                 pp_size=self.rollout_alloc.parallel.pp_size,
                 base_gpu_id=0,
             )
+            if self._is_v1_awex_colocate(self.config):
+                server_args["awex_colocate_mode"] = True
+                server_args["awex_meta_server_addr"] = self._awex_meta_server_addr
         elif rollout_backend == "vllm":
             if self.config.rollout.return_routed_experts:
                 raise ValueError(
@@ -1163,6 +1320,12 @@ class PPOTrainer:
             "initial_lora",
         )
 
+        if os.path.exists(path) and os.path.isfile(
+            os.path.join(path, "adapter_config.json")
+        ):
+            logger.info(f"Initial LoRA already exists at {path}, skipping save.")
+            return path
+
         meta = SaveLoadMeta(
             path=path,
             weight_format="hf",
@@ -1171,8 +1334,9 @@ class PPOTrainer:
             processor=self.processor,
             base_model_path=self.config.actor.path,
         )
-        # Save LoRA weights using engine's HuggingFace save
+        logger.info(f"Saving initial LoRA weights to {path}...")
         self.actor.save(meta=meta)
+        logger.info(f"Initial LoRA saved: {os.listdir(path)}")
 
         return path
 
@@ -1242,6 +1406,8 @@ class PPOTrainer:
                         eval_workflow_kwargs,
                         group_size=self.config.eval_gconfig.n_samples,
                         is_eval=True,
+                        reward_normalization=False,
+                        drop_incomplete_group=False,
                     )
                     cnt += 1
             self.eval_rollout.wait(cnt, timeout=None)
@@ -1310,14 +1476,26 @@ class PPOTrainer:
                 "offload is enabled. Please set enable_offload=True."
             )
 
-        if (
-            self._is_actor_rollout_colocated(self.config)
-            and self.config.actor.weight_update_mode != "disk"
-        ):
+        if self._is_actor_rollout_colocated(
+            self.config
+        ) and self.config.actor.weight_update_mode not in ("disk", "awex"):
             raise ValueError(
-                "weight_update_mode must be 'disk' when colocation scheduling is enabled. "
-                "Please set actor.weight_update_mode=disk."
+                "weight_update_mode must be 'disk' or 'awex' when colocation "
+                "scheduling is enabled. Please set actor.weight_update_mode "
+                "to one of them."
             )
+
+        if self._is_v1_awex_colocate(self.config):
+            if actor_backend != "megatron":
+                raise ValueError(
+                    "weight_update_mode='awex' requires Megatron actor training "
+                    f"backend, got {actor_backend!r}."
+                )
+            if rollout_backend != "sglang":
+                raise ValueError(
+                    "weight_update_mode='awex' requires SGLang rollout backend, "
+                    f"got {rollout_backend!r}."
+                )
 
         if rollout_backend == "vllm" and self.config.rollout.return_routed_experts:
             raise ValueError(
@@ -1403,9 +1581,6 @@ class PPOTrainer:
         # Only initialize proxy in single-controller mode with RolloutController
         if not is_single_controller():
             raise NotImplementedError("Proxy workers not supported in SPMD mode")
-
-        if self.config.scheduler.type == "ray":
-            raise NotImplementedError("Proxy workers not supported with RayScheduler")
 
         if not isinstance(self.rollout, RolloutController):
             self._proxy_started = True

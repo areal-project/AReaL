@@ -4,7 +4,7 @@ import os
 import subprocess
 import sys
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from concurrent.futures import Future
 from typing import Any
 
@@ -35,11 +35,21 @@ from areal.infra import RemoteInfEngine, RolloutController, WorkflowExecutor
 from areal.infra.platforms import current_platform
 from areal.infra.utils.launcher import TRITON_CACHE_PATH
 from areal.utils import perf_tracer, stats_tracker
+from areal.utils.logging import getLogger
 from areal.utils.network import format_host_for_url
+
+logger = getLogger("SGLangRemote")
 
 
 class SGLangBackend:
     """SGLang-specific backend implementation for remote inference."""
+
+    @staticmethod
+    def build_server_env(env: Mapping[str, str]) -> dict[str, str]:
+        _env = dict(env)
+        triton_cache_path = _env.get("TRITON_CACHE_PATH", TRITON_CACHE_PATH)
+        _env["TRITON_CACHE_PATH"] = os.path.join(triton_cache_path, str(uuid.uuid4()))
+        return _env
 
     def build_generation_request(
         self, req: ModelRequest, with_lora: bool, version: int
@@ -171,12 +181,14 @@ class SGLangBackend:
             if meta.version is None:
                 raise ValueError("Version is required for LoRA update.")
             lora_name = get_versioned_lora_name(meta.lora_name, meta.version)
-            # Load new LoRA
+            # Load new LoRA (best_effort: if already registered, SGLang
+            # returns 400 which is silently ignored).
             requests = [
                 HttpRequest(
                     endpoint="/load_lora_adapter",
                     payload={"lora_name": lora_name, "lora_path": str(meta.path)},
-                )
+                    best_effort=True,
+                ),
             ]
             # Unload the version that has fallen outside the retention window so
             # sglang does not accumulate one adapter per train step (which leaks
@@ -322,21 +334,49 @@ class SGLangBackend:
 
         return HttpRequest(endpoint="/init_weights_update_group", payload=payload)
 
-    def get_pause_request(self) -> HttpRequest:
+    def get_pause_request(self, mode: str | None = None) -> HttpRequest:
         """Get SGLang pause request."""
-        return HttpRequest(endpoint="/pause_generation", payload={})
+        payload = {} if mode is None else {"mode": mode}
+        return HttpRequest(endpoint="/pause_generation", payload=payload)
+
+    def get_pause_requests(self) -> list[HttpRequest]:
+        """Pause in two steps so memory can be released safely.
+
+        The first request keeps SGLang's default mode, which aborts in-flight
+        requests and returns their partial output so the client resumes them by
+        extending the prompt. That also leaves the scheduler fully idle, which
+        SGLang requires before releasing memory.
+
+        The second request looks redundant because Scheduler.pause_generation
+        sets its paused flag unconditionally, but the abort path never reaches
+        the scheduler: TokenizerManager forwards the request only for non-abort
+        modes, and otherwise just drains via abort_request(). Abort therefore
+        raises the tokenizer's own gate while the scheduler keeps scheduling.
+        Only an in-place pause raises the scheduler flag that the colocate loop
+        watches before it services awex work, and by then the abort has already
+        left nothing for that mode to retain.
+        """
+        return [
+            self.get_pause_request(),
+            self.get_pause_request(mode="in_place"),
+        ]
 
     def get_resume_request(self) -> HttpRequest:
         """Get SGLang resume request."""
         return HttpRequest(endpoint="/continue_generation", payload={})
 
+    def get_abort_all_request(self) -> HttpRequest:
+        """Get SGLang abort all requests."""
+        return HttpRequest(endpoint="/abort_request", payload={"abort_all": True})
+
     def get_health_check_request(self) -> HttpRequest:
         """Get SGLang health check request."""
         return HttpRequest(endpoint="/health", payload={}, method="GET")
 
-    def get_offload_request(self) -> HttpRequest:
+    def get_offload_request(self, tags: list[str] | None = None) -> HttpRequest:
         """Get SGLang offload request."""
-        return HttpRequest(endpoint="/release_memory_occupation", payload={})
+        payload = {"tags": tags} if tags is not None else {}
+        return HttpRequest(endpoint="/release_memory_occupation", payload=payload)
 
     def get_onload_request(self, tags: list[str] | None = None) -> HttpRequest:
         """Get SGLang onload request.
@@ -351,10 +391,47 @@ class SGLangBackend:
 
     def launch_server(self, server_args: dict[str, Any]) -> subprocess.Popen:
         """Launch SGLang server subprocess."""
+        awex_meta_addr = server_args.pop("awex_meta_server_addr", None)
+        awex_colocate = server_args.pop("awex_colocate_mode", False)
+        # Colocate placement: derive base_gpu_id from SLURM_LOCALID so two SGLang
+        # servers sharing a node never claim the same GPU range. The controller
+        # cannot do this reliably because its global rank -> node-slot mapping is
+        # not guaranteed by SLURM task dispatch (a collision degrades the
+        # TP group into an unsharded single-GPU load -> OOM). SLURM_LOCALID is the
+        # only id guaranteed unique per node-slot, and only the worker sees it at
+        # runtime. `_awex_gpus_per_server` is injected by the controller exclusively
+        # for real colocation, so its presence doubles as the colocate gate; it is
+        # absent for separated mode (where CVD isolation keeps base_gpu_id at 0).
+        awex_gpus_per_server = server_args.pop("_awex_gpus_per_server", None)
+        if awex_gpus_per_server is not None:
+            slurm_localid = os.environ.get("SLURM_LOCALID")
+            if slurm_localid is not None:
+                base_gpu_id = int(slurm_localid) * int(awex_gpus_per_server)
+                server_args["base_gpu_id"] = base_gpu_id
+                logger.info(
+                    "AWEX colocate base_gpu_id override: SLURM_LOCALID=%s x "
+                    "gpus_per_server=%s -> base_gpu_id=%s",
+                    slurm_localid,
+                    awex_gpus_per_server,
+                    base_gpu_id,
+                )
         cmd = SGLangConfig.build_cmd_from_args(server_args)
-        _env = os.environ.copy()
-        triton_cache_path = _env.get("TRITON_CACHE_PATH", TRITON_CACHE_PATH)
-        _env["TRITON_CACHE_PATH"] = os.path.join(triton_cache_path, str(uuid.uuid4()))
+        _env = self.build_server_env(os.environ)
+
+        if not awex_meta_addr:
+            awex_meta_addr = os.environ.get("AWEX_META_SERVER_ADDR")
+        if awex_colocate or awex_meta_addr:
+            sglang_entrypoints = (
+                "sglang.launch_server",
+                "areal.v2.inference_service.sglang.launch_server",
+            )
+            cmd = [
+                "areal.engine.awex.sglang_plugin" if c in sglang_entrypoints else c
+                for c in cmd
+            ]
+            if awex_meta_addr:
+                _env["AWEX_META_SERVER_ADDR"] = awex_meta_addr
+            logger.info("AWEX mode: using awex_sglang_plugin entry, cmd=%s", cmd[:4])
 
         return subprocess.Popen(
             cmd,
@@ -490,6 +567,8 @@ class RemoteSGLangEngine(InferenceEngine):
         callback_addr: str | None = None,
         is_eval: bool = False,
         proxy_addr: str | None = None,
+        reward_normalization: bool = False,
+        drop_incomplete_group: bool = False,
     ) -> int:
         """Submit a request to the inference engine."""
         return self._engine.submit(
@@ -502,6 +581,8 @@ class RemoteSGLangEngine(InferenceEngine):
             callback_addr=callback_addr,
             is_eval=is_eval,
             proxy_addr=proxy_addr,
+            reward_normalization=reward_normalization,
+            drop_incomplete_group=drop_incomplete_group,
         )
 
     def wait(
@@ -522,6 +603,8 @@ class RemoteSGLangEngine(InferenceEngine):
         workflow: WorkflowLike,
         workflow_kwargs: dict[str, Any] | None = None,
         group_size: int = 1,
+        reward_normalization: bool = False,
+        drop_incomplete_group: bool = False,
     ) -> dict[str, Any]:
         """Submit a batch of requests and wait for results.
 
@@ -533,6 +616,8 @@ class RemoteSGLangEngine(InferenceEngine):
             workflow=workflow,
             workflow_kwargs=workflow_kwargs,
             group_size=group_size,
+            reward_normalization=reward_normalization,
+            drop_incomplete_group=drop_incomplete_group,
         )
 
     def prepare_batch(
@@ -543,6 +628,8 @@ class RemoteSGLangEngine(InferenceEngine):
         should_accept_fn: Callable[[dict[str, Any]], bool] | str | None = None,
         group_size: int = 1,
         dynamic_bs: bool = False,
+        reward_normalization: bool = False,
+        drop_incomplete_group: bool = False,
     ):
         """Asynchronously submit and wait until a full batch is ready."""
         return self._engine.prepare_batch(
@@ -552,6 +639,8 @@ class RemoteSGLangEngine(InferenceEngine):
             should_accept_fn=should_accept_fn,
             group_size=group_size,
             dynamic_bs=dynamic_bs,
+            reward_normalization=reward_normalization,
+            drop_incomplete_group=drop_incomplete_group,
         )
 
     def compute_logp(self, data: list[dict[str, Any]]) -> list[torch.Tensor]:
@@ -575,8 +664,14 @@ class RemoteSGLangEngine(InferenceEngine):
     def teardown_server(self):
         return self._engine.teardown_server()
 
-    def offload(self):
-        return self._engine.offload()
+    def offload(self, tags: list[str] | None = None):
+        logger.info("RemoteSGLangEngine.offload(tags=%s) called", tags)
+        result = self._engine.offload(tags=tags)
+        logger.info("RemoteSGLangEngine.offload(tags=%s) done", tags)
+        return result
+
+    def abort_all_requests(self):
+        return self._engine.abort_all_requests()
 
     def onload(self, tags: list[str] | None = None):
         return self._engine.onload(tags=tags)

@@ -690,6 +690,8 @@ class ArchonEngine(TrainEngine):
         workflow: WorkflowLike,
         workflow_kwargs: dict[str, Any] | None = None,
         group_size: int = 1,
+        reward_normalization: bool = False,
+        drop_incomplete_group: bool = False,
     ) -> list[dict[str, Any]]:
         """Perform rollout using connected inference engine."""
         self._check_rollout_engine_connected()
@@ -698,6 +700,8 @@ class ArchonEngine(TrainEngine):
             workflow=workflow,
             workflow_kwargs=workflow_kwargs,
             group_size=group_size,
+            reward_normalization=reward_normalization,
+            drop_incomplete_group=drop_incomplete_group,
         )
 
     def prepare_batch(
@@ -708,6 +712,8 @@ class ArchonEngine(TrainEngine):
         should_accept_fn: Callable[[dict[str, Any]], bool] | str | None = None,
         group_size: int = 1,
         dynamic_bs: bool = False,
+        reward_normalization: bool = False,
+        drop_incomplete_group: bool = False,
     ) -> list[dict[str, Any]]:
         """Prepare batch from dataloader with rollout."""
         self._check_rollout_engine_connected()
@@ -718,6 +724,8 @@ class ArchonEngine(TrainEngine):
             should_accept_fn=should_accept_fn,
             group_size=group_size,
             dynamic_bs=dynamic_bs,
+            reward_normalization=reward_normalization,
+            drop_incomplete_group=drop_incomplete_group,
         )
 
     def clear_batches(self, shard_ids: list[str] | None = None) -> None:
@@ -1317,6 +1325,7 @@ class ArchonEngine(TrainEngine):
                 ctx.mb_input["input_ids"],
                 temperature=self.config.temperature,
                 tp_group=self._tp_group,
+                chunk_size=self.config.logprobs_chunk_size,
             )
             return logprobs, entropy, vocab_min, vocab_max
 
@@ -1326,6 +1335,7 @@ class ArchonEngine(TrainEngine):
             ctx.labels,
             temperature=self.config.temperature,
             tp_group=self._tp_group,
+            chunk_size=self.config.logprobs_chunk_size,
         )
         vocab_min, vocab_max = self._get_vocab_min_max_logits(logits)
 
@@ -1357,6 +1367,7 @@ class ArchonEngine(TrainEngine):
                 ctx.mb_input["input_ids"],
                 temperature=self.config.temperature,
                 tp_group=self._tp_group,
+                chunk_size=self.config.logprobs_chunk_size,
             )
 
         assert ctx.labels is not None
@@ -1365,6 +1376,7 @@ class ArchonEngine(TrainEngine):
             ctx.labels,
             temperature=self.config.temperature,
             tp_group=self._tp_group,
+            chunk_size=self.config.logprobs_chunk_size,
         )
 
         if self._cp_group is not None:

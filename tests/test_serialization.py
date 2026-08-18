@@ -5,7 +5,6 @@ from io import BytesIO
 
 import numpy as np
 import pytest
-import ray
 import torch
 from PIL import Image
 from transformers import AutoTokenizer
@@ -176,20 +175,6 @@ class TestSerializationRoundTrip:
         assert deserialized["dataclass"].name == "nested"
         assert torch.equal(deserialized["list"][0], payload["list"][0])
         assert deserialized["meta"]["text"] == "value"
-
-    @pytest.mark.skip("skipping the ray test unless skip mark is commented out")
-    def test_ray_object_ref_roundtrip(self):
-        """Ray ObjectRef handles should round-trip through RPC serialization."""
-        ray.init(local_mode=True, ignore_reinit_error=True)
-        try:
-            original = ray.put({"value": 123})
-            serialized = serialize_value({"ref": original})
-            assert serialized["ref"]["type"] == "ray_object_ref"
-
-            deserialized = deserialize_value(serialized)
-            assert ray.get(deserialized["ref"]) == {"value": 123}
-        finally:
-            ray.shutdown()
 
     @pytest.mark.skipif(
         not hasattr(torch, "cuda") or not torch.cuda.is_available(),

@@ -680,6 +680,13 @@ class TrainController:
         """
         return self._custom_function_call("get_version")
 
+    def get_lora_adapter_info(self) -> dict[str, list[int]]:
+        """Get LoRA adapter parameter names and shapes from worker rank 0."""
+        results = self._custom_function_call("get_lora_adapter_info")
+        if results:
+            return results[0]
+        return {}
+
     def save(self, meta: SaveLoadMeta):
         """Save model weights and optimizer states for later use.
 
@@ -699,6 +706,12 @@ class TrainController:
             Metadata containing information about where and how to load
         """
         self._custom_function_call("load", meta)
+
+    def init_awex_adapter(self, meta_server_addr: str | None = None):
+        """Create awex adapter early for selective memory management."""
+        self._custom_function_call(
+            "init_awex_adapter", meta_server_addr=meta_server_addr
+        )
 
     def step_lr_scheduler(self):
         """Step the learning rate scheduler.
@@ -758,6 +771,8 @@ class TrainController:
         should_accept_fn: str | None = None,
         group_size: int = 1,
         dynamic_bs: bool = False,
+        reward_normalization: bool = False,
+        drop_incomplete_group: bool = False,
     ) -> list[dict[str, Any]]:
         return self.rollout.prepare_batch(
             dataloader=dataloader,
@@ -766,6 +781,8 @@ class TrainController:
             should_accept_fn=should_accept_fn,
             group_size=group_size,
             dynamic_bs=dynamic_bs,
+            reward_normalization=reward_normalization,
+            drop_incomplete_group=drop_incomplete_group,
         )
 
     def rollout_batch(
@@ -775,6 +792,8 @@ class TrainController:
         workflow_kwargs: dict[str, Any],
         should_accept_fn: str | None = None,
         group_size: int = 1,
+        reward_normalization: bool = False,
+        drop_incomplete_group: bool = False,
     ) -> list[dict[str, Any]]:
         return self.rollout.rollout_batch(
             data=data,
@@ -782,6 +801,8 @@ class TrainController:
             workflow_kwargs=workflow_kwargs,
             should_accept_fn=should_accept_fn,
             group_size=group_size,
+            reward_normalization=reward_normalization,
+            drop_incomplete_group=drop_incomplete_group,
         )
 
     def _check_rollout_engine_connected(self):

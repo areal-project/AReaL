@@ -23,6 +23,44 @@ if TYPE_CHECKING:
     from typing import IO
 
 
+def build_target_cmd(
+    cmd: str | list[str],
+    *,
+    env_vars: dict[str, str] | None = None,
+    use_stdbuf: bool = False,
+    target_env: dict[str, str] | None = None,
+) -> str:
+    """Build a shell command with optional environment and line buffering.
+
+    GNU ``stdbuf`` injects ``libstdbuf`` through ``LD_PRELOAD``. Avoid wrapping a
+    target whose effective environment already contains ``LD_PRELOAD`` so the
+    caller-provided preload value reaches the target unchanged. A ``None`` target
+    environment follows :class:`subprocess.Popen` semantics and inherits
+    :data:`os.environ`; an explicit empty mapping does not.
+    """
+    if isinstance(cmd, list):
+        cmd_str = " ".join(shlex.quote(str(part)) for part in cmd)
+    else:
+        cmd_str = cmd
+
+    command_parts: list[str] = []
+    if env_vars:
+        command_parts.append(
+            " ".join(
+                f"{key}={shlex.quote(str(value))}" for key, value in env_vars.items()
+            )
+        )
+
+    inherited_env = os.environ if target_env is None else target_env
+    target_has_preload = (
+        "LD_PRELOAD" in (env_vars or {}) or "LD_PRELOAD" in inherited_env
+    )
+    if use_stdbuf and not target_has_preload:
+        command_parts.append("stdbuf -oL")
+    command_parts.append(cmd_str)
+    return " ".join(command_parts)
+
+
 def build_streaming_log_cmd(
     cmd: str | list[str],
     log_file: str | Path,
@@ -30,6 +68,7 @@ def build_streaming_log_cmd(
     role: str,
     *,
     env_vars: dict[str, str] | None = None,
+    target_env: dict[str, str] | None = None,
 ) -> str:
     """Build a shell command that streams output to stdout and log files.
 
@@ -50,32 +89,24 @@ def build_streaming_log_cmd(
         Role name for log prefix (e.g., "actor", "master")
     env_vars : dict[str, str] | None
         Optional environment variables to prefix the command with KEY=VALUE
+    target_env : dict[str, str] | None
+        Optional environment passed directly to the target process. ``None``
+        means that the target inherits :data:`os.environ`.
 
     Returns
     -------
     str
         Shell command string ready for execution with bash
     """
-    # Escape command if it's a list
-    if isinstance(cmd, list):
-        cmd_str = " ".join(shlex.quote(str(c)) for c in cmd)
-    else:
-        cmd_str = cmd
-
     # Check if stdbuf is available (not present on macOS by default)
     _has_stdbuf = shutil.which("stdbuf") is not None
 
-    # Build prefix with env vars if provided
-    prefix_parts = []
-    if env_vars:
-        prefix_parts.append(
-            " ".join(f"{k}={shlex.quote(str(v))}" for k, v in env_vars.items())
-        )
-    if _has_stdbuf:
-        prefix_parts.append(f"stdbuf -oL {cmd_str}")
-    else:
-        prefix_parts.append(cmd_str)
-    full_cmd = " ".join(prefix_parts)
+    full_cmd = build_target_cmd(
+        cmd,
+        env_vars=env_vars,
+        use_stdbuf=_has_stdbuf,
+        target_env=target_env,
+    )
 
     # Build log prefix for merged log
     log_prefix = f"[{role}]".ljust(LOG_PREFIX_WIDTH)
@@ -124,7 +155,12 @@ def run_with_streaming_logs(
         The spawned process
     """
     shell_cmd = build_streaming_log_cmd(
-        cmd, str(log_file), str(merged_log), role, env_vars=env_vars_in_cmd
+        cmd,
+        str(log_file),
+        str(merged_log),
+        role,
+        env_vars=env_vars_in_cmd,
+        target_env=env,
     )
 
     return subprocess.Popen(

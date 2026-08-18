@@ -432,6 +432,7 @@ class RolloutControllerV2:
                 inf_workers,
                 dp_size,
                 nnodes_per_instance,
+                dict(inf_spec.env_vars),
                 server_args,
             )
         logger.info("Inference servers: %s", self._inf_addrs)
@@ -549,6 +550,7 @@ class RolloutControllerV2:
         inf_workers: list,
         dp_size: int,
         nnodes_per_instance: int,
+        worker_env: dict[str, str],
         server_args: dict[str, Any] | None,
     ) -> None:
         if inf_backend == "sglang":
@@ -615,6 +617,30 @@ class RolloutControllerV2:
                     "worker_index": group_idx * nnodes_per_instance + node_rank,
                     "raw_cmd": cmd,
                 }
+                if inf_backend == "sglang":
+                    from areal.infra.utils.launcher import (
+                        TRITON_CACHE_PATH as _TRITON_CACHE,
+                    )
+
+                    cache_suffix = (
+                        f"inf-server-{fork_payload['worker_index']}-{uuid.uuid4()}"
+                    )
+                    triton_cache_dir = worker_env.get(
+                        "TRITON_CACHE_DIR",
+                        os.environ.get("TRITON_CACHE_DIR", _TRITON_CACHE),
+                    )
+                    triton_cache_path = worker_env.get(
+                        "TRITON_CACHE_PATH",
+                        os.environ.get("TRITON_CACHE_PATH", triton_cache_dir),
+                    )
+                    fork_payload["env"] = {
+                        "TRITON_CACHE_DIR": os.path.join(
+                            triton_cache_dir, cache_suffix
+                        ),
+                        "TRITON_CACHE_PATH": os.path.join(
+                            triton_cache_path, cache_suffix
+                        ),
+                    }
                 if inf_backend == "vllm":
                     from areal.infra.utils.launcher import (
                         TRITON_CACHE_PATH as _TRITON_CACHE,
@@ -1064,8 +1090,15 @@ class RolloutControllerV2:
         task_id: int | None = None,
         is_eval: bool = False,
         group_size: int = 1,
+        reward_normalization: bool = False,
+        drop_incomplete_group: bool = False,
     ) -> int:
         self._ensure_initialized()
+        if reward_normalization or drop_incomplete_group:
+            raise ValueError(
+                "RolloutControllerV2 does not support reward_normalization or "
+                "drop_incomplete_group yet."
+            )
         resolved_workflow = self._resolve_workflow(
             workflow,
             workflow_kwargs,
@@ -1111,6 +1144,8 @@ class RolloutControllerV2:
         should_accept_fn: Any = None,
         group_size: int = 1,
         batch_size: int | None = None,
+        reward_normalization: bool = False,
+        drop_incomplete_group: bool = False,
     ) -> list[dict[str, Any]]:
         """Submit a batch of data items and wait for all results.
 
@@ -1143,6 +1178,11 @@ class RolloutControllerV2:
             A list of trajectory dicts (one per completed rollout).
         """
         self._ensure_initialized()
+        if reward_normalization or drop_incomplete_group:
+            raise ValueError(
+                "RolloutControllerV2 does not support reward_normalization or "
+                "drop_incomplete_group yet."
+            )
         if not self._gateway_addr:
             raise RuntimeError("RolloutControllerV2.initialize() must be called first")
         if data is None:
@@ -1180,6 +1220,8 @@ class RolloutControllerV2:
         group_size: int = 1,
         dynamic_bs: bool = False,
         batch_size: int | None = None,
+        reward_normalization: bool = False,
+        drop_incomplete_group: bool = False,
     ) -> list[dict[str, Any]]:
         """Prepare a full training batch by consuming data from a dataloader.
 
@@ -1213,6 +1255,11 @@ class RolloutControllerV2:
             A list of trajectory dicts (matching ``RolloutController`` API).
         """
         self._ensure_initialized()
+        if reward_normalization or drop_incomplete_group:
+            raise ValueError(
+                "RolloutControllerV2 does not support reward_normalization or "
+                "drop_incomplete_group yet."
+            )
         if not self._gateway_addr:
             raise RuntimeError("RolloutControllerV2.initialize() must be called first")
         if dataloader is None:

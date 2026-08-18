@@ -1182,16 +1182,6 @@ class TestTensorShardInfoDocumentation:
         assert shard.shard_id == "test-shard-001"
         assert shard.node_addr == "localhost:8080"
 
-    def test_ray_backend_empty_node_addr(self):
-        """Ray backend uses empty string for node_addr."""
-        from areal.infra.rpc.rtensor import TensorShardInfo
-
-        shard = TensorShardInfo(
-            shard_id="",  # Will be filled by Ray ObjectRef
-            node_addr="",  # Empty for Ray backend
-        )
-        assert shard.node_addr == ""
-
     def test_http_backend_node_addr(self):
         """HTTP backend uses host:port for node_addr."""
         from areal.infra.rpc.rtensor import TensorShardInfo

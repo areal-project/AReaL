@@ -11,6 +11,7 @@ import pytest
 from areal.api.cli_args import PerfTracerConfig, SessionTracerConfig
 from areal.infra.platforms import current_platform
 from areal.utils import perf_tracer
+from areal.utils.environ import rank_in_env_filter
 from areal.utils.network import find_free_ports
 from areal.utils.perf_tracer import Category, SessionTraceEvent
 
@@ -247,6 +248,28 @@ def test_perf_tracer_emits_separate_rank_logs(tmp_path):
     sort_meta_rank1 = _meta(events_rank1, "process_sort_index")
     assert any(evt["args"].get("sort_index") == 0 for evt in sort_meta_rank0)
     assert any(evt["args"].get("sort_index") == 1 for evt in sort_meta_rank1)
+
+
+def test_perf_tracer_rank_filter_env(tmp_path, monkeypatch):
+    monkeypatch.setenv("AREAL_PERF_TRACER_RANKS", "0")
+    config = _make_config(tmp_path, experiment="rank-filter", trial="only-rank0")
+
+    tracer0 = perf_tracer.PerfTracer(config, rank=0)
+    tracer0.instant("rank0-mark")
+    tracer0.save()
+    assert _expected_trace_path(config, rank=0).exists()
+
+    tracer1 = perf_tracer.PerfTracer(config, rank=1)
+    tracer1.instant("rank1-mark")
+    tracer1.save()
+    assert not _expected_trace_path(config, rank=1).exists()
+
+
+def test_rank_in_env_filter_supports_lists_and_ranges(monkeypatch):
+    monkeypatch.setenv("AREAL_TEST_RANKS", "0,2-4")
+    assert rank_in_env_filter("AREAL_TEST_RANKS", 0)
+    assert not rank_in_env_filter("AREAL_TEST_RANKS", 1)
+    assert rank_in_env_filter("AREAL_TEST_RANKS", 3)
 
 
 @pytest.mark.asyncio

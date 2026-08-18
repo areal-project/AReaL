@@ -84,7 +84,9 @@ python3 examples/math/gsm8k_rl.py \
 | `eps`            | float       | -                            | 避免除零的小常数（默认：`1e-5`）   |
 | `group_size`     | int         | -                            | 分组级归一化的组大小               |
 
-"Batch"级在整个全局批次上计算均值/标准差，而"group"级在组内计算（例如，共享相同提示的轨迹）。对于分组级归一化，必须指定 `group_size`。将
+"Batch"级在整个全局批次上计算均值/标准差，而"group"级在组内计算（例如，共享相同提示的轨迹）。分组边界来自 rollout
+批次元数据（`TrajBatchMeta.traj_group_sizes`）而非
+`group_size`，因此即使各组大小不一（例如部分样本被过滤），仍会按提示逐组归一化；仅当该元数据不可用时，`group_size` 才作为固定步长的回退方案生效。将
 `mean_level` 或 `std_level` 设为 `None` 分别跳过均值减法或标准差缩放。
 
 如果整个字段被省略（例如YAML中的 `adv_norm: null`），则不执行归一化。

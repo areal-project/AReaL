@@ -733,9 +733,12 @@ class TestMultiNodeConfig:
         assert len(data_proxy_calls) == 1
 
     @pytest.mark.asyncio
-    async def test_async_initialize_multinode_fork_path(self):
+    async def test_async_initialize_multinode_fork_path(self, monkeypatch):
         """Exercise the full multi-node fork path (server_infos=None)."""
         from areal.api.cli_args import SchedulingSpec
+
+        monkeypatch.setenv("TRITON_CACHE_DIR", "/tmp/controller-triton-dir")
+        monkeypatch.setenv("TRITON_CACHE_PATH", "/tmp/controller-triton-path")
 
         worker0 = MagicMock()
         worker0.ip = "10.0.0.1"
@@ -823,6 +826,19 @@ class TestMultiNodeConfig:
         assert fork_calls[0]["worker_index"] == 0
         assert fork_calls[1]["role"] == "inf-server"
         assert fork_calls[1]["worker_index"] == 1
+
+        cache_dirs = [fc["env"]["TRITON_CACHE_DIR"] for fc in fork_calls]
+        cache_paths = [fc["env"]["TRITON_CACHE_PATH"] for fc in fork_calls]
+        assert all(
+            path.startswith("/tmp/controller-triton-dir/inf-server-")
+            for path in cache_dirs
+        )
+        assert all(
+            path.startswith("/tmp/controller-triton-path/inf-server-")
+            for path in cache_paths
+        )
+        assert len(set(cache_dirs)) == 2
+        assert len(set(cache_paths)) == 2
 
         # Verify dist_init_addr propagated to fork commands
         for fc in fork_calls:

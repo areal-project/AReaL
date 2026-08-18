@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import copy
+import math
 import os
 import subprocess
 import uuid
@@ -291,6 +292,7 @@ class WeightUpdateMeta:
     @classmethod
     def from_awex(
         cls,
+        meta_server_addr: str | None = None,
         use_lora: bool = False,
         lora_name: str = "",
         lora_int_id: int = 1,
@@ -298,6 +300,7 @@ class WeightUpdateMeta:
     ):
         return cls(
             type="awex",
+            nccl_master_address=meta_server_addr,
             use_lora=use_lora,
             lora_name=lora_name,
             lora_int_id=lora_int_id,
@@ -325,6 +328,28 @@ class HttpGenerationResult:
     output_logprobs: list[float]
     stop_reason: str
     routed_experts: np.ndarray | None = None
+
+    def __post_init__(self) -> None:
+        if len(self.output_tokens) != len(self.output_logprobs):
+            raise ValueError(
+                "Malformed generation result: received "
+                f"{len(self.output_tokens)} output tokens but "
+                f"{len(self.output_logprobs)} output logprobs; every sampled "
+                "output token requires exactly one sampling logprob."
+            )
+
+        for index, logprob in enumerate(self.output_logprobs):
+            is_finite = (
+                isinstance(logprob, (int, float))
+                and not isinstance(logprob, bool)
+                and math.isfinite(logprob)
+            )
+            if not is_finite:
+                raise ValueError(
+                    "Malformed generation result: "
+                    f"output_logprobs[{index}] must be a real, finite number, "
+                    f"got {logprob!r}."
+                )
 
 
 @dataclass
@@ -417,9 +442,25 @@ class DeviceRuntimeInfo:
         mem_used = f"{self.mem_used:.{precision}f}"
         mem_total = f"{self.mem_total:.{precision}f}"
         if (not dist.is_initialized()) or (rank is None) or (dist.get_rank() == rank):
+            # Append host RssAnon/RssShmem (from /proc/self/status) to every
+            # device-stats log point so per-step host memory growth can be
+            # attributed to a phase boundary. Near-zero cost; rank0-only.
+            host_str = ""
+            try:
+                anon = shmem = 0
+                with open("/proc/self/status") as f:
+                    for line in f:
+                        if line.startswith("RssAnon:"):
+                            anon = int(line.split()[1]) // 1024
+                        elif line.startswith("RssShmem:"):
+                            shmem = int(line.split()[1]) // 1024
+                host_str = f" | host RssAnon: {anon}MB, RssShmem: {shmem}MB"
+            except Exception:
+                pass
             logger.info(
                 f"Memory-Usage {head}: "
                 f"memory allocated ({self.unit}): {mem_allocated}, "
                 f"memory reserved ({self.unit}): {mem_reserved}, "
                 f"device memory used/total ({self.unit}): {mem_used}/{mem_total}"
+                f"{host_str}"
             )

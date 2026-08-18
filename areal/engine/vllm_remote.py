@@ -4,7 +4,7 @@ import os
 import subprocess
 import sys
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from concurrent.futures import Future
 from typing import Any
 
@@ -35,12 +35,25 @@ from areal.infra.platforms import current_platform
 from areal.infra.utils.launcher import TRITON_CACHE_PATH
 from areal.utils import logging, perf_tracer, stats_tracker
 from areal.utils.network import format_host_for_url
+from areal.utils.vllm_response import parse_vllm_generation_response
 
 logger = logging.getLogger("vLLMEngine")
 
 
 class VLLMBackend:
     """vLLM-specific backend implementation for remote inference."""
+
+    @staticmethod
+    def build_server_env(env: Mapping[str, str]) -> dict[str, str]:
+        _env = dict(env)
+        triton_cache_path = _env.get("TRITON_CACHE_PATH", TRITON_CACHE_PATH)
+        _env["TRITON_CACHE_PATH"] = os.path.join(triton_cache_path, str(uuid.uuid4()))
+
+        vllm_cache_path = _env.get("VLLM_CACHE_ROOT")
+        if vllm_cache_path:
+            _env["VLLM_CACHE_ROOT"] = os.path.join(vllm_cache_path, str(uuid.uuid4()))
+        _env["VLLM_ALLOW_RUNTIME_LORA_UPDATING"] = "True"
+        return _env
 
     def build_generation_request(
         self, req: ModelRequest, with_lora: bool, version: int
@@ -103,32 +116,7 @@ class VLLMBackend:
         self, response: dict[str, Any]
     ) -> HttpGenerationResult:
         """Parse vLLM generation response."""
-        meta_info = response["choices"][0]
-        stop_reason = meta_info["finish_reason"]
-
-        # Parse tokens from "token:123" format
-        if "tokens" in meta_info["logprobs"]:
-            output_tokens = meta_info["logprobs"]["tokens"]
-            output_tokens = [int(t.split(":")[1]) for t in output_tokens]
-            output_logprobs = meta_info["logprobs"]["token_logprobs"]
-        elif "content" in meta_info["logprobs"]:
-            outputs = meta_info["logprobs"]["content"]
-            output_tokens = [int(t["token"].split(":")[1]) for t in outputs]
-            output_logprobs = [t["logprob"] for t in outputs]
-        else:
-            raise ValueError("Unexpected vLLM response format.")
-
-        if stop_reason == "abort" and len(output_tokens) == 0:
-            return HttpGenerationResult(
-                output_tokens=[],
-                output_logprobs=[],
-                stop_reason=stop_reason,
-            )
-        return HttpGenerationResult(
-            output_tokens=output_tokens,
-            output_logprobs=output_logprobs,
-            stop_reason=stop_reason,
-        )
+        return parse_vllm_generation_response(response)
 
     def build_score_request(
         self, input_ids: list[int], target_len: int, with_lora: bool, version: int
@@ -269,11 +257,20 @@ class VLLMBackend:
         """Get vLLM health check request."""
         return HttpRequest(endpoint="/health", payload={}, method="GET")
 
-    def get_offload_request(self) -> HttpRequest:
+    def get_abort_all_request(self) -> HttpRequest:
+        raise NotImplementedError("vLLM does not support abort_all_requests")
+
+    def get_offload_request(self, tags: list[str] | None = None) -> HttpRequest:
         """Get vLLM offload request.
 
         Uses vLLM's /sleep endpoint to offload model memory to CPU.
         Default level is 1.
+
+        Parameters
+        ----------
+        tags : list[str], optional
+            Accepted for RemoteInfEngine API compatibility. vLLM sleep does not
+            support component-specific tags, so this value is ignored.
         """
         return HttpRequest(endpoint="/sleep", payload={}, method="POST")
 
@@ -299,15 +296,7 @@ class VLLMBackend:
     def launch_server(self, server_args: dict[str, Any]) -> subprocess.Popen:
         """Launch vLLM server subprocess."""
         cmd = vLLMConfig.build_cmd_from_args(server_args)
-
-        _env = os.environ.copy()
-        triton_cache_path = _env.get("TRITON_CACHE_PATH", TRITON_CACHE_PATH)
-        _env["TRITON_CACHE_PATH"] = os.path.join(triton_cache_path, str(uuid.uuid4()))
-
-        vllm_cache_path = _env.get("VLLM_CACHE_ROOT")
-        if vllm_cache_path:
-            _env["VLLM_CACHE_ROOT"] = os.path.join(vllm_cache_path, str(uuid.uuid4()))
-        _env["VLLM_ALLOW_RUNTIME_LORA_UPDATING"] = "True"
+        _env = self.build_server_env(os.environ)
 
         logger.info(f"Launching vLLM server with command: {' '.join(cmd)}")
         return subprocess.Popen(
@@ -445,6 +434,8 @@ class RemotevLLMEngine(InferenceEngine):
         callback_addr: str | None = None,
         is_eval: bool = False,
         proxy_addr: str | None = None,
+        reward_normalization: bool = False,
+        drop_incomplete_group: bool = False,
     ) -> int:
         """Submit a request to the inference engine."""
         return self._engine.submit(
@@ -457,6 +448,8 @@ class RemotevLLMEngine(InferenceEngine):
             callback_addr=callback_addr,
             is_eval=is_eval,
             proxy_addr=proxy_addr,
+            reward_normalization=reward_normalization,
+            drop_incomplete_group=drop_incomplete_group,
         )
 
     def wait(
@@ -477,6 +470,8 @@ class RemotevLLMEngine(InferenceEngine):
         workflow: WorkflowLike,
         workflow_kwargs: dict[str, Any] | None = None,
         group_size: int = 1,
+        reward_normalization: bool = False,
+        drop_incomplete_group: bool = False,
     ) -> dict[str, Any]:
         """Submit a batch of requests and wait for results.
 
@@ -488,6 +483,8 @@ class RemotevLLMEngine(InferenceEngine):
             workflow=workflow,
             workflow_kwargs=workflow_kwargs,
             group_size=group_size,
+            reward_normalization=reward_normalization,
+            drop_incomplete_group=drop_incomplete_group,
         )
 
     def prepare_batch(
@@ -498,6 +495,8 @@ class RemotevLLMEngine(InferenceEngine):
         should_accept_fn: Callable[[dict[str, Any]], bool] | str | None = None,
         group_size: int = 1,
         dynamic_bs: bool = False,
+        reward_normalization: bool = False,
+        drop_incomplete_group: bool = False,
     ):
         """Asynchronously submit and wait until a full batch is ready."""
         return self._engine.prepare_batch(
@@ -507,6 +506,8 @@ class RemotevLLMEngine(InferenceEngine):
             should_accept_fn=should_accept_fn,
             group_size=group_size,
             dynamic_bs=dynamic_bs,
+            reward_normalization=reward_normalization,
+            drop_incomplete_group=drop_incomplete_group,
         )
 
     def compute_logp(self, data: list[dict[str, Any]]) -> list[torch.Tensor]:
@@ -530,8 +531,8 @@ class RemotevLLMEngine(InferenceEngine):
     def teardown_server(self):
         return self._engine.teardown_server()
 
-    def offload(self):
-        return self._engine.offload()
+    def offload(self, tags: list[str] | None = None):
+        return self._engine.offload(tags=tags)
 
     def onload(self, tags: list[str] | None = None):
         return self._engine.onload(tags=tags)

@@ -232,6 +232,30 @@ class GenerationHyperparameters:
             "help": "Enable beam search in the vLLM engine. When enabled, sampling parameters like temperature, top-p, and top-k are auto ignored."
         },
     )
+    reward_normalization: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "If True, apply per-prompt reward normalization across the "
+                "n_samples rollouts of the same prompt inside "
+                "GroupedRolloutWorkflow. Only affects InteractionWithTokenLogpReward "
+                "workflows such as SWE agent workflows. Not supported by "
+                "RolloutControllerV2 yet."
+            )
+        },
+    )
+    drop_incomplete_group: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "If True, discard the entire group when any of the n_samples "
+                "rollouts fails or returns None. prepare_batch will automatically "
+                "retry with a new prompt. This prevents partial groups from "
+                "causing reward normalization group misalignment. Not supported by "
+                "RolloutControllerV2 yet."
+            )
+        },
+    )
     # NOTE: to add new parameters, please correctly handle them in the `to_openai_args_dict` method.
 
     def new(self, **kwargs):
@@ -281,6 +305,13 @@ class GenerationHyperparameters:
         "max_tokens",  # deprecated by "completions", not used in "responses", should be `max_new_tokens` in "openai-agents"
     }
 
+    # Workflow-layer flags, not generation arguments. Exclude silently from
+    # OpenAI client kwargs even when users enable them.
+    _WORKFLOW_ONLY_ARGS: ClassVar[set[str]] = {
+        "reward_normalization",
+        "drop_incomplete_group",
+    }
+
     def to_openai_args_dict(
         self, exclude_args: list[str] | None = None, api_format: str = "completions"
     ) -> dict[str, Any]:
@@ -302,6 +333,8 @@ class GenerationHyperparameters:
 
         res = {}
         for k, v in asdict(self).items():
+            if k in self._WORKFLOW_ONLY_ARGS:
+                continue
             if k in final_exclude_args:
                 should_warn = False
 
@@ -335,6 +368,8 @@ class GenerationHyperparameters:
 @dataclass
 class OptimizerConfig:
     """Configuration for model optimization during training."""
+
+    DEFAULT_WARMUP_STEPS_PROPORTION: ClassVar[float] = 0.001
 
     type: str = field(
         default="adam",
@@ -379,9 +414,21 @@ class OptimizerConfig:
         },
     )
     warmup_steps_proportion: float = field(
-        default=0.001,
+        default=DEFAULT_WARMUP_STEPS_PROPORTION,
         metadata={
-            "help": "Proportion of training steps for warmup",
+            "help": "Non-negative proportion of training steps for warmup. "
+            "Ignored when warmup_steps is set. For Megatron, the resolved "
+            "warmup steps must be less than the total training steps.",
+        },
+    )
+    warmup_steps: int | None = field(
+        default=None,
+        metadata={
+            "help": "Fixed number of learning-rate scheduler steps for warmup. "
+            "Must be non-negative. For Megatron, it must also be less than the "
+            "total training steps. "
+            "When both options are explicitly configured, warmup_steps takes "
+            "precedence over warmup_steps_proportion and a warning is emitted.",
         },
     )
     initial_loss_scale: float = field(
@@ -399,6 +446,18 @@ class OptimizerConfig:
     gradient_clipping: float = field(
         default=1.0, metadata={"help": "Gradient clipping threshold"}
     )
+
+    def __post_init__(self) -> None:
+        if (
+            self.warmup_steps is not None
+            and self.warmup_steps_proportion != self.DEFAULT_WARMUP_STEPS_PROPORTION
+        ):
+            warnings.warn(
+                "Both warmup_steps and warmup_steps_proportion are configured; "
+                "warmup_steps takes precedence and warmup_steps_proportion is ignored.",
+                UserWarning,
+                stacklevel=2,
+            )
 
 
 @dataclass
@@ -947,11 +1006,40 @@ class MegatronEngineConfig:
     )
 
     # Precision & Loss
+    enable_chunked_logits: bool = field(
+        default=False,
+        metadata={
+            "help": "Enable AReaL's CUDA-only chunked-logits path by replacing "
+            "Megatron's native output layer with the vocab-parallel LM Head. "
+            "NPU and tree training are unsupported."
+        },
+    )
+    entropy_requires_grad: bool = field(
+        default=False,
+        metadata={
+            "help": "Whether the training loss requires entropy gradients. "
+            "Defaults to False. With AReaL LM Head enabled, False permits "
+            "destructive logits-storage reuse, so entropy is non-differentiable. "
+            "Set True to use the differentiable fallback."
+        },
+    )
+    lm_head_loss_chunk_size: int = field(
+        default=0,
+        metadata={
+            "help": "Sequence chunk size for AReaL's chunked LM Head loss. A "
+            "positive value requires enable_chunked_logits=True and "
+            "entropy_requires_grad=False, and computes LM Head logits and their "
+            "backward one chunk at a time. The chunked path only supports packed "
+            "text actor models without MTP; 0 disables it."
+        },
+    )
     enable_fp32_lm_head: bool = field(
         default=False,
         metadata={
-            "help": "Cast lm_head output to FP32 before loss computation for "
-            "numerical stability."
+            "help": "Compute the lm_head projection with FP32 input and weight "
+            "operands for numerical stability. With enable_chunked_logits=True, "
+            "the local vocab-parallel weight is converted once per microbatch "
+            "LM-head forward and reused across sequence chunks."
         },
     )
     cross_entropy_loss_fusion: bool = field(
@@ -1007,6 +1095,23 @@ class MegatronEngineConfig:
             "(bridge_type=megatron-bridge only). Default False drops it.",
         },
     )
+
+    def __post_init__(self) -> None:
+        if self.lm_head_loss_chunk_size < 0:
+            raise ValueError(
+                "lm_head_loss_chunk_size must be non-negative, got "
+                f"{self.lm_head_loss_chunk_size}"
+            )
+        if self.lm_head_loss_chunk_size > 0 and not self.enable_chunked_logits:
+            raise ValueError(
+                "lm_head_loss_chunk_size requires enable_chunked_logits=True"
+            )
+        if self.lm_head_loss_chunk_size > 0 and self.entropy_requires_grad:
+            raise ValueError(
+                "lm_head_loss_chunk_size requires entropy_requires_grad=False"
+            )
+        if self.lm_head_loss_chunk_size > 0 and self.enable_mtp:
+            raise ValueError("lm_head_loss_chunk_size does not support enable_mtp=True")
 
 
 class SchedulingStrategyType(str, Enum):
@@ -1099,27 +1204,35 @@ class SchedulingSpec:
     nodelist: str | None = field(
         default=None, metadata={"help": "sbatch/srun's `--nodelist` option for slurm."}
     )
+    reservation: str | None = field(
+        default=None,
+        metadata={"help": "sbatch's `--reservation` option for slurm."},
+    )
+    exclusive: bool = field(
+        default=False,
+        metadata={
+            "help": "sbatch's `--exclusive` option for slurm. Ensures nodes are not shared with other jobs."
+        },
+    )
     exclude: str | None = field(
         default=None, metadata={"help": "sbatch/srun's `--exclude` option for slurm."}
     )
-    ray_placement_strategy: str = field(
-        default="shared",
+    ray_placement_strategy: str | None = field(
+        default=None,
         metadata={
-            "help": "Which placement strategy to use for Ray scheduling. "
-            "Shared will produce 1 placement group for all workers in the role (training). "
-            "Separate will 1 placement group per worker (rollout). "
-            "Deferred will do the same as separate but defers accelerator scheduling (multinode rollout). ",
-            "choices": ["shared", "separate", "deferred"],
+            "help": "Deprecated compatibility field for the legacy Ray scheduler. "
+            "It is ignored by the current Ray scheduler.",
         },
     )
 
     def __post_init__(self):
         """Validate scheduling spec configuration."""
-        valid_strategies = {"shared", "separate", "deferred"}
-        if self.ray_placement_strategy not in valid_strategies:
-            raise ValueError(
-                f"ray_placement_strategy must be one of {valid_strategies}, "
-                f"got '{self.ray_placement_strategy}'"
+        if self.ray_placement_strategy is not None:
+            warnings.warn(
+                "SchedulingSpec.ray_placement_strategy is deprecated and ignored by "
+                "the current Ray scheduler.",
+                DeprecationWarning,
+                stacklevel=2,
             )
 
 
@@ -1154,6 +1267,13 @@ class TrainEngineConfig:
     )
     temperature: float = field(
         default=1.0, metadata={"help": "Temperature during generation."}
+    )
+    logprobs_chunk_size: int = field(
+        default=1024,
+        metadata={
+            "help": "Maximum sequence chunk size used to compute log probabilities "
+            "and entropy. Must be positive."
+        },
     )
     # Runtime microbatch limit
     mb_spec: MicroBatchSpec = field(default_factory=MicroBatchSpec)
@@ -1206,7 +1326,11 @@ class TrainEngineConfig:
 
     weight_update_mode: str = field(
         default="xccl",
-        metadata={"help": "Weight update backend type.", "choices": ["disk", "xccl"]},
+        metadata={
+            "help": "Weight update backend type. 'awex' requires a Megatron actor "
+            "and an SGLang rollout, and targets colocated actor-rollout setups.",
+            "choices": ["disk", "xccl", "awex"],
+        },
     )
     fsdp: FSDPEngineConfig = field(default_factory=FSDPEngineConfig)
     archon: ArchonEngineConfig = field(default_factory=ArchonEngineConfig)
@@ -1307,6 +1431,10 @@ class TrainEngineConfig:
 
     def __post_init__(self):
         """Validate scheduling_spec length and config combinations."""
+        if self.logprobs_chunk_size <= 0:
+            raise ValueError(
+                f"logprobs_chunk_size must be positive, got {self.logprobs_chunk_size}"
+            )
         if len(self.scheduling_spec) not in (1, 2):
             raise ValueError(
                 f"scheduling_spec must contain 1 or 2 SchedulingSpec, "
@@ -1966,6 +2094,7 @@ class SGLangConfig:
     triton_attention_reduce_in_fp32: bool = False
     triton_attention_num_kv_splits: int = 8
     num_continuous_decode_steps: int = 1
+    load_format: str = "auto"
     enable_memory_saver: bool = False
     allow_auto_truncate: bool = False
     attention_backend: str | None = "fa3"
@@ -2067,7 +2196,6 @@ class SGLangConfig:
             # Model and tokenizer
             tokenizer_path=sglang_config.model_path,
             tokenizer_mode="auto",
-            load_format="auto",
             trust_remote_code=True,
             is_embedding=False,
             # Other runtime options
@@ -2206,6 +2334,17 @@ class AgentConfig:
         default=4,
         metadata={
             "help": "Maximum number of worker processes for subprocess mode execution pool."
+        },
+    )
+    drop_retry_orphans: bool = field(
+        default=False,
+        metadata={
+            "help": "Drop retry-orphan completions before export. "
+            "When upstream Agent SDK times out and retries the same request, "
+            "the proxy records both the orphan (never delivered to the agent) "
+            "and the retry, producing extra leaves in concat-mode export "
+            "(trajectory split). Enable this to discard orphans before reward "
+            "discounting."
         },
     )
     session_timeout_seconds: int = field(
@@ -2514,14 +2653,18 @@ class RecoverConfig(_Timer):
         default=False,
         metadata={
             "help": "Do not save optimizer state in recovery checkpoints. "
-            "Required when using use_distributed_optimizer with Megatron "
-            "(flattened_range incompatibility)."
+            "Shrinks checkpoints and speeds up saving, but recovery then "
+            "resumes with a freshly initialized optimizer (Adam moments "
+            "reset), which can destabilize training. Leave this off unless "
+            "the run never needs to resume optimizer state, e.g. profiling."
         },
     )
     no_load_optim: bool = field(
         default=False,
         metadata={
-            "help": "Do not load optimizer state when recovering from checkpoint."
+            "help": "Do not load optimizer state when recovering from checkpoint. "
+            "Same caveat as no_save_optim: training resumes with reset Adam "
+            "moments."
         },
     )
 
@@ -3167,6 +3310,12 @@ class PPOConfig(BaseExperimentConfig):
         """Validate the eval generation config."""
         if self.eval_gconfig is None:
             self.eval_gconfig = self.gconfig.new()
+        if self.gconfig.reward_normalization and self.actor.reward_norm is not None:
+            raise ValueError(
+                "gconfig.reward_normalization (rollout-time, per-prompt) and "
+                "actor.reward_norm (training-time, on collected batch) both apply "
+                "reward normalization. Enable only one."
+            )
         # Propagate the LoRA adapter name to the rollout engine so the OpenAI-proxy
         # generation path requests the same adapter the trainer loads. The request
         # side (ArealOpenAI) cannot read gconfig.lora_name, so it must come from

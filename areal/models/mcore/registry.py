@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import dataclasses
+import types
 from typing import Any
 
 import torch
@@ -14,6 +15,7 @@ from megatron.core.transformer import TransformerConfig
 from transformers import AutoConfig, PretrainedConfig
 
 from areal.api.cli_args import MegatronEngineConfig
+from areal.engine.megatron_utils.deterministic import set_deterministic_algorithms
 from areal.models.mcore.bailing_moe import (
     hf_to_mcore_config_bailing_moe,
     make_mcore_layer_specs_bailing_moe,
@@ -21,6 +23,9 @@ from areal.models.mcore.bailing_moe import (
 from areal.models.mcore.qwen3 import (
     hf_to_mcore_config_qwen3_dense,
     make_mcore_layer_specs_qwen3_dense,
+)
+from areal.models.mcore.vocab_parallel_head import (
+    replace_output_layer_with_areal_lm_head,
 )
 from areal.utils import logging
 
@@ -92,6 +97,189 @@ def _replace_output_layer_with_value_head(
     model.vocab_size = 1
 
 
+def _is_lm_head_module_name(name: str) -> bool:
+    return name in ("output_layer", "lm_head") or name.endswith(
+        (".output_layer", ".lm_head")
+    )
+
+
+def _call_with_optional_group(fn, tensor: torch.Tensor, group: Any | None):
+    try:
+        return fn(tensor, group=group)
+    except TypeError:
+        return fn(tensor)
+
+
+def _fp32_lm_head_forward_impl(
+    *,
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    sequence_parallel: bool,
+    tp_group: Any | None = None,
+    **_: Any,
+) -> torch.Tensor:
+    """Run the lm-head projection in fp32.
+
+    A bf16 head keeps the ``[tokens, vocab]`` logits and their gradient in bf16,
+    which is the dominant rounding error in the loss for large vocabularies.
+    Casting the operands here keeps the matmul and the bias add in fp32 while
+    leaving the rest of the model in its configured dtype.
+
+    Mirrors ``ColumnParallelLinear`` from megatron-core, verified against 0.17.0.
+    The collective helpers gained a ``group`` keyword in newer releases, so the
+    calls fall back to the positional form when it is absent.
+
+    Upgrade considerations: this replaces the fused ``_forward_impl`` with a
+    plain matmul, so the dgrad all-reduce comes from
+    ``copy_to_tensor_model_parallel_region`` instead of the fused kernel -
+    equivalent, not fused. If megatron-core changes the forward short-circuit
+    conditions or the collective signatures, this reimplementation drifts
+    silently; ``_enable_fp32_lm_head_forward`` therefore steps aside when the
+    installed megatron-core exposes a native ``ColumnParallelLinearFP32``
+    (absent as of 0.17.0).
+    """
+    if sequence_parallel:
+        try:
+            total_input = tensor_parallel.gather_from_sequence_parallel_region(
+                input,
+                tensor_parallel_output_grad=True,
+                group=tp_group,
+            )
+        except TypeError:
+            total_input = tensor_parallel.gather_from_sequence_parallel_region(
+                input,
+                tensor_parallel_output_grad=True,
+            )
+    else:
+        total_input = input
+
+    output = torch.matmul(total_input.float(), weight.t().float())
+    if bias is not None:
+        output = output + bias.float()
+    return output
+
+
+def _fp32_lm_head_forward(
+    self,
+    input_: torch.Tensor,
+    weight=None,
+    runtime_gather_output: bool | None = None,
+    **kwargs,
+):
+    if weight is None:
+        weight = self.weight
+    if weight is None:
+        raise RuntimeError(
+            "weight was not supplied to lm_head forward pass and "
+            "skip_weight_param_allocation is True."
+        )
+
+    bias = self.bias if not getattr(self, "skip_bias_add", False) else None
+    tp_group = getattr(self, "tp_group", None)
+
+    if (
+        getattr(self, "async_tensor_model_parallel_allreduce", False)
+        or getattr(self, "sequence_parallel", False)
+        or getattr(self, "explicit_expert_comm", False)
+    ):
+        input_parallel = input_
+    else:
+        input_parallel = _call_with_optional_group(
+            tensor_parallel.copy_to_tensor_model_parallel_region, input_, tp_group
+        )
+
+    output_parallel = _fp32_lm_head_forward_impl(
+        input=input_parallel,
+        weight=weight,
+        bias=bias,
+        sequence_parallel=getattr(self, "sequence_parallel", False),
+        tp_group=tp_group,
+    )
+
+    runtime_gather_output = kwargs.get("runtime_gather_output", runtime_gather_output)
+    gather_output = (
+        getattr(self, "gather_output", False)
+        if runtime_gather_output is None
+        else runtime_gather_output
+    )
+    if gather_output:
+        output = _call_with_optional_group(
+            tensor_parallel.gather_from_tensor_model_parallel_region,
+            output_parallel,
+            tp_group,
+        )
+    else:
+        output = output_parallel
+
+    output_bias = self.bias if getattr(self, "skip_bias_add", False) else None
+    return output, output_bias
+
+
+def _enable_fp32_lm_head_forward(
+    models: list[torch.nn.Module],
+    *,
+    enabled: bool,
+) -> int:
+    if not enabled:
+        return 0
+
+    native_fp32_cls = getattr(tensor_parallel, "ColumnParallelLinearFP32", None)
+    patched = []
+    already_fp32 = []
+
+    for model_idx, model in enumerate(models):
+        module = model.module if isinstance(model, DDP) else model
+        for name, submodule in module.named_modules():
+            if not _is_lm_head_module_name(name):
+                continue
+            if (
+                native_fp32_cls is not None and isinstance(submodule, native_fp32_cls)
+            ) or type(submodule).__name__ == "ColumnParallelLinearFP32":
+                already_fp32.append(f"model{model_idx}:{name}")
+                continue
+            if getattr(submodule, "_areal_fp32_lm_head_enabled", False):
+                already_fp32.append(f"model{model_idx}:{name}")
+                continue
+            if hasattr(submodule, "_forward_impl"):
+                setattr(
+                    submodule,
+                    "_areal_original_forward_impl",
+                    submodule._forward_impl,
+                )
+                setattr(submodule, "_forward_impl", _fp32_lm_head_forward_impl)
+                setattr(submodule, "_areal_fp32_lm_head_enabled", True)
+                patched.append(f"model{model_idx}:{name}:{type(submodule).__name__}")
+            elif all(hasattr(submodule, attr) for attr in ("weight", "forward")):
+                setattr(submodule, "_areal_original_forward", submodule.forward)
+                setattr(
+                    submodule,
+                    "forward",
+                    types.MethodType(_fp32_lm_head_forward, submodule),
+                )
+                setattr(submodule, "_areal_fp32_lm_head_enabled", True)
+                patched.append(f"model{model_idx}:{name}:{type(submodule).__name__}")
+
+    if patched:
+        logger.warning(
+            "Enabled FP32 lm_head/output_layer forward for modules: %s",
+            ", ".join(patched),
+        )
+    elif already_fp32:
+        logger.info(
+            "FP32 lm_head/output_layer is already enabled for modules: %s",
+            ", ".join(already_fp32),
+        )
+    else:
+        logger.warning(
+            "enable_fp32_lm_head=True, but no output_layer/lm_head module was found "
+            "on this model chunk. This is expected for non-post-process pipeline "
+            "stages."
+        )
+
+    return len(patched)
+
+
 def unwrap_to_gpt_model(model: torch.nn.Module) -> GPTModel:
     """Unwraps a model to the underlying GPTModel instance.
 
@@ -109,6 +297,42 @@ def unwrap_to_gpt_model(model: torch.nn.Module) -> GPTModel:
     ):
         return _model.language_model
     raise TypeError(f"Model could not be unwrapped to GPTModel. Got {type(_model)}")
+
+
+def _replace_actor_output_layers(
+    models: list[GPTModel | DDP],
+    *,
+    enabled: bool,
+    fp32_operands: bool = False,
+) -> None:
+    if not enabled:
+        return
+    for model in models:
+        gpt_model = unwrap_to_gpt_model(model)
+        replace_output_layer_with_areal_lm_head(
+            gpt_model,
+            fp32_output=True,
+            fp32_operands=fp32_operands,
+        )
+
+
+def _configure_actor_output_layers(
+    models: list[GPTModel | DDP],
+    mcore_config: MegatronEngineConfig | None,
+) -> None:
+    if mcore_config is None:
+        return
+    if mcore_config.enable_chunked_logits:
+        _replace_actor_output_layers(
+            models,
+            enabled=True,
+            fp32_operands=mcore_config.enable_fp32_lm_head,
+        )
+    else:
+        _enable_fp32_lm_head_forward(
+            models,
+            enabled=mcore_config.enable_fp32_lm_head,
+        )
 
 
 # Model registry for different architectures
@@ -193,6 +417,8 @@ def make_mcore_model(
             for model in models:
                 _model = unwrap_to_gpt_model(model)
                 _replace_output_layer_with_value_head(_model, tf_config)
+        else:
+            _configure_actor_output_layers(models, mcore_config)
 
         return models
 
@@ -264,6 +490,13 @@ def make_mcore_model(
         tf_config.batch_p2p_comm = provider.batch_p2p_comm
         tf_config.overlap_p2p_comm = provider.overlap_p2p_comm
 
+        # Megatron-Bridge creates a new provider instead of building from
+        # ``tf_config`` directly. Apply the prebuild deterministic settings to
+        # the actual provider so construction-time consumers (TP layers and TE
+        # attention) see the same configuration.
+        if mcore_config.use_deterministic_algorithms:
+            set_deterministic_algorithms(provider, prebuild=True)
+
         provider.finalize()
 
         ddp_config = MCoreDDPConfig(**dataclasses.asdict(mcore_config.ddp))
@@ -287,6 +520,8 @@ def make_mcore_model(
             for model in models:
                 _model = unwrap_to_gpt_model(model)
                 _replace_output_layer_with_value_head(_model, tf_config)
+        else:
+            _configure_actor_output_layers(models, mcore_config)
 
         return models
 
@@ -327,6 +562,8 @@ def make_mcore_model(
         # Replace output_layer with ValueHead for critic models
         if is_critic:
             _replace_output_layer_with_value_head(model, tf_config)
+        else:
+            _configure_actor_output_layers([model], mcore_config)
 
         if mcore_config.wrap_with_ddp:
             ddp_config = MCoreDDPConfig(**dataclasses.asdict(mcore_config.ddp))

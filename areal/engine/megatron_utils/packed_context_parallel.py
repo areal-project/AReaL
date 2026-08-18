@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+from contextlib import contextmanager
 from typing import Any
 
 import torch
@@ -9,6 +10,31 @@ from megatron.core import parallel_state as mpu
 from megatron.core.packed_seq_params import PackedSeqParams
 
 from areal.utils.data import is_multi_modal_key
+
+
+def _unwrap_language_model(model: torch.nn.Module) -> torch.nn.Module:
+    current = model
+    while hasattr(current, "module"):
+        current = current.module
+    return getattr(current, "language_model", current)
+
+
+@contextmanager
+def _hidden_states_output(model: torch.nn.Module, enabled: bool):
+    if not enabled:
+        yield
+        return
+    language_model = _unwrap_language_model(model)
+    if not hasattr(language_model, "post_process"):
+        raise TypeError(
+            "chunked LM Head loss requires a model with a post_process attribute"
+        )
+    original = language_model.post_process
+    language_model.post_process = False
+    try:
+        yield
+    finally:
+        language_model.post_process = original
 
 
 def preprocess_packed_seqs_context_parallel(
@@ -283,12 +309,55 @@ def extract_vision_from_multi_modal(
     _drop_multi_modal_payload(mb)
 
 
+def _reconstruct_padded_2d(
+    input_ids: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    max_seqlen: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+    """Reconstruct padded ``[B, S]`` ids and their validity mask."""
+    batch_size = cu_seqlens.shape[0] - 1
+    seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+    # The engine supplies max_seqlen after sequence/page padding, so it covers
+    # every length in cu_seqlens without recomputing a CUDA scalar on the host.
+    if max_seqlen is None:
+        max_seqlen = int(seq_lens.max().item())
+    # Batches may carry int32 ids, while the padded scatter destination and
+    # bridge embedding/position indexing require int64 token ids.
+    input_ids = input_ids.to(torch.long)
+    attention_mask = (
+        torch.arange(max_seqlen, device=input_ids.device)[None, :] < seq_lens[:, None]
+    )
+    input_ids_2d = torch.zeros(
+        batch_size, max_seqlen, dtype=torch.long, device=input_ids.device
+    )
+    input_ids_2d[attention_mask] = input_ids
+    return input_ids_2d, attention_mask, seq_lens, max_seqlen
+
+
+def _build_thd_packed_seq_params(
+    cu_seqlens: torch.Tensor, max_seqlen: int
+) -> PackedSeqParams:
+    """Build THD metadata for sequences already aligned by AReaL."""
+    return PackedSeqParams(
+        qkv_format="thd",
+        cu_seqlens_q=cu_seqlens,
+        max_seqlen_q=max_seqlen,
+        cu_seqlens_kv=cu_seqlens,
+        max_seqlen_kv=max_seqlen,
+        cu_seqlens_q_padded=cu_seqlens,
+        cu_seqlens_kv_padded=cu_seqlens,
+    )
+
+
 def packed_context_parallel_forward(
     model: torch.nn.Module,
     input_: dict[str, Any],
     gather_cp_output: bool = True,
     is_vision_model: bool = False,
     use_padded_seq: bool = False,
+    use_model_packed_seq: bool = False,
+    fp32_output: bool | None = None,
+    return_hidden_states: bool = False,
 ):
     input_ids = input_["input_ids"]
     position_ids = input_.get("position_ids", None)
@@ -321,7 +390,22 @@ def packed_context_parallel_forward(
     padded_repack_info = None
 
     if cu_seqlens is not None:
-        if not needs_padded_form:
+        if use_model_packed_seq:
+            if attention_mask is not None or tree_triton_data is not None:
+                raise ValueError(
+                    "Attention mask and tree attention are not supported with "
+                    "the model-packed THD forward."
+                )
+            if mpu.get_context_parallel_world_size() > 1:
+                raise NotImplementedError(
+                    "The model-packed THD forward does not support CP > 1 yet."
+                )
+            input_ids, attention_mask, _, max_seqlen = _reconstruct_padded_2d(
+                input_ids, cu_seqlens, input_.get("max_seqlen")
+            )
+            packed_seq_params = _build_thd_packed_seq_params(cu_seqlens, max_seqlen)
+            position_ids = None
+        elif not needs_padded_form:
             if attention_mask is not None or tree_triton_data is not None:
                 raise ValueError(
                     "Attention mask should be None when using packed sequences."
@@ -331,27 +415,10 @@ def packed_context_parallel_forward(
             )
             input_ids = input_ids.contiguous()
         else:
-            # VLM and BSHD-only models expect [B, S] padded input. Reconstruct
-            # padded 2D tensors from packed 1D via boolean masking — avoids
-            # per-sample Python loop and GPU-CPU sync.
-            batch_size = cu_seqlens.shape[0] - 1
-            seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
-            max_seqlen = int(seq_lens.max().item())
-            # int64 for input_ids: mbridge's get_rope_index uses input_ids.dtype
-            # for position_ids, and some kernels (_index_put_impl_) require int64.
-            # Upcast to torch.long so the scatter `input_ids_2d[mask] = input_ids`
-            # below has matching source/dest dtypes (data pipeline may emit int32).
-            if input_ids.dtype != torch.long:
-                input_ids = input_ids.to(torch.long)
-            attention_mask = (
-                torch.arange(max_seqlen, device=input_ids.device)[None, :]
-                < seq_lens[:, None]
+            # VLM and BSHD-only models expect [B, S] padded input.
+            input_ids, attention_mask, seq_lens, max_seqlen = _reconstruct_padded_2d(
+                input_ids, cu_seqlens, input_.get("max_seqlen")
             )
-            input_ids_2d = torch.zeros(
-                batch_size, max_seqlen, dtype=torch.long, device=input_ids.device
-            )
-            input_ids_2d[attention_mask] = input_ids
-            input_ids = input_ids_2d
             padded_repack_info = (cu_seqlens, seq_lens, max_seqlen)
 
     # Every VLM forward is mask-free (attention_mask=None): the model
@@ -363,7 +430,9 @@ def packed_context_parallel_forward(
     # layers skip padding. The wrapper-packed path carries no mask either
     # way (enforced above); tree data passes through untouched.
     dense_mask_text_forward = use_padded_seq and not has_vision_inputs
-    if is_vision_model and not dense_mask_text_forward:
+    if use_model_packed_seq:
+        final_attention_mask = attention_mask
+    elif is_vision_model and not dense_mask_text_forward:
         final_attention_mask = None
     else:
         final_attention_mask = (
@@ -386,18 +455,25 @@ def packed_context_parallel_forward(
         position_ids = None
 
     try:
-        output = model(
-            input_ids=input_ids,
-            attention_mask=final_attention_mask,
-            position_ids=position_ids,
-            packed_seq_params=packed_seq_params,
+        model_kwargs = {
+            "input_ids": input_ids,
+            "attention_mask": final_attention_mask,
+            "position_ids": position_ids,
+            "packed_seq_params": packed_seq_params,
             **vlm_kwargs,
-        )
+        }
+        if fp32_output is not None:
+            model_kwargs["fp32_output"] = fp32_output
+        with _hidden_states_output(model, return_hidden_states):
+            output = model(**model_kwargs)
     except Exception as e:
         raise RuntimeError(
             f"Error occurred in packed context parallel forward pass on model {model} "
             f"with input_ids shape {input_ids.shape} and packed_seq_params {packed_seq_params}."
         ) from e
+
+    if return_hidden_states:
+        return output
 
     model_vp_stage = getattr(model, "vp_stage", None)
     is_pipeline_last_stage = mpu.is_pipeline_last_stage(
