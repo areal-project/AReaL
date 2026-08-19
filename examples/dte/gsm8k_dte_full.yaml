@@ -1,0 +1,10 @@
+defaults:
+  - gsm8k_dte_base@_global_
+  - _self_
+
+experiment_name: gsm8k-dte-full
+
+actor:
+  dte:
+    enabled: true
+    transfer: full

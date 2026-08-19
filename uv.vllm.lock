@@ -452,6 +452,9 @@ cli = [
     { name = "click", marker = "(platform_machine == 'arm64' and sys_platform == 'darwin') or (platform_machine == 'x86_64' and sys_platform == 'darwin') or (platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
     { name = "colorlog", marker = "(platform_machine == 'arm64' and sys_platform == 'darwin') or (platform_machine == 'x86_64' and sys_platform == 'darwin') or (platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
 ]
+delta = [
+    { name = "delta-transfer-engine", marker = "(platform_machine == 'arm64' and sys_platform == 'darwin') or (platform_machine == 'x86_64' and sys_platform == 'darwin') or (platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
+]
 cuda = [
     { name = "flash-linear-attention", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "kernels", marker = "(platform_machine == 'arm64' and sys_platform == 'darwin') or (platform_machine == 'x86_64' and sys_platform == 'darwin') or (platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
@@ -537,6 +540,7 @@ requires-dist = [
     { name = "cookiecutter", specifier = ">2.1.1" },
     { name = "datasets", specifier = ">=3.0.0" },
     { name = "daytona", marker = "extra == 'sandbox'", specifier = ">=0.167.0" },
+    { name = "delta-transfer-engine", marker = "extra == 'delta'", git = "https://github.com/areal-project/AReaL-DTE.git?rev=6b2bc13e2b626d2677e9997f159b5a3269c97e3e" },
     { name = "distro-info", specifier = ">=1.0" },
     { name = "einops" },
     { name = "fastapi", specifier = ">=0.115.12" },
@@ -625,7 +629,7 @@ requires-dist = [
     { name = "word2number" },
     { name = "zstandard" },
 ]
-provides-extras = ["vllm", "tms", "kernels", "megatron", "cuda-train", "cuda", "sandbox", "cli"]
+provides-extras = ["vllm", "tms", "kernels", "megatron", "cuda-train", "cuda", "sandbox", "cli", "delta"]
 
 [package.metadata.requires-dev]
 dev = [
@@ -1604,6 +1608,16 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/46/5c/f4c2eb8d481fe8784a7e2331fbaab820079c06676185fa6d2177b386d590/diffusers-0.37.1.tar.gz", hash = "sha256:2346c21f77f835f273b7aacbaada1c34a596a3a2cc6ddc99d149efcd0ec298fa", size = 4135139, upload-time = "2026-03-25T08:04:04.515Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/9c/dd/51c38785ce5e1c287b5ad17ba550edaaaffce0deb0da4857019c6700fbaf/diffusers-0.37.1-py3-none-any.whl", hash = "sha256:0537c0b28cb53cf39d6195489bcf8f833986df556c10f5e28ab7427b86fc8b90", size = 5001536, upload-time = "2026-03-25T08:04:02.385Z" },
+]
+
+[[package]]
+name = "delta-transfer-engine"
+version = "0.0.1"
+source = { git = "https://github.com/areal-project/AReaL-DTE.git?rev=6b2bc13e2b626d2677e9997f159b5a3269c97e3e#6b2bc13e2b626d2677e9997f159b5a3269c97e3e" }
+dependencies = [
+    { name = "torch", version = "2.9.0", source = { registry = "https://pypi.org/simple" }, marker = "platform_machine == 'x86_64' and sys_platform == 'darwin'" },
+    { name = "torch", version = "2.10.0", source = { registry = "https://pypi.org/simple" }, marker = "(platform_machine == 'arm64' and sys_platform == 'darwin') or (platform_machine == 'aarch64' and sys_platform == 'linux')" },
+    { name = "torch", version = "2.10.0+cu129", source = { registry = "https://download.pytorch.org/whl/cu129" }, marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
 ]
 
 [[package]]

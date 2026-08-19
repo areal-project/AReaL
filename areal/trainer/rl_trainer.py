@@ -132,6 +132,7 @@ class PPOTrainer:
             logging.setup_file_logging(StatsLogger.get_log_path(config.stats_logger))
 
         self.config = config
+        self._apply_dte_config_envvars()
         self.processor, self.tokenizer = load_hf_processor_and_tokenizer(
             config.tokenizer_path
         )
@@ -153,6 +154,14 @@ class PPOTrainer:
         self._should_offload_rollout = self._is_actor_rollout_colocated(config)
         self._should_offload_actor = (
             self._should_offload_rollout or config.actor.offload
+        )
+        delta_env = os.environ.get(
+            "DTE_DELTA_TRANSFER", os.environ.get("AWEX_DELTA_TRANSFER", "0")
+        )
+        self._keep_rollout_weights_resident = (
+            config.actor._version == "v2"
+            and delta_env.strip().lower() in {"1", "true", "yes", "on"}
+            and not config.sglang.enable_weights_cpu_backup
         )
         self._should_offload_critic = (
             config.critic is not None and config.critic.offload
@@ -573,7 +582,10 @@ class PPOTrainer:
                 category=Category.IO,
             ),
         ):
-            rollout.offload()
+            if self._keep_rollout_weights_resident and not is_eval:
+                rollout.offload(tags=["kv_cache"])
+            else:
+                rollout.offload()
 
     def _onload_rollout(self, is_eval: bool = False) -> None:
         cleanup_error: Exception | None = None
@@ -1055,6 +1067,60 @@ class PPOTrainer:
         elif cfg.type == "slurm":
             return SlurmScheduler(exp_config=self.config)
         raise NotImplementedError(f"Unknown scheduler type: {cfg.type}")
+
+    def _apply_dte_config_envvars(self) -> None:
+        dte_config = self.config.actor.dte
+        transfer = dte_config.transfer
+        if transfer not in {None, "full", "delta"}:
+            raise ValueError(
+                f"actor.dte.transfer must be 'full' or 'delta', got {transfer!r}"
+            )
+        delta_enabled = transfer == "delta" if transfer is not None else None
+        detector = dte_config.delta_method
+        if detector not in {None, "snapshot", "adamw"}:
+            raise ValueError(
+                "actor.dte.delta_method must be 'snapshot' or 'adamw', "
+                f"got {detector!r}"
+            )
+        if detector == "adamw":
+            detector = "inversion"
+
+        enabled = dte_config.enabled
+        if enabled is not None and delta_enabled is None:
+            delta_enabled = False
+        if enabled is False and delta_enabled:
+            raise ValueError(
+                "actor.dte.enabled=false conflicts with actor.dte.transfer='delta'"
+            )
+        if enabled is None and transfer is not None:
+            enabled = True
+
+        values = {
+            "DTE_COLOCATE_WEIGHT_UPDATE": enabled,
+            "DTE_DELTA_TRANSFER": delta_enabled,
+            "DTE_DELTA_DETECTOR": detector,
+            "DTE_DELTA_ANCHOR_INTERVAL": dte_config.anchor_interval,
+            "DTE_DELTA_BYTES_RATIO": dte_config.bytes_ratio,
+            "DTE_RELEASE_TRAIN_WEIGHTS_AFTER_UPDATE": (
+                dte_config.release_train_weights_after_update
+            ),
+            "DTE_SYNC_MODEL_PARAMS_BEFORE_PAYLOAD": (
+                dte_config.sync_model_params_before_payload
+            ),
+            "DTE_DELTA_INVERSION_DEBUG": dte_config.inversion_debug,
+            "DTE_DELTA_INVERSION_BF16_MARGIN_REL": (
+                dte_config.inversion_bf16_margin_rel
+            ),
+        }
+        exported = {
+            name: "1" if value is True else "0" if value is False else str(value)
+            for name, value in values.items()
+            if value is not None
+        }
+        os.environ.update(exported)
+        for engine_config in (self.config.actor, self.config.rollout):
+            for spec in engine_config.scheduling_spec:
+                spec.env_vars.update(exported)
 
     def _create_dataloader(
         self,

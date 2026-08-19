@@ -67,7 +67,10 @@ class AwexFSDPAdapter(AwexTrainingAdapter):
     def _tie_word_embeddings(self) -> bool:
         return getattr(self._engine.model_config, "tie_word_embeddings", False)
 
-    def get_weight_metadata(self) -> list[ParameterMeta]:
+    def get_weight_metadata(
+        self, infer_conf: dict | None = None
+    ) -> list[ParameterMeta]:
+        del infer_conf
         rank_info = self._build_rank_info()
         metadata: list[ParameterMeta] = []
 

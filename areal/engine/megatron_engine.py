@@ -1089,6 +1089,8 @@ class MegatronEngine(TrainEngine):
     def optimizer_step(self):
         with trace_scope("megatron_engine.step"):
             update_successful, grad_norm, _ = self.optimizer.step()
+        for group in self.optimizer.param_groups:
+            group["_areal_last_step_lr"] = float(group["lr"])
         current_lr = self.optimizer.param_groups[0]["lr"]
 
         return dict(

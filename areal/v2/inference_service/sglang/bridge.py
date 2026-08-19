@@ -140,8 +140,9 @@ class SGLangBridgeBackend:
     def get_resume_request(self) -> HttpRequest:
         return HttpRequest(endpoint="/continue_generation", payload={})
 
-    def get_offload_request(self) -> HttpRequest:
-        return HttpRequest(endpoint="/release_memory_occupation", payload={})
+    def get_offload_request(self, tags: list[str] | None = None) -> HttpRequest:
+        payload = {"tags": tags} if tags is not None else {}
+        return HttpRequest(endpoint="/release_memory_occupation", payload=payload)
 
     def get_onload_request(self, tags: list[str] | None = None) -> HttpRequest:
         payload = {"tags": tags} if tags is not None else {}

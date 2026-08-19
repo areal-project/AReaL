@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import os
 import sys
 import threading
 import time
@@ -56,6 +57,7 @@ class GatewayTrainController:
         self._own_process_group = False
         self.rollout: Any | None = None
         self._weight_update_ctrl: Any | None = None
+        self._colocate_weight_update = False
 
         # Version management
         self._version_lock = Lock()
@@ -975,6 +977,13 @@ class GatewayTrainController:
 
         inference_urls: list[str] = rollout.inference_worker_urls
         pair_name = f"{self._role}-rollout"
+        colocate_env = os.environ.get("DTE_COLOCATE_WEIGHT_UPDATE", "0")
+        self._colocate_weight_update = meta.type == "awex" and colocate_env.lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
 
         if meta.type == "awex":
             # NCCL rendezvous master must live on the rank-0 process's node.
@@ -995,6 +1004,7 @@ class GatewayTrainController:
                 mode="awex",
                 nccl_master_addr=port_data["host"],
                 nccl_master_port=port_data["ports"][0],
+                colocate=self._colocate_weight_update,
             )
         else:  # disk
             ctrl.connect(
@@ -1024,8 +1034,21 @@ class GatewayTrainController:
         assert meta.version is not None and meta.version > 0, (
             f"meta.version must be a positive integer, got {meta.version}"
         )
-        result = self._weight_update_ctrl.update_weights(version=meta.version)
-        self.rollout.continue_generation()
+        try:
+            result = self._weight_update_ctrl.update_weights(version=meta.version)
+        finally:
+            if self._colocate_weight_update:
+                import requests
+
+                for url in self._worker_addrs:
+                    response = requests.post(
+                        f"{url}/awex/resume_memory",
+                        json={"tags": ["weights", "optimizer"]},
+                        timeout=120,
+                    )
+                    response.raise_for_status()
+            else:
+                self.rollout.continue_generation()
         logger.info(
             "Weight update v%d completed (%s, %.0fms)",
             meta.version,
@@ -1156,6 +1179,16 @@ class GatewayTrainController:
                 )
             except Exception:
                 logger.error("Failed to unregister model: %s", traceback.format_exc())
+
+        if self._weight_update_ctrl is not None:
+            try:
+                self._weight_update_ctrl.destroy()
+            except Exception:
+                logger.error(
+                    "Failed to destroy weight update controller: %s",
+                    traceback.format_exc(),
+                )
+            self._weight_update_ctrl = None
 
         self._graceful_shutdown_workers()
 
