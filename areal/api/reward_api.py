@@ -7,7 +7,9 @@ import threading
 from collections.abc import Callable
 from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
+from dataclasses import dataclass, field
 from functools import partial
+from typing import Any, TypeAlias
 
 from areal.utils import logging
 
@@ -57,6 +59,51 @@ def reward_fn(
         Any other attributes in the dataset will be passed as keyword arguments to this function.
     :rtype: float
     """
+
+
+@dataclass
+class RewardResult:
+    """Structured reward payload for workflows that expose process rewards.
+
+    Parameters
+    ----------
+    final_reward:
+        Sequence-level terminal reward. This is the compatibility anchor used
+        by existing workflows and PPO code paths.
+    step_rewards:
+        Optional additive reward increment for each process step, expressed in
+        the same raw units as ``final_reward``. Increments with the same
+        ``step_end`` are summed at their aligned reward timestep before PPO
+        applies ``reward_scaling`` and ``reward_clip``. Sequence-level reward
+        bias and ``reward_norm`` do not apply to process increments.
+    step_ends:
+        Optional 1-based completion-token end offsets for each step. Each entry
+        points to the completion token whose prediction timestep should receive
+        the corresponding ``step_rewards`` value.
+    metadata:
+        Optional debug-only payload for logging or inspection. This field is
+        not consumed by the trainer in Stage 1.
+    """
+
+    final_reward: float
+    step_rewards: list[float] | None = None
+    step_ends: list[int] | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+RewardValue: TypeAlias = float | RewardResult
+
+
+def normalize_reward_result(value: RewardValue) -> RewardResult:
+    """Normalize legacy scalar rewards into ``RewardResult``.
+
+    This keeps existing reward functions working unchanged while allowing new
+    implementations to return a structured process-reward payload.
+    """
+
+    if isinstance(value, RewardResult):
+        return value
+    return RewardResult(final_reward=float(value))
 
 
 class AsyncRewardWrapper:
@@ -138,7 +185,7 @@ class AsyncRewardWrapper:
             logger.info(f"Recreated ProcessPoolExecutor with {max_workers} workers")
             return new_executor
 
-    async def __call__(self, *args, **kwargs) -> float:
+    async def __call__(self, *args, **kwargs) -> RewardValue:
         for attempt in range(self.max_retries + 1):
             executor = self._executors.get(self._executor_key)
             if executor is None:
