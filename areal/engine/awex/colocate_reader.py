@@ -113,8 +113,16 @@ def _ensure_awex_models_registered() -> None:
 
     ``import_model_configs`` is ``lru_cache``-d and ``ModelRegistry`` is built
     once at module load. If anything imported the registry before our hook_mode
-    patch took effect, the BailingMoe converter would be silently missing. Clear
-    the cache and rebuild now that the patch is in place.
+    patch took effect, a native converter could be silently missing. Clear the
+    cache and rebuild now that the patch is in place.
+
+    The explicit architecture list is diagnostic only: AWEX remains the source
+    of truth for model registration, transfer plans, conversion, and sharding.
+    In particular, Qwen3.5 Dense and MoE reuse AWEX's native implementations
+    for both causal-language-model and multimodal conditional-generation
+    runtimes. Keeping those architecture names here makes an unavailable or
+    failed AWEX model import visible before the first colocated weight update,
+    without duplicating any model-specific transfer logic in AReaL.
     """
     try:
         from awex.models import registry as _reg
@@ -128,6 +136,10 @@ def _ensure_awex_models_registered() -> None:
                 "BailingMoeV2ForCausalLM",
                 "Qwen3VLForConditionalGeneration",
                 "Qwen3VLMoeForConditionalGeneration",
+                "Qwen3_5ForCausalLM",
+                "Qwen3_5MoeForCausalLM",
+                "Qwen3_5ForConditionalGeneration",
+                "Qwen3_5MoeForConditionalGeneration",
             )
             if m not in _reg.ModelRegistry.models
         ]
