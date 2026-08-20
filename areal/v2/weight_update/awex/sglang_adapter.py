@@ -11,26 +11,28 @@ import torch
 import torch.distributed as dist
 
 # Compatibility must run before importing AWEX model modules.
-from areal.engine.awex.sglang_compat import (  # noqa: E402
-    SingleInstanceMetaResolver,
+from areal.engine.weight_update.awex.protocol import (  # noqa: E402
+    ColocateKeyspace,
+    ColocateTopology,
+)
+from areal.engine.weight_update.awex.sglang import (  # noqa: E402
+    SGLangColocateBackend,
 )
 
-from awex.meta.infer_meta_resolver import InferParamMetaResolver  # noqa: E402
 from awex.meta.weight_meta import (  # noqa: E402
     ParameterMeta,
     ParameterReplicaMeta,
     ParameterShardMeta,
 )
-from awex.reader.nccl_reader import NCCLWorkerWeightsReader  # noqa: E402
 from awex.sharding.param_sharding import ShardingType  # noqa: E402
 from awex.sharding.rank_info import RankInfo  # noqa: E402
 from awex.sharding.sglang_sharding import (  # noqa: E402
     get_sglang_rank_info,
     get_sglang_sharding_strategy,
 )
+from awex.util.common import simple_hf_config  # noqa: E402
 from awex.transfer.nccl_comm import batch_send_recv, nccl_build_recv_ops  # noqa: E402
 from awex.transfer.transfer_plan import TransferPlan, TransferPlanBuilder  # noqa: E402
-from awex.util.common import simple_hf_config  # noqa: E402
 from areal.infra.platforms import current_platform  # noqa: E402
 from areal.utils import logging  # noqa: E402
 from areal.v2.weight_update.awex import (  # noqa: E402
@@ -60,16 +62,7 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
         self._separation_init_fingerprint: tuple | None = None
         self._rank_info: RankInfo | None = None
         self._parameters: dict[str, torch.Tensor] | None = None
-        self._meta_server_client = None
-        self._reader: NCCLWorkerWeightsReader | None = None
-        self._meta_server_addr: str | None = None
-        self._train_world_size: int | None = None
-        self._infer_instance_world_size: int | None = None
-        self._num_infer_engines: int | None = None
-        self._engine_rank: int | None = None
-        self._instance_local_rank: int | None = None
-        self._infer_params_meta = None
-        self._infer_conf: dict[str, Any] | None = None
+        self._colocate_backend = SGLangColocateBackend(scheduler)
         self._colocate_timeout_s = 300.0
         self._colocate_initialized = False
         self._colocate_init_fingerprint: tuple | None = None
@@ -115,34 +108,6 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
                     getattr(self._scheduler, "tp_rank", 0),
                 )
             ),
-            "attn_tp_size": int(getattr(self._scheduler, "attn_tp_size", tp_size)),
-            "attn_dp_rank": int(getattr(self._scheduler, "attn_dp_rank", 0)),
-        }
-
-    def _get_colocate_model_context(self) -> dict[str, Any]:
-        """Build the AWEX context for one inference engine instance."""
-        server_args = self._scheduler.server_args
-        tp_size = int(getattr(server_args, "tp_size", 1))
-        pp_size = int(getattr(server_args, "pp_size", 1))
-        tp_rank = int(getattr(self._scheduler, "tp_rank", 0))
-        instance_world = self._infer_instance_world_size or tp_size * pp_size
-        instance_local_rank = (
-            self._instance_local_rank
-            if self._instance_local_rank is not None
-            else tp_rank
-        )
-        return {
-            "scheduler": self._scheduler,
-            "infer_engine_config": server_args,
-            "tp_rank": tp_rank,
-            "tp_size": tp_size,
-            "pp_rank": int(getattr(self._scheduler, "pp_rank", 0)),
-            "pp_size": pp_size,
-            "dp_size": int(getattr(server_args, "dp_size", 1)),
-            "world_size": instance_world,
-            "global_rank": instance_local_rank,
-            "local_rank": tp_rank,
-            "attn_tp_rank": int(getattr(self._scheduler, "attn_tp_rank", tp_rank)),
             "attn_tp_size": int(getattr(self._scheduler, "attn_tp_size", tp_size)),
             "attn_dp_rank": int(getattr(self._scheduler, "attn_dp_rank", 0)),
         }
@@ -531,97 +496,11 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
         self._rank_info = None
         self._parameters = None
         self._separation_init_fingerprint = None
-        self._reader = None
-        self._meta_server_client = None
-        self._meta_server_addr = None
-        self._train_world_size = None
-        self._infer_instance_world_size = None
-        self._num_infer_engines = None
-        self._engine_rank = None
-        self._instance_local_rank = None
-        self._infer_params_meta = None
-        self._infer_conf = None
+        self._colocate_backend.teardown()
         self._colocate_initialized = False
         self._colocate_init_fingerprint = None
 
     # ── Colocated weight transfer methods ─────────────────────────────────
-
-    def _compute_local_raw_meta(self) -> dict:
-        """Compute this rank's metadata with AWEX's SGLang converter."""
-        return InferParamMetaResolver._get_model_param_info(
-            "sglang",
-            self._scheduler.server_args,
-            convert_params=True,
-            engine_rank=self._engine_rank or 0,
-            model=self._get_model(),
-            model_context=self._get_colocate_model_context(),
-        )
-
-    def _build_instance_params_meta(self):
-        """Exchange one instance's raw metadata through the MetaServer.
-
-        Do not gather over SGLang's ``tp_cpu_group``. The scheduler MainThread
-        uses that group to broadcast requests, while this method can run on a
-        different thread; concurrent collectives on the shared, non-thread-safe
-        group can race and deadlock. MetaServer exchange avoids process-group
-        collectives and isolates keys by inference-engine rank.
-        """
-        local_raw = self._compute_local_raw_meta()
-        instance_world = self._infer_instance_world_size or 1
-        if instance_world > 1:
-            client = self._meta_server_client
-            prefix = f"infer_instance_raw_meta_{self._engine_rank}"
-            client.put_object(f"{prefix}_{self._instance_local_rank}", local_raw)
-            raw_meta_list = [
-                client.get_object(f"{prefix}_{rank}", timeout=300.0)
-                for rank in range(instance_world)
-            ]
-        else:
-            raw_meta_list = [local_raw]
-
-        for info in raw_meta_list:
-            rank_info = info.get("rank_info")
-            if isinstance(rank_info, dict):
-                info["rank_info"] = RankInfo(**rank_info)
-
-        resolver = SingleInstanceMetaResolver(
-            self._get_model().config,
-            "sglang",
-            self._scheduler.server_args,
-            raw_meta_list,
-        )
-        return resolver.get_parameters_meta()
-
-    def _ensure_reader(self) -> NCCLWorkerWeightsReader:
-        if self._reader is not None:
-            return self._reader
-        if not self._colocate_initialized:
-            raise RuntimeError("Colocate weight update is not initialized")
-
-        training_params_meta = self._meta_server_client.get_object(
-            "training_params_meta", timeout=10000.0
-        )
-        reader = NCCLWorkerWeightsReader(
-            engine_name="sglang",
-            model=self._get_model(),
-            model_context=self._get_colocate_model_context(),
-            infer_conf=self._infer_conf,
-            engine_rank=self._engine_rank,
-            num_engines=self._num_infer_engines,
-            meta_server_addr=self._meta_server_addr,
-            parameters_meta=self._infer_params_meta,
-            training_params_meta=training_params_meta,
-            enable_colocate_mode=True,
-            ipc_backend="cuda",
-            enable_debug_mode=False,
-        )
-        reader.initialize()
-        self._reader = reader
-        logger.info(
-            "Constructed NCCLWorkerWeightsReader for transfer rank %d",
-            reader.transfer_rank,
-        )
-        return reader
 
     def init_colocate_weight_update(
         self,
@@ -656,29 +535,10 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
             raise RuntimeError(
                 "AWEX colocation is already initialized with different settings"
             )
-        if infer_world_size != train_world_size:
-            raise ValueError(
-                "Colocate mode requires equal inference and training rank counts; "
-                f"got infer={infer_world_size}, train={train_world_size}"
-            )
-
-        from awex.meta.meta_server import MetaServerClient
-
         server_args = self._scheduler.server_args
         tp_size = int(getattr(server_args, "tp_size", 1))
         pp_size = int(getattr(server_args, "pp_size", 1))
         instance_world = max(1, tp_size * pp_size)
-        if infer_world_size % instance_world != 0:
-            raise ValueError(
-                f"infer_world_size ({infer_world_size}) must be divisible by "
-                f"tp_size * pp_size ({instance_world})"
-            )
-        expected_num_engines = infer_world_size // instance_world
-        if num_engines != expected_num_engines:
-            raise ValueError(
-                "Colocate inference engine count mismatch: "
-                f"gateway={num_engines}, expected={expected_num_engines}"
-            )
         # The gateway sends ONE init per server carrying the engine-base rank;
         # the RPC is broadcast to every scheduler process of the server, so
         # each derives its own global rank from its tp/pp coordinates.
@@ -687,44 +547,26 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
                 f"expected an engine-base transfer_rank (multiple of "
                 f"{instance_world}), got {transfer_rank}"
             )
+        local_rank = int(getattr(self._scheduler, "pp_rank", 0) or 0) * tp_size + int(
+            getattr(self._scheduler, "tp_rank", 0) or 0
+        )
+        topology = ColocateTopology(
+            transfer_rank=transfer_rank + local_rank,
+            infer_world_size=infer_world_size,
+            train_world_size=train_world_size,
+            instance_world_size=instance_world,
+        )
+        model_config = self._get_model().config
         try:
-            self._train_world_size = train_world_size
-            self._meta_server_addr = meta_server_addr
             self._colocate_timeout_s = timeout_s
-            local_rank = int(
-                getattr(self._scheduler, "pp_rank", 0) or 0
-            ) * tp_size + int(getattr(self._scheduler, "tp_rank", 0) or 0)
-            self._transfer_rank = transfer_rank + local_rank
-            self._infer_instance_world_size = instance_world
-            self._num_infer_engines = expected_num_engines
-            self._engine_rank = transfer_rank // instance_world
-            self._instance_local_rank = local_rank
-
-            host, port = meta_server_addr.rsplit(":", 1)
-            self._meta_server_client = MetaServerClient(host, int(port))
-            self._infer_params_meta = self._build_instance_params_meta()
-
-            infer_conf = {
-                "engine_name": "sglang",
-                "infer_atten_tp_size": tp_size,
-                "infer_world_size": infer_world_size,
-                "hf_config": simple_hf_config(self._get_model().config),
-                # Preserve the inference router dtype. Falling back to bf16 for
-                # an fp32 gate changes message sizes and can wedge the transfer.
-                "router_dtype": getattr(
-                    self._get_model().config, "router_dtype", "bf16"
-                ),
-            }
-            self._infer_conf = infer_conf
-
-            if self._transfer_rank == 0:
-                self._meta_server_client.put_object("infer_conf", infer_conf)
-                self._meta_server_client.put_object(
-                    "num_infer_engines", self._num_infer_engines
-                )
-                self._meta_server_client.put_object(
-                    "infer_params_meta", self._infer_params_meta
-                )
+            self._colocate_backend.initialize(
+                meta_server_addr=meta_server_addr,
+                topology=topology,
+                infer_hf_config=simple_hf_config(model_config),
+                router_dtype=getattr(model_config, "router_dtype", "bf16"),
+                expected_num_infer_engines=num_engines,
+                publish_infer_params_meta=True,
+            )
         except Exception:
             self.teardown_weight_update_group()
             raise
@@ -735,23 +577,21 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
             "Initialized colocate reader metadata for pair=%r, transfer_rank=%d, "
             "engine_rank=%d, instance_local_rank=%d",
             pair_name,
-            transfer_rank,
-            self._engine_rank,
-            self._instance_local_rank,
+            topology.transfer_rank,
+            topology.engine_rank,
+            topology.instance_local_rank,
         )
 
     def execute_colocate_weight_update(self, version: int) -> None:
         self.wait_for_training_offloaded()
         self.resume_memory(["weights"])
         self._quiesce_scheduler_streams()
-        reader = self._ensure_reader()
-        reader.update_weights(step_id=version)
-        self._rebuild_derived_weights()
-        if self._instance_local_rank == 0:
-            if self._meta_server_client is None or self._engine_rank is None:
-                raise RuntimeError("Colocate inference metadata is not initialized")
-            self._meta_server_client.add_object_to_set(
-                "finished_weights_update_engines", self._engine_rank
+        self._colocate_backend.update_weights(version)
+        topology = self._colocate_backend.topology
+        if topology.instance_local_rank == 0:
+            self._colocate_backend.meta_server_client.add_object_to_set(
+                ColocateKeyspace.FINISHED_WEIGHT_UPDATE_ENGINES,
+                topology.engine_rank,
             )
         logger.info("Colocate weight update completed for version %d", version)
 
@@ -769,28 +609,12 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
         """Wait until every training rank has offloaded model weights."""
         if not self._colocate_initialized:
             raise RuntimeError("Colocate weight update is not initialized")
-        self._meta_server_client.wait_set_until_size(
-            "all_training_offloaded_weights",
-            self._train_world_size,
+        topology = self._colocate_backend.topology
+        self._colocate_backend.meta_server_client.wait_set_until_size(
+            ColocateKeyspace.ALL_TRAINING_OFFLOADED_WEIGHTS,
+            topology.train_world_size,
             timeout=self._colocate_timeout_s,
         )
-
-    def _rebuild_derived_weights(self) -> None:
-        """Rebuild non-parameter MLA tensors after every in-place transfer.
-
-        SGLang derives absorbed-path ``w_kc`` and ``w_vc`` tensors from model
-        parameters during ``post_load_weights`` and stores them outside
-        ``named_parameters``. A memory-saver release/resume remaps their pages,
-        while AWEX writes named parameters with in-place ``copy_`` and bypasses
-        normal model loading. Rebuild on every transfer because source weights
-        change each version.
-        """
-        post_load_weights = getattr(self._get_model(), "post_load_weights", None)
-        if post_load_weights is None:
-            return
-        post_load_weights()
-        torch.cuda.synchronize()
-        logger.info("Rebuilt derived model weights with post_load_weights()")
 
     # Tags understood by SGLang's native release/resume_memory_occupation.
     _SGLANG_MEMORY_TAGS = {"kv_cache", "weights", "cuda_graph"}

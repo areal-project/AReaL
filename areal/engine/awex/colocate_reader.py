@@ -1,232 +1,45 @@
 # SPDX-License-Identifier: Apache-2.0
-# ruff: noqa: E402, I001
 
-"""AWEX colocate weight reader (native awex worker-reader adapter).
-
-Runs inside the SGLang scheduler process. This is a thin shell around awex's
-native ``NCCLWorkerWeightsReader`` that:
-
-1. Eager-registers the inference-side metadata the train writer waits for
-   (``infer_conf`` + ``num_infer_engines``), computed via awex's own
-   ``InferParamMetaResolver._get_model_param_info`` + ``_build_params_meta``
-   (no hand-rolled name normalization or shard merging).
-2. Lazily constructs the awex ``NCCLWorkerWeightsReader`` on the first weight
-   update (it needs ``training_params_meta``, which only appears after the
-   first training step) and delegates the whole IPC-collect + StreamBatch
-   transport + writer handshake to it.
-
-Why the awex-native reader instead of a hand-rolled receiver: the community
-SGLang scheduler has no ``execute_task_in_model_worker`` driver layer, so we
-build the awex *worker* reader directly in-process. The native worker reader
-uses ``NcclColocateStreamBatchTransport`` (recursive partition), the transport
-AWEX ships -- a hand-rolled ring-shift transport deadlocks on mismatched
-train/infer pipeline layouts (e.g. train PP=4 vs infer PP=1).
-
-The plugin shell still owns the steps awex's *driver* would normally do
-(``_pre_update_weights`` wait-for-offload + resume weights, ``_resume_kvcache``
-signal-finished); see ``awex_sglang_plugin.process_awex_queue``.
-"""
+"""Legacy facade for the controller-independent SGLang colocate backend."""
 
 from __future__ import annotations
 
 from typing import Any
 
-import torch
-
-# Compatibility must run before importing AWEX model modules.
-from areal.engine.awex.sglang_compat import SingleInstanceMetaResolver
-
-from awex.meta.infer_meta_resolver import InferParamMetaResolver  # noqa: E402
-from awex.reader.nccl_reader import NCCLWorkerWeightsReader  # noqa: E402
-from awex.util.common import simple_hf_config  # noqa: E402
-from areal.utils.logging import getLogger  # noqa: E402
+from areal.engine.weight_update.awex.protocol import (
+    ColocateKeyspace,
+    ColocateTopology,
+)
+from areal.engine.weight_update.awex.sglang import (
+    SGLangColocateBackend,
+    SingleInstanceMetaResolver,
+    get_awex_infer_hf_config,
+    get_router_dtype,
+)
+from areal.utils.logging import getLogger
 
 logger = getLogger("AwexColocateReader")
 
-
-def _get_router_dtype(config):
-    """Read router dtype from a flat or multimodal Hugging Face config."""
-    router_dtype = getattr(config, "router_dtype", None)
-    if router_dtype is not None:
-        return router_dtype
-    text_config = getattr(config, "text_config", config)
-    return getattr(text_config, "router_dtype", "bf16")
-
-
-def _get_awex_infer_hf_config(model, model_runner=None):
-    """Serialize the complete runtime config for AWEX metadata exchange."""
-    # SGLang keeps only ``text_config`` on Qwen3-VL-MoE's runtime model while
-    # retaining the original composite config on ``ModelRunner.model_config``.
-    # Prefer that original config so AWEX also receives ``vision_config``.
-    model_config = getattr(model_runner, "model_config", None)
-    config = getattr(model_config, "hf_config", None)
-    if config is None:
-        config = model.config
-    serialized_config = simple_hf_config(config)
-    if not getattr(serialized_config, "architectures", None):
-        serialized_config.architectures = [type(model).__name__]
-    return serialized_config
+# Preserve the legacy helper imports while their implementation lives in the
+# controller-independent package.
+_get_awex_infer_hf_config = get_awex_infer_hf_config
+_get_router_dtype = get_router_dtype
 
 
 class AwexColocateReader:
-    """Thin adapter binding awex's native worker reader into a SGLang scheduler."""
+    """Bind v1 plugin orchestration to the shared SGLang data plane."""
 
     def __init__(self, scheduler: Any):
         self._scheduler = scheduler
-        self._meta_server_client = None
-        self._reader: NCCLWorkerWeightsReader | None = None
+        self._backend = SGLangColocateBackend(scheduler)
+        self._local_gpu_id: int | None = None
         self._released_tags: set[str] = set()
 
-        self._transfer_rank: int | None = None
-        self._local_gpu_id: int | None = None
-        self._infer_world_size: int | None = None
-        self._train_world_size: int | None = None
-        self._meta_server_addr: str | None = None
-
-        # External-instance decomposition (computed in initialize()).
-        self._infer_instance_world_size: int | None = None
-        self._num_infer_engines: int | None = None
-        self._engine_rank: int | None = None
-        self._instance_local_rank: int | None = None
-
-        # Inference-side parameters_meta for ONE engine instance, computed via
-        # awex resolver + MetaServer raw-meta exchange. Reused as the native
-        # reader's ``parameters_meta`` constructor arg.
-        self._infer_params_meta = None
-        self._infer_conf: dict | None = None
-        self._initialized = False
-
-    # ── model / context helpers ───────────────────────────────────────
-
-    def _get_model(self) -> torch.nn.Module:
-        return self._scheduler.tp_worker.model_runner.model
-
-    def _build_model_context(self) -> dict[str, Any]:
-        """awex model_context describing ONE inference engine instance.
-
-        ``world_size`` is the single-server tp*pp; ``global_rank`` is the
-        instance-local rank (= tp_rank for pp=1). The cross-server NCCL identity
-        (engine_rank / global transfer_rank) is tracked separately by the awex
-        reader. ``infer_engine_config`` (== server_args) is required by
-        ``WorkerWeightsReader.__init__`` and the backport's model_context omits
-        it, so we add it here.
-        """
-        scheduler = self._scheduler
-        server_args = scheduler.server_args
-        tp_size = int(getattr(server_args, "tp_size", 1))
-        pp_size = int(getattr(server_args, "pp_size", 1))
-        dp_size = int(getattr(server_args, "dp_size", 1))
-        tp_rank = int(getattr(scheduler, "tp_rank", 0))
-
-        if self._infer_instance_world_size is not None:
-            world_size = self._infer_instance_world_size
-            global_rank = self._instance_local_rank
-        else:
-            world_size = tp_size * pp_size
-            global_rank = tp_rank
-
-        return {
-            "scheduler": scheduler,
-            "infer_engine_config": server_args,
-            "tp_rank": tp_rank,
-            "tp_size": tp_size,
-            "pp_rank": int(getattr(scheduler, "pp_rank", 0)),
-            "pp_size": pp_size,
-            "dp_size": dp_size,
-            "world_size": world_size,
-            "global_rank": global_rank,
-            "local_rank": tp_rank,
-            "attn_tp_rank": int(getattr(scheduler, "attn_tp_rank", tp_rank)),
-            "attn_tp_size": int(getattr(scheduler, "attn_tp_size", tp_size)),
-            "attn_dp_rank": int(getattr(scheduler, "attn_dp_rank", 0)),
-        }
-
     def get_parallelism(self) -> dict:
-        ctx = self._build_model_context()
-        server_args = self._scheduler.server_args
-        return {
-            "world_size": ctx["world_size"],
-            "tp_size": int(getattr(server_args, "tp_size", ctx["tp_size"])),
-            "pp_size": int(getattr(server_args, "pp_size", ctx["pp_size"])),
-            "dp_size": int(getattr(server_args, "dp_size", ctx["dp_size"])),
-            "ep_size": int(getattr(server_args, "ep_size", 1)),
-            "num_engines": self._num_infer_engines or 1,
-        }
-
-    # ── metadata (awex-native, no hand-rolled normalization) ──────────
-
-    def _compute_local_raw_meta(self) -> dict:
-        """Per-rank raw meta via awex's own staticmethod (HF-converted names)."""
-        server_args = self._scheduler.server_args
-        model_context = self._build_model_context()
-        return InferParamMetaResolver._get_model_param_info(
-            "sglang",
-            server_args,
-            convert_params=True,
-            engine_rank=self._engine_rank or 0,
-            model=self._get_model(),
-            model_context=model_context,
-        )
-
-    def _build_instance_params_meta(self):
-        """Gather single-instance raw meta via the MetaServer, then aggregate.
-
-        Returns the awex ``parameters_meta`` (list[ParameterMeta]) for ONE
-        inference engine instance (the ``instance_world`` instance-local ranks).
-
-        We exchange per-rank raw meta through the MetaServer instead of an
-        ``all_gather`` over ``tp_cpu_group``: that group is sglang's TP
-        request-broadcast group, driven by the scheduler MainThread's
-        ``recv_requests`` -> ``broadcast_pyobj``. This method runs on the
-        plugin's background thread, so a collective on the shared group races
-        the MainThread broadcast and deadlocks (two ops in flight on one
-        non-thread-safe group). The MetaServer exchange needs no process-group
-        collective, is isolated per engine instance by ``engine_rank``, and also
-        sidesteps the ``dist.new_group`` collective-ordering trap (train + infer
-        share the default world in colocate mode).
-        """
-        local_raw = self._compute_local_raw_meta()
-
-        instance_world = self._infer_instance_world_size or 1
-        if instance_world > 1:
-            client = self._meta_server_client
-            prefix = f"infer_instance_raw_meta_{self._engine_rank}"
-            client.put_object(f"{prefix}_{self._instance_local_rank}", local_raw)
-            raw_meta_list = [
-                client.get_object(f"{prefix}_{r}", timeout=300.0)
-                for r in range(instance_world)
-            ]
-        else:
-            raw_meta_list = [local_raw]
-
-        # MetaServer serializes RankInfo to a dict on the wire (as did the
-        # legacy all_gather); rebuild the object before awex's resolver reads it.
-        from awex.sharding.rank_info import RankInfo
-
-        for info in raw_meta_list:
-            ri = info.get("rank_info")
-            if isinstance(ri, dict):
-                info["rank_info"] = RankInfo(**ri)
-
-        resolver = SingleInstanceMetaResolver(
-            self._get_model().config,
-            "sglang",
-            self._scheduler.server_args,
-            raw_meta_list,
-        )
-        return resolver.get_parameters_meta()
+        return self._backend.get_parallelism()
 
     def get_weight_metadata(self):
-        """Inference-side parameters_meta for ONE engine instance."""
-        if self._engine_rank is None:
-            raise RuntimeError(
-                "AwexColocateReader must be initialized before getting weight metadata"
-            )
-        if self._infer_params_meta is None:
-            self._infer_params_meta = self._build_instance_params_meta()
-        return self._infer_params_meta
-
-    # ── eager init: register infer_conf + num_infer_engines ───────────
+        return self._backend.get_weight_metadata()
 
     def initialize(
         self,
@@ -237,187 +50,42 @@ class AwexColocateReader:
         local_gpu_id: int,
         timeout_s: float = 300.0,
     ) -> None:
-        """Eager init: publish the metadata the train writer waits for.
-
-        Must NOT block on the training side (runs before the first training step
-        finishes). The native ``NCCLWorkerWeightsReader`` is built lazily in
-        ``update_weights`` once ``training_params_meta`` is available. Device
-        entry registration (``inference_device_rank_entries``) is left to the
-        native reader's ``_init_reader_in_colocate_mode``.
-        """
-        from awex.meta.meta_server import MetaServerClient
-
-        if infer_world_size != train_world_size:
-            raise ValueError(
-                f"Colocate mode requires equal total rank counts "
-                f"(same physical GPUs), got infer={infer_world_size} "
-                f"vs train={train_world_size}"
-            )
-
-        self._transfer_rank = transfer_rank
-        self._local_gpu_id = local_gpu_id
-        self._infer_world_size = infer_world_size
-        self._train_world_size = train_world_size
-        self._meta_server_addr = meta_server_addr
-
+        """Publish inference metadata; native reader creation stays lazy."""
+        del timeout_s
         server_args = self._scheduler.server_args
         tp_size = int(getattr(server_args, "tp_size", 1))
         pp_size = int(getattr(server_args, "pp_size", 1))
-        instance_world = max(1, tp_size * pp_size)
-        if infer_world_size % instance_world != 0:
-            raise ValueError(
-                f"infer_world_size ({infer_world_size}) must be divisible by the "
-                f"per-instance world tp*pp ({instance_world})"
-            )
-        self._infer_instance_world_size = instance_world
-        self._num_infer_engines = infer_world_size // instance_world
-        self._engine_rank = transfer_rank // instance_world
-        self._instance_local_rank = transfer_rank % instance_world
-        logger.info(
-            "AWEX instance decomposition: transfer_rank=%d -> engine_rank=%d, "
-            "instance_local_rank=%d (instance_world=%d, num_engines=%d)",
-            transfer_rank,
-            self._engine_rank,
-            self._instance_local_rank,
-            instance_world,
-            self._num_infer_engines,
+        topology = ColocateTopology(
+            transfer_rank=transfer_rank,
+            infer_world_size=infer_world_size,
+            train_world_size=train_world_size,
+            instance_world_size=max(1, tp_size * pp_size),
         )
-
-        host, port = meta_server_addr.rsplit(":", 1)
-        self._meta_server_client = MetaServerClient(host, int(port))
-
-        # Compute single-instance parameters_meta (also reused as the native
-        # reader's constructor arg later).
-        self.get_weight_metadata()
-
-        par = self.get_parallelism()
+        model = self._scheduler.tp_worker.model_runner.model
         model_runner = self._scheduler.tp_worker.model_runner
-        awex_hf_config = _get_awex_infer_hf_config(self._get_model(), model_runner)
-        infer_conf = {
-            "engine_name": "sglang",
-            "infer_atten_tp_size": par["tp_size"],
-            "infer_world_size": infer_world_size,
-            "hf_config": awex_hf_config,
-            # AWEX's native reader publishes router_dtype so the train-side
-            # converter casts mlp.gate.weight to the dtype the inference
-            # engine actually holds (fp32 for BailingMoe). Omitting it makes
-            # the converter fall back to its bf16 default: gate shards go out
-            # as 2N bytes against a 4N irecv and the transfer wedges
-            # deterministically. The wire-level dtype reconciliation below
-            # papers over any such mismatch generically, but keep the
-            # semantic path whole so new models behave identically to native
-            # awex.
-            "router_dtype": _get_router_dtype(self._get_model().config),
-        }
-        self._infer_conf = infer_conf
-
-        # Only one rank publishes the engine-instance-wide info the writer waits
-        # for. transfer_rank 0 is engine_rank 0, instance_local_rank 0.
-        if transfer_rank == 0:
-            self._meta_server_client.put_object("infer_conf", infer_conf)
-            self._meta_server_client.put_object(
-                "num_infer_engines", self._num_infer_engines
-            )
-            logger.info(
-                "Registered infer_conf + num_infer_engines=%d with MetaServer",
-                self._num_infer_engines,
-            )
-
-        self._initialized = True
+        self._backend.initialize(
+            meta_server_addr=meta_server_addr,
+            topology=topology,
+            infer_hf_config=get_awex_infer_hf_config(model, model_runner),
+            router_dtype=get_router_dtype(model.config),
+            publish_infer_params_meta=False,
+        )
+        self._local_gpu_id = local_gpu_id
         logger.info(
-            "Eager init done: transfer_rank=%d, local_gpu_id=%d, infer_world_size=%d "
-            "(native worker reader construction deferred to first update_weights)",
+            "Eager init done: transfer_rank=%d, local_gpu_id=%d, infer_world_size=%d",
             transfer_rank,
             local_gpu_id,
             infer_world_size,
         )
 
-    # ── lazy native-reader construction + weight update ───────────────
-
-    def _ensure_reader(self) -> NCCLWorkerWeightsReader:
-        if self._reader is not None:
-            return self._reader
-
-        client = self._meta_server_client
-        training_params_meta = client.get_object(
-            "training_params_meta", timeout=10000.0
-        )
-        logger.info("Got training_params_meta from MetaServer")
-
-        model_context = self._build_model_context()
-        reader = NCCLWorkerWeightsReader(
-            engine_name="sglang",
-            model=self._get_model(),
-            model_context=model_context,
-            infer_conf=self._infer_conf,
-            engine_rank=self._engine_rank,
-            num_engines=self._num_infer_engines,
-            meta_server_addr=self._meta_server_addr,
-            parameters_meta=self._infer_params_meta,
-            training_params_meta=training_params_meta,
-            enable_colocate_mode=True,
-            ipc_backend="cuda",
-            enable_debug_mode=False,
-        )
-        reader.initialize()
-        self._reader = reader
-        logger.info(
-            "Constructed native NCCLWorkerWeightsReader (transfer_rank=%d, "
-            "engine_rank=%d, num_engines=%d)",
-            reader.transfer_rank,
-            self._engine_rank,
-            self._num_infer_engines,
-        )
-        return reader
-
     def update_weights(self, version: int) -> None:
-        """Run one colocate weight update via the native awex worker reader.
-
-        The native reader internally does: IPC collect -> StreamBatch transport
-        -> put ``weights_update_finished`` -> barrier -> get_then_delete
-        ``write_finished`` -> flush_cache. The plugin only needs to wrap this
-        with the driver-equivalent wait-for-offload + resume + signal steps.
-        """
-        if not self._initialized:
-            raise RuntimeError("AwexColocateReader not initialized")
-        reader = self._ensure_reader()
-        reader.update_weights(step_id=version)
-        self._rebuild_derived_weights()
-        logger.info("Colocate weight update completed: version=%d", version)
-
-    def _rebuild_derived_weights(self) -> None:
-        """Re-derive non-parameter tensors after an in-place AWEX weight write.
-
-        Root cause: sglang's ``load_model`` ends with
-        ``post_load_weights()``, which splits each MLA layer's
-        ``kv_b_proj.weight`` into the absorbed-path tensors ``w_kc``/``w_vc``
-        — ``.contiguous()`` copies stored as plain attributes, in neither
-        ``named_parameters`` nor ``named_buffers``. The memory-saver
-        release/resume cycle remaps their pages to zeros, and the AWEX reader
-        rewrites only named parameters via in-place ``copy_`` (bypassing
-        ``model.load_weights``), so nothing ever rebuilds them: decode's
-        forward_absorb then consumes zeros and the 4 MLA layers degenerate
-        while the 28 Lightning layers stay healthy (reward 0.77 -> ~0 within
-        5 steps). Rebuild after EVERY transfer — train weights move each
-        version, so a one-time fix would go stale. ``bind_or_assign`` copies
-        into the existing tensors in place, which keeps captured CUDA-graph
-        addresses valid.
-        """
-        model = self._get_model()
-        fn = getattr(model, "post_load_weights", None)
-        if fn is None:
-            return
-        fn()
-        torch.cuda.synchronize()
-        logger.info("post_load_weights() re-derived absorbed MLA weights")
-
-    # ── memory release/resume (delegate to SGLang native) ─────────────
+        self._backend.update_weights(version)
 
     def release_memory(self, tags: list[str] | None = None) -> None:
         from sglang.srt.managers.io_struct import ReleaseMemoryOccupationReqInput
 
         tags = tags or ["kv_cache"]
-        native_tags = [t for t in tags if t not in self._released_tags]
+        native_tags = [tag for tag in tags if tag not in self._released_tags]
         if native_tags:
             req = ReleaseMemoryOccupationReqInput(tags=native_tags)
             self._scheduler.release_memory_occupation(req)
@@ -428,79 +96,58 @@ class AwexColocateReader:
         from sglang.srt.managers.io_struct import ResumeMemoryOccupationReqInput
 
         tags = tags or ["kv_cache"]
-        resume_tags = [t for t in tags if t in self._released_tags]
+        resume_tags = [tag for tag in tags if tag in self._released_tags]
         if resume_tags:
             req = ResumeMemoryOccupationReqInput(tags=resume_tags)
             self._scheduler.resume_memory_occupation(req)
             self._released_tags.difference_update(resume_tags)
         logger.info("resume_memory: tags=%s", tags)
 
-    # ── writer-coordination handshake (driver-equivalent shell steps) ──
-
     def wait_for_training_offloaded(self, version: int) -> None:
-        """Wait for the writer to offload its model weights (avoid 2x weights).
-
-        Equivalent to awex driver ``_pre_update_weights``'s wait on
-        ``all_training_offloaded_weights``.
-        """
+        """Wait for v1 writer memory handoff before receiving weights."""
+        del version
         from areal.engine.awex.colocate_writer import awex_colocate_timeout_s
 
-        self._meta_server_client.wait_set_until_size(
-            "all_training_offloaded_weights",
-            self._train_world_size,
+        topology = self._backend.topology
+        self._backend.meta_server_client.wait_set_until_size(
+            ColocateKeyspace.ALL_TRAINING_OFFLOADED_WEIGHTS,
+            topology.train_world_size,
             timeout=awex_colocate_timeout_s(),
         )
 
     def wait_for_weights_ready(
         self, version: int, timeout_s: float | None = None
     ) -> None:
-        """Block until the writer has published THIS version's IPC handles.
-
-        Used by the plugin's background thread as the per-version trigger to
-        enqueue a weight-update marker. We probe the per-version
-        ``training_serialized_weights_{ip}_{gpu}_{version}`` key with MetaServer
-        ``wait_key`` (existence-only, NO deserialization), for two reasons:
-
-        1. Per-version gating. The unversioned ``all_training_offloaded_weights``
-           set is only deleted by the writer's rank0 in ``finish_colocate_weight_update``
-           (a later phase than the engine's signal_finished), so gating on it
-           lets the background thread fire v+1 off a *stale* satisfied set while
-           the writer is still in v's finish phase. The collected v+1 IPC then
-           blocks waiting for a not-yet-published key, hogging the scheduler main
-           loop so it cannot serve rollout -> train waits on rollout -> deadlock.
-           The writer only puts the v+1 serialized key in the NEXT training cycle,
-           so gating on it cannot fire early.
-        2. No double-attach. ``get_object`` would deserialize the CUDA IPC handle
-           in the background thread, racing the worker reader's own collect inside
-           update_weights. ``wait_key`` only checks presence (``_has_key``).
-        """
+        """Wait for this physical GPU's versioned IPC payload key."""
         from awex.util.common import get_ip_address
 
         from areal.engine.awex.colocate_writer import awex_colocate_timeout_s
 
-        ip = get_ip_address()
-        key = f"training_serialized_weights_{ip}_{self._local_gpu_id}_{version}"
-        self._meta_server_client.wait_key(
-            key,
+        if self._local_gpu_id is None:
+            raise RuntimeError("AwexColocateReader is not initialized")
+        keyspace = ColocateKeyspace(get_ip_address(), self._local_gpu_id)
+        self._backend.meta_server_client.wait_key(
+            keyspace.serialized_weights(version),
             timeout=awex_colocate_timeout_s() if timeout_s is None else timeout_s,
         )
 
     def signal_finished_weights_update(self) -> None:
-        """Signal this engine finished, so the writer can resume kv_cache.
-
-        Equivalent to awex driver ``_resume_kvcache``'s add to
-        ``finished_weights_update_engines``. Only one rank per engine instance
-        (instance_local_rank == 0) signals, with its real engine_rank, so the
-        set collects exactly num_infer_engines unique entries.
-        """
-        if self._instance_local_rank != 0:
+        """Signal once per inference engine after v1 finishes an update."""
+        topology = self._backend.topology
+        if topology.instance_local_rank != 0:
             return
-        self._meta_server_client.add_object_to_set(
-            "finished_weights_update_engines", self._engine_rank
+        self._backend.meta_server_client.add_object_to_set(
+            ColocateKeyspace.FINISHED_WEIGHT_UPDATE_ENGINES,
+            topology.engine_rank,
         )
 
     def teardown(self) -> None:
-        self._reader = None
+        self._backend.teardown()
 
 
-__all__ = ["AwexColocateReader"]
+__all__ = [
+    "AwexColocateReader",
+    "SingleInstanceMetaResolver",
+    "_get_awex_infer_hf_config",
+    "_get_router_dtype",
+]

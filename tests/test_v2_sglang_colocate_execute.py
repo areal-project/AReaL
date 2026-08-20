@@ -2,6 +2,7 @@ import sys
 from types import ModuleType, SimpleNamespace
 from unittest import mock
 
+from areal.engine.weight_update.awex.protocol import ColocateTopology
 from areal.v2.weight_update.awex.sglang_adapter import AwexSGLangAdapter
 
 
@@ -19,22 +20,22 @@ def test_execute_colocate_update_resumes_weights_before_reader():
     adapter = AwexSGLangAdapter.__new__(AwexSGLangAdapter)
     adapter.wait_for_training_offloaded = lambda: events.append("wait")
     adapter.resume_memory = lambda tags: events.append(("resume", tuple(tags)))
-    adapter._rebuild_derived_weights = lambda: events.append("post_load")
-    adapter._instance_local_rank = 0
-    adapter._engine_rank = 2
-    adapter._meta_server_client = SimpleNamespace(
+    topology = ColocateTopology(
+        transfer_rank=2,
+        infer_world_size=4,
+        train_world_size=4,
+        instance_world_size=1,
+    )
+    client = SimpleNamespace(
         add_object_to_set=lambda key, value: events.append(("finished", key, value))
     )
-
-    reader = SimpleNamespace(
-        update_weights=lambda step_id: events.append(("transfer", step_id))
+    adapter._colocate_backend = SimpleNamespace(
+        topology=topology,
+        meta_server_client=client,
+        update_weights=lambda version: events.extend(
+            [("transfer", version), "post_load"]
+        ),
     )
-
-    def ensure_reader():
-        events.append("build_reader")
-        return reader
-
-    adapter._ensure_reader = ensure_reader
 
     with mock.patch("areal.v2.weight_update.awex.sglang_adapter.torch") as torch_mock:
         torch_mock.cuda.synchronize.side_effect = lambda: events.append("quiesce")
@@ -44,7 +45,6 @@ def test_execute_colocate_update_resumes_weights_before_reader():
         "wait",
         ("resume", ("weights",)),
         "quiesce",
-        "build_reader",
         ("transfer", 3),
         "post_load",
         ("finished", "finished_weights_update_engines", 2),
