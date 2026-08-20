@@ -118,12 +118,7 @@ def create_app(config: GatewayConfig) -> FastAPI:
     async def health():
         return GatewayHealthResponse(status="ok", router_addr=config.router_addr)
 
-    # =========================================================================
-    # POST /chat/completions — admin OR session key, streaming or non-streaming
-    # =========================================================================
-
-    @app.post("/chat/completions")
-    async def chat_completions(request: Request):
+    async def _forward_generation_request(request: Request, path: str) -> Response:
         token = extract_bearer_token(request)
         body = await request.body()
         headers = _forwarding_headers(dict(request.headers))
@@ -133,7 +128,7 @@ def create_app(config: GatewayConfig) -> FastAPI:
         try:
             body_json = json.loads(body)
             model_name = body_json.get("model")
-            is_streaming = body_json.get("stream", False) or False
+            is_streaming = bool(body_json.get("stream", False))
         except (json.JSONDecodeError, AttributeError):
             pass
 
@@ -141,7 +136,7 @@ def create_app(config: GatewayConfig) -> FastAPI:
             worker_addr = await query_router(
                 config.router_addr,
                 token,
-                "/chat/completions",
+                path,
                 config.router_timeout,
                 admin_api_key=config.admin_api_key,
                 model=model_name,
@@ -153,7 +148,7 @@ def create_app(config: GatewayConfig) -> FastAPI:
         if is_streaming:
             return StreamingResponse(
                 forward_sse_stream(
-                    f"{worker_addr}/chat/completions",
+                    f"{worker_addr}{path}",
                     body,
                     headers,
                     config.forward_timeout,
@@ -162,18 +157,30 @@ def create_app(config: GatewayConfig) -> FastAPI:
                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
             )
 
-        resp = await forward_request(
-            f"{worker_addr}/chat/completions",
+        response = await forward_request(
+            f"{worker_addr}{path}",
             body,
             headers,
             config.forward_timeout,
             client=_client(),
         )
         return Response(
-            content=resp.content,
-            status_code=resp.status_code,
-            media_type=resp.headers.get("content-type"),
+            content=response.content,
+            status_code=response.status_code,
+            media_type=response.headers.get("content-type"),
         )
+
+    # =========================================================================
+    # POST /chat/completions — admin OR session key, streaming or non-streaming
+    # =========================================================================
+
+    @app.post("/chat/completions")
+    async def chat_completions(request: Request):
+        return await _forward_generation_request(request, "/chat/completions")
+
+    @app.post("/v1/messages")
+    async def anthropic_messages(request: Request):
+        return await _forward_generation_request(request, "/v1/messages")
 
     @app.post("/register_model")
     async def register_model(request: Request):

@@ -18,10 +18,6 @@ from anthropic.types.message import Message
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import StreamingResponse
-from litellm.llms.anthropic.experimental_pass_through.adapters.transformation import (
-    AnthropicAdapter,
-)
-from litellm.types.utils import ModelResponse as LitellmModelResponse
 from openai.types.chat import ChatCompletion, ChatCompletionChunk
 from openai.types.chat.completion_create_params import CompletionCreateParams
 from openai.types.responses import Response
@@ -29,6 +25,11 @@ from openai.types.responses.response_create_params import ResponseCreateParams
 from pydantic import BaseModel
 
 from areal.api.cli_args import NameResolveConfig
+from areal.experimental.openai.anthropic import (
+    translate_anthropic_request,
+    translate_anthropic_response,
+    translate_anthropic_stream,
+)
 from areal.experimental.openai.client import ArealOpenAI
 from areal.infra.rpc.serialization import deserialize_value, serialize_value
 from areal.infra.utils.http import validate_admin_api_key
@@ -139,9 +140,6 @@ _trial_name: str | None = None
 _name_resolve_type: str = "nfs"
 _nfs_record_root: str = "/tmp/areal/name_resolve"
 _etcd3_addr: str = "localhost:2379"
-
-# Adapter to convert Anthropic request to OpenAI format
-_adapter = AnthropicAdapter()
 
 # =============================================================================
 # Request Validation
@@ -750,34 +748,12 @@ async def responses(
     )
 
 
-def _flatten_content_lists(messages: list[dict]) -> None:
-    """Flatten Anthropic content block lists to strings in-place."""
-    for msg in messages:
-        if isinstance(msg.get("content"), list):
-            text_parts = []
-            for block in msg["content"]:
-                if isinstance(block, dict) and block.get("type") == "text":
-                    text_parts.append(block.get("text", ""))
-                elif isinstance(block, str):
-                    text_parts.append(block)
-            msg["content"] = "\n".join(text_parts)
-
-
 def _translate_anthropic_to_openai_request(anthropic_request: dict[str, Any]) -> dict:
     """Translate an Anthropic Messages API request to OpenAI format."""
-    openai_request = _adapter.translate_completion_input_params(
-        anthropic_request.copy()
+    return translate_anthropic_request(
+        anthropic_request,
+        message_preprocessors=_message_preprocessors,
     )
-    if openai_request is None:
-        raise ValueError("Failed to translate request")
-    openai_request = dict(openai_request)
-
-    if "messages" in openai_request:
-        _flatten_content_lists(openai_request["messages"])
-        for preprocessor in _message_preprocessors:
-            openai_request["messages"] = preprocessor(openai_request["messages"])
-
-    return openai_request
 
 
 async def _safe_stream_wrapper(
@@ -869,11 +845,9 @@ async def anthropic_messages(
             )
 
             # Use LiteLLM's adapter to convert to Anthropic SSE format
-            anthropic_sse_stream = (
-                _adapter.translate_completion_output_params_streaming(
-                    completion_stream=openai_stream,
-                    model=anthropic_request.get("model", "default"),
-                )
+            anthropic_sse_stream = translate_anthropic_stream(
+                openai_stream,
+                model=anthropic_request.get("model", "default"),
             )
 
             # Wrap the stream to handle client disconnection gracefully
@@ -906,21 +880,7 @@ async def anthropic_messages(
 
     # Convert OpenAI response to Anthropic format using LiteLLM's adapter
     try:
-        # Convert ChatCompletion to LitellmModelResponse
-        openai_response_dict = openai_response.model_dump()
-        model_response = LitellmModelResponse(**openai_response_dict)
-        anthropic_response = _adapter.translate_completion_output_params(model_response)
-        if anthropic_response is None:
-            raise ValueError("Failed to translate response")
-
-        # LiteLLM returns Pydantic BaseModel objects in content list,
-        # Convert them to dict.
-        if "content" in anthropic_response and anthropic_response["content"]:
-            anthropic_response["content"] = [
-                block.model_dump() if hasattr(block, "model_dump") else block
-                for block in anthropic_response["content"]
-            ]
-        return Message(**anthropic_response)
+        return translate_anthropic_response(openai_response)
     except Exception as e:
         logger.error(f"Failed to convert OpenAI response to Anthropic format: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to convert response: {e}")

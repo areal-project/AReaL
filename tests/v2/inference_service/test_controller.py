@@ -416,6 +416,11 @@ class TestRolloutControllerV2Construction:
             agent=AgentConfig(
                 agent_cls_path="tests.experimental.openai.utils.SimpleAgent",
                 set_reward_finish_timeout=7.5,
+                message_preprocessors=[
+                    "examples.swe.preprocessors.StripAnthropicBillingHeader",
+                    "examples.swe.preprocessors.StripAllSystemReminders",
+                ],
+                prefix_matcher="examples.swe.prefix_matchers.swe_prefix_matcher",
             ),
             scheduling_spec=(
                 SchedulingSpec(
@@ -457,6 +462,15 @@ class TestRolloutControllerV2Construction:
         assert "--callback-server-addr" in data_proxy_cmd
         assert "http://127.0.0.1:19000" in data_proxy_cmd
         assert ("--deterministic-sampling" in data_proxy_cmd) is deterministic_sampling
+        assert data_proxy_cmd.count("--message-preprocessor") == 2
+        first = data_proxy_cmd.index("--message-preprocessor")
+        second = data_proxy_cmd.index("--message-preprocessor", first + 1)
+        assert data_proxy_cmd[first + 1].endswith("StripAnthropicBillingHeader")
+        assert data_proxy_cmd[second + 1].endswith("StripAllSystemReminders")
+        matcher = data_proxy_cmd.index("--prefix-matcher")
+        assert data_proxy_cmd[matcher + 1] == (
+            "examples.swe.prefix_matchers.swe_prefix_matcher"
+        )
 
 
 class TestOnlineCallbackFlow:

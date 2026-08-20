@@ -159,6 +159,13 @@ def session_headers(api_key: str):
     return {"Authorization": f"Bearer {api_key}"}
 
 
+def anthropic_headers(api_key: str):
+    return {
+        "x-api-key": api_key,
+        "anthropic-version": "2023-06-01",
+    }
+
+
 # =============================================================================
 # SessionStore unit tests
 # =============================================================================
@@ -296,6 +303,28 @@ class TestSessionStore:
         assert online_session1 is online_session2
         assert online_session1.session_id == "__hitl__"
 
+    def test_prefix_matcher_is_preserved_when_active_cache_rotates(self):
+        from examples.swe.prefix_matchers import swe_prefix_matcher
+
+        from areal.experimental.openai.types import InteractionWithTokenLogpReward
+
+        store = SessionStore(prefix_matcher=swe_prefix_matcher)
+        session_id, _ = store.start_session("task-prefix")
+        session = store.get_session(session_id)
+        assert isinstance(session, SessionData)
+        assert session.active_completions._prefix_matcher is swe_prefix_matcher
+
+        interaction = InteractionWithTokenLogpReward(
+            messages=[{"role": "user", "content": "hi"}],
+        )
+        interaction.interaction_id = "interaction-1"
+        interaction.output_message_list = [{"role": "assistant", "content": "hello"}]
+        session.active_completions["interaction-1"] = interaction
+
+        session.set_reward("interaction-1", 1.0)
+
+        assert session.active_completions._prefix_matcher is swe_prefix_matcher
+
     def test_online_session_count(self):
         store = SessionStore()
         store.set_admin_key(ADMIN_KEY)
@@ -331,6 +360,120 @@ async def test_start_session_without_admin_key(client):
         json={"task_id": "test-task"},
     )
     assert resp.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_anthropic_messages_applies_preprocessors_and_uses_session_cache(
+    config,
+    mock_areal_client,
+):
+    from examples.swe.prefix_matchers import swe_prefix_matcher
+
+    cc_config = DataProxyConfig(
+        **{
+            **config.__dict__,
+            "message_preprocessors": (
+                "examples.swe.preprocessors.StripAnthropicBillingHeader",
+                "examples.swe.preprocessors.StripAllSystemReminders",
+            ),
+            "prefix_matcher": "examples.swe.prefix_matchers.swe_prefix_matcher",
+        }
+    )
+    app = create_app(cc_config)
+    store = SessionStore(prefix_matcher=swe_prefix_matcher)
+    store.set_admin_key(cc_config.admin_api_key)
+    store.set_capacity(1)
+    app.state.session_store = store
+    app.state.areal_client = mock_areal_client
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        start = await c.post(
+            "/rl/start_session",
+            json={"task_id": "cc-task"},
+            headers=admin_headers(),
+        )
+        session_key = start.json()["sessions"][0]["session_api_key"]
+        response = await c.post(
+            "/v1/messages",
+            json={
+                "model": "claude-compatible",
+                "max_tokens": 64,
+                "system": (
+                    "x-anthropic-billing-header: volatile\n"
+                    "stable<system-reminder>volatile</system-reminder>"
+                ),
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [{"type": "text", "text": "hello"}],
+                    }
+                ],
+            },
+            headers=anthropic_headers(session_key),
+        )
+
+    assert response.status_code == 200
+    assert response.json()["type"] == "message"
+    call_kwargs = mock_areal_client.chat.completions.create.await_args.kwargs
+    messages = call_kwargs["messages"]
+    serialized_messages = str(messages)
+    assert "x-anthropic-billing-header" not in serialized_messages
+    assert "system-reminder" not in serialized_messages
+    assert "stable" in serialized_messages
+
+    session = store.get_session_by_api_key(session_key)
+    assert session is not None
+    assert session.active_completions._prefix_matcher is swe_prefix_matcher
+    assert len(session.active_completions) == 1
+
+
+@pytest.mark.asyncio
+async def test_anthropic_messages_streams_translated_events(
+    config,
+    mock_areal_client,
+    monkeypatch,
+):
+    app = create_app(config)
+    store = SessionStore()
+    store.set_admin_key(config.admin_api_key)
+    store.set_capacity(1)
+    app.state.session_store = store
+    app.state.areal_client = mock_areal_client
+
+    async def _translated_stream():
+        yield "event: message_start\ndata: {}\n\n"
+        yield "event: message_stop\ndata: {}\n\n"
+
+    monkeypatch.setattr(
+        "areal.v2.inference_service.data_proxy.app.translate_anthropic_stream",
+        lambda _stream, model: _translated_stream(),
+    )
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        start = await c.post(
+            "/rl/start_session",
+            json={"task_id": "cc-stream"},
+            headers=admin_headers(),
+        )
+        session_key = start.json()["sessions"][0]["session_api_key"]
+        response = await c.post(
+            "/v1/messages",
+            json={
+                "model": "claude-compatible",
+                "max_tokens": 64,
+                "stream": True,
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+            headers=anthropic_headers(session_key),
+        )
+
+    assert response.status_code == 200
+    assert "text/event-stream" in response.headers["content-type"]
+    assert "event: message_start" in response.text
+    assert "event: message_stop" in response.text
+    assert mock_areal_client.chat.completions.create.await_args.kwargs["stream"] is True
 
 
 @pytest.mark.asyncio

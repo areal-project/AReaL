@@ -6,10 +6,12 @@ import asyncio
 import hmac
 import json
 import uuid
+from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from typing import Any
 
 import httpx
+from anthropic.types.message import Message
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.wsgi import WSGIMiddleware
 from fastapi.responses import Response as RawResponse
@@ -17,6 +19,12 @@ from fastapi.responses import StreamingResponse
 from flask import Flask
 from pydantic import BaseModel
 
+from areal.experimental.openai.anthropic import (
+    MessagePreprocessor,
+    translate_anthropic_request,
+    translate_anthropic_response,
+    translate_anthropic_stream,
+)
 from areal.experimental.openai.client import ArealOpenAI
 from areal.experimental.openai.types import (
     InteractionWithTokenLogpReward,
@@ -30,6 +38,7 @@ from areal.infra.rpc.serialization import serialize_value
 from areal.infra.utils.http import create_httpx_client
 from areal.utils import logging
 from areal.utils.data import concat_padded_tensors
+from areal.utils.dynamic_import import import_from_string
 from areal.utils.seeding import derive_deterministic_seed
 from areal.v2.inference_service.data_proxy.config import DataProxyConfig
 from areal.v2.inference_service.data_proxy.pause import PauseState
@@ -52,6 +61,16 @@ from areal.v2.inference_service.sglang.bridge import SGLangBridgeBackend
 from areal.v2.inference_service.vllm.bridge import VLLMBridgeBackend
 
 logger = logging.getLogger("InferenceDataProxy")
+
+
+async def _safe_stream_wrapper(stream: AsyncGenerator[Any, None]):
+    """Close an upstream stream when forwarding ends or the client disconnects."""
+    try:
+        async for chunk in stream:
+            yield chunk
+    finally:
+        if hasattr(stream, "aclose"):
+            await stream.aclose()
 
 
 # =============================================================================
@@ -110,16 +129,22 @@ class ConfigureBackendResponse(BaseModel):
 
 
 def _extract_bearer_token(request: Request) -> str:
-    """Extract API token from Authorization header.
+    """Extract API token from an OpenAI or Anthropic authentication header.
 
     Raises HTTPException(401) if missing or malformed.
     """
     auth_header = request.headers.get("authorization", "")
     if auth_header.lower().startswith("bearer "):
         return auth_header[7:].strip()
+    x_api_key = request.headers.get("x-api-key", "")
+    if x_api_key:
+        return x_api_key
     raise HTTPException(
         status_code=401,
-        detail="Missing or malformed Authorization header. Expected 'Bearer <token>'.",
+        detail=(
+            "Missing or malformed authentication header. Expected "
+            "'Bearer <token>' or 'x-api-key: <token>'."
+        ),
     )
 
 
@@ -132,7 +157,7 @@ def _require_admin_key(request: Request, store: SessionStore) -> str:
 
 
 def _require_session_key(request: Request, store: SessionStore) -> str:
-    """Resolve session_id from the session API key in the Authorization header."""
+    """Resolve session_id from an OpenAI or Anthropic session API key."""
     token = _extract_bearer_token(request)
     session = store.get_session_by_api_key(token)
     if session is None:
@@ -146,7 +171,7 @@ def _resolve_session_from_token(
     token: str | None,
     store: SessionStore,
 ) -> SessionData | None:
-    """Resolve a session from the bearer token.
+    """Resolve a session from an API token.
 
     Session key → lookup by API key.
     Admin key → persistent HITL session.
@@ -162,7 +187,7 @@ def _resolve_session_from_token(
 
 
 def _try_extract_bearer_token(request: Request) -> str | None:
-    """Extract bearer token if present. Returns None if missing/malformed.
+    """Extract an OpenAI or Anthropic token if present.
 
     Unlike _extract_bearer_token, this never raises — it's for endpoints
     that accept requests with or without auth.
@@ -170,6 +195,9 @@ def _try_extract_bearer_token(request: Request) -> str | None:
     auth_header = request.headers.get("authorization", "")
     if auth_header.lower().startswith("bearer "):
         return auth_header[7:].strip()
+    x_api_key = request.headers.get("x-api-key", "")
+    if x_api_key:
+        return x_api_key
     return None
 
 
@@ -317,6 +345,17 @@ async def _ready_trajectory_loop(app: FastAPI) -> None:
 def create_app(config: DataProxyConfig) -> FastAPI:
     """Factory that creates the FastAPI app with lifespan-managed resources."""
 
+    message_preprocessors: list[MessagePreprocessor] = []
+    for path in config.message_preprocessors:
+        preprocessor_cls = import_from_string(path)
+        message_preprocessors.append(preprocessor_cls())
+        logger.info("Loaded message preprocessor: %s", path)
+
+    prefix_matcher = None
+    if config.prefix_matcher:
+        prefix_matcher = import_from_string(config.prefix_matcher)
+        logger.info("Loaded prefix matcher: %s", config.prefix_matcher)
+
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         logger.info(
@@ -330,6 +369,7 @@ def create_app(config: DataProxyConfig) -> FastAPI:
         app.state.config = config
         app.state.session_store = SessionStore(
             set_reward_finish_timeout=config.set_reward_finish_timeout,
+            prefix_matcher=prefix_matcher,
         )
         app.state.session_store.set_admin_key(config.admin_api_key)
         app.state.version = 0
@@ -363,6 +403,47 @@ def create_app(config: DataProxyConfig) -> FastAPI:
 
     app = FastAPI(title="AReaL Data Proxy", lifespan=lifespan)
     _registered_models: dict[str, dict[str, str | None]] = {}
+
+    async def _create_internal_chat_result(
+        body_json: dict[str, Any],
+        session: SessionData | None,
+    ) -> tuple[Any, bool]:
+        areal_client: ArealOpenAI | None = app.state.areal_client
+        if areal_client is None:
+            raise HTTPException(status_code=503, detail="Inference backend unavailable")
+
+        kwargs = dict(body_json)
+        kwargs.pop("model", None)
+        is_streaming = bool(kwargs.get("stream", False))
+        kwargs.setdefault("temperature", 1.0)
+        kwargs.setdefault("top_p", 1.0)
+        areal_cache = session.active_completions if session is not None else None
+
+        deterministic_sampling = session is not None and config.deterministic_sampling
+        request_index = (
+            session.next_sampling_request_index() if deterministic_sampling else None
+        )
+        if deterministic_sampling and kwargs.get("seed") is None:
+            assert session is not None
+            assert request_index is not None
+            kwargs["seed"] = derive_deterministic_seed(
+                session.sampling_seed_identity,
+                request_index,
+            )
+
+        try:
+            result = await areal_client.chat.completions.create(
+                areal_cache=areal_cache,
+                **kwargs,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(
+                status_code=500,
+                detail=f"{type(exc).__name__}: {exc}",
+            ) from exc
+        return result, is_streaming
 
     # =========================================================================
     # Health
@@ -518,7 +599,7 @@ def create_app(config: DataProxyConfig) -> FastAPI:
     # =========================================================================
     # Chat completions — OpenAI-compatible
     #
-    # If the bearer token is a known session key, use session cache.
+    # If the API token is a known session key, use session cache.
     # Otherwise (no token, admin key, unknown key) → standalone mode.
     # Data proxy never rejects requests on /chat/completions.
     # =========================================================================
@@ -645,52 +726,7 @@ def create_app(config: DataProxyConfig) -> FastAPI:
         # -----------------------------------------------------------------
         # Internal model path: use AReaL inference server
         # -----------------------------------------------------------------
-        areal_client: ArealOpenAI = app.state.areal_client
-
-        if session is not None:
-            areal_cache: Any = session.active_completions
-        else:
-            areal_cache = None
-
-        # Build kwargs from request body
-        kwargs = dict(body_json)
-        # Remove model (ArealOpenAI ignores it)
-        kwargs.pop("model", None)
-
-        # Determine streaming
-        is_streaming = kwargs.get("stream", False) or False
-
-        # Apply defaults for temperature/top_p if not set
-        if "temperature" not in kwargs:
-            kwargs["temperature"] = 1.0
-        if "top_p" not in kwargs:
-            kwargs["top_p"] = 1.0
-
-        deterministic_sampling = (
-            session is not None and app.state.config.deterministic_sampling
-        )
-        request_index = (
-            session.next_sampling_request_index() if deterministic_sampling else None
-        )
-        if deterministic_sampling and kwargs.get("seed") is None:
-            assert session is not None
-            assert request_index is not None
-            kwargs["seed"] = derive_deterministic_seed(
-                session.sampling_seed_identity,
-                request_index,
-            )
-
-        create_fn: Any = areal_client.chat.completions.create
-
-        try:
-            result = await create_fn(
-                areal_cache=areal_cache,
-                **kwargs,
-            )
-        except ValueError as e:
-            raise HTTPException(status_code=500, detail=str(e))
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
+        result, is_streaming = await _create_internal_chat_result(body_json, session)
 
         if is_streaming:
             # result is an async generator of ChatCompletionChunk
@@ -711,6 +747,74 @@ def create_app(config: DataProxyConfig) -> FastAPI:
             )
 
         return result
+
+    @app.post("/v1/messages", response_model=None)
+    async def anthropic_messages(request: Request) -> Message | StreamingResponse:
+        """Serve Anthropic Messages API requests for session-backed agent rollouts."""
+        store: SessionStore = app.state.session_store
+        token = _try_extract_bearer_token(request)
+        session = _resolve_session_from_token(token, store)
+        if session is None:
+            raise HTTPException(status_code=401, detail="Invalid session key")
+        session.update_last_access()
+
+        try:
+            anthropic_request = await request.json()
+            openai_request = translate_anthropic_request(
+                anthropic_request,
+                message_preprocessors=message_preprocessors,
+            )
+        except (ValueError, TypeError, KeyError) as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid Anthropic request format: {exc}",
+            ) from exc
+        except Exception as exc:
+            logger.error(
+                "Unexpected Anthropic request conversion failure: %s",
+                exc,
+                exc_info=True,
+            )
+            raise HTTPException(
+                status_code=500,
+                detail="Internal server error during request conversion.",
+            ) from exc
+
+        result, is_streaming = await _create_internal_chat_result(
+            openai_request,
+            session,
+        )
+        model = str(anthropic_request.get("model", "default"))
+
+        if is_streaming:
+            try:
+                anthropic_stream = translate_anthropic_stream(result, model=model)
+                return StreamingResponse(
+                    _safe_stream_wrapper(anthropic_stream),
+                    media_type="text/event-stream",
+                    headers={
+                        "Cache-Control": "no-cache",
+                        "Connection": "keep-alive",
+                        "X-Accel-Buffering": "no",
+                    },
+                )
+            except Exception as exc:
+                if hasattr(result, "aclose"):
+                    await result.aclose()
+                logger.error("Anthropic streaming setup failed: %s", exc)
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Streaming setup failed: {exc}",
+                ) from exc
+
+        try:
+            return translate_anthropic_response(result)
+        except Exception as exc:
+            logger.error("Anthropic response conversion failed: %s", exc)
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to convert response: {exc}",
+            ) from exc
 
     @app.post("/register_model", response_model=RegisterModelResponse)
     async def register_model(request: Request):

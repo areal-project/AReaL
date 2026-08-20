@@ -27,3 +27,5 @@ class DataProxyConfig:
     reasoning_parser: str = "qwen3"
     engine_max_tokens: int | None = None
     chat_template_type: str = "hf"
+    message_preprocessors: tuple[str, ...] = ()
+    prefix_matcher: str | None = None
