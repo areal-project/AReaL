@@ -906,7 +906,9 @@ class MegatronEngine(TrainEngine):
             self._init_weight_update_from_distributed(meta)
             self.weight_update_group_initialized = True
         elif meta.type == "awex":
-            from areal.engine.awex.colocate_writer import AwexMegatronAdapter
+            from areal.engine.weight_update.awex.v1_megatron_adapter import (
+                AwexMegatronAdapter,
+            )
 
             if self._awex_adapter is None:
                 self._awex_adapter = AwexMegatronAdapter(self)
@@ -1514,7 +1516,9 @@ class MegatronEngine(TrainEngine):
         and causes OOM on resume when SGLang occupies GPU memory).
         """
         if self._awex_adapter is None:
-            from areal.engine.awex.colocate_writer import AwexMegatronAdapter
+            from areal.engine.weight_update.awex.v1_megatron_adapter import (
+                AwexMegatronAdapter,
+            )
 
             self._awex_adapter = AwexMegatronAdapter(self)
             self.logger.info("Created AWEX adapter for memory management")

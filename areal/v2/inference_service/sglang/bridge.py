@@ -140,8 +140,44 @@ class SGLangBridgeBackend:
     def get_resume_request(self) -> HttpRequest:
         return HttpRequest(endpoint="/continue_generation", payload={})
 
-    def get_offload_request(self) -> HttpRequest:
-        return HttpRequest(endpoint="/release_memory_occupation", payload={})
+    def get_abort_all_request(self) -> HttpRequest:
+        return HttpRequest(endpoint="/abort_request", payload={"abort_all": True})
+
+    def get_load_request(self) -> HttpRequest:
+        return HttpRequest(endpoint="/v1/loads?include=core", payload={}, method="GET")
+
+    @staticmethod
+    def parse_in_flight(body: Any) -> int:
+        """Requests still queued or running, summed over data-parallel ranks.
+
+        Returns a positive count when the payload cannot be read, so a shape
+        change degrades into "still busy" rather than releasing GPU memory
+        underneath live requests.
+        """
+        if isinstance(body, dict):
+            entries = body.get("loads")
+            if entries is None:
+                entries = [body]
+        elif isinstance(body, list):
+            entries = body
+        else:
+            entries = None
+        if not entries:
+            return 1
+        total = 0
+        for entry in entries:
+            if not isinstance(entry, dict):
+                return 1
+            running = entry.get("num_running_reqs", entry.get("total_running_reqs"))
+            waiting = entry.get("num_waiting_reqs", entry.get("total_waiting_reqs"))
+            if running is None and waiting is None:
+                return 1
+            total += int(running or 0) + int(waiting or 0)
+        return total
+
+    def get_offload_request(self, tags: list[str] | None = None) -> HttpRequest:
+        payload = {"tags": tags} if tags is not None else {}
+        return HttpRequest(endpoint="/release_memory_occupation", payload=payload)
 
     def get_onload_request(self, tags: list[str] | None = None) -> HttpRequest:
         payload = {"tags": tags} if tags is not None else {}

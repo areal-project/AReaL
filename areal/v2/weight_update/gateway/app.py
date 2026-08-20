@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import asyncio
 import os
-import socket
 import time
 from contextlib import asynccontextmanager
 from typing import Any
@@ -13,9 +12,9 @@ from fastapi import FastAPI, Request  # pyright: ignore[reportMissingImports]
 from fastapi.responses import JSONResponse  # pyright: ignore[reportMissingImports]
 from pydantic import BaseModel  # pyright: ignore[reportMissingImports]
 
+from areal.infra.scheduler.colocation import colocated_gpu_rank_key
 from areal.infra.utils.http import async_http_retry
 from areal.utils import logging
-from areal.utils.network import find_free_ports
 from areal.v2.weight_update.gateway.auth import require_admin_key
 from areal.v2.weight_update.gateway.config import (
     PairInfo,
@@ -61,6 +60,7 @@ class KVSetAddBody(BaseModel):
 
 class HealthResponse(BaseModel):
     status: str = "healthy"
+    meta_server: str | None = None
 
 
 class ConnectResponse(BaseModel):
@@ -122,13 +122,57 @@ async def _post(
         resp.raise_for_status()
 
 
-def _get_own_ip() -> str:
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-            sock.connect(("8.8.8.8", 80))
-            return sock.getsockname()[0]
-    except Exception:
-        return "127.0.0.1"
+async def _post_once(
+    session: aiohttp.ClientSession,
+    url: str,
+    timeout_s: float,
+    json_data: Any = None,
+) -> None:
+    timeout = aiohttp.ClientTimeout(total=timeout_s)
+    async with session.post(url, json=json_data, timeout=timeout) as resp:
+        resp.raise_for_status()
+
+
+async def _initialize_awex_liveness(
+    session: aiohttp.ClientSession,
+    worker_urls: list[str],
+    timeout_s: float,
+    world_size: int,
+) -> None:
+    """Run the distributed liveness collective exactly once per worker."""
+    await asyncio.gather(
+        *[
+            _post_once(
+                session,
+                f"{url}/awex/batch_isend_irecv",
+                timeout_s,
+                json_data={"world_size": world_size},
+            )
+            for url in worker_urls
+        ]
+    )
+
+
+def _ensure_meta_server(app: FastAPI) -> str:
+    """Lazily start the awex MetaServer subprocess and return its address.
+
+    The MetaServer runs as a daemon subprocess (multiprocessing spawn
+    context) next to the gateway, so it dies automatically when the
+    gateway exits. It is spawned lazily — only when a colocate pair
+    needs it — so non-colocate deployments never pay the cost or
+    require awex to be importable.
+    """
+    if getattr(app.state, "meta_server_addr", ""):
+        return app.state.meta_server_addr
+
+    from awex.meta.meta_server import (  # pyright: ignore[reportMissingImports]
+        start_meta_server,
+    )
+
+    host, port = start_meta_server()
+    app.state.meta_server_addr = f"{host}:{port}"
+    logger.info("Started awex MetaServer at %s", app.state.meta_server_addr)
+    return app.state.meta_server_addr
 
 
 def _merge_training_meta_by_name(meta_list: list[dict]) -> list[dict]:
@@ -184,13 +228,16 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
     app.state.kv_store = kv_store
     app.state.registry = registry
     app.state.config = config
+    # Set by _ensure_meta_server on first colocate connect; empty until then.
+    app.state.meta_server_addr = ""
+    app.state.colocate_pair_name = ""
 
     def _auth(request: Request) -> None:
         require_admin_key(request, config.admin_api_key)
 
     @app.get("/health")
     async def health() -> HealthResponse:
-        return HealthResponse()
+        return HealthResponse(meta_server=app.state.meta_server_addr or None)
 
     @app.post("/connect")
     async def connect(request: Request, body: ConnectRequest) -> ConnectResponse:
@@ -200,6 +247,45 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
         inference_urls = body.inference_worker_urls
 
         if body.colocate:
+            if body.mode != "awex":
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": "colocate=True requires mode='awex'"},
+                )
+            if body.use_lora:
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": "AWEX colocation does not support LoRA weights"},
+                )
+            active_pair = request.app.state.colocate_pair_name
+            if active_pair:
+                existing = registry.get_by_name(pair_name)
+                if active_pair == pair_name and existing is not None:
+                    if (
+                        existing.colocate
+                        and existing.mode == "awex"
+                        and existing.train_worker_urls == train_urls
+                        and existing.inference_worker_urls == inference_urls
+                    ):
+                        return ConnectResponse(pair_name=pair_name)
+                    return JSONResponse(
+                        status_code=409,
+                        content={
+                            "error": (
+                                "An active colocate pair with this name uses "
+                                "different worker endpoints"
+                            )
+                        },
+                    )
+                return JSONResponse(
+                    status_code=409,
+                    content={
+                        "error": (
+                            "The AWEX MetaServer supports one colocate session per "
+                            f"gateway lifetime; existing pair is {active_pair!r}"
+                        )
+                    },
+                )
             return await _connect_colocate(
                 request, pair_name, train_urls, inference_urls
             )
@@ -368,16 +454,12 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
             )
         await asyncio.gather(*init_tasks)
 
-        liveness_tasks = [
-            _post(
-                session,
-                f"{url}/awex/batch_isend_irecv",
-                init_timeout_s,
-                json_data={"world_size": total_world_size},
-            )
-            for url in inference_urls + train_urls
-        ]
-        await asyncio.gather(*liveness_tasks)
+        await _initialize_awex_liveness(
+            session,
+            inference_urls + train_urls,
+            init_timeout_s,
+            total_world_size,
+        )
 
         pair_info = PairInfo(
             pair_name=pair_name,
@@ -402,92 +484,217 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
         session = request.app.state.http_session
         init_timeout_s = config.init_timeout_s
 
-        train_par, infer_par = await asyncio.gather(
-            _get_json(
-                session,
-                f"{train_urls[0]}/awex/report_parallelism",
-                init_timeout_s,
-            ),
-            _get_json(
-                session,
-                f"{inference_urls[0]}/awex/report_parallelism",
-                init_timeout_s,
-            ),
-        )
-
-        train_world_size = train_par["world_size"]
-        num_engines = len(inference_urls)
-        # report_parallelism returns per-instance world_size (e.g. TP size).
-        # The total inference world for colocate NCCL groups spans all engines.
-        infer_world_size = infer_par["world_size"] * num_engines
-
-        train_meta_resps, infer_meta_resps = await asyncio.gather(
+        train_parallelism, infer_parallelism = await asyncio.gather(
             asyncio.gather(
                 *[
-                    _post_json(
-                        session, f"{url}/awex/report_weight_meta", init_timeout_s
+                    _get_json(
+                        session,
+                        f"{url}/awex/report_parallelism?include_device=1",
+                        init_timeout_s,
                     )
                     for url in train_urls
                 ]
             ),
             asyncio.gather(
                 *[
-                    _post_json(
-                        session, f"{url}/awex/report_weight_meta", init_timeout_s
+                    _get_json(
+                        session,
+                        f"{url}/awex/report_parallelism?include_device=1",
+                        init_timeout_s,
                     )
                     for url in inference_urls
                 ]
             ),
         )
 
-        training_params_meta = []
-        for result in train_meta_resps:
-            meta = result.get("result", result.get("meta", result))
-            if isinstance(meta, list):
-                training_params_meta.extend(meta)
-            else:
-                training_params_meta.append(meta)
-        training_params_meta = _merge_training_meta_by_name(training_params_meta)
+        def _index_workers_by_device(
+            urls: list[str], reports: list[dict]
+        ) -> tuple[dict[tuple[str, int], str], list[dict[str, Any]]]:
+            urls_by_device: dict[tuple[str, int], list[str]] = {}
+            for url, report in zip(urls, reports, strict=True):
+                device = (str(report["ip"]), int(report["device_id"]))
+                urls_by_device.setdefault(device, []).append(url)
 
-        infer_params_meta = []
-        for result in infer_meta_resps:
-            meta = result.get("result", result.get("meta", result))
-            if isinstance(meta, list):
-                infer_params_meta.extend(meta)
-            else:
-                infer_params_meta.append(meta)
+            duplicates = [
+                {"ip": ip, "device_id": device_id, "urls": device_urls}
+                for (ip, device_id), device_urls in sorted(urls_by_device.items())
+                if len(device_urls) > 1
+            ]
+            return (
+                {
+                    device: device_urls[0]
+                    for device, device_urls in urls_by_device.items()
+                },
+                duplicates,
+            )
 
-        kv_store.put(pair_name, "training_params_meta", training_params_meta)
-        kv_store.put(pair_name, "infer_params_meta", infer_params_meta)
+        def _expand_inference_coverage(
+            urls: list[str], reports: list[dict]
+        ) -> tuple[dict[tuple[str, int], tuple[str, int, int]], list[dict[str, Any]]]:
+            # One inference URL fronts tp_size*pp_size scheduler processes, one
+            # per GPU, but its report carries only rank-0's device id. Expand to
+            # per-GPU coverage assuming the contiguous node-local assignment
+            # used when the servers were forked (base_gpu_id ordering). Each
+            # device maps to (url, engine_base_offset=local rank within the
+            # server, instance_world).
+            coverage: dict[tuple[str, int], list[tuple[str, int, int]]] = {}
+            for url, report in zip(urls, reports, strict=True):
+                ip = str(report["ip"])
+                base_dev = int(report["device_id"])
+                instance_world = max(
+                    1,
+                    int(report.get("tp_size", 1)) * int(report.get("pp_size", 1)),
+                )
+                for local in range(instance_world):
+                    coverage.setdefault((ip, base_dev + local), []).append(
+                        (url, local, instance_world)
+                    )
+            duplicates = [
+                {"ip": ip, "device_id": dev, "urls": [c[0] for c in covers]}
+                for (ip, dev), covers in sorted(coverage.items())
+                if len(covers) > 1
+            ]
+            return (
+                {device: covers[0] for device, covers in coverage.items()},
+                duplicates,
+            )
 
-        gateway_addr = (
-            _get_own_ip() if config.host in ("0.0.0.0", "::") else config.host
+        train_by_device, train_duplicates = _index_workers_by_device(
+            train_urls, train_parallelism
         )
-        kv_store_url = f"http://{gateway_addr}:{config.gateway_port}"
+        infer_by_device, infer_duplicates = _expand_inference_coverage(
+            inference_urls, infer_parallelism
+        )
+        if train_duplicates or infer_duplicates:
+            return JSONResponse(
+                status_code=422,
+                content={
+                    "error": "Duplicate colocate workers reported the same device",
+                    "duplicates": {
+                        "training": train_duplicates,
+                        "inference": infer_duplicates,
+                    },
+                },
+            )
 
-        [master_port] = find_free_ports(1)
+        train_devices = set(train_by_device)
+        infer_devices = set(infer_by_device)
+        if train_devices != infer_devices:
 
+            def _device_rows(devices: set[tuple[str, int]]) -> list[dict[str, Any]]:
+                return [
+                    {"ip": ip, "device_id": device_id}
+                    for ip, device_id in sorted(devices)
+                ]
+
+            return JSONResponse(
+                status_code=422,
+                content={
+                    "error": "Colocate workers must have exactly matching devices",
+                    "unmatched": {
+                        "training": _device_rows(train_devices - infer_devices),
+                        "inference": _device_rows(infer_devices - train_devices),
+                    },
+                },
+            )
+
+        # Physical device pairing prevents URL ordering from crossing CUDA IPC peers.
+        # AWEX pairs training replica (engine_rank % num_train_replicas) with each
+        # engine, so engine index parity decides which DP replica feeds an engine.
+        # Ordering engines node-major puts same-node engines in adjacent indices,
+        # which hands them different replicas and sends half the weights across the
+        # network. Keying on (base_gpu, ip) instead makes the node the fast-varying
+        # dimension, so same-node engines share a parity and a DP replica.
+        def _device_sort_key(device: tuple[str, int]) -> tuple[int, str, int]:
+            ip, device_id = device
+            _url, local, _iw = infer_by_device[device]
+            return colocated_gpu_rank_key(ip, device_id, local)
+
+        paired_devices = sorted(train_devices, key=_device_sort_key)
+        paired_world_size = len(paired_devices)
+        train_world_size = paired_world_size
+        infer_world_size = paired_world_size
+        num_engines = len(inference_urls)
+
+        # Engine-major rank layout: rank of (server e, local k) is
+        # e*instance_world + k. Servers are ordered by the same primary key as
+        # paired_devices above (base_gpu, then ip) so the two orders cannot
+        # drift apart; the check below fails loudly if per-server GPU coverage
+        # is not contiguous, rather than corrupting the IPC pairing.
+        server_base: dict[str, tuple[int, int]] = {}
+        server_infos = list(
+            {
+                (str(r["ip"]), int(r["device_id"]), url, iw)
+                for url, r, iw in (
+                    (
+                        u,
+                        rep,
+                        max(
+                            1,
+                            int(rep.get("tp_size", 1)) * int(rep.get("pp_size", 1)),
+                        ),
+                    )
+                    for u, rep in zip(inference_urls, infer_parallelism, strict=True)
+                )
+            }
+        )
+        server_infos = sorted(
+            server_infos,
+            key=lambda entry: (
+                *colocated_gpu_rank_key(entry[0], entry[1], 0),
+                entry[2],
+            ),
+        )
+        next_base = 0
+        for _ip, _dev, url, iw in server_infos:
+            server_base[url] = (next_base, iw)
+            next_base += iw
+
+        pairing_table = []
+        for rank, (ip, device_id) in enumerate(paired_devices):
+            infer_url, infer_local, _iw = infer_by_device[(ip, device_id)]
+            base_rank, _ = server_base[infer_url]
+            if base_rank + infer_local != rank:
+                return JSONResponse(
+                    status_code=422,
+                    content={
+                        "error": (
+                            "Inference server GPU coverage is not contiguous in "
+                            "(base_gpu, ip) order; colocate rank layout would "
+                            "be inconsistent"
+                        ),
+                        "device": {"ip": ip, "device_id": device_id},
+                        "expected_rank": base_rank + infer_local,
+                        "sorted_rank": rank,
+                    },
+                )
+            pairing_table.append(
+                {
+                    "ip": ip,
+                    "device_id": device_id,
+                    "train_url": train_by_device[(ip, device_id)],
+                    "infer_url": infer_url,
+                    # The N-rank offset is the awex colocate donor/reader convention.
+                    "train_rank": paired_world_size + rank,
+                    "infer_rank": rank,
+                }
+            )
+
+        meta_server_addr = _ensure_meta_server(request.app)
         init_payload_base = {
             "pair_name": pair_name,
-            "kv_store_url": kv_store_url,
+            "meta_server_addr": meta_server_addr,
             "infer_world_size": infer_world_size,
             "train_world_size": train_world_size,
             "num_engines": num_engines,
-            "master_port": master_port,
-            "admin_api_key": config.admin_api_key,
+            "timeout_s": config.update_timeout_s,
         }
 
         init_tasks = []
-        for i, url in enumerate(inference_urls):
-            init_tasks.append(
-                _post(
-                    session,
-                    f"{url}/awex/init_colocate_weight_update",
-                    init_timeout_s,
-                    json_data={**init_payload_base, "transfer_rank": i},
-                )
-            )
-        for i, url in enumerate(train_urls):
+        # Inference init goes once per SERVER with its engine-base rank: the
+        # request is broadcast to every scheduler process behind the URL, and
+        # each derives its own rank as base + its tp/pp local rank.
+        for url, (base_rank, _iw) in server_base.items():
             init_tasks.append(
                 _post(
                     session,
@@ -495,7 +702,19 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
                     init_timeout_s,
                     json_data={
                         **init_payload_base,
-                        "transfer_rank": infer_world_size + i,
+                        "transfer_rank": base_rank,
+                    },
+                )
+            )
+        for pair in pairing_table:
+            init_tasks.append(
+                _post(
+                    session,
+                    f"{pair['train_url']}/awex/init_colocate_weight_update",
+                    init_timeout_s,
+                    json_data={
+                        **init_payload_base,
+                        "transfer_rank": pair["train_rank"],
                     },
                 )
             )
@@ -510,94 +729,57 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
             colocate=True,
         )
         registry.register(pair_info)
+        request.app.state.colocate_pair_name = pair_name
 
-        logger.info("Connected colocate pair '%s'", pair_name)
+        for pair in pairing_table:
+            logger.info(
+                "[colocate-pairing] (ip=%s, gpu=%s): infer_rank=%s <- train_rank=%s",
+                pair["ip"],
+                pair["device_id"],
+                pair["infer_rank"],
+                pair["train_rank"],
+            )
+        logger.info(
+            "Connected colocate pair '%s' (%d device pairs, meta_server=%s)",
+            pair_name,
+            len(pairing_table),
+            meta_server_addr,
+        )
         return ConnectResponse(pair_name=pair_name)
 
-    async def _colocate_transfer_weights(
+    async def _colocate_execute_weight_update(
         pair_info: PairInfo,
         version: int,
         session: aiohttp.ClientSession,
         timeout_s: float,
     ) -> None:
-        await asyncio.gather(
-            *[
-                _post(
-                    session,
-                    f"{url}/awex/release_memory",
-                    timeout_s,
-                    json_data={"tags": ["optimizer"]},
-                )
-                for url in pair_info.train_worker_urls
-            ]
+        # Each adapter's execute_colocate_weight_update is self-contained:
+        # both sides coordinate memory release/resume and the CUDA IPC
+        # handoff among themselves via the MetaServer, and only return 200
+        # once their side of the update has completed. The gateway just
+        # dispatches to everyone concurrently, exactly like the awex
+        # separation path. Single-shot POST: reader/writer NCCL group init
+        # is not reentrant, so a blind HTTP retry would fail with
+        # "group name has already been created".
+        logger.info(
+            "[colocate-update] v%d: dispatching execute to %d train + %d "
+            "inference workers",
+            version,
+            len(pair_info.train_worker_urls),
+            len(pair_info.inference_worker_urls),
         )
-
         await asyncio.gather(
             *[
-                _post(
-                    session,
-                    f"{url}/awex/resume_memory",
-                    timeout_s,
-                    json_data={"tags": ["weights"]},
-                )
-                for url in pair_info.inference_worker_urls
-            ]
-        )
-
-        await asyncio.gather(
-            *[
-                _post(
+                _post_once(
                     session,
                     f"{url}/awex/execute_colocate_weight_update",
                     timeout_s,
                     json_data={"version": version},
                 )
-                for url in pair_info.train_worker_urls
-            ],
-            *[
-                _post(
-                    session,
-                    f"{url}/awex/execute_colocate_weight_update",
-                    timeout_s,
-                    json_data={"version": version},
-                )
-                for url in pair_info.inference_worker_urls
-            ],
-        )
-
-        await asyncio.gather(
-            *[
-                _post(
-                    session,
-                    f"{url}/awex/release_memory",
-                    timeout_s,
-                    json_data={"tags": ["weights"]},
-                )
-                for url in pair_info.train_worker_urls
+                for url in pair_info.train_worker_urls + pair_info.inference_worker_urls
             ]
         )
-
-        await asyncio.gather(
-            *[
-                _post(
-                    session,
-                    f"{url}/awex/resume_memory",
-                    timeout_s,
-                    json_data={"tags": ["kv_cache"]},
-                )
-                for url in pair_info.inference_worker_urls
-            ]
-        )
-
-        # Flush colocate KV keys for this version to prevent accumulation
-        infer_world_size = pair_info.inference_world_size
-        train_world_size = pair_info.train_world_size
-        for i in range(train_world_size):
-            transfer_rank = infer_world_size + i
-            weight_key = f"colocate_weights_rank{transfer_rank}_{version}"
-            done_key = f"colocate_done_rank{transfer_rank}_{version}"
-            kv_store.delete(pair_info.pair_name, weight_key)
-            kv_store.delete(pair_info.pair_name, done_key)
+        logger.info("[colocate-update] v%d: all workers completed", version)
 
     async def _awex_transfer_weights(
         pair_info: PairInfo,
@@ -607,7 +789,7 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
     ) -> None:
         await asyncio.gather(
             *[
-                _post(
+                _post_once(
                     session,
                     f"{url}/awex/update_weights",
                     timeout_s,
@@ -720,7 +902,7 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
 
         try:
             if pair_info.colocate:
-                await _colocate_transfer_weights(
+                await _colocate_execute_weight_update(
                     pair_info, body.version, session, timeout_s
                 )
             elif pair_info.mode == "disk":

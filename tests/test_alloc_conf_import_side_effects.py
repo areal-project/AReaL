@@ -55,7 +55,7 @@ class TestNoImportTimeAllocConfRewrite:
 class TestSglangPluginRejectsExpandableSegments:
     def test_import_fails_loudly_when_expandable_segments_is_enabled(self):
         result = _run(
-            "import areal.engine.awex.sglang_plugin",
+            "import areal.engine.weight_update.awex.v1_sglang_plugin",
             {"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"},
         )
 
@@ -64,7 +64,7 @@ class TestSglangPluginRejectsExpandableSegments:
 
     def test_import_is_allowed_without_expandable_segments(self):
         result = _run(
-            "import areal.engine.awex.sglang_plugin",
+            "import areal.engine.weight_update.awex.v1_sglang_plugin",
             {"PYTORCH_CUDA_ALLOC_CONF": "max_split_size_mb:128"},
         )
 

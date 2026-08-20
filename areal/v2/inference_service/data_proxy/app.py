@@ -398,6 +398,21 @@ def create_app(config: DataProxyConfig) -> FastAPI:
         await inf_bridge.pause()
         return PauseGenerationResponse(status="ok", paused=True)
 
+    @app.get("/in_flight")
+    async def in_flight():
+        inf_bridge: InfBridge | None = app.state.inf_bridge
+        if inf_bridge is None:
+            return {"in_flight": 0}
+        return {"in_flight": await inf_bridge.in_flight()}
+
+    @app.post("/abort_all")
+    async def abort_all():
+        inf_bridge: InfBridge | None = app.state.inf_bridge
+        if inf_bridge is None:
+            return {"status": "ok"}
+        await inf_bridge.abort_all()
+        return {"status": "ok"}
+
     @app.post("/continue_generation", response_model=PauseGenerationResponse)
     async def continue_generation():
         inf_bridge: InfBridge | None = app.state.inf_bridge
@@ -410,14 +425,16 @@ def create_app(config: DataProxyConfig) -> FastAPI:
         return PauseGenerationResponse(status="ok", paused=False)
 
     @app.post("/release_memory_occupation")
-    async def release_memory_occupation():
+    async def release_memory_occupation(request: Request):
         inf_bridge: InfBridge | None = app.state.inf_bridge
         if inf_bridge is None:
             raise HTTPException(
                 status_code=503,
                 detail="No inference backend configured (external model mode).",
             )
-        await inf_bridge.offload()
+        body = await request.json() if await request.body() else {}
+        tags = body.get("tags")
+        await inf_bridge.offload(tags=tags)
         return {"status": "ok"}
 
     @app.post("/resume_memory_occupation")

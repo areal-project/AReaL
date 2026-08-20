@@ -79,6 +79,18 @@ class AwexSchedulerBridge:
             self._adapter = AwexSGLangAdapter(self._scheduler)
         return self._adapter
 
+    def _require_colocate_adapter(self) -> Any:
+        from areal.v2.weight_update.inference_adapter import (
+            AwexColocateInferenceAdapter,
+        )
+
+        adapter = self._require_adapter()
+        if not isinstance(adapter, AwexColocateInferenceAdapter):
+            raise NotImplementedError(
+                f"{type(adapter).__name__} does not support AWEX colocation"
+            )
+        return adapter
+
     def _push_result(self, result: Any) -> None:
         if self._result_push is not None:
             self._result_push.send_pyobj(result)
@@ -99,8 +111,15 @@ class AwexSchedulerBridge:
         else:
             self._push_result(serialize_value(local_meta))
 
-    def awex_report_parallelism(self) -> None:
-        self._push_result(self._require_adapter().parallelism_strategy)
+    def awex_report_parallelism(self, include_device: bool = False) -> None:
+        result = dict(self._require_adapter().parallelism_strategy)
+        if include_device:
+            from areal.utils.network import gethostip
+            from areal.v2.weight_update.awex import resolve_physical_gpu_id
+
+            result["ip"] = gethostip()
+            result["device_id"] = resolve_physical_gpu_id(strict=True)
+        self._push_result(result)
 
     def awex_init_weights_update_group(self, **kwargs: Any) -> None:
         self._require_adapter().init_weight_update_group(**kwargs)
@@ -122,16 +141,16 @@ class AwexSchedulerBridge:
         self._require_adapter().randomize_parameters()
 
     def awex_init_colocate_weight_update(self, **kwargs: Any) -> None:
-        self._require_adapter().init_colocate_weight_update(**kwargs)
+        self._require_colocate_adapter().init_colocate_weight_update(**kwargs)
 
     def awex_execute_colocate_weight_update(self, version: int = 0) -> None:
-        self._require_adapter().execute_colocate_weight_update(version)
+        self._require_colocate_adapter().execute_colocate_weight_update(version)
 
     def awex_release_memory(self, tags: list[str] | None = None) -> None:
-        self._require_adapter().release_memory(tags)
+        self._require_colocate_adapter().release_memory(tags)
 
     def awex_resume_memory(self, tags: list[str] | None = None) -> None:
-        self._require_adapter().resume_memory(tags)
+        self._require_colocate_adapter().resume_memory(tags)
 
 
 # ---------------------------------------------------------------------------

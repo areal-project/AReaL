@@ -24,6 +24,11 @@ from areal.api.cli_args import (
 )
 from areal.infra.platforms import current_platform
 from areal.infra.rpc.serialization import deserialize_value, serialize_value
+from areal.infra.scheduler.colocation import (
+    canonical_colocated_gpu_slots,
+    colocated_train_guard_fork_env,
+    is_v2_training_guard_colocation,
+)
 from areal.infra.scheduler.exceptions import (
     EngineCallError,
     EngineCreationError,
@@ -175,6 +180,7 @@ class LocalScheduler(Scheduler):
 
         # Colocation tracking: colocated roles reuse workers from target role
         self._colocated_roles: dict[str, str] = {}  # colocated_role -> target_role
+        self._v2_guard_parents: dict[str, list[WorkerInfo]] = {}
 
         logger.info(
             f"LocalScheduler initialized with GPU devices: {self.gpu_devices}, "
@@ -309,6 +315,8 @@ class LocalScheduler(Scheduler):
         target_wi: WorkerInfo,
         target_role: str,
         command: str | None = None,
+        env: dict[str, str] | None = None,
+        gpu_devices: list[int] | None = None,
     ) -> WorkerInfo:
         """Fork a single worker asynchronously.
 
@@ -373,6 +381,8 @@ class LocalScheduler(Scheduler):
                 "worker_index": idx,
                 "raw_cmd": raw_cmd,
             }
+            if env:
+                payload["env"] = env
             async with session.post(
                 f"{guard_url}/fork",
                 json=payload,
@@ -439,10 +449,12 @@ class LocalScheduler(Scheduler):
             worker=worker,
             process=None,  # Managed by parent worker
             role=role,
-            gpu_devices=target_wi.gpu_devices,  # Inherited from target
+            gpu_devices=(
+                list(gpu_devices) if gpu_devices is not None else target_wi.gpu_devices
+            ),
             created_at=time.time(),
             log_file=str(self.log_dir / f"{role}.log"),
-            env_vars=target_wi.env_vars.copy(),  # Inherited from target
+            env_vars={**target_wi.env_vars, **(env or {})},
         )
 
     async def _kill_forked_worker(
@@ -480,10 +492,11 @@ class LocalScheduler(Scheduler):
         role: str,
         target_role: str,
         workers: list[WorkerInfo],
+        parent_workers: list[WorkerInfo] | None = None,
     ) -> None:
         """Cleanup forked workers by calling kill endpoint on parent workers."""
-        target_workers = self._workers.get(target_role, [])
-        if not target_workers:
+        cleanup_parents = parent_workers or self._workers.get(target_role, [])
+        if not cleanup_parents:
             logger.warning(
                 f"Cannot cleanup forked workers: target role '{target_role}' not found"
             )
@@ -497,10 +510,13 @@ class LocalScheduler(Scheduler):
             tasks = []
             for worker_info in workers:
                 worker_index = int(worker_info.worker.id.split("/")[-1])
-                if worker_index < len(target_workers):
+                if worker_index < len(cleanup_parents):
                     tasks.append(
                         self._kill_forked_worker(
-                            session, role, worker_index, target_workers[worker_index]
+                            session,
+                            role,
+                            worker_index,
+                            cleanup_parents[worker_index],
                         )
                     )
             await asyncio.gather(*tasks, return_exceptions=True)
@@ -511,6 +527,8 @@ class LocalScheduler(Scheduler):
         target_role: str,
         target_workers: list[WorkerInfo],
         command: str | None = None,
+        env_vars: list[dict[str, str]] | None = None,
+        gpu_devices: list[list[int]] | None = None,
     ) -> list[str]:
         """Create forked workers concurrently using async requests.
 
@@ -528,7 +546,14 @@ class LocalScheduler(Scheduler):
             # Launch all fork requests concurrently with exception handling
             tasks = [
                 self._fork_single_worker(
-                    session, role, idx, target_wi, target_role, command
+                    session,
+                    role,
+                    idx,
+                    target_wi,
+                    target_role,
+                    command,
+                    env_vars[idx] if env_vars else None,
+                    gpu_devices[idx] if gpu_devices else None,
                 )
                 for idx, target_wi in enumerate(target_workers)
             ]
@@ -554,7 +579,9 @@ class LocalScheduler(Scheduler):
                 )
                 # Kill the forked processes via parent RPC servers
                 try:
-                    await self._cleanup_forked_workers_async(role, target_role, workers)
+                    await self._cleanup_forked_workers_async(
+                        role, target_role, workers, target_workers
+                    )
                 except Exception as cleanup_error:
                     logger.error(f"Failed to cleanup forked workers: {cleanup_error}")
 
@@ -671,10 +698,110 @@ class LocalScheduler(Scheduler):
         strategy = job.scheduling_strategy
         strategy_type = SchedulingStrategyType(strategy.type)
         colocate_role = strategy.target
+        is_v2_guard_colocation = is_v2_training_guard_colocation(
+            role, strategy, schedulings[0].cmd
+        )
         logger.info(
             f"Creating {num_workers} workers for role '{role}' "
             f"(strategy: {strategy_type}, colocate_with: {colocate_role})"
         )
+
+        if is_v2_guard_colocation:
+            if not colocate_role:
+                raise WorkerCreationError(
+                    role,
+                    "Invalid strategy",
+                    "Colocation strategy requires target role to be specified",
+                )
+
+            target_candidates = [
+                f"{colocate_role}-inf",
+                f"{colocate_role}-guard",
+                colocate_role,
+            ]
+            target_role = None
+            wait_deadline = time.monotonic() + 600.0
+            while time.monotonic() < wait_deadline:
+                target_role = next(
+                    (
+                        candidate
+                        for candidate in target_candidates
+                        if candidate in self._workers
+                    ),
+                    None,
+                )
+                if target_role is not None:
+                    break
+                logger.info(
+                    "v2 guard colocation: waiting for target role "
+                    f"(one of {target_candidates}) to register workers..."
+                )
+                time.sleep(1.0)
+            if target_role is None:
+                raise WorkerNotFoundError(
+                    f"Cannot colocate v2 guards with role '{colocate_role}' - "
+                    f"none of {target_candidates} appeared within 600s"
+                )
+
+            self.get_workers(role=target_role, timeout=600.0)
+            target_workers = self._workers[target_role]
+            target_groups = [
+                (worker.worker.ip, [str(device) for device in worker.gpu_devices])
+                for worker in target_workers
+            ]
+            try:
+                target_slots = canonical_colocated_gpu_slots(target_groups)
+            except ValueError as exc:
+                raise WorkerCreationError(
+                    role, "Invalid colocation topology", str(exc)
+                ) from exc
+
+            allocated_devices = {slot.device_id for slot in target_slots}
+            if len(target_slots) != num_workers or allocated_devices != set(
+                self.gpu_devices
+            ):
+                raise WorkerCreationError(
+                    role,
+                    "Invalid colocation topology",
+                    "V2 guard colocation requires a full-node target allocation "
+                    "with one training guard per GPU",
+                )
+
+            command = schedulings[0].cmd
+            command_parts = shlex.split(command) if command else []
+            module = command_parts[command_parts.index("-m") + 1]
+            base_env = dict(schedulings[0].env_vars or {})
+            parent_workers = [target_workers[slot.group_index] for slot in target_slots]
+            fork_envs = [
+                colocated_train_guard_fork_env(base_env, slot.device_id)
+                for slot in target_slots
+            ]
+            child_gpus = [[slot.device_id] for slot in target_slots]
+
+            self._v2_guard_parents[role] = parent_workers
+            try:
+                return run_async_task(
+                    self._create_forked_workers_async,
+                    role,
+                    target_role,
+                    parent_workers,
+                    module,
+                    fork_envs,
+                    child_gpus,
+                )
+            except Exception:
+                created_workers = self._workers.pop(role, [])
+                if created_workers:
+                    run_async_task(
+                        self._cleanup_forked_workers_async,
+                        role,
+                        target_role,
+                        created_workers,
+                        parent_workers,
+                    )
+                self._colocated_roles.pop(role, None)
+                self._v2_guard_parents.pop(role, None)
+                raise
 
         # Handle colocation: reuse existing workers from target role
         if strategy_type == SchedulingStrategyType.colocation:
@@ -1115,6 +1242,15 @@ class LocalScheduler(Scheduler):
             if role in self._workers:
                 logger.info(f"Removing forked role '{role}' (managed by parent worker)")
                 workers = self._workers[role]
+                parent_workers = self._v2_guard_parents.pop(role, None)
+                if parent_workers is not None:
+                    run_async_task(
+                        self._cleanup_forked_workers_async,
+                        role,
+                        self._colocated_roles[role],
+                        workers,
+                        parent_workers,
+                    )
                 if reverse_order:
                     workers = list(reversed(workers))
                 self._cleanup_workers(
@@ -1124,6 +1260,7 @@ class LocalScheduler(Scheduler):
             else:
                 # Colocated roles don't have their own workers
                 logger.info(f"Removing colocated role '{role}' mapping")
+                self._v2_guard_parents.pop(role, None)
             del self._colocated_roles[role]
             return
 

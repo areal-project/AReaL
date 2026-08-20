@@ -8,6 +8,8 @@ from __future__ import annotations
 import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
+
 from areal.api.cli_args import InferenceEngineConfig, SchedulingSpec
 from areal.v2.inference_service.controller.controller import (
     RolloutControllerV2,
@@ -95,6 +97,18 @@ class TestControllerSetVersion:
         for call in mock_post.call_args_list:
             assert call.args[1] == "/set_version"
             assert call.args[2] == {"version": 10}
+
+    def test_colocate_set_version_fails_if_any_worker_fails(self):
+        ctrl = _make_controller(gateway_addr="http://gateway:8000")
+        ctrl.awex_colocate = True
+        ctrl._data_proxy_addrs = ["http://dp0:8000", "http://dp1:8000"]
+
+        mock_post = AsyncMock(side_effect=[None, RuntimeError("unreachable")])
+        with (
+            patch.object(ctrl, "_async_data_proxy_post", mock_post),
+            pytest.raises(RuntimeError, match="1/2"),
+        ):
+            asyncio.run(ctrl._async_set_version(10))
 
 
 # =============================================================================

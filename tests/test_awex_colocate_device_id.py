@@ -1,4 +1,6 @@
-from areal.engine.awex.colocate_writer import resolve_physical_gpu_id
+from areal.engine.weight_update.awex.v1_megatron_adapter import (
+    resolve_physical_gpu_id,
+)
 
 
 def test_physical_gpu_id_maps_through_visible_devices(monkeypatch):

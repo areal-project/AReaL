@@ -1,13 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
-import gc
 import os
-import threading
-import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
-import httpx
 import torch
 import torch.distributed as dist
 from awex.meta.weight_meta import (
@@ -19,15 +15,14 @@ from awex.sharding.param_sharding import ShardingType
 from awex.sharding.rank_info import RankInfo
 from awex.transfer.nccl_comm import batch_send_recv, nccl_build_send_ops
 from awex.transfer.transfer_plan import TransferPlan, TransferPlanBuilder
-from awex.util.tensor_util import (
-    cuda_ipc_serialize,
-    group_tensors_by_shape_and_dtype,
-)
 
+from areal.engine.weight_update.awex.colocate_megatron import MegatronColocateBackend
+from areal.engine.weight_update.awex.colocate_protocol import ColocateKeyspace
 from areal.utils import logging
 from areal.v2.weight_update.awex import (
     awex_wu_use_group,
     fetch_kv_metadata,
+    resolve_physical_gpu_id,
 )
 from areal.v2.weight_update.nccl_group import (
     init_weights_update_group,
@@ -63,13 +58,47 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
         self._weights_update_group = None
         self._weights_update_group_gloo = None
         self._transfer_rank: int | None = None
-        self._offloaded_optimizer_states: dict = {}
-        self._offloaded_weights: dict[str, torch.Tensor] = {}
-        self._released_tags: set[str] = set()
-        self._colocate_lock = threading.Lock()
-        self._colocate_admin_api_key: str = "areal-admin-key"
-        self._colocate_http_client: httpx.Client | None = None
-        self._colocate_timeout_s: float = 120.0
+        self._colocate_backend = MegatronColocateBackend(
+            engine,
+            physical_gpu_id_resolver=lambda: resolve_physical_gpu_id(strict=True),
+            normalize_infer_hf_config=True,
+            allow_hdo_optimizer_offload=False,
+        )
+        self._offloaded_weights = self._colocate_backend.offloaded_weights
+        self._released_tags = self._colocate_backend.released_tags
+        self._meta_server_client = None
+        self._weight_converter = None
+        self._initialized = False
+        self._rank_info: RankInfo | None = None
+        self._ip_address: str | None = None
+        self._physical_gpu_id: int | None = None
+        self._infer_world_size: int | None = None
+        self._num_infer_engines: int | None = None
+        self._logical_train_rank: int | None = None
+        self._active_mode: Literal["separation", "colocate"] | None = None
+        self._init_fingerprint: tuple | None = None
+        self._timeout_s = 300.0
+
+    def _is_init_retry(
+        self, mode: Literal["separation", "colocate"], fingerprint: tuple
+    ) -> bool:
+        if self._active_mode is None:
+            return False
+        if self._active_mode == mode and self._init_fingerprint == fingerprint:
+            return True
+        else:
+            raise RuntimeError(
+                f"AWEX adapter is already initialized for {self._active_mode} mode"
+            )
+
+    def enable_colocate_memory_management(self) -> None:
+        """Route Megatron memory lifecycle hooks through this adapter."""
+        current = getattr(self._engine, "_awex_adapter", None)
+        if current not in (None, self):
+            raise RuntimeError(
+                "MegatronEngine already has a different AWEX colocate adapter"
+            )
+        self._engine._awex_adapter = self
 
     @property
     def parallelism_strategy(self) -> dict:
@@ -163,37 +192,54 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
         train_world_size: int,
         num_engines: int,
     ) -> None:
-        self._transfer_rank = transfer_rank
+        fingerprint = (
+            pair_name,
+            master_addr,
+            master_port,
+            transfer_rank,
+            world_size,
+            kv_store_url,
+            infer_world_size,
+            train_world_size,
+            num_engines,
+        )
+        if self._is_init_retry("separation", fingerprint):
+            return
+        try:
+            self._transfer_rank = transfer_rank
+            infer_meta, train_meta = fetch_kv_metadata(kv_store_url, pair_name)
+            builder = TransferPlanBuilder(
+                infer_world_size=infer_world_size,
+                train_world_size=train_world_size,
+                num_infer_engines=num_engines,
+            )
+            self._transfer_plan = builder.build_local_transfer_plan(
+                infer_meta, train_meta, global_transfer_rank=transfer_rank
+            )
 
-        infer_meta, train_meta = fetch_kv_metadata(kv_store_url, pair_name)
-
-        builder = TransferPlanBuilder(
-            infer_world_size=infer_world_size,
-            train_world_size=train_world_size,
-            num_infer_engines=num_engines,
-        )
-        self._transfer_plan = builder.build_local_transfer_plan(
-            infer_meta, train_meta, global_transfer_rank=transfer_rank
-        )
-
-        os.environ["TORCHELASTIC_USE_AGENT_STORE"] = str(False)
-        self._weights_update_group = init_weights_update_group(
-            master_address=master_addr,
-            master_port=master_port,
-            rank=transfer_rank,
-            world_size=world_size,
-            group_name=f"awex_{pair_name}",
-            role="training",
-        )
-        self._weights_update_group_gloo = init_weights_update_group(
-            master_address=master_addr,
-            master_port=master_port,
-            rank=transfer_rank,
-            world_size=world_size,
-            group_name=f"awex_{pair_name}_gloo",
-            backend="gloo",
-            role="training",
-        )
+            os.environ["TORCHELASTIC_USE_AGENT_STORE"] = str(False)
+            self._weights_update_group = init_weights_update_group(
+                master_address=master_addr,
+                master_port=master_port,
+                rank=transfer_rank,
+                world_size=world_size,
+                group_name=f"awex_{pair_name}",
+                role="training",
+            )
+            self._weights_update_group_gloo = init_weights_update_group(
+                master_address=master_addr,
+                master_port=master_port,
+                rank=transfer_rank,
+                world_size=world_size,
+                group_name=f"awex_{pair_name}_gloo",
+                backend="gloo",
+                role="training",
+            )
+        except Exception:
+            self.teardown_weight_update_group()
+            raise
+        self._active_mode = "separation"
+        self._init_fingerprint = fingerprint
         logger.info(
             "Initialized AWEX weight update groups for pair=%s role=training "
             "rank=%s world_size=%s nccl=awex_%s gloo=awex_%s_gloo",
@@ -253,9 +299,9 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
         self._weights_update_group_gloo = None
         self._transfer_plan = None
         self._transfer_rank = None
-        if self._colocate_http_client is not None:
-            self._colocate_http_client.close()
-            self._colocate_http_client = None
+        if self._active_mode == "separation":
+            self._active_mode = None
+            self._init_fingerprint = None
 
     def _build_rank_info(self) -> RankInfo:
         from megatron.core import parallel_state as mpu
@@ -343,245 +389,173 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
 
     def init_colocate_weight_update(
         self,
+        *,
         pair_name: str,
-        kv_store_url: str,
+        meta_server_addr: str,
         transfer_rank: int,
         infer_world_size: int,
         train_world_size: int,
         num_engines: int,
-        master_port: int,
-        admin_api_key: str = "areal-admin-key",
-        timeout_s: float = 120.0,
+        timeout_s: float,
     ) -> None:
-        self._colocate_pair_name = pair_name
-        self._colocate_kv_store_url = kv_store_url
-        self._colocate_transfer_rank = transfer_rank
-        self._colocate_infer_world_size = infer_world_size
-        self._colocate_admin_api_key = admin_api_key
-        self._colocate_timeout_s = timeout_s
-        if self._colocate_http_client is None:
-            self._colocate_http_client = httpx.Client()
-        logger.info(
-            "Initialized colocate weight update for pair '%s', transfer_rank=%d",
+        """Connect to the colocate MetaServer."""
+        from awex.meta.meta_server import MetaServerClient
+
+        actual_train_world_size = dist.get_world_size(group=self._engine.cpu_group)
+        if train_world_size != actual_train_world_size:
+            raise ValueError(
+                "Colocate training world size mismatch: "
+                f"gateway={train_world_size}, local={actual_train_world_size}"
+            )
+        if infer_world_size != train_world_size:
+            raise ValueError(
+                "Colocate mode requires equal inference and training rank counts; "
+                f"got infer={infer_world_size}, train={train_world_size}"
+            )
+        if num_engines <= 0:
+            raise ValueError(f"num_engines must be positive, got {num_engines}")
+
+        fingerprint = (
             pair_name,
+            meta_server_addr,
             transfer_rank,
+            infer_world_size,
+            train_world_size,
+            num_engines,
+            timeout_s,
         )
+        if self._is_init_retry("colocate", fingerprint):
+            return
+        try:
+            host, port = meta_server_addr.rsplit(":", 1)
+            self._meta_server_client = MetaServerClient(host, int(port))
+            self._timeout_s = timeout_s
+            self._colocate_backend.configure(
+                meta_server_client=self._meta_server_client,
+                timeout_s=timeout_s,
+            )
+            self.enable_colocate_memory_management()
 
-    def execute_colocate_weight_update(self, version: int) -> None:
-        with self._colocate_lock:
-            self._execute_colocate_weight_update_locked(version)
-
-    def _execute_colocate_weight_update_locked(self, version: int) -> None:
-        kv_store_url = self._colocate_kv_store_url
-        pair_name = self._colocate_pair_name
-        transfer_rank = self._colocate_transfer_rank
-        assert self._colocate_http_client is not None, (
-            "init_colocate_weight_update must be called first"
-        )
-        client = self._colocate_http_client
-        auth_headers = {"Authorization": f"Bearer {self._colocate_admin_api_key}"}
-        timeout_s = self._colocate_timeout_s
-
-        weights_offloaded = "weights" in self._released_tags
-        if weights_offloaded:
-            self.resume_memory(tags=["weights"])
-
-        params = self.get_local_shard_parameters()
-        tensors = list(params.values())
-        names = list(params.keys())
-
-        group_tensors, metadata = group_tensors_by_shape_and_dtype(tensors)
-        torch.cuda.synchronize()
-
-        del tensors
-
-        group_shared = [t.share_memory_() for t in group_tensors]
-        serialized_weights = cuda_ipc_serialize((group_shared, metadata, names))
-        torch.cuda.synchronize()
-
-        kv_key = f"colocate_weights_rank{transfer_rank}_{version}"
-
-        client.put(
-            f"{kv_store_url}/weight_meta/{pair_name}/{kv_key}",
-            json={"value": serialized_weights.hex()},
-            headers=auth_headers,
-            timeout=timeout_s,
-        )
-
+            if dist.get_rank(group=self._engine.cpu_group) == 0:
+                self._meta_server_client.put_object(
+                    ColocateKeyspace.AWEX_TRAIN_INFO,
+                    {"train_world_size": dist.get_world_size(self._engine.cpu_group)},
+                )
+        except Exception:
+            self._rollback_colocate_init()
+            raise
+        self._active_mode = "colocate"
+        self._init_fingerprint = fingerprint
         logger.info(
-            "Serialized %d params (%d groups) for colocate transfer v%d, rank %d",
-            len(names),
-            len(group_shared),
-            version,
+            "Initialized colocate weight update for pair %r at %s, transfer_rank=%d",
+            pair_name,
+            meta_server_addr,
             transfer_rank,
         )
 
-        done_key = f"colocate_done_rank{transfer_rank}_{version}"
-        deadline = time.monotonic() + timeout_s
-        poll_count = 0
-        last_status = -1
-        while time.monotonic() < deadline:
-            resp = client.get(
-                f"{kv_store_url}/weight_meta/{pair_name}/{done_key}",
-                timeout=5.0,
-            )
-            last_status = resp.status_code
-            if resp.status_code == 200:
-                break
-            poll_count += 1
-            time.sleep(0.1)
-        else:
-            raise TimeoutError(
-                f"Inference did not signal completion within {timeout_s}s "
-                f"(waiting_key={done_key}, put_key={kv_key}, "
-                f"polls={poll_count}, last_status={last_status})"
+    def _rollback_colocate_init(self) -> None:
+        """Reset session state while preserving already-offloaded train memory."""
+        if getattr(self._engine, "_awex_adapter", None) is self:
+            self._engine._awex_adapter = None
+        self._colocate_backend.reset_session()
+        self._meta_server_client = None
+        self._weight_converter = None
+        self._initialized = False
+        self._rank_info = None
+        self._ip_address = None
+        self._physical_gpu_id = None
+        self._infer_world_size = None
+        self._num_infer_engines = None
+        self._logical_train_rank = None
+        self._active_mode = None
+        self._init_fingerprint = None
+        self._timeout_s = 300.0
+
+    def teardown_colocate_weight_update(self) -> None:
+        """Clear colocate state before the training engine is destroyed."""
+        self._rollback_colocate_init()
+        self._colocate_backend.clear_memory_state()
+
+    def _lazy_initialize(self) -> None:
+        self._colocate_backend.lazy_initialize()
+        self._weight_converter = self._colocate_backend.weight_converter
+        self._initialized = self._colocate_backend.initialized
+        self._rank_info = self._colocate_backend.rank_info
+        self._ip_address = self._colocate_backend.ip_address
+        self._physical_gpu_id = self._colocate_backend.physical_gpu_id
+        self._infer_world_size = self._colocate_backend.infer_world_size
+        self._num_infer_engines = self._colocate_backend.num_infer_engines
+        self._logical_train_rank = self._colocate_backend.logical_train_rank
+
+    def _release_grad_memory(self) -> None:
+        self._colocate_backend.release_grad_memory()
+
+    @torch.no_grad()
+    def execute_colocate_weight_update(self, version: int) -> None:
+        self._colocate_backend.execute_weight_update(
+            version,
+            publish_offloaded_before_payload=False,
+            restore_initial_weight_state=True,
+            collect_ipc_after_update=True,
+            wrap_reader_timeout=True,
+        )
+        self._lazy_initialize()
+
+    def finish_colocate_weight_update(self, training_world_size: int) -> None:
+        """Wait for all inference engines, then clear handshake state."""
+        if self._meta_server_client is None or self._num_infer_engines is None:
+            raise RuntimeError("Colocate weight update is not initialized")
+
+        cpu_group = self._engine.cpu_group
+        actual_world_size = dist.get_world_size(group=cpu_group)
+        if training_world_size != actual_world_size:
+            raise RuntimeError(
+                "Training world size changed during colocate update: "
+                f"expected={training_world_size}, actual={actual_world_size}"
             )
 
-        del group_shared, group_tensors, serialized_weights
-        torch.cuda.synchronize()
-        gc.collect()
-        torch.cuda.empty_cache()
-
-        if weights_offloaded:
-            self.release_memory(tags=["weights"])
+        # Every writer reaches this barrier only after its colocated reader has
+        # acknowledged the per-device, per-version payload. Rank 0 can then
+        # wait for one completion marker from each inference engine and clear
+        # the reusable global handover keys before the next version begins.
+        dist.barrier(group=cpu_group)
+        if dist.get_rank(group=cpu_group) == 0:
+            self._meta_server_client.wait_set_until_size(
+                ColocateKeyspace.FINISHED_WEIGHT_UPDATE_ENGINES,
+                self._num_infer_engines,
+                timeout=self._timeout_s,
+            )
+            for key in (
+                ColocateKeyspace.FINISHED_WEIGHT_UPDATE_ENGINES,
+                ColocateKeyspace.ALL_TRAINING_OFFLOADED_WEIGHTS,
+            ):
+                self._meta_server_client.delete_if_exists(key)
+        dist.barrier(group=cpu_group)
 
     def release_memory(self, tags: list[str] | None = None) -> None:
-        """Release GPU memory for specified tags by offloading to CPU.
-
-        Supported tags:
-            - "optimizer": Offload optimizer state tensors (exp_avg, exp_avg_sq, etc.)
-            - "weights": Offload model parameters
-        """
-        tags = tags or ["optimizer", "weights"]
-        tags_to_release = [t for t in tags if t not in self._released_tags]
-        if not tags_to_release:
-            logger.info("release_memory: tags=%s already released, skipping", tags)
-            return
-
-        logger.info("release_memory: offloading tags=%s", tags_to_release)
-
-        if "optimizer" in tags_to_release:
-            self._offload_optimizer_states()
-            self._released_tags.add("optimizer")
-
-        if "weights" in tags_to_release:
-            self._offload_model_weights()
-            self._released_tags.add("weights")
-
-        torch.cuda.synchronize()
-        gc.collect()
-        torch.cuda.empty_cache()
-        logger.info("release_memory: done for tags=%s", tags_to_release)
+        self._colocate_backend.release_memory(tags)
 
     def resume_memory(self, tags: list[str] | None = None) -> None:
-        """Resume GPU memory for specified tags by reloading from CPU.
+        self._colocate_backend.resume_memory(tags)
 
-        Supported tags:
-            - "optimizer": Reload optimizer state tensors to GPU
-            - "weights": Reload model parameters to GPU
-        """
-        tags = tags or ["optimizer", "weights"]
-        tags_to_resume = [t for t in tags if t in self._released_tags]
-        if not tags_to_resume:
-            logger.info("resume_memory: tags=%s not released, skipping", tags)
-            return
-
-        logger.info("resume_memory: reloading tags=%s", tags_to_resume)
-
-        if "weights" in tags_to_resume:
-            self._reload_model_weights()
-            self._released_tags.discard("weights")
-
-        if "optimizer" in tags_to_resume:
-            self._reload_optimizer_states()
-            self._released_tags.discard("optimizer")
-
-        torch.cuda.synchronize()
-        logger.info("resume_memory: done for tags=%s", tags_to_resume)
-
-    def _offload_optimizer_states(self) -> None:
-        """Move optimizer state tensors to CPU, keeping references for reload."""
-        optimizer = self._engine.optimizer
-        if optimizer is None:
-            logger.warning("No optimizer found, skipping optimizer offload")
-            return
-
-        # Megatron's ChainedOptimizer wraps per-model-chunk optimizers;
-        # each in turn wraps a base torch optimizer holding the state dict.
-        if hasattr(optimizer, "optimizers"):
-            inner_optimizers = optimizer.optimizers
-        else:
-            inner_optimizers = [optimizer]
-            logger.warning(
-                "Optimizer does not have 'optimizers' attribute. "
-                "Treating it as a single optimizer; offload may be incomplete "
-                "for non-standard Megatron optimizer structures."
-            )
-        for opt in inner_optimizers:
-            base_opt = getattr(opt, "optimizer", opt)
-            for param, state in base_opt.state.items():
-                cpu_state: dict[str, torch.Tensor] = {}
-                for key, val in state.items():
-                    if isinstance(val, torch.Tensor) and val.is_cuda:
-                        cpu_state[key] = val.detach().to("cpu", non_blocking=True)
-                        state[key] = torch.empty(0, device="cpu")
-                if cpu_state:
-                    self._offloaded_optimizer_states[param] = cpu_state
-
-        logger.info(
-            "Offloaded optimizer states for %d params",
-            len(self._offloaded_optimizer_states),
-        )
-
-    def _reload_optimizer_states(self) -> None:
-        """Restore optimizer state tensors from CPU back to GPU."""
-        if not self._offloaded_optimizer_states:
-            return
-
-        optimizer = self._engine.optimizer
-        if optimizer is None:
-            return
-
-        inner_optimizers = getattr(optimizer, "optimizers", [optimizer])
-        for opt in inner_optimizers:
-            base_opt = getattr(opt, "optimizer", opt)
-            for param, state in base_opt.state.items():
-                if param in self._offloaded_optimizer_states:
-                    cpu_state = self._offloaded_optimizer_states[param]
-                    for key, val in cpu_state.items():
-                        state[key] = val.to(param.device, non_blocking=True)
-
-        self._offloaded_optimizer_states.clear()
-        logger.info("Reloaded optimizer states to GPU")
+    @torch.no_grad()
+    def _convert_parameters(self) -> dict[str, torch.Tensor]:
+        return self._colocate_backend.convert_parameters()
 
     def _offload_model_weights(self) -> None:
-        """Move model parameters to CPU, keeping references for reload."""
-        if self._engine.model is None:
-            return
+        self._colocate_backend._offload_model_weights()
 
-        for name, param in self._engine.model.named_parameters():
-            if param.is_cuda:
-                self._offloaded_weights[name] = param.data.detach().to(
-                    "cpu", non_blocking=True
-                )
-                param.data = torch.empty(0, device="cpu")
+    def _reload_model_weights(self, load_grad: bool = False) -> None:
+        self._colocate_backend._reload_model_weights(load_grad)
 
-        logger.info(
-            "Offloaded %d model weight tensors to CPU",
-            len(self._offloaded_weights),
-        )
+    def ensure_grad_buffers(self) -> None:
+        self._colocate_backend.ensure_grad_buffers()
 
-    def _reload_model_weights(self) -> None:
-        """Restore model parameters from CPU back to GPU."""
-        if not self._offloaded_weights:
-            return
-        if self._engine.model is None:
-            return
+    def _get_inner_optimizers(self):
+        return self._colocate_backend._get_inner_optimizers()
 
-        device = self._engine.device
-        for name, param in self._engine.model.named_parameters():
-            if name in self._offloaded_weights:
-                param.data = self._offloaded_weights[name].to(device, non_blocking=True)
+    def _offload_optimizer_states(self) -> None:
+        self._colocate_backend._offload_optimizer_states()
 
-        self._offloaded_weights.clear()
-        logger.info("Reloaded model weights to GPU")
+    def _reload_optimizer_states(self) -> None:
+        self._colocate_backend._reload_optimizer_states()
