@@ -61,6 +61,13 @@ def session_headers():
     return {"Authorization": f"Bearer {SESSION_KEY}"}
 
 
+def anthropic_headers():
+    return {
+        "x-api-key": SESSION_KEY,
+        "anthropic-version": "2023-06-01",
+    }
+
+
 # =============================================================================
 # Health endpoint
 # =============================================================================
@@ -105,6 +112,75 @@ class TestAuthRejection:
             headers=session_headers(),
         )
         assert resp.status_code == 403
+
+
+class TestAnthropicMessages:
+    @pytest.mark.asyncio
+    @patch(f"{MODULE}.forward_request", new_callable=AsyncMock)
+    @patch(f"{MODULE}.query_router", new_callable=AsyncMock)
+    async def test_x_api_key_routes_non_streaming_messages(
+        self,
+        mock_query_router,
+        mock_forward,
+        client,
+    ):
+        mock_query_router.return_value = WORKER_ADDR
+        mock_forward.return_value = httpx.Response(
+            200,
+            json={"id": "msg-1", "type": "message", "content": []},
+        )
+
+        response = await client.post(
+            "/v1/messages",
+            json={
+                "model": "claude-compatible",
+                "max_tokens": 64,
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+            headers=anthropic_headers(),
+        )
+
+        assert response.status_code == 200
+        assert response.json()["id"] == "msg-1"
+        assert mock_query_router.await_args.args[1] == SESSION_KEY
+        assert mock_query_router.await_args.args[2] == "/v1/messages"
+        assert mock_forward.await_args.args[0] == f"{WORKER_ADDR}/v1/messages"
+        forwarded_headers = mock_forward.await_args.args[2]
+        assert forwarded_headers["x-api-key"] == SESSION_KEY
+        assert forwarded_headers["anthropic-version"] == "2023-06-01"
+
+    @pytest.mark.asyncio
+    @patch(f"{MODULE}.forward_sse_stream")
+    @patch(f"{MODULE}.query_router", new_callable=AsyncMock)
+    async def test_streaming_messages_forward_anthropic_sse(
+        self,
+        mock_query_router,
+        mock_forward_sse,
+        client,
+    ):
+        mock_query_router.return_value = WORKER_ADDR
+
+        async def _stream():
+            yield b"event: message_start\ndata: {}\n\n"
+            yield b"event: message_stop\ndata: {}\n\n"
+
+        mock_forward_sse.return_value = _stream()
+
+        response = await client.post(
+            "/v1/messages",
+            json={
+                "model": "claude-compatible",
+                "max_tokens": 64,
+                "stream": True,
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+            headers=anthropic_headers(),
+        )
+
+        assert response.status_code == 200
+        assert "text/event-stream" in response.headers["content-type"]
+        assert "event: message_start" in response.text
+        assert mock_forward_sse.call_args.args[0] == f"{WORKER_ADDR}/v1/messages"
 
 
 # =============================================================================
