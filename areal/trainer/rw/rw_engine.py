@@ -43,6 +43,12 @@ class RWEngine:
     def __init__(self, engine: TrainEngine):
         self.engine = engine
 
+    def _stats_device(self, data: dict[str, Any]) -> torch.device:
+        engine_device = getattr(self.engine, "device", None)
+        if engine_device is not None:
+            return engine_device
+        return data["cu_seqlens"].device
+
     @trace_perf("rw_engine.train_rw", category="compute")
     @stats_tracker.scope_func_wrapper("rw")
     def train_rw(self, data: list[dict[str, Any]]) -> None:
@@ -51,7 +57,7 @@ class RWEngine:
     def _train_rw(self, data: dict[str, Any]) -> None:
         """Train on a batch (reward model)."""
         if _rw_loss_weight(data) == 0:
-            _log_empty_rw_stats(data["cu_seqlens"].device)
+            _log_empty_rw_stats(self._stats_device(data))
         self.engine.train()
         stage_batch_for_engine(data, self.engine)
         stats = self.engine.train_batch(
@@ -68,7 +74,7 @@ class RWEngine:
 
     def _evaluate_rw(self, data: dict[str, Any]) -> None:
         if _rw_loss_weight(data) == 0:
-            _log_empty_rw_stats(data["cu_seqlens"].device)
+            _log_empty_rw_stats(self._stats_device(data))
         self.engine.eval()
         stage_batch_for_engine(data, self.engine)
         self.engine.eval_batch(
