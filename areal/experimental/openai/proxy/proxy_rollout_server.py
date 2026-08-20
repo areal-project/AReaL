@@ -75,6 +75,10 @@ _warned_messages: set[str] = set()
 _warn_lock = threading.Lock()
 
 
+def _deterministic_sampling_seed(session_id: str, request_index: int) -> int:
+    return seeding.derive_deterministic_seed(session_id, request_index)
+
+
 def _warn_once(msg: str) -> None:
     """Log a warning message, optionally only once if AREAL_PROXY_WARN_ONCE=1."""
     if not _warn_once_enabled:
@@ -125,6 +129,9 @@ _server_port: int = 8000
 # Port allocation tracking
 _allocated_ports: set[int] = set()
 _port_alloc_lock = asyncio.Lock()
+
+# Deterministic sampling (set from InferenceEngineConfig at setup time).
+_deterministic_sampling: bool = False
 
 # Server config (needed for name_resolve registration)
 _experiment_name: str | None = None
@@ -270,8 +277,9 @@ async def alloc_ports(raw_request: Request):
 
 def _setup_openai_client():
     global _openai_client, _session_timeout_seconds, _admin_api_key
-    global _message_preprocessors, _prefix_matcher
+    global _message_preprocessors, _prefix_matcher, _deterministic_sampling
     config = _engine.config
+    _deterministic_sampling = bool(getattr(config, "deterministic_sampling", False))
     tokenizer = load_hf_tokenizer(config.tokenizer_path)
     agent_cfg = config.agent
     _openai_client = ArealOpenAI(
@@ -488,6 +496,7 @@ def start_session(request: StartSessionRequest) -> StartSessionResponse:
         _session_cache[session_id] = SessionData(
             session_id=session_id,
             prefix_matcher=_prefix_matcher,
+            sampling_seed_identity=task_id,
         )
         _api_key_to_session[session_api_key] = session_id
         _session_to_api_key[session_id] = session_api_key
@@ -574,8 +583,11 @@ async def _call_client_create(
                 status_code=410, detail=f"Session {session_id} already ended or expired"
             )
         session_data = _session_cache[session_id]
+        session_data.update_last_access()
 
-    session_data.update_last_access()
+    request_index = (
+        session_data.next_sampling_request_index() if _deterministic_sampling else None
+    )
 
     sig = inspect.signature(create_fn)
     areal_client_ignored_args = ["model"] + (extra_ignored_args or [])
@@ -620,6 +632,22 @@ async def _call_client_create(
     if "top_p" not in kwargs:
         kwargs["top_p"] = 1.0
         _warn_once("top_p not set in request, defaulting to 1.0")
+
+    if (
+        _deterministic_sampling
+        and kwargs.get("seed") is None
+        and "seed" in areal_client_allowed_args
+    ):
+        assert request_index is not None
+        # The logical identity excludes the physical session collision suffix.
+        # Reserve request indices at ingress so concurrent requests remain
+        # distinct without holding a lock during inference.
+        # TODO(agent): Strict mapping of concurrent sibling requests to seeds
+        # requires a stable caller-provided request identity. Group samples use
+        # separate sessions, so their sample_idx-based identities are stable.
+        kwargs["seed"] = _deterministic_sampling_seed(
+            session_data.sampling_seed_identity, request_index
+        )
 
     # Strip stream from request body to prevent it from bypassing the explicit
     # `stream` parameter.  Without this, a request with {"stream": true} would

@@ -133,16 +133,26 @@ class SessionData:
         self,
         session_id: str,
         set_reward_finish_timeout: float = 0.0,
+        sampling_seed_identity: str | None = None,
     ):
         self.session_id = session_id
+        self.sampling_seed_identity = sampling_seed_identity or session_id
         self._set_reward_finish_timeout = set_reward_finish_timeout
         self._last_access_time = time.time()
         self._lock = threading.Lock()
         self._active_completions = InteractionCache()
         self._ready_trajectories: OrderedDict[int, ReadyTrajectory] = OrderedDict()
         self._next_trajectory_id = 0
+        self._next_sampling_request_index = 0
         self._last_set_reward_time: float | None = None
         self._last_reward_interaction_id: str | None = None
+
+    def next_sampling_request_index(self) -> int:
+        """Reserve a request index before inference without serializing generation."""
+        with self._lock:
+            request_index = self._next_sampling_request_index
+            self._next_sampling_request_index += 1
+        return request_index
 
     def update_last_access(self) -> None:
         with self._lock:
@@ -388,7 +398,10 @@ class SessionStore:
         return self._admin_api_key
 
     def start_session(
-        self, task_id: str, api_key: str | None = None
+        self,
+        task_id: str,
+        api_key: str | None = None,
+        sampling_seed_identity: str | None = None,
     ) -> tuple[str, str]:
         """Start a new session, returning (session_id, session_api_key).
 
@@ -425,6 +438,7 @@ class SessionStore:
             self._sessions[session_id] = SessionData(
                 session_id=session_id,
                 set_reward_finish_timeout=self._set_reward_finish_timeout,
+                sampling_seed_identity=sampling_seed_identity,
             )
             self._api_key_to_session[session_api_key] = session_id
             self._session_to_api_key[session_id] = session_api_key

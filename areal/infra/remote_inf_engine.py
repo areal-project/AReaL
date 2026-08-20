@@ -89,9 +89,32 @@ class GroupedRolloutWorkflow(RolloutWorkflow):
     ) -> dict[str, Any] | None:
         from areal.experimental.openai import InteractionWithTokenLogpReward
 
-        results = await asyncio.gather(
-            *[self.workflow.arun_episode(engine, data) for _ in range(self.group_size)]
+        async def run_sample(sample_idx: int) -> tuple[int, Any]:
+            from areal.infra import workflow_context
+            from areal.infra.workflow_context import WorkflowContext
+
+            parent = workflow_context.get()
+            workflow_context.set(
+                WorkflowContext(
+                    is_eval=parent.is_eval,
+                    task_id=parent.task_id,
+                    sample_idx=sample_idx,
+                )
+            )
+            result = await self.workflow.arun_episode(engine, data)
+            return sample_idx, result
+
+        indexed_results = await asyncio.gather(
+            *[run_sample(sample_idx) for sample_idx in range(self.group_size)]
         )
+        indexed_results.sort(key=lambda item: item[0])
+        sample_indices = [sample_idx for sample_idx, _ in indexed_results]
+        if sample_indices != list(range(self.group_size)):
+            raise RuntimeError(
+                "Grouped rollout returned invalid sample indices: "
+                f"expected {list(range(self.group_size))}, got {sample_indices}"
+            )
+        results = [result for _, result in indexed_results]
 
         valid_results = [r for r in results if r is not None]
 
@@ -1240,9 +1263,6 @@ class RemoteInfEngine(InferenceEngine):
             raise ValueError(
                 "workflow must be specified for submit (unless mode='online')"
             )
-        if callback_addr:
-            self.workflow_executor.dispatcher.register_callback(task_id, callback_addr)
-
         # Resolve workflow to a RolloutWorkflow instance
         resolved_workflow = self._resolve_workflow(
             workflow,
@@ -1260,6 +1280,7 @@ class RemoteInfEngine(InferenceEngine):
             should_accept_fn=resolved_should_accept_fn,
             task_id=task_id,
             is_eval=is_eval,
+            callback_addr=callback_addr,
         )
 
     def wait(

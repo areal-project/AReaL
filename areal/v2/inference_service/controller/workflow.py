@@ -53,6 +53,7 @@ class InferenceServiceWorkflow(RolloutWorkflow):
         export_style: str = "individual",
         timeout: float | None = None,
         group_size: int = 1,
+        serialize_group_samples: bool = False,
     ):
         self.controller = controller
         self.agent = agent
@@ -62,6 +63,7 @@ class InferenceServiceWorkflow(RolloutWorkflow):
         self.export_style = export_style
         self.timeout = timeout
         self.group_size = group_size
+        self.serialize_group_samples = serialize_group_samples
 
     @async_http_retry
     async def _start_session(
@@ -144,12 +146,38 @@ class InferenceServiceWorkflow(RolloutWorkflow):
         group_id, sessions = await self._start_session(
             http_session, str(task_id), group_size=self.group_size
         )
+        execution_mode = "serial" if self.serialize_group_samples else "concurrent"
+        version = self.controller.get_version()
+        logger.info(
+            "V2 rollout group dispatch: task_id=%s group_id=%s version=%s "
+            "group_size=%d mode=%s sessions=%s",
+            task_id,
+            group_id,
+            version,
+            len(sessions),
+            execution_mode,
+            [session_id for session_id, _ in sessions],
+        )
 
         assert self.agent is not None
         http_client = await workflow_context.get_httpx_client()
 
-        async def _run_one(session_id: str, session_api_key: str) -> float | None:
+        async def _run_one(
+            member_index: int,
+            session_id: str,
+            session_api_key: str,
+        ) -> float | None:
             """Run one agent session. Returns reward on success, ``None`` on failure."""
+            logger.debug(
+                "V2 rollout member start: task_id=%s group_id=%s member=%d "
+                "session_id=%s version=%s mode=%s",
+                task_id,
+                group_id,
+                member_index,
+                session_id,
+                version,
+                execution_mode,
+            )
             try:
                 rewards = await self.agent.run(
                     data,
@@ -194,10 +222,33 @@ class InferenceServiceWorkflow(RolloutWorkflow):
                         group_id,
                     )
                 return None
+            finally:
+                logger.debug(
+                    "V2 rollout member finish: task_id=%s group_id=%s member=%d "
+                    "session_id=%s version=%s mode=%s",
+                    task_id,
+                    group_id,
+                    member_index,
+                    session_id,
+                    version,
+                    execution_mode,
+                )
 
-        results = await asyncio.gather(
-            *[_run_one(sid, api_key) for sid, api_key in sessions]
-        )
+        if self.serialize_group_samples:
+            results = []
+            for member_index, (session_id, session_api_key) in enumerate(sessions):
+                results.append(
+                    await _run_one(member_index, session_id, session_api_key)
+                )
+        else:
+            results = await asyncio.gather(
+                *[
+                    _run_one(member_index, session_id, session_api_key)
+                    for member_index, (session_id, session_api_key) in enumerate(
+                        sessions
+                    )
+                ]
+            )
 
         session_ids = [sid for sid, _ in sessions]
 

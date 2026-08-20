@@ -9,6 +9,7 @@ import httpx
 import pytest
 import pytest_asyncio
 
+from areal.utils.seeding import derive_deterministic_seed
 from areal.v2.inference_service.data_proxy.app import (
     _flush_ready_trajectories,
     create_app,
@@ -438,6 +439,81 @@ async def test_chat_completions_passes_sampling_params(client, mock_areal_client
     assert kw["temperature"] == 0.5
     assert kw["top_p"] == 0.9
     assert kw["max_tokens"] == 100
+    assert "seed" not in kw
+
+
+@pytest.mark.asyncio
+async def test_chat_completions_deterministic_seed_distinguishes_group_sessions(
+    client, config, mock_areal_client
+):
+    config.deterministic_sampling = True
+    resp = await client.post(
+        "/rl/start_session",
+        json={"task_id": "seed-test", "group_size": 2},
+        headers=admin_headers(),
+    )
+    sessions = resp.json()["sessions"]
+
+    for session in sessions:
+        resp = await client.post(
+            "/chat/completions",
+            json={
+                "model": "sglang",
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+            headers=session_headers(session["session_api_key"]),
+        )
+        assert resp.status_code == 200
+
+    seeds = [
+        call.kwargs["seed"]
+        for call in mock_areal_client.chat.completions.create.call_args_list
+    ]
+    assert seeds == [
+        derive_deterministic_seed("seed-test:0", 0),
+        derive_deterministic_seed("seed-test:1", 0),
+    ]
+    assert seeds[0] != seeds[1]
+
+
+@pytest.mark.asyncio
+async def test_chat_completions_preserves_explicit_seed(
+    client, config, mock_areal_client
+):
+    config.deterministic_sampling = True
+    resp = await client.post(
+        "/rl/start_session",
+        json={"task_id": "explicit-seed"},
+        headers=admin_headers(),
+    )
+    api_key = resp.json()["sessions"][0]["session_api_key"]
+
+    resp = await client.post(
+        "/chat/completions",
+        json={
+            "model": "sglang",
+            "messages": [{"role": "user", "content": "hi"}],
+            "seed": 12345,
+        },
+        headers=session_headers(api_key),
+    )
+
+    assert resp.status_code == 200
+    assert mock_areal_client.chat.completions.create.call_args.kwargs["seed"] == 12345
+
+    resp = await client.post(
+        "/chat/completions",
+        json={
+            "model": "sglang",
+            "messages": [{"role": "user", "content": "again"}],
+        },
+        headers=session_headers(api_key),
+    )
+
+    assert resp.status_code == 200
+    assert mock_areal_client.chat.completions.create.call_args.kwargs[
+        "seed"
+    ] == derive_deterministic_seed("explicit-seed", 1)
 
 
 # =============================================================================
