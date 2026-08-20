@@ -16,8 +16,8 @@ from awex.sharding.rank_info import RankInfo
 from awex.transfer.nccl_comm import batch_send_recv, nccl_build_send_ops
 from awex.transfer.transfer_plan import TransferPlan, TransferPlanBuilder
 
-from areal.engine.weight_update.awex.megatron import MegatronColocateBackend
-from areal.engine.weight_update.awex.protocol import ColocateKeyspace
+from areal.engine.weight_update.awex.colocate_megatron import MegatronColocateBackend
+from areal.engine.weight_update.awex.colocate_protocol import ColocateKeyspace
 from areal.utils import logging
 from areal.v2.weight_update.awex import (
     awex_wu_use_group,

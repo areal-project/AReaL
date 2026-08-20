@@ -11,11 +11,11 @@ import torch
 import torch.distributed as dist
 
 # Compatibility must run before importing AWEX model modules.
-from areal.engine.weight_update.awex.protocol import (  # noqa: E402
+from areal.engine.weight_update.awex.colocate_protocol import (  # noqa: E402
     ColocateKeyspace,
     ColocateTopology,
 )
-from areal.engine.weight_update.awex.sglang import (  # noqa: E402
+from areal.engine.weight_update.awex.colocate_sglang import (  # noqa: E402
     SGLangColocateBackend,
 )
 

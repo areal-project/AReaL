@@ -5,12 +5,14 @@ from unittest import mock
 
 import pytest
 
-from areal.engine.awex.colocate_reader import AwexColocateReader
-from areal.engine.weight_update.awex.protocol import (
+from areal.engine.weight_update.awex import colocate_sglang, v1_sglang_adapter
+from areal.engine.weight_update.awex.colocate_protocol import (
     ColocateKeyspace,
     ColocateTopology,
 )
-from areal.engine.weight_update.awex.sglang import SGLangColocateBackend
+from areal.engine.weight_update.awex.colocate_sglang import SGLangColocateBackend
+from areal.engine.weight_update.awex.v1_sglang_adapter import AwexColocateReader
+from areal.v2.weight_update.awex import sglang_adapter
 from areal.v2.weight_update.awex.sglang_adapter import AwexSGLangAdapter
 
 
@@ -41,15 +43,23 @@ def test_v1_and_v2_facades_compose_shared_sglang_backend():
     assert isinstance(v2._colocate_backend, SGLangColocateBackend)
 
 
+def test_v1_and_v2_share_single_instance_meta_resolver():
+    assert (
+        v1_sglang_adapter.SingleInstanceMetaResolver
+        is colocate_sglang.SingleInstanceMetaResolver
+    )
+    assert not hasattr(sglang_adapter, "SingleInstanceMetaResolver")
+
+
 def test_v1_facade_preserves_legacy_metadata_publication_policy(monkeypatch):
     legacy = AwexColocateReader(_scheduler())
     legacy._backend.initialize = mock.Mock()
     monkeypatch.setattr(
-        "areal.engine.awex.colocate_reader.get_awex_infer_hf_config",
+        "areal.engine.weight_update.awex.v1_sglang_adapter.get_awex_infer_hf_config",
         lambda model, model_runner: ("v1_hf_config", model, model_runner),
     )
     monkeypatch.setattr(
-        "areal.engine.awex.colocate_reader.get_router_dtype",
+        "areal.engine.weight_update.awex.v1_sglang_adapter.get_router_dtype",
         lambda config: ("v1_router_dtype", config),
     )
 
@@ -182,7 +192,7 @@ def test_backend_update_reuses_reader_without_extra_copy_collective_or_sync():
     backend._initialized = True
 
     with mock.patch(
-        "areal.engine.weight_update.awex.sglang.torch.cuda.synchronize",
+        "areal.engine.weight_update.awex.colocate_sglang.torch.cuda.synchronize",
         side_effect=lambda: events.append("synchronize"),
     ) as synchronize:
         backend.update_weights(3)
@@ -205,7 +215,7 @@ def test_backend_update_without_post_load_does_not_synchronize():
     backend._initialized = True
 
     with mock.patch(
-        "areal.engine.weight_update.awex.sglang.torch.cuda.synchronize"
+        "areal.engine.weight_update.awex.colocate_sglang.torch.cuda.synchronize"
     ) as synchronize:
         backend.update_weights(1)
 

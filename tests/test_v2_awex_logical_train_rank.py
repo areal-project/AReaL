@@ -4,7 +4,9 @@ import sys
 from types import ModuleType, SimpleNamespace
 from unittest import mock
 
-from areal.engine.weight_update.awex.megatron import MegatronColocateBackend
+from areal.engine.weight_update.awex.colocate_megatron import (
+    MegatronColocateBackend,
+)
 
 
 def test_lazy_initialize_uses_megatron_global_rank_for_logical_train_rank(
@@ -61,7 +63,7 @@ def test_lazy_initialize_uses_megatron_global_rank_for_logical_train_rank(
     backend.configure(meta_server_client=client, timeout_s=30.0)
 
     with mock.patch(
-        "areal.engine.weight_update.awex.megatron.dist.get_rank",
+        "areal.engine.weight_update.awex.colocate_megatron.dist.get_rank",
         return_value=1,
     ):
         backend.lazy_initialize()

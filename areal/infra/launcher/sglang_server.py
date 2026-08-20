@@ -208,7 +208,9 @@ class SGLangServerWrapper:
         if awex_meta_addr:
             custom_env = {"AWEX_META_SERVER_ADDR": awex_meta_addr}
             cmd = [
-                "areal.engine.awex.sglang_plugin" if c == "sglang.launch_server" else c
+                "areal.engine.weight_update.awex.v1_sglang_plugin"
+                if c == "sglang.launch_server"
+                else c
                 for c in cmd
             ]
         server_process = launch_server_cmd(cmd, custom_env=custom_env)

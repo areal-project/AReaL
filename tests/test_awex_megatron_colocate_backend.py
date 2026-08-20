@@ -6,8 +6,10 @@ from unittest import mock
 
 import pytest
 
-from areal.engine.weight_update.awex import megatron
-from areal.engine.weight_update.awex.megatron import MegatronColocateBackend
+from areal.engine.weight_update.awex import colocate_megatron
+from areal.engine.weight_update.awex.colocate_megatron import (
+    MegatronColocateBackend,
+)
 
 
 class _FakeStorage:
@@ -127,23 +129,23 @@ def _ready_backend(monkeypatch, events):
     _install_tensor_util(monkeypatch, events, grouped)
 
     monkeypatch.setattr(
-        megatron.torch.cuda,
+        colocate_megatron.torch.cuda,
         "synchronize",
         lambda: events.append(("synchronize",)),
     )
     monkeypatch.setattr(
-        megatron.torch.cuda,
+        colocate_megatron.torch.cuda,
         "ipc_collect",
         lambda: events.append(("ipc_collect",)),
     )
     monkeypatch.setattr(
-        megatron.torch.cuda,
+        colocate_megatron.torch.cuda,
         "empty_cache",
         lambda: events.append(("empty_cache",)),
     )
-    monkeypatch.setattr(megatron.gc, "collect", lambda: events.append(("gc",)))
+    monkeypatch.setattr(colocate_megatron.gc, "collect", lambda: events.append(("gc",)))
     barrier = mock.Mock()
-    monkeypatch.setattr(megatron.dist, "barrier", barrier)
+    monkeypatch.setattr(colocate_megatron.dist, "barrier", barrier)
     return backend, barrier
 
 

@@ -2,7 +2,7 @@ import sys
 from types import ModuleType, SimpleNamespace
 from unittest import mock
 
-from areal.engine.weight_update.awex.protocol import ColocateTopology
+from areal.engine.weight_update.awex.colocate_protocol import ColocateTopology
 from areal.v2.weight_update.awex.sglang_adapter import AwexSGLangAdapter
 
 

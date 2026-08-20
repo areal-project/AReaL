@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
-"""AWEX protocol implementations shared across controller versions."""
+"""AWEX weight-update backends and controller-specific adapters."""
 
-from areal.engine.weight_update.awex.protocol import (
+from areal.engine.weight_update.awex.colocate_protocol import (
     ColocateKeyspace,
     ColocateTopology,
 )

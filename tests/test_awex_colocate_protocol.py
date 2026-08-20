@@ -2,7 +2,7 @@
 
 import pytest
 
-from areal.engine.weight_update.awex.protocol import (
+from areal.engine.weight_update.awex.colocate_protocol import (
     ColocateKeyspace,
     ColocateTopology,
 )

@@ -6,11 +6,11 @@ from __future__ import annotations
 
 from typing import Any
 
-from areal.engine.weight_update.awex.protocol import (
+from areal.engine.weight_update.awex.colocate_protocol import (
     ColocateKeyspace,
     ColocateTopology,
 )
-from areal.engine.weight_update.awex.sglang import (
+from areal.engine.weight_update.awex.colocate_sglang import (
     SGLangColocateBackend,
     SingleInstanceMetaResolver,
     get_awex_infer_hf_config,
@@ -106,7 +106,9 @@ class AwexColocateReader:
     def wait_for_training_offloaded(self, version: int) -> None:
         """Wait for v1 writer memory handoff before receiving weights."""
         del version
-        from areal.engine.awex.colocate_writer import awex_colocate_timeout_s
+        from areal.engine.weight_update.awex.v1_megatron_adapter import (
+            awex_colocate_timeout_s,
+        )
 
         topology = self._backend.topology
         self._backend.meta_server_client.wait_set_until_size(
@@ -121,7 +123,9 @@ class AwexColocateReader:
         """Wait for this physical GPU's versioned IPC payload key."""
         from awex.util.common import get_ip_address
 
-        from areal.engine.awex.colocate_writer import awex_colocate_timeout_s
+        from areal.engine.weight_update.awex.v1_megatron_adapter import (
+            awex_colocate_timeout_s,
+        )
 
         if self._local_gpu_id is None:
             raise RuntimeError("AwexColocateReader is not initialized")

@@ -15,11 +15,11 @@ Weight transfer flow (mirrors the AWEX reference colocate mode):
 
 Usage:
     # Option 1: Register plugin then launch SGLang
-    from areal.engine.awex.sglang_plugin import register_awex_plugin
+    from areal.engine.weight_update.awex.v1_sglang_plugin import register_awex_plugin
     register_awex_plugin()
 
     # Option 2: Run as entry module (replaces sglang.launch_server)
-    # python3 -m areal.engine.awex.sglang_plugin --model-path ...
+    # python3 -m areal.engine.weight_update.awex.v1_sglang_plugin --model-path ...
 """
 
 from __future__ import annotations
@@ -133,7 +133,9 @@ class AwexSchedulerPlugin:
 
     def _require_receiver(self):
         if self._receiver is None:
-            from areal.engine.awex.colocate_reader import AwexColocateReader
+            from areal.engine.weight_update.awex.v1_sglang_adapter import (
+                AwexColocateReader,
+            )
 
             self._receiver = AwexColocateReader(self._scheduler)
         return self._receiver
@@ -506,7 +508,7 @@ class AwexSchedulerPlugin:
 
         _host, _port = meta_server_addr.rsplit(":", 1)
         _ver_client = _MSC(_host, int(_port))
-        from areal.engine.awex.colocate_writer import (
+        from areal.engine.weight_update.awex.v1_megatron_adapter import (
             awex_colocate_timeout_s,
             resolve_physical_gpu_id,
         )
@@ -614,7 +616,7 @@ class AwexSchedulerPlugin:
         )
         # The driver publishes awex_train_info only after rollout init finishes,
         # so large models need the same timeout budget as the weight path.
-        from areal.engine.awex.colocate_writer import (
+        from areal.engine.weight_update.awex.v1_megatron_adapter import (
             awex_colocate_timeout_s,
             resolve_physical_gpu_id,
         )

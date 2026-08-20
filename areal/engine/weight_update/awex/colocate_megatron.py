@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 import torch.distributed as dist
 
-from areal.engine.weight_update.awex.protocol import ColocateKeyspace
+from areal.engine.weight_update.awex.colocate_protocol import ColocateKeyspace
 from areal.utils.logging import getLogger
 
 if TYPE_CHECKING:
