@@ -99,6 +99,12 @@ def _process_multimodal_prompt(
     """Build model-ready prompt tokens and vision tensors with an HF processor."""
     from transformers.image_utils import load_image
 
+    if any("://" in image for image in image_data):
+        raise ValueError(
+            "Remote image URLs are not supported for local multimodal processing. "
+            "Provide an inline base64 image or data URI instead."
+        )
+
     prompt_text = apply_chat_template(
         tokenizer,
         messages,
@@ -320,7 +326,7 @@ def _find_kth(lst: list, target, k: int) -> int:
         return -1
 
 
-# Regex for inline image data URI: data:image/<subtype>;base64,<data>
+# Regex for data URI: data:image/<subtype>;base64,<data>
 _DATA_URI_RE = re.compile(r"^data:image/[a-zA-Z0-9.+-]+;base64,(.+)$", re.DOTALL)
 
 
@@ -330,7 +336,7 @@ def _extract_images_from_messages(
     """Extract image data from OpenAI-format messages.
 
     Scans message ``content`` lists for ``image_url`` content parts,
-    extracts bounded inline base64 data, and converts messages to a
+    extracts base64 data (or raw URLs), and converts messages to a
     HuggingFace-compatible format for ``apply_chat_template``.
 
     Args:
@@ -339,7 +345,8 @@ def _extract_images_from_messages(
     Returns:
         A 3-tuple of:
 
-        - **image_data** – list of base64 image strings without data-URI prefixes.
+        - **image_data** – list of base64 image strings without data-URI prefixes
+          or raw URL strings for each image found.
         - **messages_for_tokenizer** – deep copy of *messages* where every
           ``{"type": "image_url", ...}`` part is replaced by
           ``{"type": "image"}`` so that HuggingFace VLM tokenizers insert
@@ -380,21 +387,14 @@ def _extract_images_from_messages(
                 if not isinstance(url, str) or not url:
                     raise ValueError(
                         "image_url content part has an empty or missing URL. "
-                        "Provide an inline base64 image or data URI in image_url.url."
+                        "Provide a valid data URI or HTTP(S) URL in image_url.url."
                     )
 
-                # Extract data-URI payloads. Raw base64 remains supported for
-                # compatibility, but URL schemes are rejected so rollout workers
-                # never fetch attacker-controlled network or local resources.
+                # Extract base64 payload from data URIs; keep raw URLs as-is.
                 m = _DATA_URI_RE.match(url)
                 if m:
                     image_data.append(m.group(1))
                 else:
-                    if "://" in url:
-                        raise ValueError(
-                            "Remote image URLs are not supported. Provide an inline "
-                            "base64 image or data URI instead."
-                        )
                     image_data.append(url)
 
                 tok_parts.append({"type": "image"})
@@ -681,16 +681,17 @@ async def _prepare_prompt(
     chat_template_type: str,
     tools: Iterable[ChatCompletionToolParam] | None,
     extra_body: Body,
+    require_multimodal_processor: bool = False,
 ) -> _PreparedPrompt:
     """Prepare text or multimodal prompt data for one agent interaction."""
     chat_template_kwargs = extra_body.get("chat_template_kwargs", {})
     processed_prompt: _PreparedPrompt | None = None
-    if image_data and processor is None:
+    if image_data and processor is None and require_multimodal_processor:
         raise ValueError(
             "Image inputs require a multimodal processor, but no processor is "
             "available for this rollout model."
         )
-    if image_data:
+    if image_data and processor is not None:
         processed_prompt = await asyncio.to_thread(
             _process_multimodal_prompt,
             processor,
@@ -802,6 +803,7 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
         engine_max_tokens: int | None = None,
         chat_template_type: str = "hf",
         lora_name: str = "",
+        require_multimodal_processor: bool = False,
     ):
         super().__init__(client)
         self.engine = engine
@@ -813,6 +815,7 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
         self.engine_max_tokens = engine_max_tokens
         self.chat_template_type = chat_template_type
         self.lora_name = lora_name
+        self.require_multimodal_processor = require_multimodal_processor
 
     def _build_chat_completion(
         self,
@@ -1008,6 +1011,7 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
             chat_template_type=self.chat_template_type,
             tools=tools_list,
             extra_body=extra_body,
+            require_multimodal_processor=self.require_multimodal_processor,
         )
         prompt_token_ids = prepared_prompt.input_ids
         if interaction is not None and self.processor is not None:
@@ -1338,6 +1342,7 @@ class AsyncResponsesWithReward(BaseAsyncResponses):
         engine_max_tokens: int | None = None,
         chat_template_type: str = "hf",
         lora_name: str = "",
+        require_multimodal_processor: bool = False,
     ):
         super().__init__(client)
         self.engine = engine
@@ -1349,6 +1354,7 @@ class AsyncResponsesWithReward(BaseAsyncResponses):
         self.engine_max_tokens = engine_max_tokens
         self.chat_template_type = chat_template_type
         self.lora_name = lora_name
+        self.require_multimodal_processor = require_multimodal_processor
 
     async def create(
         self,
@@ -1454,6 +1460,7 @@ class AsyncResponsesWithReward(BaseAsyncResponses):
             chat_template_type=self.chat_template_type,
             tools=tools_list,
             extra_body=extra_body,
+            require_multimodal_processor=self.require_multimodal_processor,
         )
         prompt_token_ids = prepared_prompt.input_ids
         if self.processor is not None:
@@ -1653,6 +1660,7 @@ class ArealOpenAI(AsyncOpenAI):
         chat_template_type: str = "hf",
         lora_name: str = "",
         processor: "ProcessorMixin | None" = None,
+        require_multimodal_processor: bool = False,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -1678,6 +1686,7 @@ class ArealOpenAI(AsyncOpenAI):
             engine_max_tokens=engine_max_tokens,
             chat_template_type=chat_template_type,
             lora_name=lora_name,
+            require_multimodal_processor=require_multimodal_processor,
         )
 
         # Override chat.completions with our extended implementation
@@ -1692,6 +1701,7 @@ class ArealOpenAI(AsyncOpenAI):
             engine_max_tokens=engine_max_tokens,
             chat_template_type=chat_template_type,
             lora_name=lora_name,
+            require_multimodal_processor=require_multimodal_processor,
         )
 
     def get_interaction(self, id: str) -> InteractionWithTokenLogpReward | None:

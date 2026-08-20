@@ -15,6 +15,7 @@ from areal.experimental.openai.client import (
     ArealOpenAI,
     _extract_images_from_messages,
     _prepare_prompt,
+    _process_multimodal_prompt,
 )
 from areal.experimental.openai.types import InteractionWithTokenLogpReward
 
@@ -94,6 +95,22 @@ def _response(input_tokens: list[int], output_tokens: list[int]) -> ModelRespons
     )
 
 
+def test_extract_images_preserves_remote_url_for_backend_forwarding():
+    """Tokenizer-only clients should keep backend-managed image URLs unchanged."""
+    url = "https://example.com/image.png"
+    messages = [
+        {
+            "role": "user",
+            "content": [{"type": "image_url", "image_url": {"url": url}}],
+        }
+    ]
+
+    image_data, tokenizer_messages, _ = _extract_images_from_messages(messages)
+
+    assert image_data == [url]
+    assert tokenizer_messages[0]["content"] == [{"type": "image"}]
+
+
 @pytest.mark.parametrize(
     "url",
     [
@@ -102,23 +119,21 @@ def _response(input_tokens: list[int], output_tokens: list[int]) -> ModelRespons
         "file:///etc/passwd",
     ],
 )
-def test_extract_images_rejects_non_inline_urls(url):
-    """Image messages must not make rollout workers fetch external resources."""
-    messages = [
-        {
-            "role": "user",
-            "content": [
-                {"type": "image_url", "image_url": {"url": url}},
-            ],
-        }
-    ]
-
+def test_local_multimodal_processing_rejects_non_inline_urls(url):
+    """Local VLM processing must not fetch external resources."""
     with pytest.raises(ValueError, match="Remote image URLs are not supported"):
-        _extract_images_from_messages(messages)
+        _process_multimodal_prompt(
+            _FakeProcessor(),
+            _FakeTokenizer(),
+            [{"role": "user", "content": [{"type": "image"}]}],
+            [url],
+            None,
+            {},
+        )
 
 
 @pytest.mark.asyncio
-async def test_prepare_prompt_rejects_image_without_processor():
+async def test_prepare_prompt_strict_mode_rejects_image_without_processor():
     """An image request must not silently export a text-only trajectory."""
     message = {"role": "user", "content": [{"type": "image"}]}
 
@@ -133,7 +148,30 @@ async def test_prepare_prompt_rejects_image_without_processor():
             chat_template_type="hf",
             tools=None,
             extra_body={},
+            require_multimodal_processor=True,
         )
+
+
+@pytest.mark.asyncio
+async def test_prepare_prompt_default_mode_preserves_image_forwarding_without_processor():
+    """Tokenizer-only clients should retain the legacy backend image path."""
+    message = {"role": "user", "content": [{"type": "image"}]}
+
+    prepared = await _prepare_prompt(
+        tokenizer=_FakeTokenizer(),
+        processor=None,
+        tokenizer_messages=[message],
+        concat_messages=[message],
+        image_data=[_png_base64()],
+        parent=None,
+        chat_template_type="hf",
+        tools=None,
+        extra_body={},
+    )
+
+    assert prepared.input_ids == [10, 2, 20]
+    assert prepared.mm_token_type_ids is None
+    assert prepared.multi_modal_input is None
 
 
 @pytest.mark.asyncio
@@ -246,12 +284,15 @@ async def test_areal_openai_shares_processor_with_both_generation_apis():
         engine=SimpleNamespace(),
         tokenizer=_FakeTokenizer(),
         processor=processor,
+        require_multimodal_processor=True,
         api_key="test-key",
         base_url="http://test.invalid/v1",
     )
     try:
         assert client.chat.completions.processor is processor
         assert client.responses.processor is processor
+        assert client.chat.completions.require_multimodal_processor is True
+        assert client.responses.require_multimodal_processor is True
     finally:
         await client.close()
 
