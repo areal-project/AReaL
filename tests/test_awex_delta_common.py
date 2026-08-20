@@ -138,6 +138,112 @@ def test_delta_runtime_config_preserves_legacy_values_and_snapshots(dc, monkeypa
     assert dc.DTERuntimeConfig.from_env().enabled is False
 
 
+def test_wire_dtype_union_is_global_sorted_and_includes_empty_local_rank(
+    dc, monkeypatch
+):
+    """Every rank derives the same rounds even when its local plan is empty."""
+    plan = SimpleNamespace(operations={})
+    group = object()
+
+    def _all_gather_object(output, local_names, group=None):
+        assert local_names == []
+        assert group is not None
+        output[:] = [[], ["torch.float32", "torch.bfloat16"]]
+
+    monkeypatch.setattr(dc.dist, "all_gather_object", _all_gather_object)
+    monkeypatch.setattr(dc.dist, "get_world_size", lambda group: 2)
+
+    dtypes = dc.synchronize_wire_dtypes(plan, group)
+
+    assert dtypes == (torch.bfloat16, torch.float32)
+
+
+def test_wire_dtype_union_ignores_rank_local_discovery_order(dc, monkeypatch):
+    """Canonical ordering is independent of each rank's metadata insertion order."""
+    op = SimpleNamespace(recv_shard_meta=SimpleNamespace(dtype=torch.float32))
+    plan = SimpleNamespace(operations={1: [op]})
+
+    def _all_gather_object(output, local_names, group=None):
+        assert local_names == ["torch.float32"]
+        output[:] = [
+            ["torch.float32", "torch.bfloat16"],
+            ["torch.bfloat16", "torch.float32"],
+        ]
+
+    monkeypatch.setattr(dc.dist, "all_gather_object", _all_gather_object)
+    monkeypatch.setattr(dc.dist, "get_world_size", lambda group: 2)
+
+    dtypes = dc.synchronize_wire_dtypes(plan, object())
+
+    assert dtypes == (torch.bfloat16, torch.float32)
+
+
+def test_wire_dtype_union_preserves_single_bfloat16_round(dc, monkeypatch):
+    """The established BF16-only path retains exactly one protocol round."""
+    op = SimpleNamespace(recv_shard_meta=SimpleNamespace(dtype=torch.bfloat16))
+    plan = SimpleNamespace(operations={1: [op]})
+
+    def _all_gather_object(output, local_names, group=None):
+        assert local_names == ["torch.bfloat16"]
+        output[:] = [["torch.bfloat16"], ["torch.bfloat16"]]
+
+    monkeypatch.setattr(dc.dist, "all_gather_object", _all_gather_object)
+    monkeypatch.setattr(dc.dist, "get_world_size", lambda group: 2)
+
+    assert dc.synchronize_wire_dtypes(plan, object()) == (torch.bfloat16,)
+
+
+def test_wire_dtype_union_rejects_globally_empty_plan(dc, monkeypatch):
+    monkeypatch.setattr(dc.dist, "get_world_size", lambda group: 2)
+
+    def _all_gather_object(output, local_names, group=None):
+        output[:] = [[], []]
+
+    monkeypatch.setattr(dc.dist, "all_gather_object", _all_gather_object)
+
+    with pytest.raises(ValueError, match="no wire dtypes"):
+        dc.synchronize_wire_dtypes(SimpleNamespace(operations={}), object())
+
+
+@pytest.mark.parametrize("world_size", [2, 4, 8, 16])
+def test_dte_world_size_accepts_recursive_scheduler_sizes(dc, world_size):
+    dc.validate_dte_world_size(world_size, world_size // 2, world_size // 2)
+
+
+@pytest.mark.parametrize("world_size", [3, 5, 6])
+def test_dte_world_size_rejects_incomplete_recursive_schedules(dc, world_size):
+    infer_world_size = world_size // 2
+    train_world_size = world_size - infer_world_size
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            f"inference={infer_world_size}, training={train_world_size}, "
+            f"combined={world_size}"
+        ),
+    ):
+        dc.validate_dte_world_size(
+            world_size,
+            infer_world_size,
+            train_world_size,
+        )
+
+
+@pytest.mark.parametrize(
+    ("combined_world_size", "infer_world_size", "train_world_size"),
+    [(1, 1, 0), (4, 1, 2)],
+)
+def test_dte_world_size_rejects_missing_side_or_inconsistent_total(
+    dc, combined_world_size, infer_world_size, train_world_size
+):
+    with pytest.raises(ValueError, match=f"combined={combined_world_size}"):
+        dc.validate_dte_world_size(
+            combined_world_size,
+            infer_world_size,
+            train_world_size,
+        )
+
+
 def test_factory_builds_dte_tracker(dc, monkeypatch):
     """The lazy factory should build a DTE tracker when DTE is available."""
     pytest.importorskip("dte")
@@ -343,6 +449,8 @@ def _load_sglang_adapter(monkeypatch):
             return SimpleNamespace(enabled=False)
 
     delta_config_mod.DTERuntimeConfig = _DTERuntimeConfig
+    delta_config_mod.synchronize_wire_dtypes = lambda *args, **kwargs: ()
+    delta_config_mod.validate_dte_world_size = lambda *args, **kwargs: None
     monkeypatch.setitem(
         sys.modules,
         "areal.v2.weight_update.awex.delta_config",
@@ -398,6 +506,8 @@ def _load_megatron_adapter(monkeypatch):
             )
 
     delta_config_mod.DTERuntimeConfig = _DTERuntimeConfig
+    delta_config_mod.synchronize_wire_dtypes = lambda *args, **kwargs: ()
+    delta_config_mod.validate_dte_world_size = lambda *args, **kwargs: None
     monkeypatch.setitem(
         sys.modules,
         "areal.v2.weight_update.awex.delta_config",

@@ -17,7 +17,18 @@ def _load_helpers():
     return module
 
 
-def _config(*, enabled=False, topology="separation", **overrides):
+def _config(
+    *,
+    enabled=False,
+    topology="separation",
+    actor_backend="megatron:d1",
+    rollout_backend="sglang:d1",
+    actor_version="v2",
+    rollout_version="v2",
+    weight_update_mode="awex",
+    use_lora=False,
+    **overrides,
+):
     dte = {
         "enabled": enabled,
         "transfer": "delta",
@@ -29,9 +40,16 @@ def _config(*, enabled=False, topology="separation", **overrides):
     rollout_spec = SimpleNamespace(env_vars={})
     return SimpleNamespace(
         actor=SimpleNamespace(
-            dte=SimpleNamespace(**dte), scheduling_spec=(actor_spec,)
+            dte=SimpleNamespace(**dte),
+            backend=actor_backend,
+            _version=actor_version,
+            weight_update_mode=weight_update_mode,
+            use_lora=use_lora,
+            scheduling_spec=(actor_spec,),
         ),
         rollout=SimpleNamespace(
+            backend=rollout_backend,
+            _version=rollout_version,
             scheduling_strategy=SimpleNamespace(type=topology),
             scheduling_spec=(rollout_spec,),
         ),
@@ -70,15 +88,26 @@ def test_dte_enabled_exports_only_separation_adamw_switches():
         ({"transfer": "full"}, "transfer must be 'delta'"),
         ({"delta_method": "snapshot"}, "delta_method must be 'adamw'"),
         ({"anchor_interval": -1}, "anchor_interval must be non-negative"),
+        ({"actor_backend": "fsdp:d1"}, "requires actor.backend='megatron"),
+        ({"rollout_backend": "vllm:d1"}, "requires rollout.backend='sglang"),
+        ({"actor_version": "v1"}, "requires actor._version='v2'"),
+        ({"rollout_version": "v1"}, "requires rollout._version='v2'"),
+        ({"weight_update_mode": "xccl"}, "requires actor.weight_update_mode='awex'"),
+        ({"use_lora": True}, "does not support actor.use_lora=True"),
     ],
 )
 def test_dte_rejects_out_of_scope_modes(kwargs, match):
     kwargs = dict(kwargs)
     topology = kwargs.pop("topology", "separation")
     config = _config(enabled=True, topology=topology, **kwargs)
+    environ = {}
 
     with pytest.raises(ValueError, match=match):
-        _load_helpers().apply_dte_config_envvars(config, environ={})
+        _load_helpers().apply_dte_config_envvars(config, environ=environ)
+
+    assert environ == {}
+    assert config.actor.scheduling_spec[0].env_vars == {}
+    assert config.rollout.scheduling_spec[0].env_vars == {}
 
 
 def test_dte_requires_one_ppo_minibatch_per_weight_update():

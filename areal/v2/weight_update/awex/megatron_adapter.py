@@ -30,7 +30,11 @@ from areal.v2.weight_update.awex import (
     awex_wu_use_group,
     fetch_kv_metadata,
 )
-from areal.v2.weight_update.awex.delta_config import DTERuntimeConfig
+from areal.v2.weight_update.awex.delta_config import (
+    DTERuntimeConfig,
+    synchronize_wire_dtypes,
+    validate_dte_world_size,
+)
 from areal.v2.weight_update.awex.delta_detect import AdamWInversionDetector
 from areal.v2.weight_update.nccl_group import (
     init_weights_update_group,
@@ -67,6 +71,7 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
         self._weights_update_group_gloo = None
         self._world_size: int | None = None
         self._separation_delta_transport: NcclColocateStreamBatchTransport | None = None
+        self._separation_wire_dtypes: tuple[torch.dtype, ...] | None = None
         self._transfer_rank: int | None = None
         self._offloaded_optimizer_states: dict = {}
         self._offloaded_weights: dict[str, torch.Tensor] = {}
@@ -171,6 +176,9 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
         train_world_size: int,
         num_engines: int,
     ) -> None:
+        if self._dte_config.enabled:
+            validate_dte_world_size(world_size, infer_world_size, train_world_size)
+
         self._transfer_rank = transfer_rank
         self._world_size = world_size
 
@@ -203,6 +211,11 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
             backend="gloo",
             role="training",
         )
+        if self._dte_config.enabled:
+            self._separation_wire_dtypes = synchronize_wire_dtypes(
+                self._transfer_plan,
+                self._weights_update_group_gloo,
+            )
         logger.info(
             "Initialized AWEX weight update groups for pair=%s role=training "
             "rank=%s world_size=%s nccl=awex_%s gloo=awex_%s_gloo",
@@ -398,6 +411,8 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
         assert self._weights_update_group is not None
         assert self._transfer_rank is not None
         assert self._world_size is not None
+        if self._separation_wire_dtypes is None:
+            raise RuntimeError("Separation DTE wire dtypes are not initialized")
 
         operations = [
             op for ops in self._transfer_plan.operations.values() for op in ops
@@ -416,7 +431,8 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
         )
 
         payload_count = 0
-        for dtype, ops in operations_by_dtype.items():
+        for dtype in self._separation_wire_dtypes:
+            ops = operations_by_dtype.get(dtype, [])
             payloads = build_send_payloads_by_op(ops, masks, params)
             send_plan = _filter_plan_by_dtype(self._transfer_plan, dtype, is_send=True)
             two_round_delta_exchange(
@@ -441,7 +457,7 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
             "separation delta v%d sent %d payload ops across %d dtypes",
             version,
             payload_count,
-            len(operations_by_dtype),
+            len(self._separation_wire_dtypes),
         )
 
     def batch_isend_irecv(self, **kwargs) -> None:
@@ -469,6 +485,7 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
         self._transfer_rank = None
         self._world_size = None
         self._separation_delta_transport = None
+        self._separation_wire_dtypes = None
         self._delta_tracker = None
         self._delta_detector = None
         if self._colocate_http_client is not None:

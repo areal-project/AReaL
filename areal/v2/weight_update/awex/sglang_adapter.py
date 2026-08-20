@@ -36,7 +36,11 @@ from areal.v2.weight_update.awex import (
     awex_wu_use_group,
     fetch_kv_metadata,
 )
-from areal.v2.weight_update.awex.delta_config import DTERuntimeConfig
+from areal.v2.weight_update.awex.delta_config import (
+    DTERuntimeConfig,
+    synchronize_wire_dtypes,
+    validate_dte_world_size,
+)
 from areal.v2.weight_update.inference_adapter import (
     AwexInferenceAdapter,
 )
@@ -58,6 +62,7 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
         self._weights_update_group_gloo = None
         self._world_size: int | None = None
         self._separation_delta_transport: NcclColocateStreamBatchTransport | None = None
+        self._separation_wire_dtypes: tuple[torch.dtype, ...] | None = None
         self._transfer_rank: int | None = None
         self._rank_info: RankInfo | None = None
         self._parameters: dict[str, torch.Tensor] | None = None
@@ -366,6 +371,9 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
         train_world_size: int,
         num_engines: int,
     ) -> None:
+        if self._dte_config.enabled:
+            validate_dte_world_size(world_size, infer_world_size, train_world_size)
+
         per_engine_world = infer_world_size // num_engines
         ctx = self._get_model_context()
         tp_size = int(ctx["tp_size"])
@@ -414,6 +422,11 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
             backend="gloo",
             role="inference",
         )
+        if self._dte_config.enabled:
+            self._separation_wire_dtypes = synchronize_wire_dtypes(
+                self._transfer_plan,
+                self._weights_update_group_gloo,
+            )
         logger.info(
             "Initialized AWEX weight update groups for pair=%s role=inference "
             "rank=%s world_size=%s nccl=awex_%s gloo=awex_%s_gloo",
@@ -509,6 +522,8 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
             raise RuntimeError("Weight update group is not initialized")
         if self._transfer_rank is None or self._world_size is None:
             raise RuntimeError("Transfer rank/world size is not initialized")
+        if self._separation_wire_dtypes is None:
+            raise RuntimeError("Separation DTE wire dtypes are not initialized")
 
         operations = [
             op for ops in self._transfer_plan.operations.values() for op in ops
@@ -527,7 +542,8 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
         )
 
         operation_count = 0
-        for dtype, ops in operations_by_dtype.items():
+        for dtype in self._separation_wire_dtypes:
+            ops = operations_by_dtype.get(dtype, [])
             recv_plan = _filter_plan_by_dtype(self._transfer_plan, dtype, is_send=False)
             two_round_delta_exchange(
                 transfer_rank=self._transfer_rank,
@@ -551,7 +567,7 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
             "separation delta v%d received %d ops across %d dtypes",
             version,
             operation_count,
-            len(operations_by_dtype),
+            len(self._separation_wire_dtypes),
         )
 
     def batch_isend_irecv(self, **kwargs) -> None:
@@ -579,6 +595,7 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
         self._transfer_rank = None
         self._world_size = None
         self._separation_delta_transport = None
+        self._separation_wire_dtypes = None
         self._rank_info = None
         self._parameters = None
         if self._colocate_http_client is not None:

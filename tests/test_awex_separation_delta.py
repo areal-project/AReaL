@@ -94,6 +94,219 @@ def test_sglang_full_transfer_initializes_gloo_control_group(monkeypatch):
     assert adapter._weights_update_group_gloo == "gloo"
 
 
+def test_megatron_dte_init_caches_global_wire_dtypes_once(monkeypatch):
+    mod = common._load_megatron_adapter(monkeypatch)
+    _capture_weight_update_groups(monkeypatch, mod)
+    calls = []
+    expected = (torch.bfloat16, torch.float32)
+    monkeypatch.setattr(
+        mod,
+        "synchronize_wire_dtypes",
+        lambda plan, group: calls.append((plan, group)) or expected,
+    )
+    adapter = object.__new__(mod.AwexMegatronAdapter)
+    adapter._dte_config = SimpleNamespace(enabled=True)
+
+    adapter.init_weight_update_group(
+        pair_name="pair",
+        master_addr="127.0.0.1",
+        master_port=23456,
+        transfer_rank=8,
+        world_size=16,
+        kv_store_url="http://127.0.0.1:9999",
+        infer_world_size=8,
+        train_world_size=8,
+        num_engines=2,
+    )
+
+    assert calls == [(adapter._transfer_plan, "gloo")]
+    assert adapter._separation_wire_dtypes == expected
+
+
+def test_sglang_dte_init_caches_global_wire_dtypes_once(monkeypatch):
+    mod = common._load_sglang_adapter(monkeypatch)
+    _capture_weight_update_groups(monkeypatch, mod)
+    calls = []
+    expected = (torch.bfloat16, torch.float32)
+    monkeypatch.setattr(
+        mod,
+        "synchronize_wire_dtypes",
+        lambda plan, group: calls.append((plan, group)) or expected,
+    )
+    adapter = object.__new__(mod.AwexSGLangAdapter)
+    adapter._dte_config = SimpleNamespace(enabled=True)
+    adapter._get_model_context = lambda: {
+        "tp_size": 4,
+        "tp_rank": 0,
+        "pp_size": 1,
+        "pp_rank": 0,
+    }
+
+    adapter.init_weight_update_group(
+        pair_name="pair",
+        master_addr="127.0.0.1",
+        master_port=23456,
+        transfer_rank=0,
+        world_size=16,
+        kv_store_url="http://127.0.0.1:9999",
+        infer_world_size=8,
+        train_world_size=8,
+        num_engines=2,
+    )
+
+    assert calls == [(adapter._transfer_plan, "gloo")]
+    assert adapter._separation_wire_dtypes == expected
+
+
+@pytest.mark.parametrize(
+    ("loader_name", "adapter_name"),
+    [
+        ("_load_megatron_adapter", "AwexMegatronAdapter"),
+        ("_load_sglang_adapter", "AwexSGLangAdapter"),
+    ],
+)
+def test_dte_world_size_fails_before_group_or_metadata_init(
+    monkeypatch, loader_name, adapter_name
+):
+    mod = getattr(common, loader_name)(monkeypatch)
+    events = []
+
+    def _reject(*args):
+        events.append(("validate", args))
+        raise ValueError("combined=5")
+
+    monkeypatch.setattr(mod, "validate_dte_world_size", _reject)
+    monkeypatch.setattr(
+        mod,
+        "fetch_kv_metadata",
+        lambda *args: events.append(("metadata", args)),
+    )
+    monkeypatch.setattr(
+        mod,
+        "init_weights_update_group",
+        lambda **kwargs: events.append(("group", kwargs)),
+    )
+    adapter = object.__new__(getattr(mod, adapter_name))
+    adapter._dte_config = SimpleNamespace(enabled=True)
+
+    with pytest.raises(ValueError, match="combined=5"):
+        adapter.init_weight_update_group(
+            pair_name="pair",
+            master_addr="127.0.0.1",
+            master_port=23456,
+            transfer_rank=0,
+            world_size=5,
+            kv_store_url="http://127.0.0.1:9999",
+            infer_world_size=3,
+            train_world_size=2,
+            num_engines=1,
+        )
+
+    assert events == [("validate", (5, 3, 2))]
+
+
+def test_non_dte_megatron_keeps_odd_world_size_compatibility(monkeypatch):
+    mod = common._load_megatron_adapter(monkeypatch)
+    calls = _capture_weight_update_groups(monkeypatch, mod)
+    monkeypatch.setattr(
+        mod,
+        "validate_dte_world_size",
+        lambda *args: pytest.fail("dense AWEX must not use the DTE world-size gate"),
+    )
+    adapter = object.__new__(mod.AwexMegatronAdapter)
+    adapter._dte_config = SimpleNamespace(enabled=False)
+
+    adapter.init_weight_update_group(
+        pair_name="pair",
+        master_addr="127.0.0.1",
+        master_port=23456,
+        transfer_rank=3,
+        world_size=5,
+        kv_store_url="http://127.0.0.1:9999",
+        infer_world_size=3,
+        train_world_size=2,
+        num_engines=1,
+    )
+
+    assert [call.get("backend", "nccl") for call in calls] == ["nccl", "gloo"]
+
+
+def test_megatron_enters_empty_local_dtype_round(monkeypatch):
+    """A sender with only BF16 ops must still enter the global FP32 round."""
+    mod = common._load_megatron_adapter(monkeypatch)
+    from dte.core import colocate_protocol, delta_p2p
+
+    op = SimpleNamespace(
+        recv_shard_meta=SimpleNamespace(dtype=torch.bfloat16),
+    )
+    calls = []
+
+    def _exchange(**kwargs):
+        calls.append(kwargs)
+
+    monkeypatch.setattr(colocate_protocol, "two_round_delta_exchange", _exchange)
+    monkeypatch.setattr(
+        delta_p2p,
+        "build_send_payloads_by_op",
+        lambda ops, masks, params: {"operation_count": len(ops)},
+    )
+    monkeypatch.setattr(mod.torch.cuda, "current_device", lambda: 0)
+    adapter = object.__new__(mod.AwexMegatronAdapter)
+    adapter._transfer_plan = SimpleNamespace(operations={0: [op]})
+    adapter._weights_update_group = object()
+    adapter._transfer_rank = 1
+    adapter._world_size = 2
+    adapter._separation_wire_dtypes = (torch.bfloat16, torch.float32)
+    adapter._separation_delta_transport = SimpleNamespace(
+        execute_recursive_partition_stream_transfer=lambda *args, **kwargs: None
+    )
+
+    adapter._execute_separation_delta_send({}, {}, version=7)
+
+    assert [call["value_dtype"] for call in calls] == [
+        torch.bfloat16,
+        torch.float32,
+    ]
+    assert calls[0]["send_payloads_by_op"] == {"operation_count": 1}
+    assert calls[1]["send_payloads_by_op"] == {"operation_count": 0}
+    assert calls[1]["send_plan"].operations == {}
+
+
+def test_sglang_enters_empty_local_dtype_round(monkeypatch):
+    """A receiver with only FP32 ops must still enter the global BF16 round."""
+    mod = common._load_sglang_adapter(monkeypatch)
+    from dte.core import colocate_protocol
+
+    op = SimpleNamespace(
+        recv_shard_meta=SimpleNamespace(dtype=torch.float32),
+    )
+    calls = []
+    monkeypatch.setattr(
+        colocate_protocol,
+        "two_round_delta_exchange",
+        lambda **kwargs: calls.append(kwargs),
+    )
+    monkeypatch.setattr(mod.torch.cuda, "current_device", lambda: 0)
+    adapter = object.__new__(mod.AwexSGLangAdapter)
+    adapter._transfer_plan = SimpleNamespace(operations={1: [op]})
+    adapter._weights_update_group = object()
+    adapter._transfer_rank = 0
+    adapter._world_size = 2
+    adapter._separation_wire_dtypes = (torch.bfloat16, torch.float32)
+    adapter._separation_delta_transport = SimpleNamespace(
+        execute_recursive_partition_stream_transfer=lambda *args, **kwargs: None
+    )
+
+    adapter._execute_separation_delta_recv({}, version=7)
+
+    assert [call["value_dtype"] for call in calls] == [
+        torch.bfloat16,
+        torch.float32,
+    ]
+    assert calls[0]["recv_plan"].operations == {}
+    assert calls[1]["recv_plan"].operations == {1: [op]}
+
+
 def test_megatron_full_transfer_uses_gloo_completion_barrier(monkeypatch):
     """Full payload P2P completes through the sideband control group."""
     mod = common._load_megatron_adapter(monkeypatch)
