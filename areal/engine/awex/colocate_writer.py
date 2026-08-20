@@ -932,25 +932,47 @@ class AwexMegatronAdapter:
         base_opt = lifecycle.base_optimizer
         if base_opt is None or not hasattr(base_opt, "state") or base_opt.state is None:
             return
+        if getattr(base_opt, "capturable", False):
+            raise RuntimeError(
+                "AWEX optimizer-state migration does not support capturable optimizers"
+            )
         for state in base_opt.state.values():
-            for key in ("exp_avg", "exp_avg_sq"):
+            # Transformer Engine's precision-aware Adam owns its main parameter
+            # in optimizer state instead of
+            # ``shard_fp32_from_float16_groups``.  Move it with the moments so
+            # the optimizer tag releases every CUDA-resident owner before the
+            # colocated inference engine resumes its memory mappings.
+            for key in ("master_param", "exp_avg", "exp_avg_sq"):
                 if (
                     key in state
                     and isinstance(state[key], torch.Tensor)
                     and state[key].is_cuda
                 ):
-                    device = state[key].device
-                    state[key] = state[key].to("cpu", non_blocking=True)
+                    tensor = state[key]
+                    if type(tensor) is not torch.Tensor:
+                        raise TypeError(
+                            "AWEX optimizer-state migration only supports plain "
+                            f"Tensor values, got {type(tensor).__module__}."
+                            f"{type(tensor).__qualname__} for {key}"
+                        )
+                    device = tensor.device
+                    # Preserve the optimizer-state Tensor identity while
+                    # replacing its storage.  External holders of this exact
+                    # object (for example sharded/checkpoint metadata) then
+                    # observe the move; replacing only ``state[key]`` can
+                    # leave such holders owning the old CUDA storage.
+                    cpu_data = tensor.data.to("cpu", non_blocking=True)
                     journal.actions.append(
                         OptimizerUndoAction(
-                            restore=lambda state=state,
-                            key=key,
-                            device=device: state.__setitem__(
-                                key, state[key].to(device, non_blocking=True)
+                            restore=lambda tensor=tensor, device=device: setattr(
+                                tensor,
+                                "data",
+                                tensor.data.to(device, non_blocking=True),
                             ),
-                            description=f"legacy optimizer state {key}",
+                            description=f"optimizer state {key}",
                         )
                     )
+                    tensor.data = cpu_data
 
 
 def _get_tf_config(models):

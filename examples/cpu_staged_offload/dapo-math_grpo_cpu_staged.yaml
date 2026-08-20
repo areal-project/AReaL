@@ -1,14 +1,14 @@
-experiment_name: gsm8k-grpo-qwen3-30b-a3b-cpu-staged
+experiment_name: dapo-math-grpo-qwen3-30b-a3b-base-cpu-staged
 trial_name: trial0
 
 seed: 1
 enable_offload: false
 total_train_epochs: 10
 tokenizer_path: ${actor.path}
+allocation_mode: "megatron[actor]:(attn:d2p1t4c1|ffn:d1e8)|sglang[rollout]:d4t2p1"
 
 export_style: concat
-agent_run_args:
-  max_turns: 2
+agent_run_args: {}
 
 cpu_staged:
   enabled: true
@@ -29,60 +29,71 @@ scheduler:
   type: null
 
 rollout:
-  backend: "sglang:d1t8p1"
+  backend: "sglang:d4t2p1"
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
   setup_timeout: 900.0
-  max_concurrent_rollouts: 16
-  queue_size: 64
+  request_retries: 1
+  max_concurrent_rollouts: 32
+  queue_size: 512
   consumer_batch_size: ${train_dataset.batch_size}
-  max_head_offpolicyness: 2
+  max_head_offpolicyness: 1
   enable_rollout_tracing: false
   scheduling_spec: ${actor.scheduling_spec}
   fileroot: ${cluster.fileroot}
   tokenizer_path: ${tokenizer_path}
   dump_to_file: false
+  agent:
+    mode: inline
+    admin_api_key: ${oc.env:AREAL_PROXY_ADMIN_API_KEY,areal-admin-key}
+    chat_template_type: concat
+    engine_max_tokens: ${gconfig.max_tokens}
+    export_style: ${export_style}
+    turn_discount: 1.0
 
 gconfig:
-  n_samples: 4
+  n_samples: 16
   min_new_tokens: 0
-  max_new_tokens: 1024
+  # SGLang 0.5.10 requires request total tokens to be below context_length.
+  max_tokens: 32767
+  max_new_tokens: 20480
   greedy: false
   temperature: 1.0
+  top_p: 1.0
 
 actor:
-  # Attention/dense parameters use DP=8; MoE experts use EP=8.
-  backend: "megatron:(attn:d8p1t1|ffn:d1p1t1e8)"
+  # VIME #79 trainer topology: dense TP=4/DP=2 and MoE EP=8/ETP=1.
+  backend: "megatron:(attn:d2p1t4c1|ffn:d1e8)"
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
-  path: ${oc.env:QWEN3_30B_A3B_MODEL_PATH,Qwen/Qwen3-30B-A3B}
+  path: ${oc.env:QWEN3_30B_A3B_BASE_MODEL_PATH,Qwen/Qwen3-30B-A3B-Base}
   init_from_scratch: false
   disable_dropout: true
   gradient_checkpointing: true
   dtype: bfloat16
   grad_reduce_dtype: float32
   mb_spec:
-    max_tokens_per_mb: 4096
+    max_tokens_per_mb: 65536
   optimizer:
     type: adam
-    lr: 3.0e-6
-    weight_decay: 0.01
+    lr: 1.0e-6
+    weight_decay: 0.1
     beta1: 0.9
-    beta2: 0.999
+    beta2: 0.98
     eps: 1e-8
     lr_scheduler_type: constant
     gradient_clipping: 1.0
-    warmup_steps_proportion: 0.001
+    warmup_steps: 10
   megatron:
     wrap_with_ddp: true
     bridge_type: mbridge
     use_precision_aware_optimizer: true
-    main_grads_dtype: bfloat16
+    main_grads_dtype: float32
     main_params_dtype: float32
     exp_avg_dtype: float32
     exp_avg_sq_dtype: float32
     ddp:
-      grad_reduce_in_fp32: false
+      grad_reduce_in_fp32: true
       overlap_grad_reduce: true
       overlap_param_gather: false
       use_distributed_optimizer: true
@@ -94,17 +105,15 @@ actor:
     moe_router_dtype: fp32
     moe_token_dispatcher_type: alltoall
     moe_router_bias_update_rate: 0.0
-  eps_clip: 0.4
+  eps_clip: 0.2
+  eps_clip_higher: 0.28
   temperature: ${gconfig.temperature}
-  reward_scaling: 10.0
+  reward_scaling: 2.0
   reward_bias: -0.5
   kl_ctl: 0.0
   ppo_n_minibatches: 1
-  recompute_logprob: true
-  use_decoupled_loss: true
-  rejection_sampling:
-    metric: ratio
-    upper: 5.0
+  recompute_logprob: false
+  use_decoupled_loss: false
   reward_norm:
     mean_level: group
     std_level: group
@@ -120,23 +129,8 @@ actor:
       gpu: 1
       mem: 128
       cmd: python3 -m areal.infra.rpc.rpc_server
-      env_vars: {}
-
-ref:
-  backend: ${actor.backend}
-  experiment_name: ${experiment_name}
-  trial_name: ${trial_name}
-  path: ${actor.path}
-  init_from_scratch: false
-  disable_dropout: true
-  dtype: ${actor.dtype}
-  mb_spec:
-    max_tokens_per_mb: 4096
-  optimizer: null
-  scheduling_strategy:
-    type: colocation
-    target: actor
-  scheduling_spec: ${actor.scheduling_spec}
+      env_vars:
+        NCCL_NVLS_ENABLE: "0"
 
 sglang:
   model_path: ${actor.path}
@@ -144,41 +138,25 @@ sglang:
   skip_tokenizer_init: true
   dtype: ${actor.dtype}
   max_running_requests: null
-  enable_dp_attention: true
-  dp_size: 8
-  ep_size: 8
-  context_length: 4096
-  mem_fraction_static: 0.8
-
-vllm:
-  model: ${actor.path}
-  seed: ${seed}
-  skip_tokenizer_init: false
-  dtype: ${actor.dtype}
-  max_model_len: 32768
-  gpu_memory_utilization: 0.9
+  context_length: 32768
+  mem_fraction_static: 0.7
 
 train_dataset:
-  batch_size: 8
+  batch_size: 32
   shuffle: true
   pin_memory: true
   num_workers: 4
-  path: openai/gsm8k
+  path: ${oc.env:DAPO_MATH_17K_PATH,/path/to/DAPO-Math-17k}
   type: rl
-  max_length: 1024
+  max_length: 2048
 
-valid_dataset:
-  batch_size: 8
-  pin_memory: true
-  num_workers: 4
-  path: openai/gsm8k
-  type: rl
+valid_dataset: null
 
 saver:
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
   fileroot: ${cluster.fileroot}
-  freq_epochs: 1
+  freq_epochs: null
   freq_steps: null
   freq_secs: null
 
@@ -195,7 +173,7 @@ evaluator:
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
   fileroot: ${cluster.fileroot}
-  freq_epochs: 1
+  freq_epochs: null
   freq_steps: null
   freq_secs: null
 

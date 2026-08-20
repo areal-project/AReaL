@@ -19,6 +19,7 @@ VALID_DATASETS = [
     "virl39k",
     "hh-rlhf",
     "torl_data",
+    "dapo-math-17k",
 ]
 
 logger = logging.getLogger("Dataset")
@@ -127,6 +128,16 @@ def _get_custom_dataset(
         from .torl_data import get_torl_data_rl_dataset
 
         return get_torl_data_rl_dataset(
+            path=path,
+            split=split,
+            tokenizer=tokenizer,
+            max_length=max_length,
+            **kwargs,
+        )
+    elif "dapo-math-17k" in path.lower() and type == "rl":
+        from .dapo_math_17k import get_dapo_math_17k_rl_dataset
+
+        return get_dapo_math_17k_rl_dataset(
             path=path,
             split=split,
             tokenizer=tokenizer,

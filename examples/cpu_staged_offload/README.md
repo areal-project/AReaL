@@ -1,11 +1,17 @@
-# Qwen3-30B-A3B Multi-Turn GSM8K with CPU-Staged AdamW
+# Qwen3-30B-A3B DAPO-Math with CPU-Staged AdamW
 
-This example keeps the multi-turn GSM8K workflow, reward verification, `concat`
-trajectory export, and reward discounting from `examples/multi_turn_math`. The only
-training change is that the primary actor is a Megatron actor whose AdamW master weights
-and moments live in pinned CPU slabs. The default model is Qwen3-30B-A3B.
+This example runs the multi-turn math agent through AReaL's OpenAI-compatible proxy. The
+agent uses the standard OpenAI `AsyncOpenAI` client, while the proxy captures the
+interactions for `concat` trajectory export. Turn-level reward discounting is disabled
+with `turn_discount: 1.0`. The primary actor is a Megatron actor whose AdamW master
+weights and moments live in pinned CPU slabs. The default model is
+`Qwen/Qwen3-30B-A3B-Base`.
 
-The train and validation datasets both use `openai/gsm8k`.
+The training dataset is a local DAPO-Math-17k checkout. Its loader first reads
+`data/*.parquet`, then falls back to JSON or JSONL files in the dataset root. Existing
+OpenAI-style `prompt` messages become `messages`; `label` is used as the answer, with
+`reward_model.ground_truth` as a fallback. Prompts longer than
+`train_dataset.max_length` after applying the tokenizer's chat template are filtered.
 
 ## CPU-staged AdamW versus `enable_offload`
 
@@ -38,10 +44,9 @@ run isolates optimizer residency and staging rather than changing MCore optimize
   tensors per optimizer leaf. Qwen3 MoE normally has separate dense and expert leaves,
   so up to about 2 GiB may remain resident per actor rank. Tune these example-local
   settings under `cpu_staged`; no AReaL CLI schema is added.
-- With Attention DP8 and FFN EP8, Qwen3-30B-A3B owns approximately 5.16 billion
-  parameters per actor rank. Its three authoritative FP32 CPU slabs require about 57.7
-  GiB of pinned host memory per rank (about 462 GiB across eight ranks), excluding model
-  backups and runtime overhead.
+- Authoritative CPU memory scales with each rank's owned optimizer shard. Account for
+  three FP32 tensors per owned parameter (master weight and two Adam moments), excluding
+  model backups and runtime overhead.
 - Managed asynchronous save and synchronous transactional load use the core staged
   optimizer implementation; this example does not copy or patch that code.
 
@@ -76,29 +81,29 @@ AREAL_CPU_STAGED_SNAPSHOT_CHUNK_MB
 
 ## Launch
 
-The provided allocation assumes one node with eight GPUs. Eight Megatron actor ranks use
-`megatron:(attn:d8p1t1|ffn:d1p1t1e8)`: dense Attention parameters are replicated with
-DP8, while 128 MoE experts are sharded with EP8. One eight-GPU SGLang server uses DP
-Attention and EP8 MoE on those same physical GPUs through AWEX. The ref configuration
-uses the standard Megatron engine path and is not given the staged optimizer subclass.
+The provided allocation assumes one node with eight GPUs. Megatron uses dense TP4/DP2
+and MoE EP8, while rollout uses four SGLang TP2 engines. Both components request all
+eight physical GPUs and AWEX time-multiplexes actor training and rollout residency. The
+actor workers set `NCCL_NVLS_ENABLE=0` for the conservative collective path used by this
+recipe.
 
-The local scheduler intentionally does not use an explicit rollout
-`scheduling_strategy`. The actor allocation has eight one-GPU workers, whereas the
-rollout allocation has one eight-GPU worker, so explicit worker-for-worker colocation
-would be invalid. After actor GPUs 0--7 are allocated, local round-robin placement wraps
-the rollout allocation back onto GPUs 0--7.
-
-Set `QWEN3_30B_A3B_MODEL_PATH` when using a local checkpoint. If it is unset, the YAML
-uses `Qwen/Qwen3-30B-A3B`.
+Set `DAPO_MATH_17K_PATH` to a local dataset checkout. Set
+`QWEN3_30B_A3B_BASE_MODEL_PATH` to use a local checkpoint; otherwise the YAML uses
+`Qwen/Qwen3-30B-A3B-Base`. The proxy total-token limit is `gconfig.max_tokens: 32767`,
+linked through `rollout.agent.engine_max_tokens`, while the completion budget is 20480
+tokens and SGLang's context length is 32768. Set a unique `AREAL_PROXY_ADMIN_API_KEY`
+whenever proxy workers are reachable beyond localhost.
 
 Single-controller local mode:
 
 ```bash
-QWEN3_30B_A3B_MODEL_PATH=/path/to/Qwen3-30B-A3B \
-uv run python examples/cpu_staged_offload/gsm8k_rl_cpu_staged.py \
-  --config examples/cpu_staged_offload/gsm8k_grpo_cpu_staged.yaml \
+AREAL_PROXY_ADMIN_API_KEY=/replace-with-a-unique-secret \
+DAPO_MATH_17K_PATH=/path/to/DAPO-Math-17k \
+QWEN3_30B_A3B_BASE_MODEL_PATH=/path/to/Qwen3-30B-A3B-Base \
+uv run python examples/cpu_staged_offload/dapo-math_rl_cpu_staged.py \
+  --config examples/cpu_staged_offload/dapo-math_grpo_cpu_staged.yaml \
   scheduler.type=local \
-  experiment_name=gsm8k-grpo-qwen3-30b-a3b-cpu-staged \
+  experiment_name=dapo-math-grpo-qwen3-30b-a3b-base-cpu-staged \
   trial_name=trial0
 ```
 
@@ -122,8 +127,7 @@ the recorded window. Set `total_train_steps=2` for a minimal capture, and use di
 `experiment_name`, `trial_name`, `AREAL_FILEROOT`, and name-resolve roots for enabled
 and disabled runs.
 
-The custom trainer also retains AReaL's non-single-controller construction branch: the
-custom actor is instantiated in-process, while ref/critic engines continue through the
-standard `PPOTrainer` factory. When using a cluster scheduler, ensure the repository is
-importable on every worker so the stable actor path
-`examples.cpu_staged_offload.engine.CPUStagedMegatronPPOActor` resolves remotely.
+The custom trainer also retains AReaL's non-single-controller construction branch. When
+using a cluster scheduler, ensure the repository is importable on every worker so the
+stable actor path `examples.cpu_staged_offload.engine.CPUStagedMegatronPPOActor`
+resolves remotely.

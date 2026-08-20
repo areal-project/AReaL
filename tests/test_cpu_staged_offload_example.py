@@ -1,4 +1,4 @@
-"""Focused checks for the CPU-staged Megatron GSM8K example."""
+"""Focused checks for the CPU-staged Megatron DAPO-Math example."""
 
 from __future__ import annotations
 
@@ -167,7 +167,7 @@ def test_example_config_and_modules_load_from_repository_root(
 ) -> None:
     """The documented YAML and remote module imports form one valid config."""
     monkeypatch.chdir(REPOSITORY_ROOT)
-    monkeypatch.setenv("QWEN3_30B_A3B_MODEL_PATH", "/models/Qwen3-30B-A3B")
+    monkeypatch.setenv("QWEN3_30B_A3B_BASE_MODEL_PATH", "/models/Qwen3-30B-A3B-Base")
     monkeypatch.setattr(cli_args.name_resolve, "reconfigure", lambda config: None)
     monkeypatch.setattr(cli_args, "save_config", lambda config, path: None)
     monkeypatch.setattr(
@@ -177,17 +177,18 @@ def test_example_config_and_modules_load_from_repository_root(
     config, config_path = load_expr_config(
         [
             "--config",
-            "examples/cpu_staged_offload/gsm8k_grpo_cpu_staged.yaml",
+            "examples/cpu_staged_offload/dapo-math_grpo_cpu_staged.yaml",
         ],
         CPUStagedGRPOConfig,
     )
     allocation = ModelAllocation.from_str(config.actor.backend)
 
-    assert config_path.endswith("gsm8k_grpo_cpu_staged.yaml")
-    assert config.actor.path == config.tokenizer_path == "/models/Qwen3-30B-A3B"
+    assert config_path.endswith("dapo-math_grpo_cpu_staged.yaml")
+    assert config.actor.path == config.tokenizer_path == "/models/Qwen3-30B-A3B-Base"
     assert allocation.parallel.world_size == 8
-    assert allocation.parallel.data_parallel_size == 8
+    assert allocation.parallel.data_parallel_size == 2
+    assert allocation.parallel.tensor_parallel_size == 4
     assert allocation.parallel.expert_parallel_size == 8
-    assert config.rollout.backend == "sglang:d1t8p1"
+    assert config.rollout.backend == "sglang:d4t2p1"
     assert config.cpu_staged.enabled is True
     assert config.memory_profiler.profile_steps == [1]
