@@ -62,6 +62,23 @@ class VLLMBackend:
         gconfig = req.gconfig
         stop_token_ids = gconfig.stop_token_ids
 
+        if gconfig.sampling_seed is not None:
+            # No native vLLM equivalent is wired here (vLLM's own per-request `seed`
+            # is stream-based and would misalign under this engine's
+            # interruption/resumption re-submits). Fail loudly rather than silently
+            # dropping the seed and producing non-reproducible rollouts the caller
+            # believes are seeded; mirrors how SGLangBackend rejects its own
+            # unsupported use_beam_search (areal/engine/sglang_remote.py).
+            # Note: PPOConfig.__post_init__ validates this combination once at
+            # config-construction time. A seed set dynamically per-request after
+            # that (e.g. by a future per-rollout seed-minting workflow) still raises
+            # here, but on the async rollout path this exception is caught
+            # generically further up the call stack and surfaces as a rejected
+            # rollout, not a hard crash.
+            raise NotImplementedError(
+                "sampling_seed is not yet supported on the vLLM backend."
+            )
+
         # NOTE: vLLM uses flat payload structure, not nested sampling_params
         payload = {
             "top_p": gconfig.top_p,

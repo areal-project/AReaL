@@ -69,6 +69,7 @@ def _make_request(
     temperature: float = 1.0,
     metadata: dict[str, Any] | None = None,
     lora_name: str | None = None,
+    sampling_seed: int | None = None,
 ) -> ModelRequest:
     """Create a ModelRequest with sensible defaults for testing."""
     if input_ids is None:
@@ -79,6 +80,7 @@ def _make_request(
         max_tokens=max_tokens,
         greedy=greedy,
         temperature=temperature,
+        sampling_seed=sampling_seed,
     )
     if lora_name is not None:
         gconfig.lora_name = lora_name
@@ -472,6 +474,15 @@ class TestVLLMBridgeBackend:
         assert http_req.payload["prompt"] == [11, 12]
         assert http_req.payload["max_tokens"] == 7
         assert http_req.payload["stream"] is False
+
+    def test_vllm_bridge_rejects_sampling_seed(self):
+        """No vLLM wiring for sampling_seed here; must fail loudly rather than
+        silently no-op, mirroring areal.engine.vllm_remote.VLLMBackend."""
+        backend = VLLMBridgeBackend()
+        req = _make_request(input_ids=[11, 12], sampling_seed=12345)
+
+        with pytest.raises(NotImplementedError):
+            backend.build_generation_request(req, with_lora=False, version=0)
 
     def test_vllm_parse_generation_response_for_chat_format(self):
         """vLLM bridge parses chat logprobs content format."""
