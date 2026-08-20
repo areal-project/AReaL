@@ -58,6 +58,11 @@ def main():
         default="",
     )
     parser.add_argument(
+        "--deterministic-sampling",
+        action="store_true",
+        help="Derive stable per-session request seeds.",
+    )
+    parser.add_argument(
         "--tool-call-parser",
         default="qwen",
     )
@@ -97,6 +102,7 @@ def main():
         set_reward_finish_timeout=args.set_reward_finish_timeout,
         admin_api_key=args.admin_api_key,
         callback_server_addr=args.callback_server_addr,
+        deterministic_sampling=args.deterministic_sampling,
         serving_addr=format_hostport(serving_host, args.port),
         tool_call_parser=args.tool_call_parser,
         reasoning_parser=args.reasoning_parser,

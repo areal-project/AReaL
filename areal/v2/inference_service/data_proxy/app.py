@@ -30,7 +30,6 @@ from areal.infra.rpc.serialization import serialize_value
 from areal.infra.utils.http import create_httpx_client
 from areal.utils import logging
 from areal.utils.data import concat_padded_tensors
-from areal.utils.environ import get_bool_env_var
 from areal.utils.seeding import derive_deterministic_seed
 from areal.v2.inference_service.data_proxy.config import DataProxyConfig
 from areal.v2.inference_service.data_proxy.pause import PauseState
@@ -667,8 +666,8 @@ def create_app(config: DataProxyConfig) -> FastAPI:
         if "top_p" not in kwargs:
             kwargs["top_p"] = 1.0
 
-        deterministic_sampling = session is not None and get_bool_env_var(
-            "AREAL_DETERMINISTIC_SAMPLING"
+        deterministic_sampling = (
+            session is not None and app.state.config.deterministic_sampling
         )
         request_index = (
             session.next_sampling_request_index() if deterministic_sampling else None

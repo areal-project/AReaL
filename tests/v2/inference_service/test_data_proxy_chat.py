@@ -444,9 +444,9 @@ async def test_chat_completions_passes_sampling_params(client, mock_areal_client
 
 @pytest.mark.asyncio
 async def test_chat_completions_deterministic_seed_distinguishes_group_sessions(
-    client, mock_areal_client, monkeypatch
+    client, config, mock_areal_client
 ):
-    monkeypatch.setenv("AREAL_DETERMINISTIC_SAMPLING", "1")
+    config.deterministic_sampling = True
     resp = await client.post(
         "/rl/start_session",
         json={"task_id": "seed-test", "group_size": 2},
@@ -478,9 +478,9 @@ async def test_chat_completions_deterministic_seed_distinguishes_group_sessions(
 
 @pytest.mark.asyncio
 async def test_chat_completions_preserves_explicit_seed(
-    client, mock_areal_client, monkeypatch
+    client, config, mock_areal_client
 ):
-    monkeypatch.setenv("AREAL_DETERMINISTIC_SAMPLING", "1")
+    config.deterministic_sampling = True
     resp = await client.post(
         "/rl/start_session",
         json={"task_id": "explicit-seed"},
@@ -500,6 +500,20 @@ async def test_chat_completions_preserves_explicit_seed(
 
     assert resp.status_code == 200
     assert mock_areal_client.chat.completions.create.call_args.kwargs["seed"] == 12345
+
+    resp = await client.post(
+        "/chat/completions",
+        json={
+            "model": "sglang",
+            "messages": [{"role": "user", "content": "again"}],
+        },
+        headers=session_headers(api_key),
+    )
+
+    assert resp.status_code == 200
+    assert mock_areal_client.chat.completions.create.call_args.kwargs[
+        "seed"
+    ] == derive_deterministic_seed("explicit-seed", 1)
 
 
 # =============================================================================

@@ -168,7 +168,7 @@ class InferenceServiceWorkflow(RolloutWorkflow):
             session_api_key: str,
         ) -> float | None:
             """Run one agent session. Returns reward on success, ``None`` on failure."""
-            logger.info(
+            logger.debug(
                 "V2 rollout member start: task_id=%s group_id=%s member=%d "
                 "session_id=%s version=%s mode=%s",
                 task_id,
@@ -223,7 +223,7 @@ class InferenceServiceWorkflow(RolloutWorkflow):
                     )
                 return None
             finally:
-                logger.info(
+                logger.debug(
                     "V2 rollout member finish: task_id=%s group_id=%s member=%d "
                     "session_id=%s version=%s mode=%s",
                     task_id,

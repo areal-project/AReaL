@@ -273,6 +273,52 @@ def test_sglang_server_args_enable_deterministic_inference(monkeypatch):
     assert args["enable_deterministic_inference"] is True
 
 
+@pytest.mark.parametrize("attention_backend", ["flashinfer", "fa3", "triton", None])
+def test_sglang_deterministic_inference_supported_backend_does_not_warn(
+    monkeypatch, attention_backend
+):
+    monkeypatch.setattr(
+        "areal.api.cli_args.pkg_version.is_version_greater_or_equal",
+        lambda *_: True,
+    )
+    mock_logger = Mock()
+    monkeypatch.setattr("areal.api.cli_args.logger", mock_logger)
+
+    SGLangConfig.build_args(
+        SGLangConfig(
+            model_path="test-model",
+            attention_backend=attention_backend,
+            enable_deterministic_inference=True,
+        ),
+        tp_size=1,
+        base_gpu_id=0,
+    )
+
+    mock_logger.warning.assert_not_called()
+
+
+def test_sglang_deterministic_inference_unsupported_backend_warns(monkeypatch):
+    monkeypatch.setattr(
+        "areal.api.cli_args.pkg_version.is_version_greater_or_equal",
+        lambda *_: True,
+    )
+    mock_logger = Mock()
+    monkeypatch.setattr("areal.api.cli_args.logger", mock_logger)
+
+    SGLangConfig.build_args(
+        SGLangConfig(
+            model_path="test-model",
+            attention_backend="torch_native",
+            enable_deterministic_inference=True,
+        ),
+        tp_size=1,
+        base_gpu_id=0,
+    )
+
+    mock_logger.warning.assert_called_once()
+    assert "torch_native" in mock_logger.warning.call_args.args
+
+
 @dataclass
 class _FakeTimedResult:
     task_id: int
@@ -280,7 +326,11 @@ class _FakeTimedResult:
     data: object | None = None
 
 
-def test_select_results_is_task_ordered_when_deterministic():
+def test_select_results_is_task_ordered_without_shuffle_when_deterministic(
+    monkeypatch,
+):
+    mock_shuffle = Mock()
+    monkeypatch.setattr(workflow_executor_module.random, "shuffle", mock_shuffle)
     # Arrival order (create_time) deliberately disagrees with task id order.
     drained = [
         _FakeTimedResult(task_id=2, create_time=1.0),
@@ -292,27 +342,12 @@ def test_select_results_is_task_ordered_when_deterministic():
 
     assert [r.task_id for r in selected] == [0, 1]
     assert [r.task_id for r in pending] == [2]
+    mock_shuffle.assert_not_called()
 
 
-def test_select_results_follows_explicit_submission_frontier():
-    drained = [
-        _FakeTimedResult(task_id=1, create_time=1.0),
-        _FakeTimedResult(task_id=50, create_time=2.0),
-        _FakeTimedResult(task_id=100, create_time=3.0),
-    ]
-
-    selected, pending = _select_results(
-        drained,
-        count=2,
-        deterministic=True,
-        task_frontier=(100, 1),
-    )
-
-    assert [r.task_id for r in selected] == [100, 1]
-    assert [r.task_id for r in pending] == [50]
-
-
-def test_select_results_is_arrival_ordered_by_default():
+def test_select_results_is_arrival_ordered_and_shuffled_by_default(monkeypatch):
+    mock_shuffle = Mock()
+    monkeypatch.setattr(workflow_executor_module.random, "shuffle", mock_shuffle)
     drained = [
         _FakeTimedResult(task_id=2, create_time=1.0),
         _FakeTimedResult(task_id=0, create_time=2.0),
@@ -325,9 +360,10 @@ def test_select_results_is_arrival_ordered_by_default():
     # shuffled, so only membership is asserted here.
     assert {r.task_id for r in selected} == {2, 0}
     assert [r.task_id for r in pending] == [1]
+    mock_shuffle.assert_called_once_with(selected)
 
 
-def test_wait_results_does_not_skip_unfinished_task_frontier():
+def test_wait_results_selects_completed_tasks_when_deterministic():
     dispatcher = object.__new__(BatchTaskDispatcher)
     dispatcher.deterministic_order = True
     dispatcher._result_cv = threading.Condition()
@@ -339,17 +375,11 @@ def test_wait_results_does_not_skip_unfinished_task_frontier():
     }
     dispatcher._check_thread_exception = lambda: None
 
-    assert dispatcher.wait_results(2, timeout=0, raise_timeout=False) == []
-    assert set(dispatcher._pending_results) == {1, 2}
-
-    dispatcher._pending_results[0] = _FakeTimedResult(
-        task_id=0, create_time=3.0, data="zero"
-    )
     results = dispatcher.wait_results(2, timeout=0)
 
-    assert results == ["zero", "one"]
-    assert set(dispatcher._pending_results) == {2}
-    assert dispatcher._active_task_ids == {2: None}
+    assert results == ["one", "two"]
+    assert dispatcher._pending_results == {}
+    assert dispatcher._active_task_ids == {0: None}
 
 
 def test_wait_results_fails_fast_when_dispatcher_is_shutting_down():
@@ -398,7 +428,7 @@ def test_submit_task_input_rolls_back_when_enqueue_hook_fails():
     assert list(dispatcher._pending_inputs) == []
 
 
-def test_wait_for_task_removes_middle_item_from_deterministic_frontier():
+def test_wait_for_task_removes_result_before_deterministic_batch_selection():
     dispatcher = object.__new__(BatchTaskDispatcher)
     dispatcher.deterministic_order = True
     dispatcher._result_cv = threading.Condition()

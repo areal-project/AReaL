@@ -76,6 +76,37 @@ class TestInferenceEngineConfigForInferenceService:
         cfg = InferenceEngineConfig(backend="sglang:d1")
         assert cfg.dump_to_file is False
 
+    def test_deterministic_sampling_with_offpolicy_head_warns(self):
+        with patch("areal.api.cli_args.logger") as mock_logger:
+            InferenceEngineConfig(
+                backend="sglang:d1",
+                deterministic_sampling=True,
+                max_head_offpolicyness=1,
+            )
+
+        mock_logger.warning.assert_called_once()
+        assert "task-to-weight-version" in mock_logger.warning.call_args.args[0]
+
+    def test_deterministic_sampling_onpolicy_does_not_warn(self):
+        with patch("areal.api.cli_args.logger") as mock_logger:
+            InferenceEngineConfig(
+                backend="sglang:d1",
+                deterministic_sampling=True,
+                max_head_offpolicyness=0,
+            )
+
+        mock_logger.warning.assert_not_called()
+
+    def test_nondeterministic_sampling_with_offpolicy_head_does_not_warn(self):
+        with patch("areal.api.cli_args.logger") as mock_logger:
+            InferenceEngineConfig(
+                backend="sglang:d1",
+                deterministic_sampling=False,
+                max_head_offpolicyness=1,
+            )
+
+        mock_logger.warning.assert_not_called()
+
 
 # =============================================================================
 # RolloutControllerV2 — workflow resolution helpers
@@ -362,9 +393,10 @@ class TestRolloutControllerV2Construction:
         controller.config_perf_tracer()
         controller.save_perf_tracer()
 
+    @pytest.mark.parametrize("deterministic_sampling", [False, True])
     @pytest.mark.asyncio
-    async def test_async_initialize_passes_callback_and_reward_timeout_to_data_proxy(
-        self,
+    async def test_async_initialize_passes_config_to_data_proxy(
+        self, deterministic_sampling
     ):
         from areal.api.cli_args import SchedulingSpec
         from areal.api.io_struct import LocalInfServerInfo
@@ -380,6 +412,7 @@ class TestRolloutControllerV2Construction:
             backend="sglang:d1",
             tokenizer_path="mock-tokenizer",
             request_timeout=15.0,
+            deterministic_sampling=deterministic_sampling,
             agent=AgentConfig(
                 agent_cls_path="tests.experimental.openai.utils.SimpleAgent",
                 set_reward_finish_timeout=7.5,
@@ -423,6 +456,7 @@ class TestRolloutControllerV2Construction:
         assert "7.5" in data_proxy_cmd
         assert "--callback-server-addr" in data_proxy_cmd
         assert "http://127.0.0.1:19000" in data_proxy_cmd
+        assert ("--deterministic-sampling" in data_proxy_cmd) is deterministic_sampling
 
 
 class TestOnlineCallbackFlow:
@@ -734,7 +768,7 @@ class TestInferenceServiceWorkflow:
         ]
 
     @pytest.mark.asyncio
-    async def test_offline_group_serial_flag_preserves_order(self):
+    async def test_offline_group_serial_flag_preserves_within_group_order(self):
         result, max_active, start_order, tracker, _ = await self._run_offline_group(
             serialize_group_samples=True,
         )

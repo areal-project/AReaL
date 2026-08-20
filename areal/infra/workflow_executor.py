@@ -9,7 +9,6 @@ import threading
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from itertools import islice
 from typing import TYPE_CHECKING, Any, Generic, TypeVar, Protocol
 from collections.abc import Generator
 from collections import deque
@@ -265,33 +264,20 @@ def _select_results(
     drained: list,
     count: int,
     deterministic: bool,
-    task_frontier: tuple[int, ...] | None = None,
 ) -> tuple[list, list]:
     """Order drained results, then split them into (selected, pending).
 
     Normally results are taken oldest-first and the returned batch is
-    shuffled to avoid systematic ordering bias. Both steps depend on arrival
-    timing. Under deterministic sampling, ``task_frontier`` identifies the
-    exact tasks to select, independent of which later tasks finished first.
+    shuffled to avoid systematic ordering bias. Under deterministic sampling,
+    completed results are ordered by task ID and are not shuffled.
     """
     if deterministic:
-        if task_frontier is None:
-            task_frontier = tuple(sorted(r.task_id for r in drained)[:count])
-        if len(task_frontier) != count:
-            raise ValueError(
-                f"Expected {count} task ids in frontier, got {len(task_frontier)}"
-            )
-        by_task_id = {result.task_id: result for result in drained}
-        missing = [task_id for task_id in task_frontier if task_id not in by_task_id]
-        if missing:
-            raise ValueError(f"Task frontier results are not ready: {missing}")
-        selected = [by_task_id.pop(task_id) for task_id in task_frontier]
-        pending = list(by_task_id.values())
-        return selected, pending
+        drained.sort(key=lambda x: x.task_id)
     else:
         drained.sort(key=lambda x: x.create_time)
     selected, pending = drained[:count], drained[count:]
-    random.shuffle(selected)
+    if not deterministic:
+        random.shuffle(selected)
     return selected, pending
 
 
@@ -622,10 +608,6 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
         list[TResult | None]
             List of task results, None for rejected tasks.
 
-        Notes
-        -----
-        Deterministic ordering assumes one batch consumer. A concurrent
-        ``wait_for_task`` call that consumes the frozen frontier fails fast.
         """
         if count <= 0:
             raise ValueError(f"count must be positive, got {count}")
@@ -635,46 +617,18 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
             timeout = _DEFAULT_WAIT_TIMEOUT_SECONDS
 
         with self._result_cv:
-            task_frontier: tuple[int, ...] | None = None
-            while True:
+            while len(self._pending_results) < count:
                 self._check_thread_exception()
                 if self._shutdown_event.is_set():
                     raise RuntimeError("Task dispatcher is shutting down")
-
-                if self.deterministic_order:
-                    if task_frontier is None and len(self._active_task_ids) >= count:
-                        task_frontier = tuple(islice(self._active_task_ids, count))
-                    consumed = (
-                        []
-                        if task_frontier is None
-                        else [
-                            task_id
-                            for task_id in task_frontier
-                            if task_id not in self._active_task_ids
-                            and task_id not in self._pending_results
-                        ]
-                    )
-                    if consumed:
-                        raise RuntimeError(
-                            f"Task frontier was consumed by another waiter: {consumed}"
-                        )
-                    results_ready = task_frontier is not None and all(
-                        task_id in self._pending_results for task_id in task_frontier
-                    )
-                else:
-                    results_ready = len(self._pending_results) >= count
-
-                if results_ready:
-                    break
 
                 elapsed = time.perf_counter() - start_time
                 remaining = timeout - elapsed
                 if remaining <= 0:
                     if raise_timeout:
                         raise TimeoutError(
-                            f"Timed out waiting for {count} results; "
-                            f"received {len(self._pending_results)}, "
-                            f"frontier={task_frontier}"
+                            f"Timed out waiting for {count} results, "
+                            f"only received {len(self._pending_results)}"
                         )
                     return []
 
@@ -686,7 +640,6 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
                 drained,
                 count,
                 self.deterministic_order,
-                task_frontier=task_frontier,
             )
             if pending:
                 for result in pending:
