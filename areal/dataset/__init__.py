@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import re
 from typing import TYPE_CHECKING, Optional
 
 from areal.api.cli_args import _DatasetConfig
@@ -19,9 +20,16 @@ VALID_DATASETS = [
     "virl39k",
     "hh-rlhf",
     "torl_data",
+    "swe_sft",
 ]
 
 logger = logging.getLogger("Dataset")
+
+# Matches "swe" only as a path token delimited by /, _, -, or . (e.g.
+# "swe_data/", "swe-bench", "my_swe.jsonl") so that paths merely containing
+# the trigram (e.g. "answer_sft", "/home/swetha/") fall through to the
+# generic load-from-disk fallback instead of the SWE trajectory pipeline.
+_SWE_PATH_PATTERN = re.compile(r"(?:^|[/_\-.])swe(?:[/_\-.]|$)")
 
 
 def _get_custom_dataset(
@@ -127,6 +135,16 @@ def _get_custom_dataset(
         from .torl_data import get_torl_data_rl_dataset
 
         return get_torl_data_rl_dataset(
+            path=path,
+            split=split,
+            tokenizer=tokenizer,
+            max_length=max_length,
+            **kwargs,
+        )
+    elif _SWE_PATH_PATTERN.search(path.lower()) and type == "sft":
+        from .swe_sft import get_swe_sft_dataset
+
+        return get_swe_sft_dataset(
             path=path,
             split=split,
             tokenizer=tokenizer,

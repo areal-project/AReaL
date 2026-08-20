@@ -20,6 +20,10 @@ from areal.models.mcore.bailing_moe import (
     hf_to_mcore_config_bailing_moe,
     make_mcore_layer_specs_bailing_moe,
 )
+from areal.models.mcore.bailing_v3 import (
+    hf_to_mcore_config_bailing_v3,
+    make_mcore_layer_specs_bailing_v3,
+)
 from areal.models.mcore.qwen3 import (
     hf_to_mcore_config_qwen3_dense,
     make_mcore_layer_specs_qwen3_dense,
@@ -366,6 +370,8 @@ def make_hf_and_mcore_config(
             "BailingHybridForCausalLM",
         ):
             return hf_config, hf_to_mcore_config_bailing_moe(hf_config, dtype)
+        elif architecture == "BailingMoeV3ForCausalLM":
+            return hf_config, hf_to_mcore_config_bailing_v3(hf_config, dtype)
         else:
             raise ValueError(
                 f"Architecture not registered for config conversion: {architecture}."
@@ -383,6 +389,8 @@ def make_mcore_layer_specs(hf_config: PretrainedConfig, tf_config: TransformerCo
         "BailingHybridForCausalLM",
     ):
         return make_mcore_layer_specs_bailing_moe(tf_config, hf_config, use_te=True)
+    elif architecture == "BailingMoeV3ForCausalLM":
+        return make_mcore_layer_specs_bailing_v3(tf_config, hf_config, use_te=True)
     else:
         raise ValueError(
             f"Architecture not registered for config conversion: {architecture}."

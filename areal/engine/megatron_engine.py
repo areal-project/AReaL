@@ -36,6 +36,7 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import PretrainedConfig
 
 import areal.models.mcore.bailing_moe_bridge  # noqa: F401  # register bridge
+import areal.models.mcore.bailing_v3_bridge  # noqa: F401  # register bridge
 from areal.api import (
     FinetuneSpec,
     InferenceEngine,
@@ -89,6 +90,7 @@ from areal.engine.megatron_utils.pipeline_parallel import (
 )
 from areal.infra.dist_rollout import DistRolloutCoordinator
 from areal.infra.platforms import current_platform, is_npu_available
+from areal.models.mcore.bailing_v3_bridge import BailingV3Bridge
 from areal.models.mcore.hf_load import load_weights_from_hf_with_mbridge_fast
 from areal.models.mcore.hf_save import (
     save_critic_value_head,
@@ -713,9 +715,19 @@ class MegatronEngine(TrainEngine):
 
     def _build_hf_mcore_bridge(self):
         if self.bridge_cls == "mbridge":
-            self.bridge = mbridge.AutoBridge.from_pretrained(
+            hf_config = PretrainedConfig.from_pretrained(
                 self.config.path, trust_remote_code=True
             )
+            architectures = getattr(hf_config, "architectures", None) or []
+            if "BailingMoeV3ForCausalLM" in architectures:
+                # BailingMoeV3 flash checkpoints keep model_type="bailing_hybrid",
+                # which overlaps the v2.5 bridge registration. Dispatch by
+                # architecture so KDA + gated-MLA weights use the v3 bridge.
+                self.bridge = BailingV3Bridge(hf_config)
+            else:
+                self.bridge = mbridge.AutoBridge.from_pretrained(
+                    self.config.path, trust_remote_code=True
+                )
             self.bridge.dtype = self.dtype
             if self.config.gradient_checkpointing:
                 self.bridge.set_extra_args(
@@ -727,13 +739,23 @@ class MegatronEngine(TrainEngine):
                 )
 
             # Set MoE configuration overrides (aux-loss-free balancing, z-loss).
+            # mbridge extra_args override per-model bridge kwargs, so fields
+            # whose cli default may disagree with a bridge's deliberate
+            # default are forwarded only when explicitly configured
+            # (None = keep the bridge default).
             moe_extra_args: dict = {
                 "moe_token_dispatcher_type": self.mcore_config.moe_token_dispatcher_type,
                 "moe_permute_fusion": self.mcore_config.moe_permute_fusion,
                 "moe_router_fusion": self.mcore_config.moe_router_fusion,
-                "moe_shared_expert_overlap": self.mcore_config.moe_shared_expert_overlap,
-                "moe_router_bias_update_rate": self.mcore_config.moe_router_bias_update_rate,
             }
+            if self.mcore_config.moe_shared_expert_overlap is not None:
+                moe_extra_args["moe_shared_expert_overlap"] = (
+                    self.mcore_config.moe_shared_expert_overlap
+                )
+            if self.mcore_config.moe_router_bias_update_rate is not None:
+                moe_extra_args["moe_router_bias_update_rate"] = (
+                    self.mcore_config.moe_router_bias_update_rate
+                )
             if self.mcore_config.moe_router_dtype is not None:
                 moe_extra_args["moe_router_dtype"] = self.mcore_config.moe_router_dtype
             if self.mcore_config.moe_z_loss_coeff is not None:
@@ -1019,6 +1041,11 @@ class MegatronEngine(TrainEngine):
                     raise ValueError(
                         "HF format does not support optimizer state saving, please use DCP format instead."
                     )
+                # HF export all-gathers full tensors across TP; reclaim allocator
+                # headroom first. Kept out of the dcp/recover path, which is
+                # frequency-driven and should not pay a full-heap GC per save.
+                gc.collect()
+                current_platform.empty_cache()
                 self._save_model_to_hf(
                     meta.path,
                     tokenizer=meta.tokenizer,
@@ -1329,6 +1356,7 @@ class MegatronEngine(TrainEngine):
         self._ensure_ready()
         if self._awex_adapter is not None:
             self._awex_adapter.ensure_grad_buffers()
+
         self.optimizer_zero_grad()
 
         input_batched, _ = self._normalize_batch_input(input_)
@@ -2912,6 +2940,7 @@ class MegatronEngine(TrainEngine):
                     inputs = {
                         k: v for k, v in inputs.items() if not k.startswith("_cp_")
                     }
+
             loss = loss_fn(
                 logprobs,
                 entropy,
