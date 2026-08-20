@@ -56,7 +56,12 @@ from areal.engine.core import (
 )
 from areal.engine.core.distributed import (
     init_custom_process_group,
+    nccl_process_groups,
+    warmup_all_to_all_transports,
+    warmup_collective_transports,
+    warmup_p2p_transports,
     warmup_process_groups,
+    warmup_sharded_transports,
 )
 from areal.engine.core.model import (
     SequencePackingMode,
@@ -1720,6 +1725,53 @@ class MegatronEngine(TrainEngine):
 
     def get_device_stats(self) -> DeviceRuntimeInfo:
         return DeviceRuntimeInfo.get_current()
+
+    def warmup_communicators(self) -> None:
+        """Pre-connect the train step's communicators while memory is light.
+
+        NCCL allocates transport buffers per (communicator, protocol) on first
+        use. Left alone, those allocations land inside the first ppo_update at
+        peak occupancy, where the per-peer calloc fails on the last pipeline
+        stage. The buffers live for the lifetime of the process, so one warmup
+        covers every later step.
+
+        Issuing collectives on every registered group means an already unhealthy
+        rank surfaces here rather than at the first train step, hence the opt-in.
+        """
+        if not self.config.warmup_communicators:
+            return
+        if not dist.is_initialized() or current_platform.device_type == "cpu":
+            return
+
+        warmup_collective_transports(*nccl_process_groups())
+        if mpu.get_expert_model_parallel_world_size() > 1:
+            warmup_all_to_all_transports(mpu.get_expert_model_parallel_group())
+        warmup_sharded_transports(
+            mpu.get_data_parallel_group(with_context_parallel=True)
+        )
+
+        pp_size = mpu.get_pipeline_model_parallel_world_size()
+        if pp_size > 1:
+            pp_group = mpu.get_pipeline_model_parallel_group()
+            # AReaL turns off batch_p2p_comm (see areal/models/mcore/registry.py),
+            # so Megatron takes the unbatched path. That path sends both
+            # directions over pp_group, except at pp_size == 2 where one
+            # direction moves to WORLD so the two transfers can overlap; the
+            # 'ucc' backend is excluded because WORLD is always nccl. See
+            # megatron/core/pipeline_parallel/p2p_communication.py::_p2p_ops.
+            p2p_groups: list[dist.ProcessGroup] = [pp_group]
+            if pp_size == 2 and str(dist.get_backend(pp_group)).lower() != "ucc":
+                p2p_groups.append(dist.group.WORLD)
+            warmup_p2p_transports(
+                *p2p_groups,
+                prev_rank=mpu.get_pipeline_model_parallel_prev_rank(),
+                next_rank=mpu.get_pipeline_model_parallel_next_rank(),
+                has_prev=not mpu.is_pipeline_first_stage(ignore_virtual=True),
+                has_next=not mpu.is_pipeline_last_stage(ignore_virtual=True),
+            )
+
+        current_platform.synchronize()
+        self.logger.info("Train-step communicator warmup complete")
 
     def start_memory_profile(self, max_entries: int = 100000) -> None:
         torch.cuda.memory._record_memory_history(max_entries=max_entries)
