@@ -368,6 +368,8 @@ class SaveLoadMeta:
     processor: Optional["AutoProcessor"] = None
     base_model_path: str | None = None
     naive_distributed: bool = False
+    checkpoint_pointer_path: str | None = None
+    checkpoint_pointer_value: str | None = None
 
 
 @dataclass
