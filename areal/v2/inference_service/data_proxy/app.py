@@ -29,6 +29,7 @@ from areal.experimental.openai.client import ArealOpenAI
 from areal.experimental.openai.types import (
     InteractionWithTokenLogpReward,
     concat_string_interactions,
+    normalize_group_rewards,
 )
 from areal.infra.rpc.guard.data_blueprint import (
     data_bp,
@@ -61,6 +62,16 @@ from areal.v2.inference_service.sglang.bridge import SGLangBridgeBackend
 from areal.v2.inference_service.vllm.bridge import VLLMBridgeBackend
 
 logger = logging.getLogger("InferenceDataProxy")
+
+_INLINE_TRAJECTORY_FIELDS = frozenset(("rewards", "original_rewards"))
+
+
+def _remotize_trajectory(traj: dict[str, Any], node_addr: str) -> dict[str, Any]:
+    """Keep scalar reward metadata local while remotizing large tensors."""
+    inline = {key: traj[key] for key in _INLINE_TRAJECTORY_FIELDS if key in traj}
+    remote_payload = {key: value for key, value in traj.items() if key not in inline}
+    remotized = RTensor.remotize(remote_payload, node_addr=node_addr)
+    return {**remotized, **inline}
 
 
 async def _safe_stream_wrapper(stream: AsyncGenerator[Any, None]):
@@ -853,11 +864,14 @@ def create_app(config: DataProxyConfig) -> FastAPI:
                 detail="session_ids must be a non-empty list",
             )
 
-        merged: dict[str, InteractionWithTokenLogpReward] = {}
+        grouped_interactions: list[
+            dict[str, InteractionWithTokenLogpReward] | None
+        ] = []
 
         for sid in body.session_ids:
             session = store.get_session(sid)
             if session is None:
+                grouped_interactions.append(None)
                 continue
 
             try:
@@ -867,13 +881,29 @@ def create_app(config: DataProxyConfig) -> FastAPI:
                     trajectory_id=body.trajectory_id,
                     drop_retry_orphans=body.drop_retry_orphans,
                 )
-                merged.update(interactions)
+                grouped_interactions.append(interactions)
             except KeyError:
+                grouped_interactions.append(None)
                 continue
+
+        if body.discard_trajectory:
+            grouped_interactions = []
+        elif body.reward_normalization and len(body.session_ids) > 1:
+            if not normalize_group_rewards(grouped_interactions):
+                logger.warning(
+                    "Reward normalization dropped an incomplete group (%d sessions)",
+                    len(body.session_ids),
+                )
+                grouped_interactions = []
+
+        merged: dict[str, InteractionWithTokenLogpReward] = {}
+        for interactions in grouped_interactions:
+            if interactions is not None:
+                merged.update(interactions)
 
         if all(v.has_tensor_data for v in merged.values()):
             traj = concat_padded_tensors([v.to_tensor_dict() for v in merged.values()])
-            traj = RTensor.remotize(traj, node_addr=config.serving_addr)
+            traj = _remotize_trajectory(traj, node_addr=config.serving_addr)
         else:
             traj = concat_string_interactions(merged)
 

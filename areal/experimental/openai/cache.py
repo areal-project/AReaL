@@ -10,6 +10,8 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
+import torch
+
 from areal.experimental.openai.types import InteractionWithTokenLogpReward
 from areal.utils import logging
 
@@ -86,8 +88,19 @@ class InteractionCache(OrderedDict[str, InteractionWithTokenLogpReward]):
     def set_reward(self, interaction_id: str, reward: float) -> None:
         """Set reward for a specific completion/response by its ID."""
         with self._lock:  # usually no need to lock, but just in case
-            self._total_reward -= self[interaction_id].reward or 0.0
-            self[interaction_id].reward = reward
+            interaction = self[interaction_id]
+            self._total_reward -= interaction.reward or 0.0
+            interaction.reward = reward
+            if interaction._cache is not None:
+                interaction._cache["rewards"] = torch.tensor([float(reward)])
+                original_reward = (
+                    interaction.original_reward
+                    if interaction.original_reward is not None
+                    else reward
+                )
+                interaction._cache["original_rewards"] = torch.tensor(
+                    [float(original_reward)]
+                )
             self._total_reward += reward
 
     def set_last_reward(self, reward: float) -> None:

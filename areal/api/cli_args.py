@@ -246,9 +246,9 @@ class GenerationHyperparameters:
             "help": (
                 "If True, apply per-prompt reward normalization across the "
                 "n_samples rollouts of the same prompt inside "
-                "GroupedRolloutWorkflow. Only affects InteractionWithTokenLogpReward "
-                "workflows such as SWE agent workflows. Not supported by "
-                "RolloutControllerV2 yet."
+                "grouped rollout workflows. Only affects "
+                "InteractionWithTokenLogpReward workflows such as SWE agent "
+                "workflows."
             )
         },
     )

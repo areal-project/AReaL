@@ -76,6 +76,8 @@ class ExportTrajectoriesRequest(BaseModel):
     style: str = "individual"
     remove_session: bool = True
     drop_retry_orphans: bool = False
+    reward_normalization: bool = False
+    discard_trajectory: bool = False
 
 
 class ExportTrajectoriesResponse(BaseModel):

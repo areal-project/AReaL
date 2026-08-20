@@ -55,6 +55,7 @@ class InferenceServiceWorkflow(RolloutWorkflow):
         group_size: int = 1,
         serialize_group_samples: bool = False,
         drop_retry_orphans: bool = False,
+        reward_normalization: bool = False,
     ):
         self.controller = controller
         self.agent = agent
@@ -66,6 +67,7 @@ class InferenceServiceWorkflow(RolloutWorkflow):
         self.group_size = group_size
         self.serialize_group_samples = serialize_group_samples
         self.drop_retry_orphans = drop_retry_orphans
+        self.reward_normalization = reward_normalization
 
     @async_http_retry
     async def _start_session(
@@ -110,6 +112,7 @@ class InferenceServiceWorkflow(RolloutWorkflow):
         session_ids: list[str],
         group_id: str | None = None,
         trajectory_id: int | None = None,
+        discard_trajectory: bool = False,
     ) -> dict[str, Any]:
         url = f"{self.gateway_addr}/{_EXPORT_TRAJECTORIES_PATHNAME}"
         headers = {"Authorization": f"Bearer {self._admin_api_key}"}
@@ -121,6 +124,8 @@ class InferenceServiceWorkflow(RolloutWorkflow):
             "style": self.export_style,
             "remove_session": True,
             "drop_retry_orphans": self.drop_retry_orphans,
+            "reward_normalization": self.reward_normalization,
+            "discard_trajectory": discard_trajectory,
         }
         async with session.post(url, json=payload, headers=headers) as resp:
             resp.raise_for_status()
@@ -254,6 +259,7 @@ class InferenceServiceWorkflow(RolloutWorkflow):
             )
 
         session_ids = [sid for sid, _ in sessions]
+        n_failed = sum(result is None for result in results)
 
         # Always export to trigger session cleanup on the data proxy,
         # even when we intend to discard the trajectories.
@@ -261,11 +267,8 @@ class InferenceServiceWorkflow(RolloutWorkflow):
             http_session,
             session_ids,
             group_id=group_id,
+            discard_trajectory=n_failed > 0,
         )
-        if not traj:
-            return None
-
-        n_failed = sum(r is None for r in results)
         if n_failed > 0:
             logger.warning(
                 "Abandoning group %s: %d/%d sessions failed",
@@ -273,6 +276,8 @@ class InferenceServiceWorkflow(RolloutWorkflow):
                 n_failed,
                 len(sessions),
             )
+            return None
+        if not traj:
             return None
 
         tracker = stats_tracker.get(workflow_context.stat_scope())

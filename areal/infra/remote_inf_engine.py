@@ -173,44 +173,21 @@ class GroupedRolloutWorkflow(RolloutWorkflow):
         dropped so the normalization base always matches the configured group
         size.
         """
-        import torch
+        from areal.experimental.openai.types import normalize_group_rewards
 
-        reward_per_result: list[float | None] = []
-        for result in results:
-            if not result:
-                reward_per_result.append(None)
-                continue
-            last_id = next(reversed(result))
-            reward_per_result.append(result[last_id].reward)
-
-        none_count = sum(1 for reward in reward_per_result if reward is None)
-        if none_count > 0:
+        if normalize_group_rewards(results):
+            return True
+        invalid_count = sum(
+            1
+            for result in results
+            if not result or result[next(reversed(result))].reward is None
+        )
+        if invalid_count > 0:
             self.logger.warning(
-                f"reward_normalization: dropping group ({none_count}/"
+                f"reward_normalization: dropping group ({invalid_count}/"
                 f"{self.group_size} rollouts have None reward)"
             )
-            return False
-
-        rewards = torch.tensor(reward_per_result, dtype=torch.float32)
-        mean = rewards.mean()
-        std = rewards.std(unbiased=False) if rewards.numel() > 1 else torch.tensor(1.0)
-        normalized = ((rewards - mean) / (std + 1e-8)).tolist()
-
-        for result, norm_reward in zip(results, normalized):
-            if not result:
-                continue
-            for interaction in result.values():
-                if interaction.reward is not None:
-                    interaction.original_reward = interaction.reward
-                    interaction.reward = norm_reward
-                    if interaction._cache is not None:
-                        interaction._cache["rewards"] = torch.tensor(
-                            [float(norm_reward)]
-                        )
-                        interaction._cache["original_rewards"] = torch.tensor(
-                            [float(interaction.original_reward)]
-                        )
-        return True
+        return False
 
 
 class RemoteInfBackendProtocol(Protocol):
