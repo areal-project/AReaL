@@ -434,7 +434,7 @@ def convert_fp8_helper_to_pytorch_fp8(
     converted = []
     for name, tensor in named_tensors:
         if isinstance(tensor, FP8BlockwiseTensorHelper):
-            weight, scale_inv = tensor.to_pytorch_fp8()
+            weight, scale_inv = tensor.to_pytorch_fp8(scale_inv_dtype=torch.float32)
             converted.append((name, weight))
             converted.append((f"{name}_scale_inv", scale_inv))
         else:
