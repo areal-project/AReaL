@@ -1059,7 +1059,7 @@ class PPOTrainer:
         raise NotImplementedError(f"Unknown scheduler type: {cfg.type}")
 
     def _apply_dte_config_envvars(self) -> None:
-        """Export ``actor.dte`` config to worker-visible runtime switches."""
+        """Export delta weight-transfer config to worker runtime switches."""
         apply_dte_config_envvars(self.config)
 
     def _create_dataloader(

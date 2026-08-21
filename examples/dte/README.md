@@ -23,8 +23,8 @@ python3 examples/math/gsm8k_rl.py \
 
 The first weight update is a full synchronization. Later contiguous versions use sparse
 AdamW deltas, with a periodic full-weight anchor after every 20 successfully committed
-deltas. Set `actor.dte.enabled=false` to return to the existing AWEX full-weight
-behavior.
+deltas. Set `actor.weight_update_transfer=full` to return to the existing AWEX
+full-weight behavior.
 
 ## Optimizer-step boundary
 
@@ -47,14 +47,14 @@ synchronization while DTE appears enabled.
 The example spells out the portable performance settings in the worker environment; none
 of them depends on a site-specific path or cluster:
 
-| Optimization                    | Effective setting                       | Source                                         |
-| ------------------------------- | --------------------------------------- | ---------------------------------------------- |
-| Streaming AdamW reconstruction  | `DTE_STREAMING_RECONSTRUCT=1`           | Explicit; also enforced by `actor.dte.enabled` |
-| Coalesced two-round sparse P2P  | `DTE_DELTA_P2P_COALESCE=1`              | Explicit; also the AReaL-DTE default           |
-| Pipelined inversion collectives | 512 MiB in-flight window                | Explicit AReaL setting                         |
-| Inversion compute device        | Payload device (GPU for this example)   | Explicit AReaL setting                         |
-| Compact change indices          | `int32` when the parameter size permits | Standard AReaL detector path                   |
-| Batched operation remapping     | Once per parameter                      | Standard AReaL-DTE payload path                |
+| Optimization                    | Effective setting                       | Source                                    |
+| ------------------------------- | --------------------------------------- | ----------------------------------------- |
+| Streaming AdamW reconstruction  | `DTE_STREAMING_RECONSTRUCT=1`           | Explicit; also enforced by delta transfer |
+| Coalesced two-round sparse P2P  | `DTE_DELTA_P2P_COALESCE=1`              | Explicit; also the AReaL-DTE default      |
+| Pipelined inversion collectives | 512 MiB in-flight window                | Explicit AReaL setting                    |
+| Inversion compute device        | Payload device (GPU for this example)   | Explicit AReaL setting                    |
+| Compact change indices          | `int32` when the parameter size permits | Standard AReaL detector path              |
+| Batched operation remapping     | Once per parameter                      | Standard AReaL-DTE payload path           |
 
 Snapshot verification, weight digests, phase timing, recovery, and deterministic rollout
 diagnostics are intentionally not enabled here because they are validation or experiment

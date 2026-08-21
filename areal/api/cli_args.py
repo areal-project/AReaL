@@ -1147,34 +1147,6 @@ class SchedulingStrategy:
 
 
 @dataclass
-class DTEConfig:
-    """Configuration for separation AdamW delta weight updates."""
-
-    enabled: bool = field(
-        default=False,
-        metadata={"help": "Enable DTE-backed separation delta weight updates."},
-    )
-    transfer: str = field(
-        default="delta",
-        metadata={
-            "help": "Weight transfer type. The supported DTE mode is 'delta'.",
-            "choices": ["delta"],
-        },
-    )
-    delta_method: str = field(
-        default="adamw",
-        metadata={
-            "help": "How DTE finds changed weights.",
-            "choices": ["adamw"],
-        },
-    )
-    anchor_interval: int = field(
-        default=0,
-        metadata={"help": "Force a full sync every N deltas. 0 means never."},
-    )
-
-
-@dataclass
 class SchedulingSpec:
     cpu: int = field(
         default=8, metadata={"help": "Number of CPU cores required per GPU"}
@@ -1364,8 +1336,29 @@ class TrainEngineConfig:
         default="xccl",
         metadata={
             "help": "Weight update backend type. 'awex' requires a Megatron actor "
-            "and an SGLang rollout, and targets colocated actor-rollout setups.",
+            "and an SGLang rollout.",
             "choices": ["disk", "xccl", "awex"],
+        },
+    )
+    weight_update_transfer: str = field(
+        default="full",
+        metadata={
+            "help": "Weight transfer type. 'delta' enables sparse weight updates.",
+            "choices": ["full", "delta"],
+        },
+    )
+    weight_update_delta_method: str = field(
+        default="adamw",
+        metadata={
+            "help": "Change detection method used for delta weight transfer.",
+            "choices": ["adamw"],
+        },
+    )
+    weight_update_anchor_interval: int = field(
+        default=0,
+        metadata={
+            "help": "Force a full sync every N committed deltas. 0 disables "
+            "periodic anchors."
         },
     )
     fsdp: FSDPEngineConfig = field(default_factory=FSDPEngineConfig)
@@ -1682,8 +1675,6 @@ class RejectionSamplingConfig:
 class PPOActorConfig(TrainEngineConfig):
     """Configuration for PPO actor model, a subclass of a TrainEngine."""
 
-    dte: DTEConfig = field(default_factory=DTEConfig)
-
     # Core PPO/GRPO Parameters
     ppo_n_minibatches: int = field(
         default=4,
@@ -1933,9 +1924,9 @@ class PPOActorConfig(TrainEngineConfig):
                 "to a single optimizer step per PPO update."
             )
             self.ppo_n_minibatches = 1
-        if self.dte.enabled and self.ppo_n_minibatches != 1:
+        if self.weight_update_transfer == "delta" and self.ppo_n_minibatches != 1:
             raise ValueError(
-                "actor.dte.enabled=true currently requires "
+                "actor.weight_update_transfer='delta' currently requires "
                 "ppo_n_minibatches=1 because separation AdamW inversion "
                 "supports exactly one optimizer step between weight updates; "
                 f"got ppo_n_minibatches={self.ppo_n_minibatches}"

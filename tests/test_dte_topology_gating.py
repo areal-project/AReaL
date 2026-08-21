@@ -19,7 +19,9 @@ def _load_helpers():
 
 def _config(
     *,
-    enabled=False,
+    transfer="full",
+    delta_method="adamw",
+    anchor_interval=20,
     topology="separation",
     actor_backend="megatron:d1",
     rollout_backend="sglang:d1",
@@ -27,23 +29,17 @@ def _config(
     rollout_version="v2",
     weight_update_mode="awex",
     use_lora=False,
-    **overrides,
 ):
-    dte = {
-        "enabled": enabled,
-        "transfer": "delta",
-        "delta_method": "adamw",
-        "anchor_interval": 20,
-        **overrides,
-    }
     actor_spec = SimpleNamespace(env_vars={})
     rollout_spec = SimpleNamespace(env_vars={})
     return SimpleNamespace(
         actor=SimpleNamespace(
-            dte=SimpleNamespace(**dte),
             backend=actor_backend,
             _version=actor_version,
             weight_update_mode=weight_update_mode,
+            weight_update_transfer=transfer,
+            weight_update_delta_method=delta_method,
+            weight_update_anchor_interval=anchor_interval,
             use_lora=use_lora,
             scheduling_spec=(actor_spec,),
         ),
@@ -56,7 +52,7 @@ def _config(
     )
 
 
-def test_dte_disabled_does_not_change_environment():
+def test_full_weight_transfer_does_not_change_environment():
     config = _config()
 
     exported = _load_helpers().apply_dte_config_envvars(config, environ={})
@@ -66,8 +62,8 @@ def test_dte_disabled_does_not_change_environment():
     assert config.rollout.scheduling_spec[0].env_vars == {}
 
 
-def test_dte_enabled_exports_only_separation_adamw_switches():
-    config = _config(enabled=True)
+def test_delta_weight_transfer_exports_only_separation_adamw_switches():
+    config = _config(transfer="delta")
 
     exported = _load_helpers().apply_dte_config_envvars(config, environ={})
 
@@ -85,9 +81,15 @@ def test_dte_enabled_exports_only_separation_adamw_switches():
     ("kwargs", "match"),
     [
         ({"topology": "colocation"}, "only with.*separation"),
-        ({"transfer": "full"}, "transfer must be 'delta'"),
-        ({"delta_method": "snapshot"}, "delta_method must be 'adamw'"),
-        ({"anchor_interval": -1}, "anchor_interval must be non-negative"),
+        ({"transfer": "snapshot"}, "must be 'full' or 'delta'"),
+        (
+            {"delta_method": "snapshot"},
+            "weight_update_delta_method must be 'adamw'",
+        ),
+        (
+            {"anchor_interval": -1},
+            "weight_update_anchor_interval must be non-negative",
+        ),
         ({"actor_backend": "fsdp:d1"}, "requires actor.backend='megatron"),
         ({"rollout_backend": "vllm:d1"}, "requires rollout.backend='sglang"),
         ({"actor_version": "v1"}, "requires actor._version='v2'"),
@@ -99,7 +101,8 @@ def test_dte_enabled_exports_only_separation_adamw_switches():
 def test_dte_rejects_out_of_scope_modes(kwargs, match):
     kwargs = dict(kwargs)
     topology = kwargs.pop("topology", "separation")
-    config = _config(enabled=True, topology=topology, **kwargs)
+    transfer = kwargs.pop("transfer", "delta")
+    config = _config(transfer=transfer, topology=topology, **kwargs)
     environ = {}
 
     with pytest.raises(ValueError, match=match):
@@ -112,13 +115,32 @@ def test_dte_rejects_out_of_scope_modes(kwargs, match):
 
 def test_dte_requires_one_ppo_minibatch_per_weight_update():
     pytest.importorskip("httpx")
-    from areal.api.cli_args import DTEConfig, PPOActorConfig
+    from areal.api.cli_args import PPOActorConfig
 
-    enabled = DTEConfig(enabled=True)
-    assert PPOActorConfig(dte=enabled, ppo_n_minibatches=1).ppo_n_minibatches == 1
+    assert (
+        PPOActorConfig(
+            weight_update_transfer="delta", ppo_n_minibatches=1
+        ).ppo_n_minibatches
+        == 1
+    )
 
     with pytest.raises(ValueError, match="requires ppo_n_minibatches=1"):
-        PPOActorConfig(dte=enabled, ppo_n_minibatches=2)
+        PPOActorConfig(weight_update_transfer="delta", ppo_n_minibatches=2)
 
-    disabled = DTEConfig(enabled=False)
-    assert PPOActorConfig(dte=disabled).ppo_n_minibatches == 4
+    assert PPOActorConfig(weight_update_transfer="full").ppo_n_minibatches == 4
+
+
+def test_delta_weight_transfer_fields_belong_to_train_engine_config():
+    pytest.importorskip("httpx")
+    from dataclasses import fields
+
+    from areal.api.cli_args import TrainEngineConfig
+
+    field_names = {config_field.name for config_field in fields(TrainEngineConfig)}
+
+    assert "dte" not in field_names
+    assert {
+        "weight_update_transfer",
+        "weight_update_delta_method",
+        "weight_update_anchor_interval",
+    } <= field_names

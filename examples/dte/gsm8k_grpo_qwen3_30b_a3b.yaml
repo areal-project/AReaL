@@ -122,12 +122,10 @@ actor:
     mean_level: batch
     std_level: batch
   weight_update_mode: awex
+  weight_update_transfer: delta
+  weight_update_delta_method: adamw
+  weight_update_anchor_interval: 20
   max_new_tokens: ${gconfig.max_new_tokens}
-  dte:
-    enabled: true
-    transfer: delta
-    delta_method: adamw
-    anchor_interval: 20
   scheduling_spec:
     - task_type: worker
       port_count: 2
