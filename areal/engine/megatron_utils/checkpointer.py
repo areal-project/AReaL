@@ -58,6 +58,13 @@ def get_device_name() -> str:
 
 
 class _UnsupportedMCoreAsyncLayout(RuntimeError):
+    """Raised when MCore's retained async payload cannot be released safely.
+
+    This includes malformed async request arguments, write buckets, bucket
+    payload tuples, or tensor payloads that are not mutable lists. The error
+    is raised before the async save request is scheduled.
+    """
+
     pass
 
 
