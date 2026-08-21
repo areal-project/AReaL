@@ -22,18 +22,13 @@ def apply_dte_config_envvars(
     environ: MutableMapping[str, str] | None = None,
 ) -> dict[str, str]:
     """Validate delta weight-transfer config and propagate runtime switches."""
-    transfer = getattr(config.actor, "weight_update_transfer", "full")
-    if transfer == "full":
+    if not getattr(config.actor, "enable_delta_weight_update", False):
         return {}
-    if transfer != "delta":
-        raise ValueError(
-            f"actor.weight_update_transfer must be 'full' or 'delta'; got {transfer!r}"
-        )
 
     topology = _enum_value(config.rollout.scheduling_strategy.type)
     if topology != "separation":
         raise ValueError(
-            "actor.weight_update_transfer='delta' is currently supported only "
+            "actor.enable_delta_weight_update=true is currently supported only "
             "with rollout scheduling strategy 'separation', "
             f"got {topology!r}"
         )
@@ -76,9 +71,14 @@ def apply_dte_config_envvars(
         raise ValueError("delta weight transfer does not support actor.use_lora=True")
 
     exported_env = {
+        # Select the separation-specific AWEX update path. Together with
+        # DTE_DELTA_TRANSFER, this enables the DTE runtime protocol.
         "DTE_SEPARATION_WEIGHT_UPDATE": "1",
+        # Send sparse deltas between full synchronization anchors.
         "DTE_DELTA_TRANSFER": "1",
+        # Force a full sync after N committed deltas; zero disables this anchor.
         "DTE_DELTA_ANCHOR_INTERVAL": str(anchor_interval),
+        # Reconstruct pre-step tensors lazily during Hugging Face conversion.
         "DTE_STREAMING_RECONSTRUCT": "1",
     }
     environ = os.environ if environ is None else environ

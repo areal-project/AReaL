@@ -23,7 +23,7 @@ python3 examples/math/gsm8k_rl.py \
 
 The first weight update is a full synchronization. Later contiguous versions use sparse
 AdamW deltas, with a periodic full-weight anchor after every 20 successfully committed
-deltas. Set `actor.weight_update_transfer=full` to return to the existing AWEX
+deltas. Set `actor.enable_delta_weight_update=false` to return to the existing AWEX
 full-weight behavior.
 
 ## Optimizer-step boundary

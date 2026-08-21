@@ -19,7 +19,7 @@ def _load_helpers():
 
 def _config(
     *,
-    transfer="full",
+    enabled=False,
     delta_method="adamw",
     anchor_interval=20,
     topology="separation",
@@ -37,7 +37,7 @@ def _config(
             backend=actor_backend,
             _version=actor_version,
             weight_update_mode=weight_update_mode,
-            weight_update_transfer=transfer,
+            enable_delta_weight_update=enabled,
             weight_update_delta_method=delta_method,
             weight_update_anchor_interval=anchor_interval,
             use_lora=use_lora,
@@ -52,7 +52,7 @@ def _config(
     )
 
 
-def test_full_weight_transfer_does_not_change_environment():
+def test_disabled_delta_weight_update_does_not_change_environment():
     config = _config()
 
     exported = _load_helpers().apply_dte_config_envvars(config, environ={})
@@ -63,7 +63,7 @@ def test_full_weight_transfer_does_not_change_environment():
 
 
 def test_delta_weight_transfer_exports_only_separation_adamw_switches():
-    config = _config(transfer="delta")
+    config = _config(enabled=True)
 
     exported = _load_helpers().apply_dte_config_envvars(config, environ={})
 
@@ -81,7 +81,6 @@ def test_delta_weight_transfer_exports_only_separation_adamw_switches():
     ("kwargs", "match"),
     [
         ({"topology": "colocation"}, "only with.*separation"),
-        ({"transfer": "snapshot"}, "must be 'full' or 'delta'"),
         (
             {"delta_method": "snapshot"},
             "weight_update_delta_method must be 'adamw'",
@@ -101,8 +100,7 @@ def test_delta_weight_transfer_exports_only_separation_adamw_switches():
 def test_dte_rejects_out_of_scope_modes(kwargs, match):
     kwargs = dict(kwargs)
     topology = kwargs.pop("topology", "separation")
-    transfer = kwargs.pop("transfer", "delta")
-    config = _config(transfer=transfer, topology=topology, **kwargs)
+    config = _config(enabled=True, topology=topology, **kwargs)
     environ = {}
 
     with pytest.raises(ValueError, match=match):
@@ -119,15 +117,15 @@ def test_dte_requires_one_ppo_minibatch_per_weight_update():
 
     assert (
         PPOActorConfig(
-            weight_update_transfer="delta", ppo_n_minibatches=1
+            enable_delta_weight_update=True, ppo_n_minibatches=1
         ).ppo_n_minibatches
         == 1
     )
 
     with pytest.raises(ValueError, match="requires ppo_n_minibatches=1"):
-        PPOActorConfig(weight_update_transfer="delta", ppo_n_minibatches=2)
+        PPOActorConfig(enable_delta_weight_update=True, ppo_n_minibatches=2)
 
-    assert PPOActorConfig(weight_update_transfer="full").ppo_n_minibatches == 4
+    assert PPOActorConfig(enable_delta_weight_update=False).ppo_n_minibatches == 4
 
 
 def test_delta_weight_transfer_fields_belong_to_train_engine_config():
@@ -140,7 +138,8 @@ def test_delta_weight_transfer_fields_belong_to_train_engine_config():
 
     assert "dte" not in field_names
     assert {
-        "weight_update_transfer",
+        "enable_delta_weight_update",
         "weight_update_delta_method",
         "weight_update_anchor_interval",
     } <= field_names
+    assert TrainEngineConfig().enable_delta_weight_update is False

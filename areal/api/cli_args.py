@@ -1340,12 +1340,9 @@ class TrainEngineConfig:
             "choices": ["disk", "xccl", "awex"],
         },
     )
-    weight_update_transfer: str = field(
-        default="full",
-        metadata={
-            "help": "Weight transfer type. 'delta' enables sparse weight updates.",
-            "choices": ["full", "delta"],
-        },
+    enable_delta_weight_update: bool = field(
+        default=False,
+        metadata={"help": "Enable sparse delta weight updates for separation AWEX."},
     )
     weight_update_delta_method: str = field(
         default="adamw",
@@ -1924,9 +1921,9 @@ class PPOActorConfig(TrainEngineConfig):
                 "to a single optimizer step per PPO update."
             )
             self.ppo_n_minibatches = 1
-        if self.weight_update_transfer == "delta" and self.ppo_n_minibatches != 1:
+        if self.enable_delta_weight_update and self.ppo_n_minibatches != 1:
             raise ValueError(
-                "actor.weight_update_transfer='delta' currently requires "
+                "actor.enable_delta_weight_update=true currently requires "
                 "ppo_n_minibatches=1 because separation AdamW inversion "
                 "supports exactly one optimizer step between weight updates; "
                 f"got ppo_n_minibatches={self.ppo_n_minibatches}"

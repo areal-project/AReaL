@@ -122,7 +122,7 @@ actor:
     mean_level: batch
     std_level: batch
   weight_update_mode: awex
-  weight_update_transfer: delta
+  enable_delta_weight_update: true
   weight_update_delta_method: adamw
   weight_update_anchor_interval: 20
   max_new_tokens: ${gconfig.max_new_tokens}
