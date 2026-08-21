@@ -742,6 +742,7 @@ def create_app(config: DataProxyConfig) -> FastAPI:
                     discount=body.discount,
                     style=body.style,
                     trajectory_id=body.trajectory_id,
+                    drop_retry_orphans=body.drop_retry_orphans,
                 )
                 merged.update(interactions)
             except KeyError:
