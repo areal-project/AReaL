@@ -396,6 +396,19 @@ def test_adamw_hparams_require_and_prefer_recorded_step_lr(monkeypatch):
 
 def test_missing_recorded_step_lr_forces_dense_reconstruction(monkeypatch):
     """Missing LR metadata must not fall back to the scheduler's current LR."""
+
+    def _unexpected_invert_adamw(*args, **kwargs):
+        del args, kwargs
+        pytest.fail("AdamW inversion must not run without a recorded step LR")
+
+    dte_mod = types.ModuleType("dte")
+    dte_mod.__path__ = []
+    dte_core_mod = types.ModuleType("dte.core")
+    dte_core_mod.invert_adamw = _unexpected_invert_adamw
+    dte_mod.core = dte_core_mod
+    monkeypatch.setitem(sys.modules, "dte", dte_mod)
+    monkeypatch.setitem(sys.modules, "dte.core", dte_core_mod)
+
     mod = _load_delta_detect(monkeypatch)
     param = torch.nn.Parameter(torch.tensor([1.0, 2.0], dtype=torch.float32))
     optimizer = torch.optim.AdamW([param], lr=1e-3)
