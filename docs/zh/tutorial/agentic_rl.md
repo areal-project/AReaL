@@ -271,6 +271,11 @@ class CamelRLVRWorkflow(RolloutWorkflow):
         return client.export_interactions(style="individual")
 ```
 
+> **注意**：`style="individual"` 每个 episode 会导出多个样本。在分组 rollout （`n_samples >= 2`）下，这与
+> group-relative normalization（`mean_level: group` / `std_level: group`）不兼容，会抛出不可重试的
+> `WorkflowContractError`；此时请改用 `style="concat"` 或 batch 级别的 normalization。参见
+> [分组 rollout 契约](../reference/rollout_workflow.md#%E5%88%86%E7%BB%84-rollout)。
+
 **关键点：**
 
 - **并行 episode 执行**：AReaL 的训练循环在多个样本上并行调用 `arun_episode`

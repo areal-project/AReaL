@@ -94,6 +94,10 @@ def _dispatch_tensors(
 
     token_weights = [_item_weight(d) for d in item_list]
     n_groups = n // group_size
+    if n_groups < dp_size:
+        raise ValueError(
+            f"item group count ({n_groups}) must be at least dp_size ({dp_size})"
+        )
 
     group_weights = [
         sum(token_weights[g * group_size + k] for k in range(group_size))
@@ -127,10 +131,14 @@ def _pad_eval_batch(
 ) -> tuple[Any, ...]:
     """Pad the first tensor-like arg to a multiple of ``dp_size * group_size``.
 
-    Called before dispatch for explicit evaluation controller paths so that
-    ``balanced_greedy_partition`` always receives a divisible input.
-    Dummy items have zero attention/loss masks and contribute nothing
-    to metrics or loss.
+    Called before dispatch for explicit evaluation controller paths: eval
+    batches may be smaller than ``dp_size`` or not group-aligned, and padding
+    guarantees every DP rank receives at least one full group
+    (``_dispatch_tensors`` rejects ``n_groups < dp_size`` and
+    ``n % group_size != 0``). Training batches are intentionally not padded —
+    incomplete rollout groups make them ragged, and engines absorb ragged
+    shards via transport padding. Dummy items have zero attention/loss masks
+    and contribute nothing to metrics or loss.
     """
     result = list(args)
     pad_target = dp_size * group_size
@@ -773,6 +781,7 @@ class TrainController:
         dynamic_bs: bool = False,
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
+        min_usable_group_size: int = 1,
     ) -> list[dict[str, Any]]:
         return self.rollout.prepare_batch(
             dataloader=dataloader,
@@ -780,6 +789,7 @@ class TrainController:
             workflow_kwargs=workflow_kwargs,
             should_accept_fn=should_accept_fn,
             group_size=group_size,
+            min_usable_group_size=min_usable_group_size,
             dynamic_bs=dynamic_bs,
             reward_normalization=reward_normalization,
             drop_incomplete_group=drop_incomplete_group,
@@ -794,6 +804,7 @@ class TrainController:
         group_size: int = 1,
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
+        min_usable_group_size: int = 1,
     ) -> list[dict[str, Any]]:
         return self.rollout.rollout_batch(
             data=data,
@@ -801,6 +812,7 @@ class TrainController:
             workflow_kwargs=workflow_kwargs,
             should_accept_fn=should_accept_fn,
             group_size=group_size,
+            min_usable_group_size=min_usable_group_size,
             reward_normalization=reward_normalization,
             drop_incomplete_group=drop_incomplete_group,
         )

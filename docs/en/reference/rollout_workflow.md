@@ -206,13 +206,54 @@ When `group_size > 1`, the workflow is wrapped in `GroupedRolloutWorkflow`:
 1. Results are merged based on their type:
    - **Tensor dictionaries**: Concatenated along the batch dimension
    - **InteractionWithTokenLogpReward dicts**: Merged into a single dictionary
-1. If some runs return `None` (rejected), only valid results are kept
-1. If all runs return `None`, the entire grouped result is `None`
+1. Each slot returns its normal result type when usable and `None` when unusable. `None`
+   is intentionally opaque: classification and retry policy stay in the producer.
+1. The wrapper waits only for the original slots. It neither retries an unusable slot
+   nor duplicates a usable result.
+1. Usable slots are retained exactly once and concatenated. Their actual count remains a
+   prompt-group boundary during reward and advantage normalization.
+1. `min_usable_group_size` defaults to `1`. The v1 RL trainer sets it to `2` when reward
+   or advantage normalization uses group statistics, because that statistic needs at
+   least two observations; a singleton target group (`n_samples: 1`) is complete by
+   definition and keeps the minimum of `1`. Setting `actor.min_usable_group_size`
+   replaces this derived value; explicit values below `2` are rejected while group
+   statistics are in use. Groups below the minimum return `None`; the asynchronous
+   collector then takes another ready prompt group. Batch-relative PPO and REINFORCE
+   retain a usable singleton.
+1. Group statistics constrain the workflow contract. When the resolved
+   `min_usable_group_size` is at least `2` — derived from group statistics
+   (`mean_level: group` or `std_level: group`), or set explicitly via
+   `actor.min_usable_group_size` — and rollouts are grouped (`n_samples >= 2`), each
+   `arun_episode` call must contribute exactly one training sample — a tensor dict with
+   batch size 1, or a single exported interaction. All built-in workflows comply. A
+   workflow returning several samples per episode (one row per turn, tree-search
+   branches, or a multi-turn agent with `agent.export_style: individual`) raises a
+   non-retryable `WorkflowContractError` that terminates training, because group
+   mean/std would otherwise treat same-episode rows as independent group members.
+   Ungrouped rollouts (`n_samples: 1`) install no group wrapper and are not checked; a
+   multi-sample episode is then normalized as its own group of same-episode rows. To
+   train such workflows, switch `mean_level`/`std_level` to `batch` (or disable
+   normalization), or merge each episode into one sequence
+   (`agent.export_style: concat`).
+
+PPO-family actor loss remains globally token-weighted by default. Consequently, a
+partial group with more valid response tokens contributes more loss weight than a
+smaller or shorter group. This is the existing backward-compatible estimator, not an
+implicit claim of equal prompt weighting.
+
+Grouped rollouts export `target_slot_count`, `usable_slot_count`,
+`trainable_slot_count`, `fully_masked_group`, `singleton_slot_group`,
+`pre_filter_usable_slot_yield`, and `pre_filter_trainable_slot_yield`. These count the
+original rollout calls; final accepted and rejected counts remain collector metrics
+after `should_accept_fn` runs. PPO training separately reports the physical usable
+group-size and valid-token loss-weight distributions, including per-size
+`group_loss_weight_size_<N>` metrics.
 
 ### Output Shape
 
-With `group_size=4` and a workflow returning `[1, seq_len]` tensors, the grouped output
-has shape `[4, seq_len]` (4 samples concatenated).
+With `group_size=4`, a workflow returning `[1, seq_len]` tensors, and all four slots
+usable, the grouped output has shape `[4, seq_len]`. An incomplete accepted group uses
+its actual usable count as the leading dimension.
 
 ### Implementation
 
@@ -227,9 +268,9 @@ class GroupedRolloutWorkflow(RolloutWorkflow):
               for _ in range(self.group_size)]
         )
 
-        # Filter None results
+        # A normal result is usable; None is unusable.
         valid_results = [r for r in results if r is not None]
-        if not valid_results:
+        if len(valid_results) < self.min_usable_group_size:
             return None
 
         # Merge based on result type

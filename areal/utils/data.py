@@ -23,6 +23,8 @@ from areal.utils.seqpack import get_allocate_fn
 
 logger = logging.getLogger("DataUtils")
 
+TRANSPORT_DUMMY_KEY = "_transport_dummy"
+
 
 def get_batch_size(data: dict[str, Any]) -> int:
     if not data:
@@ -621,6 +623,7 @@ class MicroBatchList:
     # sequence-level padding information
     align_to_lengths: list[int] | None = None
     old_cu_seqlens_list: list[torch.Tensor] | None = None
+    transport_dummy_count: int = 0
 
     @property
     def max_seqlen(self) -> int:
@@ -691,16 +694,77 @@ class MicroBatchList:
             padded_to_lengths=self.padded_to_lengths,
             old_cu_seqlens_list=old_cu_seqlens_list,
             align_to_lengths=self.align_to_lengths,
+            transport_dummy_count=self.transport_dummy_count,
         )
 
 
 DEFAULT_MAX_TOKENS_PER_MB = int(1e12)
 
 
+def make_transport_dummy(template: dict[str, Any]) -> dict[str, Any]:
+    """Create one model-valid row for collective participation."""
+    batch_size = get_batch_size(template)
+    if batch_size < 1:
+        raise ValueError("Cannot create transport padding from an empty batch")
+
+    dummy: dict[str, Any] = {}
+    for key, value in template.items():
+        if is_multi_modal_key(key) and isinstance(value, list):
+            dummy[key] = [{}]
+        elif (
+            isinstance(value, torch.Tensor)
+            and value.ndim > 0
+            and value.shape[0] == batch_size
+        ):
+            dummy[key] = torch.zeros_like(value[:1])
+        elif isinstance(value, list) and len(value) == batch_size:
+            dummy[key] = [copy.deepcopy(value[0])]
+        else:
+            dummy[key] = copy.deepcopy(value)
+
+    attention_mask = dummy.get("attention_mask")
+    if not isinstance(attention_mask, torch.Tensor) or attention_mask.ndim != 2:
+        raise ValueError("Transport padding requires a 2D attention_mask")
+    if attention_mask.shape[1] < 1:
+        raise ValueError("Transport padding requires sequence length >= 1")
+    attention_mask[:, 0] = 1
+    if isinstance(dummy.get("loss_mask"), torch.Tensor):
+        dummy["loss_mask"].zero_()
+    return dummy
+
+
+def make_transport_microbatch(template: dict[str, Any]) -> dict[str, Any]:
+    """Create one transport-only batch that arbitrary objectives must bypass."""
+    dummy = make_transport_dummy(template)
+    dummy[TRANSPORT_DUMMY_KEY] = True
+    return dummy
+
+
+def _pad_batch_to_min_groups(
+    data: dict[str, Any],
+    *,
+    min_groups: int,
+    granularity: int,
+) -> tuple[dict[str, Any], int]:
+    batch_size = get_batch_size(data)
+    if batch_size % granularity != 0:
+        raise RuntimeError(
+            f"Batch size {batch_size} cannot divide granularity {granularity}."
+        )
+    current_groups = batch_size // granularity
+    pad_count = max(min_groups - current_groups, 0) * granularity
+    if pad_count == 0:
+        return data, 0
+    dummies = [make_transport_dummy(data) for _ in range(pad_count)]
+    return concat_padded_tensors([data, *dummies]), pad_count
+
+
 def split_padded_tensor_dict_into_mb_list(
     data: dict[str, Any],
     mb_spec: MicroBatchSpec,
     group: dist.ProcessGroup | None = None,
+    allow_transport_padding: bool = False,
+    synchronize: bool = True,
 ) -> MicroBatchList:
     """Split a padded dict of tensors into micro-batches based on the attention mask.
 
@@ -708,6 +772,9 @@ def split_padded_tensor_dict_into_mb_list(
         data (Dict): Dictionary containing padded tensors.
         mb_spec (MicroBatchSpec): Specification for micro-batch splitting.
         group (Optional[dist.ProcessGroup]): Process group for distributed synchronization.
+        allow_transport_padding: Add model-valid rows when synchronized execution
+            requires more micro-batches than local semantic data can provide.
+        synchronize: Synchronize the micro-batch count across ``group``.
 
     Returns:
         MicroBatchList: A structure containing the split micro-batches and metadata.
@@ -720,19 +787,56 @@ def split_padded_tensor_dict_into_mb_list(
             mb_spec, max_tokens_per_mb=DEFAULT_MAX_TOKENS_PER_MB
         )
     granularity = mb_spec.granularity
-    bs = data["attention_mask"].shape[0]
-    if bs % granularity != 0:
-        raise RuntimeError(f"Batch size {bs} cannot divide granularity {granularity}.")
-    max_seqlen = data["attention_mask"].shape[1]
-    seq_lens = data["attention_mask"].sum(1).long().cpu().numpy().tolist()
-    input_lens = (
-        data["attention_mask"]
-        .view(bs // granularity, granularity, -1)
-        .sum(dim=(1, 2))
-        .long()
-        .cpu()
-        .numpy()
-    )
+    semantic_batch_size = data["attention_mask"].shape[0]
+    allocation_spec = mb_spec
+    transport_dummy_count = 0
+    target_n_mbs = max(mb_spec.n_mbs or 1, mb_spec.n_mbs_divisor)
+
+    while True:
+        if allow_transport_padding:
+            data, added = _pad_batch_to_min_groups(
+                data,
+                min_groups=target_n_mbs,
+                granularity=granularity,
+            )
+            transport_dummy_count += added
+            allocation_spec = MicroBatchSpec.new(mb_spec, n_mbs=target_n_mbs)
+
+        bs = data["attention_mask"].shape[0]
+        if bs % granularity != 0:
+            raise RuntimeError(
+                f"Batch size {bs} cannot divide granularity {granularity}."
+            )
+        max_seqlen = data["attention_mask"].shape[1]
+        seq_lens = data["attention_mask"].sum(1).long().cpu().numpy().tolist()
+        input_lens = (
+            data["attention_mask"]
+            .view(bs // granularity, granularity, -1)
+            .sum(dim=(1, 2))
+            .long()
+            .cpu()
+            .numpy()
+        )
+        if transport_dummy_count:
+            input_lens[-transport_dummy_count // granularity :] = 0
+
+        if not allow_transport_padding:
+            group_indices = (
+                allocate_balanced_mbs_synced(allocation_spec, input_lens, group=group)
+                if synchronize
+                else allocate_balanced_mbs(allocation_spec, input_lens)
+            )
+            break
+
+        group_indices = allocate_balanced_mbs(allocation_spec, input_lens)
+        if not synchronize or not dist.is_initialized():
+            break
+        all_n_mbs: list[int | None] = [None] * dist.get_world_size(group)
+        dist.all_gather_object(all_n_mbs, len(group_indices), group=group)
+        synchronized_n_mbs = max(n for n in all_n_mbs if n is not None)
+        if all(n == synchronized_n_mbs for n in all_n_mbs):
+            break
+        target_n_mbs = synchronized_n_mbs
 
     # check for multimodal input data
     multimodal_keys = {key for key in data if is_multi_modal_key(key)}
@@ -752,7 +856,6 @@ def split_padded_tensor_dict_into_mb_list(
             not_to_split[key] = value
 
     # split
-    group_indices = allocate_balanced_mbs_synced(mb_spec, input_lens, group=group)
     group_indices = [
         seqpack.flat2d(
             [list(range(i * granularity, (i + 1) * granularity)) for i in group_index]
@@ -803,17 +906,99 @@ def split_padded_tensor_dict_into_mb_list(
     results = []
     # organize splitted micro batches
     assert len(mbs) == len(splitted_lens), (len(mbs), len(splitted_lens))
-    for i, (mb, lens) in enumerate(zip(mbs, splitted_lens)):
-        results.append({**mb, **not_to_split})
+    for mb, indices in zip(mbs, group_indices, strict=True):
+        has_transport_dummy = any(index >= semantic_batch_size for index in indices)
+        is_transport_dummy = has_transport_dummy and all(
+            index >= semantic_batch_size for index in indices
+        )
+        if has_transport_dummy and not is_transport_dummy:
+            raise RuntimeError(
+                "Transport padding must not share a micro-batch with semantic rows"
+            )
+        result = {**mb, **not_to_split}
+        if is_transport_dummy:
+            result[TRANSPORT_DUMMY_KEY] = True
+        results.append(result)
 
     return MicroBatchList(
         data=data,
-        mb_spec=mb_spec,
+        mb_spec=allocation_spec,
         mbs=results,
         forward_indices=forward_indices,
         backward_indices=backward_indices.tolist(),
         group_lens=group_lens,
+        transport_dummy_count=transport_dummy_count,
     )
+
+
+def split_training_batch_into_microbatches(
+    data: dict[str, Any],
+    n_mbs: int,
+    group: dist.ProcessGroup | None = None,
+) -> list[dict[str, Any]]:
+    """Build a synchronized PPO schedule without all-dummy global steps."""
+    if n_mbs < 1:
+        raise ValueError(f"n_mbs must be positive, got {n_mbs}")
+    batch_size = get_batch_size(data)
+    if batch_size < 1:
+        raise ValueError("Cannot split an empty training batch")
+
+    local_n_mbs = min(batch_size, n_mbs)
+    local_mbs = split_padded_tensor_dict_into_mb_list(
+        data,
+        MicroBatchSpec(n_mbs=local_n_mbs),
+        synchronize=False,
+    ).mbs
+    if not dist.is_initialized():
+        if local_n_mbs < n_mbs:
+            logger.warning(
+                "Reducing PPO minibatches from %d to %d for a batch of %d rows",
+                n_mbs,
+                local_n_mbs,
+                batch_size,
+            )
+        return local_mbs
+
+    counts: list[int | None] = [None] * dist.get_world_size(group)
+    dist.all_gather_object(counts, len(local_mbs), group=group)
+    concrete_counts = [count for count in counts if count is not None]
+    effective_n_mbs = max(
+        min(n_mbs, sum(concrete_counts)),
+        max(concrete_counts),
+    )
+    if effective_n_mbs < n_mbs:
+        logger.warning(
+            "Reducing synchronized PPO minibatches from %d to %d for %d global "
+            "training microbatches",
+            n_mbs,
+            effective_n_mbs,
+            sum(concrete_counts),
+        )
+    elif effective_n_mbs > n_mbs:
+        logger.warning(
+            "Increasing synchronized PPO minibatches from %d to %d because one "
+            "data-parallel rank produced that many local microbatches",
+            n_mbs,
+            effective_n_mbs,
+        )
+
+    group_rank = dist.get_rank(group=group)
+    offset = sum(concrete_counts[:group_rank])
+    scheduled: list[dict[str, Any] | None] = [None] * effective_n_mbs
+    for index, microbatch in enumerate(local_mbs):
+        slot = (offset + index) % effective_n_mbs
+        if scheduled[slot] is not None:
+            raise RuntimeError(
+                "Microbatch scheduling collision at slot "
+                f"{slot} with {effective_n_mbs} synchronized slots"
+            )
+        scheduled[slot] = microbatch
+
+    dummy = make_transport_microbatch(data)
+    return [
+        microbatch if microbatch is not None else copy.deepcopy(dummy)
+        for microbatch in scheduled
+    ]
 
 
 N_TOKENS_PER_PAGE = 256
@@ -1033,6 +1218,9 @@ def pad_mb_list(
             pad_value=pad_value,
             seq_align_to=seq_align_to,
         )
+        padded_mb = {
+            key: value for key, value in padded_mb.items() if key != TRANSPORT_DUMMY_KEY
+        }
         padded_mb_inputs.append(padded_mb)
         pad_lengths.append(pad_len)
         pad_to_lengths.append(pad_to_length)
@@ -1252,6 +1440,164 @@ def all_gather_tensor_container(data, group=None) -> list:
     return results
 
 
+@dataclass(frozen=True)
+class _TensorLeaf:
+    """Picklable stand-in for a tensor leaf inside a gathered container skeleton."""
+
+    shape: tuple[int, ...]
+    dtype: torch.dtype
+    device_type: str
+
+    @property
+    def numel(self) -> int:
+        return int(np.prod(self.shape))
+
+
+def _deconstruct_tensor_container(value, out_tensors: list[torch.Tensor]):
+    """Split a container into a picklable skeleton and its tensor leaves (DFS order)."""
+    if torch.is_tensor(value):
+        out_tensors.append(value)
+        return _TensorLeaf(tuple(value.shape), value.dtype, value.device.type)
+    if isinstance(value, list):
+        return [_deconstruct_tensor_container(item, out_tensors) for item in value]
+    if isinstance(value, dict):
+        return {
+            key: _deconstruct_tensor_container(item, out_tensors)
+            for key, item in value.items()
+        }
+    return value
+
+
+def _reconstruct_tensor_container(skeleton, tensors: Iterator[torch.Tensor]):
+    """Rebuild a container from its skeleton, consuming tensor leaves in DFS order."""
+    if isinstance(skeleton, _TensorLeaf):
+        return next(tensors)
+    if isinstance(skeleton, list):
+        return [_reconstruct_tensor_container(item, tensors) for item in skeleton]
+    if isinstance(skeleton, dict):
+        return {
+            key: _reconstruct_tensor_container(item, tensors)
+            for key, item in skeleton.items()
+        }
+    return skeleton
+
+
+def _skeleton_tensor_leaves(skeletons) -> list[_TensorLeaf]:
+    leaves: list[_TensorLeaf] = []
+
+    def _walk(value):
+        if isinstance(value, _TensorLeaf):
+            leaves.append(value)
+        elif isinstance(value, list):
+            for item in value:
+                _walk(item)
+        elif isinstance(value, dict):
+            for item in value.values():
+                _walk(item)
+
+    _walk(skeletons)
+    return leaves
+
+
+def all_gather_ragged_tensor_container(items: list, group=None) -> list[list]:
+    """All-gather per-rank container lists whose lengths differ across ranks.
+
+    Complements :func:`all_gather_tensor_container`, which requires every rank
+    to contribute the same number of items. One object all-gather exchanges
+    per-item skeletons (structure, non-tensor leaves, and tensor metadata);
+    tensor payloads then travel in one padded all-gather per (dtype, device
+    type) bucket. Buckets are derived from the gathered metadata, so every
+    rank — including ranks with no items — joins the same collectives.
+    """
+    world_size = dist.get_world_size(group)
+
+    local_tensors: list[torch.Tensor] = []
+    local_skeletons = [
+        _deconstruct_tensor_container(item, local_tensors) for item in items
+    ]
+
+    all_skeletons: list[list | None] = [None] * world_size
+    dist.all_gather_object(all_skeletons, local_skeletons, group=group)
+
+    leaves_by_rank = [_skeleton_tensor_leaves(skeletons) for skeletons in all_skeletons]
+    buckets = sorted(
+        {
+            (leaf.dtype, leaf.device_type)
+            for rank_leaves in leaves_by_rank
+            for leaf in rank_leaves
+        },
+        key=str,
+    )
+
+    local_rank = dist.get_rank(group=group)
+    payloads: dict[tuple[torch.dtype, str], list[list[torch.Tensor]]] = {}
+    for bucket in buckets:
+        dtype, device_type = bucket
+        device = (
+            torch.device("cpu")
+            if device_type == "cpu"
+            else current_platform.current_device()
+        )
+        max_numel = max(
+            sum(
+                leaf.numel
+                for leaf in rank_leaves
+                if (leaf.dtype, leaf.device_type) == bucket
+            )
+            for rank_leaves in leaves_by_rank
+        )
+        local_bucket_tensors = [
+            tensor
+            for tensor, leaf in zip(
+                local_tensors, leaves_by_rank[local_rank], strict=True
+            )
+            if (leaf.dtype, leaf.device_type) == bucket
+        ]
+        flat = (
+            torch.cat([tensor.reshape(-1) for tensor in local_bucket_tensors])
+            if local_bucket_tensors
+            else torch.empty(0, dtype=dtype, device=device)
+        )
+        padded = F.pad(flat, (0, max_numel - flat.numel()))
+        if max_numel > 0:
+            gathered = [torch.empty_like(padded) for _ in range(world_size)]
+            dist.all_gather(gathered, padded, group=group)
+        else:
+            # Every rank's payload is empty; slicing below yields 0-numel views.
+            gathered = [padded] * world_size
+
+        bucket_payload: list[list[torch.Tensor]] = []
+        for rank_leaves, buffer in zip(leaves_by_rank, gathered, strict=True):
+            offset = 0
+            rank_tensors = []
+            for leaf in rank_leaves:
+                if (leaf.dtype, leaf.device_type) != bucket:
+                    continue
+                # Clone so results do not alias the padded gather buffers,
+                # which would otherwise pin world_size * max_rank_payload
+                # memory for the lifetime of the batch.
+                rank_tensors.append(
+                    buffer.narrow(0, offset, leaf.numel).view(leaf.shape).clone()
+                )
+                offset += leaf.numel
+            bucket_payload.append(rank_tensors)
+        payloads[bucket] = bucket_payload
+
+    results: list[list] = []
+    for rank_index, (skeletons, rank_leaves) in enumerate(
+        zip(all_skeletons, leaves_by_rank, strict=True)
+    ):
+        cursors = {
+            bucket: iter(bucket_payload[rank_index])
+            for bucket, bucket_payload in payloads.items()
+        }
+        ordered = [
+            next(cursors[(leaf.dtype, leaf.device_type)]) for leaf in rank_leaves
+        ]
+        results.append(_reconstruct_tensor_container(skeletons, iter(ordered)))
+    return results
+
+
 def broadcast_tensor_container(data, src_rank=0, group=None):
     if dist.get_rank() != src_rank:
         metadata = [None]
@@ -1338,9 +1684,10 @@ def bcast_mb_list(
             mb_list.padding_lengths,
             mb_list.padded_to_lengths,
             mb_list.align_to_lengths,
+            mb_list.transport_dummy_count,
         ]
         if mb_list
-        else [None for _ in range(7)]
+        else [None for _ in range(8)]
     )
     dist.broadcast_object_list(to_broadcast, src=src_rank, group=group)
     (
@@ -1351,6 +1698,7 @@ def bcast_mb_list(
         padding_lengths,
         padded_to_lengths,
         align_to_lengths,
+        transport_dummy_count,
     ) = to_broadcast
     return MicroBatchList(
         data=data,
@@ -1364,6 +1712,7 @@ def bcast_mb_list(
         padded_to_lengths=padded_to_lengths,
         old_cu_seqlens_list=old_cu_seqlens_list,
         align_to_lengths=align_to_lengths,
+        transport_dummy_count=transport_dummy_count,
     )
 
 
@@ -1423,6 +1772,11 @@ class Normalization:
                 slices.append(slice(offset, offset + sz))
                 offset += sz
             return slices
+        if bs % self.group_size != 0:
+            raise ValueError(
+                f"batch size ({bs}) must be divisible by group_size "
+                f"({self.group_size}) when group_sizes is not provided"
+            )
         return [
             slice(i * self.group_size, (i + 1) * self.group_size)
             for i in range(bs // self.group_size)

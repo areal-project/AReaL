@@ -541,6 +541,10 @@ class OpenAIProxyWorkflow(RolloutWorkflow):
 | `individual` | 将所有交互作为单独条目返回。轨迹可能共享前缀。                      |
 | `concat`     | 构建对话树，仅返回叶子节点。仅对具有匹配 token 序列的线性对话有效。 |
 
+`individual` 每个 episode 会导出多个样本；在分组 rollout（`n_samples >= 2`）下，这与 group-relative
+normalization 不兼容，会抛出不可重试的 `WorkflowContractError`。参见
+[分组 rollout 契约](rollout_workflow.md#%E5%88%86%E7%BB%84-rollout)。
+
 ## 公共 API
 
 ```python
