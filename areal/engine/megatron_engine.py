@@ -135,7 +135,12 @@ from areal.utils.data import (
     unpad_logits,
 )
 from areal.utils.functional import gather_logprobs, gather_logprobs_entropy
-from areal.utils.hf_utils import load_hf_processor_and_tokenizer, load_hf_tokenizer
+from areal.utils.hf_utils import (
+    finalize_hf_export,
+    load_hf_config_snapshot,
+    load_hf_processor_and_tokenizer,
+    load_hf_tokenizer,
+)
 from areal.utils.lock import DistributedLock
 from areal.utils.lr_scheduler import get_num_warmup_steps
 from areal.utils.network import find_free_ports, format_host_for_url, gethostip
@@ -2582,6 +2587,11 @@ class MegatronEngine(TrainEngine):
                 )
         else:
             if self.mcore_config.use_mbridge_save:
+                source_config = (
+                    load_hf_config_snapshot(base_model_path)
+                    if dist.get_rank() == 0
+                    else None
+                )
                 # when loading model using AreaL's fast hf load, the safetensor_io is never set
                 if (
                     not hasattr(self.bridge, "safetensor_io")
@@ -2591,6 +2601,13 @@ class MegatronEngine(TrainEngine):
                         self.config.path
                     )
                 self.bridge.save_weights(models=self.model, weights_path=path)
+                if dist.get_rank() == 0:
+                    finalize_hf_export(
+                        self.bridge.hf_config,
+                        path,
+                        source_model_path=base_model_path,
+                        source_config=source_config,
+                    )
             else:
                 save_weights_to_hf_with_mbridge_fast(
                     bridge=self.bridge,

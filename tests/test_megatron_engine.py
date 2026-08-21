@@ -1,7 +1,10 @@
+import json
 import os
 import time
 from importlib.metadata import version as get_version
+from types import SimpleNamespace
 from typing import Any
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -103,6 +106,46 @@ def test_mark_duplicated_params_clears_tp_metadata_for_replicated_params():
     assert sharded_linear.weight.tensor_model_parallel
 
 
+def test_native_mbridge_save_finalizes_hf_config(monkeypatch, tmp_path):
+    """The native mbridge saver runs the shared rank-zero HF finalizer."""
+    engine = MegatronEngine.__new__(MegatronEngine)
+    engine.model = [object()]
+    engine.bridge_cls = "mbridge"
+    engine.mcore_config = SimpleNamespace(use_mbridge_save=True)
+    engine.config = SimpleNamespace(is_critic=False, path="/models/source")
+    engine.bridge = Mock(safetensor_io=object())
+    engine.cpu_group = object()
+
+    finalize = Mock()
+    source_config = {"model_type": "runtime_only", "torch_dtype": "bfloat16"}
+    snapshot = Mock(return_value=source_config)
+    monkeypatch.setattr(
+        "areal.engine.megatron_engine.finalize_hf_export",
+        finalize,
+    )
+    monkeypatch.setattr(
+        "areal.engine.megatron_engine.load_hf_config_snapshot",
+        snapshot,
+    )
+    monkeypatch.setattr(dist, "get_rank", lambda: 0)
+    monkeypatch.setattr(dist, "barrier", lambda **_kwargs: None)
+    monkeypatch.setattr(current_platform, "synchronize", lambda: None)
+
+    engine._save_model_to_hf(str(tmp_path), base_model_path=str(tmp_path))
+
+    snapshot.assert_called_once_with(str(tmp_path))
+    engine.bridge.save_weights.assert_called_once_with(
+        models=engine.model,
+        weights_path=str(tmp_path),
+    )
+    finalize.assert_called_once_with(
+        engine.bridge.hf_config,
+        str(tmp_path),
+        source_model_path=str(tmp_path),
+        source_config=source_config,
+    )
+
+
 # Cannot use a "module" scope since process groups can only be initialized once.
 @pytest.fixture
 def engine():
@@ -171,6 +214,9 @@ def test_hf_save_load_weights(tmp_path_factory, engine, mock_input):
     start = time.perf_counter()
     engine.save(save_load_meta)
     logger.info(f"Save done, time cost: {time.perf_counter() - start:.4f} seconds.")
+    with open(path / "config.json") as f:
+        saved_config = json.load(f)
+    assert saved_config["model_type"] == engine.hf_config.model_type
     for name, param in engine.model.named_parameters():
         param.zero_()
 

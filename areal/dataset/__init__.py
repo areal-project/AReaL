@@ -196,12 +196,14 @@ def get_custom_dataset(
     ):
         from areal.infra.data_service.rdataset import RDataset
 
+        dataset_kwargs = dict(getattr(dataset_config, "dataset_kwargs", None) or {})
+        dataset_kwargs.update(kwargs)
         return RDataset(
             path=dataset_config.path,
             type=dataset_config.type,
             split=split,
             max_length=dataset_config.max_length,
-            dataset_kwargs=getattr(dataset_config, "dataset_kwargs", None),
+            dataset_kwargs=dataset_kwargs,
         )
 
     if dataset_config is not None:
