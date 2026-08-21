@@ -76,6 +76,8 @@ class SGLangBackend:
         }
         if stop:
             sample_params["stop"] = stop
+        if gconfig.seed is not None:
+            sample_params["sampling_seed"] = gconfig.seed
 
         payload = {
             "input_ids": req.input_ids.copy(),

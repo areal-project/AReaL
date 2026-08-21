@@ -53,6 +53,8 @@ class VLLMBridgeBackend:
             "use_beam_search": gconfig.use_beam_search,
             "stream": False,
         }
+        if gconfig.seed is not None:
+            payload["seed"] = gconfig.seed
 
         if with_lora:
             lora_name = gconfig.lora_name
