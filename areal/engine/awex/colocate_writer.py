@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import gc
 import os
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
@@ -31,6 +32,16 @@ import torch.distributed as dist
 if TYPE_CHECKING:
     from areal.engine.megatron_engine import MegatronEngine
 
+from areal.engine.megatron_utils.optimizer_chain import (
+    OptimizerLifecyclePlan,
+    OptimizerUndoAction,
+    checkpoint_awex_residency,
+    classify_optimizer_leaves,
+    release_optimizer_lifecycle,
+    resume_optimizer_lifecycle,
+    retry_optimizer_recovery,
+    rollback_optimizer_lifecycle,
+)
 from areal.engine.weight_finite import (
     check_named_tensors_finite,
     iter_module_named_tensors,
@@ -38,6 +49,15 @@ from areal.engine.weight_finite import (
 from areal.utils.logging import getLogger
 
 logger = getLogger("AwexColocate")
+
+
+@dataclass
+class _TECachePurgeJournal:
+    """Release-time snapshot and pending restores for TE's private dict cache."""
+
+    cache: dict
+    snapshot: tuple[tuple[object, object], ...]
+    pending: list[tuple[object, object]]
 
 
 def resolve_physical_gpu_id(relative_gpu_id: int) -> int:
@@ -87,6 +107,9 @@ class AwexMegatronAdapter:
         self._engine = engine
         self._offloaded_weights: dict[str, torch.Tensor] = {}
         self._released_tags: set[str] = set()
+        self._optimizer_lifecycle_cycle: OptimizerLifecyclePlan | None = None
+        self._optimizer_rollback_recovery: OptimizerLifecyclePlan | None = None
+        self._te_cache_purge_undo: _TECachePurgeJournal | None = None
         self._meta_server_addr: str | None = None
         self._meta_server_client = None
         self._transfer_rank: int | None = None
@@ -532,23 +555,41 @@ class AwexMegatronAdapter:
 
     # ── Memory management (manual offload) ────────────────────────────────
 
+    def checkpoint_residency(self, *, with_model: bool, with_optimizer: bool):
+        """Temporarily restore only resources required by a checkpoint."""
+        return checkpoint_awex_residency(
+            self,
+            self._engine.optimizer,
+            with_model=with_model,
+            with_optimizer=with_optimizer,
+        )
+
     def release_memory(self, tags: list[str] | None = None) -> None:
         tags = tags or ["optimizer", "weights"]
         tags_to_release = [t for t in tags if t not in self._released_tags]
         if not tags_to_release:
             return
 
-        if "optimizer" in tags_to_release:
-            self._offload_optimizer_states()
-            self._released_tags.add("optimizer")
+        optimizer_released = False
+        try:
+            if "optimizer" in tags_to_release:
+                self._offload_optimizer_states()
+                optimizer_released = True
 
-        if "weights" in tags_to_release:
-            self._offload_model_weights()
-            self._released_tags.add("weights")
+            if "weights" in tags_to_release:
+                self._offload_model_weights()
 
-        torch.cuda.synchronize()
-        gc.collect()
-        torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+            gc.collect()
+            torch.cuda.empty_cache()
+        except BaseException as original:
+            if optimizer_released:
+                self._rollback_te_cache_purge(original)
+                self._rollback_optimizer_release(original)
+            raise
+
+        self._released_tags.update(tags_to_release)
+        self._te_cache_purge_undo = None
         logger.info("release_memory done: tags=%s", tags_to_release)
 
     def resume_memory(self, tags: list[str] | None = None) -> None:
@@ -559,13 +600,12 @@ class AwexMegatronAdapter:
 
         if "weights" in tags_to_resume:
             self._reload_model_weights(load_grad=False)
-            self._released_tags.discard("weights")
-
         if "optimizer" in tags_to_resume:
             self._reload_optimizer_states()
-            self._released_tags.discard("optimizer")
-
         torch.cuda.synchronize()
+        self._released_tags.difference_update(tags_to_resume)
+        if "optimizer" in tags_to_resume:
+            self._optimizer_lifecycle_cycle = None
         logger.info("resume_memory done: tags=%s", tags_to_resume)
 
     def _offload_model_weights(self) -> None:
@@ -671,22 +711,13 @@ class AwexMegatronAdapter:
             torch.cuda.synchronize()
             logger.info("Allocated %d grad buffers for training", count)
 
-    def _get_inner_optimizers(self):
-        optimizer = self._engine.optimizer
-        if optimizer is None:
-            return []
-        if hasattr(optimizer, "chained_optimizers"):
-            inner_optimizers = optimizer.chained_optimizers
-        elif hasattr(optimizer, "optimizers"):
-            inner_optimizers = optimizer.optimizers
-        else:
-            inner_optimizers = [optimizer]
-        return inner_optimizers
-
     def _offload_optimizer_states(self) -> None:
         optimizer = self._engine.optimizer
-        if optimizer is None:
-            return
+        if (
+            self._optimizer_rollback_recovery is not None
+            or self._te_cache_purge_undo is not None
+        ):
+            raise RuntimeError("optimizer release has unresolved rollback state")
         # Default path mirrors the AWEX reference optimizer offload
         # (megatron_util.offload_megatron_optimizer): swap .data / state-dict
         # references to CPU, never resize_ storages, then purge TE's global
@@ -694,106 +725,254 @@ class AwexMegatronAdapter:
         # offload_to_cpu/restore_from_cpu is kept only as an opt-in fallback —
         # its internal pointer bookkeeping is hard to validate and the AWEX
         # reference integration deliberately avoids it.
-        if os.environ.get("AWEX_OPT_OFFLOAD_VIA_HDO", "").strip() == "1" and hasattr(
-            optimizer, "offload_to_cpu"
-        ):
-            optimizer.offload_to_cpu()
-            logger.info("Offloaded optimizer via offload_to_cpu()")
-            return
-
-        inner_optimizers = self._get_inner_optimizers()
-        if not inner_optimizers:
-            return
-
-        count = 0
-        for opt in inner_optimizers:
-            # Offload FP32 main parameter copies (shard_fp32_from_float16_groups)
-            if hasattr(opt, "shard_fp32_from_float16_groups"):
-                for group in opt.shard_fp32_from_float16_groups:
-                    if isinstance(group, list):
-                        for t in group:
-                            if t is not None and t.data.is_cuda:
-                                t.data = t.data.to("cpu", non_blocking=True)
-                                count += 1
-                    elif group is not None and group.data.is_cuda:
-                        group.data = group.data.to("cpu", non_blocking=True)
-                        count += 1
-
-            # Offload Adam states (exp_avg, exp_avg_sq)
-            base_opt = getattr(opt, "optimizer", opt)
-            if not hasattr(base_opt, "state") or base_opt.state is None:
-                continue
-            for state in base_opt.state.values():
-                for key in ("exp_avg", "exp_avg_sq"):
-                    if (
-                        key in state
-                        and isinstance(state[key], torch.Tensor)
-                        and state[key].is_cuda
-                    ):
-                        state[key] = state[key].to("cpu", non_blocking=True)
-                        count += 1
-
-        # Targeted fix from the AWEX reference: transformer_engine caches dummy wgrad
-        # tensors in a module-global dict; without purging it the GPU memory
-        # is never actually freed and stale references survive the offload.
+        use_hdo_lifecycle = (
+            os.environ.get("AWEX_OPT_OFFLOAD_VIA_HDO", "").strip() == "1"
+        )
+        te_cache_journal = self._prepare_te_cache_purge()
+        cycle = classify_optimizer_leaves(
+            optimizer,
+            use_hdo_lifecycle=use_hdo_lifecycle,
+            logger=logger,
+        )
         try:
-            from transformer_engine.pytorch.module.base import _dummy_wgrads
+            release_optimizer_lifecycle(
+                cycle,
+                self._release_ordinary_optimizer,
+                logger=logger,
+            )
+        except BaseException:
+            if cycle.has_pending_recovery():
+                self._optimizer_rollback_recovery = cycle
+            self._optimizer_lifecycle_cycle = None
+            raise
 
-            purged = len(_dummy_wgrads)
-            for k in list(_dummy_wgrads):
-                del _dummy_wgrads[k]
-            if purged:
-                logger.info("Purged %d TE _dummy_wgrads cache entries", purged)
-        except ImportError:
-            pass
-        torch.cuda.synchronize()
-        logger.info("Offloaded %d optimizer state tensors to CPU", count)
+        try:
+            # Complete all non-blocking state copies before publishing the
+            # cycle to the outer release transaction.
+            torch.cuda.synchronize()
+        except BaseException as original:
+            rollback_optimizer_lifecycle(cycle, original, logger=logger)
+            if cycle.has_pending_recovery():
+                self._optimizer_rollback_recovery = cycle
+            raise
+
+        try:
+            if te_cache_journal is not None:
+                self._purge_te_cache_transactionally(te_cache_journal)
+        except BaseException as original:
+            self._rollback_te_cache_purge(original)
+            rollback_optimizer_lifecycle(cycle, original, logger=logger)
+            if cycle.has_pending_recovery() or self._te_cache_purge_undo is not None:
+                self._optimizer_rollback_recovery = cycle
+            self._optimizer_lifecycle_cycle = None
+            raise
+
+        self._optimizer_lifecycle_cycle = cycle
+        logger.info("Offloaded optimizer state tensors to CPU")
 
     def _reload_optimizer_states(self) -> None:
-        optimizer = self._engine.optimizer
-        if optimizer is None:
+        cycle = self._optimizer_lifecycle_cycle
+        if cycle is None:
             return
-        if os.environ.get("AWEX_OPT_OFFLOAD_VIA_HDO", "").strip() == "1" and hasattr(
-            optimizer, "restore_from_cpu"
+        for node_type in cycle.cycle_node_types:
+            logger.warning(
+                "Detected optimizer chain cycle at %s; using release-time plan",
+                node_type,
+            )
+        resume_optimizer_lifecycle(cycle, logger=logger)
+        logger.info("Reloaded optimizer state tensors to GPU")
+
+    def _rollback_optimizer_release(self, original: BaseException) -> None:
+        cycle = self._optimizer_lifecycle_cycle
+        if cycle is None:
+            return
+        rollback_optimizer_lifecycle(cycle, original, logger=logger)
+        if cycle.has_pending_recovery() or self._te_cache_purge_undo is not None:
+            self._optimizer_rollback_recovery = cycle
+        self._optimizer_lifecycle_cycle = None
+
+    def _retry_optimizer_rollback_recovery(self) -> None:
+        cycle = self._optimizer_rollback_recovery
+        if cycle is None and self._te_cache_purge_undo is None:
+            return
+        recovery_error: BaseException | None = None
+        if cycle is not None:
+            try:
+                retry_optimizer_recovery(cycle, logger=logger)
+            except BaseException as error:
+                recovery_error = error
+        if self._te_cache_purge_undo is not None:
+            try:
+                self._restore_te_cache_items()
+            except BaseException as error:
+                if recovery_error is None:
+                    recovery_error = error
+                else:
+                    recovery_error.add_note(
+                        f"Additional AWEX TE cache recovery failure: {error!r}"
+                    )
+        if (
+            cycle is not None
+            and not cycle.has_pending_recovery()
+            and self._te_cache_purge_undo is None
         ):
-            optimizer.restore_from_cpu()
-            logger.info("Reloaded optimizer via restore_from_cpu()")
+            self._optimizer_rollback_recovery = None
+        if recovery_error is not None:
+            raise recovery_error
+
+    def _prepare_te_cache_purge(self) -> _TECachePurgeJournal | None:
+        # ImportError compatibility is deliberately limited to importing TE.
+        # Descriptor access, validation, snapshot, and mapping operations are
+        # part of the optimizer release transaction and must propagate.
+        try:
+            import transformer_engine.pytorch.module.base as te_base
+        except ImportError:
+            return None
+        return self._snapshot_te_cache(te_base._dummy_wgrads)
+
+    @staticmethod
+    def _snapshot_te_cache(cache) -> _TECachePurgeJournal:
+        # Transformer Engine 2.14.1 initializes private `_dummy_wgrads` with a
+        # dict literal. This compatibility adapter supports that concrete
+        # contract (and subclasses with trustworthy built-in dict storage),
+        # not arbitrary MutableMapping implementations.
+        if not isinstance(cache, dict):
+            raise TypeError(
+                "Transformer Engine 2.14.1 _dummy_wgrads must be a dict or "
+                f"dict subclass, got {type(cache).__module__}.{type(cache).__qualname__}"
+            )
+        snapshot = tuple(dict.items(cache))
+        return _TECachePurgeJournal(
+            cache=cache,
+            snapshot=snapshot,
+            pending=list(snapshot),
+        )
+
+    def _purge_te_cache_transactionally(self, journal: _TECachePurgeJournal) -> None:
+        # Publish the complete trusted snapshot before the first dynamic
+        # deletion. A dict subclass may delete any original entry before
+        # raising, so prefix-only undo registration is insufficient.
+        self._te_cache_purge_undo = journal
+        for key, _value in journal.snapshot:
+            del journal.cache[key]
+        if journal.snapshot:
+            logger.info(
+                "Purged %d TE _dummy_wgrads cache entries", len(journal.snapshot)
+            )
+
+    def _restore_te_cache_items(self) -> None:
+        if self._te_cache_purge_undo is None:
             return
+        journal = self._te_cache_purge_undo
+        failed: list[tuple[object, object]] = []
+        restore_errors: list[BaseException] = []
+        for key, value in reversed(tuple(journal.pending)):
+            # Assignment is deliberately unconditional: it restores the
+            # original value whether deletion happened before or after an
+            # exception, without a separate membership-check failure window.
+            try:
+                journal.cache[key] = value
+            except BaseException as error:
+                failed.append((key, value))
+                restore_errors.append(error)
+            journal.pending = list(reversed(failed))
 
-        inner_optimizers = self._get_inner_optimizers()
-        if not inner_optimizers:
+        # The supported contract treats built-in dict storage as authoritative.
+        # Rebuild it from the trusted pre-snapshot to remove deletion side
+        # effects (including newly inserted keys) and restore value identity.
+        # AWEX requires this private TE cache to be quiescent during lifecycle.
+        dict.clear(journal.cache)
+        for key, value in journal.snapshot:
+            dict.__setitem__(journal.cache, key, value)
+        if restore_errors:
+            primary = restore_errors[0]
+            for error in restore_errors[1:]:
+                primary.add_note(f"Additional AWEX TE cache restore failure: {error!r}")
+            raise primary
+        self._te_cache_purge_undo = None
+
+    def _rollback_te_cache_purge(self, original: BaseException) -> None:
+        if self._te_cache_purge_undo is None:
             return
+        try:
+            self._restore_te_cache_items()
+        except BaseException as error:
+            original.add_note(f"AWEX TE cache rollback failed: {error!r}")
+            try:
+                logger.error(
+                    "AWEX TE cache rollback failed",
+                    exc_info=(type(error), error, error.__traceback__),
+                )
+            except BaseException as logging_error:
+                original.add_note(
+                    f"AWEX failed to log TE rollback error: {logging_error!r}"
+                )
 
-        device = self._engine.device
-        count = 0
-        for opt in inner_optimizers:
-            # Reload FP32 main parameter copies
-            if hasattr(opt, "shard_fp32_from_float16_groups"):
-                for group in opt.shard_fp32_from_float16_groups:
-                    if isinstance(group, list):
-                        for t in group:
-                            if t is not None and not t.data.is_cuda:
-                                t.data = t.data.to(device, non_blocking=True)
-                                count += 1
-                    elif group is not None and not group.data.is_cuda:
-                        group.data = group.data.to(device, non_blocking=True)
-                        count += 1
+    def _release_ordinary_optimizer(self, index, lifecycle, journal) -> None:
+        del index
+        opt = lifecycle.leaf
+        if hasattr(opt, "shard_fp32_from_float16_groups"):
+            for group in opt.shard_fp32_from_float16_groups:
+                tensors = group if isinstance(group, list) else [group]
+                for tensor in tensors:
+                    if tensor is not None and tensor.data.is_cuda:
+                        device = tensor.device
+                        tensor.data = tensor.data.to("cpu", non_blocking=True)
+                        journal.actions.append(
+                            OptimizerUndoAction(
+                                restore=lambda tensor=tensor, device=device: setattr(
+                                    tensor,
+                                    "data",
+                                    tensor.data.to(device, non_blocking=True),
+                                ),
+                                description="legacy FP32 main parameter",
+                            )
+                        )
 
-            # Reload Adam states
-            base_opt = getattr(opt, "optimizer", opt)
-            if not hasattr(base_opt, "state") or base_opt.state is None:
-                continue
-            for state in base_opt.state.values():
-                for key in ("exp_avg", "exp_avg_sq"):
-                    if (
-                        key in state
-                        and isinstance(state[key], torch.Tensor)
-                        and not state[key].is_cuda
-                    ):
-                        state[key] = state[key].to(device, non_blocking=True)
-                        count += 1
-        torch.cuda.synchronize()
-        logger.info("Reloaded %d optimizer state tensors to GPU", count)
+        base_opt = lifecycle.base_optimizer
+        if base_opt is None or not hasattr(base_opt, "state") or base_opt.state is None:
+            return
+        if getattr(base_opt, "capturable", False):
+            raise RuntimeError(
+                "AWEX optimizer-state migration does not support capturable optimizers"
+            )
+        for state in base_opt.state.values():
+            # Transformer Engine's precision-aware Adam owns its main parameter
+            # in optimizer state instead of
+            # ``shard_fp32_from_float16_groups``.  Move it with the moments so
+            # the optimizer tag releases every CUDA-resident owner before the
+            # colocated inference engine resumes its memory mappings.
+            for key in ("master_param", "exp_avg", "exp_avg_sq"):
+                if (
+                    key in state
+                    and isinstance(state[key], torch.Tensor)
+                    and state[key].is_cuda
+                ):
+                    tensor = state[key]
+                    if type(tensor) is not torch.Tensor:
+                        raise TypeError(
+                            "AWEX optimizer-state migration only supports plain "
+                            f"Tensor values, got {type(tensor).__module__}."
+                            f"{type(tensor).__qualname__} for {key}"
+                        )
+                    device = tensor.device
+                    # Preserve the optimizer-state Tensor identity while
+                    # replacing its storage.  External holders of this exact
+                    # object (for example sharded/checkpoint metadata) then
+                    # observe the move; replacing only ``state[key]`` can
+                    # leave such holders owning the old CUDA storage.
+                    cpu_data = tensor.data.to("cpu", non_blocking=True)
+                    journal.actions.append(
+                        OptimizerUndoAction(
+                            restore=lambda tensor=tensor, device=device: setattr(
+                                tensor,
+                                "data",
+                                tensor.data.to(device, non_blocking=True),
+                            ),
+                            description=f"optimizer state {key}",
+                        )
+                    )
+                    tensor.data = cpu_data
 
 
 def _get_tf_config(models):

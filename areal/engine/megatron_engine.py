@@ -68,6 +68,14 @@ from areal.engine.megatron_utils import megatron_bridge_patches  # noqa: F401
 from areal.engine.megatron_utils.checkpointer import MegatronCheckpointManager
 from areal.engine.megatron_utils.deterministic import set_deterministic_algorithms
 from areal.engine.megatron_utils.fp8 import FP8BlockwiseTensorHelper
+from areal.engine.megatron_utils.gpu_staged_muon import (
+    GPUStagedMuonConfig,
+    get_megatron_optimizer_with_gpu_staged_muon,
+)
+from areal.engine.megatron_utils.gpu_staged_optimizer import (
+    GPUStagedAdamWConfig,
+    get_megatron_optimizer_with_gpu_staged_adamw,
+)
 from areal.engine.megatron_utils.megatron import (
     all_gather_param,
     convert_to_hf,
@@ -75,6 +83,7 @@ from areal.engine.megatron_utils.megatron import (
     remove_padding,
 )
 from areal.engine.megatron_utils.megatron_lora import get_vllm_lora_target_modules
+from areal.engine.megatron_utils.optimizer_chain import checkpoint_awex_residency
 from areal.engine.megatron_utils.packed_context_parallel import (
     _is_multi_modal_payload_key,
     extract_vision_from_multi_modal,
@@ -318,6 +327,8 @@ class MegatronEngine(TrainEngine):
         self.mcore_config = config.megatron
         self.parallel_strategy = None
         self.optimizer = None
+        self._gpu_staged_adamw_config: GPUStagedAdamWConfig | None = None
+        self._gpu_staged_muon_config: GPUStagedMuonConfig | None = None
         self.lr_scheduler = None
         self.bridge = None
         self.process_group_initialized = False
@@ -1007,7 +1018,27 @@ class MegatronEngine(TrainEngine):
             self._awex_adapter._release_grad_memory()
             gc.collect()
             torch.cuda.empty_cache()
-        with self._offload_aware_context():
+        defer_checkpoint_lease = bool(
+            meta.weight_format == "dcp"
+            and self.checkpointer is not None
+            and self.checkpointer.async_save
+            and self.checkpointer.managed_checkpoint_enabled
+        )
+        checkpoint_lease = self._checkpoint_aware_context(
+            with_model=True, with_optimizer=meta.with_optim
+        )
+        checkpoint_lease.__enter__()
+        lease_transferred = False
+        lease_released = False
+
+        def release_checkpoint_lease() -> None:
+            nonlocal lease_released
+            if lease_released:
+                return
+            lease_released = True
+            checkpoint_lease.__exit__(None, None, None)
+
+        try:
             if meta.weight_format == "hf":
                 if meta.with_optim:
                     raise ValueError(
@@ -1026,14 +1057,26 @@ class MegatronEngine(TrainEngine):
                         "(e.g., LoRA path without distributed optimizer support). "
                         "Please use weight_format='hf' for adapter/full-model export."
                     )
+                completion_callback = None
+                if defer_checkpoint_lease:
+                    completion_callback = release_checkpoint_lease
+
                 self.checkpointer.save_checkpoint(
-                    meta.path, with_optimizer=meta.with_optim
+                    meta.path,
+                    with_optimizer=meta.with_optim,
+                    async_completion_callback=completion_callback,
                 )
+                lease_transferred = defer_checkpoint_lease
             else:
                 raise ValueError(f"Unknown weight format {meta.weight_format}. ")
+        finally:
+            if not lease_transferred:
+                release_checkpoint_lease()
 
     def load(self, meta: SaveLoadMeta):
-        with self._offload_aware_context():
+        with self._checkpoint_aware_context(
+            with_model=True, with_optimizer=meta.with_optim
+        ):
             if meta.weight_format == "hf":
                 if meta.with_optim:
                     raise ValueError(
@@ -1052,6 +1095,39 @@ class MegatronEngine(TrainEngine):
                 )
             else:
                 raise ValueError(f"Unknown weight format {meta.weight_format}. ")
+
+    @contextmanager
+    def _checkpoint_aware_context(self, *, with_model: bool, with_optimizer: bool):
+        """Lease AWEX-released resources without onloading managed state."""
+        if self._awex_adapter is None:
+            with self._offload_aware_context():
+                yield
+            return
+
+        lease_factory = getattr(self._awex_adapter, "checkpoint_residency", None)
+        if callable(lease_factory):
+            lease = lease_factory(with_model=with_model, with_optimizer=with_optimizer)
+        else:
+            lease = checkpoint_awex_residency(
+                self._awex_adapter,
+                self.optimizer,
+                with_model=with_model,
+                with_optimizer=with_optimizer,
+            )
+        with lease:
+            if with_model:
+                self._assert_checkpoint_model_resident()
+            yield
+
+    def _assert_checkpoint_model_resident(self) -> None:
+        """Reject checkpoint access to AWEX-resized model storage."""
+        for chunk_index, chunk in enumerate(self.model):
+            for name, param in chunk.named_parameters():
+                if param.numel() and param.untyped_storage().nbytes() == 0:
+                    raise RuntimeError(
+                        "AWEX model weights are not resident for checkpoint: "
+                        f"chunk={chunk_index}, parameter={name!r}"
+                    )
 
     @contextmanager
     def _offload_aware_context(self):
@@ -1100,6 +1176,16 @@ class MegatronEngine(TrainEngine):
 
     def lr_scheduler_step(self):
         assert self.lr_scheduler is not None, "LR Scheduler is not initialized."
+        if (
+            self.checkpointer is not None
+            and self.checkpointer.managed_checkpoint_enabled
+            and self.checkpointer.managed_async_save_state
+            in ("SAVE_STAGING", "SAVE_IN_FLIGHT", "FAILED")
+        ):
+            # Scheduler.step mutates optimizer param-group metadata.  Keep it
+            # behind the same source fence even when callers invoke it without
+            # first passing through optimizer_step().
+            self.checkpointer.wait_for_managed_async_mutation()
         self.lr_scheduler.step(1)
 
     def forward_backward_batch(
@@ -1821,14 +1907,67 @@ class MegatronEngine(TrainEngine):
                 if dp_rank == mpu.get_data_parallel_rank():
                     self._cpu_model_parallel_group = cpu_group
 
+    def configure_gpu_staged_adamw(
+        self, config: GPUStagedAdamWConfig | None = None
+    ) -> None:
+        """Enable the internal AdamW staged backend before optimizer creation."""
+        if getattr(self, "optimizer", None) is not None:
+            raise RuntimeError(
+                "GPU-staged AdamW must be configured before optimizer creation"
+            )
+        self._gpu_staged_adamw_config = config or GPUStagedAdamWConfig()
+
+    def configure_gpu_staged_muon(
+        self, config: GPUStagedMuonConfig | None = None
+    ) -> None:
+        """Enable the internal layer-wise staged Muon backend before DDP setup."""
+        candidate = config or GPUStagedMuonConfig()
+        if getattr(self, "optimizer", None) is not None:
+            raise RuntimeError(
+                "GPU-staged Muon must be configured before optimizer creation"
+            )
+        if getattr(self, "_gpu_staged_adamw_config", None) is not None:
+            raise RuntimeError("GPU-staged AdamW and Muon are mutually exclusive")
+        if self.mcore_config.async_save:
+            raise RuntimeError(
+                "managed asynchronous checkpoint is not supported for staged Muon"
+            )
+        if self.mcore_config.ddp.overlap_param_gather:
+            raise RuntimeError("GPU-staged Muon does not support overlap_param_gather")
+        if self.mcore_config.overlap_param_gather_with_optimizer_step:
+            raise RuntimeError(
+                "GPU-staged Muon does not support "
+                "overlap_param_gather_with_optimizer_step"
+            )
+        if candidate.tp_mode != "duplicated":
+            raise RuntimeError(
+                "GPU-staged Muon supports only the verified duplicated TP mode; "
+                f"found {candidate.tp_mode!r}"
+            )
+        parallel_strategy = getattr(self, "parallel_strategy", None)
+        dense_tp = getattr(parallel_strategy, "tensor_parallel_size", 1)
+        expert_tp = getattr(parallel_strategy, "expert_tensor_parallel_size", 1)
+        if max(dense_tp, expert_tp) > 1 and candidate.buffer_count != 1:
+            raise RuntimeError(
+                "GPU-staged Muon TP collectives require buffer_count=1 before DDP setup"
+            )
+        if getattr(self, "model", None) is not None:
+            raise RuntimeError(
+                "GPU-staged Muon must be configured before Megatron DDP creates "
+                "model and gradient buffers"
+            )
+        self.mcore_config.ddp.use_distributed_optimizer = False
+        self._gpu_staged_muon_config = candidate
+
     def _create_optimizer(self, ft_spec: FinetuneSpec) -> None:
         if self.optimizer_config is None:
             return
         assert self.model is not None and len(self.model) > 0
 
+        staged_muon_config = getattr(self, "_gpu_staged_muon_config", None)
         use_distributed_optimizer = (
             False
-            if self.config.use_lora
+            if self.config.use_lora or staged_muon_config is not None
             else self.mcore_config.ddp.use_distributed_optimizer
         )
 
@@ -1860,6 +1999,14 @@ class MegatronEngine(TrainEngine):
                 f"total_train_steps={total_train_steps}"
             )
 
+        staged_adamw_config = getattr(self, "_gpu_staged_adamw_config", None)
+        if staged_adamw_config is not None and staged_muon_config is not None:
+            raise RuntimeError("GPU-staged AdamW and Muon cannot be enabled together")
+        if staged_muon_config is not None and self.mcore_config.async_save:
+            raise RuntimeError(
+                "managed asynchronous checkpoint is not supported for staged Muon"
+            )
+
         # Make megatron optimizer config
         mcore_opt_config = MCoreOptimizerConfig(
             optimizer=self.optimizer_config.type,
@@ -1879,15 +2026,44 @@ class MegatronEngine(TrainEngine):
                 self.mcore_config.overlap_param_gather_with_optimizer_step
             ),
             use_precision_aware_optimizer=(
-                self.mcore_config.use_precision_aware_optimizer
+                staged_adamw_config is not None
+                or self.mcore_config.use_precision_aware_optimizer
+            )
+            and staged_muon_config is None,
+            main_grads_dtype=(
+                torch.float32
+                if staged_muon_config is not None
+                else getattr(torch, self.mcore_config.main_grads_dtype)
             ),
-            main_grads_dtype=getattr(torch, self.mcore_config.main_grads_dtype),
-            main_params_dtype=getattr(torch, self.mcore_config.main_params_dtype),
-            exp_avg_dtype=getattr(torch, self.mcore_config.exp_avg_dtype),
-            exp_avg_sq_dtype=getattr(torch, self.mcore_config.exp_avg_sq_dtype),
+            main_params_dtype=(
+                torch.float32
+                if staged_adamw_config is not None
+                else getattr(torch, self.mcore_config.main_params_dtype)
+            ),
+            exp_avg_dtype=(
+                torch.float32
+                if staged_adamw_config is not None
+                else getattr(torch, self.mcore_config.exp_avg_dtype)
+            ),
+            exp_avg_sq_dtype=(
+                torch.float32
+                if staged_adamw_config is not None
+                else getattr(torch, self.mcore_config.exp_avg_sq_dtype)
+            ),
         )
 
-        self.optimizer = get_megatron_optimizer(mcore_opt_config, self.model)
+        if staged_muon_config is not None:
+            self.optimizer = get_megatron_optimizer_with_gpu_staged_muon(
+                mcore_opt_config,
+                self.model,
+                staged_muon_config,
+            )
+        elif staged_adamw_config is None:
+            self.optimizer = get_megatron_optimizer(mcore_opt_config, self.model)
+        else:
+            self.optimizer = get_megatron_optimizer_with_gpu_staged_adamw(
+                mcore_opt_config, self.model, staged_adamw_config
+            )
 
         lr_scheduler = OptimizerParamScheduler(
             self.optimizer,
@@ -1916,8 +2092,10 @@ class MegatronEngine(TrainEngine):
         )
         self.lr_scheduler = lr_scheduler
 
-        # MegatronCheckpointManager now only support distributed optimizer which lora does not support
+        # LoRA still lacks the required sharded optimizer contract. Staged Muon
+        # supplies its own fixed-topology managed checkpoint schema.
         if not self.config.use_lora:
+            managed_staged_config = staged_adamw_config or staged_muon_config
             self.checkpointer = MegatronCheckpointManager(
                 model=self.model,
                 optimizer=self.optimizer,
@@ -1925,6 +2103,15 @@ class MegatronEngine(TrainEngine):
                 use_distributed_optimizer=use_distributed_optimizer,
                 use_checkpoint_opt_param_scheduler=self.mcore_config.use_checkpoint_opt_param_scheduler,
                 async_save=self.mcore_config.async_save,
+                checkpoint_process_group=(
+                    self.cpu_group if managed_staged_config is not None else None
+                ),
+                managed_checkpoint_enabled=managed_staged_config is not None,
+                managed_checkpoint_snapshot_root=(
+                    managed_staged_config.checkpoint_snapshot_root
+                    if managed_staged_config is not None
+                    else None
+                ),
             )
 
     def _check_rollout_engine_connected(self) -> None:

@@ -1,301 +1,193 @@
-"""Unit tests for the Megatron checkpoint manager's async-save state machine.
-
-These tests do NOT exercise real Megatron dist_checkpointing or distributed
-process groups. They patch the queue and `save_dist_checkpointing` to verify
-that the manager correctly:
-
-- skips queue creation when async_save is False
-- routes the AsyncRequest to AsyncCallsQueue.schedule_async_request when True
-- finalizes completed saves non-blockingly on each new save call
-- blocks on load_checkpoint / close
-- treats close as idempotent
-- emits the async-only metric (queue_depth on schedule)
-- emits no async metrics on the sync path
-"""
+"""Focused tests for ordinary and managed Megatron asynchronous saves."""
 
 from __future__ import annotations
 
-import importlib
-import importlib.util
-import sys
-import types
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-
-def _import_checkpointer():
-    """Import the checkpointer module without triggering the full areal package."""
-    if "areal.engine.megatron_utils.checkpointer" in sys.modules:
-        return sys.modules["areal.engine.megatron_utils.checkpointer"]
-
-    # Stub out heavy/optional dependencies so the module loads on a CPU box
-    # without Megatron or a Stager-capable torch build.
-    for path in (
-        "megatron",
-        "megatron.core",
-        "megatron.core.dist_checkpointing",
-        "megatron.core.dist_checkpointing.mapping",
-        "megatron.core.dist_checkpointing.serialization",
-        "megatron.core.dist_checkpointing.strategies",
-        "megatron.core.dist_checkpointing.strategies.async_utils",
-        "megatron.core.dist_checkpointing.strategies.fully_parallel",
-        "areal",
-        "areal.engine",
-        "areal.engine.megatron_utils",
-        "areal.infra",
-        "areal.infra.platforms",
-        "areal.utils",
-        "areal.utils.logging",
-    ):
-        sys.modules.setdefault(path, types.ModuleType(path))
-
-    sys.modules["megatron.core"].dist_checkpointing = sys.modules[
-        "megatron.core.dist_checkpointing"
-    ]
-    sys.modules["megatron.core"].mpu = MagicMock()
-    sys.modules["megatron.core"].tensor_parallel = MagicMock()
-    sys.modules["megatron.core.dist_checkpointing.mapping"].ShardedObject = MagicMock()
-    sys.modules[
-        "megatron.core.dist_checkpointing.serialization"
-    ].get_default_load_sharded_strategy = MagicMock()
-    sys.modules[
-        "megatron.core.dist_checkpointing.serialization"
-    ].get_default_save_sharded_strategy = MagicMock()
-    async_utils = sys.modules["megatron.core.dist_checkpointing.strategies.async_utils"]
-    async_utils.AsyncCallsQueue = MagicMock
-    async_utils.AsyncRequest = MagicMock
-    fp_mod = sys.modules["megatron.core.dist_checkpointing.strategies.fully_parallel"]
-    fp_mod.FullyParallelLoadStrategyWrapper = MagicMock
-    fp_mod.FullyParallelSaveStrategyWrapper = MagicMock
-    sys.modules["areal.infra.platforms"].current_platform = MagicMock(
-        device_type="cuda", is_available=lambda: False
-    )
-    sys.modules["areal.utils.logging"].getLogger = lambda *_a, **_k: MagicMock()
-
-    # stats_tracker.scalar is called by the manager to report latency.
-    stats_mod = types.ModuleType("areal.utils.stats_tracker")
-    stats_mod.scalar = MagicMock()
-    sys.modules["areal.utils.stats_tracker"] = stats_mod
-
-    # The checkpointer imports `from areal.utils import logging, stats_tracker`.
-    # Make sure the parent `areal.utils` package exposes both as attributes.
-    sys.modules["areal.utils"].logging = sys.modules["areal.utils.logging"]
-    sys.modules["areal.utils"].stats_tracker = stats_mod
-
-    # Load the real checkpointer module from disk under the stubbed parents.
-    import pathlib
-
-    repo_root = pathlib.Path(__file__).resolve().parents[1]
-    spec = importlib.util.spec_from_file_location(
-        "areal.engine.megatron_utils.checkpointer",
-        repo_root / "areal" / "engine" / "megatron_utils" / "checkpointer.py",
-    )
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules["areal.engine.megatron_utils.checkpointer"] = mod
-    spec.loader.exec_module(mod)
-    return mod
+from areal.engine.megatron_utils import checkpointer as checkpointer_module
 
 
 @pytest.fixture
 def patched_checkpointer():
-    mod = _import_checkpointer()
-
     queue = MagicMock()
     queue.get_num_unfinalized_calls.return_value = 0
     queue.maybe_finalize_async_calls.return_value = []
     queue.schedule_async_request.return_value = 0
+    queue.call_idx = -1
+
+    def gather_object(output, value, **_kwargs):
+        output[0] = value
+
+    def finalize_managed(async_queue, _group, *, blocking, recovery_token, **_kwargs):
+        try:
+            result = async_queue.maybe_finalize_async_calls(blocking=blocking)
+        except BaseException:
+            recovery_token.mark_cleared()
+            raise
+        if result:
+            recovery_token.mark_cleared()
+        return result
 
     with (
         patch("torch.distributed.get_rank", return_value=0),
-        patch.object(mod, "AsyncCallsQueue", return_value=queue),
+        patch("torch.distributed.get_world_size", return_value=1),
+        patch("torch.distributed.get_backend", return_value="gloo"),
+        patch("torch.distributed.get_process_group_ranks", return_value=[0]),
+        patch("torch.distributed.broadcast_object_list"),
+        patch("torch.distributed.all_gather_object", side_effect=gather_object),
+        patch.object(checkpointer_module, "AsyncCallsQueue", return_value=queue),
+        patch.object(
+            checkpointer_module,
+            "finalize_managed_async_calls",
+            side_effect=finalize_managed,
+        ),
+        patch.object(checkpointer_module, "preflight_managed_async_finalize"),
     ):
-        manager = mod.MegatronCheckpointManager(
+        manager = checkpointer_module.MegatronCheckpointManager(
             model=MagicMock(),
             optimizer=MagicMock(),
             lr_scheduler=None,
             async_save=True,
         )
-        yield mod, manager, queue
+        yield manager, queue
 
 
-def test_async_disabled_creates_no_queue():
-    mod = _import_checkpointer()
-    with patch("torch.distributed.get_rank", return_value=0):
-        m = mod.MegatronCheckpointManager(
-            model=MagicMock(),
-            optimizer=MagicMock(),
-            lr_scheduler=None,
-            async_save=False,
-        )
-    assert m._async_queue is None
-    m._reap_finished_async_saves()
-    m.wait_async_saves()
-    m.close()
-
-
-def test_save_schedules_async_request(patched_checkpointer, tmp_path):
-    mod, manager, queue = patched_checkpointer
-    fake_request = object()
-
-    with (
-        patch.object(manager, "generate_state_dict", return_value={"model": {}}),
-        patch.object(
-            mod, "save_dist_checkpointing", return_value=fake_request
-        ) as save_fn,
-        patch("torch.cuda.empty_cache"),
-        patch("torch.distributed.barrier"),
-    ):
-        manager.save_checkpoint(str(tmp_path / "step0"))
-
-    save_fn.assert_called_once()
-    assert save_fn.call_args.kwargs["async_save"] is True
-    queue.schedule_async_request.assert_called_once_with(fake_request)
-
-
-def test_save_reaps_before_scheduling_next(patched_checkpointer, tmp_path):
-    mod, manager, queue = patched_checkpointer
-
-    with (
-        patch.object(manager, "generate_state_dict", return_value={"model": {}}),
-        patch.object(mod, "save_dist_checkpointing", side_effect=["r1", "r2"]),
-        patch("torch.cuda.empty_cache"),
-        patch("torch.distributed.barrier"),
-    ):
-        manager.save_checkpoint(str(tmp_path / "step0"))
-        manager.save_checkpoint(str(tmp_path / "step1"))
-
-    calls = queue.maybe_finalize_async_calls.call_args_list
-    assert len(calls) == 2
-    assert all(call.kwargs.get("blocking", False) is False for call in calls)
-    assert queue.schedule_async_request.call_count == 2
-
-
-def test_load_blocks_on_pending_saves(patched_checkpointer, tmp_path):
-    mod, manager, queue = patched_checkpointer
-    queue.get_num_unfinalized_calls.return_value = 1
-
-    with (
-        patch("os.path.exists", return_value=True),
-        patch.object(manager, "generate_state_dict", return_value={}),
-        patch.object(mod, "load_dist_checkpointing", return_value={}),
-    ):
-        with pytest.raises((AssertionError, KeyError)):
-            manager.load_checkpoint(str(tmp_path / "step0"))
-
-    queue.maybe_finalize_async_calls.assert_called_with(blocking=True)
-
-
-def test_close_is_idempotent(patched_checkpointer):
-    _, manager, queue = patched_checkpointer
-    queue.get_num_unfinalized_calls.return_value = 0
-
-    manager.close()
-    manager.close()
+def test_async_disabled_has_no_queue() -> None:
+    manager = checkpointer_module.MegatronCheckpointManager(
+        model=MagicMock(),
+        optimizer=MagicMock(),
+        lr_scheduler=None,
+        async_save=False,
+    )
 
     assert manager._async_queue is None
+    manager.close()
 
 
-@pytest.mark.skip(
-    reason="Fixture is not isolated across test files: if test_megatron_engine "
-    "(or any test that imports MegatronEngine) runs first, "
-    "areal.engine.megatron_utils.checkpointer is already cached in sys.modules, "
-    "so _import_checkpointer's stub-installation branch (which mocks "
-    "areal.utils.stats_tracker.scalar) is skipped. Tracked in a follow-up issue."
-)
-def test_async_save_reports_queue_depth_only(patched_checkpointer, tmp_path):
-    """async_save emits ckpt/async_save_queue_depth on schedule and no other metric.
+def test_ordinary_async_save_schedules_and_reaps(
+    patched_checkpointer, tmp_path
+) -> None:
+    manager, queue = patched_checkpointer
+    request = object()
+    with (
+        patch.object(manager, "generate_state_dict", return_value={"model": {}}),
+        patch.object(
+            checkpointer_module,
+            "save_dist_checkpointing",
+            return_value=request,
+        ),
+        patch("torch.cuda.empty_cache"),
+        patch("torch.distributed.barrier"),
+    ):
+        manager.save_checkpoint(str(tmp_path / "step0"))
 
-    Successful finalize is observable as queue_depth returning to 0; a failing
-    background save raises from wait_async_saves, so an explicit count metric
-    would be redundant.
-    """
-    mod, manager, queue = patched_checkpointer
-    stats_scalar = sys.modules["areal.utils.stats_tracker"].scalar
-    stats_scalar.reset_mock()
+    queue.maybe_finalize_async_calls.assert_called_once_with(blocking=False)
+    queue.schedule_async_request.assert_called_once_with(request)
 
-    queue.schedule_async_request.return_value = 42
+
+def _configure_managed_manager(manager, control_group):
+    manager.managed_checkpoint_enabled = True
+    manager.checkpoint_process_group = control_group
+    manager._retry_managed_checkpoint_cleanup = MagicMock()
+    manager._managed_optimizer_identities = MagicMock(
+        return_value={(): {"leaf": "managed"}}
+    )
+    manager._vote_managed_phase = MagicMock(return_value=None)
+    manager._require_managed_checkpoint_group = MagicMock(return_value=control_group)
+
+    def run_phase(_phase, operation, _transaction):
+        return operation(), None
+
+    manager._run_managed_phase = run_phase
+
+
+def test_managed_async_save_releases_fence_after_finalize(
+    patched_checkpointer, tmp_path
+) -> None:
+    manager, queue = patched_checkpointer
+    checkpoint_path = tmp_path / "managed-step0"
+    request = object()
+    leaf = MagicMock()
+    released = MagicMock()
+    _configure_managed_manager(manager, object())
+    queue.get_num_unfinalized_calls.return_value = 1
+    queue.maybe_finalize_async_calls.side_effect = [[], [], [7], []]
+    queue.schedule_async_request.return_value = 7
+    queue.call_idx = 6
+
+    with (
+        patch.object(manager, "generate_state_dict", return_value={"optimizer": {}}),
+        patch.object(
+            checkpointer_module,
+            "save_dist_checkpointing",
+            return_value=request,
+        ),
+        patch.object(
+            checkpointer_module,
+            "begin_managed_async_checkpoint_save",
+            return_value=(leaf,),
+        ),
+        patch.object(
+            checkpointer_module, "bind_managed_async_checkpoint_request"
+        ) as bind,
+        patch.object(
+            checkpointer_module, "complete_managed_async_checkpoint_save"
+        ) as complete,
+    ):
+        manager.save_checkpoint(
+            str(checkpoint_path), async_completion_callback=released
+        )
+        released.assert_not_called()
+        bind.assert_called_once_with((leaf,), request, 7)
+
+        (checkpoint_path / "metadata.json").write_text("{}")
+        manager.wait_async_saves()
+        manager.wait_async_saves()
+
+    complete.assert_called_once_with((leaf,))
+    released.assert_called_once_with()
+    assert manager._managed_async_save is None
+    assert (checkpoint_path / checkpointer_module._MANAGED_ASYNC_COMPLETE).is_file()
+
+
+def test_managed_async_background_failure_remains_incomplete(
+    patched_checkpointer, tmp_path
+) -> None:
+    manager, queue = patched_checkpointer
+    checkpoint_path = tmp_path / "managed-failed"
+    leaf = MagicMock()
+    released = MagicMock()
+    _configure_managed_manager(manager, object())
+    queue.maybe_finalize_async_calls.side_effect = [[], RuntimeError("disk exploded")]
+    queue.schedule_async_request.return_value = 9
+    queue.call_idx = 8
     queue.get_num_unfinalized_calls.return_value = 1
 
     with (
-        patch.object(manager, "generate_state_dict", return_value={"model": {}}),
-        patch.object(mod, "save_dist_checkpointing", side_effect=["r1", "r2"]),
-        patch("torch.cuda.empty_cache"),
-        patch("torch.distributed.barrier"),
-    ):
-        manager.save_checkpoint(str(tmp_path / "step0"))
-
-        # On the next save, reap returns [42] -> still no extra metrics.
-        queue.maybe_finalize_async_calls.return_value = [42]
-        queue.schedule_async_request.return_value = 43
-        manager.save_checkpoint(str(tmp_path / "step1"))
-
-    all_keys = set()
-    for c in stats_scalar.call_args_list:
-        all_keys.update(c.kwargs.keys())
-    assert all_keys == {"ckpt/async_save_queue_depth"}
-
-
-@pytest.mark.skip(
-    reason="Fixture is not isolated across test files: if test_megatron_engine "
-    "(or any test that imports MegatronEngine) runs first, "
-    "areal.engine.megatron_utils.checkpointer is already cached in sys.modules, "
-    "so _import_checkpointer's stub-installation branch (which mocks "
-    "areal.utils.stats_tracker.scalar) is skipped. Tracked in a follow-up issue."
-)
-def test_sync_save_emits_no_async_metrics(patched_checkpointer, tmp_path):
-    """Sync save path stays metric-free; trainer-side `timeperf/save` is sufficient."""
-    mod, manager, _ = patched_checkpointer
-    manager.async_save = False
-    manager._async_queue = None
-    stats_scalar = sys.modules["areal.utils.stats_tracker"].scalar
-    stats_scalar.reset_mock()
-
-    with (
-        patch.object(manager, "generate_state_dict", return_value={"model": {}}),
-        patch.object(mod, "save_dist_checkpointing", return_value=None),
-        patch("torch.cuda.empty_cache"),
-        patch("torch.distributed.barrier"),
-    ):
-        manager.save_checkpoint(str(tmp_path / "step0"))
-
-    stats_scalar.assert_not_called()
-
-
-def test_generate_state_dict_requests_dp_reshardable_sharding(patched_checkpointer):
-    _, manager, _ = patched_checkpointer
-
-    with patch("torch.distributed.barrier"):
-        state_dict = manager.generate_state_dict(
-            with_model=False, with_optimizer=True, with_rng=False
-        )
-
-    kwargs = manager.optimizer.sharded_state_dict.call_args.kwargs
-    assert kwargs["metadata"] == {"distrib_optim_sharding_type": "dp_reshardable"}
-    assert kwargs["is_loading"] is False
-    assert "optimizer" in state_dict
-
-
-def test_load_checkpoint_builds_optimizer_template_with_is_loading(
-    patched_checkpointer, tmp_path
-):
-    mod, manager, _ = patched_checkpointer
-
-    with (
-        patch("os.path.exists", return_value=True),
-        patch("torch.distributed.barrier"),
+        patch.object(manager, "generate_state_dict", return_value={"optimizer": {}}),
         patch.object(
-            mod, "load_dist_checkpointing", return_value={"optimizer": {"step": 1}}
+            checkpointer_module,
+            "save_dist_checkpointing",
+            return_value=object(),
         ),
+        patch.object(
+            checkpointer_module,
+            "begin_managed_async_checkpoint_save",
+            return_value=(leaf,),
+        ),
+        patch.object(checkpointer_module, "bind_managed_async_checkpoint_request"),
+        patch.object(checkpointer_module, "fail_managed_async_checkpoint_save") as fail,
     ):
-        manager.load_checkpoint(
-            str(tmp_path / "step0"),
-            with_model=False,
-            with_optimizer=True,
-            with_rng=False,
+        manager.save_checkpoint(
+            str(checkpoint_path), async_completion_callback=released
         )
+        with pytest.raises(RuntimeError, match="disk exploded"):
+            manager.wait_async_saves()
 
-    kwargs = manager.optimizer.sharded_state_dict.call_args.kwargs
-    assert kwargs["is_loading"] is True
-    assert kwargs["metadata"] == {"distrib_optim_sharding_type": "dp_reshardable"}
-    manager.optimizer.load_state_dict.assert_called_once_with({"step": 1})
+    fail.assert_called_once()
+    released.assert_called_once_with()
+    assert manager.managed_async_save_state == "FAILED"
+    assert (checkpoint_path / checkpointer_module._MANAGED_ASYNC_INCOMPLETE).is_file()
+    assert not (checkpoint_path / checkpointer_module._MANAGED_ASYNC_COMPLETE).exists()

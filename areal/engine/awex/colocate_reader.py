@@ -734,7 +734,14 @@ class _BailingV3PhysicalKeyNCCLWorkerWeightsReader(NCCLWorkerWeightsReader):
 
 
 def _patch_awex_qwen3_attention_names() -> None:
-    """Canonicalize Qwen3 SGLang attention names for the AWEX train reader."""
+    """Canonicalize generic Qwen3 SGLang names for the AWEX train reader.
+
+    AWEX's generic dense-Qwen3 converter keeps fused QKV parameters and uses
+    Megatron-style canonical names on the train side. Registered converters,
+    such as Qwen3-MoE in AWEX 0.8, can instead opt out of fusion so both sides
+    use HuggingFace q/k/v names. Preserve that model-specific policy rather
+    than overriding it through this base-class compatibility patch.
+    """
     from awex.converter.sglang_converter import SGlangToHFWeightConverter
 
     original_norm = SGlangToHFWeightConverter._convert_layer_norm_param
@@ -752,12 +759,13 @@ def _patch_awex_qwen3_attention_names() -> None:
         return original_norm(self, name, parameter, layer_number)
 
     def _convert_attention_param(self, name, parameter, layer_number):
-        mapping = {
-            "self_attn.qkv_proj.weight": "attention.query_key_value_proj.weight",
-            "self_attn.o_proj.weight": "attention.dense.weight",
-        }
-        if name in mapping:
-            return [(mapping[name], parameter)]
+        if self._fuse_qkv(name):
+            mapping = {
+                "self_attn.qkv_proj.weight": "attention.query_key_value_proj.weight",
+                "self_attn.o_proj.weight": "attention.dense.weight",
+            }
+            if name in mapping:
+                return [(mapping[name], parameter)]
         return original_attention(self, name, parameter, layer_number)
 
     _convert_layer_norm_param._areal_qwen3_attention_names = True

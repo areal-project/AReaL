@@ -11,7 +11,6 @@ from areal.engine.awex.colocate_reader import (
     AwexColocateReader,
     _BailingV3PhysicalKeyNCCLWorkerWeightsReader,
     _BoundedMemoryNcclColocateStreamBatchTransport,
-    _patch_awex_qwen3_attention_names,
 )
 from areal.engine.awex.memory_saver import patch_tms_hook_mode
 from areal.engine.awex.sglang_plugin import (
@@ -131,11 +130,10 @@ def test_tms_hook_mode_stays_preload_for_pauseable_cuda_graphs(monkeypatch):
     assert saver._impl_ctor_kwargs == {}
 
 
-def test_awex_converter_canonicalizes_qwen3_attention_names():
-    """Qwen3 infer metadata matches AWEX's MCore canonical attention names."""
+def test_awex_dense_qwen3_converter_uses_fused_megatron_attention_names():
+    """Dense Qwen3 infer metadata matches generic AWEX train metadata."""
     from awex.converter.sglang_converter import SGlangToHFWeightConverter
 
-    _patch_awex_qwen3_attention_names()
     converter = object.__new__(SGlangToHFWeightConverter)
     parameter = torch.ones(128, dtype=torch.bfloat16)
 
@@ -145,7 +143,7 @@ def test_awex_converter_canonicalizes_qwen3_attention_names():
     }
     for name, canonical_name in expected.items():
         converted = converter._convert_layer_norm_param(name, parameter, "0")
-        assert converted == [(canonical_name, parameter)]
+        assert [converted_name for converted_name, _ in converted] == [canonical_name]
 
     expected = {
         "self_attn.qkv_proj.weight": "attention.query_key_value_proj.weight",
@@ -153,7 +151,54 @@ def test_awex_converter_canonicalizes_qwen3_attention_names():
     }
     for name, canonical_name in expected.items():
         converted = converter._convert_attention_param(name, parameter, "0")
-        assert converted == [(canonical_name, parameter)]
+        assert [converted_name for converted_name, _ in converted] == [canonical_name]
+
+
+def test_awex_registered_qwen3_moe_converter_preserves_hf_attention_names():
+    """The registered Qwen3-MoE converter stays aligned with train metadata."""
+    from awex.models.registry import get_infer_weights_converter
+
+    model_config = SimpleNamespace(
+        num_attention_heads=32,
+        num_key_value_heads=4,
+    )
+    infer_config = SimpleNamespace(tp_size=1, ep_size=8, device_backend="cuda")
+    rank_info = SimpleNamespace(tp_rank=0, ep_rank=0)
+    converter = get_infer_weights_converter(
+        "sglang",
+        "Qwen3MoeForCausalLM",
+        model_config,
+        rank_info,
+        infer_config,
+    )
+    parameter = torch.ones(40, dtype=torch.bfloat16)
+
+    converted = converter._convert_attention_param(
+        "self_attn.qkv_proj.weight", parameter, "0"
+    )
+    assert [name for name, _ in converted] == [
+        "self_attn.q_proj.weight",
+        "self_attn.k_proj.weight",
+        "self_attn.v_proj.weight",
+    ]
+    assert [tensor.shape for _, tensor in converted] == [
+        torch.Size([32]),
+        torch.Size([4]),
+        torch.Size([4]),
+    ]
+
+    for name in (
+        "self_attn.o_proj.weight",
+        "self_attn.q_norm.weight",
+        "self_attn.k_norm.weight",
+    ):
+        convert = (
+            converter._convert_attention_param
+            if name.endswith("o_proj.weight")
+            else converter._convert_layer_norm_param
+        )
+        converted = convert(name, parameter, "0")
+        assert [converted_name for converted_name, _ in converted] == [name]
 
 
 @pytest.mark.parametrize(

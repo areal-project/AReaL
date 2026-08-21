@@ -28,6 +28,96 @@ IS_VLLM_INSTALLED = is_available("vllm")
 IS_SGLANG_INSTALLED = is_available("sglang")
 
 
+@pytest.mark.parametrize(
+    ("env", "gpus_per_server", "fallback", "expected", "source"),
+    [
+        ({"CUDA_VISIBLE_DEVICES": "7"}, 1, 7, 0, "CUDA_VISIBLE_DEVICES"),
+        (
+            {"CUDA_VISIBLE_DEVICES": "4,5,6,7", "SLURM_LOCALID": "1"},
+            4,
+            4,
+            0,
+            "CUDA_VISIBLE_DEVICES",
+        ),
+        (
+            {"CUDA_VISIBLE_DEVICES": "GPU-a,GPU-b"},
+            2,
+            2,
+            0,
+            "CUDA_VISIBLE_DEVICES",
+        ),
+        ({"SLURM_LOCALID": "2"}, 4, 0, 8, "SLURM_LOCALID"),
+        (
+            {
+                "CUDA_VISIBLE_DEVICES": "0,1,2,3,4,5,6,7",
+                "SLURM_LOCALID": "1",
+            },
+            4,
+            0,
+            4,
+            "SLURM_LOCALID",
+        ),
+        (
+            {
+                "CUDA_VISIBLE_DEVICES": "0,1,2,3,4,5,6,7",
+                "AREAL_SGLANG_BASE_GPU_ID": "4",
+            },
+            4,
+            0,
+            4,
+            "AREAL_SGLANG_BASE_GPU_ID",
+        ),
+        ({}, 1, 6, 6, "controller fallback"),
+    ],
+)
+def test_resolve_colocated_base_gpu_id_supports_scheduler_device_namespaces(
+    env, gpus_per_server, fallback, expected, source
+) -> None:
+    """Colocated SGLang uses logical IDs under scheduler device isolation."""
+    from areal.engine.sglang_remote import _resolve_colocated_base_gpu_id
+
+    resolved, resolved_source = _resolve_colocated_base_gpu_id(
+        env,
+        gpus_per_server,
+        fallback,
+    )
+
+    assert resolved == expected
+    assert resolved_source == source
+
+
+@pytest.mark.parametrize(
+    ("env", "gpus_per_server", "fallback", "error"),
+    [
+        ({}, 0, 0, "gpus_per_server must be positive"),
+        ({"SLURM_LOCALID": "-1"}, 1, 0, "SLURM_LOCALID must be non-negative"),
+        (
+            {"AREAL_SGLANG_BASE_GPU_ID": "-1"},
+            1,
+            0,
+            "AREAL_SGLANG_BASE_GPU_ID must be non-negative",
+        ),
+        (
+            {
+                "CUDA_VISIBLE_DEVICES": "7",
+                "AREAL_SGLANG_BASE_GPU_ID": "3",
+            },
+            1,
+            7,
+            "must be 0 when the worker has an isolated",
+        ),
+    ],
+)
+def test_resolve_colocated_base_gpu_id_rejects_invalid_namespaces(
+    env, gpus_per_server, fallback, error
+) -> None:
+    """Invalid colocated GPU namespaces fail before SGLang starts."""
+    from areal.engine.sglang_remote import _resolve_colocated_base_gpu_id
+
+    with pytest.raises(ValueError, match=error):
+        _resolve_colocated_base_gpu_id(env, gpus_per_server, fallback)
+
+
 def test_wait_for_server_raises_when_subprocess_exits() -> None:
     from areal.infra.remote_inf_engine import RemoteInfEngine
 
