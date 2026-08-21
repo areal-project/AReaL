@@ -22,7 +22,6 @@ from areal.infra.scheduler.exceptions import (
     GPUAllocationError,
     PortAllocationError,
     RPCConnectionError,
-    WorkerCleanupError,
     WorkerCreationError,
     WorkerFailedError,
     WorkerNotFoundError,
@@ -223,13 +222,7 @@ class TestLocalSchedulerInitialization:
 
         with (
             patch("areal.infra.scheduler.local.current_platform", mock_platform),
-            patch.dict(
-                os.environ,
-                {
-                    "CUDA_VISIBLE_DEVICES": "0,1,3",
-                    "AREAL_CONTROLLER_HIDDEN_DEVICE_ENV": "",
-                },
-            ),
+            patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "0,1,3"}),
         ):
             # Don't use create_scheduler helper here as it defaults gpu_devices to [0]
             # We want to test the auto-detection from CUDA_VISIBLE_DEVICES
@@ -1155,7 +1148,7 @@ class TestDeleteWorkers:
     def test_cleanup_workers_handles_errors(
         self, scheduler, tmp_path, mock_kill_process_tree
     ):
-        """Termination failures retain port leases and remain retryable."""
+        """Should continue cleanup even if terminating a process fails."""
         worker1 = create_worker_info(
             worker_id="test/0", ports=["8000"], log_file=str(tmp_path / "test.log")
         )
@@ -1164,16 +1157,10 @@ class TestDeleteWorkers:
         )
 
         # First termination fails, second succeeds
+        # Configure the autouse mock to raise exception on first call
         mock_kill_process_tree.side_effect = [Exception("Failed to terminate"), None]
-        scheduler._allocated_ports = {8000, 8001}
-
-        with pytest.raises(WorkerCleanupError, match="Failed to terminate"):
-            scheduler._cleanup_workers([worker1, worker2])
-
-        assert scheduler._allocated_ports == {8000, 8001}
-        mock_kill_process_tree.side_effect = None
+        # Should not raise, just log error
         scheduler._cleanup_workers([worker1, worker2])
-        assert scheduler._allocated_ports == set()
 
 
 class TestProcessTermination:
@@ -1217,10 +1204,7 @@ class TestProcessTermination:
         mock_process_class.return_value = mock_parent
 
         # Child doesn't terminate gracefully
-        mock_wait_procs.side_effect = [
-            ([], [mock_child]),  # SIGTERM leaves the child alive.
-            ([mock_child], []),  # SIGKILL reaps it.
-        ]
+        mock_wait_procs.return_value = ([], [mock_child])  # (gone, alive)
 
         kill_process_tree(1234, timeout=3, graceful=True)
 

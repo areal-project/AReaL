@@ -31,10 +31,6 @@ import torch.distributed as dist
 if TYPE_CHECKING:
     from areal.engine.megatron_engine import MegatronEngine
 
-from areal.engine.weight_finite import (
-    check_named_tensors_finite,
-    iter_module_named_tensors,
-)
 from areal.utils.logging import getLogger
 
 logger = getLogger("AwexColocate")
@@ -189,11 +185,6 @@ class AwexMegatronAdapter:
         )
         logger.info("Got infer_conf from MetaServer: %s", infer_conf)
 
-        if isinstance(infer_conf.get("hf_config"), dict):
-            from types import SimpleNamespace
-
-            infer_conf["hf_config"] = SimpleNamespace(**infer_conf["hf_config"])
-
         meta_resolver = McoreParamMetaResolver(shim, self._engine.hf_config, infer_conf)
         parameters_meta = meta_resolver.get_parameters_meta()
         logger.info(
@@ -322,14 +313,6 @@ class AwexMegatronAdapter:
         if weights_were_offloaded:
             self.resume_memory(tags=["weights"])
 
-        check_named_tensors_finite(
-            iter_module_named_tensors(self._engine.model),
-            stage="awex_writer_source",
-            version=version,
-            logger=logger,
-            process_group=self._engine.cpu_group,
-        )
-
         # _lazy_initialize AFTER the weights resume — its meta resolver
         # runs convert_param over live params, which dies with CUDA invalid
         # argument on resize_(0)-ed storages. The recover path is the only
@@ -339,13 +322,6 @@ class AwexMegatronAdapter:
         self._lazy_initialize()
 
         parameters = self._convert_parameters()
-        check_named_tensors_finite(
-            parameters.items(),
-            stage="awex_writer_converted",
-            version=version,
-            logger=logger,
-            process_group=self._engine.cpu_group,
-        )
         tensors = list(parameters.values())
         names = list(parameters.keys())
         logger.info(

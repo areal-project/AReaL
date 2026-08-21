@@ -186,10 +186,9 @@ def get_type_description(field_type, all_dataclasses: dict[str, Any]) -> str:
 def format_default_value(field_obj) -> str:
     """Format default values for display."""
 
-    if field_obj.default is not inspect._empty:
+    if field_obj.default is not DATACLASSES_MISSING:
         default_value = field_obj.default
-        # Check for MISSING by string representation to avoid import issues
-        if default_value is DATACLASSES_MISSING or default_value is OMEGACONF_MISSING:
+        if default_value == OMEGACONF_MISSING:
             return "**Required**"
         elif default_value is None:
             return "`None`"
@@ -201,7 +200,7 @@ def format_default_value(field_obj) -> str:
             return f"`{default_value}`"
         else:
             return f"`{default_value}`"
-    elif field_obj.default_factory is not inspect._empty:
+    elif field_obj.default_factory is not DATACLASSES_MISSING:
         try:
             factory_result = field_obj.default_factory()
             if isinstance(factory_result, list) and len(factory_result) == 0:
@@ -213,7 +212,7 @@ def format_default_value(field_obj) -> str:
         except Exception:
             return f"*default {field_obj.default_factory.__name__}*"
     else:
-        return "`None`"
+        return "**Required**"
 
 
 def generate_config_section(

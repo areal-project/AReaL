@@ -10,19 +10,16 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from areal.api import SaveLoadMeta, Worker
+from areal.api import SaveLoadMeta
 from areal.api.cli_args import (
     MOPDConfig,
     MOPDTeacherManagerConfig,
     MOPDTeacherSpec,
 )
-from areal.infra.controller.train_controller import TrainController
-from areal.trainer.mopd.phase import MOPDPhase, MOPDPhaseMachine
 from areal.trainer.mopd.targets import MOPD_CONTRIBUTIONS_KEY, aggregate_mopd_targets
 from areal.trainer.mopd.teacher_manager import (
     DiskCheckpointProvider,
     DrainReceipt,
-    LocalMemoryCheckpointProvider,
     PersistentTeacherManager,
     TeacherManagerState,
 )
@@ -41,9 +38,6 @@ def _write_checkpoint(root: Path, teacher_id: str, payload: bytes) -> Path:
 
 def _config(
     checkpoints: dict[str, Path],
-    *,
-    manager_type: str = "disk",
-    staging_root: Path | None = None,
 ) -> MOPDConfig:
     return MOPDConfig(
         teachers={
@@ -51,10 +45,7 @@ def _config(
             for teacher_id, path in checkpoints.items()
         },
         routes={"route": {teacher_id: 1.0 for teacher_id in checkpoints}},
-        manager=MOPDTeacherManagerConfig(
-            type=manager_type,
-            staging_root=str(staging_root or "/unused"),
-        ),
+        manager=MOPDTeacherManagerConfig(type="disk"),
     )
 
 
@@ -69,9 +60,6 @@ class _PersistentController:
         self.events.append(name)
         if self.fail_on == name:
             raise RuntimeError(f"{name} failed")
-
-    def assert_worker_identity(self) -> None:
-        self._event("health")
 
     def onload(self) -> None:
         self._event("onload")
@@ -111,7 +99,7 @@ def test_persistent_manager_reuses_controller_across_phases_and_checkpoints(tmp_
 
     assert first is second is third is controller
     assert factory_paths == [str(t0)]
-    assert controller.events == ["offload", "health", "onload", "load:t1"]
+    assert controller.events == ["offload", "onload", "load:t1"]
     assert controller.destroy_calls == 0
     assert manager.state is TeacherManagerState.RESIDENT
     manager.close()
@@ -132,7 +120,7 @@ def test_persistent_manager_onloads_before_cross_phase_checkpoint_switch(tmp_pat
 
     manager.load("t1")
 
-    assert controller.events == ["health", "onload", "load:t1"]
+    assert controller.events == ["onload", "load:t1"]
     assert manager.state is TeacherManagerState.RESIDENT
     manager.close()
 
@@ -149,45 +137,6 @@ def test_persistent_manager_repeated_release_does_not_offload_twice(tmp_path):
 
     assert controller.events == ["offload"]
     assert manager.state is TeacherManagerState.OFFLOADED
-    manager.close()
-
-
-def test_persistent_manager_retries_transient_group_cleanup_once(tmp_path):
-    """A late process exit is reaped through retained scheduler metadata."""
-    t0 = _write_checkpoint(tmp_path, "t0", b"first")
-    controller = _PersistentController(destroy_failures=1)
-    manager = PersistentTeacherManager(_config({"t0": t0}), lambda _: controller)
-    manager.load("t0")
-
-    manager.close()
-
-    assert controller.destroy_calls == 2
-    assert manager.controller is None
-    assert manager.state is TeacherManagerState.CLOSED
-
-
-def test_persistent_manager_does_not_restage_unchanged_local_checkpoint(tmp_path):
-    """An offloaded unchanged teacher resumes without copying its snapshot again."""
-    source_root = tmp_path / "source"
-    source_root.mkdir()
-    t0 = _write_checkpoint(source_root, "t0", b"first")
-    controller = _PersistentController()
-    manager = PersistentTeacherManager(
-        _config(
-            {"t0": t0},
-            manager_type="local_memory",
-            staging_root=tmp_path / "staging",
-        ),
-        lambda _: controller,
-    )
-    manager.pre_fetch("t0")
-    manager.load("t0")
-    manager.release(DrainReceipt(complete=True))
-
-    manager.pre_fetch("t0")
-    manager.load("t0")
-
-    assert controller.events == ["offload", "health", "onload"]
     manager.close()
 
 
@@ -209,14 +158,13 @@ def test_persistent_manager_rejects_release_before_drain(tmp_path):
 @pytest.mark.parametrize(
     ("failure", "prepare"),
     [
-        ("health", "offload"),
         ("onload", "offload"),
         ("load:t1", "resident"),
         ("offload", "resident"),
     ],
 )
 def test_persistent_manager_failure_destroys_companion(tmp_path, failure, prepare):
-    """Health, load, onload, and offload failures poison the whole group."""
+    """Load, onload, and offload failures poison the whole group."""
     t0 = _write_checkpoint(tmp_path, "t0", b"first")
     t1 = _write_checkpoint(tmp_path, "t1", b"second")
     controller = _PersistentController()
@@ -266,139 +214,6 @@ def test_persistent_manager_close_is_idempotent_in_every_live_state(
 
     assert controller.destroy_calls == 1
     assert manager.state is TeacherManagerState.CLOSED
-
-
-def test_persistent_manager_identity_mismatch_does_not_onload(tmp_path):
-    """A replaced or dead worker is rejected before collective onload starts."""
-    t0 = _write_checkpoint(tmp_path, "t0", b"first")
-    controller = _PersistentController(fail_on="health")
-    manager = PersistentTeacherManager(_config({"t0": t0}), lambda _: controller)
-    manager.load("t0")
-    controller.fail_on = None
-    manager.release(DrainReceipt(complete=True))
-    controller.events.clear()
-    controller.fail_on = "health"
-
-    with pytest.raises(RuntimeError, match="health failed"):
-        manager.load("t0")
-
-    assert controller.events == ["health", "destroy"]
-
-
-def test_train_controller_detects_replaced_worker_generation(monkeypatch):
-    """Teacher health checks bind rank identity to one process generation."""
-    controller = object.__new__(TrainController)
-    controller.workers = [
-        Worker(id="mopd-teacher/0", ip="127.0.0.1", worker_ports=["18000"])
-    ]
-    controller._worker_role = "mopd-teacher"
-    controller._worker_identities = {}
-    health = {
-        "role": "mopd-teacher",
-        "worker_index": 0,
-        "pid": 123,
-        "generation": "first-generation",
-        "engines": ["mopd-teacher/0"],
-    }
-
-    class _Response:
-        def raise_for_status(self):
-            return None
-
-        def json(self):
-            return health
-
-    monkeypatch.setattr(
-        "areal.infra.controller.train_controller.requests.get",
-        lambda *args, **kwargs: _Response(),
-    )
-    controller.capture_worker_identity()
-    health["generation"] = "replacement-generation"
-
-    with pytest.raises(RuntimeError, match="identity changed"):
-        controller.assert_worker_identity()
-
-
-def test_local_memory_provider_uses_atomic_single_ready_checkpoint(tmp_path):
-    """Staging publishes one ready snapshot and removes it after consumption."""
-    source_root = tmp_path / "source"
-    source_root.mkdir()
-    t0 = _write_checkpoint(source_root, "t0", b"first")
-    t1 = _write_checkpoint(source_root, "t1", b"second")
-    staging_root = tmp_path / "staging"
-    provider = LocalMemoryCheckpointProvider(
-        _config(
-            {"t0": t0, "t1": t1},
-            manager_type="local_memory",
-            staging_root=staging_root,
-        )
-    )
-
-    provider.pre_fetch("t0")
-    ready = provider.resolve("t0")
-
-    assert ready.name == "t0.ready"
-    assert (ready / "model.safetensors").read_bytes() == b"first"
-    assert not list(staging_root.rglob("*.tmp.*"))
-    with pytest.raises(RuntimeError, match="already holds ready checkpoint"):
-        provider.pre_fetch("t1")
-
-    provider.consumed("t0")
-    assert not ready.exists()
-    provider.pre_fetch("t1")
-    second = provider.resolve("t1")
-    assert (second / "model.safetensors").read_bytes() == b"second"
-    provider.close()
-    provider.close()
-    assert not list(staging_root.iterdir())
-
-
-def test_local_memory_provider_rejects_insufficient_capacity(tmp_path, monkeypatch):
-    """Capacity is checked before checkpoint bytes enter the staging root."""
-    source_root = tmp_path / "source"
-    source_root.mkdir()
-    t0 = _write_checkpoint(source_root, "t0", b"payload")
-    staging_root = tmp_path / "staging"
-    provider = LocalMemoryCheckpointProvider(
-        _config(
-            {"t0": t0},
-            manager_type="local_memory",
-            staging_root=staging_root,
-        )
-    )
-    monkeypatch.setattr(
-        "areal.trainer.mopd.teacher_manager.shutil.disk_usage",
-        lambda _: type("Usage", (), {"free": 0})(),
-    )
-
-    with pytest.raises(OSError, match="Insufficient staging space"):
-        provider.pre_fetch("t0")
-
-    provider.close()
-    assert not list(staging_root.iterdir())
-
-
-def test_local_memory_provider_sweeps_dead_run(tmp_path):
-    """Construction removes run directories whose owning process is gone."""
-    source_root = tmp_path / "source"
-    source_root.mkdir()
-    t0 = _write_checkpoint(source_root, "t0", b"payload")
-    staging_root = tmp_path / "staging"
-    stale = staging_root / ".run-stale"
-    stale.mkdir(parents=True)
-    (stale / "owner.json").write_text('{"pid": 999999999}', encoding="utf-8")
-    (stale / "orphan.tmp.data").write_bytes(b"orphan")
-
-    provider = LocalMemoryCheckpointProvider(
-        _config(
-            {"t0": t0},
-            manager_type="local_memory",
-            staging_root=staging_root,
-        )
-    )
-
-    assert not stale.exists()
-    provider.close()
 
 
 def test_disk_provider_requires_existing_local_snapshot(tmp_path):
@@ -512,8 +327,6 @@ def test_trainer_mopd_phase_routes_reuses_drains_then_releases():
     trainer = object.__new__(PPOTrainer)
     trainer.config = SimpleNamespace(mopd=mopd)
     trainer.mopd_teacher_manager = _PhaseManager(events)
-    trainer._mopd_phase_machine = MOPDPhaseMachine()
-    trainer._mopd_phase_machine.transition(MOPDPhase.TEACHER)
     trainer.actor = _PhaseActor(events)
     trainer.critic = _PhaseCritic(events)
     batch = [{"mopd_route": "r0"}, {"mopd_route": "r1"}]
@@ -537,7 +350,6 @@ def test_trainer_mopd_phase_routes_reuses_drains_then_releases():
         "clear:actor:2,4",
         "release",
     ]
-    assert trainer._mopd_phase_machine.phase is MOPDPhase.TRAIN
     torch.testing.assert_close(
         result[0]["mopd_teacher_logp_sum"],
         torch.full((2,), 2.0),
@@ -563,8 +375,6 @@ def test_trainer_mopd_phase_failure_drains_rollout_before_release():
     trainer = object.__new__(PPOTrainer)
     trainer.config = SimpleNamespace(mopd=mopd)
     trainer.mopd_teacher_manager = _PhaseManager(events)
-    trainer._mopd_phase_machine = MOPDPhaseMachine()
-    trainer._mopd_phase_machine.transition(MOPDPhase.TEACHER)
     trainer.actor = _FailingPhaseActor(events)
     trainer.critic = _PhaseCritic(events)
 
@@ -583,12 +393,3 @@ def test_trainer_mopd_phase_failure_drains_rollout_before_release():
         "clear:actor:1,1",
         "release",
     ]
-
-
-def test_mopd_phase_machine_rejects_actor_onload_before_drain():
-    """The explicit owner state machine rejects skipping teacher drain."""
-    state = MOPDPhaseMachine()
-    state.transition(MOPDPhase.TEACHER)
-
-    with pytest.raises(RuntimeError, match="teacher -> train"):
-        state.transition(MOPDPhase.TRAIN)

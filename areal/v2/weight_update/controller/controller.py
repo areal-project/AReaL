@@ -117,6 +117,7 @@ class WeightUpdateController:
         nccl_master_addr: str = "",
         nccl_master_port: int = 0,
     ) -> None:
+        self._pair_name = pair_name
         payload: dict[str, Any] = {
             "pair_name": pair_name,
             "train_worker_urls": train_worker_urls,
@@ -135,22 +136,7 @@ class WeightUpdateController:
             json=payload,
             timeout=self.config.request_timeout,
         )
-        try:
-            resp.raise_for_status()
-        except httpx.HTTPStatusError as e:
-            try:
-                payload = resp.json()
-                detail = (
-                    payload.get("error", resp.text)
-                    if isinstance(payload, dict)
-                    else resp.text
-                )
-            except (TypeError, ValueError):
-                detail = resp.text
-            raise RuntimeError(
-                f"Weight update gateway rejected pair '{pair_name}': {detail}"
-            ) from e
-        self._pair_name = pair_name
+        resp.raise_for_status()
         logger.info(
             "Connected pair '%s' (mode=%s, colocate=%s, use_lora=%s)",
             pair_name,

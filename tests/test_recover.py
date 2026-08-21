@@ -1,5 +1,7 @@
 """Tests for the recovery configuration and functionality."""
 
+import dataclasses
+import os
 import tempfile
 from unittest.mock import Mock
 
@@ -12,6 +14,7 @@ from areal.utils.recover import (
     check_if_auto_recover,
     check_if_recover,
 )
+from areal.utils.saver import Saver
 from areal.v2.training_service.controller.controller import (
     GatewayTrainController,
 )
@@ -29,6 +32,41 @@ class TestRecoverConfig:
         )
         assert config.mode == "disabled"
         assert config.retries == 3
+
+    def test_optimizer_state_is_saved_and_loaded_by_default(self):
+        """Test that recovery round-trips optimizer state unless opted out.
+
+        Megatron's optimizer save used to fail under megatron-core >=0.16 --
+        the default fully_sharded_model_space sharding emits flattened_range,
+        which ShardedTensor.validate_metadata_integrity() rejects. The
+        stop-gap was to flip these flags on. The checkpointer now requests
+        dp_reshardable sharding instead, so recovery keeps Adam moments and
+        these must stay off by default: resuming with reset moments at full
+        learning rate destabilizes training.
+        """
+        config = RecoverConfig(
+            experiment_name="test_exp",
+            trial_name="test_trial",
+            fileroot="/tmp",
+        )
+        assert config.no_save_optim is False
+        assert config.no_load_optim is False
+
+    @pytest.mark.parametrize("field_name", ["no_save_optim", "no_load_optim"])
+    def test_optim_flag_help_does_not_claim_megatron_requirement(self, field_name):
+        """Test that the optim-skip flags are not documented as required.
+
+        The old help text called no_save_optim "required" for Megatron with a
+        distributed optimizer. That workaround is obsolete, and following it
+        silently discards Adam moments across recovery.
+        """
+        help_text = next(
+            f.metadata["help"]
+            for f in dataclasses.fields(RecoverConfig)
+            if f.name == field_name
+        )
+        assert "flattened_range" not in help_text
+        assert "required" not in help_text.lower()
 
     @pytest.mark.parametrize("mode", ["on", "off", "auto", "disabled"])
     def test_valid_modes(self, mode):
@@ -180,12 +218,13 @@ class TestModeEquivalence:
 
 class TestRecoverHandler:
     @staticmethod
-    def _make_handler(tmpdir: str, mode: str) -> RecoverHandler:
+    def _make_handler(tmpdir: str, mode: str, **config_kwargs) -> RecoverHandler:
         config = RecoverConfig(
             experiment_name="test_exp",
             trial_name="test_trial",
             fileroot=tmpdir,
             mode=mode,
+            **config_kwargs,
         )
         ft_spec = FinetuneSpec(
             total_train_epochs=1,
@@ -238,6 +277,39 @@ class TestRecoverHandler:
 
             assert "GatewayTrainController" in str(exc_info.value)
             assert "recover.mode" in str(exc_info.value)
+
+    @pytest.mark.parametrize("no_save_optim", [False, True])
+    def test_save_checkpoint_passes_with_optim_from_config(self, no_save_optim):
+        """Test that _save_checkpoint asks the engine for optimizer state
+        exactly when no_save_optim is off."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            handler = self._make_handler(tmpdir, "auto", no_save_optim=no_save_optim)
+            engine = Mock()
+
+            handler._save_checkpoint(engine)
+
+            meta = engine.save.call_args[0][0]
+            assert meta.with_optim is (not no_save_optim)
+
+    @pytest.mark.parametrize("no_load_optim", [False, True])
+    def test_load_checkpoint_passes_with_optim_from_config(self, no_load_optim):
+        """Test that _load_checkpoint asks the engine for optimizer state
+        exactly when no_load_optim is off."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            handler = self._make_handler(tmpdir, "auto", no_load_optim=no_load_optim)
+            engine = Mock()
+            # _load_checkpoint requires the checkpoint dir to exist.
+            os.makedirs(
+                Saver.get_recover_checkpoint_path(
+                    "test_exp", "test_trial", tmpdir, name="default"
+                ),
+                exist_ok=True,
+            )
+
+            handler._load_checkpoint(engine)
+
+            meta = engine.load.call_args[0][0]
+            assert meta.with_optim is (not no_load_optim)
 
 
 class TestAwexColocateGate:

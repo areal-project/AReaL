@@ -152,8 +152,16 @@ class InteractionWithTokenLogpReward:
             parent_logprobs = parent_res["logprobs"].squeeze(0).tolist()
             parent_loss_mask = parent_res["loss_mask"].squeeze(0).tolist()
             parent_versions = parent_res["versions"].squeeze(0).tolist()
+            parent_turn_ids = parent_res["turn_ids"].squeeze(0).tolist()
             parent_len = len(parent_logprobs)
-            assert parent_len == len(parent_loss_mask) == len(parent_versions)
+            assert (
+                parent_len
+                == len(parent_loss_mask)
+                == len(parent_versions)
+                == len(parent_turn_ids)
+            )
+            valid_parent_turn_ids = [tid for tid in parent_turn_ids if tid >= 0]
+            own_turn_id = max(valid_parent_turn_ids) + 1 if valid_parent_turn_ids else 0
             if resp.input_len > parent_len:
                 logprobs = (
                     parent_logprobs
@@ -169,6 +177,11 @@ class InteractionWithTokenLogpReward:
                     parent_versions
                     + [-1] * (resp.input_len - parent_len)
                     + resp.output_versions
+                )
+                turn_ids = (
+                    parent_turn_ids
+                    + [-1] * (resp.input_len - parent_len)
+                    + [own_turn_id] * resp.output_len
                 )
             else:
                 # FIXME: Find out why this happens occasionally
@@ -188,10 +201,12 @@ class InteractionWithTokenLogpReward:
                 logprobs = [0.0] * resp.input_len + resp.output_logprobs
                 loss_mask = [0] * resp.input_len + [1] * resp.output_len
                 versions = [-1] * resp.input_len + resp.output_versions
+                turn_ids = [-1] * resp.input_len + [0] * resp.output_len
         else:
             logprobs = [0.0] * resp.input_len + resp.output_logprobs
             loss_mask = [0] * resp.input_len + [1] * resp.output_len
             versions = [-1] * resp.input_len + resp.output_versions
+            turn_ids = [-1] * resp.input_len + [0] * resp.output_len
         reward = self.reward if self.reward is not None else 0.0
         original_reward = (
             self.original_reward if self.original_reward is not None else reward
@@ -202,6 +217,7 @@ class InteractionWithTokenLogpReward:
             loss_mask=torch.tensor(loss_mask).unsqueeze(0),
             logprobs=torch.tensor(logprobs).unsqueeze(0),
             versions=torch.tensor(versions).unsqueeze(0),
+            turn_ids=torch.tensor(turn_ids, dtype=torch.int32).unsqueeze(0),
             attention_mask=torch.ones(len(seq), dtype=torch.bool).unsqueeze(0),
             # reward
             rewards=torch.tensor([float(reward)]),

@@ -64,19 +64,6 @@ class TestConnect:
 
         assert ctrl._pair_name == "pair0"
 
-    def test_connect_failure_preserves_error_and_does_not_store_pair(self, ctrl):
-        request = httpx.Request("POST", f"{GATEWAY_URL}/connect")
-        ctrl._session.post.return_value = httpx.Response(
-            400,
-            request=request,
-            json={"error": "set megatron.wrap_with_ddp=true"},
-        )
-
-        with pytest.raises(RuntimeError, match="megatron.wrap_with_ddp=true"):
-            ctrl.connect("pair0", ["http://t:8000"], ["http://i:8000"])
-
-        assert ctrl._pair_name is None
-
     def test_connect_sends_correct_request(self, ctrl):
         ctrl._session.post.return_value = _mock_response(200, {"pair_name": "pair0"})
         train_urls = ["http://train1:8000", "http://train2:8000"]

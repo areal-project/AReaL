@@ -1304,10 +1304,14 @@ class RolloutController:
 
     def pause(self):
         self.dispatcher.pause()
+        if self._proxy_started:
+            self._proxy_collective_rpc("pause", http_timeout=60.0)
         self._collective_rpc("pause", http_timeout=60.0)
 
     def resume(self):
         self._collective_rpc("resume", http_timeout=60.0)
+        if self._proxy_started:
+            self._proxy_collective_rpc("resume", http_timeout=60.0)
         self.dispatcher.resume()
 
     def offload(self, tags: list[str] | None = None):

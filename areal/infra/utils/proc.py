@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import errno
 import os
 import shlex
 import shutil
@@ -22,51 +21,6 @@ logger = logging.getLogger("ProcUtils")
 
 if TYPE_CHECKING:
     from typing import IO
-
-
-def _is_process_alive(proc: psutil.Process) -> bool:
-    """Return whether a process still owns live execution resources."""
-    try:
-        # is_running() also protects against PID reuse.  A zombie still returns
-        # True, but it has already exited and must not be killed again.
-        return proc.is_running() and proc.status() != psutil.STATUS_ZOMBIE
-    except (psutil.NoSuchProcess, psutil.ZombieProcess):
-        return False
-
-
-def _wait_procs_with_pidfd_race_fallback(
-    procs: list[psutil.Process],
-    timeout: int,
-) -> tuple[list[psutil.Process], list[psutil.Process]]:
-    """Wait for processes while tolerating psutil's Linux pidfd exit race.
-
-    psutil 7.2.2 may propagate ``EINVAL`` from ``pidfd_open()`` when a process
-    exits between the SIGTERM and wait calls (psutil issue #2715).  The desired
-    cleanup state may already have been reached, so re-check each process and
-    let the caller escalate only the processes that are genuinely still alive.
-    Other OS errors remain fatal.
-    """
-    try:
-        gone, candidates = psutil.wait_procs(procs, timeout=timeout)
-    except OSError as exc:
-        if exc.errno != errno.EINVAL:
-            raise
-        logger.warning(
-            "psutil.wait_procs hit the pidfd_open EINVAL exit race; "
-            "rechecking process state"
-        )
-
-        gone = []
-        candidates = procs
-
-    # ``wait_procs`` can return a non-child zombie in ``alive`` because this
-    # process cannot reap it.  Such a process has already exited and owns no
-    # execution resources, so normalize the result in both the regular and
-    # pidfd-race paths instead of retrying SIGKILL forever.
-    alive: list[psutil.Process] = []
-    for proc in candidates:
-        (alive if _is_process_alive(proc) else gone).append(proc)
-    return gone, alive
 
 
 def build_target_cmd(
@@ -271,10 +225,7 @@ def kill_process_tree(
 
         # Wait for graceful shutdown
         procs_to_wait = children + ([parent] if include_parent else [])
-        _, alive = _wait_procs_with_pidfd_race_fallback(
-            procs_to_wait,
-            timeout=timeout,
-        )
+        gone, alive = psutil.wait_procs(procs_to_wait, timeout=timeout)
 
         # Force kill any remaining processes
         if alive:
@@ -287,14 +238,8 @@ def kill_process_tree(
                 except psutil.NoSuchProcess:
                     pass
 
-            # Final wait to ensure they're gone.  The same pidfd race can occur
-            # here after SIGKILL, so use the guarded wait for both phases.
-            _, still_alive = _wait_procs_with_pidfd_race_fallback(alive, timeout=1)
-            if still_alive:
-                live_pids = [proc.pid for proc in still_alive]
-                raise RuntimeError(
-                    f"Failed to terminate process tree; still alive: {live_pids}"
-                )
+            # Final wait to ensure they're gone
+            psutil.wait_procs(alive, timeout=1)
 
         logger.info(f"Successfully cleaned up process tree for PID {parent_pid}")
     else:

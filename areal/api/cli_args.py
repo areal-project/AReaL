@@ -1714,8 +1714,34 @@ class PPOActorConfig(TrainEngineConfig):
     discount: float = field(
         default=1.0, metadata={"help": "Discount factor for future rewards"}
     )
-    gae_lambda: float = field(
-        default=1.0, metadata={"help": "Lambda parameter for GAE"}
+    gae_lambda: float | str = field(
+        default=1.0,
+        metadata={
+            "help": "Lambda parameter for GAE, either a static float or a dotted "
+            "path to a batch-vectorized per-sample lambda function. The function "
+            "receives a context dict containing effective_token_lengths, "
+            "turn_counts, and timestep_lengths tensors and must return one lambda "
+            "per local trajectory."
+        },
+    )
+    gae_lambda_kwargs: dict[str, Any] = field(
+        default_factory=dict,
+        metadata={
+            "help": "Keyword arguments passed to a custom gae_lambda function. "
+            "Ignored when gae_lambda is a float."
+        },
+    )
+    # NOTE: not annotated as Literal["token", "turn"] because the pinned
+    # OmegaConf version rejects Literal annotations in structured configs.
+    # Validated in __post_init__ instead.
+    gae_timestep_unit: str = field(
+        default="token",
+        metadata={
+            "help": "Timestep unit used by GAE. 'token' preserves standard "
+            "token-level GAE; 'turn' applies discount and lambda once per "
+            "generated turn.",
+            "choices": ["token", "turn"],
+        },
     )
     adv_norm: NormConfig | None = field(
         default=None, metadata={"help": "Normalization configuration for advantages."}
@@ -1827,6 +1853,22 @@ class PPOActorConfig(TrainEngineConfig):
 
     def __post_init__(self):
         """Validate PPO actor configuration."""
+        if isinstance(self.gae_lambda, bool) or not isinstance(
+            self.gae_lambda, int | float | str
+        ):
+            raise ValueError(
+                "gae_lambda must be a float or dotted function path, got "
+                f"{self.gae_lambda!r}"
+            )
+        if isinstance(self.gae_lambda, str) and not self.gae_lambda:
+            raise ValueError("gae_lambda function path must not be empty")
+
+        if self.gae_timestep_unit not in {"token", "turn"}:
+            raise ValueError(
+                "gae_timestep_unit must be 'token' or 'turn', got "
+                f"{self.gae_timestep_unit!r}"
+            )
+
         reward_norm = self.reward_norm
         if isinstance(reward_norm, (dict, DictConfig)):
             reward_mean_level = reward_norm.get("mean_level")
@@ -2663,14 +2705,18 @@ class RecoverConfig(_Timer):
         default=False,
         metadata={
             "help": "Do not save optimizer state in recovery checkpoints. "
-            "Required when using use_distributed_optimizer with Megatron "
-            "(flattened_range incompatibility)."
+            "Shrinks checkpoints and speeds up saving, but recovery then "
+            "resumes with a freshly initialized optimizer (Adam moments "
+            "reset), which can destabilize training. Leave this off unless "
+            "the run never needs to resume optimizer state, e.g. profiling."
         },
     )
     no_load_optim: bool = field(
         default=False,
         metadata={
-            "help": "Do not load optimizer state when recovering from checkpoint."
+            "help": "Do not load optimizer state when recovering from checkpoint. "
+            "Same caveat as no_save_optim: training resumes with reset Adam "
+            "moments."
         },
     )
 
@@ -3291,38 +3337,20 @@ class MOPDTeacherSpec:
 
 @dataclass
 class MOPDTeacherManagerConfig:
-    """Checkpoint provider configuration for phase-scoped MOPD teachers."""
+    """Checkpoint source configuration for phase-scoped MOPD teachers."""
 
     type: str = field(
         default="disk",
         metadata={
             "help": "Teacher checkpoint provider.",
-            "choices": ["disk", "local_memory"],
-        },
-    )
-    staging_root: str = field(
-        default="/dev/shm/areal-mopd",
-        metadata={"help": "Node-local staging root for local_memory providers."},
-    )
-    min_free_bytes: int | None = field(
-        default=None,
-        metadata={
-            "help": "Optional minimum free space required after staging a checkpoint."
+            "choices": ["disk"],
         },
     )
 
     def __post_init__(self):
-        if self.type not in ("disk", "local_memory"):
+        if self.type != "disk":
             raise ValueError(
-                "mopd.manager.type must be either 'disk' or 'local_memory', "
-                f"got {self.type!r}"
-            )
-        if not isinstance(self.staging_root, str) or not self.staging_root.strip():
-            raise ValueError("mopd.manager.staging_root must be a non-empty string")
-        if self.min_free_bytes is not None and self.min_free_bytes < 0:
-            raise ValueError(
-                "mopd.manager.min_free_bytes must be non-negative or None, "
-                f"got {self.min_free_bytes}"
+                f"mopd.manager.type currently supports only 'disk', got {self.type!r}"
             )
 
 
@@ -3338,6 +3366,10 @@ class MOPDLossConfig:
         default=0.005,
         metadata={"help": "Coefficient applied to the MOPD objective."},
     )
+    importance_ratio_cap: float = field(
+        default=5.0,
+        metadata={"help": "Positive cap applied to the behavior-policy ratio."},
+    )
 
     def __post_init__(self):
         for name in ("rl_coefficient", "distillation_coefficient"):
@@ -3348,6 +3380,17 @@ class MOPDLossConfig:
                 raise ValueError(
                     f"mopd.loss.{name} must be finite and non-negative, got {value}"
                 )
+        if self.rl_coefficient == 0 and self.distillation_coefficient == 0:
+            raise ValueError("MOPD loss coefficients cannot both be zero")
+        if (
+            not isinstance(self.importance_ratio_cap, (int, float))
+            or isinstance(self.importance_ratio_cap, bool)
+            or not math.isfinite(self.importance_ratio_cap)
+            or self.importance_ratio_cap <= 0
+        ):
+            raise ValueError(
+                "mopd.loss.importance_ratio_cap must be finite and positive"
+            )
 
 
 @dataclass
@@ -3471,13 +3514,6 @@ class PPOConfig(BaseExperimentConfig):
         """Validate the eval generation config."""
         if self.teacher is not None and self.mopd is not None:
             raise ValueError("teacher and mopd cannot be configured at the same time")
-        if self.teacher is not None:
-            warnings.warn(
-                "The single-teacher `teacher` config is deprecated; migrate to "
-                "`mopd` before the compatibility period ends.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
         if self.mopd is not None:
             self._validate_mopd_config()
         if self.eval_gconfig is None:
@@ -3555,17 +3591,6 @@ class PPOConfig(BaseExperimentConfig):
             raise ValueError(
                 "mopd teacher and actor must use the same parallel strategy"
             )
-        if self.mopd.manager.type == "local_memory":
-            if self.scheduler.type != "local":
-                raise ValueError(
-                    "mopd local_memory provider requires scheduler.type='local' "
-                    "so controller and teacher workers share the same host"
-                )
-            if actor_alloc.parallel.world_size > self.cluster.n_gpus_per_node:
-                raise ValueError(
-                    "mopd local_memory provider only supports a single node; use "
-                    "disk for multi-node runs"
-                )
 
 
 @dataclass

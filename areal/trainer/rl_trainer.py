@@ -47,7 +47,6 @@ from areal.infra.data_service.controller.config import DataServiceConfig
 from areal.infra.data_service.rdataset import RDataset
 from areal.infra.utils.concurrent import call_maybe_async
 from areal.trainer.mopd.compatibility import validate_mopd_model_compatibility
-from areal.trainer.mopd.phase import MOPDPhase, MOPDPhaseMachine
 from areal.trainer.mopd.targets import MOPD_CONTRIBUTIONS_KEY
 from areal.trainer.mopd.teacher_manager import (
     DrainReceipt,
@@ -379,18 +378,10 @@ class PPOTrainer:
             self.teacher = self._init_teacher_rollout(self.config.teacher.rollout)
 
         self.mopd_teacher_manager: PersistentTeacherManager | None = None
-        self._mopd_phase_machine: MOPDPhaseMachine | None = None
         if self.config.mopd is not None:
-            if self.config.mopd.manager.type == "local_memory" and not isinstance(
-                self.scheduler, LocalScheduler
-            ):
-                raise RuntimeError(
-                    "MOPD local_memory staging requires a same-host LocalScheduler"
-                )
             self.mopd_teacher_manager = PersistentTeacherManager(
                 self.config.mopd, self._create_mopd_teacher_controller
             )
-            self._mopd_phase_machine = MOPDPhaseMachine()
 
         # Proxy worker initialization (lazy, for AgentWorkflow support)
         self._proxy_started = False
@@ -828,8 +819,6 @@ class PPOTrainer:
                 self.rollout.offload(tags=["cuda_graph"])
                 try:
                     if self.config.mopd is not None:
-                        assert self._mopd_phase_machine is not None
-                        self._mopd_phase_machine.transition(MOPDPhase.TEACHER)
                         rollout_batch = self._run_mopd_teacher_phase(rollout_batch)
                     logger.info("[AWEX] colocate: offload done, onloading actor...")
                     self.actor.onload()
@@ -851,8 +840,6 @@ class PPOTrainer:
                         self.rollout.onload(tags=["kv_cache"])
                         call_maybe_async(self.rollout.continue_generation)
                         self.rollout.resume()
-                        if self._mopd_phase_machine is not None:
-                            self._mopd_phase_machine.abort_to_rollout()
                     except Exception:
                         logger.error(
                             "Failed to restore rollout during AWEX rollback; "
@@ -1051,8 +1038,6 @@ class PPOTrainer:
                     "(global_step=%s)",
                     global_step,
                 )
-            if self._mopd_phase_machine is not None:
-                self._mopd_phase_machine.transition(MOPDPhase.ROLLOUT)
 
             self._save_perf_tracer(step=global_step)
 
@@ -1300,7 +1285,6 @@ class PPOTrainer:
             # without enabling TMS in the AWEX actor processes.
             if teacher_config.backend.startswith("megatron:"):
                 controller.init_weight_residency_adapter()
-            controller.capture_worker_identity()
         except BaseException:
             controller.destroy()
             raise
@@ -1312,8 +1296,7 @@ class PPOTrainer:
         """Score routed subsets, aggregate on actor heads, then strictly drain."""
         config = self.config.mopd
         manager = self.mopd_teacher_manager
-        state = self._mopd_phase_machine
-        assert config is not None and manager is not None and state is not None
+        assert config is not None and manager is not None
 
         routed_weights: list[dict[str, float]] = []
         for trajectory in rollout_batch:
@@ -1392,7 +1375,6 @@ class PPOTrainer:
                         "weight": routed_weights[index][teacher_id],
                     }
 
-            state.transition(MOPDPhase.DRAIN)
             aggregated = self.actor.aggregate_mopd_targets(
                 rollout_batch,
                 rl_coefficient=config.loss.rl_coefficient,
@@ -1414,7 +1396,6 @@ class PPOTrainer:
             )
             manager.release(receipt)
             logger.info("[MOPD] teacher offload complete")
-            state.transition(MOPDPhase.TRAIN)
             return aggregated
         except BaseException:
             if not critic_fetch_buffer_drained:

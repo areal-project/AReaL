@@ -7,7 +7,7 @@ import torch
 
 from areal.api.cli_args import MOPDLossConfig, RejectionSamplingConfig
 from areal.trainer.mopd.loss import compose_mopd_loss, mopd_loss_fn
-from areal.trainer.ppo.actor import _compose_legacy_teacher_loss, grpo_loss_fn
+from areal.trainer.ppo.actor import grpo_loss_fn
 
 
 def _loss_inputs():
@@ -38,23 +38,6 @@ def _loss_inputs():
         teacher_weight_sum,
         loss_mask,
     )
-
-
-def test_mopd_loss_matches_closed_form_value_and_gradient():
-    """The surrogate follows the masked score-function value and gradient."""
-    inputs = _loss_inputs()
-    logprobs, old_logprobs, teacher_sum, weight_sum, loss_mask = inputs
-
-    loss, _ = mopd_loss_fn(*inputs)
-    loss.backward()
-
-    rho = torch.exp(logprobs.detach() - old_logprobs)
-    reward = teacher_sum - weight_sum * logprobs.detach()
-    expected_loss = -(rho * reward)[loss_mask].mean()
-    expected_grad = torch.zeros_like(logprobs)
-    expected_grad[loss_mask] = -(rho * reward)[loss_mask] / loss_mask.sum()
-    torch.testing.assert_close(loss.detach(), expected_loss, rtol=1e-12, atol=1e-12)
-    torch.testing.assert_close(logprobs.grad, expected_grad, rtol=1e-12, atol=1e-12)
 
 
 def test_mopd_loss_matches_exact_weighted_reverse_kl_oracle():
@@ -214,47 +197,6 @@ def test_mopd_loss_detaches_old_policy_and_teacher_targets():
     assert inputs[3].grad is None
 
 
-def test_mopd_loss_scaling_all_teacher_weights_scales_loss_and_gradient():
-    """Unnormalized teacher weights scale the distillation signal linearly."""
-    inputs = _loss_inputs()
-    base_loss, _ = mopd_loss_fn(*inputs)
-    base_loss.backward()
-    base_grad = inputs[0].grad.detach().clone()
-
-    scaled_inputs = _loss_inputs()
-    scaled_inputs = (
-        scaled_inputs[0],
-        scaled_inputs[1],
-        2 * scaled_inputs[2],
-        2 * scaled_inputs[3],
-        scaled_inputs[4],
-    )
-    scaled_loss, _ = mopd_loss_fn(*scaled_inputs)
-    scaled_loss.backward()
-
-    torch.testing.assert_close(
-        scaled_loss.detach(), 2 * base_loss.detach(), rtol=1e-12, atol=1e-12
-    )
-    torch.testing.assert_close(
-        scaled_inputs[0].grad, 2 * base_grad, rtol=1e-12, atol=1e-12
-    )
-
-
-def test_mopd_loss_teacher_logp_changes_gradient():
-    """The corrected distillation gradient remains sensitive to teacher scores."""
-    inputs = _loss_inputs()
-    loss, _ = mopd_loss_fn(*inputs)
-    loss.backward()
-    first_grad = inputs[0].grad.detach().clone()
-
-    changed_inputs = list(_loss_inputs())
-    changed_inputs[2] = changed_inputs[2] - 0.5
-    changed_loss, _ = mopd_loss_fn(*changed_inputs)
-    changed_loss.backward()
-
-    assert not torch.allclose(first_grad, changed_inputs[0].grad)
-
-
 def test_mopd_loss_empty_mask_returns_differentiable_zero():
     """An empty response mask is finite and keeps a zero current-policy graph."""
     inputs = list(_loss_inputs())
@@ -385,102 +327,7 @@ def test_grpo_loss_fn_composes_materialized_mopd_targets():
         for call in tracker.stat.call_args_list
         if "mopd_teacher_weight_sum" in call.kwargs
     )
-    assert "mopd_rkl_estimate" in mopd_stat_call.kwargs
-
-
-def test_legacy_joint_teacher_loss_preserves_value_and_gradient_contract():
-    """Deprecated joint KDRL keeps the direct log-probability penalty."""
-    logprobs = torch.tensor([[-0.4, -0.9]], dtype=torch.float64, requires_grad=True)
-    old_logprobs = torch.tensor([[-0.5, -1.0]], dtype=torch.float64)
-    teacher = torch.tensor([[-0.8, -0.7]], dtype=torch.float64, requires_grad=True)
-    mask = torch.tensor([[True, False]])
-    rl_loss = (logprobs.square() * mask).sum()
-
-    actual, per_token = _compose_legacy_teacher_loss(
-        rl_loss,
-        logprobs=logprobs,
-        old_logprobs=old_logprobs,
-        teacher_logprobs=teacher,
-        loss_mask=mask,
-        rl_loss_weight=0.7,
-        distill_loss_weight=0.3,
-    )
-    expected = 0.7 * rl_loss + 0.3 * (
-        ((logprobs - teacher.detach()) * mask).sum() / mask.count_nonzero()
-    )
-
-    torch.testing.assert_close(actual, expected, rtol=1e-12, atol=1e-12)
-    torch.testing.assert_close(
-        per_token,
-        (logprobs - teacher.detach()) * mask,
-        rtol=1e-12,
-        atol=1e-12,
-    )
-    actual.backward()
-    torch.testing.assert_close(
-        logprobs.grad,
-        torch.tensor([[-0.26, 0.0]], dtype=torch.float64),
-        rtol=1e-12,
-        atol=1e-12,
-    )
-    assert teacher.grad is None
-
-
-def test_legacy_pure_teacher_loss_masks_before_importance_exp():
-    """Masked overflow cannot create NaN in the legacy pure-KD gradient."""
-    logprobs = torch.tensor([[1000.0, -0.4]], requires_grad=True)
-    old_logprobs = torch.tensor([[-1000.0, -0.5]], requires_grad=True)
-    teacher = torch.tensor([[-0.3, -0.2]], requires_grad=True)
-    mask = torch.tensor([[False, True]])
-
-    loss, per_token = _compose_legacy_teacher_loss(
-        torch.tensor(0.0),
-        logprobs=logprobs,
-        old_logprobs=old_logprobs,
-        teacher_logprobs=teacher,
-        loss_mask=mask,
-        rl_loss_weight=0.0,
-        distill_loss_weight=1.0,
-    )
-    loss.backward()
-
-    assert torch.isfinite(loss)
-    assert torch.isfinite(per_token).all()
-    assert torch.isfinite(logprobs.grad).all()
-    assert old_logprobs.grad is None
-    assert teacher.grad is None
-
-
-@pytest.mark.parametrize("rl_loss_weight", [0.0, 1.0])
-def test_legacy_teacher_loss_respects_m2po_filtered_mask(rl_loss_weight):
-    """Legacy pure and joint KD keep the historical M2PO mask contract."""
-    logprobs = torch.tensor([[-0.2, -0.4]], dtype=torch.float64, requires_grad=True)
-    old_logprobs = torch.zeros_like(logprobs)
-    prox_logp = torch.tensor([[2.0, 0.0]], dtype=torch.float64)
-    input_data = {
-        "logprobs": old_logprobs,
-        "prox_logp": prox_logp,
-        "advantages": torch.zeros_like(logprobs),
-        "loss_mask": torch.ones_like(logprobs, dtype=torch.bool),
-        "teacher_logp": torch.tensor([[-1.0, -1.0]], dtype=torch.float64),
-        "rl_loss_weight": rl_loss_weight,
-        "distill_loss_weight": 1.0,
-    }
-
-    with patch("areal.trainer.ppo.actor.stats_tracker", MagicMock()):
-        loss = grpo_loss_fn(
-            logprobs=logprobs,
-            entropy=torch.zeros_like(logprobs),
-            input_data=input_data,
-            eps_clip=0.2,
-            eps_clip_higher=None,
-            c_clip=None,
-            m2_threshold=1.0,
-        )
-    loss.backward()
-
-    assert logprobs.grad[0, 0] == 0
-    assert logprobs.grad[0, 1] != 0
+    assert "mopd_loss" in mopd_stat_call.kwargs
 
 
 def test_mopd_loss_respects_m2po_filtered_mask():

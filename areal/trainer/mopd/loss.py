@@ -45,8 +45,8 @@ def mopd_loss_fn(
     ``teacher_logp_sum`` is ``sum_j(w_j * log pi_Tj)`` and
     ``teacher_weight_sum`` is ``sum_j(w_j)`` at every response token. Teacher
     weights are deliberately not normalized. The behavior-policy importance
-    ratio is capped with a stop-gradient weight so extreme stale tokens retain
-    a bounded policy gradient instead of overflowing or becoming constant.
+    ratio is capped with a stop-gradient weight to prevent exponential
+    overflow while retaining the score-function gradient.
     """
     if (
         not isinstance(importance_ratio_cap, (int, float))
@@ -102,7 +102,7 @@ def mopd_loss_fn(
         torch.zeros_like(logprobs),
     )
     # At forward time the carrier is exactly one. Its derivative is
-    # d log pi_theta, preserving a bounded score-function gradient even when
+    # d log pi_theta, preserving the score-function gradient even when
     # the detached importance ratio was clipped.
     score_function_carrier = torch.exp(safe_logprobs - safe_logprobs.detach())
     importance_weight = bounded_importance_weight * score_function_carrier
@@ -140,7 +140,6 @@ def compose_mopd_loss(
     teacher_weight_sum: torch.Tensor | None = None,
     loss_mask: torch.Tensor | None = None,
     normalization_mask: torch.Tensor | None = None,
-    importance_ratio_cap: float = DEFAULT_MOPD_IMPORTANCE_RATIO_CAP,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     """Compose RL and MOPD objectives without changing the disabled RL path."""
     if config is None:
@@ -169,7 +168,7 @@ def compose_mopd_loss(
         teacher_weight_sum=teacher_weight_sum,
         loss_mask=loss_mask,
         normalization_mask=normalization_mask,
-        importance_ratio_cap=importance_ratio_cap,
+        importance_ratio_cap=config.importance_ratio_cap,
     )
 
     if config.rl_coefficient == 0:

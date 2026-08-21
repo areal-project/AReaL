@@ -58,7 +58,6 @@ mopd:
     scheduling_spec: ${actor.scheduling_spec}
   manager:
     type: disk
-    staging_root: /dev/shm/areal-mopd
   loss:
     rl_coefficient: 0.0
     distillation_coefficient: 0.005
@@ -69,10 +68,7 @@ must match a key in `routes`. A route must reference known teacher IDs and conta
 least one positive weight.
 
 `manager.type: disk` loads checkpoints from shared storage and supports multi-node
-runs. `local_memory` stages checkpoints below `staging_root` and is restricted to the
-same-host LocalScheduler; Ray and Slurm controllers may not share their local
-filesystem with teacher workers. Startup removes stale MOPD staging directories whose
-owner process is no longer alive.
+runs.
 
 For teacher weights $w_j$, define $S_T(a)=\sum_j w_j\log\pi_{T_j}(a)$ and
 $W=\sum_j w_j$. MOPD minimizes the raw weighted reverse KL
@@ -80,11 +76,14 @@ $\sum_j w_j D_{KL}(\pi_\theta \parallel \pi_{T_j})$ with the on-policy
 score-function surrogate:
 
 ```text
-rho(a) = exp(log pi_theta(a) - log pi_old(a))
+rho(a) = min(exp(log pi_theta(a) - log pi_old(a)), importance_ratio_cap)
 reward(a) = S_T(a) - W * stop_gradient(log pi_theta(a))
 mopd_loss = -mean(rho(a) * reward(a))
 loss = rl_coefficient * rl_loss + distillation_coefficient * mopd_loss
 ```
+
+`importance_ratio_cap` defaults to `5.0` and bounds the importance-sampling
+multiplier to prevent exponential overflow.
 
 This is a weighted sum of reverse-KL objectives, equivalently a geometric teacher
 ensemble up to an additive constant. It is not teacher cross-entropy or an arithmetic

@@ -20,31 +20,17 @@ GUARD_APP = "areal.infra.rpc.guard.app"
 
 @pytest.fixture(autouse=True)
 def _reset_guard_globals():
-    for reservation in guard_module._state.port_reservations.values():
-        reservation.close()
     guard_module._state.allocated_ports = set()
-    guard_module._state.port_reservations = {}
-    guard_module._state.fixed_worker_ports = {}
     guard_module._state.forked_children = []
     guard_module._state.forked_children_map = {}
-    guard_module._state.forked_children_ports = {}
-    guard_module._state.deleted_forked_children = set()
-    guard_module._state.fork_lifecycle_locks = {}
     guard_module._state.server_host = "10.0.0.1"
     guard_module._state.experiment_name = "test-exp"
     guard_module._state.trial_name = "test-trial"
     guard_module._state.fileroot = None
     yield
-    for reservation in guard_module._state.port_reservations.values():
-        reservation.close()
     guard_module._state.allocated_ports = set()
-    guard_module._state.port_reservations = {}
-    guard_module._state.fixed_worker_ports = {}
     guard_module._state.forked_children = []
     guard_module._state.forked_children_map = {}
-    guard_module._state.forked_children_ports = {}
-    guard_module._state.deleted_forked_children = set()
-    guard_module._state.fork_lifecycle_locks = {}
 
 
 @pytest.fixture()
@@ -81,10 +67,8 @@ class TestHealth:
 
 
 class TestAllocPorts:
-    @patch(f"{GUARD_APP}.socket.socket")
-    @patch(f"{GUARD_APP}.is_port_free", return_value=True)
     @patch(f"{GUARD_APP}.find_free_ports")
-    def test_alloc_ports_success(self, mock_find, _mock_is_free, _mock_socket, client):
+    def test_alloc_ports_success(self, mock_find, client):
         mock_find.return_value = [9001, 9002, 9003]
         resp = client.post("/alloc_ports", json={"count": 3})
         assert resp.status_code == 200
@@ -94,12 +78,8 @@ class TestAllocPorts:
         assert data["host"] == "10.0.0.1"
         assert guard_module._state.allocated_ports == {9001, 9002, 9003}
 
-    @patch(f"{GUARD_APP}.socket.socket")
-    @patch(f"{GUARD_APP}.is_port_free", return_value=True)
     @patch(f"{GUARD_APP}.find_free_ports")
-    def test_alloc_ports_excludes_previous(
-        self, mock_find, _mock_is_free, _mock_socket, client
-    ):
+    def test_alloc_ports_excludes_previous(self, mock_find, client):
         mock_find.return_value = [9001, 9002, 9003]
         client.post("/alloc_ports", json={"count": 3})
 
@@ -247,9 +227,6 @@ class TestKillForkedWorker:
         mock_proc = _make_mock_process(pid=123)
         guard_module._state.forked_children.append(mock_proc)
         guard_module._state.forked_children_map[("test", 0)] = mock_proc
-        mock_kill.side_effect = lambda *args, **kwargs: setattr(
-            mock_proc.poll, "return_value", 0
-        )
 
         resp = client.post(
             "/kill_forked_worker",
@@ -265,13 +242,13 @@ class TestKillForkedWorker:
 
         mock_kill.assert_called_once_with(123, timeout=3, graceful=True)
 
-    def test_kill_unknown_worker_is_idempotent(self, client):
+    def test_kill_unknown_worker_returns_404(self, client):
         resp = client.post(
             "/kill_forked_worker",
             json={"role": "ghost", "worker_index": 99},
         )
-        assert resp.status_code == 200
-        assert "was not running" in resp.get_json()["message"]
+        assert resp.status_code == 404
+        assert "not found" in resp.get_json()["error"].lower()
 
     @patch(f"{GUARD_APP}.kill_process_tree")
     def test_kill_already_exited_worker(self, mock_kill, client):
@@ -297,13 +274,10 @@ class TestKillForkedWorker:
         assert "worker_index" in resp.get_json()["error"].lower()
 
     @patch(f"{GUARD_APP}.kill_process_tree")
-    def test_kill_then_kill_again_is_idempotent(self, mock_kill, client):
+    def test_kill_then_kill_again_returns_404(self, mock_kill, client):
         mock_proc = _make_mock_process(pid=789)
         guard_module._state.forked_children.append(mock_proc)
         guard_module._state.forked_children_map[("test", 0)] = mock_proc
-        mock_kill.side_effect = lambda *args, **kwargs: setattr(
-            mock_proc.poll, "return_value", 0
-        )
 
         resp1 = client.post(
             "/kill_forked_worker",
@@ -315,8 +289,7 @@ class TestKillForkedWorker:
             "/kill_forked_worker",
             json={"role": "test", "worker_index": 0},
         )
-        assert resp2.status_code == 200
-        assert "already removed" in resp2.get_json()["message"]
+        assert resp2.status_code == 404
 
 
 class TestCleanup:
@@ -329,12 +302,6 @@ class TestCleanup:
             ("a", 0): proc1,
             ("b", 0): proc2,
         }
-
-        def mark_stopped(pid, **kwargs):
-            del kwargs
-            {proc1.pid: proc1, proc2.pid: proc2}[pid].poll.return_value = 0
-
-        mock_kill.side_effect = mark_stopped
 
         cleanup_forked_children()
 
@@ -354,9 +321,6 @@ class TestCleanup:
             ("a", 0): running,
             ("b", 0): exited,
         }
-        mock_kill.side_effect = lambda *args, **kwargs: setattr(
-            running.poll, "return_value", 0
-        )
 
         cleanup_forked_children()
 
@@ -380,16 +344,10 @@ class TestCleanup:
             ("b", 0): proc2,
         }
 
-        def stop_or_fail(pid, **kwargs):
-            del kwargs
-            if pid == proc1.pid:
-                raise OSError("boom")
-            proc2.poll.return_value = 0
-
-        mock_kill.side_effect = stop_or_fail
+        mock_kill.side_effect = [OSError("boom"), None]
 
         cleanup_forked_children()
 
         assert mock_kill.call_count == 2
-        assert guard_module._state.forked_children == [proc1]
-        assert guard_module._state.forked_children_map == {("a", 0): proc1}
+        assert guard_module._state.forked_children == []
+        assert guard_module._state.forked_children_map == {}

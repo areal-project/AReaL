@@ -22,19 +22,13 @@ def _rtensor(shard_id: str, node_addr: str = "teacher:8000") -> RTensor:
     )
 
 
-@pytest.mark.parametrize(
-    ("module_name", "class_name"),
-    [
-        ("areal.engine.fsdp_engine", "FSDPPPOActor"),
-        ("areal.engine.megatron_engine", "MegatronPPOActor"),
-        ("areal.experimental.engine.archon_engine", "ArchonPPOActor"),
-    ],
-)
-def test_ppo_backend_exposes_mopd_rpc_methods(module_name, class_name):
-    """Every remote PPO backend exposes the controller's MOPD RPC surface."""
+def test_megatron_backend_exposes_mopd_rpc_methods():
+    """The supported MOPD backend exposes the controller's RPC surface."""
     import importlib
 
-    actor_cls = getattr(importlib.import_module(module_name), class_name)
+    actor_cls = getattr(
+        importlib.import_module("areal.engine.megatron_engine"), "MegatronPPOActor"
+    )
 
     assert callable(getattr(actor_cls, "aggregate_mopd_targets", None))
 

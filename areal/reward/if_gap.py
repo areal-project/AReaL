@@ -44,8 +44,11 @@ def _load_ifrl_engines() -> tuple[Any, Any, Any]:
     if _ifrl_engines is not None:
         return _ifrl_engines
 
-    root = os.path.abspath(os.getenv("IF_SYNTH_ROOT", ""))
-    if not root or not os.path.isdir(root):
+    configured_root = os.getenv("IF_SYNTH_ROOT", "").strip()
+    if not configured_root:
+        raise FileNotFoundError("IF_SYNTH_ROOT is not configured")
+    root = os.path.abspath(configured_root)
+    if not os.path.isdir(root):
         raise FileNotFoundError(
             f"IF_SYNTH_ROOT does not point to IFDataSynthesis: {root!r}"
         )

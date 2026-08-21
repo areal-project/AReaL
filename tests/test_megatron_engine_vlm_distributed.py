@@ -152,6 +152,29 @@ def test_simple_forward(model_env, tmp_path_factory):
 @pytest.mark.gpu
 @pytest.mark.slow
 @pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA not available")
+@pytest.mark.parametrize(
+    "backend", ["megatron:d1p1t1", "megatron:d1p1t2"], ids=["tp1", "tp2"]
+)
+def test_qwen3_vl_model_thd_matches_bshd(backend, tmp_path_factory):
+    """Model-owned THD must preserve text-only and image-text logprobs."""
+    required_gpus = ModelAllocation.from_str(backend).parallel.world_size
+    if torch.cuda.device_count() < required_gpus:
+        pytest.skip(f"Qwen3-VL parity with {backend} requires {required_gpus} GPUs")
+    output = str(tmp_path_factory.mktemp("vlm_test") / "thd_bshd_parity.out")
+    _run_vlm_test(
+        "thd_bshd_parity",
+        output,
+        backend=backend,
+        env_overrides={
+            "AREAL_TEST_BRIDGE_TYPE": "megatron-bridge",
+            "VLM_MODEL_PATH": DENSE_MODEL_PATHS["qwen3_vl"],
+        },
+    )
+
+
+@pytest.mark.gpu
+@pytest.mark.slow
+@pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA not available")
 @pytest.mark.parametrize("model_env", _VLM_MODELS)
 def test_hf_save_load_weights(model_env, tmp_path_factory):
     """Verify save/load preserves VLM weights and saves processor."""
@@ -193,7 +216,25 @@ def test_train_tensor_parallel(model_env, tmp_path_factory):
 @pytest.mark.slow
 @pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA not available")
 def test_qwen3vl_moe_expert_parallel(tmp_path_factory):
-    """Forward smoke test for Qwen3-VL-MoE under ``(attn:d2t4|ffn:d2e4)``.
+    """Legacy mbridge forward smoke under ``(attn:d2t4|ffn:d2e4)``."""
+    if torch.cuda.device_count() < 8:
+        pytest.skip("Qwen3-VL-MoE expert parallel requires 8 GPUs to run")
+    output = str(
+        tmp_path_factory.mktemp("test_output") / "qwen3vl_moe_expert_parallel.out"
+    )
+    _run_vlm_test(
+        "forward",
+        output,
+        backend="megatron:(attn:d2t4|ffn:d2e4)",
+        env_overrides={"VLM_MODEL_PATH": MOE_MODEL_PATHS["qwen3_vl_moe"]},
+    )
+
+
+@pytest.mark.multi_gpu
+@pytest.mark.slow
+@pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA not available")
+def test_qwen3vl_moe_model_thd_expert_parallel(tmp_path_factory):
+    """Model-owned THD smoke for Qwen3-VL-MoE under ``(attn:d2t4|ffn:d2e4)``.
 
     Allocation: attn DP=2 TP=4 (8 GPUs); ffn DP=2 EP=4 (8 GPUs). World sizes
     must match — earlier ``(attn:d2t2|ffn:d2e4)`` raised
@@ -209,7 +250,11 @@ def test_qwen3vl_moe_expert_parallel(tmp_path_factory):
         "forward",
         output,
         backend="megatron:(attn:d2t4|ffn:d2e4)",
-        env_overrides={"VLM_MODEL_PATH": MOE_MODEL_PATHS["qwen3_vl_moe"]},
+        env_overrides={
+            "AREAL_TEST_BRIDGE_TYPE": "megatron-bridge",
+            "AREAL_TEST_EXPECT_MODEL_THD": "1",
+            "VLM_MODEL_PATH": MOE_MODEL_PATHS["qwen3_vl_moe"],
+        },
     )
 
 

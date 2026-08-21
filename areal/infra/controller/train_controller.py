@@ -4,7 +4,6 @@ import asyncio
 import math
 from typing import Any
 
-import requests
 import torch
 import torch.distributed as dist
 from torchdata.stateful_dataloader import StatefulDataLoader
@@ -26,7 +25,7 @@ from areal.infra.rpc.rtensor import RTensor, flatten_shard_ids
 from areal.infra.utils.concurrent import run_async_task
 from areal.utils import logging, stats_tracker
 from areal.utils.data import make_dummy_eval_item
-from areal.utils.network import find_free_ports, format_hostport
+from areal.utils.network import find_free_ports
 from areal.utils.seqpack import balanced_greedy_partition
 
 from .rollout_callback import RolloutCallback
@@ -227,9 +226,6 @@ class TrainController:
 
         self._worker_role: str = "default"
         self._own_process_group = False
-        self._worker_identities: dict[str, tuple[int, str]] = {}
-        self._engines_destroyed = False
-        self._owns_worker_role = False
 
         self.rollout: RolloutController = None
 
@@ -246,31 +242,14 @@ class TrainController:
             Parallel strategy configuration (currently unused), by default None
         """
         if not dist.is_initialized():
-            excluded_ports: set[int] = set()
-            for attempt in range(3):
-                port = find_free_ports(1, exclude_ports=excluded_ports)[0]
-                try:
-                    dist.init_process_group(
-                        backend="gloo",
-                        init_method=f"tcp://localhost:{port}",
-                        rank=0,
-                        world_size=1,
-                    )
-                except RuntimeError as exc:
-                    message = str(exc).lower()
-                    port_in_use = "eaddrinuse" in message or (
-                        "address" in message and "in use" in message
-                    )
-                    if not port_in_use or attempt == 2:
-                        raise
-                    excluded_ports.add(port)
-                    logger.warning(
-                        "Controller process-group port %d was claimed; retrying",
-                        port,
-                    )
-                    continue
-                self._own_process_group = True
-                break
+            port = find_free_ports(1)[0]
+            dist.init_process_group(
+                backend="gloo",
+                init_method=f"tcp://localhost:{port}",
+                rank=0,
+                world_size=1,
+            )
+            self._own_process_group = True
 
     @property
     def parallel_strategy(self) -> ParallelStrategy:
@@ -311,7 +290,6 @@ class TrainController:
         """
         # Store configuration
         self._worker_role = role
-        self._engines_destroyed = False
 
         world_size = self.train_alloc.parallel.world_size
 
@@ -328,52 +306,35 @@ class TrainController:
         # Create workers via scheduler
         logger.info("Creating workers via scheduler...")
         worker_ids = self.scheduler.create_workers(job=job)
-        self._owns_worker_role = True
         logger.info(f"Workers created: {worker_ids}")
-        try:
-            # Wait for workers to be ready
-            logger.info("Waiting for workers to be ready...")
-            self.workers = self.scheduler.get_workers(role=job.role)
-            logger.info(f"Workers ready: {[w.id for w in self.workers]}")
 
-            # Determine distributed training master address and port from rank 0 worker
-            rank0_worker = self.workers[0]
-            if rank0_worker.engine_ports:
-                self._master_port = int(rank0_worker.engine_ports[1])
-            else:
-                self._master_port = int(rank0_worker.worker_ports[1])
-            self._master_addr = rank0_worker.ip
+        logger.info("Waiting for workers to be ready...")
+        self.workers = self.scheduler.get_workers(role=job.role)
+        logger.info(f"Workers ready: {[w.id for w in self.workers]}")
 
-            logger.info(
-                f"Distributed training: MASTER_ADDR={self._master_addr}, MASTER_PORT={self._master_port}"
-            )
+        rank0_worker = self.workers[0]
+        if rank0_worker.engine_ports:
+            self._master_port = int(rank0_worker.engine_ports[1])
+        else:
+            self._master_port = int(rank0_worker.worker_ports[1])
+        self._master_addr = rank0_worker.ip
 
-            engine_class = self.train_engine
-            run_async_task(
-                self._async_create_engines,
-                f"{engine_class.__module__}.{engine_class.__name__}",
-            )
-            engine_init_kwargs = dict(kwargs)
-            engine_init_kwargs.setdefault("role", role)
-            engine_init_kwargs.setdefault("data_hook_role", role)
-            run_async_task(
-                self._async_initialize_engines, ft_spec, **engine_init_kwargs
-            )
+        logger.info(
+            f"Distributed training: MASTER_ADDR={self._master_addr}, MASTER_PORT={self._master_port}"
+        )
 
-            self._identify_dp_heads()
-            logger.info("TrainController initialization complete")
-        except BaseException as initialize_error:
-            try:
-                self.scheduler.delete_workers(role=job.role, reverse_order=True)
-            except BaseException as cleanup_error:
-                raise ExceptionGroup(
-                    f"Failed to initialize and roll back worker role {job.role!r}",
-                    [initialize_error, cleanup_error],
-                ) from initialize_error
-            self._owns_worker_role = False
-            self.workers.clear()
-            self.workers_is_dp_head.clear()
-            raise
+        engine_class = self.train_engine
+        run_async_task(
+            self._async_create_engines,
+            f"{engine_class.__module__}.{engine_class.__name__}",
+        )
+        engine_init_kwargs = dict(kwargs)
+        engine_init_kwargs.setdefault("role", role)
+        engine_init_kwargs.setdefault("data_hook_role", role)
+        run_async_task(self._async_initialize_engines, ft_spec, **engine_init_kwargs)
+
+        self._identify_dp_heads()
+        logger.info("TrainController initialization complete")
 
     def _engine_name(self, rank: int) -> str:
         """Generate engine name for a worker rank.
@@ -472,10 +433,9 @@ class TrainController:
            threads poll a store whose TCP listener has already been closed.
         """
         logger.info("Destroying TrainController...")
-        cleanup_errors: list[Exception] = []
 
         # First destroy engines to release GPU memory
-        if self.workers and not self._engines_destroyed:
+        if self.workers:
             logger.info("Destroying engines on all workers...")
             try:
 
@@ -498,40 +458,28 @@ class TrainController:
                             f"Engine destroy on rank {rank} raised "
                             f"{type(res).__name__}: {res}"
                         )
-                        cleanup_errors.append(
-                            RuntimeError(f"Engine destroy failed on rank {rank}: {res}")
-                        )
-                if not cleanup_errors:
-                    self._engines_destroyed = True
                 logger.info("Engines destroyed")
             except Exception as e:
                 logger.error(f"Error destroying engines: {e}")
-                cleanup_errors.append(e)
 
         # Then delete workers via scheduler. Pass reverse_order=True so
         # that rank-0 (TCPStore owner) is killed last. All in-tree
         # Scheduler implementations (Local/Ray/Slurm) accept this kwarg;
         # third-party subclasses that override ``delete_workers`` must
         # adopt the same signature.
-        if self._owns_worker_role:
-            try:
-                logger.info("Deleting all workers (reverse rank order)...")
-                self.scheduler.delete_workers(
-                    role=self._worker_role, reverse_order=True
-                )
-                logger.info("Workers deleted")
-                self.workers.clear()
-                self.workers_is_dp_head.clear()
-                self._owns_worker_role = False
-            except Exception as e:
-                logger.error(f"Error deleting workers: {e}")
-                cleanup_errors.append(e)
+        try:
+            logger.info("Deleting all workers (reverse rank order)...")
+            self.scheduler.delete_workers(role=self._worker_role, reverse_order=True)
+            logger.info("Workers deleted")
+        except Exception as e:
+            logger.error(f"Error deleting workers: {e}")
+
+        self.workers.clear()
+        self.workers_is_dp_head.clear()
 
         if dist.is_initialized() and self._own_process_group:
             dist.destroy_process_group()
         logger.info("TrainController destroyed")
-        if cleanup_errors:
-            raise ExceptionGroup("TrainController cleanup failed", cleanup_errors)
 
     def _custom_function_call(
         self,
@@ -854,64 +802,6 @@ class TrainController:
         ]
         if failures:
             raise ExceptionGroup(f"Train worker collective {method} failed", failures)
-
-    def capture_worker_identity(self) -> None:
-        """Record the exact worker processes owned by this controller."""
-        self._worker_identities = self._query_worker_identities()
-        logger.info(
-            "Captured %s worker identities: %s",
-            self._worker_role,
-            self._worker_identities,
-        )
-
-    def assert_worker_identity(self) -> None:
-        """Reject dead or replaced workers before a collective onload."""
-        if not self._worker_identities:
-            raise RuntimeError("Train worker identity was not captured")
-        actual = self._query_worker_identities()
-        if actual != self._worker_identities:
-            raise RuntimeError(
-                "Train worker identity changed: "
-                f"expected {self._worker_identities}, got {actual}"
-            )
-
-    def _query_worker_identities(self) -> dict[str, tuple[int, str]]:
-        identities: dict[str, tuple[int, str]] = {}
-        for rank, worker in enumerate(self.workers):
-            url = (
-                f"http://{format_hostport(worker.ip, int(worker.worker_ports[0]))}"
-                "/health"
-            )
-            try:
-                response = requests.get(url, timeout=2.0)
-                response.raise_for_status()
-                health = response.json()
-            except (requests.RequestException, ValueError) as exc:
-                raise RuntimeError(
-                    f"MOPD teacher worker {worker.id!r} is not healthy"
-                ) from exc
-            if not isinstance(health, dict):
-                raise RuntimeError(
-                    f"MOPD teacher worker {worker.id!r} returned invalid health: "
-                    f"{health!r}"
-                )
-            expected_engine = self._engine_name(rank)
-            pid = health.get("pid")
-            generation = health.get("generation")
-            if (
-                health.get("role") != self._worker_role
-                or health.get("worker_index") != rank
-                or expected_engine not in health.get("engines", ())
-                or not isinstance(pid, int)
-                or not isinstance(generation, str)
-                or not generation
-            ):
-                raise RuntimeError(
-                    f"MOPD teacher worker {worker.id!r} has unexpected identity: "
-                    f"{health}"
-                )
-            identities[worker.id] = (pid, generation)
-        return identities
 
     def get_device_stats(self):
         return self._custom_function_call("get_device_stats")

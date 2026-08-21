@@ -339,7 +339,80 @@ actor:
 
 **奖励**：AReaL假设基于结果的奖励。每个可能由连接的LLM输入-输出对组成的轨迹，在序列级而非token级被分配一个标量奖励。
 
-**优势**：AReaL为轨迹中的每个输出token计算逐token优势。PPO算法将结果奖励视为最后一个token的奖励，所有前面的token奖励为0。然后AReaL通过沿token轨迹的广义优势估计（GAE）应用标准折扣和TD误差反向传播来计算每个token的优势。当折扣因子为1时，优势值等于结果奖励，并有效地广播到轨迹中的每个token。
+**优势**：AReaL为轨迹中的每个输出token计算逐token优势。PPO算法将结果奖励视为最后一个token的奖励，所有前面的token奖励为0。然后AReaL通过广义优势估计（GAE）应用标准折扣和TD误差反向传播来计算每个token的优势。使用默认的token级递推时，如果`discount=1`、`gae_lambda=1`、critic value为0且禁用KL正则化，终止结果奖励会等效广播到每个生成token。
+
+### GAE时间步单位
+
+`actor.gae_timestep_unit`用于选择GAE按生成token还是生成turn推进。Prompt、tool、padding及其他被mask的位置都不会消耗GAE时间步。
+
+#### Token级GAE
+
+`token`是默认值，并保留AReaL原有行为。对于相邻的有效生成token，AReaL计算：
+
+$$
+\delta_t = r_t + \gamma V_{t+1} - V_t, \qquad
+A_t = \delta_t + \gamma \lambda A_{t+1}, \qquad
+G_t = A_t + V_t,
+$$
+
+其中$\gamma$为`actor.discount`，$\lambda$为`actor.gae_lambda`配置解析出的逐轨迹取值。奖励$r_t$包含结果奖励增量和token级KL惩罚。以EOS结束的轨迹使用0作为终止bootstrap；没有EOS的截断轨迹则使用最后一个value估计进行bootstrap。
+
+#### Turn级GAE
+
+`turn`将每个非空生成turn视为一个宏观时间步。对于turn $u$，AReaL将其中的task reward增量求和为$r_u^{\mathrm{task}}$，并使用该turn第一个有效action token位置的value作为$V_u$，然后计算：
+
+$$
+\delta_u^{\mathrm{task}}
+= r_u^{\mathrm{task}} + \gamma V_{u+1} - V_u, \qquad
+A_u^{\mathrm{task}}
+= \delta_u^{\mathrm{task}} + \gamma \lambda A_{u+1}^{\mathrm{task}}.
+$$
+
+Task advantage $A_u^{\mathrm{task}}$和critic target $G_u=A_u^{\mathrm{task}}+V_u$会广播到该turn中的每个有效token。Token级KL不会进入turn递推和critic target；在可选的`actor.adv_norm`之前，turn $u$中token $j$的actor advantage为$A_{u,j}=A_u^{\mathrm{task}}+r_{u,j}^{\mathrm{KL}}$。这样可以避免先对一个turn的KL惩罚求和，再将总和广播回每个token。
+
+### 动态GAE lambda
+
+`actor.gae_lambda`既可以是静态float，也可以是callable的点分路径。`actor.gae_lambda_kwargs`用于向callable传递关键字参数，配置静态float时会被忽略。该函数接收包含三个`[B]`形状tensor的context：
+
+- `effective_token_lengths`：有效生成token数量，包括有效的EOS token；
+- `turn_counts`：非空生成turn数量；token模式缺少`turn_ids`时为0；
+- `timestep_lengths`：由`gae_timestep_unit`选择的长度$L$。
+
+Callable必须在相同device上返回`[B]`形状的有限浮点tensor，即每条本地轨迹一个lambda。返回的lambda会用于该轨迹的所有选定时间步。
+
+内置了两个长度自适应函数：
+
+| 函数路径 | 参数 | 定义 |
+| --- | --- | --- |
+| `areal.trainer.ppo.lambda_fn.vapo_length_adaptive_gae` | `alpha > 0` | $L>0$时$\lambda=\max(0, 1 - 1/(\alpha L))$；$L=0$时取0。 |
+| `areal.trainer.ppo.lambda_fn.relative_position_gae_lambda` | `0 < q <= 1` | $L\ge2$时$\lambda=q^{1/(L-1)}$；$L=1$时取1，$L=0$时取0。相对保留率解释假设$\gamma=1$。 |
+
+配置示例：
+
+```yaml
+actor:
+  gae_timestep_unit: turn
+  gae_lambda: areal.trainer.ppo.lambda_fn.relative_position_gae_lambda
+  gae_lambda_kwargs:
+    q: 0.5
+```
+
+### 自定义workflow的`turn_ids`约定
+
+Turn级GAE要求workflow返回原始、与token对齐的`turn_ids`；actor会在内部将其与next-token prediction mask对齐。该tensor必须满足：
+
+- 与`input_ids`和`loss_mask`形状相同（batch后为`[B, S]`）；
+- 使用整数dtype（建议使用有符号整数来表示`-1`哨兵值）；
+- 为每个有效生成token分配`[0, S)`范围内的ID；
+- 有效ID随时间单调不减，同一个assistant turn中的所有token使用相同ID；
+- prompt、user、tool、padding及其他非loss位置使用`-1`。
+
+编号允许跳跃且不会额外消耗GAE时间步，但建议从0开始连续编号。自定义workflow可以按如下方式构造该字段；不要在workflow中进行roll：
+
+```python
+turn_ids += [-1] * input_len + [turn_idx] * resp.output_len
+result["turn_ids"] = torch.tensor(turn_ids, dtype=torch.int32).unsqueeze(0)
+```
 
 ## AReaL实现说明
 
@@ -348,5 +421,4 @@ AReaL的GRPO实现在两个关键方面与原始DeepSeekMath论文不同：
 **长度归一化**：AReaL从原始GRPO目标中移除了逐token长度归一化项。这与 [Dr.GRPO](https://arxiv.org/abs/2503.20783)
 的建议一致，并消除了优势估计中的偏差。
 
-**KL正则化**：AReaL不是将KL散度项直接添加到目标函数中，而是将KL正则化纳入优势估计（PPO风格）。KL惩罚通过 `KLEstimator`
-计算，并在GAE计算之前添加到逐token奖励中，由 `actor.kl_ctl` 参数控制。
+**KL正则化**：AReaL不是将KL散度项直接添加到目标函数中，而是通过`actor.kl_ctl`将KL正则化纳入actor advantage（PPO风格）。在token模式下，`KLEstimator`计算的惩罚会在GAE之前加入逐token奖励；在turn模式下，它仅作为token局部的actor惩罚，不进入turn递推和critic target。

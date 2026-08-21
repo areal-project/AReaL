@@ -4,32 +4,16 @@
 
 from __future__ import annotations
 
-import argparse
-import json
 import os
 import sys
 from pathlib import Path
 from typing import Any
 
-from omegaconf import OmegaConf
-
 from areal import PPOTrainer
 from areal.api import AsyncRewardWrapper
-from areal.api.alloc_mode import ModelAllocation, ParallelStrategy
-from areal.api.cli_args import (
-    GRPOConfig,
-    conf_as_dict,
-    load_expr_config,
-    to_structured_cfg,
-)
+from areal.api.cli_args import GRPOConfig, load_expr_config
 from areal.dataset import get_custom_dataset
 from areal.reward import gsm8k_reward_fn
-from areal.trainer.mopd.compatibility import (
-    model_fingerprint as core_model_fingerprint,
-)
-from areal.trainer.mopd.compatibility import (
-    validate_mopd_model_compatibility,
-)
 from areal.utils.hf_utils import load_hf_tokenizer
 
 MOPD_ROUTE = "gsm8k"
@@ -81,15 +65,6 @@ class GSM8KRewardDistillationAgent:
             answer=data["answer"],
         )
         return {response.id: float(reward)}
-
-
-# Keep existing launch commands and external imports working after the agent rename.
-NoRewardDistillationAgent = GSM8KRewardDistillationAgent
-
-
-def model_fingerprint(path: Path) -> dict[str, object]:
-    """Compatibility wrapper for the core MOPD model fingerprint."""
-    return core_model_fingerprint(path)
 
 
 def add_mopd_route(sample: dict[str, Any]) -> dict[str, Any]:
@@ -160,68 +135,6 @@ def load_routed_gsm8k_dataset(
     return dataset
 
 
-def validate_heterogeneous_models(
-    actor_path: Path,
-    teacher_paths: dict[str, Path],
-) -> dict[str, dict[str, object]]:
-    """Require core persistent-teacher and token compatibility invariants."""
-    return validate_mopd_model_compatibility(actor_path, teacher_paths)
-
-
-def dry_run(config_path: Path) -> None:
-    """Validate the local topology and checkpoints without starting GPU workers."""
-    raw = OmegaConf.load(config_path)
-    config = OmegaConf.to_object(to_structured_cfg(raw, GRPOConfig))
-    assert isinstance(config, GRPOConfig) and config.mopd is not None
-
-    if config.scheduler.type != "local":
-        raise ValueError("This example requires scheduler.type=local")
-    if config.cluster.n_nodes != 1 or config.cluster.n_gpus_per_node != 8:
-        raise ValueError("This example requires one node with eight GPUs")
-    if MOPD_ROUTE not in config.mopd.routes:
-        raise ValueError(f"Missing required MOPD route {MOPD_ROUTE!r}")
-
-    actor = ModelAllocation.from_str(config.actor.backend, name="actor")
-    teacher = ModelAllocation.from_str(
-        config.mopd.teacher_engine.backend, name="mopd-teacher"
-    )
-    if not ParallelStrategy.parallelism_eq(actor.parallel, teacher.parallel):
-        raise ValueError("actor and teacher parallel strategies differ")
-
-    fingerprints = validate_heterogeneous_models(
-        Path(config.actor.path),
-        {
-            teacher_id: Path(spec.path)
-            for teacher_id, spec in config.mopd.teachers.items()
-        },
-    )
-    dataset_paths = [config.train_dataset.path]
-    if config.valid_dataset is not None:
-        dataset_paths.append(config.valid_dataset.path)
-    for dataset_path in dataset_paths:
-        if not Path(dataset_path).is_dir():
-            raise FileNotFoundError(f"Missing local dataset: {dataset_path}")
-
-    report = {
-        "scheduler": config.scheduler.type,
-        "cluster": {
-            "n_nodes": config.cluster.n_nodes,
-            "n_gpus_per_node": config.cluster.n_gpus_per_node,
-        },
-        "parallel": {
-            "world_size": actor.parallel.world_size,
-            "tp": actor.parallel.tp_size,
-            "pp": actor.parallel.pp_size,
-            "dp": actor.parallel.dp_size,
-        },
-        "routes": config.mopd.routes,
-        "fingerprints": fingerprints,
-        "dataset": config.train_dataset.path,
-        "resolved_config": conf_as_dict(config),
-    }
-    print(json.dumps(report, indent=2, default=str))
-
-
 def train(argv: list[str]) -> None:
     """Run pure MOPD and report GSM8K rewards as rollout metrics."""
     config, _ = load_expr_config(argv, GRPOConfig)
@@ -264,18 +177,5 @@ def train(argv: list[str]) -> None:
         )
 
 
-def main(argv: list[str]) -> None:
-    parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("--config", type=Path)
-    parser.add_argument("--dry-run", action="store_true")
-    known, _ = parser.parse_known_args(argv)
-    if known.dry_run:
-        if known.config is None:
-            raise ValueError("--config is required with --dry-run")
-        dry_run(known.config)
-        return
-    train(argv)
-
-
 if __name__ == "__main__":
-    main(sys.argv[1:])
+    train(sys.argv[1:])

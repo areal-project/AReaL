@@ -10,11 +10,9 @@ from areal.api.cli_args import (
     MOPDConfig,
     MOPDLossConfig,
     MOPDTeacherEngineConfig,
-    MOPDTeacherManagerConfig,
     MOPDTeacherSpec,
     PPOActorConfig,
     PPOConfig,
-    SchedulerConfig,
     SchedulingStrategy,
     TeacherConfig,
     to_structured_cfg,
@@ -182,6 +180,11 @@ def test_mopd_loss_config_invalid_coefficient_raises(coefficient):
         MOPDLossConfig(rl_coefficient=coefficient)
 
 
+def test_mopd_loss_config_rejects_disabled_objective():
+    with pytest.raises(ValueError, match="cannot both be zero"):
+        MOPDLossConfig(rl_coefficient=0.0, distillation_coefficient=0.0)
+
+
 @pytest.mark.parametrize("fork", [False, True])
 def test_mopd_config_rollout_colocation_accepts_both_fork_modes(fork):
     """MOPD supports reused and process-isolated rollout workers."""
@@ -245,47 +248,6 @@ def test_mopd_config_pipeline_parallelism_accepts_matching_topology():
     assert config.mopd.teacher_engine.backend == backend
 
 
-def test_mopd_config_local_memory_multi_node_raises():
-    """Local-memory checkpoint staging cannot span multiple compute nodes."""
-    actor = PPOActorConfig(backend="megatron:d16", weight_update_mode="awex")
-    teacher_engine = MOPDTeacherEngineConfig(
-        backend="megatron:d16",
-        optimizer=None,
-        disable_dropout=True,
-        scheduling_strategy=_colocation(fork=True),
-    )
-    manager = MOPDTeacherManagerConfig(type="local_memory")
-
-    with pytest.raises(ValueError, match="single node"):
-        _ppo_config(
-            _mopd_config(teacher_engine=teacher_engine, manager=manager),
-            actor=actor,
-            scheduler=SchedulerConfig(type="local"),
-        )
-
-
-@pytest.mark.parametrize("scheduler_type", ["ray", "slurm", None])
-def test_mopd_config_local_memory_requires_same_host_local_scheduler(scheduler_type):
-    """Controller-local staging is rejected when workers may run remotely."""
-    manager = MOPDTeacherManagerConfig(type="local_memory")
-
-    with pytest.raises(ValueError, match="scheduler.type='local'"):
-        _ppo_config(
-            _mopd_config(manager=manager),
-            scheduler=SchedulerConfig(type=scheduler_type),
-        )
-
-
-def test_mopd_config_local_memory_accepts_local_scheduler():
-    """LocalScheduler guarantees controller and fork workers share one host."""
-    config = _ppo_config(
-        _mopd_config(manager=MOPDTeacherManagerConfig(type="local_memory")),
-        scheduler=SchedulerConfig(type="local"),
-    )
-
-    assert config.mopd.manager.type == "local_memory"
-
-
 def test_mopd_config_teacher_v2_raises():
     """MOPD fails fast before selecting a controller without v1 lifecycle APIs."""
     teacher_engine = MOPDTeacherEngineConfig(
@@ -319,16 +281,3 @@ def test_mopd_and_legacy_teacher_are_mutually_exclusive():
 
     with pytest.raises(ValueError, match="cannot be configured at the same time"):
         _ppo_config(_mopd_config(), teacher=legacy_teacher)
-
-
-def test_legacy_teacher_emits_deprecation_warning():
-    """The single-teacher path remains available for one compatibility period."""
-    legacy_teacher = TeacherConfig(
-        engine_type="train",
-        train=MOPDTeacherEngineConfig(backend=MEGATRON_BACKEND),
-    )
-
-    with pytest.warns(DeprecationWarning, match="single-teacher"):
-        config = _ppo_config(teacher=legacy_teacher)
-
-    assert config.teacher is legacy_teacher

@@ -53,7 +53,6 @@ mopd:
     scheduling_spec: ${actor.scheduling_spec}
   manager:
     type: disk
-    staging_root: /dev/shm/areal-mopd
   loss:
     rl_coefficient: 0.0
     distillation_coefficient: 0.005
@@ -62,21 +61,20 @@ mopd:
 每条 dataset item 必须包含 `task_type_identifier` 指定的字段，其值必须匹配 `routes` 中的
 key。route 只能引用已知 teacher ID，并且必须至少包含一个正权重。
 
-`manager.type: disk` 从共享存储加载 checkpoint，支持多节点运行。`local_memory` 将
-checkpoint 暂存到 `staging_root`，仅支持 controller 与 teacher worker 同机的
-LocalScheduler；Ray 和 Slurm 不保证本地文件系统可见。启动时会清理由已退出 owner 遗留的
-MOPD 暂存目录。
+`manager.type: disk` 从共享存储加载 checkpoint，支持多节点运行。
 
 对 teacher 权重 $w_j$，定义 $S_T(a)=\sum_j w_j\log\pi_{T_j}(a)$ 和
 $W=\sum_j w_j$。MOPD 使用 on-policy score-function surrogate 最小化未归一化的加权
 reverse KL：$\sum_j w_j D_{KL}(\pi_\theta \parallel \pi_{T_j})$。
 
 ```text
-rho(a) = exp(log pi_theta(a) - log pi_old(a))
+rho(a) = min(exp(log pi_theta(a) - log pi_old(a)), importance_ratio_cap)
 reward(a) = S_T(a) - W * stop_gradient(log pi_theta(a))
 mopd_loss = -mean(rho(a) * reward(a))
 loss = rl_coefficient * rl_loss + distillation_coefficient * mopd_loss
 ```
+
+`importance_ratio_cap` 默认值为 `5.0`，用于限制重要性采样乘数并避免指数溢出。
 
 该目标是多个 reverse-KL 的加权和；忽略与 student 无关的常数后，也等价于几何 teacher
 ensemble。它不是 teacher cross-entropy，也不是 teacher 概率的算术混合。route 权重直接生效，
