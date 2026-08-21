@@ -8,6 +8,7 @@ import torch
 
 from areal.api import TrainEngine
 from areal.api.cli_args import MicroBatchSpec, PPOActorConfig, RejectionSamplingConfig
+from areal.engine.core import stage_batch_for_engine
 from areal.infra import TrainController
 from areal.infra.rpc.serialization import serialize_value
 from areal.trainer.ppo.gae import (
@@ -166,6 +167,7 @@ class PPOActor:
 
     def _compute_logp(self, data: dict[str, Any]) -> torch.Tensor | None:
         self.engine.eval()
+        stage_batch_for_engine(data, self.engine)
         return self.engine.forward(
             input_=data,
             aggregate_fn=lambda xs: torch.cat(xs, dim=-1),
@@ -449,6 +451,10 @@ class PPOActor:
         # Note: "versions" is kept if needed for approximation/metrics in loss function
         for key in ["rewards", "tot_rewards", "kl_rewards"]:
             data.pop(key, None)
+        # Megatron keeps the full batch on CPU and streams only the current
+        # microbatch to the accelerator. Stage before the outer PPO split so
+        # that split does not retain every optimizer minibatch on GPU.
+        stage_batch_for_engine(data, self.engine)
         # NOTE: calling engine.train() is critical to enabling gradient checkpointing
         self.engine.train()
         mb_inputs = split_padded_tensor_dict_into_mb_list(

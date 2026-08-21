@@ -7,6 +7,7 @@ import torch
 
 from areal.api import TrainEngine
 from areal.api.cli_args import MicroBatchSpec, PPOCriticConfig
+from areal.engine.core import stage_batch_for_engine
 from areal.infra import TrainController
 from areal.infra.rpc.serialization import serialize_value
 from areal.trainer.ppo.stats import infer_token_denominator
@@ -34,6 +35,7 @@ class PPOCritic:
 
     def _compute_values(self, data: dict[str, Any]) -> torch.Tensor:
         self.engine.eval()
+        stage_batch_for_engine(data, self.engine)
         return self.engine.forward(
             input_=data,
             aggregate_fn=lambda xs: torch.cat([x.squeeze(-1) for x in xs], dim=-1),
@@ -55,6 +57,8 @@ class PPOCritic:
 
         for key in ["rewards", "tot_rewards", "kl_rewards", "versions"]:
             data.pop(key, None)
+
+        stage_batch_for_engine(data, self.engine)
 
         # NOTE: calling engine.train() is critical to enabling gradient checkpointing
         self.engine.train()

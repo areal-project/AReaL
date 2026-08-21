@@ -225,9 +225,11 @@ class TestEvalBatchPadding:
             mb_list=mb_list,
             loss_weight_fn=lambda _mb: torch.tensor(0.0),
             dp_group=cast(dist.ProcessGroup, object()),
+            device=torch.device("cpu"),
         )
 
         torch.testing.assert_close(total_weight, torch.tensor(3.0), rtol=0.0, atol=0.0)
+        assert total_weight.device.type == "cpu"
 
 
 class TestRWDispatchGrouping:
@@ -432,3 +434,30 @@ class TestExplicitEvalDispatchControllers:
 
         assert stats["n_pairs"] == 0.0
         assert "loss/avg" not in stats
+
+    @pytest.mark.parametrize("method_name", ["_train_rw", "_evaluate_rw"])
+    def test_rw_empty_batch_logs_stats_on_engine_device(self, method_name: str):
+        engine_device = torch.device("cuda:3")
+
+        class _DummyEngine:
+            device = engine_device
+
+            def train(self) -> None:
+                return None
+
+            def eval(self) -> None:
+                return None
+
+            def train_batch(self, **kwargs) -> dict[str, float]:
+                del kwargs
+                return {}
+
+            def eval_batch(self, **kwargs) -> None:
+                del kwargs
+                return None
+
+        with patch("areal.trainer.rw.rw_engine._log_empty_rw_stats") as log_empty_stats:
+            method = getattr(RWEngine(_DummyEngine()), method_name)
+            method(_make_rw_input([0, 0]))
+
+        log_empty_stats.assert_called_once_with(engine_device)
