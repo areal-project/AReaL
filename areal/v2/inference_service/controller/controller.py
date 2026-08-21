@@ -1592,6 +1592,7 @@ class RolloutControllerV2:
             discount=turn_discount,
             export_style=export_style,
             group_size=group_size,
+            drop_retry_orphans=agent_cfg.drop_retry_orphans,
         )
 
     def _resolve_workflow(
@@ -1646,6 +1647,9 @@ class RolloutControllerV2:
 
             online_kwargs = dict(workflow_kwargs or {})
             online_kwargs.pop("controller", None)
+            online_kwargs.setdefault(
+                "drop_retry_orphans", self._agent_config.drop_retry_orphans
+            )
             return InferenceServiceWorkflow(
                 controller=self,
                 agent=None,
