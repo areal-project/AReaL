@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import threading
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -26,6 +28,8 @@ def _reset_server_globals(monkeypatch):
     monkeypatch.setattr(srv, "_admin_api_key", _ADMIN_KEY)
     monkeypatch.setattr(srv, "_lock", threading.Lock())
     monkeypatch.setattr(srv, "_last_cleanup_time", 0.0)
+    monkeypatch.setattr(srv, "_engine", None)
+    monkeypatch.setattr(srv, "_openai_client", None)
 
 
 httpx = pytest.importorskip("httpx")
@@ -162,6 +166,41 @@ class TestEndSessionInteractionCount:
             assert resp_end.status_code == 200
             data = resp_end.json()
             assert data["interaction_count"] == 0
+
+
+def test_setup_openai_client_loads_and_passes_vlm_processor(monkeypatch):
+    """The v1 proxy should reuse the model processor for trajectory export."""
+    processor = SimpleNamespace(image_processor=object())
+    tokenizer = object()
+    agent_config = SimpleNamespace(
+        tool_call_parser="qwen25",
+        reasoning_parser="qwen3",
+        engine_max_tokens=4096,
+        chat_template_type="concat",
+        session_timeout_seconds=60,
+        admin_api_key="test-admin-key",
+        message_preprocessors=[],
+        prefix_matcher=None,
+    )
+    engine_config = SimpleNamespace(
+        tokenizer_path="test-vlm",
+        agent=agent_config,
+        lora_name="",
+    )
+    monkeypatch.setattr(srv, "_engine", SimpleNamespace(config=engine_config))
+    monkeypatch.setattr(
+        srv,
+        "load_hf_processor_and_tokenizer",
+        lambda _path: (processor, tokenizer),
+    )
+    client_cls = MagicMock()
+    monkeypatch.setattr(srv, "ArealOpenAI", client_cls)
+    monkeypatch.setattr(srv, "validate_admin_api_key", lambda *_args, **_kwargs: None)
+
+    srv._setup_openai_client()
+
+    assert client_cls.call_args.kwargs["processor"] is processor
+    assert client_cls.call_args.kwargs["tokenizer"] is tokenizer
 
 
 # ---------------------------------------------------------------------------
