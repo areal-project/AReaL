@@ -33,7 +33,7 @@ class _FakeTokenizer:
         **_kwargs,
     ):
         tokens = [10, 2, 20] if len(messages) == 1 else [10, 2, 20, 30, 2, 40]
-        return tokens if tokenize else f"message_count={len(messages)}"
+        return {"input_ids": tokens} if tokenize else f"message_count={len(messages)}"
 
     def decode(self, tokens):
         return " ".join(str(token) for token in tokens)
