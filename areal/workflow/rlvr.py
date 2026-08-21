@@ -166,12 +166,14 @@ class RLVRWorkflow(RolloutWorkflow):
         logprobs = [0.0] * resp.input_len + resp.output_logprobs
         loss_mask = [0] * resp.input_len + [1] * resp.output_len
         versions = [-1] * resp.input_len + resp.output_versions
+        turn_ids = [-1] * resp.input_len + [0] * resp.output_len
 
         res = {
             "input_ids": torch.tensor(seq, dtype=torch.int32),
             "loss_mask": torch.tensor(loss_mask, dtype=torch.int32),
             "logprobs": torch.tensor(logprobs, dtype=torch.float32),
             "versions": torch.tensor(versions, dtype=torch.int32),
+            "turn_ids": torch.tensor(turn_ids, dtype=torch.int32),
             "attention_mask": torch.ones(len(seq), dtype=torch.bool),
             "rewards": torch.tensor(reward, dtype=torch.float32),
         }

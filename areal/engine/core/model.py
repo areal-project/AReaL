@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
+from enum import Enum
+
 import torch
 
 VALID_VISION_MODELS = [
@@ -83,6 +85,28 @@ def is_qwen3_moe_model(model_type: str) -> bool:
 
 def is_qwen3_5_model(model_type: str) -> bool:
     return model_type in ["qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text"]
+
+
+class SequencePackingMode(str, Enum):
+    WRAPPER_THD = "wrapper_thd"
+    MODEL_THD = "model_thd"
+    PADDED = "padded"
+
+
+def supports_model_packed_seq(model_type: str, bridge_type: str) -> bool:
+    """Whether the bridge model owns BSHD-to-THD packing internally."""
+    return bridge_type == "megatron-bridge" and is_qwen3_vl_model(model_type)
+
+
+def resolve_sequence_packing_mode(
+    model_type: str, bridge_type: str
+) -> SequencePackingMode:
+    """Select one packing path from the model and bridge contract."""
+    if supports_model_packed_seq(model_type, bridge_type):
+        return SequencePackingMode.MODEL_THD
+    if is_valid_vision_model(model_type) or is_qwen3_5_model(model_type):
+        return SequencePackingMode.PADDED
+    return SequencePackingMode.WRAPPER_THD
 
 
 def requires_padded_seq(model_type: str) -> bool:

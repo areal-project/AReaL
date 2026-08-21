@@ -143,6 +143,7 @@ class VisionRLVRWorkflow(RLVRWorkflow):
         logprobs = [0.0] * resp.input_len + resp.output_logprobs
         loss_mask = [0] * resp.input_len + [1] * resp.output_len
         versions = [-1] * resp.input_len + resp.output_versions
+        turn_ids = [-1] * resp.input_len + [0] * resp.output_len
 
         # Build multi-modal input
         multi_modal_input = [
@@ -162,6 +163,7 @@ class VisionRLVRWorkflow(RLVRWorkflow):
             "logprobs": torch.tensor(logprobs, dtype=torch.float32).unsqueeze(0),
             "multi_modal_input": multi_modal_input,
             "versions": torch.tensor(versions, dtype=torch.int32).unsqueeze(0),
+            "turn_ids": torch.tensor(turn_ids, dtype=torch.int32).unsqueeze(0),
             "attention_mask": torch.ones(len(seq), dtype=torch.bool).unsqueeze(0),
             "rewards": torch.tensor(reward, dtype=torch.float32).unsqueeze(0),
         }

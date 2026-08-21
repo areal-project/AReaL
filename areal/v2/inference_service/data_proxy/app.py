@@ -30,6 +30,7 @@ from areal.infra.rpc.serialization import serialize_value
 from areal.infra.utils.http import create_httpx_client
 from areal.utils import logging
 from areal.utils.data import concat_padded_tensors
+from areal.utils.seeding import derive_deterministic_seed
 from areal.v2.inference_service.data_proxy.config import DataProxyConfig
 from areal.v2.inference_service.data_proxy.pause import PauseState
 from areal.v2.inference_service.data_proxy.session import (
@@ -472,7 +473,11 @@ def create_app(config: DataProxyConfig) -> FastAPI:
         for i in range(group_size):
             try:
                 session_id, session_api_key = store.start_session(
-                    body.task_id, body.api_key if i == 0 else None
+                    body.task_id,
+                    body.api_key if i == 0 else None,
+                    sampling_seed_identity=(
+                        f"{body.task_id}:{i}" if group_size > 1 else body.task_id
+                    ),
                 )
             except ValueError as e:
                 raise HTTPException(status_code=409, detail=str(e))
@@ -660,6 +665,20 @@ def create_app(config: DataProxyConfig) -> FastAPI:
             kwargs["temperature"] = 1.0
         if "top_p" not in kwargs:
             kwargs["top_p"] = 1.0
+
+        deterministic_sampling = (
+            session is not None and app.state.config.deterministic_sampling
+        )
+        request_index = (
+            session.next_sampling_request_index() if deterministic_sampling else None
+        )
+        if deterministic_sampling and kwargs.get("seed") is None:
+            assert session is not None
+            assert request_index is not None
+            kwargs["seed"] = derive_deterministic_seed(
+                session.sampling_seed_identity,
+                request_index,
+            )
 
         create_fn: Any = areal_client.chat.completions.create
 

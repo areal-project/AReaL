@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import httpx
 import pytest
@@ -76,6 +76,37 @@ class TestInferenceEngineConfigForInferenceService:
         cfg = InferenceEngineConfig(backend="sglang:d1")
         assert cfg.dump_to_file is False
 
+    def test_deterministic_sampling_with_offpolicy_head_warns(self):
+        with patch("areal.api.cli_args.logger") as mock_logger:
+            InferenceEngineConfig(
+                backend="sglang:d1",
+                deterministic_sampling=True,
+                max_head_offpolicyness=1,
+            )
+
+        mock_logger.warning.assert_called_once()
+        assert "task-to-weight-version" in mock_logger.warning.call_args.args[0]
+
+    def test_deterministic_sampling_onpolicy_does_not_warn(self):
+        with patch("areal.api.cli_args.logger") as mock_logger:
+            InferenceEngineConfig(
+                backend="sglang:d1",
+                deterministic_sampling=True,
+                max_head_offpolicyness=0,
+            )
+
+        mock_logger.warning.assert_not_called()
+
+    def test_nondeterministic_sampling_with_offpolicy_head_does_not_warn(self):
+        with patch("areal.api.cli_args.logger") as mock_logger:
+            InferenceEngineConfig(
+                backend="sglang:d1",
+                deterministic_sampling=False,
+                max_head_offpolicyness=1,
+            )
+
+        mock_logger.warning.assert_not_called()
+
 
 # =============================================================================
 # RolloutControllerV2 — workflow resolution helpers
@@ -141,7 +172,11 @@ class TestControllerWorkflowResolution:
 
     def test_resolve_workflow_with_agent_class(self):
         """Test _resolve_workflow wraps agent-like classes in InferenceServiceWorkflow."""
-        cfg = InferenceEngineConfig(backend="sglang:d1", admin_api_key="test-key")
+        cfg = InferenceEngineConfig(
+            backend="sglang:d1",
+            admin_api_key="test-key",
+            serialize_group_samples=True,
+        )
         scheduler = MagicMock(n_gpus_per_node=8)
         controller = RolloutControllerV2(config=cfg, scheduler=scheduler)
         controller._gateway_addr = "http://test:8080"
@@ -157,6 +192,7 @@ class TestControllerWorkflowResolution:
         assert isinstance(resolved, InferenceServiceWorkflow)
         assert resolved.agent is not None
         assert hasattr(resolved, "arun_episode")
+        assert resolved.serialize_group_samples is True
 
     def test_resolve_workflow_agent_class_without_gateway_raises(self):
         controller = RolloutControllerV2(
@@ -357,9 +393,10 @@ class TestRolloutControllerV2Construction:
         controller.config_perf_tracer()
         controller.save_perf_tracer()
 
+    @pytest.mark.parametrize("deterministic_sampling", [False, True])
     @pytest.mark.asyncio
-    async def test_async_initialize_passes_callback_and_reward_timeout_to_data_proxy(
-        self,
+    async def test_async_initialize_passes_config_to_data_proxy(
+        self, deterministic_sampling
     ):
         from areal.api.cli_args import SchedulingSpec
         from areal.api.io_struct import LocalInfServerInfo
@@ -375,6 +412,7 @@ class TestRolloutControllerV2Construction:
             backend="sglang:d1",
             tokenizer_path="mock-tokenizer",
             request_timeout=15.0,
+            deterministic_sampling=deterministic_sampling,
             agent=AgentConfig(
                 agent_cls_path="tests.experimental.openai.utils.SimpleAgent",
                 set_reward_finish_timeout=7.5,
@@ -418,6 +456,7 @@ class TestRolloutControllerV2Construction:
         assert "7.5" in data_proxy_cmd
         assert "--callback-server-addr" in data_proxy_cmd
         assert "http://127.0.0.1:19000" in data_proxy_cmd
+        assert ("--deterministic-sampling" in data_proxy_cmd) is deterministic_sampling
 
 
 class TestOnlineCallbackFlow:
@@ -533,6 +572,80 @@ class TestOnlineCallbackFlow:
 
 
 class TestInferenceServiceWorkflow:
+    async def _run_offline_group(
+        self,
+        *,
+        serialize_group_samples: bool,
+        failing_member: int | None = None,
+    ):
+        active = 0
+        max_active = 0
+        start_order: list[int] = []
+        all_started = asyncio.Event()
+
+        class MockAgent:
+            async def run(self, data, **kwargs):
+                del data
+                nonlocal active, max_active
+                member_index = int(kwargs["api_key"].rsplit("-", 1)[1])
+                start_order.append(member_index)
+                active += 1
+                max_active = max(max_active, active)
+                try:
+                    if serialize_group_samples:
+                        await asyncio.sleep(0)
+                    else:
+                        if active == 4:
+                            all_started.set()
+                        await asyncio.wait_for(all_started.wait(), timeout=1.0)
+                    if member_index == failing_member:
+                        raise RuntimeError(f"member {member_index} failed")
+                    return float(member_index)
+                finally:
+                    active -= 1
+
+        controller = MagicMock()
+        controller.get_version.return_value = 3
+        workflow = InferenceServiceWorkflow(
+            controller=controller,
+            agent=MockAgent(),
+            gateway_addr="http://test:8080",
+            admin_api_key="test-key",
+            group_size=4,
+            serialize_group_samples=serialize_group_samples,
+        )
+        sessions = [(f"task-42-{i}", f"session-key-{i}") for i in range(4)]
+        workflow._start_session = AsyncMock(return_value=("grp-test-42", sessions))
+        workflow._set_last_reward = AsyncMock(return_value=None)
+        workflow._export_interactions = AsyncMock(
+            return_value={"chatcmpl-1": MagicMock(reward=1.0)}
+        )
+
+        tracker = MagicMock()
+        with (
+            patch(
+                "areal.v2.inference_service.controller.workflow.workflow_context"
+            ) as mock_wf_ctx,
+            patch(
+                "areal.v2.inference_service.controller.workflow.stats_tracker"
+            ) as mock_st,
+        ):
+            mock_http_session = AsyncMock()
+            mock_wf_ctx.get_aiohttp_session = AsyncMock(return_value=mock_http_session)
+            mock_wf_ctx.get.return_value = MagicMock(task_id=42)
+            mock_wf_ctx.get_httpx_client = AsyncMock(return_value=MagicMock())
+            mock_wf_ctx.stat_scope.return_value = "rollout"
+            mock_st.get.return_value = tracker
+
+            result = await workflow.arun_episode(engine=MagicMock(), data={})
+
+        workflow._export_interactions.assert_awaited_once_with(
+            mock_http_session,
+            [session_id for session_id, _ in sessions],
+            group_id="grp-test-42",
+        )
+        return result, max_active, start_order, tracker, workflow
+
     @pytest.mark.skip(reason="pending /export_trajectories traj schema migration")
     @pytest.mark.asyncio
     async def test_online_mode_waits_on_controller(self):
@@ -637,6 +750,57 @@ class TestInferenceServiceWorkflow:
         workflow._export_interactions.assert_awaited_once_with(
             mock_http_session, ["sess-1"], group_id="grp-test-1"
         )
+
+    @pytest.mark.asyncio
+    async def test_offline_group_is_concurrent_by_default(self):
+        result, max_active, start_order, tracker, _ = await self._run_offline_group(
+            serialize_group_samples=False,
+        )
+
+        assert result is not None
+        assert max_active == 4
+        assert sorted(start_order) == [0, 1, 2, 3]
+        assert tracker.scalar.call_args_list == [
+            call(reward=0.0),
+            call(reward=1.0),
+            call(reward=2.0),
+            call(reward=3.0),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_offline_group_serial_flag_preserves_within_group_order(self):
+        result, max_active, start_order, tracker, _ = await self._run_offline_group(
+            serialize_group_samples=True,
+        )
+
+        assert result is not None
+        assert max_active == 1
+        assert start_order == [0, 1, 2, 3]
+        assert tracker.scalar.call_args_list == [
+            call(reward=0.0),
+            call(reward=1.0),
+            call(reward=2.0),
+            call(reward=3.0),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_offline_group_serial_flag_exports_after_failure(self):
+        (
+            result,
+            max_active,
+            start_order,
+            tracker,
+            workflow,
+        ) = await self._run_offline_group(
+            serialize_group_samples=True,
+            failing_member=1,
+        )
+
+        assert result is None
+        assert max_active == 1
+        assert start_order == [0, 1, 2, 3]
+        assert workflow._set_last_reward.await_count == 4
+        assert tracker.scalar.call_count == 0
 
 
 # =============================================================================

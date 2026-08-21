@@ -203,6 +203,100 @@ class TestExtractVisionFromMultiModal:
 
 
 class TestPackedContextParallelForward:
+    def test_padding_keeps_model_thd_sequence_offsets_tp_aligned(self):
+        from areal.utils.data import pad_packed_tensor_dict
+
+        padded, _, _, _ = pad_packed_tensor_dict(
+            {
+                "input_ids": torch.tensor([10, 11, 12, 20, 21]),
+                "cu_seqlens": torch.tensor([0, 3, 5], dtype=torch.int32),
+                "max_seqlen": 3,
+            },
+            pad_to_length=16,
+            seq_align_to=4,
+        )
+
+        seq_lens = padded["cu_seqlens"][1:] - padded["cu_seqlens"][:-1]
+        assert seq_lens.tolist() == [4, 4, 248]
+        assert torch.all(seq_lens % 4 == 0)
+
+    @pytest.mark.parametrize(
+        ("use_padded_seq", "expected_mask"),
+        [
+            (False, None),
+            (True, [[True, True, True], [True, True, False]]),
+        ],
+    )
+    def test_padded_vlm_preserves_model_specific_mask_semantics(
+        self, monkeypatch, use_padded_seq, expected_mask
+    ):
+        from areal.engine.megatron_utils import packed_context_parallel
+
+        model = MagicMock(return_value=torch.ones(2, 3, 4))
+        monkeypatch.setattr(
+            packed_context_parallel.mpu,
+            "is_pipeline_last_stage",
+            lambda **_kwargs: True,
+        )
+
+        output = packed_context_parallel.packed_context_parallel_forward(
+            model,
+            {
+                "input_ids": torch.tensor([10, 11, 12, 20, 21]),
+                "cu_seqlens": torch.tensor([0, 3, 5], dtype=torch.int32),
+                "max_seqlen": 3,
+            },
+            is_vision_model=True,
+            use_padded_seq=use_padded_seq,
+        )
+
+        call = model.call_args.kwargs
+        assert call["input_ids"].tolist() == [[10, 11, 12], [20, 21, 0]]
+        if expected_mask is None:
+            assert call["attention_mask"] is None
+        else:
+            assert call["attention_mask"].tolist() == expected_mask
+        assert call["position_ids"] is None
+        assert call["packed_seq_params"] is None
+        assert output.shape == (5, 4)
+
+    def test_model_thd_passes_padded_inputs_and_packed_metadata(self, monkeypatch):
+        from areal.engine.megatron_utils import packed_context_parallel
+
+        model = MagicMock(return_value=torch.ones(1, 5, 3))
+        monkeypatch.setattr(
+            packed_context_parallel.mpu,
+            "is_pipeline_last_stage",
+            lambda **_kwargs: True,
+        )
+        monkeypatch.setattr(
+            packed_context_parallel.mpu,
+            "get_context_parallel_world_size",
+            lambda: 1,
+        )
+
+        output = packed_context_parallel.packed_context_parallel_forward(
+            model,
+            {
+                "input_ids": torch.tensor([10, 11, 12, 20, 21]),
+                "cu_seqlens": torch.tensor([0, 3, 5], dtype=torch.int32),
+                "max_seqlen": 3,
+            },
+            is_vision_model=True,
+            use_model_packed_seq=True,
+        )
+
+        call = model.call_args.kwargs
+        assert call["input_ids"].tolist() == [[10, 11, 12], [20, 21, 0]]
+        assert call["attention_mask"].tolist() == [
+            [True, True, True],
+            [True, True, False],
+        ]
+        assert call["position_ids"] is None
+        assert call["packed_seq_params"].qkv_format == "thd"
+        assert call["packed_seq_params"].cu_seqlens_q.tolist() == [0, 3, 5]
+        assert output.shape == (5, 3)
+
     def test_hidden_state_mode_bypasses_post_process_and_restores_model(self):
         from areal.engine.megatron_utils import packed_context_parallel
 

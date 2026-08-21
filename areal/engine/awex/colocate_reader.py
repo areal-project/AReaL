@@ -84,13 +84,45 @@ from areal.utils.logging import getLogger  # noqa: E402
 logger = getLogger("AwexColocateReader")
 
 
+def _get_router_dtype(config):
+    """Read router dtype from a flat or multimodal Hugging Face config."""
+    router_dtype = getattr(config, "router_dtype", None)
+    if router_dtype is not None:
+        return router_dtype
+    text_config = getattr(config, "text_config", config)
+    return getattr(text_config, "router_dtype", "bf16")
+
+
+def _get_awex_infer_hf_config(model, model_runner=None):
+    """Serialize the complete runtime config for AWEX metadata exchange."""
+    # SGLang keeps only ``text_config`` on Qwen3-VL-MoE's runtime model while
+    # retaining the original composite config on ``ModelRunner.model_config``.
+    # Prefer that original config so AWEX also receives ``vision_config``.
+    model_config = getattr(model_runner, "model_config", None)
+    config = getattr(model_config, "hf_config", None)
+    if config is None:
+        config = model.config
+    serialized_config = simple_hf_config(config)
+    if not getattr(serialized_config, "architectures", None):
+        serialized_config.architectures = [type(model).__name__]
+    return serialized_config
+
+
 def _ensure_awex_models_registered() -> None:
     """Rebuild awex's model registry in case it cached a failed auto-import.
 
     ``import_model_configs`` is ``lru_cache``-d and ``ModelRegistry`` is built
     once at module load. If anything imported the registry before our hook_mode
-    patch took effect, the BailingMoe converter would be silently missing. Clear
-    the cache and rebuild now that the patch is in place.
+    patch took effect, a native converter could be silently missing. Clear the
+    cache and rebuild now that the patch is in place.
+
+    The explicit architecture list is diagnostic only: AWEX remains the source
+    of truth for model registration, transfer plans, conversion, and sharding.
+    In particular, Qwen3.5 Dense and MoE reuse AWEX's native implementations
+    for both causal-language-model and multimodal conditional-generation
+    runtimes. Keeping those architecture names here makes an unavailable or
+    failed AWEX model import visible before the first colocated weight update,
+    without duplicating any model-specific transfer logic in AReaL.
     """
     try:
         from awex.models import registry as _reg
@@ -99,7 +131,16 @@ def _ensure_awex_models_registered() -> None:
         _reg.ModelRegistry.models = _reg.import_model_configs()
         missing = [
             m
-            for m in ("BailingMoeV2_5ForCausalLM", "BailingMoeV2ForCausalLM")
+            for m in (
+                "BailingMoeV2_5ForCausalLM",
+                "BailingMoeV2ForCausalLM",
+                "Qwen3VLForConditionalGeneration",
+                "Qwen3VLMoeForConditionalGeneration",
+                "Qwen3_5ForCausalLM",
+                "Qwen3_5MoeForCausalLM",
+                "Qwen3_5ForConditionalGeneration",
+                "Qwen3_5MoeForConditionalGeneration",
+            )
             if m not in _reg.ModelRegistry.models
         ]
         if missing:
@@ -380,11 +421,13 @@ class AwexColocateReader:
         self.get_weight_metadata()
 
         par = self.get_parallelism()
+        model_runner = self._scheduler.tp_worker.model_runner
+        awex_hf_config = _get_awex_infer_hf_config(self._get_model(), model_runner)
         infer_conf = {
             "engine_name": "sglang",
             "infer_atten_tp_size": par["tp_size"],
             "infer_world_size": infer_world_size,
-            "hf_config": simple_hf_config(self._get_model().config),
+            "hf_config": awex_hf_config,
             # AWEX's native reader publishes router_dtype so the train-side
             # converter casts mlp.gate.weight to the dtype the inference
             # engine actually holds (fp32 for BailingMoe). Omitting it makes
@@ -394,7 +437,7 @@ class AwexColocateReader:
             # papers over any such mismatch generically, but keep the
             # semantic path whole so new models behave identically to native
             # awex.
-            "router_dtype": getattr(self._get_model().config, "router_dtype", "bf16"),
+            "router_dtype": _get_router_dtype(self._get_model().config),
         }
         self._infer_conf = infer_conf
 

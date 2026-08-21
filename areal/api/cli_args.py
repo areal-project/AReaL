@@ -222,6 +222,14 @@ class GenerationHyperparameters:
             )
         },
     )
+    seed: int | None = field(
+        default=None,
+        metadata={
+            "help": "Per-request sampling seed sent to the inference backend. Leave "
+            "unset for grouped deterministic rollouts so each sample receives a "
+            "stable, distinct derived seed."
+        },
+    )
     lora_name: str = field(
         default="default_lora",
         metadata={"help": "Lora name to be used for this generation."},
@@ -1704,8 +1712,34 @@ class PPOActorConfig(TrainEngineConfig):
     discount: float = field(
         default=1.0, metadata={"help": "Discount factor for future rewards"}
     )
-    gae_lambda: float = field(
-        default=1.0, metadata={"help": "Lambda parameter for GAE"}
+    gae_lambda: float | str = field(
+        default=1.0,
+        metadata={
+            "help": "Lambda parameter for GAE, either a static float or a dotted "
+            "path to a batch-vectorized per-sample lambda function. The function "
+            "receives a context dict containing effective_token_lengths, "
+            "turn_counts, and timestep_lengths tensors and must return one lambda "
+            "per local trajectory."
+        },
+    )
+    gae_lambda_kwargs: dict[str, Any] = field(
+        default_factory=dict,
+        metadata={
+            "help": "Keyword arguments passed to a custom gae_lambda function. "
+            "Ignored when gae_lambda is a float."
+        },
+    )
+    # NOTE: not annotated as Literal["token", "turn"] because the pinned
+    # OmegaConf version rejects Literal annotations in structured configs.
+    # Validated in __post_init__ instead.
+    gae_timestep_unit: str = field(
+        default="token",
+        metadata={
+            "help": "Timestep unit used by GAE. 'token' preserves standard "
+            "token-level GAE; 'turn' applies discount and lambda once per "
+            "generated turn.",
+            "choices": ["token", "turn"],
+        },
     )
     adv_norm: NormConfig | None = field(
         default=None, metadata={"help": "Normalization configuration for advantages."}
@@ -1817,6 +1851,22 @@ class PPOActorConfig(TrainEngineConfig):
 
     def __post_init__(self):
         """Validate PPO actor configuration."""
+        if isinstance(self.gae_lambda, bool) or not isinstance(
+            self.gae_lambda, int | float | str
+        ):
+            raise ValueError(
+                "gae_lambda must be a float or dotted function path, got "
+                f"{self.gae_lambda!r}"
+            )
+        if isinstance(self.gae_lambda, str) and not self.gae_lambda:
+            raise ValueError("gae_lambda function path must not be empty")
+
+        if self.gae_timestep_unit not in {"token", "turn"}:
+            raise ValueError(
+                "gae_timestep_unit must be 'token' or 'turn', got "
+                f"{self.gae_timestep_unit!r}"
+            )
+
         reward_norm = self.reward_norm
         if isinstance(reward_norm, (dict, DictConfig)):
             reward_mean_level = reward_norm.get("mean_level")
@@ -2065,6 +2115,11 @@ class vLLMConfig:
         return vLLMConfig.build_cmd_from_args(args)
 
 
+# Keep this list aligned with SGLang's deterministic inference documentation:
+# https://docs.sglang.ai/advanced_features/deterministic_inference.html
+_SGLANG_DETERMINISTIC_ATTENTION_BACKENDS = frozenset({"flashinfer", "fa3", "triton"})
+
+
 @dataclass
 class SGLangConfig:
     """Configuration for SGLang runtime. Refer to:
@@ -2098,6 +2153,7 @@ class SGLangConfig:
     enable_memory_saver: bool = False
     allow_auto_truncate: bool = False
     attention_backend: str | None = "fa3"
+    enable_deterministic_inference: bool = False
     enable_multimodal: bool = False
     sampling_backend: str | None = None
     context_length: int | None = 32768
@@ -2181,6 +2237,19 @@ class SGLangConfig:
         node_rank: int = 0,
         pp_size: int = 1,
     ):
+        attention_backend = sglang_config.attention_backend
+        if (
+            sglang_config.enable_deterministic_inference
+            and attention_backend is not None
+            and attention_backend.lower()
+            not in _SGLANG_DETERMINISTIC_ATTENTION_BACKENDS
+        ):
+            logger.warning(
+                "SGLang deterministic inference is only documented for attention "
+                "backends %s; configured attention_backend=%r may be non-deterministic.",
+                sorted(_SGLANG_DETERMINISTIC_ATTENTION_BACKENDS),
+                attention_backend,
+            )
         # Map "all-linear" to "all"
         args: dict = conf_as_dict(sglang_config)
         if sglang_config.enable_multithread_load:
@@ -2415,6 +2484,25 @@ class InferenceEngineConfig:
             "help": "Whether to output verbose tracing messages for each generation request."
         },
     )
+    deterministic_sampling: bool = field(
+        default=False,
+        metadata={
+            "help": "Use stable request seeds for internal OpenAI-proxy/data-proxy "
+            "sessions, canonical group ordering, and task-ID ordering of completed "
+            "rollout results. Concurrent SGLang generation also requires "
+            "sglang.enable_deterministic_inference. End-to-end determinism is only "
+            "supported with max_head_offpolicyness=0."
+        },
+    )
+    serialize_group_samples: bool = field(
+        default=False,
+        metadata={
+            "help": "Run RolloutControllerV2 samples within each group sequentially "
+            "instead of concurrently. This provides stable within-group member "
+            "submission order at the cost of rollout throughput; it does not "
+            "serialize requests across groups."
+        },
+    )
     check_trajectory_format: bool = field(
         default=False,
         metadata={
@@ -2559,6 +2647,13 @@ class InferenceEngineConfig:
             )
         if not self.admin_api_key or not self.admin_api_key.strip():
             raise ValueError("admin_api_key must not be empty or whitespace-only")
+        if self.deterministic_sampling and self.max_head_offpolicyness > 0:
+            logger.warning(
+                "deterministic_sampling=True with max_head_offpolicyness=%d does "
+                "not guarantee deterministic task-to-weight-version mapping; "
+                "set max_head_offpolicyness=0 for end-to-end determinism.",
+                self.max_head_offpolicyness,
+            )
         if (
             self._version == "v2"
             and self.agent is not None
@@ -2653,14 +2748,18 @@ class RecoverConfig(_Timer):
         default=False,
         metadata={
             "help": "Do not save optimizer state in recovery checkpoints. "
-            "Required when using use_distributed_optimizer with Megatron "
-            "(flattened_range incompatibility)."
+            "Shrinks checkpoints and speeds up saving, but recovery then "
+            "resumes with a freshly initialized optimizer (Adam moments "
+            "reset), which can destabilize training. Leave this off unless "
+            "the run never needs to resume optimizer state, e.g. profiling."
         },
     )
     no_load_optim: bool = field(
         default=False,
         metadata={
-            "help": "Do not load optimizer state when recovering from checkpoint."
+            "help": "Do not load optimizer state when recovering from checkpoint. "
+            "Same caveat as no_save_optim: training resumes with reset Adam "
+            "moments."
         },
     )
 
@@ -3306,6 +3405,21 @@ class PPOConfig(BaseExperimentConfig):
         """Validate the eval generation config."""
         if self.eval_gconfig is None:
             self.eval_gconfig = self.gconfig.new()
+        if self.rollout.deterministic_sampling:
+            for config_name, generation_config in (
+                ("gconfig", self.gconfig),
+                ("eval_gconfig", self.eval_gconfig),
+            ):
+                if (
+                    generation_config.n_samples > 1
+                    and generation_config.seed is not None
+                ):
+                    raise ValueError(
+                        "deterministic_sampling with grouped rollouts cannot use "
+                        f"a shared {config_name}.seed, because every sample would "
+                        "receive the same sampling seed. Set the seed to null to "
+                        "derive stable per-sample seeds, or set n_samples=1."
+                    )
         if self.gconfig.reward_normalization and self.actor.reward_norm is not None:
             raise ValueError(
                 "gconfig.reward_normalization (rollout-time, per-prompt) and "

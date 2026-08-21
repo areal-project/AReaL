@@ -59,10 +59,12 @@ from areal.engine.core.distributed import (
     warmup_process_groups,
 )
 from areal.engine.core.model import (
+    SequencePackingMode,
     disable_dropout_in_model,
     is_valid_vision_model,
     lang_config,
     requires_padded_seq,
+    resolve_sequence_packing_mode,
 )
 from areal.engine.megatron_utils import megatron_bridge_patches  # noqa: F401
 from areal.engine.megatron_utils.checkpointer import MegatronCheckpointManager
@@ -352,6 +354,8 @@ class MegatronEngine(TrainEngine):
         self.bridge_cls: str = getattr(self.mcore_config, "bridge_type", "mbridge")
         self.bridge_lora: MegatronBridgeLoRA | None = None
         self.is_vision_model: bool = False
+        self.sequence_packing_mode: SequencePackingMode | None = None
+        self.use_model_packed_seq: bool = False
         self.processor = None
 
     def create_process_group(self, parallel_strategy: ParallelStrategy | None = None):
@@ -497,9 +501,15 @@ class MegatronEngine(TrainEngine):
                 set_deterministic_algorithms(self.tf_config, prebuild=True)
 
             self.is_vision_model = is_valid_vision_model(self.hf_config.model_type)
-            # GDN/SSM models (e.g. Qwen3.5) reject packed THD input and must run
-            # the padded BSHD forward. Derived from model type rather than a
-            # config flag so the layout can't be mis-set.
+            self.sequence_packing_mode = resolve_sequence_packing_mode(
+                self.hf_config.model_type, self.bridge_cls
+            )
+            self.use_model_packed_seq = (
+                self.sequence_packing_mode == SequencePackingMode.MODEL_THD
+            )
+            # ``PADDED`` is the input-routing fallback for every VLM without a
+            # model-owned THD contract. ``use_padded_seq`` is narrower: it
+            # enables Qwen3.5/GDN-specific dense-mask and LM-head semantics.
             self.use_padded_seq = requires_padded_seq(self.hf_config.model_type)
             if self.is_vision_model:
                 if self.parallel_strategy.context_parallel_size > 1:
@@ -1167,6 +1177,7 @@ class MegatronEngine(TrainEngine):
                 gather_cp_output=not cp_local,
                 is_vision_model=self.is_vision_model,
                 use_padded_seq=self.use_padded_seq,
+                use_model_packed_seq=self.use_model_packed_seq,
                 fp32_output=_float16_wrapper_fp32_output(
                     self.mcore_config.enable_chunked_logits,
                     self.dtype,

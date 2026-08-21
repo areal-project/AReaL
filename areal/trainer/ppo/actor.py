@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import functools
+import math
 from typing import Any
 
 import torch
@@ -9,6 +10,12 @@ from areal.api import TrainEngine
 from areal.api.cli_args import MicroBatchSpec, PPOActorConfig, RejectionSamplingConfig
 from areal.infra import TrainController
 from areal.infra.rpc.serialization import serialize_value
+from areal.trainer.ppo.gae import (
+    _build_gae_lambda_context,
+    _compute_token_level_gae,
+    _compute_turn_level_gae,
+)
+from areal.trainer.ppo.lambda_fn import resolve_gae_lambda_fn
 from areal.trainer.ppo.stats import infer_token_denominator
 from areal.utils import logging, stats_tracker
 from areal.utils.constants import (
@@ -76,6 +83,13 @@ class PPOActor:
 
         self.discount = config.discount
         self.gae_lambda = config.gae_lambda
+        self.gae_lambda_fn, self._gae_lambda_is_custom = resolve_gae_lambda_fn(
+            config.gae_lambda
+        )
+        self.gae_lambda_kwargs = (
+            dict(config.gae_lambda_kwargs) if self._gae_lambda_is_custom else {}
+        )
+        self.gae_timestep_unit = config.gae_timestep_unit
         self.mask_no_eos_with_zero = config.mask_no_eos_with_zero
 
         self.temperature = config.temperature
@@ -140,6 +154,8 @@ class PPOActor:
         logger.info(
             f"  reward_norm: {config.reward_norm if config.reward_norm else 'DISABLED (None)'}"
         )
+        logger.info(f"  gae_lambda: {config.gae_lambda}")
+        logger.info(f"  gae_timestep_unit: {config.gae_timestep_unit}")
         logger.info(f"  eps_clip: {config.eps_clip}")
         logger.info("=" * 70)
 
@@ -163,7 +179,6 @@ class PPOActor:
         self, data: dict[str, Any], meta: TrajBatchMeta | None = None
     ) -> dict[str, Any]:
         bs = data["input_ids"].shape[0]
-        max_seqlen = data["input_ids"].shape[1]
         batch_indices = torch.arange(
             bs, device=data["input_ids"].device, dtype=torch.long
         )
@@ -198,6 +213,18 @@ class PPOActor:
 
         loss_mask = data["loss_mask"].float()
         loss_mask = torch.roll(loss_mask, shifts=-1, dims=-1)
+
+        # Align structural turn IDs to the same next-token prediction
+        # convention used by loss_mask and log probabilities.
+        turn_ids = data.get("turn_ids")
+        if turn_ids is not None:
+            turn_ids = torch.roll(turn_ids, shifts=-1, dims=-1)
+            turn_ids[:, -1] = -1
+        elif self.gae_timestep_unit == "turn":
+            raise ValueError(
+                "actor.gae_timestep_unit='turn' requires rollout data to "
+                "include 'turn_ids'."
+            )
         # Apply the mask to log probabilities.
         if not self.config.use_decoupled_loss and self.config.recompute_logprob:
             # Overwrite logprobs produced by the inference engine
@@ -227,36 +254,57 @@ class PPOActor:
         kl_rewards = rewards.clone()
         # KL rewards at the next token after eos is zero.
         rewards[batch_indices, seqlens - 1] = 0
+        gae_kl_rewards = rewards.clone()
         indices = torch.clip(seqlens - 2, min=0)
+        gae_outcome_rewards = torch.zeros_like(rewards)
         if self.mask_no_eos_with_zero:
-            rewards[batch_indices, indices] += torch.where(
+            gae_outcome_rewards[batch_indices, indices] = torch.where(
                 seq_no_eos_mask, 0, reward_score
             )
         else:
-            rewards[batch_indices, indices] += reward_score
+            gae_outcome_rewards[batch_indices, indices] = reward_score
+
+        # Turn-level GAE treats each generated turn as a macro timestep. Keep
+        # token KL as a local actor penalty rather than broadcasting a turn's
+        # summed KL into every token and into critic targets.
+        if self.gae_timestep_unit == "turn":
+            rewards = gae_outcome_rewards
+        else:
+            rewards = gae_kl_rewards + gae_outcome_rewards
 
         # Compute GAE.
         if "values" not in data:
             values = torch.zeros_like(rewards)
         else:
             values = data["values"]
-        advantages_reversed = [
-            torch.zeros(bs, dtype=torch.float32, device=values.device)
-        ]
-        lastgaelam = 0
-        nextvalues = values[:, max_seqlen - 1] * seq_no_eos_mask
-        for t in reversed(range(max_seqlen - 1)):
-            delta = rewards[:, t] + self.discount * nextvalues - values[:, t]
-            newgaelam = delta + self.discount * self.gae_lambda * lastgaelam
-
-            # Skip tokens that do not contribute to the loss
-            mask = loss_mask[:, t]
-            nextvalues = nextvalues * (1 - mask) + values[:, t] * mask
-            lastgaelam = lastgaelam * (1 - mask) + newgaelam * mask
-            advantages_reversed.append(lastgaelam)
-
-        advantages = torch.stack(advantages_reversed[::-1], dim=1)
-        data["returns"] = advantages + values
+        if self._gae_lambda_is_custom:
+            gae_lambda = self._compute_gae_lambda(loss_mask, turn_ids)
+        else:
+            gae_lambda = float(self.gae_lambda)
+            if not math.isfinite(gae_lambda):
+                raise ValueError(f"Static gae_lambda must be finite, got {gae_lambda}")
+        if self.gae_timestep_unit == "turn":
+            assert turn_ids is not None
+            advantages, returns = _compute_turn_level_gae(
+                rewards=rewards,
+                values=values,
+                loss_mask=loss_mask,
+                turn_ids=turn_ids,
+                seq_no_eos_mask=seq_no_eos_mask,
+                discount=self.discount,
+                gae_lambda=gae_lambda,
+            )
+            advantages = advantages + gae_kl_rewards
+        else:
+            advantages, returns = _compute_token_level_gae(
+                rewards=rewards,
+                values=values,
+                loss_mask=loss_mask,
+                seq_no_eos_mask=seq_no_eos_mask,
+                discount=self.discount,
+                gae_lambda=gae_lambda,
+            )
+        data["returns"] = returns
 
         # Optionally perform advantage normalization.
         if self.adv_norm is not None:
@@ -267,12 +315,51 @@ class PPOActor:
         # Store data in the dict.
         data["advantages"] = advantages
         data["kl_rewards"] = kl_rewards
-        data["tot_rewards"] = rewards
+        data["tot_rewards"] = gae_kl_rewards + gae_outcome_rewards
         data["loss_mask"] = loss_mask
         # because we have rolled old_logp by -1
         data["logprobs"] = old_logp
 
         return data
+
+    def _compute_gae_lambda(
+        self,
+        loss_mask: torch.Tensor,
+        turn_ids: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Resolve one lambda value per local trajectory without changing masks."""
+        context = _build_gae_lambda_context(
+            loss_mask,
+            turn_ids,
+            gae_timestep_unit=self.gae_timestep_unit,
+        )
+        gae_lambda = self.gae_lambda_fn(context, **self.gae_lambda_kwargs)
+        if not isinstance(gae_lambda, torch.Tensor):
+            raise TypeError(
+                "gae_lambda function must return a torch.Tensor with shape "
+                f"[{loss_mask.shape[0]}], got {type(gae_lambda).__name__}"
+            )
+        expected_shape = torch.Size([loss_mask.shape[0]])
+        if gae_lambda.shape != expected_shape:
+            raise ValueError(
+                "gae_lambda function must return one value per local trajectory: "
+                f"expected shape {expected_shape}, got {gae_lambda.shape}"
+            )
+        if gae_lambda.device != loss_mask.device:
+            raise ValueError(
+                "gae_lambda output and loss_mask must be on the same device, got "
+                f"{gae_lambda.device} and {loss_mask.device}"
+            )
+        if not torch.is_floating_point(gae_lambda):
+            raise TypeError(
+                "gae_lambda function must return a floating-point tensor, got "
+                f"{gae_lambda.dtype}"
+            )
+        torch._assert_async(
+            torch.all(torch.isfinite(gae_lambda)),
+            "gae_lambda function returned a non-finite value",
+        )
+        return gae_lambda.detach().float()
 
     @trace_perf("ppo_actor.ppo_update", category="compute")
     @stats_tracker.scope_func_wrapper("ppo_actor")
