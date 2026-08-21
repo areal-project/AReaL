@@ -477,6 +477,16 @@ class RolloutControllerV2:
                 "--engine-max-tokens",
                 str(agent_cfg.engine_max_tokens),
             ]
+        for preprocessor_path in agent_cfg.message_preprocessors:
+            data_proxy_base_cmd += [
+                "--message-preprocessor",
+                preprocessor_path,
+            ]
+        if agent_cfg.prefix_matcher:
+            data_proxy_base_cmd += [
+                "--prefix-matcher",
+                agent_cfg.prefix_matcher,
+            ]
 
         async def _fork_data_proxy(group_idx: int) -> tuple[str, int, str]:
             if self.external_mode:
