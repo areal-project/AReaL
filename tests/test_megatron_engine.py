@@ -114,7 +114,8 @@ def test_native_mbridge_save_finalizes_hf_config(monkeypatch, tmp_path):
     engine.mcore_config = SimpleNamespace(use_mbridge_save=True)
     engine.config = SimpleNamespace(is_critic=False, path="/models/source")
     engine.bridge = Mock(safetensor_io=object())
-    engine.cpu_group = object()
+    engine.process_group_initialized = True
+    engine._cpu_group = object()
 
     finalize = Mock()
     source_config = {"model_type": "runtime_only", "torch_dtype": "bfloat16"}
