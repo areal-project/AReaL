@@ -691,7 +691,7 @@ class TestInferenceServiceWorkflow:
             mock_http_session,
             [session_id for session_id, _ in sessions],
             group_id="grp-test-42",
-            discard_trajectory=False,
+            discard_trajectory=failing_member is not None,
         )
         return result, max_active, start_order, tracker, workflow
 

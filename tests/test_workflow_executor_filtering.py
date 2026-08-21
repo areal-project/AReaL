@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
@@ -113,4 +114,41 @@ async def test_filter_rejection_or_failure_clears_remote_payload(
             call("node-b:1234", ["mask"]),
         ],
         any_order=True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_filter_rejection_times_out_blocked_remote_cleanup(monkeypatch):
+    trajectory = _remote_trajectory([1.0, 1.0])
+    executor, manager = _executor()
+    cleared = []
+
+    async def partially_blocked_clear(node_addr, shard_ids):
+        if node_addr == "node-a:1234":
+            await asyncio.Event().wait()
+        cleared.append((node_addr, shard_ids))
+
+    monkeypatch.setattr(RTensor, "clear_node", partially_blocked_clear)
+    monkeypatch.setattr(
+        "areal.infra.workflow_executor._REJECTED_TRAJECTORY_CLEAR_TIMEOUT_SECONDS",
+        0.01,
+    )
+    task = executor._create_workflow_task(
+        _RolloutTaskInput(
+            task_id=1,
+            data={},
+            workflow=_TrajectoryWorkflow(trajectory),
+            should_accept_fn=_reject,
+        )
+    )
+
+    result = await asyncio.wait_for(task(), timeout=1.0)
+
+    assert result is None
+    manager.on_rollout_rejected.assert_called_once_with()
+    assert cleared == [("node-b:1234", ["mask"])]
+    executor.logger.warning.assert_called_once_with(
+        "Timed out after %.1fs clearing rejected trajectory shards on %s",
+        0.01,
+        "node-a:1234",
     )
