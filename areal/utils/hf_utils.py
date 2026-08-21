@@ -68,6 +68,20 @@ def load_hf_tokenizer(
     return tokenizer
 
 
+def tokenizer_stop_token_ids(
+    tokenizer: transformers.PreTrainedTokenizerFast,
+) -> list[int]:
+    """Collect the pad and EOS token ids, dropping unset ones and flattening
+    sequence-valued ``eos_token_id``."""
+    token_ids: list[int] = []
+    for candidate in (tokenizer.pad_token_id, tokenizer.eos_token_id):
+        ids = candidate if isinstance(candidate, (list, tuple)) else [candidate]
+        for token_id in ids:
+            if token_id is not None and token_id not in token_ids:
+                token_ids.append(token_id)
+    return token_ids
+
+
 @lru_cache(maxsize=8)
 def load_hf_processor_and_tokenizer(
     model_name_or_path: str,
