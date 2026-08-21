@@ -227,6 +227,44 @@ class InteractionWithTokenLogpReward:
         return result
 
 
+def normalize_group_rewards(
+    results: list[dict[str, InteractionWithTokenLogpReward] | None],
+) -> bool:
+    """Normalize one scalar reward per rollout while preserving raw rewards."""
+    if not results:
+        return False
+
+    reward_per_result: list[float | None] = []
+    for result in results:
+        if not result:
+            reward_per_result.append(None)
+            continue
+        last_id = next(reversed(result))
+        reward_per_result.append(result[last_id].reward)
+
+    if any(reward is None for reward in reward_per_result):
+        return False
+
+    rewards = torch.tensor(reward_per_result, dtype=torch.float32)
+    mean = rewards.mean()
+    std = rewards.std(unbiased=False) if rewards.numel() > 1 else torch.tensor(1.0)
+    normalized_rewards = ((rewards - mean) / (std + 1e-8)).tolist()
+
+    for result, normalized_reward in zip(results, normalized_rewards):
+        assert result is not None
+        for interaction in result.values():
+            if interaction.reward is None:
+                continue
+            interaction.original_reward = interaction.reward
+            interaction.reward = normalized_reward
+            if interaction._cache is not None:
+                interaction._cache["rewards"] = torch.tensor([float(normalized_reward)])
+                interaction._cache["original_rewards"] = torch.tensor(
+                    [float(interaction.original_reward)]
+                )
+    return True
+
+
 def concat_string_interactions(
     interactions: dict[str, InteractionWithTokenLogpReward],
 ) -> dict[str, list[dict]]:

@@ -75,6 +75,8 @@ class ExportTrajectoriesRequest(BaseModel):
     discount: float = 1.0
     style: str = "individual"
     remove_session: bool = True
+    reward_normalization: bool = False
+    discard_trajectory: bool = False
 
 
 class ExportTrajectoriesResponse(BaseModel):
