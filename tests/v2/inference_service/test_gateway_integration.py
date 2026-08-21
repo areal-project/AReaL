@@ -249,6 +249,17 @@ def gateway_stack(sglang_server, model_path):
     # Wait briefly for router health poller to mark worker healthy
     time.sleep(3)
 
+    # Register the internal model through the gateway, matching the production
+    # initialization order. New sessions do not have a session key yet, so the
+    # router selects their data proxy from the registered model's worker pool.
+    resp = httpx.post(
+        f"{gateway_addr}/register_model",
+        json={"model": "sglang", "data_proxy_addrs": [data_proxy_addr]},
+        headers={"Authorization": f"Bearer {ADMIN_KEY}"},
+        timeout=5.0,
+    )
+    assert resp.status_code == 200, f"Failed to register model: {resp.text}"
+
     yield {
         "gateway_addr": gateway_addr,
         "router_addr": router_addr,
@@ -278,6 +289,13 @@ class TestGatewayStackHealth:
             resp = await client.get(f"{gateway_stack['gateway_addr']}/health")
             assert resp.status_code == 200
             assert resp.json()["status"] == "ok"
+
+            resp = await client.get(
+                f"{gateway_stack['gateway_addr']}/models",
+                headers={"Authorization": f"Bearer {ADMIN_KEY}"},
+            )
+            assert resp.status_code == 200
+            assert "sglang" in resp.json()["models"]
 
             # Router health (should show 1 worker)
             resp = await client.get(f"{gateway_stack['router_addr']}/health")

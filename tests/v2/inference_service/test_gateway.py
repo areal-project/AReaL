@@ -195,6 +195,12 @@ class TestAdminEndpoints:
             {"session_id": "task-1-0", "session_api_key": "sess-key-xyz"}
         ]
 
+        route_call = mock_query_router.call_args
+        assert route_call.args == ("http://mock-router:8081",)
+        assert route_call.kwargs["api_key"] is None
+        assert route_call.kwargs["path"] == "/rl/start_session"
+        assert route_call.kwargs["admin_api_key"] == ADMIN_KEY
+
         # Verify router registration
         mock_register.assert_called_once()
         reg_args = mock_register.call_args
