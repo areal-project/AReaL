@@ -121,12 +121,28 @@ def test_extract_images_preserves_remote_url_for_backend_forwarding():
 )
 def test_local_multimodal_processing_rejects_non_inline_urls(url):
     """Local VLM processing must not fetch external resources."""
-    with pytest.raises(ValueError, match="Remote image URLs are not supported"):
+    with pytest.raises(ValueError, match="requires valid base64-encoded image data"):
         _process_multimodal_prompt(
             _FakeProcessor(),
             _FakeTokenizer(),
             [{"role": "user", "content": [{"type": "image"}]}],
             [url],
+            None,
+            {},
+        )
+
+
+def test_local_multimodal_processing_rejects_existing_local_image_path(tmp_path):
+    """Local VLM processing must not open filesystem paths from requests."""
+    image_path = tmp_path / "private-image.png"
+    Image.new("RGB", (2, 2), color="red").save(image_path)
+
+    with pytest.raises(ValueError, match="requires valid base64-encoded image data"):
+        _process_multimodal_prompt(
+            _FakeProcessor(),
+            _FakeTokenizer(),
+            [{"role": "user", "content": [{"type": "image"}]}],
+            [str(image_path)],
             None,
             {},
         )

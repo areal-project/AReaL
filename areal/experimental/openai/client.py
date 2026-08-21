@@ -97,13 +97,23 @@ def _process_multimodal_prompt(
     chat_template_kwargs: dict[str, Any],
 ) -> _PreparedPrompt:
     """Build model-ready prompt tokens and vision tensors with an HF processor."""
+    import base64
+    import binascii
+    from io import BytesIO
+
+    from PIL import Image
     from transformers.image_utils import load_image
 
-    if any("://" in image for image in image_data):
-        raise ValueError(
-            "Remote image URLs are not supported for local multimodal processing. "
-            "Provide an inline base64 image or data URI instead."
-        )
+    images = []
+    for encoded_image in image_data:
+        try:
+            image_bytes = base64.b64decode(encoded_image, validate=True)
+            with Image.open(BytesIO(image_bytes)) as image:
+                images.append(load_image(image))
+        except (binascii.Error, OSError, ValueError) as exc:
+            raise ValueError(
+                "Local multimodal processing requires valid base64-encoded image data."
+            ) from exc
 
     prompt_text = apply_chat_template(
         tokenizer,
@@ -118,7 +128,6 @@ def _process_multimodal_prompt(
             "The tokenizer chat template must return text before VLM processing."
         )
 
-    images = [load_image(image) for image in image_data]
     processed = processor(
         text=[prompt_text],
         images=images,
