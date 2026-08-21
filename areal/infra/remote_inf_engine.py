@@ -1240,9 +1240,6 @@ class RemoteInfEngine(InferenceEngine):
             raise ValueError(
                 "workflow must be specified for submit (unless mode='online')"
             )
-        if callback_addr:
-            self.workflow_executor.dispatcher.register_callback(task_id, callback_addr)
-
         # Resolve workflow to a RolloutWorkflow instance
         resolved_workflow = self._resolve_workflow(
             workflow,
@@ -1260,6 +1257,7 @@ class RemoteInfEngine(InferenceEngine):
             should_accept_fn=resolved_should_accept_fn,
             task_id=task_id,
             is_eval=is_eval,
+            callback_addr=callback_addr,
         )
 
     def wait(
