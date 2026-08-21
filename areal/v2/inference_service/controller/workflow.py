@@ -54,6 +54,7 @@ class InferenceServiceWorkflow(RolloutWorkflow):
         timeout: float | None = None,
         group_size: int = 1,
         serialize_group_samples: bool = False,
+        drop_retry_orphans: bool = False,
     ):
         self.controller = controller
         self.agent = agent
@@ -64,6 +65,7 @@ class InferenceServiceWorkflow(RolloutWorkflow):
         self.timeout = timeout
         self.group_size = group_size
         self.serialize_group_samples = serialize_group_samples
+        self.drop_retry_orphans = drop_retry_orphans
 
     @async_http_retry
     async def _start_session(
@@ -118,6 +120,7 @@ class InferenceServiceWorkflow(RolloutWorkflow):
             "discount": self.discount,
             "style": self.export_style,
             "remove_session": True,
+            "drop_retry_orphans": self.drop_retry_orphans,
         }
         async with session.post(url, json=payload, headers=headers) as resp:
             resp.raise_for_status()

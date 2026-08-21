@@ -1031,6 +1031,77 @@ async def test_export_trajectories_without_admin_key(client):
     assert resp.status_code == 401
 
 
+@pytest.mark.asyncio
+async def test_export_trajectories_drops_retry_orphans_before_discount(
+    client, monkeypatch
+):
+    from areal.infra.rpc.serialization import deserialize_value
+
+    monkeypatch.setattr(
+        "areal.v2.inference_service.data_proxy.app.RTensor.remotize",
+        lambda obj, node_addr: obj,
+    )
+    start = await client.post(
+        "/rl/start_session",
+        json={"task_id": "retry-orphan"},
+        headers=admin_headers(),
+    )
+    session = start.json()["sessions"][0]
+    headers = session_headers(session["session_api_key"])
+    initial_messages = [{"role": "user", "content": "hi"}]
+
+    await client.post(
+        "/chat/completions",
+        json={"model": "sglang", "messages": initial_messages},
+        headers=headers,
+    )
+    await client.post(
+        "/chat/completions",
+        json={"model": "sglang", "messages": initial_messages},
+        headers=headers,
+    )
+    await client.post(
+        "/chat/completions",
+        json={
+            "model": "sglang",
+            "messages": initial_messages
+            + [
+                {"role": "assistant", "content": "Hello!"},
+                {"role": "user", "content": "more"},
+            ],
+        },
+        headers=headers,
+    )
+    reward_response = await client.post(
+        "/rl/set_reward",
+        json={"reward": 1.0},
+        headers=headers,
+    )
+    assert reward_response.status_code == 200
+
+    app = client._transport.app
+    session_data = app.state.session_store.get_session(session["session_id"])
+    assert session_data is not None
+    ready = next(iter(session_data._ready_trajectories.values()))
+    for interaction in ready.completions.values():
+        interaction.chat_template_type = "concat"
+
+    export_response = await client.post(
+        "/export_trajectories",
+        json={
+            "session_ids": [session["session_id"]],
+            "discount": 1.0,
+            "style": "concat",
+            "drop_retry_orphans": True,
+        },
+        headers=admin_headers(),
+    )
+
+    assert export_response.status_code == 200
+    trajectory = deserialize_value(export_response.json()["traj"])
+    assert trajectory["input_ids"].shape[0] == 1
+
+
 # =============================================================================
 # =============================================================================
 @pytest.mark.asyncio

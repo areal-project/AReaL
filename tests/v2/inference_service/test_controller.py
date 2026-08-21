@@ -126,6 +126,10 @@ class TestControllerWorkflowResolution:
         cfg = InferenceEngineConfig(
             backend="sglang:d1",
             admin_api_key="test-admin-key",
+            agent=AgentConfig(
+                agent_cls_path="tests.experimental.openai.utils.SimpleAgent",
+                drop_retry_orphans=True,
+            ),
         )
         scheduler = MagicMock(n_gpus_per_node=8)
         controller = RolloutControllerV2(config=cfg, scheduler=scheduler)
@@ -140,11 +144,16 @@ class TestControllerWorkflowResolution:
         assert resolved.controller is controller
         assert resolved.agent is None
         assert resolved.timeout == 3.0
+        assert resolved.drop_retry_orphans is True
 
     def test_resolve_workflow_agent_class_creates_offline_workflow(self):
         cfg = InferenceEngineConfig(
             backend="sglang:d1",
             admin_api_key="test-admin-key",
+            agent=AgentConfig(
+                agent_cls_path="tests.experimental.openai.utils.SimpleAgent",
+                drop_retry_orphans=True,
+            ),
         )
         scheduler = MagicMock(n_gpus_per_node=8)
         controller = RolloutControllerV2(config=cfg, scheduler=scheduler)
@@ -162,6 +171,7 @@ class TestControllerWorkflowResolution:
         assert isinstance(resolved, InferenceServiceWorkflow)
         assert resolved.agent is not None
         assert isinstance(resolved.agent, MockAgent)
+        assert resolved.drop_retry_orphans is True
 
     def test_resolve_should_accept_fn_none(self):
         assert RolloutControllerV2._resolve_should_accept_fn(None) is None
@@ -645,6 +655,28 @@ class TestInferenceServiceWorkflow:
             group_id="grp-test-42",
         )
         return result, max_active, start_order, tracker, workflow
+
+    @pytest.mark.asyncio
+    async def test_export_interactions_forwards_drop_retry_orphans(self):
+        workflow = InferenceServiceWorkflow(
+            controller=MagicMock(),
+            gateway_addr="http://test:8080",
+            admin_api_key="test-key",
+            drop_retry_orphans=True,
+        )
+        response = MagicMock()
+        response.raise_for_status = MagicMock()
+        response.json = AsyncMock(return_value={"traj": {}})
+        context = MagicMock()
+        context.__aenter__ = AsyncMock(return_value=response)
+        context.__aexit__ = AsyncMock(return_value=False)
+        session = MagicMock()
+        session.post = MagicMock(return_value=context)
+
+        result = await workflow._export_interactions(session, ["session-1"])
+
+        assert result == {}
+        assert session.post.call_args.kwargs["json"]["drop_retry_orphans"] is True
 
     @pytest.mark.skip(reason="pending /export_trajectories traj schema migration")
     @pytest.mark.asyncio

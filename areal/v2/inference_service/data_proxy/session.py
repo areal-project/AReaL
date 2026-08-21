@@ -75,6 +75,7 @@ class ExportTrajectoriesRequest(BaseModel):
     discount: float = 1.0
     style: str = "individual"
     remove_session: bool = True
+    drop_retry_orphans: bool = False
 
 
 class ExportTrajectoriesResponse(BaseModel):
@@ -322,6 +323,7 @@ class SessionData:
         discount: float,
         style: str,
         trajectory_id: int | None = None,
+        drop_retry_orphans: bool = False,
     ) -> tuple[int, dict[str, InteractionWithTokenLogpReward]]:
         """Export a ready trajectory.
 
@@ -335,6 +337,9 @@ class SessionData:
         trajectory_id : int | None
             Specific trajectory to export.  When ``None``, the latest
             ready trajectory is exported.
+        drop_retry_orphans : bool
+            Remove duplicate responses left by upstream request retries before
+            reward discounting and concat export.
 
         Returns
         -------
@@ -364,6 +369,7 @@ class SessionData:
         interactions = ready.completions.export_interactions(
             style=style,
             reward_discount=discount,
+            drop_retry_orphans=drop_retry_orphans,
         )
         return ready.trajectory_id, interactions
 
