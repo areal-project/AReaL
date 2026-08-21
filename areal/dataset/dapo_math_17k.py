@@ -4,6 +4,8 @@ from pathlib import Path
 
 from datasets import Dataset, load_dataset
 
+from areal.utils.hf_utils import apply_chat_template
+
 
 def get_dapo_math_17k_rl_dataset(
     path: str,
@@ -48,8 +50,8 @@ def get_dapo_math_17k_rl_dataset(
             raise ValueError("tokenizer is required when max_length is set")
 
         def filter_length(sample):
-            prompt_ids = tokenizer.apply_chat_template(
-                sample["messages"], add_generation_prompt=True, tokenize=True
+            prompt_ids = apply_chat_template(
+                tokenizer, sample["messages"], add_generation_prompt=True, tokenize=True
             )
             return len(prompt_ids) <= max_length
 
