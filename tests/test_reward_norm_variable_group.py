@@ -143,6 +143,15 @@ def test_group_sizes_non_positive_raises():
         norm(x, group_sizes=[4, 0])
 
 
+def test_group_sizes_none_rejects_non_divisible_group_batch():
+    """Implicit fixed-size grouping must not leave a partial tail unnormalized."""
+    norm = Normalization(_group_norm_config())  # group_size=2
+    x = torch.tensor([0.0, 1.0, 2.0], dtype=torch.float32)  # bs=3
+
+    with pytest.raises(ValueError, match="divisible by group_size"):
+        norm(x)
+
+
 def test_adv_norm_style_2d_variable_groups_normalize_per_group():
     """Token-level (2D) advantages normalize per variable-size group on dim 0.
 

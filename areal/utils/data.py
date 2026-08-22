@@ -1423,6 +1423,11 @@ class Normalization:
                 slices.append(slice(offset, offset + sz))
                 offset += sz
             return slices
+        if bs % self.group_size != 0:
+            raise ValueError(
+                f"batch size ({bs}) must be divisible by group_size "
+                f"({self.group_size}) when group_sizes is not provided"
+            )
         return [
             slice(i * self.group_size, (i + 1) * self.group_size)
             for i in range(bs // self.group_size)
