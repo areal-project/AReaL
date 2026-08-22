@@ -309,6 +309,7 @@ class LocalScheduler(Scheduler):
         target_wi: WorkerInfo,
         target_role: str,
         command: str | None = None,
+        env: dict[str, str] | None = None,
     ) -> WorkerInfo:
         """Fork a single worker asynchronously.
 
@@ -319,12 +320,13 @@ class LocalScheduler(Scheduler):
         """
         worker_id = f"{role}/{idx}"
         guard_url = f"http://{format_hostport(target_wi.worker.ip, int(target_wi.worker.worker_ports[0]))}"
+        port_cnt = len(self._workers[target_role][0].worker.worker_ports)
 
         try:
             # 1. Allocate a port on the target guard
             async with session.post(
                 f"{guard_url}/alloc_ports",
-                json={"count": 1},
+                json={"count": port_cnt},
             ) as alloc_resp:
                 if alloc_resp.status != 200:
                     error_text = await alloc_resp.text()
@@ -335,7 +337,8 @@ class LocalScheduler(Scheduler):
                     )
                 alloc_data = await alloc_resp.json()
                 forked_host = alloc_data["host"]
-                forked_port = alloc_data["ports"][0]
+                forked_ports = alloc_data["ports"]
+                forked_port = forked_ports[0]
 
             # 2. Build the full raw command
             module_path = command or "areal.infra.rpc.rpc_server"
@@ -372,6 +375,7 @@ class LocalScheduler(Scheduler):
                 "role": role,
                 "worker_index": idx,
                 "raw_cmd": raw_cmd,
+                "env": env or {},
             }
             async with session.post(
                 f"{guard_url}/fork",
@@ -428,12 +432,9 @@ class LocalScheduler(Scheduler):
         worker = Worker(
             id=worker_id,
             ip=forked_host,
-            worker_ports=[str(forked_port)],
+            worker_ports=list(map(str, forked_ports)),
             engine_ports=[],
         )
-        port_cnt = len(self._workers[target_role][0].worker.worker_ports)
-        if port_cnt > 1:
-            worker.worker_ports += self._allocate_ports(port_cnt - 1)
 
         return WorkerInfo(
             worker=worker,
@@ -442,7 +443,7 @@ class LocalScheduler(Scheduler):
             gpu_devices=target_wi.gpu_devices,  # Inherited from target
             created_at=time.time(),
             log_file=str(self.log_dir / f"{role}.log"),
-            env_vars=target_wi.env_vars.copy(),  # Inherited from target
+            env_vars={**target_wi.env_vars, **(env or {})},
         )
 
     async def _kill_forked_worker(
@@ -511,6 +512,7 @@ class LocalScheduler(Scheduler):
         target_role: str,
         target_workers: list[WorkerInfo],
         command: str | None = None,
+        env_vars: list[dict[str, str]] | None = None,
     ) -> list[str]:
         """Create forked workers concurrently using async requests.
 
@@ -528,7 +530,13 @@ class LocalScheduler(Scheduler):
             # Launch all fork requests concurrently with exception handling
             tasks = [
                 self._fork_single_worker(
-                    session, role, idx, target_wi, target_role, command
+                    session,
+                    role,
+                    idx,
+                    target_wi,
+                    target_role,
+                    command,
+                    None if env_vars is None else env_vars[idx],
                 )
                 for idx, target_wi in enumerate(target_workers)
             ]
@@ -585,6 +593,7 @@ class LocalScheduler(Scheduler):
         role: str,
         target_role: str,
         command: str | None = None,
+        env_vars: list[dict[str, str]] | None = None,
     ) -> list[str]:
         """Fork new worker processes from existing workers.
 
@@ -617,6 +626,7 @@ class LocalScheduler(Scheduler):
                 target_role,
                 target_workers,
                 command,
+                env_vars,
             )
         except Exception:
             # Cleanup on failure
@@ -701,7 +711,11 @@ class LocalScheduler(Scheduler):
             # Check if fork mode is enabled
             if strategy.fork:
                 # Fork mode: spawn new processes on same GPUs via /fork endpoint
-                worker_ids = self.fork_workers(role, colocate_role)
+                worker_ids = self.fork_workers(
+                    role,
+                    colocate_role,
+                    env_vars=[scheduling.env_vars for scheduling in schedulings],
+                )
             else:
                 # Reuse existing workers - no new processes spawned
                 worker_ids = [w.worker.id for w in target_workers]

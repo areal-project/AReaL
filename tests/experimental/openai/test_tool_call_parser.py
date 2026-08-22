@@ -210,6 +210,91 @@ def test_qwen3_coder_xml_literal_closing_tag_is_not_silently_truncated():
 
 
 @pytest.mark.sglang
+@pytest.mark.parametrize("reasoning_parser", ["", None], ids=["empty", "none"])
+def test_process_tool_calls_without_reasoning_parser_returns_plain_text(
+    reasoning_parser: str | None,
+):
+    """An empty reasoning parser disables reasoning extraction on CPU."""
+    pytest.importorskip(
+        "sglang.srt.function_call.function_call_parser",
+        reason="sglang is required for sglang parser tests",
+    )
+    pytest.importorskip(
+        "sglang.srt.parser.reasoning_parser",
+        reason="sglang is required for sglang parser tests",
+    )
+    text = "The task is complete."
+
+    tool_calls, new_text, finish_reason = parser_module.process_tool_calls(
+        text=text,
+        tools=QWEN3_CODER_TOOLS,
+        tool_call_parser="qwen3_coder",
+        reasoning_parser=reasoning_parser,
+        finish_reason="stop",
+        use_responses=False,
+        tokenizer=object(),
+    )
+
+    assert tool_calls is None
+    assert new_text == text
+    assert finish_reason == "stop"
+
+
+@pytest.mark.sglang
+def test_process_tool_calls_invalid_reasoning_parser_reports_config_key():
+    """Invalid parser names identify the exact rollout configuration field."""
+    pytest.importorskip(
+        "sglang.srt.function_call.function_call_parser",
+        reason="sglang is required for sglang parser tests",
+    )
+    pytest.importorskip(
+        "sglang.srt.parser.reasoning_parser",
+        reason="sglang is required for sglang parser tests",
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=r"rollout\.openai\.reasoning_parser='not-a-parser'.*qwen3_coder",
+    ):
+        parser_module.process_tool_calls(
+            text="The task is complete.",
+            tools=QWEN3_CODER_TOOLS,
+            tool_call_parser="qwen3_coder",
+            reasoning_parser="not-a-parser",
+            finish_reason="stop",
+            use_responses=False,
+            tokenizer=object(),
+        )
+
+
+@pytest.mark.sglang
+def test_process_tool_calls_invalid_tool_parser_reports_config_key():
+    """Invalid tool parser names identify the exact rollout config field."""
+    pytest.importorskip(
+        "sglang.srt.function_call.function_call_parser",
+        reason="sglang is required for sglang parser tests",
+    )
+    pytest.importorskip(
+        "sglang.srt.parser.reasoning_parser",
+        reason="sglang is required for sglang parser tests",
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=r"rollout\.openai\.tool_call_parser='not-a-parser'.*qwen3_coder",
+    ):
+        parser_module.process_tool_calls(
+            text="The task is complete.",
+            tools=QWEN3_CODER_TOOLS,
+            tool_call_parser="not-a-parser",
+            reasoning_parser=None,
+            finish_reason="stop",
+            use_responses=False,
+            tokenizer=object(),
+        )
+
+
+@pytest.mark.sglang
 def test_process_tool_calls_qwen25_chat_completions_sglang():
     pytest.importorskip(
         "sglang.srt.function_call.function_call_parser",
