@@ -194,6 +194,11 @@ cuda = [
 sandbox = [
     "daytona>=0.167.0",
 ]
+# Optional: HuggingFace OpenEnv adapter for agentic RL environments.
+# See examples/openenv/ for usage.
+openenv = [
+    "openenv>=0.4",
+]
 cli = [
     "click>=8.1",
     "colorlog",
