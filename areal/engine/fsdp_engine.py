@@ -60,6 +60,7 @@ from areal.api.cli_args import OptimizerConfig, PerfTracerConfig, TrainEngineCon
 from areal.api.io_struct import DeviceRuntimeInfo
 from areal.engine.core import (
     aggregate_eval_losses,
+    compute_microbatch_loss_weight,
     compute_total_loss_weight,
     reorder_and_pad_outputs,
 )
@@ -783,7 +784,9 @@ class FSDPEngine(TrainEngine):
         input_batched, _ = self._normalize_batch_input(input_)
 
         # Step 1: Prepare micro-batches
-        mb_list = self._prepare_mb_list(input_batched).to(self.device)
+        mb_list = self._prepare_mb_list(input_batched, allow_transport_padding=True).to(
+            self.device
+        )
 
         # Step 2: Compute total loss weight
         total_loss_weight = compute_total_loss_weight(
@@ -823,7 +826,9 @@ class FSDPEngine(TrainEngine):
         input_batched, _ = self._normalize_batch_input(input_)
 
         # Step 1: Prepare micro-batches
-        mb_list = self._prepare_mb_list(input_batched).to(self.device)
+        mb_list = self._prepare_mb_list(input_batched, allow_transport_padding=True).to(
+            self.device
+        )
 
         # Step 2: Compute total loss weight
         total_loss_weight = compute_total_loss_weight(
@@ -881,7 +886,9 @@ class FSDPEngine(TrainEngine):
         batch_size = len(output_seqlens)
 
         # Step 2: Prepare micro-batches
-        mb_list = self._prepare_mb_list(input_batched).to(self.device)
+        mb_list = self._prepare_mb_list(input_batched, allow_transport_padding=True).to(
+            self.device
+        )
 
         # Step 3: Forward using process_output_fn callback, collecting results
         outputs: list[torch.Tensor] = []
@@ -1880,7 +1887,12 @@ class FSDPEngine(TrainEngine):
         self.optimizer.load_state_dict(optimizer_state_dict)
         dist.barrier(group=self.cpu_group)
 
-    def _prepare_mb_list(self, input_: dict[str, Any]) -> MicroBatchList:
+    def _prepare_mb_list(
+        self,
+        input_: dict[str, Any],
+        *,
+        allow_transport_padding: bool = False,
+    ) -> MicroBatchList:
         assert "attention_mask" in input_ and "input_ids" in input_
         input_ = input_.copy()
 
@@ -1943,7 +1955,12 @@ class FSDPEngine(TrainEngine):
         else:
             input_ = amend_position_ids(input_)
 
-        mb_list = split_padded_tensor_dict_into_mb_list(input_, self.config.mb_spec)
+        mb_list = split_padded_tensor_dict_into_mb_list(
+            input_,
+            self.config.mb_spec,
+            group=self.data_parallel_group if allow_transport_padding else None,
+            allow_transport_padding=allow_transport_padding,
+        )
         mb_list.mbs = [pack_tensor_dict(mb) for mb in mb_list.mbs]
         mb_list = pad_mb_list(
             mb_list,
@@ -2154,7 +2171,7 @@ class FSDPEngine(TrainEngine):
         loss_multiplier: float = 1.0,
     ) -> torch.Tensor:
         """Compute logprobs/entropy and return scaled loss."""
-        local_weight = loss_weight_fn(ctx.mb_input)
+        local_weight = compute_microbatch_loss_weight(ctx.mb_input, loss_weight_fn)
         if local_weight == 0:
             return logits.mean() * 0.0
 

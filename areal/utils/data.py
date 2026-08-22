@@ -23,6 +23,8 @@ from areal.utils.seqpack import get_allocate_fn
 
 logger = logging.getLogger("DataUtils")
 
+TRANSPORT_DUMMY_KEY = "_transport_dummy"
+
 
 def get_batch_size(data: dict[str, Any]) -> int:
     if not data:
@@ -621,6 +623,7 @@ class MicroBatchList:
     # sequence-level padding information
     align_to_lengths: list[int] | None = None
     old_cu_seqlens_list: list[torch.Tensor] | None = None
+    transport_dummy_count: int = 0
 
     @property
     def max_seqlen(self) -> int:
@@ -691,16 +694,69 @@ class MicroBatchList:
             padded_to_lengths=self.padded_to_lengths,
             old_cu_seqlens_list=old_cu_seqlens_list,
             align_to_lengths=self.align_to_lengths,
+            transport_dummy_count=self.transport_dummy_count,
         )
 
 
 DEFAULT_MAX_TOKENS_PER_MB = int(1e12)
 
 
+def make_transport_dummy(template: dict[str, Any]) -> dict[str, Any]:
+    """Create one model-valid row for collective participation."""
+    batch_size = get_batch_size(template)
+    if batch_size < 1:
+        raise ValueError("Cannot create transport padding from an empty batch")
+
+    dummy: dict[str, Any] = {}
+    for key, value in template.items():
+        if is_multi_modal_key(key) and isinstance(value, list):
+            dummy[key] = [{}]
+        elif (
+            isinstance(value, torch.Tensor)
+            and value.ndim > 0
+            and value.shape[0] == batch_size
+        ):
+            dummy[key] = torch.zeros_like(value[:1])
+        elif isinstance(value, list) and len(value) == batch_size:
+            dummy[key] = [copy.deepcopy(value[0])]
+        else:
+            dummy[key] = copy.deepcopy(value)
+
+    attention_mask = dummy.get("attention_mask")
+    if not isinstance(attention_mask, torch.Tensor) or attention_mask.ndim != 2:
+        raise ValueError("Transport padding requires a 2D attention_mask")
+    if attention_mask.shape[1] < 1:
+        raise ValueError("Transport padding requires sequence length >= 1")
+    attention_mask[:, 0] = 1
+    if isinstance(dummy.get("loss_mask"), torch.Tensor):
+        dummy["loss_mask"].zero_()
+    return dummy
+
+
+def _pad_batch_to_min_groups(
+    data: dict[str, Any],
+    *,
+    min_groups: int,
+    granularity: int,
+) -> tuple[dict[str, Any], int]:
+    batch_size = get_batch_size(data)
+    if batch_size % granularity != 0:
+        raise RuntimeError(
+            f"Batch size {batch_size} cannot divide granularity {granularity}."
+        )
+    current_groups = batch_size // granularity
+    pad_count = max(min_groups - current_groups, 0) * granularity
+    if pad_count == 0:
+        return data, 0
+    dummies = [make_transport_dummy(data) for _ in range(pad_count)]
+    return concat_padded_tensors([data, *dummies]), pad_count
+
+
 def split_padded_tensor_dict_into_mb_list(
     data: dict[str, Any],
     mb_spec: MicroBatchSpec,
     group: dist.ProcessGroup | None = None,
+    allow_transport_padding: bool = False,
 ) -> MicroBatchList:
     """Split a padded dict of tensors into micro-batches based on the attention mask.
 
@@ -708,6 +764,8 @@ def split_padded_tensor_dict_into_mb_list(
         data (Dict): Dictionary containing padded tensors.
         mb_spec (MicroBatchSpec): Specification for micro-batch splitting.
         group (Optional[dist.ProcessGroup]): Process group for distributed synchronization.
+        allow_transport_padding: Add model-valid rows when synchronized execution
+            requires more micro-batches than local semantic data can provide.
 
     Returns:
         MicroBatchList: A structure containing the split micro-batches and metadata.
@@ -720,19 +778,54 @@ def split_padded_tensor_dict_into_mb_list(
             mb_spec, max_tokens_per_mb=DEFAULT_MAX_TOKENS_PER_MB
         )
     granularity = mb_spec.granularity
-    bs = data["attention_mask"].shape[0]
-    if bs % granularity != 0:
-        raise RuntimeError(f"Batch size {bs} cannot divide granularity {granularity}.")
-    max_seqlen = data["attention_mask"].shape[1]
-    seq_lens = data["attention_mask"].sum(1).long().cpu().numpy().tolist()
-    input_lens = (
-        data["attention_mask"]
-        .view(bs // granularity, granularity, -1)
-        .sum(dim=(1, 2))
-        .long()
-        .cpu()
-        .numpy()
-    )
+    semantic_batch_size = data["attention_mask"].shape[0]
+    allocation_spec = mb_spec
+    transport_dummy_count = 0
+    target_n_mbs = max(mb_spec.n_mbs or 1, mb_spec.n_mbs_divisor)
+
+    while True:
+        if allow_transport_padding:
+            data, added = _pad_batch_to_min_groups(
+                data,
+                min_groups=target_n_mbs,
+                granularity=granularity,
+            )
+            transport_dummy_count += added
+            allocation_spec = MicroBatchSpec.new(mb_spec, n_mbs=target_n_mbs)
+
+        bs = data["attention_mask"].shape[0]
+        if bs % granularity != 0:
+            raise RuntimeError(
+                f"Batch size {bs} cannot divide granularity {granularity}."
+            )
+        max_seqlen = data["attention_mask"].shape[1]
+        seq_lens = data["attention_mask"].sum(1).long().cpu().numpy().tolist()
+        input_lens = (
+            data["attention_mask"]
+            .view(bs // granularity, granularity, -1)
+            .sum(dim=(1, 2))
+            .long()
+            .cpu()
+            .numpy()
+        )
+        if transport_dummy_count:
+            input_lens[-transport_dummy_count // granularity :] = 0
+
+        if not allow_transport_padding:
+            group_indices = allocate_balanced_mbs_synced(
+                allocation_spec, input_lens, group=group
+            )
+            break
+
+        group_indices = allocate_balanced_mbs(allocation_spec, input_lens)
+        if not dist.is_initialized():
+            break
+        all_n_mbs: list[int | None] = [None] * dist.get_world_size(group)
+        dist.all_gather_object(all_n_mbs, len(group_indices), group=group)
+        synchronized_n_mbs = max(n for n in all_n_mbs if n is not None)
+        if all(n == synchronized_n_mbs for n in all_n_mbs):
+            break
+        target_n_mbs = synchronized_n_mbs
 
     # check for multimodal input data
     multimodal_keys = {key for key in data if is_multi_modal_key(key)}
@@ -752,7 +845,6 @@ def split_padded_tensor_dict_into_mb_list(
             not_to_split[key] = value
 
     # split
-    group_indices = allocate_balanced_mbs_synced(mb_spec, input_lens, group=group)
     group_indices = [
         seqpack.flat2d(
             [list(range(i * granularity, (i + 1) * granularity)) for i in group_index]
@@ -803,16 +895,28 @@ def split_padded_tensor_dict_into_mb_list(
     results = []
     # organize splitted micro batches
     assert len(mbs) == len(splitted_lens), (len(mbs), len(splitted_lens))
-    for i, (mb, lens) in enumerate(zip(mbs, splitted_lens)):
-        results.append({**mb, **not_to_split})
+    for mb, indices in zip(mbs, group_indices, strict=True):
+        has_transport_dummy = any(index >= semantic_batch_size for index in indices)
+        is_transport_dummy = has_transport_dummy and all(
+            index >= semantic_batch_size for index in indices
+        )
+        if has_transport_dummy and not is_transport_dummy:
+            raise RuntimeError(
+                "Transport padding must not share a micro-batch with semantic rows"
+            )
+        result = {**mb, **not_to_split}
+        if is_transport_dummy:
+            result[TRANSPORT_DUMMY_KEY] = True
+        results.append(result)
 
     return MicroBatchList(
         data=data,
-        mb_spec=mb_spec,
+        mb_spec=allocation_spec,
         mbs=results,
         forward_indices=forward_indices,
         backward_indices=backward_indices.tolist(),
         group_lens=group_lens,
+        transport_dummy_count=transport_dummy_count,
     )
 
 
@@ -1033,6 +1137,9 @@ def pad_mb_list(
             pad_value=pad_value,
             seq_align_to=seq_align_to,
         )
+        padded_mb = {
+            key: value for key, value in padded_mb.items() if key != TRANSPORT_DUMMY_KEY
+        }
         padded_mb_inputs.append(padded_mb)
         pad_lengths.append(pad_len)
         pad_to_lengths.append(pad_to_length)
@@ -1338,9 +1445,10 @@ def bcast_mb_list(
             mb_list.padding_lengths,
             mb_list.padded_to_lengths,
             mb_list.align_to_lengths,
+            mb_list.transport_dummy_count,
         ]
         if mb_list
-        else [None for _ in range(7)]
+        else [None for _ in range(8)]
     )
     dist.broadcast_object_list(to_broadcast, src=src_rank, group=group)
     (
@@ -1351,6 +1459,7 @@ def bcast_mb_list(
         padding_lengths,
         padded_to_lengths,
         align_to_lengths,
+        transport_dummy_count,
     ) = to_broadcast
     return MicroBatchList(
         data=data,
@@ -1364,6 +1473,7 @@ def bcast_mb_list(
         padded_to_lengths=padded_to_lengths,
         old_cu_seqlens_list=old_cu_seqlens_list,
         align_to_lengths=align_to_lengths,
+        transport_dummy_count=transport_dummy_count,
     )
 
 
