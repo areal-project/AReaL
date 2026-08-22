@@ -134,6 +134,8 @@ class RWTrainer:
             train_batch_size=config.train_dataset.batch_size,
         )
 
+        self.stats_logger = StatsLogger(config, ft_spec)
+
         self.actor.initialize(addr=None, ft_spec=ft_spec, role="actor")
 
         self.valid_dataloader: StatefulDataLoader | None = None
@@ -163,9 +165,6 @@ class RWTrainer:
         # Set up save as HF model
         self.saver = Saver(config.saver, ft_spec)
         self.recover_handler = RecoverHandler(config.recover, ft_spec)
-
-        # Set up statistics logging (wandb, tensorboard, etc.)
-        self.stats_logger = StatsLogger(config, ft_spec)
 
         # Set up checkpointing for recover
         self.recover_info = self.recover_handler.load(
