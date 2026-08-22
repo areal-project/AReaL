@@ -273,14 +273,14 @@ def create_app(config: GatewayConfig) -> FastAPI:
 
     @app.post("/rl/start_session")
     async def start_session(request: Request):
-        token = require_admin_key(request, config.admin_api_key)
+        require_admin_key(request, config.admin_api_key)
 
         try:
             worker_addr = await query_router(
                 config.router_addr,
-                token,
-                "/rl/start_session",
-                config.router_timeout,
+                api_key=None,
+                path="/rl/start_session",
+                timeout=config.router_timeout,
                 admin_api_key=config.admin_api_key,
                 client=_client(),
             )
