@@ -8,6 +8,7 @@ This module provides utilities that are shared between tests and profiling tools
 import asyncio
 import os
 import random
+from collections.abc import Iterator, Mapping
 from typing import Any
 
 import torch
@@ -84,49 +85,76 @@ def get_dataset_path(local_path: str, hf_id: str) -> str:
         raise
 
 
+class _LazyModelPaths(Mapping[str, str]):
+    """Resolve configured model paths only when their key is requested."""
+
+    def __init__(self, paths: Mapping[str, tuple[str, str]]) -> None:
+        self._paths = dict(paths)
+        self._resolved_paths: dict[str, str] = {}
+
+    def __getitem__(self, key: str) -> str:
+        if key not in self._resolved_paths:
+            local_path, hf_id = self._paths[key]
+            self._resolved_paths[key] = get_model_path(local_path, hf_id)
+        return self._resolved_paths[key]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._paths)
+
+    def __len__(self) -> int:
+        return len(self._paths)
+
+
 # Model paths for testing (keyed by HF model_type)
 # Dense models (fast to instantiate even on meta device)
-DENSE_MODEL_PATHS = {
-    "qwen2": get_model_path(
+_DENSE_MODEL_PATH_SPECS = {
+    "qwen2": (
         "/storage/openpsi/models/Qwen__Qwen2.5-0.5B-Instruct/",
         "Qwen/Qwen2.5-0.5B-Instruct",
     ),
-    "qwen3": get_model_path(
+    "qwen3": (
         "/storage/openpsi/models/Qwen__Qwen3-0.6B/",
         "Qwen/Qwen3-0.6B",
     ),
-    "qwen3_5": get_model_path(
+    "qwen3_5": (
         "/storage/openpsi/models/Qwen__Qwen3.5-0.8B/",
         "Qwen/Qwen3.5-0.8B",
     ),
-    "qwen2_5_vl": get_model_path(
+    "qwen2_5_vl": (
         "/storage/openpsi/models/Qwen__Qwen2.5-VL-3B-Instruct/",
         "Qwen/Qwen2.5-VL-3B-Instruct",
     ),
-    "qwen3_vl": get_model_path(
+    "qwen3_vl": (
         "/storage/openpsi/models/Qwen__Qwen3-VL-2B-Instruct/",
         "Qwen/Qwen3-VL-2B-Instruct",
     ),
 }
+DENSE_MODEL_PATHS = _LazyModelPaths(_DENSE_MODEL_PATH_SPECS)
 
 # MoE models (slow to instantiate due to large number of experts)
-MOE_MODEL_PATHS = {
-    "qwen3_moe": get_model_path(
+_MOE_MODEL_PATH_SPECS = {
+    "qwen3_moe": (
         "/storage/openpsi/models/Qwen__Qwen3-30B-A3B/",
         "Qwen/Qwen3-30B-A3B",
     ),
-    "qwen3_5_moe": get_model_path(
+    "qwen3_5_moe": (
         "/storage/openpsi/models/Qwen__Qwen3.5-35B-A3B",
         "Qwen/Qwen3.5-35B-A3B",
     ),
-    "qwen3_vl_moe": get_model_path(
+    "qwen3_vl_moe": (
         "/storage/openpsi/models/Qwen__Qwen3-VL-30B-A3B-Instruct/",
         "Qwen/Qwen3-VL-30B-A3B-Instruct",
     ),
 }
+MOE_MODEL_PATHS = _LazyModelPaths(_MOE_MODEL_PATH_SPECS)
 
 # Combined for backward compatibility
-MODEL_PATHS = {**DENSE_MODEL_PATHS, **MOE_MODEL_PATHS}
+MODEL_PATHS = _LazyModelPaths(
+    {
+        **_DENSE_MODEL_PATH_SPECS,
+        **_MOE_MODEL_PATH_SPECS,
+    }
+)
 
 
 def load_archon_model(
