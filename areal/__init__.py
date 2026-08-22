@@ -2,7 +2,12 @@
 
 """AReaL: A Large-Scale Asynchronous Reinforcement Learning System for Language Reasoning"""
 
+from typing import TYPE_CHECKING
+
 from .version import __version__  # noqa
+
+if TYPE_CHECKING:
+    from .trainer import DPOTrainer, PPOTrainer, RWTrainer, SFTTrainer
 
 from .infra import (
     RolloutController,
