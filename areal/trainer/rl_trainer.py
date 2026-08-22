@@ -706,6 +706,12 @@ class PPOTrainer:
                     reward_normalization=config.gconfig.reward_normalization,
                     drop_incomplete_group=config.gconfig.drop_incomplete_group,
                 )
+                self.stats_logger.log_rollout_traces(
+                    rollout_batch,
+                    split="rollout",
+                    global_step=global_step,
+                    tokenizer=self.tokenizer,
+                )
             if self._should_offload_rollout:
                 self._offload_rollout()
 
@@ -1401,6 +1407,7 @@ class PPOTrainer:
         self,
         eval_workflow: WorkflowLike,
         eval_workflow_kwargs,
+        global_step: int,
     ):
         if self.actor.is_data_parallel_head():
             cnt = 0
@@ -1416,7 +1423,13 @@ class PPOTrainer:
                         drop_incomplete_group=False,
                     )
                     cnt += 1
-            self.eval_rollout.wait(cnt, timeout=None)
+            eval_batch = self.eval_rollout.wait(cnt, timeout=None)
+            self.stats_logger.log_rollout_traces(
+                eval_batch,
+                split="eval-rollout",
+                global_step=global_step,
+                tokenizer=self.tokenizer,
+            )
 
         if not is_single_controller():
             dist.barrier(group=self.actor.cpu_group)
@@ -1441,6 +1454,7 @@ class PPOTrainer:
                 self._evaluate_fn,
                 eval_workflow=eval_workflow,
                 eval_workflow_kwargs=eval_workflow_kwargs,
+                global_step=global_step,
             ),
             epoch,
             epoch_step,

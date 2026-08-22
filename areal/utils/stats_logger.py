@@ -4,6 +4,7 @@ import getpass
 import os
 import time
 from dataclasses import asdict
+from typing import Any
 
 import swanlab
 import torch.distributed as dist
@@ -157,6 +158,181 @@ class StatsLogger:
                 for key, val in item.items():
                     self.summary_writer.add_scalar(f"{key}", val, log_step + i)
         self._last_commit_step = log_step + len(data) - 1
+
+    def log_rollout_traces(
+        self,
+        trajectories: list[dict[str, Any] | None],
+        *,
+        split: str,
+        global_step: int,
+        tokenizer,
+    ) -> None:
+        if dist.is_initialized() and dist.get_rank() != 0:
+            return
+        if not getattr(self, "_trackio_enabled", False):
+            return
+
+        max_traces = self.config.trackio.max_rollout_traces_per_step
+        if max_traces <= 0:
+            return
+
+        traces = []
+        for trajectory_index, trajectory in enumerate(trajectories):
+            if len(traces) >= max_traces:
+                break
+            traces.extend(
+                self._trajectory_to_trackio_traces(
+                    trajectory,
+                    split=split,
+                    global_step=global_step,
+                    trajectory_index=trajectory_index,
+                    tokenizer=tokenizer,
+                    remaining=max_traces - len(traces),
+                )
+            )
+
+        if traces:
+            trackio.log({f"{split}/trajectories": traces}, step=global_step)
+
+    def _trajectory_to_trackio_traces(
+        self,
+        trajectory: dict[str, Any] | None,
+        *,
+        split: str,
+        global_step: int,
+        trajectory_index: int,
+        tokenizer,
+        remaining: int,
+    ) -> list[Any]:
+        if trajectory is None:
+            return []
+
+        input_ids = trajectory.get("input_ids")
+        loss_mask = trajectory.get("loss_mask")
+        attention_mask = trajectory.get("attention_mask")
+        rewards = trajectory.get("rewards")
+        versions = trajectory.get("versions")
+
+        if input_ids is None or loss_mask is None or attention_mask is None:
+            return []
+
+        traces = []
+        batch_size = input_ids.shape[0]
+        input_ids_cpu = input_ids.detach().cpu()
+        loss_mask_cpu = loss_mask.detach().cpu()
+        attention_mask_cpu = attention_mask.detach().cpu()
+        rewards_cpu = rewards.detach().cpu() if rewards is not None else None
+        versions_cpu = versions.detach().cpu() if versions is not None else None
+        for sample_index in range(batch_size):
+            if len(traces) >= remaining:
+                break
+            seqlen = int(attention_mask_cpu[sample_index].sum().item())
+            if seqlen <= 0:
+                continue
+
+            ids = input_ids_cpu[sample_index, :seqlen].tolist()
+            mask = loss_mask_cpu[sample_index, :seqlen].tolist()
+            if not mask or mask[-1] != 1:
+                continue
+
+            messages = self._trajectory_messages(
+                trajectory,
+                sample_index=sample_index,
+                ids=ids,
+                mask=mask,
+                tokenizer=tokenizer,
+            )
+            if not messages:
+                continue
+
+            metadata = {
+                "split": split,
+                "global_step": global_step,
+                "trajectory_index": trajectory_index,
+                "sample_index": sample_index,
+                "seqlen": seqlen,
+                "prompt_len": mask.index(1),
+            }
+            if rewards_cpu is not None:
+                metadata["reward"] = self._metadata_value(rewards_cpu[sample_index])
+            if versions_cpu is not None:
+                sample_versions = versions_cpu[sample_index, :seqlen].tolist()
+                metadata["head_version"] = min(sample_versions)
+                metadata["tail_version"] = max(sample_versions)
+
+            traces.append(
+                trackio.Trace(
+                    messages=messages,
+                    metadata=metadata,
+                )
+            )
+        return traces
+
+    @staticmethod
+    def _metadata_value(value):
+        if hasattr(value, "numel"):
+            if value.numel() == 1:
+                return value.item()
+            return value.tolist()
+        return value
+
+    def _trajectory_messages(
+        self,
+        trajectory: dict[str, Any],
+        *,
+        sample_index: int,
+        ids: list[int],
+        mask: list[int],
+        tokenizer,
+    ) -> list[dict[str, str]]:
+        messages = self._structured_messages(trajectory, sample_index)
+        if messages is not None:
+            return messages
+
+        trace_messages = []
+        span_start = 0
+        for span_end in range(1, len(ids) + 1):
+            if span_end < len(ids) and bool(mask[span_end]) == bool(mask[span_start]):
+                continue
+
+            content = tokenizer.decode(
+                ids[span_start:span_end], skip_special_tokens=False
+            )
+            if content:
+                if bool(mask[span_start]):
+                    role = "assistant"
+                else:
+                    role = "user" if not trace_messages else "tool"
+                trace_messages.append({"role": role, "content": content})
+            span_start = span_end
+
+        return trace_messages
+
+    @staticmethod
+    def _structured_messages(
+        trajectory: dict[str, Any], sample_index: int
+    ) -> list[dict[str, str]] | None:
+        for key in ("messages", "conversation", "conversation_text"):
+            value = trajectory.get(key)
+            if value is None:
+                continue
+            if (
+                isinstance(value, list)
+                and len(value) > sample_index
+                and isinstance(value[sample_index], list)
+            ):
+                value = value[sample_index]
+            if isinstance(value, list) and all(
+                isinstance(message, dict) for message in value
+            ):
+                return [
+                    {
+                        "role": str(message.get("role", "user")),
+                        "content": str(message.get("content", "")),
+                    }
+                    for message in value
+                ]
+        return None
 
     def print_stats(self, stats: dict[str, float]):
         logger.info("\n" + tabulate_stats(stats))
