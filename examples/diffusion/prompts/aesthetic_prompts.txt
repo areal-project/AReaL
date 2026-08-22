@@ -1,0 +1,30 @@
+# Phase 1 SD1.5 + GRPO aesthetic-reward training prompts.
+# One prompt per line. Blank lines and lines starting with '#' are ignored.
+# These are short, visually rich subjects well-suited to optimizing the LAION
+# aesthetic predictor (no copyrighted names / real people on purpose).
+
+a serene mountain lake at sunrise
+a cozy bookstore cafe in autumn
+a futuristic city skyline at night
+a field of wildflowers under a blue sky
+a misty forest path in early morning
+a lighthouse on a rocky coast at dusk
+a snow-covered cabin in the woods
+a tropical beach with turquoise water
+a lavender field in southern france
+a waterfall in a tropical rainforest
+a desert canyon at golden hour
+a quiet japanese garden with a koi pond
+a vineyard on rolling hills at sunset
+a northern lights display over a frozen lake
+a hot air balloon over a patchwork countryside
+a cherry blossom avenue in spring
+a coral reef teeming with colorful fish
+a starry night sky over a mountain range
+an autumn maple forest in vivid red and orange
+a calm harbor with sailboats at sunrise
+a terraced rice field in the morning fog
+a cobblestone street in an old european town
+a flower market overflowing with bright bouquets
+a glacier lagoon with floating icebergs
+a sunflower field stretching to the horizon
