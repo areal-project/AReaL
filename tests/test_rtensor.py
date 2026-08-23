@@ -6,6 +6,7 @@ import sys
 import time
 import uuid
 
+import aiohttp
 import orjson
 import pytest
 import requests
@@ -19,6 +20,44 @@ from areal.infra.rpc.rtensor import (
 from areal.infra.rpc.serialization import deserialize_value, serialize_value
 from areal.infra.utils.proc import kill_process_tree
 from areal.utils.network import find_free_ports
+
+
+class _FakeDeleteResponse:
+    content_type = "application/json"
+
+    def __init__(self, payload):
+        self.payload = payload
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    def raise_for_status(self):
+        return None
+
+    async def json(self):
+        return self.payload
+
+
+class _FakeDeleteSession:
+    def __init__(self, responses_or_errors):
+        self.responses_or_errors = list(responses_or_errors)
+        self.requests = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    def delete(self, url, *, json, timeout):
+        self.requests.append((url, json, timeout))
+        item = self.responses_or_errors.pop(0)
+        if isinstance(item, BaseException):
+            raise item
+        return _FakeDeleteResponse(item)
 
 
 @pytest.fixture(scope="module")
@@ -262,6 +301,60 @@ class TestRTensorIntegration:
 
 class TestHttpRTensorBackendBatching:
     """Unit tests for HTTP batch fetching behavior."""
+
+    def test_delete_retries_with_payload_and_returns_storage_stats(self, monkeypatch):
+        async def no_sleep(_delay):
+            return None
+
+        result_payload = {
+            "status": "ok",
+            "cleared_count": 2,
+            "num_tensors": 3,
+            "total_bytes": 128,
+        }
+        session = _FakeDeleteSession(
+            [aiohttp.ClientConnectionError("temporary failure"), result_payload]
+        )
+        backend = HttpRTensorBackend()
+        monkeypatch.setattr(backend, "_create_session", lambda: session)
+        monkeypatch.setattr("areal.infra.utils.http.asyncio.sleep", no_sleep)
+
+        result = asyncio.run(backend.delete("node-a", ["s0", "s1"]))
+
+        assert result == result_payload
+        assert len(session.requests) == 2
+        for url, payload, timeout in session.requests:
+            assert url == "http://node-a/data/clear"
+            assert payload == {"shard_ids": ["s0", "s1"]}
+            assert timeout.total == 10
+
+    def test_delete_raises_after_three_failed_attempts(self, monkeypatch):
+        async def no_sleep(_delay):
+            return None
+
+        session = _FakeDeleteSession(
+            [aiohttp.ClientConnectionError("offline") for _ in range(3)]
+        )
+        backend = HttpRTensorBackend()
+        monkeypatch.setattr(backend, "_create_session", lambda: session)
+        monkeypatch.setattr("areal.infra.utils.http.asyncio.sleep", no_sleep)
+
+        with pytest.raises(RuntimeError, match="Failed after 3 retries"):
+            asyncio.run(backend.delete("node-a", ["s0"]))
+
+        assert len(session.requests) == 3
+
+    @pytest.mark.parametrize(
+        "payload",
+        ["not-a-dict", {"status": "error", "message": "clear failed"}],
+    )
+    def test_delete_rejects_invalid_success_payload(self, monkeypatch, payload):
+        session = _FakeDeleteSession([payload])
+        backend = HttpRTensorBackend()
+        monkeypatch.setattr(backend, "_create_session", lambda: session)
+
+        with pytest.raises(RuntimeError, match="Invalid response"):
+            asyncio.run(backend.delete("node-a", ["s0"]))
 
     def test_fetch_chunks_large_requests(self, monkeypatch):
         """Large same-node fetches are split into bounded batch requests."""
@@ -1023,6 +1116,25 @@ class TestFetchBuffer:
         # clear_node evicts from buffer
         asyncio.run(RTensor.clear_node(rpc_server, [shard_id]))
         assert shard_id not in _fetch_buffer
+
+    def test_clear_node_evicts_from_buffer_when_delete_fails(self):
+        """A failed remote delete must not regress local buffer cleanup."""
+        from areal.infra.rpc.rtensor import _fetch_buffer, set_backend
+
+        class _FailingBackend:
+            async def delete(self, _node_addr, _shard_ids):
+                raise RuntimeError("storage node unavailable")
+
+        shard_id = "failed-delete-shard"
+        _fetch_buffer[shard_id] = torch.tensor([1])
+        set_backend(_FailingBackend())
+        try:
+            with pytest.raises(RuntimeError, match="storage node unavailable"):
+                asyncio.run(RTensor.clear_node("node-a", [shard_id]))
+            assert shard_id not in _fetch_buffer
+        finally:
+            set_backend(None)
+            _fetch_buffer.pop(shard_id, None)
 
     def test_clear_fetch_buffer_selective(self):
         """clear_fetch_buffer(sids) pops only the listed entries, misses are no-ops."""

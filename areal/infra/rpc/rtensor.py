@@ -15,7 +15,11 @@ import orjson
 import torch
 
 from areal.infra.utils.concurrent import run_async_task
-from areal.infra.utils.http import DEFAULT_REQUEST_TIMEOUT, get_default_connector
+from areal.infra.utils.http import (
+    DEFAULT_REQUEST_TIMEOUT,
+    arequest_with_retry,
+    get_default_connector,
+)
 from areal.utils import logging
 
 logger = logging.getLogger("HttpRTensor")
@@ -52,7 +56,9 @@ class RTensorBackend(Protocol):
         """
         ...
 
-    async def delete(self, node_addr: str, shard_ids: list[Any]) -> None:
+    async def delete(
+        self, node_addr: str, shard_ids: list[Any]
+    ) -> dict[str, Any] | None:
         """Delete shards from storage.
 
         Parameters
@@ -61,6 +67,11 @@ class RTensorBackend(Protocol):
             The node address where shards are stored
         shard_ids : list[Any]
             List of shard IDs to delete
+
+        Returns
+        -------
+        dict[str, Any] | None
+            Storage-node cleanup statistics when provided by the backend.
         """
         ...
 
@@ -252,21 +263,24 @@ class HttpRTensorBackend:
         _store_local(shard_id, tensor)
         return shard_id
 
-    async def delete(self, node_addr: str, shard_ids: list[str]) -> None:
-        """Delete shards via HTTP DELETE request."""
-        from areal.utils.network import format_hostport, split_hostport
-
-        try:
-            host, port = split_hostport(node_addr)
-            base = format_hostport(host, port)
-        except ValueError:
-            base = node_addr
+    async def delete(self, node_addr: str, shard_ids: list[str]) -> dict[str, Any]:
+        """Delete shards with retries and return storage-node cleanup statistics."""
         async with self._create_session() as session:
-            async with session.delete(
-                f"http://{base}/data/clear", json={"shard_ids": shard_ids}
-            ) as resp:
-                if resp.status == 200:
-                    await resp.json()
+            result = await arequest_with_retry(
+                node_addr,
+                "/data/clear",
+                payload={"shard_ids": shard_ids},
+                session=session,
+                method="DELETE",
+                max_retries=3,
+                timeout=10,
+            )
+        if not isinstance(result, dict) or result.get("status") != "ok":
+            raise RuntimeError(
+                f"Invalid response while clearing RTensor shards on {node_addr}: "
+                f"{result!r}"
+            )
+        return result
 
 
 _backend: RTensorBackend | None = None
@@ -528,7 +542,7 @@ class RTensor:
         return shards_by_node
 
     @staticmethod
-    async def clear_node(node_addr: str, shard_ids: list[Any]) -> None:
+    async def clear_node(node_addr: str, shard_ids: list[Any]) -> dict[str, Any] | None:
         """Clear shards from a node and evict them from the fetch buffer.
 
         Parameters
@@ -537,11 +551,16 @@ class RTensor:
             The node address
         shard_ids : list[Any]
             List of shard IDs to delete
+
+        Returns
+        -------
+        dict[str, Any] | None
+            Storage-node cleanup statistics when provided by the backend.
         """
         with _fetch_buffer_lock:
             for sid in shard_ids:
                 _fetch_buffer.pop(sid, None)
-        await get_backend().delete(node_addr, shard_ids)
+        return await get_backend().delete(node_addr, shard_ids)
 
     @property
     def shape(self) -> torch.Size:

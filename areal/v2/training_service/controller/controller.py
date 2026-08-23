@@ -27,6 +27,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("GatewayTrainController")
 
+_MAX_CLEAR_STEP_FAILURES = 2
+
 
 class GatewayTrainController:
     _GUARD_SUFFIX = "-guard"
@@ -64,6 +66,9 @@ class GatewayTrainController:
         # Shared HTTP client (lazy, per-event-loop)
         self._async_client: Any | None = None
         self._async_client_loop: asyncio.AbstractEventLoop | None = None
+        self._pending_clear_shards: dict[str, dict[Any, int]] = {}
+        self._clear_shards_lock = Lock()
+        self._clear_batches_lock = Lock()
 
         # Pipelined initialization state
         self._init_future: concurrent.futures.Future | None = None
@@ -872,27 +877,100 @@ class GatewayTrainController:
         self._gateway_post("/save_perf_tracer", payload)
 
     def clear_batches(self, *targets: Any) -> None:
-        from areal.infra.rpc.rtensor import RTensor, flatten_shard_ids
+        """Clear worker buffers and retry failed storage deletes across one step."""
+        with self._clear_batches_lock:
+            self._clear_batches_locked(*targets)
+
+    def _clear_batches_locked(self, *targets: Any) -> None:
+        from areal.infra.rpc.rtensor import RTensor
         from areal.infra.rpc.serialization import serialize_value
 
         # Step 1: HTTP DELETE to storage nodes to evict _storage entries
         # (mirrors TrainController._async_clear_batches)
         shards_by_node = RTensor.collect_shards(targets)
-        if shards_by_node:
+        with self._clear_shards_lock:
+            for addr, sids in shards_by_node.items():
+                pending = self._pending_clear_shards.setdefault(addr, {})
+                for sid in sids:
+                    pending.setdefault(sid, 0)
+            clear_requests = [
+                (addr, list(pending))
+                for addr, pending in self._pending_clear_shards.items()
+                if pending
+            ]
+        exhausted: dict[str, int] = {}
+        if clear_requests:
 
             async def _clear_storage():
-                await asyncio.gather(
-                    *[
-                        RTensor.clear_node(addr, sids)
-                        for addr, sids in shards_by_node.items()
-                    ],
+                results = await asyncio.gather(
+                    *[RTensor.clear_node(addr, sids) for addr, sids in clear_requests],
                     return_exceptions=True,
                 )
+                fatal_error = next(
+                    (
+                        result
+                        for result in results
+                        if isinstance(result, BaseException)
+                        and not isinstance(result, Exception)
+                    ),
+                    None,
+                )
+                if fatal_error is not None:
+                    raise fatal_error
+
+                for (addr, sids), result in zip(clear_requests, results, strict=True):
+                    if isinstance(result, Exception):
+                        with self._clear_shards_lock:
+                            pending = self._pending_clear_shards.get(addr, {})
+                            exhausted_count = 0
+                            for sid in sids:
+                                if sid not in pending:
+                                    continue
+                                failures = pending[sid] + 1
+                                if failures >= _MAX_CLEAR_STEP_FAILURES:
+                                    pending.pop(sid)
+                                    exhausted_count += 1
+                                else:
+                                    pending[sid] = failures
+                            if not pending:
+                                self._pending_clear_shards.pop(addr, None)
+                            pending_count = len(pending)
+                        if exhausted_count:
+                            exhausted[addr] = exhausted_count
+                        logger.warning(
+                            "Failed to clear %d RTensor shards on storage node "
+                            "%s: %s: %s (%d pending, %d retries exhausted)",
+                            len(sids),
+                            addr,
+                            type(result).__name__,
+                            result,
+                            pending_count,
+                            exhausted_count,
+                        )
+                        continue
+                    with self._clear_shards_lock:
+                        pending = self._pending_clear_shards.get(addr)
+                        if pending is not None:
+                            for sid in sids:
+                                pending.pop(sid, None)
+                            if not pending:
+                                self._pending_clear_shards.pop(addr, None)
+                    if isinstance(result, dict):
+                        logger.debug(
+                            "Cleared RTensor shards on storage node %s "
+                            "(requested=%d, cleared=%s, remaining_tensors=%s, "
+                            "remaining_bytes=%s)",
+                            addr,
+                            len(sids),
+                            result.get("cleared_count", "unknown"),
+                            result.get("num_tensors", "unknown"),
+                            result.get("total_bytes", "unknown"),
+                        )
 
             run_async_task(_clear_storage)
 
         # Step 2: Drain _fetch_buffer on workers via engine.clear_batches(shard_ids)
-        shard_ids = flatten_shard_ids(targets)
+        shard_ids = [sid for _, sids in clear_requests for sid in sids]
         if not shard_ids:
             return
         payload = {
@@ -900,6 +978,15 @@ class GatewayTrainController:
             "kwargs": serialize_value({}),
         }
         self._gateway_post("/clear_batches", payload)
+
+        if exhausted:
+            summary = ", ".join(
+                f"{addr}: {count}" for addr, count in sorted(exhausted.items())
+            )
+            raise RuntimeError(
+                "RTensor storage cleanup failed across two clear_batches calls "
+                f"({summary})"
+            )
 
     def current_data_parallel_head(self) -> int:
         return 0
