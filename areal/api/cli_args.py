@@ -894,6 +894,85 @@ class FP8EngineConfig:
 
 
 @dataclass
+class CPUStagedMuonConfig:
+    """Algorithm settings for Megatron's CPU-staged Muon backend."""
+
+    momentum: float = 0.95
+    use_nesterov: bool = False
+    fp32_matmul_prec: str = "medium"
+    coefficient_type: str = "quintic"
+    num_ns_steps: int = 5
+    scale_mode: str = "spectral"
+    split_qkv: bool = True
+    tp_mode: str = field(
+        default="duplicated",
+        metadata={"choices": ["duplicated"]},
+    )
+    extra_scale_factor: float = 1.0
+
+    def __post_init__(self) -> None:
+        if not 0.0 <= self.momentum < 1.0:
+            raise ValueError("cpu_staged_optimizer.muon.momentum must be in [0, 1)")
+        if self.num_ns_steps < 1:
+            raise ValueError(
+                "cpu_staged_optimizer.muon.num_ns_steps must be at least 1"
+            )
+        if self.extra_scale_factor <= 0:
+            raise ValueError(
+                "cpu_staged_optimizer.muon.extra_scale_factor must be positive"
+            )
+        if self.tp_mode != "duplicated":
+            raise ValueError(
+                "cpu_staged_optimizer.muon.tp_mode currently supports only 'duplicated'"
+            )
+
+
+@dataclass
+class CPUStagedOptimizerConfig:
+    """Megatron optimizer state residency and bounded GPU staging configuration."""
+
+    enabled: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Keep FP32 AdamW master parameters and moments in pinned CPU "
+                "memory, and stream bounded chunks through GPU staging buffers "
+                "during optimizer.step(). Megatron only."
+            )
+        },
+    )
+    kind: str = field(
+        default="adamw",
+        metadata={
+            "help": "CPU-staged optimizer algorithm.",
+            "choices": ["adamw", "muon"],
+        },
+    )
+    buffer_count: int = field(
+        default=2,
+        metadata={"help": "Number of reusable GPU optimizer staging buffers."},
+    )
+    bucket_size_mb: float = field(
+        default=128.0,
+        metadata={"help": "Maximum size in MiB of one GPU optimizer staging unit."},
+    )
+    muon: CPUStagedMuonConfig = field(
+        default_factory=CPUStagedMuonConfig,
+        metadata={"help": "Muon algorithm settings used when kind=muon."},
+    )
+
+    def __post_init__(self) -> None:
+        if self.kind not in {"adamw", "muon"}:
+            raise ValueError(
+                "cpu_staged_optimizer.kind must be either 'adamw' or 'muon'"
+            )
+        if self.buffer_count < 1:
+            raise ValueError("cpu_staged_optimizer.buffer_count must be at least 1")
+        if self.bucket_size_mb <= 0:
+            raise ValueError("cpu_staged_optimizer.bucket_size_mb must be positive")
+
+
+@dataclass
 class MegatronEngineConfig:
     """Configuration for Megatron-LM training framework.
     Refer to Megatron-LM documentation for implementation details.
@@ -932,6 +1011,14 @@ class MegatronEngineConfig:
     main_params_dtype: str = "float32"
     exp_avg_dtype: str = "float32"
     exp_avg_sq_dtype: str = "float32"
+    cpu_staged_optimizer: CPUStagedOptimizerConfig = field(
+        default_factory=CPUStagedOptimizerConfig,
+        metadata={
+            "help": (
+                "CPU-resident AdamW state with bounded GPU-staged optimizer steps."
+            )
+        },
+    )
 
     # Checkpointing Configuration
     async_save: bool = field(
@@ -1099,6 +1186,31 @@ class MegatronEngineConfig:
     )
 
     def __post_init__(self) -> None:
+        if self.cpu_staged_optimizer.enabled and self.async_save:
+            raise ValueError(
+                "megatron.async_save is not supported with "
+                "megatron.cpu_staged_optimizer.enabled=true"
+            )
+        if self.cpu_staged_optimizer.enabled:
+            staged_kind = self.cpu_staged_optimizer.kind
+            if staged_kind == "adamw" and not self.ddp.use_distributed_optimizer:
+                raise ValueError(
+                    "cpu-staged AdamW requires ddp.use_distributed_optimizer=true"
+                )
+            if staged_kind == "muon":
+                if self.ddp.use_distributed_optimizer:
+                    raise ValueError(
+                        "cpu-staged Muon requires ddp.use_distributed_optimizer=false"
+                    )
+                if self.ddp.overlap_param_gather:
+                    raise ValueError(
+                        "cpu-staged Muon requires ddp.overlap_param_gather=false"
+                    )
+                if self.overlap_param_gather_with_optimizer_step:
+                    raise ValueError(
+                        "cpu-staged Muon does not support "
+                        "overlap_param_gather_with_optimizer_step"
+                    )
         if self.lm_head_loss_chunk_size < 0:
             raise ValueError(
                 "lm_head_loss_chunk_size must be non-negative, got "

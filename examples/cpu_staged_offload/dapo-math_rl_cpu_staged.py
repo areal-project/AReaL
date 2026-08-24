@@ -4,12 +4,9 @@ from __future__ import annotations
 
 import sys
 
-from examples.cpu_staged_offload.config import (
-    CPUStagedGRPOConfig,
-    install_cpu_staged_worker_environment,
-)
-from examples.cpu_staged_offload.engine import CPUStagedPPOTrainer
+from examples.multi_turn_math.config import MultiTurnGRPOConfig
 
+from areal import PPOTrainer
 from areal.api.cli_args import load_expr_config
 from areal.dataset import get_custom_dataset
 from areal.utils.hf_utils import load_hf_tokenizer
@@ -19,8 +16,7 @@ WORKFLOW_PATH = "areal.workflow.openai.math_agent.MathAgent"
 
 def main(args: list[str]) -> None:
     """Load the configured math dataset and run the standard PPO flow."""
-    config, _ = load_expr_config(args, CPUStagedGRPOConfig)
-    install_cpu_staged_worker_environment(config)
+    config, _ = load_expr_config(args, MultiTurnGRPOConfig)
     tokenizer = load_hf_tokenizer(config.tokenizer_path)
     train_dataset = get_custom_dataset(
         split="train",
@@ -40,7 +36,7 @@ def main(args: list[str]) -> None:
         "top_p": config.gconfig.top_p,
         "max_completion_tokens": config.gconfig.max_new_tokens,
     }
-    with CPUStagedPPOTrainer(
+    with PPOTrainer(
         config,
         train_dataset=train_dataset,
         valid_dataset=valid_dataset,

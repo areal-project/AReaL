@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import gc
 from contextlib import nullcontext
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -376,18 +375,14 @@ def test_official_ownership_validation_accepts_missing_lists_only_for_dp1() -> N
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_muon_checkpoint_roundtrip_preserves_cpu_slab_residency(
-    tmp_path: Path,
-) -> None:
-    """A synchronous Muon load restores both CPU slab state kinds transactionally."""
+def test_muon_checkpoint_roundtrip_preserves_cpu_slab_residency() -> None:
+    """A synchronous Muon load restores both CPU slab state kinds in place."""
     param = torch.nn.Parameter(torch.ones(4, 4, device="cuda", dtype=torch.bfloat16))
     optimizer = GPUStagedMuon(
         [{"params": [param], "lr": 0.1, "momentum": 0.9, "weight_decay": 0.0}],
         staged_config=GPUStagedMuonConfig(
             buffer_count=1,
             slot_size_mb=1,
-            checkpoint_snapshot_root=str(tmp_path),
-            checkpoint_snapshot_chunk_mb=1,
         ),
         orthogonalize=_identity_orthogonalize,
         matmul_precision=nullcontext,
@@ -410,10 +405,8 @@ def test_muon_checkpoint_roundtrip_preserves_cpu_slab_residency(
     optimizer.cpu_slabs.momentum.fill_(13.0)
     optimizer.begin_checkpoint_load()
     optimizer.load_state_dict(saved)
-    optimizer.prepare_checkpoint_load()
-    optimizer.commit_checkpoint_load()
+    optimizer.complete_checkpoint_load()
 
-    assert optimizer.checkpoint_lifecycle == "CLEAN"
     assert optimizer.residency == "CPU_RESIDENT"
     assert optimizer.cuda_state_numel == 0
     assert optimizer.cpu_slabs.master.is_pinned()

@@ -74,6 +74,8 @@ For detailed examples, see the experiment configurations in the `examples/` dire
 - [Agent Configuration](section-agent)
 - [ArchonEngine Configuration](section-archon-engine)
 - [ArchonFP8 Configuration](section-archon-fp8)
+- [CPUStagedMuon Configuration](section-cpu-staged-muon)
+- [CPUStagedOptimizer Configuration](section-cpu-staged-optimizer)
 - [DPO Configuration](section-dpo)
 - [DPOEngine Configuration](section-dpo-engine)
 - [DistributedDataParallel Configuration](section-distributed-data-parallel)
@@ -958,6 +960,38 @@ Archon FP8 training configuration.
 | `include_experts` | boolean        | `False`      | Apply FP8 to MoE expert computation. Uses per-expert blockwise FP8 matmuls via torchao.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
 | `use_triton`      | boolean        | `True`       | Use Triton GEMM kernel for FP8 blockwise matmuls instead of cuBLAS. Currently must be True: torchao's blockwise FP8 is a prototype that uses mixed per-operand scaling (1x128 activations + 128x128 weights), which torch.\_scaled_mm does not support. The Triton kernel (triton_fp8_gemm_1x128_128x128) handles this natively. Revisit when torchao stabilizes mixed-mode cuBLAS dispatch.                                                                                                                                                                                                |
 
+(section-cpu-staged-muon)=
+
+## CPUStagedMuon Configuration
+
+Algorithm settings for Megatron's CPU-staged Muon backend.
+
+| Parameter            | Type    | Default        | Description                 |
+| -------------------- | ------- | -------------- | --------------------------- |
+| `momentum`           | float   | `0.95`         | -                           |
+| `use_nesterov`       | boolean | `False`        | -                           |
+| `fp32_matmul_prec`   | string  | `"medium"`     | -                           |
+| `coefficient_type`   | string  | `"quintic"`    | -                           |
+| `num_ns_steps`       | integer | `5`            | -                           |
+| `scale_mode`         | string  | `"spectral"`   | -                           |
+| `split_qkv`          | boolean | `True`         | -                           |
+| `tp_mode`            | string  | `"duplicated"` | - **Choices:** `duplicated` |
+| `extra_scale_factor` | float   | `1.0`          | -                           |
+
+(section-cpu-staged-optimizer)=
+
+## CPUStagedOptimizer Configuration
+
+Megatron optimizer state residency and bounded GPU staging configuration.
+
+| Parameter        | Type                                             | Default      | Description                                                                                                                                                       |
+| ---------------- | ------------------------------------------------ | ------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `enabled`        | boolean                                          | `False`      | Keep FP32 AdamW master parameters and moments in pinned CPU memory, and stream bounded chunks through GPU staging buffers during optimizer.step(). Megatron only. |
+| `kind`           | string                                           | `"adamw"`    | CPU-staged optimizer algorithm. **Choices:** `adamw`, `muon`                                                                                                      |
+| `buffer_count`   | integer                                          | `2`          | Number of reusable GPU optimizer staging buffers.                                                                                                                 |
+| `bucket_size_mb` | float                                            | `128.0`      | Maximum size in MiB of one GPU optimizer staging unit.                                                                                                            |
+| `muon`           | [`CPUStagedMuonConfig`](section-cpu-staged-muon) | **Required** | Muon algorithm settings used when kind=muon.                                                                                                                      |
+
 (section-dpo)=
 
 ## DPO Configuration
@@ -1232,6 +1266,7 @@ Refer to Megatron-LM documentation for implementation details.
 | `main_params_dtype`                        | string                                                               | `"float32"`  | -                                                                                                                                                                                                                                                                                                    |
 | `exp_avg_dtype`                            | string                                                               | `"float32"`  | -                                                                                                                                                                                                                                                                                                    |
 | `exp_avg_sq_dtype`                         | string                                                               | `"float32"`  | -                                                                                                                                                                                                                                                                                                    |
+| `cpu_staged_optimizer`                     | [`CPUStagedOptimizerConfig`](section-cpu-staged-optimizer)           | **Required** | CPU-resident AdamW state with bounded GPU-staged optimizer steps.                                                                                                                                                                                                                                    |
 | `async_save`                               | boolean                                                              | `False`      | If True, Megatron checkpoint saves run in background processes and save_checkpoint() returns immediately after weights are durably staged off the GPU. Pending saves are drained before the next load_checkpoint() and during engine.destroy(). Reduces per-save sync wait on large MoE checkpoints. |
 | `use_checkpoint_opt_param_scheduler`       | boolean                                                              | `True`       | -                                                                                                                                                                                                                                                                                                    |
 | `use_deterministic_algorithms`             | boolean                                                              | `False`      | -                                                                                                                                                                                                                                                                                                    |

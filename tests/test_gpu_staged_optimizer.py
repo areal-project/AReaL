@@ -20,16 +20,6 @@ from areal.engine.megatron_utils.gpu_staged_optimizer import (
     bind_gpu_staged_adamw,
     get_megatron_optimizer_with_gpu_staged_adamw,
 )
-from areal.engine.megatron_utils.gpu_staged_optimizer_checkpoint import (
-    abort_managed_checkpoint_load,
-    begin_managed_async_checkpoint_save,
-    begin_managed_checkpoint_load,
-    bind_managed_async_checkpoint_request,
-    complete_managed_async_checkpoint_save,
-    complete_managed_checkpoint_load,
-    prepare_managed_checkpoint_save,
-    reset_managed_optimizer_from_model,
-)
 
 CUDA_AVAILABLE = torch.cuda.is_available()
 
@@ -405,8 +395,7 @@ def test_checkpoint_state_dict_aliases_cpu_slabs_and_save_drains(monkeypatch) ->
         original_drain()
 
     monkeypatch.setattr(optimizer, "drain", tracked_drain)
-    wrapper = SimpleNamespace(optimizer=optimizer)
-    prepare_managed_checkpoint_save(wrapper, async_save=False)
+    optimizer.prepare_checkpoint_save()
     state_dict = optimizer.state_dict()
     state = state_dict["state"][0]
     live_state = optimizer.state[param]
@@ -423,44 +412,6 @@ def test_checkpoint_state_dict_aliases_cpu_slabs_and_save_drains(monkeypatch) ->
             tensor.untyped_storage().data_ptr()
             == live_state[key].untyped_storage().data_ptr()
         )
-
-    assert prepare_managed_checkpoint_save(wrapper, async_save=True) == (optimizer,)
-
-
-@pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA is required for staged AdamW")
-def test_async_checkpoint_fence_waits_before_step_and_preserves_source() -> None:
-    param = torch.nn.Parameter(torch.ones(19, device="cuda", dtype=torch.bfloat16))
-    optimizer = GPUStagedAdamW(
-        [param], staged_config=_tiny_config(buffer_count=1, bucket_numel=7)
-    )
-    optimizer.bind_owned_params(optimizer.param_groups)
-    wrapper = SimpleNamespace(optimizer=optimizer)
-    waits = 0
-
-    def wait_for_save() -> None:
-        nonlocal waits
-        waits += 1
-        complete_managed_async_checkpoint_save((optimizer,))
-
-    leaves = begin_managed_async_checkpoint_save(
-        wrapper,
-        checkpoint_id="checkpoint-1",
-        path="/tmp/checkpoint-1",
-        control_group=object(),
-        wait_fn=wait_for_save,
-        identities={(): {"leaf": "test"}},
-    )
-    bind_managed_async_checkpoint_request(leaves, object(), 0)
-    checkpoint_master = optimizer.cpu_slabs.master.clone()
-    param.decoupled_grad = torch.ones_like(param)
-
-    optimizer.step()
-    optimizer.drain()
-
-    assert waits == 1
-    assert optimizer.async_save_state == "COMPLETE"
-    assert not torch.equal(optimizer.cpu_slabs.master, checkpoint_master)
-    assert optimizer.cuda_state_numel == 0
 
 
 @pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA is required for staged AdamW")
@@ -485,9 +436,9 @@ def test_checkpoint_load_restores_cpu_state_and_continues_identically() -> None:
         [resumed_param], staged_config=_tiny_config(bucket_numel=8), **kwargs
     )
     resumed.bind_owned_params(resumed.param_groups)
-    managed = begin_managed_checkpoint_load(SimpleNamespace(optimizer=resumed))
+    resumed.begin_checkpoint_load()
     resumed.load_state_dict(checkpoint)
-    complete_managed_checkpoint_load(managed)
+    resumed.complete_checkpoint_load()
 
     assert resumed.residency == "CPU_RESIDENT"
     assert resumed.cuda_state_numel == 0
@@ -516,12 +467,11 @@ def test_checkpoint_load_restores_cpu_state_and_continues_identically() -> None:
 
 
 @pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA is required for staged AdamW")
-def test_checkpoint_load_failure_rolls_back_and_fails_closed() -> None:
-    """A malformed state cannot leave partially loaded moments trainable."""
+def test_checkpoint_load_failure_fails_closed_without_rollback() -> None:
+    """A malformed load fail-stops the optimizer until process recovery."""
     param = torch.nn.Parameter(torch.ones(13, device="cuda", dtype=torch.bfloat16))
     optimizer = GPUStagedAdamW([param], staged_config=_tiny_config(bucket_numel=5))
     optimizer.bind_owned_params(optimizer.param_groups)
-    before = {key: value.clone() for key, value in optimizer.state[param].items()}
     live_state_dict = optimizer.state_dict()
     malformed = {
         "state": {
@@ -531,16 +481,12 @@ def test_checkpoint_load_failure_rolls_back_and_fails_closed() -> None:
         "param_groups": [dict(group) for group in live_state_dict["param_groups"]],
     }
     del malformed["state"][0]["exp_avg_sq"]
-    managed = begin_managed_checkpoint_load(SimpleNamespace(optimizer=optimizer))
+    optimizer.begin_checkpoint_load()
 
-    with pytest.raises(KeyError, match="missing exp_avg_sq") as exc_info:
+    with pytest.raises(KeyError, match="fields do not match") as exc_info:
         optimizer.load_state_dict(malformed)
-    abort_managed_checkpoint_load(managed, exc_info.value)
+    optimizer.mark_checkpoint_load_failed(exc_info.value)
 
-    for key, expected in before.items():
-        torch.testing.assert_close(
-            optimizer.state[param][key], expected, rtol=0.0, atol=0.0
-        )
     param.decoupled_grad = torch.ones_like(param)
     with pytest.raises(RuntimeError, match="failed checkpoint load"):
         optimizer.step()
@@ -558,7 +504,7 @@ def test_model_only_recovery_streams_master_and_zeros_moments() -> None:
     with torch.no_grad():
         param.copy_(torch.linspace(-2, 2, param.numel(), device="cuda"))
 
-    assert reset_managed_optimizer_from_model(SimpleNamespace(optimizer=optimizer)) == 1
+    optimizer.reset_from_model_params()
 
     assert optimizer.residency == "CPU_RESIDENT"
     assert optimizer.cuda_state_numel == 0

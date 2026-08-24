@@ -10,13 +10,6 @@ allocation_mode: "megatron[actor]:(attn:d2p1t4c1|ffn:d1e8)|sglang[rollout]:d4t2p
 export_style: concat
 agent_run_args: {}
 
-cpu_staged:
-  enabled: true
-  buffer_count: 2
-  bucket_size_mb: 128
-  checkpoint_snapshot_root: null
-  checkpoint_snapshot_chunk_mb: 64
-
 cluster:
   n_nodes: 1
   n_gpus_per_node: 8
@@ -87,7 +80,11 @@ actor:
   megatron:
     wrap_with_ddp: true
     bridge_type: mbridge
-    use_precision_aware_optimizer: true
+    cpu_staged_optimizer:
+      enabled: true
+      kind: adamw
+      buffer_count: 2
+      bucket_size_mb: 128
     main_grads_dtype: float32
     main_params_dtype: float32
     exp_avg_dtype: float32

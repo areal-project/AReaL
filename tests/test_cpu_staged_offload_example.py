@@ -3,169 +3,48 @@
 from __future__ import annotations
 
 from pathlib import Path
-from types import SimpleNamespace
-from typing import Any
 
 import pytest
 
-import examples.cpu_staged_offload.engine as example_engine
-from examples.cpu_staged_offload.config import (
-    CPU_STAGED_SNAPSHOT_ROOT_ENV,
-    CPUStagedGRPOConfig,
-    CPUStagedOffloadSettings,
-    install_cpu_staged_worker_environment,
-)
-from examples.cpu_staged_offload.engine import (
-    CPUStagedMegatronPPOActor,
-    CPUStagedPPOTrainer,
-)
+from examples.multi_turn_math.config import MultiTurnGRPOConfig
 
 import areal.api.cli_args as cli_args
 from areal.api.alloc_mode import ModelAllocation
-from areal.api.cli_args import load_expr_config
-from areal.engine.megatron_engine import MegatronPPOActor
-from areal.trainer import PPOTrainer
+from areal.api.cli_args import CPUStagedOptimizerConfig, load_expr_config
 from areal.utils.stats_logger import StatsLogger
 
 REPOSITORY_ROOT = Path(__file__).parents[1]
 
 
-def test_actor_configures_staged_adamw_before_parent_initialize(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """The worker configures staged AdamW before MCore creates the optimizer."""
-    events: list[tuple[str, Any]] = []
-    actor = object.__new__(CPUStagedMegatronPPOActor)
-    monkeypatch.setenv("AREAL_CPU_STAGED_BUFFER_COUNT", "3")
-    monkeypatch.setenv("AREAL_CPU_STAGED_BUCKET_SIZE_MB", "32")
-    monkeypatch.setenv(CPU_STAGED_SNAPSHOT_ROOT_ENV, str(tmp_path))
-    monkeypatch.setattr(
-        CPUStagedMegatronPPOActor,
-        "configure_gpu_staged_adamw",
-        lambda self, config: events.append(("configure", config)),
-    )
-    monkeypatch.setattr(
-        MegatronPPOActor,
-        "initialize",
-        lambda self, addr, ft_spec, *args, **kwargs: events.append(
-            ("parent", (addr, ft_spec))
+def test_cpu_staged_optimizer_config_validates_buffer_sizes() -> None:
+    with pytest.raises(ValueError, match="buffer_count"):
+        CPUStagedOptimizerConfig(buffer_count=0)
+    with pytest.raises(ValueError, match="bucket_size_mb"):
+        CPUStagedOptimizerConfig(bucket_size_mb=0)
+
+
+def test_cpu_staged_muon_requires_layerwise_optimizer_ownership() -> None:
+    with pytest.raises(ValueError, match="use_distributed_optimizer=false"):
+        cli_args.MegatronEngineConfig(
+            cpu_staged_optimizer=CPUStagedOptimizerConfig(
+                enabled=True,
+                kind="muon",
+            )
+        )
+
+    config = cli_args.MegatronEngineConfig(
+        ddp=cli_args.DistributedDataParallelConfig(use_distributed_optimizer=False),
+        cpu_staged_optimizer=CPUStagedOptimizerConfig(
+            enabled=True,
+            kind="muon",
         ),
     )
-
-    actor.initialize(None, object())
-
-    assert [event[0] for event in events] == ["configure", "parent"]
-    staged_config = events[0][1]
-    assert staged_config.buffer_count == 3
-    assert staged_config.bucket_size_mb == 32
-    assert staged_config.checkpoint_snapshot_root == str(tmp_path)
+    assert config.cpu_staged_optimizer.kind == "muon"
 
 
-@pytest.mark.parametrize("single_controller", [True, False])
-def test_trainer_uses_custom_engine_only_for_primary_actor(
-    monkeypatch: pytest.MonkeyPatch, single_controller: bool
-) -> None:
-    """Controller and in-process modes both customize only the primary actor."""
-    actor_config = object()
-    scheduler = object()
-    parallel = object()
-    events: list[tuple[str, Any]] = []
-
-    class FakeActor:
-        def __init__(self, config: Any) -> None:
-            events.append(("construct", config))
-
-        @classmethod
-        def as_controller(cls, config: Any, received_scheduler: Any) -> FakeActor:
-            events.append(("controller", (config, received_scheduler)))
-            return cls.__new__(cls)
-
-        def create_process_group(self, *, parallel_strategy: Any) -> None:
-            events.append(("process_group", parallel_strategy))
-
-    trainer = object.__new__(CPUStagedPPOTrainer)
-    trainer.config = SimpleNamespace(
-        actor=actor_config,
-        cpu_staged=SimpleNamespace(enabled=True),
-    )
-    trainer.scheduler = scheduler
-    actor_alloc = SimpleNamespace(backend="megatron", name="actor", parallel=parallel)
-    ref_alloc = SimpleNamespace(backend="megatron", name="ref", parallel=parallel)
-    standard_ref = object()
-    monkeypatch.setattr(example_engine, "CPUStagedMegatronPPOActor", FakeActor)
-    monkeypatch.setattr(
-        example_engine, "is_single_controller", lambda: single_controller
-    )
-    monkeypatch.setattr(
-        PPOTrainer,
-        "_create_train_engine",
-        lambda self, config, alloc: standard_ref,
-    )
-
-    actor = trainer._create_train_engine(actor_config, actor_alloc)
-    ref = trainer._create_train_engine(object(), ref_alloc)
-
-    assert actor is not standard_ref
-    assert ref is standard_ref
-    assert ("process_group", parallel) in events
-    expected = "controller" if single_controller else "construct"
-    assert any(event[0] == expected for event in events)
-
-
-def test_disabled_cpu_staged_uses_standard_actor_and_clean_environment(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The baseline delegates actor construction and injects no staged settings."""
-    trainer = object.__new__(CPUStagedPPOTrainer)
-    trainer.config = SimpleNamespace(cpu_staged=SimpleNamespace(enabled=False))
-    standard_actor = object()
-    monkeypatch.setattr(
-        PPOTrainer,
-        "_create_train_engine",
-        lambda self, config, alloc: standard_actor,
-    )
-    alloc = SimpleNamespace(name="actor", backend="megatron")
-
-    assert trainer._create_train_engine(object(), alloc) is standard_actor
-
-    task = SimpleNamespace(env_vars={})
-    config = SimpleNamespace(
-        cpu_staged=CPUStagedOffloadSettings(enabled=False),
-        actor=SimpleNamespace(scheduling_spec=[task]),
-    )
-    environ: dict[str, str] = {}
-    assert install_cpu_staged_worker_environment(config, environ) == {}
-    assert environ == task.env_vars == {}
-
-
-@pytest.mark.parametrize("snapshot_root", [None, "/job/scratch/rollback"])
-def test_worker_environment_forwards_optional_snapshot_root(
-    snapshot_root: str | None,
-) -> None:
-    """Example settings reach remote workers without a hard-coded machine path."""
-    task = SimpleNamespace(env_vars={})
-    config = SimpleNamespace(
-        cpu_staged=CPUStagedOffloadSettings(
-            buffer_count=3,
-            bucket_size_mb=32,
-            checkpoint_snapshot_root=snapshot_root,
-        ),
-        actor=SimpleNamespace(scheduling_spec=[task]),
-    )
-    environ: dict[str, str] = {}
-
-    values = install_cpu_staged_worker_environment(config, environ)
-
-    assert values == environ == task.env_vars
-    assert values["AREAL_CPU_STAGED_BUFFER_COUNT"] == "3"
-    assert values["AREAL_CPU_STAGED_BUCKET_SIZE_MB"] == "32"
-    assert values.get(CPU_STAGED_SNAPSHOT_ROOT_ENV) == snapshot_root
-
-
-def test_example_config_and_modules_load_from_repository_root(
+def test_example_uses_core_staged_optimizer_config(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """The documented YAML and remote module imports form one valid config."""
     monkeypatch.chdir(REPOSITORY_ROOT)
     monkeypatch.setenv("QWEN3_30B_A3B_BASE_MODEL_PATH", "/models/Qwen3-30B-A3B-Base")
     monkeypatch.setattr(cli_args.name_resolve, "reconfigure", lambda config: None)
@@ -179,16 +58,13 @@ def test_example_config_and_modules_load_from_repository_root(
             "--config",
             "examples/cpu_staged_offload/dapo-math_grpo_cpu_staged.yaml",
         ],
-        CPUStagedGRPOConfig,
+        MultiTurnGRPOConfig,
     )
     allocation = ModelAllocation.from_str(config.actor.backend)
 
     assert config_path.endswith("dapo-math_grpo_cpu_staged.yaml")
     assert config.actor.path == config.tokenizer_path == "/models/Qwen3-30B-A3B-Base"
     assert allocation.parallel.world_size == 8
-    assert allocation.parallel.data_parallel_size == 2
-    assert allocation.parallel.tensor_parallel_size == 4
-    assert allocation.parallel.expert_parallel_size == 8
-    assert config.rollout.backend == "sglang:d4t2p1"
-    assert config.cpu_staged.enabled is True
-    assert config.memory_profiler.profile_steps == [1]
+    assert config.actor.megatron.cpu_staged_optimizer.enabled is True
+    assert config.actor.megatron.cpu_staged_optimizer.buffer_count == 2
+    assert config.actor.megatron.cpu_staged_optimizer.bucket_size_mb == 128

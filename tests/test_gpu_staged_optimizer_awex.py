@@ -14,9 +14,6 @@ from areal.engine.megatron_utils.gpu_staged_optimizer import (
     GPUStagedAdamW,
     GPUStagedAdamWConfig,
 )
-from areal.engine.megatron_utils.gpu_staged_optimizer_checkpoint import (
-    prepare_managed_checkpoint_save,
-)
 from areal.v2.weight_update.awex.megatron_adapter import (
     AwexMegatronAdapter as V2AwexMegatronAdapter,
 )
@@ -54,7 +51,8 @@ def test_awex_managed_release_resume_preserves_cpu_slab_views(
     )
     optimizer.step()
     adapter = _make_adapter(adapter_cls, optimizer)
-    original_slot_ids = {id(slot) for slot in optimizer._slots}
+    original_slots = tuple(optimizer._slots)
+    original_slot_ids = {id(slot) for slot in original_slots}
     assert len(original_slot_ids) == optimizer.staged_config.buffer_count
     slabs = optimizer.cpu_slabs
     assert slabs is not None
@@ -74,17 +72,13 @@ def test_awex_managed_release_resume_preserves_cpu_slab_views(
         original_drain()
 
     monkeypatch.setattr(optimizer, "drain", tracked_drain)
-    monkeypatch.setenv("AWEX_OPT_OFFLOAD_VIA_HDO", "1")
-
     adapter.release_memory(tags=["optimizer"])
     adapter.release_memory(tags=["optimizer"])
     assert drain_calls == 1
     assert optimizer._slots == []
     assert optimizer._slot_machine is None
     original_values = {key: tensor.clone() for key, tensor in state.items()}
-    prepare_managed_checkpoint_save(
-        SimpleNamespace(optimizer=optimizer), async_save=False
-    )
+    optimizer.prepare_checkpoint_save()
     assert drain_calls == 2
     adapter.resume_memory(tags=["optimizer"])
     adapter.resume_memory(tags=["optimizer"])
@@ -113,30 +107,29 @@ def test_awex_managed_release_resume_preserves_cpu_slab_views(
 
 @pytest.mark.parametrize("adapter_cls", AWEX_ADAPTERS)
 @pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA is required for AWEX residency")
-def test_awex_mixed_chain_dispatches_managed_and_ordinary_optimizers(
+def test_awex_releases_mixed_managed_and_ordinary_optimizer_chain(
     adapter_cls,
 ) -> None:
-    """Managed and ordinary wrappers retain their distinct lifecycle behavior."""
+    """The original ordinary migration remains the non-staged fallback."""
     managed_param = torch.nn.Parameter(
         torch.tensor([1.0, -1.0], device="cuda", dtype=torch.bfloat16)
     )
     managed = GPUStagedAdamW([managed_param], lr=1e-2)
     managed.bind_owned_params(managed.param_groups)
-    managed_state = managed.state[managed_param]
-    managed_objects = dict(managed_state)
-    managed_storage = {
-        key: tensor.untyped_storage().data_ptr()
-        for key, tensor in managed_state.items()
-    }
-
     ordinary_param = torch.nn.Parameter(torch.tensor([2.0, -3.0], device="cuda"))
     ordinary = torch.optim.AdamW([ordinary_param], lr=1e-2)
     ordinary_param.grad = torch.tensor([0.5, -0.25], device="cuda")
     ordinary.step()
-    expected_ordinary = {
-        key: value.detach().clone()
-        for key, value in ordinary.state[ordinary_param].items()
-        if key in ("exp_avg", "exp_avg_sq")
+    ordinary_state = ordinary.state[ordinary_param]
+    expected_state = {
+        key: value.detach().cpu().clone()
+        for key, value in ordinary_state.items()
+        if isinstance(value, torch.Tensor)
+    }
+    original_devices = {
+        key: value.device
+        for key, value in ordinary_state.items()
+        if isinstance(value, torch.Tensor)
     }
 
     chained = SimpleNamespace(
@@ -149,18 +142,18 @@ def test_awex_mixed_chain_dispatches_managed_and_ordinary_optimizers(
     adapter = adapter_cls(engine)
 
     adapter.release_memory(tags=["optimizer"])
-    assert managed.residency == "CPU_RESIDENT"
-    assert all(
-        ordinary.state[ordinary_param][key].device.type == "cpu"
-        for key in expected_ordinary
+
+    assert managed._slots == []
+    assert not any(
+        value.is_cuda
+        for value in ordinary_state.values()
+        if isinstance(value, torch.Tensor)
     )
+
     adapter.resume_memory(tags=["optimizer"])
 
-    for key, tensor in managed_state.items():
-        assert tensor is managed_objects[key]
-        assert tensor.is_pinned()
-        assert tensor.untyped_storage().data_ptr() == managed_storage[key]
-    for key, expected_value in expected_ordinary.items():
-        actual = ordinary.state[ordinary_param][key]
-        assert actual.is_cuda
-        torch.testing.assert_close(actual, expected_value, rtol=0.0, atol=0.0)
+    assert len(managed._slots) == managed.staged_config.buffer_count
+    for key, expected in expected_state.items():
+        value = ordinary_state[key]
+        assert value.device == original_devices[key]
+        torch.testing.assert_close(value.cpu(), expected, rtol=0.0, atol=0.0)

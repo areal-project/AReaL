@@ -28,29 +28,10 @@ from typing import Any
 import torch
 from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 
-from areal.engine.megatron_utils.checkpoint_snapshot import (
-    DiskSnapshotBuildCleanup,
-    DiskTensorRollbackSnapshot,
-    SnapshotRequirement,
-    preflight_snapshot_requirements,
-    snapshot_parent,
-    validate_snapshot_chunk_bytes,
-)
 from areal.engine.megatron_utils.gpu_staged_optimizer import (
     GPUStagedAdamW,
     GPUStagedAdamWConfig,
     SlotStateMachine,
-    _CheckpointCleanupJournal,
-    _CheckpointCommitToken,
-    _CheckpointLifecycle,
-    _CheckpointLoadRollback,
-    _CheckpointRollbackAction,
-    _ParamGroupRollbackSnapshot,
-    _restore_checkpoint_drain,
-    _restore_checkpoint_param_group,
-    _restore_checkpoint_runtime_metadata,
-    _restore_checkpoint_slab,
-    _RuntimeRollbackSnapshot,
 )
 
 _SUPPORTED_MEGATRON_CORE_VERSION = "0.17.0"
@@ -61,7 +42,6 @@ _MCORE017_LAYERWISE_ALLGATHER_SOURCE_SHA256 = (
 _EMPTY_MUON_LEAF = object()
 _MUON_CHECKPOINT_SCHEMA_VERSION = 2
 _MUON_CHECKPOINT_PREFIX = "optimizer.gpu_staged_muon.v2"
-_MUON_CHECKPOINT_FORMAT = "muon_dp_reshard_v2"
 _MUON_CHECKPOINT_STATE_KINDS = {
     "muon": ("master_param", "momentum_buffer"),
     "scalar_adamw": ("master_param", "exp_avg", "exp_avg_sq"),
@@ -91,7 +71,7 @@ def _require_muon_checkpoint_versions() -> tuple[str, str]:
 
 @dataclass(frozen=True)
 class GPUStagedMuonConfig:
-    """Internal, explicit configuration for the staged Muon MVP."""
+    """Configuration for the CPU-staged Muon backend."""
 
     buffer_count: int = 2
     slot_size_mb: float = 128.0
@@ -104,8 +84,6 @@ class GPUStagedMuonConfig:
     split_qkv: bool = True
     tp_mode: str = "duplicated"
     extra_scale_factor: float = 1.0
-    checkpoint_snapshot_root: str | None = None
-    checkpoint_snapshot_chunk_mb: float = 64.0
 
     def __post_init__(self) -> None:
         if self.buffer_count < 1:
@@ -118,24 +96,10 @@ class GPUStagedMuonConfig:
             raise ValueError("Muon num_ns_steps must be at least 1")
         if self.tp_mode not in {"blockwise", "duplicated", "distributed"}:
             raise ValueError(f"unsupported Muon TP mode: {self.tp_mode!r}")
-        if self.checkpoint_snapshot_chunk_mb <= 0:
-            raise ValueError("checkpoint_snapshot_chunk_mb must be positive")
-        validate_snapshot_chunk_bytes(self.checkpoint_snapshot_chunk_bytes)
 
     @property
     def slot_numel(self) -> int:
         return max(1, int(self.slot_size_mb * 1024 * 1024) // 4)
-
-    @property
-    def checkpoint_snapshot_chunk_bytes(self) -> int:
-        raw_bytes = self.checkpoint_snapshot_chunk_mb * 1024 * 1024
-        chunk_bytes = int(raw_bytes)
-        if raw_bytes != chunk_bytes or chunk_bytes % 4:
-            raise ValueError(
-                "checkpoint snapshot chunk size must be an exact FP32-aligned "
-                f"byte count, got {raw_bytes!r} bytes"
-            )
-        return chunk_bytes
 
 
 @dataclass
@@ -336,80 +300,19 @@ def _preflight_tp_gradient_participation(
     return any_active, "; ".join(errors) if errors else None
 
 
-@dataclass
-class _EmptyCheckpointCleanupReceipt:
-    commit_token: Any
-    action_token: Any
-    completed: bool = False
-    diagnostic: str | None = None
-
-
-@dataclass
-class _EmptyCheckpointRecoveryJournal:
-    attempt_token: Any | None
-    error: BaseException
-    action_token: Any | None = None
-    completed: bool = False
-    diagnostic: str | None = None
-
-
-@dataclass(frozen=True)
-class _EmptyCheckpointCleanupTerminalReceipt:
-    """Small proof that one cleanup effect crossed its terminal boundary."""
-
-    commit_token: Any
-    action_token: Any
-    manager_confirmed: bool = False
-
-
-@dataclass(frozen=True)
-class _EmptyCheckpointRecoveryTerminalReceipt:
-    """Small proof that one recovery effect crossed its terminal boundary."""
-
-    attempt_token: Any | None
-    action_token: Any
-    reload_generation: Any
-    manager_confirmed: bool = False
-
-
 class GPUStagedEmptyOptimizer:
-    """Zero-storage managed leaf used to keep layer-wise chain topology stable."""
+    """State-free leaf used when one official partition owns no parameters."""
 
     manages_cpu_residency = True
     manages_master_weight = True
-    managed_checkpoint_format = _MUON_CHECKPOINT_FORMAT
-    supports_managed_async_checkpoint = False
-    supports_model_only_checkpoint_reset = False
 
     def __init__(self, optimizer_kind: str) -> None:
         if optimizer_kind not in {"muon", "scalar_adamw"}:
             raise ValueError(f"unsupported empty optimizer kind: {optimizer_kind!r}")
         self.optimizer_kind = optimizer_kind
         self.param_groups: list[dict[str, Any]] = []
-        self.state: dict[torch.Tensor, dict[str, Any]] = {}
-        self.cpu_slabs = None
-        self.units: tuple[MuonOwnedUnit, ...] = ()
-        self._slots: tuple[Any, ...] = ()
-        self._tp_groups: dict[str, Any] | None = None
-        self._checkpoint_identity: Any | None = None
-        self._checkpoint_token: Any | None = None
-        self._checkpoint_attempt_token: Any | None = None
-        self._checkpoint_reload_generation: Any | None = None
-        self._checkpoint_snapshot_attempt_token: Any | None = None
-        self._checkpoint_active = False
-        self._checkpoint_prepared = False
-        self._checkpoint_committed = False
-        self._checkpoint_poisoned = False
-        self._checkpoint_error: BaseException | None = None
-        self._checkpoint_cleanup_error: str | None = None
-        self._checkpoint_cleanup_receipt: _EmptyCheckpointCleanupReceipt | None = None
-        self._checkpoint_recovery_journal: _EmptyCheckpointRecoveryJournal | None = None
-        self._checkpoint_cleanup_terminal_receipt: (
-            _EmptyCheckpointCleanupTerminalReceipt | None
-        ) = None
-        self._checkpoint_recovery_terminal_receipt: (
-            _EmptyCheckpointRecoveryTerminalReceipt | None
-        ) = None
+        self.state: dict[Any, Any] = {}
+        self._checkpoint_load_error: BaseException | None = None
 
     @property
     def residency(self) -> str:
@@ -427,623 +330,60 @@ class GPUStagedEmptyOptimizer:
     def gpu_staging_numel(self) -> int:
         return 0
 
-    @property
-    def checkpoint_load_attempt_token(self) -> Any | None:
-        if self._checkpoint_commit_is_decided():
-            return None
-        return self._checkpoint_attempt_token
-
-    @property
-    def checkpoint_reload_generation(self) -> Any | None:
-        return self._checkpoint_reload_generation
-
-    @property
-    def checkpoint_snapshot_attempt_token(self) -> Any | None:
-        return self._checkpoint_snapshot_attempt_token
-
-    def _checkpoint_commit_is_decided(self) -> bool:
-        return bool(
-            self._checkpoint_token is not None
-            and getattr(self._checkpoint_token, "decided", False)
-        )
-
-    @property
-    def checkpoint_lifecycle(self) -> str:
-        recovery_terminal = self._checkpoint_recovery_terminal_receipt
-        if recovery_terminal is not None and not recovery_terminal.manager_confirmed:
-            return "POISONED"
-        cleanup_terminal = self._checkpoint_cleanup_terminal_receipt
-        if cleanup_terminal is not None and not cleanup_terminal.manager_confirmed:
-            return "CLEANUP_PENDING"
-        if self._checkpoint_cleanup_receipt is not None:
-            return "CLEANUP_PENDING"
-        if self._checkpoint_committed or self._checkpoint_commit_is_decided():
-            return "COMMIT_DECIDED"
-        if self._checkpoint_poisoned:
-            return "POISONED"
-        if self._checkpoint_active:
-            return "LOAD_ACTIVE"
-        if self._checkpoint_reload_generation is not None:
-            return "RELOAD_REQUIRED"
-        return "CLEAN"
-
     def step(self, closure: Callable[[], float] | None = None) -> float | None:
-        del closure
-        recovery_terminal = self._checkpoint_recovery_terminal_receipt
-        if (
-            self._checkpoint_poisoned
-            or (
-                recovery_terminal is not None
-                and not recovery_terminal.manager_confirmed
-            )
-            or (self._checkpoint_active and not self._checkpoint_commit_is_decided())
-            or self._checkpoint_reload_generation is not None
-        ):
+        if self._checkpoint_load_error is not None:
             raise RuntimeError(
-                f"empty optimizer cannot step while checkpoint state is "
-                f"{self.checkpoint_lifecycle}"
-            ) from self._checkpoint_error
-        return None
+                "cannot step after a failed checkpoint load; restart and recover"
+            ) from self._checkpoint_load_error
+        return closure() if closure is not None else None
 
     def bind_parallel_groups(self, *, tp: Any, expt_tp: Any) -> None:
-        if self.optimizer_kind != "muon":
-            raise RuntimeError("only an empty Muon leaf accepts TP process groups")
         if tp is None or expt_tp is None:
             raise RuntimeError("staged Muon requires explicit tp and expt_tp groups")
-        self._tp_groups = {"dense": tp, "expert": expt_tp}
 
     def preflight_step_activity(self) -> tuple[bool, str | None]:
-        if self.optimizer_kind != "muon":
-            return False, None
-        return _preflight_tp_gradient_participation(self.units, self._tp_groups)
+        return False, None
 
     def drain(self) -> None:
-        return
+        return None
 
     def offload_to_cpu(self) -> None:
-        return
+        return None
 
     def restore_from_cpu(self) -> None:
-        return
-
-    def configure_checkpoint_snapshot(
-        self,
-        *,
-        parent: str | None = None,
-        leaf_identity: Any,
-        replacement_generation: Any | None = None,
-        attempt_token: Any | None = None,
-    ) -> None:
-        del parent
-        lifecycle = self.checkpoint_lifecycle
-        if lifecycle == "RELOAD_REQUIRED":
-            self.authorize_checkpoint_replacement(replacement_generation, attempt_token)
-        elif lifecycle == "CLEAN":
-            if replacement_generation is not None or attempt_token is not None:
-                raise RuntimeError(
-                    "ordinary empty snapshot cannot use replacement authority"
-                )
-        else:
-            raise RuntimeError("empty checkpoint leaf is not clean")
-        self._checkpoint_identity = leaf_identity
-
-    def authorize_checkpoint_replacement(
-        self, replacement_generation: Any, attempt_token: Any
-    ) -> None:
-        if (
-            replacement_generation is None
-            or replacement_generation is not self._checkpoint_reload_generation
-            or attempt_token is None
-            or getattr(replacement_generation, "active_attempt", None)
-            is not attempt_token
-        ):
-            raise RuntimeError(
-                "RELOAD_REQUIRED empty snapshot requires matching manager "
-                "replacement authority"
-            )
-        if self.checkpoint_lifecycle != "RELOAD_REQUIRED":
-            raise RuntimeError("empty replacement authority requires RELOAD_REQUIRED")
-        if (
-            self._checkpoint_snapshot_attempt_token is not None
-            and self._checkpoint_snapshot_attempt_token is not attempt_token
-        ):
-            raise RuntimeError("empty snapshot belongs to another replacement attempt")
-        self._checkpoint_snapshot_attempt_token = attempt_token
-
-    def cancel_checkpoint_snapshot_configuration(
-        self, replacement_generation: Any, attempt_token: Any
-    ) -> None:
-        if replacement_generation is not self._checkpoint_reload_generation:
-            raise RuntimeError("empty replacement generation mismatch")
-        if getattr(replacement_generation, "active_attempt", None) is not attempt_token:
-            raise RuntimeError("empty replacement attempt is no longer active")
-        if self._checkpoint_snapshot_attempt_token is None:
-            return
-        if self._checkpoint_snapshot_attempt_token is not attempt_token:
-            raise RuntimeError("empty replacement attempt mismatch")
-        if self._checkpoint_active:
-            raise RuntimeError("cannot cancel empty snapshot authority after begin")
-        self._checkpoint_snapshot_attempt_token = None
+        return None
 
     def prepare_checkpoint_save(self) -> None:
-        if self.checkpoint_lifecycle != "CLEAN":
-            raise RuntimeError("empty checkpoint leaf is not clean")
-
-    def begin_checkpoint_load(
-        self,
-        *,
-        attempt_token: Any | None = None,
-        replacement_generation: Any | None = None,
-    ) -> None:
-        lifecycle = self.checkpoint_lifecycle
-        if lifecycle not in {"CLEAN", "RELOAD_REQUIRED"}:
-            raise RuntimeError("empty checkpoint load transaction is already active")
-        if self._checkpoint_attempt_token is not None:
-            raise RuntimeError("empty checkpoint leaf belongs to another begin attempt")
-        if lifecycle == "RELOAD_REQUIRED":
-            if (
-                replacement_generation is None
-                or replacement_generation is not self._checkpoint_reload_generation
-                or attempt_token is None
-                or getattr(replacement_generation, "active_attempt", None)
-                is not attempt_token
-                or self._checkpoint_snapshot_attempt_token is not attempt_token
-            ):
-                raise RuntimeError(
-                    "RELOAD_REQUIRED empty load requires matching configured "
-                    "replacement generation and attempt"
-                )
-        elif (
-            replacement_generation is not None
-            or self._checkpoint_snapshot_attempt_token is not None
-        ):
-            raise RuntimeError("ordinary empty load cannot use replacement authority")
-        # A manager-confirmed tombstone is the bounded proof used to reconcile
-        # an acknowledgement that raised after its effect.  The next begin is
-        # the first safe point at which that previous-cycle proof can be consumed.
-        if (
-            self._checkpoint_cleanup_terminal_receipt is not None
-            and self._checkpoint_cleanup_terminal_receipt.manager_confirmed
-        ):
-            self._checkpoint_cleanup_terminal_receipt = None
-        if (
-            self._checkpoint_recovery_terminal_receipt is not None
-            and self._checkpoint_recovery_terminal_receipt.manager_confirmed
-        ):
-            self._checkpoint_recovery_terminal_receipt = None
-        self._checkpoint_attempt_token = (
-            attempt_token if attempt_token is not None else object()
-        )
-        self._checkpoint_active = True
-        self._checkpoint_prepared = False
-        self._checkpoint_error = None
-        self._checkpoint_cleanup_error = None
-
-    def prepare_checkpoint_load(self) -> None:
-        if self._checkpoint_commit_is_decided():
-            raise RuntimeError("empty checkpoint commit decision is already published")
-        if not self._checkpoint_active:
-            raise RuntimeError("empty checkpoint load transaction is not active")
-        self._checkpoint_prepared = True
-
-    def prepare_checkpoint_commit(self, commit_token: Any | None = None) -> None:
-        if self._checkpoint_commit_is_decided():
-            raise RuntimeError("empty checkpoint commit decision is already published")
-        if not self._checkpoint_active or not self._checkpoint_prepared:
-            raise RuntimeError("empty checkpoint load was not prepared")
-        if (
-            self._checkpoint_token is not None
-            and self._checkpoint_token is not commit_token
-        ):
-            raise RuntimeError("checkpoint commit token cannot be replaced")
-        self._checkpoint_token = commit_token or _CheckpointCommitToken()
-        self._checkpoint_cleanup_error = None
-
-    def decide_checkpoint_commit(self) -> None:
-        if self._checkpoint_token is None or not getattr(
-            self._checkpoint_token, "decided", False
-        ):
-            raise RuntimeError("checkpoint commit decision has not been published")
-        if self._checkpoint_committed:
-            return
-        self._checkpoint_active = False
-        self._checkpoint_committed = True
-        self._checkpoint_attempt_token = None
-
-    def bind_checkpoint_cleanup_action(
-        self, commit_token: Any, action_token: Any
-    ) -> None:
-        terminal = self._checkpoint_cleanup_terminal_receipt
-        if terminal is not None:
-            if (
-                terminal.commit_token is commit_token
-                and terminal.action_token is action_token
-            ):
-                return
-            raise RuntimeError("empty checkpoint cleanup terminal receipt mismatch")
-        if self._checkpoint_token is not commit_token or not getattr(
-            commit_token, "decided", False
-        ):
-            raise RuntimeError("empty checkpoint cleanup commit token mismatch")
-        receipt = self._checkpoint_cleanup_receipt
-        if receipt is None:
-            if not self._checkpoint_committed:
-                raise RuntimeError(
-                    "empty checkpoint cleanup requires a commit decision"
-                )
-            self._checkpoint_cleanup_receipt = _EmptyCheckpointCleanupReceipt(
-                commit_token, action_token
-            )
-            return
-        if (
-            receipt.commit_token is not commit_token
-            or receipt.action_token is not action_token
-        ):
-            raise RuntimeError("empty checkpoint cleanup action token mismatch")
-
-    def discard_checkpoint_snapshot(self) -> None:
-        if self._checkpoint_cleanup_terminal_receipt is not None:
-            return
-        receipt = self._checkpoint_cleanup_receipt
-        if receipt is None:
-            if self._checkpoint_token is None:
-                raise RuntimeError(
-                    "empty checkpoint cleanup requires a commit decision"
-                )
-            self.bind_checkpoint_cleanup_action(self._checkpoint_token, object())
-            receipt = self._checkpoint_cleanup_receipt
-            assert receipt is not None
-        if receipt.completed:
-            return
-        if not self._checkpoint_committed:
-            raise RuntimeError("empty checkpoint cleanup lost its commit decision")
-        self._checkpoint_prepared = False
-        self._checkpoint_active = False
-        self._checkpoint_poisoned = False
-        self._checkpoint_error = None
-        receipt.completed = True
-
-    def acknowledge_checkpoint_cleanup(
-        self, commit_token: Any, action_token: Any
-    ) -> None:
-        terminal = self._checkpoint_cleanup_terminal_receipt
-        if terminal is not None:
-            if (
-                terminal.commit_token is commit_token
-                and terminal.action_token is action_token
-            ):
-                return
-            raise RuntimeError("empty checkpoint cleanup acknowledgement mismatch")
-        receipt = self._checkpoint_cleanup_receipt
-        if receipt is None:
-            raise RuntimeError("empty checkpoint cleanup receipt is missing")
-        if (
-            receipt.commit_token is not commit_token
-            or receipt.action_token is not action_token
-        ):
-            raise RuntimeError("empty checkpoint cleanup acknowledgement mismatch")
-        if not receipt.completed:
-            raise RuntimeError("empty checkpoint cleanup effect is not complete")
-        # Publish the immutable completion proof before releasing the active
-        # authority.  If the caller observes an after-effect exception, the
-        # exact same action can reconcile without reconstructing rollback state.
-        self._checkpoint_cleanup_terminal_receipt = (
-            _EmptyCheckpointCleanupTerminalReceipt(commit_token, action_token)
-        )
-        self._checkpoint_cleanup_receipt = None
-        self._checkpoint_token = None
-        self._checkpoint_attempt_token = None
-        self._checkpoint_prepared = False
-        self._checkpoint_active = False
-        self._checkpoint_committed = False
-        self._checkpoint_poisoned = False
-        self._checkpoint_error = None
-        self._checkpoint_cleanup_error = None
-        self._checkpoint_recovery_journal = None
-        self._checkpoint_reload_generation = None
-        self._checkpoint_snapshot_attempt_token = None
-
-    def confirm_checkpoint_cleanup(self, commit_token: Any, action_token: Any) -> None:
-        terminal = self._checkpoint_cleanup_terminal_receipt
-        if terminal is None:
-            raise RuntimeError("empty checkpoint cleanup terminal receipt is missing")
-        if (
-            terminal.commit_token is not commit_token
-            or terminal.action_token is not action_token
-        ):
-            raise RuntimeError("empty checkpoint cleanup confirmation mismatch")
-        if terminal.manager_confirmed:
-            self._checkpoint_cleanup_error = None
-            return
-        self._checkpoint_cleanup_terminal_receipt = (
-            _EmptyCheckpointCleanupTerminalReceipt(
-                commit_token, action_token, manager_confirmed=True
-            )
-        )
-        self._checkpoint_cleanup_error = None
-
-    def checkpoint_cleanup_receipt_status(
-        self, commit_token: Any, action_token: Any
-    ) -> str:
-        terminal = self._checkpoint_cleanup_terminal_receipt
-        if terminal is None:
-            return "ABSENT"
-        if (
-            terminal.commit_token is not commit_token
-            or terminal.action_token is not action_token
-        ):
-            raise RuntimeError("empty checkpoint cleanup receipt identity mismatch")
-        if not terminal.manager_confirmed:
-            raise RuntimeError("empty checkpoint cleanup receipt is not confirmed")
-        return "MATCH"
-
-    def release_checkpoint_cleanup_receipt(
-        self, commit_token: Any, action_token: Any
-    ) -> None:
-        if (
-            self.checkpoint_cleanup_receipt_status(commit_token, action_token)
-            != "MATCH"
-        ):
-            raise RuntimeError("empty checkpoint cleanup receipt is missing")
-        self._checkpoint_cleanup_terminal_receipt = None
-
-    def abort_checkpoint_load(
-        self,
-        error: BaseException,
-        *,
-        poison: bool = False,
-        attempt_token: Any | None = None,
-        replacement_generation: Any | None = None,
-    ) -> None:
-        if self._checkpoint_commit_is_decided():
-            raise RuntimeError("cannot abort after the checkpoint commit decision")
-        if (
-            attempt_token is not None
-            and self._checkpoint_attempt_token is not None
-            and attempt_token is not self._checkpoint_attempt_token
-        ):
+        if self._checkpoint_load_error is not None:
             raise RuntimeError(
-                "empty checkpoint abort belongs to a different begin attempt"
-            )
-        if self._checkpoint_reload_generation is not None:
-            if replacement_generation is not self._checkpoint_reload_generation:
-                raise RuntimeError("empty abort replacement generation mismatch")
-        elif replacement_generation is not None:
-            raise RuntimeError("ordinary empty abort received replacement authority")
-        if attempt_token is not None and self._checkpoint_attempt_token is None:
-            return
-        self._checkpoint_active = False
-        self._checkpoint_prepared = False
-        self._checkpoint_token = None
-        self._checkpoint_snapshot_attempt_token = None
-        if poison:
-            self._checkpoint_poisoned = True
-            self._checkpoint_error = error
-            self._checkpoint_recovery_journal = _EmptyCheckpointRecoveryJournal(
-                self._checkpoint_attempt_token, error
-            )
-            return
-        self._checkpoint_attempt_token = None
-        self._checkpoint_poisoned = False
-        self._checkpoint_error = None
-        self._checkpoint_cleanup_error = None
-        self._checkpoint_recovery_journal = None
+                "cannot save after a failed checkpoint load; restart and recover"
+            ) from self._checkpoint_load_error
 
-    def bind_checkpoint_recovery_action(
-        self, attempt_token: Any | None, action_token: Any
-    ) -> None:
-        terminal = self._checkpoint_recovery_terminal_receipt
-        if terminal is not None:
-            if (
-                terminal.attempt_token is attempt_token
-                and terminal.action_token is action_token
-            ):
-                return
-            raise RuntimeError("empty checkpoint recovery terminal receipt mismatch")
-        if self._checkpoint_attempt_token is not attempt_token:
+    def begin_checkpoint_load(self) -> None:
+        if self._checkpoint_load_error is not None:
             raise RuntimeError(
-                "empty checkpoint recovery belongs to a different begin attempt"
-            )
-        journal = self._checkpoint_recovery_journal
-        if journal is None:
-            raise RuntimeError("poisoned empty checkpoint lost its recovery journal")
-        if journal.attempt_token is not attempt_token:
-            raise RuntimeError(
-                "empty checkpoint recovery journal belongs to another attempt"
-            )
-        if journal.action_token is None:
-            journal.action_token = action_token
-        elif journal.action_token is not action_token:
-            raise RuntimeError("empty checkpoint recovery action token mismatch")
+                "checkpoint load already failed; restart the process to recover"
+            ) from self._checkpoint_load_error
 
-    def checkpoint_recovery_receipt_matches(
-        self,
-        attempt_token: Any | None,
-        action_token: Any,
-        reload_generation: Any | None = None,
-    ) -> bool:
-        terminal = self._checkpoint_recovery_terminal_receipt
-        return bool(
-            terminal is not None
-            and terminal.attempt_token is attempt_token
-            and terminal.action_token is action_token
-            and terminal.reload_generation is reload_generation
-        )
+    def complete_checkpoint_load(self) -> None:
+        return None
 
-    def prepare_checkpoint_recovery(
-        self,
-        *,
-        attempt_token: Any | None = None,
-        recovery_action_token: Any | None = None,
-        reload_generation: Any | None = None,
-    ) -> None:
-        terminal = self._checkpoint_recovery_terminal_receipt
-        if terminal is not None:
-            if (
-                terminal.attempt_token is attempt_token
-                and (
-                    recovery_action_token is None
-                    or terminal.action_token is recovery_action_token
-                )
-                and (
-                    reload_generation is None
-                    or terminal.reload_generation is reload_generation
-                )
-            ):
-                return
-            raise RuntimeError("empty checkpoint recovery terminal receipt mismatch")
-        if (
-            attempt_token is not None
-            and self._checkpoint_attempt_token is not attempt_token
-        ):
-            raise RuntimeError(
-                "empty checkpoint recovery belongs to a different begin attempt"
-            )
-        if (
-            self._checkpoint_cleanup_receipt is not None
-            or self._checkpoint_committed
-            or self._checkpoint_commit_is_decided()
-        ):
-            raise RuntimeError("committed empty checkpoint cannot enter recovery")
-        if self._checkpoint_active and not self._checkpoint_poisoned:
-            raise RuntimeError("cannot recover an active empty checkpoint load")
-        if not self._checkpoint_poisoned:
-            if reload_generation is None:
-                if self._checkpoint_reload_generation is None:
-                    from areal.engine.megatron_utils.gpu_staged_optimizer_checkpoint import (
-                        ManagedCheckpointReloadGeneration,
-                    )
+    def mark_checkpoint_load_failed(self, error: BaseException) -> None:
+        self._checkpoint_load_error = error
 
-                    reload_generation = ManagedCheckpointReloadGeneration()
-                else:
-                    reload_generation = self._checkpoint_reload_generation
-            if (
-                self._checkpoint_reload_generation is not None
-                and self._checkpoint_reload_generation is not reload_generation
-            ):
-                raise RuntimeError("empty checkpoint recovery generation mismatch")
-            self._checkpoint_reload_generation = reload_generation
-            self._checkpoint_snapshot_attempt_token = None
-            return
-        journal = self._checkpoint_recovery_journal
-        if journal is None:
-            raise RuntimeError("poisoned empty checkpoint lost its recovery journal")
-        if attempt_token is not None and journal.attempt_token is not attempt_token:
-            raise RuntimeError(
-                "empty checkpoint recovery journal belongs to another attempt"
-            )
-        if recovery_action_token is not None:
-            if journal.action_token is None:
-                journal.action_token = recovery_action_token
-            elif journal.action_token is not recovery_action_token:
-                raise RuntimeError("empty checkpoint recovery action token mismatch")
-        if journal.action_token is None:
-            journal.action_token = object()
-        if reload_generation is None:
-            if self._checkpoint_reload_generation is None:
-                from areal.engine.megatron_utils.gpu_staged_optimizer_checkpoint import (
-                    ManagedCheckpointReloadGeneration,
-                )
-
-                reload_generation = ManagedCheckpointReloadGeneration()
-            else:
-                reload_generation = self._checkpoint_reload_generation
-        if (
-            self._checkpoint_reload_generation is not None
-            and self._checkpoint_reload_generation is not reload_generation
-        ):
-            raise RuntimeError("empty checkpoint recovery generation mismatch")
-        journal.completed = True
-        # Publish completion before dropping the error-bearing journal and the
-        # attempt authority.  This receipt contains identities only.
-        self._checkpoint_recovery_terminal_receipt = (
-            _EmptyCheckpointRecoveryTerminalReceipt(
-                journal.attempt_token,
-                journal.action_token,
-                reload_generation,
-            )
-        )
-        self._checkpoint_reload_generation = reload_generation
-        self._checkpoint_snapshot_attempt_token = None
-        self._checkpoint_attempt_token = None
-        self._checkpoint_active = False
-        self._checkpoint_prepared = False
-        self._checkpoint_token = None
-        self._checkpoint_committed = False
-        self._checkpoint_poisoned = False
-        self._checkpoint_error = None
-        self._checkpoint_cleanup_error = None
-        self._checkpoint_recovery_journal = None
-
-    def confirm_checkpoint_recovery(
-        self,
-        attempt_token: Any | None,
-        action_token: Any,
-        reload_generation: Any | None = None,
-    ) -> None:
-        terminal = self._checkpoint_recovery_terminal_receipt
-        if terminal is None:
-            raise RuntimeError("empty checkpoint recovery terminal receipt is missing")
-        if (
-            terminal.attempt_token is not attempt_token
-            or terminal.action_token is not action_token
-            or terminal.reload_generation is not reload_generation
-        ):
-            raise RuntimeError("empty checkpoint recovery confirmation mismatch")
-        if terminal.manager_confirmed:
-            self._checkpoint_error = None
-            return
-        self._checkpoint_recovery_terminal_receipt = (
-            _EmptyCheckpointRecoveryTerminalReceipt(
-                attempt_token,
-                action_token,
-                terminal.reload_generation,
-                manager_confirmed=True,
-            )
-        )
-        self._checkpoint_error = None
-
-    def mark_checkpoint_poisoned(self, error: BaseException) -> None:
-        if (
-            self._checkpoint_commit_is_decided()
-            or self._checkpoint_committed
-            or self._checkpoint_cleanup_receipt is not None
-            or self._checkpoint_cleanup_terminal_receipt is not None
-        ):
-            self._checkpoint_cleanup_error = f"{type(error).__name__}: {error}"
-            return
-        journal = self._checkpoint_recovery_journal
-        if (
-            journal is not None
-            and journal.attempt_token is not self._checkpoint_attempt_token
-        ):
-            raise RuntimeError(
-                "empty checkpoint poison belongs to a different begin attempt"
-            )
-        self._checkpoint_active = False
-        self._checkpoint_prepared = False
-        self._checkpoint_poisoned = True
-        self._checkpoint_error = error
-        if journal is None:
-            self._checkpoint_recovery_journal = _EmptyCheckpointRecoveryJournal(
-                self._checkpoint_attempt_token, error
-            )
-        else:
-            journal.error = error
-            journal.diagnostic = f"{type(error).__name__}: {error}"
-
-    def record_checkpoint_cleanup_error(self, error: BaseException) -> None:
-        diagnostic = f"{type(error).__name__}: {error}"
-        self._checkpoint_cleanup_error = diagnostic
-        if self._checkpoint_cleanup_receipt is not None:
-            self._checkpoint_cleanup_receipt.diagnostic = diagnostic
+    def reset_from_model_params(self) -> None:
+        return None
 
     def state_dict(self) -> dict[str, Any]:
+        self.prepare_checkpoint_save()
         return {"state": {}, "param_groups": []}
 
-    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
-        if state_dict != {"state": {}, "param_groups": []}:
-            raise ValueError("empty staged checkpoint leaf must contain no state")
+    def load_state_dict(self, state_dict: Mapping[str, Any]) -> None:
+        if not isinstance(state_dict, Mapping) or state_dict != {
+            "state": {},
+            "param_groups": [],
+        }:
+            raise ValueError("empty staged optimizer checkpoint must contain no state")
 
 
 @dataclass
@@ -1082,9 +422,6 @@ class GPUStagedMuon(torch.optim.Optimizer):
     manages_cpu_residency = True
     manages_master_weight = True
     optimizer_kind = "muon"
-    managed_checkpoint_format = _MUON_CHECKPOINT_FORMAT
-    supports_managed_async_checkpoint = False
-    supports_model_only_checkpoint_reset = False
 
     def __init__(
         self,
@@ -1110,44 +447,11 @@ class GPUStagedMuon(torch.optim.Optimizer):
         self._tp_groups: dict[str, Any] | None = None
         self._bound = False
         self._residency = "UNBOUND"
-        self._checkpoint_rollback: _CheckpointLoadRollback | None = None
-        self._checkpoint_cleanup: _CheckpointCleanupJournal | None = None
-        self._checkpoint_prepared_cleanup: _CheckpointCleanupJournal | None = None
-        self._checkpoint_commit_token: Any | None = None
-        self._checkpoint_attempt_token: Any | None = None
-        self._checkpoint_reload_generation: Any | None = None
-        self._checkpoint_snapshot_attempt_token: Any | None = None
         self._checkpoint_load_error: BaseException | None = None
-        self._checkpoint_cleanup_error: str | None = None
-        self._checkpoint_lifecycle = _CheckpointLifecycle.CLEAN
-        self._checkpoint_loaded_state: dict[torch.Tensor, set[str]] = {}
-        self._checkpoint_prepared = False
-        self._checkpoint_recovery_poisoned = False
-        self._checkpoint_snapshot_parent = staged_config.checkpoint_snapshot_root
-        self._checkpoint_snapshot_identity: Any | None = None
-        self._checkpoint_build_cleanup: list[Any] = []
 
     @property
     def residency(self) -> str:
         return self._residency
-
-    @property
-    def checkpoint_lifecycle(self) -> str:
-        return self._effective_checkpoint_lifecycle().name
-
-    @property
-    def checkpoint_load_attempt_token(self) -> Any | None:
-        if self._checkpoint_commit_is_decided():
-            return None
-        return self._checkpoint_attempt_token
-
-    @property
-    def checkpoint_reload_generation(self) -> Any | None:
-        return self._checkpoint_reload_generation
-
-    @property
-    def checkpoint_snapshot_attempt_token(self) -> Any | None:
-        return self._checkpoint_snapshot_attempt_token
 
     @property
     def units(self) -> tuple[MuonOwnedUnit, ...]:
@@ -1373,16 +677,9 @@ class GPUStagedMuon(torch.optim.Optimizer):
     def step(self, closure: Callable[[], float] | None = None) -> float | None:
         if not self._bound:
             raise RuntimeError("bind_owned_params() must be called before Muon step")
-        lifecycle = self._effective_checkpoint_lifecycle()
-        if lifecycle in (
-            _CheckpointLifecycle.SNAPSHOT_ACTIVE,
-            _CheckpointLifecycle.LOAD_ACTIVE,
-            _CheckpointLifecycle.RECOVERY_PENDING,
-            _CheckpointLifecycle.POISONED,
-            _CheckpointLifecycle.RELOAD_REQUIRED,
-        ):
+        if self._checkpoint_load_error is not None:
             raise RuntimeError(
-                f"Muon step is unavailable while checkpoint state is {lifecycle.name}"
+                "cannot step after a failed checkpoint load; restart and recover"
             ) from self._checkpoint_load_error
         if closure is not None:
             raise ValueError("staged Muon does not support closures")
@@ -1463,272 +760,62 @@ class GPUStagedMuon(torch.optim.Optimizer):
                         f"Muon checkpoint state {key} lost its CPU slab alias"
                     )
 
-    def configure_checkpoint_snapshot(
-        self,
-        *,
-        parent: str | None = None,
-        leaf_identity: Any,
-        replacement_generation: Any | None = None,
-        attempt_token: Any | None = None,
-    ) -> None:
-        lifecycle = self._effective_checkpoint_lifecycle()
-        if lifecycle is _CheckpointLifecycle.RELOAD_REQUIRED:
-            self.authorize_checkpoint_replacement(replacement_generation, attempt_token)
-        elif lifecycle is _CheckpointLifecycle.CLEAN:
-            if replacement_generation is not None or attempt_token is not None:
-                raise RuntimeError(
-                    "ordinary Muon snapshot cannot use replacement authority"
-                )
-        else:
-            raise RuntimeError("checkpoint snapshot configuration requires CLEAN state")
-        if parent is not None:
-            self._checkpoint_snapshot_parent = parent
-        self._checkpoint_snapshot_identity = leaf_identity
-
-    cancel_checkpoint_snapshot_configuration = (
-        GPUStagedAdamW.cancel_checkpoint_snapshot_configuration
-    )
-    authorize_checkpoint_replacement = GPUStagedAdamW.authorize_checkpoint_replacement
-
-    def _rollback_leaf_identity(self) -> Any:
-        return self._checkpoint_snapshot_identity or {
-            "version": 1,
-            "kind": "muon-local-layout",
-            "numel": 0 if self.cpu_slabs is None else self.cpu_slabs.master.numel(),
-        }
-
-    def checkpoint_snapshot_requirement(self) -> SnapshotRequirement:
-        if not self._bound:
-            raise RuntimeError(
-                "GPU-staged Muon must be bound before snapshot preflight"
-            )
-        required = 0
-        if self.cpu_slabs is not None:
-            required = sum(
-                DiskTensorRollbackSnapshot.required_bytes(
-                    slab, self.staged_config.checkpoint_snapshot_chunk_bytes
-                )
-                for slab in (self.cpu_slabs.master, self.cpu_slabs.momentum)
-            )
-        return SnapshotRequirement(
-            snapshot_parent(self._checkpoint_snapshot_parent), required
-        )
-
-    def preflight_checkpoint_snapshot(self) -> None:
-        self.retry_checkpoint_snapshot_build_cleanup()
-        preflight_snapshot_requirements((self.checkpoint_snapshot_requirement(),))
-
-    def retry_checkpoint_snapshot_build_cleanup(self) -> None:
-        errors: list[BaseException] = []
-        pending: list[Any] = []
-        for cleanup in self._checkpoint_build_cleanup:
-            try:
-                cleanup.cleanup()
-            except BaseException as error:
-                errors.append(error)
-                pending.append(cleanup)
-        self._checkpoint_build_cleanup[:] = pending
-        if errors:
-            primary = errors[0]
-            for error in errors[1:]:
-                primary.add_note(f"additional Muon snapshot cleanup failure: {error!r}")
-            raise primary
-
-    def _create_checkpoint_slab_snapshots(
-        self,
-    ) -> dict[str, DiskTensorRollbackSnapshot]:
-        if self.cpu_slabs is None:
-            return {}
-        rank = (
-            torch.distributed.get_rank()
-            if torch.distributed.is_available() and torch.distributed.is_initialized()
-            else 0
-        )
-        snapshots: dict[str, DiskTensorRollbackSnapshot] = {}
-        try:
-            for slab_key, slab in (
-                ("master", self.cpu_slabs.master),
-                ("momentum", self.cpu_slabs.momentum),
-            ):
-                snapshots[slab_key] = DiskTensorRollbackSnapshot.create(
-                    slab,
-                    parent=self._checkpoint_snapshot_parent,
-                    leaf_identity=self._rollback_leaf_identity(),
-                    slab_key=slab_key,
-                    chunk_bytes=self.staged_config.checkpoint_snapshot_chunk_bytes,
-                    rank=rank,
-                )
-        except BaseException as original:
-            partial = getattr(original, "_areal_snapshot_build_cleanup", None)
-            if isinstance(partial, DiskSnapshotBuildCleanup):
-                self._checkpoint_build_cleanup.append(partial)
-            for snapshot in reversed(tuple(snapshots.values())):
-                try:
-                    snapshot.cleanup()
-                except BaseException as cleanup_error:
-                    self._checkpoint_build_cleanup.append(snapshot.cleanup_artifact())
-                    original.add_note(
-                        f"Muon rollback snapshot cleanup failed: {cleanup_error!r}"
-                    )
-            raise
-        return snapshots
-
-    def _install_checkpoint_rollback(
-        self,
-        slab_snapshots: Mapping[str, DiskTensorRollbackSnapshot],
-        previous_lifecycle: _CheckpointLifecycle,
-    ) -> None:
-        runtime_snapshot = _RuntimeRollbackSnapshot(
-            loaded_state={
-                param: set(fields)
-                for param, fields in self._checkpoint_loaded_state.items()
-            },
-            prepared=self._checkpoint_prepared,
-            residency=self._residency,
-            lifecycle=previous_lifecycle,
-            load_error=self._checkpoint_load_error,
-            recovery_poisoned=self._checkpoint_recovery_poisoned,
-        )
-        actions = [
-            _CheckpointRollbackAction(
-                "runtime.drain", self, self._residency, _restore_checkpoint_drain
-            )
-        ]
-        for slab_name in ("master", "momentum"):
-            snapshot = slab_snapshots.get(slab_name)
-            if snapshot is not None:
-                actions.append(
-                    _CheckpointRollbackAction(
-                        f"slab.{slab_name}",
-                        (self, slab_name),
-                        snapshot,
-                        _restore_checkpoint_slab,
-                        dependencies=("runtime.drain",),
-                    )
-                )
-        actions.extend(
-            _CheckpointRollbackAction(
-                f"param_group.{group_index}",
-                group,
-                _ParamGroupRollbackSnapshot(
-                    metadata={
-                        key: value for key, value in group.items() if key != "params"
-                    },
-                    params=group["params"],
-                ),
-                _restore_checkpoint_param_group,
-            )
-            for group_index, group in enumerate(self.param_groups)
-        )
-        dependencies = tuple(action.name for action in actions)
-        actions.append(
-            _CheckpointRollbackAction(
-                "runtime.metadata",
-                self,
-                runtime_snapshot,
-                _restore_checkpoint_runtime_metadata,
-                dependencies=dependencies,
-            )
-        )
-        self._checkpoint_rollback = _CheckpointLoadRollback(
-            actions=actions,
-            previous_state=previous_lifecycle,
-            previous_error=self._checkpoint_load_error,
-        )
-        self._checkpoint_loaded_state = {unit.param: set() for unit in self._units}
-        self._checkpoint_prepared = False
-        self._checkpoint_lifecycle = _CheckpointLifecycle.LOAD_ACTIVE
-
     def prepare_checkpoint_save(self) -> None:
-        if not self._bound:
-            raise RuntimeError("GPU-staged Muon must be bound before checkpoint save")
-        self.retry_checkpoint_snapshot_build_cleanup()
-        lifecycle = self._effective_checkpoint_lifecycle()
-        if lifecycle is not _CheckpointLifecycle.CLEAN:
+        """Drain staging before synchronous DCP reads authoritative CPU slabs."""
+        if self._checkpoint_load_error is not None:
             raise RuntimeError(
-                f"cannot save Muon optimizer while checkpoint state is {lifecycle.name}"
-            )
+                "cannot save after a failed checkpoint load; restart and recover"
+            ) from self._checkpoint_load_error
         self.drain()
+        self._validate_bound_state_views()
         if self.cuda_state_numel != 0:
-            raise RuntimeError("Muon checkpoint source contains CUDA state")
+            raise RuntimeError("staged Muon checkpoint source contains CUDA state")
+
+    def begin_checkpoint_load(self) -> None:
+        """Prepare for one in-place synchronous load without rollback state."""
+        if self._checkpoint_load_error is not None:
+            raise RuntimeError(
+                "checkpoint load already failed; restart the process to recover"
+            ) from self._checkpoint_load_error
+        self.drain()
         self._validate_bound_state_views()
 
-    def begin_checkpoint_load(
-        self,
-        *,
-        attempt_token: Any | None = None,
-        replacement_generation: Any | None = None,
-    ) -> None:
+    def complete_checkpoint_load(self) -> None:
+        """Validate CPU slab aliases after a successful load."""
+        self.drain()
+        self._validate_bound_state_views()
+
+    def mark_checkpoint_load_failed(self, error: BaseException) -> None:
+        """Fail-stop after an in-place load error; no rollback or retry."""
+        self._checkpoint_load_error = error
+        self._residency = "CPU_RESIDENT"
+
+    def reset_from_model_params(self) -> None:
+        """Rebuild masters and clear momentum after a model-only load."""
         if not self._bound:
-            raise RuntimeError("GPU-staged Muon must be bound before checkpoint load")
-        lifecycle = self._effective_checkpoint_lifecycle()
-        if (
-            lifecycle is not _CheckpointLifecycle.CLEAN
-            and lifecycle is not _CheckpointLifecycle.RELOAD_REQUIRED
-        ):
-            raise RuntimeError(
-                f"cannot begin Muon checkpoint load from {lifecycle.name}"
-            )
-        if self._checkpoint_attempt_token is not None:
-            raise RuntimeError("Muon checkpoint load belongs to another begin attempt")
-        if lifecycle is _CheckpointLifecycle.RELOAD_REQUIRED:
-            if (
-                replacement_generation is None
-                or replacement_generation is not self._checkpoint_reload_generation
-                or attempt_token is None
-                or getattr(replacement_generation, "active_attempt", None)
-                is not attempt_token
-                or self._checkpoint_snapshot_attempt_token is not attempt_token
-            ):
-                raise RuntimeError(
-                    "RELOAD_REQUIRED Muon load requires matching configured "
-                    "replacement generation and attempt"
-                )
-        elif (
-            replacement_generation is not None
-            or self._checkpoint_snapshot_attempt_token is not None
-        ):
-            raise RuntimeError("ordinary Muon load cannot use replacement authority")
-        self.preflight_checkpoint_snapshot()
-        self._checkpoint_attempt_token = (
-            attempt_token if attempt_token is not None else object()
-        )
-        self._checkpoint_lifecycle = _CheckpointLifecycle.SNAPSHOT_ACTIVE
-        snapshots: dict[str, DiskTensorRollbackSnapshot] = {}
+            raise RuntimeError("GPU-staged Muon must be bound before state reset")
+        if not self._units:
+            return
+        assert self.cpu_slabs is not None
+        slots_were_released = not self._slots
+        if slots_were_released:
+            self.restore_from_cpu()
         try:
             self.drain()
-            snapshots = self._create_checkpoint_slab_snapshots()
-            self._install_checkpoint_rollback(snapshots, lifecycle)
-        except BaseException as original:
-            for snapshot in reversed(tuple(snapshots.values())):
-                try:
-                    snapshot.cleanup()
-                except BaseException as cleanup_error:
-                    self._checkpoint_build_cleanup.append(snapshot.cleanup_artifact())
-                    original.add_note(
-                        f"Muon snapshot activation cleanup failed: {cleanup_error!r}"
-                    )
-            self._checkpoint_lifecycle = lifecycle
-            self._checkpoint_attempt_token = None
-            self._checkpoint_snapshot_attempt_token = None
-            raise
-
-    def prepare_checkpoint_load(self) -> None:
-        if self._checkpoint_rollback is None:
-            raise RuntimeError("no Muon checkpoint load transaction is active")
-        self.drain()
-        self._validate_bound_state_views()
-        expected = {"master_param", "momentum_buffer"}
-        missing = {
-            index: sorted(expected - self._checkpoint_loaded_state[unit.param])
-            for index, unit in enumerate(self._units)
-            if self._checkpoint_loaded_state[unit.param] != expected
-        }
-        if missing:
-            raise ValueError(f"Muon checkpoint is missing parameter state: {missing}")
-        if self.cuda_state_numel != 0:
-            raise RuntimeError("Muon checkpoint load created CUDA state")
-        self._checkpoint_prepared = True
+            device = self._slots[0].master.device
+            caller_stream = torch.cuda.current_stream(device)
+            params_ready = torch.cuda.Event()
+            params_ready.record(caller_stream)
+            self._residency = "STEP_ACTIVE"
+            for unit_index, unit in enumerate(self._units):
+                self._schedule_master_initialization(
+                    unit, unit_index % len(self._slots), params_ready
+                )
+            self.drain()
+            self.cpu_slabs.momentum.zero_()
+        finally:
+            if slots_were_released:
+                self.offload_to_cpu()
 
     def get_unscaled_state(self, param: torch.Tensor, key: str) -> torch.Tensor:
         self.prepare_checkpoint_save()
@@ -1737,104 +824,100 @@ class GPUStagedMuon(torch.optim.Optimizer):
     def set_scaled_state(
         self, param: torch.Tensor, key: str, value: torch.Tensor
     ) -> None:
-        if self._checkpoint_lifecycle is not _CheckpointLifecycle.LOAD_ACTIVE:
-            raise RuntimeError("Muon state setter requires an active checkpoint load")
+        if self._checkpoint_load_error is not None:
+            raise RuntimeError(
+                "cannot mutate after a failed checkpoint load; restart and recover"
+            ) from self._checkpoint_load_error
         if key not in {"master_param", "momentum_buffer"}:
-            raise KeyError(f"unsupported Muon checkpoint state: {key}")
+            raise KeyError(f"unsupported staged Muon state: {key}")
         if not isinstance(value, torch.Tensor):
-            raise TypeError(f"loaded Muon {key} must be a tensor")
+            raise TypeError(f"loaded {key} must be a tensor")
         if value.device.type != "cpu" or value.dtype is not torch.float32:
-            raise TypeError(f"loaded Muon {key} must be CPU FP32")
+            raise TypeError(f"loaded {key} must be a CPU FP32 tensor")
         destination = self.state[param][key]
         if destination.shape != value.shape:
             raise ValueError(
-                f"Muon checkpoint shape mismatch for {key}: "
-                f"expected={tuple(destination.shape)}, actual={tuple(value.shape)}"
+                f"checkpoint state shape mismatch for {key}: "
+                f"expected {tuple(destination.shape)}, got {tuple(value.shape)}"
             )
-        if destination.data_ptr() != value.data_ptr():
-            destination.copy_(value)
-        self._checkpoint_loaded_state[param].add(key)
+        destination.copy_(value)
 
     def state_dict(self) -> dict[str, Any]:
         self.prepare_checkpoint_save()
         return super().state_dict()
 
-    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
-        if self._checkpoint_lifecycle is not _CheckpointLifecycle.LOAD_ACTIVE:
-            raise RuntimeError("Muon load_state_dict requires a checkpoint transaction")
+    def load_state_dict(self, state_dict: Mapping[str, Any]) -> None:
+        """Load CPU state in place without moving it to parameter devices."""
+        if self._checkpoint_load_error is not None:
+            raise RuntimeError(
+                "cannot reload after a failed checkpoint load; restart and recover"
+            ) from self._checkpoint_load_error
         if not isinstance(state_dict, Mapping) or set(state_dict) != {
             "state",
             "param_groups",
         }:
-            raise ValueError("Muon checkpoint state_dict fields mismatch")
+            raise ValueError("staged Muon checkpoint fields mismatch")
         loaded_groups = state_dict["param_groups"]
-        if not isinstance(loaded_groups, list) or len(loaded_groups) != len(
+        if not isinstance(loaded_groups, (list, tuple)) or len(loaded_groups) != len(
             self.param_groups
         ):
-            raise ValueError("Muon checkpoint param-group count mismatch")
-        current_params = [group["params"] for group in self.param_groups]
-        loaded_ids = [group.get("params") for group in loaded_groups]
-        if any(not isinstance(ids, list) for ids in loaded_ids):
-            raise TypeError("Muon checkpoint param-group params must be lists")
-        for group_index, (loaded, current) in enumerate(
-            zip(loaded_groups, self.param_groups, strict=True)
+            raise ValueError("staged Muon parameter groups mismatch")
+        id_to_param: dict[int, torch.Tensor] = {}
+        for current_group, loaded_group in zip(
+            self.param_groups, loaded_groups, strict=True
         ):
-            _validate_muon_checkpoint_group_metadata(
-                {key: value for key, value in loaded.items() if key != "params"},
-                current,
-                location=f"Muon checkpoint group {group_index}",
-            )
-        flat_ids = [value for ids in loaded_ids for value in ids]
-        flat_params = [param for params in current_params for param in params]
-        if len(flat_ids) != len(flat_params) or len(set(flat_ids)) != len(flat_ids):
-            raise ValueError("Muon checkpoint parameter mapping is incomplete")
-        id_to_param = dict(zip(flat_ids, flat_params, strict=True))
-        if set(state_dict["state"]) != set(flat_ids):
-            raise ValueError("Muon checkpoint state parameter set mismatch")
-        expected_state_keys = {"master_param", "momentum_buffer"}
-        for state_id, loaded_state in state_dict["state"].items():
-            if (
-                not isinstance(loaded_state, Mapping)
-                or set(loaded_state) != expected_state_keys
+            if not isinstance(loaded_group, Mapping) or set(loaded_group) != set(
+                current_group
             ):
-                raise ValueError("Muon parameter checkpoint state fields mismatch")
-            param = id_to_param[state_id]
-            for key in expected_state_keys:
-                value = loaded_state[key]
-                if not isinstance(value, torch.Tensor):
-                    raise TypeError(f"loaded Muon {key} must be a tensor")
-                if value.device.type != "cpu" or value.dtype is not torch.float32:
-                    raise TypeError(f"loaded Muon {key} must be CPU FP32")
-                if value.shape != param.shape:
-                    raise ValueError(
-                        f"Muon checkpoint shape mismatch for {key}: "
-                        f"expected={tuple(param.shape)}, actual={tuple(value.shape)}"
-                    )
-        for group, loaded, params in zip(
-            self.param_groups, loaded_groups, current_params, strict=True
+                raise ValueError("staged Muon parameter-group metadata mismatch")
+            loaded_ids = loaded_group["params"]
+            if not isinstance(loaded_ids, (list, tuple)) or len(loaded_ids) != len(
+                current_group["params"]
+            ):
+                raise ValueError("staged Muon parameter-group ownership mismatch")
+            for loaded_id, param in zip(
+                loaded_ids, current_group["params"], strict=True
+            ):
+                if not isinstance(loaded_id, int) or isinstance(loaded_id, bool):
+                    raise TypeError("staged Muon parameter ids must be integers")
+                if loaded_id in id_to_param:
+                    raise ValueError("staged Muon parameter id is duplicated")
+                id_to_param[loaded_id] = param
+        loaded_state = state_dict["state"]
+        if not isinstance(loaded_state, Mapping) or set(loaded_state) != set(
+            id_to_param
         ):
-            group.clear()
-            group.update(
-                {key: value for key, value in loaded.items() if key != "params"}
+            raise ValueError("staged Muon state ownership mismatch")
+        tensor_plan: list[tuple[torch.Tensor, str, torch.Tensor]] = []
+        for loaded_id, values in loaded_state.items():
+            if not isinstance(values, Mapping) or set(values) != {
+                "master_param",
+                "momentum_buffer",
+            }:
+                raise ValueError("staged Muon state schema mismatch")
+            param = id_to_param[loaded_id]
+            for key, value in values.items():
+                destination = self.state[param][key]
+                if (
+                    not isinstance(value, torch.Tensor)
+                    or value.device.type != "cpu"
+                    or value.dtype is not torch.float32
+                    or value.shape != destination.shape
+                ):
+                    raise ValueError(f"loaded staged Muon {key} is incompatible")
+                tensor_plan.append((param, key, value))
+        self._validate_bound_state_views()
+        for current_group, loaded_group in zip(
+            self.param_groups, loaded_groups, strict=True
+        ):
+            params = current_group["params"]
+            current_group.clear()
+            current_group.update(
+                {key: value for key, value in loaded_group.items() if key != "params"}
             )
-            group["params"] = params
-        for state_id, loaded_state in state_dict["state"].items():
-            param = id_to_param[state_id]
-            for key in ("master_param", "momentum_buffer"):
-                self.set_scaled_state(param, key, loaded_state[key])
-
-    _effective_checkpoint_lifecycle = GPUStagedAdamW._effective_checkpoint_lifecycle
-    prepare_checkpoint_commit = GPUStagedAdamW.prepare_checkpoint_commit
-    _checkpoint_commit_is_decided = GPUStagedAdamW._checkpoint_commit_is_decided
-    decide_checkpoint_commit = GPUStagedAdamW.decide_checkpoint_commit
-    record_checkpoint_cleanup_error = GPUStagedAdamW.record_checkpoint_cleanup_error
-    discard_checkpoint_snapshot = GPUStagedAdamW.discard_checkpoint_snapshot
-    commit_checkpoint_load = GPUStagedAdamW.commit_checkpoint_load
-    complete_checkpoint_load = GPUStagedAdamW.complete_checkpoint_load
-    abort_checkpoint_load = GPUStagedAdamW.abort_checkpoint_load
-    retry_checkpoint_recovery = GPUStagedAdamW.retry_checkpoint_recovery
-    prepare_checkpoint_recovery = GPUStagedAdamW.prepare_checkpoint_recovery
-    mark_checkpoint_poisoned = GPUStagedAdamW.mark_checkpoint_poisoned
+            current_group["params"] = params
+        for param, key, value in tensor_plan:
+            self.state[param][key].copy_(value)
 
 
 def _make_layerwise_leaf_class():
@@ -2759,9 +1842,6 @@ def _make_staged_layerwise_class():
         """Layer-wise wrapper preserving official ownership and collectives."""
 
         manages_cpu_residency = True
-        managed_checkpoint_format = _MUON_CHECKPOINT_FORMAT
-        supports_managed_async_checkpoint = False
-        supports_model_only_checkpoint_reset = False
 
         def __init__(self, official: Any, leaves: list[Any]) -> None:
             self.pg_collection = official.pg_collection
@@ -3513,8 +2593,7 @@ def _make_staged_layerwise_class():
                     f"unexpected={sorted(set(tensor_state) - expected_tensor_keys)}"
                 )
 
-            # Every leaf, group and tensor has now passed validation. Mutation
-            # remains inside the manager-owned disk rollback transaction.
+            # Every leaf, group, and tensor has passed validation before mutation.
             for base, groups, tensor_plan in apply_plan:
                 for group, loaded_group in zip(base.param_groups, groups, strict=True):
                     params = group["params"]
@@ -4611,10 +3690,6 @@ def get_megatron_optimizer_with_gpu_staged_muon(
                 staged_config=GPUStagedAdamWConfig(
                     buffer_count=staged_config.buffer_count,
                     bucket_size_mb=staged_config.slot_size_mb,
-                    checkpoint_snapshot_root=staged_config.checkpoint_snapshot_root,
-                    checkpoint_snapshot_chunk_mb=(
-                        staged_config.checkpoint_snapshot_chunk_mb
-                    ),
                 ),
                 adam_w_mode=mcore_config.decoupled_weight_decay,
                 master_weights=True,
