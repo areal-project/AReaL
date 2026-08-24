@@ -192,6 +192,12 @@ class RWTrainer:
 
         global_step = 0
         data_generator = cycle_dataloader(self.train_dataloader)
+        if self.recover_info is None and self._evaluate_before_train():
+            self._export_and_commit_stats(
+                epoch=-1,
+                epoch_step=-1,
+                global_step=-1,
+            )
         for global_step in range(start_step, max_steps):
             if (
                 config.total_train_steps is not None
@@ -449,6 +455,27 @@ class RWTrainer:
 
         dist.barrier(group=self.actor.cpu_group)
         current_platform.synchronize()
+
+    def _evaluate_before_train(self) -> bool:
+        if self.valid_dataloader is None:
+            return self.evaluator.evaluate_before_train(None)
+
+        def evaluate_fn() -> None:
+            with (
+                stats_tracker.record_timing("eval"),
+                perf_tracer.trace_scope(
+                    "train.eval",
+                    category=Category.COMPUTE,
+                    args={"global_step": -1},
+                ),
+            ):
+                self._evaluate_fn()
+
+        evaluated = self.evaluator.evaluate_before_train(evaluate_fn)
+        if evaluated:
+            dist.barrier(group=self.actor.cpu_group)
+            current_platform.synchronize()
+        return evaluated
 
     def _evaluate(
         self,
