@@ -222,6 +222,7 @@ class InteractionWithTokenLogpReward:
             # reward
             rewards=torch.tensor([float(reward)]),
             original_rewards=torch.tensor([float(original_reward)]),
+            is_truncated=torch.tensor([resp.stop_reason == "length"], dtype=torch.bool),
         )
         self._cache = result
         return result

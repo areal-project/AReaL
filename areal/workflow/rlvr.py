@@ -176,5 +176,8 @@ class RLVRWorkflow(RolloutWorkflow):
             "turn_ids": torch.tensor(turn_ids, dtype=torch.int32),
             "attention_mask": torch.ones(len(seq), dtype=torch.bool),
             "rewards": torch.tensor(reward, dtype=torch.float32),
+            "is_truncated": torch.tensor(
+                resp.stop_reason == "length", dtype=torch.bool
+            ),
         }
         return {k: v.unsqueeze(0) for k, v in res.items()}

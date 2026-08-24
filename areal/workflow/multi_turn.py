@@ -73,6 +73,7 @@ class MultiTurnWorkflow(RolloutWorkflow):
         discount = 1.0
         prompt_str = ""
         completions_str = ""
+        is_truncated = False
         while reward == 0.0 and t < self.max_turns:
             # Send generate request to get the response.
             req = ModelRequest(
@@ -82,6 +83,9 @@ class MultiTurnWorkflow(RolloutWorkflow):
                 tokenizer=self.tokenizer,
             )
             resp = await engine.agenerate(req)
+            # Only the final turn determines whether the trajectory itself was
+            # truncated; a later turn supersedes an earlier length stop.
+            is_truncated = resp.stop_reason == "length"
             # compute reward: 1 for correct and 0 otherwise
             prompt_str = self.tokenizer.decode(input_ids)
             completions_str = self.tokenizer.decode(resp.output_tokens)
@@ -133,5 +137,6 @@ class MultiTurnWorkflow(RolloutWorkflow):
             turn_ids=torch.tensor(turn_ids, dtype=torch.int32),
             rewards=torch.tensor(reward, dtype=torch.float32),
             attention_mask=torch.ones(len(seq), dtype=torch.bool),
+            is_truncated=torch.tensor(is_truncated, dtype=torch.bool),
         )
         return {k: v.unsqueeze(0) for k, v in res.items()}

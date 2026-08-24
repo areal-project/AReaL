@@ -166,4 +166,7 @@ class VisionRLVRWorkflow(RLVRWorkflow):
             "turn_ids": torch.tensor(turn_ids, dtype=torch.int32).unsqueeze(0),
             "attention_mask": torch.ones(len(seq), dtype=torch.bool).unsqueeze(0),
             "rewards": torch.tensor(reward, dtype=torch.float32).unsqueeze(0),
+            "is_truncated": torch.tensor(
+                [resp.stop_reason == "length"], dtype=torch.bool
+            ),
         }

@@ -2044,6 +2044,7 @@ class FSDPEngine(TrainEngine):
             ulysses_pad_size = 0
 
         inputs.pop("turn_ids", None)
+        inputs.pop("is_truncated", None)
 
         ctx = FSDPTrainContext(
             model_inputs=inputs,

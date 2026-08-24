@@ -64,6 +64,22 @@ def _infer_prompt_lens(
     return torch.where(has_gen, first_gen_idx, attention_mask.long().sum(-1))
 
 
+def _get_truncated_mask(data: dict[str, Any], seqlens: torch.Tensor) -> torch.Tensor:
+    is_truncated = data.get("is_truncated")
+    if is_truncated is None:
+        # Preserve compatibility with custom tensor workflows that predate the
+        # explicit per-trajectory termination metadata.
+        return seqlens == data["attention_mask"].shape[-1]
+    if not torch.is_tensor(is_truncated):
+        raise TypeError("`is_truncated` must be a tensor")
+    if is_truncated.shape != seqlens.shape:
+        raise ValueError(
+            "`is_truncated` must have one value per trajectory, got "
+            f"shape {tuple(is_truncated.shape)} for batch shape {tuple(seqlens.shape)}"
+        )
+    return is_truncated.to(device=seqlens.device, dtype=torch.bool)
+
+
 class PPOActor:
     def __init__(self, config: PPOActorConfig, engine: TrainEngine):
         self.config = config
@@ -249,7 +265,8 @@ class PPOActor:
         # Compute KL-regularized rewards.
         attn_mask = data["attention_mask"]
         seqlens = attn_mask.sum(-1).long()
-        seq_no_eos_mask = seqlens == attn_mask.shape[1]
+        seq_truncated_mask = _get_truncated_mask(data, seqlens)
+        data["is_truncated"] = seq_truncated_mask
         rewards = -self.kl_ctl * self.kl_estimator(old_logp, ref_logp)
         kl_rewards = rewards.clone()
         # KL rewards at the next token after eos is zero.
@@ -259,7 +276,7 @@ class PPOActor:
         gae_outcome_rewards = torch.zeros_like(rewards)
         if self.mask_no_eos_with_zero:
             gae_outcome_rewards[batch_indices, indices] = torch.where(
-                seq_no_eos_mask, 0, reward_score
+                seq_truncated_mask, 0, reward_score
             )
         else:
             gae_outcome_rewards[batch_indices, indices] = reward_score
@@ -277,6 +294,7 @@ class PPOActor:
             values = torch.zeros_like(rewards)
         else:
             values = data["values"]
+        bootstrap_values = values[batch_indices, seqlens - 1]
         if self._gae_lambda_is_custom:
             gae_lambda = self._compute_gae_lambda(loss_mask, turn_ids)
         else:
@@ -290,7 +308,8 @@ class PPOActor:
                 values=values,
                 loss_mask=loss_mask,
                 turn_ids=turn_ids,
-                seq_no_eos_mask=seq_no_eos_mask,
+                seq_no_eos_mask=seq_truncated_mask,
+                bootstrap_values=bootstrap_values,
                 discount=self.discount,
                 gae_lambda=gae_lambda,
             )
@@ -300,7 +319,8 @@ class PPOActor:
                 rewards=rewards,
                 values=values,
                 loss_mask=loss_mask,
-                seq_no_eos_mask=seq_no_eos_mask,
+                seq_no_eos_mask=seq_truncated_mask,
+                bootstrap_values=bootstrap_values,
                 discount=self.discount,
                 gae_lambda=gae_lambda,
             )
@@ -415,8 +435,9 @@ class PPOActor:
         stats_tracker.stat(**stats, denominator="n_valid_tokens")
 
         prompt_lens = _infer_prompt_lens(data["attention_mask"], data["loss_mask"])
+        seq_truncated_mask = _get_truncated_mask(data, seqlens)
         seq_stats = dict(
-            no_eos_ratios=(seqlens == attn_mask.shape[-1]).float(),
+            no_eos_ratios=seq_truncated_mask.float(),
             task_reward=task_reward,
             prompt_len=prompt_lens.float(),
             seq_len=seqlens.float(),
@@ -447,7 +468,7 @@ class PPOActor:
 
         # Pop keys that are no longer needed after advantage computation
         # Note: "versions" is kept if needed for approximation/metrics in loss function
-        for key in ["rewards", "tot_rewards", "kl_rewards"]:
+        for key in ["rewards", "tot_rewards", "kl_rewards", "is_truncated"]:
             data.pop(key, None)
         # NOTE: calling engine.train() is critical to enabling gradient checkpointing
         self.engine.train()

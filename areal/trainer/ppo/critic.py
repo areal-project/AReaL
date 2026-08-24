@@ -53,7 +53,13 @@ class PPOCritic:
         stats_tracker.scalar(**scalars)
         ########## Logging code ends ##########
 
-        for key in ["rewards", "tot_rewards", "kl_rewards", "versions"]:
+        for key in [
+            "rewards",
+            "tot_rewards",
+            "kl_rewards",
+            "versions",
+            "is_truncated",
+        ]:
             data.pop(key, None)
 
         # NOTE: calling engine.train() is critical to enabling gradient checkpointing
