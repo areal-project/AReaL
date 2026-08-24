@@ -1409,9 +1409,20 @@ class GPUStagedMuon(torch.optim.Optimizer):
 
     def offload_to_cpu(self) -> None:
         self.drain()
+        self._slots.clear()
+        self._slot_machine = None
 
     def restore_from_cpu(self) -> None:
-        return
+        if not self._bound or not self._units or self._slots:
+            return
+        device = self._units[0].param.device
+        slots = [
+            _MuonCUDAStagingSlot.allocate(self.staged_config.slot_numel, device)
+            for _ in range(self.staged_config.buffer_count)
+        ]
+        self._slots = slots
+        self._slot_machine = SlotStateMachine(len(slots), self._wait_for_slot)
+        self._residency = "CPU_RESIDENT"
 
     def _validate_bound_state_views(self) -> None:
         if not self._bound:

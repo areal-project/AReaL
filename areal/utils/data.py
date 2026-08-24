@@ -701,6 +701,7 @@ def split_padded_tensor_dict_into_mb_list(
     data: dict[str, Any],
     mb_spec: MicroBatchSpec,
     group: dist.ProcessGroup | None = None,
+    seq_align_to: int | None = None,
 ) -> MicroBatchList:
     """Split a padded dict of tensors into micro-batches based on the attention mask.
 
@@ -708,6 +709,9 @@ def split_padded_tensor_dict_into_mb_list(
         data (Dict): Dictionary containing padded tensors.
         mb_spec (MicroBatchSpec): Specification for micro-batch splitting.
         group (Optional[dist.ProcessGroup]): Process group for distributed synchronization.
+        seq_align_to: Optional per-sequence alignment applied after packing. When set,
+            aligned lengths are used for micro-batch allocation so padding cannot make
+            a micro-batch exceed ``max_tokens_per_mb``.
 
     Returns:
         MicroBatchList: A structure containing the split micro-batches and metadata.
@@ -724,15 +728,16 @@ def split_padded_tensor_dict_into_mb_list(
     if bs % granularity != 0:
         raise RuntimeError(f"Batch size {bs} cannot divide granularity {granularity}.")
     max_seqlen = data["attention_mask"].shape[1]
-    seq_lens = data["attention_mask"].sum(1).long().cpu().numpy().tolist()
-    input_lens = (
-        data["attention_mask"]
-        .view(bs // granularity, granularity, -1)
-        .sum(dim=(1, 2))
-        .long()
-        .cpu()
-        .numpy()
-    )
+    seq_lens_array = data["attention_mask"].sum(1).long().cpu().numpy()
+    seq_lens = seq_lens_array.tolist()
+    packing_seq_lens = seq_lens_array
+    if seq_align_to is not None:
+        if seq_align_to <= 0:
+            raise ValueError(f"seq_align_to must be positive, got {seq_align_to}.")
+        packing_seq_lens = (
+            (packing_seq_lens + seq_align_to - 1) // seq_align_to * seq_align_to
+        )
+    input_lens = packing_seq_lens.reshape(bs // granularity, granularity).sum(axis=1)
 
     # check for multimodal input data
     multimodal_keys = {key for key in data if is_multi_modal_key(key)}
@@ -1035,7 +1040,7 @@ def pad_mb_list(
         )
         padded_mb_inputs.append(padded_mb)
         pad_lengths.append(pad_len)
-        pad_to_lengths.append(pad_to_length)
+        pad_to_lengths.append(int(padded_mb["cu_seqlens"][-1].item()))
         old_cu_seqlens_list.append(old_cu_seqlens)
         align_to_lengths.append(align_to_length)
     mb_list.padded_mbs = padded_mb_inputs

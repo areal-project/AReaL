@@ -1155,9 +1155,26 @@ class GPUStagedAdamW(torch.optim.AdamW):
 
     def offload_to_cpu(self) -> None:
         self.drain()
+        # The CPU slabs are authoritative between steps.  Keeping the bounded
+        # CUDA staging slots alive while AWEX hands the device to rollout only
+        # wastes colocation headroom (2 GiB with the default 2 x 128 MiB x 4
+        # tensors).  Streams/events are slot-owned as well, so dropping the
+        # slots releases the complete staging runtime.
+        self._slots.clear()
+        self._slot_machine = None
 
     def restore_from_cpu(self) -> None:
-        return
+        if not self._bound or not self._units or self._slots:
+            return
+        capacity = max(unit.numel for unit in self._units)
+        device = self._layouts[0].param.device
+        slots = [
+            _CUDAStagingSlot.allocate(capacity, device)
+            for _ in range(self.staged_config.buffer_count)
+        ]
+        self._slots = slots
+        self._slot_machine = SlotStateMachine(len(slots), self._wait_for_slot)
+        self._residency = "CPU_RESIDENT"
 
     def prepare_checkpoint_save(self) -> None:
         """Fence D2H and validate the synchronous CPU checkpoint source."""

@@ -395,11 +395,16 @@ def rollback_optimizer_lifecycle(
     for index in range(last_attempted, -1, -1):
         entry = plan.entries[index]
         journal = plan.journals[index]
-        if entry.kind is OptimizerLeafKind.HDO and journal.hdo_release_attempted:
+        if entry.kind in (OptimizerLeafKind.MANAGED, OptimizerLeafKind.HDO) and (
+            journal.hdo_release_attempted
+        ):
             try:
-                entry.restore_from_cpu()
+                if entry.kind is OptimizerLeafKind.MANAGED:
+                    entry.managed_optimizer.restore_from_cpu()
+                else:
+                    entry.restore_from_cpu()
             except BaseException as error:
-                rollback_errors.append((f"HDO leaf {index}", error))
+                rollback_errors.append((f"optimizer leaf {index}", error))
             else:
                 journal.hdo_release_attempted = False
         elif entry.kind is OptimizerLeafKind.ORDINARY:
@@ -421,11 +426,16 @@ def retry_optimizer_recovery(
     for index in range(len(plan.entries) - 1, -1, -1):
         entry = plan.entries[index]
         journal = plan.journals[index]
-        if entry.kind is OptimizerLeafKind.HDO and journal.hdo_release_attempted:
+        if entry.kind in (OptimizerLeafKind.MANAGED, OptimizerLeafKind.HDO) and (
+            journal.hdo_release_attempted
+        ):
             try:
-                entry.restore_from_cpu()
+                if entry.kind is OptimizerLeafKind.MANAGED:
+                    entry.managed_optimizer.restore_from_cpu()
+                else:
+                    entry.restore_from_cpu()
             except BaseException as error:
-                recovery_errors.append((f"HDO leaf {index}", error))
+                recovery_errors.append((f"optimizer leaf {index}", error))
             else:
                 journal.hdo_release_attempted = False
         elif entry.kind is OptimizerLeafKind.ORDINARY and journal.actions:
@@ -453,7 +463,8 @@ def release_optimizer_lifecycle(
     for index, (entry, journal) in enumerate(zip(plan.entries, plan.journals)):
         try:
             if entry.kind is OptimizerLeafKind.MANAGED:
-                entry.managed_optimizer.drain()
+                journal.hdo_release_attempted = True
+                entry.managed_optimizer.offload_to_cpu()
             elif entry.kind is OptimizerLeafKind.HDO:
                 journal.hdo_release_attempted = True
                 entry.offload_to_cpu()
@@ -477,7 +488,8 @@ def resume_optimizer_lifecycle(
         entry = plan.entries[index]
         journal = plan.journals[index]
         if entry.kind is OptimizerLeafKind.MANAGED:
-            pass
+            entry.managed_optimizer.restore_from_cpu()
+            journal.hdo_release_attempted = False
         elif entry.kind is OptimizerLeafKind.HDO:
             entry.restore_from_cpu()
             journal.hdo_release_attempted = False

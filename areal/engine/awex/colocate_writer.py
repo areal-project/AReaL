@@ -51,6 +51,77 @@ from areal.utils.logging import getLogger
 logger = getLogger("AwexColocate")
 
 
+@torch.no_grad()
+def _pack_tensors_for_cuda_ipc(
+    tensors: list[torch.Tensor],
+    max_group_bytes: int = 5 * 1024**3,
+) -> tuple[list[torch.Tensor], list[dict]]:
+    """Pack tensors into bounded, single-allocation CUDA IPC groups.
+
+    AWEX's packer uses ``torch.cat(...).clone()`` and only checks the size
+    limit after adding the next tensor.  The redundant allocation doubles the
+    transient pressure and makes it much more likely that the eventual export
+    occupies a split training segment.  CUDA IPC exports the whole segment, so
+    one live payload can pin tens of GiB of inactive splits.
+
+    Plan groups first, allocate each flat destination exactly once, and copy
+    shaped source views directly into it.  Grouping by dtype preserves AWEX's
+    low-handle-count format and remains compatible with
+    ``reconstruct_tensors_from_groups``.
+    """
+    if not tensors:
+        return [], []
+
+    by_dtype: dict[torch.dtype, list[tuple[int, torch.Tensor]]] = {}
+    for index, tensor in enumerate(tensors):
+        by_dtype.setdefault(tensor.dtype, []).append((index, tensor))
+
+    planned_groups: list[list[tuple[int, torch.Tensor]]] = []
+    for dtype_group in by_dtype.values():
+        current: list[tuple[int, torch.Tensor]] = []
+        current_bytes = 0
+        for index, tensor in dtype_group:
+            tensor_bytes = tensor.numel() * tensor.element_size()
+            if current and current_bytes + tensor_bytes > max_group_bytes:
+                planned_groups.append(current)
+                current = []
+                current_bytes = 0
+            current.append((index, tensor))
+            current_bytes += tensor_bytes
+            if current_bytes >= max_group_bytes:
+                planned_groups.append(current)
+                current = []
+                current_bytes = 0
+        if current:
+            planned_groups.append(current)
+
+    packed_groups: list[torch.Tensor] = []
+    metadata: list[dict] = []
+    for group_index, group in enumerate(planned_groups):
+        dtype = group[0][1].dtype
+        device = group[0][1].device
+        total_numel = sum(tensor.numel() for _, tensor in group)
+        packed = torch.empty(total_numel, dtype=dtype, device=device)
+        offset = 0
+        for original_index, tensor in group:
+            size = tensor.numel()
+            packed[offset : offset + size].view(tensor.shape).copy_(tensor)
+            metadata.append(
+                {
+                    "original_index": original_index,
+                    "shape": tensor.shape,
+                    "dtype": tensor.dtype,
+                    "group_index": group_index,
+                    "offset": offset,
+                    "size": size,
+                }
+            )
+            offset += size
+        packed_groups.append(packed)
+
+    return packed_groups, metadata
+
+
 @dataclass
 class _TECachePurgeJournal:
     """Release-time snapshot and pending restores for TE's private dict cache."""
@@ -120,6 +191,9 @@ class AwexMegatronAdapter:
         self._infer_world_size: int | None = None
         self._num_infer_engines: int | None = None
         self._logical_train_rank: int | None = None
+        self._pending_ipc_export: (
+            tuple[list[torch.Tensor], list[torch.Tensor]] | None
+        ) = None
 
     def init_colocate_weight_update(
         self,
@@ -312,20 +386,22 @@ class AwexMegatronAdapter:
           4. Signal all_training_offloaded_weights (reader waits for this)
           5. share_memory_() + cuda_ipc_serialize → put to MetaServer
           6. Wait for weights_update_finished (reader done copying)
-          7. Clean up shared tensors → signal write_finished
-          8. Wait for all infer engines to finish (finished_weights_update_engines)
+          7. Signal write_finished while retaining the exported tensors
+          8. Wait for all infer engines, then release the exported tensors
         """
         from awex.util.tensor_util import (
             cuda_ipc_serialize,
-            group_tensors_by_shape_and_dtype,
             release_tensors,
         )
 
+        if self._pending_ipc_export is not None:
+            raise RuntimeError(
+                "Previous CUDA IPC export is still pending final reader completion"
+            )
+
         weights_were_offloaded = "weights" in self._released_tags
 
-        # Reclaim any IPC-exported blocks from the previous version whose
-        # peer mappings closed after our last collect (belt-and-braces with the
-        # collect in this method's finally block).
+        # Reclaim any legacy IPC-exported blocks from a previous version.
         torch.cuda.ipc_collect()
 
         # Free optimizer states + grad buffers BEFORE reloading the train
@@ -377,7 +453,7 @@ class AwexMegatronAdapter:
             version,
         )
 
-        group_tensors, metadata = group_tensors_by_shape_and_dtype(tensors)
+        group_tensors, metadata = _pack_tensors_for_cuda_ipc(tensors)
         torch.cuda.synchronize()
         logger.info(
             "Grouped into %d tensor groups for IPC serialization", len(group_tensors)
@@ -415,6 +491,8 @@ class AwexMegatronAdapter:
         release_tensors(owned)
         del tensors, owned
         parameters.clear()
+        gc.collect()
+        torch.cuda.empty_cache()
 
         self.release_memory(tags=["weights"])
 
@@ -431,6 +509,11 @@ class AwexMegatronAdapter:
         )
 
         group_shared = [t.share_memory_() for t in group_tensors]
+        # Keep the producer storage alive until *all* readers complete their
+        # full update lifecycle.  Releasing it after the early per-GPU ack puts
+        # the storage into CudaIPCSentDataLimbo while readers can still hold a
+        # mapping, which is exactly the actor residue this path must avoid.
+        self._pending_ipc_export = (group_tensors, group_shared)
         serialized_weights = cuda_ipc_serialize((group_shared, metadata, names))
         torch.cuda.synchronize()
         logger.info("CUDA IPC serialization complete, putting to MetaServer")
@@ -478,20 +561,7 @@ class AwexMegatronAdapter:
             self._meta_server_client.delete_if_exists(serialized_weights_key)
             logger.info("Got done signal from infer side: %s", update_finished_key)
         finally:
-            release_tensors(group_tensors)
-            release_tensors(group_shared)
-            del group_tensors, group_shared
             torch.cuda.synchronize()
-            gc.collect()
-            # Storages exported via cudaIpcGetMemHandle park in PyTorch's
-            # CudaIPCSentDataLimbo when freed and are NOT returned to the
-            # allocator until ipc_collect() confirms the peer closed its
-            # mapping. GiB-scale group tensors are exported every version;
-            # without collection the train-process residual grows by GBs per
-            # version, eating the colocated rollout's prefill headroom until
-            # its logits all-gather OOMs.
-            torch.cuda.ipc_collect()
-            torch.cuda.empty_cache()
 
         write_finished_key = f"write_finished{key_suffix}"
         self._meta_server_client.put_object(write_finished_key, True)
@@ -518,6 +588,35 @@ class AwexMegatronAdapter:
         logger.info("All inference engines finished weights update")
 
         dist.barrier(group=self._engine.cpu_group)
+
+        # ``weights_update_finished`` is only an early acknowledgement.  The
+        # final engine set is the first point at which every reader has returned
+        # from its full lifecycle.  Drop the still-live producer tensors here,
+        # after peer mappings are closed, so they bypass CudaIPCSentDataLimbo.
+        allocated_before = torch.cuda.memory_allocated()
+        reserved_before = torch.cuda.memory_reserved()
+        pending_ipc_export = self._pending_ipc_export
+        if pending_ipc_export is None:
+            raise RuntimeError("CUDA IPC export disappeared before final completion")
+        self._pending_ipc_export = None
+        del pending_ipc_export
+        torch.cuda.synchronize()
+        gc.collect()
+        torch.cuda.synchronize()
+        torch.cuda.ipc_collect()
+        torch.cuda.empty_cache()
+        allocated_after = torch.cuda.memory_allocated()
+        reserved_after = torch.cuda.memory_reserved()
+        logger.info(
+            "Final CUDA IPC cleanup: rank=%d device=%d "
+            "allocated=%.3f->%.3f GiB reserved=%.3f->%.3f GiB",
+            dist.get_rank(self._engine.cpu_group),
+            torch.cuda.current_device(),
+            allocated_before / 1024**3,
+            allocated_after / 1024**3,
+            reserved_before / 1024**3,
+            reserved_after / 1024**3,
+        )
 
         if dist.get_rank() == 0:
             self._meta_server_client.delete_if_exists("finished_weights_update_engines")

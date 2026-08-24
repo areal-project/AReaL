@@ -952,6 +952,17 @@ class PPOTrainer:
                     global_step=global_step,
                 )
 
+            # Actor statistics contain detached per-token CUDA clones until
+            # export(reset=True).  In AWEX colocation those clones otherwise
+            # survive through weight exchange and overlap SGLang's resumed
+            # weights by several GiB.  Aggregate them to Python scalars before
+            # the ownership handoff, then carry the scalars to the normal
+            # end-of-step commit point.  A post-exchange export still collects
+            # controller/update timing recorded after this boundary.
+            actor_stats_before_exchange = None
+            if self._is_v1_awex_colocate(config):
+                actor_stats_before_exchange = self.actor.export_stats()
+
             # pause inference for updating weights, save, and evaluation
             self.rollout.pause()
 
@@ -1032,7 +1043,10 @@ class PPOTrainer:
                 args={"global_step": global_step},
             ):
                 self._export_and_commit_stats(
-                    epoch=epoch, epoch_step=step, global_step=global_step
+                    epoch=epoch,
+                    epoch_step=step,
+                    global_step=global_step,
+                    actor_stats_before_exchange=actor_stats_before_exchange,
                 )
 
             # Resume rollout only when another train step will consume it.
@@ -1774,9 +1788,16 @@ class PPOTrainer:
             dist.barrier(group=self.actor.cpu_group)
             current_platform.synchronize()
 
-    def _export_and_commit_stats(self, epoch: int, epoch_step: int, global_step: int):
+    def _export_and_commit_stats(
+        self,
+        epoch: int,
+        epoch_step: int,
+        global_step: int,
+        actor_stats_before_exchange: dict[str, float] | None = None,
+    ):
         # Upload statistics to the logger (e.g., wandb)
-        stats = self.actor.export_stats()
+        stats = dict(actor_stats_before_exchange or {})
+        stats.update(self.actor.export_stats())
         stats.update(self.rollout.export_stats())
         if self.eval_rollout is not None:
             stats.update(self.eval_rollout.export_stats())

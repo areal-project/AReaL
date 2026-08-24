@@ -65,6 +65,10 @@ from areal.engine.core.model import (
     requires_padded_seq,
 )
 from areal.engine.megatron_utils import megatron_bridge_patches  # noqa: F401
+from areal.engine.megatron_utils.activation_storage import (
+    install_activation_storage_tracking,
+    track_activation_storage,
+)
 from areal.engine.megatron_utils.checkpointer import MegatronCheckpointManager
 from areal.engine.megatron_utils.deterministic import set_deterministic_algorithms
 from areal.engine.megatron_utils.fp8 import FP8BlockwiseTensorHelper
@@ -317,6 +321,7 @@ class _MegatronModelList(list):
 
 class MegatronEngine(TrainEngine):
     def __init__(self, config: TrainEngineConfig):
+        install_activation_storage_tracking()
         self.config = config
         self.hf_config: PretrainedConfig
         self.tf_config: TransformerConfig
@@ -1467,11 +1472,35 @@ class MegatronEngine(TrainEngine):
                 loss_multiplier=loss_multiplier,
             )
 
-        self.forward_backward_batch(
-            mb_list,
-            process_output,
-            forward_only=False,
+        model_chunks = (
+            self.model if isinstance(self.model, (list, tuple)) else [self.model]
         )
+        protected_tensors = [
+            tensor
+            for model_chunk in model_chunks
+            # Megatron DDP stores gradient-buffer objects in an instance attribute
+            # named ``buffers``, shadowing ``torch.nn.Module.buffers``. Call the
+            # base implementation explicitly so registered model buffers are
+            # protected without touching Megatron's gradient-buffer list.
+            for tensor in (
+                *model_chunk.parameters(),
+                *torch.nn.Module.buffers(model_chunk),
+            )
+        ]
+        with track_activation_storage(protected_tensors) as activation_tracker:
+            self.forward_backward_batch(
+                mb_list,
+                process_output,
+                forward_only=False,
+            )
+
+        released_storages, released_bytes = activation_tracker.release()
+        if released_storages:
+            self.logger.debug(
+                "Released %d retained Megatron/TE activation storages (%.3f GiB)",
+                released_storages,
+                released_bytes / 1024**3,
+            )
 
         # Step 4: Optimizer step
         stats = self.optimizer_step()
@@ -2936,10 +2965,20 @@ class MegatronEngine(TrainEngine):
             n_mbs=max(min_n_mbs, self.config.mb_spec.n_mbs),
             n_mbs_divisor=pp_size,
         )
+        # Account for the per-sequence padding required by context/sequence
+        # parallelism while allocating micro-batches. Otherwise a group that is
+        # within max_tokens_per_mb before alignment can exceed it in the forward.
+        align_to_multiple_of = tp_size * cp_size * 2 if cp_size > 1 else tp_size
+        align_to_multiple_of = (
+            math.lcm(align_to_multiple_of, DEFAULT_VECTORIZED_ALIGNMENT_BYTES)
+            if self.enable_fp8
+            else align_to_multiple_of
+        )
         mb_list = split_padded_tensor_dict_into_mb_list(
             input_,
             mb_spec,
             group=mpu.get_data_parallel_group(),
+            seq_align_to=align_to_multiple_of,
         )
         mb_list.mbs = [pack_tensor_dict(mb) for mb in mb_list.mbs]
         # NOTE: Pad micro-batches to:
@@ -2947,12 +2986,6 @@ class MegatronEngine(TrainEngine):
         #  of GPU page size or max_tokens_per_mb
         # 2. Align sequence lengths to integer multiples of `align_to_multiple_of=tp_size*cp_size*2`
         #    to satisfy the requirement of Megatron parallelism.
-        align_to_multiple_of = tp_size * cp_size * 2 if cp_size > 1 else tp_size
-        align_to_multiple_of = (
-            math.lcm(align_to_multiple_of, DEFAULT_VECTORIZED_ALIGNMENT_BYTES)
-            if self.enable_fp8
-            else align_to_multiple_of
-        )
         mb_list = pad_mb_list(
             mb_list,
             pad_value=0.0,

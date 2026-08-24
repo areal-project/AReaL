@@ -37,7 +37,7 @@ def _make_adapter(adapter_cls, optimizer):
 def test_awex_managed_release_resume_preserves_cpu_slab_views(
     adapter_cls, monkeypatch
 ) -> None:
-    """Both AWEX adapters drain managed state and never replace its CPU views."""
+    """Both AWEX adapters recycle staging slots without replacing CPU views."""
     param = torch.nn.Parameter(
         torch.linspace(-1, 1, 23, device="cuda", dtype=torch.bfloat16)
     )
@@ -54,6 +54,8 @@ def test_awex_managed_release_resume_preserves_cpu_slab_views(
     )
     optimizer.step()
     adapter = _make_adapter(adapter_cls, optimizer)
+    original_slot_ids = {id(slot) for slot in optimizer._slots}
+    assert len(original_slot_ids) == optimizer.staged_config.buffer_count
     slabs = optimizer.cpu_slabs
     assert slabs is not None
     state = optimizer.state[param]
@@ -71,17 +73,14 @@ def test_awex_managed_release_resume_preserves_cpu_slab_views(
         drain_calls += 1
         original_drain()
 
-    def forbidden_lifecycle() -> None:
-        raise AssertionError("AWEX must not migrate managed optimizer state")
-
     monkeypatch.setattr(optimizer, "drain", tracked_drain)
-    monkeypatch.setattr(optimizer, "offload_to_cpu", forbidden_lifecycle)
-    monkeypatch.setattr(optimizer, "restore_from_cpu", forbidden_lifecycle)
     monkeypatch.setenv("AWEX_OPT_OFFLOAD_VIA_HDO", "1")
 
     adapter.release_memory(tags=["optimizer"])
     adapter.release_memory(tags=["optimizer"])
     assert drain_calls == 1
+    assert optimizer._slots == []
+    assert optimizer._slot_machine is None
     original_values = {key: tensor.clone() for key, tensor in state.items()}
     prepare_managed_checkpoint_save(
         SimpleNamespace(optimizer=optimizer), async_save=False
@@ -90,6 +89,9 @@ def test_awex_managed_release_resume_preserves_cpu_slab_views(
     adapter.resume_memory(tags=["optimizer"])
     adapter.resume_memory(tags=["optimizer"])
     assert drain_calls == 2
+    assert len(optimizer._slots) == optimizer.staged_config.buffer_count
+    assert all(id(slot) not in original_slot_ids for slot in optimizer._slots)
+    assert optimizer._slot_machine is not None
 
     assert optimizer.residency == "CPU_RESIDENT"
     for key, tensor in state.items():

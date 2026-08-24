@@ -661,6 +661,11 @@ class _BailingV3PhysicalKeyNCCLWorkerWeightsReader(NCCLWorkerWeightsReader):
         self.deserialized_weights = None
         gc.collect()
         torch.cuda.synchronize()
+        # Flush unused importer mappings before the early acknowledgement. The
+        # writer retains its exporter until the later all-engine completion,
+        # so that final signal has an unambiguous no-reader-owns-IPC meaning.
+        if device_util.get_device_type() == "cuda":
+            torch.cuda.empty_cache()
         duration = time.time() - start_time
         compute_statistics(
             self._history_update_weights_time,
@@ -678,9 +683,6 @@ class _BailingV3PhysicalKeyNCCLWorkerWeightsReader(NCCLWorkerWeightsReader):
             step_id,
             self.transfer_rank,
         )
-        gc.collect()
-        if device_util.get_device_type() == "cuda":
-            torch.cuda.empty_cache()
         write_finished_key = f"write_finished{key_suffix}"
         _wait_colocate_write_finished(
             self.meta_server_client,

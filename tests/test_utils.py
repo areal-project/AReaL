@@ -5,6 +5,7 @@ from areal.api.cli_args import MicroBatchSpec
 from areal.utils.data import (
     pack_tensor_dict,
     pad_and_stack_tensors_along_first_dim,
+    pad_mb_list,
     pad_sequences_to_tensors,
     reorder_list,
     split_padded_tensor_dict_into_mb_list,
@@ -73,3 +74,29 @@ def test_micro_batch_split(mock_padded_data, n_mbs, max_tokens_per_mb, n_mbs_div
         assert torch.allclose(x, packed_data[key])
         y = pad_and_stack_tensors_along_first_dim(xs)
         assert torch.allclose(mock_padded_data[key], y)
+
+
+def test_micro_batch_split_accounts_for_sequence_alignment():
+    sequences = [
+        {
+            "input_ids": torch.arange(length),
+            "position_ids": torch.arange(length),
+        }
+        for length in (255, 255, 2)
+    ]
+    padded_data = pad_sequences_to_tensors(sequences)
+    mb_spec = MicroBatchSpec(n_mbs=1, max_tokens_per_mb=512)
+
+    mb_list = split_padded_tensor_dict_into_mb_list(
+        padded_data, mb_spec, seq_align_to=16
+    )
+    mb_list.mbs = [pack_tensor_dict(mb) for mb in mb_list.mbs]
+    mb_list = pad_mb_list(mb_list, seq_align_to=16)
+
+    assert len(mb_list.mbs) == 2
+    for padded_mb, padded_to_length in zip(
+        mb_list.padded_mbs, mb_list.padded_to_lengths
+    ):
+        actual_tokens = int(padded_mb["cu_seqlens"][-1].item())
+        assert actual_tokens == padded_to_length
+        assert actual_tokens <= mb_spec.max_tokens_per_mb
