@@ -27,6 +27,7 @@ from areal.infra.data_service import DataController
 from areal.infra.data_service.controller.config import DataServiceConfig
 from areal.infra.data_service.rdataset import RDataset
 from areal.utils import logging, perf_tracer, seeding, stats_tracker
+from areal.utils.cleanup import run_batch_cleanups
 from areal.utils.data import (
     broadcast_tensor_container,
     cycle_dataloader,
@@ -293,9 +294,12 @@ class RWTrainer:
                 # SPMD mode never populates ``_fetch_buffer`` (no RTensor
                 # round-trip), so the fan-out is single-controller only.
                 if is_single_controller():
-                    self.actor.clear_batches(batch)
+                    cleanups = [("actor", lambda: self.actor.clear_batches(batch))]
                     if self.data_controller is not None:
-                        self.data_controller.clear_batches()
+                        cleanups.append(
+                            ("data", lambda: self.data_controller.clear_batches())
+                        )
+                    run_batch_cleanups(cleanups)
 
             with perf_tracer.trace_scope(
                 "train.log_stats",

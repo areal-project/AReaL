@@ -898,7 +898,7 @@ class GatewayTrainController:
                 for addr, pending in self._pending_clear_shards.items()
                 if pending
             ]
-        exhausted: dict[str, int] = {}
+        exhausted: dict[str, list[Any]] = {}
         if clear_requests:
 
             async def _clear_storage():
@@ -922,21 +922,22 @@ class GatewayTrainController:
                     if isinstance(result, Exception):
                         with self._clear_shards_lock:
                             pending = self._pending_clear_shards.get(addr, {})
-                            exhausted_count = 0
+                            exhausted_sids = []
                             for sid in sids:
                                 if sid not in pending:
                                     continue
-                                failures = pending[sid] + 1
+                                failures = min(
+                                    pending[sid] + 1, _MAX_CLEAR_STEP_FAILURES
+                                )
+                                pending[sid] = failures
                                 if failures >= _MAX_CLEAR_STEP_FAILURES:
-                                    pending.pop(sid)
-                                    exhausted_count += 1
-                                else:
-                                    pending[sid] = failures
-                            if not pending:
-                                self._pending_clear_shards.pop(addr, None)
-                            pending_count = len(pending)
-                        if exhausted_count:
-                            exhausted[addr] = exhausted_count
+                                    exhausted_sids.append(sid)
+                            pending_count = sum(
+                                failures < _MAX_CLEAR_STEP_FAILURES
+                                for failures in pending.values()
+                            )
+                        if exhausted_sids:
+                            exhausted[addr] = exhausted_sids
                         logger.warning(
                             "Failed to clear %d RTensor shards on storage node "
                             "%s: %s: %s (%d pending, %d retries exhausted)",
@@ -945,7 +946,7 @@ class GatewayTrainController:
                             type(result).__name__,
                             result,
                             pending_count,
-                            exhausted_count,
+                            len(exhausted_sids),
                         )
                         continue
                     with self._clear_shards_lock:
@@ -979,9 +980,22 @@ class GatewayTrainController:
         }
         self._gateway_post("/clear_batches", payload)
 
+        # Keep retry exhaustion pending until every worker has accepted the
+        # buffer drain. A gateway failure then leaves enough state for the next
+        # call to retry or report the remote storage leak.
+        with self._clear_shards_lock:
+            for addr, sids in exhausted.items():
+                pending = self._pending_clear_shards.get(addr)
+                if pending is None:
+                    continue
+                for sid in sids:
+                    pending.pop(sid, None)
+                if not pending:
+                    self._pending_clear_shards.pop(addr, None)
+
         if exhausted:
             summary = ", ".join(
-                f"{addr}: {count}" for addr, count in sorted(exhausted.items())
+                f"{addr}: {len(sids)}" for addr, sids in sorted(exhausted.items())
             )
             raise RuntimeError(
                 "RTensor storage cleanup failed across two clear_batches calls "

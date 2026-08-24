@@ -47,6 +47,7 @@ from areal.infra.data_service.controller.config import DataServiceConfig
 from areal.infra.data_service.rdataset import RDataset
 from areal.infra.utils.concurrent import call_maybe_async
 from areal.utils import logging, perf_tracer, seeding, stats_tracker
+from areal.utils.cleanup import run_batch_cleanups
 from areal.utils.dataloader import create_dataloader
 from areal.utils.dte import apply_dte_config_envvars
 from areal.utils.environ import is_single_controller
@@ -943,13 +944,30 @@ class PPOTrainer:
                 # SPMD mode never populates ``_fetch_buffer`` (no RTensor
                 # round-trip), so the fan-out is single-controller only.
                 if is_single_controller():
-                    self.actor.clear_batches(rollout_batch, adv_batch)
+                    cleanups = [
+                        (
+                            "actor",
+                            lambda: self.actor.clear_batches(rollout_batch, adv_batch),
+                        )
+                    ]
                     if self.critic is not None:
-                        self.critic.clear_batches(rollout_batch, adv_batch)
+                        cleanups.append(
+                            (
+                                "critic",
+                                lambda: self.critic.clear_batches(
+                                    rollout_batch, adv_batch
+                                ),
+                            )
+                        )
                     if self.ref is not None:
-                        self.ref.clear_batches(rollout_batch)
+                        cleanups.append(
+                            ("ref", lambda: self.ref.clear_batches(rollout_batch))
+                        )
                     if self.data_controller is not None:
-                        self.data_controller.clear_batches()
+                        cleanups.append(
+                            ("data", lambda: self.data_controller.clear_batches())
+                        )
+                    run_batch_cleanups(cleanups)
 
             with perf_tracer.trace_scope(
                 "train.log_stats",

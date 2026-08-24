@@ -257,6 +257,31 @@ class TestGatewayTrainControllerClearBatches:
         assert controller._pending_clear_shards == {}
         assert mock_gateway_post.call_count == 2
 
+    def test_worker_cleanup_failure_preserves_exhausted_storage_state(self):
+        controller = _make_controller()
+        target = {"batch": _make_rtensor("s0", "node-a")}
+        storage_calls = []
+
+        async def fail_clear(addr, shard_ids):
+            storage_calls.append((addr, shard_ids))
+            raise RuntimeError("delete failed")
+
+        with (
+            patch.object(RTensor, "clear_node", new=fail_clear),
+            patch.object(
+                controller,
+                "_gateway_post",
+                side_effect=[None, RuntimeError("worker cleanup failed")],
+            ) as mock_gateway_post,
+        ):
+            controller.clear_batches(target)
+            with pytest.raises(RuntimeError, match="worker cleanup failed"):
+                controller.clear_batches({})
+
+        assert storage_calls == [("node-a", ["s0"]), ("node-a", ["s0"])]
+        assert controller._pending_clear_shards == {"node-a": {"s0": 2}}
+        assert mock_gateway_post.call_count == 2
+
     def test_storage_clear_propagates_cancellation(self):
         controller = _make_controller()
         target = {"batch": _make_rtensor("s0", "node-a")}
