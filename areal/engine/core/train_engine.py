@@ -14,6 +14,7 @@ import torch.distributed as dist
 
 from areal.infra.platforms import current_platform
 from areal.utils.data import (
+    TRANSPORT_DUMMY_KEY,
     MicroBatchList,
     pad_and_stack_tensors_along_first_dim,
     reorder_list,
@@ -21,10 +22,27 @@ from areal.utils.data import (
 )
 
 __all__ = [
+    "compute_microbatch_loss_weight",
     "compute_total_loss_weight",
     "aggregate_eval_losses",
     "reorder_and_pad_outputs",
 ]
+
+
+def compute_microbatch_loss_weight(
+    microbatch: dict[str, Any],
+    loss_weight_fn: Callable[[dict[str, Any]], torch.Tensor],
+) -> torch.Tensor:
+    """Return zero without invoking an objective on transport-only data."""
+    if microbatch.get(TRANSPORT_DUMMY_KEY) is not True:
+        return loss_weight_fn(microbatch)
+    reference = next(
+        (value for value in microbatch.values() if isinstance(value, torch.Tensor)),
+        None,
+    )
+    if reference is None:
+        raise ValueError("Transport micro-batch does not contain a tensor")
+    return torch.zeros((), dtype=torch.float32, device=reference.device)
 
 
 def compute_total_loss_weight(
@@ -52,7 +70,9 @@ def compute_total_loss_weight(
         The total loss weight (scalar tensor) after all_reduce.
     """
     total_weight = (
-        torch.stack([loss_weight_fn(mb) for mb in mb_list.mbs])
+        torch.stack(
+            [compute_microbatch_loss_weight(mb, loss_weight_fn) for mb in mb_list.mbs]
+        )
         .sum()
         .detach()
         .clone()
@@ -138,7 +158,11 @@ def reorder_and_pad_outputs(
         The processed outputs, padded and stacked along batch dimension.
     """
     res = aggregate_fn(outputs)
+    semantic_batch_size = len(output_seqlens)
+    output_seqlens = [*output_seqlens, *([1] * mb_list.transport_dummy_count)]
     seqlens = [output_seqlens[i] for i in mb_list.forward_indices]
     unpacked = unpack_sequence(res, lens=seqlens, dim=0)
     reordered = reorder_list(unpacked, mb_list.backward_indices)
+    if mb_list.transport_dummy_count:
+        reordered = reordered[:semantic_batch_size]
     return pad_and_stack_tensors_along_first_dim(reordered)

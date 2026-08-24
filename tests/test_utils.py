@@ -1,10 +1,20 @@
 import pytest
 import torch
 
+import areal.utils.data as data_module
 from areal.api.cli_args import MicroBatchSpec
+from areal.engine.core.train_engine import (
+    compute_microbatch_loss_weight,
+    reorder_and_pad_outputs,
+)
+from areal.trainer.dpo.dpo_engine import _dpo_loss_weight
+from areal.trainer.rw.rw_engine import _rw_loss_weight
 from areal.utils.data import (
+    TRANSPORT_DUMMY_KEY,
+    MicroBatchList,
     pack_tensor_dict,
     pad_and_stack_tensors_along_first_dim,
+    pad_mb_list,
     pad_sequences_to_tensors,
     reorder_list,
     split_padded_tensor_dict_into_mb_list,
@@ -73,3 +83,128 @@ def test_micro_batch_split(mock_padded_data, n_mbs, max_tokens_per_mb, n_mbs_div
         assert torch.allclose(x, packed_data[key])
         y = pad_and_stack_tensors_along_first_dim(xs)
         assert torch.allclose(mock_padded_data[key], y)
+
+
+def _preference_batch() -> dict[str, torch.Tensor]:
+    return {
+        "input_ids": torch.arange(6).view(2, 3),
+        "attention_mask": torch.ones(2, 3, dtype=torch.bool),
+    }
+
+
+@pytest.mark.parametrize("loss_weight_fn", [_dpo_loss_weight, _rw_loss_weight])
+def test_transport_padding_bypasses_objective_weight(loss_weight_fn):
+    mb_list = split_padded_tensor_dict_into_mb_list(
+        _preference_batch(),
+        MicroBatchSpec(n_mbs=2, granularity=2),
+        allow_transport_padding=True,
+    )
+    mb_list.mbs = [pack_tensor_dict(mb) for mb in mb_list.mbs]
+    semantic_mb, transport_mb = sorted(
+        mb_list.mbs, key=lambda mb: TRANSPORT_DUMMY_KEY in mb
+    )
+
+    # A model-valid preference pair has non-zero objective weight. The transport
+    # marker, rather than objective-specific fields, is what makes it weightless.
+    torch.testing.assert_close(
+        loss_weight_fn(transport_mb), torch.tensor(1.0), rtol=0.0, atol=0.0
+    )
+    torch.testing.assert_close(
+        compute_microbatch_loss_weight(semantic_mb, loss_weight_fn),
+        torch.tensor(1.0),
+        rtol=0.0,
+        atol=0.0,
+    )
+    torch.testing.assert_close(
+        compute_microbatch_loss_weight(transport_mb, loss_weight_fn),
+        torch.tensor(0.0),
+        rtol=0.0,
+        atol=0.0,
+    )
+
+    pad_mb_list(mb_list)
+    assert all(
+        TRANSPORT_DUMMY_KEY not in padded_mb for padded_mb in mb_list.padded_mbs or []
+    )
+
+
+def test_noop_packed_padding_preserves_semantic_transport_marker():
+    transport_mb = pack_tensor_dict(
+        {
+            "input_ids": torch.zeros(1, 1, dtype=torch.long),
+            "attention_mask": torch.ones(1, 1, dtype=torch.bool),
+            TRANSPORT_DUMMY_KEY: True,
+        }
+    )
+    mb_list = MicroBatchList(
+        data=transport_mb,
+        mb_spec=MicroBatchSpec(max_tokens_per_mb=1),
+        mbs=[transport_mb],
+        group_lens=[1],
+        transport_dummy_count=1,
+    )
+
+    pad_mb_list(mb_list, pad_to_maximum=True)
+
+    assert mb_list.padding_lengths == [0]
+    assert mb_list.mbs[0][TRANSPORT_DUMMY_KEY] is True
+    assert mb_list.padded_mbs is not None
+    assert TRANSPORT_DUMMY_KEY not in mb_list.padded_mbs[0]
+
+    callback_called = False
+
+    def _loss_weight(_microbatch):
+        nonlocal callback_called
+        callback_called = True
+        return torch.tensor(1.0)
+
+    torch.testing.assert_close(
+        compute_microbatch_loss_weight(mb_list.mbs[0], _loss_weight),
+        torch.tensor(0.0),
+        rtol=0.0,
+        atol=0.0,
+    )
+    assert callback_called is False
+
+
+def test_forward_transport_padding_is_removed_from_outputs():
+    data = {
+        "input_ids": torch.arange(3).view(1, 3),
+        "attention_mask": torch.ones(1, 3, dtype=torch.bool),
+    }
+    mb_list = split_padded_tensor_dict_into_mb_list(
+        data,
+        MicroBatchSpec(n_mbs=3),
+        allow_transport_padding=True,
+    )
+    outputs = [mb["input_ids"][mb["attention_mask"]].float() for mb in mb_list.mbs]
+
+    result = reorder_and_pad_outputs(outputs, [3], mb_list)
+
+    torch.testing.assert_close(
+        result, torch.tensor([[0.0, 1.0, 2.0]]), rtol=0.0, atol=0.0
+    )
+
+
+def test_transport_padding_converges_to_distributed_microbatch_count(monkeypatch):
+    monkeypatch.setattr(data_module.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(data_module.dist, "get_world_size", lambda _group=None: 2)
+
+    def _all_gather_counts(output, local_count, group=None):
+        del group
+        output[:] = [3, local_count]
+
+    monkeypatch.setattr(data_module.dist, "all_gather_object", _all_gather_counts)
+
+    mb_list = split_padded_tensor_dict_into_mb_list(
+        {
+            "input_ids": torch.arange(3).view(1, 3),
+            "attention_mask": torch.ones(1, 3, dtype=torch.bool),
+        },
+        MicroBatchSpec(),
+        allow_transport_padding=True,
+    )
+
+    assert len(mb_list.mbs) == 3
+    assert mb_list.transport_dummy_count == 2
+    assert sum(TRANSPORT_DUMMY_KEY in mb for mb in mb_list.mbs) == 2
