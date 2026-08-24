@@ -68,14 +68,6 @@ class SweDataConfig:
             "text content without <think> tags and has tool_calls."
         },
     )
-    truncate_task_notifications: bool = field(
-        default=False,
-        metadata={
-            "help": "Truncate trajectories at the first <task-notification> "
-            "that follows a pure-text assistant turn. Removes noise from "
-            "background task completions."
-        },
-    )
     parse_tool_call_args: bool = field(
         default=False,
         metadata={
@@ -85,43 +77,12 @@ class SweDataConfig:
             "Bailing, which expect the standard string form."
         },
     )
-    max_no_thinking_ratio: float | None = field(
-        default=None,
-        metadata={
-            "help": "Maximum ratio of non-thinking pairs to thinking pairs. "
-            "For example, 1.0 gives 1:1 balance, 2.0 allows up to 2x "
-            "non-thinking pairs per thinking pair. "
-            "None (default) disables balancing."
-        },
-    )
     split_mode: str = field(
         default="pair",
         metadata={
             "help": "Sample construction mode: 'pair' (default) splits "
             "trajectories into progressive pairs; 'trajectory' keeps "
             "the full trajectory as a single training sample."
-        },
-    )
-    random_strip_thinking_prob: float = field(
-        default=0.0,
-        metadata={
-            "help": "Probability of stripping thinking from each target assistant "
-            "turn. 0.0 = no stripping (default), 1.0 = strip all. "
-            "Works in both pair mode and trajectory mode."
-        },
-    )
-    random_strip_thinking_seed: int = field(
-        default=42,
-        metadata={"help": "Random seed for reproducible thinking stripping decisions."},
-    )
-    n_thinking_variants: int = field(
-        default=1,
-        metadata={
-            "help": "Number of thinking-pattern variants per trajectory. "
-            "1 = no augmentation (default). K > 1 = augment each "
-            "trajectory into K variants: the first preserves all "
-            "thinking, the rest randomly strip with "
-            "random_strip_thinking_prob."
         },
     )
     cleanup_processed_dataset: bool = field(

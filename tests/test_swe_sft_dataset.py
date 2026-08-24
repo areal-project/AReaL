@@ -55,9 +55,10 @@ def _load_swe_modules():
 
 
 messages, tokenization = _load_swe_modules()
-_classify_pair = messages._classify_pair
 _clean_message = messages._clean_message
 _msg_has_thinking = messages._msg_has_thinking
+_prepare_trajectory = messages._prepare_trajectory
+_split_and_filter = messages._split_and_filter
 _add_bailing_v3_generation_tags = tokenization._add_bailing_v3_generation_tags
 _render_tokenize_mask = tokenization._render_tokenize_mask
 
@@ -157,33 +158,42 @@ def test_msg_has_thinking_requires_non_empty_reasoning(message, expected):
     assert result is expected
 
 
-@pytest.mark.parametrize(
-    ("target", "expected"),
-    [
-        (
-            {
-                "role": "assistant",
-                "content": "<think>\n</think>",
-                "tool_calls": [{"type": "function"}],
-            },
-            "no_thinking_tool_call",
-        ),
-        ({"role": "assistant", "content": "summary"}, "pure_text"),
-        (
-            {"role": "assistant", "content": "<think>reasoning</think>answer"},
-            "thinking",
-        ),
-    ],
-)
-def test_classify_pair_uses_non_empty_thinking_semantics(target, expected):
-    # Arrange
-    pair = [{"role": "user", "content": "task"}, target]
+def test_split_and_filter_preserves_canonical_target_thinking():
+    """Pair mode strips context thinking and preserves each target's thinking."""
+    raw_messages = [
+        {"role": "user", "content": "task"},
+        {"role": "assistant", "content": "<think>first</think>tool step"},
+        {"role": "user", "content": "continue"},
+        {"role": "assistant", "content": "<think>second</think>summary"},
+    ]
 
-    # Act
-    result = _classify_pair(pair)
+    pairs, n_errors, n_empty_calls, n_bare_calls = _split_and_filter(raw_messages)
 
-    # Assert
-    assert result == expected
+    assert (n_errors, n_empty_calls, n_bare_calls) == (0, 0, 0)
+    assert len(pairs) == 2
+    assert "<think>first</think>" in pairs[0][-1]["content"]
+    assert "<think>" not in pairs[1][1]["content"]
+    assert "<think>second</think>" in pairs[1][-1]["content"]
+
+
+def test_prepare_trajectory_preserves_thinking_and_masks_errors():
+    """Trajectory mode retains canonical targets while masking error segments."""
+    raw_messages = [
+        {"role": "user", "content": "task"},
+        {"role": "assistant", "content": "<think>reason</think>call"},
+        {"role": "tool", "content": "failed", "is_error": True},
+        {"role": "user", "content": "recover"},
+        {"role": "assistant", "content": "summary"},
+    ]
+
+    cleaned, masked, n_errors, n_empty_calls, n_bare_calls = _prepare_trajectory(
+        raw_messages
+    )
+
+    assert masked == [0]
+    assert (n_errors, n_empty_calls, n_bare_calls) == (1, 0, 0)
+    assert "<think>reason</think>" in cleaned[1]["content"]
+    assert cleaned[4]["content"].startswith("<think>\n</think>")
 
 
 def test_render_tokenize_mask_sets_adaptive_mode_per_trajectory():

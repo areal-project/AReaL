@@ -37,3 +37,18 @@ the exported JSON, and reload it through `AutoConfig`. Cover the production Save
 fallback and both mbridge export finalization paths without requiring GPUs. Add a
 single-controller test proving SWE preprocessing options reach `RDataset`. Existing
 Bailing V3 KDA, MLA, MoE, and weight-layout code remains untouched.
+
+## Review follow-up: dataset scope
+
+The public SWE SFT loader keeps only the preprocessing behavior exercised by the
+production recipes: canonical pair mode, full-trajectory mode, error/tool filtering,
+thinking preservation or full stripping, tool rendering, and tokenization/cache support.
+Optional random thinking augmentation, no-thinking ratio sampling, and task-notification
+truncation are removed because all tracked production configurations leave them
+disabled. Removing their CLI, config, cache-key, helper, and test surfaces together
+avoids shipping unexercised branches while preserving the default dataset exactly.
+
+The delimited SWE path matcher remains intentional. A broad substring check previously
+misrouted unrelated paths containing `swe`, including `answer_sft`, `sweep_results`, and
+user directories such as `swetha`; internal commit `c84db0bbf` fixed that production
+bug.

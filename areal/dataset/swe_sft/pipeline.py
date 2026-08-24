@@ -4,7 +4,6 @@
 
 import json
 import os
-import random
 import shutil
 import time
 
@@ -13,15 +12,10 @@ from datasets import Dataset
 from areal.utils import logging
 
 from .messages import (
-    _balance_thinking_pairs,
     _clean_message,
-    _find_segments,
     _iter_jsonl_records,
-    _log_thinking_augmentation_stats,
-    _msg_has_thinking,
     _prepare_trajectory,
     _split_and_filter,
-    _truncate_at_task_notification,
 )
 from .tokenization import (
     DATASET_NUM_PROC,
@@ -43,16 +37,8 @@ def _load_trajectory_pairs(
     strip_all_thinking: bool = False,
     filter_empty_tool_calls: bool = False,
     filter_bare_text_tool_calls: bool = False,
-    truncate_task_notifications: bool = False,
-    max_no_thinking_ratio: float | None = None,
-    random_strip_thinking_prob: float = 0.0,
-    random_strip_thinking_seed: int = 42,
-    n_thinking_variants: int = 1,
 ):
     """Load trajectory JSONL and split into progressive pairs.
-
-    When *n_thinking_variants* > 1, each trajectory is split K times:
-    variant 0 preserves all thinking, variants 1~K-1 randomly strip.
 
     Supports nested (``conversations`` wrapper) and flat JSONL formats
     (auto-detected per record via ``_iter_jsonl_records``).
@@ -67,92 +53,21 @@ def _load_trajectory_pairs(
     total_filtered_errors = 0
     total_filtered_empty_tc = 0
     total_filtered_bare_tc = 0
-    total_truncated = 0
-    total_stripped_thinking = 0
-
-    augment = n_thinking_variants > 1
-    rng = (
-        random.Random(random_strip_thinking_seed)
-        if random_strip_thinking_prob > 0.0
-        else None
-    )
-
-    if augment and random_strip_thinking_prob <= 0.0:
-        logger.warning(
-            "n_thinking_variants=%d but random_strip_thinking_prob=0; "
-            "all variants will be identical.",
-            n_thinking_variants,
-        )
-
-    # Stats collectors for augmentation logging.
-    thinking_turns_per_traj = []
-    total_asst_turns_per_traj = []
-    patterns_per_traj = []
 
     for record_idx, messages, record_tools in _iter_jsonl_records(path):
         records_in = record_idx
-
-        if truncate_task_notifications:
-            truncated = _truncate_at_task_notification(messages)
-            if len(truncated) < len(messages):
-                total_truncated += 1
-                messages = truncated
-
-        shared_kwargs = dict(
+        pairs, n_err, n_empty_tc, n_bare_tc = _split_and_filter(
+            messages,
             filter_errors=filter_errors,
             strip_all_thinking=strip_all_thinking,
             filter_empty_tool_calls=filter_empty_tool_calls,
             filter_bare_text_tool_calls=filter_bare_text_tool_calls,
         )
-
-        if augment:
-            # Variant 0: preserve all thinking.
-            pairs_orig, n_err, n_empty_tc, n_bare_tc, _ = _split_and_filter(
-                messages, **shared_kwargs, random_strip_thinking_prob=0.0, rng=None
-            )
-            total_filtered_errors += n_err
-            total_filtered_empty_tc += n_empty_tc
-            total_filtered_bare_tc += n_bare_tc
-            all_pairs.extend(pairs_orig)
-            all_tools.extend([record_tools] * len(pairs_orig))
-            # Collect stats.
-            segments = _find_segments(messages)
-            n_think = sum(1 for s, _ in segments if _msg_has_thinking(messages[s]))
-            n_asst = len(segments)
-            thinking_turns_per_traj.append(n_think)
-            total_asst_turns_per_traj.append(n_asst)
-
-            # Variants 1 ~ K-1: random strip.
-            variant_patterns = {frozenset()}  # original = no strip
-            for _k in range(n_thinking_variants - 1):
-                pairs_aug, _, _, _, n_stripped = _split_and_filter(
-                    messages,
-                    **shared_kwargs,
-                    random_strip_thinking_prob=random_strip_thinking_prob,
-                    rng=rng,
-                )
-                total_stripped_thinking += n_stripped
-                all_pairs.extend(pairs_aug)
-                all_tools.extend([record_tools] * len(pairs_aug))
-                # Approximate pattern: record which pairs had their target stripped.
-                # For stats, use the count as a proxy since _split_and_filter
-                # doesn't return per-pair strip info.
-                variant_patterns.add(frozenset([n_stripped]))
-            patterns_per_traj.append(variant_patterns)
-        else:
-            # Single variant (original behavior).
-            pairs, n_err, n_empty_tc, n_bare_tc, n_stripped = _split_and_filter(
-                messages,
-                **shared_kwargs,
-                random_strip_thinking_prob=random_strip_thinking_prob,
-                rng=rng,
-            )
-            total_filtered_errors += n_err
-            total_filtered_empty_tc += n_empty_tc
-            total_filtered_bare_tc += n_bare_tc
-            total_stripped_thinking += n_stripped
-            all_pairs.extend(pairs)
-            all_tools.extend([record_tools] * len(pairs))
+        total_filtered_errors += n_err
+        total_filtered_empty_tc += n_empty_tc
+        total_filtered_bare_tc += n_bare_tc
+        all_pairs.extend(pairs)
+        all_tools.extend([record_tools] * len(pairs))
 
     # Log extracted tools summary.
     n_with_tools = sum(1 for t in all_tools if t is not None)
@@ -168,18 +83,12 @@ def _load_trajectory_pairs(
         )
 
     filter_parts = []
-    if total_truncated:
-        filter_parts.append(
-            f"{total_truncated} trajectories truncated at task-notification"
-        )
     if total_filtered_errors:
         filter_parts.append(f"{total_filtered_errors} with tool errors")
     if total_filtered_empty_tc:
         filter_parts.append(f"{total_filtered_empty_tc} empty-content tool calls")
     if total_filtered_bare_tc:
         filter_parts.append(f"{total_filtered_bare_tc} bare-text tool calls")
-    if total_stripped_thinking:
-        filter_parts.append(f"{total_stripped_thinking} thinking blocks stripped")
     filter_msg = ", ".join(filter_parts) if filter_parts else "none"
 
     logger.info(
@@ -188,30 +97,12 @@ def _load_trajectory_pairs(
         f"(filtered: {filter_msg})"
     )
 
-    if augment and patterns_per_traj:
-        _log_thinking_augmentation_stats(
-            n_thinking_variants,
-            random_strip_thinking_prob,
-            records_in,
-            thinking_turns_per_traj,
-            total_asst_turns_per_traj,
-            patterns_per_traj,
-        )
-
-    # Balance thinking / no-thinking pair ratio.
-    all_pairs, all_tools = _balance_thinking_pairs(
-        all_pairs, max_no_thinking_ratio, tools_list=all_tools
-    )
-
     return all_pairs, all_tools
 
 
 def _load_presplit_pairs(
     path: str,
     strip_all_thinking: bool = False,
-    random_strip_thinking_prob: float = 0.0,
-    random_strip_thinking_seed: int = 42,
-    n_thinking_variants: int = 1,
 ):
     """Load pre-split pair JSONL where each line is ``{"messages": [...]}``.
 
@@ -219,9 +110,6 @@ def _load_presplit_pairs(
     By default, thinking is stripped from context assistant turns but
     preserved for the last assistant turn (the training target).  Set
     *strip_all_thinking* to strip from every assistant turn.
-
-    When *n_thinking_variants* > 1, each pair is augmented: variant 0
-    preserves thinking, variants 1~K-1 randomly strip the target turn.
 
     Also extracts per-record ``tools`` definitions so that each pair
     carries its own tools, same as ``_load_trajectory_pairs``.
@@ -232,20 +120,12 @@ def _load_presplit_pairs(
     """
     all_pairs = []
     all_tools = []
-    n_stripped = 0
-    augment = n_thinking_variants > 1
 
-    rng = (
-        random.Random(random_strip_thinking_seed)
-        if random_strip_thinking_prob > 0.0
-        else None
-    )
-
-    def _build_pair(messages, last_asst, strip_target):
+    def _build_pair(messages, last_asst):
         pair = []
         for idx, m in enumerate(messages):
             is_target = m.get("role") == "assistant" and idx == last_asst
-            strip = strip_all_thinking or not is_target or strip_target
+            strip = strip_all_thinking or not is_target
             pair.append(_clean_message(m, strip_thinking=strip))
         return pair
 
@@ -267,43 +147,8 @@ def _load_presplit_pairs(
                 if m.get("role") == "assistant":
                     last_asst = i
 
-            has_thinking = (
-                last_asst is not None
-                and not strip_all_thinking
-                and _msg_has_thinking(messages[last_asst])
-            )
-
-            if augment:
-                # Variant 0: preserve all thinking.
-                all_pairs.append(_build_pair(messages, last_asst, strip_target=False))
-                all_tools.append(record_tools)
-
-                # Variants 1 ~ K-1: random strip.
-                for _k in range(n_thinking_variants - 1):
-                    do_strip = (
-                        has_thinking
-                        and rng is not None
-                        and rng.random() < random_strip_thinking_prob
-                    )
-                    if do_strip:
-                        n_stripped += 1
-                    all_pairs.append(
-                        _build_pair(messages, last_asst, strip_target=do_strip)
-                    )
-                    all_tools.append(record_tools)
-            else:
-                # Single variant (original behavior).
-                strip_target = (
-                    has_thinking
-                    and rng is not None
-                    and rng.random() < random_strip_thinking_prob
-                )
-                if strip_target:
-                    n_stripped += 1
-                all_pairs.append(
-                    _build_pair(messages, last_asst, strip_target=strip_target)
-                )
-                all_tools.append(record_tools)
+            all_pairs.append(_build_pair(messages, last_asst))
+            all_tools.append(record_tools)
 
     # Log extracted tools summary.
     n_with_tools = sum(1 for t in all_tools if t is not None)
@@ -318,8 +163,7 @@ def _load_presplit_pairs(
             f"{sorted(all_tool_names)}"
         )
 
-    strip_msg = f", {n_stripped} thinking blocks stripped" if n_stripped else ""
-    logger.info(f"Loaded {len(all_pairs)} pre-split pairs from {path}{strip_msg}")
+    logger.info(f"Loaded {len(all_pairs)} pre-split pairs from {path}")
     return all_pairs, all_tools
 
 
@@ -328,10 +172,6 @@ def _load_full_trajectories(
     filter_errors: bool = True,
     filter_empty_tool_calls: bool = False,
     filter_bare_text_tool_calls: bool = False,
-    truncate_task_notifications: bool = False,
-    random_strip_thinking_prob: float = 0.0,
-    random_strip_thinking_seed: int = 42,
-    n_thinking_variants: int = 1,
 ):
     """Load trajectory JSONL for trajectory-level training.
 
@@ -340,10 +180,6 @@ def _load_full_trajectories(
     assistant segments with error tool responses are identified so
     tokenization can mask them (``loss_mask=0``) instead of discarding
     the entire trajectory.
-
-    When *n_thinking_variants* > 1, each trajectory is augmented into
-    K variants: the first preserves all thinking, the remaining K-1
-    randomly strip thinking turns with *random_strip_thinking_prob*.
 
     Supports nested (``conversations`` wrapper) and flat JSONL formats
     (auto-detected per record via ``_iter_jsonl_records``).
@@ -358,104 +194,27 @@ def _load_full_trajectories(
     error_indices_list = []
     all_tools = []
     records_in = 0
-    total_truncated = 0
     total_masked_errors = 0
     total_masked_empty_tc = 0
     total_masked_bare_tc = 0
-    total_stripped_thinking = 0
-
-    augment = n_thinking_variants > 1
-    rng = (
-        random.Random(random_strip_thinking_seed)
-        if random_strip_thinking_prob > 0.0
-        else None
-    )
-
-    if augment and random_strip_thinking_prob <= 0.0:
-        logger.warning(
-            "n_thinking_variants=%d but random_strip_thinking_prob=0; "
-            "all variants will be identical.",
-            n_thinking_variants,
-        )
-
-    # Stats collectors for augmentation logging.
-    thinking_turns_per_traj = []
-    total_asst_turns_per_traj = []
-    patterns_per_traj = []
 
     for record_idx, messages, record_tools in _iter_jsonl_records(path):
         records_in = record_idx
-
-        if truncate_task_notifications:
-            truncated = _truncate_at_task_notification(messages)
-            if len(truncated) < len(messages):
-                total_truncated += 1
-                messages = truncated
-
-        shared_kwargs = dict(
+        result = _prepare_trajectory(
+            messages,
             filter_errors=filter_errors,
             filter_empty_tool_calls=filter_empty_tool_calls,
             filter_bare_text_tool_calls=filter_bare_text_tool_calls,
         )
-
-        if augment:
-            # Variant 0: preserve all thinking (no stripping).
-            result_orig = _prepare_trajectory(
-                messages, **shared_kwargs, random_strip_thinking_prob=0.0, rng=None
-            )
-            if result_orig is None:
-                continue
-            cleaned_orig, masked_idxs, n_err, n_empty_tc, n_bare_tc, _ = result_orig
-            trajectories.append(cleaned_orig)
-            error_indices_list.append(masked_idxs)
-            all_tools.append(record_tools)
-            total_masked_errors += n_err
-            total_masked_empty_tc += n_empty_tc
-            total_masked_bare_tc += n_bare_tc
-
-            # Collect stats: count thinking turns in this trajectory.
-            segments = _find_segments(messages)
-            n_think = sum(1 for s, _ in segments if _msg_has_thinking(messages[s]))
-            n_asst = len(segments)
-            thinking_turns_per_traj.append(n_think)
-            total_asst_turns_per_traj.append(n_asst)
-
-            # Variants 1 ~ K-1: random strip thinking.
-            variant_patterns = {frozenset()}  # original = empty pattern
-            for _k in range(n_thinking_variants - 1):
-                result_aug = _prepare_trajectory(
-                    messages,
-                    **shared_kwargs,
-                    random_strip_thinking_prob=random_strip_thinking_prob,
-                    rng=rng,
-                )
-                if result_aug is None:
-                    continue
-                cleaned_aug, _, _, _, _, strip_pattern = result_aug
-                trajectories.append(cleaned_aug)
-                error_indices_list.append(masked_idxs)  # reuse
-                all_tools.append(record_tools)
-                total_stripped_thinking += len(strip_pattern)
-                variant_patterns.add(strip_pattern)
-            patterns_per_traj.append(variant_patterns)
-        else:
-            # Single variant (original behavior).
-            result = _prepare_trajectory(
-                messages,
-                **shared_kwargs,
-                random_strip_thinking_prob=random_strip_thinking_prob,
-                rng=rng,
-            )
-            if result is None:
-                continue
-            cleaned, masked_idxs, n_err, n_empty_tc, n_bare_tc, strip_pattern = result
-            trajectories.append(cleaned)
-            error_indices_list.append(masked_idxs)
-            all_tools.append(record_tools)
-            total_masked_errors += n_err
-            total_masked_empty_tc += n_empty_tc
-            total_masked_bare_tc += n_bare_tc
-            total_stripped_thinking += len(strip_pattern)
+        if result is None:
+            continue
+        cleaned, masked_idxs, n_err, n_empty_tc, n_bare_tc = result
+        trajectories.append(cleaned)
+        error_indices_list.append(masked_idxs)
+        all_tools.append(record_tools)
+        total_masked_errors += n_err
+        total_masked_empty_tc += n_empty_tc
+        total_masked_bare_tc += n_bare_tc
 
     # Log extracted tools summary.
     n_with_tools = sum(1 for t in all_tools if t is not None)
@@ -471,16 +230,12 @@ def _load_full_trajectories(
         )
 
     parts = []
-    if total_truncated:
-        parts.append(f"{total_truncated} trajectories truncated at task-notification")
     if total_masked_errors:
         parts.append(f"{total_masked_errors} with tool errors")
     if total_masked_empty_tc:
         parts.append(f"{total_masked_empty_tc} empty-content tool calls")
     if total_masked_bare_tc:
         parts.append(f"{total_masked_bare_tc} bare-text tool calls")
-    if total_stripped_thinking:
-        parts.append(f"{total_stripped_thinking} thinking blocks stripped")
     mask_msg = ", ".join(parts) if parts else "none"
 
     logger.info(
@@ -488,16 +243,6 @@ def _load_full_trajectories(
         f"kept {len(trajectories)} for training "
         f"(masked: {mask_msg})"
     )
-
-    if augment and patterns_per_traj:
-        _log_thinking_augmentation_stats(
-            n_thinking_variants,
-            random_strip_thinking_prob,
-            records_in,
-            thinking_turns_per_traj,
-            total_asst_turns_per_traj,
-            patterns_per_traj,
-        )
 
     return trajectories, error_indices_list, all_tools
 
@@ -620,13 +365,8 @@ def _process_swe_sft(
     strip_all_thinking: bool = False,
     filter_empty_tool_calls: bool = False,
     filter_bare_text_tool_calls: bool = False,
-    truncate_task_notifications: bool = False,
     no_tools: bool = False,
-    max_no_thinking_ratio: float | None = None,
     split_mode: str = "pair",
-    random_strip_thinking_prob: float = 0.0,
-    random_strip_thinking_seed: int = 42,
-    n_thinking_variants: int = 1,
     dump_dir: str | None = None,
     dump_n_samples: int = 0,
     parse_tool_call_args: bool = False,
@@ -647,18 +387,11 @@ def _process_swe_sft(
             filter_errors=filter_errors,
             filter_empty_tool_calls=filter_empty_tool_calls,
             filter_bare_text_tool_calls=filter_bare_text_tool_calls,
-            truncate_task_notifications=truncate_task_notifications,
-            random_strip_thinking_prob=random_strip_thinking_prob,
-            random_strip_thinking_seed=random_strip_thinking_seed,
-            n_thinking_variants=n_thinking_variants,
         )
     elif pre_split:
         messages_list, tools_list = _load_presplit_pairs(
             path,
             strip_all_thinking=strip_all_thinking,
-            random_strip_thinking_prob=random_strip_thinking_prob,
-            random_strip_thinking_seed=random_strip_thinking_seed,
-            n_thinking_variants=n_thinking_variants,
         )
     else:
         messages_list, tools_list = _load_trajectory_pairs(
@@ -667,11 +400,6 @@ def _process_swe_sft(
             strip_all_thinking=strip_all_thinking,
             filter_empty_tool_calls=filter_empty_tool_calls,
             filter_bare_text_tool_calls=filter_bare_text_tool_calls,
-            truncate_task_notifications=truncate_task_notifications,
-            max_no_thinking_ratio=max_no_thinking_ratio,
-            random_strip_thinking_prob=random_strip_thinking_prob,
-            random_strip_thinking_seed=random_strip_thinking_seed,
-            n_thinking_variants=n_thinking_variants,
         )
 
     return _tokenize_samples(
@@ -700,14 +428,9 @@ def get_swe_sft_dataset(
     strip_all_thinking: bool = False,
     filter_empty_tool_calls: bool = False,
     filter_bare_text_tool_calls: bool = False,
-    truncate_task_notifications: bool = False,
     no_tools: bool = False,
     skip_pretokenized_filter: bool = False,
-    max_no_thinking_ratio: float | None = None,
     split_mode: str = "pair",
-    random_strip_thinking_prob: float = 0.0,
-    random_strip_thinking_seed: int = 42,
-    n_thinking_variants: int = 1,
     cache_dir: str | None = None,
     dump_dir: str | None = None,
     dump_samples: int = 0,
@@ -725,8 +448,6 @@ def get_swe_sft_dataset(
     single training sample with all assistant turns as targets
     (``loss_mask=1``).  Error segments are masked (``loss_mask=0``)
     when *filter_errors* is True, instead of being discarded.
-    Thinking is preserved by default but can be randomly stripped
-    per-turn via *random_strip_thinking_prob* (both modes).
 
     In distributed (SPMD) mode, only rank 0 performs the heavy processing
     (JSONL loading, pair splitting, tokenization) and saves the result as
@@ -757,9 +478,6 @@ def get_swe_sft_dataset(
         filter_bare_text_tool_calls: If True, discard pairs whose
             training-target assistant turn has text without ``<think>``
             tags and has tool_calls.
-        truncate_task_notifications: If True, truncate trajectories at the
-            first ``<task-notification>`` that follows a pure-text assistant
-            turn, removing noise from background task completions.
         no_tools: If True, do not pass tool definitions to
             ``apply_chat_template`` even if the data contains them.
         skip_pretokenized_filter: If True, skip the ``max_length`` filter
@@ -767,23 +485,10 @@ def get_swe_sft_dataset(
             was already filtered during pretokenization and you want to
             avoid NFS cache conflicts from concurrent ``dataset.filter()``
             calls across ranks.
-        max_no_thinking_ratio: Maximum ratio of non-thinking pairs to thinking
-            pairs.  For example, ``1.0`` gives 1:1, ``2.0`` gives 1:2.
-            ``None`` (default) disables balancing.
         split_mode: ``"pair"`` (default) splits trajectories into
             progressive pairs.  ``"trajectory"`` keeps the full trajectory
             as a single sample — all assistant turns are targets with
             ``loss_mask=1``, error segments are masked instead of filtered.
-        random_strip_thinking_prob: Probability of stripping thinking from
-            each target assistant turn.  0.0 (default) = no stripping,
-            1.0 = strip all.  Works in both pair and trajectory mode.
-        random_strip_thinking_seed: Random seed for reproducible thinking
-            stripping decisions.
-        n_thinking_variants: Number of thinking-pattern variants per
-            trajectory.  ``1`` (default) = no augmentation.  ``K > 1``
-            = augment each trajectory into K variants: the first
-            preserves all thinking, the rest randomly strip with
-            *random_strip_thinking_prob*.
         cache_dir: Directory to save/load the processed Arrow dataset.
             When set in distributed mode, rank 0 processes the data and
             saves here; other ranks load from this directory.  If the
@@ -830,13 +535,8 @@ def get_swe_sft_dataset(
         strip_all_thinking=strip_all_thinking,
         filter_empty_tool_calls=filter_empty_tool_calls,
         filter_bare_text_tool_calls=filter_bare_text_tool_calls,
-        truncate_task_notifications=truncate_task_notifications,
         no_tools=no_tools,
-        max_no_thinking_ratio=max_no_thinking_ratio,
         split_mode=split_mode,
-        random_strip_thinking_prob=random_strip_thinking_prob,
-        random_strip_thinking_seed=random_strip_thinking_seed,
-        n_thinking_variants=n_thinking_variants,
         dump_dir=dump_dir,
         dump_n_samples=dump_samples,
         parse_tool_call_args=parse_tool_call_args,

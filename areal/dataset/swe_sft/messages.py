@@ -3,7 +3,6 @@
 """Message normalization, filtering, and trajectory splitting for SWE SFT."""
 
 import json
-import random
 import re
 
 from areal.utils import logging
@@ -31,19 +30,6 @@ def _extract_messages(record, record_idx):
         conv = convs[-1]
         return conv.get("messages", []), conv.get("tools")
     return record.get("messages", []), record.get("tools")
-
-
-def _set_messages(record, messages):
-    """Write *messages* back into *record* (inverse of ``_extract_messages``).
-
-    Used by the ``--save-trajectories`` CLI path to update truncated
-    messages in the original record structure before serialization.
-    """
-    convs = record.get("conversations", [])
-    if convs:
-        convs[-1]["messages"] = messages
-    else:
-        record["messages"] = messages
 
 
 def _iter_jsonl_records(path):
@@ -328,223 +314,6 @@ def _msg_has_thinking(msg):
     return bool(rc.strip())
 
 
-def _truncate_at_task_notification(messages):
-    """Truncate messages when a ``<task-notification>`` follows a pure-text assistant.
-
-    Claude Code emits ``<task-notification>`` as a user message when a
-    background task (e.g. ``pip install``) completes.  If the model has
-    already produced a text-only summary (no tool_calls), the notification
-    and all subsequent messages are noise — the model just replies
-    "nothing to do".  Truncating here removes that noise.
-
-    Only triggers when the pattern is:
-        assistant (text, no tool_calls) → user (<task-notification>)
-
-    Returns:
-        Truncated message list (or the original list if no truncation needed).
-    """
-    for i, m in enumerate(messages):
-        if m.get("role") != "user":
-            continue
-        if "<task-notification>" not in (m.get("content") or ""):
-            continue
-        # Find preceding assistant
-        prev_asst = None
-        for j in range(i - 1, -1, -1):
-            if messages[j].get("role") == "assistant":
-                prev_asst = messages[j]
-                break
-        if prev_asst is None:
-            continue
-        content = prev_asst.get("content") or ""
-        if content.strip() and not prev_asst.get("tool_calls"):
-            # Truncate: keep everything up to (but not including) this user msg
-            return messages[:i]
-    return messages
-
-
-# ============================================================
-# 3b. Balancing — downsample non-thinking pairs
-# ============================================================
-
-
-def _classify_pair(pair):
-    """Classify a pair by its target assistant turn's content type.
-
-    Returns one of:
-        ``"thinking"`` — target has actual ``<think>`` content or
-            non-empty ``reasoning_content``.
-        ``"no_thinking_tool_call"`` — target has no thinking but has
-            ``tool_calls`` (the dominant category that causes distribution
-            skew).
-        ``"pure_text"`` — target has no thinking and no tool_calls
-            (typically the final summary turn in a trajectory).
-    """
-    target = pair[-1]
-    if target.get("role") != "assistant":
-        return "pure_text"
-
-    if _msg_has_thinking(target):
-        return "thinking"
-    if target.get("tool_calls"):
-        return "no_thinking_tool_call"
-    return "pure_text"
-
-
-def _balance_thinking_pairs(pairs, max_no_thinking_ratio, seed=42, tools_list=None):
-    """Downsample non-thinking **tool-call** pairs to control balance.
-
-    Only ``no_thinking_tool_call`` pairs (no thinking but has tool_calls)
-    are subject to downsampling.  ``thinking`` pairs and ``pure_text``
-    pairs (the final summary turn, no thinking and no tool_calls) are
-    always kept — the latter are critical for the model to learn when
-    to stop calling tools and give a final answer.
-
-    Args:
-        pairs: List of progressive SFT pairs.
-        max_no_thinking_ratio: Maximum ratio of non-thinking tool-call
-            pairs to thinking pairs.  For example, ``1.0`` means at most
-            1:1, ``2.0`` means at most 2 non-thinking per 1 thinking pair.
-            ``None`` disables downsampling.
-        seed: Random seed for reproducible downsampling.
-
-    Returns:
-        Balanced list of pairs (order preserved, randomly sampled for
-        the downsampled category).
-    """
-    if max_no_thinking_ratio is None:
-        return pairs, tools_list
-
-    thinking = []
-    no_think_tc = []
-    pure_text = []
-    for i, pair in enumerate(pairs):
-        cat = _classify_pair(pair)
-        if cat == "thinking":
-            thinking.append(i)
-        elif cat == "no_thinking_tool_call":
-            no_think_tc.append(i)
-        else:
-            pure_text.append(i)
-
-    n_think = len(thinking)
-    n_no_think_tc = len(no_think_tc)
-    n_pure_text = len(pure_text)
-
-    if n_think == 0:
-        logger.warning(
-            "No thinking pairs found; skipping balance "
-            "(all %d pairs have empty thinking).",
-            n_no_think_tc + n_pure_text,
-        )
-        return pairs, tools_list
-
-    max_no_think_tc = int(n_think * max_no_thinking_ratio)
-    if n_no_think_tc <= max_no_think_tc:
-        logger.info(
-            "Thinking balance OK: %d thinking + %d no-think-tc + %d pure-text "
-            "(ratio %.1f <= %.1f), no downsampling needed.",
-            n_think,
-            n_no_think_tc,
-            n_pure_text,
-            n_no_think_tc / n_think,
-            max_no_thinking_ratio,
-        )
-        return pairs, tools_list
-
-    rng = random.Random(seed)
-    sampled_tc = set(rng.sample(no_think_tc, max_no_think_tc))
-    keep_indices = sorted(set(thinking) | sampled_tc | set(pure_text))
-    balanced = [pairs[i] for i in keep_indices]
-    balanced_tools = (
-        [tools_list[i] for i in keep_indices] if tools_list is not None else None
-    )
-
-    logger.info(
-        "Balanced thinking pairs: %d thinking + %d no-think-tc "
-        "(downsampled from %d, ratio %.1f → %.1f) + %d pure-text (kept all).",
-        n_think,
-        max_no_think_tc,
-        n_no_think_tc,
-        n_no_think_tc / n_think,
-        max_no_thinking_ratio,
-        n_pure_text,
-    )
-    return balanced, balanced_tools
-
-
-# ============================================================
-# 3c. Thinking augmentation stats
-# ============================================================
-
-
-def _log_thinking_augmentation_stats(
-    n_variants,
-    prob,
-    n_total_trajs,
-    thinking_turns_per_traj,
-    total_asst_turns_per_traj,
-    patterns_per_traj,
-):
-    """Log adaptive-thinking augmentation quality metrics.
-
-    Called after the augmentation loop in loaders to report how well
-    the ``n_thinking_variants`` / ``random_strip_thinking_prob`` settings
-    produce diverse thinking-pattern variants.
-
-    Args:
-        n_variants: ``n_thinking_variants`` setting (K).
-        prob: ``random_strip_thinking_prob`` setting.
-        n_total_trajs: Total number of source trajectories processed.
-        thinking_turns_per_traj: List of N_thinking per source trajectory.
-        total_asst_turns_per_traj: List of N_total_asst per source trajectory.
-        patterns_per_traj: List of ``set[frozenset]`` — the unique strip
-            patterns generated for each source trajectory (including the
-            empty frozenset for the original unstripped variant).
-    """
-    n_eligible = sum(1 for n in thinking_turns_per_traj if n > 0)
-    total_thinking = sum(thinking_turns_per_traj)
-    total_asst = sum(total_asst_turns_per_traj)
-
-    # 1. Thinking Turn Coverage
-    avg_thinking = total_thinking / max(n_total_trajs, 1)
-    thinking_ratio = total_thinking / max(total_asst, 1)
-
-    # 2. Pattern Diversity
-    diversity_ratios = []
-    for n_think, patterns in zip(thinking_turns_per_traj, patterns_per_traj):
-        if n_think == 0:
-            continue
-        theoretical_max = min(n_variants, 2**n_think)
-        actual_unique = len(patterns)
-        diversity_ratios.append(actual_unique / theoretical_max)
-    avg_diversity = sum(diversity_ratios) / max(len(diversity_ratios), 1)
-
-    # 3. Augmentation Efficiency
-    n_non_trivial = 0
-    for patterns in patterns_per_traj:
-        # Count variants that differ from the original (non-empty strip set)
-        n_non_trivial += sum(1 for p in patterns if p)
-    expected_aug = (n_variants - 1) * max(n_eligible, 1)
-    efficiency = n_non_trivial / max(expected_aug, 1)
-
-    # 4. Total sample count
-    n_total_samples = sum(len(p) for p in patterns_per_traj)
-
-    logger.info(
-        f"Thinking augmentation stats (K={n_variants}, p={prob:.2f}):\n"
-        f"  Source trajectories: {n_total_trajs} "
-        f"({n_eligible} with thinking turns)\n"
-        f"  Thinking coverage: {avg_thinking:.1f} thinking turns/traj, "
-        f"{thinking_ratio:.1%} of all assistant turns\n"
-        f"  Pattern diversity: {avg_diversity:.2f} "
-        f"(1.0 = all variants unique)\n"
-        f"  Augmentation efficiency: {efficiency:.2f} "
-        f"({n_non_trivial}/{expected_aug} non-trivial variants)\n"
-        f"  Total samples after augmentation: {n_total_samples}"
-    )
-
-
 # ============================================================
 # 4. Splitting — trajectory → progressive pairs
 # ============================================================
@@ -576,8 +345,6 @@ def _split_and_filter(
     strip_all_thinking=False,
     filter_empty_tool_calls=False,
     filter_bare_text_tool_calls=False,
-    random_strip_thinking_prob=0.0,
-    rng=None,
 ):
     """Split trajectory into progressive pairs and optionally filter.
 
@@ -585,11 +352,6 @@ def _split_and_filter(
     assistant turns only; the last assistant turn (training target) keeps
     its content unchanged.  Set *strip_all_thinking* to strip from every
     assistant turn including the target.
-
-    When *random_strip_thinking_prob* > 0, each target assistant turn that
-    has thinking content is independently stripped with that probability.
-    Stripped turns use the context-cleaned version (thinking fully removed,
-    no empty ``<think></think>`` injected).
 
     Args:
         messages: Raw trajectory messages.
@@ -603,23 +365,18 @@ def _split_and_filter(
         filter_bare_text_tool_calls: If True, discard pairs whose
             training-target assistant turn has text content without
             ``<think>`` tags and has tool_calls.
-        random_strip_thinking_prob: Probability of stripping thinking
-            from each target assistant turn.  0.0 = no stripping.
-        rng: ``random.Random`` instance for reproducible sampling.
-
     Returns:
         Tuple of ``(pairs, n_filtered_errors, n_filtered_empty_tc,
-        n_filtered_bare_tc, n_stripped)``.
+        n_filtered_bare_tc)``.
     """
     segments = _find_segments(messages)
     if not segments:
-        return [], 0, 0, 0, 0
+        return [], 0, 0, 0
 
     pairs = []
     n_filtered_errors = 0
     n_filtered_empty_tc = 0
     n_filtered_bare_tc = 0
-    n_stripped = 0
 
     # Pre-clean all messages in context mode (thinking stripped).
     # This avoids re-cleaning the same message for every progressive pair
@@ -628,17 +385,13 @@ def _split_and_filter(
 
     # For target assistant turns, clean with thinking preserved (unless
     # strip_all_thinking is set, in which case context_cleaned is reusable).
-    # When stripping is active (augmented variant), use ensure_thinking=False
-    # so empty-thinking turns don't get <think>\n</think> injected.
-    stripping_active = random_strip_thinking_prob > 0.0 and rng is not None
-    target_ensure = not stripping_active
     target_cleaned = {}
     if not strip_all_thinking:
         for asst_start, _ in segments:
             target_cleaned[asst_start] = _clean_message(
                 messages[asst_start],
                 strip_thinking=False,
-                ensure_thinking=target_ensure,
+                ensure_thinking=True,
             )
 
     for asst_start, seg_end in segments:
@@ -664,20 +417,10 @@ def _split_and_filter(
         # would have loss_mask=0 anyway and only add noise.
         pair = list(context_cleaned[: asst_start + 1])
         if not strip_all_thinking:
-            # Randomly strip: leave context_cleaned version (thinking
-            # already removed) instead of replacing with target_cleaned.
-            should_strip = (
-                rng is not None
-                and _msg_has_thinking(messages[asst_start])
-                and rng.random() < random_strip_thinking_prob
-            )
-            if not should_strip:
-                pair[asst_start] = target_cleaned[asst_start]
-            else:
-                n_stripped += 1
+            pair[asst_start] = target_cleaned[asst_start]
         pairs.append(pair)
 
-    return pairs, n_filtered_errors, n_filtered_empty_tc, n_filtered_bare_tc, n_stripped
+    return pairs, n_filtered_errors, n_filtered_empty_tc, n_filtered_bare_tc
 
 
 def _prepare_trajectory(
@@ -685,8 +428,6 @@ def _prepare_trajectory(
     filter_errors=True,
     filter_empty_tool_calls=False,
     filter_bare_text_tool_calls=False,
-    random_strip_thinking_prob=0.0,
-    rng=None,
 ):
     """Prepare a full trajectory for trajectory-level training.
 
@@ -694,11 +435,6 @@ def _prepare_trajectory(
     (``strip_thinking=False``, ``ensure_thinking=True``).  Identifies
     which assistant segments should be masked (``loss_mask=0``) based
     on error tool responses, empty tool calls, or bare-text tool calls.
-
-    When *random_strip_thinking_prob* > 0, each assistant turn that has
-    thinking content is independently stripped with that probability.
-    Stripped turns have their ``<think>`` blocks and ``reasoning_content``
-    completely removed (no empty ``<think></think>`` injected).
 
     Args:
         messages: Raw trajectory messages.
@@ -709,17 +445,10 @@ def _prepare_trajectory(
         filter_bare_text_tool_calls: If True, mask segments whose
             assistant turn has text without ``<think>`` tags and has
             tool_calls.
-        random_strip_thinking_prob: Probability of stripping thinking
-            from each assistant turn that has thinking content.
-            0.0 (default) = no stripping, 1.0 = strip all.
-        rng: ``random.Random`` instance for reproducible sampling.
-
     Returns:
         Tuple of ``(cleaned_messages, masked_segment_indices,
-        n_error, n_empty_tc, n_bare_tc, stripped_pattern)`` or ``None``
-        if the trajectory has no assistant turns.  *stripped_pattern* is
-        a ``frozenset`` of message indices whose thinking was stripped
-        (empty if no stripping occurred).
+        n_error, n_empty_tc, n_bare_tc)`` or ``None`` if the trajectory
+        has no assistant turns.
     """
     segments = _find_segments(messages)
     if not segments:
@@ -743,32 +472,9 @@ def _prepare_trajectory(
             masked_indices.add(idx)
             n_bare_tc += 1
 
-    # Determine which assistant turns to randomly strip thinking from.
-    strip_thinking_indices = set()
-    stripping_active = random_strip_thinking_prob > 0.0 and rng is not None
-    if stripping_active:
-        for asst_start, _seg_end in segments:
-            if _msg_has_thinking(messages[asst_start]):
-                if rng.random() < random_strip_thinking_prob:
-                    strip_thinking_indices.add(asst_start)
-
-    # When stripping is active (augmented variant), use ensure_thinking=False
-    # for ALL turns so that empty-thinking turns don't get <think>\n</think>
-    # injected.  Only real thinking content is preserved.
-    # When stripping is inactive (variant 0 or no augmentation), keep
-    # ensure_thinking=True to match the standard training format.
-    default_ensure = not stripping_active
-
-    cleaned = []
-    for i, m in enumerate(messages):
-        if i in strip_thinking_indices:
-            cleaned.append(
-                _clean_message(m, strip_thinking=True, ensure_thinking=False)
-            )
-        else:
-            cleaned.append(
-                _clean_message(m, strip_thinking=False, ensure_thinking=default_ensure)
-            )
+    cleaned = [
+        _clean_message(m, strip_thinking=False, ensure_thinking=True) for m in messages
+    ]
 
     return (
         cleaned,
@@ -776,5 +482,4 @@ def _prepare_trajectory(
         n_error,
         n_empty_tc,
         n_bare_tc,
-        frozenset(strip_thinking_indices),
     )

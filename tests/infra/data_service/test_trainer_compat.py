@@ -182,7 +182,6 @@ class TestTrainerDataServicePath:
             dataset_config=cfg,
             split_mode="trajectory",
             filter_errors=True,
-            random_strip_thinking_prob=0.5,
             cache_dir="/tmp/swe-cache",
         )
 
@@ -191,7 +190,6 @@ class TestTrainerDataServicePath:
             "filter_errors": True,
             "configured_only": "preserved",
             "split_mode": "trajectory",
-            "random_strip_thinking_prob": 0.5,
             "cache_dir": "/tmp/swe-cache",
         }
         assert cfg.dataset_kwargs == configured_kwargs

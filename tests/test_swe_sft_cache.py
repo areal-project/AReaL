@@ -76,13 +76,8 @@ def _write_cache(cache_dir, input_ids, max_length=2):
             "strip_all_thinking": False,
             "filter_empty_tool_calls": False,
             "filter_bare_text_tool_calls": False,
-            "truncate_task_notifications": False,
             "no_tools": False,
-            "max_no_thinking_ratio": None,
             "split_mode": "pair",
-            "random_strip_thinking_prob": 0.0,
-            "random_strip_thinking_seed": 42,
-            "n_thinking_variants": 1,
             "parse_tool_call_args": False,
         },
     }
