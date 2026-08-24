@@ -427,6 +427,28 @@ def _extract_images_from_messages(
     return image_data, messages_for_tokenizer, vision_messages_for_vllm
 
 
+def _validate_multimodal_agent_backend(
+    engine: TRolloutEngine,
+    image_data: list[str],
+    require_multimodal_processor: bool,
+) -> None:
+    """Reject unsupported trainable multimodal agent backends."""
+    if not image_data or not require_multimodal_processor:
+        return
+
+    backend = getattr(getattr(engine, "config", None), "backend", "")
+    backend_name = (
+        backend.split(":", maxsplit=1)[0].lower()
+        if isinstance(backend, str) and backend
+        else type(engine).__name__.lower()
+    )
+    if "vllm" in backend_name:
+        raise ValueError(
+            "Multimodal agent trajectories are currently supported only with "
+            "the SGLang rollout backend; vLLM support is deferred."
+        )
+
+
 def _convert_tool_output_format(
     item: dict,
 ) -> ChatCompletionToolMessageParam | dict:
@@ -970,6 +992,16 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
         if extra_body is None:
             extra_body = {}
 
+        image_data, messages_for_tokenizer, vision_messages_for_vllm = (
+            _extract_images_from_messages(messages_list)
+        )
+        _validate_multimodal_agent_backend(
+            self.engine,
+            image_data,
+            self.require_multimodal_processor,
+        )
+        has_images = len(image_data) > 0
+
         # Convert response to OpenAI format
         current_time = int(datetime.datetime.now().timestamp())
         # Add interaction to cache, resolve parent relationship according to input messages
@@ -999,11 +1031,6 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
             # See docs/en/tutorial/online_proxy.md.
             if "sglang" in type(self.engine).__name__.lower():
                 tools_list = _align_tools_with_sglang(tools_list)
-
-        image_data, messages_for_tokenizer, vision_messages_for_vllm = (
-            _extract_images_from_messages(messages_list)
-        )
-        has_images = len(image_data) > 0
 
         tokenizer_messages = messages_for_tokenizer if has_images else messages_list
         tokenizer_messages = _parse_tool_call_arguments(tokenizer_messages)
@@ -1428,6 +1455,17 @@ class AsyncResponsesWithReward(BaseAsyncResponses):
                 "Unsupported Responses input format: "
                 "expected str or list of message items with input_text."
             )
+
+        image_data, messages_for_tokenizer, vision_messages_for_vllm = (
+            _extract_images_from_messages(messages_list)
+        )
+        _validate_multimodal_agent_backend(
+            self.engine,
+            image_data,
+            self.require_multimodal_processor,
+        )
+        has_images = len(image_data) > 0
+
         interaction = InteractionWithTokenLogpReward(
             messages=deepcopy(messages_list),  # Store a copy of the input messages
             chat_template_type=self.chat_template_type,
@@ -1452,11 +1490,6 @@ class AsyncResponsesWithReward(BaseAsyncResponses):
             # See docs/en/tutorial/online_proxy.md.
             if "sglang" in type(self.engine).__name__.lower():
                 tools_list = _align_tools_with_sglang(tools_list)
-
-        image_data, messages_for_tokenizer, vision_messages_for_vllm = (
-            _extract_images_from_messages(messages_list)
-        )
-        has_images = len(image_data) > 0
 
         tokenizer_messages = messages_for_tokenizer if has_images else messages_list
         tokenizer_messages = _parse_tool_call_arguments(tokenizer_messages)

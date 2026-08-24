@@ -56,6 +56,10 @@ class _FakeEngine:
         )
 
 
+class _FakeVLLMEngine(_FakeEngine):
+    config = SimpleNamespace(backend="vllm:d1")
+
+
 class _FakeProcessor:
     image_processor = SimpleNamespace(image_processor_type="fake")
 
@@ -372,5 +376,57 @@ async def test_generation_api_exports_processor_multimodal_trajectory(api_type):
         assert engine.requests[0].input_ids == [10, 2, 20]
         assert result["mm_token_type_ids"].tolist() == [[1, 1, 1, 0]]
         assert len(result["multi_modal_input"]) == 1
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("api_type", ["chat", "responses"])
+async def test_generation_api_rejects_vllm_multimodal_trajectory(api_type):
+    """Trainable multimodal agent trajectories should fail fast on vLLM."""
+    engine = _FakeVLLMEngine()
+    client = ArealOpenAI(
+        engine=engine,
+        tokenizer=_FakeTokenizer(),
+        processor=_FakeProcessor(),
+        require_multimodal_processor=True,
+        api_key="test-key",
+        base_url="http://test.invalid/v1",
+    )
+    data_uri = f"data:image/png;base64,{_png_base64()}"
+    try:
+        with pytest.raises(ValueError, match="supported only with.*SGLang"):
+            if api_type == "chat":
+                await client.chat.completions.create(
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "image_url",
+                                    "image_url": {"url": data_uri},
+                                }
+                            ],
+                        }
+                    ],
+                    max_completion_tokens=1,
+                )
+            else:
+                await client.responses.create(
+                    input=[
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "input_image",
+                                    "detail": "auto",
+                                    "image_url": data_uri,
+                                }
+                            ],
+                        }
+                    ],
+                    max_output_tokens=1,
+                )
+        assert engine.requests == []
     finally:
         await client.close()
