@@ -8,6 +8,7 @@ from typing import Any
 
 from datasets import Dataset
 
+from examples.swe.arena_client import ArenaOpenAPIClient, infer_llm_protocol
 from examples.swe.utils import SWEPPOConfig
 
 from areal import PPOTrainer
@@ -81,6 +82,25 @@ def group_filter(x: dict[str, Any]):
     return x["rewards"].mean() <= 0.95
 
 
+def get_arena_dataset(econfig) -> tuple[Dataset, str]:
+    """Load all data ids from one Arena Stream without dataset sharding."""
+    client = ArenaOpenAPIClient(
+        base_url=econfig.arena_base_url,
+        timeout=econfig.arena_request_timeout,
+        request_retries=econfig.arena_request_retries,
+    )
+    stream = client.resolve_stream(econfig.stream_id)
+    stream_id = str(stream["stream_id"])
+    llm_protocol = infer_llm_protocol(stream)
+    rows = client.get_all_dataset_rows(stream_id, llm_protocol)
+    dataset = Dataset.from_list(rows)
+    logger.info(
+        f"Created Arena dataset with {len(dataset)} items from stream {stream_id} "
+        f"using {llm_protocol}"
+    )
+    return dataset, stream_id
+
+
 def _install_aweagent_deps_on_ray_nodes(aweagent_root: str):
     """Install AReaL-SWEAgent dependencies on all Ray GPU nodes.
 
@@ -151,34 +171,45 @@ def main(args):
     config, _ = load_expr_config(args, SWEPPOConfig)
     econfig = config.econfig
 
-    # When using Ray scheduler, ensure SWEAgent deps are on all nodes
-    if config.scheduler.type == "ray":
+    # When using Ray with the external agent, ensure its deps are on all nodes.
+    if config.scheduler.type == "ray" and econfig.dataset_source == "jsonl":
         import ray
 
         ray.init(address="auto", ignore_reinit_error=True)
         _install_aweagent_deps_on_ray_nodes(_resolve_aweagent_root(econfig))
 
-    # Resolve dataset paths from config
-    train_path = config.train_dataset.path
-    valid_path = config.valid_dataset.path
+    if econfig.dataset_source == "arena":
+        train_dataset, resolved_stream_id = get_arena_dataset(econfig)
+        valid_dataset = train_dataset
+        econfig.stream_id = resolved_stream_id
+        workflow = "examples.swe.arena_agent.ArenaStreamAgentWorkflow"
+    elif econfig.dataset_source == "jsonl":
+        # Resolve dataset paths from config
+        train_path = config.train_dataset.path
+        valid_path = config.valid_dataset.path
 
-    def resolve_path(p: str) -> str:
-        if Path(p).is_absolute() or Path(p).exists():
+        def resolve_path(p: str) -> str:
+            if Path(p).is_absolute() or Path(p).exists():
+                return p
+            if econfig.dataset_path:
+                candidate = Path(econfig.dataset_path) / p
+                if candidate.exists():
+                    return str(candidate)
             return p
-        if econfig.dataset_path:
-            candidate = Path(econfig.dataset_path) / p
-            if candidate.exists():
-                return str(candidate)
-        return p
 
-    train_dataset = get_swe_dataset(
-        dataset_path=resolve_path(train_path),
-        split="train",
-    )
-    valid_dataset = get_swe_dataset(
-        dataset_path=resolve_path(valid_path),
-        split="test",
-    )
+        train_dataset = get_swe_dataset(
+            dataset_path=resolve_path(train_path),
+            split="train",
+        )
+        valid_dataset = get_swe_dataset(
+            dataset_path=resolve_path(valid_path),
+            split="test",
+        )
+        workflow = "examples.swe.agent.SWEAgentWorkflow"
+    else:
+        raise ValueError(
+            f"Unsupported econfig.dataset_source: {econfig.dataset_source!r}"
+        )
 
     # Build workflow kwargs
     from dataclasses import asdict
@@ -206,7 +237,7 @@ def main(args):
         valid_dataset=valid_dataset,
     ) as trainer:
         trainer.train(
-            workflow="examples.swe.agent.SWEAgentWorkflow",
+            workflow=workflow,
             workflow_kwargs=workflow_kwargs,
             eval_workflow=None,
             eval_workflow_kwargs=eval_workflow_kwargs,

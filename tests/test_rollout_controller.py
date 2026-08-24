@@ -87,6 +87,7 @@ class MockScheduler:
             self._task_counter += 1
             # Simulate a successful rollout result
             result = {
+                "source_id": kwargs["data"].get("id"),
                 "input_ids": torch.randint(0, 100, (1, 10)),
                 "attention_mask": torch.ones(1, 10, dtype=torch.bool),
                 "loss_mask": torch.tensor(
@@ -423,6 +424,34 @@ class TestRolloutControllerSubmitAndWait:
         for b in batch:
             assert isinstance(b, dict)
 
+        controller.destroy()
+
+    def test_wait_for_task_returns_matching_trajectory(self):
+        config = create_test_config(consumer_batch_size=16, max_concurrent_rollouts=50)
+        scheduler = MockScheduler()
+        controller = RolloutController(
+            inf_engine=MockInferenceEngine,
+            config=config,
+            scheduler=scheduler,
+        )
+        controller.initialize(role="rollout", server_args={})
+
+        first_task_id = controller.submit(
+            {"id": 1},
+            workflow="tests.utils.TestWorkflow",
+            workflow_kwargs={},
+        )
+        second_task_id = controller.submit(
+            {"id": 2},
+            workflow="tests.utils.TestWorkflow",
+            workflow_kwargs={},
+        )
+
+        second_result = controller.wait_for_task(second_task_id, timeout=5.0)
+        first_result = controller.wait_for_task(first_task_id, timeout=5.0)
+
+        assert second_result is not None and second_result["source_id"] == 2
+        assert first_result is not None and first_result["source_id"] == 1
         controller.destroy()
 
     def test_wait_timeout_when_insufficient_results(self):
