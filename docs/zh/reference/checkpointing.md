@@ -192,12 +192,13 @@ RecoverHandler 保存完整训练状态：
             └── critic/         # 保存 critic 时存在
 ```
 
-所有同步 payload 保存返回后才更新指针。对于 Megatron 异步保存，发布操作会追加到 MCore 的 finalize callback，在后台 I/O
-完成后执行。进程崩溃可能在磁盘上留下未发布的 generation，但恢复仍使用 `LATEST` 选中的 generation。指针成功切换后才删除上一个已发布
-generation。
+只有所有 payload 都持久化后才更新指针。当一个 generation 包含多个训练引擎时，`RecoverHandler`
+会先等待除最后一个异步引擎以外的所有保存完成，再调度最后一个异步引擎。发布操作只追加到该引擎的 MCore finalize
+callback，因此仍可让一次后台保存与训练重叠，同时不会暴露只写完 actor 或 critic 的 generation。 进程崩溃可能在磁盘上留下未发布的
+generation，但恢复仍使用 `LATEST` 选中的 generation。指针成功切换后才删除上一个已发布 generation。
 
 为保持兼容性，SPMD trainer 继续使用原有的 `recover_info/` 和 `<engine>/recover_checkpoint/`
-布局。恢复逻辑可以读取两种布局。目前尚不支持对包含多个 训练引擎的检查点进行异步发布。
+布局。恢复逻辑可以读取两种布局。
 
 ### 恢复过程
 

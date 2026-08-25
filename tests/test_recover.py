@@ -302,33 +302,112 @@ class TestRecoverHandler:
         save_root = Saver.get_save_root("test_exp", "test_trial", str(tmp_path))
         assert cp.read_latest(save_root) is None
         meta = engine.save.call_args.args[0]
+        assert meta.wait_for_async_save is False
         assert meta.checkpoint_pointer_path == cp.latest_path(save_root)
 
         cp.publish_latest(save_root, meta.checkpoint_pointer_value)
         assert cp.read_latest(save_root).global_step == 3
 
-    def test_dump_multiple_engines_rejects_async_publication(self, tmp_path):
+    def test_dump_multiple_async_engines_waits_before_deferred_publication(
+        self, tmp_path
+    ):
         handler = self._make_handler(str(tmp_path), "on")
         handler.freq_ctl = Mock()
         handler.freq_ctl.check.return_value = True
+        handler.freq_ctl.state_dict.return_value = {}
+        save_order = []
+        actor = Mock()
+        actor.save.side_effect = lambda _meta: save_order.append("default")
+        actor.config = SimpleNamespace(
+            backend="megatron:d1", megatron=SimpleNamespace(async_save=True)
+        )
+        critic = Mock()
+        critic.save.side_effect = lambda _meta: save_order.append("critic")
+        critic.config = SimpleNamespace(
+            backend="megatron:d1", megatron=SimpleNamespace(async_save=True)
+        )
+
+        handler.dump(
+            {"default": actor, "critic": critic},
+            self._step_info(handler),
+            *self._dump_dependencies(),
+        )
+
+        save_root = Saver.get_save_root("test_exp", "test_trial", str(tmp_path))
+        assert cp.read_latest(save_root) is None
+        assert save_order == ["default", "critic"]
+
+        actor_meta = actor.save.call_args.args[0]
+        assert actor_meta.wait_for_async_save is True
+        assert actor_meta.checkpoint_pointer_path is None
+
+        critic_meta = critic.save.call_args.args[0]
+        assert critic_meta.wait_for_async_save is False
+        assert critic_meta.checkpoint_pointer_path == cp.latest_path(save_root)
+
+        cp.publish_latest(save_root, critic_meta.checkpoint_pointer_value)
+        assert cp.read_latest(save_root).global_step == 3
+
+    def test_dump_mixed_engines_saves_async_publisher_last(self, tmp_path):
+        handler = self._make_handler(str(tmp_path), "on")
+        handler.freq_ctl = Mock()
+        handler.freq_ctl.check.return_value = True
+        handler.freq_ctl.state_dict.return_value = {}
+        save_order = []
+        actor = Mock()
+        actor.save.side_effect = lambda _meta: save_order.append("default")
+        actor.config = SimpleNamespace(
+            backend="megatron:d1", megatron=SimpleNamespace(async_save=True)
+        )
+        critic = Mock()
+        critic.save.side_effect = lambda _meta: save_order.append("critic")
+        critic.config = SimpleNamespace(
+            backend="fsdp:d1", megatron=SimpleNamespace(async_save=False)
+        )
+
+        handler.dump(
+            {"default": actor, "critic": critic},
+            self._step_info(handler),
+            *self._dump_dependencies(),
+        )
+
+        save_root = Saver.get_save_root("test_exp", "test_trial", str(tmp_path))
+        assert save_order == ["critic", "default"]
+        assert critic.save.call_args.args[0].checkpoint_pointer_path is None
+        assert actor.save.call_args.args[0].checkpoint_pointer_path == cp.latest_path(
+            save_root
+        )
+        assert cp.read_latest(save_root) is None
+
+    def test_dump_multiple_engines_keeps_latest_when_publisher_save_fails(
+        self, tmp_path
+    ):
+        handler = self._make_handler(str(tmp_path), "on")
+        handler.freq_ctl = Mock()
+        handler.freq_ctl.check.return_value = True
+        handler.freq_ctl.state_dict.return_value = {}
         actor = Mock()
         actor.config = SimpleNamespace(
             backend="megatron:d1", megatron=SimpleNamespace(async_save=True)
         )
         critic = Mock()
+        critic.save.side_effect = RuntimeError("critic save failed")
         critic.config = SimpleNamespace(
             backend="megatron:d1", megatron=SimpleNamespace(async_save=True)
         )
+        save_root = Saver.get_save_root("test_exp", "test_trial", str(tmp_path))
+        _, previous = cp.prepare_generation(save_root, 2, ["default", "critic"])
+        cp.publish_latest(save_root, previous.to_json())
 
-        with pytest.raises(NotImplementedError, match="one train engine"):
+        with pytest.raises(RuntimeError, match="critic save failed"):
             handler.dump(
                 {"default": actor, "critic": critic},
                 self._step_info(handler),
                 *self._dump_dependencies(),
             )
 
-        actor.save.assert_not_called()
-        critic.save.assert_not_called()
+        assert actor.save.call_args.args[0].wait_for_async_save is True
+        assert cp.read_latest(save_root).global_step == 2
 
     def test_dump_spmd_mode_preserves_legacy_layout(self, tmp_path, monkeypatch):
         handler = self._make_handler(str(tmp_path), "on")
@@ -408,6 +487,18 @@ class TestRecoverHandler:
 
             meta = engine.save.call_args[0][0]
             assert meta.with_optim is (not no_save_optim)
+
+    def test_save_checkpoint_passes_wait_for_async_save(self, tmp_path):
+        handler = self._make_handler(str(tmp_path), "auto")
+        engine = Mock()
+
+        handler._save_checkpoint(
+            engine,
+            path=str(tmp_path / "checkpoint"),
+            wait_for_async_save=True,
+        )
+
+        assert engine.save.call_args.args[0].wait_for_async_save is True
 
     @pytest.mark.parametrize("no_load_optim", [False, True])
     def test_load_checkpoint_passes_with_optim_from_config(self, no_load_optim):
