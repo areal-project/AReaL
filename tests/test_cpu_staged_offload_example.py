@@ -10,36 +10,28 @@ from examples.multi_turn_math.config import MultiTurnGRPOConfig
 
 import areal.api.cli_args as cli_args
 from areal.api.alloc_mode import ModelAllocation
-from areal.api.cli_args import CPUStagedOptimizerConfig, load_expr_config
+from areal.api.cli_args import CPUStagedOffloadConfig, load_expr_config
 from areal.utils.stats_logger import StatsLogger
 
 REPOSITORY_ROOT = Path(__file__).parents[1]
 
 
-def test_cpu_staged_optimizer_config_validates_buffer_sizes() -> None:
+def test_cpu_staged_offload_config_validates_buffer_sizes() -> None:
     with pytest.raises(ValueError, match="buffer_count"):
-        CPUStagedOptimizerConfig(buffer_count=0)
+        CPUStagedOffloadConfig(buffer_count=0)
     with pytest.raises(ValueError, match="bucket_size_mb"):
-        CPUStagedOptimizerConfig(bucket_size_mb=0)
+        CPUStagedOffloadConfig(bucket_size_mb=0)
 
 
-def test_cpu_staged_muon_requires_layerwise_optimizer_ownership() -> None:
-    with pytest.raises(ValueError, match="use_distributed_optimizer=false"):
-        cli_args.MegatronEngineConfig(
-            cpu_staged_optimizer=CPUStagedOptimizerConfig(
-                enabled=True,
-                kind="muon",
-            )
-        )
-
-    config = cli_args.MegatronEngineConfig(
-        ddp=cli_args.DistributedDataParallelConfig(use_distributed_optimizer=False),
-        cpu_staged_optimizer=CPUStagedOptimizerConfig(
-            enabled=True,
-            kind="muon",
-        ),
+def test_muon_algorithm_config_is_independent_from_staged_offload() -> None:
+    optimizer = cli_args.OptimizerConfig(type="dist_muon")
+    megatron = cli_args.MegatronEngineConfig(
+        cpu_staged_offload=CPUStagedOffloadConfig(enabled=True)
     )
-    assert config.cpu_staged_optimizer.kind == "muon"
+
+    assert optimizer.type == "dist_muon"
+    assert optimizer.muon.momentum == 0.95
+    assert megatron.cpu_staged_offload.enabled is True
 
 
 def test_example_uses_core_staged_optimizer_config(
@@ -65,6 +57,6 @@ def test_example_uses_core_staged_optimizer_config(
     assert config_path.endswith("dapo-math_grpo_cpu_staged.yaml")
     assert config.actor.path == config.tokenizer_path == "/models/Qwen3-30B-A3B-Base"
     assert allocation.parallel.world_size == 8
-    assert config.actor.megatron.cpu_staged_optimizer.enabled is True
-    assert config.actor.megatron.cpu_staged_optimizer.buffer_count == 2
-    assert config.actor.megatron.cpu_staged_optimizer.bucket_size_mb == 128
+    assert config.actor.megatron.cpu_staged_offload.enabled is True
+    assert config.actor.megatron.cpu_staged_offload.buffer_count == 2
+    assert config.actor.megatron.cpu_staged_offload.bucket_size_mb == 128

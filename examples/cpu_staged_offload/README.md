@@ -9,7 +9,7 @@ The feature is configured directly through AReaL's Megatron configuration:
 ```yaml
 actor:
   megatron:
-    cpu_staged_optimizer:
+    cpu_staged_offload:
       enabled: true
       buffer_count: 2
       bucket_size_mb: 128
@@ -28,23 +28,27 @@ The staged Muon backend remains available through the same core configuration:
 
 ```yaml
 actor:
+  optimizer:
+    type: dist_muon
+    muon:
+      momentum: 0.95
+      num_ns_steps: 5
+      tp_mode: duplicated
   megatron:
     ddp:
       use_distributed_optimizer: false
-    cpu_staged_optimizer:
+    cpu_staged_offload:
       enabled: true
-      kind: muon
       buffer_count: 1
       bucket_size_mb: 128
-      muon:
-        momentum: 0.95
-        num_ns_steps: 5
-        tp_mode: duplicated
 ```
 
-Muon retains MCore's official LayerWise ownership and synchronous DCP schema. It
-requires Megatron-Core 0.17.0, emerging-optimizers 0.3.0, BF16, and synchronous
-parameter gather; TP or expert-TP greater than one requires `buffer_count: 1`.
+The optimizer algorithm is independent from CPU staging: set `type: dist_muon` with
+`cpu_staged_offload.enabled: false` to use native layer-wise Muon, or enable CPU staging
+without changing any Muon hyperparameters. Muon retains MCore's official LayerWise
+ownership and the staged variant's synchronous DCP schema. It requires Megatron-Core
+0.17.0, emerging-optimizers 0.3.0, BF16, and synchronous parameter gather; TP or
+expert-TP greater than one requires `buffer_count: 1`.
 
 Checkpoint loading is fail-stop. DCP writes optimizer state into the authoritative CPU
 slabs in place. If loading fails, the process must terminate and AReaL recovery starts a

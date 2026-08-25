@@ -80,9 +80,8 @@ actor:
   megatron:
     wrap_with_ddp: true
     bridge_type: mbridge
-    cpu_staged_optimizer:
+    cpu_staged_offload:
       enabled: true
-      kind: adamw
       buffer_count: 2
       bucket_size_mb: 128
     main_grads_dtype: float32

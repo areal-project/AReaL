@@ -860,7 +860,12 @@ class AwexMegatronAdapter:
                 "AWEX optimizer-state migration does not support capturable optimizers"
             )
         for param_state in state.values():
-            for key in ("master_param", "exp_avg", "exp_avg_sq"):
+            for key in (
+                "master_param",
+                "exp_avg",
+                "exp_avg_sq",
+                "momentum_buffer",
+            ):
                 value = param_state.get(key)
                 if isinstance(value, torch.Tensor):
                     move_tensor(value, f"optimizer state {key}")

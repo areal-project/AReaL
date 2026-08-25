@@ -74,8 +74,7 @@ For detailed examples, see the experiment configurations in the `examples/` dire
 - [Agent Configuration](section-agent)
 - [ArchonEngine Configuration](section-archon-engine)
 - [ArchonFP8 Configuration](section-archon-fp8)
-- [CPUStagedMuon Configuration](section-cpu-staged-muon)
-- [CPUStagedOptimizer Configuration](section-cpu-staged-optimizer)
+- [CPUStagedOffload Configuration](section-cpu-staged-offload)
 - [DPO Configuration](section-dpo)
 - [DPOEngine Configuration](section-dpo-engine)
 - [DistributedDataParallel Configuration](section-distributed-data-parallel)
@@ -87,6 +86,7 @@ For detailed examples, see the experiment configurations in the `examples/` dire
 - [MOPDTeacher Specification](section-mopd-teacher)
 - [MegatronEngine Configuration](section-megatron-engine)
 - [MemoryProfiler Configuration](section-memory-profiler)
+- [MuonOptimizer Configuration](section-muon-optimizer)
 - [PerfTracer Configuration](section-perf-tracer)
 - [RejectionSampling Configuration](section-rejection-sampling)
 - [Scheduler Configuration](section-scheduler)
@@ -333,23 +333,24 @@ Configuration for reward/advantage normalization.
 
 Configuration for model optimization during training.
 
-| Parameter                 | Type            | Default      | Description                                                                                                                                                                                                                                                                         |
-| ------------------------- | --------------- | ------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `type`                    | string          | `"adam"`     | Optimizer type. For FSDP Engine, adam_bf16 enables memory-efficient BF16 optimizer states. For Megatron Engine, adam_bf16 requires dtype=bfloat16 and is automatically converted to adam with precision-aware optimizer enabled. **Choices:** `adam`, `sgd`, `adam_bf16`            |
-| `lr`                      | float           | `0.001`      | Learning rate                                                                                                                                                                                                                                                                       |
-| `weight_decay`            | float           | `0.01`       | Weight decay                                                                                                                                                                                                                                                                        |
-| `beta1`                   | float           | `0.9`        | Adam beta1 parameter. Only effective when optimizer_type is adam/adam_bf16                                                                                                                                                                                                          |
-| `beta2`                   | float           | `0.999`      | Adam beta2 parameter. Only effective when optimizer_type is adam/adam_bf16                                                                                                                                                                                                          |
-| `eps`                     | float           | `1e-08`      | Adam epsilon parameter. Only effective when optimizer_type is adam/adam_bf16                                                                                                                                                                                                        |
-| `min_lr_ratio`            | float           | `0.0`        | Minimum learning rate ratio after annealing                                                                                                                                                                                                                                         |
-| `lr_scheduler_type`       | string          | `"constant"` | Learning rate scheduler type **Choices:** `linear`, `cosine`, `constant`                                                                                                                                                                                                            |
-| `warmup_steps_proportion` | float           | `0.001`      | Non-negative proportion of training steps for warmup. Ignored when warmup_steps is set. For Megatron, the resolved warmup steps must be less than the total training steps.                                                                                                         |
-| `warmup_steps`            | integer \| None | `None`       | Fixed number of learning-rate scheduler steps for warmup. Must be non-negative. For Megatron, it must also be less than the total training steps. When both options are explicitly configured, warmup_steps takes precedence over warmup_steps_proportion and a warning is emitted. |
-| `initial_loss_scale`      | float           | `4294967296` | Initial loss scaling factor                                                                                                                                                                                                                                                         |
-| `min_loss_scale`          | float           | `1.0`        | Minimum loss scaling factor                                                                                                                                                                                                                                                         |
-| `loss_scale_window`       | float           | `5`          | Window size for loss scaling adjustment                                                                                                                                                                                                                                             |
-| `hysteresis`              | integer         | `2`          | Hysteresis (scaling factor) for loss scaling                                                                                                                                                                                                                                        |
-| `gradient_clipping`       | float           | `1.0`        | Gradient clipping threshold                                                                                                                                                                                                                                                         |
+| Parameter                 | Type                                            | Default      | Description                                                                                                                                                                                                                                                                                                                                                                                               |
+| ------------------------- | ----------------------------------------------- | ------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `type`                    | string                                          | `"adam"`     | Optimizer type. For FSDP Engine, adam_bf16 enables memory-efficient BF16 optimizer states. For Megatron Engine, adam_bf16 requires dtype=bfloat16 and is automatically converted to adam with precision-aware optimizer enabled. dist_muon selects Megatron's layer-wise distributed Muon optimizer and uses AdamW for scalar/non-matrix parameters. **Choices:** `adam`, `sgd`, `adam_bf16`, `dist_muon` |
+| `lr`                      | float                                           | `0.001`      | Learning rate                                                                                                                                                                                                                                                                                                                                                                                             |
+| `weight_decay`            | float                                           | `0.01`       | Weight decay                                                                                                                                                                                                                                                                                                                                                                                              |
+| `beta1`                   | float                                           | `0.9`        | Adam beta1 parameter. Only effective when optimizer_type is adam/adam_bf16                                                                                                                                                                                                                                                                                                                                |
+| `beta2`                   | float                                           | `0.999`      | Adam beta2 parameter. Only effective when optimizer_type is adam/adam_bf16                                                                                                                                                                                                                                                                                                                                |
+| `eps`                     | float                                           | `1e-08`      | Adam epsilon parameter. Only effective when optimizer_type is adam/adam_bf16                                                                                                                                                                                                                                                                                                                              |
+| `muon`                    | [`MuonOptimizerConfig`](section-muon-optimizer) | **Required** | Muon algorithm settings used when type=dist_muon.                                                                                                                                                                                                                                                                                                                                                         |
+| `min_lr_ratio`            | float                                           | `0.0`        | Minimum learning rate ratio after annealing                                                                                                                                                                                                                                                                                                                                                               |
+| `lr_scheduler_type`       | string                                          | `"constant"` | Learning rate scheduler type **Choices:** `linear`, `cosine`, `constant`                                                                                                                                                                                                                                                                                                                                  |
+| `warmup_steps_proportion` | float                                           | `0.001`      | Non-negative proportion of training steps for warmup. Ignored when warmup_steps is set. For Megatron, the resolved warmup steps must be less than the total training steps.                                                                                                                                                                                                                               |
+| `warmup_steps`            | integer \| None                                 | `None`       | Fixed number of learning-rate scheduler steps for warmup. Must be non-negative. For Megatron, it must also be less than the total training steps. When both options are explicitly configured, warmup_steps takes precedence over warmup_steps_proportion and a warning is emitted.                                                                                                                       |
+| `initial_loss_scale`      | float                                           | `4294967296` | Initial loss scaling factor                                                                                                                                                                                                                                                                                                                                                                               |
+| `min_loss_scale`          | float                                           | `1.0`        | Minimum loss scaling factor                                                                                                                                                                                                                                                                                                                                                                               |
+| `loss_scale_window`       | float                                           | `5`          | Window size for loss scaling adjustment                                                                                                                                                                                                                                                                                                                                                                   |
+| `hysteresis`              | integer                                         | `2`          | Hysteresis (scaling factor) for loss scaling                                                                                                                                                                                                                                                                                                                                                              |
+| `gradient_clipping`       | float                                           | `1.0`        | Gradient clipping threshold                                                                                                                                                                                                                                                                                                                                                                               |
 
 (section-ppo-actor)=
 
@@ -960,37 +961,17 @@ Archon FP8 training configuration.
 | `include_experts` | boolean        | `False`      | Apply FP8 to MoE expert computation. Uses per-expert blockwise FP8 matmuls via torchao.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
 | `use_triton`      | boolean        | `True`       | Use Triton GEMM kernel for FP8 blockwise matmuls instead of cuBLAS. Currently must be True: torchao's blockwise FP8 is a prototype that uses mixed per-operand scaling (1x128 activations + 128x128 weights), which torch.\_scaled_mm does not support. The Triton kernel (triton_fp8_gemm_1x128_128x128) handles this natively. Revisit when torchao stabilizes mixed-mode cuBLAS dispatch.                                                                                                                                                                                                |
 
-(section-cpu-staged-muon)=
+(section-cpu-staged-offload)=
 
-## CPUStagedMuon Configuration
+## CPUStagedOffload Configuration
 
-Algorithm settings for Megatron's CPU-staged Muon backend.
+Bounded GPU staging for CPU-resident Megatron optimizer state.
 
-| Parameter            | Type    | Default        | Description                 |
-| -------------------- | ------- | -------------- | --------------------------- |
-| `momentum`           | float   | `0.95`         | -                           |
-| `use_nesterov`       | boolean | `False`        | -                           |
-| `fp32_matmul_prec`   | string  | `"medium"`     | -                           |
-| `coefficient_type`   | string  | `"quintic"`    | -                           |
-| `num_ns_steps`       | integer | `5`            | -                           |
-| `scale_mode`         | string  | `"spectral"`   | -                           |
-| `split_qkv`          | boolean | `True`         | -                           |
-| `tp_mode`            | string  | `"duplicated"` | - **Choices:** `duplicated` |
-| `extra_scale_factor` | float   | `1.0`          | -                           |
-
-(section-cpu-staged-optimizer)=
-
-## CPUStagedOptimizer Configuration
-
-Megatron optimizer state residency and bounded GPU staging configuration.
-
-| Parameter        | Type                                             | Default      | Description                                                                                                                                                       |
-| ---------------- | ------------------------------------------------ | ------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `enabled`        | boolean                                          | `False`      | Keep FP32 AdamW master parameters and moments in pinned CPU memory, and stream bounded chunks through GPU staging buffers during optimizer.step(). Megatron only. |
-| `kind`           | string                                           | `"adamw"`    | CPU-staged optimizer algorithm. **Choices:** `adamw`, `muon`                                                                                                      |
-| `buffer_count`   | integer                                          | `2`          | Number of reusable GPU optimizer staging buffers.                                                                                                                 |
-| `bucket_size_mb` | float                                            | `128.0`      | Maximum size in MiB of one GPU optimizer staging unit.                                                                                                            |
-| `muon`           | [`CPUStagedMuonConfig`](section-cpu-staged-muon) | **Required** | Muon algorithm settings used when kind=muon.                                                                                                                      |
+| Parameter        | Type    | Default | Description                                                                                                                                                                                |
+| ---------------- | ------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `enabled`        | boolean | `False` | Keep optimizer state in pinned CPU memory and stream bounded update units through GPU staging buffers. The optimizer algorithm is selected independently by optimizer.type. Megatron only. |
+| `buffer_count`   | integer | `2`     | Number of reusable GPU optimizer staging buffers.                                                                                                                                          |
+| `bucket_size_mb` | float   | `128.0` | Maximum size in MiB of one GPU optimizer staging unit.                                                                                                                                     |
 
 (section-dpo)=
 
@@ -1266,7 +1247,7 @@ Refer to Megatron-LM documentation for implementation details.
 | `main_params_dtype`                        | string                                                               | `"float32"`  | -                                                                                                                                                                                                                                                                                                    |
 | `exp_avg_dtype`                            | string                                                               | `"float32"`  | -                                                                                                                                                                                                                                                                                                    |
 | `exp_avg_sq_dtype`                         | string                                                               | `"float32"`  | -                                                                                                                                                                                                                                                                                                    |
-| `cpu_staged_optimizer`                     | [`CPUStagedOptimizerConfig`](section-cpu-staged-optimizer)           | **Required** | CPU-resident AdamW state with bounded GPU-staged optimizer steps.                                                                                                                                                                                                                                    |
+| `cpu_staged_offload`                       | [`CPUStagedOffloadConfig`](section-cpu-staged-offload)               | **Required** | Keep the selected optimizer's state CPU-resident and use bounded GPU staging buffers for optimizer steps.                                                                                                                                                                                            |
 | `async_save`                               | boolean                                                              | `False`      | If True, Megatron checkpoint saves run in background processes and save_checkpoint() returns immediately after weights are durably staged off the GPU. Pending saves are drained before the next load_checkpoint() and during engine.destroy(). Reduces per-save sync wait on large MoE checkpoints. |
 | `use_checkpoint_opt_param_scheduler`       | boolean                                                              | `True`       | -                                                                                                                                                                                                                                                                                                    |
 | `use_deterministic_algorithms`             | boolean                                                              | `False`      | -                                                                                                                                                                                                                                                                                                    |
@@ -1308,6 +1289,24 @@ entries for torch.cuda.memory.\_record_memory_history.
 | --------------- | --------------- | ------------ | ------------------------------------------------- |
 | `profile_steps` | list of integer | **Required** | List of global steps to capture memory snapshots. |
 | `max_entries`   | integer         | `100000`     | Max entries for memory history ring buffer.       |
+
+(section-muon-optimizer)=
+
+## MuonOptimizer Configuration
+
+Algorithm settings for Megatron's distributed Muon optimizer.
+
+| Parameter            | Type    | Default        | Description                                                 |
+| -------------------- | ------- | -------------- | ----------------------------------------------------------- |
+| `momentum`           | float   | `0.95`         | -                                                           |
+| `use_nesterov`       | boolean | `False`        | -                                                           |
+| `fp32_matmul_prec`   | string  | `"medium"`     | - **Choices:** `low`, `medium`, `high`                      |
+| `coefficient_type`   | string  | `"quintic"`    | -                                                           |
+| `num_ns_steps`       | integer | `5`            | -                                                           |
+| `scale_mode`         | string  | `"spectral"`   | - **Choices:** `spectral`, `unit_rms_norm`, `shape_scaling` |
+| `split_qkv`          | boolean | `True`         | -                                                           |
+| `tp_mode`            | string  | `"duplicated"` | - **Choices:** `blockwise`, `duplicated`, `distributed`     |
+| `extra_scale_factor` | float   | `1.0`          | -                                                           |
 
 (section-perf-tracer)=
 

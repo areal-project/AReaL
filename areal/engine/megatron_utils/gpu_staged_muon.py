@@ -71,31 +71,16 @@ def _require_muon_checkpoint_versions() -> tuple[str, str]:
 
 @dataclass(frozen=True)
 class GPUStagedMuonConfig:
-    """Configuration for the CPU-staged Muon backend."""
+    """GPU staging capacity for the CPU-resident Muon backend."""
 
     buffer_count: int = 2
     slot_size_mb: float = 128.0
-    momentum: float = 0.95
-    use_nesterov: bool = False
-    fp32_matmul_prec: str = "medium"
-    coefficient_type: str = "quintic"
-    num_ns_steps: int = 5
-    scale_mode: str = "spectral"
-    split_qkv: bool = True
-    tp_mode: str = "duplicated"
-    extra_scale_factor: float = 1.0
 
     def __post_init__(self) -> None:
         if self.buffer_count < 1:
             raise ValueError("Muon staging buffer_count must be at least 1")
         if self.slot_size_mb <= 0:
             raise ValueError("Muon staging slot_size_mb must be positive")
-        if not 0.0 <= self.momentum < 1.0:
-            raise ValueError("Muon momentum must satisfy 0 <= momentum < 1")
-        if self.num_ns_steps < 1:
-            raise ValueError("Muon num_ns_steps must be at least 1")
-        if self.tp_mode not in {"blockwise", "duplicated", "distributed"}:
-            raise ValueError(f"unsupported Muon TP mode: {self.tp_mode!r}")
 
     @property
     def slot_numel(self) -> int:
@@ -1044,6 +1029,110 @@ def _validate_mcore017_layerwise_allgather_contract(layerwise_cls: type[Any]) ->
         )
 
 
+@torch.no_grad()
+def _allgather_mcore017_layerwise_params_empty_safe(self: Any) -> None:
+    """MCore 0.17 all-gather that permits an empty first owner shard."""
+
+    def _allgather(params_list: list[list[torch.Tensor]], group: Any) -> None:
+        first_param = next(
+            (param for owner_params in params_list for param in owner_params), None
+        )
+        if first_param is None:
+            return
+        rank = torch.distributed.get_rank(group)
+        world_size = torch.distributed.get_world_size(group)
+        if len(params_list) != world_size:
+            raise RuntimeError(
+                "Muon owner list does not match its process group: "
+                f"owners={len(params_list)}, world_size={world_size}"
+            )
+        local_params = params_list[rank]
+        source = (
+            _flatten_dense_tensors(local_params)
+            if local_params
+            else torch.empty(
+                0,
+                device=first_param.device,
+                dtype=first_param.dtype,
+            )
+        )
+        flat_sizes = [sum(param.numel() for param in params) for params in params_list]
+        gathered = [
+            source
+            if owner_rank == rank
+            else torch.empty(
+                size,
+                device=first_param.device,
+                dtype=first_param.dtype,
+            )
+            for owner_rank, size in enumerate(flat_sizes)
+        ]
+        torch.distributed.all_gather(gathered, source, group=group)
+        for owner_rank, owner_params in enumerate(params_list):
+            if owner_rank == rank or not owner_params:
+                continue
+            updated = _unflatten_dense_tensors(gathered[owner_rank], owner_params)
+            for source_param, model_param in zip(updated, owner_params, strict=True):
+                model_param.data.copy_(source_param)
+
+    if self.pg_collection is None:
+        return
+    if self.dp_cp_params_list:
+        _allgather(self.dp_cp_params_list, self.pg_collection.dp_cp)
+    if self.expt_dp_params_list:
+        _allgather(self.expt_dp_params_list, self.pg_collection.expt_dp)
+
+
+def get_megatron_optimizer_with_dist_muon(
+    mcore_config: Any,
+    model: list[Any],
+    *,
+    pg_collection: Any | None = None,
+) -> Any:
+    """Build MCore's native layer-wise Muon without mutating caller config."""
+    version = importlib.metadata.version("megatron-core")
+    if version != _SUPPORTED_MEGATRON_CORE_VERSION:
+        raise RuntimeError(
+            f"distributed Muon supports megatron-core 0.17.0 exactly, found {version}"
+        )
+    if mcore_config.optimizer != "dist_muon":
+        raise ValueError("distributed Muon requires optimizer='dist_muon'")
+    if mcore_config.use_distributed_optimizer:
+        raise ValueError("distributed Muon does not use Megatron dist-opt")
+    if mcore_config.muon_scalar_optimizer != "adam":
+        raise ValueError("AReaL distributed Muon supports only scalar AdamW")
+    if not mcore_config.bf16 or mcore_config.fp16:
+        raise ValueError("distributed Muon requires BF16 without FP16 loss scaling")
+    if mcore_config.use_precision_aware_optimizer:
+        raise ValueError("distributed Muon does not support precision-aware optimizer")
+
+    from megatron.core.optimizer.layer_wise_optimizer import (
+        LayerWiseDistributedOptimizer,
+    )
+    from megatron.core.optimizer.muon import get_megatron_muon_optimizer
+
+    _validate_mcore017_layerwise_allgather_contract(LayerWiseDistributedOptimizer)
+    build_config = copy.copy(mcore_config)
+    optimizer = get_megatron_muon_optimizer(
+        build_config,
+        model,
+        config_overrides=None,
+        use_gloo_process_groups=True,
+        layer_wise_distributed_optimizer=True,
+        pg_collection=pg_collection,
+    )
+    if type(optimizer) is not LayerWiseDistributedOptimizer:
+        raise TypeError(
+            "official Muon builder did not return LayerWiseDistributedOptimizer"
+        )
+    optimizer.allgather_params = (
+        _allgather_mcore017_layerwise_params_empty_safe.__get__(
+            optimizer, type(optimizer)
+        )
+    )
+    return optimizer
+
+
 def _checkpoint_group_identity(
     group: Any, *, name: str, singleton_global_rank: int
 ) -> dict[str, Any]:
@@ -1842,6 +1931,7 @@ def _make_staged_layerwise_class():
         """Layer-wise wrapper preserving official ownership and collectives."""
 
         manages_cpu_residency = True
+        supports_non_distributed_checkpoint = True
 
         def __init__(self, official: Any, leaves: list[Any]) -> None:
             self.pg_collection = official.pg_collection
@@ -3294,7 +3384,8 @@ def _validate_muon_parallel_topology(
                 f"parameter={_parameter_identities((param,))}, "
                 f"partition_dim={partition_dim!r}"
             )
-        if tensor_parallel != (partition_dim in {0, 1}):
+        has_partition_axis = partition_dim in {0, 1}
+        if tensor_parallel and not has_partition_axis:
             raise RuntimeError(
                 "official Muon tensor-parallel metadata is inconsistent: "
                 f"parameter={_parameter_identities((param,))}, "
@@ -3302,7 +3393,15 @@ def _validate_muon_parallel_topology(
                 f"partition_dim={partition_dim}, group={tp_group_name}, "
                 f"group_size={tp_size}, group_rank={tp_rank}"
             )
-        if tensor_parallel:
+        if not tensor_parallel and has_partition_axis and not expert_tp and tp_size > 1:
+            raise RuntimeError(
+                "official dense Muon TP metadata has a partition axis without "
+                "tensor_model_parallel: "
+                f"parameter={_parameter_identities((param,))}, "
+                f"partition_dim={partition_dim}, group_size={tp_size}, "
+                f"group_rank={tp_rank}"
+            )
+        if has_partition_axis:
             partition_stride = getattr(param, "partition_stride", None)
             if (
                 isinstance(partition_stride, bool)
@@ -3409,8 +3508,10 @@ def get_megatron_optimizer_with_gpu_staged_muon(
         )
     if mcore_config.use_distributed_optimizer:
         raise ValueError("staged Muon uses official layer-wise ownership, not dist-opt")
-    if mcore_config.optimizer != "adam":
-        raise ValueError("staged Muon MVP requires AdamW for scalar parameters")
+    if mcore_config.optimizer != "dist_muon":
+        raise ValueError("staged Muon requires optimizer='dist_muon'")
+    if mcore_config.muon_scalar_optimizer != "adam":
+        raise ValueError("staged Muon requires AdamW for scalar parameters")
     if not mcore_config.decoupled_weight_decay:
         raise ValueError("staged Muon MVP requires decoupled weight decay")
     if not mcore_config.bf16 or mcore_config.fp16:
@@ -3425,10 +3526,10 @@ def get_megatron_optimizer_with_gpu_staged_muon(
         )
     if mcore_config.use_precision_aware_optimizer:
         raise ValueError("staged Muon owns precision explicitly; PAO must be disabled")
-    if staged_config.tp_mode != "duplicated":
+    if mcore_config.muon_tp_mode != "duplicated":
         raise ValueError(
             "staged Muon currently supports only the verified duplicated TP mode; "
-            f"found {staged_config.tp_mode!r}"
+            f"found {mcore_config.muon_tp_mode!r}"
         )
 
     # This is deliberately before importing/calling either optimizer builder and
@@ -3549,15 +3650,6 @@ def get_megatron_optimizer_with_gpu_staged_muon(
     build_config.main_params_dtype = torch.float32
     build_config.exp_avg_dtype = torch.float32
     build_config.exp_avg_sq_dtype = torch.float32
-    build_config.muon_momentum = staged_config.momentum
-    build_config.muon_use_nesterov = staged_config.use_nesterov
-    build_config.muon_fp32_matmul_prec = staged_config.fp32_matmul_prec
-    build_config.muon_coefficient_type = staged_config.coefficient_type
-    build_config.muon_num_ns_steps = staged_config.num_ns_steps
-    build_config.muon_scale_mode = staged_config.scale_mode
-    build_config.muon_split_qkv = staged_config.split_qkv
-    build_config.muon_tp_mode = staged_config.tp_mode
-    build_config.muon_extra_scale_factor = staged_config.extra_scale_factor
     build_config.muon_scalar_optimizer = "adam"
     build_config.overlap_param_gather = False
     build_config.overlap_param_gather_with_optimizer_step = False
@@ -3582,6 +3674,7 @@ def get_megatron_optimizer_with_gpu_staged_muon(
             if pg_collection is not None
             else ProcessGroupCollection.use_mpu_process_groups()
         )
+        build_config.optimizer = "adam"
         scalar_chain = get_scalar_optimizer(
             build_config,
             model,
@@ -3636,7 +3729,7 @@ def get_megatron_optimizer_with_gpu_staged_muon(
         official,
         tuple(base for base in official_bases if isinstance(base, TensorParallelMuon)),
         tuple(trainable),
-        tp_mode=staged_config.tp_mode,
+        tp_mode=mcore_config.muon_tp_mode,
     )
     if not has_muon_parameters:
         official_bases.insert(0, _EMPTY_MUON_LEAF)
@@ -3718,15 +3811,15 @@ def get_megatron_optimizer_with_gpu_staged_muon(
     result.configure_managed_checkpoint_schema(
         checkpoint_parameter_names,
         algorithm={
-            "momentum": staged_config.momentum,
-            "use_nesterov": staged_config.use_nesterov,
-            "fp32_matmul_prec": staged_config.fp32_matmul_prec,
-            "coefficient_type": staged_config.coefficient_type,
-            "num_ns_steps": staged_config.num_ns_steps,
-            "scale_mode": staged_config.scale_mode,
-            "split_qkv": staged_config.split_qkv,
-            "tp_mode": staged_config.tp_mode,
-            "extra_scale_factor": staged_config.extra_scale_factor,
+            "momentum": mcore_config.muon_momentum,
+            "use_nesterov": mcore_config.muon_use_nesterov,
+            "fp32_matmul_prec": mcore_config.muon_fp32_matmul_prec,
+            "coefficient_type": mcore_config.muon_coefficient_type,
+            "num_ns_steps": mcore_config.muon_num_ns_steps,
+            "scale_mode": mcore_config.muon_scale_mode,
+            "split_qkv": mcore_config.muon_split_qkv,
+            "tp_mode": mcore_config.muon_tp_mode,
+            "extra_scale_factor": mcore_config.muon_extra_scale_factor,
         },
     )
     if result.cuda_state_numel != 0 or result.residency != "CPU_RESIDENT":

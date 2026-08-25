@@ -12,6 +12,7 @@ import torch
 from areal.engine.megatron_utils.gpu_staged_muon import (
     GPUStagedMuon,
     GPUStagedMuonConfig,
+    _validate_muon_parallel_topology,
     _validate_official_ownership,
 )
 from areal.engine.megatron_utils.gpu_staged_optimizer import (
@@ -24,8 +25,6 @@ def _config(*, slot_numel: int = 64, buffer_count: int = 2) -> GPUStagedMuonConf
     return GPUStagedMuonConfig(
         buffer_count=buffer_count,
         slot_size_mb=slot_numel * 4 / (1024 * 1024),
-        split_qkv=False,
-        fp32_matmul_prec="highest",
     )
 
 
@@ -372,6 +371,35 @@ def test_official_ownership_validation_accepts_missing_lists_only_for_dp1() -> N
     )
 
     _validate_official_ownership(official, [param])
+
+
+def test_muon_topology_accepts_explicit_expert_partition_metadata() -> None:
+    """MCore expert comm keeps the partition axis without the dense TP flag."""
+    param = torch.nn.Parameter(torch.ones(2, 2))
+    param.expert_tp = True
+    param.tensor_model_parallel = False
+    param.partition_dim = 0
+    param.partition_stride = 1
+    singleton = SimpleNamespace(rank=lambda: 0, size=lambda: 1)
+    pg_collection = SimpleNamespace(
+        tp=singleton,
+        expt_tp=singleton,
+        dp_cp=singleton,
+        expt_dp=singleton,
+    )
+    optimizer = SimpleNamespace(
+        pg_collection=pg_collection,
+        mode="duplicated",
+        param_groups=[{"params": [param], "is_expert_parallel": True}],
+    )
+    official = SimpleNamespace(pg_collection=pg_collection)
+
+    _validate_muon_parallel_topology(
+        official,
+        [optimizer],
+        [param],
+        tp_mode="duplicated",
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")

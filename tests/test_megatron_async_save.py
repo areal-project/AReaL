@@ -134,6 +134,34 @@ def test_async_disabled_creates_no_queue():
     m.close()
 
 
+def test_non_distributed_optimizer_requires_checkpoint_capability():
+    mod = _import_checkpointer()
+    with (
+        patch("torch.distributed.get_rank", return_value=0),
+        pytest.raises(NotImplementedError, match="explicit non-distributed"),
+    ):
+        mod.MegatronCheckpointManager(
+            model=MagicMock(),
+            optimizer=MagicMock(spec=[]),
+            lr_scheduler=None,
+            use_distributed_optimizer=False,
+        )
+
+
+def test_checkpoint_capable_non_distributed_optimizer_is_supported():
+    mod = _import_checkpointer()
+    optimizer = MagicMock()
+    optimizer.supports_non_distributed_checkpoint = True
+    with patch("torch.distributed.get_rank", return_value=0):
+        manager = mod.MegatronCheckpointManager(
+            model=MagicMock(),
+            optimizer=optimizer,
+            lr_scheduler=None,
+            use_distributed_optimizer=False,
+        )
+    assert manager.optimizer is optimizer
+
+
 def test_save_schedules_async_request(patched_checkpointer, tmp_path):
     mod, manager, queue = patched_checkpointer
     fake_request = object()
