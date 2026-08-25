@@ -495,6 +495,16 @@ class PPOTrainer:
             if sm is not None:
                 sm.on_version_recovered(recovery_version)
 
+        if (
+            config.rollout.initial_weight_source == "actor"
+            and self.recover_info is None
+        ):
+            initial_version = self.actor.get_version()
+            self.actor.update_weights(
+                self.weight_update_meta.with_version(initial_version)
+            )
+            self.rollout.set_version(initial_version)
+
         self._config_perf_tracer()
         self._apply_initial_offload_policy()
 
@@ -1274,6 +1284,9 @@ class PPOTrainer:
                 f"Invalid backend: {rollout_backend}, expected sglang or vllm"
             )
 
+        if config.initial_weight_source == "actor":
+            server_args["load_format"] = "dummy"
+
         if not is_single_controller():
             engine = engine_cls(config)
             engine.initialize(
@@ -1498,6 +1511,18 @@ class PPOTrainer:
         """validate config for incompatible settings before weight initialization, to avoid wasted resources on spawning workers and loading models."""
         rollout_backend = self.rollout_alloc.backend
         actor_backend = self.actor_alloc.backend
+        if self.config.rollout.initial_weight_source == "actor":
+            if self.config.actor.use_lora:
+                raise ValueError(
+                    "rollout.initial_weight_source='actor' does not support "
+                    "actor.use_lora=True: adapter-only updates cannot initialize "
+                    "the dummy base model. Use initial_weight_source='checkpoint'."
+                )
+            if self.config.actor.weight_update_mode == "disk":
+                raise ValueError(
+                    "rollout.initial_weight_source='actor' requires "
+                    "actor.weight_update_mode to be 'xccl' or 'awex', not 'disk'."
+                )
         requires_train_engine_offload = any(
             (
                 self._should_offload_rollout,

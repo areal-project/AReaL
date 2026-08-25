@@ -2517,6 +2517,15 @@ class InferenceEngineConfig:
             "e.g. 'sglang:d4', 'vllm:d2t4'. Required."
         },
     )
+    initial_weight_source: str = field(
+        default="checkpoint",
+        metadata={
+            "help": "Initial rollout weights: 'checkpoint' loads independently; "
+            "'actor' starts the rollout engine with dummy weights and syncs from the actor "
+            "before the first rollout. Requires a non-disk weight update mode.",
+            "choices": ["checkpoint", "actor"],
+        },
+    )
     scheduling_strategy: SchedulingStrategy = field(
         default_factory=SchedulingStrategy,
         metadata={
@@ -2593,6 +2602,11 @@ class InferenceEngineConfig:
 
     def __post_init__(self):
         """Validate scheduling_spec length."""
+        if self.initial_weight_source not in ("checkpoint", "actor"):
+            raise ValueError(
+                "initial_weight_source must be 'checkpoint' or 'actor', "
+                f"got '{self.initial_weight_source}'"
+            )
         if len(self.scheduling_spec) not in (1, 2):
             raise ValueError(
                 f"scheduling_spec must contain 1 or 2 SchedulingSpec, "
