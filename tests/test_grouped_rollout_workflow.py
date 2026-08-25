@@ -128,7 +128,7 @@ def test_dist_rollout_coordinator_forwards_reward_group_flags(monkeypatch):
     monkeypatch.setattr(
         coordinator,
         "_broadcast_and_redistribute_trajectories",
-        lambda trajectories: trajectories,
+        lambda trajectories, preparation_error=None: trajectories,
     )
     monkeypatch.setattr(dist_rollout.current_platform, "current_device", lambda: "cpu")
     monkeypatch.setattr(dist_rollout, "tensor_container_to", lambda data, device: data)
@@ -142,6 +142,7 @@ def test_dist_rollout_coordinator_forwards_reward_group_flags(monkeypatch):
     coordinator.rollout_batch(
         data=[{}],
         workflow=object(),
+        min_usable_group_size=2,
         reward_normalization=True,
         drop_incomplete_group=True,
     )
@@ -150,3 +151,80 @@ def test_dist_rollout_coordinator_forwards_reward_group_flags(monkeypatch):
     assert rollout_engine.prepare_kwargs["drop_incomplete_group"] is True
     assert rollout_engine.rollout_kwargs["reward_normalization"] is True
     assert rollout_engine.rollout_kwargs["drop_incomplete_group"] is True
+    assert rollout_engine.rollout_kwargs["min_usable_group_size"] == 2
+
+
+def test_ragged_trajectory_gather_routes_to_batched_ragged_gather(monkeypatch):
+    monkeypatch.setattr(dist_rollout.dist, "get_world_size", lambda _: 2)
+    monkeypatch.setattr(
+        dist_rollout.dist,
+        "all_gather_object",
+        lambda output, value, group=None: output.__setitem__(slice(None), [1, 2]),
+    )
+    expected = [
+        [{"rank": 0, "item": 0}],
+        [{"rank": 1, "item": 0}, {"rank": 1, "item": 1}],
+    ]
+    monkeypatch.setattr(
+        dist_rollout,
+        "all_gather_ragged_tensor_container",
+        lambda items, group=None: expected,
+    )
+
+    gathered = dist_rollout._all_gather_ragged_trajectory_lists(
+        [{"rank": 0, "item": 0}], group=object()
+    )
+
+    assert gathered == expected
+
+
+def test_equal_trajectory_gather_keeps_fast_path(monkeypatch):
+    monkeypatch.setattr(dist_rollout.dist, "get_world_size", lambda _: 2)
+    monkeypatch.setattr(
+        dist_rollout.dist,
+        "all_gather_object",
+        lambda output, value, group=None: output.__setitem__(slice(None), [1, 1]),
+    )
+    expected = [[{"rank": 0}], [{"rank": 1}]]
+    monkeypatch.setattr(
+        dist_rollout,
+        "all_gather_tensor_container",
+        lambda items, group=None: expected,
+    )
+
+    gathered = dist_rollout._all_gather_ragged_trajectory_lists(
+        [{"rank": 0}], group=object()
+    )
+
+    assert gathered == expected
+
+
+def test_stalled_dynamic_preparation_fails_instead_of_spinning(monkeypatch):
+    class _EmptyRolloutEngine:
+        def __init__(self):
+            self.calls = 0
+
+        def prepare_batch(self, *args, **kwargs):
+            self.calls += 1
+            return []
+
+    rollout_engine = _EmptyRolloutEngine()
+    coordinator = DistRolloutCoordinator(rollout_engine, _TrainEngine())
+    monkeypatch.setattr(dist_rollout, "ROLLOUT_COLLECTION_STALL_TIMEOUT_SECONDS", 0.0)
+    captured = {}
+    monkeypatch.setattr(
+        coordinator,
+        "_broadcast_and_redistribute_trajectories",
+        lambda trajectories, preparation_error=None: captured.setdefault(
+            "error", preparation_error
+        ),
+    )
+
+    coordinator.prepare_batch(
+        dataloader=object(),
+        workflow=object(),
+        dynamic_bs=True,
+    )
+
+    assert rollout_engine.calls == 8
+    assert "added no trainable group" in captured["error"]

@@ -499,8 +499,14 @@ class TestDispatcherParityWithTrainController:
             }
         )
 
-        with pytest.raises(ValueError, match="divisible by K"):
-            await dispatcher.dispatch("/train_batch").post(body)
+        result_bytes = await dispatcher.dispatch("/train_batch").post(body)
+        result_payload = orjson.loads(result_bytes)
+        merged = deserialize_value(result_payload["result"])
+
+        assert merged == [5, 11, 7]
+        assert sorted(
+            len(payload["args"][0]) for payload in session.captured_payloads
+        ) == [1, 2]
 
     @pytest.mark.asyncio
     async def test_dispatch_post_pads_eval_routes_only(self):

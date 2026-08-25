@@ -196,12 +196,39 @@ rollout:
 1. 根据类型合并结果：
    - **张量字典**：沿批次维度连接
    - **InteractionWithTokenLogpReward 字典**：合并为单个字典
-1. 如果某些运行返回 `None`（拒绝），仅保留有效结果
-1. 如果所有运行都返回 `None`，则整个分组结果为 `None`
+1. 每个 slot 可用时返回正常结果类型，不可用时返回 `None`。`None` 有意保持不透明；原因分类与重试策略仍由 producer 负责。
+1. 包装器只等待最初提交的 slots，既不会重试不可用 slot，也不会复制可用结果。
+1. 可用 slots 会各保留一次并连接；实际数量会在 reward 和 advantage normalization 中继续作为 prompt-group 边界。
+1. `min_usable_group_size` 默认为 `1`。仅当 v1 RL trainer 的 reward 或 advantage normalization
+   使用 group statistics（该统计量至少需要两个观测值）时，才会将其设为 `2`；singleton 目标 group
+   （`n_samples: 1`）本身即是完整的，因此下限保持为 `1`。设置 `actor.min_usable_group_size` 可覆盖该推导值；使用 group
+   statistics 时，低于 `2` 的显式值会被拒绝。低于下限的 group 返回 `None`，异步 collector 随后会接收另一个已就绪的 prompt
+   group。采用 batch-relative PPO 或 REINFORCE 时则会保留可用的 singleton。
+1. Group statistics 会约束 workflow 契约：当解析后的 `min_usable_group_size` 至少为 `2` ——由 group
+   statistics（`mean_level: group` 或 `std_level: group`）推导，或通过
+   `actor.min_usable_group_size` 显式设置——且 rollout 分组（`n_samples >= 2`）时，每次 `arun_episode`
+   调用必须恰好贡献一个训练样本——batch size 为 1 的张量字典，或单个导出的 interaction。所有内置 workflow 均满足该契约。如果
+   workflow 每个 episode 返回多个样本（每 turn 一行、tree-search 分支，或使用
+   `agent.export_style: individual` 的多轮 agent），会抛出不可重试的 `WorkflowContractError` 并终止训练，因为
+   group mean/std 会把同一 episode 的多行当作独立的 group 成员。未分组的 rollout（`n_samples: 1`）不会安装 group
+   wrapper，因此不做该检查；此时多样本 episode 会作为由同一 episode 各行组成的独立 group 参与 normalization。若要训练此类
+   workflow，请将 `mean_level`/`std_level` 改为 `batch`（或关闭 normalization），或把每个 episode
+   合并为单条序列（`agent.export_style: concat`）。
+
+PPO 系列 actor loss 默认仍按全局 token 加权。因此，有更多有效 response tokens 的 partial group 会比更小或更短的
+group 获得更高 loss weight。这是保持向后兼容的现有 estimator，并不表示各 prompt 隐式等权。
+
+Grouped rollout 会导出 `target_slot_count`、`usable_slot_count`、
+`trainable_slot_count`、`fully_masked_group`、`singleton_slot_group`、
+`pre_filter_usable_slot_yield` 和 `pre_filter_trainable_slot_yield`。这些指标统计最初的 rollout
+调用；`should_accept_fn` 运行后的最终 accepted 和 rejected 数量仍由 collector metrics 提供。PPO 训练会另外报告物理
+usable group size 与有效 token 的 loss-weight 分布，其中包括按 size 区分的 `group_loss_weight_size_<N>`
+指标。
 
 ### 输出形状
 
-当 `group_size=4` 且工作流返回 `[1, seq_len]` 张量时，分组输出的形状为 `[4, seq_len]`（4 个样本连接）。
+当 `group_size=4`、工作流返回 `[1, seq_len]` 张量且 4 个 slot 均可用时，分组输出的形状为
+`[4, seq_len]`。如果接受的是不完整 group，则第一维是实际可用的 slot 数量。
 
 ### 实现
 
@@ -216,9 +243,9 @@ class GroupedRolloutWorkflow(RolloutWorkflow):
               for _ in range(self.group_size)]
         )
 
-        # 过滤 None 结果
+        # 正常结果表示可用，None 表示不可用
         valid_results = [r for r in results if r is not None]
-        if not valid_results:
+        if len(valid_results) < self.min_usable_group_size:
             return None
 
         # 根据结果类型合并

@@ -12,6 +12,7 @@ from transformers import AutoTokenizer
 from tests.utils import get_model_path
 
 from areal.infra.rpc.serialization import deserialize_value, serialize_value
+from areal.infra.workflow_executor import WorkflowContractFailure
 
 
 @dataclass
@@ -116,6 +117,14 @@ class TestSerializationRoundTrip:
         assert deserialized.name == original.name
         assert deserialized.value == original.value
         assert torch.equal(deserialized.tensor, original.tensor)
+
+    def test_workflow_contract_failure(self):
+        """Workflow contract failures retain their terminal error identity."""
+        original = WorkflowContractFailure(message="invalid group shape")
+
+        deserialized = deserialize_value(serialize_value(original))
+
+        assert deserialized == original
 
     def test_tokenizer(self):
         """Test Hugging Face tokenizer serialization."""

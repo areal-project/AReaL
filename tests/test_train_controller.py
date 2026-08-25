@@ -593,6 +593,8 @@ class TestTrainControllerRolloutIntegration:
             dataloader=mock_dataloader,
             workflow="test.workflow",
             workflow_kwargs={"key": "value"},
+            group_size=2,
+            min_usable_group_size=2,
         )
 
         mock_rollout.prepare_batch.assert_called_once_with(
@@ -601,9 +603,10 @@ class TestTrainControllerRolloutIntegration:
             workflow_kwargs={"key": "value"},
             should_accept_fn=None,
             dynamic_bs=False,
-            group_size=1,
+            group_size=2,
             reward_normalization=False,
             drop_incomplete_group=False,
+            min_usable_group_size=2,
         )
 
     def test_rollout_batch_delegates_to_rollout(self, train_controller, ft_spec):
@@ -623,6 +626,8 @@ class TestTrainControllerRolloutIntegration:
             data=data,
             workflow="test.workflow",
             workflow_kwargs={"key": "value"},
+            group_size=2,
+            min_usable_group_size=2,
         )
 
         mock_rollout.rollout_batch.assert_called_once_with(
@@ -630,7 +635,8 @@ class TestTrainControllerRolloutIntegration:
             workflow="test.workflow",
             workflow_kwargs={"key": "value"},
             should_accept_fn=None,
-            group_size=1,
+            group_size=2,
+            min_usable_group_size=2,
             reward_normalization=False,
             drop_incomplete_group=False,
         )

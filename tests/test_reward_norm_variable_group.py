@@ -127,6 +127,27 @@ def test_leave_one_out_singleton_group_outputs_zero():
     assert out[0].item() == 0.0
 
 
+def test_leave_one_out_uses_only_usable_group_members():
+    norm = Normalization(
+        NormConfig(
+            mean_level="group",
+            mean_leave1out=True,
+            std_level=None,
+            group_size=3,
+        )
+    )
+    rewards = torch.tensor([1.0, 3.0, 10.0, 20.0, 30.0])
+
+    result = norm(rewards, group_sizes=[2, 3])
+
+    torch.testing.assert_close(
+        result,
+        torch.tensor([-2.0, 2.0, -15.0, 0.0, 15.0]),
+        rtol=0.0,
+        atol=0.0,
+    )
+
+
 def test_group_sizes_sum_mismatch_raises():
     """Boundaries whose sizes do not sum to the batch size are rejected."""
     norm = Normalization(_group_norm_config())
