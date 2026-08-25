@@ -359,13 +359,7 @@ class RecoverHandler:
             for name, engine_ in normalized_engine.items()
             if self._uses_async_checkpoint(engine_)
         ]
-        # TODO(agent): coordinate per-engine finalize callbacks before allowing
-        # an asynchronous generation containing both actor and critic payloads.
-        if async_engines and len(normalized_engine) != 1:
-            raise NotImplementedError(
-                "Crash-safe asynchronous recovery currently supports one train "
-                "engine. Disable Megatron async_save when saving multiple engines."
-            )
+        publisher_name = async_engines[-1] if async_engines else None
 
         generation, pointer_record = cp.prepare_generation(
             save_root, step_info.global_step, engine_names
@@ -374,7 +368,15 @@ class RecoverHandler:
         recover_info.dump(cp.manifest_dir(generation))
 
         pointer_value = pointer_record.to_json()
-        for name, engine_ in normalized_engine.items():
+        # Finish every other async payload before scheduling the publisher. Its
+        # finalize callback can then expose the generation without waiting for
+        # another engine, while preserving one background save for overlap.
+        save_order = [name for name in engine_names if name != publisher_name]
+        if publisher_name is not None:
+            save_order.append(publisher_name)
+        for name in save_order:
+            engine_ = normalized_engine[name]
+            publishes_generation = name == publisher_name
             self._save_checkpoint(
                 engine_,
                 path=cp.payload_dir(generation, name),
@@ -383,18 +385,22 @@ class RecoverHandler:
                 processor=processor,
                 base_model_path=base_model_path,
                 checkpoint_pointer_path=(
-                    cp.latest_path(save_root) if name in async_engines else None
+                    cp.latest_path(save_root) if publishes_generation else None
                 ),
                 checkpoint_pointer_value=(
-                    pointer_value if name in async_engines else None
+                    pointer_value if publishes_generation else None
+                ),
+                wait_for_async_save=(
+                    name in async_engines and not publishes_generation
                 ),
             )
 
-        if async_engines:
+        if publisher_name is not None:
             logger.info(
-                "Checkpoint generation %s will be published after Megatron "
-                "async finalize completes",
+                "Checkpoint generation %s will be published after engine %s "
+                "finishes Megatron async finalize",
                 generation,
+                publisher_name,
             )
         else:
             cp.publish_latest(save_root, pointer_value)
@@ -530,6 +536,7 @@ class RecoverHandler:
         base_model_path: str | None = None,
         checkpoint_pointer_path: str | None = None,
         checkpoint_pointer_value: str | None = None,
+        wait_for_async_save: bool = False,
     ):
         weight_format = "dcp"
         with_optim = not self.config.no_save_optim
@@ -542,6 +549,7 @@ class RecoverHandler:
             base_model_path=base_model_path,
             checkpoint_pointer_path=checkpoint_pointer_path,
             checkpoint_pointer_value=checkpoint_pointer_value,
+            wait_for_async_save=wait_for_async_save,
         )
         engine.save(meta)
         logger.info(f"Saved recover checkpoint to {path} (with_optim={with_optim})")

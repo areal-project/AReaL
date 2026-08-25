@@ -201,15 +201,16 @@ In single-controller mode, recovery checkpoints are saved as immutable generatio
             └── critic/         # Present when a critic is checkpointed
 ```
 
-The pointer is updated only after every synchronous payload save returns. For Megatron
-asynchronous saves, publication is appended to MCore's finalize callbacks, after
-background I/O finishes. A crash may leave an unpublished generation on disk, but
-recovery continues to use the generation selected by `LATEST`. The previous published
-generation is removed after the pointer switches successfully.
+The pointer is updated only after every payload is durable. When a generation contains
+multiple train engines, `RecoverHandler` drains all but one asynchronous save before
+scheduling the final asynchronous engine. Publication is appended only to that engine's
+MCore finalize callback, so one background save can still overlap training without
+exposing a partially written actor/critic generation. A crash may leave an unpublished
+generation on disk, but recovery continues to use the generation selected by `LATEST`.
+The previous published generation is removed after the pointer switches successfully.
 
 SPMD trainers keep the pre-pointer `recover_info/` and `<engine>/recover_checkpoint/`
-layout for compatibility. Recovery can read both layouts. Asynchronous publication of a
-checkpoint containing multiple train engines is not supported yet.
+layout for compatibility. Recovery can read both layouts.
 
 ### Recovery Process
 

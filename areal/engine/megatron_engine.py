@@ -1067,6 +1067,8 @@ class MegatronEngine(TrainEngine):
                 if finalize_fn is not None:
                     save_kwargs["finalize_fn"] = finalize_fn
                 self.checkpointer.save_checkpoint(meta.path, **save_kwargs)
+                if meta.wait_for_async_save:
+                    self.checkpointer.wait_async_saves()
             else:
                 raise ValueError(f"Unknown weight format {meta.weight_format}. ")
 
