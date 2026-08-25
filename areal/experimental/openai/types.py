@@ -16,6 +16,17 @@ from areal.utils import logging
 logger = logging.getLogger("TokenLogpReward")
 
 
+def ensure_parent_token_prefix(
+    child_input_tokens: list[int], parent_input_tokens: list[int]
+) -> None:
+    """Require a child prompt to preserve the exact parent token sequence."""
+    if child_input_tokens[: len(parent_input_tokens)] != parent_input_tokens:
+        raise ValueError(
+            "Child input token prefix does not match the parent token "
+            "sequence; refusing to reuse parent token data."
+        )
+
+
 class ApiType(str, Enum):
     """API type for interaction."""
 
@@ -149,6 +160,7 @@ class InteractionWithTokenLogpReward:
         self.seq_tokens = seq = resp.input_tokens + resp.output_tokens
         if self.chat_template_type == "concat" and self.parent is not None:
             parent_res = self.parent.to_tensor_dict()
+            parent_input_ids = parent_res["input_ids"].squeeze(0).tolist()
             parent_logprobs = parent_res["logprobs"].squeeze(0).tolist()
             parent_loss_mask = parent_res["loss_mask"].squeeze(0).tolist()
             parent_versions = parent_res["versions"].squeeze(0).tolist()
@@ -163,6 +175,7 @@ class InteractionWithTokenLogpReward:
             valid_parent_turn_ids = [tid for tid in parent_turn_ids if tid >= 0]
             own_turn_id = max(valid_parent_turn_ids) + 1 if valid_parent_turn_ids else 0
             if resp.input_len > parent_len:
+                ensure_parent_token_prefix(resp.input_tokens, parent_input_ids)
                 logprobs = (
                     parent_logprobs
                     + [0.0] * (resp.input_len - parent_len)
