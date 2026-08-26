@@ -1,14 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import asyncio
 import datetime
 import json
 import os
 import re
 import uuid
-from collections.abc import AsyncGenerator, Iterable, Mapping
+from collections.abc import AsyncGenerator, Callable, Iterable, Mapping
 from copy import deepcopy
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal, Protocol, TypeVar, cast, overload
 
+import torch
 from openai import AsyncOpenAI
 from openai._types import NOT_GIVEN, Body, NotGiven
 from openai.resources.chat.completions.completions import (
@@ -146,6 +149,169 @@ def _find_kth(lst: list, target, k: int) -> int:
 
 # Regex for data URI: data:image/<subtype>;base64,<data>
 _DATA_URI_RE = re.compile(r"^data:image/[a-zA-Z0-9.+-]+;base64,(.+)$", re.DOTALL)
+
+# Anything that still carries a scheme after _extract_images_from_messages is a
+# remote reference the inference server would fetch on our behalf.
+_URL_SCHEME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.\-]*://")
+
+
+@dataclass
+class _VisionPrompt:
+    """Processor output for a single request.
+
+    ``input_ids`` are vision-expanded (one entry per image-pad token), which is
+    what the training side must see. ``mm_token_type_ids`` is prompt-scoped and
+    ``multi_modal_input`` holds one dict for the whole sequence, matching the
+    convention used by the non-agent vision workflows.
+    """
+
+    input_ids: list[int]
+    mm_token_type_ids: list[int] | None
+    multi_modal_input: list[dict[str, Any]]
+
+
+def _require_processor(processor: Any) -> None:
+    """Fail loudly when images arrive without a processor to expand them."""
+    if processor is None:
+        raise ValueError(
+            "Received image content but no processor is configured on this "
+            "client. Without a processor the recorded prompt tokens would not "
+            "match what the inference engine ran, and the exported trajectory "
+            "would carry no pixel_values, silently corrupting VLM training. "
+            "Pass processor=... to ArealOpenAI; the proxy server loads it from "
+            "the configured tokenizer_path automatically for VLMs."
+        )
+
+
+_VISION_PAD_TOKENS = ("<|image_pad|>", "<|video_pad|>")
+
+
+def vision_pad_token_ids(tokenizer: Any) -> frozenset[int]:
+    """Reserved vision-placeholder ids, which must never appear in generated text.
+
+    A prompt's pad-token count is fixed by the processor from the supplied
+    images, and both the processor re-render and the VLM forward count those
+    positions. A sampled pad token adds a position no image tensor describes,
+    so it breaks the embedding merge in training and on the next turn.
+    """
+    ids = set()
+    for token in _VISION_PAD_TOKENS:
+        try:
+            token_id = tokenizer.convert_tokens_to_ids(token)
+            # Unknown tokens come back as None or the unk id, so round-trip.
+            if token_id is None or tokenizer.convert_ids_to_tokens(token_id) != token:
+                continue
+        except Exception:
+            continue
+        ids.add(token_id)
+    return frozenset(ids)
+
+
+def drop_vision_pad_tokens(response: Any, pad_ids: frozenset[int]) -> None:
+    """Strip sampled vision-pad tokens from a response, in place.
+
+    Tokens, logprobs and versions are filtered together so they stay index
+    aligned; callers decode the text from the filtered tokens afterwards.
+    """
+    if not pad_ids or not response.output_tokens:
+        return
+    keep = [i for i, tok in enumerate(response.output_tokens) if tok not in pad_ids]
+    n_dropped = len(response.output_tokens) - len(keep)
+    if not n_dropped:
+        return
+    response.output_tokens = [response.output_tokens[i] for i in keep]
+    for attr in ("output_logprobs", "output_versions"):
+        seq = getattr(response, attr, None)
+        if seq is not None and len(seq) == n_dropped + len(keep):
+            setattr(response, attr, [seq[i] for i in keep])
+    logger.warning(
+        f"Dropped {n_dropped} generated vision-pad token(s) from the response. "
+        "The model is sampling reserved image/video placeholders, which would "
+        "desync the placeholder count from the supplied images."
+    )
+
+
+def _decode_images_for_processor(image_data: list[str]) -> list[Any]:
+    """Decode base64 image payloads, rejecting remote URLs.
+
+    A processor needs the actual bytes. Fetching remote URLs here would add an
+    SSRF surface to the proxy for no benefit, so URLs are refused explicitly.
+    """
+    from areal.utils.image import base642image
+
+    for item in image_data:
+        if _URL_SCHEME_RE.match(item):
+            raise ValueError(
+                "Remote image URLs are not supported for VLM training because "
+                "the processor needs the image bytes to build pixel_values. "
+                "Inline the image as a data URI "
+                "(data:image/png;base64,...) instead. Got: "
+                f"{item[:64]}..."
+            )
+    return base642image(image_data)
+
+
+def _process_vision_prompt(
+    processor: Any,
+    text: str,
+    image_data: list[str],
+) -> _VisionPrompt:
+    """Run the processor over a rendered prompt to get expanded ids and pixels."""
+    images = _decode_images_for_processor(image_data)
+    processor_callable = cast(Callable[..., dict[str, Any]], processor)
+    processed = processor_callable(
+        images=images,
+        text=[text],
+        padding=False,
+        return_tensors="pt",
+    )
+
+    input_ids_tensor = processed.get("input_ids")
+    if not torch.is_tensor(input_ids_tensor) or input_ids_tensor.ndim != 2:
+        raise ValueError("The VLM processor must return 2D input_ids.")
+    if input_ids_tensor.shape[0] != 1:
+        raise ValueError(
+            "AReaL agent rollout expects one processed prompt per interaction, "
+            f"got batch size {input_ids_tensor.shape[0]}."
+        )
+    input_ids: list[int] = input_ids_tensor[0].tolist()
+
+    token_type_ids = processed.get("mm_token_type_ids")
+    if token_type_ids is None:
+        token_type_ids = processed.get("token_type_ids")
+    if token_type_ids is None:
+        mm_token_type_ids = [0] * len(input_ids)
+    else:
+        if not torch.is_tensor(token_type_ids) or token_type_ids.ndim != 2:
+            raise ValueError("The VLM processor token type IDs must be 2D.")
+        if token_type_ids.shape[0] != 1:
+            raise ValueError(
+                "AReaL agent rollout expects one token-type row per interaction, "
+                f"got batch size {token_type_ids.shape[0]}."
+            )
+        mm_token_type_ids = token_type_ids[0].tolist()
+        if len(mm_token_type_ids) != len(input_ids):
+            raise ValueError(
+                "The VLM processor returned token type IDs that do not align "
+                f"with input_ids: {len(mm_token_type_ids)} != {len(input_ids)}."
+            )
+
+    pixel_values = processed.get("pixel_values")
+    if not torch.is_tensor(pixel_values):
+        raise ValueError(
+            "The VLM processor did not return pixel_values for an image prompt."
+        )
+    multi_modal_input: dict[str, Any] = {"pixel_values": pixel_values.detach().cpu()}
+    for key in ("image_grid_thw", "video_grid_thw"):
+        value = processed.get(key)
+        if torch.is_tensor(value):
+            multi_modal_input[key] = value.detach().cpu()
+
+    return _VisionPrompt(
+        input_ids=input_ids,
+        mm_token_type_ids=mm_token_type_ids,
+        multi_modal_input=[multi_modal_input],
+    )
 
 
 def _postprocess_tool_call_arguments_for_template(
@@ -449,6 +615,22 @@ def concat_prompt_token_ids_with_parent(
             else extra_body.get("chat_template_kwargs", {})
         ),
     )
+    prompt_token_ids, _ = _splice_with_parent_tokens(
+        all_tokens, parent_tokens, eos_token_id
+    )
+    return prompt_token_ids
+
+
+def _splice_with_parent_tokens(
+    all_tokens: list[int],
+    parent_tokens: list[int],
+    eos_token_id: int,
+) -> tuple[list[int], int]:
+    """Graft the newly rendered tail onto the parent's actual tokens.
+
+    Returns the spliced prompt and the index in ``all_tokens`` where the child's
+    own tokens begin.
+    """
     parent_eos_num = parent_tokens.count(eos_token_id)
     if parent_eos_num > 0:
         child_tokens_truncate_idx = _find_kth(all_tokens, eos_token_id, parent_eos_num)
@@ -464,8 +646,94 @@ def concat_prompt_token_ids_with_parent(
     else:
         child_tokens_truncate_idx = -1
 
-    prompt_token_ids = parent_tokens + all_tokens[child_tokens_truncate_idx + 1 :]
-    return prompt_token_ids
+    child_start = child_tokens_truncate_idx + 1
+    return parent_tokens + all_tokens[child_start:], child_start
+
+
+def concat_vision_prompt_with_parent(
+    message_list: list[dict],
+    parent: InteractionWithTokenLogpReward | None,
+    tokenizer: "PreTrainedTokenizerFast",
+    processor: Any,
+    tools: Iterable[ChatCompletionToolParam] | None = None,
+    extra_body: Body = {},
+    chat_template_kwargs: Mapping[str, Any] | None = None,
+) -> _VisionPrompt:
+    """Vision-aware counterpart of :func:`concat_prompt_token_ids_with_parent`.
+
+    The whole conversation (parent context plus the new turn) is rendered and
+    processed together so that ``pixel_values`` cover every image the spliced
+    prompt references, then the parent's real tokens are grafted back on. Image
+    expansion inserts image-pad tokens rather than EOS tokens, so the EOS-based
+    alignment used by the text path stays valid.
+    """
+    parent_tokens: list[int] = []
+    parent_mm_token_type_ids: list[int] = []
+    all_message_list: list[dict] = []
+    eos_token_id = tokenizer.eos_token_id
+
+    if parent is not None:
+        if parent.model_response is None:
+            raise ValueError("Parent interaction has no model_response.")
+        parent_tokens = (
+            parent.model_response.input_tokens
+            + parent.model_response.output_tokens_without_stop
+        )
+        all_message_list += parent.messages if parent.messages is not None else []
+        all_message_list += (
+            parent.output_message_list if parent.output_message_list is not None else []
+        )
+        # Mirrors the text path: realign with the chat template by appending the
+        # EOS the parent may not have emitted.
+        parent_tokens += [eos_token_id]
+        # Generated tokens and the alignment EOS are never multimodal, so the
+        # parent's prompt-scoped ids only need zero-extending.
+        parent_mm_token_type_ids = list(parent.mm_token_type_ids or [])
+        parent_mm_token_type_ids += [0] * (
+            len(parent_tokens) - len(parent_mm_token_type_ids)
+        )
+        parent_mm_token_type_ids = parent_mm_token_type_ids[: len(parent_tokens)]
+
+    all_message_list += message_list
+
+    # Parent messages are stored raw (image_url parts intact), so normalise the
+    # assembled list here rather than relying on the caller. Extracting from the
+    # exact list being rendered also guarantees the image order matches the
+    # placeholders the template emits.
+    all_image_data, all_message_list, _ = _extract_images_from_messages(
+        all_message_list
+    )
+    all_message_list = _postprocess_tool_call_arguments_for_template(all_message_list)
+
+    text = apply_chat_template(
+        tokenizer,
+        all_message_list,
+        tools=tools,
+        add_generation_prompt=True,
+        tokenize=False,
+        **(
+            dict(chat_template_kwargs)
+            if chat_template_kwargs is not None
+            else extra_body.get("chat_template_kwargs", {})
+        ),
+    )
+    processed = _process_vision_prompt(processor, text, all_image_data)
+
+    prompt_token_ids, child_start = _splice_with_parent_tokens(
+        processed.input_ids, parent_tokens, eos_token_id
+    )
+
+    mm_token_type_ids = None
+    if processed.mm_token_type_ids is not None:
+        mm_token_type_ids = (
+            parent_mm_token_type_ids + processed.mm_token_type_ids[child_start:]
+        )
+
+    return _VisionPrompt(
+        input_ids=prompt_token_ids,
+        mm_token_type_ids=mm_token_type_ids,
+        multi_modal_input=processed.multi_modal_input,
+    )
 
 
 class AsyncCompletionsWithReward(BaseAsyncCompletions):
@@ -487,6 +755,7 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
         chat_template_type: str = "hf",
         chat_template_kwargs: Mapping[str, Any] | None = None,
         lora_name: str = "",
+        processor: Any | None = None,
     ):
         super().__init__(client)
         self.engine = engine
@@ -498,6 +767,8 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
         self.chat_template_type = chat_template_type
         self.chat_template_kwargs = dict(chat_template_kwargs or {})
         self.lora_name = lora_name
+        self.processor = processor
+        self.vision_pad_ids = vision_pad_token_ids(tokenizer)
 
     def _build_chat_completion(
         self,
@@ -673,15 +944,34 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
         tokenizer_messages = _postprocess_tool_call_arguments_for_template(
             tokenizer_messages
         )
+        vision_prompt: _VisionPrompt | None = None
+        if has_images:
+            _require_processor(self.processor)
         if self.chat_template_type == "hf":
-            prompt_token_ids = apply_chat_template(
-                self.tokenizer,
-                tokenizer_messages,
-                tools=tools_list,
-                add_generation_prompt=True,
-                tokenize=True,
-                **chat_template_kwargs,
-            )
+            if has_images:
+                vision_prompt = await asyncio.to_thread(
+                    _process_vision_prompt,
+                    self.processor,
+                    apply_chat_template(
+                        self.tokenizer,
+                        tokenizer_messages,
+                        tools=tools_list,
+                        add_generation_prompt=True,
+                        tokenize=False,
+                        **chat_template_kwargs,
+                    ),
+                    image_data,
+                )
+                prompt_token_ids = vision_prompt.input_ids
+            else:
+                prompt_token_ids = apply_chat_template(
+                    self.tokenizer,
+                    tokenizer_messages,
+                    tools=tools_list,
+                    add_generation_prompt=True,
+                    tokenize=True,
+                    **chat_template_kwargs,
+                )
         elif self.chat_template_type == "concat":
             concat_messages = (
                 interaction.remaining_messages
@@ -689,26 +979,37 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
                 else messages_list
             )
             if has_images:
-                _, concat_tok_messages, _ = _extract_images_from_messages(
+                vision_prompt = await asyncio.to_thread(
+                    concat_vision_prompt_with_parent,
+                    concat_messages,
+                    interaction.parent if interaction is not None else None,
+                    self.tokenizer,
+                    self.processor,
+                    tools=tools_list,
+                    extra_body=extra_body,
+                    chat_template_kwargs=chat_template_kwargs,
+                )
+                prompt_token_ids = vision_prompt.input_ids
+            else:
+                concat_tok_messages = _postprocess_tool_call_arguments_for_template(
                     concat_messages
                 )
-            else:
-                concat_tok_messages = concat_messages
-            concat_tok_messages = _postprocess_tool_call_arguments_for_template(
-                concat_tok_messages
-            )
-            prompt_token_ids = concat_prompt_token_ids_with_parent(
-                concat_tok_messages,
-                interaction.parent if interaction is not None else None,
-                self.tokenizer,
-                tools=tools_list,
-                extra_body=extra_body,
-                chat_template_kwargs=chat_template_kwargs,
-            )
+                prompt_token_ids = concat_prompt_token_ids_with_parent(
+                    concat_tok_messages,
+                    interaction.parent if interaction is not None else None,
+                    self.tokenizer,
+                    tools=tools_list,
+                    extra_body=extra_body,
+                    chat_template_kwargs=chat_template_kwargs,
+                )
         else:
             raise RuntimeError(
                 f"Unsupported chat_template_type {self.chat_template_type}"
             )
+
+        if interaction is not None and vision_prompt is not None:
+            interaction.mm_token_type_ids = vision_prompt.mm_token_type_ids
+            interaction.multi_modal_input = vision_prompt.multi_modal_input
 
         temp = 1.0 if is_omitted(temperature) else (temperature or 0.0)
         if not is_omitted(max_tokens):
@@ -816,6 +1117,7 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
 
         # Call inference engine
         response = await self.engine.agenerate(model_request)
+        drop_vision_pad_tokens(response, self.vision_pad_ids)
         output_text = self.tokenizer.decode(response.output_tokens_without_stop)
 
         # Parse tool calls.
@@ -1002,6 +1304,7 @@ class AsyncResponsesWithReward(BaseAsyncResponses):
         chat_template_type: str = "hf",
         chat_template_kwargs: Mapping[str, Any] | None = None,
         lora_name: str = "",
+        processor: Any | None = None,
     ):
         super().__init__(client)
         self.engine = engine
@@ -1013,6 +1316,8 @@ class AsyncResponsesWithReward(BaseAsyncResponses):
         self.chat_template_type = chat_template_type
         self.chat_template_kwargs = dict(chat_template_kwargs or {})
         self.lora_name = lora_name
+        self.processor = processor
+        self.vision_pad_ids = vision_pad_token_ids(tokenizer)
 
     async def create(
         self,
@@ -1100,33 +1405,65 @@ class AsyncResponsesWithReward(BaseAsyncResponses):
         tokenizer_messages = _postprocess_tool_call_arguments_for_template(
             tokenizer_messages
         )
+        vision_prompt: _VisionPrompt | None = None
+        if has_images:
+            _require_processor(self.processor)
         if self.chat_template_type == "hf":
-            prompt_token_ids = apply_chat_template(
-                self.tokenizer,
-                tokenizer_messages,
-                tools=tools_list,
-                add_generation_prompt=True,
-                tokenize=True,
-                **chat_template_kwargs,
-            )
+            if has_images:
+                vision_prompt = await asyncio.to_thread(
+                    _process_vision_prompt,
+                    self.processor,
+                    apply_chat_template(
+                        self.tokenizer,
+                        tokenizer_messages,
+                        tools=tools_list,
+                        add_generation_prompt=True,
+                        tokenize=False,
+                        **chat_template_kwargs,
+                    ),
+                    image_data,
+                )
+                prompt_token_ids = vision_prompt.input_ids
+            else:
+                prompt_token_ids = apply_chat_template(
+                    self.tokenizer,
+                    tokenizer_messages,
+                    tools=tools_list,
+                    add_generation_prompt=True,
+                    tokenize=True,
+                    **chat_template_kwargs,
+                )
         elif self.chat_template_type == "concat":
             remaining = interaction.remaining_messages
             if has_images:
-                _, remaining_tok, _ = _extract_images_from_messages(remaining)
+                vision_prompt = await asyncio.to_thread(
+                    concat_vision_prompt_with_parent,
+                    remaining,
+                    interaction.parent if interaction is not None else None,
+                    self.tokenizer,
+                    self.processor,
+                    tools=tools_list,
+                    extra_body=extra_body,
+                    chat_template_kwargs=chat_template_kwargs,
+                )
+                prompt_token_ids = vision_prompt.input_ids
             else:
-                remaining_tok = remaining
-            prompt_token_ids = concat_prompt_token_ids_with_parent(
-                remaining_tok,
-                interaction.parent if interaction is not None else None,
-                self.tokenizer,
-                tools=tools_list,
-                extra_body=extra_body,
-                chat_template_kwargs=chat_template_kwargs,
-            )
+                prompt_token_ids = concat_prompt_token_ids_with_parent(
+                    remaining,
+                    interaction.parent if interaction is not None else None,
+                    self.tokenizer,
+                    tools=tools_list,
+                    extra_body=extra_body,
+                    chat_template_kwargs=chat_template_kwargs,
+                )
         else:
             raise RuntimeError(
                 f"Unsupported chat_template_type {self.chat_template_type}"
             )
+
+        if interaction is not None and vision_prompt is not None:
+            interaction.mm_token_type_ids = vision_prompt.mm_token_type_ids
+            interaction.multi_modal_input = vision_prompt.multi_modal_input
 
         # Map sampling params
         temp = 1.0 if is_omitted(temperature) else (temperature or 0.0)
@@ -1193,6 +1530,7 @@ class AsyncResponsesWithReward(BaseAsyncResponses):
 
         # Call inference engine
         engine_resp = await self.engine.agenerate(model_request)
+        drop_vision_pad_tokens(engine_resp, self.vision_pad_ids)
         output_text = self.tokenizer.decode(engine_resp.output_tokens_without_stop)
 
         # Parse tool calls.
@@ -1321,6 +1659,7 @@ class ArealOpenAI(AsyncOpenAI):
         chat_template_type: str = "hf",
         chat_template_kwargs: Mapping[str, Any] | None = None,
         lora_name: str = "",
+        processor: Any | None = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -1329,6 +1668,7 @@ class ArealOpenAI(AsyncOpenAI):
         self.tool_call_parser = tool_call_parser
         self.reasoning_parser = reasoning_parser
         self.lora_name = lora_name
+        self.processor = processor
 
         # Use an ordered dict to maintain insertion order of completions/responses
         self._cache: InteractionCache = InteractionCache()
@@ -1345,6 +1685,7 @@ class ArealOpenAI(AsyncOpenAI):
             chat_template_type=chat_template_type,
             chat_template_kwargs=chat_template_kwargs,
             lora_name=lora_name,
+            processor=processor,
         )
 
         # Override chat.completions with our extended implementation
@@ -1359,6 +1700,7 @@ class ArealOpenAI(AsyncOpenAI):
             chat_template_type=chat_template_type,
             chat_template_kwargs=chat_template_kwargs,
             lora_name=lora_name,
+            processor=processor,
         )
 
     def get_interaction(self, id: str) -> InteractionWithTokenLogpReward | None:

@@ -93,6 +93,47 @@ def load_hf_processor_and_tokenizer(
     return processor, tokenizer
 
 
+def _is_multimodal_processor(obj: Any) -> bool:
+    """Whether ``obj`` is a real processor rather than a bare tokenizer."""
+    if obj is None or not hasattr(obj, "tokenizer"):
+        return False
+    return any(
+        hasattr(obj, attr)
+        for attr in ("image_processor", "video_processor", "image_token")
+    )
+
+
+@lru_cache(maxsize=8)
+def load_hf_processor(
+    model_name_or_path: str,
+) -> transformers.ProcessorMixin | None:
+    """Load a processor from Hugging Face, returning ``None`` for text-only models.
+
+    Unlike :func:`load_hf_processor_and_tokenizer` this never forces a re-download,
+    so it is safe to call from short-lived worker processes.
+    """
+    try:
+        processor = transformers.AutoProcessor.from_pretrained(
+            model_name_or_path,
+            trust_remote_code=True,
+            use_fast=True,
+        )
+    except Exception as e:
+        logger.info(
+            f"No processor available for {model_name_or_path} ({e}). "
+            "Treating the model as text-only."
+        )
+        return None
+    if not _is_multimodal_processor(processor):
+        logger.info(
+            f"AutoProcessor returned {type(processor).__name__} for "
+            f"{model_name_or_path}, which cannot process media. "
+            "Treating the model as text-only."
+        )
+        return None
+    return processor
+
+
 def download_from_huggingface(
     repo_id: str, filename: str, revision: str = "main", repo_type: str = "dataset"
 ) -> str:

@@ -37,7 +37,7 @@ from areal.infra.rpc.serialization import deserialize_value, serialize_value
 from areal.infra.utils.http import validate_admin_api_key
 from areal.utils import name_resolve, names, seeding
 from areal.utils.dynamic_import import import_from_string
-from areal.utils.hf_utils import load_hf_tokenizer
+from areal.utils.hf_utils import load_hf_processor, load_hf_tokenizer
 from areal.utils.logging import getLogger
 from areal.utils.network import find_free_ports, gethostip
 
@@ -290,6 +290,10 @@ def _setup_openai_client():
     if agent_cfg.keep_all_reasoning and not supports_preserve_thinking:
         for patch_name in apply_keep_all_reasoning_patches(tokenizer):
             logger.info("Applied chat template patch: %s", patch_name)
+    # VLM agents need the processor to expand image placeholders and to build
+    # the pixel_values carried in exported trajectories. Text-only models get
+    # None here and take the tokenizer-only path unchanged.
+    processor = load_hf_processor(config.tokenizer_path)
     _openai_client = ArealOpenAI(
         engine=_engine,
         tokenizer=tokenizer,
@@ -299,6 +303,7 @@ def _setup_openai_client():
         chat_template_type=agent_cfg.chat_template_type,
         chat_template_kwargs=chat_template_kwargs,
         lora_name=config.lora_name,
+        processor=processor,
     )
     # Set session timeout from config
     _session_timeout_seconds = agent_cfg.session_timeout_seconds

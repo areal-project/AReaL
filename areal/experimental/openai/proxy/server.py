@@ -126,20 +126,93 @@ class SessionData:
 # =============================================================================
 
 
+# Envelope marker for the blob-deduplicated payload shape.
+_MM_BLOB_FORMAT = "mm-blobs-v1"
+_BLOB_REF_KEY = "__mm_blob__"
+
+
+def _blob_key(tensor: Any) -> str:
+    """Content-address a tensor so identical vision payloads are sent once."""
+    import hashlib
+
+    import torch
+
+    cpu_tensor = tensor.detach().cpu().contiguous()
+    if cpu_tensor.dtype is torch.bfloat16:
+        cpu_tensor = cpu_tensor.to(torch.float32)
+    digest = hashlib.blake2b(digest_size=16)
+    digest.update(str(tuple(tensor.shape)).encode())
+    digest.update(str(tensor.dtype).encode())
+    digest.update(cpu_tensor.numpy().tobytes())
+    return digest.hexdigest()
+
+
+def _dedup_multi_modal(
+    multi_modal_input: list[dict[str, Any]],
+    blobs: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Replace vision tensors with references into a shared blob table.
+
+    Multi-turn agents re-process the same images on every turn, so an episode
+    exported in ``individual`` style would otherwise ship one full copy of
+    ``pixel_values`` per interaction.
+    """
+    import torch
+
+    deduped = []
+    for entry in multi_modal_input:
+        ref_entry: dict[str, Any] = {}
+        for key, value in entry.items():
+            if isinstance(value, torch.Tensor):
+                blob_key = _blob_key(value)
+                blobs.setdefault(blob_key, value)
+                ref_entry[key] = {_BLOB_REF_KEY: blob_key}
+            else:
+                ref_entry[key] = value
+        deduped.append(ref_entry)
+    return deduped
+
+
+def _resolve_blob_refs(value: Any, blobs: dict[str, Any]) -> Any:
+    """Substitute blob references back with their tensors."""
+    if isinstance(value, dict):
+        if len(value) == 1 and _BLOB_REF_KEY in value:
+            blob_key = value[_BLOB_REF_KEY]
+            if blob_key not in blobs:
+                raise KeyError(
+                    f"Vision blob {blob_key} missing from the exported payload."
+                )
+            return blobs[blob_key]
+        return {k: _resolve_blob_refs(v, blobs) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_resolve_blob_refs(v, blobs) for v in value]
+    return value
+
+
 def serialize_interactions(
     interactions: dict[str, InteractionWithTokenLogpReward],
 ) -> dict[str, Any]:
     """Serialize interactions into a json-compatible format for HTTP transport."""
     from areal.infra.rpc.serialization import serialize_value
 
+    blobs: dict[str, Any] = {}
     result = {}
     for key, interaction in interactions.items():
         if interaction.has_tensor_data:
-            result[key] = {
-                "tensor_dict": interaction.to_tensor_dict(),
+            # Copy so popping the vision payload leaves the interaction's own
+            # cached tensor dict intact.
+            tensor_dict = dict(interaction.to_tensor_dict())
+            multi_modal_input = tensor_dict.pop("multi_modal_input", None)
+            entry: dict[str, Any] = {
+                "tensor_dict": tensor_dict,
                 "reward": interaction.reward,
                 "interaction_id": interaction.interaction_id,
             }
+            if multi_modal_input is not None:
+                entry["multi_modal_input"] = _dedup_multi_modal(
+                    multi_modal_input, blobs
+                )
+            result[key] = entry
         else:
             result[key] = {
                 "messages": interaction.messages,
@@ -147,7 +220,9 @@ def serialize_interactions(
                 "reward": interaction.reward,
                 "interaction_id": interaction.interaction_id,
             }
-    return serialize_value(result)
+    return serialize_value(
+        {"__format__": _MM_BLOB_FORMAT, "interactions": result, "blobs": blobs}
+    )
 
 
 def deserialize_interactions(
@@ -158,11 +233,23 @@ def deserialize_interactions(
     from areal.infra.rpc.serialization import deserialize_value
 
     data = deserialize_value(data)
+
+    blobs: dict[str, Any] = {}
+    if isinstance(data, dict) and data.get("__format__") == _MM_BLOB_FORMAT:
+        blobs = data.get("blobs") or {}
+        data = data.get("interactions") or {}
+
     result = {}
     for key, item in data.items():
         interaction = InteractionWithTokenLogpReward()
         if "tensor_dict" in item:
-            interaction._cache = item["tensor_dict"]
+            tensor_dict = dict(item["tensor_dict"])
+            multi_modal_input = item.get("multi_modal_input")
+            if multi_modal_input is not None:
+                tensor_dict["multi_modal_input"] = _resolve_blob_refs(
+                    multi_modal_input, blobs
+                )
+            interaction._cache = tensor_dict
         else:
             interaction.messages = item["messages"]
             interaction.output_message_list = item["output_message_list"]

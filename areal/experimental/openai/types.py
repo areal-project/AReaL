@@ -4,6 +4,7 @@ from __future__ import annotations  # noqa
 
 from dataclasses import dataclass, field
 from enum import Enum
+from typing import Any
 
 import torch
 from openai.types.chat import ChatCompletion
@@ -32,6 +33,29 @@ class InputName(str, Enum):
     NONE = "none"
 
 
+def _align_mm_token_type_ids(
+    prompt_mm_token_type_ids: list[int],
+    resp: ModelResponse,
+    seq_len: int,
+) -> list[int]:
+    """Extend prompt-scoped ``mm_token_type_ids`` over the full sequence.
+
+    Output tokens are never multimodal, so they are zero-filled. The prompt
+    portion is expected to line up with ``resp.input_len``; a mismatch means the
+    prompt was built without the processor, so the values are padded/truncated
+    and a warning is emitted rather than producing a shape error downstream.
+    """
+    mm = list(prompt_mm_token_type_ids)
+    if len(mm) != resp.input_len:
+        logger.warning(
+            f"mm_token_type_ids length ({len(mm)}) does not match the prompt "
+            f"length ({resp.input_len}). Padding/truncating to match; vision "
+            "position ids may be wrong for this sample."
+        )
+        mm = (mm + [0] * resp.input_len)[: resp.input_len]
+    return mm + [0] * (seq_len - resp.input_len)
+
+
 @dataclass
 class InteractionWithTokenLogpReward:
     """Internal structure to store completions/responses with their rewards."""
@@ -43,6 +67,13 @@ class InteractionWithTokenLogpReward:
     chat_template_type: str = "hf"
     trajectory_metadata: dict[str, str] = field(default_factory=dict)
     _cache: dict[str, torch.Tensor] | None = None
+
+    # Vision payload for VLM training. ``mm_token_type_ids`` covers the prompt
+    # only (it is extended with zeros over the output at tensor-dict time);
+    # ``multi_modal_input`` holds a single dict for the whole sequence, matching
+    # the convention of the non-agent vision workflows.
+    mm_token_type_ids: list[int] | None = None
+    multi_modal_input: list[dict[str, Any]] | None = None
 
     # Fields used for parent-child relationship resolving
     messages: list[dict] = field(default_factory=list)
@@ -203,6 +234,13 @@ class InteractionWithTokenLogpReward:
             # reward
             rewards=torch.tensor([float(reward)]),
         )
+        if self.multi_modal_input is not None:
+            result["multi_modal_input"] = self.multi_modal_input
+        if self.mm_token_type_ids is not None:
+            result["mm_token_type_ids"] = torch.tensor(
+                _align_mm_token_type_ids(self.mm_token_type_ids, resp, len(seq)),
+                dtype=torch.long,
+            ).unsqueeze(0)
         self._cache = result
         return result
 

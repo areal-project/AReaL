@@ -49,6 +49,7 @@ from areal.infra.rpc.serialization import serialize_value
 from areal.infra.utils.http import create_httpx_client
 from areal.utils import logging
 from areal.utils.data import concat_padded_tensors
+from areal.utils.hf_utils import load_hf_processor
 
 logger = logging.getLogger("InferenceDataProxy")
 
@@ -208,6 +209,9 @@ def _create_areal_client(
         reasoning_parser=config.reasoning_parser,
         engine_max_tokens=config.engine_max_tokens,
         chat_template_type=config.chat_template_type,
+        processor=(
+            load_hf_processor(config.tokenizer_path) if config.tokenizer_path else None
+        ),
     )
 
 

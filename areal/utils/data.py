@@ -238,6 +238,62 @@ def _pad_cat_dim0(tensors: list[torch.Tensor], pad_value: float = 0.0) -> torch.
     return torch.cat(padded_tensors, dim=0)
 
 
+#: Optional per-row vision keys. Rows without them are treated as text-only
+#: rather than as a batching error.
+VISION_PAYLOAD_KEYS = ("multi_modal_input", "mm_token_type_ids")
+
+
+def normalize_vision_keys(
+    tensor_dicts: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Give every row the same vision keys so a mixed batch can be stacked.
+
+    A batch may legitimately mix trajectories with and without images — some
+    tasks carry a screenshot, others are text-only, and a multi-turn agent may
+    attach an image partway through an episode. Rows that lack the vision keys
+    get empty placeholders: an empty ``multi_modal_input`` entry per sequence
+    (which the engines skip when gathering ``pixel_values``) and all-zero
+    ``mm_token_type_ids`` (no token is multimodal).
+
+    Returns the input unchanged when every row already agrees, so the common
+    homogeneous case costs nothing.
+    """
+    if not tensor_dicts:
+        return tensor_dicts
+
+    needs_fill = {
+        key
+        for key in VISION_PAYLOAD_KEYS
+        if any(key in td for td in tensor_dicts)
+        and not all(key in td for td in tensor_dicts)
+    }
+    if not needs_fill:
+        return tensor_dicts
+
+    normalized = []
+    for tensor_dict in tensor_dicts:
+        if not needs_fill - set(tensor_dict):
+            normalized.append(tensor_dict)
+            continue
+        tensor_dict = dict(tensor_dict)
+        if "multi_modal_input" in needs_fill:
+            tensor_dict.setdefault(
+                "multi_modal_input", [{} for _ in range(get_batch_size(tensor_dict))]
+            )
+        if "mm_token_type_ids" in needs_fill and "mm_token_type_ids" not in tensor_dict:
+            reference = tensor_dict.get("input_ids", tensor_dict.get("attention_mask"))
+            if reference is None or reference.ndim != 2:
+                raise ValueError(
+                    "Cannot synthesize mm_token_type_ids for a text-only row "
+                    "without a 2D input_ids or attention_mask to size it from."
+                )
+            tensor_dict["mm_token_type_ids"] = torch.zeros_like(
+                reference, dtype=torch.long
+            )
+        normalized.append(tensor_dict)
+    return normalized
+
+
 def concat_padded_tensors(
     tensor_dicts: list[dict[str, Any]], pad_value: float = 0.0
 ) -> dict[str, Any]:
@@ -259,6 +315,8 @@ def concat_padded_tensors(
         return {}
     if len(tensor_dicts) == 1:
         return dict(tensor_dicts[0])
+
+    tensor_dicts = normalize_vision_keys(tensor_dicts)
 
     # Validate key consistency
     first_keys = set(tensor_dicts[0].keys())
