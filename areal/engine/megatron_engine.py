@@ -63,7 +63,6 @@ from areal.engine.core.model import (
     disable_dropout_in_model,
     is_valid_vision_model,
     lang_config,
-    requires_padded_seq,
     resolve_sequence_packing_mode,
 )
 from areal.engine.megatron_utils import megatron_bridge_patches  # noqa: F401
@@ -227,50 +226,6 @@ def _map_chunked_lm_head_output(
     fn: Callable[[torch.Tensor], torch.Tensor],
 ) -> ChunkedLMHeadOutput:
     return ChunkedLMHeadOutput(*(fn(tensor) for tensor in output))
-
-
-def _padded_lm_head_labels(
-    input_ids: torch.Tensor,
-    cu_seqlens: torch.Tensor,
-    max_seqlen: int,
-) -> torch.Tensor:
-    """Build next-token labels matching Megatron's padded ``[S, B, H]`` layout."""
-    if input_ids.ndim != 1:
-        raise ValueError(
-            "padded LM Head expects packed 1D input_ids before BSHD reconstruction, "
-            f"got shape {tuple(input_ids.shape)}"
-        )
-    seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
-    mask = (
-        torch.arange(max_seqlen, device=input_ids.device)[None, :] < seq_lens[:, None]
-    )
-    padded_ids = torch.zeros(
-        (seq_lens.numel(), max_seqlen),
-        dtype=input_ids.dtype,
-        device=input_ids.device,
-    )
-    padded_ids[mask] = input_ids
-    return torch.roll(padded_ids, shifts=-1, dims=-1).transpose(0, 1).contiguous()
-
-
-def _repack_padded_lm_head_output(
-    tensor: torch.Tensor,
-    cu_seqlens: torch.Tensor,
-    max_seqlen: int,
-) -> torch.Tensor:
-    """Restore flattened padded LM Head values to packed sequence order."""
-    seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
-    batch_size = seq_lens.numel()
-    expected_tokens = batch_size * max_seqlen
-    if tensor.shape[0] != expected_tokens:
-        raise ValueError(
-            "padded LM Head output does not match the BSHD token layout: "
-            f"got shape {tuple(tensor.shape)}, expected first dimension "
-            f"{batch_size} * {max_seqlen} = {expected_tokens}"
-        )
-    mask = torch.arange(max_seqlen, device=tensor.device)[None, :] < seq_lens[:, None]
-    padded = tensor.reshape(max_seqlen, batch_size, *tensor.shape[1:])
-    return padded.transpose(0, 1)[mask]
 
 
 def _mbridge_precision_args(
@@ -509,10 +464,6 @@ class MegatronEngine(TrainEngine):
             self.use_model_packed_seq = (
                 self.sequence_packing_mode == SequencePackingMode.MODEL_THD
             )
-            # ``PADDED`` is the input-routing fallback for every VLM without a
-            # model-owned THD contract. ``use_padded_seq`` is narrower: it
-            # enables Qwen3.5/GDN-specific dense-mask and LM-head semantics.
-            self.use_padded_seq = requires_padded_seq(self.hf_config.model_type)
             if self.is_vision_model:
                 if self.parallel_strategy.context_parallel_size > 1:
                     raise NotImplementedError(
@@ -526,15 +477,6 @@ class MegatronEngine(TrainEngine):
                 self.logger.info(
                     f"VLM model detected (type={self.hf_config.model_type}). "
                     f"Loaded processor and tokenizer."
-                )
-
-            if self.use_padded_seq and self.parallel_strategy.context_parallel_size > 1:
-                raise NotImplementedError(
-                    f"Context parallel (CP > 1) is not supported for "
-                    f"model_type={self.hf_config.model_type!r}, which requires the "
-                    "padded BSHD forward (it operates on [B, S] tensors while the "
-                    "CP path packs sequences). "
-                    f"Got context_parallel_size={self.parallel_strategy.context_parallel_size}."
                 )
 
             self.quantization_config = getattr(
@@ -1168,15 +1110,9 @@ class MegatronEngine(TrainEngine):
                 and not self.enable_tree_training
                 and is_pipeline_last_stage
             )
-            has_vision_inputs = any(
-                _is_multi_modal_payload_key(key) for key in mb_input.padded_mb
-            )
-            if use_chunked_lm_head and (
-                has_vision_inputs or (self.is_vision_model and not self.use_padded_seq)
-            ):
+            if use_chunked_lm_head and self.is_vision_model:
                 raise NotImplementedError(
-                    "chunked LM Head loss does not support vision inputs; padded "
-                    "BSHD is supported only for text-only models such as Qwen3.5"
+                    "chunked LM Head loss does not support VLM models"
                 )
 
             output = packed_context_parallel_forward(
@@ -1184,7 +1120,6 @@ class MegatronEngine(TrainEngine):
                 mb_input.padded_mb,
                 gather_cp_output=not cp_local,
                 is_vision_model=self.is_vision_model,
-                use_padded_seq=self.use_padded_seq,
                 use_model_packed_seq=self.use_model_packed_seq,
                 fp32_output=_float16_wrapper_fp32_output(
                     self.mcore_config.enable_chunked_logits,
@@ -1194,24 +1129,16 @@ class MegatronEngine(TrainEngine):
             )
 
             if use_chunked_lm_head:
-                padded_lm_head = self.use_padded_seq and cu_seqlens is not None
-                if padded_lm_head:
-                    labels = _padded_lm_head_labels(
-                        mb_input.padded_mb["input_ids"],
-                        cu_seqlens,
-                        mb_input.padded_mb["max_seqlen"],
-                    )
-                else:
-                    rolled_ids = torch.roll(
-                        mb_input.padded_mb["input_ids"], shifts=-1, dims=-1
-                    )
-                if not padded_lm_head and cp_size > 1 and cu_seqlens is not None:
+                rolled_ids = torch.roll(
+                    mb_input.padded_mb["input_ids"], shifts=-1, dims=-1
+                )
+                if cp_size > 1 and cu_seqlens is not None:
                     labels = split_packed_seqs_for_context_parallel(
                         rolled_ids, mb_input.padded_mb["cu_seqlens"]
                     )
-                elif not padded_lm_head and rolled_ids.ndim == 2:
+                elif rolled_ids.ndim == 2:
                     labels = rolled_ids.transpose(0, 1).contiguous()
-                elif not padded_lm_head:
+                else:
                     labels = rolled_ids
 
                 gpt_model = unwrap_to_gpt_model(model)
@@ -1235,15 +1162,6 @@ class MegatronEngine(TrainEngine):
                     logit_scale=logit_scale,
                 )
 
-                if padded_lm_head:
-                    output = _map_chunked_lm_head_output(
-                        output,
-                        lambda tensor: _repack_padded_lm_head_output(
-                            tensor,
-                            cu_seqlens,
-                            mb_input.padded_mb["max_seqlen"],
-                        ),
-                    )
                 if cp_size > 1 and cu_seqlens is not None and not cp_local:
                     padded_cu_seqlens = mb_input.padded_mb["cu_seqlens"]
                     output = _map_chunked_lm_head_output(

@@ -304,16 +304,7 @@ class TestPackedContextParallelForward:
         assert prepared.padded_mbs is not None
         assert prepared.padded_mbs[0]["cu_seqlens"].tolist() == [0, 14_010, 14_080]
 
-    @pytest.mark.parametrize(
-        ("use_padded_seq", "expected_mask"),
-        [
-            (False, None),
-            (True, [[True, True, True], [True, True, False]]),
-        ],
-    )
-    def test_padded_vlm_preserves_model_specific_mask_semantics(
-        self, monkeypatch, use_padded_seq, expected_mask
-    ):
+    def test_padded_vlm_uses_mask_free_forward(self, monkeypatch):
         from areal.engine.megatron_utils import packed_context_parallel
 
         model = MagicMock(return_value=torch.ones(2, 3, 4))
@@ -331,15 +322,11 @@ class TestPackedContextParallelForward:
                 "max_seqlen": 3,
             },
             is_vision_model=True,
-            use_padded_seq=use_padded_seq,
         )
 
         call = model.call_args.kwargs
         assert call["input_ids"].tolist() == [[10, 11, 12], [20, 21, 0]]
-        if expected_mask is None:
-            assert call["attention_mask"] is None
-        else:
-            assert call["attention_mask"].tolist() == expected_mask
+        assert call["attention_mask"] is None
         assert call["position_ids"] is None
         assert call["packed_seq_params"] is None
         assert output.shape == (5, 4)
@@ -404,36 +391,6 @@ class TestPackedContextParallelForward:
         assert output.shape == (2, 1, 3)
         assert model.seen_post_process is False
         assert model.post_process is True
-
-    def test_padded_lm_head_labels_and_outputs_preserve_sequence_order(self):
-        from areal.engine.megatron_engine import (
-            _padded_lm_head_labels,
-            _repack_padded_lm_head_output,
-        )
-
-        input_ids = torch.tensor([10, 11, 12, 20, 21])
-        cu_seqlens = torch.tensor([0, 3, 5], dtype=torch.int32)
-
-        labels = _padded_lm_head_labels(input_ids, cu_seqlens, max_seqlen=3)
-        assert labels.tolist() == [[11, 21], [12, 0], [10, 20]]
-
-        # Chunked LM Head flattens [S, B] token outputs. Repacking must remove
-        # the padded slot and restore sequence-major packed order.
-        padded_outputs = torch.tensor([100, 200, 101, 201, 102, 0])
-        repacked = _repack_padded_lm_head_output(
-            padded_outputs, cu_seqlens, max_seqlen=3
-        )
-        assert repacked.tolist() == [100, 101, 102, 200, 201]
-
-    def test_repack_padded_lm_head_output_rejects_wrong_token_count(self):
-        from areal.engine.megatron_engine import _repack_padded_lm_head_output
-
-        with pytest.raises(ValueError, match="does not match the BSHD token layout"):
-            _repack_padded_lm_head_output(
-                torch.ones(5),
-                torch.tensor([0, 3, 5], dtype=torch.int32),
-                max_seqlen=3,
-            )
 
     @pytest.mark.parametrize(
         (

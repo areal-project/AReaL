@@ -387,7 +387,6 @@ def packed_context_parallel_forward(
     input_: dict[str, Any],
     gather_cp_output: bool = True,
     is_vision_model: bool = False,
-    use_padded_seq: bool = False,
     use_model_packed_seq: bool = False,
     fp32_output: bool | None = None,
     return_hidden_states: bool = False,
@@ -402,21 +401,14 @@ def packed_context_parallel_forward(
     tree_triton_data = input_.get("tree_triton_data", None)
     packed_seq_params = None
 
-    # Whether this particular microbatch carries vision tensors. Gates only
-    # the vision kwargs and the dense-mask exception below — never the
-    # padded-vs-packed routing.
+    # Whether this particular microbatch carries vision tensors. This gates
+    # only the vision kwargs, never the model-level padded-vs-packed routing.
     has_vision_inputs = is_vision_model and any(
         key in input_ for key in _VLM_FORWARD_KEYS
     )
-    # Padded-vs-packed routing is keyed on the MODEL type:
-    # - VLM models cannot consume the wrapper-packed [1, total_len] layout
-    #   (their internal packing needs a per-sequence 2D mask — mbridge
-    #   crashes on the missing mask and megatron-bridge silently corrupts
-    #   positions/packing), so image-free microbatches take the padded
-    #   branch too.
-    # - Architectures whose attention/SSM kernels reject packed sequences
-    #   (use_padded_seq, e.g. Qwen3.5 GDN) must run on [B, S] padded input.
-    needs_padded_form = is_vision_model or use_padded_seq
+    # VLM models cannot consume the wrapper-packed [1, total_len] layout.
+    # Models without a model-owned THD contract therefore reconstruct BSHD,
+    # including image-free microbatches from a VLM model.
 
     # Track shape metadata so the output can be repacked back to packed
     # [total_len, ...] form on the last PP stage.
@@ -438,7 +430,7 @@ def packed_context_parallel_forward(
             )
             packed_seq_params = _build_thd_packed_seq_params(cu_seqlens, max_seqlen)
             position_ids = None
-        elif not needs_padded_form:
+        elif not is_vision_model:
             if attention_mask is not None or tree_triton_data is not None:
                 raise ValueError(
                     "Attention mask should be None when using packed sequences."
@@ -448,24 +440,19 @@ def packed_context_parallel_forward(
             )
             input_ids = input_ids.contiguous()
         else:
-            # VLM and BSHD-only models expect [B, S] padded input.
+            # VLMs without a model-owned THD contract expect padded [B, S].
             input_ids, attention_mask, seq_lens, max_seqlen = _reconstruct_padded_2d(
                 input_ids, cu_seqlens, input_.get("max_seqlen")
             )
             padded_repack_info = (cu_seqlens, seq_lens, max_seqlen)
 
-    # Every VLM forward is mask-free (attention_mask=None): the model
-    # computes (m)RoPE positions internally, each batch slot holds one
-    # sequence with trailing padding so causal attention yields correct
-    # outputs at non-padding positions, and padding outputs are discarded
-    # during repack. The one exception is the padded BSHD text forward of
-    # use_padded_seq models, which consumes the dense 2D mask so attention
-    # layers skip padding. The wrapper-packed path carries no mask either
-    # way (enforced above); tree data passes through untouched.
-    dense_mask_text_forward = use_padded_seq and not has_vision_inputs
+    # Model-owned THD receives the reconstructed 2D validity mask so the model
+    # can fuse vision embeddings and perform its internal THD conversion.
+    # Padded VLMs remain mask-free and compute (m)RoPE positions internally;
+    # wrapper-owned THD/tree paths retain their existing mask contract.
     if use_model_packed_seq:
         final_attention_mask = attention_mask
-    elif is_vision_model and not dense_mask_text_forward:
+    elif is_vision_model:
         final_attention_mask = None
     else:
         final_attention_mask = (
@@ -479,13 +466,6 @@ def packed_context_parallel_forward(
         for key in _VLM_FORWARD_KEYS:
             if key in input_:
                 vlm_kwargs[key] = input_[key]
-
-    # For BSHD text-only, drop the packed-form position_ids (a 1D tensor of
-    # length total_len) — they don't match the 2D [B, S] input. Let mcore
-    # compute the default torch.arange positions per row; padding positions
-    # are masked out by attention_mask.
-    if dense_mask_text_forward:
-        position_ids = None
 
     try:
         model_kwargs = {
