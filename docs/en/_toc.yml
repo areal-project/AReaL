@@ -30,6 +30,7 @@ parts:
     chapters:
     - file: customization/dataset
     - file: customization/agent
+    - file: customization/reward
   - caption: Algorithms
     chapters:
     - file: algorithms/async
