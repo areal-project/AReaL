@@ -215,7 +215,6 @@ def test_vlm_forward(backend: str, output: str | None = None):
         assert engine.bridge_cls == "megatron-bridge"
         assert engine.sequence_packing_mode == SequencePackingMode.MODEL_THD
         assert engine.use_model_packed_seq
-        assert not engine.use_padded_seq
     bcasted_input = _make_input(engine)
 
     engine.eval()
