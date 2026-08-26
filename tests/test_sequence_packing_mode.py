@@ -9,8 +9,10 @@ from areal.engine.core.model import (
 )
 
 
-@pytest.mark.parametrize("model_type", ["qwen3_vl", "qwen3_vl_moe"])
-def test_qwen3_vl_family_uses_model_thd_with_megatron_bridge(model_type):
+@pytest.mark.parametrize(
+    "model_type", ["qwen3_vl", "qwen3_vl_moe", "qwen3_5", "qwen3_5_moe"]
+)
+def test_qwen_vl_family_uses_model_thd_with_megatron_bridge(model_type):
     assert supports_model_packed_seq(model_type, "megatron-bridge")
     assert (
         resolve_sequence_packing_mode(model_type, "megatron-bridge")
@@ -23,9 +25,9 @@ def test_qwen3_vl_family_uses_model_thd_with_megatron_bridge(model_type):
     [
         ("qwen3_vl", "mbridge"),
         ("qwen3_vl_moe", "mbridge"),
+        ("qwen3_5", "mbridge"),
+        ("qwen3_5_moe", "mbridge"),
         ("qwen2_5_vl", "megatron-bridge"),
-        ("qwen3_5", "megatron-bridge"),
-        ("qwen3_5_moe", "megatron-bridge"),
     ],
 )
 def test_models_without_gpu_model_thd_contract_stay_padded(model_type, bridge_type):
