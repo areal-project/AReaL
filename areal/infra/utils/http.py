@@ -16,6 +16,7 @@ from tenacity import (
 
 from areal.utils import logging
 from areal.utils.network import format_hostport, gethostip, split_hostport
+from areal.utils.vision_canary import EXACT_TOKEN_REFUSAL
 
 DEFAULT_RETRIES = 1
 DEFAULT_REQUEST_TIMEOUT = 3600
@@ -213,6 +214,22 @@ async def arequest_with_retry(
                     await _session.close()
                 return res
         except (TimeoutError, aiohttp.ClientError, aiohttp.ClientResponseError) as e:
+            if EXACT_TOKEN_REFUSAL in str(e):
+                # The server refused to run a prompt it could not verify against
+                # the tokens sent for it. Retrying re-sends the same bytes and
+                # gets the same answer, so it only multiplies the request and
+                # the alarming log line. Surface it immediately instead.
+                #
+                # Scoped to this one signature on purpose: 4xx stays retryable
+                # in general because AReaL's own weight-update handlers answer
+                # worker-side failures with 400.
+                #
+                # Leaving by this path skips the closes below, so a session this
+                # function opened has to be released here. A caller-supplied one
+                # is shared and must be left alone.
+                if session is None:
+                    await _session.close()
+                raise
             if isinstance(e, asyncio.TimeoutError):
                 logger.warning(
                     "HTTP request to %s%s timed out after %.2fs (attempt %d/%d)",
@@ -233,11 +250,6 @@ async def arequest_with_retry(
                     max_retries,
                 )
             last_exception = e
-            # NOTE: 4xx is deliberately still retried. It is tempting to skip
-            # retries for client errors, but AReaL's own weight-update handlers
-            # answer worker-side failures with 400 (`to_json_response`), and
-            # those are what `request_retries` exists to cover. Any change here
-            # needs a per-caller policy, not a blanket rule.
             if attempt < max_retries - 1:
                 await asyncio.sleep(retry_delay)
             continue

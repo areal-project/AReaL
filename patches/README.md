@@ -5,14 +5,16 @@ Patches applied to the pinned vLLM / vllm-ascend sources during the NPU image bu
 after its `pip install -e .`, so a patch that no longer applies fails the build instead
 of silently dropping the fix.
 
-| Patch                              | Applies to                     | Upstream                                                                      | Delete when             |
-| ---------------------------------- | ------------------------------ | ----------------------------------------------------------------------------- | ----------------------- |
-| `vllm.v0.23.0.patch`               | vLLM `v0.23.0`                 | [vllm#44483](https://github.com/vllm-project/vllm/pull/44483)                 | the pin contains #44483 |
-| `vllm.v0.23.0-content-parts.patch` | vLLM `v0.23.0`                 | [vllm#51478](https://github.com/vllm-project/vllm/pull/51478)                 | the pin contains #51478 |
-| `vllm-ascend.v0.23.0.patch`        | vllm-ascend `releases/v0.23.0` | [vllm-ascend#11548](https://github.com/vllm-project/vllm-ascend/issues/11548) | the fix lands upstream  |
+| Patch                                       | Applies to                     | Upstream                                                                      | Delete when                                     |
+| ------------------------------------------- | ------------------------------ | ----------------------------------------------------------------------------- | ----------------------------------------------- |
+| `vllm.v0.23.0.patch`                        | vLLM `v0.23.0`                 | [vllm#44483](https://github.com/vllm-project/vllm/pull/44483)                 | the pin contains #44483                         |
+| `vllm.v0.23.0-content-parts.patch`          | vLLM `v0.23.0`                 | [vllm#51478](https://github.com/vllm-project/vllm/pull/51478)                 | the pin contains #51478                         |
+| `vllm.v0.23.0-exact-token-validation.patch` | vLLM `v0.23.0`                 | none — AReaL-local                                                            | upstream exposes an equivalent prompt assertion |
+| `vllm-ascend.v0.23.0.patch`                 | vllm-ascend `releases/v0.23.0` | [vllm-ascend#11548](https://github.com/vllm-project/vllm-ascend/issues/11548) | the fix lands upstream                          |
 
-The vLLM patches are applied in table order and kept in separate files because their
-lifetimes differ, so each can be deleted when its upstream fix reaches the pin.
+The three vLLM patches are applied in table order and kept in separate files because
+their lifetimes differ. Folding them together would entangle deleting the compatibility
+backport with the longer-lived AReaL policy.
 
 The two sleep/wake bugs sit on the path AReaL drives between rollout and training, so
 both are load-bearing for NPU RL runs.
@@ -29,10 +31,19 @@ both are load-bearing for NPU RL runs.
   `w13_weight` and `w2_weight` branches, re-transposing expert weights restored from
   sleep and breaking the next inference with a shape mismatch.
 
+The other two carry AReaL's exact-token generation contract, so that a multimodal
+rollout computes behavior logprobs from the same token sequence it trains on. See issue
+#1612 for the problem statement and the staged plan.
+
 - **vllm#51478** — merged upstream on 2026-08-11, after the `v0.23.0` tag. Adds
   `content_parts` to `/inference/v1/generate` so one request carries caller-supplied
   token ids together with raw media. Python frontend only: AReaL launches vLLM through
   `areal.engine.vllm_ext.areal_vllm_server`, which patches Python vLLM's `build_app`.
+- **exact-token-validation** — AReaL-local, no upstream equivalent. vLLM expands
+  multimodal placeholders itself, so the caller sends the collapsed prompt in
+  `token_ids` and its locally expanded prompt in `expected_token_ids`; the server
+  refuses to generate unless its expansion matches. Neither vLLM patch may reference
+  AReaL's pause event — weight-update policy stays in AReaL source.
 
 ## Patching dirties the tree, which changes `vllm.__version__`
 

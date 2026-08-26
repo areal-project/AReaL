@@ -1,0 +1,132 @@
+AReaL-local extension to /inference/v1/generate. No upstream equivalent.
+
+Adds `expected_token_ids` and refuses to generate unless the fully preprocessed
+engine prompt equals it.
+
+RL requires that behavior logprobs and training logprobs come from the same token
+sequence. On the multimodal path the caller cannot simply send that sequence:
+vLLM treats a tokenized multimodal prompt as unexpanded and expands placeholders
+itself, so an already-expanded prompt is expanded a second time. Measured on
+Qwen3-VL-2B with one 112x112 image, a 64-placeholder prompt came back with 127.
+
+The contract is therefore inverted: `token_ids` carries one placeholder per media
+item and `expected_token_ids` carries the caller's locally expanded prompt. This
+check confirms vLLM's expansion agrees with the processor that built the training
+row, so a processor-version skew between proxy and server fails the request
+instead of silently training on a prompt the model never saw.
+
+Applies on top of vllm.v0.23.0-content-parts.patch, but has a different lifetime:
+keep it until upstream exposes an equivalent assertion, including after the
+content-parts backport is dropped.
+
+Diagnostics report lengths, the first divergence index, a bounded token window and
+media/placeholder counts. They deliberately never echo the full prompt.
+
+Contains no reference to AReaL's pause event: weight-update policy stays in AReaL
+source, in the same-path wrapper in areal/engine/vllm_ext/areal_vllm_server.py.
+
+diff --git a/vllm/entrypoints/serve/disagg/protocol.py b/vllm/entrypoints/serve/disagg/protocol.py
+index a01977c..347a9ba 100644
+--- a/vllm/entrypoints/serve/disagg/protocol.py
++++ b/vllm/entrypoints/serve/disagg/protocol.py
+@@ -91,6 +91,19 @@ class GenerateRequest(BaseModel):
+             raise ValueError("content_parts and features are mutually exclusive")
+         return self
+ 
++    expected_token_ids: list[int] | None = None
++    """AReaL extension: the exact prompt the caller records and trains on.
++
++    ``token_ids`` carries one unexpanded placeholder per media item, because
++    the multimodal renderer expands placeholders itself. This field carries the
++    caller's locally expanded prompt instead. The server refuses to generate
++    unless the fully preprocessed engine prompt equals it, so a processor
++    mismatch between caller and server surfaces as a failed request rather than
++    as silently divergent behavior and training prompts.
++
++    When omitted, no exact-token assertion is performed.
++    """
++
+     sampling_params: SamplingParams
+     """The sampling parameters for the model."""
+ 
+diff --git a/vllm/entrypoints/serve/disagg/serving.py b/vllm/entrypoints/serve/disagg/serving.py
+index fbe0c7d..34e1eed 100644
+--- a/vllm/entrypoints/serve/disagg/serving.py
++++ b/vllm/entrypoints/serve/disagg/serving.py
+@@ -54,6 +54,40 @@ from vllm.utils.collection_utils import as_list
+ 
+ logger = init_logger(__name__)
+ 
++# Tokens of context shown on either side of an exact-token mismatch. Enough to
++# identify where the sequences part without echoing the prompt into logs.
++_MISMATCH_WINDOW = 8
++
++
++def _describe_prompt_mismatch(
++    expected: GenericSequence[int],
++    actual: GenericSequence[int],
++    request: GenerateRequest,
++    engine_input: EngineInput,
++) -> str:
++    """Locate an exact-token mismatch without echoing the whole prompt."""
++    shorter = min(len(expected), len(actual))
++    divergence = shorter
++    for i in range(shorter):
++        if expected[i] != actual[i]:
++            divergence = i
++            break
++
++    lo = max(0, divergence - _MISMATCH_WINDOW // 2)
++    hi = divergence + _MISMATCH_WINDOW
++    placeholders = engine_input.get("mm_placeholders") or {}
++    return (
++        "[areal-exact-token] Rendered prompt does not match "
++        "expected_token_ids. "
++        f"expected_len={len(expected)} actual_len={len(actual)} "
++        f"first_divergence={divergence} "
++        f"expected[{lo}:{hi}]={list(expected[lo:hi])} "
++        f"actual[{lo}:{hi}]={list(actual[lo:hi])} "
++        f"media_items={len(request.content_parts or ())} "
++        "placeholders="
++        f"{ {modality: len(v) for modality, v in placeholders.items()} }"
++    )
++
+ 
+ class ServingTokens(OpenAIServing):
+     """Provides Tokens IN <> Tokens OUT functionality to vLLM API."""
+@@ -209,6 +242,35 @@ class ServingTokens(OpenAIServing):
+                 skip_mm_cache=True,
+             )
+ 
++        # AReaL exactness check: when a caller states the sequence it will
++        # record and train on, the engine must be about to run exactly that.
++        # Multimodal callers send the collapsed prompt in token_ids and the
++        # expanded one in expected_token_ids. A request that omits
++        # expected_token_ids is making no such claim and is left alone: this
++        # patch runs on a shared server, and imposing a contract on clients
++        # that never opted into it would reject their valid requests.
++        if request.expected_token_ids is not None:
++            actual_prompt_ids = engine_input.get("prompt_token_ids")
++            if actual_prompt_ids is None:
++                # Fail closed. The claim cannot be checked here, and generating
++                # anyway would return tokens the caller believes were produced
++                # from a prompt nothing ever verified.
++                return self.create_error_response(
++                    "[areal-exact-token] Cannot verify expected_token_ids: "
++                    "this request produced "
++                    "no prompt_token_ids, so the sequence the engine would run "
++                    "is unknown."
++                )
++            if list(actual_prompt_ids) != list(request.expected_token_ids):
++                return self.create_error_response(
++                    _describe_prompt_mismatch(
++                        request.expected_token_ids,
++                        actual_prompt_ids,
++                        request,
++                        engine_input,
++                    )
++                )
++
+         # Schedule the request and get the result generator.
+         result_generator: AsyncGenerator[RequestOutput, None] | None = None
+ 

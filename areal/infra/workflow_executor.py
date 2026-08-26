@@ -38,6 +38,7 @@ from areal.experimental.openai.types import (
 from areal.utils import logging, perf_tracer, stats_tracker
 from areal.infra.utils.concurrent import get_executor
 from areal.utils.data import cycle_dataloader
+from areal.utils.vision_canary import is_exact_token_refusal
 from areal.utils.perf_tracer import trace_perf, trace_session_event
 from logging import Logger
 
@@ -318,6 +319,21 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
             if self._thread_exception is None:
                 self._thread_exception = exc
 
+    def fail_fast(self, exc: Exception) -> None:
+        """Fail the dispatcher from outside its own threads.
+
+        A workflow body runs on the task runner, not on the producer or
+        consumer thread, so raising there only rejects one rollout. Routing an
+        unrecoverable failure here stops the run the same way a dead producer
+        would, and wakes any waiter so the error surfaces immediately rather
+        than at the next timeout.
+        """
+        self._set_thread_exception(exc)
+        with self._result_cv:
+            self._result_cv.notify_all()
+        with self._input_cv:
+            self._input_cv.notify()
+
     def _check_thread_exception(self):
         """Check if any background thread has failed and raise if so."""
         with self._thread_exception_lock:
@@ -586,6 +602,11 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
 
                 self._result_cv.wait(timeout=remaining)
 
+            # Again after the loop: the body above is skipped entirely when the
+            # results were already there, so a fatal error set in the meantime
+            # would otherwise be handed back as a healthy batch.
+            self._check_thread_exception()
+
             drained: list[TimedResult[TResult]] = list(self._pending_results.values())
             self._pending_results.clear()
 
@@ -626,6 +647,10 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
                     return None
 
                 self._result_cv.wait(timeout=remaining)
+
+            # Again after the loop, for the same reason as wait_results:
+            # an already-present result skips the check above.
+            self._check_thread_exception()
 
             found_result = self._pending_results.pop(task_id)
             self._active_task_ids.remove(task_id)
@@ -1223,14 +1248,35 @@ class WorkflowExecutor:
                 return None
 
             except Exception as exc:  # pragma: no cover - workflow execution errors
+                fatal = self.config.abort_on_prompt_mismatch and is_exact_token_refusal(
+                    exc
+                )
                 manager.on_rollout_rejected()
                 stats_tracker.get("rollout").scalar(rejected=1)
                 trace_session_event(
                     "mark_finalized",
                     task_id=task_id,
                     status="failed",
-                    reason="workflow_exception",
+                    reason="prompt_mismatch" if fatal else "workflow_exception",
                 )
+                if fatal:
+                    # Not a trajectory to drop. The server renders this prompt
+                    # differently from the way this worker built it, which is a
+                    # property of the deployment: every rollout is affected the
+                    # same way. Swallowing it would spend the run producing
+                    # nothing while reporting ordinary rejections.
+                    if self.logger is not None:
+                        self.logger.error(
+                            "Aborting: an inference server refused a prompt "
+                            "because its rendering disagrees with the tokens "
+                            "sent for it. Rollout and training would not have "
+                            "seen the same prompt. Set "
+                            "abort_on_prompt_mismatch=false to drop these "
+                            "rollouts and continue instead. %s",
+                            exc,
+                        )
+                    self.dispatcher.fail_fast(exc)
+                    return None
                 if self.logger is not None:
                     self.logger.error(
                         "Workflow execution failed: %s", exc, exc_info=True

@@ -178,8 +178,8 @@ class _InnerEngine:
         self.requests.append(request)
         if list(request.input_ids) != list(_StubVisionPrompt.input_ids):
             raise RuntimeError(
-                "400, message='Rendered prompt does not match expected_token_ids. "
-                "expected_len=3 actual_len=3 first_divergence=2'"
+                "400, message='[areal-exact-token] Rendered prompt does not "
+                "match expected_token_ids. expected_len=3 actual_len=3'"
             )
         return object()
 
@@ -202,8 +202,8 @@ class _SingleBackendEngine:
         self.requests.append(request)
         if list(request.input_ids) != list(_StubVisionPrompt.input_ids):
             raise RuntimeError(
-                "400, message='Rendered prompt does not match expected_token_ids. "
-                "expected_len=3 actual_len=3 first_divergence=2'"
+                "400, message='[areal-exact-token] Rendered prompt does not "
+                "match expected_token_ids. expected_len=3 actual_len=3'"
             )
         return object()
 
@@ -347,21 +347,52 @@ async def test_canary_detects_a_server_that_ignores_expected_token_ids(monkeypat
 
 
 @pytest.mark.asyncio
-async def test_canary_probes_with_a_valid_request_then_a_negative_control(monkeypatch):
-    """Test the probe order and that the control uses a throwaway image."""
+async def test_the_control_is_invalid_and_carries_a_throwaway_image(monkeypatch):
+    """Test the probe order and that the control uses a throwaway image.
+
+    Positive first: a rejected request is rendered before it is refused, so
+    leading with the control would strand its image in the server's cache and
+    the valid request would then be sent by-reference against nothing.
+    """
     _patch_probe_deps(monkeypatch)
     engine = _InnerEngine(["a:1"])
 
     await vision_canary.run_exact_token_canary(engine, _StubProcessor(), object())
 
     assert len(engine.requests) == 2
-    # Positive first: a rejected request is rendered before it is refused, so
-    # leading with the control would strand its image in the server's cache and
-    # the valid request would then be sent by-reference against nothing.
-    assert list(engine.requests[0].input_ids) == list(_StubVisionPrompt.input_ids)
-    assert list(engine.requests[1].input_ids) != list(_StubVisionPrompt.input_ids)
-    # And the control carries its own image, so its rejection strands nothing.
-    assert engine.requests[1].image_data != engine.requests[0].image_data
+    valid, control = engine.requests
+    assert list(valid.input_ids) == list(_StubVisionPrompt.input_ids)
+    assert list(control.input_ids) != list(_StubVisionPrompt.input_ids)
+    # The control carries its own image, so its rejection strands nothing.
+    assert control.image_data != valid.image_data
+
+
+@pytest.mark.asyncio
+async def test_servers_are_probed_concurrently(monkeypatch):
+    """Test that probe cost does not scale with the number of servers.
+
+    Each server costs a full request round trip, so probing in sequence would
+    add that wait per server to every training start.
+    """
+    _patch_probe_deps(monkeypatch)
+
+    class _Slow(_InnerEngine):
+        in_flight = 0
+        peak = 0
+
+        async def agenerate(self, request):
+            type(self).in_flight += 1
+            type(self).peak = max(type(self).peak, type(self).in_flight)
+            try:
+                await asyncio.sleep(0.05)
+                return await super().agenerate(request)
+            finally:
+                type(self).in_flight -= 1
+
+    engine = _Slow(["a:1", "b:2", "c:3"])
+    await vision_canary.run_exact_token_canary(engine, _StubProcessor(), object())
+
+    assert _Slow.peak == 3  # one in flight per address
 
 
 @pytest.mark.asyncio
@@ -380,7 +411,7 @@ async def test_an_unrelated_failure_is_not_accepted_as_proof(monkeypatch):
                 raise TimeoutError("connection reset")  # not a mismatch rejection
             return object()
 
-    with pytest.raises(RuntimeError, match="not with the prompt-mismatch"):
+    with pytest.raises(RuntimeError, match="not with the refusal that proves"):
         await vision_canary.run_exact_token_canary(
             _FlakyOnControl(["a:1"]), _StubProcessor(), object()
         )
@@ -398,7 +429,7 @@ async def test_probe_covers_a_single_backend_engine(monkeypatch):
 
     await vision_canary.run_exact_token_canary(engine, _StubProcessor(), object())
 
-    # One valid probe plus one negative control, exactly as for a listed server.
+    # Probed exactly as a listed server would be: valid, then the control.
     assert len(engine.requests) == 2
 
 
@@ -426,3 +457,34 @@ async def test_single_backend_engine_detects_a_missing_patch(monkeypatch):
         await vision_canary.run_exact_token_canary(
             _Unpatched(), _StubProcessor(), object()
         )
+
+
+@pytest.mark.asyncio
+async def test_a_failing_probe_settles_its_siblings(monkeypatch):
+    """Test that no probe is still running once the canary raises.
+
+    The caller treats a raised canary as fatal and begins tearing the engine
+    down, so a sibling left in flight would issue requests against an engine
+    being disposed of.
+    """
+    _patch_probe_deps(monkeypatch)
+
+    class _OneBadServer(_InnerEngine):
+        live = 0
+
+        async def agenerate(self, request):
+            if "b:2" in self.rid_to_address.get(request.rid, ""):
+                raise RuntimeError("that server is broken")
+            type(self).live += 1
+            try:
+                await asyncio.sleep(5)  # outlives the failure unless cancelled
+                return await super().agenerate(request)
+            finally:
+                type(self).live -= 1
+
+    engine = _OneBadServer(["a:1", "b:2"])
+    with pytest.raises(RuntimeError):
+        await vision_canary.run_exact_token_canary(engine, _StubProcessor(), object())
+
+    assert _OneBadServer.live == 0
+    assert not engine.rid_to_address  # every pin cleaned up

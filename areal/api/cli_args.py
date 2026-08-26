@@ -2374,6 +2374,19 @@ class InferenceEngineConfig:
     request_retries: int = field(
         default=3, metadata={"help": "Number of retries for failed requests."}
     )
+    abort_on_prompt_mismatch: bool = field(
+        default=True,
+        metadata={
+            "help": "Stop training when an inference server refuses a prompt "
+            "because its own rendering disagrees with the tokens sent for it. "
+            "Such a refusal may indicate deployment or input-specific "
+            "preprocessing divergence, so it can affect every rollout or only "
+            "some class of them. Either way the affected rollouts are dropped "
+            "and reported as ordinary rejections, which is why the default "
+            "treats it as fatal. Set to false to drop the trajectory and "
+            "carry on."
+        },
+    )
     pause_grace_period: float = field(
         default=0.0,
         metadata={
