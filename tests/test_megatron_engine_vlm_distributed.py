@@ -150,6 +150,32 @@ def test_simple_forward(model_env, tmp_path_factory):
 
 
 @pytest.mark.gpu
+@pytest.mark.multi_gpu
+@pytest.mark.slow
+@pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA not available")
+@pytest.mark.parametrize(
+    "model_path",
+    [DENSE_MODEL_PATHS["qwen3_vl"], DENSE_MODEL_PATHS["qwen3_5"]],
+    ids=["qwen3_vl", "qwen3_5"],
+)
+def test_model_thd_context_parallel_forward(model_path, tmp_path_factory):
+    """Model-owned VLM THD delegates its language sequence partition to CP."""
+    if torch.cuda.device_count() < 2:
+        pytest.skip("VLM context parallel forward requires at least 2 GPUs")
+    output = str(tmp_path_factory.mktemp("vlm_test") / "cp2_forward.out")
+    _run_vlm_test(
+        "forward",
+        output,
+        backend="megatron:d1p1t1c2",
+        env_overrides={
+            "AREAL_TEST_BRIDGE_TYPE": "megatron-bridge",
+            "AREAL_TEST_EXPECT_MODEL_THD": "1",
+            "VLM_MODEL_PATH": model_path,
+        },
+    )
+
+
+@pytest.mark.gpu
 @pytest.mark.slow
 @pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA not available")
 @pytest.mark.parametrize(
@@ -208,7 +234,6 @@ def test_train_tensor_parallel(model_env, tmp_path_factory):
 
 # ──────────────────────────────────────────────────────────────────────
 # Qwen3-VL-MoE: 30B-A3B-Instruct under hybrid (attn|ffn) allocation.
-# CP > 1 is forbidden for VLMs (megatron_engine.py:347).
 # ──────────────────────────────────────────────────────────────────────
 
 
@@ -265,8 +290,8 @@ def test_qwen3vl_moe_dcp_save_load(tmp_path_factory):
     """DCP save/load round-trip for Qwen3-VL-MoE under ``(attn:d2p1t4|ffn:d1p1t2e4)``.
 
     Allocation: attn DP=2 PP=1 TP=4 (8 GPUs); ffn DP=1 PP=1 TP=2 EP=4 (8 GPUs).
-    Drops the ``cp=2`` segment from the dense Qwen3-MoE analog because VLM
-    forbids CP>1 (megatron_engine.py:347).
+    CP coverage is kept in the dedicated model-owned THD tests above so this
+    round-trip remains focused on distributed checkpoint conversion.
     """
     if torch.cuda.device_count() < 8:
         pytest.skip("Qwen3-VL-MoE DCP save load requires 8 GPUs to run")

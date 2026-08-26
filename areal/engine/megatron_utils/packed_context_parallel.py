@@ -421,10 +421,9 @@ def packed_context_parallel_forward(
                     "Attention mask and tree attention are not supported with "
                     "the model-packed THD forward."
                 )
-            if mpu.get_context_parallel_world_size() > 1:
-                raise NotImplementedError(
-                    "The model-packed THD forward does not support CP > 1 yet."
-                )
+            # Keep the full BSHD inputs on every CP rank. The bridge first fuses
+            # vision embeddings and computes multimodal RoPE, then partitions
+            # the resulting THD sequence with its model-owned CP layout.
             input_ids, attention_mask, _, max_seqlen = _reconstruct_padded_2d(
                 input_ids, cu_seqlens, input_.get("max_seqlen")
             )
