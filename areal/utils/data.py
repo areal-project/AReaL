@@ -1302,6 +1302,15 @@ def broadcast_tensor_container(data, src_rank=0, group=None):
                 broadcast_tensor_container(None, src_rank=src_rank, group=group)
                 for _ in range(length)
             ]
+        elif data_type == "tuple":
+            length, container_type = info
+            values = [
+                broadcast_tensor_container(None, src_rank=src_rank, group=group)
+                for _ in range(length)
+            ]
+            if container_type is not None:
+                return container_type(*values)
+            return tuple(values)
         elif data_type == "dict":
             keys = info
             return {
@@ -1330,6 +1339,17 @@ def broadcast_tensor_container(data, src_rank=0, group=None):
                 broadcast_tensor_container(d, src_rank=src_rank, group=group)
                 for d in data
             ]
+        elif isinstance(data, tuple):
+            container_type = type(data) if hasattr(data, "_fields") else None
+            metadata = [("tuple", (len(data), container_type))]
+            dist.broadcast_object_list(metadata, src=src_rank, group=group)
+            values = [
+                broadcast_tensor_container(d, src_rank=src_rank, group=group)
+                for d in data
+            ]
+            if container_type is not None:
+                return container_type(*values)
+            return tuple(values)
         elif isinstance(data, dict):
             metadata = [("dict", list(data.keys()))]
             dist.broadcast_object_list(metadata, src=src_rank, group=group)

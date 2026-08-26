@@ -99,13 +99,18 @@ def resolve_broadcast_target(
     ranks of ``context_and_model_parallel_group`` or the broadcast deadlocks;
     engines without one keep the pre-offload device broadcast.
     """
-    cpu_mirror_group = getattr(engine, "cpu_model_parallel_group", None)
     cpu_staged = method_name is not None and _should_stage_rpc_payload_on_cpu(
         engine, method_name
     )
-    if (getattr(engine, "is_offload", False) or cpu_staged) and (
-        cpu_mirror_group is not None
-    ):
+    cpu_mirror_group = getattr(engine, "cpu_model_parallel_group", None)
+    if cpu_staged:
+        if cpu_mirror_group is None:
+            raise RuntimeError(
+                "Broadcast required for CPU-staged method, but "
+                "engine.cpu_model_parallel_group is None"
+            )
+        return cpu_mirror_group, "cpu"
+    if getattr(engine, "is_offload", False) and cpu_mirror_group is not None:
         return cpu_mirror_group, "cpu"
     return engine.context_and_model_parallel_group, device
 
