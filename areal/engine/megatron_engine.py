@@ -1279,17 +1279,24 @@ class MegatronEngine(TrainEngine):
         )
 
         # Step 3: Forward-backward using Megatron's pipeline function.
-        # `len(mb_list)` compensates Megatron Core's `output_tensor /= num_microbatches`
-        # applied in the 2-tuple `(loss, {})` branch of
-        # `megatron.core.pipeline_parallel.schedules._forward_step_helper`. Our
-        # per-microbatch loss is already globally normalized via `w_i / W_total`, so
-        # that extra division would shrink every gradient (and thus grad_norm and the
-        # effective optimizer step) by `num_microbatches`.
-        loss_multiplier = (
-            mpu.get_data_parallel_world_size()
-            * self.optimizer.get_loss_scale().item()
-            * len(mb_list)
-        )
+        # The 2-tuple `(loss, {})` branch in Megatron Core scales the loss by
+        # `cp_size / num_microbatches`. Normally DDP then scales the DP+CP gradient
+        # reduction by `1 / (dp_size * cp_size)`, so the existing DP multiplier is
+        # required. With per-token loss normalization, however, DDP performs an
+        # unscaled sum and the 2-tuple branch supplies no token count for the final
+        # normalization. Compensate the schedule's CP multiplier directly and do not
+        # introduce an additional DP multiplier in that case.
+        loss_scale = self.optimizer.get_loss_scale().item()
+        num_microbatches = len(mb_list)
+        model_config = get_model_config(self.model[0])
+        if model_config.calculate_per_token_loss:
+            loss_multiplier = (
+                loss_scale * num_microbatches / mpu.get_context_parallel_world_size()
+            )
+        else:
+            loss_multiplier = (
+                mpu.get_data_parallel_world_size() * loss_scale * num_microbatches
+            )
 
         def process_output(
             output: torch.Tensor, inputs: dict[str, Any]
