@@ -1,0 +1,109 @@
+Backport of vllm-project/vllm#51478 onto vLLM v0.23.0.
+
+    [Frontend] Support raw multimodal content in /inference/v1/generate
+    https://github.com/vllm-project/vllm/pull/51478
+    Merged upstream 2026-08-11, after the v0.23.0 tag.
+
+Adds `content_parts` so one request can carry caller-supplied token ids together
+with raw images/audio/video. Without it the only multimodal route that accepts an
+authoritative prompt is /render -> /generate, which returns placeholder offsets
+relative to a separately rendered sequence and forces the caller to remap them.
+
+Python frontend only. AReaL launches vLLM through
+areal.engine.vllm_ext.areal_vllm_server, which imports Python vLLM's run_server and
+monkey-patches its Python build_app, so the Rust frontend is not on this path. A
+Rust-fronted or externally managed server must carry #51478's Rust half instead;
+AReaL's startup canary rejects an unpatched frontend rather than assuming it works.
+
+Adapted rather than cherry-picked: upstream has since moved these modules under
+scale_out/token_in_token_out, and v0.23.0 reaches the renderer through
+self.openai_serving_render.renderer rather than self.online_renderer.renderer.
+The unsupported-part-type branch is an addition, so an unrecognised type fails
+loudly instead of being dropped from the prompt.
+
+Delete this patch when the pinned vLLM release contains #51478.
+
+diff --git a/vllm/entrypoints/serve/disagg/protocol.py b/vllm/entrypoints/serve/disagg/protocol.py
+index 60d2a64..a01977c 100644
+--- a/vllm/entrypoints/serve/disagg/protocol.py
++++ b/vllm/entrypoints/serve/disagg/protocol.py
+@@ -81,6 +81,16 @@ class GenerateRequest(BaseModel):
+     features: MultiModalFeatures | None = None
+     """Multimodal hashes and placeholder positions (populated for MM inputs)."""
+ 
++    content_parts: list[dict[str, Any]] | None = None
++    """Raw multimodal input; server resolves media. Mutually exclusive
++    with ``features``."""
++
++    @model_validator(mode="after")
++    def _check_mm_fields_exclusive(self) -> "GenerateRequest":
++        if self.content_parts and self.features:
++            raise ValueError("content_parts and features are mutually exclusive")
++        return self
++
+     sampling_params: SamplingParams
+     """The sampling parameters for the model."""
+ 
+diff --git a/vllm/entrypoints/serve/disagg/serving.py b/vllm/entrypoints/serve/disagg/serving.py
+index 72aeb84..fbe0c7d 100644
+--- a/vllm/entrypoints/serve/disagg/serving.py
++++ b/vllm/entrypoints/serve/disagg/serving.py
+@@ -14,6 +14,7 @@ import pybase64 as base64
+ from fastapi import Request
+ 
+ from vllm.engine.protocol import EngineClient
++from vllm.entrypoints.chat_utils import AsyncMultiModalItemTracker
+ from vllm.entrypoints.openai.chat_completion.protocol import (
+     ChatCompletionLogProb,
+     ChatCompletionLogProbs,
+@@ -39,7 +40,7 @@ from vllm.entrypoints.serve.disagg.protocol import (
+ from vllm.entrypoints.serve.render.serving import OpenAIServingRender
+ from vllm.entrypoints.serve.utils.api_utils import get_max_tokens, should_include_usage
+ from vllm.entrypoints.serve.utils.request_logger import RequestLogger
+-from vllm.inputs import EngineInput, mm_input
++from vllm.inputs import EngineInput, TokensPrompt, mm_input
+ from vllm.logger import init_logger
+ from vllm.logprobs import Logprob
+ from vllm.multimodal.inputs import (
+@@ -139,7 +140,40 @@ class ServingTokens(OpenAIServing):
+             return self.create_error_response(e)
+ 
+         engine_input: EngineInput
+-        if features := request.features:
++        if request.content_parts:
++            # Raw media supplied alongside caller-controlled token ids. The
++            # renderer expands the placeholder tokens in-process, so no
++            # placeholder offsets have to cross the HTTP boundary.
++            tracker = AsyncMultiModalItemTracker(self.model_config)
++            mm_parser = tracker.create_parser()
++            for part in request.content_parts:
++                ptype = part.get("type", "")
++                url = part.get("url")
++                uuid = part.get("uuid")
++                if ptype == "image_url":
++                    mm_parser.parse_image(url, uuid)
++                elif ptype == "audio_url":
++                    mm_parser.parse_audio(url, uuid)
++                elif ptype == "video_url":
++                    mm_parser.parse_video(url, uuid)
++                else:
++                    return self.create_error_response(
++                        f"Unsupported content_parts type: {ptype!r}"
++                    )
++            mm_data, mm_uuids = await tracker.resolve_items()
++
++            prompt = TokensPrompt(prompt_token_ids=request.token_ids)
++            if mm_data:
++                prompt["multi_modal_data"] = mm_data
++            if mm_uuids:
++                prompt["multi_modal_uuids"] = mm_uuids
++            if request.cache_salt:
++                prompt["cache_salt"] = request.cache_salt
++
++            (engine_input,) = await self.openai_serving_render.renderer.render_cmpl_async(
++                [prompt]
++            )
++        elif features := request.features:
+             # Convert PlaceholderRangeInfo → PlaceholderRange per modality.
+             mm_placeholders: dict[str, list[PlaceholderRange]] = {
+                 modality: [

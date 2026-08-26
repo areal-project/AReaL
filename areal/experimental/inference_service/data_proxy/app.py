@@ -346,6 +346,17 @@ def create_app(config: DataProxyConfig) -> FastAPI:
             tok = TokenizerProxy(config.tokenizer_path)
             inf_bridge = _create_inf_bridge(config.backend_addr, pause_state, config)
             areal_client = _create_areal_client(inf_bridge, tok, config)
+            # This proxy sends collapsed ids plus raw media, which only a vLLM
+            # carrying the exact-token patches understands. An unpatched server
+            # ignores the unknown fields and silently re-renders the prompt, so
+            # probe it before any session can open rather than discovering the
+            # skew in the training data.
+            if areal_client.processor is not None:
+                from areal.utils.vision_canary import run_exact_token_canary
+
+                await run_exact_token_canary(
+                    inf_bridge, areal_client.processor, tok._tok
+                )
             app.state.tokenizer = tok
             app.state.inf_bridge = inf_bridge
             app.state.areal_client = areal_client

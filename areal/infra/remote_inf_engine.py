@@ -1034,7 +1034,7 @@ class RemoteInfEngine(InferenceEngine):
                 accumulated_routed_experts.append(gen_result.routed_experts)
 
             # Update request for next iteration
-            req.input_ids += gen_result.output_tokens
+            req.extend_prompt(gen_result.output_tokens)
             req.gconfig.max_new_tokens -= len(gen_result.output_tokens)
             assert req.gconfig.max_new_tokens >= 0, (
                 req.gconfig.max_new_tokens,

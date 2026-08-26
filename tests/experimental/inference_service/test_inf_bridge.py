@@ -9,7 +9,12 @@ from unittest.mock import AsyncMock
 import pytest
 
 from areal.api.cli_args import GenerationHyperparameters
-from areal.api.io_struct import ModelRequest, ModelResponse, get_versioned_lora_name
+from areal.api.io_struct import (
+    HttpRequest,
+    ModelRequest,
+    ModelResponse,
+    get_versioned_lora_name,
+)
 from areal.experimental.inference_service.data_proxy.pause import PauseState
 from areal.experimental.inference_service.inf_bridge import InfBridge
 from areal.experimental.inference_service.sglang.bridge import SGLangBridgeBackend
@@ -46,14 +51,18 @@ def _make_vllm_response(
     token_logprobs: list[float],
     finish_reason: str = "stop",
 ) -> dict[str, Any]:
-    """Build a minimal vLLM completions JSON response."""
+    """Build a minimal /inference/v1/generate JSON response."""
     return {
         "choices": [
             {
+                "index": 0,
                 "finish_reason": finish_reason,
+                "token_ids": list(tokens),
                 "logprobs": {
-                    "tokens": [f"token:{token}" for token in tokens],
-                    "token_logprobs": token_logprobs,
+                    "content": [
+                        {"token": str(token), "logprob": logprob}
+                        for token, logprob in zip(tokens, token_logprobs)
+                    ]
                 },
             }
         ]
@@ -430,6 +439,16 @@ class TestInfBridge:
         bridge._send_request.assert_called_once()
 
 
+class _MarkerTokenizer:
+    """Resolves a single media placeholder to id 2, the marker used below."""
+
+    def convert_tokens_to_ids(self, token):
+        return 2 if token == "<|image_pad|>" else None
+
+    def convert_ids_to_tokens(self, token_id):
+        return "<|image_pad|>" if token_id == 2 else None
+
+
 class TestVLLMBridgeBackend:
     @pytest.mark.asyncio
     async def test_vllm_text_abort_then_stop_accumulates_tokens(self):
@@ -439,8 +458,8 @@ class TestVLLMBridgeBackend:
         async def mock_send(http_req, **kwargs):
             calls.append(
                 {
-                    "prompt": list(http_req.payload["prompt"]),
-                    "max_tokens": http_req.payload["max_tokens"],
+                    "prompt": list(http_req.payload["token_ids"]),
+                    "max_tokens": http_req.payload["sampling_params"]["max_tokens"],
                 }
             )
             if len(calls) == 1:
@@ -468,22 +487,23 @@ class TestVLLMBridgeBackend:
 
         http_req = backend.build_generation_request(req, with_lora=False, version=0)
 
-        assert http_req.endpoint == "/v1/completions"
-        assert http_req.payload["prompt"] == [11, 12]
-        assert http_req.payload["max_tokens"] == 7
+        assert http_req.endpoint == "/inference/v1/generate"
+        assert http_req.payload["token_ids"] == [11, 12]
+        assert http_req.payload["sampling_params"]["max_tokens"] == 7
         assert http_req.payload["stream"] is False
 
-    def test_vllm_parse_generation_response_for_chat_format(self):
-        """vLLM bridge parses chat logprobs content format."""
+    def test_vllm_parse_reads_integer_token_ids_directly(self):
+        """vLLM bridge reads token ids from the response, not from strings."""
         backend = VLLMBridgeBackend()
         response = {
             "choices": [
                 {
                     "finish_reason": "stop",
+                    "token_ids": [42, 43],
                     "logprobs": {
                         "content": [
-                            {"token": "token:42", "logprob": -0.1},
-                            {"token": "token:43", "logprob": -0.2},
+                            {"token": "a", "logprob": -0.1},
+                            {"token": "b", "logprob": -0.2},
                         ]
                     },
                 }
@@ -506,8 +526,8 @@ class TestVLLMBridgeBackend:
         async def mock_send(http_req, **kwargs):
             calls.append(
                 {
-                    "prompt": list(http_req.payload["prompt"]),
-                    "max_tokens": http_req.payload["max_tokens"],
+                    "prompt": list(http_req.payload["token_ids"]),
+                    "max_tokens": http_req.payload["sampling_params"]["max_tokens"],
                 }
             )
             return _make_vllm_response([100], [-0.5], "stop")
@@ -529,7 +549,9 @@ class TestVLLMBridgeBackend:
         calls: list[dict[str, Any]] = []
 
         async def mock_send(http_req, **kwargs):
-            calls.append({"temperature": http_req.payload["temperature"]})
+            calls.append(
+                {"temperature": http_req.payload["sampling_params"]["temperature"]}
+            )
             return _make_vllm_response([100], [-0.5], "stop")
 
         bridge = _make_bridge(backend=VLLMBridgeBackend())
@@ -554,40 +576,59 @@ class TestVLLMBridgeBackend:
 
     # -- 7. Vision request uses chat endpoint ------------------------------------
 
-    def test_vllm_vision_request_uses_chat_endpoint(self):
-        """vLLM: vision_msg_vllm field routes request to /v1/chat/completions."""
+    def test_vllm_vision_request_sends_raw_media_with_exact_tokens(self):
+        """vLLM: media rides with token ids on the same endpoint.
+
+        No messages cross the boundary, so the server cannot render a prompt
+        that differs from the one training will score.
+        """
         backend = VLLMBridgeBackend()
         gconfig = GenerationHyperparameters(
             n_samples=1,
             max_new_tokens=20,
             max_tokens=32768,
         )
-        vision_msgs = [
-            [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": "describe"},
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": "placeholder"},
-                        },
-                    ],
-                }
-            ]
-        ]
         req = ModelRequest(
-            input_ids=[1, 2, 3],
+            input_ids=[1, 2, 2, 2, 3],
+            collapsed_input_ids=[1, 2, 3],
             gconfig=gconfig,
             metadata={},
-            vision_msg_vllm=vision_msgs,
             image_data=["base64data"],
+            tokenizer=_MarkerTokenizer(),
         )
 
         http_req = backend.build_generation_request(req, with_lora=False, version=0)
 
-        assert http_req.endpoint == "/v1/chat/completions"
-        assert "messages" in http_req.payload
+        assert http_req.endpoint == "/inference/v1/generate"
+        assert "messages" not in http_req.payload
+        assert http_req.payload["token_ids"] == [1, 2, 3]
+        assert http_req.payload["expected_token_ids"] == [1, 2, 2, 2, 3]
+        assert http_req.payload["content_parts"][0]["type"] == "image_url"
+
+    def test_vllm_vision_resubmit_advances_both_prompt_forms(self):
+        """vLLM: an interrupted multimodal retry grows both representations.
+
+        Advancing only one would make the server's expansion disagree with
+        expected_token_ids and reject every post-abort retry.
+        """
+        backend = VLLMBridgeBackend()
+        req = ModelRequest(
+            input_ids=[1, 2, 2, 2, 3],
+            collapsed_input_ids=[1, 2, 3],
+            gconfig=GenerationHyperparameters(max_new_tokens=20, max_tokens=32768),
+            metadata={},
+            image_data=["base64data"],
+            tokenizer=_MarkerTokenizer(),
+        )
+        http_req = backend.build_generation_request(req, with_lora=False, version=0)
+
+        backend.patch_generation_request(
+            http_req, req, accumulated_tokens=[77, 78], remaining_tokens=18
+        )
+
+        assert http_req.payload["token_ids"] == [1, 2, 3, 77, 78]
+        assert http_req.payload["expected_token_ids"] == [1, 2, 2, 2, 3, 77, 78]
+        assert http_req.payload["sampling_params"]["max_tokens"] == 18
 
     # -- 8. Pause blocks vLLM backend -------------------------------------------
 
@@ -659,3 +700,130 @@ class TestVLLMBridgeBackend:
         assert bridge._send_request.call_count == 3
         assert resp.stop_reason == "length"
         assert len(resp.output_tokens) == 3  # 1 token per retry
+
+
+class TestInfBridgeErrorBody:
+    """A rejection is only actionable if its reason survives into the exception."""
+
+    @pytest.mark.asyncio
+    async def test_error_body_reaches_the_exception_text(self):
+        """Test that a 400 body is in the raised message, not only the log.
+
+        The exact-token canary distinguishes a real validation rejection from a
+        timeout or a 503 purely by the response text, so httpx's stock message
+        (status and URL only) would make the negative control unverifiable.
+        """
+        import httpx
+
+        detail = "Rendered prompt does not match expected_token_ids. expected_len=3"
+
+        def _handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(400, text=detail)
+
+        bridge = InfBridge(
+            backend=VLLMBridgeBackend(),
+            backend_addr="http://mock",
+            pause_state=PauseState(),
+        )
+        bridge._client = httpx.AsyncClient(transport=httpx.MockTransport(_handler))
+
+        with pytest.raises(httpx.HTTPStatusError) as excinfo:
+            await bridge._send_request(
+                HttpRequest(endpoint="/inference/v1/generate", payload={})
+            )
+
+        assert detail in str(excinfo.value)
+
+    @pytest.mark.asyncio
+    async def test_error_body_is_bounded(self):
+        """Test that a huge error body cannot flood the exception or the log."""
+        import httpx
+
+        from areal.experimental.inference_service.inf_bridge import ERROR_BODY_CHARS
+
+        def _handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(500, text="x" * (ERROR_BODY_CHARS * 4))
+
+        bridge = InfBridge(
+            backend=VLLMBridgeBackend(),
+            backend_addr="http://mock",
+            pause_state=PauseState(),
+        )
+        bridge._client = httpx.AsyncClient(transport=httpx.MockTransport(_handler))
+
+        with pytest.raises(httpx.HTTPStatusError) as excinfo:
+            await bridge._send_request(
+                HttpRequest(endpoint="/inference/v1/generate", payload={})
+            )
+
+        assert str(excinfo.value).count("x") == ERROR_BODY_CHARS
+
+
+class TestBackendParity:
+    """The two vLLM adapters are separate code; they must not drift apart.
+
+    They deliberately stay separate rather than sharing a builder -- the bridge
+    caps max_tokens by the remaining context window and the engine does not --
+    so the guard against drift is this comparison, not a shared implementation.
+    """
+
+    @staticmethod
+    def _both(req_kwargs):
+        from areal.engine.vllm_remote import VLLMBackend
+
+        engine_req = ModelRequest(**req_kwargs)
+        bridge_req = ModelRequest(**req_kwargs)
+        engine = VLLMBackend().build_generation_request(
+            engine_req, with_lora=False, version=0
+        )
+        bridge = VLLMBridgeBackend().build_generation_request(
+            bridge_req, with_lora=False, version=0
+        )
+        return engine.payload, bridge.payload
+
+    def test_text_sampling_params_match(self):
+        """Every sampling field except the context-capped max_tokens agrees."""
+        engine, bridge = self._both(
+            dict(
+                input_ids=[1, 2, 3],
+                gconfig=GenerationHyperparameters(
+                    max_new_tokens=10, max_tokens=32768, frequency_penalty=0.5
+                ),
+                metadata={},
+            )
+        )
+
+        assert engine["sampling_params"].keys() == bridge["sampling_params"].keys()
+        for key in engine["sampling_params"]:
+            if key == "max_tokens":
+                continue  # bridge caps by remaining context on purpose
+            assert engine["sampling_params"][key] == bridge["sampling_params"][key], key
+
+    def test_frequency_penalty_reaches_both(self):
+        """A configured penalty must not be silently dropped by either adapter."""
+        engine, bridge = self._both(
+            dict(
+                input_ids=[1, 2, 3],
+                gconfig=GenerationHyperparameters(
+                    max_new_tokens=10, max_tokens=32768, frequency_penalty=0.7
+                ),
+                metadata={},
+            )
+        )
+
+        assert engine["sampling_params"]["frequency_penalty"] == 0.7
+        assert bridge["sampling_params"]["frequency_penalty"] == 0.7
+
+    def test_endpoint_and_payload_shape_match(self):
+        """Both send token ids to the same endpoint with the same envelope."""
+        engine, bridge = self._both(
+            dict(
+                input_ids=[1, 2, 3],
+                gconfig=GenerationHyperparameters(max_new_tokens=10, max_tokens=32768),
+                metadata={},
+            )
+        )
+
+        assert engine["token_ids"] == bridge["token_ids"]
+        assert engine["stream"] == bridge["stream"] is False
+        assert "messages" not in engine and "messages" not in bridge

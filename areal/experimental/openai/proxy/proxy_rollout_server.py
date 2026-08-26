@@ -279,7 +279,7 @@ async def alloc_ports(raw_request: Request):
 
 
 def _setup_openai_client():
-    global _openai_client, _session_timeout_seconds, _admin_api_key
+    global _session_timeout_seconds, _admin_api_key
     config = _engine.config
     tokenizer = load_hf_tokenizer(config.tokenizer_path)
     agent_cfg = config.agent
@@ -290,11 +290,8 @@ def _setup_openai_client():
     if agent_cfg.keep_all_reasoning and not supports_preserve_thinking:
         for patch_name in apply_keep_all_reasoning_patches(tokenizer):
             logger.info("Applied chat template patch: %s", patch_name)
-    # VLM agents need the processor to expand image placeholders and to build
-    # the pixel_values carried in exported trajectories. Text-only models get
-    # None here and take the tokenizer-only path unchanged.
     processor = load_hf_processor(config.tokenizer_path)
-    _openai_client = ArealOpenAI(
+    client = ArealOpenAI(
         engine=_engine,
         tokenizer=tokenizer,
         tool_call_parser=agent_cfg.tool_call_parser,
@@ -322,6 +319,24 @@ def _setup_openai_client():
     # Only commit the key to the global after validation has passed.
     with _lock:
         _admin_api_key = agent_cfg.admin_api_key
+    return client
+
+
+async def _run_multimodal_canary(client) -> None:
+    """Probe the exact-token contract on every server before sessions open.
+
+    Shares its implementation with the lazy probe used by workflows that reach
+    the engine directly, so the two cannot drift.
+
+    Takes the client rather than reading the global: the global is published
+    only once this returns, so nothing can open a session mid-probe.
+    """
+    if client is None or client.processor is None:
+        return  # text-only deployment: nothing expands, nothing to verify
+
+    from areal.utils.vision_canary import run_exact_token_canary
+
+    await run_exact_token_canary(_engine, client.processor, client.tokenizer)
 
 
 @app.post("/configure")
@@ -369,7 +384,15 @@ async def call_engine_method(raw_request: Request):
     result = method(*args, **kwargs)
 
     if method_name == "initialize":
-        _setup_openai_client()
+        global _openai_client
+        # The processor only exists once the client is built, which is after
+        # the engine reports healthy -- so this is the first point where the
+        # contract can be checked. Publish the client only once the canary has
+        # passed: the session endpoints gate on it being non-None, and awaiting
+        # the probe yields the event loop to any request already in flight.
+        client = _setup_openai_client()
+        await _run_multimodal_canary(client)
+        _openai_client = client
 
     return {"status": "success", "result": serialize_value(result)}
 

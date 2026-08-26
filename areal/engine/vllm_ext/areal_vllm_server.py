@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import asyncio
+import inspect
 import logging
 from http import HTTPStatus
 
@@ -11,10 +12,12 @@ from vllm.entrypoints.openai.api_server import build_app as _original_build_app
 from vllm.entrypoints.openai.api_server import run_server
 from vllm.entrypoints.openai.cli_args import make_arg_parser, validate_parsed_serve_args
 from vllm.entrypoints.openai.completion.api_router import (
-    create_completion as original_create_completion,
+    create_completion as _decorated_create_completion,
 )
 from vllm.entrypoints.openai.completion.protocol import CompletionRequest
 from vllm.entrypoints.openai.engine.protocol import ErrorResponse, OpenAIBaseModel
+from vllm.entrypoints.serve.disagg.api_router import generate as _decorated_generate
+from vllm.entrypoints.serve.disagg.protocol import GenerateRequest
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.utils.argparse_utils import FlexibleArgumentParser
@@ -32,6 +35,16 @@ except ImportError:
 
 # AReaL's own router for custom endpoints (replaces vLLM's removed global router)
 router = APIRouter()
+
+# vLLM already decorates its handlers with @with_cancellation and
+# @load_aware_call. AReaL's wrappers below re-apply both, so they must delegate
+# to the *undecorated* handler. Applying with_cancellation twice starts two
+# listen_for_disconnect tasks on one ASGI receive channel -- its own docstring
+# calls that unsafe, since each consumes and discards messages the other needs,
+# so a disconnect can be seen by the outer listener while the inner generation
+# keeps running and the load counter stays elevated.
+original_create_completion = inspect.unwrap(_decorated_create_completion)
+original_generate = inspect.unwrap(_decorated_generate)
 
 
 logger = init_logger("areal_vllm_server")
@@ -383,29 +396,66 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
     return response
 
 
+@router.post(
+    "/inference/v1/generate",
+    dependencies=[Depends(validate_json_request)],
+    responses={
+        HTTPStatus.OK.value: {"content": {"text/event-stream": {}}},
+        HTTPStatus.BAD_REQUEST.value: {"model": ErrorResponse},
+        HTTPStatus.NOT_FOUND.value: {"model": ErrorResponse},
+        HTTPStatus.INTERNAL_SERVER_ERROR.value: {"model": ErrorResponse},
+    },
+)
+@with_cancellation
+@load_aware_call
+async def generate(request: GenerateRequest, raw_request: Request):
+    """Wrapped token-in/token-out endpoint that respects pause state.
+
+    Rollout generation runs here, so without this gate a request admitted
+    during a weight update would be served by a model that is mid-update. The
+    policy lives in AReaL rather than in the vLLM patches: same path, same
+    schema, same handler underneath, so the patches stay deletable.
+    """
+
+    await _wait_if_paused()
+
+    return await original_generate(request, raw_request)
+
+
 if __name__ == "__main__":
     # NOTE(simon):
     # This section should be in sync with vllm/entrypoints/cli/main.py for CLI
     # entrypoints.
     import vllm.entrypoints.openai.api_server as _api_server_module
 
+    # Generation routes AReaL replaces with pause-aware wrappers. Every route
+    # that reaches the engine must wait on the pause event, or a weight update
+    # can land underneath an admitted request.
+    _OVERRIDDEN_POST_ROUTES = ("/v1/completions", "/inference/v1/generate")
+
     def _areal_build_app(*args, **kwargs):
-        """Monkey-patched build_app: swap in AReaL's /v1/completions route + custom
+        """Monkey-patched build_app: swap in AReaL's generation routes + custom
         endpoints. ``**kwargs`` forwards version-specific params (model_config was
         added in vLLM 0.19) so it works on both 0.18 and 0.19."""
         app = _original_build_app(*args, **kwargs)
-        # Remove vLLM's /v1/completions POST route so AReaL's takes precedence
-        app.router.routes = [
+        replaced = [
             route
             for route in app.router.routes
-            if not (
-                hasattr(route, "path")
-                and route.path == "/v1/completions"
-                and hasattr(route, "methods")
-                and "POST" in route.methods
-            )
+            if hasattr(route, "path")
+            and route.path in _OVERRIDDEN_POST_ROUTES
+            and hasattr(route, "methods")
+            and "POST" in route.methods
         ]
-        # Include AReaL's router with custom endpoints + overridden /v1/completions
+        # A silently missing route would drop the pause gate, so fail loudly
+        # instead of serving unpaused traffic.
+        missing = set(_OVERRIDDEN_POST_ROUTES) - {r.path for r in replaced}
+        if missing:
+            raise RuntimeError(
+                f"vLLM did not register the generation routes AReaL wraps: "
+                f"{sorted(missing)}. Without the wrapper these routes bypass "
+                f"AReaL's weight-update pause gate."
+            )
+        app.router.routes = [r for r in app.router.routes if r not in replaced]
         app.include_router(router)
         return app
 

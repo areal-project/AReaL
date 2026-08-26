@@ -39,8 +39,14 @@ class ModelRequest:
     image_data: list[str] | None = field(default_factory=list)
     processor: Optional["AutoProcessor"] = None
 
-    # vlm+vllm:
-    vision_msg_vllm: list | None = None
+    # vlm+vllm: the same prompt as ``input_ids`` but with one unexpanded
+    # placeholder per media item. vLLM's tokenized multimodal path expands
+    # placeholders itself and would expand an already-expanded prompt a second
+    # time, so the collapsed form is what goes on the wire while ``input_ids``
+    # stays authoritative for response bookkeeping and training export. Built
+    # alongside ``input_ids``, never recovered by scanning it for placeholder
+    # runs. Only the vLLM backend reads this; SGLang keeps sending ``input_ids``.
+    collapsed_input_ids: list[int] | None = None
 
     def copy(self):
         return ModelRequest(
@@ -51,12 +57,25 @@ class ModelRequest:
             tokenizer=self.tokenizer,
             image_data=self.image_data.copy() if self.image_data is not None else None,
             processor=self.processor,
-            vision_msg_vllm=(
-                self.vision_msg_vllm.copy()
-                if self.vision_msg_vllm is not None
+            collapsed_input_ids=(
+                self.collapsed_input_ids.copy()
+                if self.collapsed_input_ids is not None
                 else None
             ),
         )
+
+    def extend_prompt(self, tokens: list[int]) -> None:
+        """Append generated tokens to every prompt representation.
+
+        Interrupted generations are resubmitted by growing the prompt with what
+        was produced so far. Generated tokens never contain media placeholders,
+        so the same suffix applies to both forms -- but advancing only one would
+        make the collapsed prompt disagree with the expanded one, and the
+        server's exact-token check would then reject every retry.
+        """
+        self.input_ids += tokens
+        if self.collapsed_input_ids is not None:
+            self.collapsed_input_ids += tokens
 
 
 @dataclass

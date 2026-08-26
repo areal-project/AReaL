@@ -35,10 +35,47 @@ from areal.infra import RemoteInfEngine, RolloutController, WorkflowExecutor
 from areal.infra.platforms import current_platform
 from areal.infra.utils.launcher import TRITON_CACHE_PATH
 from areal.utils import logging, perf_tracer, stats_tracker
+from areal.utils.hf_utils import media_marker_token_ids, vision_pad_tokens
 from areal.utils.network import format_host_for_url
 from areal.utils.offload import sanitize_tms_env_vars
 
 logger = logging.getLogger("vLLMEngine")
+
+
+def _check_placeholder_count(req: ModelRequest) -> None:
+    """Fail here rather than let the server fail opaquely.
+
+    vLLM replaces one placeholder per media item. If the collapsed prompt has a
+    different number, its renderer raises an assertion and the caller sees an
+    HTTP 500 with no indication of which prompt was wrong -- the exact-token
+    check never runs, because rendering fails first. This turns that into a
+    named error naming both counts, before the request leaves the process.
+    """
+    processor = getattr(req, "processor", None)
+    tokenizer = getattr(req, "tokenizer", None) or getattr(processor, "tokenizer", None)
+    if tokenizer is None:
+        raise ValueError(
+            "A multimodal vLLM request needs a tokenizer (directly or via its "
+            "processor) so the collapsed prompt can be checked against the "
+            "media it carries. Skipping the check here only moves the failure "
+            "to the server, where it surfaces as an opaque render error."
+        )
+    marker_ids = media_marker_token_ids(tokenizer, processor=processor)
+    if not marker_ids:
+        raise ValueError(
+            "Could not resolve this model's collapsed media marker, so the "
+            "prompt cannot be checked against the media it carries. The "
+            "processor should declare boi_token or image_token."
+        )
+    found = sum(1 for token in req.collapsed_input_ids if token in marker_ids)
+    expected = len(req.image_data or ())
+    if found != expected:
+        raise ValueError(
+            f"Collapsed prompt carries {found} media placeholder(s) for "
+            f"{expected} media item(s). vLLM replaces exactly one placeholder "
+            f"per item, so it would fail to render this prompt. The collapsed "
+            f"prompt must be built from the same rendered text as input_ids."
+        )
 
 
 class VLLMBackend:
@@ -59,27 +96,79 @@ class VLLMBackend:
     def build_generation_request(
         self, req: ModelRequest, with_lora: bool, version: int
     ) -> HttpRequest:
-        """Build vLLM generation request."""
-        gconfig = req.gconfig
-        stop_token_ids = gconfig.stop_token_ids
+        """Build a vLLM generation request.
 
-        # NOTE: vLLM uses flat payload structure, not nested sampling_params
-        payload = {
+        Text and multimodal rollouts share one endpoint. The engine consumes the
+        token ids we send rather than re-rendering messages, so the prompt that
+        produces the behaviour logprobs is the prompt we record and train on.
+
+        For media, ``token_ids`` carries the collapsed prompt (one placeholder
+        per item) because vLLM expands placeholders itself, and
+        ``expected_token_ids`` carries the expanded prompt the server must
+        reproduce before it will generate.
+        """
+        gconfig = req.gconfig
+        if gconfig.use_beam_search:
+            raise NotImplementedError(
+                "use_beam_search is not supported by the vLLM generate API; "
+                "vLLM exposes beam search through a separate entrypoint."
+            )
+
+        sampling_params: dict[str, Any] = {
             "top_p": gconfig.top_p,
             "top_k": gconfig.top_k,
             "max_tokens": gconfig.max_new_tokens,
             "temperature": 0.0 if gconfig.greedy else gconfig.temperature,
-            "stop_token_ids": stop_token_ids,
+            "stop_token_ids": gconfig.stop_token_ids,
             "ignore_eos": gconfig.ignore_eos,
             "skip_special_tokens": gconfig.skip_special_tokens,
             "frequency_penalty": gconfig.frequency_penalty,
-            "return_tokens_as_token_ids": True,
+            # 0 = the sampled token's own logprob, no top-k alternatives.
             "logprobs": 0,
-            "use_beam_search": gconfig.use_beam_search,
-            "stream": False,
         }
         if gconfig.stop:
-            payload["stop"] = gconfig.stop
+            # Stop strings require server-side detokenization, so `detokenize`
+            # must stay enabled whenever they are present.
+            sampling_params["stop"] = gconfig.stop
+
+        payload: dict[str, Any] = {
+            "request_id": req.rid,
+            "sampling_params": sampling_params,
+            "stream": False,
+        }
+
+        has_media = bool(req.image_data)
+        if has_media:
+            # Prohibit this model's media placeholders at the sampler; vLLM
+            # resolves these strings to token ids server side. Filtering them
+            # out of the response is too late for an interrupted generation:
+            # the abort loop appends each partial segment to both prompts
+            # before the client-side filter runs, so a sampled placeholder
+            # would reach the next request and fail media matching or the
+            # exact-token check. The response filter stays as a backstop.
+            bad_words = vision_pad_tokens(req.tokenizer, processor=req.processor)
+            if bad_words:
+                sampling_params["bad_words"] = list(bad_words)
+            if not req.collapsed_input_ids:
+                raise ValueError(
+                    "A multimodal vLLM request needs collapsed_input_ids: the "
+                    "prompt with one unexpanded placeholder per media item. "
+                    "vLLM expands placeholders itself, so sending the expanded "
+                    "input_ids would expand them twice. Build both forms where "
+                    "the prompt is constructed."
+                )
+            _check_placeholder_count(req)
+            payload["token_ids"] = req.collapsed_input_ids.copy()
+            payload["expected_token_ids"] = req.input_ids.copy()
+            payload["content_parts"] = [
+                {
+                    "type": "image_url",
+                    "url": f"data:{detect_image_mime(img)};base64,{img}",
+                }
+                for img in req.image_data
+            ]
+        else:
+            payload["token_ids"] = req.input_ids.copy()
 
         if with_lora:
             lora_name = gconfig.lora_name
@@ -89,55 +178,26 @@ class VLLMBackend:
                 )
             payload["model"] = get_versioned_lora_name(lora_name, version)
 
-        if req.vision_msg_vllm:
-            images = iter(req.image_data)
-            parsed_input = req.vision_msg_vllm[0]
-            for msg in parsed_input:
-                if isinstance(msg["content"], list):
-                    for content in msg["content"]:
-                        if content.get("type") == "image_url":
-                            try:
-                                base64_img = next(images)
-                            except StopIteration:
-                                raise ValueError(
-                                    "Not enough images in req.image_data to match image_url entries."
-                                )
-                            mime = detect_image_mime(base64_img)
-                            content["image_url"] = {
-                                "url": f"data:{mime};base64,{base64_img}"
-                            }
-            payload["messages"] = parsed_input.copy()
-            payload["logprobs"] = True
-            return HttpRequest(endpoint="/v1/chat/completions", payload=payload)
-        else:
-            payload["prompt"] = req.input_ids.copy()
-            return HttpRequest(endpoint="/v1/completions", payload=payload)
+        return HttpRequest(endpoint="/inference/v1/generate", payload=payload)
 
     def parse_generation_response(
         self, response: dict[str, Any]
     ) -> HttpGenerationResult:
         """Parse vLLM generation response."""
-        meta_info = response["choices"][0]
-        stop_reason = meta_info["finish_reason"]
+        choice = response["choices"][0]
+        stop_reason = choice.get("finish_reason") or "stop"
+        output_tokens = list(choice.get("token_ids") or [])
 
-        # Parse tokens from "token:123" format
-        if "tokens" in meta_info["logprobs"]:
-            output_tokens = meta_info["logprobs"]["tokens"]
-            output_tokens = [int(t.split(":")[1]) for t in output_tokens]
-            output_logprobs = meta_info["logprobs"]["token_logprobs"]
-        elif "content" in meta_info["logprobs"]:
-            outputs = meta_info["logprobs"]["content"]
-            output_tokens = [int(t["token"].split(":")[1]) for t in outputs]
-            output_logprobs = [t["logprob"] for t in outputs]
-        else:
-            raise ValueError("Unexpected vLLM response format.")
-
-        if stop_reason == "abort" and len(output_tokens) == 0:
-            return HttpGenerationResult(
-                output_tokens=[],
-                output_logprobs=[],
-                stop_reason=stop_reason,
+        logprobs_payload = choice.get("logprobs") or {}
+        content = logprobs_payload.get("content") or []
+        output_logprobs = [entry["logprob"] for entry in content]
+        # Behavior logprobs must remain parallel with generated tokens.
+        if len(output_logprobs) != len(output_tokens):
+            raise ValueError(
+                f"vLLM returned {len(output_tokens)} token ids but "
+                f"{len(output_logprobs)} logprobs; they must stay parallel."
             )
+
         return HttpGenerationResult(
             output_tokens=output_tokens,
             output_logprobs=output_logprobs,

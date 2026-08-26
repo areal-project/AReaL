@@ -75,6 +75,21 @@ class InteractionWithTokenLogpReward:
     mm_token_type_ids: list[int] | None = None
     multi_modal_input: list[dict[str, Any]] | None = None
 
+    # Inference-transport state, live-cache only. The prompt this turn sent to
+    # vLLM, with one unexpanded placeholder per media item (identical to the
+    # expanded prompt when the turn carried no media). A concat child needs its
+    # parent's copy to build its own collapsed prompt, and cannot recover it
+    # from the expanded one without assuming placeholders form dense contiguous
+    # runs. Deliberately excluded from to_tensor_dict() and from proxy
+    # serialization: training only ever sees the expanded prompt, and
+    # deserialized interactions are training inputs, never future parents.
+    #
+    # Must be a snapshot taken before generation. ModelRequest.extend_prompt()
+    # appends generated tokens in place after every response, so sharing the
+    # list object with the request would grow this prompt and make the next
+    # turn splice the parent's output twice.
+    collapsed_input_ids: list[int] | None = None
+
     # Fields used for parent-child relationship resolving
     messages: list[dict] = field(default_factory=list)
     output_message_list: list[dict] | None = None

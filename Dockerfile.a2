@@ -39,9 +39,12 @@ RUN apt-get update -y && \
     python3 -m pip install -U pip "setuptools==80.10.2" uv && \
     python3 -m pip cache purge
 
-# Sleep/wake bugfixes for the pinned vLLM / vllm-ascend releases above; see
-# patches/README.md for provenance. Bump alongside VLLM_TAG / VLLM_ASCEND_BRANCH.
-COPY patches/vllm.v0.23.0.patch patches/vllm-ascend.v0.23.0.patch /areal-workspace/patches/
+# Sleep/wake bugfixes plus raw-media generation transport for the pinned vLLM /
+# vllm-ascend releases above; see patches/README.md for provenance and per-patch
+# deletion conditions. Bump alongside VLLM_TAG / VLLM_ASCEND_BRANCH.
+COPY patches/vllm.v0.23.0.patch \
+     patches/vllm.v0.23.0-content-parts.patch \
+     patches/vllm-ascend.v0.23.0.patch /areal-workspace/patches/
 
 # Install vLLM + vllm-ascend (torch-npu comes from vllm-ascend requirements.txt).
 # The torch-npu 2.10.0.post2 P2P regression is worked around at runtime in
@@ -62,6 +65,7 @@ RUN export PIP_EXTRA_INDEX_URL=https://triton-ascend.osinfra.cn/pypi/simple/ && 
     cd /areal-workspace/vllm && \
     VLLM_TARGET_DEVICE=empty pip install -v -e . && \
     git apply -v /areal-workspace/patches/vllm.v0.23.0.patch && \
+    git apply -v /areal-workspace/patches/vllm.v0.23.0-content-parts.patch && \
     python3 -c "import sys, os; sys.path.insert(0, 'vllm'); import _version; want = os.environ['VLLM_TAG'].removeprefix('v'); assert _version.__version__ == want, f'vllm reports {_version.__version__}, expected {want}'" && \
     pip uninstall -y triton && \
     cd /areal-workspace/vllm-ascend && \

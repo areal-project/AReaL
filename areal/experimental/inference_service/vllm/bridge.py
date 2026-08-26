@@ -12,6 +12,8 @@ from areal.api.io_struct import (
     detect_image_mime,
     get_versioned_lora_name,
 )
+from areal.engine.vllm_remote import _check_placeholder_count
+from areal.utils.hf_utils import vision_pad_tokens
 
 if TYPE_CHECKING:
     from areal.api.io_struct import ModelRequest
@@ -30,8 +32,13 @@ class VLLMBridgeBackend:
         with_lora: bool,
         version: int = -1,
     ) -> HttpRequest:
-        """Build a ``/v1/completions`` or ``/v1/chat/completions`` request."""
+        """Build an ``/inference/v1/generate`` request."""
         gconfig = req.gconfig
+        if gconfig.use_beam_search:
+            raise NotImplementedError(
+                "use_beam_search is not supported by the vLLM generate API; "
+                "vLLM exposes beam search through a separate entrypoint."
+            )
 
         # Compute effective max_new_tokens (cap by remaining context window)
         max_new_tokens = min(
@@ -39,7 +46,7 @@ class VLLMBridgeBackend:
             gconfig.max_new_tokens,
         )
 
-        payload: dict[str, Any] = {
+        sampling_params: dict[str, Any] = {
             "top_p": gconfig.top_p,
             "top_k": gconfig.top_k,
             "max_tokens": max_new_tokens,
@@ -47,9 +54,16 @@ class VLLMBridgeBackend:
             "stop_token_ids": gconfig.stop_token_ids,
             "ignore_eos": gconfig.ignore_eos,
             "skip_special_tokens": gconfig.skip_special_tokens,
-            "return_tokens_as_token_ids": True,
+            "frequency_penalty": gconfig.frequency_penalty,
+            # 0 = the sampled token's own logprob, no top-k alternatives.
             "logprobs": 0,
-            "use_beam_search": gconfig.use_beam_search,
+        }
+        if gconfig.stop:
+            sampling_params["stop"] = gconfig.stop
+
+        payload: dict[str, Any] = {
+            "request_id": req.rid,
+            "sampling_params": sampling_params,
             "stream": False,
         }
 
@@ -61,55 +75,48 @@ class VLLMBridgeBackend:
                 )
             payload["model"] = get_versioned_lora_name(lora_name, version)
 
-        if req.vision_msg_vllm:
-            images = iter(req.image_data or [])
-            parsed_input = req.vision_msg_vllm[0]
-            for msg in parsed_input:
-                if isinstance(msg["content"], list):
-                    for content in msg["content"]:
-                        if content.get("type") == "image_url":
-                            try:
-                                base64_img = next(images)
-                            except StopIteration as exc:
-                                raise ValueError(
-                                    "Not enough images in req.image_data to match image_url entries."
-                                ) from exc
-                            mime = detect_image_mime(base64_img)
-                            content["image_url"] = {
-                                "url": f"data:{mime};base64,{base64_img}"
-                            }
-            payload["messages"] = parsed_input.copy()
-            payload["logprobs"] = True
-            return HttpRequest(endpoint="/v1/chat/completions", payload=payload)
+        if req.image_data:
+            # Prohibited at the sampler, not just filtered from the response; see
+            # areal.engine.vllm_remote.VLLMBackend for why.
+            bad_words = vision_pad_tokens(req.tokenizer, processor=req.processor)
+            if bad_words:
+                sampling_params["bad_words"] = list(bad_words)
+            if not req.collapsed_input_ids:
+                raise ValueError(
+                    "A multimodal vLLM request needs collapsed_input_ids: the "
+                    "prompt with one unexpanded placeholder per media item."
+                )
+            _check_placeholder_count(req)
+            payload["token_ids"] = list(req.collapsed_input_ids)
+            payload["expected_token_ids"] = list(req.input_ids)
+            payload["content_parts"] = [
+                {
+                    "type": "image_url",
+                    "url": f"data:{detect_image_mime(img)};base64,{img}",
+                }
+                for img in req.image_data
+            ]
+        else:
+            payload["token_ids"] = list(req.input_ids)
 
-        payload["prompt"] = list(req.input_ids)
-        return HttpRequest(endpoint="/v1/completions", payload=payload)
+        return HttpRequest(endpoint="/inference/v1/generate", payload=payload)
 
     def parse_generation_response(
         self,
         response: dict[str, Any],
     ) -> HttpGenerationResult:
         """Parse vLLM JSON into :class:`HttpGenerationResult`."""
-        meta_info = response["choices"][0]
-        stop_reason = meta_info["finish_reason"]
+        choice = response["choices"][0]
+        stop_reason = choice.get("finish_reason") or "stop"
+        output_tokens = list(choice.get("token_ids") or [])
 
-        if "tokens" in meta_info["logprobs"]:
-            output_tokens = [
-                int(token.split(":")[1]) for token in meta_info["logprobs"]["tokens"]
-            ]
-            output_logprobs = meta_info["logprobs"]["token_logprobs"]
-        elif "content" in meta_info["logprobs"]:
-            outputs = meta_info["logprobs"]["content"]
-            output_tokens = [int(token["token"].split(":")[1]) for token in outputs]
-            output_logprobs = [token["logprob"] for token in outputs]
-        else:
-            raise ValueError("Unexpected vLLM response format.")
-
-        if stop_reason == "abort" and len(output_tokens) == 0:
-            return HttpGenerationResult(
-                output_tokens=[],
-                output_logprobs=[],
-                stop_reason=stop_reason,
+        content = (choice.get("logprobs") or {}).get("content") or []
+        output_logprobs = [entry["logprob"] for entry in content]
+        # Behavior logprobs must remain parallel with generated tokens.
+        if len(output_logprobs) != len(output_tokens):
+            raise ValueError(
+                f"vLLM returned {len(output_tokens)} token ids but "
+                f"{len(output_logprobs)} logprobs; they must stay parallel."
             )
 
         return HttpGenerationResult(
@@ -138,7 +145,7 @@ class VLLMBridgeBackend:
         return HttpRequest(endpoint=endpoint, payload={}, method="POST")
 
     def get_generation_max_new_tokens(self, http_req: HttpRequest) -> int:
-        return int(http_req.payload["max_tokens"])
+        return int(http_req.payload["sampling_params"]["max_tokens"])
 
     def patch_generation_request(
         self,
@@ -147,6 +154,21 @@ class VLLMBridgeBackend:
         accumulated_tokens: list[int],
         remaining_tokens: int,
     ) -> None:
-        http_req.payload["max_tokens"] = remaining_tokens
-        if "prompt" in http_req.payload:
-            http_req.payload["prompt"] = list(req.input_ids) + accumulated_tokens
+        """Resume an interrupted generation from the tokens produced so far.
+
+        Both prompt representations have to grow by the same suffix. Advancing
+        only ``token_ids`` would leave ``expected_token_ids`` describing a
+        different sequence, and the server's exact-token check would reject
+        every retry -- which happens after each weight update, so uninterrupted
+        tests would still pass.
+        """
+        http_req.payload["sampling_params"]["max_tokens"] = remaining_tokens
+        if "expected_token_ids" in http_req.payload:
+            http_req.payload["token_ids"] = (
+                list(req.collapsed_input_ids) + accumulated_tokens
+            )
+            http_req.payload["expected_token_ids"] = (
+                list(req.input_ids) + accumulated_tokens
+            )
+        else:
+            http_req.payload["token_ids"] = list(req.input_ids) + accumulated_tokens

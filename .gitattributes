@@ -1,0 +1,6 @@
+# Patch files are unified diffs: a blank context line is encoded as a single
+# space, so Git's whitespace check flags every one of them. Stripping those
+# spaces would leave truly empty lines in a hunk body, which is ambiguous with
+# end-of-hunk and gets reintroduced the moment a patch is regenerated with
+# `git diff`. Exempt them instead.
+*.patch -whitespace

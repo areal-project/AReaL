@@ -8,6 +8,8 @@ vision-expanded, the exported tensor dict must carry ``multi_modal_input`` and
 serialization without shipping one copy of ``pixel_values`` per turn.
 """
 
+import json
+
 import pytest
 import torch
 
@@ -26,6 +28,7 @@ from tests.experimental.openai.vision_stubs import (
 
 from areal.api import ModelResponse
 from areal.experimental.openai.client import (
+    _check_collapsed_matches_expanded,
     _extract_images_from_messages,
     _process_vision_prompt,
     _require_processor,
@@ -41,7 +44,13 @@ from areal.experimental.openai.types import (
     InteractionWithTokenLogpReward,
     interactions_to_trajectory,
 )
-from areal.utils.hf_utils import apply_chat_template
+from areal.utils.hf_utils import (
+    VISION_PAD_TOKENS,
+    _is_multimodal_processor,
+    apply_chat_template,
+    media_marker_token_ids,
+    vision_pad_tokens,
+)
 from areal.utils.image import base642image, image2base64
 
 
@@ -402,6 +411,7 @@ def _turn_one(tokenizer, processor, image):
             tokenizer=tokenizer,
         ),
         chat_template_type="concat",
+        collapsed_input_ids=list(vision.collapsed_input_ids),
         mm_token_type_ids=vision.mm_token_type_ids,
         multi_modal_input=vision.multi_modal_input,
     )
@@ -537,6 +547,7 @@ def _thinking_parent(tokenizer, processor, image):
             tokenizer=tokenizer,
         ),
         chat_template_type="concat",
+        collapsed_input_ids=list(vision.collapsed_input_ids),
         mm_token_type_ids=vision.mm_token_type_ids,
         multi_modal_input=vision.multi_modal_input,
     )
@@ -645,10 +656,12 @@ async def test_chat_completion_exports_vision_tensors(tokenizer, processor):
         max_completion_tokens=8,
     )
 
-    # The engine must receive the expanded prompt plus the raw image payload.
+    # The engine must receive the expanded prompt plus the raw image payload,
+    # and the collapsed companion the vLLM transport puts on the wire. Messages
+    # no longer cross the inference boundary at all.
     assert engine.last_request.input_ids.count(IMAGE_PAD_ID) == PATCHES_PER_IMAGE
     assert len(engine.last_request.image_data) == 1
-    assert engine.last_request.vision_msg_vllm is not None
+    assert engine.last_request.collapsed_input_ids.count(IMAGE_PAD_ID) == 1
 
     interaction = client.get_interaction(completion.id)
     assert interaction.multi_modal_input is not None
@@ -725,6 +738,110 @@ def test_vision_pad_token_ids_empty_without_the_conversion_api():
         pass
 
     assert vision_pad_token_ids(_Bare()) == frozenset()
+
+
+def test_vision_pad_tokens_prefers_what_the_processor_declares(tokenizer):
+    """Test that the model's own placeholder names win over the fallback list.
+
+    vLLM builds its expansion target from ``hf_processor.image_token``, so a ban
+    derived from the same attribute aims at the token vLLM will actually expand.
+    """
+
+    class _Processor:
+        image_token = "<|image_pad|>"
+        video_token = "<|video_pad|>"
+
+    assert vision_pad_tokens(tokenizer, processor=_Processor()) == (
+        "<|image_pad|>",
+        "<|video_pad|>",
+    )
+
+
+def test_vision_pad_tokens_falls_back_when_the_processor_declares_none(tokenizer):
+    """Test that a processor without placeholder attributes uses the defaults."""
+
+    class _Processor:
+        pass
+
+    assert vision_pad_tokens(tokenizer, processor=_Processor()) == VISION_PAD_TOKENS
+    assert vision_pad_tokens(tokenizer) == VISION_PAD_TOKENS
+
+
+def test_vision_pad_tokens_drops_names_the_tokenizer_lacks():
+    """Test that an unresolvable placeholder is dropped rather than banned blind.
+
+    ``bad_words`` takes strings and vLLM re-encodes them, so banning a name this
+    vocabulary lacks would silently prohibit an ordinary sub-word sequence.
+    """
+
+    class _ForeignTokenizer:
+        def convert_tokens_to_ids(self, token):
+            return None
+
+        def convert_ids_to_tokens(self, token_id):
+            return None
+
+    assert vision_pad_tokens(_ForeignTokenizer()) == ()
+
+
+def test_a_bare_tokenizer_is_not_mistaken_for_a_processor():
+    """Test that a text-only model is not treated as multimodal.
+
+    ``AutoProcessor.from_pretrained`` returns the plain tokenizer for a
+    text-only model instead of raising. Treating that as a processor would run
+    the vision canary against something that cannot process an image.
+    """
+
+    class _Tokenizer:
+        def convert_tokens_to_ids(self, token):
+            return None
+
+    assert not _is_multimodal_processor(_Tokenizer())
+    assert not _is_multimodal_processor(None)
+
+
+def test_a_real_processor_is_recognised():
+    """Test that a processor delegating to a tokenizer is accepted."""
+
+    class _Processor:
+        tokenizer = object()
+        image_processor = object()
+
+    assert _is_multimodal_processor(_Processor())
+
+
+def test_collapsed_marker_differs_from_the_expanded_pad(tokenizer):
+    """Test that a Gemma3-style processor is counted by its collapsed marker.
+
+    Gemma3 rewrites ``boi_token`` into a run built from ``image_token``, so
+    counting pads in a collapsed prompt would find none.
+    """
+
+    class _Gemma3Like:
+        boi_token = "<|video_pad|>"  # stands in for boi; distinct from the pad
+        image_token = "<|image_pad|>"
+
+    proc = _Gemma3Like()
+    assert media_marker_token_ids(tokenizer, processor=proc) == {VIDEO_PAD_ID}
+    assert vision_pad_token_ids(tokenizer, processor=proc) == {IMAGE_PAD_ID}
+
+
+def test_collapsed_marker_falls_back_to_the_pad_when_undeclared(tokenizer):
+    """Test that Qwen-style processors keep one token for both roles."""
+
+    class _QwenLike:
+        image_token = "<|image_pad|>"
+
+    assert media_marker_token_ids(tokenizer, processor=_QwenLike()) == {IMAGE_PAD_ID}
+
+
+def test_vision_pad_tokens_unchecked_without_a_tokenizer():
+    """Test that a missing tokenizer still bans the declared placeholders.
+
+    Nothing can be verified without a tokenizer, and banning nothing would leave
+    such a request less protected than it was before the check existed.
+    """
+    assert vision_pad_tokens(None) == VISION_PAD_TOKENS
 
 
 def test_drop_vision_pad_tokens_filters_all_parallel_sequences(tokenizer):
@@ -806,3 +923,332 @@ async def test_generated_pad_token_never_reaches_the_exported_trajectory(
     tensor_dict = interaction.to_tensor_dict()
     n_pads = int((tensor_dict["input_ids"][0] == IMAGE_PAD_ID).sum())
     assert n_pads == PATCHES_PER_IMAGE
+
+
+# ---------------------------------------------------------------------------
+# Collapsed prompt (exact-token transport)
+# ---------------------------------------------------------------------------
+
+
+def test_collapsed_prompt_keeps_one_placeholder_per_image(tokenizer, processor):
+    """Test that the collapsed prompt is the unexpanded form vLLM expects."""
+    messages = [user_message_with_image(make_image(9), "what is this?")]
+    image_data, tok_messages, _ = _extract_images_from_messages(messages)
+    text = apply_chat_template(
+        tokenizer, tok_messages, add_generation_prompt=True, tokenize=False
+    )
+
+    result = _process_vision_prompt(processor, text, image_data)
+
+    assert result.collapsed_input_ids.count(IMAGE_PAD_ID) == 1
+    assert result.input_ids.count(IMAGE_PAD_ID) == PATCHES_PER_IMAGE
+    # Same prompt either way once the media span is excluded.
+    pad_ids = vision_pad_token_ids(processor.tokenizer)
+    assert [t for t in result.collapsed_input_ids if t not in pad_ids] == [
+        t for t, mm in zip(result.input_ids, result.mm_token_type_ids) if not mm
+    ]
+
+
+def test_collapsed_prompt_scales_with_image_count(tokenizer, processor):
+    """Test that each image contributes exactly one collapsed placeholder."""
+    messages = [
+        user_message_with_image(make_image(11), "first"),
+        {"role": "assistant", "content": "ok"},
+        user_message_with_image(make_image(22), "second"),
+    ]
+    image_data, tok_messages, _ = _extract_images_from_messages(messages)
+    text = apply_chat_template(
+        tokenizer, tok_messages, add_generation_prompt=True, tokenize=False
+    )
+
+    result = _process_vision_prompt(processor, text, image_data)
+
+    assert result.collapsed_input_ids.count(IMAGE_PAD_ID) == 2
+    assert result.input_ids.count(IMAGE_PAD_ID) == 2 * PATCHES_PER_IMAGE
+
+
+def test_concat_splices_the_collapsed_form_in_parallel(tokenizer, processor):
+    """Test that the child's collapsed prompt extends the parent's collapsed one.
+
+    The two splices locate the same conversational seam by EOS count, at
+    different token indices, so neither index may be shared.
+    """
+    image = make_image(31)
+    turn0 = [user_message_with_image(image, "find x")]
+    vision = concat_vision_prompt_with_parent(turn0, None, tokenizer, processor)
+
+    output_tokens = [11, 12, EOS_ID]
+    parent = InteractionWithTokenLogpReward(
+        messages=turn0,
+        output_message_list=[{"role": "assistant", "content": "x = 12"}],
+        model_response=ModelResponse(
+            input_tokens=list(vision.input_ids),
+            output_tokens=output_tokens,
+            output_logprobs=[0.0] * len(output_tokens),
+            output_versions=[0] * len(output_tokens),
+            stop_reason="stop",
+            tokenizer=tokenizer,
+        ),
+        chat_template_type="concat",
+        collapsed_input_ids=list(vision.collapsed_input_ids),
+        mm_token_type_ids=vision.mm_token_type_ids,
+        multi_modal_input=vision.multi_modal_input,
+    )
+
+    child = concat_vision_prompt_with_parent(
+        [{"role": "user", "content": "wrong, retry"}], parent, tokenizer, processor
+    )
+
+    # Each form extends its own parent representation verbatim.
+    expanded_prefix = vision.input_ids + output_tokens[:-1] + [EOS_ID]
+    collapsed_prefix = vision.collapsed_input_ids + output_tokens[:-1] + [EOS_ID]
+    assert child.input_ids[: len(expanded_prefix)] == expanded_prefix
+    assert child.collapsed_input_ids[: len(collapsed_prefix)] == collapsed_prefix
+    # The image is still described once in the collapsed form, and in full in the
+    # expanded one.
+    assert child.collapsed_input_ids.count(IMAGE_PAD_ID) == 1
+    assert child.input_ids.count(IMAGE_PAD_ID) == PATCHES_PER_IMAGE
+
+
+def test_concat_without_a_parent_collapsed_snapshot_fails(tokenizer, processor):
+    """Test that a parent missing its snapshot raises instead of guessing.
+
+    Falling back to the expanded prompt would make the server expand the media
+    placeholders a second time.
+    """
+    image = make_image(41)
+    turn0 = [user_message_with_image(image, "find x")]
+    vision = concat_vision_prompt_with_parent(turn0, None, tokenizer, processor)
+    output_tokens = [11, EOS_ID]
+    parent = InteractionWithTokenLogpReward(
+        messages=turn0,
+        output_message_list=[{"role": "assistant", "content": "x"}],
+        model_response=ModelResponse(
+            input_tokens=list(vision.input_ids),
+            output_tokens=output_tokens,
+            output_logprobs=[0.0] * len(output_tokens),
+            output_versions=[0] * len(output_tokens),
+            stop_reason="stop",
+            tokenizer=tokenizer,
+        ),
+        chat_template_type="concat",
+        collapsed_input_ids=None,
+        mm_token_type_ids=vision.mm_token_type_ids,
+        multi_modal_input=vision.multi_modal_input,
+    )
+
+    with pytest.raises(ValueError, match="collapsed_input_ids"):
+        concat_vision_prompt_with_parent(
+            [{"role": "user", "content": "retry"}], parent, tokenizer, processor
+        )
+
+
+def test_collapsed_snapshot_survives_request_prompt_growth(tokenizer, processor):
+    """Test that resuming generation does not mutate the interaction's snapshot.
+
+    ModelRequest.extend_prompt appends in place after every response, so a
+    shared list would make the next turn splice the parent's output twice.
+    """
+    from areal.api.cli_args import GenerationHyperparameters
+    from areal.api.io_struct import ModelRequest
+
+    messages = [user_message_with_image(make_image(5), "hi")]
+    image_data, tok_messages, _ = _extract_images_from_messages(messages)
+    text = apply_chat_template(
+        tokenizer, tok_messages, add_generation_prompt=True, tokenize=False
+    )
+    vision = _process_vision_prompt(processor, text, image_data)
+
+    interaction = InteractionWithTokenLogpReward(
+        collapsed_input_ids=list(vision.collapsed_input_ids)
+    )
+    request = ModelRequest(
+        input_ids=list(vision.input_ids),
+        collapsed_input_ids=list(vision.collapsed_input_ids),
+        gconfig=GenerationHyperparameters(max_new_tokens=4),
+    )
+    snapshot = list(interaction.collapsed_input_ids)
+
+    request.extend_prompt([42, EOS_ID])
+
+    assert interaction.collapsed_input_ids == snapshot
+    assert request.collapsed_input_ids[-2:] == [42, EOS_ID]
+
+
+def test_collapsed_snapshot_never_reaches_training_data(tokenizer, processor):
+    """Test that the collapsed prompt stays out of exports.
+
+    It is inference-transport state. Training must only ever see the expanded
+    prompt, and deserialized interactions are training inputs rather than
+    future concat parents, so the proxy must not ship it either.
+    """
+    messages = [user_message_with_image(make_image(13), "hi")]
+    image_data, tok_messages, _ = _extract_images_from_messages(messages)
+    text = apply_chat_template(
+        tokenizer, tok_messages, add_generation_prompt=True, tokenize=False
+    )
+    vision = _process_vision_prompt(processor, text, image_data)
+
+    interaction = _make_interaction(
+        vision.input_ids, vision.mm_token_type_ids, vision.multi_modal_input
+    )
+    interaction.collapsed_input_ids = list(vision.collapsed_input_ids)
+
+    tensor_dict = interaction.to_tensor_dict()
+    # Matched by substring rather than by exact key: this guards the concept,
+    # so renaming the field cannot quietly turn the check into a no-op.
+    assert not [key for key in tensor_dict if "collapsed" in key]
+    # The exported prompt is the expanded one.
+    assert tensor_dict["input_ids"].shape[1] == len(vision.input_ids) + 3
+
+    payload = serialize_interactions({"a": interaction})
+    assert "collapsed" not in json.dumps(payload, default=str)
+
+
+def test_collapsed_prompt_helper_returns_a_fresh_list(processor, tokenizer):
+    """Test that repeated calls do not share one mutable list.
+
+    The engine appends generated tokens to this list in place while resuming an
+    interrupted generation, so a cached list would leak one rollout's output
+    into the next prompt that renders identically. Callers that assign the
+    result straight into a ModelRequest depend on this.
+    """
+    from areal.utils.hf_utils import collapsed_prompt_token_ids
+
+    messages = [user_message_with_image(make_image(17), "same prompt")]
+    _, tok_messages, _ = _extract_images_from_messages(messages)
+    text = apply_chat_template(
+        tokenizer, tok_messages, add_generation_prompt=True, tokenize=False
+    )
+
+    first = collapsed_prompt_token_ids(processor, text)
+    second = collapsed_prompt_token_ids(processor, text)
+
+    assert first == second
+    assert first is not second
+    first.extend([1234, 5678])
+    assert collapsed_prompt_token_ids(processor, text) == second
+
+
+def test_collapsed_check_counts_markers_not_expanded_pads(tokenizer):
+    """Test that a Gemma3-shaped prompt is validated against its collapsed marker.
+
+    Its collapsed prompt holds boi_token and its expanded prompt holds a run of
+    image_token, so counting pads on the collapsed side would find none and
+    reject a perfectly valid request before it ever reached vLLM.
+    """
+    BOI = VIDEO_PAD_ID  # stands in for boi_token: a real id, distinct from the pad
+
+    class _Gemma3Like:
+        boi_token = "<|video_pad|>"
+        image_token = "<|image_pad|>"
+        tokenizer = None
+
+    proc = _Gemma3Like()
+    proc.tokenizer = tokenizer
+
+    collapsed = [10, BOI, 11]
+    expanded = [10, IMAGE_PAD_ID, IMAGE_PAD_ID, 11]
+    mm_mask = [0, 1, 1, 0]
+
+    # One marker, one image: accepted.
+    _check_collapsed_matches_expanded(collapsed, expanded, mm_mask, proc, 1)
+
+    # Two images against one marker: rejected, with the counts named.
+    with pytest.raises(ValueError, match="1 media placeholders for 2 media"):
+        _check_collapsed_matches_expanded(collapsed, expanded, mm_mask, proc, 2)
+
+
+def test_loader_rejects_the_tokenizer_autoprocessor_returns_for_text_models(
+    monkeypatch,
+):
+    """Test that load_hf_processor returns None for a text-only model.
+
+    ``AutoProcessor.from_pretrained`` does not raise there; it returns the
+    model's tokenizer. Returning that would make a text-only deployment look
+    multimodal and run the vision canary against it.
+    """
+    import transformers
+
+    from areal.utils import hf_utils
+
+    class _Tokenizer:
+        def convert_tokens_to_ids(self, token):
+            return None
+
+    monkeypatch.setattr(
+        transformers.AutoProcessor,
+        "from_pretrained",
+        classmethod(lambda cls, *a, **k: _Tokenizer()),
+    )
+    hf_utils.load_hf_processor.cache_clear()
+    try:
+        assert hf_utils.load_hf_processor("some/text-only-model") is None
+    finally:
+        hf_utils.load_hf_processor.cache_clear()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "with_image, chat_template_type, retained",
+    [
+        (True, "concat", True),  # only a concat child can splice a parent
+        (True, "hf", False),  # hf re-renders each turn; no parent is read
+        (False, "concat", False),  # text-only has nothing to collapse
+        (False, "hf", False),
+    ],
+)
+async def test_collapsed_prompts_are_retained_only_where_concat_uses_them(
+    tokenizer, processor, with_image, chat_template_type, retained
+):
+    """Test the retention rule through create(), not through the helper.
+
+    Asserting on the predicate alone would still pass if a request path stopped
+    consulting it, or set the field unconditionally. This drives the real path
+    and inspects what the interaction ends up holding.
+    """
+    from areal.experimental.openai import ArealOpenAI
+
+    engine = _EchoEngine(tokenizer)
+    client = ArealOpenAI(
+        engine=engine,
+        tokenizer=tokenizer,
+        processor=processor if with_image else None,
+        chat_template_type=chat_template_type,
+        api_key="test",
+    )
+    messages = (
+        [user_message_with_image(make_image(41), "describe")]
+        if with_image
+        else [{"role": "user", "content": "hello"}]
+    )
+
+    completion = await client.chat.completions.create(
+        messages=messages, model="default", max_completion_tokens=8
+    )
+
+    interaction = client.get_interaction(completion.id)
+    assert (interaction.collapsed_input_ids is not None) is retained
+
+
+def test_the_two_request_paths_agree_on_the_retention_rule():
+    """Test that Completions and Responses carry the same rule.
+
+    They are separate classes with separate copies of it, so they can drift.
+    """
+    from areal.experimental.openai.client import (
+        AsyncCompletionsWithReward,
+        AsyncResponsesWithReward,
+    )
+
+    def _retains(cls, processor, chat_template_type):
+        obj = cls.__new__(cls)
+        obj.processor = processor
+        obj.chat_template_type = chat_template_type
+        return obj._retains_collapsed_prompts()
+
+    for cls in (AsyncCompletionsWithReward, AsyncResponsesWithReward):
+        assert _retains(cls, object(), "concat"), cls.__name__
+        assert not _retains(cls, object(), "hf"), cls.__name__
+        assert not _retains(cls, None, "concat"), cls.__name__
+        assert not _retains(cls, None, "hf"), cls.__name__

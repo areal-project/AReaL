@@ -118,6 +118,12 @@ async_httpx_retry = retry(
 )
 
 
+# Bounded slices for error reporting. A rejected multimodal request carries the
+# expanded prompt and a base64 image, so echoing either in full turns one
+# failure into megabytes of log and leaks prompt content.
+ERROR_BODY_BYTES = 2048
+ERROR_PAYLOAD_CHARS = 400
+
 logger = logging.getLogger("HTTPUtils")
 
 
@@ -178,7 +184,22 @@ async def arequest_with_retry(
             async with ctx as response:
                 if verbose:
                     logger.info("http requests return")
-                response.raise_for_status()
+                if response.status >= 400:
+                    # raise_for_status() discards the body, but for a rejected
+                    # request the body *is* the explanation -- the exact-token
+                    # check answers with the prompt lengths and the first
+                    # divergence index. Read a bounded prefix rather than
+                    # buffering an arbitrarily large body, and never let a
+                    # decoding problem replace the status with a UnicodeError.
+                    raw = await response.content.read(ERROR_BODY_BYTES)
+                    detail = raw.decode("utf-8", errors="replace")
+                    raise aiohttp.ClientResponseError(
+                        response.request_info,
+                        response.history,
+                        status=response.status,
+                        message=detail or (response.reason or ""),
+                        headers=response.headers,
+                    )
                 ctype = response.content_type or ""
                 if ctype == "application/json":
                     res = await response.json()
@@ -212,14 +233,25 @@ async def arequest_with_retry(
                     max_retries,
                 )
             last_exception = e
+            # NOTE: 4xx is deliberately still retried. It is tempting to skip
+            # retries for client errors, but AReaL's own weight-update handlers
+            # answer worker-side failures with 400 (`to_json_response`), and
+            # those are what `request_retries` exists to cover. Any change here
+            # needs a per-caller policy, not a blanket rule.
             if attempt < max_retries - 1:
                 await asyncio.sleep(retry_delay)
             continue
     if session is None:
         await _session.close()
+    payload_summary = str(payload)
+    if len(payload_summary) > ERROR_PAYLOAD_CHARS:
+        payload_summary = (
+            f"{payload_summary[:ERROR_PAYLOAD_CHARS]}... "
+            f"[{len(payload_summary)} chars total]"
+        )
     raise RuntimeError(
         f"Failed after {max_retries} retries each. "
-        f"Payload: {payload}. Addr: {addr}. Endpoint: {endpoint}. "
+        f"Payload: {payload_summary}. Addr: {addr}. Endpoint: {endpoint}. "
         f"Last error: {repr(last_exception)}"
     )
 

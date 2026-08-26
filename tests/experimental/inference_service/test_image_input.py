@@ -350,148 +350,87 @@ class TestSGLangBridgeBackendImageForwarding:
 # =========================================================================
 
 
-class TestVLLMBridgeBackendVisionMessages:
-    def test_vision_messages_get_real_data_uris(self, red_pixel_b64):
-        backend = VLLMBridgeBackend()
+class _MarkerTokenizer:
+    """Resolves a single media placeholder to id 2, the marker used below."""
+
+    def convert_tokens_to_ids(self, token):
+        return 2 if token == "<|image_pad|>" else None
+
+    def convert_ids_to_tokens(self, token_id):
+        return "<|image_pad|>" if token_id == 2 else None
+
+
+class TestVLLMBridgeBackendRawMedia:
+    """Media travels as content_parts data URIs beside the exact token ids."""
+
+    @staticmethod
+    def _request(image_data, **kwargs):
+        """One collapsed marker (id 2) per supplied image, as vLLM requires."""
         gconfig = GenerationHyperparameters(
-            n_samples=1,
-            max_new_tokens=10,
-            max_tokens=32768,
+            n_samples=1, max_new_tokens=10, max_tokens=32768
         )
-        vision_msgs = [
-            [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": "Describe"},
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": "placeholder"},
-                        },
-                    ],
-                }
-            ]
-        ]
-        req = ModelRequest(
-            input_ids=[1, 2, 3],
+        n_media = len(image_data or ())
+        params = dict(
+            input_ids=[1] + [2] * (2 * n_media) + [3],
+            collapsed_input_ids=[1] + [2] * n_media + [3],
             gconfig=gconfig,
             metadata={},
-            image_data=[red_pixel_b64],
-            vision_msg_vllm=vision_msgs,
+            image_data=image_data,
+            tokenizer=_MarkerTokenizer(),
         )
+        params.update(kwargs)
+        return ModelRequest(**params)
 
-        http_req = backend.build_generation_request(req, with_lora=False, version=0)
-
-        assert http_req.endpoint == "/v1/chat/completions"
-        msg_content = http_req.payload["messages"][0]["content"]
-        image_part = msg_content[1]
-        assert image_part["type"] == "image_url"
-        expected_uri = f"data:image/png;base64,{red_pixel_b64}"
-        assert image_part["image_url"]["url"] == expected_uri
-
-    def test_multiple_vision_images_injected(self, red_pixel_b64, blue_pixel_b64):
+    def test_media_becomes_a_data_uri_content_part(self, red_pixel_b64):
         backend = VLLMBridgeBackend()
-        gconfig = GenerationHyperparameters(
-            n_samples=1,
-            max_new_tokens=10,
-            max_tokens=32768,
-        )
-        vision_msgs = [
-            [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": "Compare"},
-                        {"type": "image_url", "image_url": {"url": "placeholder"}},
-                        {"type": "image_url", "image_url": {"url": "placeholder"}},
-                    ],
-                }
-            ]
-        ]
-        req = ModelRequest(
-            input_ids=[1, 2, 3],
-            gconfig=gconfig,
-            metadata={},
-            image_data=[red_pixel_b64, blue_pixel_b64],
-            vision_msg_vllm=vision_msgs,
+
+        http_req = backend.build_generation_request(
+            self._request([red_pixel_b64]), with_lora=False, version=0
         )
 
-        http_req = backend.build_generation_request(req, with_lora=False, version=0)
+        assert http_req.endpoint == "/inference/v1/generate"
+        assert "messages" not in http_req.payload
+        part = http_req.payload["content_parts"][0]
+        assert part["type"] == "image_url"
+        assert part["url"] == f"data:image/png;base64,{red_pixel_b64}"
 
-        msg_content = http_req.payload["messages"][0]["content"]
-        assert (
-            msg_content[1]["image_url"]["url"]
-            == f"data:image/png;base64,{red_pixel_b64}"
-        )
-        assert (
-            msg_content[2]["image_url"]["url"]
-            == f"data:image/png;base64,{blue_pixel_b64}"
-        )
-
-    def test_mismatched_image_count_raises(self, red_pixel_b64):
+    def test_multiple_images_keep_their_order(self, red_pixel_b64, blue_pixel_b64):
+        """Order matters: it pairs each image with a placeholder span."""
         backend = VLLMBridgeBackend()
-        gconfig = GenerationHyperparameters(
-            n_samples=1,
-            max_new_tokens=10,
-            max_tokens=32768,
-        )
-        vision_msgs = [
-            [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "image_url", "image_url": {"url": "placeholder"}},
-                        {"type": "image_url", "image_url": {"url": "placeholder"}},
-                    ],
-                }
-            ]
-        ]
-        req = ModelRequest(
-            input_ids=[1, 2, 3],
-            gconfig=gconfig,
-            metadata={},
-            image_data=[red_pixel_b64],
-            vision_msg_vllm=vision_msgs,
+
+        http_req = backend.build_generation_request(
+            self._request([red_pixel_b64, blue_pixel_b64]), with_lora=False, version=0
         )
 
-        with pytest.raises(ValueError, match="Not enough images"):
+        parts = http_req.payload["content_parts"]
+        assert [p["url"] for p in parts] == [
+            f"data:image/png;base64,{red_pixel_b64}",
+            f"data:image/png;base64,{blue_pixel_b64}",
+        ]
+
+    def test_media_without_a_collapsed_prompt_raises(self, red_pixel_b64):
+        """The collapsed form is required; input_ids would double-expand."""
+        backend = VLLMBridgeBackend()
+        req = self._request([red_pixel_b64], collapsed_input_ids=None)
+
+        with pytest.raises(ValueError, match="collapsed_input_ids"):
             backend.build_generation_request(req, with_lora=False, version=0)
 
     def test_real_image_survives_data_uri_roundtrip(self):
-        """Encode a real 2x2 PNG, build vLLM request, decode from the payload."""
+        """Encode a real 2x2 PNG, build the request, decode from the payload."""
         original = Image.new("RGB", (2, 2), color=(255, 0, 0))
         buf = io.BytesIO()
         original.save(buf, format="PNG")
         raw_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
 
         backend = VLLMBridgeBackend()
-        gconfig = GenerationHyperparameters(
-            n_samples=1, max_new_tokens=10, max_tokens=32768
-        )
-        vision_msgs = [
-            [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "image_url", "image_url": {"url": "placeholder"}},
-                    ],
-                }
-            ]
-        ]
-        req = ModelRequest(
-            input_ids=[1, 2, 3],
-            gconfig=gconfig,
-            metadata={},
-            image_data=[raw_b64],
-            vision_msg_vllm=vision_msgs,
+        http_req = backend.build_generation_request(
+            self._request([raw_b64]), with_lora=False, version=0
         )
 
-        http_req = backend.build_generation_request(req, with_lora=False, version=0)
-
-        full_url = http_req.payload["messages"][0]["content"][0]["image_url"]["url"]
+        full_url = http_req.payload["content_parts"][0]["url"]
         assert full_url.startswith("data:image/png;base64,")
-        b64_payload = full_url.split(",", 1)[1]
-        decoded = base64.b64decode(b64_payload)
+        decoded = base64.b64decode(full_url.split(",", 1)[1])
         recovered = Image.open(io.BytesIO(decoded))
         assert recovered.size == (2, 2)
 

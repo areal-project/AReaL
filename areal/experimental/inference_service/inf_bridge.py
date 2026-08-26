@@ -28,6 +28,9 @@ _StopReason = Literal["length", "stop", "tool_calls", "abort"]
 
 logger = logging.getLogger("InferenceInfBridge")
 
+#: Cap on the backend error body echoed into logs and exceptions.
+ERROR_BODY_CHARS = 500
+
 
 class InfBridge:
     """Backend-agnostic HTTP client implementing ``_AsyncGenerateEngine`` protocol.
@@ -152,9 +155,17 @@ class InfBridge:
         else:
             resp = await self._client.post(url, json=http_req.payload, timeout=_timeout)
         if resp.status_code >= 400:
-            body = resp.text[:500]
+            body = resp.text[:ERROR_BODY_CHARS]
             logger.error("Backend returned %d for %s: %s", resp.status_code, url, body)
-        resp.raise_for_status()
+            # httpx's own message names only the status and URL. The body is
+            # the part that says *why* -- an exact-token rejection is only
+            # distinguishable from a timeout or a 503 by its text -- so put it
+            # in the exception rather than leaving it in the log.
+            raise httpx.HTTPStatusError(
+                f"{resp.status_code} from {url}: {body}",
+                request=resp.request,
+                response=resp,
+            )
         return resp.json()
 
     # -- main generation with pause/abort/resubmit --------------------------

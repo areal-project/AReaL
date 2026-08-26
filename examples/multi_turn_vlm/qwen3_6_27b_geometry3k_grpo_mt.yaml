@@ -9,13 +9,11 @@ tokenizer_path: ${actor.path}
 # Multi-turn tool-calling configuration
 max_turns: 2
 turn_discount: 1.0  # 1.0 = flat terminal reward
-# 'individual', not 'concat', because Qwen3.6 is a thinking model on the vision
-# path. vLLM generates image requests from the message list, not from the token
-# ids we send, and its chat template drops <think> from earlier assistant turns.
-# 'concat' splices the parent's raw tokens, so training would score turn >= 1
-# against a prompt the model never saw. 'hf' re-renders each turn with the same
-# template vLLM uses, keeping rollout and training aligned.
-export_style: individual
+# 'concat' is safe again: rollout generation sends exact token ids to
+# /inference/v1/generate, so vLLM no longer re-renders the conversation and
+# cannot drop <think> from earlier turns. The server rejects the request if its
+# media expansion disagrees with the prompt we export for training.
+export_style: concat
 tool_format: qwen3_coder   # Qwen3.5 emits qwen3_coder XML tool calls
 
 cluster:
@@ -49,7 +47,7 @@ rollout:
     mode: inline
     export_style: ${export_style}
     turn_discount: ${turn_discount}
-    chat_template_type: hf   # re-render per turn; see export_style above
+    chat_template_type: concat   # required by export_style: concat
     tool_call_parser: qwen3_coder
     reasoning_parser: qwen3
     # The proxy refuses to bind a non-loopback host with the default key.
@@ -104,15 +102,13 @@ actor:
     action: clamp
     metric: ratio
     upper: 2.0
-  # Batch-level, not group-level: 'individual' export emits a variable number of
-  # rows per episode, which misaligns the positional group windows.
+  # Group-level is available again with 'concat': one row per episode keeps the
+  # positional group windows aligned.
   reward_norm:
-    mean_level: batch
-    std_level: null
+    mean_level: group
+    std_level: group
     group_size: ${gconfig.n_samples}
-  adv_norm:
-    mean_level: batch
-    std_level: null
+  adv_norm: null   # group-normalized rewards already standardize; do not re-center
   megatron:
     bridge_type: megatron-bridge
     use_bridge_for_update_weights: true

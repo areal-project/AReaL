@@ -98,6 +98,12 @@ class StubTokenizer:
     def encode(self, text: str, add_special_tokens: bool = True) -> list[int]:
         return encode_text(text)
 
+    def __call__(
+        self, text: list[str], padding: bool = False, **kwargs: Any
+    ) -> dict[str, list[list[int]]]:
+        """Tokenize without expanding placeholders, as a processor delegate."""
+        return {"input_ids": [encode_text(item) for item in text]}
+
     def convert_tokens_to_ids(self, token: str) -> int | None:
         return VISION_PAD_TOKEN_IDS.get(token)
 
@@ -110,6 +116,11 @@ class StubTokenizer:
 
 class StubProcessor:
     """Expands image placeholders and emits content-derived pixel values."""
+
+    def __init__(self) -> None:
+        # Real processors expand placeholders in the text and then delegate to
+        # this tokenizer, which is how the collapsed prompt is produced.
+        self.tokenizer = StubTokenizer()
 
     def __call__(
         self,

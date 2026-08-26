@@ -11,12 +11,14 @@ from areal.api import AsyncRewardWrapper, InferenceEngine, ModelRequest, ModelRe
 from areal.api.cli_args import GenerationHyperparameters
 from areal.utils import logging
 from areal.utils.dynamic_import import import_from_string
+from areal.utils.hf_utils import collapsed_prompt_token_ids
 from areal.utils.image import image2base64
 from areal.utils.perf_tracer import (
     atrace_session_phase,
     session_context,
     trace_session,
 )
+from areal.utils.vision_canary import ensure_exact_token_support
 from areal.workflow.rlvr import RLVRWorkflow, log_reward_metrics
 
 logger = logging.getLogger("VisionRLVRWorkflow")
@@ -90,6 +92,11 @@ class VisionRLVRWorkflow(RLVRWorkflow):
         tuple[ModelResponse, float]
             Model response and reward value.
         """
+        # This workflow reaches the engine directly rather than through the
+        # proxy, which probes at initialization, so the contract is verified
+        # lazily here. Runs once per engine/processor; later calls are cheap.
+        await ensure_exact_token_support(engine, self.processor, self.tokenizer)
+
         async with atrace_session_phase("generate"):
             resp = await engine.agenerate(req)
 
@@ -123,9 +130,15 @@ class VisionRLVRWorkflow(RLVRWorkflow):
             rid=uuid.uuid4().hex,
             input_ids=input_ids,
             image_data=byte_images,
-            vision_msg_vllm=[data["messages_chat"]]
-            if "messages_chat" in data
-            else None,
+            # vLLM expands media placeholders itself, so the wire carries the
+            # unexpanded prompt while input_ids stays authoritative for
+            # training. Built here rather than recovered from input_ids, which
+            # would assume placeholders form dense contiguous runs.
+            # data["messages"] is the already-rendered prompt string, the same
+            # value handed to the processor above -- not a list of messages.
+            collapsed_input_ids=collapsed_prompt_token_ids(
+                self.processor, data["messages"]
+            ),
             gconfig=self.gconfig.new(n_samples=1),
             tokenizer=self.tokenizer,
             processor=self.processor,

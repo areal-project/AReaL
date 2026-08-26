@@ -60,7 +60,12 @@ from areal.experimental.openai.cache import InteractionCache
 from areal.experimental.openai.tool_call_parser import process_tool_calls
 from areal.experimental.openai.types import InteractionWithTokenLogpReward
 from areal.utils import logging
-from areal.utils.hf_utils import apply_chat_template
+from areal.utils.hf_utils import (
+    apply_chat_template,
+    collapsed_prompt_token_ids,
+    media_marker_token_ids,
+    vision_pad_token_ids,
+)
 
 if TYPE_CHECKING:
     from transformers.tokenization_utils_fast import PreTrainedTokenizerFast
@@ -163,11 +168,16 @@ class _VisionPrompt:
     what the training side must see. ``mm_token_type_ids`` is prompt-scoped and
     ``multi_modal_input`` holds one dict for the whole sequence, matching the
     convention used by the non-agent vision workflows.
+
+    ``collapsed_input_ids`` is the same prompt with one unexpanded placeholder
+    per media item. vLLM expands placeholders server side, so that is the form
+    the wire carries while ``input_ids`` stays authoritative for training.
     """
 
     input_ids: list[int]
     mm_token_type_ids: list[int] | None
     multi_modal_input: list[dict[str, Any]]
+    collapsed_input_ids: list[int]
 
 
 def _require_processor(processor: Any) -> None:
@@ -181,30 +191,6 @@ def _require_processor(processor: Any) -> None:
             "Pass processor=... to ArealOpenAI; the proxy server loads it from "
             "the configured tokenizer_path automatically for VLMs."
         )
-
-
-_VISION_PAD_TOKENS = ("<|image_pad|>", "<|video_pad|>")
-
-
-def vision_pad_token_ids(tokenizer: Any) -> frozenset[int]:
-    """Reserved vision-placeholder ids, which must never appear in generated text.
-
-    A prompt's pad-token count is fixed by the processor from the supplied
-    images, and both the processor re-render and the VLM forward count those
-    positions. A sampled pad token adds a position no image tensor describes,
-    so it breaks the embedding merge in training and on the next turn.
-    """
-    ids = set()
-    for token in _VISION_PAD_TOKENS:
-        try:
-            token_id = tokenizer.convert_tokens_to_ids(token)
-            # Unknown tokens come back as None or the unk id, so round-trip.
-            if token_id is None or tokenizer.convert_ids_to_tokens(token_id) != token:
-                continue
-        except Exception:
-            continue
-        ids.add(token_id)
-    return frozenset(ids)
 
 
 def drop_vision_pad_tokens(response: Any, pad_ids: frozenset[int]) -> None:
@@ -307,11 +293,60 @@ def _process_vision_prompt(
         if torch.is_tensor(value):
             multi_modal_input[key] = value.detach().cpu()
 
+    collapsed_input_ids = collapsed_prompt_token_ids(processor, text)
+    _check_collapsed_matches_expanded(
+        collapsed_input_ids,
+        input_ids,
+        mm_token_type_ids,
+        processor,
+        n_media=len(images),
+    )
+
     return _VisionPrompt(
         input_ids=input_ids,
         mm_token_type_ids=mm_token_type_ids,
         multi_modal_input=[multi_modal_input],
+        collapsed_input_ids=collapsed_input_ids,
     )
+
+
+def _check_collapsed_matches_expanded(
+    collapsed_ids: list[int],
+    expanded_ids: list[int],
+    mm_token_type_ids: list[int] | None,
+    processor: Any,
+    n_media: int,
+) -> None:
+    """Fail in the client rather than have the server reject the request.
+
+    Media spans are identified from the processor's own ``mm_token_type_ids``
+    mask, never by scanning for repeated placeholder runs -- that assumes dense
+    contiguous placeholders and does not hold for every model.
+    """
+    # Collapsed markers, not expanded pads: Gemma3 collapses to boi_token and
+    # expands into a run of image_token, so counting pads here would find none.
+    marker_ids = media_marker_token_ids(processor.tokenizer, processor=processor)
+    n_placeholders = sum(1 for token in collapsed_ids if token in marker_ids)
+    if marker_ids and n_placeholders != n_media:
+        raise ValueError(
+            f"Collapsed prompt carries {n_placeholders} media placeholders for "
+            f"{n_media} media item(s). vLLM expands exactly one placeholder per "
+            f"item, so the server would reject this prompt."
+        )
+
+    if mm_token_type_ids is None:
+        return
+    expanded_text_only = [
+        token for token, is_mm in zip(expanded_ids, mm_token_type_ids) if not is_mm
+    ]
+    collapsed_text_only = [token for token in collapsed_ids if token not in marker_ids]
+    if expanded_text_only != collapsed_text_only:
+        raise ValueError(
+            "Collapsed and expanded prompts disagree outside the media spans "
+            f"({len(collapsed_text_only)} vs {len(expanded_text_only)} tokens). "
+            "The collapsed prompt is not the same prompt as the one that will "
+            "be exported for training."
+        )
 
 
 def _postprocess_tool_call_arguments_for_template(
@@ -671,12 +706,26 @@ def concat_vision_prompt_with_parent(
     parent_mm_token_type_ids: list[int] = []
     all_message_list: list[dict] = []
     eos_token_id = tokenizer.eos_token_id
+    collapsed_parent_tokens: list[int] = []
 
     if parent is not None:
         if parent.model_response is None:
             raise ValueError("Parent interaction has no model_response.")
+        if parent.collapsed_input_ids is None:
+            raise ValueError(
+                "Parent interaction has no collapsed_input_ids. Concat needs "
+                "the parent's unexpanded prompt to build the child's; falling "
+                "back to the expanded prompt would make the server expand the "
+                "media placeholders a second time."
+            )
         parent_tokens = (
             parent.model_response.input_tokens
+            + parent.model_response.output_tokens_without_stop
+        )
+        # Generated output contains no media placeholders, so both parent forms
+        # take the identical suffix.
+        collapsed_parent_tokens = (
+            list(parent.collapsed_input_ids)
             + parent.model_response.output_tokens_without_stop
         )
         all_message_list += parent.messages if parent.messages is not None else []
@@ -684,8 +733,10 @@ def concat_vision_prompt_with_parent(
             parent.output_message_list if parent.output_message_list is not None else []
         )
         # Mirrors the text path: realign with the chat template by appending the
-        # EOS the parent may not have emitted.
+        # EOS the parent may not have emitted. Both forms must gain it, or their
+        # EOS counts diverge and the two splices would find different seams.
         parent_tokens += [eos_token_id]
+        collapsed_parent_tokens += [eos_token_id]
         # Generated tokens and the alignment EOS are never multimodal, so the
         # parent's prompt-scoped ids only need zero-extending.
         parent_mm_token_type_ids = list(parent.mm_token_type_ids or [])
@@ -723,6 +774,14 @@ def concat_vision_prompt_with_parent(
         processed.input_ids, parent_tokens, eos_token_id
     )
 
+    # The collapsed form is spliced independently against the parent's collapsed
+    # prompt. Media placeholders carry no EOS, so both splices locate the same
+    # conversational seam by EOS count, just at different token indices; the two
+    # child_start values are unrelated and must not be shared.
+    collapsed_prompt_token_ids, _ = _splice_with_parent_tokens(
+        processed.collapsed_input_ids, collapsed_parent_tokens, eos_token_id
+    )
+
     mm_token_type_ids = None
     if processed.mm_token_type_ids is not None:
         mm_token_type_ids = (
@@ -733,6 +792,7 @@ def concat_vision_prompt_with_parent(
         input_ids=prompt_token_ids,
         mm_token_type_ids=mm_token_type_ids,
         multi_modal_input=processed.multi_modal_input,
+        collapsed_input_ids=collapsed_prompt_token_ids,
     )
 
 
@@ -768,7 +828,11 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
         self.chat_template_kwargs = dict(chat_template_kwargs or {})
         self.lora_name = lora_name
         self.processor = processor
-        self.vision_pad_ids = vision_pad_token_ids(tokenizer)
+        self.vision_pad_ids = vision_pad_token_ids(tokenizer, processor=processor)
+
+    def _retains_collapsed_prompts(self) -> bool:
+        """Whether a future concat child could read the collapsed prompt."""
+        return self.processor is not None and self.chat_template_type == "concat"
 
     def _build_chat_completion(
         self,
@@ -935,8 +999,8 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
                 raise TypeError("tools must be an iterable of ChatCompletionToolParam")
             tools_list = list(tools)
 
-        image_data, messages_for_tokenizer, vision_messages_for_vllm = (
-            _extract_images_from_messages(messages_list)
+        image_data, messages_for_tokenizer, _ = _extract_images_from_messages(
+            messages_list
         )
         has_images = len(image_data) > 0
 
@@ -1010,6 +1074,16 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
         if interaction is not None and vision_prompt is not None:
             interaction.mm_token_type_ids = vision_prompt.mm_token_type_ids
             interaction.multi_modal_input = vision_prompt.multi_modal_input
+
+        # A text-only turn can parent a later image turn. Keep a snapshot because
+        # generation resume mutates the request's copy.
+        collapsed_prompt_token_ids = (
+            vision_prompt.collapsed_input_ids
+            if vision_prompt is not None
+            else prompt_token_ids
+        )
+        if interaction is not None and self._retains_collapsed_prompts():
+            interaction.collapsed_input_ids = list(collapsed_prompt_token_ids)
 
         temp = 1.0 if is_omitted(temperature) else (temperature or 0.0)
         if not is_omitted(max_tokens):
@@ -1111,8 +1185,13 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
             rid=str(uuid.uuid4()),
             metadata=metadata if not is_omitted(metadata) else {},
             tokenizer=self.tokenizer,
+            processor=self.processor,
             image_data=image_data if has_images else None,
-            vision_msg_vllm=([vision_messages_for_vllm] if has_images else None),
+            # Its own list: the engine extends this in place as generation
+            # resumes, and the interaction's snapshot must not follow.
+            collapsed_input_ids=(
+                list(collapsed_prompt_token_ids) if has_images else None
+            ),
         )
 
         # Call inference engine
@@ -1317,7 +1396,11 @@ class AsyncResponsesWithReward(BaseAsyncResponses):
         self.chat_template_kwargs = dict(chat_template_kwargs or {})
         self.lora_name = lora_name
         self.processor = processor
-        self.vision_pad_ids = vision_pad_token_ids(tokenizer)
+        self.vision_pad_ids = vision_pad_token_ids(tokenizer, processor=processor)
+
+    def _retains_collapsed_prompts(self) -> bool:
+        """Whether a future concat child could read the collapsed prompt."""
+        return self.processor is not None and self.chat_template_type == "concat"
 
     async def create(
         self,
@@ -1396,8 +1479,8 @@ class AsyncResponsesWithReward(BaseAsyncResponses):
                 raise TypeError("tools must be an iterable of ChatCompletionToolParam")
             tools_list = list(tools)
 
-        image_data, messages_for_tokenizer, vision_messages_for_vllm = (
-            _extract_images_from_messages(messages_list)
+        image_data, messages_for_tokenizer, _ = _extract_images_from_messages(
+            messages_list
         )
         has_images = len(image_data) > 0
 
@@ -1465,6 +1548,16 @@ class AsyncResponsesWithReward(BaseAsyncResponses):
             interaction.mm_token_type_ids = vision_prompt.mm_token_type_ids
             interaction.multi_modal_input = vision_prompt.multi_modal_input
 
+        # A text-only turn can parent a later image turn. Keep a snapshot because
+        # generation resume mutates the request's copy.
+        collapsed_prompt_token_ids = (
+            vision_prompt.collapsed_input_ids
+            if vision_prompt is not None
+            else prompt_token_ids
+        )
+        if interaction is not None and self._retains_collapsed_prompts():
+            interaction.collapsed_input_ids = list(collapsed_prompt_token_ids)
+
         # Map sampling params
         temp = 1.0 if is_omitted(temperature) else (temperature or 0.0)
         top_p_val = 1.0 if is_omitted(top_p) else (top_p or 1.0)
@@ -1524,8 +1617,13 @@ class AsyncResponsesWithReward(BaseAsyncResponses):
             rid=str(uuid.uuid4()),
             metadata=metadata if not is_omitted(metadata) else {},
             tokenizer=self.tokenizer,
+            processor=self.processor,
             image_data=image_data if has_images else None,
-            vision_msg_vllm=([vision_messages_for_vllm] if has_images else None),
+            # Its own list: the engine extends this in place as generation
+            # resumes, and the interaction's snapshot must not follow.
+            collapsed_input_ids=(
+                list(collapsed_prompt_token_ids) if has_images else None
+            ),
         )
 
         # Call inference engine
