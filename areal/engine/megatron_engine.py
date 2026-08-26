@@ -570,9 +570,11 @@ class MegatronEngine(TrainEngine):
                     self.use_model_packed_seq and supports_gdn_packed_seq()
                 ):
                     raise NotImplementedError(
-                        "Context parallel (CP > 1) is not supported with VLM models. "
+                        "Context parallel (CP > 1) requires a VLM with a "
+                        "model-owned THD contract. "
                         f"Got context_parallel_size={self.parallel_strategy.context_parallel_size} "
-                        f"for model_type={self.hf_config.model_type}."
+                        f"for model_type={self.hf_config.model_type} and "
+                        f"bridge_type={self.bridge_cls}."
                     )
                 self.processor, self.tokenizer = load_hf_processor_and_tokenizer(
                     self.config.path

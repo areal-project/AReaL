@@ -520,6 +520,9 @@ def packed_context_parallel_forward(
                     "Model-packed THD with CP > 1 requires megatron-core>=0.18.2 "
                     "and megatron-bridge>=0.5.1."
                 )
+            # Keep the full BSHD inputs on every CP rank. The bridge first fuses
+            # vision embeddings and computes multimodal RoPE, then partitions
+            # the resulting THD sequence with its model-owned CP layout.
             input_ids, attention_mask, _, max_seqlen = _reconstruct_padded_2d(
                 input_ids, cu_seqlens, input_.get("max_seqlen")
             )
