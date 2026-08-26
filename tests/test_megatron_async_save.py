@@ -171,6 +171,7 @@ def test_async_save_publishes_only_from_finalize(patched_checkpointer, tmp_path)
     with (
         patch.object(manager, "generate_state_dict", return_value={"model": {}}),
         patch.object(mod, "save_dist_checkpointing", return_value=fake_request),
+        patch.object(mod, "_inspect_retained_payload", return_value=[]),
         patch("torch.cuda.empty_cache"),
         patch("torch.distributed.barrier"),
     ):
