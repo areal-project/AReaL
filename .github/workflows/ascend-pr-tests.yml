@@ -205,7 +205,7 @@ jobs:
     runs-on: linux-aarch64-a3-4
     timeout-minutes: 75
     container:
-      image: ghcr.io/hwvanici/areal_npu:v1.0.5-a3
+      image: ghcr.io/hwvanici/areal_npu:v1.0.6rc1-a3
 
     env:
       AREAL_IS_IN_CI: "1"
@@ -506,7 +506,7 @@ jobs:
     runs-on: linux-aarch64-a3-8
     timeout-minutes: 75
     container:
-      image: ghcr.io/hwvanici/areal_npu:v1.0.5-a3
+      image: ghcr.io/hwvanici/areal_npu:v1.0.6rc1-a3
 
     env:
       AREAL_IS_IN_CI: "1"
