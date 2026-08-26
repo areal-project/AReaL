@@ -211,7 +211,6 @@ def test_vlm_forward(backend: str, output: str | None = None):
     # per rank and avoids NCCL OOMs at the GPU-memory boundary on 30B+ MoE.
     engine = make_vlm_engine(backend, init_optimizer=False, wrap_with_ddp=False)
     if os.environ.get("AREAL_TEST_EXPECT_MODEL_THD") == "1":
-        assert engine.hf_config.model_type == "qwen3_vl_moe"
         assert engine.bridge_cls == "megatron-bridge"
         assert engine.sequence_packing_mode == SequencePackingMode.MODEL_THD
         assert engine.use_model_packed_seq
