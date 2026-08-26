@@ -9,7 +9,13 @@ tokenizer_path: ${actor.path}
 # Multi-turn tool-calling configuration
 max_turns: 2
 turn_discount: 1.0  # 1.0 = flat terminal reward
-export_style: individual   # thinking VLM: per-turn samples (template strips <think>)
+# 'individual', not 'concat', because Qwen3.6 is a thinking model on the vision
+# path. vLLM generates image requests from the message list, not from the token
+# ids we send, and its chat template drops <think> from earlier assistant turns.
+# 'concat' splices the parent's raw tokens, so training would score turn >= 1
+# against a prompt the model never saw. 'hf' re-renders each turn with the same
+# template vLLM uses, keeping rollout and training aligned.
+export_style: individual
 tool_format: qwen3_coder   # Qwen3.5 emits qwen3_coder XML tool calls
 
 cluster:
@@ -37,6 +43,18 @@ rollout:
   fileroot: ${cluster.fileroot}
   tokenizer_path: ${tokenizer_path}
   dump_to_file: true
+  # Multi-turn bookkeeping, vision tensors, reward propagation and export shape
+  # are owned by the OpenAI proxy (agent workflows).
+  agent:
+    mode: inline
+    export_style: ${export_style}
+    turn_discount: ${turn_discount}
+    chat_template_type: hf   # re-render per turn; see export_style above
+    tool_call_parser: qwen3_coder
+    reasoning_parser: qwen3
+    # The proxy refuses to bind a non-loopback host with the default key.
+    # Change this for any shared or multi-tenant cluster.
+    admin_api_key: areal-geo3k-mt-key
 
 gconfig:
   n_samples: 4
@@ -80,8 +98,14 @@ actor:
   recompute_logprob: true
   use_decoupled_loss: true
   rejection_sampling:
+    # clamp rather than mask: keeps every token in the gradient with a bounded
+    # weight instead of discarding stale ones, which matters under async rollout.
+    level: token
+    action: clamp
     metric: ratio
-    upper: 5.0
+    upper: 2.0
+  # Batch-level, not group-level: 'individual' export emits a variable number of
+  # rows per episode, which misaligns the positional group windows.
   reward_norm:
     mean_level: batch
     std_level: null

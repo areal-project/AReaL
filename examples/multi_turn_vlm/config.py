@@ -13,15 +13,18 @@ class MultiTurnVLMGRPOConfig(GRPOConfig):
         default=1.0,
         metadata={
             "help": "Per-turn reward discount in (0, 1]. 1.0 = flat terminal reward; "
-            "< 1.0 adds an early-success incentive."
+            "< 1.0 adds an early-success incentive. Feeds rollout.agent.turn_discount."
         },
     )
     export_style: str = field(
         default="concat",
         metadata={
-            "help": "'concat' (one trajectory/episode; non-thinking VLMs, default) "
-            "or 'individual' (one sample/turn; required for thinking models whose "
-            "chat template strips prior <think>, e.g. Qwen3.5/3.6).",
+            "help": "'concat' (one trajectory/episode; default) or 'individual' "
+            "(one sample/turn). Feeds rollout.agent.export_style; 'concat' also "
+            "requires rollout.agent.chat_template_type='concat' and a strictly "
+            "linear conversation. 'concat' encodes the image once per episode "
+            "instead of once per turn, and is required by group-level "
+            "normalization.",
             "choices": ["concat", "individual"],
         },
     )

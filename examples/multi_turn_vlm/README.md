@@ -21,16 +21,18 @@ answer: a wrong answer or a missing tool call is fed back and the model retries 
 credit. The episode ends when the answer is correct or `max_turns` is reached; reward is
 the best (discounted) grade across turns (`turn_discount` 1.0 = flat terminal).
 
-The design splits responsibilities: a **general, task-agnostic workflow** drives the
-loop and owns the VLM trajectory mechanics, while a **task env** owns the tool, grading,
-feedback, and termination.
+The design splits responsibilities: a **general, task-agnostic agent** drives the loop,
+while a **task env** owns the tool, grading, feedback, and termination. The agent talks
+to the model through AReaL's OpenAI proxy, which records token-level data and builds the
+training tensors (including `pixel_values`) — so nothing here assembles token sequences
+by hand.
 
 - `MultiTurnVisionEnv` ABC —
   [areal/workflow/vision_env.py](../../areal/workflow/vision_env.py) (`reset`/`step`,
   `EnvResetResult`/`EnvStepResult`)
-- `VisionMultiTurnWorkflow` —
+- `VisionMultiTurnAgent` —
   [areal/workflow/vision_multiturn.py](../../areal/workflow/vision_multiturn.py)
-  (env-driven)
+  (env-driven, proxy-based)
 - `Geo3kCalcScoreEnv` — [geo3k_env.py](geo3k_env.py) (the `calc_score` tool)
 
 ## Files
@@ -38,7 +40,7 @@ feedback, and termination.
 - `geometry3k_grpo_mt.py` — training script (wires `env_factory`/`env_args`).
 - `geo3k_env.py` — the `Geo3kCalcScoreEnv` (tool schema + grading + feedback).
 - `qwen3_vl_2b_geometry3k_grpo_mt.yaml` — Qwen3-VL-2B-Instruct (non-thinking): `hermes`
-  \+ `concat`, one Ascend NPU node.
+  \+ `individual`, one Ascend NPU node.
 - `qwen3_6_27b_geometry3k_grpo_mt.yaml` — Qwen3.6-27B (thinking, GDN): `qwen3_coder` +
   `individual`, two nodes via Ray.
 - `config.py` — `MultiTurnVLMGRPOConfig` (`max_turns`, `turn_discount`, `export_style`,
@@ -47,12 +49,12 @@ feedback, and termination.
 
 ## Multi-turn parameters
 
-| Parameter       | Default  | Description                                                                                                         |
-| --------------- | -------- | ------------------------------------------------------------------------------------------------------------------- |
-| `max_turns`     | 2        | Maximum tool-calling turns per episode.                                                                             |
-| `turn_discount` | 1.0      | Per-turn reward discount; 1.0 = flat terminal reward.                                                               |
-| `export_style`  | `concat` | `concat` (one trajectory/episode; non-thinking) or `individual` (one sample/turn; thinking models strip `<think>`). |
-| `tool_format`   | `hermes` | `hermes` (Qwen3-VL JSON) or `qwen3_coder` (Qwen3.5 XML); the parser accepts both.                                   |
+| Parameter       | Default      | Description                                                                                                                 |
+| --------------- | ------------ | --------------------------------------------------------------------------------------------------------------------------- |
+| `max_turns`     | 2            | Maximum tool-calling turns per episode.                                                                                     |
+| `turn_discount` | 1.0          | Per-turn reward discount; 1.0 = flat terminal reward.                                                                       |
+| `export_style`  | `individual` | `individual` (one sample/turn) or `concat` (one trajectory/episode; also needs `rollout.agent.chat_template_type: concat`). |
+| `tool_format`   | `hermes`     | `hermes` (Qwen3-VL JSON) or `qwen3_coder` (Qwen3.5 XML); the parser accepts both.                                           |
 
 ## Quick start (NPU)
 
@@ -75,21 +77,24 @@ both, for the non-thinking 2B and the thinking 27B.
 Subclass `MultiTurnVisionEnv`: `reset(data)` returns the turn-0 prompt (`messages_chat`
 incl. a system turn with your tool instructions, plus `images`); `step(assistant_text)`
 parses the action, grades it, and returns `EnvStepResult(observation, reward, done)`.
-Point `env_factory` at it. The workflow is unchanged.
+Point `env_factory` at it. The agent is unchanged.
 
 ## Compatibility notes
 
-- The tool schema is delivered in the **turn-0 system prompt**; the workflow builds the
-  token-path prompt and the vLLM `messages_chat` from the same message list, so both
-  stay consistent (`vllm.skip_tokenizer_init: false`).
-- The workflow emits `mm_token_type_ids` for the FSDP 3D mRoPE path; the Megatron path
-  ignores it and instead requires the image-pad-token count to stay aligned with
-  `image_grid_thw` — satisfied because observations are text-only (one fixed image,
-  processed once at turn 0).
+- Works under `local`, `slurm` and `ray`. Under `ray`, point `cluster.fileroot` and
+  `cluster.name_resolve` at paths reachable from every node Ray may use —
+  `cluster.n_nodes` sizes the request but does not pin placement to the driver node.
+- The tool schema is delivered in the **turn-0 system prompt**. The proxy renders the
+  prompt with the model's own chat template and processor, so the recorded tokens are
+  the ones the engine ran (`vllm.skip_tokenizer_init: false`).
+- The proxy emits `multi_modal_input` (`pixel_values` + `image_grid_thw`) and
+  `mm_token_type_ids`; the FSDP 3D mRoPE path consumes the latter, and the Megatron path
+  requires the image-pad-token count to stay aligned with `image_grid_thw` — satisfied
+  because observations are text-only (one fixed image, re-processed per turn).
 - One image per trajectory → a single-element `multi_modal_input`; no `num_images` field
   needed.
 - A multi-turn trajectory must fit in **one** microbatch (it can't be split — the image
-  binds it to a single mb). The workflow caps trajectory length at
+  binds it to a single mb). The agent caps trajectory length at
   `actor.mb_spec.max_tokens_per_mb`, stopping early instead of crashing the FFD packer.
   Ensure `max_tokens_per_mb ≳ prompt + max_turns × max_new_tokens` to allow full
   episodes without early truncation; raise it (more memory) for longer turns.

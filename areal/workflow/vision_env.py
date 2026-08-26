@@ -5,8 +5,9 @@
 A `MultiTurnVisionEnv` owns all task-specific semantics (the initial prompt
 incl. any system/tool instructions, how to parse the model's action, how to
 grade it, the feedback to return, and when the episode terminates). The
-`VisionMultiTurnWorkflow` is task-agnostic: it drives generation, calls
-`env.step()` each turn, and accumulates the training trajectory.
+`VisionMultiTurnAgent` is task-agnostic: it drives generation, calls
+`env.step()` each turn, and lets the OpenAI proxy accumulate the training
+trajectory.
 """
 
 from abc import ABC, abstractmethod
@@ -54,7 +55,7 @@ class EnvStepResult:
 class MultiTurnVisionEnv(ABC):
     """Per-episode environment for multi-turn tool-calling VLM RL.
 
-    One instance is created per episode: the workflow resolves ``env_factory``,
+    One instance is created per episode: the agent resolves ``env_factory``,
     instantiates it with ``env_args``, calls ``reset(data)`` once, then
     ``step(assistant_text)`` per turn. Implementations hold per-episode state
     (ground truth, turn counter, ...). ``env_args`` must be JSON-serializable

@@ -422,8 +422,61 @@ The `to_tensor_dict()` method converts to training format:
     "versions": torch.tensor([...], dtype=torch.int32),
     "attention_mask": torch.ones(..., dtype=torch.bool),
     "rewards": torch.tensor([reward], dtype=torch.float32),
+    # VLM only, see "Multimodal Agents" below
+    "multi_modal_input": [{"pixel_values": ..., "image_grid_thw": ...}],
+    "mm_token_type_ids": torch.tensor([...], dtype=torch.long),
 }
 ```
+
+## Multimodal Agents
+
+Agents can send images through the proxy using standard OpenAI `image_url` content
+parts. The proxy loads an `AutoProcessor` alongside the tokenizer, so image handling is
+automatic for VLMs — no agent-side change beyond sending the image.
+
+```python
+response = await client.chat.completions.create(
+    model="default",
+    messages=[{
+        "role": "user",
+        "content": [
+            {"type": "image_url",
+             "image_url": {"url": f"data:image/png;base64,{payload}"}},
+            {"type": "text", "text": "What is in this image?"},
+        ],
+    }],
+)
+```
+
+**What the processor does.** The chat template is rendered to text first, then the
+processor expands each image placeholder into the model's image-pad tokens and produces
+`pixel_values`. The prompt sent to the engine and recorded for training is the expanded
+one, so rollout and training see the same sequence. Exported trajectories carry
+`multi_modal_input` (one dict per sequence, holding every image in that context) and
+`mm_token_type_ids`, which the FSDP and Megatron engines already consume for mRoPE
+position ids.
+
+**Multi-turn.** Each turn re-processes every image in its context, so a later turn's
+`pixel_values` cover images introduced by earlier turns. Identical images are
+content-hashed and transmitted once per export rather than once per turn.
+
+**Both chat template types are supported.** With `concat`, the whole conversation is
+processed together and the parent's real tokens are grafted back on; image expansion
+inserts image-pad tokens rather than EOS tokens, so the EOS-based alignment used by the
+text path stays valid.
+
+**Mixed task sets.** Image-bearing and text-only rows may be freely mixed, both across
+turns within an episode and across episodes in one training batch.
+`normalize_vision_keys` fills text-only rows with an empty `multi_modal_input` entry per
+sequence and all-zero `mm_token_type_ids`; the engines gather `pixel_values` only from
+rows that actually have them. Batches with no images at all gain no vision keys.
+
+**Constraints:**
+
+- Images must be inline data URIs. Remote `http(s)://` URLs are rejected, because the
+  processor needs the bytes and fetching them would add an SSRF surface to the proxy.
+- Sending images to a client with no processor raises rather than silently exporting a
+  trajectory with no `pixel_values`.
 
 ## Reward System
 

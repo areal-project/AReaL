@@ -9,7 +9,7 @@ tokenizer_path: ${actor.path}
 # Multi-turn tool-calling configuration
 max_turns: 2
 turn_discount: 1.0  # 1.0 = flat terminal reward
-export_style: concat       # non-thinking VLM: one trajectory/episode
+export_style: concat
 tool_format: hermes        # Qwen3-VL emits Hermes JSON tool calls
 
 cluster:
@@ -37,6 +37,18 @@ rollout:
   fileroot: ${cluster.fileroot}
   tokenizer_path: ${tokenizer_path}
   dump_to_file: true
+  # Multi-turn bookkeeping, vision tensors, reward propagation and export shape
+  # are owned by the OpenAI proxy (agent workflows).
+  agent:
+    mode: inline
+    export_style: ${export_style}
+    turn_discount: ${turn_discount}
+    chat_template_type: concat   # required by export_style: concat
+    tool_call_parser: qwen25
+    reasoning_parser: qwen3
+    # The proxy refuses to bind a non-loopback host with the default key.
+    # Change this for any shared or multi-tenant cluster.
+    admin_api_key: areal-geo3k-mt-key
 
 gconfig:
   n_samples: 4
@@ -80,15 +92,17 @@ actor:
   recompute_logprob: true
   use_decoupled_loss: true
   rejection_sampling:
+    # clamp rather than mask: keeps every token in the gradient with a bounded
+    # weight instead of discarding stale ones, which matters under async rollout.
+    level: token
+    action: clamp
     metric: ratio
-    upper: 5.0
+    upper: 2.0
   reward_norm:
-    mean_level: batch
-    std_level: null
+    mean_level: group
+    std_level: group
     group_size: ${gconfig.n_samples}
-  adv_norm:
-    mean_level: batch
-    std_level: null
+  adv_norm: null   # group-normalized rewards already standardize; do not re-center
   megatron:
     bridge_type: megatron-bridge
     use_bridge_for_update_weights: true

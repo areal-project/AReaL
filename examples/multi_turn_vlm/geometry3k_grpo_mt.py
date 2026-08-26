@@ -27,34 +27,37 @@ def main(args):
         processor=processor,
     )
 
-    # Reward / grading / feedback live in the env (calc_score tool); the workflow
+    # Reward / grading / feedback live in the env (calc_score tool); the agent
     # is task-agnostic. env_factory is a dotted import path resolved in the
     # rollout worker; env_args must be JSON-serializable.
+    #
+    # Token bookkeeping, vision tensors, reward propagation (turn_discount) and
+    # trajectory export shape (export_style) are handled by the OpenAI proxy and
+    # configured under `rollout.agent` in the YAML.
     workflow_kwargs = dict(
         env_factory="examples.multi_turn_vlm.geo3k_env.Geo3kCalcScoreEnv",
         env_args={"max_turns": config.max_turns, "tool_format": config.tool_format},
-        gconfig=config.gconfig,
-        tokenizer=config.tokenizer_path,
-        processor=config.tokenizer_path,
         max_turns=config.max_turns,
-        turn_discount=config.turn_discount,
+        max_completion_tokens=config.gconfig.max_new_tokens,
+        temperature=config.gconfig.temperature,
+        top_p=config.gconfig.top_p,
         # Cap a trajectory to one microbatch so multi-turn sequences never
         # exceed the FFD packing capacity (they cannot be split for VLM).
         max_tokens_per_traj=config.actor.mb_spec.max_tokens_per_mb,
-        export_style=config.export_style,
     )
     eval_workflow_kwargs = workflow_kwargs.copy()
-    eval_workflow_kwargs["gconfig"] = config.gconfig.new(temperature=0.6)
+    eval_workflow_kwargs["temperature"] = 0.6
 
+    agent = "areal.workflow.vision_multiturn.VisionMultiTurnAgent"
     with PPOTrainer(
         config,
         train_dataset=train_dataset,
         valid_dataset=valid_dataset,
     ) as trainer:
         trainer.train(
-            workflow="areal.workflow.vision_multiturn.VisionMultiTurnWorkflow",
+            workflow=agent,
             workflow_kwargs=workflow_kwargs,
-            eval_workflow="areal.workflow.vision_multiturn.VisionMultiTurnWorkflow",
+            eval_workflow=agent,
             eval_workflow_kwargs=eval_workflow_kwargs,
         )
 
