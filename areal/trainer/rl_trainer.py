@@ -463,7 +463,7 @@ class PPOTrainer:
 
         # Set up checkpointing for recover
         self.recover_info = self.recover_handler.load(
-            self.actor,
+            self._recover_engines(),
             self.saver,
             self.evaluator,
             self.stats_logger,
@@ -1383,9 +1383,6 @@ class PPOTrainer:
 
     def _save_recover_checkpoint(self, epoch: int, epoch_step: int, global_step: int):
         # Save recoverable checkpoints
-        to_save: dict = dict(default=self.actor)
-        if self.critic is not None:
-            to_save["critic"] = self.critic
         step_info = StepInfo(
             global_step=global_step,
             epoch=epoch,
@@ -1393,7 +1390,7 @@ class PPOTrainer:
             steps_per_epoch=len(self.train_dataloader),
         )
         self.recover_handler.dump(
-            to_save,
+            self._recover_engines(),
             step_info,
             self.saver,
             self.evaluator,
@@ -1406,6 +1403,12 @@ class PPOTrainer:
         if not is_single_controller():
             dist.barrier(group=self.actor.cpu_group)
             current_platform.synchronize()
+
+    def _recover_engines(self) -> dict[str, Any]:
+        engines = {"default": self.actor}
+        if self.critic is not None:
+            engines["critic"] = self.critic
+        return engines
 
     def _evaluate_fn(
         self,

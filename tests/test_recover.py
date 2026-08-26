@@ -526,6 +526,29 @@ class TestRecoverHandler:
             assert meta.with_optim is (not no_load_optim)
 
 
+class TestPPORecoverEngines:
+    def test_actor_only_returns_default_engine(self):
+        from areal.trainer.rl_trainer import PPOTrainer
+
+        trainer = PPOTrainer.__new__(PPOTrainer)
+        trainer.actor = Mock()
+        trainer.critic = None
+
+        assert trainer._recover_engines() == {"default": trainer.actor}
+
+    def test_critic_is_included_with_stable_name(self):
+        from areal.trainer.rl_trainer import PPOTrainer
+
+        trainer = PPOTrainer.__new__(PPOTrainer)
+        trainer.actor = Mock()
+        trainer.critic = Mock()
+
+        assert trainer._recover_engines() == {
+            "default": trainer.actor,
+            "critic": trainer.critic,
+        }
+
+
 class TestAwexColocateGate:
     """The AWEX pre-transfer sequence must run only for colocated rollouts."""
 
