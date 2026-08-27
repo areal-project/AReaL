@@ -418,8 +418,8 @@ class TestPackedContextParallelForward:
             )
             assert output.shape == (expected_ids.numel(), 4)
 
-    def test_qwen35_multimodal_mtp_uses_padded_labels_and_mask(self, monkeypatch):
-        """MTP supervision must follow Qwen3.5's padded execution layout."""
+    def test_padded_vlm_mtp_uses_padded_labels_and_mask(self, monkeypatch):
+        """MTP supervision must follow the ordinary VLM padded layout."""
         from areal.engine.megatron_utils import packed_context_parallel
 
         model = MagicMock(return_value=torch.ones(2, 3, 4))
@@ -443,7 +443,6 @@ class TestPackedContextParallelForward:
                 },
             },
             is_vision_model=True,
-            use_padded_seq=True,
         )
 
         call = model.call_args.kwargs
