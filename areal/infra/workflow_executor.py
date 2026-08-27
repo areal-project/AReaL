@@ -2,6 +2,7 @@
 
 from __future__ import annotations  # noqa
 
+import asyncio
 import json
 import os
 import random
@@ -43,6 +44,9 @@ from logging import Logger
 
 if TYPE_CHECKING:
     from .remote_inf_engine import RemoteInfEngine
+
+
+_REJECTED_TRAJECTORY_CLEAR_TIMEOUT_SECONDS = 5.0
 
 
 def check_trajectory_format(
@@ -1131,6 +1135,39 @@ class WorkflowExecutor:
             f"rejected: {stats.rejected}."
         )
 
+    async def _clear_rejected_trajectory(self, traj: dict[str, Any] | None) -> None:
+        """Best-effort cleanup for remote shards that will not reach training."""
+        shards_by_node = RTensor.collect_shards(traj)
+        if not shards_by_node:
+            return
+
+        async def _clear_node(node_addr: str, shard_ids: list[Any]) -> None:
+            await asyncio.wait_for(
+                RTensor.clear_node(node_addr, shard_ids),
+                timeout=_REJECTED_TRAJECTORY_CLEAR_TIMEOUT_SECONDS,
+            )
+
+        results = await asyncio.gather(
+            *(
+                _clear_node(node_addr, shard_ids)
+                for node_addr, shard_ids in shards_by_node.items()
+            ),
+            return_exceptions=True,
+        )
+        for node_addr, result in zip(shards_by_node, results):
+            if isinstance(result, TimeoutError):
+                self.logger.warning(
+                    "Timed out after %.1fs clearing rejected trajectory shards on %s",
+                    _REJECTED_TRAJECTORY_CLEAR_TIMEOUT_SECONDS,
+                    node_addr,
+                )
+            elif isinstance(result, BaseException):
+                self.logger.warning(
+                    "Failed to clear rejected trajectory shards on %s: %s",
+                    node_addr,
+                    result,
+                )
+
     def _create_workflow_task(
         self, pending_task: _RolloutTaskInput
     ) -> Callable[[], Awaitable[_RolloutResult | None]]:
@@ -1255,6 +1292,7 @@ class WorkflowExecutor:
                     self.logger.info(
                         f"Finish but reject rollout. {self._rollout_stats()}",
                     )
+                await self._clear_rejected_trajectory(traj)
                 return None
 
             except Exception as exc:  # pragma: no cover - workflow execution errors
@@ -1270,6 +1308,7 @@ class WorkflowExecutor:
                     self.logger.error(
                         "Workflow execution failed: %s", exc, exc_info=True
                     )
+                await self._clear_rejected_trajectory(traj)
                 return None
 
         return _execute_workflow

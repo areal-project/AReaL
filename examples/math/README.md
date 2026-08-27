@@ -1,8 +1,20 @@
 ## Hyper-parameters for GSM8K Finetuning on Qwen2.5-1.5b-Instruct
 
-The hyperparameters given in gsm8k_grpo.yaml is the set that we found to achieve the
-highest max `grpo-eval/task_reward/avg` during training for `Qwen2.5-1.5b-Instruct`. You
-are free to try out more of the hyperparameters listed below!
+`gsm8k_grpo.yaml` uses `6e-6`, retuned for the current FSDP FP32-master optimizer path.
+
+### Current FP32-Master Recipe
+
+A seed-1 run on 8 NVIDIA A800 GPUs completed the official 10-epoch schedule with the
+following held-out evaluation results:
+
+| lr     | weight decay | group size | best eval reward | final eval reward |
+| ------ | ------------ | ---------- | ---------------- | ----------------- |
+| 6.0E-6 | 0.017        | 4          | **0.78412**      | 0.77767           |
+
+### Historical Pre-FP32-Master Sweep
+
+The results below were collected with BF16 parameter and optimizer-state storage. They
+are retained for reference and are not directly comparable with the current recipe.
 
 | lr       | weight decay | group size | max task_reward |
 | -------- | ------------ | ---------- | --------------- |
@@ -13,7 +25,7 @@ are free to try out more of the hyperparameters listed below!
 | 1.00E-05 | 0.02         | 4          | 0.78311         |
 | 1.00E-05 | 0.01         | 8          | 0.78066         |
 
-### Other Training Details
+#### Training Details
 
 - Devices: 8 Nvidia H800 GPUs
 - Optimizer: Adam

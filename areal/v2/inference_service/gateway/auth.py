@@ -27,16 +27,22 @@ class AuthError(Exception):
 
 
 def extract_bearer_token(request: Request) -> str:
-    """Extract API token from Authorization header.
+    """Extract API token from an OpenAI or Anthropic authentication header.
 
     Raises HTTPException(401) if missing or malformed.
     """
     auth_header = request.headers.get("authorization", "")
     if auth_header.lower().startswith("bearer "):
         return auth_header[7:].strip()
+    x_api_key = request.headers.get("x-api-key", "")
+    if x_api_key:
+        return x_api_key
     raise HTTPException(
         status_code=401,
-        detail="Missing or malformed Authorization header. Expected 'Bearer <token>'.",
+        detail=(
+            "Missing or malformed authentication header. Expected "
+            "'Bearer <token>' or 'x-api-key: <token>'."
+        ),
     )
 
 

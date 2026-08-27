@@ -31,9 +31,9 @@ $$ A_{i,t}=\frac{r_i-mean({R_i}_{i=1}^G)}{std({R_i}_{i=1}^G)}. $$
 
 更多详情：
 
-- AReal详情：[AReal论文](https://arxiv.org/abs/2505.24298)
+- AReaL 详情：[AReaL 论文](https://arxiv.org/abs/2505.24298)
 
-- M2PO详情：[M2PO论文](https://arxiv.org/abs/2510.01161)
+- M2PO 详情：[M2PO 论文](https://arxiv.org/abs/2510.01161)
 
 ## 核心参数
 
@@ -41,7 +41,7 @@ $$ A_{i,t}=\frac{r_i-mean({R_i}_{i=1}^G)}{std({R_i}_{i=1}^G)}. $$
 
 ## 示例用法
 
-我们建议在配置文件中修改参数（即gsm8k_m2po.yaml）。
+我们建议在配置文件 `examples/math/gsm8k_m2po.yaml` 中修改参数。
 
 | 后端      | CMD                                                                                                                         |
 | --------- | --------------------------------------------------------------------------------------------------------------------------- |
@@ -56,10 +56,10 @@ $$ A_{i,t}=\frac{r_i-mean({R_i}_{i=1}^G)}{std({R_i}_{i=1}^G)}. $$
 在本测试中，我们按以下规则命名实验：
 
 - **stale：** `max_head_offpolicyness` 的值
-- **dx+dy**：x为rollout worker数量，y为训练worker数量
+- **dx+dy**：`x` 为 rollout worker 数量，`y` 为训练 worker 数量
 - **rollout：** `max_concurrent_rollout` 的值
 
-GRPO的设置为stale 256 d2+d1 rollout 96
+GRPO 的设置为 `stale 256 d2+d1 rollout 96`。
 
 实验的关键发现如下：
 

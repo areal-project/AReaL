@@ -203,7 +203,7 @@ class TestExtractVisionFromMultiModal:
 
 
 class TestPackedContextParallelForward:
-    def test_padding_keeps_model_thd_sequence_offsets_tp_aligned(self):
+    def test_wrapper_thd_padding_keeps_sequence_offsets_tp_aligned(self):
         from areal.utils.data import pad_packed_tensor_dict
 
         padded, _, _, _ = pad_packed_tensor_dict(
@@ -219,6 +219,90 @@ class TestPackedContextParallelForward:
         seq_lens = padded["cu_seqlens"][1:] - padded["cu_seqlens"][:-1]
         assert seq_lens.tolist() == [4, 4, 248]
         assert torch.all(seq_lens % 4 == 0)
+
+    @pytest.mark.parametrize(
+        ("sequence_packing_mode", "expected_cu_seqlens", "expected_bshd_shape"),
+        [
+            ("wrapper_thd", [0, 14_010, 14_080], None),
+            ("padded", [0, 14_010], (1, 14_010)),
+            ("model_thd", [0, 14_010], (1, 14_010)),
+        ],
+    )
+    def test_sequence_layout_controls_batch_padding(
+        self, sequence_packing_mode, expected_cu_seqlens, expected_bshd_shape
+    ):
+        from areal.api.cli_args import MicroBatchSpec
+        from areal.engine.core.model import SequencePackingMode
+        from areal.engine.megatron_utils.packed_context_parallel import (
+            _reconstruct_padded_2d,
+            prepare_microbatches_for_sequence_layout,
+        )
+        from areal.utils.data import MicroBatchList
+
+        input_ids = torch.arange(14_010)
+        mb = {
+            "input_ids": input_ids,
+            "cu_seqlens": torch.tensor([0, 14_010], dtype=torch.int32),
+            "max_seqlen": 14_010,
+        }
+        mb_list = MicroBatchList(
+            data=mb,
+            mb_spec=MicroBatchSpec(),
+            mbs=[mb],
+            group_lens=[14_010],
+        )
+
+        prepared = prepare_microbatches_for_sequence_layout(
+            mb_list,
+            sequence_packing_mode=SequencePackingMode(sequence_packing_mode),
+            pad_to_maximum=False,
+            seq_align_to=1,
+        )
+
+        assert prepared.padded_mbs is not None
+        padded_mb = prepared.padded_mbs[0]
+        assert padded_mb["cu_seqlens"].tolist() == expected_cu_seqlens
+        if expected_bshd_shape is None:
+            return
+
+        reconstructed, _, seq_lens, _ = _reconstruct_padded_2d(
+            padded_mb["input_ids"],
+            padded_mb["cu_seqlens"],
+            padded_mb["max_seqlen"],
+        )
+        assert seq_lens.tolist() == [14_010]
+        assert reconstructed.shape == expected_bshd_shape
+
+    def test_bshd_pad_to_maximum_preserves_legacy_packed_axis_behavior(self):
+        from areal.api.cli_args import MicroBatchSpec
+        from areal.engine.core.model import SequencePackingMode
+        from areal.engine.megatron_utils.packed_context_parallel import (
+            prepare_microbatches_for_sequence_layout,
+        )
+        from areal.utils.data import MicroBatchList
+
+        input_ids = torch.arange(14_010)
+        mb = {
+            "input_ids": input_ids,
+            "cu_seqlens": torch.tensor([0, 14_010], dtype=torch.int32),
+            "max_seqlen": 14_010,
+        }
+        mb_list = MicroBatchList(
+            data=mb,
+            mb_spec=MicroBatchSpec(max_tokens_per_mb=14_080),
+            mbs=[mb],
+            group_lens=[14_010],
+        )
+
+        prepared = prepare_microbatches_for_sequence_layout(
+            mb_list,
+            sequence_packing_mode=SequencePackingMode.PADDED,
+            pad_to_maximum=True,
+            seq_align_to=1,
+        )
+
+        assert prepared.padded_mbs is not None
+        assert prepared.padded_mbs[0]["cu_seqlens"].tolist() == [0, 14_010, 14_080]
 
     @pytest.mark.parametrize(
         ("use_padded_seq", "expected_mask"),

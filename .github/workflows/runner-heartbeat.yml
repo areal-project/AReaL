@@ -21,7 +21,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       INSTANCE_NAME: areal-docker-builder
-      INSTANCE_ZONE: us-central1-f
+      INSTANCE_ZONE: us-central1-a
     steps:
       - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@v3
@@ -122,7 +122,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       INSTANCE_NAME: areal-docker-builder
-      INSTANCE_ZONE: us-central1-f
+      INSTANCE_ZONE: us-central1-a
     steps:
       - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@v3

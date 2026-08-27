@@ -12,6 +12,7 @@ import pytest_asyncio
 from areal.utils.seeding import derive_deterministic_seed
 from areal.v2.inference_service.data_proxy.app import (
     _flush_ready_trajectories,
+    _remotize_trajectory,
     create_app,
 )
 from areal.v2.inference_service.data_proxy.config import DataProxyConfig
@@ -159,6 +160,13 @@ def session_headers(api_key: str):
     return {"Authorization": f"Bearer {api_key}"}
 
 
+def anthropic_headers(api_key: str):
+    return {
+        "x-api-key": api_key,
+        "anthropic-version": "2023-06-01",
+    }
+
+
 # =============================================================================
 # SessionStore unit tests
 # =============================================================================
@@ -296,11 +304,66 @@ class TestSessionStore:
         assert online_session1 is online_session2
         assert online_session1.session_id == "__hitl__"
 
+    def test_prefix_matcher_is_preserved_when_active_cache_rotates(self):
+        from examples.swe.prefix_matchers import swe_prefix_matcher
+
+        from areal.experimental.openai.types import InteractionWithTokenLogpReward
+
+        store = SessionStore(prefix_matcher=swe_prefix_matcher)
+        session_id, _ = store.start_session("task-prefix")
+        session = store.get_session(session_id)
+        assert isinstance(session, SessionData)
+        assert session.active_completions._prefix_matcher is swe_prefix_matcher
+
+        interaction = InteractionWithTokenLogpReward(
+            messages=[{"role": "user", "content": "hi"}],
+        )
+        interaction.interaction_id = "interaction-1"
+        interaction.output_message_list = [{"role": "assistant", "content": "hello"}]
+        session.active_completions["interaction-1"] = interaction
+
+        session.set_reward("interaction-1", 1.0)
+
+        assert session.active_completions._prefix_matcher is swe_prefix_matcher
+
     def test_online_session_count(self):
         store = SessionStore()
         store.set_admin_key(ADMIN_KEY)
         store.get_or_create_hitl_session()
         assert store.session_count == 1
+
+
+def test_remotize_trajectory_keeps_reward_metadata_inline(monkeypatch):
+    import torch
+
+    rewards = torch.tensor([1.0])
+    original_rewards = torch.tensor([3.0])
+    captured = {}
+
+    def _remotize(payload, node_addr):
+        captured["payload"] = payload
+        captured["node_addr"] = node_addr
+        return {"input_ids": "remote-input-ids"}
+
+    monkeypatch.setattr(
+        "areal.v2.inference_service.data_proxy.app.RTensor.remotize",
+        _remotize,
+    )
+
+    result = _remotize_trajectory(
+        {
+            "input_ids": torch.tensor([[1, 2]]),
+            "rewards": rewards,
+            "original_rewards": original_rewards,
+        },
+        node_addr="127.0.0.1:1234",
+    )
+
+    assert set(captured["payload"]) == {"input_ids"}
+    assert captured["node_addr"] == "127.0.0.1:1234"
+    assert result["input_ids"] == "remote-input-ids"
+    assert result["rewards"] is rewards
+    assert result["original_rewards"] is original_rewards
 
 
 # =============================================================================
@@ -331,6 +394,120 @@ async def test_start_session_without_admin_key(client):
         json={"task_id": "test-task"},
     )
     assert resp.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_anthropic_messages_applies_preprocessors_and_uses_session_cache(
+    config,
+    mock_areal_client,
+):
+    from examples.swe.prefix_matchers import swe_prefix_matcher
+
+    cc_config = DataProxyConfig(
+        **{
+            **config.__dict__,
+            "message_preprocessors": (
+                "examples.swe.preprocessors.StripAnthropicBillingHeader",
+                "examples.swe.preprocessors.StripAllSystemReminders",
+            ),
+            "prefix_matcher": "examples.swe.prefix_matchers.swe_prefix_matcher",
+        }
+    )
+    app = create_app(cc_config)
+    store = SessionStore(prefix_matcher=swe_prefix_matcher)
+    store.set_admin_key(cc_config.admin_api_key)
+    store.set_capacity(1)
+    app.state.session_store = store
+    app.state.areal_client = mock_areal_client
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        start = await c.post(
+            "/rl/start_session",
+            json={"task_id": "cc-task"},
+            headers=admin_headers(),
+        )
+        session_key = start.json()["sessions"][0]["session_api_key"]
+        response = await c.post(
+            "/v1/messages",
+            json={
+                "model": "claude-compatible",
+                "max_tokens": 64,
+                "system": (
+                    "x-anthropic-billing-header: volatile\n"
+                    "stable<system-reminder>volatile</system-reminder>"
+                ),
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [{"type": "text", "text": "hello"}],
+                    }
+                ],
+            },
+            headers=anthropic_headers(session_key),
+        )
+
+    assert response.status_code == 200
+    assert response.json()["type"] == "message"
+    call_kwargs = mock_areal_client.chat.completions.create.await_args.kwargs
+    messages = call_kwargs["messages"]
+    serialized_messages = str(messages)
+    assert "x-anthropic-billing-header" not in serialized_messages
+    assert "system-reminder" not in serialized_messages
+    assert "stable" in serialized_messages
+
+    session = store.get_session_by_api_key(session_key)
+    assert session is not None
+    assert session.active_completions._prefix_matcher is swe_prefix_matcher
+    assert len(session.active_completions) == 1
+
+
+@pytest.mark.asyncio
+async def test_anthropic_messages_streams_translated_events(
+    config,
+    mock_areal_client,
+    monkeypatch,
+):
+    app = create_app(config)
+    store = SessionStore()
+    store.set_admin_key(config.admin_api_key)
+    store.set_capacity(1)
+    app.state.session_store = store
+    app.state.areal_client = mock_areal_client
+
+    async def _translated_stream():
+        yield "event: message_start\ndata: {}\n\n"
+        yield "event: message_stop\ndata: {}\n\n"
+
+    monkeypatch.setattr(
+        "areal.v2.inference_service.data_proxy.app.translate_anthropic_stream",
+        lambda _stream, model: _translated_stream(),
+    )
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        start = await c.post(
+            "/rl/start_session",
+            json={"task_id": "cc-stream"},
+            headers=admin_headers(),
+        )
+        session_key = start.json()["sessions"][0]["session_api_key"]
+        response = await c.post(
+            "/v1/messages",
+            json={
+                "model": "claude-compatible",
+                "max_tokens": 64,
+                "stream": True,
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+            headers=anthropic_headers(session_key),
+        )
+
+    assert response.status_code == 200
+    assert "text/event-stream" in response.headers["content-type"]
+    assert "event: message_start" in response.text
+    assert "event: message_stop" in response.text
+    assert mock_areal_client.chat.completions.create.await_args.kwargs["stream"] is True
 
 
 @pytest.mark.asyncio
@@ -897,6 +1074,106 @@ async def test_batch_online_set_reward_completes_that_session(client):
     assert "traj" in export_resp.json()
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("raw_rewards", "normalized_rewards"),
+    [
+        ((1.0, 3.0), (-1.0, 1.0)),
+        ((1.0, 1.0), (0.0, 0.0)),
+        ((3.0,), (3.0,)),
+    ],
+)
+async def test_export_trajectories_normalizes_rewards_within_group(
+    client, monkeypatch, raw_rewards, normalized_rewards
+):
+    import torch
+
+    from areal.infra.rpc.serialization import deserialize_value
+
+    monkeypatch.setattr(
+        "areal.v2.inference_service.data_proxy.app.RTensor.remotize",
+        lambda obj, node_addr: obj,
+    )
+    start = await client.post(
+        "/rl/start_session",
+        json={"task_id": "normalized-group", "group_size": len(raw_rewards)},
+        headers=admin_headers(),
+    )
+    sessions = start.json()["sessions"]
+    for session, reward in zip(sessions, raw_rewards):
+        await client.post(
+            "/chat/completions",
+            json={"model": "sglang", "messages": [{"role": "user", "content": "q"}]},
+            headers=session_headers(session["session_api_key"]),
+        )
+        reward_response = await client.post(
+            "/rl/set_reward",
+            json={"reward": reward},
+            headers=session_headers(session["session_api_key"]),
+        )
+        assert reward_response.status_code == 200
+
+    export_response = await client.post(
+        "/export_trajectories",
+        json={
+            "session_ids": [session["session_id"] for session in sessions],
+            "discount": 1.0,
+            "style": "individual",
+            "reward_normalization": True,
+        },
+        headers=admin_headers(),
+    )
+
+    assert export_response.status_code == 200
+    trajectory = deserialize_value(export_response.json()["traj"])
+    torch.testing.assert_close(
+        trajectory["rewards"].flatten(),
+        torch.tensor(normalized_rewards),
+    )
+    torch.testing.assert_close(
+        trajectory["original_rewards"].flatten(),
+        torch.tensor(raw_rewards),
+    )
+
+
+@pytest.mark.asyncio
+async def test_export_trajectories_drops_incomplete_normalization_group(
+    client, monkeypatch
+):
+    monkeypatch.setattr(
+        "areal.v2.inference_service.data_proxy.app.RTensor.remotize",
+        lambda obj, node_addr: obj,
+    )
+    start = await client.post(
+        "/rl/start_session",
+        json={"task_id": "incomplete-group"},
+        headers=admin_headers(),
+    )
+    session = start.json()["sessions"][0]
+    await client.post(
+        "/chat/completions",
+        json={"model": "sglang", "messages": [{"role": "user", "content": "q"}]},
+        headers=session_headers(session["session_api_key"]),
+    )
+    await client.post(
+        "/rl/set_reward",
+        json={"reward": 1.0},
+        headers=session_headers(session["session_api_key"]),
+    )
+
+    export_response = await client.post(
+        "/export_trajectories",
+        json={
+            "session_ids": [session["session_id"], "missing-session"],
+            "reward_normalization": True,
+        },
+        headers=admin_headers(),
+    )
+
+    assert export_response.status_code == 200
+    assert export_response.json()["traj"] == {}
+
+
 # =============================================================================
 # Coexistence tests — HITL and batch running simultaneously
 # =============================================================================
@@ -1029,6 +1306,77 @@ async def test_export_trajectories_without_admin_key(client):
         json={"session_ids": ["x"], "discount": 1.0, "style": "individual"},
     )
     assert resp.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_export_trajectories_drops_retry_orphans_before_discount(
+    client, monkeypatch
+):
+    from areal.infra.rpc.serialization import deserialize_value
+
+    monkeypatch.setattr(
+        "areal.v2.inference_service.data_proxy.app.RTensor.remotize",
+        lambda obj, node_addr: obj,
+    )
+    start = await client.post(
+        "/rl/start_session",
+        json={"task_id": "retry-orphan"},
+        headers=admin_headers(),
+    )
+    session = start.json()["sessions"][0]
+    headers = session_headers(session["session_api_key"])
+    initial_messages = [{"role": "user", "content": "hi"}]
+
+    await client.post(
+        "/chat/completions",
+        json={"model": "sglang", "messages": initial_messages},
+        headers=headers,
+    )
+    await client.post(
+        "/chat/completions",
+        json={"model": "sglang", "messages": initial_messages},
+        headers=headers,
+    )
+    await client.post(
+        "/chat/completions",
+        json={
+            "model": "sglang",
+            "messages": initial_messages
+            + [
+                {"role": "assistant", "content": "Hello!"},
+                {"role": "user", "content": "more"},
+            ],
+        },
+        headers=headers,
+    )
+    reward_response = await client.post(
+        "/rl/set_reward",
+        json={"reward": 1.0},
+        headers=headers,
+    )
+    assert reward_response.status_code == 200
+
+    app = client._transport.app
+    session_data = app.state.session_store.get_session(session["session_id"])
+    assert session_data is not None
+    ready = next(iter(session_data._ready_trajectories.values()))
+    for interaction in ready.completions.values():
+        interaction.chat_template_type = "concat"
+
+    export_response = await client.post(
+        "/export_trajectories",
+        json={
+            "session_ids": [session["session_id"]],
+            "discount": 1.0,
+            "style": "concat",
+            "drop_retry_orphans": True,
+        },
+        headers=admin_headers(),
+    )
+
+    assert export_response.status_code == 200
+    trajectory = deserialize_value(export_response.json()["traj"])
+    assert trajectory["input_ids"].shape[0] == 1
 
 
 # =============================================================================

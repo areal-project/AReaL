@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import asyncio
 import datetime
 import json
 import os
@@ -7,8 +8,10 @@ import re
 import uuid
 from collections.abc import AsyncGenerator, Iterable, Mapping
 from copy import deepcopy
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal, Protocol, TypeVar, cast, overload
 
+import torch
 from openai import AsyncOpenAI
 from openai._types import NOT_GIVEN, Body, NotGiven
 from openai.resources.chat.completions.completions import (
@@ -60,6 +63,7 @@ from areal.utils import logging
 from areal.utils.hf_utils import apply_chat_template
 
 if TYPE_CHECKING:
+    from transformers.processing_utils import ProcessorMixin
     from transformers.tokenization_utils_fast import PreTrainedTokenizerFast
 
 
@@ -75,6 +79,100 @@ os.environ["OPENAI_API_KEY"] = os.environ.get("OPENAI_API_KEY", "none")
 os.environ["OPENAI_BASE_URL"] = os.environ.get("OPENAI_BASE_URL", "none")
 
 logger = logging.getLogger("OpenAIClient")
+
+
+@dataclass
+class _PreparedPrompt:
+    input_ids: list[int]
+    mm_token_type_ids: list[int] | None = None
+    multi_modal_input: dict[str, torch.Tensor] | None = None
+
+
+def _process_multimodal_prompt(
+    processor: "ProcessorMixin",
+    tokenizer: "PreTrainedTokenizerFast",
+    messages: list[dict[str, Any]],
+    image_data: list[str],
+    tools: Iterable[ChatCompletionToolParam] | None,
+    chat_template_kwargs: dict[str, Any],
+) -> _PreparedPrompt:
+    """Build model-ready prompt tokens and vision tensors with an HF processor."""
+    import base64
+    import binascii
+    from io import BytesIO
+
+    from PIL import Image
+    from transformers.image_utils import load_image
+
+    images = []
+    for encoded_image in image_data:
+        try:
+            image_bytes = base64.b64decode(encoded_image, validate=True)
+            with Image.open(BytesIO(image_bytes)) as image:
+                images.append(load_image(image))
+        except (binascii.Error, OSError, ValueError) as exc:
+            raise ValueError(
+                "Local multimodal processing requires valid base64-encoded image data."
+            ) from exc
+
+    prompt_text = apply_chat_template(
+        tokenizer,
+        messages,
+        tools=tools,
+        add_generation_prompt=True,
+        tokenize=False,
+        **chat_template_kwargs,
+    )
+    if not isinstance(prompt_text, str):
+        raise TypeError(
+            "The tokenizer chat template must return text before VLM processing."
+        )
+
+    processed = processor(
+        text=[prompt_text],
+        images=images,
+        padding=False,
+        return_tensors="pt",
+    )
+    input_ids_tensor = processed.get("input_ids")
+    if not torch.is_tensor(input_ids_tensor) or input_ids_tensor.ndim != 2:
+        raise ValueError("The VLM processor must return 2D input_ids.")
+    if input_ids_tensor.shape[0] != 1:
+        raise ValueError(
+            "AReaL agent rollout expects one processed prompt per interaction, "
+            f"got batch size {input_ids_tensor.shape[0]}."
+        )
+    input_ids = input_ids_tensor[0].tolist()
+
+    token_type_ids = processed.get("mm_token_type_ids")
+    if token_type_ids is None:
+        token_type_ids = processed.get("token_type_ids")
+    if token_type_ids is None:
+        mm_token_type_ids = [0] * len(input_ids)
+    else:
+        if not torch.is_tensor(token_type_ids) or token_type_ids.ndim != 2:
+            raise ValueError("The VLM processor token type IDs must be 2D.")
+        mm_token_type_ids = token_type_ids[0].tolist()
+        if len(mm_token_type_ids) != len(input_ids):
+            raise ValueError(
+                "The VLM processor returned token type IDs that do not align "
+                f"with input_ids: {len(mm_token_type_ids)} != {len(input_ids)}."
+            )
+
+    multi_modal_input = {
+        key: processed[key].detach().cpu()
+        for key in ("pixel_values", "image_grid_thw", "video_grid_thw")
+        if torch.is_tensor(processed.get(key))
+    }
+    if "pixel_values" not in multi_modal_input:
+        raise ValueError(
+            "The VLM processor did not return pixel_values for an image prompt."
+        )
+    return _PreparedPrompt(
+        input_ids=input_ids,
+        mm_token_type_ids=mm_token_type_ids,
+        multi_modal_input=multi_modal_input,
+    )
 
 
 def _align_tools_with_sglang(tools_list: list) -> list[dict]:
@@ -256,7 +354,7 @@ def _extract_images_from_messages(
     Returns:
         A 3-tuple of:
 
-        - **image_data** – list of base64 image strings (no data-URI prefix)
+        - **image_data** – list of base64 image strings without data-URI prefixes
           or raw URL strings for each image found.
         - **messages_for_tokenizer** – deep copy of *messages* where every
           ``{"type": "image_url", ...}`` part is replaced by
@@ -295,11 +393,10 @@ def _extract_images_from_messages(
                     else ""
                 )
 
-                if not url:
+                if not isinstance(url, str) or not url:
                     raise ValueError(
                         "image_url content part has an empty or missing URL. "
-                        "Provide a valid data URI or HTTP(S) URL in "
-                        "image_url.url."
+                        "Provide a valid data URI or HTTP(S) URL in image_url.url."
                     )
 
                 # Extract base64 payload from data URIs; keep raw URLs as-is.
@@ -328,6 +425,28 @@ def _extract_images_from_messages(
         vision_messages_for_vllm.append(vllm_msg)
 
     return image_data, messages_for_tokenizer, vision_messages_for_vllm
+
+
+def _validate_multimodal_agent_backend(
+    engine: TRolloutEngine,
+    image_data: list[str],
+    require_multimodal_processor: bool,
+) -> None:
+    """Reject unsupported trainable multimodal agent backends."""
+    if not image_data or not require_multimodal_processor:
+        return
+
+    backend = getattr(getattr(engine, "config", None), "backend", "")
+    backend_name = (
+        backend.split(":", maxsplit=1)[0].lower()
+        if isinstance(backend, str) and backend
+        else type(engine).__name__.lower()
+    )
+    if "vllm" in backend_name:
+        raise ValueError(
+            "Multimodal agent trajectories are currently supported only with "
+            "the SGLang rollout backend; vLLM support is deferred."
+        )
 
 
 def _convert_tool_output_format(
@@ -495,6 +614,29 @@ def concat_prompt_token_ids_with_parent(
     """
     Concatenate prompt token IDs with parent interaction's tokens.
     """
+    prompt_token_ids, _, _ = _concat_prompt_token_ids_with_parent(
+        message_list=message_list,
+        parent=parent,
+        tokenizer=tokenizer,
+        tools=tools,
+        extra_body=extra_body,
+    )
+    return prompt_token_ids
+
+
+def _concat_prompt_token_ids_with_parent(
+    message_list: list[dict],
+    parent: InteractionWithTokenLogpReward | None,
+    tokenizer: "PreTrainedTokenizerFast",
+    tools: Iterable[ChatCompletionToolParam] | None = None,
+    extra_body: Body = {},
+    full_prompt_token_ids: list[int] | None = None,
+) -> tuple[list[int], int, int]:
+    """Return concat prompt IDs, full-prompt cutoff, and parent-prefix length.
+
+    ``full_prompt_token_ids`` lets multimodal callers provide processor-expanded
+    prompt IDs while preserving the existing parent-token concatenation rules.
+    """
     parent_tokens: list[int] = []
     all_message_list: list[dict] = []
     eos_token_id = tokenizer.eos_token_id
@@ -529,14 +671,17 @@ def concat_prompt_token_ids_with_parent(
     all_message_list += message_list
     all_message_list = _parse_tool_call_arguments(all_message_list)
 
-    all_tokens = apply_chat_template(
-        tokenizer,
-        all_message_list,
-        tools=tools,
-        add_generation_prompt=True,
-        tokenize=True,
-        **extra_body.get("chat_template_kwargs", {}),
-    )
+    if full_prompt_token_ids is None:
+        all_tokens = apply_chat_template(
+            tokenizer,
+            all_message_list,
+            tools=tools,
+            add_generation_prompt=True,
+            tokenize=True,
+            **extra_body.get("chat_template_kwargs", {}),
+        )
+    else:
+        all_tokens = full_prompt_token_ids
     parent_eos_num = parent_tokens.count(eos_token_id)
     if parent_eos_num > 0:
         child_tokens_truncate_idx = _find_kth(all_tokens, eos_token_id, parent_eos_num)
@@ -553,7 +698,121 @@ def concat_prompt_token_ids_with_parent(
         child_tokens_truncate_idx = -1
 
     prompt_token_ids = parent_tokens + all_tokens[child_tokens_truncate_idx + 1 :]
-    return prompt_token_ids
+    return prompt_token_ids, child_tokens_truncate_idx, len(parent_tokens)
+
+
+async def _prepare_prompt(
+    *,
+    tokenizer: "PreTrainedTokenizerFast",
+    processor: "ProcessorMixin | None",
+    tokenizer_messages: list[dict[str, Any]],
+    concat_messages: list[dict[str, Any]],
+    image_data: list[str],
+    parent: InteractionWithTokenLogpReward | None,
+    chat_template_type: str,
+    tools: Iterable[ChatCompletionToolParam] | None,
+    extra_body: Body,
+    require_multimodal_processor: bool = False,
+) -> _PreparedPrompt:
+    """Prepare text or multimodal prompt data for one agent interaction."""
+    chat_template_kwargs = extra_body.get("chat_template_kwargs", {})
+    processed_prompt: _PreparedPrompt | None = None
+    if image_data and processor is None and require_multimodal_processor:
+        raise ValueError(
+            "Image inputs require a multimodal processor, but no processor is "
+            "available for this rollout model."
+        )
+    if image_data and processor is not None:
+        processed_prompt = await asyncio.to_thread(
+            _process_multimodal_prompt,
+            processor,
+            tokenizer,
+            tokenizer_messages,
+            image_data,
+            tools,
+            chat_template_kwargs,
+        )
+
+    if chat_template_type == "hf":
+        input_ids = (
+            processed_prompt.input_ids
+            if processed_prompt is not None
+            else apply_chat_template(
+                tokenizer,
+                tokenizer_messages,
+                tools=tools,
+                add_generation_prompt=True,
+                tokenize=True,
+                **chat_template_kwargs,
+            )
+        )
+        if processor is None:
+            return _PreparedPrompt(input_ids=input_ids)
+        return _PreparedPrompt(
+            input_ids=input_ids,
+            mm_token_type_ids=(
+                processed_prompt.mm_token_type_ids
+                if processed_prompt is not None
+                else [0] * len(input_ids)
+            ),
+            multi_modal_input=(
+                processed_prompt.multi_modal_input
+                if processed_prompt is not None
+                else {}
+            ),
+        )
+
+    if chat_template_type != "concat":
+        raise RuntimeError(f"Unsupported chat_template_type {chat_template_type}")
+
+    input_ids, cutoff, parent_prefix_len = _concat_prompt_token_ids_with_parent(
+        concat_messages,
+        parent,
+        tokenizer,
+        tools=tools,
+        extra_body=extra_body,
+        full_prompt_token_ids=(
+            processed_prompt.input_ids if processed_prompt is not None else None
+        ),
+    )
+    if processor is None:
+        return _PreparedPrompt(input_ids=input_ids)
+
+    if processed_prompt is None:
+        return _PreparedPrompt(
+            input_ids=input_ids,
+            mm_token_type_ids=[0] * len(input_ids),
+            multi_modal_input={},
+        )
+
+    parent_mm_token_type_ids: list[int] = []
+    if parent is not None:
+        if parent.model_response is None or parent.mm_token_type_ids is None:
+            raise ValueError(
+                "A multimodal concat parent must contain model response and token "
+                "type IDs."
+            )
+        parent_mm_token_type_ids = list(parent.mm_token_type_ids)
+        parent_suffix_len = parent_prefix_len - len(parent_mm_token_type_ids)
+        if parent_suffix_len < 0:
+            raise ValueError(
+                "The multimodal concat parent token type IDs exceed its token prefix."
+            )
+        parent_mm_token_type_ids.extend([0] * parent_suffix_len)
+
+    mm_token_type_ids = (
+        parent_mm_token_type_ids + processed_prompt.mm_token_type_ids[cutoff + 1 :]
+    )
+    if len(mm_token_type_ids) != len(input_ids):
+        raise ValueError(
+            "Multimodal concat token type IDs do not align with prompt input IDs: "
+            f"{len(mm_token_type_ids)} != {len(input_ids)}."
+        )
+    return _PreparedPrompt(
+        input_ids=input_ids,
+        mm_token_type_ids=mm_token_type_ids,
+        multi_modal_input=processed_prompt.multi_modal_input,
+    )
 
 
 class AsyncCompletionsWithReward(BaseAsyncCompletions):
@@ -568,22 +827,26 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
         client,
         engine: TRolloutEngine,
         tokenizer: "PreTrainedTokenizerFast",
+        processor: "ProcessorMixin | None",
         cache: InteractionCache,
         tool_call_parser: str,
         reasoning_parser: str,
         engine_max_tokens: int | None = None,
         chat_template_type: str = "hf",
         lora_name: str = "",
+        require_multimodal_processor: bool = False,
     ):
         super().__init__(client)
         self.engine = engine
         self.tokenizer = tokenizer
+        self.processor = processor
         self.tool_call_parser = tool_call_parser
         self.reasoning_parser = reasoning_parser
         self._cache = cache
         self.engine_max_tokens = engine_max_tokens
         self.chat_template_type = chat_template_type
         self.lora_name = lora_name
+        self.require_multimodal_processor = require_multimodal_processor
 
     def _build_chat_completion(
         self,
@@ -729,6 +992,16 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
         if extra_body is None:
             extra_body = {}
 
+        image_data, messages_for_tokenizer, vision_messages_for_vllm = (
+            _extract_images_from_messages(messages_list)
+        )
+        _validate_multimodal_agent_backend(
+            self.engine,
+            image_data,
+            self.require_multimodal_processor,
+        )
+        has_images = len(image_data) > 0
+
         # Convert response to OpenAI format
         current_time = int(datetime.datetime.now().timestamp())
         # Add interaction to cache, resolve parent relationship according to input messages
@@ -759,45 +1032,31 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
             if "sglang" in type(self.engine).__name__.lower():
                 tools_list = _align_tools_with_sglang(tools_list)
 
-        image_data, messages_for_tokenizer, vision_messages_for_vllm = (
-            _extract_images_from_messages(messages_list)
-        )
-        has_images = len(image_data) > 0
-
         tokenizer_messages = messages_for_tokenizer if has_images else messages_list
         tokenizer_messages = _parse_tool_call_arguments(tokenizer_messages)
-        if self.chat_template_type == "hf":
-            prompt_token_ids = apply_chat_template(
-                self.tokenizer,
-                tokenizer_messages,
-                tools=tools_list,
-                add_generation_prompt=True,
-                tokenize=True,
-                **extra_body.get("chat_template_kwargs", {}),
-            )
-        elif self.chat_template_type == "concat":
-            concat_messages = (
-                interaction.remaining_messages
-                if interaction is not None
-                else messages_list
-            )
-            if has_images:
-                _, concat_tok_messages, _ = _extract_images_from_messages(
-                    concat_messages
-                )
-            else:
-                concat_tok_messages = concat_messages
-            prompt_token_ids = concat_prompt_token_ids_with_parent(
-                concat_tok_messages,
-                interaction.parent if interaction is not None else None,
-                self.tokenizer,
-                tools=tools_list,
-                extra_body=extra_body,
-            )
-        else:
-            raise RuntimeError(
-                f"Unsupported chat_template_type {self.chat_template_type}"
-            )
+        concat_messages = (
+            interaction.remaining_messages if interaction is not None else messages_list
+        )
+        if has_images:
+            _, concat_messages, _ = _extract_images_from_messages(concat_messages)
+        concat_messages = _parse_tool_call_arguments(concat_messages)
+        prepared_prompt = await _prepare_prompt(
+            tokenizer=self.tokenizer,
+            processor=self.processor,
+            tokenizer_messages=tokenizer_messages,
+            concat_messages=concat_messages,
+            image_data=image_data,
+            parent=interaction.parent if interaction is not None else None,
+            chat_template_type=self.chat_template_type,
+            tools=tools_list,
+            extra_body=extra_body,
+            require_multimodal_processor=self.require_multimodal_processor,
+        )
+        prompt_token_ids = prepared_prompt.input_ids
+        if interaction is not None and self.processor is not None:
+            interaction.prompt_token_ids = list(prompt_token_ids)
+            interaction.mm_token_type_ids = prepared_prompt.mm_token_type_ids
+            interaction.multi_modal_input = prepared_prompt.multi_modal_input
 
         temp = 1.0 if is_omitted(temperature) else (temperature or 0.0)
         if not is_omitted(max_tokens):
@@ -898,6 +1157,7 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
             rid=str(uuid.uuid4()),
             metadata=metadata if not is_omitted(metadata) else {},
             tokenizer=self.tokenizer,
+            processor=self.processor,
             image_data=image_data if has_images else None,
             vision_msg_vllm=([vision_messages_for_vllm] if has_images else None),
         )
@@ -1115,22 +1375,26 @@ class AsyncResponsesWithReward(BaseAsyncResponses):
         client,
         engine: TRolloutEngine,
         tokenizer: "PreTrainedTokenizerFast",
+        processor: "ProcessorMixin | None",
         cache: InteractionCache,
         tool_call_parser: str,
         reasoning_parser: str,
         engine_max_tokens: int | None = None,
         chat_template_type: str = "hf",
         lora_name: str = "",
+        require_multimodal_processor: bool = False,
     ):
         super().__init__(client)
         self.engine = engine
         self.tokenizer = tokenizer
+        self.processor = processor
         self.tool_call_parser = tool_call_parser
         self.reasoning_parser = reasoning_parser
         self._cache = cache
         self.engine_max_tokens = engine_max_tokens
         self.chat_template_type = chat_template_type
         self.lora_name = lora_name
+        self.require_multimodal_processor = require_multimodal_processor
 
     async def create(
         self,
@@ -1191,6 +1455,17 @@ class AsyncResponsesWithReward(BaseAsyncResponses):
                 "Unsupported Responses input format: "
                 "expected str or list of message items with input_text."
             )
+
+        image_data, messages_for_tokenizer, vision_messages_for_vllm = (
+            _extract_images_from_messages(messages_list)
+        )
+        _validate_multimodal_agent_backend(
+            self.engine,
+            image_data,
+            self.require_multimodal_processor,
+        )
+        has_images = len(image_data) > 0
+
         interaction = InteractionWithTokenLogpReward(
             messages=deepcopy(messages_list),  # Store a copy of the input messages
             chat_template_type=self.chat_template_type,
@@ -1216,39 +1491,29 @@ class AsyncResponsesWithReward(BaseAsyncResponses):
             if "sglang" in type(self.engine).__name__.lower():
                 tools_list = _align_tools_with_sglang(tools_list)
 
-        image_data, messages_for_tokenizer, vision_messages_for_vllm = (
-            _extract_images_from_messages(messages_list)
-        )
-        has_images = len(image_data) > 0
-
         tokenizer_messages = messages_for_tokenizer if has_images else messages_list
         tokenizer_messages = _parse_tool_call_arguments(tokenizer_messages)
-        if self.chat_template_type == "hf":
-            prompt_token_ids = apply_chat_template(
-                self.tokenizer,
-                tokenizer_messages,
-                tools=tools_list,
-                add_generation_prompt=True,
-                tokenize=True,
-                **extra_body.get("chat_template_kwargs", {}),
-            )
-        elif self.chat_template_type == "concat":
-            remaining = interaction.remaining_messages
-            if has_images:
-                _, remaining_tok, _ = _extract_images_from_messages(remaining)
-            else:
-                remaining_tok = remaining
-            prompt_token_ids = concat_prompt_token_ids_with_parent(
-                remaining_tok,
-                interaction.parent if interaction is not None else None,
-                self.tokenizer,
-                tools=tools_list,
-                extra_body=extra_body,
-            )
-        else:
-            raise RuntimeError(
-                f"Unsupported chat_template_type {self.chat_template_type}"
-            )
+        concat_messages = interaction.remaining_messages
+        if has_images:
+            _, concat_messages, _ = _extract_images_from_messages(concat_messages)
+        concat_messages = _parse_tool_call_arguments(concat_messages)
+        prepared_prompt = await _prepare_prompt(
+            tokenizer=self.tokenizer,
+            processor=self.processor,
+            tokenizer_messages=tokenizer_messages,
+            concat_messages=concat_messages,
+            image_data=image_data,
+            parent=interaction.parent,
+            chat_template_type=self.chat_template_type,
+            tools=tools_list,
+            extra_body=extra_body,
+            require_multimodal_processor=self.require_multimodal_processor,
+        )
+        prompt_token_ids = prepared_prompt.input_ids
+        if self.processor is not None:
+            interaction.prompt_token_ids = list(prompt_token_ids)
+            interaction.mm_token_type_ids = prepared_prompt.mm_token_type_ids
+            interaction.multi_modal_input = prepared_prompt.multi_modal_input
 
         # Map sampling params
         temp = 1.0 if is_omitted(temperature) else (temperature or 0.0)
@@ -1308,6 +1573,7 @@ class AsyncResponsesWithReward(BaseAsyncResponses):
             rid=str(uuid.uuid4()),
             metadata=metadata if not is_omitted(metadata) else {},
             tokenizer=self.tokenizer,
+            processor=self.processor,
             image_data=image_data if has_images else None,
             vision_msg_vllm=([vision_messages_for_vllm] if has_images else None),
         )
@@ -1381,7 +1647,7 @@ class AsyncResponsesWithReward(BaseAsyncResponses):
             parallel_tool_calls=False,
             temperature=temp,
             tool_choice=tool_choice if not is_omitted(tool_choice) else "none",
-            tools=tools_list,
+            tools=tools_list or [],
             top_p=top_p_val,
             background=None,
             conversation=None,
@@ -1441,11 +1707,14 @@ class ArealOpenAI(AsyncOpenAI):
         engine_max_tokens: int | None = None,
         chat_template_type: str = "hf",
         lora_name: str = "",
+        processor: "ProcessorMixin | None" = None,
+        require_multimodal_processor: bool = False,
         **kwargs,
     ):
         super().__init__(**kwargs)
         self.engine = engine
         self.tokenizer = tokenizer
+        self.processor = processor
         self.tool_call_parser = tool_call_parser
         self.reasoning_parser = reasoning_parser
         self.lora_name = lora_name
@@ -1458,12 +1727,14 @@ class ArealOpenAI(AsyncOpenAI):
             self,
             engine,
             tokenizer,
+            processor,
             self._cache,
             tool_call_parser=self.tool_call_parser,
             reasoning_parser=self.reasoning_parser,
             engine_max_tokens=engine_max_tokens,
             chat_template_type=chat_template_type,
             lora_name=lora_name,
+            require_multimodal_processor=require_multimodal_processor,
         )
 
         # Override chat.completions with our extended implementation
@@ -1471,12 +1742,14 @@ class ArealOpenAI(AsyncOpenAI):
             self,
             engine,
             tokenizer,
+            processor,
             self._cache,
             tool_call_parser=self.tool_call_parser,
             reasoning_parser=self.reasoning_parser,
             engine_max_tokens=engine_max_tokens,
             chat_template_type=chat_template_type,
             lora_name=lora_name,
+            require_multimodal_processor=require_multimodal_processor,
         )
 
     def get_interaction(self, id: str) -> InteractionWithTokenLogpReward | None:

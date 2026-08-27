@@ -9,7 +9,40 @@ import torch.distributed.nn.functional as dist_F
 from megatron.core import parallel_state as mpu
 from megatron.core.packed_seq_params import PackedSeqParams
 
-from areal.utils.data import is_multi_modal_key
+from areal.engine.core.model import SequencePackingMode
+from areal.utils.data import (
+    MicroBatchList,
+    align_mb_list_sequences,
+    is_multi_modal_key,
+    pad_mb_list,
+)
+
+
+def prepare_microbatches_for_sequence_layout(
+    mb_list: MicroBatchList,
+    sequence_packing_mode: SequencePackingMode,
+    pad_to_maximum: bool,
+    seq_align_to: int,
+) -> MicroBatchList:
+    """Apply padding that remains inert in the model's input layout.
+
+    Wrapper-owned THD consumes trailing packed-token padding as a segment.
+    BSHD and model-owned THD reconstruct every segment as a batch row, so their
+    default path aligns only real sequences. ``pad_to_maximum`` keeps its
+    explicit legacy packed-axis behavior until it has a BSHD-native contract.
+    """
+    if sequence_packing_mode == SequencePackingMode.WRAPPER_THD or pad_to_maximum:
+        return pad_mb_list(
+            mb_list,
+            pad_value=0.0,
+            pad_to_maximum=pad_to_maximum,
+            seq_align_to=seq_align_to,
+        )
+    return align_mb_list_sequences(
+        mb_list,
+        pad_value=0.0,
+        seq_align_to=seq_align_to,
+    )
 
 
 def _unwrap_language_model(model: torch.nn.Module) -> torch.nn.Module:

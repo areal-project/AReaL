@@ -81,6 +81,7 @@ from areal.engine.megatron_utils.packed_context_parallel import (
     _is_multi_modal_payload_key,
     extract_vision_from_multi_modal,
     packed_context_parallel_forward,
+    prepare_microbatches_for_sequence_layout,
     reassemble_cp_packed_logprobs,
     split_packed_seqs_for_context_parallel,
 )
@@ -126,7 +127,6 @@ from areal.utils.data import (
     broadcast_tensor,
     concat_batch,
     pack_tensor_dict,
-    pad_mb_list,
     split_batch,
     split_padded_tensor_dict_into_mb_list,
     tensor_container_to,
@@ -2766,20 +2766,21 @@ class MegatronEngine(TrainEngine):
             group=mpu.get_data_parallel_group(),
         )
         mb_list.mbs = [pack_tensor_dict(mb) for mb in mb_list.mbs]
-        # NOTE: Pad micro-batches to:
-        # 1. Reduce GPU memory fragmentation, pad actual # tokens per mb to integer multiples
-        #  of GPU page size or max_tokens_per_mb
-        # 2. Align sequence lengths to integer multiples of `align_to_multiple_of=tp_size*cp_size*2`
-        #    to satisfy the requirement of Megatron parallelism.
+        # Project each micro-batch to the model's sequence layout. Wrapper-owned
+        # THD can use a trailing padding segment to reduce memory fragmentation;
+        # The default BSHD/model-owned THD path cannot, because reconstruction
+        # would turn that segment into a synthetic batch row. Every layout
+        # still aligns each real sequence for Megatron parallelism.
         align_to_multiple_of = tp_size * cp_size * 2 if cp_size > 1 else tp_size
         align_to_multiple_of = (
             math.lcm(align_to_multiple_of, DEFAULT_VECTORIZED_ALIGNMENT_BYTES)
             if self.enable_fp8
             else align_to_multiple_of
         )
-        mb_list = pad_mb_list(
+        assert self.sequence_packing_mode is not None
+        mb_list = prepare_microbatches_for_sequence_layout(
             mb_list,
-            pad_value=0.0,
+            sequence_packing_mode=self.sequence_packing_mode,
             pad_to_maximum=self.config.pad_to_maximum,
             seq_align_to=align_to_multiple_of,
         )

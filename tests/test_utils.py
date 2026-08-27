@@ -3,18 +3,72 @@ import torch
 
 from areal.api.cli_args import MicroBatchSpec
 from areal.utils.data import (
+    MicroBatchList,
+    align_mb_list_sequences,
     pack_tensor_dict,
     pad_and_stack_tensors_along_first_dim,
     pad_sequences_to_tensors,
     reorder_list,
     split_padded_tensor_dict_into_mb_list,
     unpack_sequence,
+    unpad_logits,
 )
 
 BS = 16
 MAX_ANSWER_LEN = 16
 MAX_PROMPT_LEN = 8
 VOCAB_SIZE = 100
+
+
+@pytest.mark.parametrize(
+    ("seq_lens", "seq_align_to", "expected_cu_seqlens"),
+    [
+        ([14010], 1, [0, 14010]),
+        ([7, 130], 8, [0, 8, 144]),
+    ],
+)
+def test_align_mb_list_sequences_does_not_add_batch_row(
+    seq_lens, seq_align_to, expected_cu_seqlens
+):
+    """BSHD sequence alignment must preserve the number of real batch rows."""
+    total_length = sum(seq_lens)
+    cu_seqlens = torch.tensor(
+        [0, *torch.tensor(seq_lens).cumsum(0).tolist()], dtype=torch.int32
+    )
+    input_ids = torch.arange(total_length)
+    mb = {
+        "input_ids": input_ids,
+        "position_ids": torch.cat([torch.arange(length) for length in seq_lens]),
+        "cu_seqlens": cu_seqlens,
+        "max_seqlen": max(seq_lens),
+    }
+    mb_list = MicroBatchList(
+        data=mb,
+        mb_spec=MicroBatchSpec(),
+        mbs=[mb],
+        group_lens=[total_length],
+    )
+
+    aligned = align_mb_list_sequences(mb_list, seq_align_to=seq_align_to)
+
+    assert aligned.padded_mbs is not None
+    assert aligned.old_cu_seqlens_list is not None
+    padded_mb = aligned.padded_mbs[0]
+    assert padded_mb["cu_seqlens"].tolist() == expected_cu_seqlens
+    assert padded_mb["cu_seqlens"].numel() == len(seq_lens) + 1
+    assert aligned.padding_lengths == [0]
+    assert aligned.padded_to_lengths == [expected_cu_seqlens[-1]]
+    assert torch.all(
+        (padded_mb["cu_seqlens"][1:] - padded_mb["cu_seqlens"][:-1]) % seq_align_to == 0
+    ).item()
+
+    restored_ids = unpad_logits(
+        padded_mb["input_ids"],
+        padding_length=0,
+        cu_seqlens=padded_mb["cu_seqlens"],
+        old_cu_seqlens=aligned.old_cu_seqlens_list[0],
+    )
+    torch.testing.assert_close(restored_ids, input_ids, rtol=0, atol=0)
 
 
 @pytest.fixture

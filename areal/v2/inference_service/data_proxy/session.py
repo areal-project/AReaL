@@ -14,7 +14,7 @@ from typing import Any
 
 from pydantic import BaseModel
 
-from areal.experimental.openai.cache import InteractionCache
+from areal.experimental.openai.cache import InteractionCache, PrefixMatcher
 from areal.experimental.openai.types import InteractionWithTokenLogpReward
 
 # Session timeout for cleanup (1 hour)
@@ -75,6 +75,9 @@ class ExportTrajectoriesRequest(BaseModel):
     discount: float = 1.0
     style: str = "individual"
     remove_session: bool = True
+    drop_retry_orphans: bool = False
+    reward_normalization: bool = False
+    discard_trajectory: bool = False
 
 
 class ExportTrajectoriesResponse(BaseModel):
@@ -134,13 +137,15 @@ class SessionData:
         session_id: str,
         set_reward_finish_timeout: float = 0.0,
         sampling_seed_identity: str | None = None,
+        prefix_matcher: PrefixMatcher | None = None,
     ):
         self.session_id = session_id
         self.sampling_seed_identity = sampling_seed_identity or session_id
         self._set_reward_finish_timeout = set_reward_finish_timeout
+        self._prefix_matcher = prefix_matcher
         self._last_access_time = time.time()
         self._lock = threading.Lock()
-        self._active_completions = InteractionCache()
+        self._active_completions = self._new_interaction_cache()
         self._ready_trajectories: OrderedDict[int, ReadyTrajectory] = OrderedDict()
         self._next_trajectory_id = 0
         self._next_sampling_request_index = 0
@@ -153,6 +158,12 @@ class SessionData:
             request_index = self._next_sampling_request_index
             self._next_sampling_request_index += 1
         return request_index
+
+    def _new_interaction_cache(self) -> InteractionCache:
+        return InteractionCache(
+            session_id=self.session_id,
+            prefix_matcher=self._prefix_matcher,
+        )
 
     def update_last_access(self) -> None:
         with self._lock:
@@ -215,7 +226,7 @@ class SessionData:
             needs_online_callback=True,
         )
         self._ready_trajectories[trajectory_id] = ready
-        self._active_completions = InteractionCache()
+        self._active_completions = self._new_interaction_cache()
         self._last_set_reward_time = None
         self._last_reward_interaction_id = None
 
@@ -322,6 +333,7 @@ class SessionData:
         discount: float,
         style: str,
         trajectory_id: int | None = None,
+        drop_retry_orphans: bool = False,
     ) -> tuple[int, dict[str, InteractionWithTokenLogpReward]]:
         """Export a ready trajectory.
 
@@ -335,6 +347,9 @@ class SessionData:
         trajectory_id : int | None
             Specific trajectory to export.  When ``None``, the latest
             ready trajectory is exported.
+        drop_retry_orphans : bool
+            Remove duplicate responses left by upstream request retries before
+            reward discounting and concat export.
 
         Returns
         -------
@@ -364,6 +379,7 @@ class SessionData:
         interactions = ready.completions.export_interactions(
             style=style,
             reward_discount=discount,
+            drop_retry_orphans=drop_retry_orphans,
         )
         return ready.trajectory_id, interactions
 
@@ -376,7 +392,11 @@ class SessionData:
 class SessionStore:
     """Thread-safe store for session lifecycle management."""
 
-    def __init__(self, set_reward_finish_timeout: float = 0.0):
+    def __init__(
+        self,
+        set_reward_finish_timeout: float = 0.0,
+        prefix_matcher: PrefixMatcher | None = None,
+    ):
         self._sessions: dict[str, SessionData] = {}
         self._api_key_to_session: dict[str, str] = {}
         self._session_to_api_key: dict[str, str] = {}
@@ -384,6 +404,7 @@ class SessionStore:
         self._capacity: int = 0
         self._admin_api_key: str = "areal-admin-key"
         self._set_reward_finish_timeout = set_reward_finish_timeout
+        self._prefix_matcher = prefix_matcher
 
     def set_capacity(self, n: int) -> None:
         with self._lock:
@@ -439,6 +460,7 @@ class SessionStore:
                 session_id=session_id,
                 set_reward_finish_timeout=self._set_reward_finish_timeout,
                 sampling_seed_identity=sampling_seed_identity,
+                prefix_matcher=self._prefix_matcher,
             )
             self._api_key_to_session[session_api_key] = session_id
             self._session_to_api_key[session_id] = session_api_key
@@ -460,6 +482,7 @@ class SessionStore:
                 session = SessionData(
                     session_id="__hitl__",
                     set_reward_finish_timeout=self._set_reward_finish_timeout,
+                    prefix_matcher=self._prefix_matcher,
                 )
                 self._sessions["__hitl__"] = session
             return session

@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Release tag to build (e.g., v2.0.0-sglang)'
+        description: 'Release tag to build (e.g., v2.1.0-sglang)'
         required: true
         type: string
 
@@ -30,7 +30,7 @@ jobs:
       was_running: ${{ steps.start-instance.outputs.was_running }}
     env:
       INSTANCE_NAME: areal-docker-builder
-      INSTANCE_ZONE: us-central1-f
+      INSTANCE_ZONE: us-central1-a
     steps:
       - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@v3
@@ -202,7 +202,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       INSTANCE_NAME: areal-docker-builder
-      INSTANCE_ZONE: us-central1-f
+      INSTANCE_ZONE: us-central1-a
     steps:
       - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@v3
