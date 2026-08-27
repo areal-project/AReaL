@@ -497,6 +497,35 @@ def test_reconstructed_override_preserves_tensor_parallel_metadata(monkeypatch):
     assert overrides == {}
 
 
+def test_megatron_tied_embedding_keeps_converted_lm_head(monkeypatch):
+    """Training metadata keeps the head key expected by tied inference models."""
+    mod = common._load_megatron_adapter(monkeypatch)
+    param = torch.nn.Parameter(torch.ones(4, 4))
+
+    megatron_mod = types.ModuleType("areal.engine.megatron_utils.megatron")
+    megatron_mod.get_named_parameters = lambda model, experts: [
+        ("module.module.output_layer.weight", param)
+    ]
+    megatron_mod.all_gather_param = lambda name, tensor, **kwargs: tensor
+    megatron_mod.convert_to_hf = lambda *args, **kwargs: [("lm_head.weight", param)]
+    monkeypatch.setitem(
+        sys.modules, "areal.engine.megatron_utils.megatron", megatron_mod
+    )
+
+    adapter = object.__new__(mod.AwexMegatronAdapter)
+    adapter._engine = SimpleNamespace(
+        model=object(),
+        tf_config=SimpleNamespace(num_moe_experts=None),
+        hf_config=SimpleNamespace(model_type="qwen3", tie_word_embeddings=True),
+        _duplicated_param_names=set(),
+    )
+
+    items = list(adapter._iter_hf_params())
+
+    assert [name for name, _ in items] == ["lm_head.weight"]
+    torch.testing.assert_close(items[0][1], param, rtol=0, atol=0)
+
+
 def test_streaming_generator_waits_async_batch_before_yield(monkeypatch):
     """HF conversion never starts with inversion all-reduces in flight."""
     monkeypatch.setenv("DTE_INVERSION_ALLREDUCE_WINDOW_MB", "0.000001")

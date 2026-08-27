@@ -540,8 +540,8 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
 
         Uses get_named_parameters + all_gather_param + convert_to_hf to produce
         HF-style per-expert names (e.g. experts.0.gate_proj.weight). The SGLang
-        adapter's _unfuse_params converts SGLang's fused w13/w2 format to the
-        same per-expert names, so both sides match for the transfer plan.
+        adapter uses AWEX's model converter to produce the same canonical names
+        for transfer-plan matching.
         """
         from areal.engine.megatron_utils.megatron import (
             all_gather_param,
@@ -551,9 +551,6 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
 
         num_moe_experts = getattr(self._engine.tf_config, "num_moe_experts", None)
         model_name = self._engine.hf_config.model_type
-        tie_word_embeddings = getattr(
-            self._engine.hf_config, "tie_word_embeddings", False
-        )
         overrides = theta_by_id if theta_by_id is not None else {}
 
         for mcore_name, param in get_named_parameters(
@@ -585,8 +582,6 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
                 gathered,
                 hf_config=self._engine.hf_config,
             ):
-                if tie_word_embeddings and hf_name == "lm_head.weight":
-                    continue
                 yield hf_name, tensor.detach()
             if consume_overrides:
                 overrides.pop(id(param), None)

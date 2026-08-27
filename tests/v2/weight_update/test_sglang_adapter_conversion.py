@@ -87,3 +87,65 @@ def test_sglang_adapter_reuses_awex_converter_for_vlm_names(monkeypatch):
         rank_info=rank_info,
         infer_engine_config=server_args,
     )
+
+
+def test_sglang_adapter_tied_embedding_adds_missing_lm_head_alias(monkeypatch):
+    """Mirror v1's tied-head fallback when the converter only exposes embedding."""
+
+    class Qwen3ForCausalLM:
+        def __init__(self):
+            self.config = SimpleNamespace(tie_word_embeddings=True)
+            self.embedding = torch.nn.Parameter(torch.ones(4, 4))
+
+        def named_parameters(self):
+            return iter((("model.embed_tokens.weight", self.embedding),))
+
+    model = Qwen3ForCausalLM()
+    scheduler = SimpleNamespace(
+        server_args=SimpleNamespace(),
+        tp_worker=SimpleNamespace(model_runner=SimpleNamespace(model=model)),
+    )
+    adapter = AwexSGLangAdapter(scheduler)
+    rank_info = SimpleNamespace(
+        tp_rank=0,
+        attn_tp_rank=0,
+        pp_rank=0,
+        pp_size=1,
+        ep_rank=0,
+        ep_tp_rank=0,
+        global_rank=0,
+        world_size=1,
+        engine_rank=0,
+        cp_rank=0,
+        cp_size=1,
+        cp_mode="none",
+    )
+    monkeypatch.setattr(adapter, "_build_rank_info", lambda: rank_info)
+
+    strategy = MagicMock()
+    strategy.get_sharding_strategy.return_value = (
+        ShardingType.NO_SHARDING,
+        0,
+        1,
+    )
+    monkeypatch.setattr(adapter, "_build_sharding_strategy", lambda _: strategy)
+
+    converter = MagicMock()
+    converter.convert_param.return_value = [
+        ("model.embed_tokens.weight", model.embedding)
+    ]
+    from awex.models import registry
+
+    monkeypatch.setattr(
+        registry,
+        "get_infer_weights_converter",
+        MagicMock(return_value=converter),
+    )
+
+    metadata = adapter.get_weight_metadata()
+    local_params = adapter.get_local_shard_parameters()
+
+    expected_names = {"model.embed_tokens.weight", "lm_head.weight"}
+    assert {meta.name for meta in metadata} == expected_names
+    assert set(local_params) == expected_names
+    assert local_params["lm_head.weight"] is local_params["model.embed_tokens.weight"]

@@ -154,6 +154,26 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
             )
         return self._weight_converter
 
+    def _get_converted_parameters(self, rank_info: RankInfo) -> dict[str, torch.Tensor]:
+        """Convert local parameters and restore v1's tied-head alias contract."""
+        weight_converter = self._get_weight_converter(rank_info)
+        converted = {
+            hf_name: hf_tensor
+            for name, param in self._get_model().named_parameters()
+            for hf_name, hf_tensor in weight_converter.convert_param(name, param.data)
+        }
+
+        model_config = self._get_model().config
+        if (
+            getattr(model_config, "tie_word_embeddings", False)
+            and rank_info.pp_rank == rank_info.pp_size - 1
+            and "lm_head.weight" not in converted
+            and "model.embed_tokens.weight" in converted
+        ):
+            converted["lm_head.weight"] = converted["model.embed_tokens.weight"]
+
+        return converted
+
     def _build_rank_info(self) -> RankInfo:
         model_context = self._get_model_context()
         return get_sglang_rank_info(model_context, engine_rank=0)
@@ -168,82 +188,76 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
     def get_weight_metadata(self) -> list[ParameterMeta]:
         rank_info = self._build_rank_info()
         strategy = self._build_sharding_strategy(rank_info)
-        weight_converter = self._get_weight_converter(rank_info)
         self._rank_info = rank_info
 
         metadata: list[ParameterMeta] = []
 
-        for name, param in self._get_model().named_parameters():
-            for hf_name, local_tensor in weight_converter.convert_param(
-                name, param.data
+        for hf_name, local_tensor in self._get_converted_parameters(rank_info).items():
+            local_shape = tuple(local_tensor.shape)
+            sharding_type, sharding_dim, num_shards = strategy.get_sharding_strategy(
+                hf_name
+            )
+
+            global_offset = [0] * len(local_shape)
+            if sharding_type == ShardingType.TP_SHARDING:
+                rank_pos = rank_info.tp_rank
+            elif sharding_type == ShardingType.DP_TP_SHARDING:
+                rank_pos = rank_info.attn_tp_rank
+            elif sharding_type == ShardingType.EP_SHARDING:
+                rank_pos = rank_info.ep_rank
+            elif sharding_type == ShardingType.EP_TP_SHARDING:
+                rank_pos = rank_info.ep_tp_rank
+            else:
+                rank_pos = 0
+
+            if sharding_type != ShardingType.NO_SHARDING and 0 <= sharding_dim < len(
+                local_shape
             ):
-                local_shape = tuple(local_tensor.shape)
-                sharding_type, sharding_dim, num_shards = (
-                    strategy.get_sharding_strategy(hf_name)
+                global_offset[sharding_dim] = int(rank_pos) * int(
+                    local_shape[sharding_dim]
                 )
 
-                global_offset = [0] * len(local_shape)
-                if sharding_type == ShardingType.TP_SHARDING:
-                    rank_pos = rank_info.tp_rank
-                elif sharding_type == ShardingType.DP_TP_SHARDING:
-                    rank_pos = rank_info.attn_tp_rank
-                elif sharding_type == ShardingType.EP_SHARDING:
-                    rank_pos = rank_info.ep_rank
-                elif sharding_type == ShardingType.EP_TP_SHARDING:
-                    rank_pos = rank_info.ep_tp_rank
-                else:
-                    rank_pos = 0
+            global_shape = list(local_shape)
+            if sharding_type != ShardingType.NO_SHARDING and 0 <= sharding_dim < len(
+                global_shape
+            ):
+                global_shape[sharding_dim] = int(local_shape[sharding_dim]) * int(
+                    num_shards
+                )
 
-                if (
-                    sharding_type != ShardingType.NO_SHARDING
-                    and 0 <= sharding_dim < len(local_shape)
-                ):
-                    global_offset[sharding_dim] = int(rank_pos) * int(
-                        local_shape[sharding_dim]
-                    )
+            shard_meta = ParameterShardMeta(
+                tp_rank=rank_info.tp_rank,
+                attn_tp_rank=rank_info.attn_tp_rank,
+                pp_rank=rank_info.pp_rank,
+                ep_rank=rank_info.ep_rank,
+                ep_tp_rank=rank_info.ep_tp_rank,
+                global_rank=rank_info.global_rank,
+                world_size=rank_info.world_size,
+                engine_rank=rank_info.engine_rank,
+                cp_rank=rank_info.cp_rank,
+                cp_size=rank_info.cp_size,
+                cp_mode=rank_info.cp_mode,
+                name=hf_name,
+                shape=local_shape,
+                numel=int(local_tensor.numel()),
+                dtype=local_tensor.dtype,
+                global_offset=tuple(global_offset),
+                sharding_type=sharding_type,
+                num_shards=int(num_shards),
+                sharding_dim=int(sharding_dim),
+            )
 
-                global_shape = list(local_shape)
-                if (
-                    sharding_type != ShardingType.NO_SHARDING
-                    and 0 <= sharding_dim < len(global_shape)
-                ):
-                    global_shape[sharding_dim] = int(local_shape[sharding_dim]) * int(
-                        num_shards
-                    )
-
-                shard_meta = ParameterShardMeta(
-                    tp_rank=rank_info.tp_rank,
-                    attn_tp_rank=rank_info.attn_tp_rank,
-                    pp_rank=rank_info.pp_rank,
-                    ep_rank=rank_info.ep_rank,
-                    ep_tp_rank=rank_info.ep_tp_rank,
-                    global_rank=rank_info.global_rank,
-                    world_size=rank_info.world_size,
-                    engine_rank=rank_info.engine_rank,
-                    cp_rank=rank_info.cp_rank,
-                    cp_size=rank_info.cp_size,
-                    cp_mode=rank_info.cp_mode,
+            replica = ParameterReplicaMeta(shards=[shard_meta])
+            metadata.append(
+                ParameterMeta(
                     name=hf_name,
-                    shape=local_shape,
-                    numel=int(local_tensor.numel()),
+                    global_numel=math.prod(global_shape) if global_shape else 1,
+                    global_shape=tuple(global_shape),
                     dtype=local_tensor.dtype,
-                    global_offset=tuple(global_offset),
-                    sharding_type=sharding_type,
-                    num_shards=int(num_shards),
-                    sharding_dim=int(sharding_dim),
+                    shards=[shard_meta],
+                    replicas=[replica],
                 )
-
-                replica = ParameterReplicaMeta(shards=[shard_meta])
-                metadata.append(
-                    ParameterMeta(
-                        name=hf_name,
-                        global_numel=math.prod(global_shape) if global_shape else 1,
-                        global_shape=tuple(global_shape),
-                        dtype=local_tensor.dtype,
-                        shards=[shard_meta],
-                        replicas=[replica],
-                    )
-                )
+            )
 
         return metadata
 
@@ -251,14 +265,13 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
         self, required_names: list[str] | None = None
     ) -> dict[str, torch.Tensor]:
         required = set(required_names) if required_names else None
-        local_params: dict[str, torch.Tensor] = {}
         rank_info = self._rank_info or self._build_rank_info()
-        weight_converter = self._get_weight_converter(rank_info)
-
-        for name, param in self._get_model().named_parameters():
-            for hf_name, hf_tensor in weight_converter.convert_param(name, param.data):
-                if required is None or hf_name in required:
-                    local_params[hf_name] = hf_tensor
+        converted = self._get_converted_parameters(rank_info)
+        local_params = {
+            hf_name: hf_tensor
+            for hf_name, hf_tensor in converted.items()
+            if required is None or hf_name in required
+        }
 
         self._parameters = local_params
         return local_params
