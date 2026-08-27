@@ -248,6 +248,7 @@ def test_muon_steps_match_official_tensor_parallel_muon(
         matmul_precision=lambda: fp32_matmul_precision(baseline.fp32_matmul_prec),
         nesterov=baseline.nesterov,
         weight_decay_method=baseline.weight_decay_method,
+        native_optimizer=baseline,
     )
     staged.bind_owned_params(staged.param_groups)
 
@@ -321,6 +322,7 @@ def test_muon_checkpoint_resume_matches_official_tensor_parallel_muon() -> None:
             matmul_precision=lambda: fp32_matmul_precision(baseline.fp32_matmul_prec),
             nesterov=baseline.nesterov,
             weight_decay_method=baseline.weight_decay_method,
+            native_optimizer=baseline,
         )
         optimizer.bind_owned_params(optimizer.param_groups)
         return optimizer
@@ -347,6 +349,8 @@ def test_muon_checkpoint_resume_matches_official_tensor_parallel_muon() -> None:
     resumed.begin_checkpoint_load()
     resumed.load_state_dict(checkpoint)
     resumed.complete_checkpoint_load()
+    resumed.offload_to_cpu()
+    resumed.restore_from_cpu()
 
     for _ in range(3):
         grad = torch.randn_like(resumed_param)

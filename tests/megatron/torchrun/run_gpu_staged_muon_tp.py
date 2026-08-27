@@ -64,11 +64,10 @@ def _run_partition_case(partition_dim: int) -> None:
             slot_size_mb=staged_param.numel() * 4 / (1024 * 1024),
         ),
         orthogonalize=baseline.orthogonalize,
-        matmul_precision=lambda: fp32_matmul_precision(
-            baseline.fp32_matmul_prec
-        ),
+        matmul_precision=lambda: fp32_matmul_precision(baseline.fp32_matmul_prec),
         nesterov=baseline.nesterov,
         weight_decay_method=baseline.weight_decay_method,
+        native_optimizer=baseline,
     )
     staged.bind_parallel_groups(tp=dist.group.WORLD, expt_tp=dist.group.WORLD)
     staged.bind_owned_params(staged.param_groups)

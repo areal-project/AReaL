@@ -391,6 +391,7 @@ class GPUStagedMuon(torch.optim.Optimizer):
         matmul_precision: Callable[[], AbstractContextManager[Any]],
         nesterov: bool,
         weight_decay_method: str,
+        native_optimizer: torch.optim.Optimizer | None = None,
     ) -> None:
         if weight_decay_method != "decoupled":
             raise ValueError("staged Muon MVP requires decoupled weight decay")
@@ -399,6 +400,8 @@ class GPUStagedMuon(torch.optim.Optimizer):
         self._orthogonalize = orthogonalize
         self._matmul_precision = matmul_precision
         self._nesterov = nesterov
+        self._native_template = native_optimizer
+        self._native_unit_optimizers: dict[int, torch.optim.Optimizer] = {}
         self.cpu_slabs: MuonCPUSlabs | None = None
         self._units: tuple[MuonOwnedUnit, ...] = ()
         self._runtime = StagedOptimizerRuntime(
@@ -513,6 +516,7 @@ class GPUStagedMuon(torch.optim.Optimizer):
             ).view_as(unit.param)
 
         self._runtime.bind(capacity=self.staged_config.slot_numel, device=device)
+        self._bind_native_unit_optimizers()
         self._bound = True
         self._runtime.schedule_units(
             self._units,
@@ -532,6 +536,31 @@ class GPUStagedMuon(torch.optim.Optimizer):
     def preflight_step_activity(self) -> tuple[bool, str | None]:
         """Validate raw TP gradient participation before MCore prepares gradients."""
         return _preflight_tp_gradient_participation(self._units, self._tp_groups)
+
+    def _bind_native_unit_optimizers(self) -> None:
+        """Bind native Muon steps to persistent views of reusable slot buffers."""
+        if self._native_template is None:
+            return
+        for unit_index, unit in enumerate(self._units):
+            slot = self._slots[unit_index % len(self._slots)]
+            proxy = slot.master[: unit.numel].view_as(unit.param).detach()
+            for name in (
+                "expert_tp",
+                "partition_dim",
+                "partition_stride",
+                "tensor_model_parallel",
+                "is_qkv",
+            ):
+                if hasattr(unit.param, name):
+                    setattr(proxy, name, getattr(unit.param, name))
+            momentum = slot.momentum[: unit.numel].view_as(unit.param)
+            native = copy.copy(self._native_template)
+            vars(native).update(vars(self._native_template))
+            group = dict(self.param_groups[unit.group_index])
+            group["params"] = [proxy]
+            native.param_groups = [group]
+            native.state = {proxy: {"momentum_buffer": momentum}}
+            self._native_unit_optimizers[id(unit.param)] = native
 
     def _schedule_master_initialization(
         self,
@@ -587,32 +616,39 @@ class GPUStagedMuon(torch.optim.Optimizer):
                 master = slot.master[: unit.numel].view_as(unit.param)
                 momentum = slot.momentum[: unit.numel].view_as(unit.param)
                 grad_matrix = slot.grad[: unit.numel].view_as(unit.param)
-                if weight_decay:
-                    master.mul_(1.0 - lr * weight_decay)
-                momentum.lerp_(grad_matrix, 1.0 - momentum_beta)
-                update = (
-                    grad_matrix.lerp(momentum, momentum_beta)
-                    if self._nesterov
-                    else momentum
-                )
-                with self._matmul_precision():
-                    orthogonalized = self._orthogonalize(
-                        unit.param,
-                        update,
-                        **{
-                            key: value
-                            for key, value in group.items()
-                            if key != "params"
-                        },
+                native = self._native_unit_optimizers.get(id(unit.param))
+                if native is not None:
+                    proxy = native.param_groups[0]["params"][0]
+                    proxy.grad = grad_matrix
+                    native.step()
+                    unit.param.copy_(proxy)
+                else:
+                    if weight_decay:
+                        master.mul_(1.0 - lr * weight_decay)
+                    momentum.lerp_(grad_matrix, 1.0 - momentum_beta)
+                    update = (
+                        grad_matrix.lerp(momentum, momentum_beta)
+                        if self._nesterov
+                        else momentum
                     )
-                if orthogonalized.shape != unit.param.shape:
-                    raise RuntimeError(
-                        "official Muon orthogonalization changed matrix shape"
-                    )
-                workspace = slot.workspace[: unit.numel].view_as(unit.param)
-                workspace.copy_(orthogonalized)
-                master.add_(workspace, alpha=-lr)
-                unit.param.copy_(master)
+                    with self._matmul_precision():
+                        orthogonalized = self._orthogonalize(
+                            unit.param,
+                            update,
+                            **{
+                                key: value
+                                for key, value in group.items()
+                                if key != "params"
+                            },
+                        )
+                    if orthogonalized.shape != unit.param.shape:
+                        raise RuntimeError(
+                            "official Muon orthogonalization changed matrix shape"
+                        )
+                    workspace = slot.workspace[: unit.numel].view_as(unit.param)
+                    workspace.copy_(orthogonalized)
+                    master.add_(workspace, alpha=-lr)
+                    unit.param.copy_(master)
             slot.compute_done.record(slot.compute_stream)
 
         with torch.cuda.stream(slot.d2h_stream):
@@ -649,6 +685,7 @@ class GPUStagedMuon(torch.optim.Optimizer):
 
     def offload_to_cpu(self) -> None:
         self.drain()
+        self._native_unit_optimizers.clear()
         self._runtime.release_slots()
 
     def restore_from_cpu(self) -> None:
@@ -658,6 +695,7 @@ class GPUStagedMuon(torch.optim.Optimizer):
         self._runtime.restore_slots(
             capacity=self.staged_config.slot_numel, device=device
         )
+        self._bind_native_unit_optimizers()
 
     def _validate_bound_state_views(self) -> None:
         if not self._bound:
@@ -3711,6 +3749,7 @@ def get_megatron_optimizer_with_gpu_staged_muon(
                 ),
                 nesterov=base.nesterov,
                 weight_decay_method=base.weight_decay_method,
+                native_optimizer=base,
             )
             staged_inner.bind_parallel_groups(
                 tp=official.pg_collection.tp,

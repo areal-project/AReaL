@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
+from torch.optim.adamw import adamw as functional_adamw
 
 from areal.engine.megatron_utils.optimizer_chain import (
     iter_megatron_optimizer_leaves,
@@ -500,6 +501,10 @@ class GPUStagedAdamW(torch.optim.AdamW):
             slot.compute_stream.wait_event(grads_ready)
             slot.compute_stream.wait_event(slot.h2d_done)
             active_parts: list[_UnitPart] = []
+            master_parts: list[torch.Tensor] = []
+            grad_parts: list[torch.Tensor] = []
+            exp_avg_parts: list[torch.Tensor] = []
+            exp_avg_sq_parts: list[torch.Tensor] = []
             for part in unit.parts:
                 grad = getattr(part.param, "decoupled_grad", None)
                 if grad is None:
@@ -510,27 +515,49 @@ class GPUStagedAdamW(torch.optim.AdamW):
                     grad.detach().view(-1).narrow(0, part.param_offset, part.numel)
                 )
                 active_parts.append(part)
+                master_parts.append(slot.master.narrow(0, part.unit_offset, part.numel))
+                grad_parts.append(slot.grad.narrow(0, part.unit_offset, part.numel))
+                exp_avg_parts.append(
+                    slot.exp_avg.narrow(0, part.unit_offset, part.numel)
+                )
+                exp_avg_sq_parts.append(
+                    slot.exp_avg_sq.narrow(0, part.unit_offset, part.numel)
+                )
 
-            bias_correction1 = 1.0 - beta1**step
-            bias_correction2 = 1.0 - beta2**step
-            for part in active_parts:
-                master_part = slot.master.narrow(0, part.unit_offset, part.numel)
-                exp_avg_part = slot.exp_avg.narrow(0, part.unit_offset, part.numel)
-                exp_avg_sq_part = slot.exp_avg_sq.narrow(
-                    0, part.unit_offset, part.numel
+            if active_parts:
+                # Functional AdamW increments each supplied state step. Every
+                # slice in this unit therefore receives a disposable copy of
+                # the Megatron group step immediately before this update.
+                state_steps = [
+                    torch.tensor(float(step - 1), dtype=torch.float32)
+                    for _ in active_parts
+                ]
+                functional_adamw(
+                    master_parts,
+                    grad_parts,
+                    exp_avg_parts,
+                    exp_avg_sq_parts,
+                    [],
+                    state_steps,
+                    foreach=False,
+                    capturable=False,
+                    differentiable=False,
+                    fused=False,
+                    grad_scale=None,
+                    found_inf=None,
+                    has_complex=False,
+                    amsgrad=False,
+                    beta1=beta1,
+                    beta2=beta2,
+                    lr=lr,
+                    weight_decay=weight_decay,
+                    eps=eps,
+                    maximize=False,
                 )
-                grad_part = slot.grad.narrow(0, part.unit_offset, part.numel)
-                if weight_decay != 0.0:
-                    master_part.mul_(1.0 - lr * weight_decay)
-                exp_avg_part.mul_(beta1).add_(grad_part, alpha=1.0 - beta1)
-                exp_avg_sq_part.mul_(beta2).addcmul_(
-                    grad_part, grad_part, value=1.0 - beta2
-                )
-                denom = exp_avg_sq_part.sqrt().div_(bias_correction2**0.5).add_(eps)
-                master_part.addcdiv_(exp_avg_part, denom, value=-lr / bias_correction1)
+            for part, master_part in zip(active_parts, master_parts, strict=True):
                 part.param.detach().view(-1).narrow(
                     0, part.param_offset, part.numel
-                ).copy_(slot.master.narrow(0, part.unit_offset, part.numel))
+                ).copy_(master_part)
             slot.compute_done.record(slot.compute_stream)
 
         with torch.cuda.stream(slot.d2h_stream):
