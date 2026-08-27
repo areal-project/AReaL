@@ -545,13 +545,6 @@ def packed_context_parallel_forward(
             if key in input_:
                 vlm_kwargs[key] = input_[key]
 
-    # For BSHD text-only, drop the packed-form position_ids (a 1D tensor of
-    # length total_len) — they don't match the 2D [B, S] input. Let mcore
-    # compute the default torch.arange positions per row; padding positions
-    # are masked out by attention_mask.
-    if dense_mask_text_forward:
-        position_ids = None
-
     # MTP training: convert the independent label and mask channels to the
     # exact layout used by this forward. MCore rolls both once per MTP layer;
     # keeping them aligned prevents cross-sequence targets and masks padding
@@ -565,7 +558,7 @@ def packed_context_parallel_forward(
             attention_mask,
             cu_seqlens=cu_seqlens,
             packed_num_tokens=packed_num_tokens,
-            uses_padded_form=needs_padded_form,
+            uses_padded_form=is_vision_model and not use_model_packed_seq,
             uses_model_packed_seq=use_model_packed_seq,
         )
 
