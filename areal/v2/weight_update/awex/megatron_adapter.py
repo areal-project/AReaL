@@ -550,8 +550,17 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
         )
 
         num_moe_experts = getattr(self._engine.tf_config, "num_moe_experts", None)
-        model_name = self._engine.hf_config.model_type
+        hf_config = self._engine.hf_config
+        model_name = hf_config.model_type
+        text_config = getattr(hf_config, "text_config", None)
+        tie_word_embeddings = bool(
+            getattr(hf_config, "tie_word_embeddings", False)
+            or getattr(text_config, "tie_word_embeddings", False)
+        )
         overrides = theta_by_id if theta_by_id is not None else {}
+        flat_embedding: torch.Tensor | None = None
+        language_embedding: torch.Tensor | None = None
+        has_lm_head = False
 
         for mcore_name, param in get_named_parameters(
             self._engine.model, num_moe_experts
@@ -580,11 +589,27 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
                 model_name,
                 mcore_name,
                 gathered,
-                hf_config=self._engine.hf_config,
+                hf_config=hf_config,
             ):
-                yield hf_name, tensor.detach()
+                detached = tensor.detach()
+                if hf_name == "lm_head.weight":
+                    has_lm_head = True
+                elif hf_name == "model.embed_tokens.weight":
+                    flat_embedding = detached
+                elif hf_name == "model.language_model.embed_tokens.weight":
+                    language_embedding = detached
+                yield hf_name, detached
             if consume_overrides:
                 overrides.pop(id(param), None)
+
+        if tie_word_embeddings and not has_lm_head:
+            tied_embedding = (
+                language_embedding if language_embedding is not None else flat_embedding
+            )
+            if tied_embedding is not None:
+                rank_info = self._build_rank_info()
+                if rank_info.pp_rank == rank_info.pp_size - 1:
+                    yield "lm_head.weight", tied_embedding
 
     def _iter_model_params_for_delta(self):
         """Yield model tensors in the same order used by the HF converter."""
