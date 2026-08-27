@@ -65,6 +65,7 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
         self._separation_wire_dtypes: tuple[torch.dtype, ...] | None = None
         self._transfer_rank: int | None = None
         self._rank_info: RankInfo | None = None
+        self._weight_converter = None
         self._parameters: dict[str, torch.Tensor] | None = None
         self._released_tags: set[str] = set()
         self._colocate_admin_api_key: str = "areal-admin-key"
@@ -138,105 +139,20 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
             "num_engines": 1,
         }
 
-    def _unfuse_params(
-        self, name: str, tensor: torch.Tensor
-    ) -> list[tuple[str, torch.Tensor]]:
-        """Split SGLang fused parameters into HuggingFace-style unfused pairs.
+    def _get_weight_converter(self, rank_info: RankInfo):
+        """Build the same AWEX SGLang-to-HF converter used by the v1 reader."""
+        if self._weight_converter is None:
+            from awex.models.registry import get_infer_weights_converter
 
-        SGLang fuses Q/K/V into ``qkv_proj`` and gate/up into ``gate_up_proj``
-        for efficiency.  For MoE models, SGLang also fuses all routed experts
-        into ``experts.w13_weight`` (gate+up) and ``experts.w2_weight`` (down).
-        The training side keeps per-expert HF names, so we unfuse here to match.
-        """
-        if "qkv_proj" in name:
-            cfg = self._get_model().config
-            num_heads = cfg.num_attention_heads
-            num_kv_heads = getattr(cfg, "num_key_value_heads", num_heads)
-            total_head_units = num_heads + 2 * num_kv_heads
-            dim0 = tensor.shape[0]
-            q_size = dim0 * num_heads // total_head_units
-            kv_size = dim0 * num_kv_heads // total_head_units
-            return [
-                (name.replace("qkv_proj", "q_proj"), tensor.narrow(0, 0, q_size)),
-                (
-                    name.replace("qkv_proj", "k_proj"),
-                    tensor.narrow(0, q_size, kv_size),
-                ),
-                (
-                    name.replace("qkv_proj", "v_proj"),
-                    tensor.narrow(0, q_size + kv_size, kv_size),
-                ),
-            ]
-        if "gate_up_proj" in name:
-            half = tensor.shape[0] // 2
-            return [
-                (name.replace("gate_up_proj", "gate_proj"), tensor.narrow(0, 0, half)),
-                (name.replace("gate_up_proj", "up_proj"), tensor.narrow(0, half, half)),
-            ]
-        if "shared_experts" in name and "gate_up_weight" in name:
-            half = tensor.shape[0] // 2
-            return [
-                (
-                    name.replace("gate_up_weight", "gate_proj.weight"),
-                    tensor.narrow(0, 0, half),
-                ),
-                (
-                    name.replace("gate_up_weight", "up_proj.weight"),
-                    tensor.narrow(0, half, half),
-                ),
-            ]
-        if "shared_experts" in name and name.endswith("down_weight"):
-            return [(name.replace("down_weight", "down_proj.weight"), tensor)]
-        if ".experts.w13_weight" in name:
-            # w13_weight shape: [num_total_experts, 2*ffn_hidden, hidden]
-            # num_total_experts may include shared experts appended after
-            # routed experts (e.g. 128 routed + 1 shared = 129 total).
-            cfg = self._get_model().config
-            num_routed = getattr(cfg, "num_experts", None) or cfg.n_routed_experts
-            prefix = name.replace(".w13_weight", "")
-            result = []
-            ffn_hidden = tensor.shape[1] // 2
-            for i in range(tensor.shape[0]):
-                expert_tensor = tensor[i]
-                if i < num_routed:
-                    expert_prefix = f"{prefix}.{i}"
-                else:
-                    shared_idx = i - num_routed
-                    num_shared = tensor.shape[0] - num_routed
-                    if num_shared > 1:
-                        expert_prefix = prefix.replace(
-                            "experts", f"shared_experts.{shared_idx}"
-                        )
-                    else:
-                        expert_prefix = prefix.replace("experts", "shared_experts")
-                result.append(
-                    (f"{expert_prefix}.gate_proj.weight", expert_tensor[:ffn_hidden])
-                )
-                result.append(
-                    (f"{expert_prefix}.up_proj.weight", expert_tensor[ffn_hidden:])
-                )
-            return result
-        if ".experts.w2_weight" in name:
-            # w2_weight shape: [num_total_experts, hidden, ffn_hidden]
-            cfg = self._get_model().config
-            num_routed = getattr(cfg, "num_experts", None) or cfg.n_routed_experts
-            prefix = name.replace(".w2_weight", "")
-            result = []
-            for i in range(tensor.shape[0]):
-                if i < num_routed:
-                    expert_prefix = f"{prefix}.{i}"
-                else:
-                    shared_idx = i - num_routed
-                    num_shared = tensor.shape[0] - num_routed
-                    if num_shared > 1:
-                        expert_prefix = prefix.replace(
-                            "experts", f"shared_experts.{shared_idx}"
-                        )
-                    else:
-                        expert_prefix = prefix.replace("experts", "shared_experts")
-                result.append((f"{expert_prefix}.down_proj.weight", tensor[i]))
-            return result
-        return [(name, tensor)]
+            model = self._get_model()
+            self._weight_converter = get_infer_weights_converter(
+                "sglang",
+                type(model).__name__,
+                hf_config=model.config,
+                rank_info=rank_info,
+                infer_engine_config=self._scheduler.server_args,
+            )
+        return self._weight_converter
 
     def _build_rank_info(self) -> RankInfo:
         model_context = self._get_model_context()
@@ -244,28 +160,23 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
 
     def _build_sharding_strategy(self, rank_info: RankInfo):
         model = self._get_model()
-        model_name = None
-        model_config = getattr(model, "config", None)
-        if model_config is not None:
-            architectures = getattr(model_config, "architectures", None)
-            if architectures and len(architectures) > 0:
-                model_name = architectures[0]
-
-        if model_name is None:
-            model_name = type(model).__name__
-
         infer_engine_config = self._scheduler.server_args
-        return get_sglang_sharding_strategy(model_name, infer_engine_config, rank_info)
+        return get_sglang_sharding_strategy(
+            type(model).__name__, infer_engine_config, rank_info
+        )
 
     def get_weight_metadata(self) -> list[ParameterMeta]:
         rank_info = self._build_rank_info()
         strategy = self._build_sharding_strategy(rank_info)
+        weight_converter = self._get_weight_converter(rank_info)
         self._rank_info = rank_info
 
         metadata: list[ParameterMeta] = []
 
         for name, param in self._get_model().named_parameters():
-            for hf_name, local_tensor in self._unfuse_params(name, param.data):
+            for hf_name, local_tensor in weight_converter.convert_param(
+                name, param.data
+            ):
                 local_shape = tuple(local_tensor.shape)
                 sharding_type, sharding_dim, num_shards = (
                     strategy.get_sharding_strategy(hf_name)
@@ -341,9 +252,11 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
     ) -> dict[str, torch.Tensor]:
         required = set(required_names) if required_names else None
         local_params: dict[str, torch.Tensor] = {}
+        rank_info = self._rank_info or self._build_rank_info()
+        weight_converter = self._get_weight_converter(rank_info)
 
         for name, param in self._get_model().named_parameters():
-            for hf_name, hf_tensor in self._unfuse_params(name, param.data):
+            for hf_name, hf_tensor in weight_converter.convert_param(name, param.data):
                 if required is None or hf_name in required:
                     local_params[hf_name] = hf_tensor
 
@@ -597,6 +510,7 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
         self._separation_delta_transport = None
         self._separation_wire_dtypes = None
         self._rank_info = None
+        self._weight_converter = None
         self._parameters = None
         if self._colocate_http_client is not None:
             self._colocate_http_client.close()
