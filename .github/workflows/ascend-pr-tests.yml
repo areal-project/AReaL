@@ -202,315 +202,16 @@ jobs:
 
   npu-pr-tests:
     name: npu-pr-tests
-    runs-on: linux-aarch64-a3-4
-    timeout-minutes: 75
+    runs-on: linux-aarch64-a3-16
+    timeout-minutes: 90
     container:
       image: ghcr.io/hwvanici/areal_npu:v1.0.6rc1-a3
 
     env:
       AREAL_IS_IN_CI: "1"
       AREAL_TEST_QWEN3_PATH: "/root/.cache/modelscope/hub/models/Qwen/Qwen3-0.6B"
-      AREAL_TEST_QWEN35_PATH: "/root/.cache/modelscope/hub/models/Qwen/Qwen3.5-0.8B"
-      HF_ENDPOINT: "https://hf-mirror.com"
-      HF_HUB_DISABLE_XET: "1"
-      PYTHONUNBUFFERED: "1"
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-          clean: true
-
-      - name: Install current AReaL repository
-        run: pip install -e . --no-deps
-
-      - name: Verify NPU runtime
-        run: |
-          set -euo pipefail
-
-          python - <<'PY'
-          import torch
-          import torch_npu
-
-          print("torch:", torch.__version__)
-          print("torch_npu:", torch_npu.__version__)
-          print("NPU available:", torch.npu.is_available())
-          print("NPU count:", torch.npu.device_count())
-
-          assert torch.npu.is_available()
-          assert torch.npu.device_count() >= 4
-          PY
-
-          npu-smi info
-
-      - name: Inspect mounted model storage
-        run: |
-          set -uo pipefail
-
-          echo "Container-visible mounts:"
-          if command -v findmnt >/dev/null 2>&1; then
-            findmnt -rn -o TARGET,SOURCE,FSTYPE,OPTIONS | sort || true
-          else
-            mount || true
-          fi
-
-          echo "Filesystem capacity:"
-          df -hT || true
-
-          echo "Likely shared-storage roots:"
-          for path in /models /model /home/model /home/nfs /data/efs_rl /mnt /nfs /storage; do
-            if [[ -d "${path}" ]]; then
-              echo "--- ${path}"
-              ls -lah "${path}" 2>/dev/null | sed -n '1,120p' || true
-            fi
-          done
-
-          echo "Checkpoint configs under likely model roots:"
-          found_model_root=0
-          for path in \
-            /models \
-            /model \
-            /home/model \
-            /home/nfs/models \
-            /data/efs_rl/models \
-            /mnt/models \
-            /nfs/models \
-            /storage/models; do
-            if [[ -d "${path}" ]]; then
-              found_model_root=1
-              find "${path}" -mindepth 1 -maxdepth 3 -type f \
-                -name config.json -print 2>/dev/null | sort | sed -n '1,200p' || true
-            fi
-          done
-
-          if [[ "${found_model_root}" -eq 0 ]]; then
-            echo "No likely model root is visible inside the job container."
-          fi
-
-          echo "ModelScope Qwen cache entries:"
-          modelscope_qwen_root=/root/.cache/modelscope/hub/models/Qwen
-          if [[ -d "${modelscope_qwen_root}" ]]; then
-            find "${modelscope_qwen_root}" -mindepth 1 -maxdepth 1 -type d \
-              -printf '%f\n' 2>/dev/null | sort | sed -n '1,200p' || true
-          else
-            echo "MISSING: ${modelscope_qwen_root}"
-          fi
-
-          echo "Exact ModelScope checkpoint probe:"
-          for model_path in \
-            /root/.cache/modelscope/hub/models/Qwen/Qwen3-0.6B \
-            /root/.cache/modelscope/hub/models/Qwen/Qwen3-30B-A3B \
-            /root/.cache/modelscope/hub/models/Qwen/Qwen3.5-0.8B \
-            /root/.cache/modelscope/hub/models/Qwen/Qwen3.5-35B-A3B; do
-            if [[ ! -f "${model_path}/config.json" ]]; then
-              echo "MISSING: ${model_path}"
-              continue
-            fi
-
-            weight_file_count=$(find -L "${model_path}" -maxdepth 1 -type f \
-              \( -name '*.safetensors' -o -name '*.bin' \) -print 2>/dev/null | wc -l)
-            weight_bytes=$(find -L "${model_path}" -maxdepth 1 -type f \
-              \( -name '*.safetensors' -o -name '*.bin' \) -printf '%s\n' \
-              2>/dev/null | awk '{ total += $1 } END { print total + 0 }')
-
-            if [[ "${weight_file_count}" -gt 0 ]]; then
-              echo "FOUND: ${model_path} weight_files=${weight_file_count} weight_bytes=${weight_bytes}"
-            else
-              echo "METADATA_ONLY: ${model_path}"
-            fi
-          done
-
-      - name: Run NPU-image dependency tests
-        env:
-          HF_HUB_OFFLINE: "1"
-          TRANSFORMERS_OFFLINE: "1"
-        run: |
-          pytest -q \
-            --deselect tests/test_megatron_engine_vlm.py::TestVisionModelDetection \
-            tests/test_megatron_engine_vlm.py
-          pytest -q \
-            tests/test_model_packed_seq_cp.py
-          pytest -q -m skipif tests/test_reassemble_cp_logprobs.py
-
-      - name: Verify cached NPU test models
-        run: |
-          set -euo pipefail
-
-          verify_model() {
-            local model_path="$1"
-            local weight_file
-
-            test -f "${model_path}/config.json"
-            weight_file=$(find -L "${model_path}" -maxdepth 1 -type f \
-              \( -name '*.safetensors' -o -name '*.bin' \) -print -quit)
-            test -n "${weight_file}"
-            echo "Using cached model: ${model_path}"
-          }
-
-          verify_model "${AREAL_TEST_QWEN3_PATH}"
-          verify_model "${AREAL_TEST_QWEN35_PATH}"
-
-      - name: Run qualified NPU tests
-        env:
-          HF_HUB_OFFLINE: "1"
-          PYTHONWARNINGS: "ignore"
-          TRANSFORMERS_OFFLINE: "1"
-        run: |
-          set -euo pipefail
-
-          mkdir -p npu-test-logs
-
-          pids=()
-          names=()
-
-          start_test() {
-            local name="$1"
-            local devices="$2"
-            local selector="$3"
-
-            (
-              export ASCEND_RT_VISIBLE_DEVICES="${devices}"
-              timeout 900 pytest -q "${selector}"
-            ) >"npu-test-logs/${name}.log" 2>&1 &
-
-            pids+=("$!")
-            names+=("${name}")
-          }
-
-          failed=0
-
-          wait_for_wave() {
-            local index
-            local log_path
-            local status
-
-            for index in "${!pids[@]}"; do
-              if wait "${pids[$index]}"; then
-                status=0
-                echo "PASS: ${names[$index]}"
-              else
-                status=$?
-                echo "FAIL: ${names[$index]}"
-                failed=1
-              fi
-
-              log_path="npu-test-logs/${names[$index]}.log"
-              if [[ "${status}" -eq 0 ]]; then
-                tail -n 40 "${log_path}" >"${log_path}.compact"
-                mv "${log_path}.compact" "${log_path}"
-                cat "${log_path}"
-              else
-                echo "Last 240 lines from ${log_path}:"
-                tail -n 240 "${log_path}"
-              fi
-            done
-
-            pids=()
-            names=()
-          }
-
-          start_test \
-            qwen35-hf-save-load \
-            0,1 \
-            tests/test_megatron_engine_distributed.py::test_qwen3_5_hf_save_load
-          start_test \
-            qwen35-tp2 \
-            2,3 \
-            tests/test_megatron_engine_distributed.py::test_qwen3_5_tensor_parallel
-          wait_for_wave
-
-          start_test \
-            qwen35-pp2 \
-            0,1 \
-            tests/test_megatron_engine_distributed.py::test_qwen3_5_pipeline_parallel
-          start_test \
-            qwen35-single-forward \
-            2 \
-            tests/test_megatron_engine_distributed.py::test_qwen3_5_single_gpu_forward
-          start_test \
-            distributed-lock \
-            3 \
-            'tests/test_lock.py::test_distributed_lock_single_rank[1]'
-          wait_for_wave
-
-          start_test \
-            qwen3-grad-norm \
-            0,1 \
-            tests/test_megatron_engine_distributed.py::test_qwen3_grad_norm_mb_invariance
-          start_test \
-            qwen3-tp2 \
-            2,3 \
-            tests/test_megatron_engine_distributed.py::test_qwen3_tensor_parallel
-          wait_for_wave
-
-          start_test \
-            qwen3-pp2 \
-            0,1 \
-            tests/test_megatron_engine_distributed.py::test_qwen3_pipeline_parallel
-          start_test \
-            qwen3-vpp2 \
-            2,3 \
-            tests/test_megatron_engine_distributed.py::test_qwen3_virtual_pipeline_parallel
-          wait_for_wave
-
-          start_test \
-            qwen3-cp2 \
-            0,1 \
-            tests/test_megatron_engine_distributed.py::test_qwen3_context_parallel
-          start_test \
-            ulysses \
-            2,3 \
-            'tests/test_ulysses.py::test_ulysses[2]'
-          wait_for_wave
-
-          start_test \
-            vocab-parallel \
-            0,1 \
-            'tests/test_vocab_parallel.py::test_vocab_parallel[2]'
-          start_test \
-            perf-tracer \
-            2,3 \
-            tests/test_perf_tracer.py::test_perf_tracer_torchrun_multi_rank
-          wait_for_wave
-
-          start_test \
-            distributed-lock2 \
-            0,1 \
-            'tests/test_lock.py::test_distributed_lock_multi_rank[2]'
-          wait_for_wave
-
-          start_test \
-            vocab-parallel4 \
-            0,1,2,3 \
-            'tests/test_vocab_parallel.py::test_vocab_parallel[4]'
-          wait_for_wave
-
-          exit "${failed}"
-
-      - name: Upload NPU test logs
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: npu-pr-test-logs-${{ github.run_id }}-${{ github.run_attempt }}
-          path: npu-test-logs/
-          if-no-files-found: warn
-          retention-days: 14
-
-      - name: Collect final NPU diagnostics
-        if: always()
-        run: npu-smi info || true
-
-  large-model-npu-tests:
-    name: large-model-npu-tests
-    runs-on: linux-aarch64-a3-8
-    timeout-minutes: 75
-    container:
-      image: ghcr.io/hwvanici/areal_npu:v1.0.6rc1-a3
-
-    env:
-      AREAL_IS_IN_CI: "1"
       AREAL_TEST_QWEN3_MOE_PATH: "/root/.cache/modelscope/hub/models/Qwen/Qwen3-30B-A3B"
+      AREAL_TEST_QWEN35_PATH: "/root/.cache/modelscope/hub/models/Qwen/Qwen3.5-0.8B"
       AREAL_TEST_QWEN35_MOE_PATH: "/root/.cache/modelscope/hub/models/Qwen/Qwen3.5-35B-A3B"
       HF_ENDPOINT: "https://hf-mirror.com"
       HF_HUB_DISABLE_XET: "1"
@@ -540,12 +241,24 @@ jobs:
           print("NPU count:", torch.npu.device_count())
 
           assert torch.npu.is_available()
-          assert torch.npu.device_count() >= 8
+          assert torch.npu.device_count() >= 16
           PY
 
           npu-smi info
 
-      - name: Verify cached large NPU test models
+      - name: Run NPU-image dependency tests
+        env:
+          HF_HUB_OFFLINE: "1"
+          TRANSFORMERS_OFFLINE: "1"
+        run: |
+          pytest -q \
+            --deselect tests/test_megatron_engine_vlm.py::TestVisionModelDetection \
+            tests/test_megatron_engine_vlm.py
+          pytest -q \
+            tests/test_model_packed_seq_cp.py
+          pytest -q -m skipif tests/test_reassemble_cp_logprobs.py
+
+      - name: Verify cached NPU test models
         run: |
           set -euo pipefail
 
@@ -560,10 +273,12 @@ jobs:
             echo "Using cached model: ${model_path}"
           }
 
+          verify_model "${AREAL_TEST_QWEN3_PATH}"
           verify_model "${AREAL_TEST_QWEN3_MOE_PATH}"
+          verify_model "${AREAL_TEST_QWEN35_PATH}"
           verify_model "${AREAL_TEST_QWEN35_MOE_PATH}"
 
-      - name: Run large-model NPU tests
+      - name: Run balanced NPU test lanes
         env:
           HF_HUB_OFFLINE: "1"
           PYTHONWARNINGS: "ignore"
@@ -571,48 +286,72 @@ jobs:
         run: |
           set -euo pipefail
 
-          mkdir -p large-npu-test-logs
+          mkdir -p npu-test-logs
           mkdir -p /root/.cache/areal-ci-tmp
 
-          local_tmpdir=$(mktemp -d \
-            "/tmp/areal-ci-run-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-XXXXXX")
-          nfs_tmpdir=$(mktemp -d \
-            "/root/.cache/areal-ci-tmp/run-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-XXXXXX")
-          active_pid=""
-          timer_pid=""
+          dcp_tmpdir=$(mktemp -d \
+            "/root/.cache/areal-ci-tmp/dcp-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-XXXXXX")
+          hf_tmpdir=$(mktemp -d \
+            "/root/.cache/areal-ci-tmp/hf-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-XXXXXX")
+          dcp_followup_tmpdir=$(mktemp -d \
+            "/tmp/areal-ci-dcp-followup-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-XXXXXX")
+          compute_tmpdir=$(mktemp -d \
+            "/tmp/areal-ci-compute-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-XXXXXX")
+          checkpoint_pid=""
+          compute_pid=""
 
           cleanup() {
-            if [[ -n "${timer_pid}" ]]; then
-              kill "${timer_pid}" 2>/dev/null || true
-            fi
-            if [[ -n "${active_pid}" ]]; then
-              kill "${active_pid}" 2>/dev/null || true
-            fi
-            rm -rf -- "${local_tmpdir}" "${nfs_tmpdir}"
+            local pid
+
+            for pid in "${checkpoint_pid}" "${compute_pid}"; do
+              if [[ -n "${pid}" ]]; then
+                kill "${pid}" 2>/dev/null || true
+              fi
+            done
+            rm -rf -- \
+              "${dcp_tmpdir}" \
+              "${hf_tmpdir}" \
+              "${dcp_followup_tmpdir}" \
+              "${compute_tmpdir}"
           }
           trap cleanup EXIT
 
-          echo "35B local compiler scratch: ${local_tmpdir}"
-          echo "30B NFS checkpoint scratch: ${nfs_tmpdir}"
-          df -hT / "${local_tmpdir}" "${nfs_tmpdir}"
+          finish_log() {
+            local name="$1"
+            local status="$2"
+            local log_path="npu-test-logs/${name}.log"
+
+            if [[ "${status}" -eq 0 ]]; then
+              tail -n 40 "${log_path}" >"${log_path}.compact"
+              mv "${log_path}.compact" "${log_path}"
+              cat "${log_path}"
+            else
+              echo "Last 240 lines from ${log_path}:"
+              tail -n 240 "${log_path}"
+            fi
+          }
 
           run_test() {
             local name="$1"
-            local selector="$2"
-            local test_tmpdir="$3"
+            local devices="$2"
+            local selector="$3"
+            local test_tmpdir="$4"
+            local timeout_seconds="$5"
+            local active_pid
             local completed_pid
             local completed_status
             local started_at
             local status
+            local timer_pid
 
             started_at=${SECONDS}
-            echo "START: ${name} TMPDIR=${test_tmpdir}"
+            echo "START: ${name} devices=${devices} TMPDIR=${test_tmpdir}"
 
             (
-              export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+              export ASCEND_RT_VISIBLE_DEVICES="${devices}"
               export TMPDIR="${test_tmpdir}"
-              timeout --kill-after=60s 1200s pytest -q "${selector}"
-            ) >"large-npu-test-logs/${name}.log" 2>&1 &
+              timeout --kill-after=60s "${timeout_seconds}s" pytest -q "${selector}"
+            ) >"npu-test-logs/${name}.log" 2>&1 &
             active_pid=$!
 
             while true; do
@@ -628,14 +367,11 @@ jobs:
                 status=${completed_status}
                 kill "${timer_pid}" 2>/dev/null || true
                 wait "${timer_pid}" 2>/dev/null || true
-                timer_pid=""
                 break
               fi
 
-              timer_pid=""
               echo "PROGRESS: ${name} elapsed=$((SECONDS - started_at))s"
               du -sh "${test_tmpdir}" 2>/dev/null || true
-              df -hP "${test_tmpdir}" | tail -n 1 || true
             done
 
             if [[ "${status}" -eq 0 ]]; then
@@ -643,43 +379,194 @@ jobs:
             else
               echo "FAIL: ${name} status=${status} elapsed=$((SECONDS - started_at))s"
             fi
-
-            active_pid=""
-
-            if [[ "${status}" -eq 0 ]]; then
-              tail -n 40 "large-npu-test-logs/${name}.log" \
-                >"large-npu-test-logs/${name}.log.compact"
-              mv \
-                "large-npu-test-logs/${name}.log.compact" \
-                "large-npu-test-logs/${name}.log"
-              cat "large-npu-test-logs/${name}.log"
-            else
-              echo "Last 240 lines from large-npu-test-logs/${name}.log:"
-              tail -n 240 "large-npu-test-logs/${name}.log"
-            fi
+            finish_log "${name}" "${status}"
             return "${status}"
           }
 
+          start_normal_test() {
+            local name="$1"
+            local devices="$2"
+            local selector="$3"
+
+            echo "START: ${name} devices=${devices}"
+            (
+              export ASCEND_RT_VISIBLE_DEVICES="${devices}"
+              export TMPDIR="${lane_tmpdir}"
+              timeout --kill-after=60s 900s pytest -q "${selector}"
+            ) >"npu-test-logs/${name}.log" 2>&1 &
+            pids+=("$!")
+            names+=("${name}")
+          }
+
+          wait_for_normal_wave() {
+            local index
+            local status
+
+            for index in "${!pids[@]}"; do
+              if wait "${pids[$index]}"; then
+                status=0
+                echo "PASS: ${names[$index]}"
+              else
+                status=$?
+                echo "FAIL: ${names[$index]} status=${status}"
+                failed=1
+              fi
+              finish_log "${names[$index]}" "${status}"
+            done
+
+            pids=()
+            names=()
+          }
+
+          checkpoint_lane() {
+            local failed=0
+            local lane_tmpdir="${dcp_followup_tmpdir}"
+            local -a names=()
+            local -a pids=()
+
+            run_test \
+              qwen3-30b-dcp-save-load \
+              8,9,10,11,12,13,14,15 \
+              tests/test_megatron_engine_distributed.py::test_qwen3moe_dcp_save_load \
+              "${dcp_tmpdir}" \
+              1200 \
+              || failed=1
+            rm -rf -- "${dcp_tmpdir}"
+
+            start_normal_test \
+              qwen35-hf-save-load \
+              8,9 \
+              tests/test_megatron_engine_distributed.py::test_qwen3_5_hf_save_load
+            start_normal_test \
+              qwen35-tp2 \
+              10,11 \
+              tests/test_megatron_engine_distributed.py::test_qwen3_5_tensor_parallel
+            start_normal_test \
+              qwen35-pp2 \
+              12,13 \
+              tests/test_megatron_engine_distributed.py::test_qwen3_5_pipeline_parallel
+            start_normal_test \
+              qwen35-single-forward \
+              14 \
+              tests/test_megatron_engine_distributed.py::test_qwen3_5_single_gpu_forward
+            start_normal_test \
+              distributed-lock \
+              15 \
+              'tests/test_lock.py::test_distributed_lock_single_rank[1]'
+            wait_for_normal_wave
+
+            return "${failed}"
+          }
+
+          compute_lane() {
+            local failed=0
+            local lane_tmpdir="${compute_tmpdir}"
+            local -a names=()
+            local -a pids=()
+
+            run_test \
+              qwen35-35b-hf-save-load \
+              0,1,2,3,4,5,6,7 \
+              tests/test_megatron_engine_distributed.py::test_qwen3_5_moe_hf_save_load \
+              "${hf_tmpdir}" \
+              1800 \
+              || failed=1
+            rm -rf -- "${hf_tmpdir}"
+
+            run_test \
+              qwen35-35b-expert-parallel \
+              0,1,2,3,4,5,6,7 \
+              tests/test_megatron_engine_distributed.py::test_qwen3_5_moe_expert_parallel \
+              "${compute_tmpdir}" \
+              1200 \
+              || failed=1
+            run_test \
+              qwen3-30b-expert-parallel \
+              0,1,2,3,4,5,6,7 \
+              tests/test_megatron_engine_distributed.py::test_qwen3moe_expert_parallel \
+              "${compute_tmpdir}" \
+              1200 \
+              || failed=1
+
+            start_normal_test \
+              qwen3-grad-norm \
+              0,1 \
+              tests/test_megatron_engine_distributed.py::test_qwen3_grad_norm_mb_invariance
+            start_normal_test \
+              qwen3-tp2 \
+              2,3 \
+              tests/test_megatron_engine_distributed.py::test_qwen3_tensor_parallel
+            start_normal_test \
+              qwen3-pp2 \
+              4,5 \
+              tests/test_megatron_engine_distributed.py::test_qwen3_pipeline_parallel
+            start_normal_test \
+              qwen3-vpp2 \
+              6,7 \
+              tests/test_megatron_engine_distributed.py::test_qwen3_virtual_pipeline_parallel
+            wait_for_normal_wave
+
+            start_normal_test \
+              qwen3-cp2 \
+              0,1 \
+              tests/test_megatron_engine_distributed.py::test_qwen3_context_parallel
+            start_normal_test \
+              ulysses \
+              2,3 \
+              'tests/test_ulysses.py::test_ulysses[2]'
+            start_normal_test \
+              vocab-parallel \
+              4,5 \
+              'tests/test_vocab_parallel.py::test_vocab_parallel[2]'
+            start_normal_test \
+              perf-tracer \
+              6,7 \
+              tests/test_perf_tracer.py::test_perf_tracer_torchrun_multi_rank
+            wait_for_normal_wave
+
+            start_normal_test \
+              distributed-lock2 \
+              0,1 \
+              'tests/test_lock.py::test_distributed_lock_multi_rank[2]'
+            start_normal_test \
+              vocab-parallel4 \
+              2,3,4,5 \
+              'tests/test_vocab_parallel.py::test_vocab_parallel[4]'
+            wait_for_normal_wave
+
+            return "${failed}"
+          }
+
+          checkpoint_lane &
+          checkpoint_pid=$!
+          compute_lane &
+          compute_pid=$!
+
           failed=0
-          run_test \
-            qwen35-35b-expert-parallel \
-            tests/test_megatron_engine_distributed.py::test_qwen3_5_moe_expert_parallel \
-            "${local_tmpdir}" \
-            || failed=1
-          run_test \
-            qwen3-30b-dcp-save-load \
-            tests/test_megatron_engine_distributed.py::test_qwen3moe_dcp_save_load \
-            "${nfs_tmpdir}" \
-            || failed=1
+          if wait "${checkpoint_pid}"; then
+            echo "PASS: checkpoint lane"
+          else
+            echo "FAIL: checkpoint lane"
+            failed=1
+          fi
+          checkpoint_pid=""
+
+          if wait "${compute_pid}"; then
+            echo "PASS: compute lane"
+          else
+            echo "FAIL: compute lane"
+            failed=1
+          fi
+          compute_pid=""
 
           exit "${failed}"
 
-      - name: Upload large-model NPU test logs
+      - name: Upload NPU test logs
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: large-model-npu-test-logs-${{ github.run_id }}-${{ github.run_attempt }}
-          path: large-npu-test-logs/
+          name: npu-pr-test-logs-${{ github.run_id }}-${{ github.run_attempt }}
+          path: npu-test-logs/
           if-no-files-found: warn
           retention-days: 14
 

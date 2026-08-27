@@ -111,12 +111,21 @@ def test_qwen3_virtual_pipeline_parallel(tmp_path_factory):
 @pytest.mark.multi_gpu
 @pytest.mark.slow
 def test_qwen3moe_expert_parallel(tmp_path_factory):
-    if current_platform.device_count() < 4:
-        pytest.skip("Qwen3 MoE expert parallel requires 4 GPUs to run")
+    """Qwen3-MoE forward with context and expert parallelism.
+
+    NPU uses PP=2 across eight ranks to keep the 30B model within per-rank
+    memory. Other platforms retain the four-rank layout.
+    """
+    pipeline_parallel_size = 2 if current_platform.device_type == "npu" else 1
+    world_size = pipeline_parallel_size * 4
+    if current_platform.device_count() < world_size:
+        pytest.skip(f"Qwen3 MoE expert parallel requires {world_size} accelerators")
     output = tmp_path_factory.mktemp("test_output") / "qwen3moe_expert_parallel.out"
     _run_test_with_torchrun(
         "qwen3moe",
-        "megatron:(attn:d1p1t2c2|ffn:d1p1t1e4)",
+        "megatron:"
+        f"(attn:d1p{pipeline_parallel_size}t2c2|"
+        f"ffn:d1p{pipeline_parallel_size}t1e4)",
         test_type="forward",
         output=str(output),
     )
