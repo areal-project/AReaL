@@ -8,6 +8,8 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from emerging_optimizers.utils import fp32_matmul_precision
+from megatron.core.optimizer.muon import TensorParallelMuon
 
 from areal.engine.megatron_utils.gpu_staged_muon import (
     GPUStagedMuon,
@@ -203,6 +205,177 @@ def test_muon_step_matches_reference_across_accumulated_gradients() -> None:
     )
     assert optimizer.residency == "CPU_RESIDENT"
     assert optimizer.cuda_state_numel == 0
+
+
+@pytest.mark.parametrize("use_nesterov", [False, True])
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_muon_steps_match_official_tensor_parallel_muon(
+    use_nesterov: bool,
+) -> None:
+    """Staged master and momentum match MCore's official Muon update."""
+    torch.manual_seed(20260829)
+    initial = [
+        torch.randn(shape, device="cuda", dtype=torch.bfloat16)
+        for shape in ((5, 7), (8, 3))
+    ]
+    staged_params = [torch.nn.Parameter(value.clone()) for value in initial]
+    baseline_params = [torch.nn.Parameter(value.float()) for value in initial]
+    kwargs = {
+        "lr": 0.03,
+        "momentum_beta": 0.8,
+        "use_nesterov": use_nesterov,
+        "weight_decay": 0.02,
+        "use_decoupled_weight_decay": True,
+        "fp32_matmul_prec": "highest",
+        "coefficient_type": "quintic",
+        "num_ns_steps": 3,
+        "scale_mode": "spectral",
+        "extra_scale_factor": 1.0,
+        "mode": "duplicated",
+    }
+    baseline = TensorParallelMuon(baseline_params, **kwargs)
+    staged = GPUStagedMuon(
+        [
+            {
+                "params": staged_params,
+                "lr": kwargs["lr"],
+                "momentum": kwargs["momentum_beta"],
+                "weight_decay": kwargs["weight_decay"],
+            }
+        ],
+        staged_config=_config(slot_numel=64, buffer_count=1),
+        orthogonalize=baseline.orthogonalize,
+        matmul_precision=lambda: fp32_matmul_precision(baseline.fp32_matmul_prec),
+        nesterov=baseline.nesterov,
+        weight_decay_method=baseline.weight_decay_method,
+    )
+    staged.bind_owned_params(staged.param_groups)
+
+    for step in range(5):
+        for param_index, (staged_param, baseline_param) in enumerate(
+            zip(staged_params, baseline_params, strict=True)
+        ):
+            grad = torch.randn_like(staged_param).mul_(0.1 + step + param_index)
+            staged_param.decoupled_grad = grad
+            baseline_param.grad = grad.float()
+        staged.step()
+        baseline.step()
+        staged.drain()
+
+        for staged_param, baseline_param in zip(
+            staged_params, baseline_params, strict=True
+        ):
+            staged_state = staged.state[staged_param]
+            baseline_state = baseline.state[baseline_param]
+            torch.testing.assert_close(
+                staged_state["master_param"],
+                baseline_param.detach().cpu(),
+                rtol=3e-6,
+                atol=3e-6,
+            )
+            torch.testing.assert_close(
+                staged_state["momentum_buffer"],
+                baseline_state["momentum_buffer"].cpu(),
+                rtol=3e-6,
+                atol=3e-6,
+            )
+            torch.testing.assert_close(
+                staged_param,
+                baseline_param.detach().bfloat16(),
+                rtol=0.0,
+                atol=0.0,
+            )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_muon_checkpoint_resume_matches_official_tensor_parallel_muon() -> None:
+    """Muon CPU state resumes on the official optimization trajectory."""
+    torch.manual_seed(20260830)
+    initial = torch.randn(6, 5, device="cuda", dtype=torch.bfloat16)
+    kwargs = {
+        "lr": 0.02,
+        "momentum_beta": 0.85,
+        "use_nesterov": True,
+        "weight_decay": 0.03,
+        "use_decoupled_weight_decay": True,
+        "fp32_matmul_prec": "highest",
+        "num_ns_steps": 3,
+        "mode": "duplicated",
+    }
+    baseline_param = torch.nn.Parameter(initial.float())
+    baseline = TensorParallelMuon([baseline_param], **kwargs)
+    source_param = torch.nn.Parameter(initial.clone())
+
+    def make_staged(param: torch.nn.Parameter) -> GPUStagedMuon:
+        optimizer = GPUStagedMuon(
+            [
+                {
+                    "params": [param],
+                    "lr": kwargs["lr"],
+                    "momentum": kwargs["momentum_beta"],
+                    "weight_decay": kwargs["weight_decay"],
+                }
+            ],
+            staged_config=_config(slot_numel=32, buffer_count=1),
+            orthogonalize=baseline.orthogonalize,
+            matmul_precision=lambda: fp32_matmul_precision(baseline.fp32_matmul_prec),
+            nesterov=baseline.nesterov,
+            weight_decay_method=baseline.weight_decay_method,
+        )
+        optimizer.bind_owned_params(optimizer.param_groups)
+        return optimizer
+
+    source = make_staged(source_param)
+    for _ in range(3):
+        grad = torch.randn_like(source_param)
+        source_param.decoupled_grad = grad
+        baseline_param.grad = grad.float()
+        source.step()
+        baseline.step()
+        source.drain()
+
+    live_checkpoint = source.state_dict()
+    checkpoint = {
+        "state": {
+            state_id: {key: value.clone() for key, value in state.items()}
+            for state_id, state in live_checkpoint["state"].items()
+        },
+        "param_groups": [dict(group) for group in live_checkpoint["param_groups"]],
+    }
+    resumed_param = torch.nn.Parameter(source_param.detach().clone())
+    resumed = make_staged(resumed_param)
+    resumed.begin_checkpoint_load()
+    resumed.load_state_dict(checkpoint)
+    resumed.complete_checkpoint_load()
+
+    for _ in range(3):
+        grad = torch.randn_like(resumed_param)
+        resumed_param.decoupled_grad = grad
+        baseline_param.grad = grad.float()
+        resumed.step()
+        baseline.step()
+        resumed.drain()
+
+        resumed_state = resumed.state[resumed_param]
+        baseline_state = baseline.state[baseline_param]
+        torch.testing.assert_close(
+            resumed_state["master_param"],
+            baseline_param.detach().cpu(),
+            rtol=3e-6,
+            atol=3e-6,
+        )
+        torch.testing.assert_close(
+            resumed_state["momentum_buffer"],
+            baseline_state["momentum_buffer"].cpu(),
+            rtol=3e-6,
+            atol=3e-6,
+        )
+        torch.testing.assert_close(
+            resumed_param,
+            baseline_param.detach().bfloat16(),
+            rtol=0.0,
+            atol=0.0,
+        )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")

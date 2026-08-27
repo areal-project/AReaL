@@ -139,6 +139,86 @@ def test_multiple_steps_match_fp32_master_adamw() -> None:
         )
 
 
+@pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA is required for staged AdamW")
+def test_param_groups_and_bucket_slices_match_pytorch_adamw() -> None:
+    """Group overrides and sliced parameters match native PyTorch AdamW."""
+    torch.manual_seed(20260827)
+    initial = [
+        torch.randn(numel, device="cuda", dtype=torch.bfloat16) for numel in (7, 11, 13)
+    ]
+    staged_params = [torch.nn.Parameter(value.clone()) for value in initial]
+    baseline_params = [torch.nn.Parameter(value.float()) for value in initial]
+    group_options = [
+        {
+            "lr": 3e-3,
+            "betas": (0.8, 0.95),
+            "eps": 1e-6,
+            "weight_decay": 0.07,
+        },
+        {
+            "lr": 7e-4,
+            "betas": (0.6, 0.9),
+            "eps": 3e-7,
+            "weight_decay": 0.02,
+        },
+    ]
+    staged_groups = [
+        {"params": staged_params[:2], **group_options[0]},
+        {"params": staged_params[2:], **group_options[1]},
+    ]
+    baseline_groups = [
+        {"params": baseline_params[:2], **group_options[0]},
+        {"params": baseline_params[2:], **group_options[1]},
+    ]
+    staged = GPUStagedAdamW(
+        staged_groups, staged_config=_tiny_config(buffer_count=2, bucket_numel=9)
+    )
+    staged.bind_owned_params(staged.param_groups)
+    baseline = torch.optim.AdamW(baseline_groups)
+
+    assert [unit.numel for unit in staged.units] == [9, 9, 9, 4]
+    assert len(staged.units[0].parts) == 2
+    assert len(staged.units[1].parts) == 1
+
+    for step in range(5):
+        for param_index, (staged_param, baseline_param) in enumerate(
+            zip(staged_params, baseline_params, strict=True)
+        ):
+            grad = torch.randn_like(staged_param).mul_(0.1 + step + param_index)
+            staged_param.decoupled_grad = grad
+            baseline_param.grad = grad.float()
+        staged.step()
+        baseline.step()
+        staged.drain()
+
+        for staged_param, baseline_param in zip(
+            staged_params, baseline_params, strict=True
+        ):
+            staged_state = staged.state[staged_param]
+            baseline_state = baseline.state[baseline_param]
+            torch.testing.assert_close(
+                staged_state["master_param"],
+                baseline_param.detach().cpu(),
+                rtol=2e-6,
+                atol=2e-6,
+            )
+            for key in ("exp_avg", "exp_avg_sq"):
+                torch.testing.assert_close(
+                    staged_state[key],
+                    baseline_state[key].cpu(),
+                    rtol=2e-6,
+                    atol=2e-6,
+                )
+            torch.testing.assert_close(
+                staged_param,
+                baseline_param.detach().bfloat16(),
+                rtol=0.0,
+                atol=0.0,
+            )
+            assert int(baseline_state["step"].item()) == step + 1
+        assert [group["step"] for group in staged.param_groups] == [step + 1] * 2
+
+
 @pytest.mark.parametrize("use_non_default_stream", [False, True])
 @pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA is required for staged AdamW")
 def test_step_waits_for_caller_stream_gradient_write(
@@ -463,6 +543,81 @@ def test_checkpoint_load_restores_cpu_state_and_continues_identically() -> None:
             source.state[source_param][key],
             rtol=2e-6,
             atol=2e-6,
+        )
+
+
+@pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA is required for staged AdamW")
+def test_checkpoint_resume_continues_to_match_pytorch_adamw() -> None:
+    """A staged checkpoint resumes on the native AdamW optimization path."""
+    torch.manual_seed(20260828)
+    initial = torch.randn(31, device="cuda", dtype=torch.bfloat16)
+    kwargs = {
+        "lr": 2e-3,
+        "betas": (0.75, 0.93),
+        "eps": 2e-6,
+        "weight_decay": 0.04,
+    }
+    source_param = torch.nn.Parameter(initial.clone())
+    source = GPUStagedAdamW(
+        [source_param], staged_config=_tiny_config(bucket_numel=8), **kwargs
+    )
+    source.bind_owned_params(source.param_groups)
+    baseline_param = torch.nn.Parameter(initial.float())
+    baseline = torch.optim.AdamW([baseline_param], **kwargs)
+
+    for _ in range(3):
+        grad = torch.randn_like(source_param)
+        source_param.decoupled_grad = grad
+        baseline_param.grad = grad.float()
+        source.step()
+        baseline.step()
+        source.drain()
+
+    live_checkpoint = source.state_dict()
+    checkpoint = {
+        "state": {
+            state_id: {key: value.clone() for key, value in state.items()}
+            for state_id, state in live_checkpoint["state"].items()
+        },
+        "param_groups": [dict(group) for group in live_checkpoint["param_groups"]],
+    }
+    resumed_param = torch.nn.Parameter(source_param.detach().clone())
+    resumed = GPUStagedAdamW(
+        [resumed_param], staged_config=_tiny_config(bucket_numel=8), **kwargs
+    )
+    resumed.bind_owned_params(resumed.param_groups)
+    resumed.begin_checkpoint_load()
+    resumed.load_state_dict(checkpoint)
+    resumed.complete_checkpoint_load()
+
+    for _ in range(4):
+        grad = torch.randn_like(resumed_param)
+        resumed_param.decoupled_grad = grad
+        baseline_param.grad = grad.float()
+        resumed.step()
+        baseline.step()
+        resumed.drain()
+
+        resumed_state = resumed.state[resumed_param]
+        baseline_state = baseline.state[baseline_param]
+        torch.testing.assert_close(
+            resumed_state["master_param"],
+            baseline_param.detach().cpu(),
+            rtol=2e-6,
+            atol=2e-6,
+        )
+        for key in ("exp_avg", "exp_avg_sq"):
+            torch.testing.assert_close(
+                resumed_state[key],
+                baseline_state[key].cpu(),
+                rtol=2e-6,
+                atol=2e-6,
+            )
+        torch.testing.assert_close(
+            resumed_param,
+            baseline_param.detach().bfloat16(),
+            rtol=0.0,
+            atol=0.0,
         )
 
 
