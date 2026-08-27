@@ -31,7 +31,11 @@ from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 from areal.engine.megatron_utils.gpu_staged_optimizer import (
     GPUStagedAdamW,
     GPUStagedAdamWConfig,
+)
+from areal.engine.megatron_utils.staged_optimizer_runtime import (
+    CUDAStagingSlot,
     SlotStateMachine,
+    StagedOptimizerRuntime,
 )
 
 _SUPPORTED_MEGATRON_CORE_VERSION = "0.17.0"
@@ -371,36 +375,6 @@ class GPUStagedEmptyOptimizer:
             raise ValueError("empty staged optimizer checkpoint must contain no state")
 
 
-@dataclass
-class _MuonCUDAStagingSlot:
-    master: torch.Tensor
-    momentum: torch.Tensor
-    grad: torch.Tensor
-    workspace: torch.Tensor
-    h2d_stream: torch.cuda.Stream
-    compute_stream: torch.cuda.Stream
-    d2h_stream: torch.cuda.Stream
-    h2d_done: torch.cuda.Event
-    compute_done: torch.cuda.Event
-    d2h_done: torch.cuda.Event
-
-    @classmethod
-    def allocate(cls, capacity: int, device: torch.device) -> _MuonCUDAStagingSlot:
-        kwargs = {"size": (capacity,), "dtype": torch.float32, "device": device}
-        return cls(
-            master=torch.empty(**kwargs),
-            momentum=torch.empty(**kwargs),
-            grad=torch.empty(**kwargs),
-            workspace=torch.empty(**kwargs),
-            h2d_stream=torch.cuda.Stream(device=device),
-            compute_stream=torch.cuda.Stream(device=device),
-            d2h_stream=torch.cuda.Stream(device=device),
-            h2d_done=torch.cuda.Event(),
-            compute_done=torch.cuda.Event(),
-            d2h_done=torch.cuda.Event(),
-        )
-
-
 class GPUStagedMuon(torch.optim.Optimizer):
     """Muon shell whose master and momentum live in pinned CPU slabs."""
 
@@ -427,16 +401,24 @@ class GPUStagedMuon(torch.optim.Optimizer):
         self._nesterov = nesterov
         self.cpu_slabs: MuonCPUSlabs | None = None
         self._units: tuple[MuonOwnedUnit, ...] = ()
-        self._slots: list[_MuonCUDAStagingSlot] = []
-        self._slot_machine: SlotStateMachine | None = None
+        self._runtime = StagedOptimizerRuntime(
+            self.staged_config.buffer_count,
+            ("master", "momentum", "grad", "workspace"),
+        )
         self._tp_groups: dict[str, Any] | None = None
         self._bound = False
-        self._residency = "UNBOUND"
-        self._checkpoint_load_error: BaseException | None = None
 
     @property
     def residency(self) -> str:
-        return self._residency
+        return self._runtime.residency
+
+    @property
+    def _slots(self) -> list[CUDAStagingSlot]:
+        return self._runtime.slots
+
+    @property
+    def _slot_machine(self) -> SlotStateMachine | None:
+        return self._runtime.slot_machine
 
     @property
     def units(self) -> tuple[MuonOwnedUnit, ...]:
@@ -516,8 +498,8 @@ class GPUStagedMuon(torch.optim.Optimizer):
         self.state.clear()
         if not units:
             self.cpu_slabs = None
+            self._runtime.bind(capacity=None, device=device)
             self._bound = True
-            self._residency = "CPU_RESIDENT"
             return
 
         self.cpu_slabs = MuonCPUSlabs.allocate(offset)
@@ -530,22 +512,13 @@ class GPUStagedMuon(torch.optim.Optimizer):
                 0, unit.slab_offset, unit.numel
             ).view_as(unit.param)
 
-        if units:
-            self._slots = [
-                _MuonCUDAStagingSlot.allocate(self.staged_config.slot_numel, device)
-                for _ in range(self.staged_config.buffer_count)
-            ]
-            self._slot_machine = SlotStateMachine(len(self._slots), self._wait_for_slot)
+        self._runtime.bind(capacity=self.staged_config.slot_numel, device=device)
         self._bound = True
-        self._residency = "STEP_ACTIVE"
-        if units:
-            caller_stream = torch.cuda.current_stream(device)
-            params_ready = torch.cuda.Event()
-            params_ready.record(caller_stream)
-            for unit_index, unit in enumerate(units):
-                self._schedule_master_initialization(
-                    unit, unit_index % len(self._slots), params_ready
-                )
+        self._runtime.schedule_units(
+            self._units,
+            self._schedule_master_initialization,
+            wait_for_compute=False,
+        )
         self.drain()
 
     def bind_parallel_groups(self, *, tp: Any, expt_tp: Any) -> None:
@@ -560,18 +533,14 @@ class GPUStagedMuon(torch.optim.Optimizer):
         """Validate raw TP gradient participation before MCore prepares gradients."""
         return _preflight_tp_gradient_participation(self._units, self._tp_groups)
 
-    def _wait_for_slot(self, slot_index: int) -> None:
-        self._slots[slot_index].d2h_done.synchronize()
-
     def _schedule_master_initialization(
         self,
         unit: MuonOwnedUnit,
         slot_index: int,
         params_ready: torch.cuda.Event,
     ) -> None:
-        assert self.cpu_slabs is not None and self._slot_machine is not None
-        self._slot_machine.acquire(slot_index)
-        slot = self._slots[slot_index]
+        assert self.cpu_slabs is not None
+        slot = self._runtime.acquire_slot(slot_index)
         with torch.cuda.stream(slot.h2d_stream):
             slot.h2d_stream.wait_event(params_ready)
             slot.master[: unit.numel].copy_(unit.param.detach().view(-1))
@@ -582,7 +551,7 @@ class GPUStagedMuon(torch.optim.Optimizer):
                 slot.master[: unit.numel], non_blocking=True
             )
             slot.d2h_done.record(slot.d2h_stream)
-        self._slot_machine.mark_d2h_pending(slot_index)
+        self._runtime.mark_d2h_pending(slot_index)
 
     def _schedule_update(
         self,
@@ -590,9 +559,8 @@ class GPUStagedMuon(torch.optim.Optimizer):
         slot_index: int,
         grads_ready: torch.cuda.Event,
     ) -> None:
-        assert self.cpu_slabs is not None and self._slot_machine is not None
-        self._slot_machine.acquire(slot_index)
-        slot = self._slots[slot_index]
+        assert self.cpu_slabs is not None
+        slot = self._runtime.acquire_slot(slot_index)
         slab_slice = slice(unit.slab_offset, unit.slab_offset + unit.numel)
         with torch.cuda.stream(slot.h2d_stream):
             slot.h2d_stream.wait_event(grads_ready)
@@ -656,55 +624,40 @@ class GPUStagedMuon(torch.optim.Optimizer):
                 slot.momentum[: unit.numel], non_blocking=True
             )
             slot.d2h_done.record(slot.d2h_stream)
-        self._slot_machine.mark_d2h_pending(slot_index)
+        self._runtime.mark_d2h_pending(slot_index)
 
     @torch.no_grad()
     def step(self, closure: Callable[[], float] | None = None) -> float | None:
         if not self._bound:
             raise RuntimeError("bind_owned_params() must be called before Muon step")
-        if self._checkpoint_load_error is not None:
+        if self._runtime.checkpoint_load_error is not None:
             raise RuntimeError(
                 "cannot step after a failed checkpoint load; restart and recover"
-            ) from self._checkpoint_load_error
+            ) from self._runtime.checkpoint_load_error
         if closure is not None:
             raise ValueError("staged Muon does not support closures")
         if not self._units:
-            self._residency = "CPU_RESIDENT"
+            self._runtime.residency = "CPU_RESIDENT"
             return None
-        device = self._slots[0].master.device
-        caller_stream = torch.cuda.current_stream(device)
-        grads_ready = torch.cuda.Event()
-        grads_ready.record(caller_stream)
-        self._residency = "STEP_ACTIVE"
-        for unit_index, unit in enumerate(self._units):
-            self._schedule_update(unit, unit_index % len(self._slots), grads_ready)
-        for slot_index, phase in enumerate(self._slot_machine.phases):
-            if phase == "D2H_PENDING":
-                caller_stream.wait_event(self._slots[slot_index].compute_done)
+        self._runtime.schedule_units(
+            self._units, self._schedule_update, wait_for_compute=True
+        )
         return None
 
     def drain(self) -> None:
-        if self._slot_machine is not None:
-            self._slot_machine.drain()
-        if self._bound:
-            self._residency = "CPU_RESIDENT"
+        self._runtime.drain()
 
     def offload_to_cpu(self) -> None:
         self.drain()
-        self._slots.clear()
-        self._slot_machine = None
+        self._runtime.release_slots()
 
     def restore_from_cpu(self) -> None:
         if not self._bound or not self._units or self._slots:
             return
         device = self._units[0].param.device
-        slots = [
-            _MuonCUDAStagingSlot.allocate(self.staged_config.slot_numel, device)
-            for _ in range(self.staged_config.buffer_count)
-        ]
-        self._slots = slots
-        self._slot_machine = SlotStateMachine(len(slots), self._wait_for_slot)
-        self._residency = "CPU_RESIDENT"
+        self._runtime.restore_slots(
+            capacity=self.staged_config.slot_numel, device=device
+        )
 
     def _validate_bound_state_views(self) -> None:
         if not self._bound:
@@ -747,10 +700,10 @@ class GPUStagedMuon(torch.optim.Optimizer):
 
     def prepare_checkpoint_save(self) -> None:
         """Drain staging before synchronous DCP reads authoritative CPU slabs."""
-        if self._checkpoint_load_error is not None:
+        if self._runtime.checkpoint_load_error is not None:
             raise RuntimeError(
                 "cannot save after a failed checkpoint load; restart and recover"
-            ) from self._checkpoint_load_error
+            ) from self._runtime.checkpoint_load_error
         self.drain()
         self._validate_bound_state_views()
         if self.cuda_state_numel != 0:
@@ -758,10 +711,10 @@ class GPUStagedMuon(torch.optim.Optimizer):
 
     def begin_checkpoint_load(self) -> None:
         """Prepare for one in-place synchronous load without rollback state."""
-        if self._checkpoint_load_error is not None:
+        if self._runtime.checkpoint_load_error is not None:
             raise RuntimeError(
                 "checkpoint load already failed; restart the process to recover"
-            ) from self._checkpoint_load_error
+            ) from self._runtime.checkpoint_load_error
         self.drain()
         self._validate_bound_state_views()
 
@@ -772,8 +725,7 @@ class GPUStagedMuon(torch.optim.Optimizer):
 
     def mark_checkpoint_load_failed(self, error: BaseException) -> None:
         """Fail-stop after an in-place load error; no rollback or retry."""
-        self._checkpoint_load_error = error
-        self._residency = "CPU_RESIDENT"
+        self._runtime.mark_checkpoint_load_failed(error)
 
     def reset_from_model_params(self) -> None:
         """Rebuild masters and clear momentum after a model-only load."""
@@ -787,15 +739,11 @@ class GPUStagedMuon(torch.optim.Optimizer):
             self.restore_from_cpu()
         try:
             self.drain()
-            device = self._slots[0].master.device
-            caller_stream = torch.cuda.current_stream(device)
-            params_ready = torch.cuda.Event()
-            params_ready.record(caller_stream)
-            self._residency = "STEP_ACTIVE"
-            for unit_index, unit in enumerate(self._units):
-                self._schedule_master_initialization(
-                    unit, unit_index % len(self._slots), params_ready
-                )
+            self._runtime.schedule_units(
+                self._units,
+                self._schedule_master_initialization,
+                wait_for_compute=False,
+            )
             self.drain()
             self.cpu_slabs.momentum.zero_()
         finally:
@@ -809,10 +757,10 @@ class GPUStagedMuon(torch.optim.Optimizer):
     def set_scaled_state(
         self, param: torch.Tensor, key: str, value: torch.Tensor
     ) -> None:
-        if self._checkpoint_load_error is not None:
+        if self._runtime.checkpoint_load_error is not None:
             raise RuntimeError(
                 "cannot mutate after a failed checkpoint load; restart and recover"
-            ) from self._checkpoint_load_error
+            ) from self._runtime.checkpoint_load_error
         if key not in {"master_param", "momentum_buffer"}:
             raise KeyError(f"unsupported staged Muon state: {key}")
         if not isinstance(value, torch.Tensor):
@@ -833,10 +781,10 @@ class GPUStagedMuon(torch.optim.Optimizer):
 
     def load_state_dict(self, state_dict: Mapping[str, Any]) -> None:
         """Load CPU state in place without moving it to parameter devices."""
-        if self._checkpoint_load_error is not None:
+        if self._runtime.checkpoint_load_error is not None:
             raise RuntimeError(
                 "cannot reload after a failed checkpoint load; restart and recover"
-            ) from self._checkpoint_load_error
+            ) from self._runtime.checkpoint_load_error
         if not isinstance(state_dict, Mapping) or set(state_dict) != {
             "state",
             "param_groups",

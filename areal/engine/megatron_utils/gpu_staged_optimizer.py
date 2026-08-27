@@ -8,13 +8,17 @@ import importlib.metadata
 import math
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
-from enum import Enum, auto
 from typing import Any
 
 import torch
 
 from areal.engine.megatron_utils.optimizer_chain import (
     iter_megatron_optimizer_leaves,
+)
+from areal.engine.megatron_utils.staged_optimizer_runtime import (
+    CUDAStagingSlot,
+    SlotStateMachine,
+    StagedOptimizerRuntime,
 )
 
 _SUPPORTED_MEGATRON_CORE_VERSION = "0.17.0"
@@ -215,71 +219,6 @@ class AdamWCPUSlabs:
         )
 
 
-class _SlotPhase(Enum):
-    FREE = auto()
-    D2H_PENDING = auto()
-
-
-class SlotStateMachine:
-    """Tracks the rule that a slot cannot be reused before its D2H completes."""
-
-    def __init__(self, slot_count: int, wait_for_slot: Callable[[int], None]) -> None:
-        if slot_count < 1:
-            raise ValueError("slot_count must be at least 1")
-        self._phases = [_SlotPhase.FREE] * slot_count
-        self._wait_for_slot = wait_for_slot
-
-    @property
-    def phases(self) -> tuple[str, ...]:
-        return tuple(phase.name for phase in self._phases)
-
-    def acquire(self, slot_index: int) -> None:
-        if self._phases[slot_index] is _SlotPhase.D2H_PENDING:
-            self._wait_for_slot(slot_index)
-            self._phases[slot_index] = _SlotPhase.FREE
-
-    def mark_d2h_pending(self, slot_index: int) -> None:
-        if self._phases[slot_index] is not _SlotPhase.FREE:
-            raise RuntimeError(f"staging slot {slot_index} is already in use")
-        self._phases[slot_index] = _SlotPhase.D2H_PENDING
-
-    def drain(self) -> None:
-        for slot_index, phase in enumerate(self._phases):
-            if phase is _SlotPhase.D2H_PENDING:
-                self._wait_for_slot(slot_index)
-                self._phases[slot_index] = _SlotPhase.FREE
-
-
-@dataclass
-class _CUDAStagingSlot:
-    master: torch.Tensor
-    exp_avg: torch.Tensor
-    exp_avg_sq: torch.Tensor
-    grad: torch.Tensor
-    h2d_stream: torch.cuda.Stream
-    compute_stream: torch.cuda.Stream
-    d2h_stream: torch.cuda.Stream
-    h2d_done: torch.cuda.Event
-    compute_done: torch.cuda.Event
-    d2h_done: torch.cuda.Event
-
-    @classmethod
-    def allocate(cls, capacity: int, device: torch.device) -> _CUDAStagingSlot:
-        tensor_kwargs = {"size": (capacity,), "dtype": torch.float32, "device": device}
-        return cls(
-            master=torch.empty(**tensor_kwargs),
-            exp_avg=torch.empty(**tensor_kwargs),
-            exp_avg_sq=torch.empty(**tensor_kwargs),
-            grad=torch.empty(**tensor_kwargs),
-            h2d_stream=torch.cuda.Stream(device=device),
-            compute_stream=torch.cuda.Stream(device=device),
-            d2h_stream=torch.cuda.Stream(device=device),
-            h2d_done=torch.cuda.Event(),
-            compute_done=torch.cuda.Event(),
-            d2h_done=torch.cuda.Event(),
-        )
-
-
 class GPUStagedAdamW(torch.optim.AdamW):
     """AdamW whose FP32 master weights and moments live in pinned CPU slabs."""
 
@@ -345,19 +284,27 @@ class GPUStagedAdamW(torch.optim.AdamW):
         self.cpu_slabs: AdamWCPUSlabs | None = None
         self._layouts: tuple[_ParamLayout, ...] = ()
         self._units: tuple[_UpdateUnit, ...] = ()
-        self._slots: list[_CUDAStagingSlot] = []
-        self._slot_machine: SlotStateMachine | None = None
+        self._runtime = StagedOptimizerRuntime(
+            self.staged_config.buffer_count,
+            ("master", "exp_avg", "exp_avg_sq", "grad"),
+        )
         self._bound = False
-        self._residency = "UNBOUND"
-        self._checkpoint_load_error: BaseException | None = None
 
     @property
     def residency(self) -> str:
-        return self._residency
+        return self._runtime.residency
+
+    @property
+    def _slots(self) -> list[CUDAStagingSlot]:
+        return self._runtime.slots
+
+    @property
+    def _slot_machine(self) -> SlotStateMachine | None:
+        return self._runtime.slot_machine
 
     @property
     def checkpoint_lifecycle(self) -> str:
-        return "FAILED" if self._checkpoint_load_error is not None else "IDLE"
+        return "FAILED" if self._runtime.checkpoint_load_error is not None else "IDLE"
 
     @property
     def units(self) -> tuple[_UpdateUnit, ...]:
@@ -425,17 +372,12 @@ class GPUStagedAdamW(torch.optim.AdamW):
         self.cpu_slabs = AdamWCPUSlabs.allocate(total_numel)
         self._layouts = tuple(layouts)
         self._units = self._build_units(layouts, self.staged_config.bucket_numel)
-        capacity = max((unit.numel for unit in self._units), default=1)
         device = next(iter(devices), empty_device)
         assert device is not None
         if device.type != "cuda":
             raise ValueError("staged AdamW device must be CUDA")
-        if self._units:
-            self._slots = [
-                _CUDAStagingSlot.allocate(capacity, device)
-                for _ in range(self.staged_config.buffer_count)
-            ]
-            self._slot_machine = SlotStateMachine(len(self._slots), self._wait_for_slot)
+        capacity = max((unit.numel for unit in self._units), default=None)
+        self._runtime.bind(capacity=capacity, device=device)
 
         self.state.clear()
         for layout in self._layouts:
@@ -451,15 +393,12 @@ class GPUStagedAdamW(torch.optim.AdamW):
             ).view_as(layout.param)
 
         self._bound = True
-        self._residency = "STEP_ACTIVE"
         if self._units:
-            caller_stream = torch.cuda.current_stream(device)
-            params_ready = torch.cuda.Event()
-            params_ready.record(caller_stream)
-            for unit_index, unit in enumerate(self._units):
-                self._schedule_master_initialization(
-                    unit, unit_index % len(self._slots), params_ready
-                )
+            self._runtime.schedule_units(
+                self._units,
+                self._schedule_master_initialization,
+                wait_for_compute=False,
+            )
         self.drain()
 
     @staticmethod
@@ -500,18 +439,14 @@ class GPUStagedAdamW(torch.optim.AdamW):
                 unit_start = unit_end
         return tuple(units)
 
-    def _wait_for_slot(self, slot_index: int) -> None:
-        self._slots[slot_index].d2h_done.synchronize()
-
     def _schedule_master_initialization(
         self,
         unit: _UpdateUnit,
         slot_index: int,
         params_ready: torch.cuda.Event,
     ) -> None:
-        assert self.cpu_slabs is not None and self._slot_machine is not None
-        self._slot_machine.acquire(slot_index)
-        slot = self._slots[slot_index]
+        assert self.cpu_slabs is not None
+        slot = self._runtime.acquire_slot(slot_index)
         with torch.cuda.stream(slot.h2d_stream):
             slot.h2d_stream.wait_event(params_ready)
             for part in unit.parts:
@@ -527,7 +462,7 @@ class GPUStagedAdamW(torch.optim.AdamW):
                 slot.master.narrow(0, 0, unit.numel), non_blocking=True
             )
             slot.d2h_done.record(slot.d2h_stream)
-        self._slot_machine.mark_d2h_pending(slot_index)
+        self._runtime.mark_d2h_pending(slot_index)
 
     def _schedule_update(
         self,
@@ -535,9 +470,8 @@ class GPUStagedAdamW(torch.optim.AdamW):
         slot_index: int,
         grads_ready: torch.cuda.Event,
     ) -> None:
-        assert self.cpu_slabs is not None and self._slot_machine is not None
-        self._slot_machine.acquire(slot_index)
-        slot = self._slots[slot_index]
+        assert self.cpu_slabs is not None
+        slot = self._runtime.acquire_slot(slot_index)
         count = unit.numel
         slab_slice = slice(unit.slab_offset, unit.slab_offset + count)
 
@@ -611,44 +545,32 @@ class GPUStagedAdamW(torch.optim.AdamW):
                 slot.exp_avg_sq[:count], non_blocking=True
             )
             slot.d2h_done.record(slot.d2h_stream)
-        self._slot_machine.mark_d2h_pending(slot_index)
+        self._runtime.mark_d2h_pending(slot_index)
 
     @torch.no_grad()
     def step(self, closure: Callable[[], float] | None = None) -> float | None:
         if not self._bound:
             raise RuntimeError("bind_owned_params() must be called before step()")
-        if self._checkpoint_load_error is not None:
+        if self._runtime.checkpoint_load_error is not None:
             raise RuntimeError(
                 "GPU-staged AdamW is unavailable after a failed checkpoint load"
-            ) from self._checkpoint_load_error
+            ) from self._runtime.checkpoint_load_error
         loss = closure() if closure is not None else None
         if not self._units:
-            self._residency = "CPU_RESIDENT"
+            self._runtime.residency = "CPU_RESIDENT"
             return loss
         for group in self.param_groups:
             if group["params"]:
                 group["step"] = int(group.get("step", 0)) + 1
-        device = self._slots[0].master.device
-        caller_stream = torch.cuda.current_stream(device)
-        grads_ready = torch.cuda.Event()
-        grads_ready.record(caller_stream)
-        self._residency = "STEP_ACTIVE"
-        for unit_index, unit in enumerate(self._units):
-            self._schedule_update(unit, unit_index % len(self._slots), grads_ready)
-
-        # Megatron starts parameter all-gather immediately after inner step.
-        # Queue model-shard visibility on the exact calling stream so the
-        # following parameter all-gather cannot race. State D2H remains async.
-        for slot_index, phase in enumerate(self._slot_machine.phases):
-            if phase == _SlotPhase.D2H_PENDING.name:
-                caller_stream.wait_event(self._slots[slot_index].compute_done)
+        # Megatron starts parameter all-gather immediately after inner step, so
+        # the shared runtime queues compute visibility on the calling stream.
+        self._runtime.schedule_units(
+            self._units, self._schedule_update, wait_for_compute=True
+        )
         return loss
 
     def drain(self) -> None:
-        if self._slot_machine is not None:
-            self._slot_machine.drain()
-        if self._bound:
-            self._residency = "CPU_RESIDENT"
+        self._runtime.drain()
 
     def offload_to_cpu(self) -> None:
         self.drain()
@@ -657,28 +579,21 @@ class GPUStagedAdamW(torch.optim.AdamW):
         # wastes colocation headroom (2 GiB with the default 2 x 128 MiB x 4
         # tensors).  Streams/events are slot-owned as well, so dropping the
         # slots releases the complete staging runtime.
-        self._slots.clear()
-        self._slot_machine = None
+        self._runtime.release_slots()
 
     def restore_from_cpu(self) -> None:
         if not self._bound or not self._units or self._slots:
             return
         capacity = max(unit.numel for unit in self._units)
         device = self._layouts[0].param.device
-        slots = [
-            _CUDAStagingSlot.allocate(capacity, device)
-            for _ in range(self.staged_config.buffer_count)
-        ]
-        self._slots = slots
-        self._slot_machine = SlotStateMachine(len(slots), self._wait_for_slot)
-        self._residency = "CPU_RESIDENT"
+        self._runtime.restore_slots(capacity=capacity, device=device)
 
     def prepare_checkpoint_save(self) -> None:
         """Drain GPU staging before synchronous DCP reads the CPU slabs."""
-        if self._checkpoint_load_error is not None:
+        if self._runtime.checkpoint_load_error is not None:
             raise RuntimeError(
                 "cannot save after a failed checkpoint load; restart and recover"
-            ) from self._checkpoint_load_error
+            ) from self._runtime.checkpoint_load_error
         if not self._bound or self.cpu_slabs is None:
             raise RuntimeError("GPU-staged AdamW must be bound before checkpoint save")
         self.drain()
@@ -688,10 +603,10 @@ class GPUStagedAdamW(torch.optim.AdamW):
 
     def begin_checkpoint_load(self) -> None:
         """Prepare for an in-place synchronous load without rollback state."""
-        if self._checkpoint_load_error is not None:
+        if self._runtime.checkpoint_load_error is not None:
             raise RuntimeError(
                 "checkpoint load already failed; restart the process to recover"
-            ) from self._checkpoint_load_error
+            ) from self._runtime.checkpoint_load_error
         if not self._bound:
             raise RuntimeError("GPU-staged AdamW must be bound before checkpoint load")
         self.drain()
@@ -703,8 +618,7 @@ class GPUStagedAdamW(torch.optim.AdamW):
 
     def mark_checkpoint_load_failed(self, error: BaseException) -> None:
         """Fail-stop after an in-place load error; no current-process rollback."""
-        self._checkpoint_load_error = error
-        self._residency = "CPU_RESIDENT"
+        self._runtime.mark_checkpoint_load_failed(error)
 
     def reset_from_model_params(self) -> None:
         """Rebuild masters and clear moments after a model-only checkpoint load."""
@@ -716,15 +630,11 @@ class GPUStagedAdamW(torch.optim.AdamW):
         try:
             self.drain()
             if self._units:
-                device = self._slots[0].master.device
-                caller_stream = torch.cuda.current_stream(device)
-                params_ready = torch.cuda.Event()
-                params_ready.record(caller_stream)
-                self._residency = "STEP_ACTIVE"
-                for unit_index, unit in enumerate(self._units):
-                    self._schedule_master_initialization(
-                        unit, unit_index % len(self._slots), params_ready
-                    )
+                self._runtime.schedule_units(
+                    self._units,
+                    self._schedule_master_initialization,
+                    wait_for_compute=False,
+                )
                 self.drain()
             self.cpu_slabs.exp_avg.zero_()
             self.cpu_slabs.exp_avg_sq.zero_()
@@ -741,10 +651,10 @@ class GPUStagedAdamW(torch.optim.AdamW):
     def set_scaled_state(
         self, param: torch.Tensor, key: str, value: torch.Tensor
     ) -> None:
-        if self._checkpoint_load_error is not None:
+        if self._runtime.checkpoint_load_error is not None:
             raise RuntimeError(
                 "cannot mutate optimizer after a failed checkpoint load"
-            ) from self._checkpoint_load_error
+            ) from self._runtime.checkpoint_load_error
         self.drain()
         if key not in ("master_param", "exp_avg", "exp_avg_sq"):
             raise KeyError(f"unsupported staged AdamW checkpoint state: {key}")
@@ -767,10 +677,10 @@ class GPUStagedAdamW(torch.optim.AdamW):
 
     def load_state_dict(self, state_dict: Mapping[str, Any]) -> None:
         """Load without torch Optimizer casting CPU state to the parameter device."""
-        if self._checkpoint_load_error is not None:
+        if self._runtime.checkpoint_load_error is not None:
             raise RuntimeError(
                 "cannot reload optimizer after a failed checkpoint load"
-            ) from self._checkpoint_load_error
+            ) from self._runtime.checkpoint_load_error
         if not self._bound:
             self._load_unbound_metadata_state_dict(state_dict)
             return
