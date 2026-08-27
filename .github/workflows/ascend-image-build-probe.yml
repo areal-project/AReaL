@@ -1,0 +1,72 @@
+name: Ascend Image Build Probe
+
+on:
+  pull_request:
+    branches:
+      - ascend
+    paths:
+      - Dockerfile.a2
+      - Dockerfile.a3
+      - .github/workflows/ascend-image-build-probe.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ascend-image-build-probe-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  probe-docker-build:
+    name: probe-docker-build
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.pull_request.head.repo.full_name == github.repository &&
+      github.actor == 'HwVanICI')
+    runs-on: linux-aarch64-a3-8
+    timeout-minutes: 30
+    container:
+      image: ghcr.io/hwvanici/areal_npu:v1.0.6rc1-a3
+
+    steps:
+      - name: Inspect runner and Docker access
+        run: |
+          set -euo pipefail
+
+          echo "Architecture: $(uname -m)"
+          echo "CPU cores: $(nproc)"
+          free -h
+          df -h
+
+          echo "Docker client: $(command -v docker)"
+          echo "DOCKER_HOST: ${DOCKER_HOST:-<unset>}"
+          if [[ -S /var/run/docker.sock ]]; then
+            stat /var/run/docker.sock
+          else
+            echo "/var/run/docker.sock is not mounted"
+          fi
+
+          docker version
+          docker buildx version
+          docker info --format \
+            'Server={{.ServerVersion}} Driver={{.Driver}} CPUs={{.NCPU}} Memory={{.MemTotal}}'
+
+      - name: Build and run a minimal ARM image
+        env:
+          PROBE_IMAGE: areal-npu-build-probe:${{ github.run_id }}
+        run: |
+          set -euo pipefail
+
+          docker buildx build \
+            --load \
+            --progress=plain \
+            --tag "${PROBE_IMAGE}" \
+            - <<'DOCKERFILE'
+          FROM alpine:3.22
+          RUN uname -m
+          DOCKERFILE
+
+          docker image inspect "${PROBE_IMAGE}" \
+            --format 'Image={{.Id}} Architecture={{.Architecture}} OS={{.Os}}'
+          docker run --rm "${PROBE_IMAGE}" uname -m
