@@ -17,6 +17,7 @@ from areal.engine.megatron_utils.gpu_staged_optimizer import (
     GPUStagedAdamW,
     GPUStagedAdamWConfig,
     SlotStateMachine,
+    _resolve_adamw_update_backend,
     bind_gpu_staged_adamw,
     get_megatron_optimizer_with_gpu_staged_adamw,
 )
@@ -29,6 +30,15 @@ def _tiny_config(buffer_count: int = 2, bucket_numel: int = 16):
         buffer_count=buffer_count,
         bucket_size_mb=bucket_numel * 4 / (1024 * 1024),
     )
+
+
+def test_auto_backend_balances_foreach_speed_and_fused_memory() -> None:
+    """Auto uses fused for small units and foreach for many parameter slices."""
+    config = GPUStagedAdamWConfig(update_backend="auto")
+
+    assert _resolve_adamw_update_backend(config, 1) == "fused"
+    assert _resolve_adamw_update_backend(config, 31) == "fused"
+    assert _resolve_adamw_update_backend(config, 32) == "foreach"
 
 
 def test_cpu_slabs_are_contiguous_pinned_and_zero_initialized() -> None:
@@ -137,6 +147,78 @@ def test_multiple_steps_match_fp32_master_adamw() -> None:
         torch.testing.assert_close(
             staged_param, baseline_param.detach().bfloat16(), rtol=0.0, atol=0.0
         )
+
+
+@pytest.mark.parametrize("backend", ["single", "foreach", "fused", "auto"])
+@pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA is required for staged AdamW")
+def test_functional_backends_match_pytorch_adamw(backend: str) -> None:
+    """Single-tensor, foreach, and fused slot updates match native AdamW."""
+    torch.manual_seed(20260901)
+    initial = [
+        torch.randn(numel, device="cuda", dtype=torch.bfloat16)
+        for numel in (5, 7, 11, 13)
+    ]
+    staged_params = [torch.nn.Parameter(value.clone()) for value in initial]
+    baseline_params = [torch.nn.Parameter(value.float()) for value in initial]
+    kwargs = {
+        "lr": 2e-3,
+        "betas": (0.77, 0.94),
+        "eps": 1e-6,
+        "weight_decay": 0.05,
+    }
+    staged = GPUStagedAdamW(
+        staged_params,
+        staged_config=GPUStagedAdamWConfig(
+            buffer_count=1,
+            bucket_size_mb=64 * 4 / (1024 * 1024),
+            update_backend=backend,
+        ),
+        **kwargs,
+    )
+    staged.bind_owned_params(staged.param_groups)
+    use_foreach = backend == "foreach"
+    use_fused = backend in {"fused", "auto"}
+    baseline = torch.optim.AdamW(
+        baseline_params, foreach=use_foreach, fused=use_fused, **kwargs
+    )
+
+    assert len(staged.units) == 1
+    assert len(staged.units[0].parts) == len(staged_params)
+    for step in range(5):
+        for param_index, (staged_param, baseline_param) in enumerate(
+            zip(staged_params, baseline_params, strict=True)
+        ):
+            grad = torch.randn_like(staged_param).mul_(step + param_index + 1)
+            staged_param.decoupled_grad = grad
+            baseline_param.grad = grad.float()
+        staged.step()
+        baseline.step()
+        staged.drain()
+
+        for staged_param, baseline_param in zip(
+            staged_params, baseline_params, strict=True
+        ):
+            staged_state = staged.state[staged_param]
+            baseline_state = baseline.state[baseline_param]
+            torch.testing.assert_close(
+                staged_state["master_param"],
+                baseline_param.detach().cpu(),
+                rtol=3e-6,
+                atol=3e-6,
+            )
+            for key in ("exp_avg", "exp_avg_sq"):
+                torch.testing.assert_close(
+                    staged_state[key],
+                    baseline_state[key].cpu(),
+                    rtol=3e-6,
+                    atol=3e-6,
+                )
+            torch.testing.assert_close(
+                staged_param,
+                baseline_param.detach().bfloat16(),
+                rtol=0.0,
+                atol=0.0,
+            )
 
 
 @pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA is required for staged AdamW")

@@ -8,7 +8,7 @@ import importlib.metadata
 import math
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 import torch
 from torch.optim.adamw import adamw as functional_adamw
@@ -23,6 +23,7 @@ from areal.engine.megatron_utils.staged_optimizer_runtime import (
 )
 
 _SUPPORTED_MEGATRON_CORE_VERSION = "0.17.0"
+_FOREACH_MIN_ACTIVE_PARTS = 32
 
 _PARAM_GROUP_OWNERSHIP_KEYS = (
     "wd_mult",
@@ -161,16 +162,27 @@ class GPUStagedAdamWConfig:
 
     buffer_count: int = 2
     bucket_size_mb: float = 128.0
+    update_backend: Literal["auto", "single", "foreach", "fused"] = "auto"
 
     def __post_init__(self) -> None:
         if self.buffer_count < 1:
             raise ValueError("buffer_count must be at least 1")
         if self.bucket_size_mb <= 0:
             raise ValueError("bucket_size_mb must be positive")
+        if self.update_backend not in {"auto", "single", "foreach", "fused"}:
+            raise ValueError(f"unsupported AdamW update backend: {self.update_backend}")
 
     @property
     def bucket_numel(self) -> int:
         return max(1, int(self.bucket_size_mb * 1024 * 1024) // 4)
+
+
+def _resolve_adamw_update_backend(
+    config: GPUStagedAdamWConfig, active_part_count: int
+) -> Literal["single", "foreach", "fused"]:
+    if config.update_backend != "auto":
+        return config.update_backend
+    return "foreach" if active_part_count >= _FOREACH_MIN_ACTIVE_PARTS else "fused"
 
 
 @dataclass(frozen=True)
@@ -525,11 +537,19 @@ class GPUStagedAdamW(torch.optim.AdamW):
                 )
 
             if active_parts:
+                backend = _resolve_adamw_update_backend(
+                    self.staged_config, len(active_parts)
+                )
+                use_foreach = backend == "foreach"
+                use_fused = backend == "fused"
                 # Functional AdamW increments each supplied state step. Every
                 # slice in this unit therefore receives a disposable copy of
                 # the Megatron group step immediately before this update.
+                step_device = master_parts[0].device if use_fused else None
                 state_steps = [
-                    torch.tensor(float(step - 1), dtype=torch.float32)
+                    torch.tensor(
+                        float(step - 1), dtype=torch.float32, device=step_device
+                    )
                     for _ in active_parts
                 ]
                 functional_adamw(
@@ -539,10 +559,10 @@ class GPUStagedAdamW(torch.optim.AdamW):
                     exp_avg_sq_parts,
                     [],
                     state_steps,
-                    foreach=False,
+                    foreach=use_foreach,
                     capturable=False,
                     differentiable=False,
-                    fused=False,
+                    fused=use_fused,
                     grad_scale=None,
                     found_inf=None,
                     has_complex=False,
