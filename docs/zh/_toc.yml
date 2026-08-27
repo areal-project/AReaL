@@ -29,6 +29,7 @@ parts:
   - caption: 定制指南
     chapters:
     - file: customization/dataset
+    - file: customization/reward
     - file: customization/agent
   - caption: 算法
     chapters:
