@@ -583,6 +583,7 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
                 model_name,
                 mcore_name,
                 gathered,
+                hf_config=self._engine.hf_config,
             ):
                 if tie_word_embeddings and hf_name == "lm_head.weight":
                     continue

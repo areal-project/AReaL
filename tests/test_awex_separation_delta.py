@@ -466,16 +466,23 @@ def test_reconstructed_override_preserves_tensor_parallel_metadata(monkeypatch):
         return tensor
 
     megatron_mod.all_gather_param = _all_gather_param
-    megatron_mod.convert_to_hf = lambda config, model, name, tensor: [("w", tensor)]
+
+    def _convert_to_hf(config, model, name, tensor, hf_config=None):
+        del config, model, name
+        captured["hf_config"] = hf_config
+        return [("w", tensor)]
+
+    megatron_mod.convert_to_hf = _convert_to_hf
     monkeypatch.setitem(
         sys.modules, "areal.engine.megatron_utils.megatron", megatron_mod
     )
 
     adapter = object.__new__(mod.AwexMegatronAdapter)
+    hf_config = SimpleNamespace(model_type="qwen3", tie_word_embeddings=False)
     adapter._engine = SimpleNamespace(
         model=object(),
         tf_config=SimpleNamespace(num_moe_experts=None),
-        hf_config=SimpleNamespace(model_type="qwen3", tie_word_embeddings=False),
+        hf_config=hf_config,
         _duplicated_param_names=set(),
     )
 
@@ -486,6 +493,7 @@ def test_reconstructed_override_preserves_tensor_parallel_metadata(monkeypatch):
     torch.testing.assert_close(items[0][1], override, rtol=0, atol=0)
     assert captured["uses_override"] is True
     assert captured["metadata"] == (True, 0, 1)
+    assert captured["hf_config"] is hf_config
     assert overrides == {}
 
 
