@@ -1061,7 +1061,7 @@ class MegatronEngine(TrainEngine):
         mb_list: MicroBatchList,
         process_output_fn: Callable[
             [torch.Tensor | ChunkedLMHeadOutput, dict[str, Any]],
-            torch.Tensor | None,
+            torch.Tensor | tuple[torch.Tensor, torch.Tensor] | None,
         ],
         forward_only: bool = False,
         gather_cp_output: bool = False,
@@ -1191,15 +1191,18 @@ class MegatronEngine(TrainEngine):
                 del mb_input.padded_mb[key]
 
             def _process_output(input_, output_):
-                loss = process_output_fn(output_, input_)
-                if loss is None:
+                loss_output = process_output_fn(output_, input_)
+                if loss_output is None:
                     device = (
                         output_.logprobs.device
                         if isinstance(output_, ChunkedLMHeadOutput)
                         else output_.device
                     )
-                    loss = torch.tensor(1.0, device=device)
-                return loss, {}
+                    loss_output = torch.tensor(1.0, device=device)
+                if isinstance(loss_output, tuple):
+                    loss, num_tokens = loss_output
+                    return loss, num_tokens, {}
+                return loss_output, {}
 
             if is_pipeline_last_stage:
                 if use_chunked_lm_head:
@@ -1267,40 +1270,40 @@ class MegatronEngine(TrainEngine):
         # Step 1: Prepare micro-batches
         mb_list = self._prepare_mb_list(input_batched).to(self.device)
 
-        # Step 2: Compute total loss weight.
-        # Use DP+CP group: after CP all-gather each rank computes the full-sequence
-        # loss, so all_gather's backward (reduce_scatter) sums cp_size identical
-        # gradients, amplifying by cp_size. Including CP in the weight all-reduce
-        # introduces a matching cp_size factor in the denominator, cancelling out.
-        total_loss_weight = compute_total_loss_weight(
-            mb_list,
-            loss_weight_fn,
-            mpu.get_data_parallel_group(with_context_parallel=True),
-        )
-
-        # Step 3: Forward-backward using Megatron's pipeline function.
-        # The 2-tuple `(loss, {})` branch in Megatron Core scales the loss by
-        # `cp_size / num_microbatches`. Normally DDP then scales the DP+CP gradient
-        # reduction by `1 / (dp_size * cp_size)`, so the existing DP multiplier is
-        # required. With per-token loss normalization, however, DDP performs an
-        # unscaled sum and the 2-tuple branch supplies no token count for the final
-        # normalization. Compensate the schedule's CP multiplier directly and do not
-        # introduce an additional DP multiplier in that case.
-        loss_scale = self.optimizer.get_loss_scale().item()
-        num_microbatches = len(mb_list)
+        # Step 2: Select the normalization path from the model's effective config.
+        # Megatron Core requires a 3-tuple loss callback when per-token loss is
+        # enabled. It accumulates the provided token counts and normalizes all
+        # gradients, including MoE auxiliary losses, in finalize_model_grads.
+        # Preserve the existing 2-tuple/manual-normalization path for every model
+        # that does not explicitly enable calculate_per_token_loss.
         model_config = get_model_config(self.model[0])
-        if model_config.calculate_per_token_loss:
-            loss_multiplier = (
-                loss_scale * num_microbatches / mpu.get_context_parallel_world_size()
-            )
+        per_token_loss = model_config.calculate_per_token_loss
+        previous_grad_scale_func = model_config.grad_scale_func
+        if per_token_loss:
+            # Match MCore's canonical optimizer setup so the pipeline schedule
+            # applies the same dynamic loss scale to the main loss and to MoE/MTP
+            # auxiliary losses. The legacy path below keeps its explicit scale.
+            model_config.grad_scale_func = self.optimizer.scale_loss
+            total_loss_weight = None
+            loss_multiplier = 1.0
         else:
+            # Use DP+CP group: after CP all-gather each rank computes the
+            # full-sequence loss, so all_gather's backward (reduce_scatter) sums
+            # cp_size identical gradients. Including CP in the weight all-reduce
+            # introduces a matching factor in the denominator.
+            total_loss_weight = compute_total_loss_weight(
+                mb_list,
+                loss_weight_fn,
+                mpu.get_data_parallel_group(with_context_parallel=True),
+            )
+            loss_scale = self.optimizer.get_loss_scale().item()
             loss_multiplier = (
-                mpu.get_data_parallel_world_size() * loss_scale * num_microbatches
+                mpu.get_data_parallel_world_size() * loss_scale * len(mb_list)
             )
 
         def process_output(
             output: torch.Tensor, inputs: dict[str, Any]
-        ) -> torch.Tensor:
+        ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
             return self._compute_logprobs_and_loss(
                 output,
                 inputs,
@@ -1308,13 +1311,18 @@ class MegatronEngine(TrainEngine):
                 loss_weight_fn,
                 total_loss_weight,
                 loss_multiplier=loss_multiplier,
+                per_token_loss=per_token_loss,
             )
 
-        self.forward_backward_batch(
-            mb_list,
-            process_output,
-            forward_only=False,
-        )
+        try:
+            self.forward_backward_batch(
+                mb_list,
+                process_output,
+                forward_only=False,
+            )
+        finally:
+            if per_token_loss:
+                model_config.grad_scale_func = previous_grad_scale_func
 
         # Step 4: Optimizer step
         stats = self.optimizer_step()
@@ -2708,15 +2716,21 @@ class MegatronEngine(TrainEngine):
         inputs: dict[str, Any],
         loss_fn: Callable[..., torch.Tensor],
         loss_weight_fn: Callable[[dict[str, Any]], torch.Tensor],
-        total_loss_weight: torch.Tensor,
+        total_loss_weight: torch.Tensor | None,
         loss_multiplier: float = 1.0,
-    ) -> torch.Tensor:
+        per_token_loss: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         local_weight = loss_weight_fn(inputs)
         if local_weight == 0:
             connected_output = (
                 output.logprobs if isinstance(output, ChunkedLMHeadOutput) else output
             )
-            return connected_output.mean() * 0.0
+            loss = connected_output.mean() * 0.0
+            if per_token_loss:
+                return self._build_per_token_loss_output(
+                    loss, local_weight, loss_multiplier
+                )
+            return loss
 
         if self.config.is_critic and self.enable_tree_training:
             raise NotImplementedError(
@@ -2730,7 +2744,12 @@ class MegatronEngine(TrainEngine):
                 if trie_node is None or not trie_node.all_sequence_ids:
                     # Return zero loss that maintains gradient connection to output
                     # This ensures backward() works correctly for distributed synchronization
-                    return output.mean() * 0.0
+                    loss = output.mean() * 0.0
+                    if per_token_loss:
+                        return self._build_per_token_loss_output(
+                            loss, local_weight, loss_multiplier
+                        )
+                    return loss
 
                 # For tree training, use gather_packed_tree_vocab_stats to properly
                 # unpack vocab stats from tree structure back to per-sequence format.
@@ -2864,8 +2883,36 @@ class MegatronEngine(TrainEngine):
             values = output.squeeze(-1)
             loss = loss_fn(values, inputs)
 
+        if per_token_loss:
+            return self._build_per_token_loss_output(
+                loss, local_weight, loss_multiplier
+            )
+        assert total_loss_weight is not None
         loss_scale = local_weight / total_loss_weight * loss_multiplier
         return loss * loss_scale
+
+    def _build_per_token_loss_output(
+        self,
+        loss: torch.Tensor,
+        loss_weight: torch.Tensor,
+        loss_multiplier: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Build MCore's per-token loss numerator and local token count.
+
+        CP training reassembles the full loss on every CP rank. Split the integer
+        loss weight across those ranks so their numerators and token counts sum to
+        exactly one copy of the microbatch. This keeps the main loss invariant to
+        CP while letting MCore apply the same global-token normalization to MoE
+        auxiliary gradients.
+        """
+        loss_weight = loss_weight.detach().to(device=loss.device, dtype=torch.int64)
+        cp_size = mpu.get_context_parallel_world_size()
+        cp_rank = mpu.get_context_parallel_rank()
+        local_weight = torch.div(loss_weight, cp_size, rounding_mode="floor")
+        remainder = torch.remainder(loss_weight, cp_size)
+        local_weight = local_weight + (remainder > cp_rank).to(local_weight.dtype)
+        loss_numerator = loss * local_weight.to(loss.dtype) * loss_multiplier
+        return loss_numerator, local_weight
 
     def _compute_forward_result(
         self,
