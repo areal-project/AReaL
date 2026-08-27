@@ -39,6 +39,8 @@ def _get_custom_dataset(
     max_length: int | None = None,
     tokenizer: Optional["PreTrainedTokenizerFast"] = None,
     processor: Optional["ProcessorMixin"] = None,
+    data_worker_rank: int | None = None,
+    data_worker_world_size: int | None = None,
     **kwargs,
 ) -> "Dataset":
     if "gsm8k" in path and type == "sft":
@@ -149,6 +151,8 @@ def _get_custom_dataset(
             split=split,
             tokenizer=tokenizer,
             max_length=max_length,
+            cache_rank=data_worker_rank,
+            cache_world_size=data_worker_world_size,
             **kwargs,
         )
     else:

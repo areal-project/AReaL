@@ -19,9 +19,9 @@ from .messages import (
 )
 from .tokenization import (
     DATASET_NUM_PROC,
-    _detect_template_pattern,
     _dump_samples,
     _patch_chat_template_for_training,
+    _require_generation_tracking,
     _TokenizeAndMask,
 )
 
@@ -29,6 +29,68 @@ logger = logging.getLogger("SWESFTDataset")
 
 _RANK0_CACHE_TIMEOUT = 36000
 _RANK0_CACHE_POLL_INTERVAL = 5
+
+
+def _has_supervised_tokens(input_ids, loss_mask) -> bool:
+    return len(input_ids) > 0 and len(input_ids) == len(loss_mask) and any(loss_mask)
+
+
+def _filter_trainable_samples(
+    dataset,
+    *,
+    num_proc: int | None,
+    context: str,
+    keep_in_memory: bool = False,
+):
+    required = {"input_ids", "loss_mask"}
+    missing = required.difference(dataset.column_names)
+    if missing:
+        raise ValueError(f"{context} is missing required columns: {sorted(missing)}")
+
+    before = len(dataset)
+    dataset = dataset.filter(
+        _has_supervised_tokens,
+        input_columns=["input_ids", "loss_mask"],
+        num_proc=num_proc,
+        keep_in_memory=keep_in_memory,
+        load_from_cache_file=False,
+    )
+    removed = before - len(dataset)
+    if removed:
+        logger.info(
+            "Filtered %d samples without a valid supervised-token mask from %s",
+            removed,
+            context,
+        )
+    if len(dataset) == 0:
+        raise ValueError(
+            f"{context} has no samples with a non-empty, length-aligned "
+            "loss_mask containing at least one supervised token"
+        )
+    return dataset
+
+
+def _resolve_cache_topology(
+    cache_rank: int | None,
+    cache_world_size: int | None,
+) -> tuple[int, int]:
+    if (cache_rank is None) != (cache_world_size is None):
+        raise ValueError(
+            "cache_rank and cache_world_size must either both be provided or "
+            "both be omitted"
+        )
+    if cache_rank is None:
+        cache_rank = int(os.getenv("RANK", "0"))
+        cache_world_size = int(os.getenv("WORLD_SIZE", "1"))
+
+    assert cache_world_size is not None
+    if cache_world_size < 1:
+        raise ValueError(f"cache_world_size must be positive, got {cache_world_size}")
+    if cache_rank < 0 or cache_rank >= cache_world_size:
+        raise ValueError(
+            f"cache_rank must be in [0, {cache_world_size}), got {cache_rank}"
+        )
+    return cache_rank, cache_world_size
 
 
 def _load_trajectory_pairs(
@@ -313,14 +375,13 @@ def _tokenize_samples(
 
     dataset = Dataset.from_dict(data)
     _patch_chat_template_for_training(tokenizer)
-    assistant_pattern = _detect_template_pattern(tokenizer, tools=first_tools)
+    _require_generation_tracking(tokenizer)
 
     # Dump samples for inspection before the heavy map() pass.
     if dump_dir and dump_n_samples != 0:
         _dump_samples(
             messages_list,
             tokenizer,
-            assistant_pattern,
             tools_list,
             dump_dir,
             dump_n_samples,
@@ -331,7 +392,6 @@ def _tokenize_samples(
 
     process_fn = _TokenizeAndMask(
         tokenizer,
-        assistant_pattern,
         max_length=max_length,
         split_mode=split_mode,
         parse_tool_call_args=parse_tool_call_args,
@@ -339,16 +399,13 @@ def _tokenize_samples(
 
     dataset = dataset.map(process_fn, num_proc=num_proc).remove_columns(remove_cols)
 
-    # Single filter pass: removes both apply_chat_template-failure empties and
-    # overlength samples (which _TokenizeAndMask also marks as empty).
-    before_filter = len(dataset)
-    dataset = dataset.filter(lambda x: len(x["input_ids"]) > 0, num_proc=num_proc)
-    n_filtered = before_filter - len(dataset)
-    if n_filtered > 0:
-        logger.info(
-            f"Filtered {n_filtered} samples "
-            f"(empty from template failures or exceeding max_length={max_length})"
-        )
+    # Remove template failures, overlength rows, malformed masks, and rows with
+    # no supervised token before they can reach the SFT loss normalizer.
+    dataset = _filter_trainable_samples(
+        dataset,
+        num_proc=num_proc,
+        context="freshly tokenized SWE dataset",
+    )
 
     logger.info(f"Final dataset: {len(dataset)} samples")
     return dataset
@@ -435,6 +492,8 @@ def get_swe_sft_dataset(
     dump_dir: str | None = None,
     dump_samples: int = 0,
     parse_tool_call_args: bool = False,
+    cache_rank: int | None = None,
+    cache_world_size: int | None = None,
 ):
     """Load SWE trajectory data and convert to SFT training pairs.
 
@@ -502,16 +561,31 @@ def get_swe_sft_dataset(
             ``tool_calls.arguments`` to dicts before ``apply_chat_template``.
             Required by GLM-4.x / GLM-5.x templates; leave at the default
             (False) for Qwen / Llama / Bailing.
+        cache_rank: Explicit rank for shared-cache coordination. Data-service
+            workers pass their worker rank here. Direct SPMD callers may omit
+            it to use ``RANK``.
+        cache_world_size: Explicit world size for shared-cache coordination.
+            Must be provided together with *cache_rank*. Direct SPMD callers
+            may omit it to use ``WORLD_SIZE``.
 
     Returns:
         A HuggingFace ``Dataset`` with ``input_ids`` and ``loss_mask`` columns.
     """
     from datasets import load_from_disk
 
+    rank, world_size = _resolve_cache_topology(cache_rank, cache_world_size)
+
     # Pre-tokenized Arrow dataset: load directly, skip all processing.
     if os.path.isdir(path):
         logger.info(f"Loading pre-tokenized dataset from {path}")
         dataset = load_from_disk(path)
+
+        dataset = _filter_trainable_samples(
+            dataset,
+            num_proc=num_proc,
+            context=f"pre-tokenized SWE dataset at {path}",
+            keep_in_memory=True,
+        )
 
         if max_length is not None and not skip_pretokenized_filter:
             before_filter = len(dataset)
@@ -543,14 +617,11 @@ def get_swe_sft_dataset(
     )
 
     # --- Distributed rank-0-only processing ---
-    rank = int(os.getenv("RANK", "0"))
-    world_size = int(os.getenv("WORLD_SIZE", "1"))
-
     if cache_dir is not None and world_size > 1:
         done_marker = os.path.join(cache_dir, ".done")
         meta_path = os.path.join(cache_dir, ".meta.json")
         cache_meta = {
-            "version": 1,
+            "version": 2,
             "path": path,
             "tokenizer": getattr(tokenizer, "name_or_path", None),
             "process_kwargs": {

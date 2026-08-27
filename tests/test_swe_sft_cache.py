@@ -65,7 +65,7 @@ def _write_cache(cache_dir, input_ids, max_length=2):
     )
     dataset.save_to_disk(str(cache_dir))
     meta = {
-        "version": 1,
+        "version": 2,
         "path": "unused.jsonl",
         "tokenizer": None,
         "process_kwargs": {
@@ -184,8 +184,9 @@ def test_get_swe_sft_dataset_refuses_to_cache_empty_processed_dataset(
 def test_get_swe_sft_dataset_worker_loads_cache_written_by_rank0(tmp_path, monkeypatch):
     """Test that a non-rank-0 worker loads the cache once rank 0 publishes it."""
     cache_dir = tmp_path / "processed_dataset"
-    monkeypatch.setenv("RANK", "1")
-    monkeypatch.setenv("WORLD_SIZE", "2")
+    # Explicit data-worker topology must win over conflicting SPMD env values.
+    monkeypatch.setenv("RANK", "0")
+    monkeypatch.setenv("WORLD_SIZE", "1")
     monkeypatch.setattr(swe_sft, "_RANK0_CACHE_TIMEOUT", 10)
     monkeypatch.setattr(swe_sft, "_RANK0_CACHE_POLL_INTERVAL", 0.05)
 
@@ -197,12 +198,65 @@ def test_get_swe_sft_dataset_worker_loads_cache_written_by_rank0(tmp_path, monke
             tokenizer=object(),
             cache_dir=str(cache_dir),
             max_length=2,
+            cache_rank=1,
+            cache_world_size=2,
         )
     finally:
         writer.join()
 
     assert len(dataset) == 1
     assert dataset[0]["input_ids"] == [1, 2]
+
+
+@pytest.mark.parametrize("skip_length_filter", [False, True])
+def test_get_swe_sft_dataset_filters_unsupervised_pretokenized_rows(
+    tmp_path,
+    skip_length_filter,
+):
+    dataset_path = tmp_path / "pretokenized"
+    Dataset.from_dict(
+        {
+            "input_ids": [[1, 2], [3, 4], [5]],
+            "loss_mask": [[0, 0], [0, 1], []],
+        }
+    ).save_to_disk(str(dataset_path))
+
+    dataset = swe_sft.get_swe_sft_dataset(
+        str(dataset_path),
+        max_length=8,
+        skip_pretokenized_filter=skip_length_filter,
+    )
+
+    assert len(dataset) == 1
+    assert dataset[0]["input_ids"] == [3, 4]
+    assert dataset[0]["loss_mask"] == [0, 1]
+
+
+def test_get_swe_sft_dataset_rejects_pretokenized_data_without_supervision(tmp_path):
+    dataset_path = tmp_path / "pretokenized"
+    Dataset.from_dict({"input_ids": [[1, 2]], "loss_mask": [[0, 0]]}).save_to_disk(
+        str(dataset_path)
+    )
+
+    with pytest.raises(ValueError, match="no samples with a non-empty"):
+        swe_sft.get_swe_sft_dataset(str(dataset_path))
+
+
+@pytest.mark.parametrize(
+    ("cache_rank", "cache_world_size"),
+    [(1, None), (None, 2), (-1, 2), (2, 2), (0, 0)],
+)
+def test_get_swe_sft_dataset_rejects_invalid_explicit_cache_topology(
+    cache_rank,
+    cache_world_size,
+):
+    with pytest.raises(ValueError):
+        swe_sft.get_swe_sft_dataset(
+            "unused.jsonl",
+            tokenizer=object(),
+            cache_rank=cache_rank,
+            cache_world_size=cache_world_size,
+        )
 
 
 def test_get_swe_sft_dataset_worker_rejects_mismatched_cache(tmp_path, monkeypatch):

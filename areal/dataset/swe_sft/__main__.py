@@ -9,13 +9,12 @@ from .pipeline import (
     _load_full_trajectories,
     _load_presplit_pairs,
     _load_trajectory_pairs,
+    _tokenize_samples,
 )
 from .tokenization import (
     DATASET_NUM_PROC,
-    _detect_template_pattern,
     _dump_samples,
     _patch_chat_template_for_training,
-    _tokenize_samples,
 )
 
 
@@ -236,14 +235,9 @@ def main():
     # Dump can run independently without full tokenization.
     if dump_dir and dump_n != 0:
         dump_tools = None if args.no_tools else tools_list
-        first_tools = None
-        if dump_tools:
-            first_tools = next((t for t in dump_tools if t is not None), None)
-        assistant_pattern = _detect_template_pattern(tok, tools=first_tools)
         _dump_samples(
             samples,
             tok,
-            assistant_pattern,
             dump_tools,
             dump_dir,
             dump_n,

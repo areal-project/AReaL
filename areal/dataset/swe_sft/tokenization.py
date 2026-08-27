@@ -14,6 +14,10 @@ logger = logging.getLogger("SWESFTDataset")
 
 DATASET_NUM_PROC = 1
 
+_TRAINING_PATCH_MARKER = "{# areal-swe-sft-training-patch-v1 #}"
+_GENERATION_START_RE = re.compile(r"\{%-?\s*generation\s*-?%\}")
+_GENERATION_END_RE = re.compile(r"\{%-?\s*endgeneration\s*-?%\}")
+
 
 # -- Chat template patch (runtime, no file modification) --------
 
@@ -31,8 +35,8 @@ DATASET_NUM_PROC = 1
 # 2. Removes the ``ns.last_query_index`` gate so all assistant turns render
 #    ``<think>`` uniformly when think intent is detected — which is why
 #    multi-user trajectories are now handled (no think loss).
-# An unrecognized family (e.g. a future ring3.0 revision) is skipped with a
-# warning; add its exact block here rather than blindly neutralizing.
+# An unrecognized family (e.g. a future template revision) fails closed; add
+# its exact block here rather than blindly neutralizing it.
 #
 # Applied at runtime via ``tokenizer.chat_template = patched`` — the
 # original template file on disk is never modified.
@@ -50,14 +54,48 @@ _BAILING_OLD_BLOCK = (
     "            {{- '<role>ASSISTANT</role>\\n' + content }}\n"
     "        {%- endif %}"
 )
-_BAILING_NEW_BLOCK = (
-    "{%- if reasoning_content != '' or had_think_tags %}\n"
-    "                {{- '<role>ASSISTANT</role>\\n' + '<think>\\n'"
+_BAILING_CURRENT_OLD_BLOCK = (
+    "{%- if loop.index0 > ns.last_query_index %}\n"
+    "            {%- if reasoning_content %}\n"
+    "                {{- '<role>ASSISTANT</role>' + '\\n<think>\\n'"
     " + reasoning_content.strip('\\n') + '\\n</think>\\n\\n'"
     " + content.lstrip('\\n') }}\n"
     "            {%- else %}\n"
-    "                {{- '<role>ASSISTANT</role>\\n' + content }}\n"
+    "                {{- '<role>ASSISTANT</role>' + content }}\n"
+    "            {%- endif %}\n"
+    "        {%- else %}\n"
+    "            {{- '<role>ASSISTANT</role>' + content }}\n"
+    "        {%- endif %}"
+)
+_BAILING_NEW_BLOCK = (
+    "{{- '<role>ASSISTANT</role>' }}\n"
+    "        {%- generation %}\n"
+    "{%- if reasoning_content != '' or had_think_tags %}\n"
+    "                {{- '\\n<think>\\n'"
+    " + reasoning_content.strip('\\n') + '\\n</think>\\n\\n'"
+    " + content.lstrip('\\n') }}\n"
+    "            {%- else %}\n"
+    "                {{- '\\n' + content }}\n"
     "            {%- endif %}"
+)
+_BAILING_CURRENT_NEW_BLOCK = (
+    "{{- '<role>ASSISTANT</role>' }}\n"
+    "        {%- generation %}\n"
+    "{%- if reasoning_content or had_think_tags %}\n"
+    "                {{- '\\n<think>\\n'"
+    " + reasoning_content.strip('\\n') + '\\n</think>\\n\\n'"
+    " + content.lstrip('\\n') }}\n"
+    "            {%- else %}\n"
+    "                {{- content }}\n"
+    "            {%- endif %}"
+)
+_BAILING_ASSISTANT_END = (
+    "        {{- '<|role_end|>' }}\n    {%- elif message.role == \"tool\" %}"
+)
+_BAILING_ASSISTANT_END_WITH_GENERATION = (
+    "        {{- '<|role_end|>' }}\n"
+    "        {%- endgeneration %}\n"
+    '    {%- elif message.role == "tool" %}'
 )
 
 # Qwen3 uses `loop.last or (not loop.last and reasoning_content)` so the
@@ -77,13 +115,23 @@ _QWEN3_OLD_BLOCK = (
     "        {%- endif %}"
 )
 _QWEN3_NEW_BLOCK = (
+    "{{- '<|im_start|>' + message.role + '\\n' }}\n"
+    "        {%- generation %}\n"
     "{%- if loop.last or reasoning_content != '' or had_think_tags %}\n"
-    "                {{- '<|im_start|>' + message.role + '\\n<think>\\n'"
+    "                {{- '<think>\\n'"
     " + reasoning_content.strip('\\n') + '\\n</think>\\n\\n'"
     " + content.lstrip('\\n') }}\n"
     "            {%- else %}\n"
-    "                {{- '<|im_start|>' + message.role + '\\n' + content }}\n"
+    "                {{- content }}\n"
     "            {%- endif %}"
+)
+_QWEN3_ASSISTANT_END = (
+    "        {{- '<|im_end|>\\n' }}\n    {%- elif message.role == \"tool\" %}"
+)
+_QWEN3_ASSISTANT_END_WITH_GENERATION = (
+    "        {{- '<|im_end|>\\n' }}\n"
+    "        {%- endgeneration %}\n"
+    '    {%- elif message.role == "tool" %}'
 )
 
 _OLD_DETECT = "{%- set reasoning_content = '' %}"
@@ -144,6 +192,41 @@ def _add_bailing_v3_generation_tags(template):
     return patched
 
 
+def _has_generation_tracking(template: str) -> bool:
+    """Return whether a template has balanced assistant-generation tags."""
+    starts = len(_GENERATION_START_RE.findall(template))
+    ends = len(_GENERATION_END_RE.findall(template))
+    return starts > 0 and starts == ends
+
+
+def _require_generation_tracking(tokenizer) -> None:
+    template = getattr(tokenizer, "chat_template", None) or ""
+    if not _has_generation_tracking(template):
+        raise ValueError(
+            "SWE SFT requires a chat template with Jinja generation tracking "
+            "to build a structural assistant loss mask. Delimiter-based "
+            "masking is unsafe when message payloads contain role or "
+            "end-of-turn tokens."
+        )
+
+
+def _add_generation_end(template: str, family: str) -> str:
+    if family == "Bailing":
+        old_end = _BAILING_ASSISTANT_END
+        new_end = _BAILING_ASSISTANT_END_WITH_GENERATION
+    else:
+        old_end = _QWEN3_ASSISTANT_END
+        new_end = _QWEN3_ASSISTANT_END_WITH_GENERATION
+
+    if template.count(old_end) != 1:
+        raise ValueError(
+            f"{family} assistant render block matched, but its end-of-turn "
+            "boundary was not found exactly once. Refusing to create an "
+            "incomplete generation mask."
+        )
+    return template.replace(old_end, new_end, 1)
+
+
 def _patch_chat_template_for_training(tokenizer):
     """Patch Bailing/Qwen3 chat templates to render ``<think>`` uniformly.
 
@@ -156,13 +239,15 @@ def _patch_chat_template_for_training(tokenizer):
     assistant body is instrumented with Jinja generation tags so Transformers
     can construct a structural loss mask without parsing role delimiters.
 
-    Other templates (plain ChatML without ``last_query_index``) are left
-    unchanged.  If the template has ``last_query_index`` but no known block
-    matches, logs a warning and skips — add an explicit block pattern for that
-    family rather than relying on a blind neutralization.
+    Other templates without ``last_query_index`` are left unchanged and must
+    already provide Jinja generation tracking. If a gated template matches no
+    known block, patching fails closed; add an explicit block pattern for that
+    family rather than relying on blind neutralization.
     """
     template = getattr(tokenizer, "chat_template", None)
-    if not template or "last_query_index" not in template:
+    if not template or _TRAINING_PATCH_MARKER in template:
+        return
+    if "last_query_index" not in template:
         return
 
     # Bailing V3 adaptive already preserves thinking. Add Transformers'
@@ -170,23 +255,29 @@ def _patch_chat_template_for_training(tokenizer):
     # on delimiters that may also occur literally in message payloads.
     if "preserved_thinking = true" in template and "preserved_thinking or" in template:
         patched = _add_bailing_v3_generation_tags(template)
-        if patched is not None:
-            tokenizer.chat_template = patched
-            logger.info(
-                "Bailing V3 adaptive template detected: added generation "
-                "tracking around assistant bodies."
+        if patched is None:
+            raise ValueError(
+                "Bailing V3 adaptive template preserves thinking but its "
+                "assistant block does not match the verified generation-mask "
+                "layout. Refusing to trust pre-existing or partial generation "
+                "tags; update the known Bailing V3 template boundaries."
             )
-            return
+        tokenizer.chat_template = _TRAINING_PATCH_MARKER + patched
         logger.info(
-            "Bailing V3 adaptive template detected (preserved_thinking=true): "
-            "all assistant turns already render <think>, but its assistant "
-            "block was not recognized for generation tracking."
+            "Bailing V3 adaptive template detected: ensured generation "
+            "tracking around assistant bodies."
         )
         return
 
     if _BAILING_OLD_BLOCK in template:
         family = "Bailing"
         patched = template.replace(_BAILING_OLD_BLOCK, _BAILING_NEW_BLOCK)
+    elif _BAILING_CURRENT_OLD_BLOCK in template:
+        family = "Bailing"
+        patched = template.replace(
+            _BAILING_CURRENT_OLD_BLOCK,
+            _BAILING_CURRENT_NEW_BLOCK,
+        )
     elif _QWEN3_OLD_BLOCK in template:
         family = "Qwen3"
         patched = template.replace(_QWEN3_OLD_BLOCK, _QWEN3_NEW_BLOCK)
@@ -197,26 +288,15 @@ def _patch_chat_template_for_training(tokenizer):
         # loudly beats silently training on data whose <think> blocks the
         # stock template strips (see _clean_message / ensure_thinking).
         #
-        # Escape hatch for uses that do not depend on think normalization
-        # (e.g. precision-alignment forward dumps): set
-        # AREAL_SWE_ALLOW_UNPATCHED_TEMPLATE=1 to proceed with a warning.
-        if os.environ.get("AREAL_SWE_ALLOW_UNPATCHED_TEMPLATE", ""):
-            logger.warning(
-                "Chat template has last_query_index but matches neither known "
-                "render block; proceeding UNPATCHED because "
-                "AREAL_SWE_ALLOW_UNPATCHED_TEMPLATE is set. Empty <think> "
-                "blocks may be discarded by the stock template."
-            )
-            return
         raise ValueError(
             "Chat template has last_query_index but matches neither the known "
             "Bailing nor Qwen3 render block; the training patch cannot be "
             "applied. Without it, empty <think> blocks are discarded and "
             "multi-turn thinking renders inconsistently. Update "
-            "_BAILING_OLD_BLOCK/_QWEN3_OLD_BLOCK for this template revision, "
-            "or set AREAL_SWE_ALLOW_UNPATCHED_TEMPLATE=1 if think "
-            "normalization is irrelevant for this run."
+            "the known Bailing/Qwen3 block patterns for this template revision."
         )
+
+    patched = _add_generation_end(patched, family)
 
     if _OLD_DETECT not in patched:
         raise ValueError(
@@ -227,28 +307,11 @@ def _patch_chat_template_for_training(tokenizer):
         )
     patched = patched.replace(_OLD_DETECT, _NEW_DETECT)
 
-    tokenizer.chat_template = patched
+    tokenizer.chat_template = _TRAINING_PATCH_MARKER + patched
     logger.info(
         f"Patched {family} chat template for training: removed "
-        "last_query_index gate, added had_think_tags detection."
+        "last_query_index gate and added structural generation tracking."
     )
-
-
-_TEMPLATE_PATTERNS = [
-    # ChatML (Qwen, etc.):  <|im_start|>assistant\n ... <|im_end|>
-    (r"<\|im_start\|>assistant\n", r"<\|im_end\|>"),
-    # Llama 3:  <|start_header_id|>assistant<|end_header_id|>\n\n ... <|eot_id|>
-    (r"<\|start_header_id\|>assistant<\|end_header_id\|>\n\n", r"<\|eot_id\|>"),
-    # GLM:  <|assistant|> ... (ends at next <|user|>, <|observation|>, or end of string)
-    (r"<\|assistant\|>", r"(?=<\|user\|>|<\|observation\|>|\Z)"),
-    # Bailing (V2.5 / V3 / V3-adaptive):  <role>ASSISTANT</role> ... <|role_end|>
-    # Must be a KNOWN pattern (not probe-derived): the V3-adaptive template
-    # (config_ling_adaptive) renders an empty ``<think></think>`` for
-    # non-reasoning turns, which the double-probe would bake into the header and
-    # then fail to match real reasoning turns (``<think>{reasoning}</think>``).
-    # This header/eot captures the whole turn (think + content + tool_calls).
-    (r"<role>ASSISTANT</role>", r"<\|role_end\|>"),
-]
 
 
 def _parse_tool_call_arguments(messages):
@@ -284,7 +347,6 @@ def _parse_tool_call_arguments(messages):
 def _render_tokenize_mask(
     messages,
     tokenizer,
-    assistant_pattern,
     tools=None,
     *,
     split_mode="pair",
@@ -306,6 +368,9 @@ def _render_tokenize_mask(
         Tuple of ``(full_text, input_ids, loss_mask, offset_mapping)``, or
         ``None`` if ``apply_chat_template`` fails.
     """
+    _require_generation_tracking(tokenizer)
+    _tmpl = getattr(tokenizer, "chat_template", None) or ""
+
     # 1) Render the full template text.
     try:
         kwargs = {"tokenize": False}
@@ -321,7 +386,6 @@ def _render_tokenize_mask(
         # rule: on iff >=1 assistant turn thinks); in pair mode it is the pair.
         # Gated on the preserved_thinking + enable_thinking signature so other
         # templates (e.g. Qwen3) are left untouched.
-        _tmpl = getattr(tokenizer, "chat_template", None) or ""
         if "enable_thinking" in _tmpl and "preserved_thinking" in _tmpl:
             kwargs["enable_thinking"] = any(_msg_has_thinking(m) for m in messages)
         if parse_tool_call_args:
@@ -346,104 +410,54 @@ def _render_tokenize_mask(
 
     # Templates instrumented with Jinja's generation extension provide
     # structural assistant spans. Unlike delimiter matching, these spans cannot
-    # be forged by literal role markers in user/tool payloads.
-    if re.search(r"\{%-?\s*generation\s*-?%\}", _tmpl):
-        try:
-            tracked_kwargs = {
-                **kwargs,
-                "tokenize": True,
-                "return_dict": True,
-                "return_assistant_tokens_mask": True,
-            }
-            tracked = tokenizer.apply_chat_template(messages, **tracked_kwargs)
-            tracked_ids = tracked["input_ids"]
-            tracked_mask = list(tracked["assistant_masks"])
-            if tracked_ids != input_ids or len(tracked_mask) != len(input_ids):
-                raise ValueError("tracked tokenization differs from rendered text")
-        except Exception as e:
-            logger.warning(
-                "Native assistant-mask generation failed: %s. Skipping sample.",
-                e,
-            )
-            return None
+    # be forged by literal role markers in message payloads.
+    try:
+        tracked_kwargs = {
+            **kwargs,
+            "tokenize": True,
+            "return_dict": True,
+            "return_assistant_tokens_mask": True,
+        }
+        tracked = tokenizer.apply_chat_template(messages, **tracked_kwargs)
+        tracked_ids = tracked["input_ids"]
+        tracked_mask = list(tracked["assistant_masks"])
+        if tracked_ids != input_ids or len(tracked_mask) != len(input_ids):
+            raise ValueError("tracked tokenization differs from rendered text")
+    except Exception as e:
+        logger.warning(
+            "Native assistant-mask generation failed: %s. Skipping sample.",
+            e,
+        )
+        return None
 
-        segments = []
-        start = None
-        for idx, enabled in enumerate([*tracked_mask, 0]):
-            if enabled and start is None:
-                start = idx
-            elif not enabled and start is not None:
-                segments.append((start, idx))
-                start = None
+    segments = []
+    start = None
+    for idx, enabled in enumerate([*tracked_mask, 0]):
+        if enabled and start is None:
+            start = idx
+        elif not enabled and start is not None:
+            segments.append((start, idx))
+            start = None
 
-        n_asst = sum(1 for m in messages if m.get("role") == "assistant")
-        if len(segments) != n_asst:
-            logger.warning(
-                "Native assistant-mask segment mismatch: %d assistant messages "
-                "but %d tracked segments. Skipping sample.",
-                n_asst,
-                len(segments),
-            )
-            return None
-
-        if split_mode == "trajectory":
-            skip = set(error_indices) if error_indices else set()
-            selected = (
-                segment
-                for seg_idx, segment in enumerate(segments)
-                if seg_idx not in skip
-            )
-        else:
-            selected = segments[-1:] if segments else []
-        for start, end in selected:
-            loss_mask[start:end] = [1] * (end - start)
-        return full_text, input_ids, loss_mask, offset_mapping
+    n_asst = sum(1 for m in messages if m.get("role") == "assistant")
+    if len(segments) != n_asst:
+        logger.warning(
+            "Native assistant-mask segment mismatch: %d assistant messages "
+            "but %d tracked segments. Skipping sample.",
+            n_asst,
+            len(segments),
+        )
+        return None
 
     if split_mode == "trajectory":
-        # Trajectory mode: mask ALL assistant segments, skip error_indices.
         skip = set(error_indices) if error_indices else set()
-        matches = list(assistant_pattern.finditer(full_text))
-
-        # Verify regex matches correspond 1:1 to assistant messages.
-        n_asst = sum(1 for m in messages if m.get("role") == "assistant")
-        if len(matches) != n_asst:
-            # Fail closed: a spurious match (e.g. a tool output quoting the
-            # chat-template header literal) would otherwise put loss on
-            # user/tool tokens and silently defeat error masking.
-            logger.warning(
-                "Segment count mismatch: %d assistant messages but %d regex "
-                "matches in rendered text. Dropping this sample.",
-                n_asst,
-                len(matches),
-            )
-            return None
-
-        for seg_idx, m in enumerate(matches):
-            if seg_idx in skip:
-                continue
-            rs, re_ = m.start(1), m.end(0)
-            for tok_idx, (cs, ce) in enumerate(offset_mapping):
-                if ce > rs and cs < re_:
-                    loss_mask[tok_idx] = 1
+        selected = (
+            segment for seg_idx, segment in enumerate(segments) if seg_idx not in skip
+        )
     else:
-        # Pair mode: mask only the LAST assistant segment.
-        last_match = None
-        for m in assistant_pattern.finditer(full_text):
-            last_match = m
-        if last_match is not None:
-            rs, re_ = last_match.start(1), last_match.end(0)
-            for tok_idx, (cs, ce) in enumerate(offset_mapping):
-                if ce > rs and cs < re_:
-                    loss_mask[tok_idx] = 1
-        else:
-            # Loss lands nowhere; the SFT loss path tolerates all-zero masks
-            # (kept, not dropped, to preserve cache compatibility) but this
-            # always signals template/pattern drift worth investigating.
-            logger.warning(
-                "No assistant segment matched the template pattern; sample "
-                "keeps an all-zero loss_mask."
-            )
-
+        selected = segments[-1:] if segments else []
+    for start, end in selected:
+        loss_mask[start:end] = [1] * (end - start)
     return full_text, input_ids, loss_mask, offset_mapping
 
 
@@ -453,14 +467,12 @@ class _TokenizeAndMask:
     def __init__(
         self,
         tokenizer,
-        assistant_pattern,
         max_length=None,
         *,
         split_mode="pair",
         parse_tool_call_args=False,
     ):
         self.tokenizer = tokenizer
-        self.assistant_pattern = assistant_pattern
         self.max_length = max_length
         self.split_mode = split_mode
         self.parse_tool_call_args = parse_tool_call_args
@@ -474,7 +486,6 @@ class _TokenizeAndMask:
         result = _render_tokenize_mask(
             sample["messages"],
             self.tokenizer,
-            self.assistant_pattern,
             tools,
             split_mode=self.split_mode,
             error_indices=error_indices,
@@ -493,97 +504,9 @@ class _TokenizeAndMask:
         return {"input_ids": input_ids, "loss_mask": loss_mask}
 
 
-def _detect_template_pattern(tokenizer, tools=None):
-    """Detect the assistant role delimiter used by this tokenizer's template.
-
-    When *tools* is provided the probe is rendered with ``tools=`` so that
-    the detected delimiters match the actual training text (some templates
-    alter the system block when tools are present).
-
-    Strategy:
-        1. Try known ``_TEMPLATE_PATTERNS`` (fast, battle-tested).
-        2. Fall back to double-probe diff: render the template with a known
-           marker and with empty content, then diff the two strings to extract
-           the exact header and end-of-turn delimiters.
-
-    Raises:
-        ValueError: If both strategies fail to detect a usable pattern.
-    """
-    _PROBE_CONTENT = "PROBE_MARKER"
-
-    extra_kwargs = {}
-    if tools is not None:
-        extra_kwargs["tools"] = tools
-
-    probe_msgs = [
-        {"role": "user", "content": "x"},
-        {"role": "assistant", "content": _PROBE_CONTENT},
-    ]
-    probe_text = tokenizer.apply_chat_template(
-        probe_msgs, tokenize=False, **extra_kwargs
-    )
-
-    # --- Strategy 1: known patterns ---
-    for hdr_re, eot_re in _TEMPLATE_PATTERNS:
-        if re.search(hdr_re, probe_text):
-            pattern = re.compile(hdr_re + r"(.*?)" + eot_re, re.DOTALL)
-            logger.info(
-                f"Detected template style (known pattern): "
-                f"header_re={hdr_re!r}, eot_re={eot_re!r}"
-            )
-            return pattern
-
-    # --- Strategy 2: double-probe diff ---
-    try:
-        probe_empty = [
-            {"role": "user", "content": "x"},
-            {"role": "assistant", "content": ""},
-        ]
-        text_empty = tokenizer.apply_chat_template(
-            probe_empty, tokenize=False, **extra_kwargs
-        )
-
-        marker_idx = probe_text.index(_PROBE_CONTENT)
-        header = probe_text[:marker_idx]
-        tail = probe_text[marker_idx + len(_PROBE_CONTENT) :]
-
-        if text_empty == header + tail:
-            # Extract the assistant-specific header by removing the shared
-            # user-only prefix.
-            user_only = tokenizer.apply_chat_template(
-                [{"role": "user", "content": "x"}],
-                tokenize=False,
-                **extra_kwargs,
-            )
-            asst_header = header[len(user_only) :]
-            # end-of-turn delimiter: strip leading newlines, then take
-            # up to the first newline (or the full string if none).
-            eot_stripped = tail.lstrip("\n")
-            eot = eot_stripped.split("\n")[0] if "\n" in eot_stripped else eot_stripped
-
-            if asst_header and eot:
-                hdr_re = re.escape(asst_header)
-                eot_re = re.escape(eot)
-                pattern = re.compile(hdr_re + r"(.*?)" + eot_re, re.DOTALL)
-                logger.info(
-                    f"Detected template style (probe diff): "
-                    f"header={asst_header!r}, eot={eot!r}"
-                )
-                return pattern
-    except (ValueError, IndexError):
-        pass  # PROBE_CONTENT not found in rendered text, skip
-
-    raise ValueError(
-        "Could not detect chat template assistant delimiters. "
-        "Unable to build a reliable loss mask. "
-        f"Probe text: {probe_text[:200]!r}"
-    )
-
-
 def _dump_samples(
     samples,
     tokenizer,
-    assistant_pattern,
     tools_list,
     dump_dir,
     n_samples,
@@ -597,7 +520,6 @@ def _dump_samples(
     Args:
         samples: List of message-list samples (pairs or full trajectories).
         tokenizer: Tokenizer with ``apply_chat_template`` support.
-        assistant_pattern: Compiled regex from ``_detect_template_pattern``.
         tools_list: Per-sample tool definitions (parallel to *samples*),
             or ``None`` when no tools are available.
         dump_dir: Directory to write files into (created if needed).
@@ -627,7 +549,6 @@ def _dump_samples(
         result = _render_tokenize_mask(
             sample,
             tokenizer,
-            assistant_pattern,
             sample_tools,
             split_mode=split_mode,
             error_indices=err_idxs,

@@ -111,6 +111,11 @@ def create_worker_app(config: DataWorkerConfig) -> FastAPI:
                     body.tokenizer_or_processor_path
                 )
 
+            dataset_kwargs = dict(body.dataset_kwargs)
+            # Worker topology belongs to DataWorkerConfig, not to a client
+            # request. Remove spoofed values before forwarding user options.
+            dataset_kwargs.pop("data_worker_rank", None)
+            dataset_kwargs.pop("data_worker_world_size", None)
             _dataset = _get_custom_dataset(
                 path=body.dataset_path,
                 type=body.dataset_type,
@@ -118,7 +123,9 @@ def create_worker_app(config: DataWorkerConfig) -> FastAPI:
                 max_length=body.max_length,
                 tokenizer=_tokenizer,
                 processor=_processor,
-                **body.dataset_kwargs,
+                data_worker_rank=config.rank,
+                data_worker_world_size=config.world_size,
+                **dataset_kwargs,
             )
 
             _sampler_cls = (
