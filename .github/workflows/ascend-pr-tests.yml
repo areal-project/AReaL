@@ -4,9 +4,13 @@ on:
   pull_request:
     branches:
       - ascend
+    paths-ignore:
+      - .github/workflows/ascend-image-build-probe.yml
   push:
     branches:
       - ascend
+    paths-ignore:
+      - .github/workflows/ascend-image-build-probe.yml
   workflow_dispatch:
 
 permissions:
