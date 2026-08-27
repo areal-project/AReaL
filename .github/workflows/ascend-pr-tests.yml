@@ -278,7 +278,7 @@ jobs:
           verify_model "${AREAL_TEST_QWEN35_PATH}"
           verify_model "${AREAL_TEST_QWEN35_MOE_PATH}"
 
-      - name: Run balanced NPU test lanes
+      - name: Run NPU test suites
         env:
           HF_HUB_OFFLINE: "1"
           PYTHONWARNINGS: "ignore"
