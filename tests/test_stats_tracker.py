@@ -154,3 +154,12 @@ def test_export_scalar_key_missing_on_this_rank_does_not_crash():
     assert all_reduce_groups == [dp_group, dp_group]
     assert result["loss_scalar"] == 0.0  # guarded 0/0, not NaN
     assert result["loss_scalar__count"] == 0
+
+
+def test_export_single_key_with_reset():
+    tracker = DistributedStatsTracker()
+    tracker.scalar(foo=1.0)
+
+    assert tracker.export(key="foo", reset=True) == {"foo": 1.0, "foo__count": 1}
+    assert "foo" not in tracker.reduce_types
+    assert "foo" not in tracker.stats
