@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
-"""Numerical parity between staged and official Muon under real TP collectives."""
+"""Layer-wise DP-owner parity for GPU-staged Muon."""
 
 from __future__ import annotations
 
@@ -19,24 +19,24 @@ pytestmark = pytest.mark.skipif(
 )
 
 _PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-_WORKER = "tests/megatron/torchrun/run_gpu_staged_muon_tp.py"
+_WORKER = "tests/megatron/torchrun/run_gpu_staged_muon_dp.py"
 
 
 @pytest.mark.multi_gpu
 @pytest.mark.slow
 @pytest.mark.parametrize(
     ("world_size", "tp_size"),
-    [(2, 2), (4, 2)],
-    ids=["dp1-tp2", "dp2-tp2"],
+    [(2, 1), (4, 2)],
+    ids=["dp2-tp1", "dp2-tp2"],
 )
-def test_gpu_staged_muon_matches_official_parallel_grid(
+def test_gpu_staged_muon_matches_layerwise_dp2_owners(
     tmp_path_factory, world_size: int, tp_size: int
 ) -> None:
-    """Dense, expert, QKV, and DP-replicated updates match official Muon."""
+    """Dense, expert, scalar, and empty-owner DP paths match native MCore."""
     if current_platform.device_count() < world_size:
-        pytest.skip(f"staged Muon parity requires {world_size} GPUs")
+        pytest.skip(f"staged Muon layer-wise parity requires {world_size} GPUs")
     output = (
-        tmp_path_factory.mktemp(f"gpu_staged_muon_{world_size}_{tp_size}")
+        tmp_path_factory.mktemp(f"gpu_staged_muon_dp_{world_size}_{tp_size}")
         / "result.txt"
     )
     port = find_free_ports(1)[0]
