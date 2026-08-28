@@ -77,6 +77,7 @@ LOGGER_COLORS_EXACT = {
     "SFTTrainer": "light_green",
     # Algorithm-specific - cyan
     "PPOActor": "cyan",
+    "PeakMemory": "light_cyan",
     # Rewards - purple
     "GSM8KReward": "purple",
     "Geometry3KReward": "purple",

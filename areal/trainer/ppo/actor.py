@@ -42,6 +42,7 @@ from areal.utils.functional import (
     reward_overlong_penalty,
     sapo_loss_fn,
 )
+from areal.utils.memory import report_peak_memory
 from areal.utils.perf_tracer import trace_perf
 from areal.v2.training_service.controller.controller import (
     GatewayTrainController,
@@ -162,8 +163,14 @@ class PPOActor:
 
     @trace_perf("ppo_actor.compute_logp", category="compute")
     @torch.no_grad()
-    def compute_logp(self, data: list[dict[str, Any]]) -> list[torch.Tensor] | None:
-        return batched_call(self._compute_logp, data)
+    def compute_logp(
+        self,
+        data: list[dict[str, Any]],
+        *,
+        peak_memory_phase: str = "compute logp",
+    ) -> list[torch.Tensor] | None:
+        with report_peak_memory(peak_memory_phase):
+            return batched_call(self._compute_logp, data)
 
     def _compute_logp(self, data: dict[str, Any]) -> torch.Tensor | None:
         self.engine.eval()
@@ -365,8 +372,14 @@ class PPOActor:
 
     @trace_perf("ppo_actor.ppo_update", category="compute")
     @stats_tracker.scope_func_wrapper("ppo_actor")
-    def ppo_update(self, data: list[dict[str, Any]]) -> None:
-        batched_call(self._ppo_update, data, unpack=False)
+    def ppo_update(
+        self,
+        data: list[dict[str, Any]],
+        *,
+        peak_memory_phase: str = "actor ppo update",
+    ) -> None:
+        with report_peak_memory(peak_memory_phase):
+            batched_call(self._ppo_update, data, unpack=False)
 
     def _ppo_update(self, data: dict[str, Any]) -> None:
         attn_mask = data["attention_mask"]
