@@ -24,8 +24,7 @@ from areal.api import (
 )
 from areal.api.cli_args import RecoverConfig
 from areal.infra import TrainController
-from areal.utils import checkpoint_pointer as cp
-from areal.utils import logging, timeutil
+from areal.utils import checkpoint_pointer, logging, timeutil
 from areal.utils.environ import is_single_controller
 from areal.utils.evaluator import Evaluator
 from areal.utils.saver import Saver
@@ -325,8 +324,8 @@ class RecoverHandler:
         )
 
         if not self._supports_checkpoint_pointer():
-            if cp.read_latest(save_root) is not None:
-                raise cp.CheckpointConsistencyError(
+            if checkpoint_pointer.read_latest(save_root) is not None:
+                raise checkpoint_pointer.CheckpointConsistencyError(
                     "Cannot write a legacy recovery checkpoint while LATEST "
                     "selects a transactional checkpoint generation"
                 )
@@ -361,11 +360,11 @@ class RecoverHandler:
         ]
         publisher_name = async_engines[-1] if async_engines else None
 
-        generation, pointer_record = cp.prepare_generation(
+        generation, pointer_record = checkpoint_pointer.prepare_generation(
             save_root, step_info.global_step, engine_names
         )
 
-        recover_info.dump(cp.manifest_dir(generation))
+        recover_info.dump(checkpoint_pointer.manifest_dir(generation))
 
         pointer_value = pointer_record.to_json()
         # Finish every other async payload before scheduling the publisher. Its
@@ -379,13 +378,15 @@ class RecoverHandler:
             publishes_generation = name == publisher_name
             self._save_checkpoint(
                 engine_,
-                path=cp.payload_dir(generation, name),
+                path=checkpoint_pointer.payload_dir(generation, name),
                 name=name,
                 tokenizer=tokenizer,
                 processor=processor,
                 base_model_path=base_model_path,
                 checkpoint_pointer_path=(
-                    cp.latest_path(save_root) if publishes_generation else None
+                    checkpoint_pointer.latest_path(save_root)
+                    if publishes_generation
+                    else None
                 ),
                 checkpoint_pointer_value=(
                     pointer_value if publishes_generation else None
@@ -403,7 +404,7 @@ class RecoverHandler:
                 publisher_name,
             )
         else:
-            cp.publish_latest(save_root, pointer_value)
+            checkpoint_pointer.publish_latest(save_root, pointer_value)
             logger.info(
                 "Published recovery checkpoint generation %s at step %s",
                 generation,
@@ -441,7 +442,9 @@ class RecoverHandler:
             self.config.trial_name,
             self.config.fileroot,
         )
-        source = cp.resolve_checkpoint(save_root, list(normalized_engine))
+        source = checkpoint_pointer.resolve_checkpoint(
+            save_root, list(normalized_engine)
+        )
         if source is None:
             logger.warning(
                 f"Resume info not found under {save_root}. "
@@ -518,7 +521,7 @@ class RecoverHandler:
             return recover_info
         except (FileNotFoundError, InValidRecoverInfo) as e:
             if source.transactional:
-                raise cp.CheckpointConsistencyError(
+                raise checkpoint_pointer.CheckpointConsistencyError(
                     f"Published checkpoint {source.label} is not loadable: {e}"
                 ) from e
             logger.warning(
@@ -584,7 +587,7 @@ def check_if_auto_recover(config: RecoverConfig) -> bool:
         config.experiment_name, config.trial_name, config.fileroot
     )
     logger.info(f"Searching for recovery checkpoint under {save_root}.")
-    source = cp.resolve_checkpoint(save_root, None)
+    source = checkpoint_pointer.resolve_checkpoint(save_root, None)
     if source is None:
         logger.warning(f"Recover info not found under: {save_root}")
         return False
@@ -592,7 +595,7 @@ def check_if_auto_recover(config: RecoverConfig) -> bool:
         info = RecoverInfo.load(source.manifest)
     except Exception as e:
         if source.transactional:
-            raise cp.CheckpointConsistencyError(
+            raise checkpoint_pointer.CheckpointConsistencyError(
                 f"Published checkpoint {source.label} is not loadable: {e}"
             ) from e
         logger.warning(f"Failed to load recover info from {source.manifest}: {e}")

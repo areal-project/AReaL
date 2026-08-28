@@ -199,7 +199,7 @@ def test_publication_failure_is_broadcast_before_all_ranks_raise(
         patch("torch.distributed.broadcast_object_list") as broadcast,
         pytest.raises(RuntimeError, match="disk unavailable"),
     ):
-        mod._run_rank0_finalize(0, publish)
+        mod._run_checkpoint_publication(0, publish)
 
     status = broadcast.call_args.args[0]
     assert status == [("OSError", "disk unavailable")]
@@ -224,7 +224,7 @@ def test_nonzero_rank_raises_publication_failure_received_from_rank0(
         ),
         pytest.raises(RuntimeError, match="disk unavailable"),
     ):
-        mod._run_rank0_finalize(1, publish)
+        mod._run_checkpoint_publication(1, publish)
 
     publish.assert_not_called()
 
