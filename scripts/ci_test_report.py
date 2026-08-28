@@ -80,6 +80,8 @@ def summarize_reports(
     base: dict[str, Any] | None = None,
     *,
     base_is_inventory: bool = False,
+    changed_test_files: set[str] | None = None,
+    unavailable_base_test_files: set[str] | None = None,
 ) -> dict[str, int]:
     selected = set(current.get("selected_nodeids", []))
     outcomes = current.get("outcomes", {})
@@ -101,7 +103,22 @@ def summarize_reports(
         return counts
 
     base_selected = set(base.get("selected_nodeids", []))
-    new_selected = selected - base_selected
+    unmatched_selected = selected - base_selected
+    unavailable_selected: set[str] = set()
+    if unavailable_base_test_files is not None:
+        unavailable_selected = {
+            nodeid
+            for nodeid in selected
+            if nodeid.split("::", maxsplit=1)[0] in unavailable_base_test_files
+        }
+    comparable_unmatched = unmatched_selected - unavailable_selected
+    new_selected = comparable_unmatched
+    if changed_test_files is not None:
+        new_selected = {
+            nodeid
+            for nodeid in comparable_unmatched
+            if nodeid.split("::", maxsplit=1)[0] in changed_test_files
+        }
     counts.update(
         {
             "base_selected": len(selected & base_selected)
@@ -113,6 +130,10 @@ def summarize_reports(
             "new_incomplete": len(new_selected & incomplete),
         }
     )
+    if changed_test_files is not None:
+        counts["unchanged_unmatched"] = len(comparable_unmatched - new_selected)
+    if unavailable_base_test_files is not None:
+        counts["uncompared_selected"] = len(unavailable_selected)
     return counts
 
 
@@ -140,12 +161,23 @@ def render_summary(
         rows.extend(
             [
                 (previous_label, counts["base_selected"]),
-                ("New selected cases", counts["new_selected"]),
-                ("New cases executed", counts["new_executed"]),
-                ("New cases skipped", counts["new_skipped"]),
-                ("New cases incomplete", counts["new_incomplete"]),
+                ("New test cases selected", counts["new_selected"]),
+                ("New test cases executed", counts["new_executed"]),
+                ("New test cases skipped", counts["new_skipped"]),
+                ("New test cases incomplete", counts["new_incomplete"]),
             ]
         )
+        if "unchanged_unmatched" in counts:
+            rows.append(
+                (
+                    "Unmatched cases from unchanged test files",
+                    counts["unchanged_unmatched"],
+                )
+            )
+        if "uncompared_selected" in counts:
+            rows.append(
+                ("Cases without a base inventory", counts["uncompared_selected"])
+            )
 
     lines = [f"## {suite} test summary", "", "| Metric | Count |", "| --- | ---: |"]
     lines.extend(f"| {label} | {value} |" for label, value in rows)
@@ -159,6 +191,14 @@ def _load_reports(path: Path) -> dict[str, Any]:
     )
 
 
+def _load_changed_test_files(path: Path) -> set[str]:
+    return {
+        line.strip().removeprefix("./")
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -167,17 +207,31 @@ def main() -> None:
     summary_parser.add_argument("--base", type=Path)
     summary_parser.add_argument("--base-sha")
     summary_parser.add_argument("--base-is-inventory", action="store_true")
+    summary_parser.add_argument("--changed-test-files", type=Path)
+    summary_parser.add_argument("--unavailable-base-test-files", type=Path)
     summary_parser.add_argument("--suite", required=True)
     summary_parser.add_argument("--step-summary", type=Path)
     args = parser.parse_args()
 
     current = _load_reports(args.current)
     base = _load_reports(args.base) if args.base else None
+    changed_test_files = (
+        _load_changed_test_files(args.changed_test_files)
+        if args.changed_test_files
+        else None
+    )
+    unavailable_base_test_files = (
+        _load_changed_test_files(args.unavailable_base_test_files)
+        if args.unavailable_base_test_files
+        else None
+    )
     summary = render_summary(
         summarize_reports(
             current,
             base,
             base_is_inventory=args.base_is_inventory,
+            changed_test_files=changed_test_files,
+            unavailable_base_test_files=unavailable_base_test_files,
         ),
         suite=args.suite,
         base_sha=args.base_sha,

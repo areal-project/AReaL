@@ -70,6 +70,74 @@ def test_summarize_reports_uses_base_as_inventory():
     assert counts["new_executed"] == 1
 
 
+def test_summarize_reports_ignores_unmatched_cases_from_unchanged_files():
+    current = {
+        "selected_nodeids": [
+            "tests/test_npu.py::test_existing",
+            "tests/test_npu.py::test_import_sensitive",
+        ],
+        "outcomes": {
+            "tests/test_npu.py::test_existing": "passed",
+            "tests/test_npu.py::test_import_sensitive": "passed",
+        },
+    }
+    base = {
+        "selected_nodeids": ["tests/test_npu.py::test_existing"],
+        "outcomes": {},
+    }
+
+    counts = summarize_reports(
+        current,
+        base,
+        base_is_inventory=True,
+        changed_test_files={"tests/test_cpu.py"},
+    )
+
+    assert counts["new_selected"] == 0
+    assert counts["new_executed"] == 0
+    assert counts["unchanged_unmatched"] == 1
+
+
+def test_summarize_reports_counts_unmatched_cases_from_changed_files():
+    current = {
+        "selected_nodeids": ["tests/test_npu.py::test_new"],
+        "outcomes": {"tests/test_npu.py::test_new": "passed"},
+    }
+    base = {"selected_nodeids": [], "outcomes": {}}
+
+    counts = summarize_reports(
+        current,
+        base,
+        base_is_inventory=True,
+        changed_test_files={"tests/test_npu.py"},
+    )
+
+    assert counts["new_selected"] == 1
+    assert counts["new_executed"] == 1
+    assert counts["unchanged_unmatched"] == 0
+
+
+def test_summarize_reports_excludes_cases_without_base_inventory():
+    current = {
+        "selected_nodeids": ["tests/test_npu.py::test_import_sensitive"],
+        "outcomes": {"tests/test_npu.py::test_import_sensitive": "passed"},
+    }
+    base = {"selected_nodeids": [], "outcomes": {}}
+
+    counts = summarize_reports(
+        current,
+        base,
+        base_is_inventory=True,
+        changed_test_files={"tests/test_npu.py"},
+        unavailable_base_test_files={"tests/test_npu.py"},
+    )
+
+    assert counts["new_selected"] == 0
+    assert counts["new_executed"] == 0
+    assert counts["unchanged_unmatched"] == 0
+    assert counts["uncompared_selected"] == 1
+
+
 def test_render_summary_includes_suite_and_base_comparison():
     summary = render_summary(
         {
@@ -92,4 +160,4 @@ def test_render_summary_includes_suite_and_base_comparison():
     assert "## NPU test summary" in summary
     assert "| Selected NPU test cases | 10 |" in summary
     assert "| Base selected cases at `1234567890ab` | 9 |" in summary
-    assert "| New cases executed | 2 |" in summary
+    assert "| New test cases executed | 2 |" in summary

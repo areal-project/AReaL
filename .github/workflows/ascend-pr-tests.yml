@@ -224,9 +224,12 @@ jobs:
             --step-summary "${GITHUB_STEP_SUMMARY}"
           )
           if [[ -d /tmp/base-cpu-test-reports ]]; then
+            git diff --name-only "${CPU_TEST_BASE_SHA}" HEAD -- tests \
+              > /tmp/changed-cpu-test-files.txt
             report_args+=(
               --base /tmp/base-cpu-test-reports
               --base-sha "${CPU_TEST_BASE_SHA}"
+              --changed-test-files /tmp/changed-cpu-test-files.txt
             )
           fi
           uv run python scripts/ci_test_report.py summarize "${report_args[@]}"
@@ -279,41 +282,54 @@ jobs:
           trap cleanup EXIT
 
           cp scripts/ci_test_report.py "${plugin_dir}/ci_test_report.py"
-          git archive "${NPU_TEST_BASE_SHA}" | tar -x -C "${base_dir}"
+          git -c safe.directory="${GITHUB_WORKSPACE}" \
+            archive "${NPU_TEST_BASE_SHA}" | tar -x -C "${base_dir}"
+          : > /tmp/unavailable-base-npu-test-files.txt
 
-          npu_test_files=(
-            tests/test_lock.py
-            tests/test_megatron_engine_distributed.py
-            tests/test_megatron_engine_vlm.py
-            tests/test_model_packed_seq_cp.py
-            tests/test_perf_tracer.py
-            tests/test_reassemble_cp_logprobs.py
-            tests/test_ulysses.py
-            tests/test_vocab_parallel.py
-          )
-          base_test_files=()
-          for test_file in "${npu_test_files[@]}"; do
-            if [[ -f "${base_dir}/${test_file}" ]]; then
-              base_test_files+=("${test_file}")
+          collect_base_tests() {
+            local name="$1"
+            local status
+            local test_file="${!#}"
+            shift
+
+            if [[ ! -f "${base_dir}/${test_file}" ]]; then
+              echo "Base test file does not exist: ${test_file}"
+              return 0
             fi
-          done
 
-          if [[ "${#base_test_files[@]}" -eq 0 ]]; then
-            echo "No NPU test files exist at the base commit"
-            exit 0
-          fi
+            set +e
+            (
+              cd "${base_dir}"
+              PYTHONPATH="${plugin_dir}:${base_dir}" \
+                python -m pytest -q \
+                --collect-only \
+                -p ci_test_report \
+                "$@"
+            ) > "/tmp/base-npu-${name}.log" 2>&1
+            status=$?
+            set -e
 
-          (
-            cd "${base_dir}"
-            PYTHONPATH="${plugin_dir}:${base_dir}" \
-              python -m pytest -q \
-              --collect-only \
-              -p ci_test_report \
-              "${base_test_files[@]}"
-          ) > /tmp/base-npu-collection.log 2>&1 || {
-            cat /tmp/base-npu-collection.log
-            exit 1
+            if [[ "${status}" -ne 0 ]]; then
+              printf '%s\n' "${test_file}" \
+                >> /tmp/unavailable-base-npu-test-files.txt
+              echo "::warning title=Base NPU inventory unavailable::${test_file} exited with status ${status}"
+              tail -n 40 "/tmp/base-npu-${name}.log"
+            fi
           }
+
+          collect_base_tests megatron-vlm \
+            --deselect tests/test_megatron_engine_vlm.py::TestVisionModelDetection \
+            tests/test_megatron_engine_vlm.py
+          collect_base_tests model-packed-seq-cp \
+            tests/test_model_packed_seq_cp.py
+          collect_base_tests reassemble-cp-logprobs \
+            -m skipif tests/test_reassemble_cp_logprobs.py
+          collect_base_tests megatron-distributed \
+            tests/test_megatron_engine_distributed.py
+          collect_base_tests lock tests/test_lock.py
+          collect_base_tests perf-tracer tests/test_perf_tracer.py
+          collect_base_tests ulysses tests/test_ulysses.py
+          collect_base_tests vocab-parallel tests/test_vocab_parallel.py
 
       - name: Verify NPU runtime
         run: |
@@ -672,10 +688,15 @@ jobs:
             --step-summary "${GITHUB_STEP_SUMMARY}"
           )
           if [[ -d /tmp/base-npu-test-reports ]]; then
+            git -c safe.directory="${GITHUB_WORKSPACE}" \
+              diff --name-only "${NPU_TEST_BASE_SHA}" HEAD -- tests \
+              > /tmp/changed-npu-test-files.txt
             report_args+=(
               --base /tmp/base-npu-test-reports
               --base-sha "${NPU_TEST_BASE_SHA}"
               --base-is-inventory
+              --changed-test-files /tmp/changed-npu-test-files.txt
+              --unavailable-base-test-files /tmp/unavailable-base-npu-test-files.txt
             )
           fi
           python scripts/ci_test_report.py summarize "${report_args[@]}"
