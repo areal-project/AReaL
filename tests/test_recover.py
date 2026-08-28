@@ -10,7 +10,7 @@ import pytest
 
 from areal.api.cli_args import RecoverConfig
 from areal.api.io_struct import FinetuneSpec, StepInfo
-from areal.utils import checkpoint_pointer as cp
+from areal.utils import checkpoint_pointer
 from areal.utils.recover import (
     RecoverHandler,
     check_if_auto_recover,
@@ -278,9 +278,11 @@ class TestRecoverHandler:
         )
 
         save_root = Saver.get_save_root("test_exp", "test_trial", str(tmp_path))
-        assert cp.read_latest(save_root).global_step == 3
+        assert checkpoint_pointer.read_latest(save_root).global_step == 3
         meta = engine.save.call_args.args[0]
-        assert meta.path == cp.payload_dir(cp.generation_dir(save_root, 3), "default")
+        assert meta.path == checkpoint_pointer.payload_dir(
+            checkpoint_pointer.generation_dir(save_root, 3), "default"
+        )
         assert meta.checkpoint_pointer_path is None
 
     def test_dump_async_megatron_defers_pointer_to_finalize(self, tmp_path):
@@ -300,13 +302,13 @@ class TestRecoverHandler:
         )
 
         save_root = Saver.get_save_root("test_exp", "test_trial", str(tmp_path))
-        assert cp.read_latest(save_root) is None
+        assert checkpoint_pointer.read_latest(save_root) is None
         meta = engine.save.call_args.args[0]
         assert meta.wait_for_async_save is False
-        assert meta.checkpoint_pointer_path == cp.latest_path(save_root)
+        assert meta.checkpoint_pointer_path == checkpoint_pointer.latest_path(save_root)
 
-        cp.publish_latest(save_root, meta.checkpoint_pointer_value)
-        assert cp.read_latest(save_root).global_step == 3
+        checkpoint_pointer.publish_latest(save_root, meta.checkpoint_pointer_value)
+        assert checkpoint_pointer.read_latest(save_root).global_step == 3
 
     def test_dump_multiple_async_engines_waits_before_deferred_publication(
         self, tmp_path
@@ -334,7 +336,7 @@ class TestRecoverHandler:
         )
 
         save_root = Saver.get_save_root("test_exp", "test_trial", str(tmp_path))
-        assert cp.read_latest(save_root) is None
+        assert checkpoint_pointer.read_latest(save_root) is None
         assert save_order == ["default", "critic"]
 
         actor_meta = actor.save.call_args.args[0]
@@ -343,10 +345,14 @@ class TestRecoverHandler:
 
         critic_meta = critic.save.call_args.args[0]
         assert critic_meta.wait_for_async_save is False
-        assert critic_meta.checkpoint_pointer_path == cp.latest_path(save_root)
+        assert critic_meta.checkpoint_pointer_path == checkpoint_pointer.latest_path(
+            save_root
+        )
 
-        cp.publish_latest(save_root, critic_meta.checkpoint_pointer_value)
-        assert cp.read_latest(save_root).global_step == 3
+        checkpoint_pointer.publish_latest(
+            save_root, critic_meta.checkpoint_pointer_value
+        )
+        assert checkpoint_pointer.read_latest(save_root).global_step == 3
 
     def test_dump_mixed_engines_saves_async_publisher_last(self, tmp_path):
         handler = self._make_handler(str(tmp_path), "on")
@@ -374,10 +380,10 @@ class TestRecoverHandler:
         save_root = Saver.get_save_root("test_exp", "test_trial", str(tmp_path))
         assert save_order == ["critic", "default"]
         assert critic.save.call_args.args[0].checkpoint_pointer_path is None
-        assert actor.save.call_args.args[0].checkpoint_pointer_path == cp.latest_path(
-            save_root
-        )
-        assert cp.read_latest(save_root) is None
+        assert actor.save.call_args.args[
+            0
+        ].checkpoint_pointer_path == checkpoint_pointer.latest_path(save_root)
+        assert checkpoint_pointer.read_latest(save_root) is None
 
     def test_dump_multiple_engines_keeps_latest_when_publisher_save_fails(
         self, tmp_path
@@ -396,8 +402,10 @@ class TestRecoverHandler:
             backend="megatron:d1", megatron=SimpleNamespace(async_save=True)
         )
         save_root = Saver.get_save_root("test_exp", "test_trial", str(tmp_path))
-        _, previous = cp.prepare_generation(save_root, 2, ["default", "critic"])
-        cp.publish_latest(save_root, previous.to_json())
+        _, previous = checkpoint_pointer.prepare_generation(
+            save_root, 2, ["default", "critic"]
+        )
+        checkpoint_pointer.publish_latest(save_root, previous.to_json())
 
         with pytest.raises(RuntimeError, match="critic save failed"):
             handler.dump(
@@ -407,7 +415,7 @@ class TestRecoverHandler:
             )
 
         assert actor.save.call_args.args[0].wait_for_async_save is True
-        assert cp.read_latest(save_root).global_step == 2
+        assert checkpoint_pointer.read_latest(save_root).global_step == 2
 
     def test_dump_spmd_mode_preserves_legacy_layout(self, tmp_path, monkeypatch):
         handler = self._make_handler(str(tmp_path), "on")
@@ -431,8 +439,10 @@ class TestRecoverHandler:
         assert meta.path == Saver.get_recover_checkpoint_path(
             "test_exp", "test_trial", str(tmp_path), name="default"
         )
-        assert os.path.isdir(os.path.join(save_root, cp.LEGACY_MANIFEST_DIRNAME))
-        assert cp.read_latest(save_root) is None
+        assert os.path.isdir(
+            os.path.join(save_root, checkpoint_pointer.LEGACY_MANIFEST_DIRNAME)
+        )
+        assert checkpoint_pointer.read_latest(save_root) is None
 
     @pytest.mark.parametrize("mode", ["on", "auto"])
     def test_load_rejects_gateway_train_controller(self, mode):

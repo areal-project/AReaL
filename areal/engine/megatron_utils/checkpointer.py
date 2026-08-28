@@ -132,7 +132,7 @@ def _release_retained_payload(tensor_lists: list[list]) -> None:
         raise RuntimeError("Failed to release MCore's retained async-save payload")
 
 
-def _run_rank0_finalize(rank: int, finalize_fn: Callable[[], None]) -> None:
+def _run_checkpoint_publication(rank: int, finalize_fn: Callable[[], None]) -> None:
     """Run a filesystem publication on rank 0 and propagate any failure."""
     status: list[tuple[str, str] | None] = [None]
     if rank == 0:
@@ -568,7 +568,7 @@ class MegatronCheckpointManager:
             tensor_lists = _inspect_retained_payload(async_save_request)
             if finalize_fn is not None:
                 async_save_request.add_finalize_fn(
-                    partial(_run_rank0_finalize, self.rank, finalize_fn)
+                    partial(_run_checkpoint_publication, self.rank, finalize_fn)
                 )
             call_idx = self._async_queue.schedule_async_request(async_save_request)
             _release_retained_payload(tensor_lists)
@@ -598,7 +598,7 @@ class MegatronCheckpointManager:
             )
             torch.distributed.barrier()
             if finalize_fn is not None:
-                _run_rank0_finalize(self.rank, finalize_fn)
+                _run_checkpoint_publication(self.rank, finalize_fn)
 
     def _reap_finished_async_saves(self) -> None:
         """Non-blocking finalize of any background save processes that have finished.
