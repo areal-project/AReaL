@@ -55,6 +55,7 @@ from areal.infra.rpc.rtensor import RTensor
 from areal.infra.utils.concurrent import call_maybe_async
 from areal.utils import logging, perf_tracer, seeding, stats_tracker
 from areal.utils.awex_runtime import prepare_awex_runtime
+from areal.utils.cleanup import run_batch_cleanups
 from areal.utils.dataloader import create_dataloader
 from areal.utils.environ import is_single_controller
 from areal.utils.evaluator import Evaluator
@@ -1010,21 +1011,44 @@ class PPOTrainer:
                 # SPMD mode never populates ``_fetch_buffer`` (no RTensor
                 # round-trip), so the fan-out is single-controller only.
                 if is_single_controller():
-                    self.actor.clear_batches(rollout_batch, adv_batch)
+                    cleanups = [
+                        (
+                            "actor",
+                            lambda: self.actor.clear_batches(rollout_batch, adv_batch),
+                        )
+                    ]
                     if self.critic is not None:
-                        self.critic.clear_batches(rollout_batch, adv_batch)
+                        cleanups.append(
+                            (
+                                "critic",
+                                lambda: self.critic.clear_batches(
+                                    rollout_batch, adv_batch
+                                ),
+                            )
+                        )
                     if self.ref is not None:
-                        self.ref.clear_batches(rollout_batch)
+                        cleanups.append(
+                            ("ref", lambda: self.ref.clear_batches(rollout_batch))
+                        )
                     if self.data_controller is not None:
-                        self.data_controller.clear_batches()
+                        cleanups.append(
+                            ("data", lambda: self.data_controller.clear_batches())
+                        )
                     # Defensive sweep: drain RTensors created by auxiliary RPC
                     # returns (stats dicts, etc.) that aren't tracked by the
                     # standard batch lifecycle above. See #1209.
-                    self.actor.clear_all_local_rtensors()
+                    cleanups.append(
+                        ("actor sweep", self.actor.clear_all_local_rtensors)
+                    )
                     if self.critic is not None:
-                        self.critic.clear_all_local_rtensors()
+                        cleanups.append(
+                            ("critic sweep", self.critic.clear_all_local_rtensors)
+                        )
                     if self.ref is not None:
-                        self.ref.clear_all_local_rtensors()
+                        cleanups.append(
+                            ("ref sweep", self.ref.clear_all_local_rtensors)
+                        )
+                    run_batch_cleanups(cleanups)
 
             with perf_tracer.trace_scope(
                 "train.log_stats",

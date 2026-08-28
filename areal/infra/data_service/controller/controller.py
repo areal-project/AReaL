@@ -413,20 +413,28 @@ class DataController:
 
     async def _async_clear_batches(self) -> None:
         async def _clear_one(session: aiohttp.ClientSession, addr: str) -> None:
-            try:
-                async with session.delete(
-                    f"{addr}/data/clear",
-                    timeout=aiohttp.ClientTimeout(total=10),
-                ) as resp:
-                    resp.raise_for_status()
-            except Exception:
-                logger.debug("Failed to clear batches on %s", addr)
+            async with session.delete(
+                f"{addr}/data/clear",
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                resp.raise_for_status()
 
         async with aiohttp.ClientSession(trust_env=False) as session:
-            await asyncio.gather(
-                *(_clear_one(session, addr) for addr in self._worker_addrs),
+            clear_requests = list(self._worker_addrs)
+            results = await asyncio.gather(
+                *(_clear_one(session, addr) for addr in clear_requests),
                 return_exceptions=True,
             )
+            for addr, result in zip(clear_requests, results, strict=True):
+                if isinstance(result, asyncio.CancelledError):
+                    raise result
+                if isinstance(result, BaseException):
+                    logger.warning(
+                        "Failed to clear batches on data worker %s: %s: %s",
+                        addr,
+                        type(result).__name__,
+                        result,
+                    )
 
     # -- Destroy -----------------------------------------------------------
 

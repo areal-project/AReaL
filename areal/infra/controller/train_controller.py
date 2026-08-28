@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import asyncio
+from threading import Lock
 from typing import Any
 
 import torch
@@ -20,7 +21,7 @@ from areal.api import (
 )
 from areal.api.alloc_mode import ModelAllocation
 from areal.api.cli_args import PerfTracerConfig, TrainEngineConfig
-from areal.infra.rpc.rtensor import RTensor, flatten_shard_ids
+from areal.infra.rpc.rtensor import RTensor
 from areal.infra.utils.concurrent import run_async_task
 from areal.utils import logging, stats_tracker
 from areal.utils.data import make_dummy_eval_item
@@ -31,6 +32,8 @@ from .rollout_callback import RolloutCallback
 from .rollout_controller import RolloutController
 
 logger = logging.getLogger("TrainController")
+
+_MAX_CLEAR_STEP_FAILURES = 2
 
 
 def _find_in_structure(obj: Any, type_: type) -> Any | None:
@@ -206,6 +209,9 @@ class TrainController:
 
         self._worker_role: str = "default"
         self._own_process_group = False
+        self._pending_clear_shards: dict[Any, dict[Any, int]] = {}
+        self._clear_shards_lock = Lock()
+        self._clear_batches_lock = Lock()
 
         self.rollout: RolloutController = None
 
@@ -792,23 +798,113 @@ class TrainController:
                 " before using rollout/update_weight methods."
             )
 
-    async def _async_clear_batches(self, *targets: dict[str, RTensor]):
-        """Extract shard IDs and clear tensors on each worker.
+    async def _async_clear_batches(
+        self, *targets: dict[str, RTensor]
+    ) -> tuple[list[Any], dict[Any, list[Any]]]:
+        """Extract shard IDs and stage storage cleanup results.
 
         HTTP DELETEs to each storage node's ``/data/clear`` — this evicts
         ``_storage`` (mandatory, otherwise HTTP storage grows unboundedly)
         and, via :func:`rtensor.remove`, also pops the storage owner's own
-        ``_fetch_buffer`` (covers storage-owner-as-consumer). See #1209.
+        ``_fetch_buffer`` (covers storage-owner-as-consumer). Failed shards
+        remain pending for one cross-step retry. Exhausted shards stay pending
+        until consumer-worker buffers are drained, so a worker RPC failure
+        cannot lose the storage-leak state. See #1209 and #1581.
         """
         shards_by_node = RTensor.collect_shards(targets)
+        with self._clear_shards_lock:
+            for addr, sids in shards_by_node.items():
+                pending = self._pending_clear_shards.setdefault(addr, {})
+                for sid in sids:
+                    pending.setdefault(sid, 0)
+            clear_requests = [
+                (addr, list(pending))
+                for addr, pending in self._pending_clear_shards.items()
+                if pending
+            ]
 
-        if not shards_by_node:
-            return
+        if not clear_requests:
+            return [], {}
 
-        await asyncio.gather(
-            *[RTensor.clear_node(addr, sids) for addr, sids in shards_by_node.items()],
+        results = await asyncio.gather(
+            *[RTensor.clear_node(addr, sids) for addr, sids in clear_requests],
             return_exceptions=True,
         )
+        fatal_error = next(
+            (
+                result
+                for result in results
+                if isinstance(result, BaseException)
+                and not isinstance(result, Exception)
+            ),
+            None,
+        )
+        if fatal_error is not None:
+            raise fatal_error
+
+        exhausted: dict[Any, list[Any]] = {}
+        for (addr, sids), result in zip(clear_requests, results, strict=True):
+            if isinstance(result, Exception):
+                with self._clear_shards_lock:
+                    pending = self._pending_clear_shards.get(addr, {})
+                    exhausted_sids = []
+                    for sid in sids:
+                        if sid not in pending:
+                            continue
+                        failures = min(pending[sid] + 1, _MAX_CLEAR_STEP_FAILURES)
+                        pending[sid] = failures
+                        if failures >= _MAX_CLEAR_STEP_FAILURES:
+                            exhausted_sids.append(sid)
+                    pending_count = sum(
+                        failures < _MAX_CLEAR_STEP_FAILURES
+                        for failures in pending.values()
+                    )
+                if exhausted_sids:
+                    exhausted[addr] = exhausted_sids
+                logger.warning(
+                    "Failed to clear %d RTensor shards on storage node %s: "
+                    "%s: %s (%d pending, %d retries exhausted)",
+                    len(sids),
+                    addr,
+                    type(result).__name__,
+                    result,
+                    pending_count,
+                    len(exhausted_sids),
+                )
+                continue
+            with self._clear_shards_lock:
+                pending = self._pending_clear_shards.get(addr)
+                if pending is not None:
+                    for sid in sids:
+                        pending.pop(sid, None)
+                    if not pending:
+                        self._pending_clear_shards.pop(addr, None)
+            if isinstance(result, dict):
+                logger.debug(
+                    "Cleared RTensor shards on storage node %s "
+                    "(requested=%d, cleared=%s, remaining_tensors=%s, "
+                    "remaining_bytes=%s)",
+                    addr,
+                    len(sids),
+                    result.get("cleared_count", "unknown"),
+                    result.get("num_tensors", "unknown"),
+                    result.get("total_bytes", "unknown"),
+                )
+
+        attempted_sids = [sid for _, sids in clear_requests for sid in sids]
+        return attempted_sids, exhausted
+
+    def _commit_exhausted_clear_shards(self, exhausted: dict[Any, list[Any]]) -> None:
+        """Remove exhausted shards after every consumer worker is drained."""
+        with self._clear_shards_lock:
+            for addr, sids in exhausted.items():
+                pending = self._pending_clear_shards.get(addr)
+                if pending is None:
+                    continue
+                for sid in sids:
+                    pending.pop(sid, None)
+                if not pending:
+                    self._pending_clear_shards.pop(addr, None)
 
     def clear_batches(self, *targets: dict[str, RTensor]):
         """Clear distributed batch shards from workers to free memory.
@@ -827,16 +923,25 @@ class TrainController:
            full sid set.
 
         After the second fan-out, a ``fetch_buffer_stats`` RPC logs the
-        drain result — WARNING on leak, DEBUG when clean.
+        drain result — WARNING on leak, DEBUG when clean. A shard that also
+        fails on the next call raises after worker buffers have been drained,
+        preventing training from silently accumulating remote storage.
         """
-        run_async_task(self._async_clear_batches, *targets)
-        sids = flatten_shard_ids(targets)
+        with self._clear_batches_lock:
+            self._clear_batches_locked(*targets)
+
+    def _clear_batches_locked(self, *targets: dict[str, RTensor]) -> None:
+        sids, exhausted = run_async_task(self._async_clear_batches, *targets)
         if not sids:
             return
         # broadcast=False → purely local per-head op (no NCCL collective).
         # list[str] is not tensor-like → _replicate_inputs copies the full
         # sid set to every DP head.
         self._custom_function_call("clear_batches", sids, rpc_meta={"broadcast": False})
+        # Commit retry exhaustion only after every consumer worker accepted the
+        # buffer drain. If that RPC raises, exhausted shards remain pending so
+        # the next call can retry or report the remote storage leak.
+        self._commit_exhausted_clear_shards(exhausted)
         # Always observe post-drain state. _custom_function_call returns
         # the first DP head's stats (scalar dispatch collapses via
         # _collect_results[0]); all heads are symmetric in steady state,
@@ -852,19 +957,31 @@ class TrainController:
                 self._worker_role,
                 e,
             )
-            return
-        n_entries = stats.get("num_entries", 0) if isinstance(stats, dict) else 0
-        if n_entries > 0:
-            logger.warning(
-                "clear_batches: _fetch_buffer non-empty on DP head 0 "
-                "(role=%s, num_entries=%d) — possible leak, see #1209",
-                self._worker_role,
-                n_entries,
-            )
         else:
-            logger.debug(
-                "clear_batches: _fetch_buffer drained on DP head 0 (role=%s)",
-                self._worker_role,
+            n_entries = stats.get("num_entries", 0) if isinstance(stats, dict) else 0
+            if n_entries > 0:
+                logger.warning(
+                    "clear_batches: _fetch_buffer non-empty on DP head 0 "
+                    "(role=%s, num_entries=%d) — possible leak, see #1209",
+                    self._worker_role,
+                    n_entries,
+                )
+            else:
+                logger.debug(
+                    "clear_batches: _fetch_buffer drained on DP head 0 (role=%s)",
+                    self._worker_role,
+                )
+
+        if exhausted:
+            summary = ", ".join(
+                f"{addr}: {len(sids)}"
+                for addr, sids in sorted(
+                    exhausted.items(), key=lambda item: str(item[0])
+                )
+            )
+            raise RuntimeError(
+                "RTensor storage cleanup failed across two clear_batches calls "
+                f"({summary})"
             )
 
     def clear_all_local_rtensors(self):
