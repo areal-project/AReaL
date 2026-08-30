@@ -11,9 +11,59 @@ sentinel prevents double-application. Apply patches at import time via
 
 from __future__ import annotations
 
+import contextvars
+
 import areal.utils.logging as logging
 
 logger = logging.getLogger("MegatronBridgePatches")
+
+# Carry the per-forward MTP labels and loss mask from ``GPTModel.forward``
+# (where the caller passes ``mtp_kwargs``) down to ``process_mtp_loss`` (invoked
+# inside ``_postprocess``) without touching the long forward signature.
+# ContextVars are PP/recompute-safe: each rank-process has its own values and the
+# forward call is synchronous, so set/read/reset stay paired within one forward.
+_MTP_TRAIN_LABELS: contextvars.ContextVar = contextvars.ContextVar(
+    "areal_mtp_train_labels", default=None
+)
+_MTP_TRAIN_LOSS_MASK: contextvars.ContextVar = contextvars.ContextVar(
+    "areal_mtp_train_loss_mask", default=None
+)
+
+
+def _wrap_forward_for_mtp_kwargs(model_cls) -> None:
+    """Patch ``model_cls.forward`` to pop/consume ``mtp_kwargs``.
+
+    Stashes ``mtp_kwargs["mtp_labels"]`` and ``mtp_loss_mask`` into paired
+    ContextVars for the duration of the call so the (separately patched)
+    module-level ``process_mtp_loss`` can pick them up inside ``_postprocess``,
+    then calls the original ``forward`` with ``mtp_kwargs`` stripped out
+    (the original signature never declares it).
+    """
+    _orig_forward = model_cls.forward
+
+    def _patched_forward(self, *args, **kwargs):
+        mtp_kwargs = kwargs.pop("mtp_kwargs", None)
+        mtp_labels = mtp_kwargs.get("mtp_labels") if mtp_kwargs else None
+        mtp_loss_mask = mtp_kwargs.get("mtp_loss_mask") if mtp_kwargs else None
+        # Multimodal wrappers pass precomputed decoder_input and deliberately
+        # set language_model.input_ids=None. MCore still needs token IDs inside
+        # the MTP block to build the shifted token embeddings, so restore the
+        # layout-aligned IDs from the independent MTP channel in that case.
+        if (
+            mtp_labels is not None
+            and "input_ids" in kwargs
+            and kwargs["input_ids"] is None
+        ):
+            kwargs["input_ids"] = mtp_labels
+        labels_token = _MTP_TRAIN_LABELS.set(mtp_labels)
+        mask_token = _MTP_TRAIN_LOSS_MASK.set(mtp_loss_mask)
+        try:
+            return _orig_forward(self, *args, **kwargs)
+        finally:
+            _MTP_TRAIN_LOSS_MASK.reset(mask_token)
+            _MTP_TRAIN_LABELS.reset(labels_token)
+
+    model_cls.forward = _patched_forward
 
 
 def _patch_qwen3vl_pr3143_word_embeddings() -> None:
@@ -77,8 +127,168 @@ def _patch_qwen3vl_pr3143_word_embeddings() -> None:
     )
 
 
+def _roll_mtp_labels_and_mask(
+    mtp_labels,
+    mtp_loss_mask,
+    roll_tensor,
+    *,
+    cp_group=None,
+    packed_seq_params=None,
+):
+    """Roll MTP targets and their validity mask with identical boundaries."""
+    roll_kwargs = {
+        "shifts": -1,
+        "dims": -1,
+        "cp_group": cp_group,
+        "packed_seq_params": packed_seq_params,
+    }
+    rolled_labels, _ = roll_tensor(mtp_labels.clone(), **roll_kwargs)
+    rolled_loss_mask, _ = roll_tensor(mtp_loss_mask.clone(), **roll_kwargs)
+    return rolled_labels, rolled_loss_mask
+
+
+def _patch_gpt_model_mtp_training() -> None:
+    """Enable training the Multi-Token-Prediction (MTP) head as an auxiliary loss.
+
+    AReaL computes the *main* loss outside Megatron from logits, so
+    ``GPTModel.forward`` is always called with ``labels=None`` and must keep
+    returning logits. Megatron-Core 0.17.0's ``process_mtp_loss`` instead derives
+    the MTP labels from the main ``labels`` and early-returns when it is None, so
+    the MTP loss never fires under AReaL. It also feeds the *shared* output weight
+    into the MTP output layer un-detached, which would leak MTP gradients into the
+    backbone.
+
+    This patch mirrors slime's ``docker/patch/latest/megatron.patch`` but adapts to
+    0.17.0's refactor (MTP loss extracted into the standalone ``process_mtp_loss``):
+
+    1. ``GPTModel.forward`` accepts independent ``mtp_labels`` and
+       ``mtp_loss_mask`` channels in ``mtp_kwargs`` and stashes both in
+       ContextVars; the main ``labels`` stays None so the main path keeps
+       emitting logits.
+    2. The module-level ``process_mtp_loss`` (looked up at call time inside
+       ``_postprocess``) is wrapped so that, when MTP labels are present, it:
+         - pre-rolls labels and loss mask once (slime parity: 0.17.0 only rolls
+           inside its per-layer loop, so MTP layer 0 would otherwise predict
+           t+1 instead of t+2); and
+         - detaches the shared ``output_weight`` to isolate backbone gradients.
+    3. ``MultiTokenPredictionLayer._get_embeddings`` is wrapped to detach the
+       backbone hidden states and the MTP embedding input, so the MTP loss only
+       updates MTP parameters.
+    """
+    try:
+        from megatron.core.models.gpt import gpt_model
+        from megatron.core.transformer import multi_token_prediction as mtp_mod
+    except ImportError:
+        return
+
+    if getattr(gpt_model, "_areal_mtp_training_applied", False):
+        return
+
+    roll_tensor = mtp_mod.roll_tensor
+    GPTModel = gpt_model.GPTModel
+    MultiTokenPredictionLayer = mtp_mod.MultiTokenPredictionLayer
+
+    # --- 1. GPTModel.forward: capture mtp_kwargs into the ContextVar ---
+    _wrap_forward_for_mtp_kwargs(GPTModel)
+
+    # --- 2. process_mtp_loss: inject mtp_labels (pre-rolled) + detach weight ---
+    _orig_process_mtp_loss = gpt_model.process_mtp_loss
+
+    def _patched_process_mtp_loss(*args, **kwargs):
+        mtp_labels = _MTP_TRAIN_LABELS.get()
+        if mtp_labels is not None:
+            mtp_loss_mask = _MTP_TRAIN_LOSS_MASK.get()
+            if mtp_loss_mask is None:
+                raise ValueError("MTP labels were provided without an MTP loss mask.")
+            # Roll both once up front so the in-loop roll inside the original
+            # process_mtp_loss aligns MTP layer 0 to the t+2 target and applies
+            # the mask of that same future token. roll_tensor zero-fills the
+            # vacated position and respects packed boundaries when metadata is
+            # present; padded BSHD rolls independently within each batch row.
+            rolled_labels, rolled_loss_mask = _roll_mtp_labels_and_mask(
+                mtp_labels,
+                mtp_loss_mask,
+                roll_tensor,
+                cp_group=kwargs.get("cp_group"),
+                packed_seq_params=kwargs.get("packed_seq_params"),
+            )
+            kwargs["labels"] = rolled_labels
+            kwargs["loss_mask"] = rolled_loss_mask
+            output_weight = kwargs.get("output_weight")
+            if output_weight is not None:
+                kwargs["output_weight"] = output_weight.detach()
+        return _orig_process_mtp_loss(*args, **kwargs)
+
+    gpt_model.process_mtp_loss = _patched_process_mtp_loss
+
+    # --- 3. MTP layer embeddings: cut backbone from the MTP graph ---
+    _orig_get_embeddings = MultiTokenPredictionLayer._get_embeddings
+
+    def _patched_get_embeddings(self, *args, **kwargs):
+        out = _orig_get_embeddings(self, *args, **kwargs)
+        if _MTP_TRAIN_LABELS.get() is None:
+            return out
+        input_ids, position_ids, decoder_input, hidden_states = out
+        # detach the shared embedding output and the backbone hidden states so
+        # only MTP-internal parameters receive gradients.
+        decoder_input = decoder_input.detach()
+        hidden_states = hidden_states.detach().requires_grad_(True)
+        return input_ids, position_ids, decoder_input, hidden_states
+
+    MultiTokenPredictionLayer._get_embeddings = _patched_get_embeddings
+
+    gpt_model._areal_mtp_training_applied = True
+    logger.info(
+        "Applied MTP training patch: GPTModel.forward accepts mtp_kwargs, "
+        "process_mtp_loss uses independent label/mask channels with detached "
+        "output weight, and MTP gradients are isolated from the backbone."
+    )
+
+
+def _patch_qwen3vl_mtp_training() -> None:
+    """Extend the MTP training kwarg patch to megatron-bridge's Qwen3-VL decoder.
+
+    ``Qwen3VLGPTModel`` is the decoder class megatron-bridge uses for the whole
+    Qwen3.5 family (dense/MoE, text-only or multimodal ``model_type`` variants
+    such as ``qwen3_5_text``). It subclasses mcore's ``GPTModel`` but *overrides*
+    ``forward`` with its own explicit signature (deepstack visual kwargs, no
+    ``**kwargs`` catch-all), while leaving ``_postprocess`` inherited from
+    ``GPTModel``. Because Python resolves ``forward`` on the subclass first,
+    ``_patch_gpt_model_mtp_training``'s patch on ``GPTModel.forward`` never fires
+    here, so ``packed_context_parallel_forward`` passing ``mtp_kwargs=...`` raises:
+
+        TypeError: Qwen3VLGPTModel.forward() got an unexpected keyword
+        argument 'mtp_kwargs'
+
+    This mirrors step 1 of ``_patch_gpt_model_mtp_training`` for
+    ``Qwen3VLGPTModel`` specifically. Steps 2/3 of that patch
+    (``process_mtp_loss`` label injection, MTP embedding detach) already apply
+    transparently here since they patch module-level/shared code that
+    ``Qwen3VLGPTModel`` reuses via its inherited ``_postprocess``.
+    """
+    try:
+        from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.text_model import (
+            Qwen3VLGPTModel,
+        )
+    except ImportError:
+        return
+
+    if getattr(Qwen3VLGPTModel, "_areal_mtp_training_applied", False):
+        return
+
+    _wrap_forward_for_mtp_kwargs(Qwen3VLGPTModel)
+    Qwen3VLGPTModel._areal_mtp_training_applied = True
+    logger.info(
+        "Applied MTP training patch to Qwen3VLGPTModel.forward: "
+        "mtp_kwargs passthrough enabled for Qwen3.5-family models "
+        "(including text-only model_type variants)."
+    )
+
+
 def _apply_patches_on_import() -> None:
     _patch_qwen3vl_pr3143_word_embeddings()
+    _patch_gpt_model_mtp_training()
+    _patch_qwen3vl_mtp_training()
 
 
 _apply_patches_on_import()
