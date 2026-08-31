@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from typing import Any
 
 import torch
@@ -10,6 +10,12 @@ from megatron.core import parallel_state as mpu
 from megatron.core.packed_seq_params import PackedSeqParams
 
 from areal.engine.core.model import SequencePackingMode
+from areal.models.mcore.mtp_training import (
+    MTPTrainingSupervision,
+    build_mtp_supervision,
+    mtp_backbone_only_context,
+    mtp_supervision_context,
+)
 from areal.utils.data import (
     MicroBatchList,
     align_mb_list_sequences,
@@ -134,8 +140,7 @@ def split_packed_seqs_for_context_parallel(
     tensor: torch.Tensor,
     cu_seqlens: torch.Tensor,
 ) -> torch.Tensor:
-    """Split a 1D packed tensor using the same interleaved pattern as
-    preprocess_packed_seqs_context_parallel."""
+    """Split a packed ``[T, ...]`` tensor with the model's zigzag CP layout."""
     cp_size = mpu.get_context_parallel_world_size()
     cp_rank = mpu.get_context_parallel_rank()
     if cp_size <= 1:
@@ -145,7 +150,11 @@ def split_packed_seqs_for_context_parallel(
     batch_size = input_lens.shape[0]
     output_len = input_lens.sum().item() // cp_size
 
-    splitted = torch.zeros(output_len, dtype=tensor.dtype, device=tensor.device)
+    splitted = torch.zeros(
+        (output_len, *tensor.shape[1:]),
+        dtype=tensor.dtype,
+        device=tensor.device,
+    )
     for i in range(batch_size):
         seqlen = input_lens[i] // cp_size
         half_seqlen = seqlen // 2
@@ -367,6 +376,25 @@ def _reconstruct_padded_2d(
     return input_ids_2d, attention_mask, seq_lens, max_seqlen
 
 
+def _reconstruct_padded_values_2d(
+    values: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    max_seqlen: int,
+) -> torch.Tensor:
+    """Scatter packed values into the same padded layout as model input IDs."""
+
+    batch_size = cu_seqlens.shape[0] - 1
+    seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+    valid = torch.arange(max_seqlen, device=values.device)[None, :] < seq_lens[:, None]
+    padded = torch.zeros(
+        (batch_size, max_seqlen, *values.shape[1:]),
+        dtype=values.dtype,
+        device=values.device,
+    )
+    padded[valid] = values
+    return padded
+
+
 def _build_thd_packed_seq_params(
     cu_seqlens: torch.Tensor, max_seqlen: int
 ) -> PackedSeqParams:
@@ -391,7 +419,12 @@ def packed_context_parallel_forward(
     use_model_packed_seq: bool = False,
     fp32_output: bool | None = None,
     return_hidden_states: bool = False,
+    mtp_loss_mask: torch.Tensor | None = None,
+    mtp_loss_multiplier: float | torch.Tensor = 1.0,
+    disable_mtp: bool = False,
 ):
+    if mtp_loss_mask is not None and disable_mtp:
+        raise ValueError("MTP supervision and disable_mtp are mutually exclusive.")
     input_ids = input_["input_ids"]
     position_ids = input_.get("position_ids", None)
     cu_seqlens = input_.get("cu_seqlens", None)
@@ -401,6 +434,18 @@ def packed_context_parallel_forward(
     attention_mask = input_.get("attention_mask", None)
     tree_triton_data = input_.get("tree_triton_data", None)
     packed_seq_params = None
+    mtp_supervision = None
+    if mtp_loss_mask is not None:
+        if use_model_packed_seq:
+            raise NotImplementedError(
+                "MTP training does not support the model-owned THD layout."
+            )
+        mtp_supervision = build_mtp_supervision(
+            input_ids,
+            mtp_loss_mask,
+            cu_seqlens,
+            loss_multiplier=mtp_loss_multiplier,
+        )
 
     # Whether this particular microbatch carries vision tensors. Gates only
     # the vision kwargs and the dense-mask exception below — never the
@@ -408,6 +453,11 @@ def packed_context_parallel_forward(
     has_vision_inputs = is_vision_model and any(
         key in input_ for key in _VLM_FORWARD_KEYS
     )
+    if mtp_supervision is not None and has_vision_inputs:
+        raise NotImplementedError(
+            "MTP auxiliary training supports text-only batches; multimodal "
+            "inputs are not supported."
+        )
     # Padded-vs-packed routing is keyed on the MODEL type:
     # - VLM models cannot consume the wrapper-packed [1, total_len] layout
     #   (their internal packing needs a per-sequence 2D mask — mbridge
@@ -447,12 +497,51 @@ def packed_context_parallel_forward(
                 input_ids, cu_seqlens
             )
             input_ids = input_ids.contiguous()
+            if position_ids is not None:
+                position_ids = split_packed_seqs_for_context_parallel(
+                    position_ids,
+                    cu_seqlens,
+                ).contiguous()
+            if mtp_supervision is not None:
+                mtp_supervision = MTPTrainingSupervision(
+                    labels=split_packed_seqs_for_context_parallel(
+                        mtp_supervision.labels,
+                        cu_seqlens,
+                    )
+                    .unsqueeze(0)
+                    .contiguous(),
+                    loss_mask=split_packed_seqs_for_context_parallel(
+                        mtp_supervision.loss_mask,
+                        cu_seqlens,
+                    )
+                    .unsqueeze(0)
+                    .contiguous(),
+                    loss_multiplier=mtp_supervision.loss_multiplier,
+                    context_parallel=mpu.get_context_parallel_world_size() > 1,
+                    packed=True,
+                )
         else:
             # VLM and BSHD-only models expect [B, S] padded input.
             input_ids, attention_mask, seq_lens, max_seqlen = _reconstruct_padded_2d(
                 input_ids, cu_seqlens, input_.get("max_seqlen")
             )
             padded_repack_info = (cu_seqlens, seq_lens, max_seqlen)
+            if mtp_supervision is not None:
+                mtp_supervision = MTPTrainingSupervision(
+                    labels=_reconstruct_padded_values_2d(
+                        mtp_supervision.labels,
+                        cu_seqlens,
+                        max_seqlen,
+                    ).contiguous(),
+                    loss_mask=_reconstruct_padded_values_2d(
+                        mtp_supervision.loss_mask,
+                        cu_seqlens,
+                        max_seqlen,
+                    ).contiguous(),
+                    loss_multiplier=mtp_supervision.loss_multiplier,
+                    context_parallel=False,
+                    packed=False,
+                )
 
     # Every VLM forward is mask-free (attention_mask=None): the model
     # computes (m)RoPE positions internally, each batch slot holds one
@@ -497,7 +586,13 @@ def packed_context_parallel_forward(
         }
         if fp32_output is not None:
             model_kwargs["fp32_output"] = fp32_output
-        with _hidden_states_output(model, return_hidden_states):
+        if mtp_supervision is not None:
+            mtp_scope = mtp_supervision_context(mtp_supervision)
+        elif disable_mtp:
+            mtp_scope = mtp_backbone_only_context()
+        else:
+            mtp_scope = nullcontext()
+        with mtp_scope, _hidden_states_output(model, return_hidden_states):
             output = model(**model_kwargs)
     except Exception as e:
         raise RuntimeError(

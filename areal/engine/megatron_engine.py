@@ -95,6 +95,10 @@ from areal.models.mcore.hf_save import (
     save_critic_value_head,
     save_weights_to_hf_with_mbridge_fast,
 )
+from areal.models.mcore.mtp_training import (
+    collect_mtp_metrics,
+    compute_mtp_loss_multiplier,
+)
 from areal.models.mcore.registry import (
     make_hf_and_mcore_config,
     make_mcore_model,
@@ -1141,8 +1145,27 @@ class MegatronEngine(TrainEngine):
         ],
         forward_only: bool = False,
         gather_cp_output: bool = False,
+        mtp_loss_multiplier_fn: Callable[[dict[str, Any]], float | torch.Tensor]
+        | None = None,
     ) -> None:
         self._ensure_ready()
+
+        mtp_training = self.mcore_config.enable_mtp_training
+        if mtp_training:
+            if self.config.is_critic:
+                raise ValueError("MTP auxiliary training is supported only for actors.")
+            if self.enable_tree_training:
+                raise NotImplementedError(
+                    "MTP auxiliary training does not support tree training."
+                )
+            if self.use_model_packed_seq:
+                raise NotImplementedError(
+                    "MTP auxiliary training does not support model-owned THD."
+                )
+            if not forward_only and mtp_loss_multiplier_fn is None:
+                raise ValueError(
+                    "MTP auxiliary training requires a loss multiplier function."
+                )
 
         def forward_step(batch_iter, model):
             source_mb: MicroBatchItem = next(batch_iter)
@@ -1201,6 +1224,11 @@ class MegatronEngine(TrainEngine):
             has_vision_inputs = any(
                 _is_multi_modal_payload_key(key) for key in mb_input.padded_mb
             )
+            if mtp_training and not forward_only and has_vision_inputs:
+                raise NotImplementedError(
+                    "MTP auxiliary training supports text-only batches; "
+                    "multimodal inputs are not supported."
+                )
             if use_chunked_lm_head and (
                 has_vision_inputs or (self.is_vision_model and not self.use_padded_seq)
             ):
@@ -1208,6 +1236,18 @@ class MegatronEngine(TrainEngine):
                     "chunked LM Head loss does not support vision inputs; padded "
                     "BSHD is supported only for text-only models such as Qwen3.5"
                 )
+
+            mtp_loss_mask = None
+            mtp_loss_multiplier: float | torch.Tensor = 1.0
+            if mtp_training and not forward_only:
+                mtp_loss_mask = mb_input.padded_mb.get("loss_mask")
+                if mtp_loss_mask is None:
+                    raise ValueError(
+                        "MTP auxiliary training requires loss_mask in every "
+                        "padded microbatch."
+                    )
+                assert mtp_loss_multiplier_fn is not None
+                mtp_loss_multiplier = mtp_loss_multiplier_fn(mb_input.orig_mb)
 
             output = packed_context_parallel_forward(
                 model,
@@ -1221,6 +1261,9 @@ class MegatronEngine(TrainEngine):
                     self.dtype,
                 ),
                 return_hidden_states=use_chunked_lm_head,
+                mtp_loss_mask=mtp_loss_mask,
+                mtp_loss_multiplier=mtp_loss_multiplier,
+                disable_mtp=mtp_training and forward_only,
             )
 
             if use_chunked_lm_head:
@@ -1411,15 +1454,33 @@ class MegatronEngine(TrainEngine):
                 loss_multiplier=loss_multiplier,
             )
 
+        def mtp_loss_multiplier_fn(
+            inputs: dict[str, Any],
+        ) -> float | torch.Tensor:
+            local_weight = loss_weight_fn(inputs)
+            return compute_mtp_loss_multiplier(
+                local_weight,
+                total_loss_weight,
+                loss_multiplier,
+                mpu.get_context_parallel_world_size(),
+            )
+
         self.forward_backward_batch(
             mb_list,
             process_output,
             forward_only=False,
+            mtp_loss_multiplier_fn=(
+                mtp_loss_multiplier_fn
+                if self.mcore_config.enable_mtp_training
+                else None
+            ),
         )
 
         # Step 4: Optimizer step
         stats = self.optimizer_step()
         stats["num_micro_batches"] = len(mb_list.mbs)
+        if self.mcore_config.enable_mtp_training:
+            stats.update(collect_mtp_metrics(len(mb_list.mbs)))
         return stats
 
     @torch.no_grad()
