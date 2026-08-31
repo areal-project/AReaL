@@ -20,6 +20,7 @@ from areal.models.mcore.bailing_moe import (
     hf_to_mcore_config_bailing_moe,
     make_mcore_layer_specs_bailing_moe,
 )
+from areal.models.mcore.mtp_training import configure_mtp_training
 from areal.models.mcore.qwen3 import (
     hf_to_mcore_config_qwen3_dense,
     make_mcore_layer_specs_qwen3_dense,
@@ -423,6 +424,8 @@ def make_mcore_model(
         return models
 
     if bridge is not None and bridge_type == "megatron-bridge":
+        if mcore_config.enable_mtp_training and is_critic:
+            raise ValueError("MTP auxiliary training is supported only for actors.")
         provider = bridge.to_megatron_provider(load_weights=False)
         vpp_size = mcore_config.virtual_pipeline_parallel_size or 0
 
@@ -458,6 +461,8 @@ def make_mcore_model(
                 raise ValueError(
                     "megatron.enable_mtp=True but the model has no MTP layers."
                 )
+            if mcore_config.enable_mtp_training:
+                provider.mtp_loss_scaling_factor = mcore_config.mtp_loss_scaling_factor
         elif has_mtp:
             logger.warning(
                 "Dropping MTP head (mtp_num_layers=%s -> None); not used in RL and not "
@@ -522,6 +527,8 @@ def make_mcore_model(
                 _replace_output_layer_with_value_head(_model, tf_config)
         else:
             _configure_actor_output_layers(models, mcore_config)
+            if mcore_config.enable_mtp_training:
+                configure_mtp_training(models)
 
         return models
 

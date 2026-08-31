@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import math
 import os
 import warnings
 from dataclasses import MISSING as dataclass_missing
@@ -1104,6 +1105,25 @@ class MegatronEngineConfig:
         },
     )
 
+    enable_mtp_training: bool = field(
+        default=False,
+        metadata={
+            "help": "Train the retained MTP head without changing logits. Requires "
+            "enable_mtp=True and bridge_type='megatron-bridge'; updates only MTP "
+            "parameters. Wrapper-packed text THD supports CP with CP-aware MCore. "
+            "Pinned Qwen3.5/GDN is CP=1. Multimodal batches, model-owned THD, and "
+            "tree training are unsupported.",
+        },
+    )
+
+    mtp_loss_scaling_factor: float = field(
+        default=0.1,
+        metadata={
+            "help": "Weight of the auxiliary MTP objective relative to the "
+            "main training loss.",
+        },
+    )
+
     def __post_init__(self) -> None:
         if self.lm_head_loss_chunk_size < 0:
             raise ValueError(
@@ -1120,6 +1140,20 @@ class MegatronEngineConfig:
             )
         if self.lm_head_loss_chunk_size > 0 and self.enable_mtp:
             raise ValueError("lm_head_loss_chunk_size does not support enable_mtp=True")
+        if self.enable_mtp_training and not self.enable_mtp:
+            raise ValueError("enable_mtp_training requires enable_mtp=True")
+        if self.enable_mtp_training and self.bridge_type != "megatron-bridge":
+            raise ValueError(
+                "enable_mtp_training requires bridge_type='megatron-bridge'"
+            )
+        if (
+            not math.isfinite(self.mtp_loss_scaling_factor)
+            or self.mtp_loss_scaling_factor < 0
+        ):
+            raise ValueError(
+                "mtp_loss_scaling_factor must be finite and non-negative, got "
+                f"{self.mtp_loss_scaling_factor}"
+            )
 
 
 class SchedulingStrategyType(str, Enum):
