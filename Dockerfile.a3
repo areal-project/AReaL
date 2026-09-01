@@ -15,17 +15,22 @@
 # This file is a part of the AReaL project.
 #
 
-FROM quay.io/ascend/cann:9.0.1-a3-ubuntu22.04-py3.11
+FROM quay.io/ascend/cann:9.1.0-a3-ubuntu22.04-py3.12
 
-ARG MEGATRON_TAG=core_v0.16.1
-ARG MINDSPEED_BRANCH=core_r0.16.0
-ARG MINDSPEED_COMMIT=79626c1380b78f5cea8a971f265a49f96b04d416
-# Must be pinned to this specific commit: megatron-core 0.16.x compatible. The v0.4.x tags pin
-# megatron-core 0.17.1, which MindSpeed core_r0.16.0 does not support.
-ARG MEGATRON_BRIDGE_COMMIT=de93536e
+ARG CANN_VERSION=9.1.0
+ARG MEGATRON_BRANCH=core_r0.18.0
+ARG MEGATRON_COMMIT=dc0ee41ada177d4c74ba46bb501bba5967264815
+ARG MINDSPEED_BRANCH=core_r0.18.0
+ARG MINDSPEED_COMMIT=9dec7d14495f82c16e4e19566c80a524b39fd023
+ARG MEGATRON_ADAPTOR_BRANCH=core_r0.18.0
+ARG MEGATRON_ADAPTOR_COMMIT=f519fce6c0d073f8daea8e18e871dcd9ed7ec5c8
+ARG TRANSFORMER_ENGINE_NPU_BRANCH=main
+ARG TRANSFORMER_ENGINE_NPU_COMMIT=7087393d894c1f0c5103c01c162854c65008303f
+ARG MEGATRON_BRIDGE_TAG=v0.5.1
+ARG MEGATRON_BRIDGE_COMMIT=5cb3444c43f7499cf3872b2d46870cf8bc2e00ce
 ARG VLLM_TAG=v0.23.0
 ARG VLLM_ASCEND_BRANCH=releases/v0.23.0
-ARG VLLM_ASCEND_COMMIT=eaefc536d4475808e18b0c12b42c7710bc4bccb9
+ARG VLLM_ASCEND_COMMIT=84f60b825aa83b78b9a0b46047c5fefc2876c211
 ARG ASCEND_INSTALL_PATH=/usr/local/Ascend
 ARG SOC_VERSION=ascend910_9391
 
@@ -36,7 +41,7 @@ RUN apt-get update -y && \
     update-alternatives --install /usr/bin/clang clang /usr/bin/clang-15 20 && \
     update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-15 20 && \
     apt-get clean && rm -rf /var/lib/apt/lists/* && \
-    python3 -m pip install -U pip "setuptools==80.10.2" uv && \
+    python3 -m pip install -U pip "setuptools==79.0.1" uv && \
     python3 -m pip cache purge
 
 # Sleep/wake bugfixes plus exact-token generation transport for the pinned vLLM /
@@ -47,17 +52,16 @@ COPY patches/vllm.v0.23.0.patch \
      patches/vllm.v0.23.0-exact-token-validation.patch \
      patches/vllm-ascend.v0.23.0.patch /areal-workspace/patches/
 
-# Install vLLM + vllm-ascend (torch-npu comes from vllm-ascend requirements.txt).
-# The torch-npu 2.10.0.post2 P2P regression is worked around at runtime in
-# areal/utils/torch_npu_compat.py.
+# Install vLLM + vllm-ascend. The latter pins torch 2.10.0,
+# torch-npu 2.10.0.post4, and triton-ascend 3.2.2.
 # Patches are applied after each editable install, never before: a dirty tree makes
 # setuptools-scm report 0.23.1.dev0 instead of 0.23.0, which flips vllm-ascend's
 # vllm_version_is("0.23.0") gates onto their 0.24+ paths. The recorded version is
 # asserted so any regression fails the build, not the first rollout of a training run.
-RUN export PIP_EXTRA_INDEX_URL=https://triton-ascend.osinfra.cn/pypi/simple/ && \
-    export PIP_TRUSTED_HOST=triton-ascend.osinfra.cn && \
+RUN export PIP_EXTRA_INDEX_URL="https://mirrors.huaweicloud.com/ascend/repos/pypi https://download.pytorch.org/whl/cpu https://triton-ascend.osinfra.cn/pypi/simple/" && \
+    export PIP_TRUSTED_HOST="mirrors.huaweicloud.com triton-ascend.osinfra.cn download.pytorch.org download-r2.pytorch.org" && \
     export SOC_VERSION=${SOC_VERSION} && \
-    export LD_LIBRARY_PATH=${ASCEND_INSTALL_PATH}/cann-9.0.1/aarch64-linux/devlib/linux/aarch64:$LD_LIBRARY_PATH && \
+    export LD_LIBRARY_PATH=${ASCEND_INSTALL_PATH}/cann-${CANN_VERSION}/aarch64-linux/devlib/linux/aarch64:$LD_LIBRARY_PATH && \
     . ${ASCEND_INSTALL_PATH}/ascend-toolkit/set_env.sh && \
     . ${ASCEND_INSTALL_PATH}/nnal/atb/set_env.sh && \
     git clone --depth 1 --branch ${VLLM_TAG} https://github.com/vllm-project/vllm.git /areal-workspace/vllm && \
@@ -74,23 +78,36 @@ RUN export PIP_EXTRA_INDEX_URL=https://triton-ascend.osinfra.cn/pypi/simple/ && 
     pip install -r requirements.txt && \
     COMPILE_CUSTOM_KERNELS=1 pip install --no-build-isolation --no-deps -v -e . && \
     git apply -v /areal-workspace/patches/vllm-ascend.v0.23.0.patch && \
+    python3 -c "from importlib.metadata import version; from packaging.version import Version; expected = {'torch': '2.10.0', 'torch-npu': '2.10.0.post4', 'triton-ascend': '3.2.2'}; actual = {name: Version(version(name)).public for name in expected}; assert actual == expected, (actual, expected)" && \
     python3 -m pip cache purge
 
-# Install Megatron & MindSpeed (megatron-core lives inside the MindSpeed tree).
-RUN git clone --depth 1 --branch ${MEGATRON_TAG} https://github.com/NVIDIA/Megatron-LM.git /areal-workspace/Megatron-LM && \
+# Install the MCore 0.18 NPU stack in its required MA -> TENPU -> MindSpeed order.
+RUN git clone --branch ${MEGATRON_BRANCH} https://github.com/NVIDIA/Megatron-LM.git /areal-workspace/Megatron-LM && \
+    git -C /areal-workspace/Megatron-LM checkout ${MEGATRON_COMMIT} && \
+    git clone --branch ${MEGATRON_ADAPTOR_BRANCH} https://gitcode.com/Ascend/MegatronAdaptor.git /areal-workspace/MegatronAdaptor && \
+    git -C /areal-workspace/MegatronAdaptor checkout ${MEGATRON_ADAPTOR_COMMIT} && \
+    python3 -m pip install -e /areal-workspace/MegatronAdaptor --no-deps && \
+    git clone --branch ${TRANSFORMER_ENGINE_NPU_BRANCH} https://gitcode.com/Ascend/TransformerEngineNPU.git /areal-workspace/TransformerEngineNPU && \
+    git -C /areal-workspace/TransformerEngineNPU checkout ${TRANSFORMER_ENGINE_NPU_COMMIT} && \
+    python3 -m pip install --no-build-isolation --no-deps -e /areal-workspace/TransformerEngineNPU && \
     git clone --branch ${MINDSPEED_BRANCH} https://gitcode.com/Ascend/MindSpeed.git /areal-workspace/MindSpeed && \
     git -C /areal-workspace/MindSpeed checkout ${MINDSPEED_COMMIT} && \
-    cp -r /areal-workspace/Megatron-LM/megatron /areal-workspace/MindSpeed/megatron && \
     python3 -m pip install -e /areal-workspace/MindSpeed --no-deps && \
     python3 -m pip cache purge
 
-# Install AReaL deps. No --upgrade: keep vllm-ascend's torch/torch-npu/triton.
+# Install AReaL deps without re-resolving vllm-ascend's torch stack. Megatron-Bridge
+# 0.5.1 requires Transformers 5.8.x; the NPU manifest stays on vLLM's 5.5.4.
 RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=type=bind,source=pyproject.npu.toml,target=pyproject.toml \
-    UV_HTTP_TIMEOUT=300 uv pip install -r pyproject.toml --system --group dev
+    UV_HTTP_TIMEOUT=300 uv pip install -r pyproject.toml --system --group dev && \
+    python3 -m pip install --no-cache-dir --no-deps \
+        "transformers==5.8.1" \
+        "nvidia-modelopt==0.44.0" \
+        "nvdlfw-inspect==0.2.2" \
+        "setuptools==79.0.1"
 
 # Install Megatron-Bridge
-RUN git clone https://github.com/NVIDIA-NeMo/Megatron-Bridge.git /areal-workspace/Megatron-Bridge && \
+RUN git clone --branch ${MEGATRON_BRIDGE_TAG} https://github.com/NVIDIA-NeMo/Megatron-Bridge.git /areal-workspace/Megatron-Bridge && \
     git -C /areal-workspace/Megatron-Bridge checkout ${MEGATRON_BRIDGE_COMMIT} && \
     python3 -m pip cache purge
 
@@ -100,7 +117,11 @@ RUN cp /AReaL/pyproject.npu.toml /AReaL/pyproject.toml && \
     uv pip install --no-deps -e /AReaL --system && \
     python3 -c "import importlib.metadata as m, tomllib; expected = tomllib.load(open('/AReaL/pyproject.toml', 'rb'))['project']['version']; actual = m.version('areal'); assert actual == expected, f'areal reports {actual}, expected {expected}'"
 
-ENV PYTHONPATH=/areal-workspace/MindSpeed:/areal-workspace/Megatron-Bridge/src:$PYTHONPATH
+ENV PYTHONPATH=/areal-workspace/MegatronAdaptor:/areal-workspace/TransformerEngineNPU:/areal-workspace/MindSpeed:/areal-workspace/Megatron-LM:/areal-workspace/Megatron-Bridge/src:$PYTHONPATH
+
+# Full imports require libascend_hal.so from the host driver mount at runtime.
+RUN python3 -c "from importlib.metadata import version; from packaging.version import Version; expected = {'torch': '2.10.0', 'torch-npu': '2.10.0.post4', 'triton-ascend': '3.2.2', 'transformers': '5.8.1', 'nvidia-modelopt': '0.44.0', 'nvdlfw-inspect': '0.2.2', 'setuptools': '79.0.1'}; actual = {name: Version(version(name)).public for name in expected}; assert actual == expected, (actual, expected)" && \
+    python3 -c "from importlib.util import find_spec; modules = ('megatron_adaptor', 'transformer_engine', 'mindspeed', 'mbridge', 'megatron'); missing = [name for name in modules if find_spec(name) is None]; assert not missing, missing"
 
 ENV HCCL_IF_BASE_PORT=63000 \
     HCCL_NPU_SOCKET_PORT_RANGE="62100-62350"
