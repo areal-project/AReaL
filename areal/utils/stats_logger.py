@@ -12,8 +12,10 @@ from tensorboardX import SummaryWriter
 
 from areal.api import FinetuneSpec
 from areal.api.cli_args import BaseExperimentConfig, StatsLoggerConfig
+from areal.infra.platforms import is_npu_available
 from areal.utils import logging
 from areal.utils.printing import tabulate_stats
+from areal.utils.swanlab_ascend import install_dcmi_ascend_collector
 from areal.version import version_info
 
 logger = logging.getLogger("StatsLogger", "system")
@@ -87,6 +89,15 @@ class StatsLogger:
             else:
                 swanlab.login()
 
+        # SwanLab's hardware monitor runs even when mode is "disabled" (it only
+        # stops uploading), so this is installed regardless of mode. If SwanLab's
+        # internals have moved and its npu-smi polling cannot be neutralized,
+        # switch the monitor off rather than let the forking collector hang
+        # shutdown.
+        hardware_monitor = True
+        if is_npu_available:
+            hardware_monitor = install_dcmi_ascend_collector() != "unavailable"
+
         swanlab_config = self.config.swanlab
         swanlab.init(
             project=swanlab_config.project or self.config.experiment_name,
@@ -95,7 +106,9 @@ class StatsLogger:
             config=exp_config_dict,
             logdir=self.get_log_path(self.config),
             mode=swanlab_config.mode,
-            settings=swanlab.Settings(log_proxy_type="none"),
+            settings=swanlab.Settings(
+                log_proxy_type="none", hardware_monitor=hardware_monitor
+            ),
         )
 
         # trackio init

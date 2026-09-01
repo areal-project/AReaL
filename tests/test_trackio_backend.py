@@ -7,6 +7,7 @@ from areal.api.cli_args import (
     StatsLoggerConfig,
     TrackioConfig,
 )
+from areal.utils.stats_logger import StatsLogger
 
 
 class TestTrackioConfig:
@@ -202,8 +203,97 @@ class TestStatsLoggerTrackioIntegration:
         config.stats_logger.swanlab.mode = "cloud"
         StatsLogger(config, _make_ft_spec())
 
-        mock_swanlab.Settings.assert_called_once_with(log_proxy_type="none")
+        mock_swanlab.Settings.assert_called_once()
+        assert mock_swanlab.Settings.call_args.kwargs["log_proxy_type"] == "none"
         assert (
             mock_swanlab.init.call_args.kwargs["settings"]
             is mock_swanlab.Settings.return_value
         )
+
+
+class TestStatsLoggerAscendCollectorWiring:
+    """StatsLogger should only touch SwanLab's Ascend collector on NPU hosts."""
+
+    @patch("areal.utils.stats_logger.install_dcmi_ascend_collector")
+    @patch("areal.utils.stats_logger.is_npu_available", True)
+    @patch("areal.utils.stats_logger.trackio")
+    @patch("areal.utils.stats_logger.swanlab")
+    @patch("areal.utils.stats_logger.dist")
+    def test_called_on_npu(self, mock_dist, mock_swanlab, mock_trackio, mock_install):
+        mock_dist.is_initialized.return_value = False
+
+        from areal.utils.stats_logger import StatsLogger
+
+        StatsLogger(_make_test_config(), _make_ft_spec())
+        mock_install.assert_called_once()
+
+    @patch("areal.utils.stats_logger.install_dcmi_ascend_collector")
+    @patch("areal.utils.stats_logger.is_npu_available", False)
+    @patch("areal.utils.stats_logger.trackio")
+    @patch("areal.utils.stats_logger.swanlab")
+    @patch("areal.utils.stats_logger.dist")
+    def test_not_called_off_npu(
+        self, mock_dist, mock_swanlab, mock_trackio, mock_install
+    ):
+        mock_dist.is_initialized.return_value = False
+
+        from areal.utils.stats_logger import StatsLogger
+
+        StatsLogger(_make_test_config(), _make_ft_spec())
+        mock_install.assert_not_called()
+
+    @patch("areal.utils.stats_logger.install_dcmi_ascend_collector")
+    @patch("areal.utils.stats_logger.is_npu_available", True)
+    @patch("areal.utils.stats_logger.trackio")
+    @patch("areal.utils.stats_logger.swanlab")
+    @patch("areal.utils.stats_logger.dist")
+    def test_installed_even_when_swanlab_mode_is_disabled(
+        self, mock_dist, mock_swanlab, mock_trackio, mock_install
+    ):
+        """Test that the install happens on NPU even when SwanLab is disabled.
+
+        SwanLab's "disabled" mode only stops uploading -- the hardware monitor
+        thread still runs. Gating the install on mode would leave the forking
+        npu-smi collector active on the default config and hang shutdown.
+        """
+        mock_dist.is_initialized.return_value = False
+        mock_install.return_value = "dcmi"
+        config = _make_test_config()
+        assert config.stats_logger.swanlab.mode == "disabled"
+
+        StatsLogger(config, _make_ft_spec())
+
+        mock_install.assert_called_once()
+        assert mock_swanlab.Settings.call_args.kwargs["hardware_monitor"] is True
+
+    @patch("areal.utils.stats_logger.install_dcmi_ascend_collector")
+    @patch("areal.utils.stats_logger.is_npu_available", True)
+    @patch("areal.utils.stats_logger.trackio")
+    @patch("areal.utils.stats_logger.swanlab")
+    @patch("areal.utils.stats_logger.dist")
+    def test_monitor_disabled_when_swanlab_internals_move(
+        self, mock_dist, mock_swanlab, mock_trackio, mock_install
+    ):
+        """Test that an un-neutralizable SwanLab turns hardware monitoring off."""
+        mock_dist.is_initialized.return_value = False
+        mock_install.return_value = "unavailable"
+
+        StatsLogger(_make_test_config(), _make_ft_spec())
+
+        assert mock_swanlab.Settings.call_args.kwargs["hardware_monitor"] is False
+
+    @patch("areal.utils.stats_logger.install_dcmi_ascend_collector")
+    @patch("areal.utils.stats_logger.is_npu_available", True)
+    @patch("areal.utils.stats_logger.trackio")
+    @patch("areal.utils.stats_logger.swanlab")
+    @patch("areal.utils.stats_logger.dist")
+    def test_monitor_kept_on_when_collector_only_dropped(
+        self, mock_dist, mock_swanlab, mock_trackio, mock_install
+    ):
+        """Test that dropping only the Ascend collector keeps the other charts."""
+        mock_dist.is_initialized.return_value = False
+        mock_install.return_value = "dropped"
+
+        StatsLogger(_make_test_config(), _make_ft_spec())
+
+        assert mock_swanlab.Settings.call_args.kwargs["hardware_monitor"] is True
