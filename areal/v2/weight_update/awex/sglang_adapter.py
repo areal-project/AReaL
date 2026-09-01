@@ -82,7 +82,31 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
         self._infer_to_train_device_mapping: dict | None = None
         self._dte_config = DTERuntimeConfig.from_env()
 
+    def _ensure_pair_state_fields(self) -> None:
+        """Initialize lifecycle fields for lightweight test construction too."""
+
+        if not hasattr(self, "_pair_states"):
+            self._pair_states = {}
+        if not hasattr(self, "_active_pair_name"):
+            self._active_pair_name = None
+        if not hasattr(self, "_colocate_pair_states"):
+            self._colocate_pair_states = {}
+        for name, value in (
+            ("_weights_update_group", None),
+            ("_weights_update_group_gloo", None),
+            ("_transfer_plan", None),
+            ("_transfer_rank", None),
+            ("_world_size", None),
+            ("_separation_delta_transport", None),
+            ("_separation_wire_dtypes", None),
+            ("_rank_info", None),
+            ("_parameters", None),
+        ):
+            if not hasattr(self, name):
+                setattr(self, name, value)
+
     def _capture_active_pair_state(self) -> AwexPairState:
+        self._ensure_pair_state_fields()
         return AwexPairState(
             weights_update_group=self._weights_update_group,
             control_group=self._weights_update_group_gloo,
@@ -109,6 +133,7 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
         self._parameters = None
 
     def _park_active_pair(self) -> None:
+        self._ensure_pair_state_fields()
         if self._active_pair_name is not None:
             self._pair_states[self._active_pair_name] = (
                 self._capture_active_pair_state()
@@ -117,6 +142,7 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
         self._clear_active_pair_state()
 
     def _activate_pair(self, pair_name: str) -> AwexPairState:
+        self._ensure_pair_state_fields()
         if self._active_pair_name == pair_name:
             state = self._capture_active_pair_state()
         else:
@@ -132,9 +158,7 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
             self._transfer_plan = state.transfer_plan
             self._transfer_rank = state.transfer_rank
             self._world_size = runtime.get("world_size")
-            self._separation_delta_transport = runtime.get(
-                "separation_delta_transport"
-            )
+            self._separation_delta_transport = runtime.get("separation_delta_transport")
             self._separation_wire_dtypes = runtime.get("separation_wire_dtypes")
             self._rank_info = runtime.get("rank_info")
             self._parameters = runtime.get("parameters")
@@ -439,7 +463,15 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
         train_world_size: int,
         num_engines: int,
     ) -> None:
+        self._ensure_pair_state_fields()
         if self._active_pair_name == pair_name:
+            if (
+                self._weights_update_group is None
+                or self._weights_update_group_gloo is None
+            ):
+                raise RuntimeError(
+                    f"AWEX pair {pair_name!r} is only partially initialized"
+                )
             logger.info("AWEX pair '%s' is already initialized", pair_name)
             return
         if pair_name in self._pair_states:
@@ -447,8 +479,6 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
                 f"AWEX pair {pair_name!r} is still registered; "
                 "teardown must complete before it can be reused"
             )
-        self._park_active_pair()
-        self._active_pair_name = pair_name
         if self._dte_config.enabled:
             validate_dte_world_size(world_size, infer_world_size, train_world_size)
 
@@ -468,9 +498,6 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
 
         engine_local_rank = pp_rank * tp_size + tp_rank
         global_rank = transfer_rank * per_engine_world + engine_local_rank
-        self._transfer_rank = global_rank
-        self._world_size = world_size
-
         infer_meta, train_meta = fetch_kv_metadata(kv_store_url, pair_name)
 
         builder = TransferPlanBuilder(
@@ -478,33 +505,62 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
             train_world_size=train_world_size,
             num_infer_engines=num_engines,
         )
-        self._transfer_plan = builder.build_local_transfer_plan(
+        transfer_plan = builder.build_local_transfer_plan(
             infer_meta, train_meta, global_transfer_rank=global_rank
         )
 
         os.environ["TORCHELASTIC_USE_AGENT_STORE"] = str(False)
-        self._weights_update_group = init_weights_update_group(
-            master_address=master_addr,
-            master_port=master_port,
-            rank=global_rank,
-            world_size=world_size,
-            group_name=f"awex_{pair_name}",
-            role="inference",
-        )
-        self._weights_update_group_gloo = init_weights_update_group(
-            master_address=master_addr,
-            master_port=master_port,
-            rank=global_rank,
-            world_size=world_size,
-            group_name=f"awex_{pair_name}_gloo",
-            backend="gloo",
-            role="inference",
-        )
-        if self._dte_config.enabled:
-            self._separation_wire_dtypes = synchronize_wire_dtypes(
-                self._transfer_plan,
-                self._weights_update_group_gloo,
+        weights_update_group = None
+        control_group = None
+        separation_wire_dtypes = None
+        try:
+            weights_update_group = init_weights_update_group(
+                master_address=master_addr,
+                master_port=master_port,
+                rank=global_rank,
+                world_size=world_size,
+                group_name=f"awex_{pair_name}",
+                role="inference",
             )
+            control_group = init_weights_update_group(
+                master_address=master_addr,
+                master_port=master_port,
+                rank=global_rank,
+                world_size=world_size,
+                group_name=f"awex_{pair_name}_gloo",
+                backend="gloo",
+                role="inference",
+            )
+            if self._dte_config.enabled:
+                separation_wire_dtypes = synchronize_wire_dtypes(
+                    transfer_plan,
+                    control_group,
+                )
+        except BaseException:
+            for group in (control_group, weights_update_group):
+                if group is None or not dist.is_initialized():
+                    continue
+                try:
+                    dist.destroy_process_group(group)
+                except Exception:
+                    logger.warning(
+                        "Failed to roll back a candidate AWEX group for pair %r",
+                        pair_name,
+                        exc_info=True,
+                    )
+            raise
+
+        self._park_active_pair()
+        self._weights_update_group = weights_update_group
+        self._weights_update_group_gloo = control_group
+        self._transfer_plan = transfer_plan
+        self._transfer_rank = global_rank
+        self._world_size = world_size
+        self._separation_delta_transport = None
+        self._separation_wire_dtypes = separation_wire_dtypes
+        self._rank_info = None
+        self._parameters = None
+        self._active_pair_name = pair_name
         logger.info(
             "Initialized AWEX weight update groups for pair=%s role=inference "
             "rank=%s world_size=%s nccl=awex_%s gloo=awex_%s_gloo",
@@ -665,6 +721,7 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
         )
 
     def teardown_weight_update_group(self, pair_name: str) -> None:
+        self._ensure_pair_state_fields()
         is_active = self._active_pair_name == pair_name
         if is_active:
             state = self._capture_active_pair_state()

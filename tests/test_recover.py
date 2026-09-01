@@ -446,9 +446,51 @@ class TestRecoverHandler:
                     weight_update_meta=weight_update_meta,
                 )
 
-            inference_engine.resume.assert_called_once_with()
+            inference_engine.resume.assert_not_called()
             controller.set_version.assert_not_called()
             inference_engine.set_version.assert_not_called()
+
+    def test_pre_mutation_weight_sync_failure_resumes_inference(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            handler = self._make_handler(tmpdir, "auto")
+            handler.freq_ctl = Mock()
+            handler._load_checkpoint = Mock()
+            controller = self._make_gateway_controller()
+            controller.connect_engine = Mock()
+            error = RuntimeError("preflight failed")
+            error.inference_weights_may_be_mutated = False
+            controller.update_weights = Mock(side_effect=error)
+            controller.set_version = Mock()
+            recover_info = SimpleNamespace(
+                last_step_info=SimpleNamespace(global_step=2, next=lambda: "step-3"),
+                saver_info={},
+                evaluator_info={},
+                stats_logger_info={},
+                dataloader_info={},
+                checkpoint_info={},
+                pipeline_info=None,
+            )
+            inference_engine = Mock()
+            weight_update_meta = Mock(type="awex", colocate=False)
+            weight_update_meta.with_version.return_value = Mock(version=3)
+
+            with (
+                patch(
+                    "areal.utils.recover.RecoverInfo.load", return_value=recover_info
+                ),
+                pytest.raises(RuntimeError, match="preflight failed"),
+            ):
+                handler.load(
+                    controller,
+                    Mock(),
+                    Mock(),
+                    Mock(),
+                    Mock(),
+                    inference_engine=inference_engine,
+                    weight_update_meta=weight_update_meta,
+                )
+
+            inference_engine.resume.assert_called_once_with()
 
 
 class TestRecoverInfoPipelineState:

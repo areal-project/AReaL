@@ -162,13 +162,37 @@ def test_inference_teardown_endpoint_dispatches_collectively():
     )
 
 
+def test_inference_memory_probe_dispatches_to_all_scheduler_ranks():
+    app = FastAPI()
+    rpc_proxy = MagicMock()
+    rpc_proxy.collective_rpc_with_result.return_value = [
+        {"rank": "tp=0", "nvml_used_bytes": 123}
+    ]
+    register_awex_endpoints(app, rpc_proxy)
+
+    response = TestClient(app).post(
+        "/awex/memory_probe",
+        json={"pair_names": ["actor-rollout-v1", "actor-rollout-v2"]},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "status": "ok",
+        "probes": [{"rank": "tp=0", "nvml_used_bytes": 123}],
+    }
+    rpc_proxy.collective_rpc_with_result.assert_called_once_with(
+        "awex_report_memory_probe",
+        pair_names=["actor-rollout-v1", "actor-rollout-v2"],
+    )
+
+
 def test_adapter_teardown_is_idempotent_and_pair_scoped():
     adapter = AwexFSDPAdapter(MagicMock())
     group_a = object()
     group_b = object()
     adapter._pair_states = {
-        "pair-a": AwexPairState(group_a, MagicMock(), 0),
-        "pair-b": AwexPairState(group_b, MagicMock(), 1),
+        "pair-a": AwexPairState(group_a, MagicMock(), MagicMock(), 0),
+        "pair-b": AwexPairState(group_b, MagicMock(), MagicMock(), 1),
     }
 
     with (
@@ -181,3 +205,34 @@ def test_adapter_teardown_is_idempotent_and_pair_scoped():
     destroy_group.assert_called_once_with(group_a)
     assert "pair-a" not in adapter._pair_states
     assert adapter._pair_states["pair-b"].weights_update_group is group_b
+
+
+def test_partial_awex_transfer_error_is_marked_unsafe_for_resume(monkeypatch):
+    calls, _ = _install_gateway_rpc_stubs(monkeypatch)
+    app, client = _create_gateway_client()
+
+    async def fail_after_inference_write(*args, **kwargs):
+        del args, kwargs
+        raise RuntimeError("inference rank wrote a partial payload")
+
+    monkeypatch.setattr(
+        gateway_app, "_awex_transfer_weights", fail_after_inference_write
+    )
+
+    with client:
+        assert (
+            client.post(
+                "/connect", json=CONNECT_BODY, headers=ADMIN_HEADERS
+            ).status_code
+            == 200
+        )
+        response = client.post(
+            "/update_weights",
+            json={"pair_name": CONNECT_BODY["pair_name"], "version": 1},
+            headers=ADMIN_HEADERS,
+        )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "error"
+    assert response.json()["inference_weights_may_be_mutated"] is True
+    assert calls

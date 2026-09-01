@@ -375,6 +375,7 @@ class RecoverHandler:
                 versioned_meta = weight_update_meta.with_version(recovery_version)
                 update_engine.connect_engine(inference_engine, versioned_meta)
                 inference_engine.pause()
+                should_resume_inference = True
                 try:
                     # AWEX colocate transfer requires the full engine-level
                     # pause/offload protocol, not just the controller pause. The
@@ -398,10 +399,23 @@ class RecoverHandler:
                         for name, engine_ in normalized_engine.items():
                             self._load_checkpoint(engine_, name=name)
                     update_engine.update_weights(versioned_meta)
+                except BaseException as exc:
+                    # A transfer error is unsafe by default: inference may have
+                    # applied only part of the payload.  The controller can
+                    # explicitly mark errors that occurred before any mutation.
+                    should_resume_inference = not getattr(
+                        exc, "inference_weights_may_be_mutated", True
+                    )
+                    raise
                 finally:
-                    # Always resume: leaving rollout paused after a failed
-                    # checkpoint load or transfer would hang every later step.
-                    inference_engine.resume()
+                    if should_resume_inference:
+                        inference_engine.resume()
+                    else:
+                        logger.critical(
+                            "Recovery weight synchronization may have partially "
+                            "mutated inference weights; leaving inference paused "
+                            "until a known-good recovery succeeds"
+                        )
                 update_engine.set_version(recovery_version)
                 inference_engine.set_version(recovery_version)
             return recover_info

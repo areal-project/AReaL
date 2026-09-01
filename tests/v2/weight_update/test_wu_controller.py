@@ -12,6 +12,7 @@ from areal.v2.weight_update.controller.config import (
 )
 from areal.v2.weight_update.controller.controller import (
     WeightUpdateController,
+    WeightUpdateError,
 )
 from areal.v2.weight_update.gateway.config import WeightUpdateResult
 
@@ -160,8 +161,28 @@ class TestUpdateWeights:
             },
         )
 
-        with pytest.raises(RuntimeError, match="collective failed"):
+        with pytest.raises(WeightUpdateError, match="collective failed") as exc_info:
             ctrl.update_weights(version=5)
+
+        assert exc_info.value.inference_weights_may_be_mutated is True
+
+    def test_update_weights_preserves_safe_pre_mutation_status(self, ctrl):
+        ctrl._pair_name = "pair0"
+        ctrl._session.post.return_value = _mock_response(
+            200,
+            {
+                "status": "error",
+                "version": 5,
+                "duration_ms": 12.0,
+                "error": "preflight failed",
+                "inference_weights_may_be_mutated": False,
+            },
+        )
+
+        with pytest.raises(WeightUpdateError) as exc_info:
+            ctrl.update_weights(version=5)
+
+        assert exc_info.value.inference_weights_may_be_mutated is False
 
     def test_update_weights_raises_when_not_connected(self, ctrl):
         with pytest.raises(RuntimeError, match="Not connected"):

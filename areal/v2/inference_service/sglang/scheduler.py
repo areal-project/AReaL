@@ -57,6 +57,7 @@ class AwexSchedulerBridge:
         methods = [
             "awex_report_weight_meta",
             "awex_report_parallelism",
+            "awex_report_memory_probe",
             "awex_init_weights_update_group",
             "awex_execute_weight_update",
             "awex_batch_isend_irecv",
@@ -102,6 +103,33 @@ class AwexSchedulerBridge:
 
     def awex_report_parallelism(self) -> None:
         self._push_result(self._require_adapter().parallelism_strategy)
+
+    def awex_report_memory_probe(self, pair_names: list[str]) -> None:
+        from areal.v2.weight_update.memory_probe import collect_awex_memory_probe
+
+        scheduler = self._scheduler
+        rank = (
+            f"dp={getattr(scheduler, 'dp_rank', 0)} "
+            f"pp={getattr(scheduler, 'pp_rank', 0)} "
+            f"tp={getattr(scheduler, 'tp_rank', 0)}"
+        )
+        local_probe = collect_awex_memory_probe(
+            role="inference",
+            pair_names=pair_names,
+            rank=rank,
+        )
+        if dist.is_available() and dist.is_initialized():
+            # The default SGLang group covers all local TP/PP/DP scheduler
+            # ranks.  Reporting only the TP group would miss PP/DP workers and
+            # can leave a stale PUSH result from another rank.
+            world_size = dist.get_world_size()
+            probes: list[dict[str, Any]] = [{} for _ in range(world_size)]
+            dist.all_gather_object(probes, local_probe)
+            if dist.get_rank() == 0:
+                self._push_result(probes)
+            return
+
+        self._push_result([local_probe])
 
     def awex_init_weights_update_group(self, **kwargs: Any) -> None:
         self._require_adapter().init_weight_update_group(**kwargs)

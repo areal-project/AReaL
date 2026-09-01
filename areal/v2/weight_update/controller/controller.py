@@ -20,6 +20,19 @@ from areal.v2.weight_update.gateway.config import WeightUpdateResult
 logger = logging.getLogger("WeightUpdateController")
 
 
+class WeightUpdateError(RuntimeError):
+    """A gateway-reported update failure with its inference safety status."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        inference_weights_may_be_mutated: bool,
+    ) -> None:
+        super().__init__(message)
+        self.inference_weights_may_be_mutated = inference_weights_may_be_mutated
+
+
 class WeightUpdateController:
     def __init__(self, config: WeightUpdateControllerConfig | None = None) -> None:
         self.config = config or WeightUpdateControllerConfig()
@@ -172,11 +185,17 @@ class WeightUpdateController:
             version=data["version"],
             duration_ms=data["duration_ms"],
             error=data.get("error"),
+            inference_weights_may_be_mutated=data.get(
+                "inference_weights_may_be_mutated", True
+            ),
         )
         if result.status != "ok":
-            raise RuntimeError(
+            raise WeightUpdateError(
                 f"Weight update failed for pair {self._pair_name!r}, "
-                f"version={version}: {result.error or 'unknown error'}"
+                f"version={version}: {result.error or 'unknown error'}",
+                inference_weights_may_be_mutated=(
+                    result.inference_weights_may_be_mutated
+                ),
             )
         return result
 

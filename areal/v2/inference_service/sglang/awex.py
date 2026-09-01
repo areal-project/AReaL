@@ -45,6 +45,27 @@ def register_awex_endpoints(app: FastAPI, rpc_proxy: RpcProxy) -> None:
             logger.error("Failed to report parallelism: %s", e)
             return JSONResponse(status_code=500, content={"error": str(e)})
 
+    @app.post("/awex/memory_probe")
+    async def memory_probe(request: Request) -> JSONResponse:
+        try:
+            data = await request.json()
+            pair_names = data.get("pair_names", [])
+            if not isinstance(pair_names, list) or not all(
+                isinstance(pair_name, str) for pair_name in pair_names
+            ):
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": "pair_names must be a list[str]"},
+                )
+            probes = rpc_proxy.collective_rpc_with_result(
+                "awex_report_memory_probe",
+                pair_names=pair_names,
+            )
+            return JSONResponse(content={"status": "ok", "probes": probes})
+        except Exception as e:
+            logger.error("Failed to collect AWEX memory probe: %s", e)
+            return JSONResponse(status_code=500, content={"error": str(e)})
+
     @app.post("/awex/init_weights_update_group")
     async def init_weights_update_group(request: Request) -> JSONResponse:
         try:

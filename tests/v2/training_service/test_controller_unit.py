@@ -335,6 +335,8 @@ class TestGatewayTrainControllerClearBatches:
             "cancel-node": {"s-cancel": 0},
         }
         mock_gateway_post.assert_not_called()
+
+
 class TestGatewayTrainControllerWeightUpdateReconnect:
     def test_awex_reconnect_commits_candidate_before_destroying_old_gateway(self):
         from areal.v2.inference_service.controller.controller import (
@@ -460,7 +462,7 @@ class TestGatewayTrainControllerWeightUpdateReconnect:
         assert pair_name.startswith("actor-rollout-v1-")
         assert pair_name != old_ctrl.pair_name
 
-    def test_old_teardown_failure_rolls_back_candidate_and_preserves_old(self):
+    def test_old_teardown_failure_keeps_candidate_and_retries_old_cleanup(self):
         from areal.v2.inference_service.controller.controller import (
             RolloutControllerV2,
         )
@@ -487,19 +489,19 @@ class TestGatewayTrainControllerWeightUpdateReconnect:
                 return_value=candidate,
             ),
             patch("requests.post", return_value=port_response),
-            pytest.raises(RuntimeError, match="old teardown failed"),
         ):
             controller.connect_engine(
                 new_rollout,
                 SimpleNamespace(type="awex", colocate=False, version=1),
             )
 
-        candidate.destroy.assert_called_once_with()
+        candidate.destroy.assert_not_called()
         old_ctrl.destroy.assert_not_called()
-        assert controller._weight_update_ctrl is old_ctrl
-        assert controller.rollout is old_rollout
+        assert controller._weight_update_ctrl is candidate
+        assert controller.rollout is new_rollout
+        assert controller._stale_weight_update_ctrls == [old_ctrl]
 
-    def test_update_failure_always_continues_generation(self):
+    def test_update_failure_that_may_mutate_weights_leaves_generation_paused(self):
         controller = _make_controller()
         controller.rollout = MagicMock()
         controller._weight_update_ctrl = MagicMock()
@@ -508,6 +510,20 @@ class TestGatewayTrainControllerWeightUpdateReconnect:
         )
 
         with pytest.raises(RuntimeError, match="transfer failed"):
+            controller.update_weights(SimpleNamespace(version=3))
+
+        controller.rollout.pause_generation.assert_called_once_with()
+        controller.rollout.continue_generation.assert_not_called()
+
+    def test_pre_mutation_update_failure_continues_generation(self):
+        controller = _make_controller()
+        controller.rollout = MagicMock()
+        controller._weight_update_ctrl = MagicMock()
+        error = RuntimeError("preflight failed")
+        error.inference_weights_may_be_mutated = False
+        controller._weight_update_ctrl.update_weights.side_effect = error
+
+        with pytest.raises(RuntimeError, match="preflight failed"):
             controller.update_weights(SimpleNamespace(version=3))
 
         controller.rollout.pause_generation.assert_called_once_with()

@@ -898,6 +898,12 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
                 version=body.version,
                 duration_ms=duration_ms,
                 error=str(e),
+                # Transfers are not transactional: a failure reported after the
+                # gateway starts dispatching may follow writes on one or more
+                # inference ranks.  Make callers recover rather than serve a
+                # mixed model.  Pre-dispatch failures can opt into ``False`` in
+                # a future typed preflight path.
+                inference_weights_may_be_mutated=True,
             )
 
         duration_ms = (time.monotonic() - start) * 1000

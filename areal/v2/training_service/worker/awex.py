@@ -57,6 +57,32 @@ def create_awex_blueprint(
             lambda: submit_to_engine_thread("report_weight_meta", action),
         )
 
+    @bp.route("/memory_probe", methods=["POST"])
+    def memory_probe():
+        data = flask_module.request.get_json(silent=True) or {}
+        pair_names = data.get("pair_names", [])
+        if not isinstance(pair_names, list) or not all(
+            isinstance(pair_name, str) for pair_name in pair_names
+        ):
+            return flask_module.jsonify(
+                {"error": "pair_names must be a list[str]"}
+            ), 400
+
+        def action():
+            from areal.v2.weight_update.memory_probe import collect_awex_memory_probe
+
+            engine = get_engine()
+            return collect_awex_memory_probe(
+                role="training",
+                pair_names=pair_names,
+                rank=getattr(engine, "rank", None),
+            )
+
+        return run_endpoint(
+            "memory_probe",
+            lambda: submit_to_engine_thread("awex_memory_probe", action),
+        )
+
     @bp.route("/init_weights_update_group", methods=["POST"])
     def init_weights_update_group():
         data = flask_module.request.get_json(force=True)

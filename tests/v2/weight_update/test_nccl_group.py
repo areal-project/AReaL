@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, call
 
 import pytest
@@ -7,6 +8,27 @@ import torch
 
 from areal.v2.weight_update import nccl_group
 from areal.v2.weight_update.awex import fsdp_adapter, megatron_adapter, sglang_adapter
+from areal.v2.weight_update.awex.state import AwexPairState
+
+PAIR_NAME = "test-pair"
+
+
+def _install_pair_state(adapter, payload_group, sidecar_group, transfer_rank):
+    if isinstance(adapter, fsdp_adapter.AwexFSDPAdapter):
+        adapter._pair_states[PAIR_NAME] = AwexPairState(
+            payload_group,
+            sidecar_group,
+            MagicMock(),
+            transfer_rank,
+        )
+        return
+
+    adapter._active_pair_name = PAIR_NAME
+    adapter._transfer_plan = MagicMock()
+    adapter._weights_update_group = payload_group
+    adapter._weights_update_group_gloo = sidecar_group
+    adapter._transfer_rank = transfer_rank
+    adapter._dte_config = SimpleNamespace(enabled=False)
 
 
 def test_setup_batch_isend_irecv_uses_sidecar_for_final_barrier(monkeypatch):
@@ -208,16 +230,14 @@ def test_sglang_adapter_initializes_nccl_and_gloo_groups(monkeypatch):
 )
 def test_awex_adapters_use_sidecar_for_setup_barrier(adapter_cls, module, monkeypatch):
     """Both AWEX adapters retain NCCL payloads and select the Gloo barrier."""
-    adapter = object.__new__(adapter_cls)
+    adapter = adapter_cls(MagicMock())
     payload_group = MagicMock(name="nccl_group")
     sidecar_group = MagicMock(name="gloo_group")
-    adapter._weights_update_group = payload_group
-    adapter._weights_update_group_gloo = sidecar_group
-    adapter._transfer_rank = 3
+    _install_pair_state(adapter, payload_group, sidecar_group, 3)
     setup = MagicMock()
     monkeypatch.setattr(module, "setup_batch_isend_irecv", setup)
 
-    adapter.batch_isend_irecv(world_size=4)
+    adapter.batch_isend_irecv(PAIR_NAME, world_size=4)
 
     setup.assert_called_once_with(
         payload_group,
@@ -254,10 +274,7 @@ def test_awex_adapters_use_sidecar_for_completion_barrier(
     adapter = adapter_cls(MagicMock())
     payload_group = MagicMock(name="nccl_group")
     sidecar_group = MagicMock(name="gloo_group")
-    adapter._transfer_plan = MagicMock()
-    adapter._weights_update_group = payload_group
-    adapter._weights_update_group_gloo = sidecar_group
-    adapter._transfer_rank = 0
+    _install_pair_state(adapter, payload_group, sidecar_group, 0)
     adapter.get_local_shard_parameters = MagicMock(return_value={})
     monkeypatch.setattr(module, build_ops_name, lambda *args, **kwargs: ([], [], None))
     monkeypatch.setattr(module, "batch_send_recv", MagicMock())
@@ -265,7 +282,7 @@ def test_awex_adapters_use_sidecar_for_completion_barrier(
     distributed = getattr(module, "dist", module.torch.distributed)
     monkeypatch.setattr(distributed, "barrier", barrier)
 
-    adapter.execute_weight_update(version=1)
+    adapter.execute_weight_update(PAIR_NAME, version=1)
 
     barrier.assert_called_once_with(group=sidecar_group)
 
@@ -273,10 +290,12 @@ def test_awex_adapters_use_sidecar_for_completion_barrier(
 def test_sglang_synchronizes_weight_copies_before_gloo_barrier(monkeypatch):
     """The success barrier runs only after inference weights reach the device."""
     adapter = sglang_adapter.AwexSGLangAdapter(MagicMock())
-    adapter._transfer_plan = MagicMock()
-    adapter._weights_update_group = MagicMock(name="nccl_group")
-    adapter._weights_update_group_gloo = MagicMock(name="gloo_group")
-    adapter._transfer_rank = 0
+    _install_pair_state(
+        adapter,
+        MagicMock(name="nccl_group"),
+        MagicMock(name="gloo_group"),
+        0,
+    )
     adapter.get_local_shard_parameters = MagicMock(return_value={})
 
     events = []
@@ -298,7 +317,7 @@ def test_sglang_synchronizes_weight_copies_before_gloo_barrier(monkeypatch):
         lambda **kwargs: events.append("barrier"),
     )
 
-    adapter.execute_weight_update(version=1)
+    adapter.execute_weight_update(PAIR_NAME, version=1)
 
     original.copy_.assert_called_once_with(contiguous)
     assert events == ["copy", "synchronize", "barrier"]
@@ -319,18 +338,20 @@ def test_awex_adapters_destroy_payload_and_sidecar_groups(
     adapter = adapter_cls(MagicMock())
     payload_group = MagicMock(name="nccl_group")
     sidecar_group = MagicMock(name="gloo_group")
-    adapter._weights_update_group = payload_group
-    adapter._weights_update_group_gloo = sidecar_group
+    _install_pair_state(adapter, payload_group, sidecar_group, 0)
     destroy = MagicMock()
     distributed = getattr(module, "dist", module.torch.distributed)
     monkeypatch.setattr(distributed, "is_initialized", lambda: True)
     monkeypatch.setattr(distributed, "destroy_process_group", destroy)
 
-    adapter.teardown_weight_update_group()
+    adapter.teardown_weight_update_group(PAIR_NAME)
 
     assert destroy.call_args_list == [call(payload_group), call(sidecar_group)]
-    assert adapter._weights_update_group is None
-    assert adapter._weights_update_group_gloo is None
+    if adapter_cls is fsdp_adapter.AwexFSDPAdapter:
+        assert PAIR_NAME not in adapter._pair_states
+    else:
+        assert adapter._weights_update_group is None
+        assert adapter._weights_update_group_gloo is None
     if adapter_cls in (
         megatron_adapter.AwexMegatronAdapter,
         sglang_adapter.AwexSGLangAdapter,
