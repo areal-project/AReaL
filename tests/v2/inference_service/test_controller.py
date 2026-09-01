@@ -1065,6 +1065,7 @@ class TestMultiNodeConfig:
 
         # Track async client .post calls to /alloc_ports and /fork
         alloc_port_counter = 0
+        alloc_calls = []
         fork_calls = []
 
         async def mock_async_post(url, json=None, timeout=None):
@@ -1074,10 +1075,13 @@ class TestMultiNodeConfig:
             resp.raise_for_status = MagicMock()
             if "/alloc_ports" in url:
                 alloc_port_counter += 1
+                alloc_calls.append(json)
+                port_count = json["count"]
+                first_port = 30000 + 2 * alloc_port_counter
                 resp.json.return_value = {
                     "status": "success",
                     "host": url.split("//")[1].split(":")[0],
-                    "ports": [30000 + alloc_port_counter],
+                    "ports": list(range(first_port, first_port + port_count)),
                 }
             elif "/fork" in url:
                 fork_calls.append(json)
@@ -1115,9 +1119,13 @@ class TestMultiNodeConfig:
         job = create_call.kwargs.get("job") or create_call.args[0]
         assert job.replicas == 2
 
-        # Async client .post calls for inf server fork:
-        # 1 rendezvous alloc (nnodes_per_instance > 1) + 2 node allocs + 2 forks = 5
-        assert alloc_port_counter == 3  # 1 rendezvous + 2 per-node
+        # One owner-bound reservation per inference worker. The head reserves
+        # both its HTTP port and the distributed rendezvous port.
+        assert alloc_port_counter == 2
+        assert alloc_calls == [
+            {"count": 2, "role": "inf-server", "worker_index": 0},
+            {"count": 1, "role": "inf-server", "worker_index": 1},
+        ]
         assert len(fork_calls) == 2  # 1 per node in the group
 
         # Verify fork payloads have correct worker_index and role
@@ -1149,3 +1157,67 @@ class TestMultiNodeConfig:
             c for c in mock_fork.call_args_list if c.kwargs.get("role") == "data-proxy"
         ]
         assert len(data_proxy_calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_async_fork_inf_servers_failure_releases_owned_ports(self):
+        worker = MagicMock()
+        worker.ip = "10.0.0.1"
+        worker.worker_ports = [18000]
+
+        cfg = InferenceEngineConfig(
+            tokenizer_path="mock-tokenizer",
+            backend="sglang:d1",
+        )
+        controller = RolloutControllerV2(
+            config=cfg, scheduler=MagicMock(n_gpus_per_node=8)
+        )
+        requests = []
+
+        async def mock_async_post(url, json=None, timeout=None):
+            requests.append((url, json))
+            resp = MagicMock()
+            if url.endswith("/alloc_ports"):
+                resp.json.return_value = {
+                    "status": "success",
+                    "host": "10.0.0.1",
+                    "ports": [30000],
+                }
+            elif url.endswith("/fork"):
+                resp.raise_for_status.side_effect = RuntimeError("fork failed")
+            return resp
+
+        mock_async_client = AsyncMock()
+        mock_async_client.post = mock_async_post
+
+        with (
+            patch.object(
+                controller, "_get_async_client", return_value=mock_async_client
+            ),
+            patch(
+                "areal.api.cli_args.SGLangConfig.build_cmd_from_args",
+                return_value=["python", "-m", "sglang.launch_server"],
+            ),
+        ):
+            with pytest.raises(RuntimeError, match="fork failed"):
+                await controller._async_fork_inf_servers(
+                    cfg=cfg,
+                    alloc=None,
+                    inf_backend="sglang",
+                    inf_workers=[worker],
+                    dp_size=1,
+                    nnodes_per_instance=1,
+                    worker_env={},
+                    server_args=None,
+                )
+
+        assert requests[0] == (
+            "http://10.0.0.1:18000/alloc_ports",
+            {"count": 1, "role": "inf-server", "worker_index": 0},
+        )
+        assert [url.rsplit("/", 1)[-1] for url, _ in requests[-2:]] == [
+            "kill_forked_worker",
+            "release_ports",
+        ]
+        assert controller._inf_addrs == []
+        assert controller._server_infos == []
+        assert controller._forked_services == []

@@ -392,7 +392,7 @@ class AgentController:
     ) -> tuple[str, int]:
         resp = requests.post(
             f"{guard_addr}/alloc_ports",
-            json={"count": 1},
+            json={"count": 1, "role": role, "worker_index": worker_index},
             timeout=30,
         )
         resp.raise_for_status()
@@ -412,17 +412,27 @@ class AgentController:
         if merged_env:
             fork_payload["env"] = merged_env
 
-        resp = requests.post(
-            f"{guard_addr}/fork",
-            json=fork_payload,
-            timeout=30,
-        )
-        resp.raise_for_status()
-
-        self._forked_services.append((guard_addr, role, worker_index))
-
-        addr = f"http://{format_hostport(host, port)}"
-        self._wait_for_service(f"{addr}{health_path}", role)
+        try:
+            resp = requests.post(
+                f"{guard_addr}/fork",
+                json=fork_payload,
+                timeout=30,
+            )
+            resp.raise_for_status()
+            self._forked_services.append((guard_addr, role, worker_index))
+            addr = f"http://{format_hostport(host, port)}"
+            self._wait_for_service(f"{addr}{health_path}", role)
+        except BaseException:
+            for endpoint in ("kill_forked_worker", "release_ports"):
+                try:
+                    requests.post(
+                        f"{guard_addr}/{endpoint}",
+                        json={"role": role, "worker_index": worker_index},
+                        timeout=10,
+                    )
+                except Exception:
+                    pass
+            raise
 
         return host, port
 
