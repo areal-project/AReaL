@@ -542,11 +542,11 @@ def patch_qwen3_5_chunk_gated_delta_rule_with_mindspeed() -> None:
     try:
         # patch L2 norm before importing GDN
         import areal.engine.megatron_utils.triton_l2norm_patch  # noqa: F401, I001
-        from mindspeed.core.ssm.chunk_gated_delta_rule import chunk_gated_delta_rule
-    except ImportError as exc:
-        logger.warning(
-            "Failed to import embedded MindSpeed chunk_gated_delta_rule: %s", exc
+        from mindspeed.core.ssm.npu_chunk_gated_delta_rule import (
+            chunk_gated_delta_rule,
         )
+    except ImportError as exc:
+        logger.warning("Failed to import MindSpeed NPU chunk_gated_delta_rule: %s", exc)
         raise
 
     causal_conv1d = None
@@ -587,7 +587,7 @@ def patch_qwen3_5_chunk_gated_delta_rule_with_mindspeed() -> None:
 
     if patched_modules:
         logger.info(
-            "Patched Qwen3.5 chunk_gated_delta_rule to embedded MindSpeed implementation: %s.",
+            "Patched Qwen3.5 chunk_gated_delta_rule to MindSpeed's NPU implementation: %s.",
             ", ".join(patched_modules),
         )
         if causal_conv1d is not None:

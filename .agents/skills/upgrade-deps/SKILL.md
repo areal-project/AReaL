@@ -540,7 +540,7 @@ ______________________________________________________________________
 | Package           | Checklist file                  | Status                                                                                                                                             |
 | ----------------- | ------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `megatron-core`   | `checklists/megatron-core.md`   | ✅ 18 API entries (parallel_state, DDP, optimizer, pipeline, checkpointing, transformer config, FP8, GPTModel, tensor_parallel, layer specs, RoPE) |
-| `megatron-bridge` | `checklists/megatron-bridge.md` | ✅ 7 API entries (AutoBridge, LoRA, save/load HF, monkey-patch guard)                                                                              |
+| `megatron-bridge` | `checklists/megatron-bridge.md` | ✅ 11 API entries (AutoBridge, LoRA, weight export, save/load HF, model providers and layer specs)                                                 |
 | `mbridge`         | `checklists/mbridge.md`         | ✅ 14 API entries (AutoBridge, Bridge properties, weight mappings, LLMBridge subclassing, register_model, monkey-patch target)                     |
 | `vllm`            | `checklists/vllm.md`            | ✅ 14 API entries (entrypoints, LoRA manager, worker V0/V1, tool parsers, CLI)                                                                     |
 | `sglang`          | `checklists/sglang.md`          | ✅ 14 API entries (HTTP endpoints, tool/reasoning parsers, CLI flags, version guards)                                                              |

@@ -389,7 +389,7 @@ class FSDPEngine(TrainEngine):
             except Exception as e:
                 self.logger.warning(
                     f"Failed to apply FLA patch for Qwen3.5 series: {e}. "
-                    "Please ensure you have MindSpeed and Megatron 0.16.0 installed. "
+                    "Please ensure the matching MindSpeed and Megatron stack is installed. "
                     "Falling back to native transformers implementation."
                 )
 

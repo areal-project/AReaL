@@ -21,7 +21,7 @@ upstream_paths:
 | File                                             | Imports / Usage                                                                                                                                                     |
 | ------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `areal/engine/megatron_engine.py`                | indirect — consumes PEFT config dict schema (`r`, `lora_alpha`, `target_modules`, `bias`) via `megatron.bridge.peft.lora`; stores in `WeightUpdateMeta.peft_config` |
-| `areal/engine/megatron_utils/megatron_lora.py`   | no direct import — generates `adapter_config.json` in PEFT format; parses PEFT weight key format (`base_model.model.layers.N.self_attn.q_proj.lora_A.weight`)       |
+| `areal/models/mcore/hf_save.py`                  | no direct import — generates PEFT adapter weights and `adapter_config.json` for the legacy mbridge save path                                                        |
 | `areal/engine/vllm_ext/vllm_worker_extension.py` | indirect — uses `vllm.lora.peft_helper.PEFTHelper`, not direct peft import                                                                                          |
 | `areal/engine/vllm_remote.py`                    | builds HTTP payloads containing `peft_config` dict for distributed LoRA updates                                                                                     |
 | `areal/api/cli_args.py`                          | config fields only: `use_lora`, `lora_rank`, `lora_alpha`, `target_modules`, `peft_type`                                                                            |
@@ -104,50 +104,37 @@ ______________________________________________________________________
 
 **Source:** `src/peft/tuners/lora/` (weight saving conventions)
 
-Parsed in `areal/engine/megatron_utils/megatron_lora.py`
-(`_infer_target_modules_from_adapter_weights`, lines 124–150):
+Produced in `areal/models/mcore/hf_save.py` (lines 586-610):
 
 ```python
-# Expected key pattern for LoRA weights:
-# "base_model.model.layers.0.self_attn.q_proj.lora_A.weight" -> q_proj
-# "base_model.model.layers.1.mlp.gate_proj.lora_B.weight"   -> gate_proj
-for key in weight_keys:
-    key = key.replace("base_model.model.", "")
-    if ".lora_A.weight" in key:
-        module_name = key.replace(".lora_A.weight", "").split(".")[-1]
-    elif ".lora_B.weight" in key:
-        module_name = key.replace(".lora_B.weight", "").split(".")[-1]
+lora_state_dict[f"base_model.model.{hf_name_q}"] = q_param
+lora_state_dict[f"base_model.model.{hf_name_k}"] = k_param
+lora_state_dict[f"base_model.model.{hf_name_v}"] = v_param
 ```
 
-Also used in `_build_adapter_config_dict` (lines 153–178) to emit an
-`adapter_config.json`:
+The same function emits `adapter_config.json` at lines 656-673:
 
 ```python
 {
-    "base_model_name_or_path": base_model_name_or_path,
-    "peft_type": "LORA",
-    "task_type": "CAUSAL_LM",
-    "inference_mode": False,
-    "r": peft_config.dim,
-    "lora_alpha": peft_config.alpha,
-    "lora_dropout": peft_config.dropout,
-    "target_modules": target_modules,
+    "base_model_name_or_path": base_model_name,
     "bias": "none",
     "fan_in_fan_out": False,
-    "modules_to_save": None,
+    "inference_mode": True,
     "init_lora_weights": True,
-    "layers_to_transform": None,
-    "layers_pattern": None,
+    "lora_alpha": lora_alpha,
+    "lora_dropout": 0.0,
+    "modules_to_save": None,
+    "peft_type": "LORA",
+    "r": rank,
+    "target_modules": target_modules,
+    "task_type": "CAUSAL_LM",
 }
 ```
 
 **Check:** Confirm the saved weight key format (`base_model.model.<...>.lora_A.weight` /
-`lora_B.weight`) hasn't changed. Check whether new LoRA variants (e.g.,
-`lora_magnitude_vector` for DoRA) added extra keys that the parser doesn't handle.
-Verify all `adapter_config.json` fields (`peft_type`, `task_type`, `r`, `lora_alpha`,
-`lora_dropout`, `target_modules`, `bias`, `fan_in_fan_out`, etc.) still match what
-PEFT's `LoraConfig.from_pretrained()` expects when loading. This schema is also used for
-vLLM LoRA hot-swap via `WeightUpdateMeta.peft_config`.
+`lora_B.weight`) has not changed. Verify all emitted `adapter_config.json` fields still
+match what PEFT's `LoraConfig.from_pretrained()` expects when loading. The smaller
+runtime schema used for vLLM LoRA hot-swap is documented separately below.
 
 ______________________________________________________________________
 
@@ -155,8 +142,8 @@ ______________________________________________________________________
 
 **Source:** PEFT conventions (not a direct import, but a schema contract)
 
-Populated in `areal/engine/megatron_engine.py` (lines 1196–1203) and
-`areal/engine/fsdp_engine.py` (lines 1148–1153):
+Populated in `areal/engine/megatron_engine.py` (lines 2066-2074) and
+`areal/engine/fsdp_engine.py` (lines 1376-1389):
 
 ```python
 meta.peft_config = {
@@ -167,7 +154,7 @@ meta.peft_config = {
 }
 ```
 
-Consumed in `areal/engine/vllm_remote.py` (lines 169–172):
+Consumed in `areal/engine/vllm_remote.py` (lines 290-293):
 
 ```python
 "lora_target_modules": meta.peft_config["target_modules"],
@@ -176,7 +163,7 @@ Consumed in `areal/engine/vllm_remote.py` (lines 169–172):
 "lora_bias": meta.peft_config["bias"],
 ```
 
-And in `areal/engine/vllm_ext/vllm_worker_extension.py` (lines 243–246) to reconstruct a
+And in `areal/engine/vllm_ext/vllm_worker_extension.py` (lines 325-330) to reconstruct a
 `PEFTHelper` for vLLM's LoRA manager.
 
 **Check:** This dict is the **contract** between AReaL's training engines and inference

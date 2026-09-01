@@ -95,6 +95,7 @@ class StatsLogger:
             config=exp_config_dict,
             logdir=self.get_log_path(self.config),
             mode=swanlab_config.mode,
+            settings=swanlab.Settings(log_proxy_type="none"),
         )
 
         # trackio init

@@ -186,3 +186,24 @@ class TestStatsLoggerTrackioIntegration:
         data = {"loss/avg": 0.5}
         logger.commit(epoch=0, step=0, global_step=0, data=data)
         mock_trackio.log.assert_not_called()
+
+    @patch("areal.utils.stats_logger.trackio")
+    @patch("areal.utils.stats_logger.swanlab")
+    @patch("areal.utils.stats_logger.dist")
+    def test_swanlab_init_disables_terminal_proxy(
+        self, mock_dist, mock_swanlab, mock_trackio
+    ):
+        """SwanLab should not intercept stdout or stderr from the trainer."""
+        mock_dist.is_initialized.return_value = False
+
+        from areal.utils.stats_logger import StatsLogger
+
+        config = _make_test_config()
+        config.stats_logger.swanlab.mode = "cloud"
+        StatsLogger(config, _make_ft_spec())
+
+        mock_swanlab.Settings.assert_called_once_with(log_proxy_type="none")
+        assert (
+            mock_swanlab.init.call_args.kwargs["settings"]
+            is mock_swanlab.Settings.return_value
+        )

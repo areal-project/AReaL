@@ -2,18 +2,16 @@
 
 """Quiet known-benign NPU log spam (NPU-only; no-op elsewhere).
 
-Three unrelated, harmless sources flood the per-rank logs, each filtered/guarded
+Two unrelated, harmless sources flood the per-rank logs, each filtered/guarded
 below without editing the installed packages:
 
-1. Transformers 5.5.4's image-processor alias warning on non-``Fast`` symbols.
-2. MindSpeed's ``tp_group is None`` DeprecationWarning, repeated per TP layer.
-3. torch_npu's MSTX ``range_end`` TypeError from no-id native calls, per op-range.
+1. Transformers image-processor alias warnings on non-``Fast`` symbols.
+2. torch_npu's MSTX ``range_end`` TypeError from no-id native calls, per op-range.
 """
 
 from __future__ import annotations
 
 import logging as stdlib_logging
-import warnings
 
 import areal.utils.logging as logging
 
@@ -92,15 +90,6 @@ class _TransformersImageAliasNoiseFilter(stdlib_logging.Filter):
         return name.endswith("Fast")
 
 
-def _silence_tp_group_deprecation_warning() -> None:
-    warnings.filterwarnings(
-        "ignore",
-        message=r"Warning: tp_group is None",
-        category=DeprecationWarning,
-    )
-    logger.info("Filtered megatron-core 'tp_group is None' DeprecationWarning.")
-
-
 def _silence_mstx_range_end_error() -> None:
     import importlib
 
@@ -137,7 +126,6 @@ def _apply() -> None:
 
     if not is_npu_available:
         return
-    _silence_tp_group_deprecation_warning()
     _silence_mstx_range_end_error()
 
 

@@ -1,40 +1,23 @@
 # SPDX-License-Identifier: Apache-2.0
-"""mbridge compatibility shims for the NPU + MindSpeed stack.
+"""Compatibility shims needed before and after importing mbridge.
 
 Importing this module installs two shims, both idempotent / no-op when
 unnecessary:
 
-1. ``transformer_engine`` (and ``.pytorch`` / ``.common.recipe``) — required
-   by ``megatron.core.extensions.transformer_engine`` (pulled in
-   transitively by ``mbridge.models.gemma3``). transformer_engine is
-   CUDA-only and not available on Ascend NPU. Register inert stub modules
-   so the unconditional ``import transformer_engine as te`` and
-   class-statement bases like ``class TELinear(te.pytorch.Linear)`` succeed
-   at import time. Anything that actually instantiates these stubs at
-   runtime raises a clear error.
+1. Register inert ``transformer_engine`` modules when TE is unavailable so
+   mbridge's unconditional import-time class definitions remain importable.
+   Real CUDA TE and TransformerEngineNPU make this a no-op.
 
-2. Re-wrap mbridge's ``@dataclass`` ``TransformerConfig`` subclasses
-   (``Qwen3VLTransformerConfig``, ``Qwen2VLTransformerConfig``) with
-   MindSpeed's ``transformer_config_init_wrapper``. MindSpeed patches the
-   parent ``TransformerConfig.__init__`` to inject CLI args (e.g.
-   ``moe_zero_memory_num_layers``) onto the instance before
-   ``__post_init__`` reads them. The mbridge subclasses get a fresh
-   dataclass-generated ``__init__`` that drops that wrapper, so the
-   inherited (still-wrapped) ``__post_init__`` raises ``AttributeError``
-   on the missing attribute. Applied via ``apply_post_mbridge()`` because
-   the mbridge classes don't exist until ``import mbridge`` runs.
+2. Preserve Qwen3-VL's requested ``position_embedding_type`` after MindSpeed
+   injects argument defaults into the MCore config.
 
 Import this module at the top of any AReaL file that does ``import mbridge``
 (or any transitive equivalent) so the shim lands before mbridge's
 ``__init__.py`` cascades. Then call ``apply_post_mbridge()`` after the
 ``import mbridge`` line for the second shim.
 
-The mcore<0.13 compatibility shims (``get_tensor_model_parallel_group_if_none``,
-``tp_group``/``vp_stage`` kwarg swallowing, ``_preprocess``/``_postprocess``
-backports, attention return-tuple padding, NVTX no-ops) lived here when AReaL
-ran against MindSpeed's vendored mcore 0.12.1. They were removed when the NPU
-stack moved to MindSpeed ``core_r0.16.0`` which vendors mcore 0.16+ natively;
-see git history for the previous implementations.
+Older MCore API shims and MindSpeed transformer-config rewrapping are no
+longer needed by the pinned MCore 0.18 / MegatronAdaptor stack.
 """
 
 from __future__ import annotations
@@ -112,54 +95,9 @@ def _install_transformer_engine_stub() -> None:
     te.__version__ = "999.0.0"
 
 
-def _wrap_mbridge_custom_transformer_configs() -> None:
-    """Re-apply MindSpeed's ``transformer_config_init_wrapper`` to mbridge's
-    ``@dataclass`` ``TransformerConfig`` subclasses.
-
-    mbridge defines ``Qwen3VLTransformerConfig(TransformerConfig)`` (and
-    similar) with its own dataclass fields; the ``@dataclass`` decorator
-    regenerates ``__init__``, dropping MindSpeed's wrapper that would
-    otherwise inject CLI args (``moe_zero_memory_num_layers`` etc.) onto
-    the instance. The inherited ``__post_init__`` is still wrapped and
-    calls ``MindSpeedFeaturesManager.pre_validate_features_args(self)``,
-    which fails on the missing attribute.
-
-    No-op outside MindSpeed (e.g. CUDA) and idempotent across multiple
-    calls.
-    """
-    try:
-        from mindspeed.core.megatron_basic.arguments_basic import (
-            transformer_config_init_wrapper,
-        )
-    except ImportError:
-        return  # not on NPU/MindSpeed — nothing to do
-
-    targets: list[type] = []
-    try:
-        from mbridge.models.qwen3_vl.transformer_config import (
-            Qwen3VLTransformerConfig,
-        )
-
-        targets.append(Qwen3VLTransformerConfig)
-    except ImportError:
-        pass
-    try:
-        from mbridge.models.qwen2_5_vl.transformer_config import (
-            Qwen2VLTransformerConfig,
-        )
-
-        targets.append(Qwen2VLTransformerConfig)
-    except ImportError:
-        pass
-
-    for cls in targets:
-        if getattr(cls.__init__, "_areal_mindspeed_wrapped", False):
-            continue
-        wrapped = transformer_config_init_wrapper(cls.__init__)
-        wrapped._areal_mindspeed_wrapped = True
-        cls.__init__ = wrapped
-
-    # mcore 0.16's ``GPTModel.__init__`` prefers ``self.config.position_embedding_type``
+def _patch_qwen3vl_position_embedding_type() -> None:
+    """Preserve mbridge's requested Qwen3-VL position embedding type."""
+    # MCore prefers ``self.config.position_embedding_type``
     # over the constructor kwarg when the attribute exists (gpt_model.py:128-131).
     # MindSpeed's ``transformer_config_init_wrapper`` injects every CLI arg onto
     # every ``TransformerConfig`` instance — including ``position_embedding_type``
@@ -182,8 +120,6 @@ def _wrap_mbridge_custom_transformer_configs() -> None:
             _orig_q3_gpt_init(
                 self, *args, position_embedding_type=position_embedding_type, **kwargs
             )
-            # Re-apply the kwarg the user actually passed (mbridge always
-            # passes ``"mrope"`` here).
             self.position_embedding_type = position_embedding_type
 
         _q3vl_gpt_init._areal_pet_compat = True
@@ -195,12 +131,8 @@ def apply() -> None:
 
 
 def apply_post_mbridge() -> None:
-    """Apply shims that need mbridge to be already imported.
-
-    Call this from any AReaL file that does ``import mbridge`` and may
-    trigger ``TransformerConfig`` instantiation downstream.
-    """
-    _wrap_mbridge_custom_transformer_configs()
+    """Apply shims that need mbridge classes to be defined."""
+    _patch_qwen3vl_position_embedding_type()
 
 
 apply()

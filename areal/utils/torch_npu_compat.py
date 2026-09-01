@@ -25,6 +25,7 @@ GROUPED_P2P_ENV = "AREAL_NPU_GROUPED_P2P"
 # ``ProcessGroupHCCL::batch_isend_irecv()`` call is not.
 #
 # Upstream fix: https://gitcode.com/Ascend/pytorch/pull/42579
+# The pinned 2.10.0.post4 wheel (git 5dd8ef3f) still contains this code.
 GROUPED_P2P_BROKEN_SINCE = "2.10.0.post2"
 GROUPED_P2P_FIXED_IN = None  # set once a wheel carrying the fix is validated
 

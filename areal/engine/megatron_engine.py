@@ -22,40 +22,19 @@ from typing import TYPE_CHECKING, Any
 import areal.engine.megatron_utils.ascend_log_patches  # noqa: F401 isort: skip  # before MindSpeed
 import areal.utils.torch_npu_compat  # noqa: F401 isort: skip  # before MindSpeed
 import areal.engine.megatron_utils.triton_l2norm_patch  # noqa: F401 isort: skip  # before MindSpeed: fast GDN l2norm
+from areal.engine.megatron_utils.mindspeed_args_patch import (
+    ensure_mindspeed_args_sanitized,
+)  # isort: skip
+
+ensure_mindspeed_args_sanitized()
 import mindspeed.megatron_adaptor  # noqa: F401 isort: skip
 
-# Patch MindSpeed get_full_args to filter invalid field names.
-# MindSpeed's argument parser strips "--" prefix from unknown CLI flags
-# (args_utils.py:add_args does key[2:]). Short flags like pytest's "-v"
-# become "" after stripping, causing make_dataclass to fail in
-# transformer_config_init_wrapper with "Field names must be valid identifiers: ''".
-import mindspeed.core.megatron_basic.arguments_basic as _ms_args_basic
-
-_ms_orig_get_full_args = _ms_args_basic.get_full_args
-
-
-def _ms_sanitized_get_full_args():
-    result = _ms_orig_get_full_args()
-    d = vars(result)
-    invalid_keys = [
-        k for k in d if not isinstance(k, str) or not k or not k.isidentifier()
-    ]
-    for k in invalid_keys:
-        del d[k]
-    return result
-
-
-_ms_args_basic.get_full_args = _ms_sanitized_get_full_args
-
-# Install mbridge compatibility shims (missing mcore APIs, transformer_engine
-# stub) before the first ``import mbridge``. See areal/utils/mbridge_compat.py.
+# Install the Transformer Engine import shim before the first ``import mbridge``.
 import areal.utils.mbridge_compat  # noqa: F401, I001  # isort: skip
 
 import mbridge
 
-# Re-wrap mbridge's @dataclass TransformerConfig subclasses (Qwen3VL etc.)
-# so MindSpeed's CLI-args injection lands before the inherited __post_init__
-# tries to validate ``moe_zero_memory_num_layers`` and friends. No-op on CUDA.
+# Apply compatibility that depends on mbridge classes being defined.
 areal.utils.mbridge_compat.apply_post_mbridge()
 import torch
 import torch.distributed as dist
@@ -106,7 +85,6 @@ from areal.engine.core.model import (
     resolve_sequence_packing_mode,
     validate_context_parallel_mode,
 )
-from areal.engine.megatron_utils import megatron_bridge_patches  # noqa: F401
 from areal.engine.megatron_utils.checkpointer import MegatronCheckpointManager
 from areal.engine.megatron_utils.deterministic import set_deterministic_algorithms
 from areal.engine.megatron_utils.fp8 import FP8BlockwiseTensorHelper
@@ -182,112 +160,6 @@ if TYPE_CHECKING:
 
     from areal.api import Scheduler
     from areal.api.cli_args import DPOEngineConfig, PPOActorConfig, PPOCriticConfig
-
-
-def _patch_mindspeed_mlp_init_tp_group():
-    """Make MindSpeed's ``mlp_init`` swallow mcore 0.16's ``tp_group`` kwarg.
-
-    When ``moe_alltoall_overlap_comm=True``, MindSpeed (``core_r0.16.0``)
-    replaces ``megatron.core.transformer.mlp.MLP.__init__`` with
-    ``mindspeed.core.transformer.moe.moe_feature.overlap.moe_common.mlp_init``
-    via its patch manager. That wrapper's signature is
-    ``(self, config, submodules, is_expert=False, input_size=None,
-    with_shared_expert=False)`` — it predates mcore 0.16's addition of a
-    ``tp_group`` kwarg that ``TransformerLayer.__init__`` now propagates
-    into ``build_module(submodules.mlp, ..., tp_group=tp_group)``. Result:
-    ``TypeError: mlp_init() got an unexpected keyword argument 'tp_group'``
-    on every dense MLP construction (e.g. Qwen3-VL vision-encoder blocks).
-
-    Fix: wrap ``MLP.__init__`` to discard ``tp_group``. Safe because
-    ``mlp_init``'s internal ``build_module`` calls don't forward the
-    parameter anyway — single-group MoE setups always use the default TP
-    group for inner-linear collectives. No-op when ``MLP.__init__`` is
-    mcore's native (e.g. ``moe_alltoall_overlap_comm=False``) since mcore
-    0.16's native ``MLP.__init__`` accepts ``tp_group`` natively.
-    """
-    from megatron.core.transformer.mlp import MLP
-
-    cur_init = MLP.__init__
-    if getattr(cur_init, "_areal_mlp_tp_group_patched", False):
-        return
-    # Only patch the MindSpeed replacement; leave mcore's native __init__ alone.
-    if cur_init.__name__ != "mlp_init":
-        return
-
-    @functools.wraps(cur_init)
-    def _wrapped(self, *args, tp_group=None, **kwargs):
-        return cur_init(self, *args, **kwargs)
-
-    _wrapped._areal_mlp_tp_group_patched = True
-    MLP.__init__ = _wrapped
-
-
-def _patch_mindspeed_npu_groupmatmul_add_fp32_dtype():
-    """Backport MindSpeed commit ``6cd85e8a`` / ``2b38a9e9`` (landed on
-    ``26.0.0_core_r0.12.1`` but not yet ported to ``core_r0.16.0``, see
-    ``mindspeed/core/transformer/moe/moe_feature/overlap/grouped_mlp_with_comp_and_comm_overlap_all2all.py``).
-
-    In ``GroupedMlpWithCompAndCommOverlapAll2All.backward`` (and the
-    all2allseq / fb_overlap variants), the recompute_activation branch
-    rebinds ``mm2_inputs``:
-
-        mm2_inputs = act_without_probs_ * permuted_probs_inputs_detach.unsqueeze(-1)
-
-    When ``moe_router_dtype=fp32`` (mbridge's Qwen3-VL-MoE default),
-    ``permuted_probs_inputs_detach`` is fp32 while ``act_without_probs_`` is
-    bf16, so the product upcasts to fp32. The fp32 ``mm2_inputs`` is then
-    fed to ``npu_groupmatmul_add_fp32(x=mm2_inputs, dy=grad_outs[bf16], ...,
-    main_grad)`` — the op silently produces wrong gradients when ``x.dtype !=
-    dy.dtype``. Upstream 26.0.0 adds ``mm2_inputs = mm2_inputs.to(act_inputs.dtype)``
-    after the multiply; we do the equivalent at the consumer boundary by
-    casting ``x`` to ``dy.dtype`` inside the op wrapper.
-
-    All three preconditions are satisfied by examples/vlm/qwen3-vl-30b-moe.yaml:
-    ``moe_alltoall_overlap_comm=true``, ``moe_router_dtype="fp32"`` (mbridge
-    auto-set), ``moe_zero_memory="level 1"``. Self-correcting: no-op when
-    dtypes already match.
-    """
-    import importlib
-
-    from mindspeed.ops import npu_groupmatmul_add as _mod
-
-    if getattr(_mod, "_areal_dtype_patched", False):
-        return
-
-    _orig = _mod.npu_groupmatmul_add_fp32
-
-    @functools.wraps(_orig)
-    def _wrapped(x, dy, group_list, grad):
-        if x.dtype != dy.dtype:
-            x = x.to(dy.dtype)
-        return _orig(x, dy, group_list, grad)
-
-    _mod.npu_groupmatmul_add_fp32 = _wrapped
-
-    # ``from ... import npu_groupmatmul_add_fp32`` binds a local reference
-    # in each call-site module; replacing ``_mod.npu_groupmatmul_add_fp32``
-    # alone leaves those bindings pointing at the unwrapped function.
-    _call_site_modules = (
-        "mindspeed.core.transformer.moe.moe_feature.overlap."
-        "grouped_mlp_with_comp_and_comm_overlap_all2all",
-        "mindspeed.core.transformer.moe.moe_feature.overlap."
-        "grouped_mlp_with_comp_and_comm_overlap_all2allseq",
-        "mindspeed.core.transformer.moe.moe_feature.overlap."
-        "grouped_mlp_with_comp_and_comm_overlap_allgather",
-        "mindspeed.core.transformer.moe.moe_feature.fb_overlap.modules.experts",
-        "mindspeed.core.transformer.moe.moe_feature.fb_overlap.modules."
-        "weight_grad_store",
-        "mindspeed.ops.gmm",
-    )
-    for modname in _call_site_modules:
-        try:
-            m = importlib.import_module(modname)
-        except ImportError:
-            continue
-        if getattr(m, "npu_groupmatmul_add_fp32", None) is _orig:
-            m.npu_groupmatmul_add_fp32 = _wrapped
-
-    _mod._areal_dtype_patched = True
 
 
 # `model.named_modules()` yields LOCAL layer indices on each PP rank, while
@@ -453,11 +325,9 @@ class MegatronEngine(TrainEngine):
         from megatron.bridge.peft.lora import LoRA as MegatronBridgeLoRA
 
         from areal.engine.megatron_utils.megatron_bridge_patches import (
-            patch_mindspeed_row_parallel_lora,
             patch_qwen35_hybrid_lora_specs,
         )
 
-        patch_mindspeed_row_parallel_lora()
         if is_qwen3_5_model(self.hf_config.model_type):
             patch_qwen35_hybrid_lora_specs()
 
@@ -678,20 +548,29 @@ class MegatronEngine(TrainEngine):
             if self.use_model_packed_seq and is_qwen3_5_model(
                 self.hf_config.model_type
             ):
+                from megatron.core.models.gpt import (
+                    experimental_attention_variant_module_specs as attention_specs,
+                )
                 from megatron.core.ssm.gated_delta_net import GatedDeltaNet
                 from mindspeed.core.ssm import gated_delta_net as mindspeed_gdn
 
-                if not GatedDeltaNet.__module__.startswith("mindspeed"):
+                from areal.engine.megatron_utils.mindspeed_gdn_patch import (
+                    has_mindspeed_gdn_conv1d,
+                    has_mindspeed_gdn_model_classes,
+                )
+
+                if not has_mindspeed_gdn_model_classes(
+                    GatedDeltaNet, attention_specs.GatedDeltaNet
+                ):
                     raise RuntimeError(
                         "Packed (THD) forward for Qwen3.5-family models requires "
-                        "MindSpeed's GatedDeltaNet, but the stock megatron-core "
-                        "class is active (it rejects packed sequences)."
+                        "MindSpeed's GatedDeltaNet, but a stock megatron-core class "
+                        "is active in the GDN module or model specifications."
                     )
-                if mindspeed_gdn.causal_conv1d is None:
+                if not has_mindspeed_gdn_conv1d(mindspeed_gdn):
                     raise RuntimeError(
                         "Packed (THD) forward for Qwen3.5-family models requires "
-                        "a varlen causal_conv1d implementation, but neither "
-                        "fla_npu nor fla.modules.convolution is available."
+                        "MindSpeed's NPU varlen causal_conv1d implementation."
                     )
             if self.is_vision_model:
                 self.processor, self.tokenizer = load_hf_processor_and_tokenizer(
@@ -1265,13 +1144,9 @@ class MegatronEngine(TrainEngine):
                 return loss, {}
 
             model_vp_stage = getattr(model, "vp_stage", 0)
-            try:
-                is_last_stage = mpu.is_pipeline_last_stage(
-                    ignore_virtual=False, vp_stage=model_vp_stage
-                )
-            except TypeError:
-                # MindSpeed's patched is_pipeline_last_stage may not accept vp_stage
-                is_last_stage = mpu.is_pipeline_last_stage(ignore_virtual=False)
+            is_last_stage = mpu.is_pipeline_last_stage(
+                ignore_virtual=False, vp_stage=model_vp_stage
+            )
             if is_last_stage:
                 if cp_local and cu_seqlens is not None:
                     padded_cu_seqlens = mb_input.padded_mb["cu_seqlens"]
@@ -2862,8 +2737,8 @@ class MegatronEngine(TrainEngine):
             "recompute_method": megatron_config.recompute_method,
             "recompute_granularity": megatron_config.recompute_granularity,
             "recompute_num_layers": megatron_config.recompute_num_layers,
-            # MindSpeed ``core_r0.16.0``'s ``SwapOptimizerFeature.validate_args``
-            # asserts ``args.use_distributed_optimizer`` whenever
+            # MindSpeed's ``SwapOptimizerFeature.validate_args`` asserts
+            # ``args.use_distributed_optimizer`` whenever
             # ``swap_optimizer=True``. Propagate AReaL's DDP setting so the
             # validation sees the same value the engine actually uses.
             "use_distributed_optimizer": megatron_config.ddp.use_distributed_optimizer,
@@ -2871,15 +2746,16 @@ class MegatronEngine(TrainEngine):
 
         config.update(config_overrides)
         repatch(config)
-        _patch_mindspeed_mlp_init_tp_group()
-        _patch_mindspeed_npu_groupmatmul_add_fp32_dtype()
+        from areal.engine.megatron_utils.mindspeed_pipeline_layout_patch import (
+            ensure_mindspeed_pipeline_layout_stage_count,
+        )
+
+        ensure_mindspeed_pipeline_layout_stage_count()
         if self.bridge_cls == "megatron-bridge":
             from areal.engine.megatron_utils.mindspeed_gdn_patch import (
                 ensure_mindspeed_gdn_conv1d,
-                ensure_mindspeed_gdn_model_class,
             )
 
-            ensure_mindspeed_gdn_model_class()
             ensure_mindspeed_gdn_conv1d()
 
     def _save_model_to_hf(

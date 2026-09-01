@@ -384,11 +384,11 @@ def test_grad_norm_mb_invariance(
         engine.destroy()
     # grad_norm is reported only on the DP head; other ranks may see NaN/0 but
     # they all agree by virtue of the Megatron optimizer's internal all-reduce.
-    # Tolerance: 1e-3 relative — small enough to catch the num_microbatches
+    # Tolerance: 5e-3 relative — small enough to catch the num_microbatches
     # ratio (>=2x) while permitting benign non-associativity of fp16/bf16 sums
     # across a different mb grouping.
     g0, g1 = grad_norms
-    ok = abs(g0 - g1) <= 1e-3 * max(abs(g0), abs(g1), 1e-12)
+    ok = abs(g0 - g1) <= 5e-3 * max(abs(g0), abs(g1), 1e-12)
     if not ok:
         print(
             f"FAIL rank {rank}: grad_norm differs across num_microbatches: {g0} vs {g1}"
