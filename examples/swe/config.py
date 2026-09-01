@@ -1,6 +1,7 @@
 """Configuration for SWE SFT training with AReaL."""
 
 from dataclasses import dataclass, field
+from typing import Literal
 
 from areal.api.cli_args import SFTConfig
 
@@ -72,12 +73,12 @@ class SweDataConfig:
         default=False,
         metadata={
             "help": "Convert OpenAI JSON-string tool_calls.arguments to dicts "
-            "before apply_chat_template. Required by GLM-4.x / GLM-5.x "
-            "templates; leave at the default (False) for Qwen / Llama / "
-            "Bailing, which expect the standard string form."
+            "before apply_chat_template for templates that require structured "
+            "arguments. Leave disabled for templates that expect the standard "
+            "OpenAI string form."
         },
     )
-    split_mode: str = field(
+    split_mode: Literal["pair", "trajectory"] = field(
         default="pair",
         metadata={
             "help": "Sample construction mode: 'pair' (default) splits "

@@ -750,6 +750,17 @@ class MegatronEngine(TrainEngine):
             )
             architectures = getattr(hf_config, "architectures", None) or []
             if "BailingMoeV3ForCausalLM" in architectures:
+                if self.mcore_config.enable_mtp:
+                    raise ValueError(
+                        "BailingMoeV3 mbridge does not support enable_mtp; "
+                        "the first open-source implementation intentionally "
+                        "drops the MTP head."
+                    )
+                if (self.mcore_config.virtual_pipeline_parallel_size or 1) > 1:
+                    raise ValueError(
+                        "BailingMoeV3 does not support virtual pipeline "
+                        "parallelism; set virtual_pipeline_parallel_size=1."
+                    )
                 # BailingMoeV3 flash checkpoints keep model_type="bailing_hybrid",
                 # which overlaps the v2.5 bridge registration. Dispatch by
                 # architecture so KDA + gated-MLA weights use the v3 bridge.
@@ -2637,7 +2648,14 @@ class MegatronEngine(TrainEngine):
     @property
     def _mtp_head_dropped(self) -> bool:
         """True when the model declares an MTP head but enable_mtp left it unbuilt."""
-        if self.bridge_cls != "megatron-bridge" or self.mcore_config.enable_mtp:
+        is_bailing_v3_mbridge = self.bridge_cls == "mbridge" and isinstance(
+            self.bridge, BailingV3Bridge
+        )
+        if self.bridge_cls != "megatron-bridge" and not is_bailing_v3_mbridge:
+            return False
+        if not is_bailing_v3_mbridge and getattr(
+            self.mcore_config, "enable_mtp", False
+        ):
             return False
         text_config = getattr(self.hf_config, "text_config", self.hf_config)
         return any(

@@ -2,10 +2,12 @@
 
 """SWE SFT loading, processing, distributed caching, and public dataset API."""
 
+import hashlib
 import json
 import os
 import shutil
 import time
+import uuid
 
 from datasets import Dataset
 
@@ -29,6 +31,198 @@ logger = logging.getLogger("SWESFTDataset")
 
 _RANK0_CACHE_TIMEOUT = 36000
 _RANK0_CACHE_POLL_INTERVAL = 5
+_RANK0_STALE_FAILURE_GRACE = 60
+_CACHE_SCHEMA_VERSION = 3
+_SWE_SFT_ARTIFACT_MARKER = ".areal_swe_sft.json"
+_SWE_SFT_ARTIFACT_FORMAT = "areal.swe_sft.pretokenized"
+_SWE_SFT_ARTIFACT_VERSION = 1
+
+
+def _stable_json_value(value):
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, dict):
+        return {
+            str(key): _stable_json_value(item)
+            for key, item in sorted(value.items(), key=lambda item: str(item[0]))
+        }
+    if isinstance(value, (list, tuple)):
+        return [_stable_json_value(item) for item in value]
+    return str(value)
+
+
+def _json_digest(value) -> str:
+    payload = json.dumps(
+        _stable_json_value(value),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _source_identity(path: str) -> dict:
+    resolved_path = os.path.realpath(os.path.abspath(path))
+    try:
+        stat = os.stat(resolved_path)
+    except FileNotFoundError:
+        return {"path": resolved_path, "missing": True}
+
+    identity = {
+        "path": resolved_path,
+        "size": stat.st_size,
+        "mtime_ns": stat.st_mtime_ns,
+    }
+    # Correctness takes precedence over startup I/O: size/mtime plus sampled
+    # regions can miss an in-place rewrite that preserves metadata and changes
+    # an unsampled offset. Stream the entire source in bounded chunks instead.
+    digest = hashlib.sha256()
+    with open(resolved_path, "rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    identity["digest_kind"] = "sha256"
+    identity["digest"] = digest.hexdigest()
+    return identity
+
+
+def _tokenizer_identity(tokenizer) -> dict | None:
+    if tokenizer is None:
+        return None
+
+    tokenizer_class = type(tokenizer)
+    identity = {
+        "class": f"{tokenizer_class.__module__}.{tokenizer_class.__qualname__}",
+        "name_or_path": getattr(tokenizer, "name_or_path", None),
+        "vocab_size": getattr(tokenizer, "vocab_size", None),
+        "special_tokens": _stable_json_value(
+            getattr(tokenizer, "special_tokens_map", None)
+        ),
+        "chat_template_digest": _json_digest(getattr(tokenizer, "chat_template", None)),
+    }
+    try:
+        vocab = tokenizer.get_vocab()
+    except (AttributeError, NotImplementedError):
+        vocab = None
+    if vocab is not None:
+        identity["vocab_digest"] = _json_digest(vocab)
+        identity["vocab_entries"] = len(vocab)
+    backend_tokenizer = getattr(tokenizer, "backend_tokenizer", None)
+    try:
+        backend_serialized = backend_tokenizer.to_str()
+    except (AttributeError, TypeError, ValueError):
+        backend_serialized = None
+    if backend_serialized is not None:
+        # Captures fast-tokenizer normalizer, pre-tokenizer, decoder, and model
+        # state that vocab size/content alone does not describe.
+        identity["backend_tokenizer_digest"] = _json_digest(backend_serialized)
+    else:
+        identity["init_kwargs_digest"] = _json_digest(
+            getattr(tokenizer, "init_kwargs", None)
+        )
+    return identity
+
+
+def _build_cache_metadata(path: str, tokenizer, process_kwargs: dict) -> dict:
+    return {
+        "version": _CACHE_SCHEMA_VERSION,
+        "source": _source_identity(path),
+        "tokenizer": _tokenizer_identity(tokenizer),
+        "process_kwargs": {
+            key: value
+            for key, value in process_kwargs.items()
+            if key not in ("dump_dir", "dump_n_samples")
+        },
+    }
+
+
+def _atomic_write_json(path: str, value: dict) -> None:
+    parent = os.path.dirname(path) or "."
+    os.makedirs(parent, exist_ok=True)
+    temporary = f"{path}.tmp.{os.getpid()}.{uuid.uuid4().hex}"
+    try:
+        with open(temporary, "w", encoding="utf-8") as output:
+            json.dump(value, output, ensure_ascii=False, sort_keys=True)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, path)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+
+def _read_json_marker(path: str) -> dict | None:
+    try:
+        with open(path, encoding="utf-8") as marker:
+            value = json.load(marker)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _failed_marker_path(cache_dir: str, attempt_id: str) -> str:
+    attempt_tag = hashlib.sha256(attempt_id.encode("utf-8")).hexdigest()[:32]
+    return f"{cache_dir}.failed.{attempt_tag}.json"
+
+
+def _building_marker_path(cache_dir: str, attempt_id: str | None) -> str:
+    if attempt_id is None:
+        # Legacy/direct SPMD without a shared launcher identifier needs a
+        # discoverable pointer and retains the bounded stale-marker grace.
+        return f"{cache_dir}.building.json"
+    attempt_tag = hashlib.sha256(attempt_id.encode("utf-8")).hexdigest()[:32]
+    return f"{cache_dir}.building.{attempt_tag}.json"
+
+
+def _unlink_marker_for_attempt(path: str, attempt_id: str) -> None:
+    marker = _read_json_marker(path)
+    if marker is None or marker.get("attempt_id") != attempt_id:
+        return
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+
+
+def _resolve_cache_attempt_id(cache_attempt_id: str | None) -> str | None:
+    if cache_attempt_id:
+        return cache_attempt_id
+    elastic_run_id = os.getenv("TORCHELASTIC_RUN_ID")
+    if elastic_run_id:
+        restart_count = os.getenv("TORCHELASTIC_RESTART_COUNT", "0")
+        return f"TORCHELASTIC_RUN_ID:{elastic_run_id}:restart:{restart_count}"
+    slurm_job_id = os.getenv("SLURM_JOB_ID")
+    if slurm_job_id:
+        step_id = os.getenv("SLURM_STEP_ID", "unknown")
+        restart_count = os.getenv("SLURM_RESTART_COUNT", "0")
+        return f"SLURM_JOB_ID:{slurm_job_id}:step:{step_id}:restart:{restart_count}"
+    return None
+
+
+def _cache_entry_path(cache_dir: str, cache_key: str) -> str:
+    return os.path.join(cache_dir, "entries", cache_key)
+
+
+def _cache_coordination_prefix(cache_dir: str, cache_key: str) -> str:
+    return os.path.join(cache_dir, ".coord", cache_key, "build")
+
+
+def _write_swe_sft_artifact_marker(path: str) -> None:
+    _atomic_write_json(
+        os.path.join(path, _SWE_SFT_ARTIFACT_MARKER),
+        {
+            "format": _SWE_SFT_ARTIFACT_FORMAT,
+            "version": _SWE_SFT_ARTIFACT_VERSION,
+        },
+    )
+
+
+def _validate_split_mode(split_mode: str) -> None:
+    if split_mode not in ("pair", "trajectory"):
+        raise ValueError(
+            f"split_mode must be either 'pair' or 'trajectory', got {split_mode!r}"
+        )
 
 
 def _has_supervised_tokens(input_ids, loss_mask) -> bool:
@@ -337,6 +531,7 @@ def _tokenize_samples(
             *messages_list*).  Each element is either ``None`` or a
             list of tool dicts.
     """
+    _validate_split_mode(split_mode)
     if num_proc is None:
         num_proc = max(1, min(os.cpu_count() or 1, DATASET_NUM_PROC))
 
@@ -436,6 +631,7 @@ def _process_swe_sft(
     When *split_mode* is ``"trajectory"``, the full trajectory is kept as a
     single training sample with all assistant turns as targets.
     """
+    _validate_split_mode(split_mode)
     error_indices_list = None
 
     if split_mode == "trajectory":
@@ -494,6 +690,7 @@ def get_swe_sft_dataset(
     parse_tool_call_args: bool = False,
     cache_rank: int | None = None,
     cache_world_size: int | None = None,
+    cache_attempt_id: str | None = None,
 ):
     """Load SWE trajectory data and convert to SFT training pairs.
 
@@ -549,10 +746,10 @@ def get_swe_sft_dataset(
             as a single sample — all assistant turns are targets with
             ``loss_mask=1``, error segments are masked instead of filtered.
         cache_dir: Directory to save/load the processed Arrow dataset.
-            When set in distributed mode, rank 0 processes the data and
-            saves here; other ranks load from this directory.  If the
-            directory already contains a completed cache (``.done`` marker),
-            all ranks load from it directly without reprocessing.
+            In distributed mode this is a cache root; each preprocessing
+            identity is stored as an immutable Arrow entry under
+            ``entries/<cache-key>``. Rank 0 publishes only its entry and other
+            ranks load that same key without overwriting unrelated settings.
         dump_dir: Directory to write sample dump files (``.txt`` + ``.json``).
             Only rank 0 writes.  Set to None to disable.
         dump_samples: Number of random samples to dump.  ``-1`` = all,
@@ -567,13 +764,19 @@ def get_swe_sft_dataset(
         cache_world_size: Explicit world size for shared-cache coordination.
             Must be provided together with *cache_rank*. Direct SPMD callers
             may omit it to use ``WORLD_SIZE``.
+        cache_attempt_id: Shared launch identifier used to isolate cache-build
+            failures across concurrent or restarted launchers. Data-service
+            workers receive one from the controller. Direct SPMD callers fall
+            back to ``TORCHELASTIC_RUN_ID`` or ``SLURM_JOB_ID`` when available.
 
     Returns:
         A HuggingFace ``Dataset`` with ``input_ids`` and ``loss_mask`` columns.
     """
     from datasets import load_from_disk
 
+    _validate_split_mode(split_mode)
     rank, world_size = _resolve_cache_topology(cache_rank, cache_world_size)
+    resolved_attempt_id = _resolve_cache_attempt_id(cache_attempt_id)
 
     # Pre-tokenized Arrow dataset: load directly, skip all processing.
     if os.path.isdir(path):
@@ -596,11 +799,17 @@ def get_swe_sft_dataset(
                 f"Filtered {before_filter - len(dataset)} samples "
                 f"exceeding max_length={max_length}"
             )
+            if len(dataset) == 0:
+                raise ValueError(
+                    f"pre-tokenized SWE dataset at {path} has 0 samples after "
+                    f"max_length={max_length} filtering"
+                )
 
         logger.info(f"Final dataset: {len(dataset)} samples")
         return dataset
 
     # --- Shared kwargs for _process_swe_sft ---
+    effective_dump_dir = dump_dir if world_size == 1 or rank == 0 else None
     process_kwargs = dict(
         max_length=max_length,
         num_proc=num_proc,
@@ -611,25 +820,26 @@ def get_swe_sft_dataset(
         filter_bare_text_tool_calls=filter_bare_text_tool_calls,
         no_tools=no_tools,
         split_mode=split_mode,
-        dump_dir=dump_dir,
+        dump_dir=effective_dump_dir,
         dump_n_samples=dump_samples,
         parse_tool_call_args=parse_tool_call_args,
     )
 
     # --- Distributed rank-0-only processing ---
     if cache_dir is not None and world_size > 1:
-        done_marker = os.path.join(cache_dir, ".done")
-        meta_path = os.path.join(cache_dir, ".meta.json")
-        cache_meta = {
-            "version": 2,
-            "path": path,
-            "tokenizer": getattr(tokenizer, "name_or_path", None),
-            "process_kwargs": {
-                k: v
-                for k, v in process_kwargs.items()
-                if k not in ("dump_dir", "dump_n_samples")
-            },
-        }
+        # Cache identity must describe the effective template used by
+        # preprocessing, not the unpatched tokenizer state held by the caller.
+        # The patch is idempotent, so _tokenize_samples can safely call it again.
+        _patch_chat_template_for_training(tokenizer)
+        cache_meta = _build_cache_metadata(path, tokenizer, process_kwargs)
+        cache_key = _json_digest(cache_meta)
+        entry_dir = _cache_entry_path(cache_dir, cache_key)
+        done_marker = os.path.join(entry_dir, ".done")
+        meta_path = os.path.join(entry_dir, ".meta.json")
+        coordination_prefix = _cache_coordination_prefix(cache_dir, cache_key)
+        building_marker = _building_marker_path(
+            coordination_prefix, resolved_attempt_id
+        )
 
         def _filter_by_max_length(ds):
             if max_length is None:
@@ -656,7 +866,7 @@ def get_swe_sft_dataset(
                 )
             if len(ds) == 0:
                 raise ValueError(
-                    f"processed dataset at {cache_dir} has 0 samples after "
+                    f"processed dataset at {entry_dir} has 0 samples after "
                     f"max_length={max_length} filtering"
                 )
             return ds
@@ -671,20 +881,78 @@ def get_swe_sft_dataset(
                     f"cached dataset metadata does not match current SWE settings: "
                     f"{meta_path}"
                 )
-            dataset = load_from_disk(cache_dir)
+            dataset = load_from_disk(entry_dir)
             if len(dataset) == 0:
-                raise ValueError(f"cached dataset is empty: {cache_dir}")
+                raise ValueError(f"cached dataset is empty: {entry_dir}")
             return dataset
 
         def _wait_for_valid_cache():
             start = time.monotonic()
             last_error = None
+
+            initial_building = _read_json_marker(building_marker)
+            initial_attempt = resolved_attempt_id
+            if initial_attempt is None and initial_building is not None:
+                initial_attempt = initial_building.get("attempt_id")
+            initial_failed = (
+                _read_json_marker(
+                    _failed_marker_path(coordination_prefix, initial_attempt)
+                )
+                if initial_attempt
+                else None
+            )
+            initial_failed_attempt = None
+            if (
+                initial_failed is not None
+                and initial_failed.get("cache_key") == cache_key
+                and initial_failed.get("attempt_id") == initial_attempt
+            ):
+                initial_failed_attempt = initial_failed.get("attempt_id")
+
             while True:
                 if os.path.exists(done_marker):
                     try:
                         return _load_valid_cache()
                     except Exception as e:
                         last_error = e
+
+                building = _read_json_marker(building_marker)
+                current_attempt = resolved_attempt_id
+                if current_attempt is None and building is not None:
+                    current_attempt = building.get("attempt_id")
+                failed = (
+                    _read_json_marker(
+                        _failed_marker_path(coordination_prefix, current_attempt)
+                    )
+                    if current_attempt
+                    else None
+                )
+                matching_failure = (
+                    failed is not None
+                    and failed.get("cache_key") == cache_key
+                    and failed.get("attempt_id") == current_attempt
+                )
+                if matching_failure:
+                    attempt_id = failed["attempt_id"]
+                    elapsed = time.monotonic() - start
+                    # A complete failure pair already present when this worker
+                    # starts may belong to a previous launcher run. Give rank 0
+                    # a bounded startup window to atomically replace the
+                    # building marker with this run's attempt. Failures first
+                    # observed after invocation are current and propagate on
+                    # the next poll without waiting for the cache timeout.
+                    stale_candidate_in_grace = (
+                        resolved_attempt_id is None
+                        and attempt_id == initial_failed_attempt
+                        and elapsed < _RANK0_STALE_FAILURE_GRACE
+                    )
+                    if not stale_candidate_in_grace:
+                        error_type = failed.get("error_type", "Exception")
+                        error = failed.get("error", "unknown preprocessing failure")
+                        raise RuntimeError(
+                            "Rank 0 failed to build SWE dataset cache "
+                            f"at {cache_dir}: {error_type}: {error}"
+                        )
                 elapsed = time.monotonic() - start
                 if elapsed > _RANK0_CACHE_TIMEOUT:
                     raise TimeoutError(
@@ -711,7 +979,6 @@ def get_swe_sft_dataset(
                         cache_dir,
                         e,
                     )
-                    shutil.rmtree(cache_dir, ignore_errors=True)
             else:
                 try:
                     logger.info(
@@ -738,26 +1005,97 @@ def get_swe_sft_dataset(
 
         if rank == 0:
             # Rank 0: do the heavy processing and save for other ranks.
-            dataset = _process_swe_sft(path, tokenizer, **process_kwargs)
-            if len(dataset) == 0:
-                raise RuntimeError(
-                    "SWE SFT preprocessing produced 0 samples; refusing to cache "
-                    "an empty processed_dataset."
-                )
-            shutil.rmtree(cache_dir, ignore_errors=True)
-            os.makedirs(cache_dir, exist_ok=True)
-            dataset.save_to_disk(cache_dir)
-            with open(meta_path, "w") as f:
-                json.dump(cache_meta, f, sort_keys=True)
-            # Write marker AFTER save completes so readers see a consistent dir.
-            with open(done_marker, "w") as f:
-                f.write(str(len(dataset)))
-            logger.info(
-                f"Rank 0: saved processed dataset "
-                f"({len(dataset)} samples) to {cache_dir}"
+            attempt_id = resolved_attempt_id or uuid.uuid4().hex
+            attempt_tag = hashlib.sha256(attempt_id.encode("utf-8")).hexdigest()[:32]
+            failed_marker = _failed_marker_path(coordination_prefix, attempt_id)
+            entries_dir = os.path.dirname(entry_dir)
+            os.makedirs(entries_dir, exist_ok=True)
+            temporary_cache = os.path.join(
+                entries_dir,
+                f".{cache_key}.tmp.{attempt_tag}.{uuid.uuid4().hex}",
             )
-            dataset = _filter_by_max_length(dataset)
-            return dataset
+            _atomic_write_json(
+                building_marker,
+                {
+                    "attempt_id": attempt_id,
+                    "cache_key": cache_key,
+                    "started_at_ns": time.time_ns(),
+                },
+            )
+            _unlink_marker_for_attempt(failed_marker, attempt_id)
+            try:
+                dataset = _process_swe_sft(path, tokenizer, **process_kwargs)
+                if len(dataset) == 0:
+                    raise RuntimeError(
+                        "SWE SFT preprocessing produced 0 samples; refusing to "
+                        "cache an empty processed_dataset."
+                    )
+
+                shutil.rmtree(temporary_cache, ignore_errors=True)
+                dataset.save_to_disk(temporary_cache)
+                _atomic_write_json(
+                    os.path.join(temporary_cache, ".meta.json"), cache_meta
+                )
+                with open(
+                    os.path.join(temporary_cache, ".done"),
+                    "w",
+                    encoding="utf-8",
+                ) as marker:
+                    marker.write(str(len(dataset)))
+
+                try:
+                    os.rename(temporary_cache, entry_dir)
+                except OSError as publish_error:
+                    # Another builder for the same immutable key may have won
+                    # publication. Reuse it only after full metadata/load
+                    # validation; different keys live in different entries
+                    # and are never touched here.
+                    try:
+                        dataset = _filter_by_max_length(_load_valid_cache())
+                    except Exception:
+                        quarantine = f"{entry_dir}.invalid.{uuid.uuid4().hex}"
+                        try:
+                            os.rename(entry_dir, quarantine)
+                        except FileNotFoundError:
+                            quarantine = None
+                        except OSError:
+                            raise publish_error
+                        try:
+                            try:
+                                os.rename(temporary_cache, entry_dir)
+                            except OSError:
+                                # A concurrent repair may have published while
+                                # this builder moved the corrupt entry aside.
+                                dataset = _filter_by_max_length(_load_valid_cache())
+                                shutil.rmtree(temporary_cache, ignore_errors=True)
+                        finally:
+                            if quarantine is not None:
+                                shutil.rmtree(quarantine, ignore_errors=True)
+                    else:
+                        shutil.rmtree(temporary_cache, ignore_errors=True)
+            except Exception as error:
+                shutil.rmtree(temporary_cache, ignore_errors=True)
+                _atomic_write_json(
+                    failed_marker,
+                    {
+                        "attempt_id": attempt_id,
+                        "cache_key": cache_key,
+                        "error_type": type(error).__name__,
+                        "error": str(error)[:2000],
+                        "failed_at_ns": time.time_ns(),
+                    },
+                )
+                raise
+            else:
+                for marker_path in (building_marker, failed_marker):
+                    _unlink_marker_for_attempt(marker_path, attempt_id)
+
+                logger.info(
+                    f"Rank 0: published processed dataset "
+                    f"({len(dataset)} samples) to {entry_dir}"
+                )
+                dataset = _filter_by_max_length(dataset)
+                return dataset
         else:
             # Other ranks: wait for rank 0, then load with meta validation so a
             # cache rebuilt for different settings (or mid-rmtree) is never

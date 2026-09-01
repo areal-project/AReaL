@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import logging
 import sys
 import types
@@ -47,7 +48,8 @@ def _load_dataset_module():
     return module
 
 
-_SWE_PATH_PATTERN = _load_dataset_module()._SWE_PATH_PATTERN
+_DATASET_MODULE = _load_dataset_module()
+_SWE_PATH_PATTERN = _DATASET_MODULE._SWE_PATH_PATTERN
 
 
 @pytest.mark.parametrize(
@@ -79,3 +81,40 @@ def test_swe_path_pattern_matches_swe_token_paths(path):
 def test_swe_path_pattern_ignores_incidental_trigram(path):
     """Test that _SWE_PATH_PATTERN does not fire on paths merely containing 'swe'."""
     assert not _SWE_PATH_PATTERN.search(path.lower())
+
+
+def test_pretokenized_artifact_marker_dispatches_arbitrary_directory(
+    tmp_path, monkeypatch
+):
+    """Test that CLI artifacts do not depend on a 'swe' pathname token."""
+    artifact_path = tmp_path / "tokenized_training_data"
+    artifact_path.mkdir()
+    (artifact_path / ".areal_swe_sft.json").write_text(
+        json.dumps({"format": "areal.swe_sft.pretokenized", "version": 1}),
+        encoding="utf-8",
+    )
+    captured = {}
+
+    def fake_get_swe_sft_dataset(**kwargs):
+        captured.update(kwargs)
+        return "swe-dataset"
+
+    swe_module = types.ModuleType("areal.dataset.swe_sft")
+    swe_module.get_swe_sft_dataset = fake_get_swe_sft_dataset
+    monkeypatch.setitem(sys.modules, "areal.dataset", _DATASET_MODULE)
+    monkeypatch.setitem(sys.modules, "areal.dataset.swe_sft", swe_module)
+
+    result = _DATASET_MODULE._get_custom_dataset(
+        path=str(artifact_path),
+        type="sft",
+        tokenizer="tokenizer",
+        data_worker_rank=1,
+        data_worker_world_size=2,
+        data_worker_cache_attempt_id="launch-123",
+    )
+
+    assert result == "swe-dataset"
+    assert captured["path"] == str(artifact_path)
+    assert captured["cache_rank"] == 1
+    assert captured["cache_world_size"] == 2
+    assert captured["cache_attempt_id"] == "launch-123"

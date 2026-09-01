@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import uuid
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from areal.api.cli_args import (
@@ -200,6 +201,10 @@ class TestDataControllerRegisterDataset:
                 dataset_path="dummy",
                 dataset_type="rl",
                 drop_last=True,
+                dataset_kwargs={
+                    "custom_option": "kept",
+                    "_areal_cache_attempt_id": "spoofed",
+                },
             )
 
         assert mock_run.called
@@ -208,6 +213,14 @@ class TestDataControllerRegisterDataset:
         assert result["total_samples"] == 32
         assert result["num_workers"] == 4
         assert controller._datasets["ds-key"]["dataset_id"] == "test-ds"
+        sent_payload = mock_run.call_args.args[3]
+        sent_kwargs = sent_payload["dataset_kwargs"]
+        assert sent_kwargs["custom_option"] == "kept"
+        assert sent_kwargs["_areal_cache_attempt_id"] != "spoofed"
+        assert (
+            uuid.UUID(sent_kwargs["_areal_cache_attempt_id"]).hex
+            == sent_kwargs["_areal_cache_attempt_id"]
+        )
 
     def test_register_stores_drop_last_flag(self):
         controller = DataController(DataServiceConfig(), MagicMock())

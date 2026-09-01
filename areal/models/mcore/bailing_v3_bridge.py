@@ -235,6 +235,10 @@ class BailingV3Bridge(LLMBridge):
 
     def _get_transformer_layer_spec(self, vp_stage: int | None = None):
         """Return heterogeneous layer specs (KDA + gated MLA). VPP is not supported."""
+        if vp_stage is not None:
+            raise ValueError(
+                "BailingMoeV3 does not support virtual pipeline parallel stages."
+            )
         assert self.config.normalization == "RMSNorm"
         self.has_vp_stage = False
         return make_mcore_layer_specs_bailing_v3(

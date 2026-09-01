@@ -317,10 +317,9 @@ def _patch_chat_template_for_training(tokenizer):
 def _parse_tool_call_arguments(messages):
     """Parse JSON-string arguments in tool_calls to dicts.
 
-    OpenAI returns tool_call arguments as JSON strings, but some chat
-    templates (e.g. GLM-4.x / GLM-5.x) expect parsed dicts. Most other
-    templates (Qwen / ChatML, Llama 3, Bailing, ...) accept the standard
-    OpenAI string form, so this conversion must be opt-in.
+    OpenAI returns tool_call arguments as JSON strings, while some chat
+    templates expect parsed dicts. This conversion is opt-in because other
+    templates require the standard OpenAI string form.
     """
     patched = []
     for m in messages:
@@ -344,7 +343,33 @@ def _parse_tool_call_arguments(messages):
     return patched
 
 
-def _render_tokenize_mask(
+def _prepare_chat_template_call(
+    messages,
+    tokenizer,
+    tools=None,
+    *,
+    parse_tool_call_args=False,
+):
+    """Prepare messages and keyword arguments for a chat-template call."""
+    _require_generation_tracking(tokenizer)
+    template = getattr(tokenizer, "chat_template", None) or ""
+    kwargs = {}
+    if tools is not None:
+        kwargs["tools"] = tools
+
+    # Adaptive-thinking templates (Bailing V3 config_ling_adaptive) read an
+    # ``enable_thinking`` flag that sets the ``detailed thinking on/off``
+    # system label. Match it to whether this sample actually contains
+    # thinking. In trajectory mode this naturally becomes a per-trajectory
+    # decision; in pair mode it is a per-pair decision.
+    if "enable_thinking" in template and "preserved_thinking" in template:
+        kwargs["enable_thinking"] = any(_msg_has_thinking(m) for m in messages)
+    if parse_tool_call_args:
+        messages = _parse_tool_call_arguments(messages)
+    return messages, kwargs
+
+
+def _tokenize_and_mask(
     messages,
     tokenizer,
     tools=None,
@@ -353,76 +378,38 @@ def _render_tokenize_mask(
     error_indices=None,
     parse_tool_call_args=False,
 ):
-    """Render, tokenize, and build loss_mask for a message list.
+    """Tokenize once with native generation tracking and build ``loss_mask``.
 
     In **pair mode** (default), only the **last** assistant turn gets
     ``loss_mask=1``.  In **trajectory mode**, **all** assistant turns
     get ``loss_mask=1`` except those at indices in *error_indices*.
 
     When *parse_tool_call_args* is True, JSON-string ``tool_calls`` arguments
-    are converted to dicts before rendering (required by GLM chat templates;
-    other templates such as Qwen / Llama / Bailing must keep the OpenAI
-    string form).
+    are converted to dicts before rendering. This remains opt-in because many
+    templates require the standard OpenAI string form.
 
     Returns:
-        Tuple of ``(full_text, input_ids, loss_mask, offset_mapping)``, or
-        ``None`` if ``apply_chat_template`` fails.
+        Tuple of ``(input_ids, loss_mask)``, or ``None`` if native assistant
+        mask generation fails.
     """
-    _require_generation_tracking(tokenizer)
-    _tmpl = getattr(tokenizer, "chat_template", None) or ""
-
-    # 1) Render the full template text.
-    try:
-        kwargs = {"tokenize": False}
-        if tools is not None:
-            kwargs["tools"] = tools
-        # Adaptive-thinking templates (Bailing V3 config_ling_adaptive) read an
-        # ``enable_thinking`` flag that sets the ``detailed thinking on/off``
-        # system label. Match it to whether THIS rendered example actually
-        # contains thinking, so the switch is trained consistently
-        # (on<->think, off<->no-think); training an all-no-think example under
-        # "on" (or a thinking example under "off") would corrupt the switch.
-        # In trajectory mode ``messages`` is the whole trajectory (=> per-traj
-        # rule: on iff >=1 assistant turn thinks); in pair mode it is the pair.
-        # Gated on the preserved_thinking + enable_thinking signature so other
-        # templates (e.g. Qwen3) are left untouched.
-        if "enable_thinking" in _tmpl and "preserved_thinking" in _tmpl:
-            kwargs["enable_thinking"] = any(_msg_has_thinking(m) for m in messages)
-        if parse_tool_call_args:
-            messages = _parse_tool_call_arguments(messages)
-        full_text = tokenizer.apply_chat_template(messages, **kwargs)
-    except Exception as e:
-        logger.warning(
-            "apply_chat_template failed: %s. Skipping sample.",
-            e,
-        )
-        return None
-
-    # 2) Tokenize with offset mapping so we can map char→token.
-    encoding = tokenizer(
-        full_text, add_special_tokens=False, return_offsets_mapping=True
+    messages, kwargs = _prepare_chat_template_call(
+        messages,
+        tokenizer,
+        tools,
+        parse_tool_call_args=parse_tool_call_args,
     )
-    input_ids = encoding["input_ids"]
-    offset_mapping = encoding["offset_mapping"]
-
-    # 3) Build loss_mask.
-    loss_mask = [0] * len(input_ids)
-
-    # Templates instrumented with Jinja's generation extension provide
-    # structural assistant spans. Unlike delimiter matching, these spans cannot
-    # be forged by literal role markers in message payloads.
     try:
-        tracked_kwargs = {
+        tracked = tokenizer.apply_chat_template(
+            messages,
             **kwargs,
-            "tokenize": True,
-            "return_dict": True,
-            "return_assistant_tokens_mask": True,
-        }
-        tracked = tokenizer.apply_chat_template(messages, **tracked_kwargs)
-        tracked_ids = tracked["input_ids"]
+            tokenize=True,
+            return_dict=True,
+            return_assistant_tokens_mask=True,
+        )
+        input_ids = tracked["input_ids"]
         tracked_mask = list(tracked["assistant_masks"])
-        if tracked_ids != input_ids or len(tracked_mask) != len(input_ids):
-            raise ValueError("tracked tokenization differs from rendered text")
+        if len(tracked_mask) != len(input_ids):
+            raise ValueError("assistant mask length differs from tokenized input")
     except Exception as e:
         logger.warning(
             "Native assistant-mask generation failed: %s. Skipping sample.",
@@ -430,6 +417,7 @@ def _render_tokenize_mask(
         )
         return None
 
+    loss_mask = [0] * len(input_ids)
     segments = []
     start = None
     for idx, enabled in enumerate([*tracked_mask, 0]):
@@ -458,6 +446,57 @@ def _render_tokenize_mask(
         selected = segments[-1:] if segments else []
     for start, end in selected:
         loss_mask[start:end] = [1] * (end - start)
+    return input_ids, loss_mask
+
+
+def _render_tokenize_mask(
+    messages,
+    tokenizer,
+    tools=None,
+    *,
+    split_mode="pair",
+    error_indices=None,
+    parse_tool_call_args=False,
+):
+    """Build a token mask and additionally render offsets for sample dumps.
+
+    Training calls :func:`_tokenize_and_mask` directly and therefore performs
+    exactly one native tracked tokenization. This helper intentionally does
+    the extra render and offset tokenization needed by human-readable dumps.
+    """
+    result = _tokenize_and_mask(
+        messages,
+        tokenizer,
+        tools,
+        split_mode=split_mode,
+        error_indices=error_indices,
+        parse_tool_call_args=parse_tool_call_args,
+    )
+    if result is None:
+        return None
+    input_ids, loss_mask = result
+
+    messages, kwargs = _prepare_chat_template_call(
+        messages,
+        tokenizer,
+        tools,
+        parse_tool_call_args=parse_tool_call_args,
+    )
+    try:
+        full_text = tokenizer.apply_chat_template(messages, **kwargs, tokenize=False)
+        encoding = tokenizer(
+            full_text,
+            add_special_tokens=False,
+            return_offsets_mapping=True,
+        )
+        rendered_ids = encoding["input_ids"]
+        offset_mapping = encoding["offset_mapping"]
+        if rendered_ids != input_ids or len(offset_mapping) != len(input_ids):
+            raise ValueError("dump tokenization differs from tracked tokenization")
+    except Exception as e:
+        logger.warning("Sample dump rendering failed: %s. Skipping sample.", e)
+        return None
+
     return full_text, input_ids, loss_mask, offset_mapping
 
 
@@ -483,7 +522,7 @@ class _TokenizeAndMask:
         )
         tools_json = sample.get("tools_json")
         tools = json.loads(tools_json) if tools_json else None
-        result = _render_tokenize_mask(
+        result = _tokenize_and_mask(
             sample["messages"],
             self.tokenizer,
             tools,
@@ -494,7 +533,7 @@ class _TokenizeAndMask:
         if result is None:
             return {"input_ids": [], "loss_mask": []}
 
-        _full_text, input_ids, loss_mask, _offset_mapping = result
+        input_ids, loss_mask = result
 
         # Early exit: overlength or empty → return empty so a single
         # filter pass removes it together with template-failure empties.

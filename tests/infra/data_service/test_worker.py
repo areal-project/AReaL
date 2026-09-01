@@ -180,6 +180,10 @@ class TestDatasetLoading:
                             "custom_option": "kept",
                             "data_worker_rank": 99,
                             "data_worker_world_size": 100,
+                            "cache_rank": 98,
+                            "cache_world_size": 101,
+                            "cache_attempt_id": "spoofed-public-attempt",
+                            "_areal_cache_attempt_id": "controller-attempt",
                         }
                     ),
                 )
@@ -189,6 +193,10 @@ class TestDatasetLoading:
         assert kwargs["data_worker_rank"] == 1
         assert kwargs["data_worker_world_size"] == 2
         assert kwargs["custom_option"] == "kept"
+        assert "cache_rank" not in kwargs
+        assert "cache_world_size" not in kwargs
+        assert "cache_attempt_id" not in kwargs
+        assert kwargs["data_worker_cache_attempt_id"] == "controller-attempt"
 
     async def test_load_dataset_duplicate_409(self, loaded_client: httpx.AsyncClient):
         resp = await loaded_client.post("/datasets/load", json=_load_payload())

@@ -163,58 +163,56 @@ def _clean_message(msg, strip_thinking=True, ensure_thinking=False):
     # in a separate ``reasoning_content`` field instead of inline
     # ``<think>`` tags.  Handle both representations.
     raw_reasoning = msg.get("reasoning_content") if msg["role"] == "assistant" else None
+    if raw_reasoning is not None and not raw_reasoning.strip():
+        raw_reasoning = None
     has_thinking = False
-    if content is not None:
-        if msg["role"] == "assistant":
+    if msg["role"] == "assistant":
+        if content is not None:
             content = _normalize_thinking_tags(content)
-            has_inline_thinking = bool(_THINK_RE.search(content))
-            if has_inline_thinking and raw_reasoning and raw_reasoning.strip():
-                # Conflict: both reasoning_content and inline <think> tags.
-                # Keep inline tags (they are already in the content the
-                # tokenizer will see) and drop reasoning_content to avoid
-                # double thinking blocks in the rendered template.
-                if not strip_thinking:
-                    logger.warning(
-                        "Message has both reasoning_content and inline "
-                        "<think> tags.  Keeping inline tags, dropping "
-                        "reasoning_content."
-                    )
-                raw_reasoning = None
-            elif not has_inline_thinking and raw_reasoning and raw_reasoning.strip():
-                # Convert reasoning_content → inline <think> in content.
-                # This ensures a single representation that templates
-                # render identically to the reasoning_content path, while
-                # being more transparent and debuggable.
-                if not strip_thinking:
-                    content = (
-                        f"<think>\n{raw_reasoning.strip(chr(10))}\n</think>"
-                        f"\n\n{content.lstrip(chr(10))}"
-                    )
-                    has_inline_thinking = True
-                raw_reasoning = None
-            has_thinking = has_inline_thinking or bool(
-                raw_reasoning and raw_reasoning.strip()
-            )
-            if strip_thinking:
-                content = _extract_thinking(content)
-        cleaned["content"] = content
-    elif msg["role"] == "assistant" and msg.get("tool_calls"):
-        # Assistant with tool_calls but content=None.
-        if raw_reasoning and raw_reasoning.strip():
+        has_inline_thinking = bool(content and _THINK_RE.search(content))
+        has_separate_thinking = raw_reasoning is not None
+
+        if has_inline_thinking and has_separate_thinking:
+            # Conflict: both reasoning_content and inline <think> tags.
+            # Keep inline tags (they are already in the content the
+            # tokenizer will see) and drop reasoning_content to avoid
+            # double thinking blocks in the rendered template.
+            if not strip_thinking:
+                logger.warning(
+                    "Message has both reasoning_content and inline "
+                    "<think> tags.  Keeping inline tags, dropping "
+                    "reasoning_content."
+                )
+            raw_reasoning = None
+        elif not has_inline_thinking and has_separate_thinking:
+            # Convert reasoning_content → inline <think> regardless of
+            # whether content is text or None, and regardless of tool_calls.
+            # Keeping a single representation prevents ensure_thinking from
+            # adding an empty block on top of the real reasoning.
             has_thinking = True
             if not strip_thinking:
-                # Convert reasoning_content → inline <think> in content.
-                cleaned["content"] = (
-                    f"<think>\n{raw_reasoning.strip(chr(10))}\n</think>"
+                thinking = f"<think>\n{raw_reasoning.strip(chr(10))}\n</think>"
+                content = (
+                    thinking
+                    if content is None or content == ""
+                    else f"{thinking}\n\n{content.lstrip(chr(10))}"
                 )
-            else:
-                cleaned["content"] = None
             raw_reasoning = None
+
+        has_thinking = has_thinking or has_inline_thinking
+        if strip_thinking and content is not None:
+            content = _extract_thinking(content)
+        if content is None:
+            # Preserve None for tool-only assistant messages; otherwise use
+            # the empty string expected by ordinary assistant templates.
+            cleaned["content"] = None if msg.get("tool_calls") else ""
         else:
-            cleaned["content"] = None
-    else:
+            cleaned["content"] = content
+    elif content is None:
         # Non-assistant messages without content: default to empty string.
         cleaned["content"] = ""
+    else:
+        cleaned["content"] = content
 
     # Preserve reasoning_content for target turns only when it was NOT
     # already inlined above (i.e. only when raw_reasoning is still set).

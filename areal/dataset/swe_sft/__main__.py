@@ -10,6 +10,7 @@ from .pipeline import (
     _load_presplit_pairs,
     _load_trajectory_pairs,
     _tokenize_samples,
+    _write_swe_sft_artifact_marker,
 )
 from .tokenization import (
     DATASET_NUM_PROC,
@@ -97,9 +98,8 @@ def main():
         "--parse-tool-call-args",
         action="store_true",
         help="Convert OpenAI JSON-string tool_calls.arguments to dicts "
-        "before apply_chat_template. Required by GLM-4.x / GLM-5.x "
-        "templates; leave off for Qwen / Llama / Bailing (which expect "
-        "the standard string form).",
+        "before apply_chat_template. Enable this only when the selected "
+        "tokenizer template expects structured argument objects.",
     )
     parser.add_argument(
         "--filter-empty-tool-calls",
@@ -264,6 +264,7 @@ def main():
     print(f"\nTokenized: {len(ds)} samples")
     if args.save_tokenized:
         ds.save_to_disk(args.save_tokenized)
+        _write_swe_sft_artifact_marker(args.save_tokenized)
         print(f"Saved tokenized dataset ({len(ds)} samples) to {args.save_tokenized}")
 
 

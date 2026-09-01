@@ -63,8 +63,11 @@ _msg_has_thinking = messages._msg_has_thinking
 _prepare_trajectory = messages._prepare_trajectory
 _split_and_filter = messages._split_and_filter
 _add_bailing_v3_generation_tags = tokenization._add_bailing_v3_generation_tags
+_dump_samples = tokenization._dump_samples
 _patch_chat_template_for_training = tokenization._patch_chat_template_for_training
 _render_tokenize_mask = tokenization._render_tokenize_mask
+_tokenize_and_mask = tokenization._tokenize_and_mask
+_TokenizeAndMask = tokenization._TokenizeAndMask
 
 
 class _AdaptiveTokenizer:
@@ -138,6 +141,24 @@ class _NativeMaskTokenizer:
             "input_ids": list(range(len(text))),
             "offset_mapping": [(idx, idx + 1) for idx in range(len(text))],
         }
+
+
+class _CountingNativeMaskTokenizer(_NativeMaskTokenizer):
+    def __init__(self):
+        self.apply_modes = []
+        self.offset_tokenizations = 0
+
+    def apply_chat_template(self, messages, *, tokenize, **kwargs):
+        self.apply_modes.append(tokenize)
+        return super().apply_chat_template(messages, tokenize=tokenize, **kwargs)
+
+    def __call__(self, text, *, add_special_tokens, return_offsets_mapping):
+        self.offset_tokenizations += 1
+        return super().__call__(
+            text,
+            add_special_tokens=add_special_tokens,
+            return_offsets_mapping=return_offsets_mapping,
+        )
 
 
 class _JinjaCharTokenizer:
@@ -315,7 +336,32 @@ def test_prepare_trajectory_preserves_thinking_and_masks_errors():
     assert cleaned[4]["content"].startswith("<think>\n</think>")
 
 
-def test_render_tokenize_mask_sets_adaptive_mode_per_trajectory():
+@pytest.mark.parametrize("with_tool_calls", [False, True])
+def test_clean_message_inlines_reasoning_when_content_is_none(with_tool_calls):
+    """Real separate reasoning must not be paired with an injected empty block."""
+    raw = {
+        "role": "assistant",
+        "content": None,
+        "reasoning_content": "inspect the failure",
+    }
+    if with_tool_calls:
+        raw["tool_calls"] = [
+            {"function": {"name": "inspect", "arguments": {"path": "log"}}}
+        ]
+
+    cleaned = _clean_message(
+        raw,
+        strip_thinking=False,
+        ensure_thinking=True,
+    )
+
+    assert cleaned["content"] == "<think>\ninspect the failure\n</think>"
+    assert cleaned["content"].count("<think>") == 1
+    assert "reasoning_content" not in cleaned
+    assert bool(cleaned.get("tool_calls")) is with_tool_calls
+
+
+def test_tokenize_and_mask_sets_adaptive_mode_per_trajectory():
     # Arrange
     empty_thinking = _clean_message(
         {"role": "assistant", "content": "answer"},
@@ -330,13 +376,13 @@ def test_render_tokenize_mask_sets_adaptive_mode_per_trajectory():
 
     # Act
     no_thinking_tokenizer = _AdaptiveTokenizer()
-    _render_tokenize_mask(
+    _tokenize_and_mask(
         [{"role": "user", "content": "task"}, empty_thinking],
         no_thinking_tokenizer,
         split_mode="trajectory",
     )
     mixed_tokenizer = _AdaptiveTokenizer()
-    _render_tokenize_mask(
+    _tokenize_and_mask(
         [
             {"role": "user", "content": "task"},
             empty_thinking,
@@ -349,6 +395,37 @@ def test_render_tokenize_mask_sets_adaptive_mode_per_trajectory():
     # Assert
     assert no_thinking_tokenizer.enable_thinking is False
     assert mixed_tokenizer.enable_thinking is True
+
+
+def test_training_tokenizes_once_but_dump_still_renders_offsets(tmp_path):
+    """Fresh training uses one tracked tokenization; dumps add text offsets."""
+    messages = [
+        {"role": "user", "content": "task"},
+        {"role": "assistant", "content": "answer"},
+    ]
+    training_tokenizer = _CountingNativeMaskTokenizer()
+    transform = _TokenizeAndMask(training_tokenizer)
+
+    transformed = transform({"messages": messages})
+
+    assert transformed["input_ids"]
+    assert any(transformed["loss_mask"])
+    assert training_tokenizer.apply_modes == [True]
+    assert training_tokenizer.offset_tokenizations == 0
+
+    dump_tokenizer = _CountingNativeMaskTokenizer()
+    _dump_samples(
+        [messages],
+        dump_tokenizer,
+        [None],
+        str(tmp_path),
+        n_samples=-1,
+    )
+
+    assert dump_tokenizer.apply_modes == [True, False]
+    assert dump_tokenizer.offset_tokenizations == 1
+    assert (tmp_path / "sample_0.txt").is_file()
+    assert (tmp_path / "sample_0.json").is_file()
 
 
 def test_native_mask_ignores_literal_assistant_delimiter_and_masks_errors():
