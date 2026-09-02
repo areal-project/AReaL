@@ -848,6 +848,55 @@ class TestInferenceServiceWorkflow:
         )
 
     @pytest.mark.asyncio
+    async def test_offline_mode_assigns_each_interaction_reward(self):
+        class StepRewardAgent:
+            async def run(self, data, **kwargs):
+                return {"turn-1": -0.25, "turn-2": 1.0}
+
+        workflow = InferenceServiceWorkflow(
+            controller=MagicMock(),
+            agent=StepRewardAgent(),
+            gateway_addr="http://test:8080",
+            admin_api_key="test-key",
+        )
+        workflow._start_session = AsyncMock(
+            return_value=("grp-test-1", [("sess-1", "sess-api-key-1")])
+        )
+        workflow._set_last_reward = AsyncMock(return_value=None)
+        workflow._export_interactions = AsyncMock(
+            return_value={"turn-1": MagicMock(), "turn-2": MagicMock()}
+        )
+
+        with (
+            patch(
+                "areal.v2.inference_service.controller.workflow.workflow_context"
+            ) as context,
+            patch("areal.v2.inference_service.controller.workflow.stats_tracker"),
+        ):
+            context.get_aiohttp_session = AsyncMock(return_value=AsyncMock())
+            context.get.return_value = MagicMock(task_id=42)
+            context.get_httpx_client = AsyncMock(return_value=MagicMock())
+            context.stat_scope.return_value = "rollout"
+
+            result = await workflow.arun_episode(engine=MagicMock(), data={})
+
+        assert result is not None
+        assert workflow._set_last_reward.await_args_list == [
+            call(
+                context.get_aiohttp_session.return_value,
+                -0.25,
+                "sess-api-key-1",
+                interaction_id="turn-1",
+            ),
+            call(
+                context.get_aiohttp_session.return_value,
+                1.0,
+                "sess-api-key-1",
+                interaction_id="turn-2",
+            ),
+        ]
+
+    @pytest.mark.asyncio
     async def test_offline_mode_discards_export_when_agent_fails(self):
         class FailingAgent:
             async def run(self, data, **kwargs):
