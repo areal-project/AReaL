@@ -283,6 +283,71 @@ class PPOActor:
         else:
             gae_outcome_rewards[batch_indices, indices] = reward_score
 
+        # Add token-level dense/step rewards if provided in data.
+        step_rewards = data.get("step_rewards")
+        if step_rewards is not None:
+            if not torch.is_tensor(step_rewards):
+                raise TypeError("`step_rewards` must be a torch.Tensor")
+            if step_rewards.shape != loss_mask.shape:
+                raise ValueError(
+                    f"`step_rewards` shape {tuple(step_rewards.shape)} must match loss_mask shape {tuple(loss_mask.shape)}"
+                )
+            step_rewards = step_rewards.to(device=rewards.device, dtype=rewards.dtype)
+            step_rewards = torch.roll(step_rewards, shifts=-1, dims=-1)
+            scaled_step_rewards = (
+                step_rewards + self.reward_bias
+            ) * self.reward_scaling
+            scaled_step_rewards = torch.clip(
+                scaled_step_rewards, max=self.reward_clip, min=-self.reward_clip
+            )
+            scaled_step_rewards = scaled_step_rewards * loss_mask
+            if self.mask_no_eos_with_zero:
+                scaled_step_rewards = torch.where(
+                    seq_truncated_mask.unsqueeze(-1),
+                    torch.zeros_like(scaled_step_rewards),
+                    scaled_step_rewards,
+                )
+            gae_outcome_rewards = gae_outcome_rewards + scaled_step_rewards
+
+        # Add turn-level rewards if provided as [bs, num_turns] tensor.
+        turn_rewards = data.get("turn_rewards")
+        if turn_rewards is not None and turn_ids is not None:
+            if not torch.is_tensor(turn_rewards):
+                raise TypeError("`turn_rewards` must be a torch.Tensor")
+            if turn_rewards.dim() == 2 and turn_rewards.shape[0] == bs:
+                scaled_turn_rewards = (
+                    turn_rewards.to(device=rewards.device, dtype=rewards.dtype)
+                    + self.reward_bias
+                ) * self.reward_scaling
+                scaled_turn_rewards = torch.clip(
+                    scaled_turn_rewards,
+                    max=self.reward_clip,
+                    min=-self.reward_clip,
+                )
+                max_turns = turn_rewards.shape[1]
+                safe_tids = torch.clamp(turn_ids.long(), min=0, max=max_turns - 1)
+                valid_turn = (turn_ids >= 0) & (turn_ids < max_turns) & loss_mask.bool()
+                next_tids = torch.roll(turn_ids, shifts=-1, dims=-1)
+                next_loss = torch.roll(loss_mask, shifts=-1, dims=-1)
+                is_last_token_of_turn = valid_turn & (
+                    (next_tids != turn_ids) | (next_loss == 0)
+                )
+                expanded_turn_rewards = torch.gather(
+                    scaled_turn_rewards, dim=1, index=safe_tids
+                )
+                turn_rewards_tensor = torch.where(
+                    is_last_token_of_turn,
+                    expanded_turn_rewards,
+                    torch.zeros_like(rewards),
+                )
+                if self.mask_no_eos_with_zero:
+                    turn_rewards_tensor = torch.where(
+                        seq_truncated_mask.unsqueeze(-1),
+                        torch.zeros_like(turn_rewards_tensor),
+                        turn_rewards_tensor,
+                    )
+                gae_outcome_rewards = gae_outcome_rewards + turn_rewards_tensor
+
         # Turn-level GAE treats each generated turn as a macro timestep. Keep
         # token KL as a local actor penalty rather than broadcasting a turn's
         # summed KL into every token and into critic targets.
