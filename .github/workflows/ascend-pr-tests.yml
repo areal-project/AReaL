@@ -257,10 +257,6 @@ jobs:
     env:
       AREAL_IS_IN_CI: "1"
       NPU_TEST_BASE_SHA: ""
-      AREAL_TEST_QWEN3_PATH: "/root/.cache/modelscope/hub/models/Qwen/Qwen3-0.6B"
-      AREAL_TEST_QWEN3_MOE_PATH: "/root/.cache/modelscope/hub/models/Qwen/Qwen3-30B-A3B"
-      AREAL_TEST_QWEN35_PATH: "/root/.cache/modelscope/hub/models/Qwen/Qwen3.5-0.8B"
-      AREAL_TEST_QWEN35_MOE_PATH: "/root/.cache/modelscope/hub/models/Qwen/Qwen3.5-35B-A3B"
       HF_ENDPOINT: "https://hf-mirror.com"
       HF_HUB_DISABLE_XET: "1"
       PYTHONUNBUFFERED: "1"
@@ -392,6 +388,189 @@ jobs:
 
           npu-smi info
 
+      - name: Resolve cached NPU test models
+        run: |
+          set -euo pipefail
+
+          modelscope_root="/root/.cache/modelscope/hub/models"
+          huggingface_root="/root/.cache/huggingface/hub"
+          nfs_model_paths=()
+
+          verify_model() {
+            local model_path="$1"
+            local weight_file
+
+            [[ -f "${model_path}/config.json" ]] || return 1
+            weight_file=$(find -L "${model_path}" -maxdepth 1 -type f \
+              \( -name '*.safetensors' -o -name '*.bin' \) -print -quit)
+            [[ -n "${weight_file}" ]]
+          }
+
+          matches_model() {
+            local candidate_path="$1"
+            local namespace="$2"
+            local model_name="$3"
+            local normalized_path="${candidate_path//___/.}"
+            local candidate_name
+
+            candidate_name=$(basename "${normalized_path}")
+            [[ "${candidate_name}" == "${model_name}" || \
+              "${normalized_path}" == *"__${model_name}" || \
+              "${normalized_path}" == \
+                *"models--${namespace}--${model_name}/snapshots/"* ]]
+          }
+
+          resolve_model() {
+            local env_name="$1"
+            local namespace="$2"
+            local model_name="$3"
+            local encoded_model_name="${model_name//./___}"
+            local candidate
+            local snapshot_root
+            local model_path=""
+            local -a modelscope_paths=(
+              "${modelscope_root}/${namespace}/${model_name}"
+            )
+            local -a huggingface_snapshot_roots=(
+              "${huggingface_root}/models--${namespace}--${model_name}/snapshots"
+            )
+
+            if [[ "${encoded_model_name}" != "${model_name}" ]]; then
+              modelscope_paths+=(
+                "${modelscope_root}/${namespace}/${encoded_model_name}"
+              )
+              huggingface_snapshot_roots+=(
+                "${huggingface_root}/models--${namespace}--${encoded_model_name}/snapshots"
+              )
+            fi
+
+            for candidate in "${modelscope_paths[@]}"; do
+              if verify_model "${candidate}"; then
+                model_path="${candidate}"
+                break
+              fi
+            done
+
+            for candidate in "${nfs_model_paths[@]}"; do
+              [[ -z "${model_path}" && "${candidate,,}" == *modelscope* ]] \
+                || continue
+              if matches_model "${candidate}" "${namespace}" "${model_name}"; then
+                model_path="${candidate}"
+                break
+              fi
+            done
+
+            for snapshot_root in "${huggingface_snapshot_roots[@]}"; do
+              [[ -z "${model_path}" && -d "${snapshot_root}" ]] || continue
+              while IFS= read -r candidate; do
+                if verify_model "${candidate}"; then
+                  model_path="${candidate}"
+                  break
+                fi
+              done < <(find -L "${snapshot_root}" -mindepth 1 \
+                -maxdepth 1 -type d -print | sort)
+            done
+
+            for candidate in "${nfs_model_paths[@]}"; do
+              [[ -z "${model_path}" ]] || break
+              if matches_model "${candidate}" "${namespace}" "${model_name}"; then
+                model_path="${candidate}"
+                break
+              fi
+            done
+
+            if [[ -z "${model_path}" ]]; then
+              echo "::error title=Cached model unavailable::${namespace}/${model_name} was not found in the configured caches or visible NFS mounts"
+              return 1
+            fi
+
+            echo "${env_name}=${model_path}" >> "${GITHUB_ENV}"
+            echo "Using cached model for ${namespace}/${model_name}: ${model_path}"
+          }
+
+          probe_cache_root() {
+            local cache_root="$1"
+
+            echo "Cache root: ${cache_root}"
+            if [[ ! -e "${cache_root}" && ! -L "${cache_root}" ]]; then
+              echo "Cache root is missing"
+              return
+            fi
+
+            if command -v findmnt >/dev/null; then
+              findmnt -T "${cache_root}" \
+                -o TARGET,SOURCE,FSTYPE,OPTIONS || true
+            fi
+            ls -lad "${cache_root}"
+            echo "Exact cache folders and symlinks:"
+            find -H "${cache_root}" -mindepth 1 -maxdepth 3 \
+              \( -type d -o -type l \) -printf '%y %p -> %l\n' \
+              2>/dev/null | sort || true
+          }
+
+          probe_cache_root "${modelscope_root}"
+          probe_cache_root "${huggingface_root}"
+
+          if command -v findmnt >/dev/null; then
+            mapfile -t nfs_mounts < <(
+              findmnt -rn -t nfs,nfs4 -o TARGET | sort -u
+            )
+          else
+            mapfile -t nfs_mounts < <(
+              awk '$3 == "nfs" || $3 == "nfs4" {print $2}' \
+                /proc/mounts | sort -u
+            )
+          fi
+
+          echo "Visible NFS mount targets:"
+          if [[ "${#nfs_mounts[@]}" -eq 0 ]]; then
+            echo "No NFS or NFS4 mounts are visible"
+          fi
+
+          for nfs_target in "${nfs_mounts[@]}"; do
+            echo "NFS mount: ${nfs_target}"
+            if command -v findmnt >/dev/null; then
+              findmnt -T "${nfs_target}" \
+                -o TARGET,SOURCE,FSTYPE,OPTIONS || true
+            fi
+
+            nfs_tree_file=$(mktemp)
+            if ! timeout --kill-after=10s 60s \
+              find -H "${nfs_target}" -xdev -mindepth 1 -maxdepth 6 \
+                \( -type d -o -type l \) -printf '%y %p -> %l\n' \
+                > "${nfs_tree_file}"; then
+              echo "NFS directory inventory timed out or failed: ${nfs_target}"
+            fi
+            nfs_tree_count=$(wc -l < "${nfs_tree_file}")
+            echo "NFS directory entries (showing up to 500 of ${nfs_tree_count}):"
+            sort "${nfs_tree_file}" | head -n 500 || true
+            rm -f -- "${nfs_tree_file}"
+
+            nfs_probe_file=$(mktemp)
+            if ! timeout --kill-after=10s 120s \
+              find -L "${nfs_target}" -xdev -type f \
+                -name config.json -print \
+                > "${nfs_probe_file}"; then
+              echo "NFS search timed out or failed: ${nfs_target}"
+            fi
+
+            while IFS= read -r config_path; do
+              candidate=$(dirname "${config_path}")
+              if verify_model "${candidate}"; then
+                nfs_model_paths+=("${candidate}")
+                echo "Valid NFS model folder: ${candidate}"
+              fi
+            done < <(sort -u "${nfs_probe_file}")
+            rm -f -- "${nfs_probe_file}"
+          done
+
+          failed=0
+          resolve_model AREAL_TEST_QWEN3_PATH Qwen Qwen3-0.6B || failed=1
+          resolve_model AREAL_TEST_QWEN3_MOE_PATH Qwen Qwen3-30B-A3B || failed=1
+          resolve_model AREAL_TEST_QWEN35_PATH Qwen Qwen3.5-0.8B || failed=1
+          resolve_model AREAL_TEST_QWEN35_MOE_PATH Qwen Qwen3.5-35B-A3B || failed=1
+          exit "${failed}"
+
       - name: Run NPU-image dependency tests
         env:
           AREAL_TEST_REPORT_DIR: /tmp/current-npu-test-reports
@@ -405,26 +584,6 @@ jobs:
             tests/test_model_packed_seq_cp.py
           pytest -q -p scripts.ci_test_report \
             -m skipif tests/test_reassemble_cp_logprobs.py
-
-      - name: Verify cached NPU test models
-        run: |
-          set -euo pipefail
-
-          verify_model() {
-            local model_path="$1"
-            local weight_file
-
-            test -f "${model_path}/config.json"
-            weight_file=$(find -L "${model_path}" -maxdepth 1 -type f \
-              \( -name '*.safetensors' -o -name '*.bin' \) -print -quit)
-            test -n "${weight_file}"
-            echo "Using cached model: ${model_path}"
-          }
-
-          verify_model "${AREAL_TEST_QWEN3_PATH}"
-          verify_model "${AREAL_TEST_QWEN3_MOE_PATH}"
-          verify_model "${AREAL_TEST_QWEN35_PATH}"
-          verify_model "${AREAL_TEST_QWEN35_MOE_PATH}"
 
       - name: Run NPU test suites
         env:
