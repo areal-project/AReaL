@@ -95,10 +95,14 @@ class InferenceServiceWorkflow(RolloutWorkflow):
         session: aiohttp.ClientSession,
         reward: float,
         session_api_key: str,
+        interaction_id: str | None = None,
     ) -> int | None:
         url = f"{self.gateway_addr}/{_RL_SET_REWARD_PATHNAME}"
         headers = {"Authorization": f"Bearer {session_api_key}"}
-        payload: dict[str, Any] = {"interaction_id": None, "reward": reward}
+        payload: dict[str, Any] = {
+            "interaction_id": interaction_id,
+            "reward": reward,
+        }
         async with session.post(url, json=payload, headers=headers) as resp:
             resp.raise_for_status()
             data = await resp.json()
@@ -194,15 +198,28 @@ class InferenceServiceWorkflow(RolloutWorkflow):
                     api_key=session_api_key,
                 )
                 if isinstance(rewards, dict):
-                    final_reward = float(
-                        next(reversed(rewards.values())) if rewards else 0.0
-                    )
+                    if rewards:
+                        for interaction_id, reward in rewards.items():
+                            await self._set_last_reward(
+                                http_session,
+                                float(reward),
+                                session_api_key,
+                                interaction_id=interaction_id,
+                            )
+                        final_reward = float(next(reversed(rewards.values())))
+                    else:
+                        final_reward = 0.0
+                        await self._set_last_reward(
+                            http_session, final_reward, session_api_key
+                        )
                 elif isinstance(rewards, (int, float)):
                     final_reward = float(rewards)
+                    await self._set_last_reward(
+                        http_session, final_reward, session_api_key
+                    )
                 else:
                     raise ValueError(f"Invalid reward type: {type(rewards)}")
 
-                await self._set_last_reward(http_session, final_reward, session_api_key)
                 return final_reward
             except Exception as exc:
                 is_conn_err = isinstance(exc, _CONNECTION_ERROR_TYPES) or (
