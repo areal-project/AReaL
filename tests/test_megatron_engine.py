@@ -1,7 +1,10 @@
+import json
 import os
 import time
 from importlib.metadata import version as get_version
+from types import SimpleNamespace
 from typing import Any
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -19,6 +22,7 @@ from areal.api.cli_args import (
 )
 from areal.engine import MegatronEngine
 from areal.infra.platforms import current_platform
+from areal.models.mcore.bailing_v3_bridge import BailingV3Bridge
 from areal.utils import logging
 
 logger = logging.getLogger("TestMegatronEngine")
@@ -103,6 +107,103 @@ def test_mark_duplicated_params_clears_tp_metadata_for_replicated_params():
     assert sharded_linear.weight.tensor_model_parallel
 
 
+def test_native_mbridge_save_finalizes_hf_config(monkeypatch, tmp_path):
+    """The native mbridge saver runs the shared rank-zero HF finalizer."""
+    engine = MegatronEngine.__new__(MegatronEngine)
+    engine.model = [object()]
+    engine.bridge_cls = "mbridge"
+    engine.mcore_config = SimpleNamespace(use_mbridge_save=True)
+    engine.config = SimpleNamespace(is_critic=False, path="/models/source")
+    engine.bridge = Mock(safetensor_io=object())
+    engine.process_group_initialized = True
+    engine._cpu_group = object()
+
+    finalize = Mock()
+    source_config = {"model_type": "runtime_only", "torch_dtype": "bfloat16"}
+    snapshot = Mock(return_value=source_config)
+    monkeypatch.setattr(
+        "areal.engine.megatron_engine.finalize_hf_export",
+        finalize,
+    )
+    monkeypatch.setattr(
+        "areal.engine.megatron_engine.load_hf_config_snapshot",
+        snapshot,
+    )
+    monkeypatch.setattr(dist, "get_rank", lambda: 0)
+    monkeypatch.setattr(dist, "barrier", lambda **_kwargs: None)
+    monkeypatch.setattr(current_platform, "synchronize", lambda: None)
+
+    engine._save_model_to_hf(str(tmp_path), base_model_path=str(tmp_path))
+
+    snapshot.assert_called_once_with(str(tmp_path))
+    engine.bridge.save_weights.assert_called_once_with(
+        models=engine.model,
+        weights_path=str(tmp_path),
+    )
+    finalize.assert_called_once_with(
+        engine.bridge.hf_config,
+        str(tmp_path),
+        source_model_path=str(tmp_path),
+        source_config=source_config,
+    )
+
+
+def test_bailing_v3_mbridge_declared_mtp_is_scrubbed(tmp_path):
+    """Bailing V3 declares MTP in HF config but intentionally drops its head."""
+    engine = MegatronEngine.__new__(MegatronEngine)
+    engine.bridge_cls = "mbridge"
+    engine.mcore_config = SimpleNamespace(enable_mtp=False)
+    engine.logger = Mock()
+    engine.bridge = Mock(spec=BailingV3Bridge)
+    engine.hf_config = SimpleNamespace(num_nextn_predict_layers=1)
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump({"num_nextn_predict_layers": 1}, f)
+
+    assert engine._mtp_head_dropped
+    engine._scrub_mtp_from_saved_config(str(tmp_path))
+
+    with open(tmp_path / "config.json") as f:
+        assert json.load(f)["num_nextn_predict_layers"] == 0
+
+
+def test_bailing_v3_bridge_rejects_virtual_pipeline_parallelism(monkeypatch):
+    """Bailing V3 fails before model construction when VPP is requested."""
+    engine = MegatronEngine.__new__(MegatronEngine)
+    engine.bridge_cls = "mbridge"
+    engine.config = SimpleNamespace(path="organization/ling-v3")
+    engine.mcore_config = SimpleNamespace(
+        enable_mtp=False, virtual_pipeline_parallel_size=2
+    )
+    monkeypatch.setattr(
+        "areal.engine.megatron_engine.PretrainedConfig.from_pretrained",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            architectures=["BailingMoeV3ForCausalLM"]
+        ),
+    )
+
+    with pytest.raises(ValueError, match="does not support virtual pipeline"):
+        engine._build_hf_mcore_bridge()
+
+
+def test_bailing_v3_bridge_rejects_mtp_construction(monkeypatch):
+    """Bailing V3 cannot claim an MTP head that its mbridge never constructs."""
+    engine = MegatronEngine.__new__(MegatronEngine)
+    engine.bridge_cls = "mbridge"
+    engine.config = SimpleNamespace(path="organization/ling-v3")
+    engine.mcore_config = SimpleNamespace(
+        enable_mtp=True, virtual_pipeline_parallel_size=1
+    )
+    monkeypatch.setattr(
+        "areal.engine.megatron_engine.PretrainedConfig.from_pretrained",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            architectures=["BailingMoeV3ForCausalLM"]
+        ),
+    )
+
+    with pytest.raises(ValueError, match="does not support enable_mtp"):
+        engine._build_hf_mcore_bridge()
+
+
 # Cannot use a "module" scope since process groups can only be initialized once.
 @pytest.fixture
 def engine():
@@ -171,6 +272,9 @@ def test_hf_save_load_weights(tmp_path_factory, engine, mock_input):
     start = time.perf_counter()
     engine.save(save_load_meta)
     logger.info(f"Save done, time cost: {time.perf_counter() - start:.4f} seconds.")
+    with open(path / "config.json") as f:
+        saved_config = json.load(f)
+    assert saved_config["model_type"] == engine.hf_config.model_type
     for name, param in engine.model.named_parameters():
         param.zero_()
 

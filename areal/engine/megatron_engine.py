@@ -36,6 +36,7 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import PretrainedConfig
 
 import areal.models.mcore.bailing_moe_bridge  # noqa: F401  # register bridge
+import areal.models.mcore.bailing_v3_bridge  # noqa: F401  # register bridge
 from areal.api import (
     FinetuneSpec,
     InferenceEngine,
@@ -90,6 +91,7 @@ from areal.engine.megatron_utils.pipeline_parallel import (
 )
 from areal.infra.dist_rollout import DistRolloutCoordinator
 from areal.infra.platforms import current_platform, is_npu_available
+from areal.models.mcore.bailing_v3_bridge import BailingV3Bridge
 from areal.models.mcore.hf_load import load_weights_from_hf_with_mbridge_fast
 from areal.models.mcore.hf_save import (
     save_critic_value_head,
@@ -133,7 +135,12 @@ from areal.utils.data import (
     unpad_logits,
 )
 from areal.utils.functional import gather_logprobs, gather_logprobs_entropy
-from areal.utils.hf_utils import load_hf_processor_and_tokenizer, load_hf_tokenizer
+from areal.utils.hf_utils import (
+    finalize_hf_export,
+    load_hf_config_snapshot,
+    load_hf_processor_and_tokenizer,
+    load_hf_tokenizer,
+)
 from areal.utils.lock import DistributedLock
 from areal.utils.lr_scheduler import get_num_warmup_steps
 from areal.utils.network import find_free_ports, format_host_for_url, gethostip
@@ -738,9 +745,30 @@ class MegatronEngine(TrainEngine):
 
     def _build_hf_mcore_bridge(self):
         if self.bridge_cls == "mbridge":
-            self.bridge = mbridge.AutoBridge.from_pretrained(
+            hf_config = PretrainedConfig.from_pretrained(
                 self.config.path, trust_remote_code=True
             )
+            architectures = getattr(hf_config, "architectures", None) or []
+            if "BailingMoeV3ForCausalLM" in architectures:
+                if self.mcore_config.enable_mtp:
+                    raise ValueError(
+                        "BailingMoeV3 mbridge does not support enable_mtp; "
+                        "the first open-source implementation intentionally "
+                        "drops the MTP head."
+                    )
+                if (self.mcore_config.virtual_pipeline_parallel_size or 1) > 1:
+                    raise ValueError(
+                        "BailingMoeV3 does not support virtual pipeline "
+                        "parallelism; set virtual_pipeline_parallel_size=1."
+                    )
+                # BailingMoeV3 flash checkpoints keep model_type="bailing_hybrid",
+                # which overlaps the v2.5 bridge registration. Dispatch by
+                # architecture so KDA + gated-MLA weights use the v3 bridge.
+                self.bridge = BailingV3Bridge(hf_config)
+            else:
+                self.bridge = mbridge.AutoBridge.from_pretrained(
+                    self.config.path, trust_remote_code=True
+                )
             self.bridge.dtype = self.dtype
             if self.config.gradient_checkpointing:
                 self.bridge.set_extra_args(
@@ -752,13 +780,23 @@ class MegatronEngine(TrainEngine):
                 )
 
             # Set MoE configuration overrides (aux-loss-free balancing, z-loss).
+            # mbridge extra_args override per-model bridge kwargs, so fields
+            # whose cli default may disagree with a bridge's deliberate
+            # default are forwarded only when explicitly configured
+            # (None = keep the bridge default).
             moe_extra_args: dict = {
                 "moe_token_dispatcher_type": self.mcore_config.moe_token_dispatcher_type,
                 "moe_permute_fusion": self.mcore_config.moe_permute_fusion,
                 "moe_router_fusion": self.mcore_config.moe_router_fusion,
-                "moe_shared_expert_overlap": self.mcore_config.moe_shared_expert_overlap,
-                "moe_router_bias_update_rate": self.mcore_config.moe_router_bias_update_rate,
             }
+            if self.mcore_config.moe_shared_expert_overlap is not None:
+                moe_extra_args["moe_shared_expert_overlap"] = (
+                    self.mcore_config.moe_shared_expert_overlap
+                )
+            if self.mcore_config.moe_router_bias_update_rate is not None:
+                moe_extra_args["moe_router_bias_update_rate"] = (
+                    self.mcore_config.moe_router_bias_update_rate
+                )
             if self.mcore_config.moe_router_dtype is not None:
                 moe_extra_args["moe_router_dtype"] = self.mcore_config.moe_router_dtype
             if self.mcore_config.moe_z_loss_coeff is not None:
@@ -1044,6 +1082,11 @@ class MegatronEngine(TrainEngine):
                     raise ValueError(
                         "HF format does not support optimizer state saving, please use DCP format instead."
                     )
+                # HF export all-gathers full tensors across TP; reclaim allocator
+                # headroom first. Kept out of the dcp/recover path, which is
+                # frequency-driven and should not pay a full-heap GC per save.
+                gc.collect()
+                current_platform.empty_cache()
                 self._save_model_to_hf(
                     meta.path,
                     tokenizer=meta.tokenizer,
@@ -1402,6 +1445,7 @@ class MegatronEngine(TrainEngine):
         self._ensure_ready()
         if self._awex_adapter is not None:
             self._awex_adapter.ensure_grad_buffers()
+
         self.optimizer_zero_grad()
 
         input_batched, _ = self._normalize_batch_input(input_)
@@ -2622,6 +2666,11 @@ class MegatronEngine(TrainEngine):
                 )
         else:
             if self.mcore_config.use_mbridge_save:
+                source_config = (
+                    load_hf_config_snapshot(base_model_path)
+                    if dist.get_rank() == 0
+                    else None
+                )
                 # when loading model using AreaL's fast hf load, the safetensor_io is never set
                 if (
                     not hasattr(self.bridge, "safetensor_io")
@@ -2631,6 +2680,13 @@ class MegatronEngine(TrainEngine):
                         self.config.path
                     )
                 self.bridge.save_weights(models=self.model, weights_path=path)
+                if dist.get_rank() == 0:
+                    finalize_hf_export(
+                        self.bridge.hf_config,
+                        path,
+                        source_model_path=base_model_path,
+                        source_config=source_config,
+                    )
             else:
                 save_weights_to_hf_with_mbridge_fast(
                     bridge=self.bridge,
@@ -2660,7 +2716,14 @@ class MegatronEngine(TrainEngine):
     @property
     def _mtp_head_dropped(self) -> bool:
         """True when the model declares an MTP head but enable_mtp left it unbuilt."""
-        if self.bridge_cls != "megatron-bridge" or self.mcore_config.enable_mtp:
+        is_bailing_v3_mbridge = self.bridge_cls == "mbridge" and isinstance(
+            self.bridge, BailingV3Bridge
+        )
+        if self.bridge_cls != "megatron-bridge" and not is_bailing_v3_mbridge:
+            return False
+        if not is_bailing_v3_mbridge and getattr(
+            self.mcore_config, "enable_mtp", False
+        ):
             return False
         text_config = getattr(self.hf_config, "text_config", self.hf_config)
         return any(
@@ -3038,6 +3101,7 @@ class MegatronEngine(TrainEngine):
                     inputs = {
                         k: v for k, v in inputs.items() if not k.startswith("_cp_")
                     }
+
             loss = loss_fn(
                 logprobs,
                 entropy,

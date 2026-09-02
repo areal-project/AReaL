@@ -16,6 +16,7 @@ import os
 import sys
 import threading
 import time
+import uuid
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
@@ -30,6 +31,7 @@ if TYPE_CHECKING:
     from areal.api.scheduler_api import Scheduler, Worker
 
 logger = logging.getLogger("DataController")
+_CACHE_ATTEMPT_ID_KEY = "_areal_cache_attempt_id"
 
 
 class DataController:
@@ -331,6 +333,12 @@ class DataController:
         """
         self._ensure_initialized()
 
+        worker_dataset_kwargs = dict(dataset_kwargs or {})
+        # Reserved coordination state is generated per registration and
+        # overwritten here so caller-provided dataset kwargs cannot make a new
+        # launcher consume another launcher's cache-build failure marker.
+        worker_dataset_kwargs[_CACHE_ATTEMPT_ID_KEY] = uuid.uuid4().hex
+
         payload = {
             "dataset_id": dataset_id,
             "dataset_path": dataset_path,
@@ -340,7 +348,7 @@ class DataController:
             "max_length": max_length,
             "shuffle": shuffle,
             "drop_last": drop_last,
-            "dataset_kwargs": dataset_kwargs or {},
+            "dataset_kwargs": worker_dataset_kwargs,
         }
 
         from areal.infra.utils.concurrent import run_async_task

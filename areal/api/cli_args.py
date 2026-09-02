@@ -970,11 +970,12 @@ class MegatronEngineConfig:
 
     # MoE
     moe_router_dtype: str | None = "fp32"
-    moe_shared_expert_overlap: bool = field(
-        default=False,
+    moe_shared_expert_overlap: bool | None = field(
+        default=None,
         metadata={
             "help": "Enable overlapping between shared expert computations and dispatcher communications. "
-            "Without this, the shared experts execute after the routed experts."
+            "Without this, the shared experts execute after the routed experts. "
+            "None keeps the model bridge's own default."
         },
     )
     moe_enable_deepep: bool = False
@@ -995,13 +996,14 @@ class MegatronEngineConfig:
             "Requires TransformerEngine >= 2.7.0.",
         },
     )
-    moe_router_bias_update_rate: float = field(
-        default=0.0,
+    moe_router_bias_update_rate: float | None = field(
+        default=None,
         metadata={
             "help": "Update rate for auxiliary-loss-free MoE load balancing "
             "(DeepSeek V3 style). Controls how fast expert_bias adjusts. "
-            "Default 0.0 disables bias updates; set a positive value such as "
-            "1e-3 to enable.",
+            "None keeps the model bridge's own default (AReaL bridges "
+            "disable it or derive it from the checkpoint). Set 0.0 to "
+            "disable explicitly; 1e-3 matches DeepSeek V3.",
         },
     )
     moe_z_loss_coeff: float | None = field(
