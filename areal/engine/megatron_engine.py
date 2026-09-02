@@ -694,7 +694,27 @@ class MegatronEngine(TrainEngine):
         model_config.finalize_model_grads_func = finalize_model_grads
         self._mark_duplicated_params()
         self._create_optimizer(ft_spec)
+        self._set_optimizer_grad_scale_func()
         self._initialized = True
+
+    def _set_optimizer_grad_scale_func(self) -> None:
+        """Use one optimizer loss scale for the main and auxiliary losses.
+
+        MCore seeds MTP and MoE auxiliary-loss gradients separately from the
+        main backward graph. Wiring the optimizer hook here ensures FP16
+        unscaling does not shrink those auxiliary gradients by the loss scale.
+        """
+        if self.optimizer is None:
+            return
+
+        grad_scale_func = self.optimizer.scale_loss
+        configured: set[int] = set()
+        for model_chunk in self.model:
+            model_config = get_model_config(model_chunk)
+            if id(model_config) in configured:
+                continue
+            model_config.grad_scale_func = grad_scale_func
+            configured.add(id(model_config))
 
     def _build_glu_fc1_names(self) -> set[str]:
         """Detect which `linear_fc1` parameters belong to GLU MLPs.
@@ -1471,12 +1491,10 @@ class MegatronEngine(TrainEngine):
         # `megatron.core.pipeline_parallel.schedules._forward_step_helper`. Our
         # per-microbatch loss is already globally normalized via `w_i / W_total`, so
         # that extra division would shrink every gradient (and thus grad_norm and the
-        # effective optimizer step) by `num_microbatches`.
-        loss_multiplier = (
-            mpu.get_data_parallel_world_size()
-            * self.optimizer.get_loss_scale().item()
-            * len(mb_list)
-        )
+        # effective optimizer step) by `num_microbatches`. MCore applies the dynamic
+        # FP16 loss scale through `model_config.grad_scale_func` to both the main loss
+        # and auxiliary losses such as MTP and MoE.
+        loss_multiplier = mpu.get_data_parallel_world_size() * len(mb_list)
 
         def process_output(
             output: torch.Tensor, inputs: dict[str, Any]
