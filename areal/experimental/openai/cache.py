@@ -219,28 +219,37 @@ class InteractionCache(OrderedDict[str, InteractionWithTokenLogpReward]):
         return list(orphan_ids)
 
     def apply_reward_discount(
-        self, turn_discount: float = 1.0
+        self,
+        turn_discount: float = 1.0,
+        discount_mode: str = "tree",
     ) -> dict[str, InteractionWithTokenLogpReward]:
         """Apply backward discounted rewards across cached completions/responses.
 
-        This method iterates over the cached completions/responses in reverse creation
-        (insertion) order and applies a geometric discount to propagate reward
-        signal backward in time. The most recent completion/response is treated as the
-        starting point. If it does not have an explicit reward, a warning is
-        logged and a default reward of ``0.0`` is used. For each earlier
-        completion/response, its reward is initialized to ``0.0`` if unset, then the
-        discounted reward from the next later completion/response is added:
+        When ``discount_mode='tree'`` (default) and parent-child links exist:
+        Propagates discounted returns from child nodes to their direct parent along
+        the interaction tree edges:
+
+        ``parent.reward = parent.raw_reward + turn_discount * sum(child.reward for child in children) / len(children)``.
+
+        This correctly isolates tree branches and parallel exploration paths without
+        polluting unrelated siblings.
+
+        When ``discount_mode='linear'`` or when no parent relationships exist:
+        Iterates over the cached completions in reverse creation order:
 
         ``reward[i] += reward[i+1] * turn_discount``.
 
-        Typically called before exporting completions/responses in 'individual' style
-        to each completion/response is assigned with a valid reward value.
+        Preserves each interaction's raw undiscounted reward on ``original_reward``
+        and synchronizes tensor cache data.
 
         Parameters
         ----------
         turn_discount : float, optional
             The per-turn discount factor applied when propagating reward
-            backward from a later completion/response to an earlier one, by default 1.0.
+            backward, by default 1.0.
+        discount_mode : str, optional
+            The discount propagation strategy: ``'tree'`` (default) to follow
+            parent-child DAG edges, or ``'linear'`` to follow flat reverse creation order.
 
         Returns
         -------
@@ -252,22 +261,74 @@ class InteractionCache(OrderedDict[str, InteractionWithTokenLogpReward]):
         if self._apply_reward_discount_called:
             raise RuntimeError("apply_reward_discount should only be called once.")
         self._apply_reward_discount_called = True
-        reversed_interactions = list(reversed(self.values()))
 
-        if reversed_interactions:
-            current_reward = 0.0
-            for i, interaction in enumerate(reversed_interactions):
+        # Preserve original_reward for all interactions before any discount is applied
+        for interaction in self.values():
+            if interaction.original_reward is None and interaction.reward is not None:
+                interaction.original_reward = interaction.reward
+
+        # Check if any parent pointers exist
+        has_parents = any(inter.parent is not None for inter in self.values())
+
+        if discount_mode == "tree" and has_parents:
+            # Build parent -> children map
+            children_map: dict[str, list[InteractionWithTokenLogpReward]] = defaultdict(
+                list
+            )
+            for interaction in self.values():
+                if (
+                    interaction.parent is not None
+                    and interaction.parent.interaction_id is not None
+                ):
+                    children_map[interaction.parent.interaction_id].append(interaction)
+
+            # In InteractionCache, parents are always inserted before children.
+            # Thus, iterating in reversed(self.values()) guarantees reverse topological order.
+            for interaction in reversed(list(self.values())):
+                cid = interaction.interaction_id
                 if interaction.reward is None:
-                    # If the last-created interaction has no reward set, log a warning
-                    if i == 0:
-                        logger.warning(
-                            "The most recent interaction does not have a reward set. "
-                            "All interactions will have None reward."
-                        )
                     interaction.reward = 0.0
+                if cid and cid in children_map:
+                    kids = children_map[cid]
+                    kids_discounted = sum(
+                        (k.reward if k.reward is not None else 0.0) for k in kids
+                    ) / len(kids)
+                    interaction.reward = (
+                        interaction.reward + turn_discount * kids_discounted
+                    )
 
-                current_reward = current_reward * turn_discount + interaction.reward
-                interaction.reward = current_reward
+                if interaction._cache is not None:
+                    interaction._cache["rewards"] = torch.tensor(
+                        [float(interaction.reward)]
+                    )
+                    if interaction.original_reward is not None:
+                        interaction._cache["original_rewards"] = torch.tensor(
+                            [float(interaction.original_reward)]
+                        )
+        else:
+            reversed_interactions = list(reversed(self.values()))
+            if reversed_interactions:
+                current_reward = 0.0
+                for i, interaction in enumerate(reversed_interactions):
+                    if interaction.reward is None:
+                        # If the last-created interaction has no reward set, log a warning
+                        if i == 0:
+                            logger.warning(
+                                "The most recent interaction does not have a reward set. "
+                                "All interactions will have None reward."
+                            )
+                        interaction.reward = 0.0
+
+                    current_reward = current_reward * turn_discount + interaction.reward
+                    interaction.reward = current_reward
+                    if interaction._cache is not None:
+                        interaction._cache["rewards"] = torch.tensor(
+                            [float(interaction.reward)]
+                        )
+                        if interaction.original_reward is not None:
+                            interaction._cache["original_rewards"] = torch.tensor(
+                                [float(interaction.original_reward)]
+                            )
         return dict(**self)
 
     def __setitem__(
@@ -418,6 +479,7 @@ class InteractionCache(OrderedDict[str, InteractionWithTokenLogpReward]):
         style: str,
         reward_discount: float | None = None,
         drop_retry_orphans: bool = False,
+        discount_mode: str = "tree",
     ) -> dict[str, InteractionWithTokenLogpReward]:
         """Export cached completions/responses in different formats.
 
@@ -435,6 +497,12 @@ class InteractionCache(OrderedDict[str, InteractionWithTokenLogpReward]):
         style : str, optional
             The export style, either ``'concat'`` (build tree and return leaves)
             or ``'individual'`` (return all), by default 'concat'.
+        reward_discount : float, optional
+            Discount factor to apply before export if not already applied.
+        drop_retry_orphans : bool, optional
+            Whether to drop retry-orphan completions before export.
+        discount_mode : str, optional
+            Discount propagation strategy: ``'tree'`` (default) or ``'linear'``.
 
         Returns
         -------
@@ -451,7 +519,9 @@ class InteractionCache(OrderedDict[str, InteractionWithTokenLogpReward]):
         if drop_retry_orphans:
             self.drop_retry_orphans()
         if reward_discount is not None and not self._apply_reward_discount_called:
-            self.apply_reward_discount(turn_discount=reward_discount)
+            self.apply_reward_discount(
+                turn_discount=reward_discount, discount_mode=discount_mode
+            )
 
         cache = self
         if len(cache) == 0:

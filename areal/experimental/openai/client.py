@@ -1768,27 +1768,20 @@ class ArealOpenAI(AsyncOpenAI):
             raise RuntimeError("No interaction in cache to set reward for")
         return self._cache.set_last_reward(reward)
 
-    def apply_reward_discount(self, turn_discount: float = 1.0) -> None:
+    def apply_reward_discount(
+        self,
+        turn_discount: float = 1.0,
+        discount_mode: str = "tree",
+    ) -> dict[str, InteractionWithTokenLogpReward]:
         """Apply backward discounted rewards across cached completions/responses.
-
-        This method iterates over the cached completions/responses in reverse creation
-        (insertion) order and applies a geometric discount to propagate reward
-        signal backward in time. The most recent completion/response is treated as the
-        starting point. If it does not have an explicit reward, a warning is
-        logged and a default reward of ``0.0`` is used. For each earlier
-        completion/response, its reward is initialized to ``0.0`` if unset, then the
-        discounted reward from the next later completion/response is added:
-
-        ``reward[i] += reward[i+1] * turn_discount``.
-
-        Typically called before exporting completions/responses in 'individual' style
-        to each completion/response is assigned with a valid reward value.
 
         Parameters
         ----------
         turn_discount : float, optional
             The per-turn discount factor applied when propagating reward
-            backward from a later completion/response to an earlier one, by default 1.0.
+            backward, by default 1.0.
+        discount_mode : str, optional
+            The discount propagation strategy: ``'tree'`` (default) or ``'linear'``.
 
         Returns
         -------
@@ -1796,41 +1789,43 @@ class ArealOpenAI(AsyncOpenAI):
             A shallow copy of the completion/response cache after rewards have been
             updated in-place.
         """
-        return self._cache.apply_reward_discount(turn_discount)
+        return self._cache.apply_reward_discount(
+            turn_discount=turn_discount,
+            discount_mode=discount_mode,
+        )
 
     def export_interactions(
-        self, style: str
+        self,
+        style: str,
+        reward_discount: float | None = None,
+        drop_retry_orphans: bool = False,
+        discount_mode: str = "tree",
     ) -> dict[str, InteractionWithTokenLogpReward]:
         """Export cached completions/responses in different formats.
 
-        When ``style='concat'``, this method constructs a conversation tree by
-        linking completions/responses whose input message lists form a strict-prefix
-        relationship. The longest-prefix rule is used to determine each node's
-        parent. It then returns only leaf-node completions/responses (those without
-        children). No reward propagation is performed here.
-
-        When ``style='individual'``, all cached completions/responses are returned as-is
-        without constructing the tree.
-
         Parameters
         ----------
-        style : str, optional
+        style : str
             The export style, either ``'concat'`` (build tree and return leaves)
-            or ``'individual'`` (return all), by default 'concat'.
+            or ``'individual'`` (return all).
+        reward_discount : float, optional
+            Discount factor to apply before export if not already applied.
+        drop_retry_orphans : bool, optional
+            Whether to drop retry-orphan completions before export.
+        discount_mode : str, optional
+            Discount propagation strategy: ``'tree'`` (default) or ``'linear'``.
 
         Returns
         -------
         Dict[str, InteractionWithTokenLogpReward]
-            A mapping from completion/response ID to completion/response objects. For
-            ``'concat'``, this contains only leaf nodes. For ``'individual'``,
-            this contains all cached completions/responses.
-
-        Raises
-        ------
-        ValueError
-            If an unsupported ``style`` is provided.
+            A mapping from completion/response ID to completion/response objects.
         """
-        return self._cache.export_interactions(style)
+        return self._cache.export_interactions(
+            style=style,
+            reward_discount=reward_discount,
+            drop_retry_orphans=drop_retry_orphans,
+            discount_mode=discount_mode,
+        )
 
 
 def is_omitted(value) -> bool:
