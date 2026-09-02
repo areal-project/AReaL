@@ -127,15 +127,14 @@ def _patch_qwen3vl_pr3143_word_embeddings() -> None:
     )
 
 
-def _roll_mtp_labels_and_mask(
+def _roll_mtp_labels(
     mtp_labels,
-    mtp_loss_mask,
     roll_tensor,
     *,
     cp_group=None,
     packed_seq_params=None,
 ):
-    """Roll MTP targets and their validity mask with identical boundaries."""
+    """Align raw input IDs with MCore's next-token label convention."""
     roll_kwargs = {
         "shifts": -1,
         "dims": -1,
@@ -143,8 +142,22 @@ def _roll_mtp_labels_and_mask(
         "packed_seq_params": packed_seq_params,
     }
     rolled_labels, _ = roll_tensor(mtp_labels.clone(), **roll_kwargs)
-    rolled_loss_mask, _ = roll_tensor(mtp_loss_mask.clone(), **roll_kwargs)
-    return rolled_labels, rolled_loss_mask
+    return rolled_labels
+
+
+def _detach_mtp_output_weight(output_layer, output_weight):
+    """Detach the effective output weight for both tied and untied models."""
+    if output_weight is None:
+        # MCore only passes output_weight explicitly when the LM head is tied
+        # to the input embedding. Untied models instead let output_layer use
+        # its internal trainable weight when weight=None.
+        output_weight = getattr(output_layer, "weight", None)
+    if output_weight is None:
+        raise RuntimeError(
+            "MTP gradient isolation requires an explicit shared output weight "
+            "or an output layer with an internal weight."
+        )
+    return output_weight.detach()
 
 
 def _patch_gpt_model_mtp_training() -> None:
@@ -156,7 +169,8 @@ def _patch_gpt_model_mtp_training() -> None:
     the MTP labels from the main ``labels`` and early-returns when it is None, so
     the MTP loss never fires under AReaL. It also feeds the *shared* output weight
     into the MTP output layer un-detached, which would leak MTP gradients into the
-    backbone.
+    backbone. For untied models it passes ``output_weight=None``, causing the
+    output layer to use its internal trainable LM-head weight with the same leak.
 
     This patch mirrors slime's ``docker/patch/latest/megatron.patch`` but adapts to
     0.17.0's refactor (MTP loss extracted into the standalone ``process_mtp_loss``):
@@ -167,10 +181,11 @@ def _patch_gpt_model_mtp_training() -> None:
        emitting logits.
     2. The module-level ``process_mtp_loss`` (looked up at call time inside
        ``_postprocess``) is wrapped so that, when MTP labels are present, it:
-         - pre-rolls labels and loss mask once (slime parity: 0.17.0 only rolls
-           inside its per-layer loop, so MTP layer 0 would otherwise predict
-           t+1 instead of t+2); and
-         - detaches the shared ``output_weight`` to isolate backbone gradients.
+         - pre-rolls raw input IDs once to match the next-token-aligned loss
+           mask (0.17.0 then rolls both inside its per-layer loop, so MTP layer
+           0 predicts t+2); and
+         - detaches the effective output weight (shared or untied LM head) to
+           isolate backbone gradients.
     3. ``MultiTokenPredictionLayer._get_embeddings`` is wrapped to detach the
        backbone hidden states and the MTP embedding input, so the MTP loss only
        updates MTP parameters.
@@ -200,23 +215,23 @@ def _patch_gpt_model_mtp_training() -> None:
             mtp_loss_mask = _MTP_TRAIN_LOSS_MASK.get()
             if mtp_loss_mask is None:
                 raise ValueError("MTP labels were provided without an MTP loss mask.")
-            # Roll both once up front so the in-loop roll inside the original
-            # process_mtp_loss aligns MTP layer 0 to the t+2 target and applies
-            # the mask of that same future token. roll_tensor zero-fills the
-            # vacated position and respects packed boundaries when metadata is
-            # present; padded BSHD rolls independently within each batch row.
-            rolled_labels, rolled_loss_mask = _roll_mtp_labels_and_mask(
+            # mtp_labels contains raw input IDs, while mtp_loss_mask is already
+            # next-token aligned by the trainer. Pre-roll only the labels so the
+            # in-loop roll inside the original process_mtp_loss aligns both to
+            # the t+2 target for MTP layer 0. roll_tensor zero-fills the vacated
+            # position and respects packed boundaries when metadata is present;
+            # padded BSHD rolls independently within each batch row.
+            rolled_labels = _roll_mtp_labels(
                 mtp_labels,
-                mtp_loss_mask,
                 roll_tensor,
                 cp_group=kwargs.get("cp_group"),
                 packed_seq_params=kwargs.get("packed_seq_params"),
             )
             kwargs["labels"] = rolled_labels
-            kwargs["loss_mask"] = rolled_loss_mask
-            output_weight = kwargs.get("output_weight")
-            if output_weight is not None:
-                kwargs["output_weight"] = output_weight.detach()
+            kwargs["loss_mask"] = mtp_loss_mask.clone()
+            kwargs["output_weight"] = _detach_mtp_output_weight(
+                kwargs.get("output_layer"), kwargs.get("output_weight")
+            )
         return _orig_process_mtp_loss(*args, **kwargs)
 
     gpt_model.process_mtp_loss = _patched_process_mtp_loss
