@@ -140,7 +140,6 @@ actor:
       check_for_nan_in_grad: false
   mindspeed:
     swap_optimizer: true
-    use_fused_rotary_pos_emb: true
     use_fused_swiglu: true
     use_cp_send_recv_overlap: true
     use_fused_ring_attention_update: true

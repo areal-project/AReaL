@@ -61,7 +61,6 @@ actor:
     warmup_steps_proportion: 0.001
   mindspeed:
     swap_optimizer: true
-    use_fused_rotary_pos_emb: true
     use_fused_swiglu: true
     position_embedding_type: "rope"
   eps_clip: 0.4

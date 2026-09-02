@@ -61,7 +61,6 @@ actor:
     warmup_steps_proportion: 0.001
   mindspeed:
     swap_optimizer: true
-    use_fused_rotary_pos_emb: true
     use_fused_swiglu: true
     moe_alltoall_overlap_comm: true
     moe_grouped_gemm: true
