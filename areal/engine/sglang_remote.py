@@ -44,6 +44,9 @@ logger = getLogger("SGLangRemote")
 class SGLangBackend:
     """SGLang-specific backend implementation for remote inference."""
 
+    def __init__(self) -> None:
+        self._readiness_endpoint = "/health"
+
     @staticmethod
     def build_server_env(env: Mapping[str, str]) -> dict[str, str]:
         _env = dict(env)
@@ -372,8 +375,8 @@ class SGLangBackend:
         return HttpRequest(endpoint="/abort_request", payload={"abort_all": True})
 
     def get_health_check_request(self) -> HttpRequest:
-        """Get SGLang health check request."""
-        return HttpRequest(endpoint="/health", payload={}, method="GET")
+        """Get SGLang readiness check request."""
+        return HttpRequest(endpoint=self._readiness_endpoint, payload={}, method="GET")
 
     def get_offload_request(self, tags: list[str] | None = None) -> HttpRequest:
         """Get SGLang offload request."""
@@ -386,7 +389,7 @@ class SGLangBackend:
         Parameters:
         ----------
         tags: list[str], optional
-            Available tags for multi-stage resume: weights, kv_cache
+            Available tags for multi-stage resume: weights, kv_cache, cuda_graph
         """
         payload = {"tags": tags} if tags is not None else {}
         return HttpRequest(endpoint="/resume_memory_occupation", payload=payload)
@@ -402,8 +405,13 @@ class SGLangBackend:
                 "input IDs together with image data may be processed again by the "
                 "server. Set skip_tokenizer_init=True for VLM rollout recipes."
             )
-        awex_meta_addr = server_args.pop("awex_meta_server_addr", None)
+        awex_meta_addr = server_args.pop(
+            "awex_meta_server_addr", None
+        ) or os.environ.get("AWEX_META_SERVER_ADDR")
         awex_colocate = server_args.pop("awex_colocate_mode", False)
+        self._readiness_endpoint = (
+            "/model_info" if awex_colocate or awex_meta_addr else "/health"
+        )
         # Colocate placement: derive base_gpu_id from SLURM_LOCALID so two SGLang
         # servers sharing a node never claim the same GPU range. The controller
         # cannot do this reliably because its global rank -> node-slot mapping is
@@ -428,9 +436,40 @@ class SGLangBackend:
                 )
         cmd = SGLangConfig.build_cmd_from_args(server_args)
         _env = self.build_server_env(os.environ)
+        _env.setdefault("PYTHONFAULTHANDLER", "1")
 
-        if not awex_meta_addr:
-            awex_meta_addr = os.environ.get("AWEX_META_SERVER_ADDR")
+        awex_graph_memory_saver = bool(
+            (awex_colocate or awex_meta_addr)
+            and server_args.get("enable_memory_saver", False)
+        )
+        if awex_graph_memory_saver:
+            # SGLang 0.5.10 gates CUDA-graph region registration separately
+            # from --enable-memory-saver. This must be set before graph capture.
+            _env.setdefault("SGLANG_MEMORY_SAVER_CUDA_GRAPH", "1")
+
+        drop_ld_preload_default = "1" if (awex_colocate or awex_meta_addr) else "0"
+        if _env.get(
+            "AREAL_SGLANG_DROP_LD_PRELOAD", drop_ld_preload_default
+        ).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "y",
+            "on",
+        }:
+            dropped = _env.pop("LD_PRELOAD", "")
+            dropped_tms = {
+                key: _env.pop(key)
+                for key in ("TMS_INIT_ENABLE", "TMS_INIT_ENABLE_CPU_BACKUP")
+                if key in _env
+            }
+            logger.info(
+                "Dropping training TMS environment for SGLang child: "
+                "LD_PRELOAD=%s, TMS=%s",
+                dropped,
+                dropped_tms,
+            )
+
         if awex_colocate or awex_meta_addr:
             sglang_entrypoints = (
                 "sglang.launch_server",

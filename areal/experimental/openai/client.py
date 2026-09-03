@@ -852,6 +852,7 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
         self,
         completion_id: str,
         current_time: int,
+        model: str,
         output_text: str,
         tool_calls: list | None,
         response: ModelResponse,
@@ -885,7 +886,7 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
                 )
             ],
             created=current_time,
-            model="None",
+            model=model,
             object="chat.completion",
             service_tier=None,
             system_fingerprint=None,
@@ -903,6 +904,7 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
         *,
         messages: Iterable[ChatCompletionMessageParam],
         stream: Literal[True],
+        model: str | NotGiven = NOT_GIVEN,
         frequency_penalty: float | None | NotGiven = NOT_GIVEN,
         max_completion_tokens: int | None | NotGiven = NOT_GIVEN,
         max_tokens: int | None | NotGiven = NOT_GIVEN,
@@ -926,6 +928,7 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
         self,
         *,
         messages: Iterable[ChatCompletionMessageParam],
+        model: str | NotGiven = NOT_GIVEN,
         stream: Literal[False] | NotGiven = NOT_GIVEN,
         frequency_penalty: float | None | NotGiven = NOT_GIVEN,
         max_completion_tokens: int | None | NotGiven = NOT_GIVEN,
@@ -949,6 +952,7 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
         self,
         *,
         messages: Iterable[ChatCompletionMessageParam],
+        model: str | NotGiven = NOT_GIVEN,
         stream: bool | NotGiven = NOT_GIVEN,
         frequency_penalty: float | None | NotGiven = NOT_GIVEN,
         max_completion_tokens: int | None | NotGiven = NOT_GIVEN,
@@ -970,6 +974,7 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
         """Override create method to use AReaL engine and cache responses."""
 
         is_streaming = not is_omitted(stream) and stream is True
+        response_model = "default" if is_omitted(model) else str(model)
 
         # Extract and validate supported parameters
         cache, interaction = None, None
@@ -1196,6 +1201,7 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
                 chat_completion, output_message = self._build_chat_completion(
                     completion_id=completion_id,
                     current_time=current_time,
+                    model=response_model,
                     output_text=output_text,
                     tool_calls=tool_calls,
                     response=response,
@@ -1208,6 +1214,7 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
             return self._create_stream(
                 completion_id=completion_id,
                 current_time=current_time,
+                model=response_model,
                 output_text=output_text,
                 tool_calls=tool_calls,
                 response=response,
@@ -1217,6 +1224,7 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
         chat_completion, output_message = self._build_chat_completion(
             completion_id=completion_id,
             current_time=current_time,
+            model=response_model,
             output_text=output_text,
             tool_calls=tool_calls,
             response=response,
@@ -1234,6 +1242,7 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
         self,
         completion_id: str,
         current_time: int,
+        model: str,
         output_text: str,
         tool_calls: list | None,
         response: ModelResponse,
@@ -1259,7 +1268,7 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
                     )
                 ],
                 created=current_time,
-                model="None",
+                model=model,
                 object="chat.completion.chunk",
             )
 
@@ -1276,7 +1285,7 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
                         )
                     ],
                     created=current_time,
-                    model="None",
+                    model=model,
                     object="chat.completion.chunk",
                 )
 
@@ -1314,7 +1323,7 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
                             )
                         ],
                         created=current_time,
-                        model="None",
+                        model=model,
                         object="chat.completion.chunk",
                     )
                     # Chunk 2: arguments only, emitted as input_json_delta by
@@ -1338,7 +1347,7 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
                             )
                         ],
                         created=current_time,
-                        model="None",
+                        model=model,
                         object="chat.completion.chunk",
                     )
 
@@ -1353,7 +1362,7 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
                     )
                 ],
                 created=current_time,
-                model="None",
+                model=model,
                 object="chat.completion.chunk",
                 usage=CompletionUsage(
                     completion_tokens=len(response.output_tokens),
@@ -1399,6 +1408,7 @@ class AsyncResponsesWithReward(BaseAsyncResponses):
     async def create(
         self,
         *,
+        model: str | NotGiven = NOT_GIVEN,
         include: list[str] | None | NotGiven = NOT_GIVEN,
         input: str | ResponseInputParam | NotGiven = NOT_GIVEN,
         instructions: str | None | NotGiven = NOT_GIVEN,
@@ -1415,6 +1425,7 @@ class AsyncResponsesWithReward(BaseAsyncResponses):
         **kwargs: Any,
     ) -> Response:
         """Override create method to use AReaL engine"""
+        response_model = "default" if is_omitted(model) else str(model)
         # Initialize IDs and timestamps
         resp_id = f"resp-{uuid.uuid4().hex[:29]}"
         msg_id = f"msg-{uuid.uuid4().hex[:29]}"
@@ -1641,7 +1652,7 @@ class AsyncResponsesWithReward(BaseAsyncResponses):
             incomplete_details=None,
             instructions=None if is_omitted(instructions) else instructions,
             metadata=None if is_omitted(metadata) else metadata,
-            model="None",
+            model=response_model,
             object="response",
             output=resp_output,
             parallel_tool_calls=False,

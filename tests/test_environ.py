@@ -99,3 +99,21 @@ def test_get_bool_env_var_can_strip_legacy_dte_values(monkeypatch):
         )
         is True
     )
+
+
+def test_numeric_env_helpers_parse_supported_values(monkeypatch):
+    environ = _load_environ(monkeypatch)
+    monkeypatch.setenv("AREAL_TEST_FLOAT", "1.25")
+    monkeypatch.setenv("AREAL_TEST_INT", "7")
+
+    assert environ.get_float_env_var("AREAL_TEST_FLOAT", 0.0) == 1.25
+    assert environ.get_int_env_var("AREAL_TEST_INT", 0) == 7
+
+
+def test_numeric_env_helpers_use_defaults_for_invalid_values(monkeypatch):
+    environ = _load_environ(monkeypatch)
+    monkeypatch.setenv("AREAL_TEST_FLOAT", "many")
+    monkeypatch.setenv("AREAL_TEST_INT", "several")
+
+    assert environ.get_float_env_var("AREAL_TEST_FLOAT", 2.5) == 2.5
+    assert environ.get_int_env_var("AREAL_TEST_INT", 3) == 3

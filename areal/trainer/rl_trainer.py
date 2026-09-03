@@ -34,6 +34,7 @@ from areal.api.cli_args import (
     ValidDatasetConfig,
     vLLMConfig,
 )
+from areal.dataset.mopd import RoutedDataset, is_remote_dataset
 from areal.engine import RemoteSGLangEngine, RemotevLLMEngine
 from areal.infra import (
     LocalScheduler,
@@ -46,6 +47,12 @@ from areal.infra.data_service import DataController
 from areal.infra.data_service.controller.config import DataServiceConfig
 from areal.infra.data_service.rdataset import RDataset
 from areal.infra.utils.concurrent import call_maybe_async
+from areal.trainer.mopd.compatibility import validate_mopd_model_compatibility
+from areal.trainer.mopd.execution import MOPDExecutionPlan
+from areal.trainer.mopd.teacher_manager import (
+    PersistentTeacherManager,
+)
+from areal.trainer.mopd.teacher_phase import MOPDTeacherPhase
 from areal.utils import logging, perf_tracer, seeding, stats_tracker
 from areal.utils.cleanup import run_batch_cleanups
 from areal.utils.dataloader import create_dataloader
@@ -134,6 +141,7 @@ class PPOTrainer:
             logging.setup_file_logging(StatsLogger.get_log_path(config.stats_logger))
 
         self.config = config
+        self.mopd_execution_plan = MOPDExecutionPlan.from_config(config)
         self._apply_dte_config_envvars()
         self.processor, self.tokenizer = load_hf_processor_and_tokenizer(
             config.tokenizer_path
@@ -142,8 +150,8 @@ class PPOTrainer:
         if is_single_controller():
             self.scheduler = self._init_scheduler()
         self.data_controller: DataController | None = None
-        self._train_rdataset: RDataset | None = None
-        self._valid_rdataset: RDataset | None = None
+        self._train_rdataset: RDataset | RoutedDataset | None = None
+        self._valid_rdataset: RDataset | RoutedDataset | None = None
 
         # Set seed.
         seeding.set_random_seed(config.seed, key=f"trainer{rank}")
@@ -157,10 +165,22 @@ class PPOTrainer:
         self._should_offload_actor = (
             self._should_offload_rollout or config.actor.offload
         )
-        self._should_offload_critic = (
-            config.critic is not None and config.critic.offload
+        requires_critic = (
+            self.mopd_execution_plan.requires_critic
+            if self.mopd_execution_plan is not None
+            else config.critic is not None
         )
-        self._should_offload_ref = config.ref is not None and config.ref.offload
+        requires_ref = (
+            self.mopd_execution_plan.requires_ref
+            if self.mopd_execution_plan is not None
+            else config.actor.kl_ctl > 0 and config.ref is not None
+        )
+        self._should_offload_critic = bool(
+            requires_critic and config.critic is not None and config.critic.offload
+        )
+        self._should_offload_ref = bool(
+            requires_ref and config.ref is not None and config.ref.offload
+        )
         self._should_offload_teacher = (
             config.teacher is not None and config.teacher.offload
         )
@@ -197,13 +217,13 @@ class PPOTrainer:
         # Create models: actor, critic, ref — each with its own allocation.
         self.actor = self._create_train_engine(config.actor, self.actor_alloc)
         self.critic = None
-        if config.critic is not None:
+        if requires_critic and config.critic is not None:
             critic_alloc = ModelAllocation.from_str(
                 config.critic.backend, name="critic"
             )
             self.critic = self._create_critic(config.critic, critic_alloc)
         self.ref = None
-        if config.actor.kl_ctl > 0 and config.ref is not None:
+        if requires_ref and config.ref is not None:
             ref_alloc = ModelAllocation.from_str(config.ref.backend, name="ref")
             self.ref = self._create_train_engine(config.ref, ref_alloc)
 
@@ -246,7 +266,7 @@ class PPOTrainer:
             )
         else:
             assert train_dataset is not None
-            if is_single_controller() and isinstance(train_dataset, RDataset):
+            if is_single_controller() and is_remote_dataset(train_dataset):
                 ds_cfg = DataServiceConfig.from_dataset_config(
                     config.train_dataset, seed=config.seed
                 )
@@ -275,7 +295,7 @@ class PPOTrainer:
         self.valid_dataloader: StatefulDataLoader | None = None
         if self.config.valid_dataset is not None and valid_dataset is not None:
             assert self.config.valid_dataset is not None
-            if is_single_controller() and isinstance(valid_dataset, RDataset):
+            if is_single_controller() and is_remote_dataset(valid_dataset):
                 assert self.data_controller is not None
                 valid_dataset.connect(
                     self.data_controller,
@@ -308,11 +328,14 @@ class PPOTrainer:
                 * config.train_dataset.batch_size,
                 train_batch_size=config.train_dataset.batch_size,
             )
+        self._ft_spec = ft_spec
 
         # Initialize engines first — the scheduler must know about roles
         # before the data controller can colocate with them.
         engine_init_kwargs = {"addr": None, "ft_spec": ft_spec}
         self.actor.initialize(**engine_init_kwargs, role="actor")
+        if self.config.mopd is not None:
+            self.actor.configure_mopd_loss(self.config.mopd.loss)
         if self.critic is not None:
             self.critic.initialize(**engine_init_kwargs, role="critic")
         if self.ref is not None:
@@ -370,6 +393,30 @@ class PPOTrainer:
             and self.config.teacher.engine_type == "rollout"
         ):
             self.teacher = self._init_teacher_rollout(self.config.teacher.rollout)
+
+        self.mopd_teacher_manager: PersistentTeacherManager | None = None
+        self.mopd_teacher_phase: MOPDTeacherPhase | None = None
+        if (
+            self.config.mopd is not None
+            and self.mopd_execution_plan is not None
+            and self.mopd_execution_plan.requires_teacher_scoring
+        ):
+            if self.config.mopd.manager.type == "local_memory" and not isinstance(
+                self.scheduler, LocalScheduler
+            ):
+                raise RuntimeError(
+                    "MOPD local_memory staging requires a same-host LocalScheduler"
+                )
+            self.mopd_teacher_manager = PersistentTeacherManager(
+                self.config.mopd, self._create_mopd_teacher_controller
+            )
+            self.mopd_teacher_phase = MOPDTeacherPhase(
+                config=self.config.mopd,
+                manager=self.mopd_teacher_manager,
+                actor=self.actor,
+                critic=self.critic,
+                ref=self.ref,
+            )
 
         # Proxy worker initialization (lazy, for AgentWorkflow support)
         self._proxy_started = False
@@ -545,6 +592,32 @@ class PPOTrainer:
             ),
         ):
             engine.offload()
+
+    def _update_weights_and_publish_version(
+        self, meta: WeightUpdateMeta, new_version: int
+    ) -> None:
+        """Update weights, publish their version, then restore AWEX rollout."""
+        self.actor.update_weights(meta)
+
+        self.actor.set_version(new_version)
+        if self.critic is not None:
+            self.critic.set_version(new_version)
+        self.rollout.set_version(new_version)
+        if self.eval_rollout is not None:
+            self.eval_rollout.set_version(new_version)
+
+        if not self._is_v1_awex_colocate(self.config):
+            return
+
+        # The AWEX reader flushes all old cache entries while installing the
+        # new weights. Reallocate an empty KV pool only after every actor worker
+        # has returned, then let SGLang serve requests again. This must remain a
+        # controller-side call: invoking rollout RPCs from an actor worker creates
+        # a nested controller call while its update_weights collective is active.
+        self.rollout.abort_all_requests()
+        self.rollout.onload(tags=["cuda_graph"])
+        self.rollout.onload(tags=["kv_cache"])
+        call_maybe_async(self.rollout.continue_generation)
 
     def _offload_rollout(self, is_eval: bool = False):
         rollout = self.rollout if not is_eval else self.eval_rollout
@@ -787,12 +860,49 @@ class PPOTrainer:
                 self.rollout.offload(tags=["kv_cache"])
                 logger.info("[AWEX] colocate: offload weights...")
                 self.rollout.offload(tags=["weights"])
-                logger.info("[AWEX] colocate: offload done, onloading actor...")
-                self.actor.onload()
+                logger.info("[AWEX] colocate: offload cuda_graph...")
+                self.rollout.offload(tags=["cuda_graph"])
+                try:
+                    if self.mopd_teacher_phase is not None:
+                        rollout_batch = self.mopd_teacher_phase.materialize(
+                            rollout_batch
+                        )
+                    logger.info("[AWEX] colocate: offload done, onloading actor...")
+                    self.actor.onload()
+                except BaseException:
+                    logger.error(
+                        "AWEX teacher/train ownership transition failed; "
+                        "restoring rollout owner",
+                        exc_info=True,
+                    )
+                    try:
+                        self.actor.offload()
+                    except Exception:
+                        logger.error(
+                            "Failed to re-offload actor during rollback", exc_info=True
+                        )
+                    try:
+                        self.rollout.onload(tags=["cuda_graph"])
+                        self.rollout.onload(tags=["weights"])
+                        self.rollout.onload(tags=["kv_cache"])
+                        call_maybe_async(self.rollout.continue_generation)
+                        self.rollout.resume()
+                    except Exception:
+                        logger.error(
+                            "Failed to restore rollout during AWEX rollback; "
+                            "leaving large owners offloaded",
+                            exc_info=True,
+                        )
+                    raise
 
             if self._should_offload_actor:
                 self._onload_model(self.actor, role="actor")
-            if config.actor.should_compute_prox_logp():
+            should_compute_prox_logp = (
+                self.mopd_execution_plan.requires_prox_logp
+                if self.mopd_execution_plan is not None
+                else config.actor.should_compute_prox_logp()
+            )
+            if should_compute_prox_logp:
                 with (
                     stats_tracker.record_timing("recompute_logp"),
                     perf_tracer.trace_scope(
@@ -814,8 +924,15 @@ class PPOTrainer:
                     args={"global_step": global_step},
                 ),
             ):
-                adv_batch = self.actor.compute_advantages(rollout_batch)
-                self.actor.get_device_stats().log("compute advantages")
+                if (
+                    self.mopd_execution_plan is not None
+                    and not self.mopd_execution_plan.requires_rl
+                ):
+                    adv_batch = self.actor.prepare_mopd_batch(rollout_batch)
+                    self.actor.get_device_stats().log("prepare MOPD batch")
+                else:
+                    adv_batch = self.actor.compute_advantages(rollout_batch)
+                    self.actor.get_device_stats().log("compute advantages")
 
             # Wait for async checkpoint staging to complete before modifying parameters
             self.saver.maybe_wait_for_staging()
@@ -898,14 +1015,7 @@ class PPOTrainer:
                 # Use versioned path for weight updates
                 new_version = global_step + 1
                 versioned_meta = self.weight_update_meta.with_version(new_version)
-                self.actor.update_weights(versioned_meta)
-
-                self.actor.set_version(new_version)
-                if self.critic is not None:
-                    self.critic.set_version(new_version)
-                self.rollout.set_version(new_version)
-                if self.eval_rollout is not None:
-                    self.eval_rollout.set_version(new_version)
+                self._update_weights_and_publish_version(versioned_meta, new_version)
 
             if not self._is_v1_awex_colocate(config):
                 self._save_training_state(
@@ -988,8 +1098,22 @@ class PPOTrainer:
                     epoch=epoch, epoch_step=step, global_step=global_step
                 )
 
-            # Resume rollout
-            self.rollout.resume()
+            # Resume rollout only when another train step will consume it.
+            #
+            # The dispatcher may have queued overlap rollouts while producing
+            # the current batch. Resuming it after the final step lets those
+            # stale tasks hit the inference server while close() is already
+            # tearing workers down, producing noisy ConnectionRefused errors.
+            if not self._is_final_train_step(
+                global_step=global_step, max_steps=max_steps
+            ):
+                self.rollout.resume()
+            else:
+                logger.info(
+                    "Skipping rollout resume after final training step "
+                    "(global_step=%s)",
+                    global_step,
+                )
 
             self._save_perf_tracer(step=global_step)
 
@@ -1024,25 +1148,65 @@ class PPOTrainer:
                 global_step=global_step,
             )
 
+    def _is_final_train_step(self, *, global_step: int, max_steps: int) -> bool:
+        next_step = global_step + 1
+        if next_step >= max_steps:
+            return True
+        return (
+            self.config.total_train_steps is not None
+            and next_step >= self.config.total_train_steps
+        )
+
     def close(self):
-        self.saver.finalize()
-        if hasattr(self, "_train_rdataset") and self._train_rdataset is not None:
-            self._train_rdataset.close()
-        if hasattr(self, "_valid_rdataset") and self._valid_rdataset is not None:
-            self._valid_rdataset.close()
-        if hasattr(self, "data_controller") and self.data_controller is not None:
-            self.data_controller.destroy()
-        self.stats_logger.close()
-        if self.eval_rollout is not None:
-            self.eval_rollout.destroy()
-        self.rollout.destroy()
-        if self.teacher is not None:
-            self.teacher.destroy()
-        if self.ref is not None:
-            self.ref.destroy()
-        if self.critic is not None:
-            self.critic.destroy()
-        self.actor.destroy()
+        # P87: must tolerate a partially-constructed trainer (called from
+        # __init__'s failure path), and one engine's destroy() failure must
+        # not keep the remaining workers alive.
+        saver = getattr(self, "saver", None)
+        if saver is not None:
+            try:
+                saver.finalize()
+            except Exception:
+                logger.warning("saver.finalize() failed during close", exc_info=True)
+        for attr in ("_train_rdataset", "_valid_rdataset"):
+            rdataset = getattr(self, attr, None)
+            if rdataset is not None:
+                try:
+                    rdataset.close()
+                except Exception:
+                    logger.warning(f"{attr}.close() failed during close", exc_info=True)
+        data_controller = getattr(self, "data_controller", None)
+        if data_controller is not None:
+            try:
+                data_controller.destroy()
+            except Exception:
+                logger.warning(
+                    "data_controller.destroy() failed during close", exc_info=True
+                )
+        stats_logger = getattr(self, "stats_logger", None)
+        if stats_logger is not None:
+            try:
+                stats_logger.close()
+            except Exception:
+                logger.warning(
+                    "stats_logger.close() failed during close", exc_info=True
+                )
+        mopd_phase = getattr(self, "mopd_teacher_phase", None)
+        if mopd_phase is not None:
+            try:
+                mopd_phase.close()
+            except Exception:
+                logger.warning(
+                    "mopd_teacher_phase.close() failed during close", exc_info=True
+                )
+        for attr in ("eval_rollout", "rollout", "teacher", "ref", "critic", "actor"):
+            engine = getattr(self, attr, None)
+            if engine is not None:
+                try:
+                    engine.destroy()
+                except Exception:
+                    logger.warning(
+                        f"{attr}.destroy() failed during close", exc_info=True
+                    )
         perf_tracer.save(force=True)
 
     def _config_perf_tracer(self):
@@ -1175,6 +1339,44 @@ class PPOTrainer:
         actor.create_process_group(parallel_strategy=alloc.parallel)
         return actor
 
+    def _create_mopd_teacher_controller(self, checkpoint_path: str):
+        """Create one persistent fork teacher from its first checkpoint."""
+        from areal.engine import MegatronScoringEngine
+
+        assert self.config.mopd is not None
+        teacher_config = deepcopy(self.config.mopd.teacher_engine)
+        teacher_config.path = checkpoint_path
+        teacher_config.experiment_name = self.config.experiment_name
+        teacher_config.trial_name = self.config.trial_name
+        if teacher_config.optimizer is None and teacher_config.backend.startswith(
+            "megatron:"
+        ):
+            teacher_config.megatron.disable_grad_buffers_cpu_backup = True
+        teacher_alloc = ModelAllocation.from_str(
+            teacher_config.backend, name="mopd-teacher"
+        )
+        if is_single_controller():
+            controller = MegatronScoringEngine.as_controller(
+                teacher_config, self.scheduler
+            )
+        else:
+            controller = MegatronScoringEngine(config=teacher_config)
+        controller.create_process_group(parallel_strategy=teacher_alloc.parallel)
+        try:
+            controller.initialize(
+                addr=None,
+                ft_spec=self._ft_spec,
+                role="mopd-teacher",
+            )
+            # The scoring-only teacher needs DDP-flat-buffer CPU residency,
+            # without enabling TMS in the AWEX actor processes.
+            if teacher_config.backend.startswith("megatron:"):
+                controller.init_weight_residency_adapter()
+        except BaseException:
+            controller.destroy()
+            raise
+        return controller
+
     def _create_critic(
         self, critic_config: PPOCriticConfig, alloc: ModelAllocation
     ) -> FSDPPPOCritic | MegatronPPOCritic | ArchonPPOCritic | PPOCriticController:
@@ -1245,6 +1447,12 @@ class PPOTrainer:
             if self._is_v1_awex_colocate(self.config):
                 server_args["awex_colocate_mode"] = True
                 server_args["awex_meta_server_addr"] = self._awex_meta_server_addr
+                # SGLang's release/resume endpoints are no-ops unless its
+                # torch-memory-saver regions were enabled at server startup.
+                # AWEX relies on those endpoints to hand the colocated GPU to
+                # teachers and the actor, so this is a correctness requirement
+                # rather than an optional inference tuning flag.
+                server_args["enable_memory_saver"] = True
         elif rollout_backend == "vllm":
             if self.config.rollout.return_routed_experts:
                 raise ValueError(
@@ -1281,6 +1489,12 @@ class PPOTrainer:
             )
         else:
             controller = engine_cls.as_controller(config, self.scheduler)
+        if (
+            self.mopd_execution_plan is not None
+            and self.mopd_execution_plan.requires_teacher_scoring
+            and not is_eval
+        ):
+            controller.enable_mopd_routing()
         init_kwargs = dict(
             role="rollout",
             server_args=server_args,
@@ -1593,6 +1807,29 @@ class PPOTrainer:
                 f"actor._version ('{actor_version}') and rollout._version "
                 f"('{rollout_version}') must match. Both must be 'v1' or both 'v2'."
             )
+        if self.config.mopd is not None:
+            requires_teacher_scoring = (
+                self.mopd_execution_plan is not None
+                and self.mopd_execution_plan.requires_teacher_scoring
+            )
+            if requires_teacher_scoring and not is_single_controller():
+                raise ValueError("MOPD currently requires single-controller mode")
+            if actor_version != "v1":
+                raise ValueError(
+                    "MOPD objective configuration currently requires the v1 actor "
+                    "and rollout controller API"
+                )
+            if requires_teacher_scoring:
+                validate_mopd_model_compatibility(
+                    self.config.actor.path,
+                    {
+                        teacher_id: teacher.path
+                        for teacher_id, teacher in self.config.mopd.teachers.items()
+                    },
+                    actor_tokenizer_path=(
+                        self.config.tokenizer_path or self.config.actor.path
+                    ),
+                )
 
     def _requires_proxy_workflow(self, workflow: WorkflowLike | None) -> bool:
         """Check if workflow requires proxy workers (i.e., not a RolloutWorkflow).
