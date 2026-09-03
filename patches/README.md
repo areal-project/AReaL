@@ -1,16 +1,18 @@
 # Third-party patches
 
-Patches applied to the pinned vLLM / vllm-ascend sources during the NPU image build
-(`Dockerfile.a2`, `Dockerfile.a3`). Each patch is applied with `git apply` immediately
-after its `pip install -e .`, so a patch that no longer applies fails the build instead
-of silently dropping the fix.
+Patches applied to pinned third-party sources during the NPU image build
+(`Dockerfile.a2`, `Dockerfile.a3`). Each patch is applied with `git apply` at an
+explicit point in the target's installation, so a patch that no longer applies fails the
+build instead of silently dropping the fix. The vLLM patches run after their editable
+installs; the Megatron-Bridge patch runs immediately after its pinned checkout.
 
-| Patch                                       | Applies to                     | Upstream                                                                      | Delete when                                     |
-| ------------------------------------------- | ------------------------------ | ----------------------------------------------------------------------------- | ----------------------------------------------- |
-| `vllm.v0.23.0.patch`                        | vLLM `v0.23.0`                 | [vllm#44483](https://github.com/vllm-project/vllm/pull/44483)                 | the pin contains #44483                         |
-| `vllm.v0.23.0-content-parts.patch`          | vLLM `v0.23.0`                 | [vllm#51478](https://github.com/vllm-project/vllm/pull/51478)                 | the pin contains #51478                         |
-| `vllm.v0.23.0-exact-token-validation.patch` | vLLM `v0.23.0`                 | none — AReaL-local                                                            | upstream exposes an equivalent prompt assertion |
-| `vllm-ascend.v0.23.0.patch`                 | vllm-ascend `releases/v0.23.0` | [vllm-ascend#11548](https://github.com/vllm-project/vllm-ascend/issues/11548) | the fix lands upstream                          |
+| Patch                                       | Applies to                     | Upstream                                                                         | Delete when                                     |
+| ------------------------------------------- | ------------------------------ | -------------------------------------------------------------------------------- | ----------------------------------------------- |
+| `vllm.v0.23.0.patch`                        | vLLM `v0.23.0`                 | [vllm#44483](https://github.com/vllm-project/vllm/pull/44483)                    | the pin contains #44483                         |
+| `vllm.v0.23.0-content-parts.patch`          | vLLM `v0.23.0`                 | [vllm#51478](https://github.com/vllm-project/vllm/pull/51478)                    | the pin contains #51478                         |
+| `vllm.v0.23.0-exact-token-validation.patch` | vLLM `v0.23.0`                 | none — AReaL-local                                                               | upstream exposes an equivalent prompt assertion |
+| `vllm-ascend.v0.23.0.patch`                 | vllm-ascend `releases/v0.23.0` | [vllm-ascend#11548](https://github.com/vllm-project/vllm-ascend/issues/11548)    | the fix lands upstream                          |
+| `megatron-bridge.v0.5.1-vision-dp-cp.patch` | Megatron-Bridge `v0.5.1`       | [Megatron-Bridge#4784](https://github.com/NVIDIA-NeMo/Megatron-Bridge/pull/4784) | the pin contains #4784                          |
 
 The three vLLM patches are applied in table order and kept in separate files because
 their lifetimes differ. Folding them together would entangle deleting the compatibility
@@ -44,6 +46,20 @@ rollout computes behavior logprobs from the same token sequence it trains on. Se
   `token_ids` and its locally expanded prompt in `expected_token_ids`; the server
   refuses to generate unless its expansion matches. Neither vLLM patch may reference
   AReaL's pause event — weight-update policy stays in AReaL source.
+
+## Megatron-Bridge vision DP with context parallelism
+
+**Megatron-Bridge#4784** fixes the autograd collective used when
+`vision_dp_when_cp=True`. Its backward pass must sum gradients from every CP rank before
+slicing the local image range. It also keeps empty-image and frozen-vision ranks in the
+collective and creates empty outputs in the model parameter dtype. Without the complete
+fix, training can silently compute incomplete vision gradients or hang when ranks do not
+participate symmetrically.
+
+The patch contains only the two production-source hunks from upstream commit
+`1d65d5756f2bf9f7f8734467a72272901bfcb4e3`. Those hunks apply directly to the pinned
+Megatron-Bridge `v0.5.1` revision and do not require Megatron-Core 0.19. Remove the
+patch when the Bridge pin contains that commit.
 
 ## Patching dirties the tree, which changes `vllm.__version__`
 

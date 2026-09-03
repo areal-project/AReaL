@@ -7,6 +7,8 @@ from unittest.mock import patch
 import pytest
 import torch
 
+from areal.api.cli_args import MegatronEngineConfig
+
 try:
     # Import the engine before raw megatron.core so NPU compatibility patches and
     # the MindSpeed adaptor are installed in AReaL's supported order. MindSpeed
@@ -42,6 +44,10 @@ class _RecordingModel(torch.nn.Module):
     def forward(self, **kwargs):
         self.forward_kwargs = kwargs
         return self.output
+
+
+def test_vision_dp_when_cp_defaults_off():
+    assert MegatronEngineConfig().vision_dp_when_cp is False
 
 
 @pytest.mark.parametrize("context_parallel_size", [1, 2])
@@ -170,6 +176,76 @@ def test_model_packed_forward_cp2_forwards_vision_inputs():
         packed_seq_params.cu_seqlens_q, cu_seqlens, rtol=0, atol=0
     )
     torch.testing.assert_close(output, local_output.squeeze(0), rtol=0, atol=0)
+
+
+def _import_vision_cp_backport():
+    pytest.importorskip("megatron.bridge")
+    try:
+        from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.utils import (
+            AllGatherVisionEmbeddings,
+            ensure_requires_grad_for_cp_collective,
+        )
+    except ImportError:
+        pytest.skip("Megatron-Bridge vision CP backport is not installed")
+    return AllGatherVisionEmbeddings, ensure_requires_grad_for_cp_collective
+
+
+def test_vision_cp_collective_forces_grad_participation():
+    """Empty and frozen vision outputs must enter the CP backward collective."""
+    _, ensure_requires_grad_for_cp_collective = _import_vision_cp_backport()
+
+    plain = torch.zeros(2, 3)
+    empty = torch.zeros(0, 3)
+    already = torch.zeros(2, 3, requires_grad=True)
+
+    ensure_requires_grad_for_cp_collective((plain, empty, already))
+
+    assert plain.requires_grad
+    assert empty.requires_grad
+    assert already.requires_grad
+
+    with torch.no_grad():
+        untouched = torch.zeros(2, 3)
+        ensure_requires_grad_for_cp_collective((untouched,))
+    assert not untouched.requires_grad
+
+
+@pytest.mark.parametrize("cp_rank", [0, 1])
+def test_vision_cp_backward_reduces_then_slices(cp_rank, monkeypatch):
+    """The vision gather backward sums every CP rank before taking its local slice."""
+    AllGatherVisionEmbeddings, _ = _import_vision_cp_backport()
+
+    hidden_size = 4
+    seqlens_on_cp_ranks = [torch.tensor([2]), torch.tensor([3])]
+    total = int(sum(seqlens.sum() for seqlens in seqlens_on_cp_ranks))
+    peer_grad = (
+        torch.arange(total, dtype=torch.float32).unsqueeze(1).expand(total, hidden_size)
+    )
+    fake_group = object()
+
+    def fake_all_gather(outputs, input_, group=None):
+        assert group is fake_group
+        outputs[cp_rank].copy_(input_)
+        outputs[1 - cp_rank].fill_(7.0)
+
+    def fake_all_reduce(tensor, group=None):
+        assert group is fake_group
+        tensor.add_(peer_grad)
+
+    monkeypatch.setattr(torch.distributed, "all_gather", fake_all_gather)
+    monkeypatch.setattr(torch.distributed, "all_reduce", fake_all_reduce)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda group=None: cp_rank)
+
+    local_seqlen = int(seqlens_on_cp_ranks[cp_rank].sum())
+    input_ = torch.randn(local_seqlen, hidden_size, requires_grad=True)
+    output = AllGatherVisionEmbeddings.apply(input_, seqlens_on_cp_ranks, fake_group)
+    output.sum().backward()
+
+    start = int(sum(s.sum() for s in seqlens_on_cp_ranks[:cp_rank]))
+    expected = (torch.ones(total, hidden_size) + peer_grad)[
+        start : start + local_seqlen
+    ]
+    torch.testing.assert_close(input_.grad, expected)
 
 
 def test_forward_result_reassembles_cp_local_logprobs():

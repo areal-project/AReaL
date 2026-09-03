@@ -107,8 +107,10 @@ RUN --mount=type=cache,target=/root/.cache/uv \
         "setuptools==79.0.1"
 
 # Install Megatron-Bridge
+COPY patches/megatron-bridge.v0.5.1-vision-dp-cp.patch /areal-workspace/patches/
 RUN git clone --branch ${MEGATRON_BRIDGE_TAG} https://github.com/NVIDIA-NeMo/Megatron-Bridge.git /areal-workspace/Megatron-Bridge && \
     git -C /areal-workspace/Megatron-Bridge checkout ${MEGATRON_BRIDGE_COMMIT} && \
+    git -C /areal-workspace/Megatron-Bridge apply -v /areal-workspace/patches/megatron-bridge.v0.5.1-vision-dp-cp.patch && \
     python3 -m pip cache purge
 
 # Copy AReaL source code

@@ -979,6 +979,16 @@ class MegatronEngineConfig:
         },
     )
 
+    vision_dp_when_cp: bool = field(
+        default=False,
+        metadata={
+            "help": "Distribute whole images across context-parallel ranks while "
+            "running a Megatron-Bridge Qwen3-VL or Qwen3.5/3.6 vision encoder, "
+            "then gather the vision embeddings before the language-model forward. "
+            "Only effective when context parallel size is greater than one."
+        },
+    )
+
     freeze_vision_model: bool = field(
         default=False,
         metadata={"help": "Freeze the vision portion of a VL model (vision encoder)"},

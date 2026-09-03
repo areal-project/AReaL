@@ -364,6 +364,8 @@ jobs:
             tests/test_megatron_engine_vlm.py
           collect_base_tests model-packed-seq-cp \
             tests/test_model_packed_seq_cp.py
+          collect_base_tests megatron-bridge-vision-cp \
+            tests/test_megatron_bridge_vision_cp.py
           collect_base_tests reassemble-cp-logprobs \
             -m skipif tests/test_reassemble_cp_logprobs.py
           collect_base_tests megatron-distributed \
@@ -662,6 +664,10 @@ jobs:
               vocab-parallel4 \
               2,3,4,5 \
               'tests/test_vocab_parallel.py::test_vocab_parallel[4]'
+            start_normal_test \
+              megatron-bridge-vision-cp \
+              6,7 \
+              tests/test_megatron_bridge_vision_cp.py::test_vision_cp_allgather_backward_hccl
             wait_for_normal_wave
 
             return "${failed}"

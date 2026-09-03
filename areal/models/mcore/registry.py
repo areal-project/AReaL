@@ -336,6 +336,7 @@ def make_mcore_model(
 
     if bridge is not None and bridge_type == "megatron-bridge":
         provider = bridge.to_megatron_provider(load_weights=False)
+        provider.vision_dp_when_cp = mcore_config.vision_dp_when_cp
         if use_lora and hf_config.model_type == "qwen3_5":
             from megatron.bridge.models.qwen_vl import qwen35_vl_provider
 
