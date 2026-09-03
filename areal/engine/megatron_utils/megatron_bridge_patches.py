@@ -12,6 +12,7 @@ sentinel prevents double-application. Apply patches at import time via
 from __future__ import annotations
 
 import contextvars
+import functools
 
 import areal.utils.logging as logging
 
@@ -27,6 +28,9 @@ _MTP_TRAIN_LABELS: contextvars.ContextVar = contextvars.ContextVar(
 )
 _MTP_TRAIN_LOSS_MASK: contextvars.ContextVar = contextvars.ContextVar(
     "areal_mtp_train_loss_mask", default=None
+)
+_MTP_TRAIN_DEPTH: contextvars.ContextVar = contextvars.ContextVar(
+    "areal_mtp_train_depth", default=None
 )
 
 
@@ -160,6 +164,51 @@ def _detach_mtp_output_weight(output_layer, output_weight):
     return output_weight.detach()
 
 
+def _wrap_mtp_block_forward_for_gradient_isolation(forward):
+    """Track prediction depth for one MTP block invocation."""
+
+    @functools.wraps(forward)
+    def _patched_forward(self, *args, **kwargs):
+        if _MTP_TRAIN_LABELS.get() is None:
+            return forward(self, *args, **kwargs)
+        depth_token = _MTP_TRAIN_DEPTH.set(0)
+        try:
+            return forward(self, *args, **kwargs)
+        finally:
+            _MTP_TRAIN_DEPTH.reset(depth_token)
+
+    return _patched_forward
+
+
+def _wrap_mtp_get_embeddings_for_gradient_isolation(get_embeddings):
+    """Cut only backbone/shared-embedding edges from the auxiliary graph."""
+
+    @functools.wraps(get_embeddings)
+    def _patched_get_embeddings(self, *args, **kwargs):
+        out = get_embeddings(self, *args, **kwargs)
+        if _MTP_TRAIN_LABELS.get() is None:
+            return out
+        input_ids, position_ids, decoder_input, hidden_states = out
+        depth = _MTP_TRAIN_DEPTH.get()
+        if depth is None:
+            raise RuntimeError(
+                "MTP depth tracking is inactive while isolating training gradients."
+            )
+        _MTP_TRAIN_DEPTH.set(depth + 1)
+
+        # Every prediction depth reuses the backbone embedding. Detach each
+        # embedding output, but detach hidden states only where the backbone
+        # enters the first MTP layer. Later depths must retain their graph so
+        # deeper losses can update preceding MTP layers, including when one
+        # physical layer is applied repeatedly.
+        decoder_input = decoder_input.detach()
+        if depth == 0:
+            hidden_states = hidden_states.detach().requires_grad_(True)
+        return input_ids, position_ids, decoder_input, hidden_states
+
+    return _patched_get_embeddings
+
+
 def _patch_gpt_model_mtp_training() -> None:
     """Enable training the Multi-Token-Prediction (MTP) head as an auxiliary loss.
 
@@ -186,9 +235,11 @@ def _patch_gpt_model_mtp_training() -> None:
            0 predicts t+2); and
          - detaches the effective output weight (shared or untied LM head) to
            isolate backbone gradients.
-    3. ``MultiTokenPredictionLayer._get_embeddings`` is wrapped to detach the
-       backbone hidden states and the MTP embedding input, so the MTP loss only
-       updates MTP parameters.
+    3. ``MultiTokenPredictionBlock.forward`` tracks prediction depth, while
+       ``MultiTokenPredictionLayer._get_embeddings`` detaches the backbone
+       hidden states only at depth zero and detaches the shared embedding input
+       at every depth. This isolates backbone parameters without breaking the
+       gradient chain between distinct or repeated MTP layers.
     """
     try:
         from megatron.core.models.gpt import gpt_model
@@ -201,6 +252,7 @@ def _patch_gpt_model_mtp_training() -> None:
 
     roll_tensor = mtp_mod.roll_tensor
     GPTModel = gpt_model.GPTModel
+    MultiTokenPredictionBlock = mtp_mod.MultiTokenPredictionBlock
     MultiTokenPredictionLayer = mtp_mod.MultiTokenPredictionLayer
 
     # --- 1. GPTModel.forward: capture mtp_kwargs into the ContextVar ---
@@ -236,27 +288,22 @@ def _patch_gpt_model_mtp_training() -> None:
 
     gpt_model.process_mtp_loss = _patched_process_mtp_loss
 
-    # --- 3. MTP layer embeddings: cut backbone from the MTP graph ---
-    _orig_get_embeddings = MultiTokenPredictionLayer._get_embeddings
-
-    def _patched_get_embeddings(self, *args, **kwargs):
-        out = _orig_get_embeddings(self, *args, **kwargs)
-        if _MTP_TRAIN_LABELS.get() is None:
-            return out
-        input_ids, position_ids, decoder_input, hidden_states = out
-        # detach the shared embedding output and the backbone hidden states so
-        # only MTP-internal parameters receive gradients.
-        decoder_input = decoder_input.detach()
-        hidden_states = hidden_states.detach().requires_grad_(True)
-        return input_ids, position_ids, decoder_input, hidden_states
-
-    MultiTokenPredictionLayer._get_embeddings = _patched_get_embeddings
+    # --- 3. MTP layer embeddings: isolate the backbone without severing MTP depth ---
+    MultiTokenPredictionBlock.forward = _wrap_mtp_block_forward_for_gradient_isolation(
+        MultiTokenPredictionBlock.forward
+    )
+    MultiTokenPredictionLayer._get_embeddings = (
+        _wrap_mtp_get_embeddings_for_gradient_isolation(
+            MultiTokenPredictionLayer._get_embeddings
+        )
+    )
 
     gpt_model._areal_mtp_training_applied = True
     logger.info(
         "Applied MTP training patch: GPTModel.forward accepts mtp_kwargs, "
         "process_mtp_loss uses independent label/mask channels with detached "
-        "output weight, and MTP gradients are isolated from the backbone."
+        "output weight, and MTP gradients are isolated from the backbone while "
+        "remaining connected across prediction depths."
     )
 
 
