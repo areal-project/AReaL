@@ -231,6 +231,131 @@ def test_non_dte_megatron_keeps_odd_world_size_compatibility(monkeypatch):
     assert [call.get("backend", "nccl") for call in calls] == ["nccl", "gloo"]
 
 
+@pytest.mark.parametrize(
+    ("loader_name", "adapter_name"),
+    [
+        ("_load_megatron_adapter", "AwexMegatronAdapter"),
+        ("_load_sglang_adapter", "AwexSGLangAdapter"),
+    ],
+)
+def test_candidate_pair_init_rolls_back_and_preserves_active_pair(
+    monkeypatch, loader_name, adapter_name
+):
+    """A failed B candidate leaves A usable and permits an immediate B retry."""
+    mod = getattr(common, loader_name)(monkeypatch)
+    adapter = object.__new__(getattr(mod, adapter_name))
+    adapter._dte_config = SimpleNamespace(enabled=False)
+    if adapter_name == "AwexSGLangAdapter":
+        adapter._get_model_context = lambda: {
+            "tp_size": 1,
+            "tp_rank": 0,
+            "pp_size": 1,
+            "pp_rank": 0,
+        }
+
+    old_payload = object()
+    old_control = object()
+    candidate_payload = object()
+    retried_payload = object()
+    retried_control = object()
+    groups = iter(
+        [
+            old_payload,
+            old_control,
+            candidate_payload,
+            RuntimeError("candidate gloo failed"),
+            retried_payload,
+            retried_control,
+        ]
+    )
+
+    def init_group(**kwargs):
+        del kwargs
+        result = next(groups)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    monkeypatch.setattr(mod, "init_weights_update_group", init_group)
+    monkeypatch.setattr(mod, "fetch_kv_metadata", lambda *args: ([], []))
+    monkeypatch.setattr(mod, "TransferPlanBuilder", _FakeTransferPlanBuilder)
+    destroyed = []
+    monkeypatch.setattr(mod.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(
+        mod.dist, "destroy_process_group", lambda group: destroyed.append(group)
+    )
+
+    init_kwargs = dict(
+        master_addr="127.0.0.1",
+        master_port=23456,
+        transfer_rank=0,
+        world_size=2,
+        kv_store_url="http://127.0.0.1:9999",
+        infer_world_size=1,
+        train_world_size=1,
+        num_engines=1,
+    )
+    adapter.init_weight_update_group(pair_name="pair-a", **init_kwargs)
+
+    with pytest.raises(RuntimeError, match="candidate gloo failed"):
+        adapter.init_weight_update_group(pair_name="pair-b", **init_kwargs)
+
+    assert destroyed == [candidate_payload]
+    assert adapter._active_pair_name == "pair-a"
+    assert adapter._weights_update_group is old_payload
+    assert adapter._weights_update_group_gloo is old_control
+    assert "pair-b" not in adapter._pair_states
+
+    adapter.init_weight_update_group(pair_name="pair-b", **init_kwargs)
+
+    assert adapter._active_pair_name == "pair-b"
+    assert adapter._weights_update_group is retried_payload
+    assert adapter._weights_update_group_gloo is retried_control
+    assert adapter._pair_states["pair-a"].weights_update_group is old_payload
+
+
+def test_sglang_colocate_init_rolls_back_group_and_client(monkeypatch):
+    mod = common._load_sglang_adapter(monkeypatch)
+    adapter = mod.AwexSGLangAdapter(SimpleNamespace())
+    close_calls = []
+
+    class _Client:
+        def close(self):
+            close_calls.append("client")
+
+    client = _Client()
+    group = object()
+    monkeypatch.setattr(mod.httpx, "Client", lambda: client)
+    monkeypatch.setattr(mod, "fetch_kv_metadata", lambda *args: ([], []))
+    monkeypatch.setattr(mod, "TransferPlanBuilder", _FakeTransferPlanBuilder)
+    monkeypatch.setattr(mod, "init_weights_update_group", lambda **kwargs: group)
+    monkeypatch.setattr(
+        mod,
+        "NcclColocateStreamBatchTransport",
+        lambda *args: (_ for _ in ()).throw(RuntimeError("transport init failed")),
+    )
+    destroyed = []
+    monkeypatch.setattr(mod.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(
+        mod.dist, "destroy_process_group", lambda candidate: destroyed.append(candidate)
+    )
+
+    with pytest.raises(RuntimeError, match="transport init failed"):
+        adapter.init_colocate_weight_update(
+            pair_name="pair",
+            kv_store_url="http://127.0.0.1:9999",
+            transfer_rank=0,
+            infer_world_size=1,
+            train_world_size=1,
+            num_engines=1,
+            master_port=23456,
+        )
+
+    assert destroyed == [group]
+    assert close_calls == ["client"]
+    assert adapter._colocate_pair_states == {}
+
+
 def test_megatron_enters_empty_local_dtype_round(monkeypatch):
     """A sender with only BF16 ops must still enter the global FP32 round."""
     mod = common._load_megatron_adapter(monkeypatch)
@@ -323,9 +448,10 @@ def test_megatron_full_transfer_uses_gloo_completion_barrier(monkeypatch):
     adapter._weights_update_group_gloo = "gloo"
     adapter._transfer_rank = 8
     adapter._world_size = 16
+    adapter._active_pair_name = "pair"
     adapter.get_local_shard_parameters = lambda: {}
 
-    adapter.execute_weight_update(version=1)
+    adapter.execute_weight_update("pair", version=1)
 
     assert barriers == ["gloo"]
 
@@ -345,9 +471,10 @@ def test_sglang_full_transfer_uses_gloo_completion_barrier(monkeypatch):
     adapter._weights_update_group = "nccl"
     adapter._weights_update_group_gloo = "gloo"
     adapter._transfer_rank = 0
+    adapter._active_pair_name = "pair"
     adapter.get_local_shard_parameters = lambda: {}
 
-    adapter.execute_weight_update(version=1)
+    adapter.execute_weight_update("pair", version=1)
 
     assert barriers == ["gloo"]
 

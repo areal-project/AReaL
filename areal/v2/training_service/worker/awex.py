@@ -57,6 +57,32 @@ def create_awex_blueprint(
             lambda: submit_to_engine_thread("report_weight_meta", action),
         )
 
+    @bp.route("/memory_probe", methods=["POST"])
+    def memory_probe():
+        data = flask_module.request.get_json(silent=True) or {}
+        pair_names = data.get("pair_names", [])
+        if not isinstance(pair_names, list) or not all(
+            isinstance(pair_name, str) for pair_name in pair_names
+        ):
+            return flask_module.jsonify(
+                {"error": "pair_names must be a list[str]"}
+            ), 400
+
+        def action():
+            from areal.v2.weight_update.memory_probe import collect_awex_memory_probe
+
+            engine = get_engine()
+            return collect_awex_memory_probe(
+                role="training",
+                pair_names=pair_names,
+                rank=getattr(engine, "rank", None),
+            )
+
+        return run_endpoint(
+            "memory_probe",
+            lambda: submit_to_engine_thread("awex_memory_probe", action),
+        )
+
     @bp.route("/init_weights_update_group", methods=["POST"])
     def init_weights_update_group():
         data = flask_module.request.get_json(force=True)
@@ -73,11 +99,12 @@ def create_awex_blueprint(
     @bp.route("/update_weights", methods=["POST"])
     def update_weights():
         data = flask_module.request.get_json(force=True)
+        pair_name = data["pair_name"]
         version = data.get("version", 0)
 
         def action():
             adapter = _require_adapter()
-            adapter.execute_weight_update(version)
+            adapter.execute_weight_update(pair_name, version)
 
         return run_endpoint(
             "update_weights",
@@ -87,10 +114,11 @@ def create_awex_blueprint(
     @bp.route("/batch_isend_irecv", methods=["POST"])
     def batch_isend_irecv():
         data = flask_module.request.get_json(force=True)
+        pair_name = data.pop("pair_name")
 
         def action():
             adapter = _require_adapter()
-            adapter.batch_isend_irecv(**data)
+            adapter.batch_isend_irecv(pair_name, **data)
 
         return run_endpoint(
             "batch_isend_irecv",
@@ -99,13 +127,16 @@ def create_awex_blueprint(
 
     @bp.route("/teardown", methods=["POST"])
     def teardown():
+        data = flask_module.request.get_json(silent=True) or {}
+        pair_name = data.get("pair_name")
+        if not pair_name:
+            return flask_module.jsonify({"error": "pair_name is required"}), 400
         adapter = _state.get("adapter")
         if adapter is None:
             return flask_module.jsonify({"status": "success"})
 
         def action():
-            adapter.teardown_weight_update_group()
-            _state["adapter"] = None
+            adapter.teardown_weight_update_group(pair_name)
 
         return run_endpoint(
             "awex_teardown",
@@ -130,11 +161,12 @@ def create_awex_blueprint(
     @bp.route("/execute_colocate_weight_update", methods=["POST"])
     def execute_colocate_weight_update():
         data = flask_module.request.get_json(force=True)
+        pair_name = data["pair_name"]
         version = data.get("version", 0)
 
         def action():
             adapter = _require_adapter()
-            adapter.execute_colocate_weight_update(version)
+            adapter.execute_colocate_weight_update(pair_name, version)
 
         return run_endpoint(
             "execute_colocate_weight_update",

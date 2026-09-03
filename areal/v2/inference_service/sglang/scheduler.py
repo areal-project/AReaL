@@ -57,9 +57,11 @@ class AwexSchedulerBridge:
         methods = [
             "awex_report_weight_meta",
             "awex_report_parallelism",
+            "awex_report_memory_probe",
             "awex_init_weights_update_group",
             "awex_execute_weight_update",
             "awex_batch_isend_irecv",
+            "awex_teardown_weight_update_group",
             "awex_get_parameters",
             "awex_randomize_parameters",
             "awex_init_colocate_weight_update",
@@ -102,14 +104,45 @@ class AwexSchedulerBridge:
     def awex_report_parallelism(self) -> None:
         self._push_result(self._require_adapter().parallelism_strategy)
 
+    def awex_report_memory_probe(self, pair_names: list[str]) -> None:
+        from areal.v2.weight_update.memory_probe import collect_awex_memory_probe
+
+        scheduler = self._scheduler
+        rank = (
+            f"dp={getattr(scheduler, 'dp_rank', 0)} "
+            f"pp={getattr(scheduler, 'pp_rank', 0)} "
+            f"tp={getattr(scheduler, 'tp_rank', 0)}"
+        )
+        local_probe = collect_awex_memory_probe(
+            role="inference",
+            pair_names=pair_names,
+            rank=rank,
+        )
+        if dist.is_available() and dist.is_initialized():
+            # The default SGLang group covers all local TP/PP/DP scheduler
+            # ranks.  Reporting only the TP group would miss PP/DP workers and
+            # can leave a stale PUSH result from another rank.
+            world_size = dist.get_world_size()
+            probes: list[dict[str, Any]] = [{} for _ in range(world_size)]
+            dist.all_gather_object(probes, local_probe)
+            if dist.get_rank() == 0:
+                self._push_result(probes)
+            return
+
+        self._push_result([local_probe])
+
     def awex_init_weights_update_group(self, **kwargs: Any) -> None:
         self._require_adapter().init_weight_update_group(**kwargs)
 
-    def awex_execute_weight_update(self, version: int = 0) -> None:
-        self._require_adapter().execute_weight_update(version)
+    def awex_execute_weight_update(self, pair_name: str, version: int = 0) -> None:
+        self._require_adapter().execute_weight_update(pair_name, version)
 
-    def awex_batch_isend_irecv(self, **kwargs: Any) -> None:
-        self._require_adapter().batch_isend_irecv(**kwargs)
+    def awex_batch_isend_irecv(self, pair_name: str, **kwargs: Any) -> None:
+        self._require_adapter().batch_isend_irecv(pair_name, **kwargs)
+
+    def awex_teardown_weight_update_group(self, pair_name: str) -> None:
+        if self._adapter is not None:
+            self._adapter.teardown_weight_update_group(pair_name)
 
     def awex_get_parameters(
         self, save_path: str, names: list[str] | None = None
@@ -124,8 +157,10 @@ class AwexSchedulerBridge:
     def awex_init_colocate_weight_update(self, **kwargs: Any) -> None:
         self._require_adapter().init_colocate_weight_update(**kwargs)
 
-    def awex_execute_colocate_weight_update(self, version: int = 0) -> None:
-        self._require_adapter().execute_colocate_weight_update(version)
+    def awex_execute_colocate_weight_update(
+        self, pair_name: str, version: int = 0
+    ) -> None:
+        self._require_adapter().execute_colocate_weight_update(pair_name, version)
 
     def awex_release_memory(self, tags: list[str] | None = None) -> None:
         self._require_adapter().release_memory(tags)

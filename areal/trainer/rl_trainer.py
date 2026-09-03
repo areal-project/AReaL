@@ -1417,6 +1417,7 @@ class PPOTrainer:
             self.evaluator,
             self.stats_logger,
             self.train_dataloader,
+            inference_engine=self.rollout,
             tokenizer=self.tokenizer,
             processor=self.processor,
         )

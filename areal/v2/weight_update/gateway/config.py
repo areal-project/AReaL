@@ -41,6 +41,10 @@ class WeightUpdateResult(BaseModel):
     version: int
     duration_ms: float
     error: str | None = None
+    # ``True`` means inference may have received a prefix of the transfer and
+    # must be restored before generation resumes.  The default keeps responses
+    # from older gateways safely fail-closed.
+    inference_weights_may_be_mutated: bool = True
 
 
 @dataclass

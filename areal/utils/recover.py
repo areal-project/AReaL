@@ -49,6 +49,7 @@ class RecoverInfo:
     stats_logger_info: dict
     dataloader_info: dict | list[dict]
     checkpoint_info: dict
+    pipeline_info: dict | list[dict] | None = None
 
     def dump(self, dump_dir: str):
         # Dumps the recover info to multiple files in `dump_dir`:
@@ -61,12 +62,15 @@ class RecoverInfo:
             # In this situation, saved dataloader_info is a list of states from all ranks.
             dataloader_info = [None for _ in range(dist.get_world_size())]
             dist.all_gather_object(dataloader_info, self.dataloader_info)
+            pipeline_info = [None for _ in range(dist.get_world_size())]
+            dist.all_gather_object(pipeline_info, self.pipeline_info)
 
             # To avoid contention, do not dump on multiple ranks
             if dist.get_rank() != 0:
                 return
         else:
             dataloader_info = self.dataloader_info
+            pipeline_info = self.pipeline_info
 
         os.makedirs(dump_dir, exist_ok=True)
         step_info_path = os.path.join(dump_dir, "step_info.json")
@@ -92,6 +96,10 @@ class RecoverInfo:
         dataloader_info_path = os.path.join(dump_dir, "dataloader_info.pkl")
         with open(dataloader_info_path, "wb") as f:
             pickle.dump(dataloader_info, f)
+
+        pipeline_info_path = os.path.join(dump_dir, "pipeline_info.pkl")
+        with open(pipeline_info_path, "wb") as f:
+            pickle.dump(pipeline_info, f)
 
     @classmethod
     def load(cls, load_dir: str):
@@ -136,6 +144,19 @@ class RecoverInfo:
                         )
                         dataloader_info = dataloader_info[dist.get_rank()]
 
+            pipeline_info_path = os.path.join(load_dir, "pipeline_info.pkl")
+            if os.path.exists(pipeline_info_path):
+                with open(pipeline_info_path, "rb") as f:
+                    pipeline_info = pickle.load(f)
+                    if isinstance(pipeline_info, list) and dist.is_initialized():
+                        assert dist.get_world_size() == len(pipeline_info), (
+                            f"Pipeline info list length {len(pipeline_info)} does not "
+                            f"match the world size {dist.get_world_size()}."
+                        )
+                        pipeline_info = pipeline_info[dist.get_rank()]
+            else:
+                pipeline_info = None
+
             return cls(
                 last_step_info=last_step_info,
                 saver_info=saver_info,
@@ -143,6 +164,7 @@ class RecoverInfo:
                 stats_logger_info=stats_logger_info,
                 dataloader_info=dataloader_info,
                 checkpoint_info=checkpoint_info,
+                pipeline_info=pipeline_info,
             )
         except Exception as e:
             logger.error(f"Failed to load recover info from {load_dir}: {e}")
@@ -175,38 +197,6 @@ class RecoverHandler:
             Saver.get_save_root(experiment_name, trial_name, fileroot),
             "recover_info",
         )
-
-    @staticmethod
-    def _is_gateway_train_controller(
-        engine: TrainEngine
-        | TrainController
-        | dict[str, TrainEngine | TrainController],
-    ) -> bool:
-        from areal.v2.training_service.controller.controller import (
-            GatewayTrainController,
-        )
-
-        if isinstance(engine, GatewayTrainController):
-            return True
-        if isinstance(engine, dict):
-            return any(
-                isinstance(controller, GatewayTrainController)
-                for controller in engine.values()
-            )
-        return False
-
-    def _ensure_recover_supported(
-        self,
-        engine: TrainEngine
-        | TrainController
-        | dict[str, TrainEngine | TrainController],
-    ) -> None:
-        if self._is_gateway_train_controller(engine):
-            raise NotImplementedError(
-                "Recovery is not supported with GatewayTrainController "
-                '(`_version="v2"`) yet. Disable `recover.mode` or use '
-                '`_version="v1"`.'
-            )
 
     @staticmethod
     def _normalize_recover_engines(
@@ -273,19 +263,24 @@ class RecoverHandler:
         evaluator: Evaluator,
         stats_logger: StatsLogger,
         dataloader: Any,
+        inference_engine: InferenceEngine | None = None,
         tokenizer: PreTrainedTokenizerFast | None = None,
         processor: AutoProcessor | None = None,
         base_model_path: str | None = None,
     ):
         if self.config.mode in ("disabled", "off"):
             return
-        self._ensure_recover_supported(engine)
         # currently only support recover on one engine
         if not self.freq_ctl.check(
             epochs=int(step_info.epoch_step == self.ft_spec.steps_per_epoch - 1),
             steps=1,
         ):
             return
+        pipeline_info = None
+        if inference_engine is not None:
+            recover_state_dict = getattr(inference_engine, "recover_state_dict", None)
+            if callable(recover_state_dict):
+                pipeline_info = recover_state_dict()
         normalized_engine: dict[str, TrainEngine | TrainController] = (
             self._normalize_recover_engines(engine)
         )
@@ -306,6 +301,7 @@ class RecoverHandler:
             stats_logger_info=stats_logger.state_dict(),
             dataloader_info=dataloader.state_dict(),
             checkpoint_info=self.freq_ctl.state_dict(),
+            pipeline_info=pipeline_info,
         )
 
         recover_info_path = self.recover_info_path(
@@ -329,14 +325,8 @@ class RecoverHandler:
     ) -> RecoverInfo | None:
         if self.config.mode in ("disabled", "off"):
             return
-        self._ensure_recover_supported(engine)
         if inference_engine is not None and weight_update_meta is None:
             raise ValueError("Weight update meta is required for recovery.")
-
-        # TODO(agent): GatewayTrainController is currently duck-typed and does
-        # not satisfy this TrainController type check. Extend recovery to accept
-        # controller-v2 instances (or make v2 inherit TrainController) before
-        # relying on resumed runs with `_version="v2"`.
         normalized_engine: dict[str, TrainEngine | TrainController] = (
             self._normalize_recover_engines(engine)
         )
@@ -355,6 +345,14 @@ class RecoverHandler:
             evaluator.load_state_dict(recover_info.evaluator_info)
             stats_logger.load_state_dict(recover_info.stats_logger_info)
             dataloader.load_state_dict(recover_info.dataloader_info)
+            if inference_engine is not None:
+                load_recover_state_dict = getattr(
+                    inference_engine, "load_recover_state_dict", None
+                )
+                if callable(load_recover_state_dict):
+                    load_recover_state_dict(
+                        getattr(recover_info, "pipeline_info", None)
+                    )
 
             global_step = recover_info.last_step_info.global_step
             recovery_version = global_step + 1
@@ -377,6 +375,7 @@ class RecoverHandler:
                 versioned_meta = weight_update_meta.with_version(recovery_version)
                 update_engine.connect_engine(inference_engine, versioned_meta)
                 inference_engine.pause()
+                should_resume_inference = True
                 try:
                     # AWEX colocate transfer requires the full engine-level
                     # pause/offload protocol, not just the controller pause. The
@@ -400,10 +399,23 @@ class RecoverHandler:
                         for name, engine_ in normalized_engine.items():
                             self._load_checkpoint(engine_, name=name)
                     update_engine.update_weights(versioned_meta)
+                except BaseException as exc:
+                    # A transfer error is unsafe by default: inference may have
+                    # applied only part of the payload.  The controller can
+                    # explicitly mark errors that occurred before any mutation.
+                    should_resume_inference = not getattr(
+                        exc, "inference_weights_may_be_mutated", True
+                    )
+                    raise
                 finally:
-                    # Always resume: leaving rollout paused after a failed
-                    # checkpoint load or transfer would hang every later step.
-                    inference_engine.resume()
+                    if should_resume_inference:
+                        inference_engine.resume()
+                    else:
+                        logger.critical(
+                            "Recovery weight synchronization may have partially "
+                            "mutated inference weights; leaving inference paused "
+                            "until a known-good recovery succeeds"
+                        )
                 update_engine.set_version(recovery_version)
                 inference_engine.set_version(recovery_version)
             return recover_info
