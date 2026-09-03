@@ -13,6 +13,7 @@ from areal.experimental.openai.cache import InteractionCache
 
 if TYPE_CHECKING:
     from areal.experimental.openai.types import InteractionWithTokenLogpReward
+    from areal.infra.processor_cache import ProcessorCallCache
 
 # Session timeout for cleanup (1 hour)
 SESSION_TIMEOUT_SECONDS = 3600
@@ -28,6 +29,8 @@ class StartSessionRequest(BaseModel):
 
     task_id: str
     api_key: str | None = None  # Reuse a previously-issued key (refresh)
+    processor_cache_group_id: str | None = None
+    processor_cache_group_size: int = 1
 
 
 class StartSessionResponse(BaseModel):
@@ -35,6 +38,12 @@ class StartSessionResponse(BaseModel):
 
     session_id: str
     api_key: str
+
+
+class ProcessorCacheGroupRequest(BaseModel):
+    """Request to discard one completed or aborted processor-cache group."""
+
+    group_id: str
 
 
 class SetRewardRequest(BaseModel):
@@ -72,9 +81,13 @@ class SessionData:
         session_id: str,
         prefix_matcher=None,
         sampling_seed_identity: str | None = None,
+        processor_cache: ProcessorCallCache | None = None,
+        processor_cache_group_id: str | None = None,
     ):
         self.session_id = session_id
         self.sampling_seed_identity = sampling_seed_identity or session_id
+        self.processor_cache = processor_cache
+        self.processor_cache_group_id = processor_cache_group_id
 
         self._completed = False
         self._completions = InteractionCache(
@@ -87,6 +100,7 @@ class SessionData:
         self._end_time = None
         self._lock = threading.Lock()
         self._next_sampling_request_index = 0
+        self._processor_cache_released = False
 
     def next_sampling_request_index(self) -> int:
         """Reserve a unique request index without serializing request execution."""
@@ -99,6 +113,15 @@ class SessionData:
         """Update the last access time for this session."""
         with self._lock:
             self._last_access_time = time.time()
+
+    def take_processor_cache_group_id(self) -> str | None:
+        """Detach the cache and return its group ID once for idempotent release."""
+        with self._lock:
+            if self._processor_cache_released:
+                return None
+            self._processor_cache_released = True
+            self.processor_cache = None
+            return self.processor_cache_group_id
 
     def is_stale(self, timeout_seconds: float = SESSION_TIMEOUT_SECONDS) -> bool:
         """Check if this session has been inactive for too long."""
@@ -198,6 +221,7 @@ def deserialize_interactions(
 
 RL_START_SESSION_PATHNAME = "rl/start_session"
 RL_END_SESSION_PATHNAME = "rl/end_session"
+RL_END_PROCESSOR_CACHE_GROUP_PATHNAME = "rl/end_processor_cache_group"
 RL_SET_REWARD_PATHNAME = "rl/set_reward"
 CHAT_COMPLETIONS_PATHNAME = "chat/completions"
 RESPONSES_PATHNAME = "responses"

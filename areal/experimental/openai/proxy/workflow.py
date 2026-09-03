@@ -16,8 +16,13 @@ from areal.infra import workflow_context
 from areal.utils import logging, stats_tracker
 from areal.utils.perf_tracer import session_context, trace_session
 
-from .client_session import OpenAIProxyClient
-from .server import DEFAULT_ADMIN_API_KEY, GRANT_CAPACITY_PATHNAME
+from .client_session import OpenAIProxyClient, post_json
+from .server import (
+    DEFAULT_ADMIN_API_KEY,
+    GRANT_CAPACITY_PATHNAME,
+    RL_END_PROCESSOR_CACHE_GROUP_PATHNAME,
+    ProcessorCacheGroupRequest,
+)
 
 if TYPE_CHECKING:
     from ..client import TRolloutEngine
@@ -70,6 +75,13 @@ def _wrap_run(agent: Any, data: dict[str, Any], extra_envs: dict[str, str]):
 
 
 class OpenAIProxyWorkflow(RolloutWorkflow):
+    """Run an agent through the v1 proxy.
+
+    Group-scoped processor caching is supported in ``inline`` and ``subproc``
+    modes. Online mode owns its sessions externally and does not receive the
+    rollout group's cache identity.
+    """
+
     def __init__(
         self,
         mode: str,
@@ -162,6 +174,30 @@ class OpenAIProxyWorkflow(RolloutWorkflow):
         async with session.post(url, headers=headers) as resp:
             resp.raise_for_status()
 
+    def _processor_cache_group_id(
+        self, context: workflow_context.WorkflowContext
+    ) -> str | None:
+        if self.mode == "online" or context.group_size <= 1 or context.task_id is None:
+            return None
+        scope = "eval" if context.is_eval else "train"
+        return f"{scope}:{context.task_id}"
+
+    async def _afinalize_processor_cache_group(
+        self, context: workflow_context.WorkflowContext
+    ) -> None:
+        """Release proxy-side cache state after an inline/subproc group ends."""
+        group_id = self._processor_cache_group_id(context)
+        if group_id is None:
+            return
+
+        http_session = await workflow_context.get_aiohttp_session()
+        await post_json(
+            http_session,
+            url=(f"{self.proxy_addr}/{RL_END_PROCESSOR_CACHE_GROUP_PATHNAME}"),
+            payload=ProcessorCacheGroupRequest(group_id=group_id),
+            headers={"Authorization": f"Bearer {self._admin_api_key}"},
+        )
+
     @session_context()
     async def arun_episode(
         self, engine: TRolloutEngine, data: dict[str, Any]
@@ -175,6 +211,7 @@ class OpenAIProxyWorkflow(RolloutWorkflow):
             if context.sample_idx is not None
             else str(task_id)
         )
+        processor_cache_group_id = self._processor_cache_group_id(context)
 
         http_session = await workflow_context.get_aiohttp_session()
 
@@ -230,6 +267,8 @@ class OpenAIProxyWorkflow(RolloutWorkflow):
             base_url=self.proxy_addr,
             task_id=proxy_task_id,
             admin_api_key=self._admin_api_key,
+            processor_cache_group_id=processor_cache_group_id,
+            processor_cache_group_size=context.group_size,
         )
         async with proxy_client:
             # Run the user code.

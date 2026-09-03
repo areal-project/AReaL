@@ -58,6 +58,10 @@ class OpenAIProxyClient:
         Unique identifier for this task
     admin_api_key : str
         Admin API key for management operations
+    processor_cache_group_id : str | None
+        Shared processor-cache identity for grouped rollout sessions.
+    processor_cache_group_size : int
+        Expected number of sessions sharing the processor cache.
 
     Example
     -------
@@ -85,11 +89,15 @@ class OpenAIProxyClient:
         base_url: str,
         task_id: str,
         admin_api_key: str,
+        processor_cache_group_id: str | None = None,
+        processor_cache_group_size: int = 1,
     ):
         self._session = session
         self.base_url = ensure_end_with_slash(base_url)
         self.task_id = task_id
         self._admin_api_key = admin_api_key
+        self._processor_cache_group_id = processor_cache_group_id
+        self._processor_cache_group_size = processor_cache_group_size
         self.session_id: str | None = None
         self._session_api_key: str | None = None
 
@@ -195,7 +203,11 @@ class OpenAIProxyClient:
         data = await _start_session(
             self._session,
             url=f"{self.base_url}{RL_START_SESSION_PATHNAME}",
-            payload=StartSessionRequest(task_id=self.task_id),
+            payload=StartSessionRequest(
+                task_id=self.task_id,
+                processor_cache_group_id=self._processor_cache_group_id,
+                processor_cache_group_size=self._processor_cache_group_size,
+            ),
             headers=self._admin_auth_headers(),
         )
         self.session_id = data["session_id"]
