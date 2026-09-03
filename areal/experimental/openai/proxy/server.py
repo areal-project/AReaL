@@ -15,6 +15,8 @@ if TYPE_CHECKING:
     from areal.experimental.openai.types import InteractionWithTokenLogpReward
     from areal.infra.processor_cache import ProcessorCallCache
 
+    from .tensor_reference import GroupTensorStore
+
 # Session timeout for cleanup (1 hour)
 SESSION_TIMEOUT_SECONDS = 3600
 
@@ -46,6 +48,19 @@ class ProcessorCacheGroupRequest(BaseModel):
     group_id: str
 
 
+class FetchSharedTensorsRequest(BaseModel):
+    """Request unique multimodal tensors referenced by grouped trajectories."""
+
+    group_id: str
+    ref_ids: list[str]
+
+
+class FetchSharedTensorsResponse(BaseModel):
+    """Response containing tensors keyed by their group-scoped references."""
+
+    tensors: dict[str, Any]
+
+
 class SetRewardRequest(BaseModel):
     """Request to set reward for an interaction."""
 
@@ -60,12 +75,14 @@ class ExportTrajectoriesRequest(BaseModel):
     discount: float = 1.0
     style: str = "individual"
     drop_retry_orphans: bool = False
+    supports_shared_tensor_references: bool = False
 
 
 class ExportTrajectoriesResponse(BaseModel):
     """Response containing serialized interactions."""
 
     interactions: dict[str, Any]
+    tensor_reference_group_id: str | None = None
 
 
 # =============================================================================
@@ -171,6 +188,7 @@ class SessionData:
 
 def serialize_interactions(
     interactions: dict[str, InteractionWithTokenLogpReward],
+    tensor_store: GroupTensorStore | None = None,
 ) -> dict[str, Any]:
     """Serialize interactions into a json-compatible format for HTTP transport."""
     from areal.infra.rpc.serialization import serialize_value
@@ -190,6 +208,8 @@ def serialize_interactions(
                 "reward": interaction.reward,
                 "interaction_id": interaction.interaction_id,
             }
+    if tensor_store is not None:
+        result = tensor_store.encode_multimodal_tensors(result)
     return serialize_value(result)
 
 
@@ -222,6 +242,7 @@ def deserialize_interactions(
 RL_START_SESSION_PATHNAME = "rl/start_session"
 RL_END_SESSION_PATHNAME = "rl/end_session"
 RL_END_PROCESSOR_CACHE_GROUP_PATHNAME = "rl/end_processor_cache_group"
+RL_FETCH_SHARED_TENSORS_PATHNAME = "rl/fetch_shared_tensors"
 RL_SET_REWARD_PATHNAME = "rl/set_reward"
 CHAT_COMPLETIONS_PATHNAME = "chat/completions"
 RESPONSES_PATHNAME = "responses"
