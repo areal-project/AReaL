@@ -1,6 +1,7 @@
 import pytest
 from flask import Flask
 
+from areal.infra.rpc.guard import engine_blueprint
 from areal.infra.rpc.guard.app import GuardState
 from areal.infra.rpc.guard.engine_blueprint import engine_bp
 
@@ -44,3 +45,73 @@ def test_set_env_invalid_json(client):
     # Sending a string where an object is expected for 'env'
     resp = client.post("/set_env", json={"env": "not-a-dict"})
     assert resp.status_code == 400
+
+
+@pytest.mark.parametrize(
+    (
+        "method",
+        "cpu_staged_rpc_methods",
+        "expected_localize",
+        "expected_remotize",
+    ),
+    [
+        ("echo", frozenset(), False, False),
+        ("echo", frozenset({"echo"}), True, False),
+        ("wait_for_task", frozenset(), False, True),
+    ],
+)
+def test_call_engine_scopes_alias_preservation_to_supported_v1_boundaries(
+    client,
+    monkeypatch,
+    method,
+    cpu_staged_rpc_methods,
+    expected_localize,
+    expected_remotize,
+):
+    """Only CPU-staged inputs and grouped rollout outputs preserve aliases."""
+
+    class FakeEngine:
+        def __init__(self):
+            self.cpu_staged_rpc_methods = cpu_staged_rpc_methods
+
+        def echo(self, value):
+            return value
+
+        def wait_for_task(self, value):
+            return value
+
+    localize_calls = []
+    remotize_calls = []
+
+    def fake_localize(obj, *, preserve_tensor_aliases=False):
+        localize_calls.append(preserve_tensor_aliases)
+        return obj
+
+    def fake_remotize(obj, node_addr, *, preserve_tensor_aliases=False):
+        remotize_calls.append(preserve_tensor_aliases)
+        return obj
+
+    monkeypatch.setitem(engine_blueprint._engines, "test", FakeEngine())
+    monkeypatch.setattr(
+        engine_blueprint, "_submit_to_engine_thread", lambda _name, func: func()
+    )
+    monkeypatch.setattr(
+        engine_blueprint.RTensor, "localize", staticmethod(fake_localize)
+    )
+    monkeypatch.setattr(
+        engine_blueprint.RTensor, "remotize", staticmethod(fake_remotize)
+    )
+
+    response = client.post(
+        "/call",
+        json={
+            "method": method,
+            "engine_name": "test",
+            "args": ["payload"],
+            "kwargs": {},
+        },
+    )
+
+    assert response.status_code == 200
+    assert localize_calls == [expected_localize]
+    assert remotize_calls == [expected_remotize]
