@@ -383,11 +383,15 @@ class RTensor:
         return self.data
 
     @staticmethod
-    def remotize(obj: Any, node_addr: str) -> Any:
+    def remotize(
+        obj: Any, node_addr: str, *, preserve_tensor_aliases: bool = False
+    ) -> Any:
         """Convert tensors to RTensors in nested structures.
 
         For dict objects that look like trajectory dicts (contain attention_mask),
         trailing padding is trimmed before storage to keep each RTensor compact.
+        When ``preserve_tensor_aliases`` is enabled, repeated references to the
+        same tensor object share one stored shard for this root call.
 
         Parameters
         ----------
@@ -395,23 +399,42 @@ class RTensor:
             Object potentially containing tensors
         node_addr : str
             Node address for shard storage
+        preserve_tensor_aliases : bool, default=False
+            Preserve tensor object aliases as shared RTensor shards. Distinct
+            tensor objects are never merged, even when their values match.
 
         Returns
         -------
         Any
             Object with tensors converted to RTensors
         """
+        tensor_memo = {} if preserve_tensor_aliases else None
+        return RTensor._remotize_recursive(obj, node_addr, tensor_memo)
+
+    @staticmethod
+    def _remotize_recursive(
+        obj: Any,
+        node_addr: str,
+        tensor_memo: dict[int, RTensor] | None,
+    ) -> Any:
         if obj is None:
             return None
 
         if isinstance(obj, torch.Tensor):
+            tensor_id = id(obj)
+            if tensor_memo is not None and tensor_id in tensor_memo:
+                return tensor_memo[tensor_id]
+
             tensor = obj.detach().cpu()
             shard_id = get_backend().store(tensor)
             shard = TensorShardInfo(
                 shard_id=shard_id,
                 node_addr=node_addr,
             )
-            return RTensor(shard=shard, data=tensor.to("meta"))
+            remote_tensor = RTensor(shard=shard, data=tensor.to("meta"))
+            if tensor_memo is not None:
+                tensor_memo[tensor_id] = remote_tensor
+            return remote_tensor
 
         if isinstance(obj, dict):
             # Compact trajectory dicts by trimming padding before storage.
@@ -427,27 +450,41 @@ class RTensor:
                 )
                 if compacted is not None:
                     obj = compacted[0]
-            return {k: RTensor.remotize(v, node_addr=node_addr) for k, v in obj.items()}
+            return {
+                k: RTensor._remotize_recursive(v, node_addr, tensor_memo)
+                for k, v in obj.items()
+            }
 
         if isinstance(obj, list):
-            return [RTensor.remotize(item, node_addr=node_addr) for item in obj]
+            return [
+                RTensor._remotize_recursive(item, node_addr, tensor_memo)
+                for item in obj
+            ]
 
         if isinstance(obj, tuple):
-            return tuple(RTensor.remotize(item, node_addr=node_addr) for item in obj)
+            return tuple(
+                RTensor._remotize_recursive(item, node_addr, tensor_memo)
+                for item in obj
+            )
 
         return obj
 
     @staticmethod
-    def localize(obj: Any) -> Any:
+    def localize(obj: Any, *, preserve_tensor_aliases: bool = False) -> Any:
         """Convert RTensors to local tensors in nested structures.
 
         Inverse of remotize() - fetches remote data and converts to local tensors.
         All remote fetches are batched concurrently for performance.
+        When ``preserve_tensor_aliases`` is enabled, RTensors that reference the
+        same shard are fetched once and resolve to the same local tensor object.
 
         Parameters
         ----------
         obj : Any
             Object potentially containing RTensors
+        preserve_tensor_aliases : bool, default=False
+            Preserve aliases represented by repeated shard IDs within this root
+            call. The default retains the existing localization behavior.
 
         Returns
         -------
@@ -457,6 +494,10 @@ class RTensor:
         # Pre-fetch all remote tensors concurrently
         rtensors: list[RTensor] = []
         RTensor._collect_all(obj, rtensors)
+        if preserve_tensor_aliases:
+            RTensor._localize_preserving_aliases(rtensors)
+            return RTensor._localize_recursive(obj)
+
         meta_rtensors = [rt for rt in rtensors if rt.data.is_meta]
         if meta_rtensors:
             # Resolve as many as possible from the client-side fetch buffer.
@@ -480,6 +521,46 @@ class RTensor:
 
         # Recursively replace RTensors with local tensors (all buffer hits now)
         return RTensor._localize_recursive(obj)
+
+    @staticmethod
+    def _localize_preserving_aliases(rtensors: list[RTensor]) -> None:
+        """Resolve each shard once and assign its tensor to every reference."""
+        references_by_shard: dict[Any, list[RTensor]] = {}
+        for rtensor in rtensors:
+            references_by_shard.setdefault(rtensor.shard.shard_id, []).append(rtensor)
+
+        misses: dict[Any, list[RTensor]] = {}
+
+        with _fetch_buffer_lock:
+            for shard_id, references in references_by_shard.items():
+                tensor = next(
+                    (
+                        rtensor.data
+                        for rtensor in references
+                        if not rtensor.data.is_meta
+                    ),
+                    None,
+                )
+                if tensor is None:
+                    tensor = _fetch_buffer.get(shard_id)
+
+                if tensor is not None:
+                    for rtensor in references:
+                        rtensor.data = tensor
+                else:
+                    misses[shard_id] = references
+
+        if not misses:
+            return
+
+        representatives = [references[0] for references in misses.values()]
+        results = get_backend().fetch([rtensor.shard for rtensor in representatives])
+        with _fetch_buffer_lock:
+            for references, tensor in zip(misses.values(), results, strict=True):
+                shard_id = references[0].shard.shard_id
+                _fetch_buffer[shard_id] = tensor
+                for rtensor in references:
+                    rtensor.data = tensor
 
     @staticmethod
     def _collect_all(obj: Any, result: list[RTensor]) -> None:

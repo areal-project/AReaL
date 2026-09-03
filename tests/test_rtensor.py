@@ -60,6 +60,23 @@ class _FakeDeleteSession:
         return _FakeDeleteResponse(item)
 
 
+class _RecordingRTensorBackend:
+    def __init__(self):
+        self.tensors = {}
+        self.store_calls = []
+        self.fetch_calls = []
+
+    def store(self, tensor):
+        shard_id = f"shard-{len(self.store_calls)}"
+        self.store_calls.append(tensor)
+        self.tensors[shard_id] = tensor
+        return shard_id
+
+    def fetch(self, shards):
+        self.fetch_calls.append(shards)
+        return [self.tensors[shard.shard_id] for shard in shards]
+
+
 @pytest.fixture(scope="module")
 def rpc_server():
     """Start RPC server for integration tests."""
@@ -910,6 +927,104 @@ class TestRemotize:
         # attention_mask should be trimmed to [[1,1,1],[1,1,0]]
         expected_mask = torch.tensor([[1, 1, 1], [1, 1, 0]])
         assert torch.equal(localized["attention_mask"], expected_mask)
+
+
+class TestRTensorAliasPreservation:
+    def test_remotize_shared_tensor_default_uses_distinct_shards(self, monkeypatch):
+        """Alias preservation should remain opt-in for existing callers."""
+        backend = _RecordingRTensorBackend()
+        monkeypatch.setattr("areal.infra.rpc.rtensor.get_backend", lambda: backend)
+        tensor = torch.arange(6)
+
+        result = RTensor.remotize([tensor, tensor], node_addr="node-a")
+
+        assert result[0].shard.shard_id != result[1].shard.shard_id
+        assert len(backend.store_calls) == 2
+
+    def test_remotize_shared_multimodal_tensors_stores_each_object_once(
+        self, monkeypatch
+    ):
+        """Shared group image tensors should map to one shard per object."""
+        backend = _RecordingRTensorBackend()
+        monkeypatch.setattr("areal.infra.rpc.rtensor.get_backend", lambda: backend)
+
+        pixel_values = torch.arange(24, dtype=torch.float32).reshape(2, 3, 4)
+        image_grid_thw = torch.tensor([[1, 2, 2]])
+        trajectory = {
+            "attention_mask": torch.tensor([[1, 1, 0], [1, 1, 0]]),
+            "multi_modal_input": [
+                {
+                    "pixel_values": pixel_values,
+                    "image_grid_thw": image_grid_thw,
+                },
+                {
+                    "pixel_values": pixel_values,
+                    "image_grid_thw": image_grid_thw,
+                },
+            ],
+        }
+
+        result = RTensor.remotize(
+            trajectory,
+            node_addr="node-a",
+            preserve_tensor_aliases=True,
+        )
+
+        first, second = result["multi_modal_input"]
+        assert first["pixel_values"] is second["pixel_values"]
+        assert first["image_grid_thw"] is second["image_grid_thw"]
+        assert len(backend.store_calls) == 3
+
+    def test_remotize_equal_distinct_tensors_uses_distinct_shards(self, monkeypatch):
+        """Equal values should not merge when tensor identities differ."""
+        backend = _RecordingRTensorBackend()
+        monkeypatch.setattr("areal.infra.rpc.rtensor.get_backend", lambda: backend)
+        first = torch.arange(6)
+        second = first.clone()
+
+        result = RTensor.remotize(
+            [first, second],
+            node_addr="node-a",
+            preserve_tensor_aliases=True,
+        )
+
+        assert result[0].shard.shard_id != result[1].shard.shard_id
+        assert len(backend.store_calls) == 2
+
+    def test_localize_repeated_shard_fetches_once_and_restores_aliases(
+        self, monkeypatch
+    ):
+        """Repeated shard references should share one fetch and local tensor."""
+        backend = _RecordingRTensorBackend()
+        backend.tensors["shared-image"] = torch.arange(12).reshape(3, 4)
+        monkeypatch.setattr("areal.infra.rpc.rtensor.get_backend", lambda: backend)
+        monkeypatch.setattr("areal.infra.rpc.rtensor._fetch_buffer", {})
+
+        def make_remote_tensor():
+            return RTensor(
+                shard=TensorShardInfo(
+                    shard_id="shared-image",
+                    node_addr="node-a",
+                ),
+                data=torch.empty(3, 4, device="meta"),
+            )
+
+        serialized_payload = serialize_value(
+            {
+                "args": [make_remote_tensor()],
+                "kwargs": {"image": make_remote_tensor()},
+            }
+        )
+        payload = deserialize_value(serialized_payload)
+
+        result = RTensor.localize(
+            payload,
+            preserve_tensor_aliases=True,
+        )
+
+        assert len(backend.fetch_calls) == 1
+        assert len(backend.fetch_calls[0]) == 1
+        assert result["args"][0] is result["kwargs"]["image"]
 
 
 class TestFetchBuffer:
