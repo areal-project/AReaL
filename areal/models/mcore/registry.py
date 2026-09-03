@@ -467,6 +467,11 @@ def make_mcore_model(
                     "megatron.enable_mtp=True but the model has no MTP layers."
                 )
             if mcore_config.enable_mtp_training:
+                if provider.mtp_num_layers != 1:
+                    raise ValueError(
+                        "MTP training currently supports exactly one prediction "
+                        f"layer, got mtp_num_layers={provider.mtp_num_layers}."
+                    )
                 # Weight of the auxiliary MTP loss; consumed by Megatron-Core's
                 # process_mtp_loss via config.mtp_loss_scaling_factor.
                 provider.mtp_loss_scaling_factor = mcore_config.mtp_loss_scaling_factor
