@@ -59,6 +59,7 @@ from areal.api.cli_args import GenerationHyperparameters
 from areal.experimental.openai.cache import InteractionCache
 from areal.experimental.openai.tool_call_parser import process_tool_calls
 from areal.experimental.openai.types import InteractionWithTokenLogpReward
+from areal.infra.processor_cache import ProcessorCallCache
 from areal.utils import logging
 from areal.utils.hf_utils import apply_chat_template
 
@@ -86,6 +87,22 @@ class _PreparedPrompt:
     input_ids: list[int]
     mm_token_type_ids: list[int] | None = None
     multi_modal_input: dict[str, torch.Tensor] | None = None
+
+    def copy_for_consumer(self) -> "_PreparedPrompt":
+        """Copy mutable containers while sharing immutable processor tensors."""
+        return _PreparedPrompt(
+            input_ids=list(self.input_ids),
+            mm_token_type_ids=(
+                list(self.mm_token_type_ids)
+                if self.mm_token_type_ids is not None
+                else None
+            ),
+            multi_modal_input=(
+                dict(self.multi_modal_input)
+                if self.multi_modal_input is not None
+                else None
+            ),
+        )
 
 
 def _process_multimodal_prompt(
@@ -713,6 +730,7 @@ async def _prepare_prompt(
     tools: Iterable[ChatCompletionToolParam] | None,
     extra_body: Body,
     require_multimodal_processor: bool = False,
+    processor_cache: ProcessorCallCache | None = None,
 ) -> _PreparedPrompt:
     """Prepare text or multimodal prompt data for one agent interaction."""
     chat_template_kwargs = extra_body.get("chat_template_kwargs", {})
@@ -723,15 +741,34 @@ async def _prepare_prompt(
             "available for this rollout model."
         )
     if image_data and processor is not None:
-        processed_prompt = await asyncio.to_thread(
-            _process_multimodal_prompt,
-            processor,
-            tokenizer,
-            tokenizer_messages,
-            image_data,
-            tools,
-            chat_template_kwargs,
-        )
+
+        def process_prompt() -> _PreparedPrompt:
+            return _process_multimodal_prompt(
+                processor,
+                tokenizer,
+                tokenizer_messages,
+                image_data,
+                tools,
+                chat_template_kwargs,
+            )
+
+        if processor_cache is None:
+            processed_prompt = await asyncio.to_thread(process_prompt)
+        else:
+            cache_key = processor_cache.make_key(
+                "openai_multimodal",
+                id(processor),
+                id(tokenizer),
+                tokenizer_messages,
+                image_data,
+                tools,
+                chat_template_kwargs,
+            )
+            cached_prompt = await processor_cache.aget_or_compute(
+                cache_key,
+                process_prompt,
+            )
+            processed_prompt = cached_prompt.copy_for_consumer()
 
     if chat_template_type == "hf":
         input_ids = (
@@ -918,6 +955,7 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
         top_p: float | None | NotGiven = NOT_GIVEN,
         extra_body: Body | None = None,
         areal_cache: InteractionCache | None = None,
+        processor_cache: ProcessorCallCache | None = None,
         **kwargs: Any,
     ) -> AsyncGenerator[ChatCompletionChunk, None]: ...
 
@@ -942,6 +980,7 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
         top_p: float | None | NotGiven = NOT_GIVEN,
         extra_body: Body | None = None,
         areal_cache: InteractionCache | None = None,
+        processor_cache: ProcessorCallCache | None = None,
         **kwargs: Any,
     ) -> ChatCompletion: ...
 
@@ -965,6 +1004,7 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
         top_p: float | None | NotGiven = NOT_GIVEN,
         extra_body: Body | None = None,
         areal_cache: InteractionCache | None = None,
+        processor_cache: ProcessorCallCache | None = None,
         **kwargs: Any,
     ) -> ChatCompletion | AsyncGenerator[ChatCompletionChunk, None]:
         """Override create method to use AReaL engine and cache responses."""
@@ -1051,6 +1091,7 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
             tools=tools_list,
             extra_body=extra_body,
             require_multimodal_processor=self.require_multimodal_processor,
+            processor_cache=processor_cache,
         )
         prompt_token_ids = prepared_prompt.input_ids
         if interaction is not None and self.processor is not None:
@@ -1412,6 +1453,7 @@ class AsyncResponsesWithReward(BaseAsyncResponses):
         frequency_penalty: float | None | NotGiven = NOT_GIVEN,
         extra_body: Body | None = None,
         areal_cache: dict[str, InteractionWithTokenLogpReward] | None = None,
+        processor_cache: ProcessorCallCache | None = None,
         **kwargs: Any,
     ) -> Response:
         """Override create method to use AReaL engine"""
@@ -1508,6 +1550,7 @@ class AsyncResponsesWithReward(BaseAsyncResponses):
             tools=tools_list,
             extra_body=extra_body,
             require_multimodal_processor=self.require_multimodal_processor,
+            processor_cache=processor_cache,
         )
         prompt_token_ids = prepared_prompt.input_ids
         if self.processor is not None:
