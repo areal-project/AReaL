@@ -183,3 +183,78 @@ def test_batched_call_pass_meta_provides_traj_group_sizes():
     assert len(out) == 2
     torch.testing.assert_close(out[0]["values"], torch.tensor([[2.0], [3.0]]))
     torch.testing.assert_close(out[1]["values"], torch.tensor([[4.0]]))
+
+
+def test_fixed_group_size_with_remainder_does_not_explode():
+    """When bs % group_size != 0, remainder tail forms its own slice and does not explode."""
+    cfg = NormConfig(
+        mean_level="group",
+        std_level="group",
+        group_size=2,
+        mean_leave1out=False,
+        std_unbiased=False,
+        eps=1e-5,
+    )
+    norm = Normalization(cfg)
+    # bs=3, group_size=2 -> groups [2, 1]
+    x = torch.tensor([1.0, 2.0, 3.0], dtype=torch.float32)
+    out = norm(x)
+
+    assert torch.isfinite(out).all()
+    # The first 2 elements are centered and scaled: mean=1.5, std=0.5 -> [-1.0, 1.0]
+    torch.testing.assert_close(out[:2], torch.tensor([-1.0, 1.0]), atol=1e-4, rtol=1e-4)
+    # The remainder singleton is centered to 0.0 and must not explode to 3.0 / eps (300,000)
+    assert out[2].item() == 0.0
+
+
+def test_fixed_group_size_multi_item_remainder():
+    """A remainder group with multiple items is properly normalized internally."""
+    cfg = NormConfig(
+        mean_level="group",
+        std_level="group",
+        group_size=3,
+        mean_leave1out=False,
+        std_unbiased=False,
+        eps=1e-5,
+    )
+    norm = Normalization(cfg)
+    # bs=5, group_size=3 -> group 0 has 3 items, remainder has 2 items
+    x = torch.tensor([1.0, 2.0, 3.0, 10.0, 20.0], dtype=torch.float32)
+    out = norm(x)
+
+    assert torch.isfinite(out).all()
+    # First group [1, 2, 3] mean=2.0
+    torch.testing.assert_close(out[:3].mean().item(), 0.0, atol=1e-5, rtol=1e-5)
+    # Remainder group [10, 20] mean=15.0 -> [-1.0, 1.0]
+    torch.testing.assert_close(out[3:], torch.tensor([-1.0, 1.0]), atol=1e-4, rtol=1e-4)
+
+
+def test_batch_smaller_than_group_size():
+    """When batch size is strictly smaller than group_size, batch is safely normalized."""
+    cfg = NormConfig(
+        mean_level="group",
+        std_level="group",
+        group_size=4,
+        mean_leave1out=False,
+        std_unbiased=False,
+        eps=1e-5,
+    )
+    norm = Normalization(cfg)
+
+    # bs=1 < 4
+    x1 = torch.tensor([42.0], dtype=torch.float32)
+    out1 = norm(x1)
+    assert torch.isfinite(out1).all()
+    assert out1[0].item() == 0.0
+
+    # bs=2 < 4
+    x2 = torch.tensor([4.0, 8.0], dtype=torch.float32)
+    out2 = norm(x2)
+    assert torch.isfinite(out2).all()
+    torch.testing.assert_close(out2, torch.tensor([-1.0, 1.0]), atol=1e-4, rtol=1e-4)
+
+
+def test_invalid_group_size_raises():
+    """Non-positive group_size raises ValueError when group normalization is used."""
+    with pytest.raises(ValueError, match="positive integer"):
+        NormConfig(mean_level="group", std_level="group", group_size=0)

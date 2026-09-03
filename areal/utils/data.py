@@ -1517,10 +1517,17 @@ class Normalization:
                 slices.append(slice(offset, offset + sz))
                 offset += sz
             return slices
-        return [
+        if self.group_size <= 0:
+            raise ValueError(f"group_size must be positive, got {self.group_size}")
+
+        slices = [
             slice(i * self.group_size, (i + 1) * self.group_size)
             for i in range(bs // self.group_size)
         ]
+        rem = bs % self.group_size
+        if rem > 0:
+            slices.append(slice(bs - rem, bs))
+        return slices
 
     @torch.no_grad()
     def __call__(
@@ -1607,8 +1614,8 @@ class Normalization:
                 group_mean_slice = mean[s]  # already computed and expanded
                 group_sz = s.stop - s.start
 
-                # Special case: with group_size=1 and std_unbiased=True, std should be 1 for numerical stability
-                if group_sz == 1 and self.std_unbiased:
+                # Special case: with group_size=1, std should be 1 for numerical stability
+                if group_sz == 1:
                     dtype = torch.float64 if high_precision else torch.float32
                     group_std = torch.ones(
                         (1, *xx.shape[1:]), dtype=dtype, device=xx.device
