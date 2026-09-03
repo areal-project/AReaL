@@ -28,6 +28,8 @@ def _reset_server_globals(monkeypatch):
     monkeypatch.setattr(srv, "_admin_api_key", _ADMIN_KEY)
     monkeypatch.setattr(srv, "_lock", threading.Lock())
     monkeypatch.setattr(srv, "_last_cleanup_time", 0.0)
+    monkeypatch.setattr(srv, "_worker_role", None)
+    monkeypatch.setattr(srv, "_worker_index", None)
     monkeypatch.setattr(srv, "_engine", None)
     monkeypatch.setattr(srv, "_openai_client", None)
 
@@ -43,6 +45,43 @@ def _client():
 
 def _admin_headers():
     return {"Authorization": f"Bearer {_ADMIN_KEY}"}
+
+
+# ---------------------------------------------------------------------------
+# Tests: health reports forked worker identity
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_health_with_worker_identity_returns_exact_role_and_index(monkeypatch):
+    """Health identifies the forked worker that owns the listening port."""
+    monkeypatch.setattr(srv, "_worker_role", "proxy-rollout")
+    monkeypatch.setattr(srv, "_worker_index", 7)
+
+    async with _client() as client:
+        response = await client.get("/health")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "status": "ok",
+        "initialized": False,
+        "role": "proxy-rollout",
+        "worker_index": 7,
+    }
+
+
+def test_explicit_proxy_worker_index_wins_over_stale_slurm_env(monkeypatch):
+    """A local proxy keeps the identity supplied by its scheduler."""
+    monkeypatch.setenv("SLURM_PROCID", "0")
+
+    assert srv._resolve_worker_index(7) == 7
+
+
+def test_proxy_worker_index_falls_back_to_slurm_env(monkeypatch):
+    """A Slurm proxy can still obtain its identity from the task environment."""
+    monkeypatch.setenv("SLURM_PROCID", "5")
+
+    assert srv._resolve_worker_index(-1) == 5
 
 
 # ---------------------------------------------------------------------------

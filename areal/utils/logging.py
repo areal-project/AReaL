@@ -129,6 +129,8 @@ LOGGER_COLORS_EXACT = {
     # AWEX weight exchange - cyan (compute backend)
     "AwexColocate": "light_cyan",
     "AwexColocateReader": "light_cyan",
+    "MegatronResidency": "light_cyan",
+    "MOPDTeacherPhase": "light_cyan",
     "AwexSGLangPlugin": "light_cyan",
 }
 

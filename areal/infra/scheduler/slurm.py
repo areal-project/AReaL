@@ -494,6 +494,7 @@ class SlurmScheduler(Scheduler):
         target_wi: SlurmWorkerInfo,
         target_role: str,
         command: str | None = None,
+        env: dict[str, str] | None = None,
     ) -> SlurmWorkerInfo:
         """Fork a single worker asynchronously.
 
@@ -568,6 +569,7 @@ class SlurmScheduler(Scheduler):
                 "role": role,
                 "worker_index": idx,
                 "raw_cmd": raw_cmd,
+                "env": env or {},
             }
             async with session.post(
                 f"{guard_url}/fork",
@@ -715,6 +717,7 @@ class SlurmScheduler(Scheduler):
         target_role: str,
         target_workers: list[SlurmWorkerInfo],
         command: str | None = None,
+        env_vars: list[dict[str, str]] | None = None,
     ) -> list[str]:
         """Create forked workers concurrently using async requests.
 
@@ -732,7 +735,13 @@ class SlurmScheduler(Scheduler):
             # Launch all fork requests concurrently with exception handling
             tasks = [
                 self._fork_single_worker(
-                    session, role, idx, target_wi, target_role, command
+                    session,
+                    role,
+                    idx,
+                    target_wi,
+                    target_role,
+                    command,
+                    None if env_vars is None else env_vars[idx],
                 )
                 for idx, target_wi in enumerate(target_workers)
             ]
@@ -795,6 +804,7 @@ class SlurmScheduler(Scheduler):
         role: str,
         target_role: str,
         command: str | None = None,
+        env_vars: list[dict[str, str]] | None = None,
     ) -> list[str]:
         """Fork new worker processes from existing workers.
 
@@ -827,6 +837,7 @@ class SlurmScheduler(Scheduler):
                 target_role,
                 target_workers,
                 command,
+                env_vars,
             )
         except Exception:
             # Cleanup on failure
@@ -1042,7 +1053,11 @@ class SlurmScheduler(Scheduler):
                 # Check if fork mode is enabled
                 if strategy.fork:
                     # Fork mode: spawn new processes on same nodes via /fork endpoint
-                    return self.fork_workers(role, colocate_role)
+                    return self.fork_workers(
+                        role,
+                        colocate_role,
+                        env_vars=[scheduling.env_vars for scheduling in schedulings],
+                    )
 
                 # Reuse existing workers - no new Slurm job submitted
                 worker_ids = [w.worker.id for w in target_workers]

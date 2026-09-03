@@ -1,3 +1,5 @@
+import pytest
+
 from areal.engine.awex.colocate_writer import resolve_physical_gpu_id
 
 
@@ -14,13 +16,15 @@ def test_physical_gpu_id_is_identity_without_visible_devices(monkeypatch):
     assert resolve_physical_gpu_id(2) == 2
 
 
-def test_physical_gpu_id_falls_back_on_non_integer_entries(monkeypatch):
+def test_physical_gpu_id_rejects_non_integer_entries(monkeypatch):
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "GPU-abc,GPU-def")
 
-    assert resolve_physical_gpu_id(1) == 1
+    with pytest.raises(ValueError, match="numeric CUDA_VISIBLE_DEVICES"):
+        resolve_physical_gpu_id(1)
 
 
-def test_physical_gpu_id_falls_back_when_index_out_of_range(monkeypatch):
+def test_physical_gpu_id_rejects_index_out_of_range(monkeypatch):
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "4")
 
-    assert resolve_physical_gpu_id(2) == 2
+    with pytest.raises(ValueError, match="outside CUDA_VISIBLE_DEVICES"):
+        resolve_physical_gpu_id(2)

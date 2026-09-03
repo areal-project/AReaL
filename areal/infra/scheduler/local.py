@@ -309,6 +309,7 @@ class LocalScheduler(Scheduler):
         target_wi: WorkerInfo,
         target_role: str,
         command: str | None = None,
+        env: dict[str, str] | None = None,
     ) -> WorkerInfo:
         """Fork a single worker asynchronously.
 
@@ -382,6 +383,7 @@ class LocalScheduler(Scheduler):
                 "role": role,
                 "worker_index": idx,
                 "raw_cmd": raw_cmd,
+                "env": env or {},
             }
             async with session.post(
                 f"{guard_url}/fork",
@@ -462,7 +464,7 @@ class LocalScheduler(Scheduler):
             gpu_devices=target_wi.gpu_devices,  # Inherited from target
             created_at=time.time(),
             log_file=str(self.log_dir / f"{role}.log"),
-            env_vars=target_wi.env_vars.copy(),  # Inherited from target
+            env_vars={**target_wi.env_vars, **(env or {})},
         )
 
     async def _kill_forked_worker(
@@ -533,6 +535,7 @@ class LocalScheduler(Scheduler):
         target_role: str,
         target_workers: list[WorkerInfo],
         command: str | None = None,
+        env_vars: list[dict[str, str]] | None = None,
     ) -> list[str]:
         """Create forked workers concurrently using async requests.
 
@@ -550,7 +553,13 @@ class LocalScheduler(Scheduler):
             # Launch all fork requests concurrently with exception handling
             tasks = [
                 self._fork_single_worker(
-                    session, role, idx, target_wi, target_role, command
+                    session,
+                    role,
+                    idx,
+                    target_wi,
+                    target_role,
+                    command,
+                    None if env_vars is None else env_vars[idx],
                 )
                 for idx, target_wi in enumerate(target_workers)
             ]
@@ -613,6 +622,7 @@ class LocalScheduler(Scheduler):
         role: str,
         target_role: str,
         command: str | None = None,
+        env_vars: list[dict[str, str]] | None = None,
     ) -> list[str]:
         """Fork new worker processes from existing workers.
 
@@ -645,6 +655,7 @@ class LocalScheduler(Scheduler):
                 target_role,
                 target_workers,
                 command,
+                env_vars,
             )
         except Exception:
             # Cleanup on failure
@@ -729,7 +740,11 @@ class LocalScheduler(Scheduler):
             # Check if fork mode is enabled
             if strategy.fork:
                 # Fork mode: spawn new processes on same GPUs via /fork endpoint
-                worker_ids = self.fork_workers(role, colocate_role)
+                worker_ids = self.fork_workers(
+                    role,
+                    colocate_role,
+                    env_vars=[scheduling.env_vars for scheduling in schedulings],
+                )
             else:
                 # Reuse existing workers - no new processes spawned
                 worker_ids = [w.worker.id for w in target_workers]
