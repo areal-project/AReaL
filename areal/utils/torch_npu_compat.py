@@ -35,21 +35,22 @@ GROUPED_P2P_FIXED_IN = None  # set once a wheel carrying the fix is validated
 
 
 def import_mindspeed_adaptor() -> ModuleType:
-    """Import MindSpeed without retaining TorchAir's process signal handlers.
+    """Import the MindSpeed adaptor stack without retaining signal handlers.
 
-    MindSpeed 0.18 eagerly imports TorchAir, whose import-time handlers consume
-    SIGINT and SIGTERM instead of terminating the process. Preserve whatever
-    handlers the application installed before the adaptor import so Ctrl-C and
-    scheduler termination retain their original semantics.
+    The official MegatronAdaptor entrypoint imports MindSpeed, which eagerly
+    imports TorchAir. TorchAir's import-time handlers consume SIGINT and SIGTERM
+    instead of terminating the process. Preserve whatever handlers the
+    application installed before the adaptor import so Ctrl-C and scheduler
+    termination retain their original semantics.
     """
     if threading.current_thread() is not threading.main_thread():
-        return importlib.import_module("mindspeed.megatron_adaptor")
+        return importlib.import_module("megatron_adaptor")
 
     original_handlers = {
         signum: signal.getsignal(signum) for signum in (signal.SIGINT, signal.SIGTERM)
     }
     try:
-        return importlib.import_module("mindspeed.megatron_adaptor")
+        return importlib.import_module("megatron_adaptor")
     finally:
         for signum, handler in original_handlers.items():
             signal.signal(signum, handler)

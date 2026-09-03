@@ -30,10 +30,10 @@ def _mock_signal_state(monkeypatch):
 def test_import_mindspeed_adaptor_restores_signal_handlers(monkeypatch):
     handlers, original_sigint, original_sigterm = _mock_signal_state(monkeypatch)
     torchair_handler = object()
-    adaptor = ModuleType("mindspeed.megatron_adaptor")
+    adaptor = ModuleType("megatron_adaptor")
 
     def import_module(name):
-        assert name == "mindspeed.megatron_adaptor"
+        assert name == "megatron_adaptor"
         handlers[signal.SIGINT] = torchair_handler
         handlers[signal.SIGTERM] = torchair_handler
         return adaptor
@@ -52,7 +52,7 @@ def test_import_mindspeed_adaptor_restores_handlers_after_error(monkeypatch):
     torchair_handler = object()
 
     def import_module(name):
-        assert name == "mindspeed.megatron_adaptor"
+        assert name == "megatron_adaptor"
         handlers[signal.SIGINT] = torchair_handler
         handlers[signal.SIGTERM] = torchair_handler
         raise RuntimeError("adaptor import failed")
@@ -69,7 +69,7 @@ def test_import_mindspeed_adaptor_restores_handlers_after_error(monkeypatch):
 
 
 def test_import_mindspeed_adaptor_skips_signal_calls_off_main_thread(monkeypatch):
-    adaptor = ModuleType("mindspeed.megatron_adaptor")
+    adaptor = ModuleType("megatron_adaptor")
     monkeypatch.setattr(torch_npu_compat.threading, "current_thread", lambda: object())
     monkeypatch.setattr(
         torch_npu_compat.importlib, "import_module", lambda name: adaptor

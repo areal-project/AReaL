@@ -88,7 +88,7 @@ actor:
     hysteresis: 2
   mindspeed:
     swap_optimizer: true
-    use_fused_rotary_pos_emb: true
+    apply_rope_fusion: true
     use_fused_swiglu: true
     moe_alltoall_overlap_comm: true
     moe_grouped_gemm: true

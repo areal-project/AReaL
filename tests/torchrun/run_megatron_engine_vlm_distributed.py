@@ -126,7 +126,6 @@ def make_vlm_engine(
     mindspeed_cfg = MindSpeedEngineConfig()
     if current_platform.device_type == "npu" and IS_MOE_MODEL:
         mindspeed_cfg = MindSpeedEngineConfig(
-            use_fused_rotary_pos_emb=True,
             use_fused_swiglu=True,
             moe_alltoall_overlap_comm=True,
             moe_grouped_gemm=True,

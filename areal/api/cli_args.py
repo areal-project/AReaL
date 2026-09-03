@@ -1010,7 +1010,7 @@ class MindSpeedEngineConfig:
     use_legacy_models: bool = False
 
     swap_optimizer: bool = False
-    use_fused_rotary_pos_emb: bool = False
+    apply_rope_fusion: bool = False
     use_fused_swiglu: bool = False
     use_cp_send_recv_overlap: bool = False
     use_fused_ring_attention_update: bool = False

@@ -26,8 +26,8 @@ from areal.engine.megatron_utils.mindspeed_args_patch import (
     ensure_mindspeed_args_sanitized,
 )  # isort: skip
 
-ensure_mindspeed_args_sanitized()
 import_mindspeed_adaptor()
+ensure_mindspeed_args_sanitized()
 
 # Install the Transformer Engine import shim before the first ``import mbridge``.
 import areal.utils.mbridge_compat  # noqa: F401, I001  # isort: skip
