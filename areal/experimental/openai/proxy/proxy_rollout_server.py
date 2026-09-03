@@ -49,10 +49,13 @@ from .server import (
     RESPONSES_PATHNAME,
     RL_END_PROCESSOR_CACHE_GROUP_PATHNAME,
     RL_END_SESSION_PATHNAME,
+    RL_FETCH_SHARED_TENSORS_PATHNAME,
     RL_SET_REWARD_PATHNAME,
     RL_START_SESSION_PATHNAME,
     ExportTrajectoriesRequest,
     ExportTrajectoriesResponse,
+    FetchSharedTensorsRequest,
+    FetchSharedTensorsResponse,
     ProcessorCacheGroupRequest,
     SessionData,
     SetRewardRequest,
@@ -60,6 +63,7 @@ from .server import (
     StartSessionResponse,
     serialize_interactions,
 )
+from .tensor_reference import GroupTensorStoreRegistry
 
 if TYPE_CHECKING:
     from areal.api import InferenceEngine
@@ -111,6 +115,7 @@ _capacity = 0
 _last_cleanup_time: float = 0
 _session_timeout_seconds: int = 3600  # Default timeout (overridden by config)
 _processor_cache_registry = ProcessorCacheRegistry()
+_group_tensor_store_registry = GroupTensorStoreRegistry()
 
 # API key authentication
 # Initialized to a random value so pre-configuration requests cannot bypass auth.
@@ -432,6 +437,7 @@ def _cleanup_stale_sessions():
                 _processor_cache_registry.release(cache_group_id)
 
     _processor_cache_registry.discard_stale(_session_timeout_seconds)
+    _group_tensor_store_registry.discard_stale(_session_timeout_seconds)
 
     # Clean up API key mappings for stale sessions
     if stale_sessions:
@@ -563,9 +569,25 @@ def end_session(session_id: str = Depends(_require_session_key)):
     dependencies=[Depends(_require_admin_key)],
 )
 def end_processor_cache_group(request: ProcessorCacheGroupRequest):
-    """Discard cached processor results after a rollout group finishes."""
+    """Discard processor and shared-tensor state after a rollout group finishes."""
     _processor_cache_registry.discard(request.group_id)
+    _group_tensor_store_registry.discard(request.group_id)
     return {"message": "success"}
+
+
+@app.post(
+    f"/{RL_FETCH_SHARED_TENSORS_PATHNAME}",
+    dependencies=[Depends(_require_admin_key)],
+)
+def fetch_shared_tensors(
+    request: FetchSharedTensorsRequest,
+) -> FetchSharedTensorsResponse:
+    """Fetch each unique multimodal tensor once for a grouped rollout."""
+    try:
+        tensors = _group_tensor_store_registry.fetch(request.group_id, request.ref_ids)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return FetchSharedTensorsResponse(tensors=serialize_value(tensors))
 
 
 @app.post(f"/{RL_SET_REWARD_PATHNAME}")
@@ -983,9 +1005,23 @@ async def export_trajectories(
         _session_cache.pop(session_id, None)
         _remove_api_keys_for_session(session_id)
 
-    # Serialize for HTTP transport
-    serialized = serialize_interactions(interactions)
-    return ExportTrajectoriesResponse(interactions=serialized)
+    # Grouped inline/subproc sessions export only multimodal tensor references.
+    # The workflow fetches each unique tensor once through the group endpoint.
+    tensor_reference_group_id = (
+        session_data.processor_cache_group_id
+        if request.supports_shared_tensor_references
+        else None
+    )
+    tensor_store = (
+        _group_tensor_store_registry.get_or_create(tensor_reference_group_id)
+        if tensor_reference_group_id is not None
+        else None
+    )
+    serialized = serialize_interactions(interactions, tensor_store=tensor_store)
+    return ExportTrajectoriesResponse(
+        interactions=serialized,
+        tensor_reference_group_id=tensor_reference_group_id,
+    )
 
 
 # =============================================================================

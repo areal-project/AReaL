@@ -7,9 +7,14 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
+import torch
 
 from areal.experimental.openai.proxy import proxy_rollout_server as srv
 from areal.experimental.openai.proxy.server import SessionData
+from areal.experimental.openai.proxy.tensor_reference import GroupTensorStoreRegistry
+from areal.experimental.openai.types import InteractionWithTokenLogpReward
+from areal.infra.processor_cache import ProcessorCacheRegistry
+from areal.infra.rpc.serialization import deserialize_value
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -30,6 +35,8 @@ def _reset_server_globals(monkeypatch):
     monkeypatch.setattr(srv, "_last_cleanup_time", 0.0)
     monkeypatch.setattr(srv, "_engine", None)
     monkeypatch.setattr(srv, "_openai_client", None)
+    monkeypatch.setattr(srv, "_processor_cache_registry", ProcessorCacheRegistry())
+    monkeypatch.setattr(srv, "_group_tensor_store_registry", GroupTensorStoreRegistry())
 
 
 httpx = pytest.importorskip("httpx")
@@ -244,6 +251,104 @@ class TestExportTrajectories:
             )
             assert resp_export.status_code == 200
             assert "interactions" in resp_export.json()
+
+    @pytest.mark.asyncio
+    async def test_group_exports_share_multimodal_tensor_reference(self):
+        """Two grouped sessions should export refs and fetch one tensor payload."""
+        group_id = "train:task-1"
+        pixel_values = torch.arange(12).reshape(1, 3, 2, 2)
+
+        for sample_idx in range(2):
+            session_id = f"task-1:{sample_idx}-0"
+            session = SessionData(
+                session_id=session_id,
+                processor_cache_group_id=group_id,
+            )
+            interaction = InteractionWithTokenLogpReward()
+            interaction.interaction_id = f"interaction-{sample_idx}"
+            interaction.messages = [{"role": "user", "content": "question"}]
+            interaction.reward = 1.0
+            interaction._cache = {
+                "input_ids": torch.tensor([[sample_idx, 2]]),
+                "multi_modal_input": [{"pixel_values": pixel_values}],
+            }
+            session.completions[interaction.interaction_id] = interaction
+            session.finish()
+            srv._session_cache[session_id] = session
+
+        async with _client() as client:
+            responses = []
+            for sample_idx in range(2):
+                response = await client.post(
+                    "/export_trajectories",
+                    headers=_admin_headers(),
+                    json={
+                        "session_id": f"task-1:{sample_idx}-0",
+                        "supports_shared_tensor_references": True,
+                    },
+                )
+                assert response.status_code == 200
+                responses.append(response.json())
+
+            first_item = next(iter(responses[0]["interactions"].values()))
+            second_item = next(iter(responses[1]["interactions"].values()))
+            first_ref = first_item["tensor_dict"]["multi_modal_input"][0][
+                "pixel_values"
+            ]
+            second_ref = second_item["tensor_dict"]["multi_modal_input"][0][
+                "pixel_values"
+            ]
+            assert first_ref == second_ref
+            assert responses[0]["tensor_reference_group_id"] == group_id
+            assert "data" not in first_ref
+
+            fetch_response = await client.post(
+                "/rl/fetch_shared_tensors",
+                headers=_admin_headers(),
+                json={"group_id": group_id, "ref_ids": [first_ref["ref_id"]]},
+            )
+
+        assert fetch_response.status_code == 200
+        fetched = deserialize_value(fetch_response.json()["tensors"])
+        assert list(fetched) == [first_ref["ref_id"]]
+        torch.testing.assert_close(
+            fetched[first_ref["ref_id"]], pixel_values, rtol=0, atol=0
+        )
+
+    @pytest.mark.asyncio
+    async def test_group_export_without_reference_capability_keeps_inline_tensor(self):
+        """Legacy clients should continue receiving inline multimodal tensors."""
+        pixel_values = torch.arange(4)
+        session = SessionData(
+            session_id="legacy-session",
+            processor_cache_group_id="train:legacy-task",
+        )
+        interaction = InteractionWithTokenLogpReward()
+        interaction.interaction_id = "legacy-interaction"
+        interaction.messages = [{"role": "user", "content": "question"}]
+        interaction.reward = 1.0
+        interaction._cache = {
+            "input_ids": torch.tensor([[1, 2]]),
+            "multi_modal_input": [{"pixel_values": pixel_values}],
+        }
+        session.completions[interaction.interaction_id] = interaction
+        session.finish()
+        srv._session_cache[session.session_id] = session
+
+        async with _client() as client:
+            response = await client.post(
+                "/export_trajectories",
+                headers=_admin_headers(),
+                json={"session_id": session.session_id},
+            )
+
+        assert response.status_code == 200
+        data = response.json()
+        item = next(iter(data["interactions"].values()))
+        serialized_image = item["tensor_dict"]["multi_modal_input"][0]["pixel_values"]
+        assert serialized_image["type"] == "tensor"
+        assert serialized_image["data"] is not None
+        assert data["tensor_reference_group_id"] is None
 
     @pytest.mark.asyncio
     async def test_export_rejects_non_admin_key(self, monkeypatch):

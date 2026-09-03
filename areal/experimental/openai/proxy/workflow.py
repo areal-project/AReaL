@@ -23,6 +23,7 @@ from .server import (
     RL_END_PROCESSOR_CACHE_GROUP_PATHNAME,
     ProcessorCacheGroupRequest,
 )
+from .tensor_reference import SharedTensorResolver
 
 if TYPE_CHECKING:
     from ..client import TRolloutEngine
@@ -131,6 +132,7 @@ class OpenAIProxyWorkflow(RolloutWorkflow):
         self.export_style = export_style
         self.subproc_max_workers = subproc_max_workers
         self.drop_retry_orphans = drop_retry_orphans
+        self._shared_tensor_resolver = SharedTensorResolver()
 
     @trace_session("run_agent")
     async def _run_agent(self, session_api_key: str, data: dict):
@@ -185,18 +187,21 @@ class OpenAIProxyWorkflow(RolloutWorkflow):
     async def _afinalize_processor_cache_group(
         self, context: workflow_context.WorkflowContext
     ) -> None:
-        """Release proxy-side cache state after an inline/subproc group ends."""
+        """Release processor and tensor-ref state after an inline/subproc group."""
         group_id = self._processor_cache_group_id(context)
         if group_id is None:
             return
 
         http_session = await workflow_context.get_aiohttp_session()
-        await post_json(
-            http_session,
-            url=(f"{self.proxy_addr}/{RL_END_PROCESSOR_CACHE_GROUP_PATHNAME}"),
-            payload=ProcessorCacheGroupRequest(group_id=group_id),
-            headers={"Authorization": f"Bearer {self._admin_api_key}"},
-        )
+        try:
+            await post_json(
+                http_session,
+                url=(f"{self.proxy_addr}/{RL_END_PROCESSOR_CACHE_GROUP_PATHNAME}"),
+                payload=ProcessorCacheGroupRequest(group_id=group_id),
+                headers={"Authorization": f"Bearer {self._admin_api_key}"},
+            )
+        finally:
+            self._shared_tensor_resolver.discard(group_id)
 
     @session_context()
     async def arun_episode(
@@ -269,6 +274,7 @@ class OpenAIProxyWorkflow(RolloutWorkflow):
             admin_api_key=self._admin_api_key,
             processor_cache_group_id=processor_cache_group_id,
             processor_cache_group_size=context.group_size,
+            shared_tensor_resolver=self._shared_tensor_resolver,
         )
         async with proxy_client:
             # Run the user code.
