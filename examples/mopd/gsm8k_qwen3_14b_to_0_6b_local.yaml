@@ -1,0 +1,153 @@
+# Single-node, eight-GPU heterogeneous MOPD example.
+experiment_name: mopd_gsm8k
+trial_name: qwen3-14b-to-0p6b-local
+seed: 1
+enable_offload: false
+total_train_epochs: 10
+tokenizer_path: ${actor.path}
+
+cluster:
+  n_nodes: 1
+  n_gpus_per_node: 8
+  fileroot: ${oc.env:AREAL_FILEROOT,/tmp/areal/experiments}
+  name_resolve:
+    type: nfs
+    nfs_record_root: ${cluster.fileroot}/name_resolve
+
+scheduler: {type: local}
+
+gconfig:
+  n_samples: 4
+  min_new_tokens: 0
+  max_new_tokens: 2048
+  max_tokens: 32768
+  greedy: false
+  top_p: 1.0
+  top_k: 100000000
+  temperature: 1.0
+
+actor:
+  _version: v1
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  path: ${oc.env:MOPD_STUDENT_MODEL_PATH}
+  backend: megatron:d1p1t8
+  weight_update_mode: awex
+  disable_dropout: true
+  gradient_checkpointing: true
+  dtype: bfloat16
+  mb_spec: {n_mbs: 1, max_tokens_per_mb: 10240}
+  optimizer:
+    type: adam
+    lr: 5.0e-6
+    weight_decay: 0.017
+    beta1: 0.9
+    beta2: 0.999
+    eps: 1.0e-8
+    lr_scheduler_type: constant
+    warmup_steps_proportion: 0.001
+    gradient_clipping: 1.0
+  megatron:
+    wrap_with_ddp: true
+    ddp: {use_distributed_optimizer: true, grad_reduce_in_fp32: true}
+    cross_entropy_loss_fusion: false
+  kl_ctl: 0.0
+  ppo_n_minibatches: 1
+  # Reuse the training forward as pi_prox while preserving rollout behavior
+  # logprobs for pure-MOPD pi_theta / pi_behavior importance sampling.
+  recompute_logprob: false
+  use_decoupled_loss: true
+  prox_logp_method: reuse_train_logp
+  max_new_tokens: ${gconfig.max_new_tokens}
+  scheduling_spec:
+    - task_type: worker
+      port_count: 3
+      gpu: 1
+      cpu: 8
+      mem: 64
+      image: ${oc.env:AREAL_IMAGE}
+      cmd: python3 -m areal.infra.rpc.rpc_server
+      env_vars: {}
+
+rollout:
+  _version: v1
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  backend: sglang:d8t1p1
+  scheduling_strategy: {type: colocation, target: actor, fork: true}
+  scheduling_spec: ${actor.scheduling_spec}
+  max_concurrent_rollouts: 256
+  consumer_batch_size: ${train_dataset.batch_size}
+  max_head_offpolicyness: 2
+  fileroot: ${cluster.fileroot}
+  tokenizer_path: ${tokenizer_path}
+  dump_to_file: true
+  setup_timeout: 7200.0
+  agent:
+    admin_api_key: ${oc.env:AREAL_ADMIN_API_KEY}
+
+mopd:
+  teachers:
+    qwen3_14b: {path: "${oc.env:MOPD_TEACHER_MODEL_PATH}"}
+  teacher_groups:
+    gsm8k: {qwen3_14b: 1.0}
+  teacher_engine:
+    _version: v1
+    experiment_name: ${experiment_name}
+    trial_name: ${trial_name}
+    backend: ${actor.backend}
+    optimizer: null
+    disable_dropout: true
+    dtype: ${actor.dtype}
+    mb_spec: {n_mbs: 1, max_tokens_per_mb: 10240}
+    megatron:
+      wrap_with_ddp: true
+      ddp: {use_distributed_optimizer: true, grad_reduce_in_fp32: true}
+      cross_entropy_loss_fusion: false
+    scheduling_strategy: {type: colocation, target: actor, fork: true}
+    scheduling_spec: ${actor.scheduling_spec}
+  manager: {type: disk}
+  loss: {rl_coefficient: 0.0, distillation_coefficient: 1.0}
+
+sglang:
+  model_path: ${actor.path}
+  random_seed: ${seed}
+  skip_tokenizer_init: true
+  disable_radix_cache: true
+  dtype: ${actor.dtype}
+  context_length: 32768
+  max_running_requests: null
+  mem_fraction_static: 0.8
+
+train_dataset:
+  mixture_sampling_policy: proportional
+  sources:
+    - path: ${oc.env:MOPD_GSM8K_PATH}
+      type: rl
+      teacher_group: gsm8k
+  batch_size: 256
+  shuffle: true
+  pin_memory: true
+  num_workers: 4
+
+valid_dataset:
+  mixture_sampling_policy: proportional
+  sources:
+    - path: ${oc.env:MOPD_GSM8K_PATH}
+      type: rl
+      teacher_group: gsm8k
+  batch_size: 256
+  shuffle: false
+  num_workers: 4
+
+saver: {experiment_name: "${experiment_name}", trial_name: "${trial_name}", fileroot: "${cluster.fileroot}", freq_epochs: 1}
+recover: {mode: disabled, experiment_name: "${experiment_name}", trial_name: "${trial_name}", fileroot: "${cluster.fileroot}"}
+evaluator: {experiment_name: "${experiment_name}", trial_name: "${trial_name}", fileroot: "${cluster.fileroot}", freq_epochs: 1}
+stats_logger:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  wandb:
+    mode: disabled
+    wandb_api_key: ${oc.env:WANDB_API_KEY,""}
+    wandb_base_url: ${oc.env:WANDB_BASE_URL,""}

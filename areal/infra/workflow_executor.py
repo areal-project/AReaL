@@ -795,7 +795,6 @@ class WorkflowExecutor:
 
         self.config = config
         self.inference_engine = inference_engine
-
         # Use provided staleness manager or create a default one
         # The manager will be properly initialized in initialize()
         self._staleness_manager = staleness_manager
@@ -1207,9 +1206,11 @@ class WorkflowExecutor:
             reason: str | None = None
 
             try:
-                traj = await pending_task.workflow.arun_episode(
-                    self.inference_engine, pending_task.data
-                )
+                workflow_data = pending_task.data
+                if workflow_data is not None:
+                    traj = await pending_task.workflow.arun_episode(
+                        self.inference_engine, workflow_data
+                    )
 
                 # Trajectory format checking
                 if self.config.check_trajectory_format and traj is not None:

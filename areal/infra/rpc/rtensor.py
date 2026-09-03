@@ -25,6 +25,34 @@ from areal.utils import logging
 logger = logging.getLogger("HttpRTensor")
 
 
+@dataclass(frozen=True)
+class RTensorDrainReceipt:
+    """Typed proof that one controller drained its registered consumers.
+
+    This receipt describes one controller fan-out. Cross-role lease ownership
+    remains with the caller until the runtime has a dynamic consumer registry;
+    callers must collect a receipt from every role that localized the batch
+    before releasing its storage owner.
+    """
+
+    consumer_role: str
+    shard_count: int
+    source_node_count: int
+    consumer_dp_head_count: int
+
+    def __post_init__(self) -> None:
+        if not self.consumer_role:
+            raise ValueError("consumer_role must be a non-empty string")
+        for name in (
+            "shard_count",
+            "source_node_count",
+            "consumer_dp_head_count",
+        ):
+            value = getattr(self, name)
+            if value < 0:
+                raise ValueError(f"{name} must be non-negative, got {value}")
+
+
 class RTensorBackend(Protocol):
     def fetch(self, shards: list[TensorShardInfo]) -> list[torch.Tensor]:
         """Fetch multiple tensors concurrently.
@@ -341,6 +369,16 @@ def fetch_buffer_stats() -> dict[str, int]:
     """Return observability stats for the local client-side fetch buffer."""
     with _fetch_buffer_lock:
         return {"num_entries": len(_fetch_buffer)}
+
+
+def fetch_buffer_matching_stats(shard_ids: Iterable[Any]) -> dict[str, int]:
+    """Return total and requested-shard counts for strict drain verification."""
+    requested = set(shard_ids)
+    with _fetch_buffer_lock:
+        return {
+            "num_entries": len(_fetch_buffer),
+            "matching_entries": sum(sid in _fetch_buffer for sid in requested),
+        }
 
 
 def flatten_shard_ids(obj: Any) -> list[Any]:

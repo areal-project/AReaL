@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import asyncio
+import math
 from threading import Lock
 from typing import Any
 
@@ -21,7 +22,7 @@ from areal.api import (
 )
 from areal.api.alloc_mode import ModelAllocation
 from areal.api.cli_args import PerfTracerConfig, TrainEngineConfig
-from areal.infra.rpc.rtensor import RTensor
+from areal.infra.rpc.rtensor import RTensor, RTensorDrainReceipt
 from areal.infra.utils.concurrent import run_async_task
 from areal.utils import logging, stats_tracker
 from areal.utils.data import make_dummy_eval_item
@@ -126,29 +127,48 @@ def _dispatch_tensors(
 
 
 def _pad_eval_batch(
-    args: tuple[Any, ...], dp_size: int, group_size: int = 1
+    args: tuple[Any, ...],
+    dp_size: int,
+    group_size: int = 1,
+    *,
+    min_items_per_dp: int = 1,
+    items_per_dp_divisor: int = 1,
+    active_dummies: bool = False,
 ) -> tuple[Any, ...]:
-    """Pad the first tensor-like arg to a multiple of ``dp_size * group_size``.
+    """Pad the first tensor-like arg evenly across all DP replicas.
 
     Called before dispatch for explicit evaluation controller paths so that
     ``balanced_greedy_partition`` always receives a divisible input.
-    Dummy items have zero attention/loss masks and contribute nothing
-    to metrics or loss.
+    ``min_items_per_dp`` can reserve enough inputs for pipeline microbatches.
+    Active dummies contain one attended token, which keeps pipeline forwards
+    valid; their outputs must be discarded by the caller.
     """
+    if min_items_per_dp < 1:
+        raise ValueError("min_items_per_dp must be positive")
+    if items_per_dp_divisor < 1:
+        raise ValueError("items_per_dp_divisor must be positive")
     result = list(args)
-    pad_target = dp_size * group_size
+    per_dp_quantum = math.lcm(group_size, items_per_dp_divisor)
+    pad_quantum = dp_size * per_dp_quantum
+    minimum_size = dp_size * min_items_per_dp
     for i, arg in enumerate(result):
         if isinstance(arg, list) and arg and _is_tensor_like(arg):
             n = len(arg)
-            pad_count = (-n) % pad_target
+            padded_size = max(n, minimum_size)
+            padded_size += (-padded_size) % pad_quantum
+            pad_count = padded_size - n
             if pad_count > 0:
                 padded = list(arg)
                 template = arg[0]
-                padded.extend(make_dummy_eval_item(template) for _ in range(pad_count))
+                padded.extend(
+                    make_dummy_eval_item(template, active_attention=active_dummies)
+                    for _ in range(pad_count)
+                )
                 result[i] = padded
                 logger.info(
                     f"Eval dispatch: padded {pad_count} dummy items "
-                    f"(total {len(padded)}) for dp_size={dp_size}"
+                    f"(total {len(padded)}) for dp_size={dp_size}, "
+                    f"min_items_per_dp={min_items_per_dp}"
                 )
             break  # only pad the first tensor-like arg
     return tuple(result)
@@ -294,14 +314,10 @@ class TrainController:
         worker_ids = self.scheduler.create_workers(job=job)
         logger.info(f"Workers created: {worker_ids}")
 
-        # Wait for workers to be ready
         logger.info("Waiting for workers to be ready...")
         self.workers = self.scheduler.get_workers(role=job.role)
         logger.info(f"Workers ready: {[w.id for w in self.workers]}")
 
-        # Determine distributed training master address and port from rank 0 worker
-        # These are used for PyTorch distributed initialization across workers
-        # Prefer engine_ports[1] if available, fallback to worker_ports[1]
         rank0_worker = self.workers[0]
         if rank0_worker.engine_ports:
             self._master_port = int(rank0_worker.engine_ports[1])
@@ -313,18 +329,15 @@ class TrainController:
             f"Distributed training: MASTER_ADDR={self._master_addr}, MASTER_PORT={self._master_port}"
         )
 
-        # Construct engine class import path for dynamic loading on workers
-        # Workers will import and instantiate the engine class using this path
         engine_class = self.train_engine
-
-        # Create and initialize engines on workers
         run_async_task(
             self._async_create_engines,
             f"{engine_class.__module__}.{engine_class.__name__}",
         )
-        run_async_task(self._async_initialize_engines, ft_spec, **kwargs)
+        engine_init_kwargs = dict(kwargs)
+        engine_init_kwargs.setdefault("role", role)
+        run_async_task(self._async_initialize_engines, ft_spec, **engine_init_kwargs)
 
-        # Identify DP head workers
         self._identify_dp_heads()
         logger.info("TrainController initialization complete")
 
@@ -466,7 +479,6 @@ class TrainController:
         except Exception as e:
             logger.error(f"Error deleting workers: {e}")
 
-        # Clear worker lists
         self.workers.clear()
         self.workers_is_dp_head.clear()
 
@@ -488,6 +500,26 @@ class TrainController:
         )
         return self._collect_results(results, group_indices)
 
+    def _custom_function_call_all_dp_heads(
+        self,
+        method: str,
+        *args,
+        rpc_meta: dict[str, Any] | None = None,
+        **kwargs,
+    ) -> list[Any]:
+        """Call every rank and retain one result for every DP head."""
+        dp_args, dp_kwargs, group_indices = self._prepare_dispatch(*args, **kwargs)
+        if group_indices is not None:
+            raise ValueError("all-DP-head calls only support replicated inputs")
+        results = run_async_task(
+            self._call_workers, method, dp_args, dp_kwargs, rpc_meta=rpc_meta
+        )
+        return [
+            result
+            for result, is_head in zip(results, self.workers_is_dp_head, strict=True)
+            if is_head
+        ]
+
     async def _async_custom_function_call(
         self,
         method: str,
@@ -508,11 +540,19 @@ class TrainController:
         kwargs: dict[str, Any],
         *,
         group_size: int,
+        min_items_per_dp: int = 1,
+        items_per_dp_divisor: int = 1,
+        active_dummies: bool = False,
     ) -> tuple[tuple[Any, ...], dict[str, Any]]:
         """Pad eval batches for explicit algorithm-level evaluation dispatch."""
         kwargs = dict(kwargs)
         args = _pad_eval_batch(
-            args, self.parallel_strategy.dp_size, group_size=group_size
+            args,
+            self.parallel_strategy.dp_size,
+            group_size=group_size,
+            min_items_per_dp=min_items_per_dp,
+            items_per_dp_divisor=items_per_dp_divisor,
+            active_dummies=active_dummies,
         )
         return args, kwargs
 
@@ -719,6 +759,10 @@ class TrainController:
             "init_awex_adapter", meta_server_addr=meta_server_addr
         )
 
+    def init_weight_residency_adapter(self):
+        """Create the Megatron DDP-flat-buffer residency adapter."""
+        self._custom_function_call("init_weight_residency_adapter")
+
     def step_lr_scheduler(self):
         """Step the learning rate scheduler.
 
@@ -734,11 +778,35 @@ class TrainController:
 
     def offload(self) -> None:
         """Offload model parameters to CPU across all train workers."""
-        self._custom_function_call("offload")
+        self._collective_lifecycle_call("offload")
 
     def onload(self) -> None:
         """Onload model parameters to GPU across all train workers."""
-        self._custom_function_call("onload")
+        self._collective_lifecycle_call("onload")
+
+    def _collective_lifecycle_call(self, method: str) -> None:
+        """Wait for every rank once; lifecycle collectives are not retry-safe."""
+
+        async def _call_all_workers():
+            tasks = [
+                self.scheduler.async_call_engine(
+                    worker.id,
+                    method,
+                    self._engine_name(rank),
+                    max_retries=1,
+                )
+                for rank, worker in enumerate(self.workers)
+            ]
+            return await asyncio.gather(*tasks, return_exceptions=True)
+
+        results = run_async_task(_call_all_workers)
+        failures = [
+            RuntimeError(f"{method} failed on rank {rank}: {result}")
+            for rank, result in enumerate(results)
+            if isinstance(result, BaseException)
+        ]
+        if failures:
+            raise ExceptionGroup(f"Train worker collective {method} failed", failures)
 
     def get_device_stats(self):
         return self._custom_function_call("get_device_stats")
@@ -1001,3 +1069,59 @@ class TrainController:
                 "RTensor storage cleanup failed across two clear_batches calls "
                 f"({summary})"
             )
+
+    def strict_clear_batches(self, *targets: Any) -> RTensorDrainReceipt:
+        """Clear source shards and prove every consumer DP head drained them.
+
+        Unlike :meth:`clear_batches`, any source-delete or consumer RPC failure is
+        fatal.  The returned receipt is suitable for the MOPD teacher lifecycle
+        gate; callers must not destroy teacher workers before this succeeds.
+        """
+        shards_by_node = {
+            node_addr: list(dict.fromkeys(shard_ids))
+            for node_addr, shard_ids in RTensor.collect_shards(targets).items()
+        }
+        shard_ids = [
+            shard_id
+            for node_shards in shards_by_node.values()
+            for shard_id in node_shards
+        ]
+        if not shard_ids:
+            return RTensorDrainReceipt(
+                consumer_role=self._worker_role,
+                shard_count=0,
+                source_node_count=0,
+                consumer_dp_head_count=0,
+            )
+
+        async def _strict_clear_sources() -> None:
+            await asyncio.gather(
+                *[
+                    RTensor.clear_node(node_addr, node_shards)
+                    for node_addr, node_shards in shards_by_node.items()
+                ]
+            )
+
+        run_async_task(_strict_clear_sources)
+        self._custom_function_call_all_dp_heads(
+            "clear_batches", shard_ids, rpc_meta={"broadcast": False}
+        )
+        stats = self._custom_function_call_all_dp_heads(
+            "fetch_buffer_stats", shard_ids, rpc_meta={"broadcast": False}
+        )
+        leaking_heads = [
+            index
+            for index, stat in enumerate(stats)
+            if not isinstance(stat, dict) or stat.get("matching_entries") != 0
+        ]
+        if leaking_heads:
+            raise RuntimeError(
+                f"RTensor drain incomplete on {self._worker_role} DP heads "
+                f"{leaking_heads}: stats={stats}"
+            )
+        return RTensorDrainReceipt(
+            consumer_role=self._worker_role,
+            shard_count=len(shard_ids),
+            source_node_count=len(shards_by_node),
+            consumer_dp_head_count=len(stats),
+        )
