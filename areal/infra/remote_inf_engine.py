@@ -88,25 +88,52 @@ class GroupedRolloutWorkflow(RolloutWorkflow):
         self, engine: InferenceEngine, data: dict[str, Any]
     ) -> dict[str, Any] | None:
         from areal.experimental.openai import InteractionWithTokenLogpReward
+        from areal.infra import workflow_context
+        from areal.infra.processor_cache import ProcessorCallCache
+        from areal.infra.workflow_context import WorkflowContext
+
+        parent = workflow_context.get()
+        shared_processor_cache = ProcessorCallCache()
+        group_context = WorkflowContext(
+            is_eval=parent.is_eval,
+            task_id=parent.task_id,
+            group_size=self.group_size,
+            processor_cache=shared_processor_cache,
+        )
 
         async def run_sample(sample_idx: int) -> tuple[int, Any]:
-            from areal.infra import workflow_context
-            from areal.infra.workflow_context import WorkflowContext
-
-            parent = workflow_context.get()
             workflow_context.set(
                 WorkflowContext(
-                    is_eval=parent.is_eval,
-                    task_id=parent.task_id,
+                    is_eval=group_context.is_eval,
+                    task_id=group_context.task_id,
                     sample_idx=sample_idx,
+                    group_size=group_context.group_size,
+                    processor_cache=shared_processor_cache,
                 )
             )
             result = await self.workflow.arun_episode(engine, data)
             return sample_idx, result
 
-        indexed_results = await asyncio.gather(
-            *[run_sample(sample_idx) for sample_idx in range(self.group_size)]
-        )
+        group_tasks = [
+            asyncio.create_task(run_sample(sample_idx))
+            for sample_idx in range(self.group_size)
+        ]
+        try:
+            indexed_results = await asyncio.gather(*group_tasks)
+        finally:
+            # gather propagates the first child error without waiting for the
+            # remaining children. Drain them before releasing group resources.
+            await asyncio.gather(*group_tasks, return_exceptions=True)
+            finalizer = getattr(self.workflow, "_afinalize_processor_cache_group", None)
+            if finalizer is not None:
+                try:
+                    await finalizer(group_context)
+                except Exception as exc:
+                    self.logger.warning(
+                        "Failed to finalize rollout group resources (%s: %s).",
+                        type(exc).__name__,
+                        exc,
+                    )
         indexed_results.sort(key=lambda item: item[0])
         sample_indices = [sample_idx for sample_idx, _ in indexed_results]
         if sample_indices != list(range(self.group_size)):
