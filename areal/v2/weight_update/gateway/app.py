@@ -167,6 +167,19 @@ def _merge_training_meta_by_name(meta_list: list[dict]) -> list[dict]:
     return list(by_name.values()) + overflow
 
 
+def _build_infer_converter_context(
+    infer_parallelism: dict[str, Any], infer_world_size: int
+) -> dict[str, Any] | None:
+    """Complete the inference context consumed by AWEX train converters."""
+    converter_context = infer_parallelism.get("converter_context")
+    if converter_context is None:
+        return None
+    return {
+        **converter_context,
+        "infer_world_size": infer_world_size,
+    }
+
+
 def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
     config = config or WeightUpdateConfig()
 
@@ -284,12 +297,19 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
         num_engines = len(inference_urls)
         total_infer_ranks = infer_world_size * num_engines
         total_world_size = total_infer_ranks + train_world_size
+        infer_converter_context = _build_infer_converter_context(
+            infer_par, total_infer_ranks
+        )
+        parameter_layout = train_par.get("parameter_layout", "hf")
 
         train_meta_resps, infer_meta_resps = await asyncio.gather(
             asyncio.gather(
                 *[
                     _post_json(
-                        session, f"{url}/awex/report_weight_meta", init_timeout_s
+                        session,
+                        f"{url}/awex/report_weight_meta",
+                        init_timeout_s,
+                        json_data={"infer_conf": infer_converter_context},
                     )
                     for url in train_urls
                 ]
@@ -297,7 +317,10 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
             asyncio.gather(
                 *[
                     _post_json(
-                        session, f"{url}/awex/report_weight_meta", init_timeout_s
+                        session,
+                        f"{url}/awex/report_weight_meta",
+                        init_timeout_s,
+                        json_data={"parameter_layout": parameter_layout},
                     )
                     for url in inference_urls
                 ]
@@ -420,12 +443,19 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
         # report_parallelism returns per-instance world_size (e.g. TP size).
         # The total inference world for colocate NCCL groups spans all engines.
         infer_world_size = infer_par["world_size"] * num_engines
+        infer_converter_context = _build_infer_converter_context(
+            infer_par, infer_world_size
+        )
+        parameter_layout = train_par.get("parameter_layout", "hf")
 
         train_meta_resps, infer_meta_resps = await asyncio.gather(
             asyncio.gather(
                 *[
                     _post_json(
-                        session, f"{url}/awex/report_weight_meta", init_timeout_s
+                        session,
+                        f"{url}/awex/report_weight_meta",
+                        init_timeout_s,
+                        json_data={"infer_conf": infer_converter_context},
                     )
                     for url in train_urls
                 ]
@@ -433,7 +463,10 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
             asyncio.gather(
                 *[
                     _post_json(
-                        session, f"{url}/awex/report_weight_meta", init_timeout_s
+                        session,
+                        f"{url}/awex/report_weight_meta",
+                        init_timeout_s,
+                        json_data={"parameter_layout": parameter_layout},
                     )
                     for url in inference_urls
                 ]
