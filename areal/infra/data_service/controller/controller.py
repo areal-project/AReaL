@@ -505,7 +505,7 @@ class DataController:
     ) -> tuple[str, int]:
         async with session.post(
             f"{guard_addr}/alloc_ports",
-            json={"count": 1},
+            json={"count": 1, "role": role, "worker_index": worker_index},
             timeout=aiohttp.ClientTimeout(total=10),
         ) as resp:
             resp.raise_for_status()
@@ -515,21 +515,33 @@ class DataController:
 
         cmd = list(raw_cmd) + ["--host", host, "--port", str(port)]
 
-        async with session.post(
-            f"{guard_addr}/fork",
-            json={
-                "role": role,
-                "worker_index": worker_index,
-                "raw_cmd": cmd,
-            },
-            timeout=aiohttp.ClientTimeout(total=30),
-        ) as resp:
-            resp.raise_for_status()
+        try:
+            async with session.post(
+                f"{guard_addr}/fork",
+                json={
+                    "role": role,
+                    "worker_index": worker_index,
+                    "raw_cmd": cmd,
+                },
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as resp:
+                resp.raise_for_status()
 
-        self._forked_services.append((guard_addr, role, worker_index))
+            self._forked_services.append((guard_addr, role, worker_index))
 
-        addr = f"http://{format_hostport(host, port)}"
-        await self._async_wait_for_service(session, f"{addr}{health_path}", role)
+            addr = f"http://{format_hostport(host, port)}"
+            await self._async_wait_for_service(session, f"{addr}{health_path}", role)
+        except BaseException:
+            for endpoint in ("kill_forked_worker", "release_ports"):
+                try:
+                    async with session.post(
+                        f"{guard_addr}/{endpoint}",
+                        json={"role": role, "worker_index": worker_index},
+                    ):
+                        pass
+                except Exception:
+                    pass
+            raise
 
         return host, port
 
