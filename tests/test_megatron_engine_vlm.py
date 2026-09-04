@@ -5,6 +5,7 @@ Distributed integration tests live in
 subprocesses and require GPUs.
 """
 
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -598,6 +599,239 @@ class TestPackedContextParallelForward:
         assert seen_mask is loss_mask
         assert _MTP_TRAIN_LABELS.get() is None
         assert _MTP_TRAIN_LOSS_MASK.get() is None
+
+    @pytest.mark.parametrize("repeated_layer", [False, True])
+    def test_mtp_multidepth_gradient_isolation_and_unclipped_sgd_updates(
+        self,
+        monkeypatch,
+        repeated_layer,
+    ):
+        """Auxiliary gradients stay inside all MTP depths, including reuse."""
+        from megatron.core import transformer as transformer_package
+        from megatron.core.models import gpt as gpt_package
+
+        from areal.engine.megatron_utils.megatron_bridge_patches import (
+            _MTP_TRAIN_DEPTH,
+            _MTP_TRAIN_LABELS,
+            _MTP_TRAIN_LOSS_MASK,
+            _patch_gpt_model_mtp_training,
+        )
+
+        class FakeMTPLayer(torch.nn.Module):
+            def __init__(self, weight):
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.tensor([weight]))
+
+            def _get_embeddings(
+                self,
+                input_ids,
+                position_ids,
+                embedding,
+                hidden_states,
+            ):
+                return (
+                    input_ids,
+                    position_ids,
+                    embedding(input_ids=input_ids, position_ids=position_ids),
+                    hidden_states,
+                )
+
+            def forward(
+                self,
+                input_ids,
+                position_ids,
+                embedding,
+                hidden_states,
+            ):
+                input_ids, position_ids, decoder_input, hidden_states = (
+                    self._get_embeddings(
+                        input_ids=input_ids,
+                        position_ids=position_ids,
+                        embedding=embedding,
+                        hidden_states=hidden_states,
+                    )
+                )
+                return (
+                    self.weight * (decoder_input + hidden_states),
+                    input_ids,
+                    position_ids,
+                )
+
+        class FakeMTPBlock(torch.nn.Module):
+            def __init__(self, use_repeated_layer):
+                super().__init__()
+                self.use_repeated_layer = use_repeated_layer
+                weights = [7.0] if use_repeated_layer else [7.0, 11.0]
+                self.layers = torch.nn.ModuleList(
+                    [FakeMTPLayer(weight) for weight in weights]
+                )
+
+            def forward(
+                self,
+                input_ids,
+                position_ids,
+                embedding,
+                hidden_states,
+            ):
+                depth_outputs = []
+                for depth in range(2):
+                    layer = (
+                        self.layers[0]
+                        if self.use_repeated_layer
+                        else self.layers[depth]
+                    )
+                    hidden_states, input_ids, position_ids = layer(
+                        input_ids=input_ids,
+                        position_ids=position_ids,
+                        embedding=embedding,
+                        hidden_states=hidden_states,
+                    )
+                    depth_outputs.append(hidden_states)
+                return depth_outputs
+
+        fake_gpt_model = None
+
+        class FakeGPTModel(torch.nn.Module):
+            def __init__(self, use_repeated_layer):
+                super().__init__()
+                self.backbone_weight = torch.nn.Parameter(torch.tensor([5.0]))
+                self.embedding_weight = torch.nn.Parameter(torch.tensor([3.0]))
+                self.output_weight = torch.nn.Parameter(torch.tensor([2.0]))
+                self.mtp = FakeMTPBlock(use_repeated_layer)
+
+            def embedding(self, *, input_ids, position_ids):
+                del input_ids, position_ids
+                return self.embedding_weight
+
+            def forward(self, input_ids, position_ids):
+                backbone_hidden = self.backbone_weight
+                depth_outputs = self.mtp(
+                    input_ids=input_ids,
+                    position_ids=position_ids,
+                    embedding=self.embedding,
+                    hidden_states=backbone_hidden,
+                )
+                mtp_loss = fake_gpt_model.process_mtp_loss(
+                    hidden_states=depth_outputs,
+                    labels=None,
+                    loss_mask=None,
+                    output_weight=self.output_weight,
+                )
+                main_loss = (
+                    13.0
+                    * self.output_weight
+                    * (backbone_hidden + self.embedding_weight)
+                )
+                return main_loss, mtp_loss
+
+        def fake_roll_tensor(tensor, **_kwargs):
+            return tensor.clone(), tensor.sum()
+
+        def fake_process_mtp_loss(
+            *,
+            hidden_states,
+            labels,
+            loss_mask,
+            output_weight,
+        ):
+            assert labels is not None
+            assert loss_mask is not None
+            return output_weight * (2.0 * hidden_states[0] + 3.0 * hidden_states[1])
+
+        fake_gpt_model = SimpleNamespace(
+            GPTModel=FakeGPTModel,
+            process_mtp_loss=fake_process_mtp_loss,
+        )
+        fake_mtp_module = SimpleNamespace(
+            roll_tensor=fake_roll_tensor,
+            MultiTokenPredictionBlock=FakeMTPBlock,
+            MultiTokenPredictionLayer=FakeMTPLayer,
+        )
+        monkeypatch.setattr(gpt_package, "gpt_model", fake_gpt_model)
+        monkeypatch.setattr(
+            transformer_package,
+            "multi_token_prediction",
+            fake_mtp_module,
+        )
+        _patch_gpt_model_mtp_training()
+
+        mtp_kwargs = {
+            "mtp_labels": torch.ones(1, dtype=torch.long),
+            "mtp_loss_mask": torch.ones(1),
+        }
+        model = FakeGPTModel(repeated_layer)
+        main_loss, mtp_loss = model(
+            input_ids=torch.ones(1, dtype=torch.long),
+            position_ids=torch.zeros(1, dtype=torch.long),
+            mtp_kwargs=mtp_kwargs,
+        )
+        (main_loss + mtp_loss).backward()
+
+        torch.testing.assert_close(model.backbone_weight.grad, torch.tensor([26.0]))
+        torch.testing.assert_close(model.embedding_weight.grad, torch.tensor([26.0]))
+        torch.testing.assert_close(model.output_weight.grad, torch.tensor([104.0]))
+        if repeated_layer:
+            torch.testing.assert_close(
+                model.mtp.layers[0].weight.grad,
+                torch.tensor([722.0]),
+            )
+        else:
+            torch.testing.assert_close(
+                model.mtp.layers[0].weight.grad,
+                torch.tensor([560.0]),
+            )
+            torch.testing.assert_close(
+                model.mtp.layers[1].weight.grad,
+                torch.tensor([354.0]),
+            )
+        assert _MTP_TRAIN_LABELS.get() is None
+        assert _MTP_TRAIN_LOSS_MASK.get() is None
+        assert _MTP_TRAIN_DEPTH.get() is None
+
+        # This update check intentionally uses uncoupled, unclipped SGD. It
+        # verifies the direct gradient boundary above; production-wide gradient
+        # clipping may still couple parameter updates through the global norm.
+        baseline = FakeGPTModel(repeated_layer)
+        combined = FakeGPTModel(repeated_layer)
+        baseline_optimizer = torch.optim.SGD(baseline.parameters(), lr=0.01)
+        combined_optimizer = torch.optim.SGD(combined.parameters(), lr=0.01)
+
+        baseline_main_loss, _ = baseline(
+            input_ids=torch.ones(1, dtype=torch.long),
+            position_ids=torch.zeros(1, dtype=torch.long),
+            mtp_kwargs=mtp_kwargs,
+        )
+        baseline_main_loss.backward()
+        baseline_optimizer.step()
+
+        combined_main_loss, combined_mtp_loss = combined(
+            input_ids=torch.ones(1, dtype=torch.long),
+            position_ids=torch.zeros(1, dtype=torch.long),
+            mtp_kwargs=mtp_kwargs,
+        )
+        (combined_main_loss + combined_mtp_loss).backward()
+        combined_optimizer.step()
+
+        for parameter_name in (
+            "backbone_weight",
+            "embedding_weight",
+            "output_weight",
+        ):
+            torch.testing.assert_close(
+                getattr(combined, parameter_name),
+                getattr(baseline, parameter_name),
+                rtol=0,
+                atol=0,
+            )
+        assert not torch.equal(
+            combined.mtp.layers[0].weight,
+            baseline.mtp.layers[0].weight,
+        )
+        if not repeated_layer:
+            assert not torch.equal(
+                combined.mtp.layers[1].weight,
+                baseline.mtp.layers[1].weight,
+            )
 
     def test_model_thd_passes_padded_inputs_and_packed_metadata(self, monkeypatch):
         from areal.engine.megatron_utils import packed_context_parallel
