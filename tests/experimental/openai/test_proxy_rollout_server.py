@@ -267,6 +267,9 @@ class TestExportTrajectories:
             interaction = InteractionWithTokenLogpReward()
             interaction.interaction_id = f"interaction-{sample_idx}"
             interaction.messages = [{"role": "user", "content": "question"}]
+            interaction.output_message_list = [
+                {"role": "assistant", "content": "answer"}
+            ]
             interaction.reward = 1.0
             interaction._cache = {
                 "input_ids": torch.tensor([[sample_idx, 2]]),
@@ -326,6 +329,7 @@ class TestExportTrajectories:
         interaction = InteractionWithTokenLogpReward()
         interaction.interaction_id = "legacy-interaction"
         interaction.messages = [{"role": "user", "content": "question"}]
+        interaction.output_message_list = [{"role": "assistant", "content": "answer"}]
         interaction.reward = 1.0
         interaction._cache = {
             "input_ids": torch.tensor([[1, 2]]),
