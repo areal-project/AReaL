@@ -9,9 +9,9 @@ import areal.utils.logging as logging
 
 from .cpu import CpuPlatform
 from .cuda import CudaPlatform
+from .rocm import ROCmPlatform
 from .npu import NPUPlatform
 from .platform import Platform
-from .rocm import ROCmPlatform
 from .unknown import UnknownPlatform
 
 logger = logging.getLogger("PlatformInit")
