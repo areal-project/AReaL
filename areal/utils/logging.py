@@ -89,6 +89,8 @@ LOGGER_COLORS_EXACT = {
     "TreeAttentionCore": "light_cyan",
     "TreeAttentionConstants": "light_cyan",
     "TreeAttentionViz": "light_cyan",
+    # Vision model patches - cyan
+    "VisionDedup": "light_cyan",
     # Checkpoint - blue (infrastructure)
     "Saver": "blue",
     "AsyncCheckpoint": "blue",
