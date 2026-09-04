@@ -16,6 +16,7 @@ from awex.meta.weight_meta import (
     ParameterReplicaMeta,
     ParameterShardMeta,
 )
+from awex.models.registry import get_infer_weights_converter
 from awex.sharding.param_sharding import ShardingType
 from awex.sharding.rank_info import RankInfo
 from awex.sharding.sglang_sharding import (
@@ -52,6 +53,32 @@ from areal.v2.weight_update.nccl_group import (
 logger = logging.getLogger("AwexSGLangAdapter")
 
 
+def _get_router_dtype(config: Any) -> Any:
+    """Read router dtype from a flat or multimodal Hugging Face config."""
+    router_dtype = getattr(config, "router_dtype", None)
+    if router_dtype is not None:
+        return router_dtype
+    text_config = getattr(config, "text_config", config)
+    return getattr(text_config, "router_dtype", "bf16")
+
+
+def _normalize_router_dtype(dtype: Any) -> str:
+    normalized = str(dtype).lower().replace("torch.", "")
+    aliases = {
+        "bf16": "bf16",
+        "bfloat16": "bf16",
+        "fp16": "fp16",
+        "float16": "fp16",
+        "half": "fp16",
+        "fp32": "fp32",
+        "float32": "fp32",
+        "float": "fp32",
+    }
+    if normalized not in aliases:
+        raise ValueError(f"Unsupported AWEX router dtype: {dtype}")
+    return aliases[normalized]
+
+
 class AwexSGLangAdapter(AwexInferenceAdapter):
     """Awex inference adapter for in-process SGLang schedulers."""
 
@@ -65,6 +92,8 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
         self._separation_wire_dtypes: tuple[torch.dtype, ...] | None = None
         self._transfer_rank: int | None = None
         self._rank_info: RankInfo | None = None
+        self._weight_converter = None
+        self._parameter_layout: str | None = None
         self._parameters: dict[str, torch.Tensor] | None = None
         self._released_tags: set[str] = set()
         self._colocate_admin_api_key: str = "areal-admin-key"
@@ -77,6 +106,24 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
 
     def _get_model(self) -> torch.nn.Module:
         return self._scheduler.tp_worker.model_runner.model
+
+    def _get_awex_hf_config(self):
+        """Return the complete runtime HF config retained by SGLang."""
+        model_runner = self._scheduler.tp_worker.model_runner
+        model_config = getattr(model_runner, "model_config", None)
+        hf_config = getattr(model_config, "hf_config", None)
+        if hf_config is None:
+            hf_config = self._get_model().config
+        return hf_config
+
+    def _serialize_awex_hf_config(self) -> dict[str, Any]:
+        config = self._get_awex_hf_config().to_dict()
+        if not config.get("architectures"):
+            config["architectures"] = [self._get_model_arch_name()]
+        return config
+
+    def _get_model_arch_name(self) -> str:
+        return type(self._get_model()).__name__
 
     def _get_model_context(self) -> dict[str, Any]:
         server_args = self._scheduler.server_args
@@ -136,18 +183,25 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
             "dp_size": dp_size,
             "ep_size": ep_size,
             "num_engines": 1,
+            "converter_context": {
+                "engine_name": "sglang",
+                "infer_atten_tp_size": int(model_context["attn_tp_size"]),
+                "hf_config": self._serialize_awex_hf_config(),
+                "router_dtype": _normalize_router_dtype(
+                    _get_router_dtype(self._get_model().config)
+                ),
+                "device_backend": current_platform.device_type,
+            },
         }
+
+    def _build_rank_info(self) -> RankInfo:
+        model_context = self._get_model_context()
+        return get_sglang_rank_info(model_context, engine_rank=0)
 
     def _unfuse_params(
         self, name: str, tensor: torch.Tensor
     ) -> list[tuple[str, torch.Tensor]]:
-        """Split SGLang fused parameters into HuggingFace-style unfused pairs.
-
-        SGLang fuses Q/K/V into ``qkv_proj`` and gate/up into ``gate_up_proj``
-        for efficiency.  For MoE models, SGLang also fuses all routed experts
-        into ``experts.w13_weight`` (gate+up) and ``experts.w2_weight`` (down).
-        The training side keeps per-expert HF names, so we unfuse here to match.
-        """
+        """Expose fused SGLang tensors as the HF layout used by FSDP."""
         if "qkv_proj" in name:
             cfg = self._get_model().config
             num_heads = cfg.num_attention_heads
@@ -188,9 +242,6 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
         if "shared_experts" in name and name.endswith("down_weight"):
             return [(name.replace("down_weight", "down_proj.weight"), tensor)]
         if ".experts.w13_weight" in name:
-            # w13_weight shape: [num_total_experts, 2*ffn_hidden, hidden]
-            # num_total_experts may include shared experts appended after
-            # routed experts (e.g. 128 routed + 1 shared = 129 total).
             cfg = self._get_model().config
             num_routed = getattr(cfg, "num_experts", None) or cfg.n_routed_experts
             prefix = name.replace(".w13_weight", "")
@@ -217,7 +268,6 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
                 )
             return result
         if ".experts.w2_weight" in name:
-            # w2_weight shape: [num_total_experts, hidden, ffn_hidden]
             cfg = self._get_model().config
             num_routed = getattr(cfg, "num_experts", None) or cfg.n_routed_experts
             prefix = name.replace(".w2_weight", "")
@@ -238,101 +288,134 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
             return result
         return [(name, tensor)]
 
-    def _build_rank_info(self) -> RankInfo:
-        model_context = self._get_model_context()
-        return get_sglang_rank_info(model_context, engine_rank=0)
-
     def _build_sharding_strategy(self, rank_info: RankInfo):
-        model = self._get_model()
-        model_name = None
-        model_config = getattr(model, "config", None)
-        if model_config is not None:
-            architectures = getattr(model_config, "architectures", None)
-            if architectures and len(architectures) > 0:
+        model_name = self._get_model_arch_name()
+        if self._parameter_layout == "hf":
+            architectures = getattr(self._get_model().config, "architectures", None)
+            if architectures:
                 model_name = architectures[0]
-
-        if model_name is None:
-            model_name = type(model).__name__
-
         infer_engine_config = self._scheduler.server_args
         return get_sglang_sharding_strategy(model_name, infer_engine_config, rank_info)
 
-    def get_weight_metadata(self) -> list[ParameterMeta]:
+    def _get_weight_converter(self, rank_info: RankInfo):
+        if self._weight_converter is None:
+            self._weight_converter = get_infer_weights_converter(
+                "sglang",
+                self._get_model_arch_name(),
+                self._get_model().config,
+                rank_info,
+                self._scheduler.server_args,
+            )
+        return self._weight_converter
+
+    def _iter_hf_params(self, rank_info: RankInfo):
+        """Yield parameters in the canonical layout selected by training."""
+        if self._parameter_layout == "hf":
+            for name, param in self._get_model().named_parameters():
+                yield from self._unfuse_params(name, param.data)
+            return
+
+        converter = self._get_weight_converter(rank_info)
+        converted_names: set[str] = set()
+        embed_tensor: torch.Tensor | None = None
+
+        for name, param in self._get_model().named_parameters():
+            for hf_name, hf_tensor in converter.convert_param(name, param.data):
+                converted_names.add(hf_name)
+                if hf_name == "model.embed_tokens.weight":
+                    embed_tensor = hf_tensor
+                yield hf_name, hf_tensor
+
+        model_context = self._get_model_context()
+        if (
+            getattr(self._get_model().config, "tie_word_embeddings", False)
+            and model_context["pp_rank"] == model_context["pp_size"] - 1
+            and "lm_head.weight" not in converted_names
+            and embed_tensor is not None
+        ):
+            yield "lm_head.weight", embed_tensor
+
+    def get_weight_metadata(self, parameter_layout: str = "hf") -> list[ParameterMeta]:
+        if parameter_layout not in {"awex", "hf"}:
+            raise ValueError(f"Unsupported parameter layout: {parameter_layout}")
+        if self._parameter_layout not in (None, parameter_layout):
+            raise RuntimeError(
+                "AWEX SGLang adapter is already configured for parameter layout "
+                f"{self._parameter_layout}, got {parameter_layout}"
+            )
+        self._parameter_layout = parameter_layout
         rank_info = self._build_rank_info()
         strategy = self._build_sharding_strategy(rank_info)
         self._rank_info = rank_info
 
         metadata: list[ParameterMeta] = []
 
-        for name, param in self._get_model().named_parameters():
-            for hf_name, local_tensor in self._unfuse_params(name, param.data):
-                local_shape = tuple(local_tensor.shape)
-                sharding_type, sharding_dim, num_shards = (
-                    strategy.get_sharding_strategy(hf_name)
+        for hf_name, local_tensor in self._iter_hf_params(rank_info):
+            local_shape = tuple(local_tensor.shape)
+            sharding_type, sharding_dim, num_shards = strategy.get_sharding_strategy(
+                hf_name
+            )
+
+            global_offset = [0] * len(local_shape)
+            if sharding_type == ShardingType.TP_SHARDING:
+                rank_pos = rank_info.tp_rank
+            elif sharding_type == ShardingType.DP_TP_SHARDING:
+                rank_pos = rank_info.attn_tp_rank
+            elif sharding_type == ShardingType.EP_SHARDING:
+                rank_pos = rank_info.ep_rank
+            elif sharding_type == ShardingType.EP_TP_SHARDING:
+                rank_pos = rank_info.ep_tp_rank
+            else:
+                rank_pos = 0
+
+            if sharding_type != ShardingType.NO_SHARDING and 0 <= sharding_dim < len(
+                local_shape
+            ):
+                global_offset[sharding_dim] = int(rank_pos) * int(
+                    local_shape[sharding_dim]
                 )
 
-                global_offset = [0] * len(local_shape)
-                if sharding_type == ShardingType.TP_SHARDING:
-                    rank_pos = rank_info.tp_rank
-                elif sharding_type == ShardingType.DP_TP_SHARDING:
-                    rank_pos = rank_info.attn_tp_rank
-                elif sharding_type == ShardingType.EP_SHARDING:
-                    rank_pos = rank_info.ep_rank
-                elif sharding_type == ShardingType.EP_TP_SHARDING:
-                    rank_pos = rank_info.ep_tp_rank
-                else:
-                    rank_pos = 0
+            global_shape = list(local_shape)
+            if sharding_type != ShardingType.NO_SHARDING and 0 <= sharding_dim < len(
+                global_shape
+            ):
+                global_shape[sharding_dim] = int(local_shape[sharding_dim]) * int(
+                    num_shards
+                )
 
-                if (
-                    sharding_type != ShardingType.NO_SHARDING
-                    and 0 <= sharding_dim < len(local_shape)
-                ):
-                    global_offset[sharding_dim] = int(rank_pos) * int(
-                        local_shape[sharding_dim]
-                    )
+            shard_meta = ParameterShardMeta(
+                tp_rank=rank_info.tp_rank,
+                attn_tp_rank=rank_info.attn_tp_rank,
+                pp_rank=rank_info.pp_rank,
+                ep_rank=rank_info.ep_rank,
+                ep_tp_rank=rank_info.ep_tp_rank,
+                global_rank=rank_info.global_rank,
+                world_size=rank_info.world_size,
+                engine_rank=rank_info.engine_rank,
+                cp_rank=rank_info.cp_rank,
+                cp_size=rank_info.cp_size,
+                cp_mode=rank_info.cp_mode,
+                name=hf_name,
+                shape=local_shape,
+                numel=int(local_tensor.numel()),
+                dtype=local_tensor.dtype,
+                global_offset=tuple(global_offset),
+                sharding_type=sharding_type,
+                num_shards=int(num_shards),
+                sharding_dim=int(sharding_dim),
+            )
 
-                global_shape = list(local_shape)
-                if (
-                    sharding_type != ShardingType.NO_SHARDING
-                    and 0 <= sharding_dim < len(global_shape)
-                ):
-                    global_shape[sharding_dim] = int(local_shape[sharding_dim]) * int(
-                        num_shards
-                    )
-
-                shard_meta = ParameterShardMeta(
-                    tp_rank=rank_info.tp_rank,
-                    attn_tp_rank=rank_info.attn_tp_rank,
-                    pp_rank=rank_info.pp_rank,
-                    ep_rank=rank_info.ep_rank,
-                    ep_tp_rank=rank_info.ep_tp_rank,
-                    global_rank=rank_info.global_rank,
-                    world_size=rank_info.world_size,
-                    engine_rank=rank_info.engine_rank,
-                    cp_rank=rank_info.cp_rank,
-                    cp_size=rank_info.cp_size,
-                    cp_mode=rank_info.cp_mode,
+            replica = ParameterReplicaMeta(shards=[shard_meta])
+            metadata.append(
+                ParameterMeta(
                     name=hf_name,
-                    shape=local_shape,
-                    numel=int(local_tensor.numel()),
+                    global_numel=math.prod(global_shape) if global_shape else 1,
+                    global_shape=tuple(global_shape),
                     dtype=local_tensor.dtype,
-                    global_offset=tuple(global_offset),
-                    sharding_type=sharding_type,
-                    num_shards=int(num_shards),
-                    sharding_dim=int(sharding_dim),
+                    shards=[shard_meta],
+                    replicas=[replica],
                 )
-
-                replica = ParameterReplicaMeta(shards=[shard_meta])
-                metadata.append(
-                    ParameterMeta(
-                        name=hf_name,
-                        global_numel=math.prod(global_shape) if global_shape else 1,
-                        global_shape=tuple(global_shape),
-                        dtype=local_tensor.dtype,
-                        shards=[shard_meta],
-                        replicas=[replica],
-                    )
-                )
+            )
 
         return metadata
 
@@ -342,10 +425,10 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
         required = set(required_names) if required_names else None
         local_params: dict[str, torch.Tensor] = {}
 
-        for name, param in self._get_model().named_parameters():
-            for hf_name, hf_tensor in self._unfuse_params(name, param.data):
-                if required is None or hf_name in required:
-                    local_params[hf_name] = hf_tensor
+        rank_info = self._rank_info or self._build_rank_info()
+        for hf_name, hf_tensor in self._iter_hf_params(rank_info):
+            if required is None or hf_name in required:
+                local_params[hf_name] = hf_tensor
 
         self._parameters = local_params
         return local_params
@@ -597,6 +680,8 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
         self._separation_delta_transport = None
         self._separation_wire_dtypes = None
         self._rank_info = None
+        self._weight_converter = None
+        self._parameter_layout = None
         self._parameters = None
         if self._colocate_http_client is not None:
             self._colocate_http_client.close()

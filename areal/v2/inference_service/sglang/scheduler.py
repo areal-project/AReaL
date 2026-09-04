@@ -83,9 +83,9 @@ class AwexSchedulerBridge:
         if self._result_push is not None:
             self._result_push.send_pyobj(result)
 
-    def awex_report_weight_meta(self) -> None:
+    def awex_report_weight_meta(self, parameter_layout: str = "hf") -> None:
         adapter = self._require_adapter()
-        local_meta = adapter.get_weight_metadata()
+        local_meta = adapter.get_weight_metadata(parameter_layout=parameter_layout)
         s = self._scheduler
 
         # All-gather across TP ranks so rank 0 returns aggregated metadata
