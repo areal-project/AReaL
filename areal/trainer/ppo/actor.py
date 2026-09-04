@@ -413,6 +413,7 @@ class PPOActor:
                         eps_clip_higher=self.config.eps_clip_higher,
                         c_clip=self.config.c_clip,
                         rejection_sampling=self.config.rejection_sampling,
+                        importance_sampling=self.config.importance_sampling,
                         m2_threshold=self.m2_threshold,
                         importance_sampling_level=self.config.importance_sampling_level,
                         current_version=current_version,
@@ -564,6 +565,7 @@ def grpo_loss_fn(
     eps_clip_higher: float | None,
     c_clip: float | None,
     rejection_sampling: RejectionSamplingConfig | None = None,
+    importance_sampling: RejectionSamplingConfig | None = None,
     m2_threshold: float | None = None,
     importance_sampling_level: str = "token",
     current_version: int | None = None,
@@ -633,6 +635,7 @@ def grpo_loss_fn(
             c_clip=c_clip,
             proximal_logprobs=prox_logp,
             rejection_sampling=rejection_sampling,
+            importance_sampling=importance_sampling,
             importance_sampling_level=importance_sampling_level,
             cu_seqlens=input_data.get("cu_seqlens"),
             pg_reduction=pg_reduction,
@@ -756,6 +759,8 @@ def grpo_loss_fn(
         )
     if "filtered_fraction" in stat:
         stats_tracker.scalar(rs_filtered_fraction=stat["filtered_fraction"])
+    if "is_filtered_fraction" in stat:
+        stats_tracker.scalar(is_filtered_fraction=stat["is_filtered_fraction"])
 
     if vocab_min_logits is not None and vocab_max_logits is not None:
         stats_tracker.stat(

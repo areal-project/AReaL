@@ -1696,6 +1696,19 @@ class PPOActorConfig(TrainEngineConfig):
             "Only effective when use_decoupled_loss=True."
         },
     )
+    importance_sampling: RejectionSamplingConfig | None = field(
+        default=None,
+        metadata={
+            "help": "Second rollout-correction stage supplying the "
+            "pi_proximal/pi_behave weight, while 'rejection_sampling' supplies "
+            "the mask. None leaves 'rejection_sampling' supplying both, which is "
+            "the single-stage behavior. Setting both gives the Geo-RS + Token-TIS "
+            "combination: 'rejection_sampling' rejects whole sequences whose "
+            "geometric-mean ratio leaves its band, 'importance_sampling' keeps "
+            "per-token weights on the sequences that survive. "
+            "Only effective when use_decoupled_loss=True."
+        },
+    )
     importance_sampling_level: str = field(
         default="token",
         metadata={
@@ -1811,10 +1824,29 @@ class PPOActorConfig(TrainEngineConfig):
                 "training supports only 'token-mean'."
             )
         # Warn if rejection_sampling is configured but use_decoupled_loss is False
-        if not self.use_decoupled_loss and self.rejection_sampling is not None:
+        if not self.use_decoupled_loss and (
+            self.rejection_sampling is not None or self.importance_sampling is not None
+        ):
             logger.warning(
-                "rejection_sampling is configured but use_decoupled_loss=False. "
+                "rollout correction is configured but use_decoupled_loss=False. "
                 "Filtering will be ignored. Set use_decoupled_loss=True to enable."
+            )
+        # The weight stage is only meaningful next to a mask stage: on its own it
+        # is indistinguishable from putting the same config in rejection_sampling.
+        if self.importance_sampling is not None and self.rejection_sampling is None:
+            raise ValueError(
+                "importance_sampling requires rejection_sampling to be set; "
+                "configure the single stage through rejection_sampling instead."
+            )
+        if (
+            self.importance_sampling is not None
+            and self.importance_sampling.action == "mask"
+            and self.rejection_sampling is not None
+        ):
+            logger.warning(
+                "importance_sampling.action='mask' masks tokens in the weight "
+                "stage; its verdict is intersected with rejection_sampling's. "
+                "Use action='clamp' for the usual Token-TIS weighting."
             )
         # Warn if decoupled loss is enabled but no rejection sampling configured.
         # The old default (behave_imp_weight_cap=5.0, mode=token_mask) enabled
