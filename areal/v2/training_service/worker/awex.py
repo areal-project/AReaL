@@ -48,8 +48,19 @@ def create_awex_blueprint(
 
     @bp.route("/report_weight_meta", methods=["POST"])
     def report_weight_meta():
+        data = flask_module.request.get_json(silent=True) or {}
+        infer_conf = data.get("infer_conf")
+
         def action():
             adapter = _require_adapter()
+            configure_converter = getattr(adapter, "configure_model_converter", None)
+            if configure_converter is not None:
+                if infer_conf is None:
+                    raise RuntimeError(
+                        "Inference converter context is required for this training "
+                        "adapter"
+                    )
+                configure_converter(infer_conf)
             return adapter.get_weight_metadata()
 
         return run_endpoint(

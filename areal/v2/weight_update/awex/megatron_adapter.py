@@ -10,13 +10,9 @@ from typing import TYPE_CHECKING
 import httpx
 import torch
 import torch.distributed as dist
-from awex.meta.weight_meta import (
-    ParameterMeta,
-    ParameterReplicaMeta,
-    ParameterShardMeta,
-)
-from awex.sharding.param_sharding import ShardingType
-from awex.sharding.rank_info import RankInfo
+from awex.meta.weight_meta import ParameterMeta
+from awex.models.registry import get_train_weights_converter
+from awex.sharding.param_sharding import get_rank_info_extractor
 from awex.transfer.nccl_comm import batch_send_recv, nccl_build_send_ops
 from awex.transfer.nccl_stream_batch import NcclColocateStreamBatchTransport
 from awex.transfer.transfer_plan import TransferPlan, TransferPlanBuilder, slice_tensor
@@ -50,19 +46,19 @@ if TYPE_CHECKING:
 logger = logging.getLogger("AwexMegatronAdapter")
 
 
+def _get_tf_config(models):
+    if not isinstance(models, (list, tuple)):
+        models = [models]
+    for model in models:
+        for attr in ("transformer_config", "config"):
+            config = getattr(model, attr, None)
+            if config is not None:
+                return config
+    return None
+
+
 class AwexMegatronAdapter(AwexTrainingAdapter):
-    """Awex training adapter for MegatronEngine supporting DP, TP, and PP.
-
-    PP: get_named_parameters already yields only the current stage's layers
-    (with globally-correct HF layer indices via get_transformer_layer_offset),
-    so each rank naturally reports and sends only its own subset of parameters.
-    The gateway's _merge_training_meta_by_name unions disjoint PP stage params
-    by name, so the full model is covered across all PP ranks.
-
-    TP: all_gather_param gathers the full tensor on every TP rank before
-    convert_to_hf. dp_replicated=True tells awex that TP ranks within a DP
-    group hold identical full tensors and only one needs to send.
-    """
+    """AWEX-native Megatron adapter supporting DP, TP, EP, PP, and VPP."""
 
     def __init__(self, engine: MegatronEngine):
         self._engine = engine
@@ -83,6 +79,9 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
         self._dte_config = DTERuntimeConfig.from_env()
         self._delta_tracker = None
         self._delta_detector = None
+        self._weight_converter = None
+        self._parameters_meta: list[ParameterMeta] | None = None
+        self._rank_info = None
 
     @property
     def parallelism_strategy(self) -> dict:
@@ -97,49 +96,59 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
             "dp_size": self._engine.data_parallel_world_size,
             "ep_size": mpu.get_expert_model_parallel_world_size(),
             "dp_replicated": tp_size > 1 or cp_size > 1,
+            "parameter_layout": "awex",
         }
 
+    def configure_model_converter(self, infer_conf: dict) -> None:
+        """Initialize AWEX metadata and converters collectively on train ranks."""
+        if self._weight_converter is not None:
+            return
+
+        from awex.meta.train_meta_resolver import McoreParamMetaResolver
+
+        class _EngineShim:
+            def __init__(self, engine: MegatronEngine):
+                self.model = engine.model
+                if not isinstance(self.model, (list, tuple)):
+                    self.model = [self.model]
+                self.hf_config = engine.hf_config
+                self.enable_debug_mode = False
+                self.enable_colocate_mode = False
+                self.engine_name = "mcore"
+                self.config = {}
+                self.meta_server_addr = ""
+
+            def release_memory_occupation(self, tags=None):
+                del tags
+
+            def resume_memory_occupation(self, tags=None):
+                del tags
+
+        resolver = McoreParamMetaResolver(
+            _EngineShim(self._engine), self._engine.hf_config, infer_conf
+        )
+        self._parameters_meta = resolver.get_parameters_meta()
+        self._rank_info = get_rank_info_extractor("mcore")()
+        self._weight_converter = get_train_weights_converter(
+            "mcore",
+            self._engine.hf_config.architectures[0],
+            self._engine.hf_config,
+            self._rank_info,
+            {
+                **infer_conf,
+                "train_pp_stage_layer_id_map": (resolver.get_pp_stage_layer_id_map()),
+            },
+            tf_config=_get_tf_config(self._engine.model),
+        )
+
     def get_weight_metadata(self) -> list[ParameterMeta]:
-        rank_info = self._build_rank_info()
-        metadata: list[ParameterMeta] = []
-
-        for hf_name, tensor in self._iter_hf_params():
-            shape = tuple(tensor.shape)
-            numel = int(tensor.numel())
-            shard_meta = ParameterShardMeta(
-                tp_rank=rank_info.tp_rank,
-                attn_tp_rank=rank_info.attn_tp_rank,
-                pp_rank=rank_info.pp_rank,
-                ep_rank=rank_info.ep_rank,
-                ep_tp_rank=rank_info.ep_tp_rank,
-                global_rank=rank_info.global_rank,
-                world_size=rank_info.world_size,
-                engine_rank=rank_info.engine_rank,
-                cp_rank=rank_info.cp_rank,
-                cp_size=rank_info.cp_size,
-                cp_mode=rank_info.cp_mode,
-                name=hf_name,
-                shape=shape,
-                numel=numel,
-                dtype=tensor.dtype,
-                global_offset=tuple([0] * len(shape)),
-                sharding_type=ShardingType.NO_SHARDING,
-                num_shards=1,
-                sharding_dim=0,
-            )
-            replica = ParameterReplicaMeta(shards=[shard_meta])
-            metadata.append(
-                ParameterMeta(
-                    name=hf_name,
-                    global_numel=numel,
-                    global_shape=shape,
-                    dtype=tensor.dtype,
-                    shards=[shard_meta],
-                    replicas=[replica],
-                )
-            )
-
-        return metadata
+        if self._parameters_meta is None:
+            raise RuntimeError("AWEX Megatron converter is not configured")
+        # The native resolver gathers every rank into one global metadata list.
+        # Publish it once so the gateway does not merge duplicate replicas.
+        if dist.get_rank() != 0:
+            return []
+        return self._parameters_meta
 
     def get_local_shard_parameters(
         self, required_names: list[str] | None = None
@@ -492,117 +501,59 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
             self._colocate_http_client.close()
             self._colocate_http_client = None
 
-    def _build_rank_info(self) -> RankInfo:
-        from megatron.core import parallel_state as mpu
-
-        tp_size = mpu.get_tensor_model_parallel_world_size()
-        tp_rank = mpu.get_tensor_model_parallel_rank()
-        pp_size = mpu.get_pipeline_model_parallel_world_size()
-        pp_rank = mpu.get_pipeline_model_parallel_rank()
-        ep_size = mpu.get_expert_model_parallel_world_size()
-        ep_rank = mpu.get_expert_model_parallel_rank()
-        etp_size = mpu.get_expert_tensor_parallel_world_size()
-        etp_rank = mpu.get_expert_tensor_parallel_rank()
-        cp_size = mpu.get_context_parallel_world_size()
-        cp_rank = mpu.get_context_parallel_rank()
-        local_rank = int(os.environ.get("LOCAL_RANK", self._engine.rank))
-
-        return RankInfo(
-            tp_rank=tp_rank,
-            tp_size=tp_size,
-            pp_rank=pp_rank,
-            pp_size=pp_size,
-            dp_size=self._engine.data_parallel_world_size,
-            dp_rank=self._engine.data_parallel_rank,
-            ep_rank=ep_rank,
-            ep_size=ep_size,
-            ep_tp_rank=etp_rank,
-            ep_tp_size=etp_size,
-            attn_tp_rank=tp_rank,
-            attn_tp_size=tp_size,
-            attn_dp_rank=self._engine.data_parallel_rank,
-            world_size=self._engine.world_size,
-            global_rank=self._engine.rank,
-            local_rank=local_rank,
-            engine_rank=0,
-            is_infer=False,
-            cp_rank=cp_rank,
-            cp_size=cp_size,
-            cp_mode="ring" if cp_size > 1 else "none",
-        )
-
     def _iter_hf_params(
         self,
         theta_by_id: dict[int, torch.Tensor] | None = None,
         consume_overrides: bool = False,
     ):
-        """Yield (hf_name, tensor) for every parameter on this rank.
+        """Yield canonical parameters through AWEX's model registry."""
+        from awex.converter.mcore_converter import get_mcore_model_parameters
 
-        Uses get_named_parameters + all_gather_param + convert_to_hf to produce
-        HF-style per-expert names (e.g. experts.0.gate_proj.weight). The SGLang
-        adapter's _unfuse_params converts SGLang's fused w13/w2 format to the
-        same per-expert names, so both sides match for the transfer plan.
-        """
-        from areal.engine.megatron_utils.megatron import (
-            all_gather_param,
-            convert_to_hf,
-            get_named_parameters,
-        )
+        if self._weight_converter is None or self._rank_info is None:
+            raise RuntimeError("AWEX Megatron converter is not configured")
 
-        num_moe_experts = getattr(self._engine.tf_config, "num_moe_experts", None)
-        model_name = self._engine.hf_config.model_type
-        tie_word_embeddings = getattr(
-            self._engine.hf_config, "tie_word_embeddings", False
-        )
         overrides = theta_by_id if theta_by_id is not None else {}
+        converted_names: set[str] = set()
+        embed_tensor: torch.Tensor | None = None
+        models = self._engine.model
+        if not isinstance(models, (list, tuple)):
+            models = [models]
 
-        for mcore_name, param in get_named_parameters(
-            self._engine.model, num_moe_experts
-        ):
-            src = overrides.get(id(param), param)
-            if src is not param:
-                for attr in (
-                    "tensor_model_parallel",
-                    "partition_dim",
-                    "partition_stride",
+        for vp_stage, model in enumerate(models):
+            for mcore_name, param in get_mcore_model_parameters(model).items():
+                source = overrides.get(id(param), param)
+                for hf_name, tensor in self._weight_converter.convert_param(
+                    mcore_name, source.detach(), vp_stage=vp_stage
                 ):
-                    if hasattr(param, attr):
-                        setattr(src, attr, getattr(param, attr))
-            gathered = all_gather_param(
-                mcore_name,
-                src,
-                fp8_direct_convert=False,
-                quantization_config=None,
-                duplicated_param_names=self._engine._duplicated_param_names,
-            )
-            if not isinstance(gathered, torch.Tensor):
-                gathered = gathered.data
+                    converted_names.add(hf_name)
+                    if hf_name == "model.embed_tokens.weight":
+                        embed_tensor = tensor
+                    yield hf_name, tensor.detach()
+                if consume_overrides:
+                    overrides.pop(id(param), None)
 
-            for hf_name, tensor in convert_to_hf(
-                self._engine.tf_config,
-                model_name,
-                mcore_name,
-                gathered,
-            ):
-                if tie_word_embeddings and hf_name == "lm_head.weight":
-                    continue
-                yield hf_name, tensor.detach()
-            if consume_overrides:
-                overrides.pop(id(param), None)
+        if (
+            getattr(self._engine.hf_config, "tie_word_embeddings", False)
+            and self._rank_info.pp_rank == self._rank_info.pp_size - 1
+            and "lm_head.weight" not in converted_names
+            and embed_tensor is not None
+        ):
+            yield "lm_head.weight", embed_tensor.detach()
 
     def _iter_model_params_for_delta(self):
         """Yield model tensors in the same order used by the HF converter."""
-        from areal.engine.megatron_utils.megatron import get_named_parameters
+        from awex.converter.mcore_converter import get_mcore_model_parameters
 
-        num_moe_experts = getattr(self._engine.tf_config, "num_moe_experts", None)
         seen: set[int] = set()
-        for _mcore_name, param in get_named_parameters(
-            self._engine.model, num_moe_experts
-        ):
-            if id(param) in seen:
-                continue
-            seen.add(id(param))
-            yield param
+        models = self._engine.model
+        if not isinstance(models, (list, tuple)):
+            models = [models]
+        for model in models:
+            for param in get_mcore_model_parameters(model).values():
+                if not isinstance(param, torch.nn.Parameter) or id(param) in seen:
+                    continue
+                seen.add(id(param))
+                yield param
 
     def _convert_hf_with_overrides(
         self, theta_by_id: dict[int, torch.Tensor]
