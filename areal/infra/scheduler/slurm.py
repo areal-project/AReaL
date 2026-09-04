@@ -2,6 +2,7 @@
 
 import asyncio
 import getpass
+import os
 import re
 import shlex
 import subprocess
@@ -947,6 +948,17 @@ class SlurmScheduler(Scheduler):
             final_cmd += f" {env_string}"
             final_cmd += f" {spec.image}"
             final_cmd += f" {cmd}"
+            # Stagger container creation across each node's tasks: concurrent
+            # singularity mounts on one node race for the kernel's loop devices
+            # and intermittently die with "failed to find loop device".
+            # AREAL_APPTAINER_STAGGER_SECONDS had been exported by launch
+            # scripts for a while but nothing consumed it. srun does not go
+            # through a shell, so wrap in bash -c for the sleep.
+            stagger = int(os.environ.get("AREAL_APPTAINER_STAGGER_SECONDS", "0"))
+            if stagger > 0:
+                final_cmd = "bash -c " + shlex.quote(
+                    f"sleep $((SLURM_LOCALID * {stagger})); exec {final_cmd}"
+                )
         else:  # native
             final_cmd = cmd
 
