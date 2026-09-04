@@ -404,3 +404,36 @@ class TestEngineWiring:
             assert getattr(tower, "_vision_dedup_patched", False) is True
         finally:
             engine.destroy()
+
+
+class TestComposesWithVisionSpShardDistributed:
+    """The stacking above runs at ``sp_size=1``, where ``dp_vision_forward`` is a
+    passthrough. This launches a real two-rank sequence-parallel group so the
+    shard/all-gather path actually executes underneath the dedup wrapper.
+
+    gloo/CPU: the composition is about which wrapper sees which tensors and how
+    counts flow through the all-gather, none of which is device-specific.
+    """
+
+    def test_dedup_over_sp_shard_two_ranks_matches_unpatched(self):
+        import os
+        import subprocess
+
+        from areal.utils.network import find_free_ports
+
+        env = dict(os.environ, CUDA_VISIBLE_DEVICES="")
+        result = subprocess.run(
+            [
+                "torchrun",
+                "--nproc_per_node=2",
+                "--nnodes=1",
+                "--master-addr=localhost",
+                f"--master_port={find_free_ports(1)[0]}",
+                "tests/torchrun/run_vision_dedup_sp_shard.py",
+            ],
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        if result.returncode != 0:
+            pytest.fail(result.stdout[-3000:] + result.stderr[-3000:])
