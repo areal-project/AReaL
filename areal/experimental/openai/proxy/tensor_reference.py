@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+import uuid
 from collections.abc import Awaitable, Callable
 from threading import Lock
 from typing import Any, Literal
@@ -26,6 +27,8 @@ class GroupTensorStore:
 
     def __init__(self) -> None:
         self._lock = Lock()
+        # A recreated store must not reuse references cached by group resolvers.
+        self._generation = uuid.uuid4().hex
         self._ref_by_tensor_id: dict[int, str] = {}
         self._tensor_by_ref: dict[str, torch.Tensor] = {}
 
@@ -79,7 +82,7 @@ class GroupTensorStore:
         with self._lock:
             ref_id = self._ref_by_tensor_id.get(tensor_id)
             if ref_id is None:
-                ref_id = f"tensor-{len(self._tensor_by_ref)}"
+                ref_id = f"{self._generation}:tensor-{len(self._tensor_by_ref)}"
                 self._ref_by_tensor_id[tensor_id] = ref_id
                 # Keep a strong reference so Python cannot reuse ``tensor_id``
                 # during the lifetime of this rollout group.

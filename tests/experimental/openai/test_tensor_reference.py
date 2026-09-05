@@ -179,3 +179,60 @@ def test_group_tensor_store_registry_discard_removes_references():
 
     with pytest.raises(KeyError, match="Unknown shared tensor group"):
         registry.fetch("train:task-1", [ref_id])
+
+
+@pytest.mark.asyncio
+async def test_staggered_exports_after_cleanup_resolve_new_store_tensors(monkeypatch):
+    """A recreated store must not collide with an earlier export's cached refs."""
+    now = 0.0
+    monkeypatch.setattr(
+        "areal.experimental.openai.proxy.tensor_reference.time.monotonic", lambda: now
+    )
+    registry = GroupTensorStoreRegistry()
+    resolver = SharedTensorResolver()
+    group_id = "train:staggered"
+    fetch_calls = []
+
+    async def fetch(ref_ids: list[str]) -> dict[str, torch.Tensor]:
+        fetch_calls.append(ref_ids)
+        return registry.fetch(group_id, ref_ids)
+
+    first = registry.get_or_create(group_id).encode_multimodal_tensors(
+        {"multi_modal_input": [{"pixel_values": torch.tensor([1])}]}
+    )
+    resolved_first = await resolver.resolve(first, group_id=group_id, fetch=fetch)
+
+    now = 61.0
+    registry.discard_stale(timeout_seconds=60)
+    with pytest.raises(KeyError, match="Unknown shared tensor group"):
+        registry.fetch(group_id, [])
+
+    later = registry.get_or_create(group_id).encode_multimodal_tensors(
+        {"multi_modal_input": [{"pixel_values": torch.tensor([99])}]}
+    )
+    first_ref = first["multi_modal_input"][0]["pixel_values"]["ref_id"]
+    later_ref = later["multi_modal_input"][0]["pixel_values"]["ref_id"]
+    assert later_ref != first_ref
+    with pytest.raises(KeyError, match="Unknown shared tensor references"):
+        registry.fetch(group_id, [first_ref])
+
+    resolved_later = await resolver.resolve(later, group_id=group_id, fetch=fetch)
+    resolved_again = await resolver.resolve(later, group_id=group_id, fetch=fetch)
+
+    assert fetch_calls == [[first_ref], [later_ref]]
+    torch.testing.assert_close(
+        resolved_first["multi_modal_input"][0]["pixel_values"],
+        torch.tensor([1]),
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        resolved_later["multi_modal_input"][0]["pixel_values"],
+        torch.tensor([99]),
+        rtol=0,
+        atol=0,
+    )
+    assert (
+        resolved_again["multi_modal_input"][0]["pixel_values"]
+        is resolved_later["multi_modal_input"][0]["pixel_values"]
+    )
