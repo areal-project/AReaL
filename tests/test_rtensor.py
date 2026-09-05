@@ -5,6 +5,7 @@ import subprocess
 import sys
 import time
 import uuid
+import weakref
 
 import aiohttp
 import orjson
@@ -738,7 +739,8 @@ class TestRTensorMemoryCleanup:
 class TestRemotize:
     """Test remotize method with various input types."""
 
-    def test_remotize_list_of_dicts(self, rpc_server):
+    @pytest.mark.parametrize("preserve_tensor_aliases", [False, True])
+    def test_remotize_list_of_dicts(self, rpc_server, preserve_tensor_aliases):
         """Test remotizing list of dicts with different attention masks."""
         # Create two trajectory dicts with different seqlens
         traj1 = {
@@ -754,7 +756,11 @@ class TestRemotize:
             "logits": torch.randn(3, 5).cpu(),
         }
 
-        result = RTensor.remotize([traj1, traj2], node_addr=rpc_server)
+        result = RTensor.remotize(
+            [traj1, traj2],
+            node_addr=rpc_server,
+            preserve_tensor_aliases=preserve_tensor_aliases,
+        )
 
         assert isinstance(result, list)
         assert len(result) == 2
@@ -767,6 +773,14 @@ class TestRemotize:
         # Verify size matches batch dimension
         assert result[0]["logits"].shape[0] == 2
         assert result[1]["logits"].shape[0] == 3
+
+        for original, remote, seqlen in zip(
+            [traj1, traj2], result, [3, 4], strict=True
+        ):
+            for key in original:
+                torch.testing.assert_close(
+                    remote[key].to_local(), original[key][:, :seqlen], rtol=0, atol=0
+                )
 
     def test_remotize_list_of_tensors(self, rpc_server):
         """Test remotizing list of standalone tensors."""
@@ -930,6 +944,60 @@ class TestRemotize:
 
 
 class TestRTensorAliasPreservation:
+    def test_remotize_nested_trajectories_retains_temporary_sources(self, monkeypatch):
+        """Compacted sources stay alive across siblings, only until remotize ends."""
+        from areal.utils import data as data_utils
+
+        backend = _RecordingRTensorBackend()
+        monkeypatch.setattr("areal.infra.rpc.rtensor.get_backend", lambda: backend)
+        split_and_unpad = data_utils.split_and_unpad_tensor
+        source_refs: list[weakref.ReferenceType[torch.Tensor]] = []
+        compaction_calls = 0
+
+        def track_compacted_sources(*args, **kwargs):
+            nonlocal compaction_calls
+            # Check lifetime directly, without relying on allocator-dependent
+            # ID reuse to expose an unrelated shard being returned.
+            assert all(ref() is not None for ref in source_refs)
+            compacted = split_and_unpad(*args, **kwargs)
+            source_refs.extend(weakref.ref(value) for value in compacted[0].values())
+            compaction_calls += 1
+            return compacted
+
+        monkeypatch.setattr(
+            data_utils, "split_and_unpad_tensor", track_compacted_sources
+        )
+        first = {
+            "attention_mask": torch.tensor([[1, 1, 0]]),
+            "input_ids": torch.tensor([[1, 2, 0]]),
+        }
+        second = {
+            "attention_mask": torch.tensor([[1, 1, 1, 0]]),
+            "input_ids": torch.tensor([[99, 98, 97, 0]]),
+        }
+
+        result = RTensor.remotize(
+            [first, {"nested": [second]}],
+            node_addr="node-a",
+            preserve_tensor_aliases=True,
+        )
+
+        assert compaction_calls == 2
+        assert len(source_refs) == 4
+        assert all(ref() is None for ref in source_refs)
+        assert len(backend.store_calls) == 4
+        for original, remote, seqlen in (
+            (first, result[0], 2),
+            (second, result[1]["nested"][0], 3),
+        ):
+            for key in original:
+                torch.testing.assert_close(
+                    backend.tensors[remote[key].shard.shard_id],
+                    original[key][:, :seqlen],
+                    rtol=0,
+                    atol=0,
+                )
+
     def test_remotize_shared_tensor_default_uses_distinct_shards(self, monkeypatch):
         """Alias preservation should remain opt-in for existing callers."""
         backend = _RecordingRTensorBackend()

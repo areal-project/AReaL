@@ -415,7 +415,7 @@ class RTensor:
     def _remotize_recursive(
         obj: Any,
         node_addr: str,
-        tensor_memo: dict[int, RTensor] | None,
+        tensor_memo: dict[int, tuple[torch.Tensor, RTensor]] | None,
     ) -> Any:
         if obj is None:
             return None
@@ -423,7 +423,7 @@ class RTensor:
         if isinstance(obj, torch.Tensor):
             tensor_id = id(obj)
             if tensor_memo is not None and tensor_id in tensor_memo:
-                return tensor_memo[tensor_id]
+                return tensor_memo[tensor_id][1]
 
             tensor = obj.detach().cpu()
             shard_id = get_backend().store(tensor)
@@ -433,7 +433,9 @@ class RTensor:
             )
             remote_tensor = RTensor(shard=shard, data=tensor.to("meta"))
             if tensor_memo is not None:
-                tensor_memo[tensor_id] = remote_tensor
+                # Compaction creates temporary tensor objects. Keep them alive
+                # until this root call ends so their Python IDs cannot be reused.
+                tensor_memo[tensor_id] = (obj, remote_tensor)
             return remote_tensor
 
         if isinstance(obj, dict):
