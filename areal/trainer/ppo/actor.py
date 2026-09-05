@@ -471,7 +471,15 @@ class PPOActor:
 
         # Pop keys that are no longer needed after advantage computation
         # Note: "versions" is kept if needed for approximation/metrics in loss function
-        for key in ["rewards", "tot_rewards", "kl_rewards", "is_truncated"]:
+        for key in [
+            "rewards",
+            "original_rewards",
+            "turn_rewards",
+            "step_rewards",
+            "tot_rewards",
+            "kl_rewards",
+            "is_truncated",
+        ]:
             data.pop(key, None)
         # Megatron keeps the full batch on CPU and streams only the current
         # microbatch to the accelerator. Stage before the outer PPO split so

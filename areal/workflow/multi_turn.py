@@ -16,6 +16,12 @@ from areal.utils.hf_utils import apply_chat_template
 logger = logging.getLogger("MultiTurnWorkflow")
 
 
+DEFAULT_MULTI_TURN_RETRY_PROMPT = (
+    "Your answer is either wrong or not parsable to the reward function. You may misunderstand the original question. "
+    "Please carefully read the original question, check the previous errors, and try to answer it again."
+)
+
+
 class MultiTurnWorkflow(RolloutWorkflow):
     """Multi-attempt workflow that retries generation until the reward is positive."""
 
@@ -26,6 +32,7 @@ class MultiTurnWorkflow(RolloutWorkflow):
         tokenizer: PreTrainedTokenizerFast,
         max_turns: int,
         turn_discount: float,
+        retry_prompt: str | None = None,
     ):
         if max_turns <= 0:
             raise ValueError("max_turns must be positive")
@@ -37,6 +44,7 @@ class MultiTurnWorkflow(RolloutWorkflow):
         self.tokenizer = tokenizer
         self.max_turns = max_turns
         self.turn_discount = turn_discount
+        self.retry_prompt = retry_prompt or DEFAULT_MULTI_TURN_RETRY_PROMPT
         self.async_reward_fn = AsyncRewardWrapper(reward_fn)
 
         # Create tokens that should be amended if the answer is incorrect.
@@ -46,8 +54,7 @@ class MultiTurnWorkflow(RolloutWorkflow):
         messages += [
             {
                 "role": "user",
-                "content": "Your answer is either wrong or not parsable to the reward function. You may misunderstand the original question. "
-                "Please carefully read the original question, check the previous errors, and try to answer it again.",
+                "content": self.retry_prompt,
             }
         ]
         s2 = apply_chat_template(
@@ -70,7 +77,9 @@ class MultiTurnWorkflow(RolloutWorkflow):
         # Run multi-turn rollout until correct
         t = 0
         reward = 0.0
+        raw_reward = 0.0
         discount = 1.0
+        turn_rewards_list: list[float] = []
         prompt_str = ""
         completions_str = ""
         is_truncated = False
@@ -96,6 +105,8 @@ class MultiTurnWorkflow(RolloutWorkflow):
                 resp.output_tokens,
                 **data,
             )
+            raw_reward = float(reward)
+            turn_rewards_list.append(float(raw_reward * discount))
             # Amend results
             input_len = len(resp.input_tokens) - len(seq)
             assert len(seq) == 0 or resp.input_tokens[:-input_len] == seq, (
@@ -122,12 +133,16 @@ class MultiTurnWorkflow(RolloutWorkflow):
                 input_ids += self.multi_turn_prompt_ids
                 discount *= self.turn_discount
 
-        reward = float(reward * discount)
+        discounted_reward = float(raw_reward * discount)
 
         # Log reward.
         stats_tracker.get(workflow_context.stat_scope()).scalar(
-            reward=reward, num_turns=t
+            reward=discounted_reward, num_turns=t
         )
+
+        step_rewards = [0.0] * len(seq)
+        if len(step_rewards) > 0 and discounted_reward != 0.0:
+            step_rewards[-1] = discounted_reward
 
         res = dict(
             input_ids=torch.tensor(seq, dtype=torch.int32),
@@ -135,7 +150,10 @@ class MultiTurnWorkflow(RolloutWorkflow):
             loss_mask=torch.tensor(loss_mask, dtype=torch.int32),
             versions=torch.tensor(versions, dtype=torch.int32),
             turn_ids=torch.tensor(turn_ids, dtype=torch.int32),
-            rewards=torch.tensor(reward, dtype=torch.float32),
+            rewards=torch.tensor(discounted_reward, dtype=torch.float32),
+            original_rewards=torch.tensor(raw_reward, dtype=torch.float32),
+            turn_rewards=torch.tensor(turn_rewards_list, dtype=torch.float32),
+            step_rewards=torch.tensor(step_rewards, dtype=torch.float32),
             attention_mask=torch.ones(len(seq), dtype=torch.bool),
             is_truncated=torch.tensor(is_truncated, dtype=torch.bool),
         )
