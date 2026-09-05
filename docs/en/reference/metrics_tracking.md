@@ -254,6 +254,7 @@ sends aggregated metrics to external logging backends. It is automatically manag
 | **Weights & Biases** | `config.stats_logger.wandb`       | Cloud-based experiment tracking |
 | **SwanLab**          | `config.stats_logger.swanlab`     | Alternative experiment tracking |
 | **TensorBoard**      | `config.stats_logger.tensorboard` | Local visualization             |
+| **Trackio**          | `config.stats_logger.trackio`     | Local-first metrics and traces  |
 
 ### Integration with PPOTrainer
 
@@ -288,10 +289,16 @@ def commit(self, epoch, step, global_step, data):
     # Log to all backends
     wandb.log(data, step=global_step)
     swanlab.log(data, step=global_step)
+    trackio.log(data, step=global_step)
     if self.summary_writer:
         for key, val in data.items():
             self.summary_writer.add_scalar(key, val, global_step)
 ```
+
+When Trackio is enabled, `PPOTrainer` also logs rollout and evaluation trajectories as
+`trackio.Trace` records. These traces decode each tensor trajectory into a user prompt
+and assistant completion, with metadata such as `global_step`, trajectory index, sample
+index, sequence length, prompt length, reward, and head/tail model versions.
 
 ### Configuration
 
@@ -314,6 +321,12 @@ stats_logger:
 
   tensorboard:
     path: "/path/to/tensorboard/logs"  # null to disable
+
+  trackio:
+    mode: "online"  # "online", "local", or "disabled"
+    project: "my-project"
+    name: "run_001"
+    max_rollout_traces_per_step: 32  # <=0 disables trace logging
 ```
 
 ## Best Practices
