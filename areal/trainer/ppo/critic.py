@@ -57,6 +57,9 @@ class PPOCritic:
 
         for key in [
             "rewards",
+            "original_rewards",
+            "turn_rewards",
+            "step_rewards",
             "tot_rewards",
             "kl_rewards",
             "versions",
