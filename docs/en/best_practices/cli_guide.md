@@ -1,7 +1,7 @@
 # AReaL CLI Guide
 
-The `areal` CLI ships three top-level subcommand groups, one per service in the AReaL
-2.0 microservice architecture:
+The `areal` CLI ships four top-level subcommand groups, one per service in the AReaL 2.0
+microservice architecture:
 
 - **`areal train`** — resolve an experiment driver and config, forward hydra overrides,
   and hand off to the training script.
@@ -9,6 +9,8 @@ The `areal` CLI ships three top-level subcommand groups, one per service in the 
   workers, data proxies).
 - **`areal agent`** — launch and manage a local agent service (gateway, router, N
   worker/data-proxy pairs).
+- **`areal weight-update`** — inspect a running weight-update service (gateway, pairs).
+  Read-only: the gateway is started by the training controller.
 
 `areal inf` and `areal agent` share the same lifecycle model — `run`, `ps`, `status`,
 `logs`, `stop` — with per-service state stored under `~/.areal/` (override with the
@@ -509,3 +511,86 @@ The current `areal agent` does **not** include:
   running `status` or checking logs.
 - Distributed scheduling — only local processes on the local machine; k8s / slurm and
   friends are out of scope for the current CLI.
+
+## Weight Update CLI (`areal weight-update`)
+
+`areal weight-update` inspects a running weight-update service. Unlike `areal inf` and
+`areal agent` it does not launch anything: in the v2 flow the gateway is started by
+`WeightUpdateController` on the training side, and this CLI is read-only.
+
+### Basic concepts
+
+A weight-update service has one component, the `gateway`, which holds the registry of
+`(train, inference)` pairs and drives transfers between them.
+
+The controller picks an ephemeral port when `WeightUpdateControllerConfig.port` is `0`,
+so it records where the gateway landed in
+`~/.areal/weight-update/services/<service>.json` (override the root with `AREAL_HOME`)
+and removes that file on teardown. `service_name` on the controller config names the
+file, so two jobs on one machine do not overwrite each other.
+
+### Inspecting a service
+
+```bash
+areal weight-update ps                    # services this machine knows about
+areal weight-update ps --all              # include ones whose gateway is gone
+areal weight-update status --service default
+areal weight-update pairs --service default
+```
+
+`ps` columns: `SERVICE / GATEWAY / LAUNCH / STATUS`. `pairs` columns:
+`NAME / MODE / TRAIN / INFER / VERSION / COLOCATE`.
+
+`status` exits non-zero when the gateway does not answer, so it works as a gate:
+
+```bash
+areal weight-update status --service default || echo "gateway is down"
+```
+
+Every verb takes `--json`:
+
+```bash
+areal weight-update pairs --service default --json | jq -r '.[].pair_name'
+```
+
+### Reaching a gateway started elsewhere
+
+`--gateway` skips the state file, for a gateway whose controller runs on another host:
+
+```bash
+areal weight-update pairs \
+  --gateway http://10.0.0.4:7080 \
+  --admin-api-key "$AREAL_ADMIN_KEY"
+```
+
+### Configuration file
+
+`areal weight-update` reads `~/.areal/weight-update/config.toml` as defaults; an extra
+file can be passed in:
+
+```bash
+areal weight-update --config ./my-wu.toml status
+```
+
+```toml
+[default]
+service = "default"
+gateway = "http://10.0.0.4:7080"
+admin_api_key = "areal-admin-key"
+```
+
+Precedence: \*\*CLI flag > TOML passed via `--config` >
+`~/.areal/weight-update/config.toml`
+
+> hardcoded defaults\*\*.
+
+### Not implemented yet
+
+The current `areal weight-update` does **not** include:
+
+- `run` / `stop` — the gateway's lifetime belongs to the training controller that starts
+  it, so the CLI would be tearing down a process it does not own.
+- `logs` — the controller lets the gateway inherit its stdout instead of redirecting it
+  to a file, so the output is in the training log rather than under `~/.areal/`.
+- Any write verb (connect, disconnect, trigger an update) — those change what a training
+  run is doing, and the gateway already exposes them over HTTP for the controller.

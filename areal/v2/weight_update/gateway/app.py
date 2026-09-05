@@ -6,6 +6,7 @@ import os
 import socket
 import time
 from contextlib import asynccontextmanager
+from dataclasses import asdict
 from typing import Any
 
 import aiohttp  # pyright: ignore[reportMissingImports]
@@ -191,6 +192,24 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
     @app.get("/health")
     async def health() -> HealthResponse:
         return HealthResponse()
+
+    @app.get("/pairs")
+    async def list_pairs(request: Request) -> dict:
+        """Read-only view of the pairs this gateway currently holds.
+
+        The registry already tracks them, but every other endpoint needs a
+        pair name to be useful, so an operator has no way to ask which
+        (train, inference) pairs are connected or what version they last
+        synced. Admin-keyed like the rest of the surface: the payload carries
+        worker URLs and the rendezvous address.
+        """
+        _auth(request)
+        pairs = [
+            asdict(info)
+            for info in (registry.get_by_name(n) for n in registry.list_pairs())
+            if info is not None
+        ]
+        return {"pairs": pairs}
 
     @app.post("/connect")
     async def connect(request: Request, body: ConnectRequest) -> ConnectResponse:

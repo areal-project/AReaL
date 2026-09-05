@@ -69,6 +69,10 @@ class WeightUpdateController:
         )
 
         self._gateway_url = f"http://{cfg.host}:{port}"
+        # Record where the gateway landed. cfg.port defaults to 0, so the port
+        # is chosen here and would otherwise be known only inside this process,
+        # leaving `areal weight-update` with no address to connect to.
+        self._write_discovery_state()
         self._session = httpx.Client()
         self._session.headers["Authorization"] = f"Bearer {cfg.admin_api_key}"
         self._wait_for_health()
@@ -92,6 +96,31 @@ class WeightUpdateController:
         raise TimeoutError(
             f"Gateway did not become healthy within {self.config.setup_timeout}s"
         )
+
+    def _write_discovery_state(self) -> None:
+        """Publish the gateway address for the operator CLI. Best effort."""
+        try:
+            from areal.v2.cli.weight_update.state import GatewayHandle, ServiceState
+
+            ServiceState(
+                service=self.config.service_name,
+                launch_mode="controller",
+                admin_api_key=self.config.admin_api_key,
+                gateway=GatewayHandle(
+                    url=self._gateway_url,
+                    pid=self._gateway_proc.pid if self._gateway_proc else 0,
+                ),
+            ).save()
+        except Exception:  # never fail a training run over a diagnostic file
+            logger.debug("Could not write weight-update discovery state", exc_info=True)
+
+    def _clear_discovery_state(self) -> None:
+        try:
+            from areal.v2.cli.weight_update.state import ServiceState
+
+            ServiceState.remove(self.config.service_name)
+        except Exception:
+            logger.debug("Could not clear weight-update discovery state", exc_info=True)
 
     def health_check(self) -> bool:
         try:
@@ -216,4 +245,5 @@ class WeightUpdateController:
                 logger.warning("Failed to kill gateway process", exc_info=True)
             self._gateway_proc = None
         self._gateway_url = ""
+        self._clear_discovery_state()
         logger.info("WeightUpdateController destroyed")

@@ -8,6 +8,9 @@ from dataclasses import dataclass
 @dataclass
 class WeightUpdateControllerConfig:
     host: str = "127.0.0.1"
+    # Names this controller's gateway in ~/.areal/weight-update/ so two
+    # jobs on one machine do not overwrite each other's discovery file.
+    service_name: str = "default"
     port: int = 0
     admin_api_key: str = "areal-admin-key"
     log_level: str = "warning"

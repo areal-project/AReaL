@@ -1,10 +1,11 @@
 # AReaL CLI 指南
 
-`areal` CLI 在 AReaL 2.0 微服务架构下提供三个顶层子命令组，每个对应一种服务：
+`areal` CLI 在 AReaL 2.0 微服务架构下提供四个顶层子命令组，每个对应一种服务：
 
 - **`areal train`** — 解析实验 driver 与配置文件，转发 hydra 覆盖参数，将控制权交给训练脚本。
 - **`areal inf`** — 启动并管理本机上的推理服务（gateway、router、model worker、data proxy）。
 - **`areal agent`** — 启动并管理本机上的 agent 服务（gateway、router、N 对 worker / data-proxy）。
+- **`areal weight-update`** — 查看正在运行的权重更新服务（gateway、配对）。只读：gateway 由训练 controller 拉起。
 
 `areal inf` 与 `areal agent` 共用同一套生命周期模型 —— `run`、`ps`、`status`、 `logs`、`stop`，每个服务的状态存放在
 `~/.areal/` 下（可通过 `AREAL_HOME` 环境变量覆盖）。`areal train` 有意保持无状态：它只是将 argv 传递给 Python
@@ -463,3 +464,76 @@ session_timeout = 1800
 - 会话级 CLI 操作（开启会话 / 设置奖励 / 导出轨迹）—— 这类操作与应用耦合很紧，由应用直接调用 gateway HTTP 处理。
 - 自动故障恢复 / 心跳监控 —— `status` 是按需查询，不会持续观察组件健康。worker 死掉后需要用户运行 `status` 或看日志才能发现。
 - 分布式调度 —— 只在本机启动本地进程；k8s / slurm 等超出当前 CLI 的范围。
+
+## 权重更新 CLI（`areal weight-update`）
+
+`areal weight-update` 用于查看正在运行的权重更新服务。与 `areal inf`、`areal agent` 不同，它不启动任何进程：在 v2 流程里
+gateway 由训练侧的 `WeightUpdateController` 拉起，本 CLI 是只读的。
+
+### 基础概念
+
+权重更新服务只有一个组件 `gateway`，它保存 `(train, inference)` 配对的注册表，并驱动两者之间的权重传输。
+
+当 `WeightUpdateControllerConfig.port` 为 `0` 时，controller 会选一个临时端口，因此它把 gateway 的地址写入
+`~/.areal/weight-update/services/<service>.json`（根目录可用 `AREAL_HOME` 覆盖），并在销毁时删除该文件。
+controller 配置里的 `service_name` 决定文件名，同一台机器上的两个作业因此不会互相覆盖。
+
+### 查看服务状态
+
+```bash
+areal weight-update ps                    # 本机已知的服务
+areal weight-update ps --all              # 包含 gateway 已经不在的服务
+areal weight-update status --service default
+areal weight-update pairs --service default
+```
+
+`ps` 的列：`SERVICE / GATEWAY / LAUNCH / STATUS`。 `pairs`
+的列：`NAME / MODE / TRAIN / INFER / VERSION / COLOCATE`。
+
+gateway 无响应时 `status` 以非零码退出，可以直接当作脚本里的判断条件：
+
+```bash
+areal weight-update status --service default || echo "gateway is down"
+```
+
+每个子命令都支持 `--json`：
+
+```bash
+areal weight-update pairs --service default --json | jq -r '.[].pair_name'
+```
+
+### 连接其他机器上的 gateway
+
+`--gateway` 跳过状态文件，用于 controller 跑在别的主机上的场景：
+
+```bash
+areal weight-update pairs \
+  --gateway http://10.0.0.4:7080 \
+  --admin-api-key "$AREAL_ADMIN_KEY"
+```
+
+### 配置文件
+
+`areal weight-update` 启动时读取 `~/.areal/weight-update/config.toml` 作为默认值，也可以额外传入配置文件：
+
+```bash
+areal weight-update --config ./my-wu.toml status
+```
+
+```toml
+[default]
+service = "default"
+gateway = "http://10.0.0.4:7080"
+admin_api_key = "areal-admin-key"
+```
+
+优先级：**命令行参数 > `--config` 传入的 TOML > `~/.areal/weight-update/config.toml` > 内置默认值**。
+
+### 尚未实现
+
+当前的 `areal weight-update` **不包含**：
+
+- `run` / `stop` —— gateway 的生命周期属于拉起它的训练 controller，CLI 去停一个不属于自己的进程并不合适。
+- `logs` —— controller 让 gateway 继承自己的 stdout，而不是重定向到文件，因此输出在训练日志里，不在 `~/.areal/` 下。
+- 任何写操作（connect、disconnect、触发一次更新）—— 这些会改变训练任务的行为，而且 gateway 已经通过 HTTP 把它们暴露给 controller
+  了。
