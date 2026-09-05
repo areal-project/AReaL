@@ -279,13 +279,24 @@ def normalize_group_rewards(
 
     for result, normalized_reward in zip(results, normalized_rewards):
         assert result is not None
-        for interaction in result.values():
+        last_id = next(reversed(result))
+        for cid, interaction in result.items():
             if interaction.reward is None:
                 continue
-            interaction.original_reward = interaction.reward
-            interaction.reward = normalized_reward
+            if interaction.original_reward is None:
+                interaction.original_reward = interaction.reward
+
+            # In multi-turn rollouts (len(result) > 1), only the terminal interaction
+            # that supplied the rollout outcome reward is normalized against the group.
+            # Intermediate interactions retain their distinct step-level rewards.
+            if cid == last_id or len(result) == 1:
+                interaction.reward = normalized_reward
+                if interaction._cache is not None:
+                    interaction._cache["rewards"] = torch.tensor(
+                        [float(normalized_reward)]
+                    )
+
             if interaction._cache is not None:
-                interaction._cache["rewards"] = torch.tensor([float(normalized_reward)])
                 interaction._cache["original_rewards"] = torch.tensor(
                     [float(interaction.original_reward)]
                 )
