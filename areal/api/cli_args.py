@@ -3,6 +3,7 @@
 import argparse
 import json
 import os
+import sys
 import warnings
 from dataclasses import MISSING as dataclass_missing
 from dataclasses import asdict, dataclass, field, fields
@@ -2008,7 +2009,7 @@ class PPOCriticConfig(TrainEngineConfig):
 
 def get_py_cmd(module: str, args: dict[str, Any]):
     # convert to flags
-    cmd = ["python3", "-m", module]
+    cmd = [sys.executable, "-m", module]
     for k, v in args.items():
         if v is None or v is False or v == "" or (isinstance(v, list) and not v):
             continue
