@@ -120,20 +120,29 @@ class GroupedRolloutWorkflow(RolloutWorkflow):
         ]
         try:
             indexed_results = await asyncio.gather(*group_tasks)
+        except BaseException:
+            # gather does not cancel siblings when a child fails or is cancelled.
+            for task in group_tasks:
+                if not task.done():
+                    task.cancel()
+            raise
         finally:
-            # gather propagates the first child error without waiting for the
-            # remaining children. Drain them before releasing group resources.
-            await asyncio.gather(*group_tasks, return_exceptions=True)
-            finalizer = getattr(self.workflow, "_afinalize_processor_cache_group", None)
-            if finalizer is not None:
-                try:
-                    await finalizer(group_context)
-                except Exception as exc:
-                    self.logger.warning(
-                        "Failed to finalize rollout group resources (%s: %s).",
-                        type(exc).__name__,
-                        exc,
-                    )
+            try:
+                # Drain cancellation handlers before releasing shared resources.
+                await asyncio.gather(*group_tasks, return_exceptions=True)
+            finally:
+                finalizer = getattr(
+                    self.workflow, "_afinalize_processor_cache_group", None
+                )
+                if finalizer is not None:
+                    try:
+                        await finalizer(group_context)
+                    except Exception as exc:
+                        self.logger.warning(
+                            "Failed to finalize rollout group resources (%s: %s).",
+                            type(exc).__name__,
+                            exc,
+                        )
         indexed_results.sort(key=lambda item: item[0])
         sample_indices = [sample_idx for sample_idx, _ in indexed_results]
         if sample_indices != list(range(self.group_size)):

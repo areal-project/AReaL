@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 import torch
 
 from areal.api import RolloutWorkflow
 from areal.experimental.openai import InteractionWithTokenLogpReward
-from areal.infra import dist_rollout
+from areal.infra import dist_rollout, workflow_context
 from areal.infra.dist_rollout import DistRolloutCoordinator
 from areal.infra.remote_inf_engine import GroupedRolloutWorkflow
 
@@ -150,3 +152,55 @@ def test_dist_rollout_coordinator_forwards_reward_group_flags(monkeypatch):
     assert rollout_engine.prepare_kwargs["drop_incomplete_group"] is True
     assert rollout_engine.rollout_kwargs["reward_normalization"] is True
     assert rollout_engine.rollout_kwargs["drop_incomplete_group"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["child_error", "child_cancel", "parent_cancel"])
+async def test_group_failure_cancels_siblings_before_finalizing(failure):
+    """Failed or cancelled groups must not wait forever on unfinished siblings."""
+    sibling_started = asyncio.Event()
+    sibling_cancelled = asyncio.Event()
+    never_set = asyncio.Event()
+    finalized = []
+    original_error = ValueError("candidate failed")
+
+    class FailingWorkflow(RolloutWorkflow):
+        async def arun_episode(self, engine, data):
+            if workflow_context.get().sample_idx == 0:
+                await sibling_started.wait()
+                if failure == "child_error":
+                    raise original_error
+                if failure == "child_cancel":
+                    raise asyncio.CancelledError()
+                await never_set.wait()
+            else:
+                sibling_started.set()
+                try:
+                    await never_set.wait()
+                except asyncio.CancelledError:
+                    # Include async teardown to verify it is drained as well.
+                    await asyncio.sleep(0)
+                    sibling_cancelled.set()
+                    raise
+
+        async def _afinalize_processor_cache_group(self, context):
+            finalized.append(sibling_cancelled.is_set())
+
+    workflow = GroupedRolloutWorkflow(FailingWorkflow(), group_size=2, logger=_Logger())
+    task = asyncio.create_task(workflow.arun_episode(engine=None, data={}))
+    try:
+        await asyncio.wait_for(sibling_started.wait(), timeout=1)
+        if failure == "parent_cancel":
+            task.cancel()
+        error_type = ValueError if failure == "child_error" else asyncio.CancelledError
+        with pytest.raises(error_type) as exc_info:
+            # Shield keeps the timeout from making the broken implementation
+            # pass by cancelling its otherwise indefinitely waiting siblings.
+            await asyncio.wait_for(asyncio.shield(task), timeout=1)
+        if failure == "child_error":
+            assert exc_info.value is original_error
+        assert sibling_cancelled.is_set()
+        assert finalized == [True]
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
