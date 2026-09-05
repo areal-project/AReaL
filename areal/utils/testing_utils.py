@@ -15,7 +15,6 @@ from huggingface_hub import snapshot_download
 from transformers import AutoConfig
 
 from areal.api import InferenceEngine, RolloutWorkflow
-from areal.experimental.models.archon import get_model_spec, is_supported_model
 from areal.experimental.openai.types import InteractionWithTokenLogpReward
 from areal.utils import logging
 from areal.utils.save_load import get_state_dict_from_repo_id_or_path
@@ -84,49 +83,85 @@ def get_dataset_path(local_path: str, hf_id: str) -> str:
         raise
 
 
-# Model paths for testing (keyed by HF model_type)
-# Dense models (fast to instantiate even on meta device)
-DENSE_MODEL_PATHS = {
-    "qwen2": get_model_path(
+class _LazyModelDict(dict):
+    """Dictionary that lazily resolves model paths upon access."""
+
+    def __init__(self, specs: dict[str, tuple[str, str]]):
+        super().__init__()
+        self._specs = specs
+
+    def __getitem__(self, key: str) -> str:
+        if key not in self:
+            if key in self._specs:
+                local_path, hf_id = self._specs[key]
+                self[key] = get_model_path(local_path, hf_id)
+            else:
+                raise KeyError(key)
+        return super().__getitem__(key)
+
+    def get(self, key: str, default: Any = None) -> Any:
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+    def __contains__(self, key: object) -> bool:
+        return key in self._specs or super().__contains__(key)
+
+    def items(self):
+        for k in self._specs:
+            yield k, self[k]
+
+    def values(self):
+        for k in self._specs:
+            yield self[k]
+
+    def keys(self):
+        return self._specs.keys()
+
+
+_DENSE_SPECS = {
+    "qwen2": (
         "/storage/openpsi/models/Qwen__Qwen2.5-0.5B-Instruct/",
         "Qwen/Qwen2.5-0.5B-Instruct",
     ),
-    "qwen3": get_model_path(
+    "qwen3": (
         "/storage/openpsi/models/Qwen__Qwen3-0.6B/",
         "Qwen/Qwen3-0.6B",
     ),
-    "qwen3_5": get_model_path(
+    "qwen3_5": (
         "/storage/openpsi/models/Qwen__Qwen3.5-0.8B/",
         "Qwen/Qwen3.5-0.8B",
     ),
-    "qwen2_5_vl": get_model_path(
+    "qwen2_5_vl": (
         "/storage/openpsi/models/Qwen__Qwen2.5-VL-3B-Instruct/",
         "Qwen/Qwen2.5-VL-3B-Instruct",
     ),
-    "qwen3_vl": get_model_path(
+    "qwen3_vl": (
         "/storage/openpsi/models/Qwen__Qwen3-VL-2B-Instruct/",
         "Qwen/Qwen3-VL-2B-Instruct",
     ),
 }
 
-# MoE models (slow to instantiate due to large number of experts)
-MOE_MODEL_PATHS = {
-    "qwen3_moe": get_model_path(
+_MOE_SPECS = {
+    "qwen3_moe": (
         "/storage/openpsi/models/Qwen__Qwen3-30B-A3B/",
         "Qwen/Qwen3-30B-A3B",
     ),
-    "qwen3_5_moe": get_model_path(
+    "qwen3_5_moe": (
         "/storage/openpsi/models/Qwen__Qwen3.5-35B-A3B",
         "Qwen/Qwen3.5-35B-A3B",
     ),
-    "qwen3_vl_moe": get_model_path(
+    "qwen3_vl_moe": (
         "/storage/openpsi/models/Qwen__Qwen3-VL-30B-A3B-Instruct/",
         "Qwen/Qwen3-VL-30B-A3B-Instruct",
     ),
 }
 
-# Combined for backward compatibility
-MODEL_PATHS = {**DENSE_MODEL_PATHS, **MOE_MODEL_PATHS}
+# Model paths for testing (keyed by HF model_type)
+DENSE_MODEL_PATHS = _LazyModelDict(_DENSE_SPECS)
+MOE_MODEL_PATHS = _LazyModelDict(_MOE_SPECS)
+MODEL_PATHS = _LazyModelDict({**_DENSE_SPECS, **_MOE_SPECS})
 
 
 def load_archon_model(
@@ -142,6 +177,7 @@ def load_archon_model(
     Returns:
         Tuple of (model, adapter) or (None, None) if skip_unsupported and model not supported.
     """
+    from areal.experimental.models.archon import get_model_spec, is_supported_model
     from areal.infra.platforms import current_platform
 
     config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
