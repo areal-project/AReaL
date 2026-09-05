@@ -205,6 +205,27 @@ HttpRequest(
 string representations of torch dtypes. Check whether `abort_all_requests` is still
 honored.
 
+AReaL's NEXTN compatibility bridge in
+`areal/v2/inference_service/sglang/mtp_weight_update_bridge.py` additionally depends on
+the following SGLang 0.5.10.post1 internals:
+
+- `Scheduler.tp_worker.model_runner` is the target `ModelRunner`.
+- Spec v1 exposes the NEXTN draft `ModelRunner` as `Scheduler.draft_worker.model_runner`
+  (`EAGLEWorker`).
+- Spec v2 exposes it as `Scheduler.draft_worker.draft_worker.draft_runner`
+  (`EAGLEWorkerV2` wrapping `EagleDraftWorker`).
+- `ModelRunner._model_update_group`, `ModelRunner.device`, and
+  `ModelRunner.update_weights_from_tensor(named_tensors, load_format)` retain their
+  current semantics.
+- `sglang.srt.weight_sync.tensor_bucket.FlattenedTensorBucket` accepts `named_tensors`,
+  exposes `get_flattened_tensor()`, and reconstructs regular `(name, tensor)` pairs with
+  `reconstruct_tensors()`.
+
+**Check:** Revalidate these private APIs before changing the SGLang pin. The bridge must
+receive every distributed bucket exactly once, then apply the same named tensor objects
+to draft and target runners. Keep the explicit version guard until this path has been
+revalidated end to end.
+
 ______________________________________________________________________
 
 ### 6. `POST /init_weights_update_group` — request payload

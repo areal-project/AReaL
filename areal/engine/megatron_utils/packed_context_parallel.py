@@ -382,6 +382,84 @@ def _build_thd_packed_seq_params(
     )
 
 
+def _prepare_mtp_forward_kwargs(
+    mtp_kwargs: dict[str, Any],
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    *,
+    cu_seqlens: torch.Tensor | None,
+    packed_num_tokens: int,
+    uses_padded_form: bool,
+    uses_model_packed_seq: bool,
+) -> dict[str, torch.Tensor]:
+    """Align packed MTP labels and masks with the model's execution layout."""
+    labels = mtp_kwargs.get("mtp_labels")
+    loss_mask = mtp_kwargs.get("mtp_loss_mask")
+    if labels is None or loss_mask is None:
+        raise ValueError("MTP training requires both mtp_labels and mtp_loss_mask.")
+    if labels.shape != loss_mask.shape:
+        raise ValueError(
+            "MTP labels and loss mask must have identical shapes, got "
+            f"{labels.shape} and {loss_mask.shape}."
+        )
+
+    if cu_seqlens is None:
+        if labels.numel() != input_ids.numel():
+            raise ValueError(
+                "MTP labels must contain one value per input token, got "
+                f"{labels.numel()} labels for {input_ids.numel()} tokens."
+            )
+        return {
+            "mtp_labels": labels.reshape(input_ids.shape).contiguous(),
+            "mtp_loss_mask": loss_mask.reshape(input_ids.shape).contiguous(),
+        }
+
+    if labels.ndim != 1:
+        raise ValueError(
+            "MTP labels and loss mask must enter packed sequence-layout conversion "
+            f"as 1-D tensors, got {labels.shape=} and {loss_mask.shape=}."
+        )
+
+    if uses_model_packed_seq:
+        raise NotImplementedError(
+            "MTP training with model-owned THD packing is not supported yet."
+        )
+
+    if labels.numel() != packed_num_tokens:
+        raise ValueError(
+            "MTP labels must match the packed sequence length, got "
+            f"{labels.numel()} labels for {packed_num_tokens} tokens."
+        )
+
+    if uses_padded_form:
+        if attention_mask is None:
+            raise ValueError("Padded MTP training requires a 2-D validity mask.")
+        padded_labels = torch.zeros_like(input_ids)
+        padded_loss_mask = torch.zeros(
+            input_ids.shape,
+            dtype=loss_mask.dtype,
+            device=loss_mask.device,
+        )
+        padded_labels[attention_mask] = labels
+        padded_loss_mask[attention_mask] = loss_mask
+        return {
+            "mtp_labels": padded_labels,
+            "mtp_loss_mask": padded_loss_mask,
+        }
+
+    # Packed context parallelism assigns each rank two zigzag chunks per
+    # sequence. Apply the exact same mapping used for input_ids so every local
+    # hidden state keeps its token-aligned MTP target and validity mask. MCore's
+    # roll_tensor subsequently uses cp_group and packed_seq_params to exchange
+    # future-token boundaries across CP ranks.
+    labels = split_packed_seqs_for_context_parallel(labels, cu_seqlens)
+    loss_mask = split_packed_seqs_for_context_parallel(loss_mask, cu_seqlens)
+    return {
+        "mtp_labels": labels.unsqueeze(0).contiguous(),
+        "mtp_loss_mask": loss_mask.unsqueeze(0).contiguous(),
+    }
+
+
 def packed_context_parallel_forward(
     model: torch.nn.Module,
     input_: dict[str, Any],
@@ -393,6 +471,7 @@ def packed_context_parallel_forward(
     return_hidden_states: bool = False,
 ):
     input_ids = input_["input_ids"]
+    packed_num_tokens = input_ids.numel()
     position_ids = input_.get("position_ids", None)
     cu_seqlens = input_.get("cu_seqlens", None)
     # `attention_mask`: dense torch.Tensor (flex attention with Megatron) or None.
@@ -487,12 +566,30 @@ def packed_context_parallel_forward(
     if dense_mask_text_forward:
         position_ids = None
 
+    # MTP training: convert the independent label and mask channels to the
+    # exact layout used by this forward. MCore rolls both once per MTP layer;
+    # keeping them aligned prevents cross-sequence targets and masks padding
+    # or unavailable future-token positions.
+    extra_forward_kwargs: dict[str, Any] = {}
+    mtp_kwargs = input_.get("mtp_kwargs", None)
+    if mtp_kwargs is not None:
+        extra_forward_kwargs["mtp_kwargs"] = _prepare_mtp_forward_kwargs(
+            mtp_kwargs,
+            input_ids,
+            attention_mask,
+            cu_seqlens=cu_seqlens,
+            packed_num_tokens=packed_num_tokens,
+            uses_padded_form=needs_padded_form,
+            uses_model_packed_seq=use_model_packed_seq,
+        )
+
     try:
         model_kwargs = {
             "input_ids": input_ids,
             "attention_mask": final_attention_mask,
             "position_ids": position_ids,
             "packed_seq_params": packed_seq_params,
+            **extra_forward_kwargs,
             **vlm_kwargs,
         }
         if fp32_output is not None:

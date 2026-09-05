@@ -694,7 +694,27 @@ class MegatronEngine(TrainEngine):
         model_config.finalize_model_grads_func = finalize_model_grads
         self._mark_duplicated_params()
         self._create_optimizer(ft_spec)
+        self._set_optimizer_grad_scale_func()
         self._initialized = True
+
+    def _set_optimizer_grad_scale_func(self) -> None:
+        """Use one optimizer loss scale for the main and auxiliary losses.
+
+        MCore seeds MTP and MoE auxiliary-loss gradients separately from the
+        main backward graph. Wiring the optimizer hook here ensures FP16
+        unscaling does not shrink those auxiliary gradients by the loss scale.
+        """
+        if self.optimizer is None:
+            return
+
+        grad_scale_func = self.optimizer.scale_loss
+        configured: set[int] = set()
+        for model_chunk in self.model:
+            model_config = get_model_config(model_chunk)
+            if id(model_config) in configured:
+                continue
+            model_config.grad_scale_func = grad_scale_func
+            configured.add(id(model_config))
 
     def _build_glu_fc1_names(self) -> set[str]:
         """Detect which `linear_fc1` parameters belong to GLU MLPs.
@@ -1252,6 +1272,38 @@ class MegatronEngine(TrainEngine):
                     "BSHD is supported only for text-only models such as Qwen3.5"
                 )
 
+            # MTP training: feed the MTP head independent label and mask
+            # channels so the main forward keeps labels=None and returns
+            # logits. packed_context_parallel_forward converts both tensors to
+            # the model's actual THD or BSHD layout before forwarding them.
+            # This is intentionally enabled by the training config rather than
+            # gated by the model family: Qwen3.5 is registered as vision-capable
+            # but its text-only and multimodal batches use the same padded MTP
+            # label path. The token loss mask excludes prompt/image tokens;
+            # synchronized rolling additionally removes unavailable future-token
+            # targets at sequence and padding boundaries. For packed CP, the
+            # forward wrapper applies the same zigzag split to these channels as
+            # input_ids before MCore performs its CP-aware target rolling.
+            if not forward_only and self.mcore_config.enable_mtp_training:
+                mtp_loss_mask = mb_input.padded_mb.get("loss_mask")
+                if mtp_loss_mask is None:
+                    raise ValueError(
+                        "MTP training requires a token-aligned loss_mask so prompt, "
+                        "multimodal, padding, and sequence-boundary positions are "
+                        "not used as MTP supervision."
+                    )
+                mtp_labels = mb_input.padded_mb["input_ids"]
+                if mtp_loss_mask.shape != mtp_labels.shape:
+                    raise ValueError(
+                        "MTP training requires loss_mask to match input_ids before "
+                        f"layout conversion, got {mtp_loss_mask.shape} and "
+                        f"{mtp_labels.shape}."
+                    )
+                mb_input.padded_mb["mtp_kwargs"] = {
+                    "mtp_labels": mtp_labels,
+                    "mtp_loss_mask": mtp_loss_mask,
+                }
+
             output = packed_context_parallel_forward(
                 model,
                 mb_input.padded_mb,
@@ -1335,6 +1387,9 @@ class MegatronEngine(TrainEngine):
                             old_cu_seqlens=mb_input.old_cu_seqlens,
                         ),
                     )
+
+            # Release MTP label channel after forward pass
+            mb_input.padded_mb.pop("mtp_kwargs", None)
 
             # Release tree attention metadata after forward pass
             for key in tree_attn_keys:
@@ -1436,12 +1491,10 @@ class MegatronEngine(TrainEngine):
         # `megatron.core.pipeline_parallel.schedules._forward_step_helper`. Our
         # per-microbatch loss is already globally normalized via `w_i / W_total`, so
         # that extra division would shrink every gradient (and thus grad_norm and the
-        # effective optimizer step) by `num_microbatches`.
-        loss_multiplier = (
-            mpu.get_data_parallel_world_size()
-            * self.optimizer.get_loss_scale().item()
-            * len(mb_list)
-        )
+        # effective optimizer step) by `num_microbatches`. MCore applies the dynamic
+        # FP16 loss scale through `model_config.grad_scale_func` to both the main loss
+        # and auxiliary losses such as MTP and MoE.
+        loss_multiplier = mpu.get_data_parallel_world_size() * len(mb_list)
 
         def process_output(
             output: torch.Tensor, inputs: dict[str, Any]
@@ -1464,7 +1517,40 @@ class MegatronEngine(TrainEngine):
         # Step 4: Optimizer step
         stats = self.optimizer_step()
         stats["num_micro_batches"] = len(mb_list.mbs)
+
+        # Step 5: Surface the auxiliary MTP loss for logging (if enabled).
+        mtp_loss = self._collect_mtp_loss(len(mb_list.mbs))
+        if mtp_loss is not None:
+            stats["mtp_loss"] = mtp_loss
         return stats
+
+    def _collect_mtp_loss(self, num_microbatches: int) -> float | None:
+        """Reduce and return the per-microbatch Multi-Token-Prediction loss.
+
+        Megatron-Core's ``process_mtp_loss`` accumulates the (detached) per-layer
+        MTP loss across micro-batches into ``MTPLossLoggingHelper.tracker`` and
+        records the reduce/avg groups. The tracker only holds ``values`` on the
+        last pipeline stage (where the MTP loss is computed); other stages skip
+        the reduction. The reduce step's collectives stay matched because the
+        avg_group (data-parallel + context-parallel) is contained within a single
+        pipeline stage. Returns ``None`` on ranks without an MTP loss value.
+        """
+        if not self.mcore_config.enable_mtp_training:
+            return None
+
+        from megatron.core.transformer.multi_token_prediction import (
+            MTPLossLoggingHelper,
+        )
+
+        tracker = MTPLossLoggingHelper.tracker
+        if "values" not in tracker:
+            return None
+
+        MTPLossLoggingHelper.reduce_loss_in_tracker()
+        # `values` is summed over micro-batches; normalize to a per-microbatch loss.
+        mtp_loss = tracker["values"].sum().item() / max(num_microbatches, 1)
+        MTPLossLoggingHelper.clean_loss_in_tracker()
+        return mtp_loss
 
     @torch.no_grad()
     def eval_batch(
