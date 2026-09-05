@@ -12,13 +12,69 @@ GSM8K。在继续之前，请确保已完成[安装和环境设置](installation
 - 配置文件 YAML：
   [examples/math/gsm8k_grpo.yaml](https://github.com/areal-project/AReaL/blob/main/examples/math/gsm8k_grpo.yaml)
 
-我们的训练脚本会自动下载数据集（openai/gsm8k）和模型（Qwen/Qwen2-1.5B-Instruct）。要使用默认配置运行示例，请从仓库目录执行：
+我们的训练脚本会自动下载数据集（openai/gsm8k）和模型（Qwen/Qwen2.5-1.5B-Instruct）。要使用默认配置运行示例，请从仓库目录执行：
 
 ```
 python3 examples/math/gsm8k_rl.py --config examples/math/gsm8k_grpo.yaml scheduler.type=local experiment_name=<您的实验名称> trial_name=<您的试验名称>
 ```
 
 > **注意**：如需在多节点上运行分布式实验，请参阅[使用 Ray 或 Slurm 的分布式实验](#distributed-experiments-with-ray-or-slurm)。
+
+### 单 GPU 快速验证
+
+AReaL 可以在同一张 GPU 上运行单 rank 的 SGLang rollout 和单 rank 的 FSDP 训练。下面的命令使用 Qwen3-0.6B，并在两个训练
+step 后停止，适合在 32 GB 显存的工作站上验证环境。这是快速验证配置，不是针对吞吐量优化的训练配置。
+
+```bash
+python3 examples/math/gsm8k_rl.py \
+    --config examples/math/gsm8k_grpo.yaml \
+    scheduler.type=local \
+    experiment_name=gsm8k-grpo-single-gpu \
+    trial_name=smoke \
+    actor.path=Qwen/Qwen3-0.6B \
+    actor.backend=fsdp:d1 \
+    +actor.attn_impl=sdpa \
+    rollout.backend=sglang:d1 \
+    +rollout.setup_timeout=900 \
+    actor.weight_update_mode=disk \
+    enable_offload=false \
+    +total_train_steps=2 \
+    rollout.max_concurrent_rollouts=2 \
+    +reward_max_workers=1 \
+    gconfig.n_samples=2 \
+    gconfig.max_new_tokens=64 \
+    gconfig.max_tokens=512 \
+    actor.mb_spec.max_tokens_per_mb=512 \
+    actor.optimizer.type=adam_bf16 \
+    +actor.optimizer_dtype=bfloat16 \
+    train_dataset.batch_size=2 \
+    train_dataset.num_workers=0 \
+    train_dataset.pin_memory=false \
+    +train_dataset.scheduling_spec=null \
+    valid_dataset=null \
+    sglang.context_length=1024 \
+    sglang.mem_fraction_static=0.2 \
+    +sglang.max_prefill_tokens=1024 \
+    +sglang.attention_backend=torch_native \
+    +sglang.sampling_backend=pytorch \
+    cluster.n_nodes=1 \
+    cluster.n_gpus_per_node=1
+```
+
+关键配置如下：
+
+- `actor.backend=fsdp:d1` 和 `rollout.backend=sglang:d1` 会在唯一配置的 GPU 上分别启动单 rank
+  的训练与推理服务。
+- `valid_dataset=null` 在这次训练快速验证中跳过独立的评估 rollout。
+- `reward_max_workers=1` 将奖励计算限制为一个工作进程，降低工作站的系统内存占用。
+- `actor.weight_update_mode=disk` 通过磁盘传递更新后的权重，避免在同一张 GPU 上建立 NCCL 通信组。
+- BF16 优化器以及较小的 batch、序列长度和 SGLang 内存配置可使快速验证控制在 32 GB 显存以内。
+- `rollout.setup_timeout=900` 为新机器上 SGLang 的冷启动预留了足够时间。
+- PyTorch attention 和 sampling 后端优先保证快速验证的兼容性，而非吞吐量。
+- 当运行接近显存上限时，优先降低 `sglang.mem_fraction_static` 和 `actor.mb_spec.max_tokens_per_mb`。
+
+该快速验证成功后，再增加 `total_train_steps`、序列长度、batch size 和模型规模。更多显存调优方法请参阅
+{doc}`../best_practices/handling_oom`。
 
 ## 修改配置
 

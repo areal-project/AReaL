@@ -15,8 +15,8 @@ To run the experiment, you will need:
   [examples/math/gsm8k_grpo.yaml](https://github.com/areal-project/AReaL/blob/main/examples/math/gsm8k_grpo.yaml)
 
 Our training scripts will automatically download the dataset (openai/gsm8k) and model
-(Qwen/Qwen2-1.5B-Instruct). To run the example with default configuration, execute from
-the repository directory:
+(Qwen/Qwen2.5-1.5B-Instruct). To run the example with default configuration, execute
+from the repository directory:
 
 ```
 python3 examples/math/gsm8k_rl.py --config examples/math/gsm8k_grpo.yaml scheduler.type=local experiment_name=<your experiment name> trial_name=<your trial name>
@@ -24,6 +24,72 @@ python3 examples/math/gsm8k_rl.py --config examples/math/gsm8k_grpo.yaml schedul
 
 > **Note**: For distributed experiments across multiple nodes, see
 > [Distributed Experiments with Ray or Slurm](#distributed-experiments-with-ray-or-slurm).
+
+### Single-GPU smoke run
+
+AReaL can run one-rank SGLang rollout and one-rank FSDP training on the same GPU. The
+command below uses Qwen3-0.6B and stops after two training steps, making it suitable for
+validating a 32 GB workstation before starting a longer experiment. It is a smoke-test
+configuration, not a throughput-optimized training recipe.
+
+```bash
+python3 examples/math/gsm8k_rl.py \
+    --config examples/math/gsm8k_grpo.yaml \
+    scheduler.type=local \
+    experiment_name=gsm8k-grpo-single-gpu \
+    trial_name=smoke \
+    actor.path=Qwen/Qwen3-0.6B \
+    actor.backend=fsdp:d1 \
+    +actor.attn_impl=sdpa \
+    rollout.backend=sglang:d1 \
+    +rollout.setup_timeout=900 \
+    actor.weight_update_mode=disk \
+    enable_offload=false \
+    +total_train_steps=2 \
+    rollout.max_concurrent_rollouts=2 \
+    +reward_max_workers=1 \
+    gconfig.n_samples=2 \
+    gconfig.max_new_tokens=64 \
+    gconfig.max_tokens=512 \
+    actor.mb_spec.max_tokens_per_mb=512 \
+    actor.optimizer.type=adam_bf16 \
+    +actor.optimizer_dtype=bfloat16 \
+    train_dataset.batch_size=2 \
+    train_dataset.num_workers=0 \
+    train_dataset.pin_memory=false \
+    +train_dataset.scheduling_spec=null \
+    valid_dataset=null \
+    sglang.context_length=1024 \
+    sglang.mem_fraction_static=0.2 \
+    +sglang.max_prefill_tokens=1024 \
+    +sglang.attention_backend=torch_native \
+    +sglang.sampling_backend=pytorch \
+    cluster.n_nodes=1 \
+    cluster.n_gpus_per_node=1
+```
+
+The important settings are:
+
+- `actor.backend=fsdp:d1` and `rollout.backend=sglang:d1` start one rank of each service
+  on the only configured GPU.
+- `valid_dataset=null` skips the separate evaluation rollout in this training smoke
+  test.
+- `reward_max_workers=1` limits reward computation to one worker process, reducing host
+  memory use on a workstation.
+- `actor.weight_update_mode=disk` transfers updated weights without creating a same-GPU
+  NCCL group.
+- The BF16 optimizer and reduced batch, sequence, and SGLang memory settings keep the
+  smoke run within a 32 GB GPU budget.
+- `rollout.setup_timeout=900` leaves enough time for a cold SGLang startup on a new
+  machine.
+- The PyTorch attention and sampling backends favor compatibility over throughput for
+  the smoke run.
+- `sglang.mem_fraction_static` and `actor.mb_spec.max_tokens_per_mb` are the first
+  settings to reduce if the run is close to the GPU memory limit.
+
+Increase `total_train_steps`, sequence lengths, batch size, and model size only after
+this smoke run succeeds. See {doc}`../best_practices/handling_oom` for additional memory
+tuning guidance.
 
 ## Modifying configuration
 

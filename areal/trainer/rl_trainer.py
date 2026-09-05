@@ -360,11 +360,9 @@ class PPOTrainer:
             config.rollout, is_eval=False, lora_path=initial_lora_path
         )
 
-        self.eval_rollout = None
-        if not self._online_mode:
-            self.eval_rollout = self._init_rollout(
-                config.rollout, is_eval=True, lora_path=initial_lora_path
-            )
+        self.eval_rollout = self._maybe_init_eval_rollout(
+            config.rollout, lora_path=initial_lora_path
+        )
         if (
             self.config.teacher is not None
             and self.config.teacher.engine_type == "rollout"
@@ -1291,6 +1289,20 @@ class PPOTrainer:
             init_kwargs["role"] = "eval-rollout"
         controller.initialize(**init_kwargs)
         return controller
+
+    def _maybe_init_eval_rollout(
+        self,
+        rollout_config: InferenceEngineConfig,
+        lora_path: str | None = None,
+    ) -> InferenceEngine | RolloutController | None:
+        """Initialize an eval engine only when validation can actually run."""
+        if self._online_mode or self.valid_dataloader is None:
+            return None
+        return self._init_rollout(
+            rollout_config,
+            is_eval=True,
+            lora_path=lora_path,
+        )
 
     def _init_teacher_rollout(
         self, rollout_config: InferenceEngineConfig
