@@ -197,7 +197,11 @@ def check_trajectory_format(
                     f"The first dim of tensor `{key}` is {value.shape[0]}, "
                     f"rather than the batch size of input_ids ({inferred_batch_size})."
                 )
-            if value.ndim >= 2 and value.shape[1] != max_seqlen:
+            if (
+                key != "turn_rewards"
+                and value.ndim >= 2
+                and value.shape[1] != max_seqlen
+            ):
                 logger.warning(
                     f"The second dim of tensor `{key}` is {value.shape[1]}, "
                     f"rather than the max seqlen of input_ids ({max_seqlen})."
