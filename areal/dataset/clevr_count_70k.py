@@ -9,6 +9,7 @@ import torch.distributed as dist
 from datasets import load_dataset
 from PIL.Image import Image as ImageObject
 
+from areal.dataset.tokenization import get_multimodal_sft_loss_mask
 from areal.utils import logging
 
 logger = logging.getLogger("CLEVR70KDataset")
@@ -113,11 +114,12 @@ def get_clevr_count_70k_sft_dataset(
             if "image_grid_thw" in processed_input:
                 multi_modal_input["image_grid_thw"] = processed_input["image_grid_thw"]
             example["multi_modal_input"] = [multi_modal_input]
-            answer_token = tokenizer.encode(example["answer"])
-            loss_mask = [0] * (len(example["input_ids"]) - len(answer_token)) + [
-                1
-            ] * len(answer_token)
-            example["loss_mask"] = loss_mask
+            example["loss_mask"] = get_multimodal_sft_loss_mask(
+                input_ids=example["input_ids"],
+                prompt=example["problem"],
+                sequence=example["seq"],
+                tokenizer=tokenizer,
+            )
             return example
 
         dataset = dataset.map(
