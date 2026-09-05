@@ -64,6 +64,7 @@ from areal.utils.network import (
     split_hostport,
 )
 from areal.utils.offload import get_tms_env_vars
+from areal.utils.wandb_system_metrics import prepare_wandb_run_identity
 
 logger = logging.getLogger("RayScheduler")
 
@@ -600,6 +601,8 @@ class RayScheduler(Scheduler):
         exp_config: BaseExperimentConfig | None = None,
     ):
         initialize_ray()
+
+        prepare_wandb_run_identity(exp_config)
 
         # Get n_gpus_per_node from parameter or config
         self._n_gpus_per_node = n_gpus_per_node

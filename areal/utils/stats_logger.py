@@ -12,12 +12,25 @@ import wandb
 from tensorboardX import SummaryWriter
 
 from areal.api import FinetuneSpec
-from areal.api.cli_args import BaseExperimentConfig, StatsLoggerConfig
+from areal.api.cli_args import BaseExperimentConfig, StatsLoggerConfig, WandBConfig
 from areal.utils import logging
 from areal.utils.printing import tabulate_stats
 from areal.version import version_info
 
 logger = logging.getLogger("StatsLogger", "system")
+
+
+def resolve_wandb_id_suffix(config: WandBConfig) -> str | None:
+    """Resolve ``id_suffix``, expanding the ``"timestamp"`` alias."""
+    if config.id_suffix == "timestamp":
+        return time.strftime("%Y_%m_%d_%H_%M_%S")
+    return config.id_suffix
+
+
+def resolve_wandb_run_id(config: StatsLoggerConfig) -> str:
+    """Build the W&B run id ``{experiment}_{trial}_{suffix}``."""
+    suffix = resolve_wandb_id_suffix(config.wandb)
+    return f"{config.experiment_name}_{config.trial_name}_{suffix}"
 
 
 class StatsLogger:
@@ -48,10 +61,6 @@ class StatsLogger:
         if self.config.wandb.mode != "disabled":
             wandb.login()
 
-        suffix = self.config.wandb.id_suffix
-        if suffix == "timestamp":
-            suffix = time.strftime("%Y_%m_%d_%H_%M_%S")
-
         exp_config_dict = asdict(self.exp_config)
         exp_config_dict["version_info"] = {
             "commit_id": version_info.commit,
@@ -59,6 +68,14 @@ class StatsLogger:
             "is_dirty": version_info.is_dirty,
             "version": version_info.full_version_with_dirty_description,
         }
+
+        settings = None
+        if self.config.wandb.system_metrics.enabled:
+            settings = wandb.Settings(
+                mode="shared",
+                x_primary=True,
+                x_label="controller",
+            )
 
         wandb.init(
             mode=self.config.wandb.mode,
@@ -73,8 +90,9 @@ class StatsLogger:
             config=exp_config_dict,  # save all experiment config to wandb
             dir=self.get_log_path(self.config),
             force=True,
-            id=f"{self.config.experiment_name}_{self.config.trial_name}_{suffix}",
+            id=resolve_wandb_run_id(self.config),
             resume="allow",
+            settings=settings,
         )
 
         swanlab_config = self.config.swanlab

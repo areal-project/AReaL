@@ -26,6 +26,9 @@ from areal.infra.rpc.guard.app import (
 from areal.infra.rpc.guard.data_blueprint import data_bp
 from areal.infra.rpc.guard.engine_blueprint import engine_bp, register_engine_hooks
 from areal.utils import logging, perf_tracer
+from areal.utils.wandb_system_metrics import (
+    register_worker_wandb_system_metrics_hooks,
+)
 
 logger = logging.getLogger("SyncRPCServer")
 
@@ -54,6 +57,7 @@ def main():
     app.register_blueprint(data_bp)
     app.register_blueprint(engine_bp)
     register_engine_hooks(state)
+    register_worker_wandb_system_metrics_hooks(state)
 
     state.register_cleanup_hook(lambda: perf_tracer.save(force=True))
 
