@@ -506,6 +506,7 @@ class PPOActor:
                         sapo_tau_neg=self.config.sapo_tau_neg,
                         use_cispo_loss=self.config.use_cispo_loss,
                         use_decoupled_loss=self.config.use_decoupled_loss,
+                        entropy_coeff=self.config.entropy_coeff,
                     ),
                     loss_weight_fn=lambda x: x["loss_mask"].count_nonzero(),
                 )
@@ -619,6 +620,7 @@ def grpo_loss_fn(
     vocab_max_logits: torch.Tensor | None = None,
     vocab_mean_logits: torch.Tensor | None = None,
     vocab_norm_logits: torch.Tensor | None = None,
+    entropy_coeff: float = 0.0,
 ):
     """Loss function for actor step, all inputs should be splitted into
     pipeline micro batches, returns loss and logging stats."""
@@ -627,7 +629,8 @@ def grpo_loss_fn(
     loss_mask = input_data["loss_mask"].bool()
     prox_logp_gt = input_data.get("prox_logp")  # Could be None if skipped
 
-    entropy = entropy.detach()
+    if entropy_coeff == 0.0:
+        entropy = entropy.detach()
 
     if ProxLogpMethod(prox_logp_method) == ProxLogpMethod.REUSE_TRAIN_LOGP:
         prox_logp_gt = logprobs.detach()
@@ -732,6 +735,12 @@ def grpo_loss_fn(
 
             rkl_stat = rkl_penalty_per_token
 
+    entropy_stat = None
+    if entropy_coeff > 0.0:
+        entropy_loss = -(entropy * loss_mask).sum() / loss_mask.sum().clamp(min=1)
+        loss = loss + entropy_coeff * entropy_loss
+        entropy_stat = -entropy.detach() * loss_mask
+
     # Log training statistics
     stats_tracker.denominator(
         n_tokens=infer_token_denominator(input_data, loss_mask),
@@ -746,13 +755,19 @@ def grpo_loss_fn(
             denominator="n_valid_tokens",
         )
 
+    if entropy_stat is not None:
+        stats_tracker.stat(
+            entropy_loss=entropy_stat,
+            denominator="n_valid_tokens",
+        )
+
     logp_diff = (old_logp - logprobs.detach()) * loss_mask
     stats_tracker.stat(
         importance_weight=stat["importance_weight"],
         approx_kl=stat["approx_kl"],
         new_logp=logprobs.detach(),
         old_logp=old_logp,
-        entropy=entropy.float(),
+        entropy=entropy.detach().float(),
         actor_loss=stat["loss"],
         clip_ratio=stat["clip_mask"].float(),
         dual_clip_ratio=stat["dual_clip_mask"].float(),
