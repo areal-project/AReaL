@@ -18,6 +18,7 @@ import enum
 import importlib
 import importlib.util
 import io
+import math
 import os
 import subprocess
 import tempfile
@@ -622,7 +623,11 @@ def serialize_value(value: Any) -> Any:
             "value": value.value,
         }
 
-    # Primitives (int, float, str, bool) pass through unchanged
+    # JSON encoders may turn non-finite configuration sentinels into null.
+    if isinstance(value, float) and not math.isfinite(value):
+        return {"type": "nonfinite_float", "value": str(value)}
+
+    # Primitives (int, finite float, str, bool) pass through unchanged
     return value
 
 
@@ -655,6 +660,14 @@ def deserialize_value(value: Any) -> Any:
 
     # Handle dict - check if it's a SerializedDataclass or SerializedTensor
     if isinstance(value, dict):
+        if value.get("type") == "nonfinite_float":
+            if set(value) != {"type", "value"} or value.get("value") not in (
+                "inf",
+                "-inf",
+                "nan",
+            ):
+                raise ValueError("Invalid nonfinite_float RPC payload")
+            return float(value["value"])
         # Check for SerializedDataclass marker (check before tensor)
         if value.get("type") == "dataclass":
             try:
