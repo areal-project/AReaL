@@ -42,6 +42,34 @@ ConfigT = TypeVar("ConfigT")
 
 
 @dataclass
+class PluginConfig:
+    """Explicit, worker-local plugin construction; modules must be importable on all workers."""
+
+    target: str = field(metadata={"help": "Dotted import path to a plugin class."})
+    kwargs: dict[str, Any] = field(
+        default_factory=dict, metadata={"help": "Plugin constructor keyword arguments."}
+    )
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.target, str)
+            or not self.target
+            or "." not in self.target
+            or self.target != self.target.strip()
+        ):
+            raise ValueError("Plugin target must be a dotted import path")
+
+    def build(self, interface: type[ConfigT]) -> ConfigT:
+        """Instantiate locally instead of serializing plugin instances through RPC."""
+        from areal.utils.dynamic_import import import_from_string
+
+        instance = import_from_string(self.target)(**self.kwargs)
+        if not isinstance(instance, interface):
+            raise TypeError(f"{self.target} must implement {interface.__name__}")
+        return instance
+
+
+@dataclass
 class NormConfig:
     """Configuration for reward/advantage normalization."""
 
@@ -166,6 +194,12 @@ class MicroBatchSpec:
 class GenerationHyperparameters:
     """Controls text generation behavior for rollout."""
 
+    request_plugin: PluginConfig | None = field(
+        default=None,
+        kw_only=True,
+        metadata={"help": "Optional GenerationRequestPlugin for SGLang requests."},
+    )
+
     n_samples: int = field(
         default=1, metadata={"help": "Number of sequences to generate per prompt."}
     )
@@ -271,6 +305,8 @@ class GenerationHyperparameters:
     def new(self, **kwargs):
         args = asdict(self)
         args.update(kwargs)
+        if isinstance(args.get("request_plugin"), dict):
+            args["request_plugin"] = PluginConfig(**args["request_plugin"])
         return GenerationHyperparameters(**args)
 
     def new_with_stop_and_pad_token_ids(self, tokenizer: "PreTrainedTokenizerFast"):
@@ -304,6 +340,7 @@ class GenerationHyperparameters:
         )
 
     _OPENAI_UNSUPPORTED_ARGS: ClassVar[set[str]] = {
+        "request_plugin",  # Native backend request extension
         "min_new_tokens",  # Not supported by OpenAI
         "greedy",  # Not directly supported by OpenAI
         "top_k",  # Not supported by OpenAI
@@ -910,6 +947,14 @@ class MegatronEngineConfig:
     # Distributed Training Configuration
     wrap_with_ddp: bool = True
     use_torch_fsdp2: bool = False  # TODO: pending test
+    policy_distribution: PluginConfig | None = field(
+        default=None,
+        kw_only=True,
+        metadata={
+            "help": "Optional PolicyDistribution plugin. Requires CP=1 and full logits."
+        },
+    )
+
     use_custom_fsdp: bool = False  # TODO: pending test
     ddp: DistributedDataParallelConfig = field(
         default_factory=DistributedDataParallelConfig
@@ -1709,6 +1754,14 @@ class RejectionSamplingConfig:
 class PPOActorConfig(TrainEngineConfig):
     """Configuration for PPO actor model, a subclass of a TrainEngine."""
 
+    objective_plugin: PluginConfig | None = field(
+        default=None,
+        kw_only=True,
+        metadata={
+            "help": "Optional PPOObjective plugin for advantages and loss reduction."
+        },
+    )
+
     # Core PPO/GRPO Parameters
     ppo_n_minibatches: int = field(
         default=4,
@@ -2192,6 +2245,11 @@ class SGLangConfig:
     https://github.com/sgl-project/sglang for detailed documentation.
     """
 
+    enable_custom_logit_processor: bool = field(
+        default=False,
+        kw_only=True,
+        metadata={"help": "Enable SGLang custom logit processors."},
+    )
     model_path: str = ""
     random_seed: int = 1
     skip_tokenizer_init: bool = False
