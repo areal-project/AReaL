@@ -276,9 +276,9 @@ class AwexSchedulerPlugin:
 
     def _require_receiver(self):
         if self._receiver is None:
-            from areal.engine.awex.colocate_reader import AwexColocateReader
+            from areal.engine.awex.sglang_adapter import AwexSGLangAdapter
 
-            self._receiver = AwexColocateReader(self._scheduler)
+            self._receiver = AwexSGLangAdapter(self._scheduler)
         return self._receiver
 
     def _patch_memory_transitions(self) -> None:
@@ -365,7 +365,7 @@ class AwexSchedulerPlugin:
 
         We act as the awex *driver* layer for the queued colocate update. The
         collect-IPC + StreamBatch transport + writer handshake is delegated to the
-        awex-native worker reader (``AwexColocateReader.update_weights`` ->
+        awex-native worker reader (``AwexSGLangAdapter.update_weights`` ->
         ``NCCLWorkerWeightsReader``). We only own the driver-equivalent steps
         around it:
           1. Wait for all_training_offloaded_weights (= driver _pre_update_weights)
@@ -852,7 +852,7 @@ class AwexSchedulerPlugin:
                 # per-version trigger: the writer only publishes v+1's key in the
                 # next training cycle, so the background thread cannot fire early
                 # off a stale unversioned set and dead-lock the main loop. See
-                # AwexColocateReader.wait_for_weights_ready for the full rationale.
+                # AwexSGLangAdapter.wait_for_weights_ready for the full rationale.
                 logger.info(
                     f"[AWEX] background worker: waiting for writer weights v{version}",
                 )
@@ -934,7 +934,7 @@ class AwexSchedulerPlugin:
         )
         # The driver publishes awex_train_info only after rollout init finishes,
         # so large models need the same timeout budget as the weight path.
-        from areal.engine.awex.colocate_writer import awex_colocate_timeout_s
+        from areal.engine.awex.utils import awex_colocate_timeout_s
 
         train_info = client.get_object(
             "awex_train_info",
