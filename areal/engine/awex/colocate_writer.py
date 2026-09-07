@@ -548,11 +548,9 @@ class AwexWeightPublisher:
         # after peer mappings are closed, so they bypass CudaIPCSentDataLimbo.
         allocated_before = torch.cuda.memory_allocated()
         reserved_before = torch.cuda.memory_reserved()
-        pending_ipc_export = self._pending_ipc_export
-        if pending_ipc_export is None:
+        if self._pending_ipc_export is None:
             raise RuntimeError("CUDA IPC export disappeared before final completion")
         self._pending_ipc_export = None
-        del pending_ipc_export
         torch.cuda.synchronize()
         gc.collect()
         torch.cuda.synchronize()

@@ -216,7 +216,7 @@ class MegatronWeightResidency:
 
     def _offload_optimizer_states(self) -> None:
         optimizer = self._engine.optimizer
-        plan = build_optimizer_residency_plan(optimizer, logger=logger)
+        plan = build_optimizer_residency_plan(optimizer)
         if self._ordinary_optimizer_restores:
             raise RuntimeError("stale ordinary optimizer state before AWEX release")
         ordinary_restores: dict[int, list[tuple[torch.Tensor, torch.device]]] = {}
@@ -252,10 +252,9 @@ class MegatronWeightResidency:
     ) -> list[tuple[torch.Tensor, torch.device]]:
         """Mirror AWEX's original ordinary Megatron optimizer migration."""
         restores: list[tuple[torch.Tensor, torch.device]] = []
-        seen: set[int] = set()
 
         def move_tensor(tensor: torch.Tensor, description: str) -> None:
-            if id(tensor) in seen or not tensor.data.is_cuda:
+            if not tensor.data.is_cuda:
                 return
             if type(tensor) is not torch.Tensor:
                 raise TypeError(
@@ -263,7 +262,6 @@ class MegatronWeightResidency:
                     f"Tensor values, got {type(tensor).__module__}."
                     f"{type(tensor).__qualname__} for {description}"
                 )
-            seen.add(id(tensor))
             device = tensor.device
             tensor.data = tensor.data.to("cpu", non_blocking=True)
             restores.append((tensor, device))
@@ -304,11 +302,6 @@ class MegatronWeightResidency:
         except ImportError:
             return
         cache = te_base._dummy_wgrads
-        if not isinstance(cache, dict):
-            raise TypeError(
-                "Transformer Engine 2.14.1 _dummy_wgrads must be a dict or "
-                f"dict subclass, got {type(cache).__module__}.{type(cache).__qualname__}"
-            )
         count = len(cache)
         cache.clear()
         if count:

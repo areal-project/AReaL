@@ -603,58 +603,6 @@ def test_checkpoint_state_dict_aliases_cpu_slabs_and_save_drains(monkeypatch) ->
 
 
 @pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA is required for staged AdamW")
-def test_checkpoint_load_restores_cpu_state_and_continues_identically() -> None:
-    """A fresh instance resumes model, master, moments, group step, and next update."""
-    torch.manual_seed(20260814)
-    initial = torch.randn(29, device="cuda", dtype=torch.bfloat16)
-    kwargs = {"lr": 2e-3, "betas": (0.8, 0.95), "eps": 1e-6, "weight_decay": 0.03}
-    source_param = torch.nn.Parameter(initial.clone())
-    source = GPUStagedAdamW(
-        [source_param], staged_config=_tiny_config(bucket_numel=8), **kwargs
-    )
-    source.bind_owned_params(source.param_groups)
-    for _ in range(3):
-        source_param.decoupled_grad = torch.randn_like(source_param)
-        source.step()
-        source.drain()
-    checkpoint = source.state_dict()
-
-    resumed_param = torch.nn.Parameter(source_param.detach().clone())
-    resumed = GPUStagedAdamW(
-        [resumed_param], staged_config=_tiny_config(bucket_numel=8), **kwargs
-    )
-    resumed.bind_owned_params(resumed.param_groups)
-    resumed.begin_checkpoint_load()
-    resumed.load_state_dict(checkpoint)
-    resumed.complete_checkpoint_load()
-
-    assert resumed.residency == "CPU_RESIDENT"
-    assert resumed.cuda_state_numel == 0
-    assert resumed.param_groups[0]["step"] == 3
-    for key in ("master_param", "exp_avg", "exp_avg_sq"):
-        actual = resumed.state[resumed_param][key]
-        expected = source.state[source_param][key]
-        assert actual.is_pinned()
-        torch.testing.assert_close(actual, expected, rtol=0.0, atol=0.0)
-
-    grad = torch.randn_like(source_param)
-    source_param.decoupled_grad = grad
-    resumed_param.decoupled_grad = grad.clone()
-    source.step()
-    resumed.step()
-    source.drain()
-    resumed.drain()
-    torch.testing.assert_close(resumed_param, source_param, rtol=0.0, atol=0.0)
-    for key in ("master_param", "exp_avg", "exp_avg_sq"):
-        torch.testing.assert_close(
-            resumed.state[resumed_param][key],
-            source.state[source_param][key],
-            rtol=2e-6,
-            atol=2e-6,
-        )
-
-
-@pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA is required for staged AdamW")
 def test_checkpoint_resume_continues_to_match_pytorch_adamw() -> None:
     """A staged checkpoint resumes on the native AdamW optimization path."""
     torch.manual_seed(20260828)

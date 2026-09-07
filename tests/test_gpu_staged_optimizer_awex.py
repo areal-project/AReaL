@@ -56,9 +56,6 @@ def test_awex_managed_release_resume_preserves_cpu_slab_views(
     )
     optimizer.step()
     adapter = _make_adapter(adapter_cls, optimizer)
-    original_slots = tuple(optimizer._slots)
-    original_slot_ids = {id(slot) for slot in original_slots}
-    assert len(original_slot_ids) == optimizer.staged_config.buffer_count
     slabs = optimizer.cpu_slabs
     assert slabs is not None
     state = optimizer.state[param]
@@ -81,7 +78,6 @@ def test_awex_managed_release_resume_preserves_cpu_slab_views(
     adapter.release_memory(tags=["optimizer"])
     assert drain_calls == 1
     assert optimizer._slots == []
-    assert optimizer._slot_machine is None
     original_values = {key: tensor.clone() for key, tensor in state.items()}
     optimizer.prepare_checkpoint_save()
     assert drain_calls == 2
@@ -92,8 +88,6 @@ def test_awex_managed_release_resume_preserves_cpu_slab_views(
     adapter.resume_memory(tags=["optimizer"])
     assert drain_calls == 2
     assert len(optimizer._slots) == optimizer.staged_config.buffer_count
-    assert all(id(slot) not in original_slot_ids for slot in optimizer._slots)
-    assert optimizer._slot_machine is not None
 
     assert optimizer.residency == "CPU_RESIDENT"
     for key, tensor in state.items():

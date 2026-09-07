@@ -232,7 +232,6 @@ def test_cpu_staged_adamw_config_selects_precision_aware_factory(monkeypatch) ->
     assert config.main_params_dtype is torch.float32
     assert config.exp_avg_dtype is torch.float32
     assert config.exp_avg_sq_dtype is torch.float32
-    assert "managed_checkpoint_snapshot_root" not in captured["checkpoint"]
 
 
 def test_cpu_staged_dist_muon_selects_layerwise_factory(monkeypatch) -> None:

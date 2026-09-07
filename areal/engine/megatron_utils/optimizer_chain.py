@@ -8,13 +8,9 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from inspect import getattr_static
-from typing import Any, Protocol
+from typing import Any
 
 _MISSING = object()
-
-
-class _WarningLogger(Protocol):
-    def warning(self, message: str, *args: Any) -> Any: ...
 
 
 def _getattr_descriptor_once(optimizer: Any, attribute: str) -> Any:
@@ -42,49 +38,20 @@ def _chain_children(optimizer: Any) -> tuple[Any, ...] | None:
         ) from exc
 
 
-def iter_megatron_optimizer_leaves(
-    optimizer: Any | None,
-    *,
-    logger: _WarningLogger | None = None,
-) -> Iterator[Any]:
+def iter_megatron_optimizer_leaves(optimizer: Any | None) -> Iterator[Any]:
     """Yield unique lifecycle leaves in stable depth-first order."""
-    if optimizer is None:
-        return
-
-    active_chains: set[int] = set()
-    expanded_chains: set[int] = set()
-    yielded_leaves: set[int] = set()
-    stack: list[tuple[bool, Any]] = [(False, optimizer)]
+    seen: set[int] = set()
+    stack = [optimizer]
     while stack:
-        exiting, node = stack.pop()
-        node_id = id(node)
-        if exiting:
-            active_chains.remove(node_id)
-            expanded_chains.add(node_id)
+        node = stack.pop()
+        if node is None or id(node) in seen:
             continue
-        if node is None:
-            continue
-
+        seen.add(id(node))
         children = _chain_children(node)
         if children is None:
-            if node_id not in yielded_leaves:
-                yielded_leaves.add(node_id)
-                yield node
-            continue
-        if node_id in active_chains:
-            node_type = type(node).__name__
-            if logger is not None:
-                logger.warning(
-                    "Detected optimizer chain cycle at %s; skipping repeated node",
-                    node_type,
-                )
-            continue
-        if node_id in expanded_chains:
-            continue
-
-        active_chains.add(node_id)
-        stack.append((True, node))
-        stack.extend((False, child) for child in reversed(children))
+            yield node
+        else:
+            stack.extend(reversed(children))
 
 
 def get_managed_base_optimizer(optimizer: Any) -> Any | None:
@@ -119,12 +86,10 @@ class OptimizerResidencyPlan:
 
 def build_optimizer_residency_plan(
     optimizer: Any | None,
-    *,
-    logger: _WarningLogger | None = None,
 ) -> OptimizerResidencyPlan:
     """Classify leaves as managed staged state or ordinary GPU state."""
     entries: list[OptimizerResidencyEntry] = []
-    for leaf in iter_megatron_optimizer_leaves(optimizer, logger=logger):
+    for leaf in iter_megatron_optimizer_leaves(optimizer):
         base_optimizer = getattr(leaf, "optimizer", leaf)
         entries.append(
             OptimizerResidencyEntry(
@@ -145,9 +110,7 @@ def checkpoint_awex_residency(
     with_optimizer: bool,
 ) -> Iterator[None]:
     """Temporarily restore model weights required by one checkpoint operation."""
-    released_tags = getattr(adapter, "_released_tags", None)
-    if not isinstance(released_tags, set):
-        raise TypeError("AWEX checkpoint residency requires a released-tag set")
+    released_tags = adapter._released_tags
     plan = build_optimizer_residency_plan(optimizer)
     leased_tags: list[str] = []
     if with_model and "weights" in released_tags:

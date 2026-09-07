@@ -11,7 +11,6 @@ from types import SimpleNamespace
 
 import torch
 import torch.distributed as dist
-from emerging_optimizers.utils import fp32_matmul_precision
 from megatron.core.optimizer.muon import TensorParallelMuon
 
 from areal.engine.megatron_utils.gpu_staged_muon import (
@@ -120,9 +119,6 @@ def _run_case(
             buffer_count=1,
             slot_size_mb=staged_param.numel() * 4 / (1024 * 1024),
         ),
-        orthogonalize=baseline.orthogonalize,
-        matmul_precision=lambda: fp32_matmul_precision(baseline.fp32_matmul_prec),
-        nesterov=baseline.nesterov,
         weight_decay_method=baseline.weight_decay_method,
         native_optimizer=baseline,
     )

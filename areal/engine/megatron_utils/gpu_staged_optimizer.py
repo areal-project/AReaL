@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import importlib.metadata
 import math
-from collections.abc import Callable, Iterable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -314,10 +314,6 @@ class GPUStagedAdamW(torch.optim.AdamW):
     @property
     def _slot_machine(self) -> SlotStateMachine | None:
         return self._runtime.slot_machine
-
-    @property
-    def checkpoint_lifecycle(self) -> str:
-        return "FAILED" if self._runtime.checkpoint_load_error is not None else "IDLE"
 
     @property
     def units(self) -> tuple[_UpdateUnit, ...]:
@@ -904,14 +900,10 @@ def _check_megatron_compatibility() -> None:
         )
 
 
-def _iter_megatron_optimizers(optimizer: Any) -> Iterator[Any]:
-    yield from iter_megatron_optimizer_leaves(optimizer)
-
-
 def bind_gpu_staged_adamw(optimizer: Any) -> int:
     """Bind all managed inner optimizers after MCore has established DP shards."""
     bound = 0
-    for megatron_optimizer in _iter_megatron_optimizers(optimizer):
+    for megatron_optimizer in iter_megatron_optimizer_leaves(optimizer):
         inner = getattr(megatron_optimizer, "optimizer", None)
         if not getattr(inner, "manages_cpu_residency", False):
             continue
@@ -940,7 +932,7 @@ def _replace_metadata_optimizers_with_staged_adamw(
 ) -> int:
     """Replace only already-built DP optimizer instances, never MCore globals."""
     replaced = 0
-    for megatron_optimizer in _iter_megatron_optimizers(optimizer):
+    for megatron_optimizer in iter_megatron_optimizer_leaves(optimizer):
         inner = getattr(megatron_optimizer, "optimizer", None)
         if inner is None or getattr(megatron_optimizer, "is_stub_optimizer", False):
             continue

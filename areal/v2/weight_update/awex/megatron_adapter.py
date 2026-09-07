@@ -79,7 +79,6 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
         self._separation_delta_transport: NcclColocateStreamBatchTransport | None = None
         self._separation_wire_dtypes: tuple[torch.dtype, ...] | None = None
         self._transfer_rank: int | None = None
-        self._offloaded_weights: dict[str, torch.Tensor] = {}
         self._released_tags: set[str] = set()
         self._optimizer_residency_plan: OptimizerResidencyPlan | None = None
         self._ordinary_optimizer_restores: dict[
@@ -809,7 +808,7 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
 
     def _offload_optimizer_states(self) -> None:
         """Release managed buffers or migrate ordinary optimizer state to CPU."""
-        plan = build_optimizer_residency_plan(self._engine.optimizer, logger=logger)
+        plan = build_optimizer_residency_plan(self._engine.optimizer)
         if self._ordinary_optimizer_restores:
             raise RuntimeError("stale ordinary optimizer state before AWEX release")
         ordinary_restores: dict[

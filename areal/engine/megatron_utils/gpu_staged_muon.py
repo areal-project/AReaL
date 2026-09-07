@@ -16,12 +16,10 @@ from __future__ import annotations
 import copy
 import hashlib
 import importlib.metadata
-import inspect
 import itertools
 import json
 import math
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from typing import Any
 
@@ -40,9 +38,6 @@ from areal.engine.megatron_utils.staged_optimizer_runtime import (
 
 _SUPPORTED_MEGATRON_CORE_VERSION = "0.17.0"
 _SUPPORTED_EMERGING_OPTIMIZERS_VERSION = "0.3.0"
-_MCORE017_LAYERWISE_ALLGATHER_SOURCE_SHA256 = (
-    "8a8f3d3d914a38665deba909917cf30e92a69d60d08bd0af0a5d7eaed7e3c846"
-)
 _EMPTY_MUON_LEAF = object()
 _MUON_CHECKPOINT_SCHEMA_VERSION = 2
 _MUON_CHECKPOINT_PREFIX = "optimizer.gpu_staged_muon.v2"
@@ -387,26 +382,20 @@ class GPUStagedMuon(torch.optim.Optimizer):
         params: Iterable[torch.Tensor] | Iterable[dict[str, Any]],
         *,
         staged_config: GPUStagedMuonConfig,
-        orthogonalize: Callable[..., torch.Tensor],
-        matmul_precision: Callable[[], AbstractContextManager[Any]],
-        nesterov: bool,
         weight_decay_method: str,
-        native_optimizer: torch.optim.Optimizer | None = None,
+        native_optimizer: torch.optim.Optimizer,
     ) -> None:
         if weight_decay_method != "decoupled":
             raise ValueError("staged Muon MVP requires decoupled weight decay")
         super().__init__(params, defaults={})
         self.staged_config = staged_config
-        self._orthogonalize = orthogonalize
-        self._matmul_precision = matmul_precision
-        self._nesterov = nesterov
         self._native_template = native_optimizer
         self._native_unit_optimizers: dict[int, torch.optim.Optimizer] = {}
         self.cpu_slabs: MuonCPUSlabs | None = None
         self._units: tuple[MuonOwnedUnit, ...] = ()
         self._runtime = StagedOptimizerRuntime(
             self.staged_config.buffer_count,
-            ("master", "momentum", "grad", "workspace"),
+            ("master", "momentum", "grad"),
         )
         self._tp_groups: dict[str, Any] | None = None
         self._bound = False
@@ -442,12 +431,9 @@ class GPUStagedMuon(torch.optim.Optimizer):
 
     @property
     def gpu_staging_numel(self) -> int:
-        """Total bounded slot storage, including grad and NS workspace."""
+        """Total bounded slot storage, including gradients."""
         return sum(
-            slot.master.numel()
-            + slot.momentum.numel()
-            + slot.grad.numel()
-            + slot.workspace.numel()
+            slot.master.numel() + slot.momentum.numel() + slot.grad.numel()
             for slot in self._slots
         )
 
@@ -539,8 +525,6 @@ class GPUStagedMuon(torch.optim.Optimizer):
 
     def _bind_native_unit_optimizers(self) -> None:
         """Bind native Muon steps to persistent views of reusable slot buffers."""
-        if self._native_template is None:
-            return
         for unit_index, unit in enumerate(self._units):
             slot = self._slots[unit_index % len(self._slots)]
             proxy = slot.master[: unit.numel].view_as(unit.param).detach()
@@ -555,6 +539,7 @@ class GPUStagedMuon(torch.optim.Optimizer):
                     setattr(proxy, name, getattr(unit.param, name))
             momentum = slot.momentum[: unit.numel].view_as(unit.param)
             native = copy.copy(self._native_template)
+            # Optimizer.__getstate__ omits Muon's algorithm and topology attributes.
             vars(native).update(vars(self._native_template))
             group = dict(self.param_groups[unit.group_index])
             group["params"] = [proxy]
@@ -602,9 +587,6 @@ class GPUStagedMuon(torch.optim.Optimizer):
             slot.h2d_done.record(slot.h2d_stream)
 
         group = self.param_groups[unit.group_index]
-        lr = float(group["lr"])
-        momentum_beta = float(group["momentum"])
-        weight_decay = float(group["weight_decay"])
         with torch.cuda.stream(slot.compute_stream):
             slot.compute_stream.wait_event(grads_ready)
             slot.compute_stream.wait_event(slot.h2d_done)
@@ -613,48 +595,18 @@ class GPUStagedMuon(torch.optim.Optimizer):
                 grad = unit.param.grad
             if grad is not None:
                 slot.grad[: unit.numel].copy_(grad.detach().view(-1))
-                master = slot.master[: unit.numel].view_as(unit.param)
-                momentum = slot.momentum[: unit.numel].view_as(unit.param)
                 grad_matrix = slot.grad[: unit.numel].view_as(unit.param)
-                native = self._native_unit_optimizers.get(id(unit.param))
-                if native is not None:
-                    native_group = native.param_groups[0]
-                    # Scheduler and checkpoint updates target the outer groups.
-                    # Keep the slot's proxy parameter while refreshing settings.
-                    native_group.update(
-                        {key: value for key, value in group.items() if key != "params"}
-                    )
-                    proxy = native_group["params"][0]
-                    proxy.grad = grad_matrix
-                    native.step()
-                    unit.param.copy_(proxy)
-                else:
-                    if weight_decay:
-                        master.mul_(1.0 - lr * weight_decay)
-                    momentum.lerp_(grad_matrix, 1.0 - momentum_beta)
-                    update = (
-                        grad_matrix.lerp(momentum, momentum_beta)
-                        if self._nesterov
-                        else momentum
-                    )
-                    with self._matmul_precision():
-                        orthogonalized = self._orthogonalize(
-                            unit.param,
-                            update,
-                            **{
-                                key: value
-                                for key, value in group.items()
-                                if key != "params"
-                            },
-                        )
-                    if orthogonalized.shape != unit.param.shape:
-                        raise RuntimeError(
-                            "official Muon orthogonalization changed matrix shape"
-                        )
-                    workspace = slot.workspace[: unit.numel].view_as(unit.param)
-                    workspace.copy_(orthogonalized)
-                    master.add_(workspace, alpha=-lr)
-                    unit.param.copy_(master)
+                native = self._native_unit_optimizers[id(unit.param)]
+                native_group = native.param_groups[0]
+                # Scheduler and checkpoint updates target the outer groups.
+                # Keep the slot's proxy parameter while refreshing settings.
+                native_group.update(
+                    {key: value for key, value in group.items() if key != "params"}
+                )
+                proxy = native_group["params"][0]
+                proxy.grad = grad_matrix
+                native.step()
+                unit.param.copy_(proxy)
             slot.compute_done.record(slot.compute_stream)
 
         with torch.cuda.stream(slot.d2h_stream):
@@ -1000,27 +952,6 @@ def _make_layerwise_leaf_class():
     return GPUStagedLayerWiseLeaf
 
 
-def _validate_mcore017_layerwise_allgather_contract(layerwise_cls: type[Any]) -> None:
-    """Pin the private MCore method whose empty-shard bug we adapt."""
-    method = layerwise_cls.allgather_params
-    if tuple(inspect.signature(method).parameters) != ("self",):
-        raise RuntimeError(
-            "unsupported MCore 0.17 layer-wise allgather_params signature"
-        )
-    try:
-        source = inspect.getsource(method)
-    except (OSError, TypeError) as error:
-        raise RuntimeError(
-            "cannot verify MCore 0.17 layer-wise allgather_params source"
-        ) from error
-    digest = hashlib.sha256(source.encode()).hexdigest()
-    if digest != _MCORE017_LAYERWISE_ALLGATHER_SOURCE_SHA256:
-        raise RuntimeError(
-            "unsupported MCore 0.17 layer-wise allgather_params implementation: "
-            f"sha256={digest}"
-        )
-
-
 @torch.no_grad()
 def _allgather_mcore017_layerwise_params_empty_safe(self: Any) -> None:
     """MCore 0.17 all-gather that permits an empty first owner shard."""
@@ -1103,7 +1034,6 @@ def get_megatron_optimizer_with_dist_muon(
     )
     from megatron.core.optimizer.muon import get_megatron_muon_optimizer
 
-    _validate_mcore017_layerwise_allgather_contract(LayerWiseDistributedOptimizer)
     build_config = copy.copy(mcore_config)
     optimizer = get_megatron_muon_optimizer(
         build_config,
@@ -3628,29 +3558,6 @@ def get_megatron_optimizer_with_gpu_staged_muon(
             "staged Muon supports emerging-optimizers 0.3.0 exactly, "
             f"found {eo_version}"
         )
-    builder_parameters = tuple(
-        inspect.signature(get_megatron_muon_optimizer).parameters
-    )
-    if builder_parameters != (
-        "config",
-        "model_chunks",
-        "config_overrides",
-        "use_gloo_process_groups",
-        "layer_wise_distributed_optimizer",
-        "pg_collection",
-    ):
-        raise RuntimeError(
-            f"unsupported MCore 0.17 Muon builder signature: {builder_parameters}"
-        )
-    if tuple(
-        inspect.signature(LayerWiseDistributedOptimizer.shard_params).parameters
-    ) != (
-        "self",
-        "optimizers",
-    ):
-        raise RuntimeError("unsupported MCore 0.17 layer-wise ownership signature")
-    _validate_mcore017_layerwise_allgather_contract(LayerWiseDistributedOptimizer)
-
     trainable = []
     checkpoint_parameter_names: dict[torch.Tensor, str] = {}
     for model_index, chunk in enumerate(model):
@@ -3797,16 +3704,9 @@ def get_megatron_optimizer_with_gpu_staged_muon(
                 expt_tp=official.pg_collection.expt_tp,
             )
         elif isinstance(base, TensorParallelMuon):
-            from emerging_optimizers.utils import fp32_matmul_precision
-
             staged_inner = GPUStagedMuon(
                 base.param_groups,
                 staged_config=staged_config,
-                orthogonalize=base.orthogonalize,
-                matmul_precision=lambda base=base: fp32_matmul_precision(
-                    base.fp32_matmul_prec
-                ),
-                nesterov=base.nesterov,
                 weight_decay_method=base.weight_decay_method,
                 native_optimizer=base,
             )

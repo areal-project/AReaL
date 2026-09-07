@@ -1,4 +1,4 @@
-"""Train DAPO-Math RL with a CPU-staged Qwen3-30B-A3B MoE actor."""
+"""Train DAPO-Math RL with a CPU-staged Megatron MoE actor."""
 
 from __future__ import annotations
 

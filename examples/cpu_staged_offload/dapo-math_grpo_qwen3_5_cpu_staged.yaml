@@ -1,0 +1,56 @@
+defaults:
+  - dapo-math_grpo_cpu_staged
+  - _self_
+
+experiment_name: dapo-math-grpo-qwen3.5-35b-a3b-base-cpu-staged
+total_train_epochs: 1
+total_train_steps: 3
+allocation_mode: "megatron[actor]:(attn:d4p1t2c1|ffn:d1e8)|sglang[rollout]:d4t2p1"
+
+scheduler:
+  type: local
+
+rollout:
+  max_concurrent_rollouts: 8
+  queue_size: 32
+
+gconfig:
+  n_samples: 2
+  max_new_tokens: 128
+  max_tokens: 2047
+
+actor:
+  # Qwen3.5 has two KV heads; Megatron Bridge requires TP <= 2.
+  backend: "megatron:(attn:d4p1t2c1|ffn:d1e8)"
+  path: ${oc.env:QWEN3_5_35B_A3B_BASE_MODEL_PATH,Qwen/Qwen3.5-35B-A3B-Base}
+  mb_spec:
+    max_tokens_per_mb: 4096
+  optimizer:
+    warmup_steps: 1
+  megatron:
+    bridge_type: megatron-bridge
+    # Keep optimizer precision identical when comparing staged on/off.
+    use_precision_aware_optimizer: true
+    enable_mtp: false
+    enable_mtp_training: false
+    # Use fused FLA kernels for Gated DeltaNet.
+    use_deterministic_algorithms: false
+    ddp:
+      # Text-only batches leave vision parameters unused.
+      overlap_grad_reduce: false
+
+sglang:
+  context_length: 2048
+  mem_fraction_static: 0.4
+
+train_dataset:
+  batch_size: 8
+  max_length: 1024
+  num_workers: 0
+
+recover:
+  freq_epochs: null
+  freq_secs: null
+
+memory_profiler:
+  profile_steps: [1, 2]

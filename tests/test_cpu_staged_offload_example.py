@@ -23,22 +23,18 @@ def test_cpu_staged_offload_config_validates_buffer_sizes() -> None:
         CPUStagedOffloadConfig(bucket_size_mb=0)
 
 
-def test_muon_algorithm_config_is_independent_from_staged_offload() -> None:
-    optimizer = cli_args.OptimizerConfig(type="dist_muon")
-    megatron = cli_args.MegatronEngineConfig(
-        cpu_staged_offload=CPUStagedOffloadConfig(enabled=True)
-    )
-
-    assert optimizer.type == "dist_muon"
-    assert optimizer.muon.momentum == 0.95
-    assert megatron.cpu_staged_offload.enabled is True
-
-
+@pytest.mark.parametrize(
+    ("filename", "model_env"),
+    [
+        ("dapo-math_grpo_cpu_staged.yaml", "QWEN3_30B_A3B_BASE_MODEL_PATH"),
+        ("dapo-math_grpo_qwen3_5_cpu_staged.yaml", "QWEN3_5_35B_A3B_BASE_MODEL_PATH"),
+    ],
+)
 def test_example_uses_core_staged_optimizer_config(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, filename: str, model_env: str
 ) -> None:
     monkeypatch.chdir(REPOSITORY_ROOT)
-    monkeypatch.setenv("QWEN3_30B_A3B_BASE_MODEL_PATH", "/models/Qwen3-30B-A3B-Base")
+    monkeypatch.setenv(model_env, str(tmp_path / "model"))
     monkeypatch.setattr(cli_args.name_resolve, "reconfigure", lambda config: None)
     monkeypatch.setattr(cli_args, "save_config", lambda config, path: None)
     monkeypatch.setattr(
@@ -48,14 +44,14 @@ def test_example_uses_core_staged_optimizer_config(
     config, config_path = load_expr_config(
         [
             "--config",
-            "examples/cpu_staged_offload/dapo-math_grpo_cpu_staged.yaml",
+            f"examples/cpu_staged_offload/{filename}",
         ],
         MultiTurnGRPOConfig,
     )
     allocation = ModelAllocation.from_str(config.actor.backend)
 
-    assert config_path.endswith("dapo-math_grpo_cpu_staged.yaml")
-    assert config.actor.path == config.tokenizer_path == "/models/Qwen3-30B-A3B-Base"
+    assert config_path.endswith(filename)
+    assert config.actor.path == config.tokenizer_path == str(tmp_path / "model")
     assert allocation.parallel.world_size == 8
     assert config.actor.megatron.cpu_staged_offload.enabled is True
     assert config.actor.megatron.cpu_staged_offload.buffer_count == 2

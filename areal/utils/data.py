@@ -1114,7 +1114,9 @@ def pad_mb_list(
         )
         padded_mb_inputs.append(padded_mb)
         pad_lengths.append(pad_len)
-        pad_to_lengths.append(int(padded_mb["cu_seqlens"][-1].item()))
+        pad_to_lengths.append(
+            (align_to_length if align_to_length is not None else length) + pad_len
+        )
         old_cu_seqlens_list.append(old_cu_seqlens)
         align_to_lengths.append(align_to_length)
     mb_list.padded_mbs = padded_mb_inputs

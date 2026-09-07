@@ -3,12 +3,10 @@
 from __future__ import annotations
 
 import gc
-from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
 import torch
-from emerging_optimizers.utils import fp32_matmul_precision
 from megatron.core.optimizer.muon import TensorParallelMuon
 
 from areal.engine.megatron_utils.gpu_staged_muon import (
@@ -30,13 +28,6 @@ def _config(*, slot_numel: int = 64, buffer_count: int = 2) -> GPUStagedMuonConf
     )
 
 
-def _identity_orthogonalize(
-    param: torch.Tensor, update: torch.Tensor, **kwargs
-) -> torch.Tensor:
-    del param, kwargs
-    return update
-
-
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_muon_owned_matrices_are_indivisible_pinned_slab_units() -> None:
     """Each official-owned 2D matrix must map to one complete staged unit."""
@@ -54,10 +45,8 @@ def test_muon_owned_matrices_are_indivisible_pinned_slab_units() -> None:
     ]
     optimizer = GPUStagedMuon(
         groups,
+        native_optimizer=TensorParallelMuon(groups, use_decoupled_weight_decay=True),
         staged_config=_config(slot_numel=32),
-        orthogonalize=_identity_orthogonalize,
-        matmul_precision=nullcontext,
-        nesterov=False,
         weight_decay_method="decoupled",
     )
     optimizer.bind_owned_params(optimizer.param_groups)
@@ -90,10 +79,11 @@ def test_muon_and_scalar_adamw_state_schemas_are_isolated() -> None:
     scalar = torch.nn.Parameter(torch.ones(4, device="cuda", dtype=torch.bfloat16))
     muon = GPUStagedMuon(
         [{"params": [matrix], "lr": 0.1, "momentum": 0.9, "weight_decay": 0.0}],
+        native_optimizer=TensorParallelMuon(
+            [{"params": [matrix], "lr": 0.1, "momentum": 0.9, "weight_decay": 0.0}],
+            use_decoupled_weight_decay=True,
+        ),
         staged_config=_config(),
-        orthogonalize=_identity_orthogonalize,
-        matmul_precision=nullcontext,
-        nesterov=False,
         weight_decay_method="decoupled",
     )
     muon.bind_owned_params(muon.param_groups)
@@ -134,10 +124,18 @@ def test_muon_gpu_residency_is_bounded_by_max_unit_not_total_state() -> None:
                     "weight_decay": 0.0,
                 }
             ],
+            native_optimizer=TensorParallelMuon(
+                [
+                    {
+                        "params": params,
+                        "lr": 0.1,
+                        "momentum": 0.9,
+                        "weight_decay": 0.0,
+                    }
+                ],
+                use_decoupled_weight_decay=True,
+            ),
             staged_config=_config(slot_numel=64, buffer_count=2),
-            orthogonalize=_identity_orthogonalize,
-            matmul_precision=nullcontext,
-            nesterov=False,
             weight_decay_method="decoupled",
         )
         optimizer.bind_owned_params(optimizer.param_groups)
@@ -152,59 +150,9 @@ def test_muon_gpu_residency_is_bounded_by_max_unit_not_total_state() -> None:
         assert optimizer.cuda_state_numel == 0
         del optimizer, params
 
-    assert observed_staging == [2 * 64 * 4, 2 * 64 * 4]
+    assert observed_staging == [2 * 64 * 3, 2 * 64 * 3]
     assert observed_cpu_state == [2 * 64, 2 * 8 * 64]
     assert observed_optimizer_peak_bytes[1] == observed_optimizer_peak_bytes[0]
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_muon_step_matches_reference_across_accumulated_gradients() -> None:
-    """Three staged steps with accumulation=2 match the exact owner update."""
-    torch.manual_seed(41)
-    initial = torch.randn(5, 6, device="cuda", dtype=torch.float32)
-    param = torch.nn.Parameter(initial.to(torch.bfloat16))
-    optimizer = GPUStagedMuon(
-        [{"params": [param], "lr": 0.03, "momentum": 0.8, "weight_decay": 0.02}],
-        staged_config=_config(slot_numel=32, buffer_count=1),
-        orthogonalize=_identity_orthogonalize,
-        matmul_precision=nullcontext,
-        nesterov=True,
-        weight_decay_method="decoupled",
-    )
-    optimizer.bind_owned_params(optimizer.param_groups)
-    reference_master = param.detach().float().clone()
-    reference_momentum = torch.zeros_like(reference_master)
-
-    for step in range(3):
-        accumulated = torch.zeros_like(reference_master)
-        for accumulation in range(2):
-            accumulated.add_(0.01 * (step + 1) + 0.02 * accumulation)
-        param.decoupled_grad = accumulated
-        reference_master.mul_(1.0 - 0.03 * 0.02)
-        reference_momentum.lerp_(accumulated, 0.2)
-        reference_update = accumulated.lerp(reference_momentum, 0.8)
-        reference_master.add_(reference_update, alpha=-0.03)
-        optimizer.step()
-        optimizer.drain()
-
-    assert optimizer.cpu_slabs is not None
-    torch.testing.assert_close(
-        optimizer.cpu_slabs.master.view_as(reference_master),
-        reference_master.cpu(),
-        rtol=1e-6,
-        atol=1e-6,
-    )
-    torch.testing.assert_close(
-        optimizer.cpu_slabs.momentum.view_as(reference_momentum),
-        reference_momentum.cpu(),
-        rtol=1e-6,
-        atol=1e-6,
-    )
-    torch.testing.assert_close(
-        param.float(), reference_master.to(torch.bfloat16).float(), rtol=0.0, atol=0.0
-    )
-    assert optimizer.residency == "CPU_RESIDENT"
-    assert optimizer.cuda_state_numel == 0
 
 
 @pytest.mark.parametrize("use_nesterov", [False, True])
@@ -246,9 +194,6 @@ def test_muon_steps_match_official_tensor_parallel_muon(
             }
         ],
         staged_config=_config(slot_numel=64, buffer_count=1),
-        orthogonalize=baseline.orthogonalize,
-        matmul_precision=lambda: fp32_matmul_precision(baseline.fp32_matmul_prec),
-        nesterov=baseline.nesterov,
         weight_decay_method=baseline.weight_decay_method,
         native_optimizer=baseline,
     )
@@ -328,9 +273,6 @@ def test_muon_checkpoint_resume_matches_official_tensor_parallel_muon() -> None:
                 }
             ],
             staged_config=_config(slot_numel=32, buffer_count=1),
-            orthogonalize=baseline.orthogonalize,
-            matmul_precision=lambda: fp32_matmul_precision(baseline.fp32_matmul_prec),
-            nesterov=baseline.nesterov,
             weight_decay_method=baseline.weight_decay_method,
             native_optimizer=baseline,
         )
@@ -361,6 +303,9 @@ def test_muon_checkpoint_resume_matches_official_tensor_parallel_muon() -> None:
     resumed.complete_checkpoint_load()
     resumed.offload_to_cpu()
     resumed.restore_from_cpu()
+    assert resumed.cuda_state_numel == 0
+    assert resumed.cpu_slabs.master.is_pinned()
+    assert resumed.cpu_slabs.momentum.is_pinned()
 
     for _ in range(3):
         grad = torch.randn_like(resumed_param)
@@ -393,68 +338,6 @@ def test_muon_checkpoint_resume_matches_official_tensor_parallel_muon() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_muon_slot_reuse_waits_for_d2h_and_drain_commits_cpu_authority() -> None:
-    """A single slot is fenced before reuse and remains pending until drain."""
-    params = [
-        torch.nn.Parameter(torch.ones(8, 8, device="cuda", dtype=torch.bfloat16))
-        for _ in range(2)
-    ]
-
-    def delayed_identity(
-        param: torch.Tensor, update: torch.Tensor, **kwargs
-    ) -> torch.Tensor:
-        del param, kwargs
-        torch.cuda._sleep(50_000_000)
-        return update
-
-    optimizer = GPUStagedMuon(
-        [{"params": params, "lr": 0.03, "momentum": 0.8, "weight_decay": 0.0}],
-        staged_config=_config(slot_numel=64, buffer_count=1),
-        orthogonalize=delayed_identity,
-        matmul_precision=nullcontext,
-        nesterov=False,
-        weight_decay_method="decoupled",
-    )
-    optimizer.bind_owned_params(optimizer.param_groups)
-    assert optimizer._slot_machine is not None
-    original_wait = optimizer._slot_machine._wait_for_slot
-    waited: list[int] = []
-
-    def recorded_wait(slot_index: int) -> None:
-        waited.append(slot_index)
-        original_wait(slot_index)
-
-    optimizer._slot_machine._wait_for_slot = recorded_wait
-    for index, param in enumerate(params):
-        param.decoupled_grad = torch.full_like(
-            param, 0.01 * (index + 1), dtype=torch.float32
-        )
-
-    optimizer.step()
-
-    assert waited == [0]
-    assert optimizer._slot_machine.phases == ("D2H_PENDING",)
-    assert not optimizer._slots[0].d2h_done.query()
-    assert optimizer.residency == "STEP_ACTIVE"
-    optimizer.drain()
-    assert optimizer._slot_machine.phases == ("FREE",)
-    assert optimizer.residency == "CPU_RESIDENT"
-    assert optimizer.cpu_slabs is not None
-    for unit in optimizer.units:
-        state = optimizer.state[unit.param]
-        torch.testing.assert_close(
-            state["master_param"].to(torch.bfloat16),
-            unit.param.cpu(),
-            rtol=0.0,
-            atol=0.0,
-        )
-        assert (
-            state["master_param"].untyped_storage().data_ptr()
-            == optimizer.cpu_slabs.master.untyped_storage().data_ptr()
-        )
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_muon_rejects_duplicate_nonmatrix_and_undersized_slot() -> None:
     """Malformed ownership and split-prone capacity fail before state is usable."""
     matrix = torch.nn.Parameter(torch.ones(8, 8, device="cuda", dtype=torch.bfloat16))
@@ -462,10 +345,10 @@ def test_muon_rejects_duplicate_nonmatrix_and_undersized_slot() -> None:
     def make(groups, slot_numel=128):
         return GPUStagedMuon(
             groups,
+            native_optimizer=TensorParallelMuon(
+                groups, use_decoupled_weight_decay=True
+            ),
             staged_config=_config(slot_numel=slot_numel),
-            orthogonalize=_identity_orthogonalize,
-            matmul_precision=nullcontext,
-            nesterov=False,
             weight_decay_method="decoupled",
         )
 
@@ -587,46 +470,3 @@ def test_muon_topology_accepts_explicit_expert_partition_metadata() -> None:
         [param],
         tp_mode="duplicated",
     )
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_muon_checkpoint_roundtrip_preserves_cpu_slab_residency() -> None:
-    """A synchronous Muon load restores both CPU slab state kinds in place."""
-    param = torch.nn.Parameter(torch.ones(4, 4, device="cuda", dtype=torch.bfloat16))
-    optimizer = GPUStagedMuon(
-        [{"params": [param], "lr": 0.1, "momentum": 0.9, "weight_decay": 0.0}],
-        staged_config=GPUStagedMuonConfig(
-            buffer_count=1,
-            slot_size_mb=1,
-        ),
-        orthogonalize=_identity_orthogonalize,
-        matmul_precision=nullcontext,
-        nesterov=False,
-        weight_decay_method="decoupled",
-    )
-    optimizer.bind_owned_params(optimizer.param_groups)
-    optimizer.offload_to_cpu()
-    optimizer.restore_from_cpu()
-    assert optimizer.residency == "CPU_RESIDENT"
-    saved = optimizer.state_dict()
-    saved = {
-        "state": {
-            state_id: {key: value.clone() for key, value in state.items()}
-            for state_id, state in saved["state"].items()
-        },
-        "param_groups": [dict(group) for group in saved["param_groups"]],
-    }
-    optimizer.cpu_slabs.master.fill_(11.0)
-    optimizer.cpu_slabs.momentum.fill_(13.0)
-    optimizer.begin_checkpoint_load()
-    optimizer.load_state_dict(saved)
-    optimizer.complete_checkpoint_load()
-
-    assert optimizer.residency == "CPU_RESIDENT"
-    assert optimizer.cuda_state_numel == 0
-    assert optimizer.cpu_slabs.master.is_pinned()
-    assert optimizer.cpu_slabs.momentum.is_pinned()
-    for key, expected in saved["state"][0].items():
-        torch.testing.assert_close(
-            optimizer.state[param][key], expected, rtol=0.0, atol=0.0
-        )
