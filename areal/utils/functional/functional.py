@@ -461,6 +461,7 @@ def ppo_actor_loss_fn(
     rejection_sampling: RejectionSamplingConfig | None = None,
     importance_sampling_level: str = "token",
     cu_seqlens: torch.Tensor | None = None,
+    loss_reduction_weights: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict]:
     """PPO actor loss function with optional rejection sampling.
 
@@ -494,11 +495,28 @@ def ppo_actor_loss_fn(
         importance_sampling_level: Level at which to compute importance sampling ratios.
             - 'token': Per-token ratios (standard PPO)
             - 'sequence': Sequence-level geometric mean of per-token ratios (GSPO)
+        loss_reduction_weights: Optional per-token weights. The denominator uses
+            the pre-rejection mask and must match the engine's loss_weight_fn.
         cu_seqlens: Cumulative sequence lengths for packed sequences (1D tensors).
             Required when inputs are 1D and importance_sampling_level='sequence'.
             Shape: [batch_size + 1], where cu_seqlens[i] marks the start of sequence i.
             Not needed for 2D padded inputs (sequences identified by batch dimension).
     """
+    # Optional weights are fixed before rejection, matching engine loss_weight_fn.
+    if loss_reduction_weights is not None:
+        if loss_reduction_weights.shape != loss_mask.shape:
+            raise ValueError("loss_reduction_weights must have the loss_mask shape")
+        torch._assert_async(
+            torch.all(
+                torch.isfinite(loss_reduction_weights) & (loss_reduction_weights >= 0)
+            ),
+            "loss_reduction_weights must be finite and nonnegative",
+        )
+        if loss_reduction_weights.requires_grad:
+            raise ValueError("loss_reduction_weights must not require gradients")
+        normalization_weight = (
+            (loss_reduction_weights * loss_mask).sum().clamp_min(1e-12)
+        )
     # Save original count BEFORE rejection sampling may modify loss_mask.
     # This keeps the denominator consistent with loss_weight_fn in actor.py,
     # which always uses the original loss_mask from input_data. Without this,
@@ -568,7 +586,13 @@ def ppo_actor_loss_fn(
         pg_loss = pg_loss * behave_imp_weight
 
     logging_loss = pg_loss.detach()
-    pg_loss = torch.where(loss_mask, pg_loss, 0).sum() / loss_mask_count
+    if loss_reduction_weights is None:
+        pg_loss = torch.where(loss_mask, pg_loss, 0).sum() / loss_mask_count
+    else:
+        pg_loss = (
+            torch.where(loss_mask, pg_loss * loss_reduction_weights, 0).sum()
+            / normalization_weight
+        )
     clip_mask.logical_and_(stat_loss_mask)
     dual_clip_mask.logical_and_(stat_loss_mask)
     # One host sync per microbatch: the count feeds three derived stats.

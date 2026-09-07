@@ -13,6 +13,7 @@ from areal.api.cli_args import (
     PPOActorConfig,
     RejectionSamplingConfig,
 )
+from areal.api.rl_plugins import PPOObjective
 from areal.engine.core import stage_batch_for_engine
 from areal.infra import TrainController
 from areal.infra.rpc.serialization import serialize_value
@@ -94,6 +95,11 @@ class PPOActor:
     def __init__(self, config: PPOActorConfig, engine: TrainEngine):
         self.config = config
         self.engine = engine
+        self.objective = (
+            config.objective_plugin.build(PPOObjective)
+            if config.objective_plugin
+            else None
+        )
 
         self.reward_bias = config.reward_bias
         self.reward_scaling = config.reward_scaling
@@ -242,6 +248,8 @@ class PPOActor:
     def _compute_advantages(
         self, data: dict[str, Any], meta: TrajBatchMeta | None = None
     ) -> dict[str, Any]:
+        if getattr(self, "objective", None) is not None:
+            return self.objective.compute_advantages(data, meta, self.config)
         bs = data["input_ids"].shape[0]
         batch_indices = torch.arange(
             bs, device=data["input_ids"].device, dtype=torch.long
@@ -547,26 +555,35 @@ class PPOActor:
             current_version = self.engine.get_version()
 
             for mb in mb_inputs.mbs:
+                loss_fn = functools.partial(
+                    grpo_loss_fn,
+                    eps_clip=self.config.eps_clip,
+                    eps_clip_higher=self.config.eps_clip_higher,
+                    c_clip=self.config.c_clip,
+                    rejection_sampling=self.config.rejection_sampling,
+                    m2_threshold=self.m2_threshold,
+                    importance_sampling_level=self.config.importance_sampling_level,
+                    current_version=current_version,
+                    prox_logp_method=self.config.prox_logp_method,
+                    use_sapo_loss=self.config.use_sapo_loss,
+                    sapo_tau_pos=self.config.sapo_tau_pos,
+                    sapo_tau_neg=self.config.sapo_tau_neg,
+                    use_cispo_loss=self.config.use_cispo_loss,
+                    use_decoupled_loss=self.config.use_decoupled_loss,
+                    mopd_loss_config=self._mopd_loss_config,
+                )
                 train_stat = self.engine.train_batch(
                     mb,
-                    loss_fn=functools.partial(
-                        grpo_loss_fn,
-                        eps_clip=self.config.eps_clip,
-                        eps_clip_higher=self.config.eps_clip_higher,
-                        c_clip=self.config.c_clip,
-                        rejection_sampling=self.config.rejection_sampling,
-                        m2_threshold=self.m2_threshold,
-                        importance_sampling_level=self.config.importance_sampling_level,
-                        current_version=current_version,
-                        prox_logp_method=self.config.prox_logp_method,
-                        use_sapo_loss=self.config.use_sapo_loss,
-                        sapo_tau_pos=self.config.sapo_tau_pos,
-                        sapo_tau_neg=self.config.sapo_tau_neg,
-                        use_cispo_loss=self.config.use_cispo_loss,
-                        use_decoupled_loss=self.config.use_decoupled_loss,
-                        mopd_loss_config=self._mopd_loss_config,
+                    loss_fn=(
+                        functools.partial(self.objective.loss, default_loss=loss_fn)
+                        if self.objective is not None
+                        else loss_fn
                     ),
-                    loss_weight_fn=lambda x: x["loss_mask"].count_nonzero(),
+                    loss_weight_fn=(
+                        self.objective.loss_weight
+                        if self.objective is not None
+                        else lambda x: x["loss_mask"].count_nonzero()
+                    ),
                 )
                 stats_tracker.scalar(**train_stat)
 
@@ -869,6 +886,7 @@ def grpo_loss_fn(
             proximal_logprobs=prox_logp,
             rejection_sampling=rejection_sampling,
             importance_sampling_level=importance_sampling_level,
+            loss_reduction_weights=input_data.get("loss_reduction_weights"),
             cu_seqlens=input_data.get("cu_seqlens"),
         )
 
