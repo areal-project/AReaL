@@ -1,6 +1,6 @@
 import pytest
 
-from areal.engine.awex.colocate_writer import resolve_physical_gpu_id
+from areal.engine.awex.utils import resolve_physical_gpu_id
 
 
 def test_physical_gpu_id_maps_through_visible_devices(monkeypatch):
