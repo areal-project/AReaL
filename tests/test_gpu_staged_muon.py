@@ -208,11 +208,13 @@ def test_muon_step_matches_reference_across_accumulated_gradients() -> None:
 
 
 @pytest.mark.parametrize("use_nesterov", [False, True])
+@pytest.mark.parametrize("schedule_hyperparameters", [False, True])
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_muon_steps_match_official_tensor_parallel_muon(
     use_nesterov: bool,
+    schedule_hyperparameters: bool,
 ) -> None:
-    """Staged master and momentum match MCore's official Muon update."""
+    """Staged updates match native Muon with fixed or scheduled settings."""
     torch.manual_seed(20260829)
     initial = [
         torch.randn(shape, device="cuda", dtype=torch.bfloat16)
@@ -253,6 +255,14 @@ def test_muon_steps_match_official_tensor_parallel_muon(
     staged.bind_owned_params(staged.param_groups)
 
     for step in range(5):
+        if schedule_hyperparameters:
+            settings = {
+                "lr": (0.0, 0.01, 0.03, 0.015, 0.0)[step],
+                "weight_decay": (0.02, 0.04, 0.0, 0.01, 0.03)[step],
+                "momentum": (0.8, 0.85, 0.9, 0.85, 0.8)[step],
+            }
+            for group in (*staged.param_groups, *baseline.param_groups):
+                group.update(settings)
         for param_index, (staged_param, baseline_param) in enumerate(
             zip(staged_params, baseline_params, strict=True)
         ):

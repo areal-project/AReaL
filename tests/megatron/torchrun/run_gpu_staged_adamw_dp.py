@@ -9,9 +9,9 @@ import argparse
 import os
 from types import SimpleNamespace
 
+import megatron.core.optimizer.distrib_optimizer as distrib_optimizer_module
 import torch
 import torch.distributed as dist
-import megatron.core.optimizer.distrib_optimizer as distrib_optimizer_module
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.optimizer.optimizer_config import OptimizerConfig
 
@@ -137,9 +137,7 @@ def _run_dp2() -> None:
     if bind_gpu_staged_adamw(optimizer) != 1:
         raise AssertionError("staged AdamW was not bound to the MCore DP shards")
     expected_owned_params = 2 if dist.get_rank() == 0 else 1
-    actual_owned_params = sum(
-        len(group) for group in optimizer.model_float16_groups
-    )
+    actual_owned_params = sum(len(group) for group in optimizer.model_float16_groups)
     if actual_owned_params != expected_owned_params:
         raise AssertionError(
             f"unexpected DP-local parameter count: {actual_owned_params}"

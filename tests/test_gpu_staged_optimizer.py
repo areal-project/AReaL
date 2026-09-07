@@ -72,6 +72,32 @@ def test_slot_state_machine_waits_before_reuse_and_drain() -> None:
 
 
 @pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA is required for staged AdamW")
+def test_bind_adamw_empty_dp_shard_uses_buffer_device() -> None:
+    """A padding-only DP owner binds and steps without allocating CUDA slots."""
+    inner = GPUStagedAdamW([{"params": []}], staged_config=_tiny_config())
+    bucket = SimpleNamespace(grad_data=torch.zeros(64, device="cuda"))
+    wrapper = SimpleNamespace(
+        optimizer=inner,
+        opt_group_ranges=[{"orig_group": inner.param_groups[0]}],
+        gbuf_ranges=[],
+        model_param_gbuf_map={},
+        buffers=[SimpleNamespace(buckets=[bucket])],
+    )
+
+    assert bind_gpu_staged_adamw(wrapper) == 1
+    inner.step()
+    inner.prepare_checkpoint_save()
+
+    assert inner.residency == "CPU_RESIDENT"
+    assert not inner.units
+    assert not inner.state
+    assert inner.cuda_state_numel == 0
+    torch.testing.assert_close(
+        bucket.grad_data, torch.zeros_like(bucket.grad_data), rtol=0, atol=0
+    )
+
+
+@pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA is required for staged AdamW")
 def test_bind_builds_cpu_state_views_and_bounded_units() -> None:
     """Binding initializes slab-backed state without persistent CUDA state."""
     params = [

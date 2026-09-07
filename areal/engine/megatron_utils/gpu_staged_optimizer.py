@@ -920,6 +920,14 @@ def bind_gpu_staged_adamw(optimizer: Any) -> int:
             gbuf_ranges=megatron_optimizer.gbuf_ranges,
             model_param_gbuf_map=megatron_optimizer.model_param_gbuf_map,
             buffers=megatron_optimizer.buffers,
+            empty_device=next(
+                (
+                    bucket.grad_data.device
+                    for buffer in megatron_optimizer.buffers
+                    for bucket in buffer.buckets
+                ),
+                None,
+            ),
         )
         bound += 1
     return bound

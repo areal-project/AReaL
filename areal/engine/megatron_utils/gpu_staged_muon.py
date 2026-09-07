@@ -618,7 +618,13 @@ class GPUStagedMuon(torch.optim.Optimizer):
                 grad_matrix = slot.grad[: unit.numel].view_as(unit.param)
                 native = self._native_unit_optimizers.get(id(unit.param))
                 if native is not None:
-                    proxy = native.param_groups[0]["params"][0]
+                    native_group = native.param_groups[0]
+                    # Scheduler and checkpoint updates target the outer groups.
+                    # Keep the slot's proxy parameter while refreshing settings.
+                    native_group.update(
+                        {key: value for key, value in group.items() if key != "params"}
+                    )
+                    proxy = native_group["params"][0]
                     proxy.grad = grad_matrix
                     native.step()
                     unit.param.copy_(proxy)
@@ -1784,6 +1790,11 @@ def merge_muon_checkpoint_metadata(
         {} for _ in range(leaf_count)
     ]
     groups: list[dict[int, dict[str, Any]]] = [{} for _ in range(leaf_count)]
+    owned_groups: list[set[int]] = [set() for _ in range(leaf_count)]
+    empty_groups: list[dict[int, list[dict[str, Any]]]] = [
+        {} for _ in range(leaf_count)
+    ]
+    group_counts: dict[int, int] = {}
 
     for participant_slot, metadata in enumerate(local_metadata):
         participant_rank = trusted_by_slot[participant_slot]
@@ -1819,16 +1830,15 @@ def merge_muon_checkpoint_metadata(
                 raise ValueError(
                     f"Muon checkpoint rank {participant_rank} leaf {leaf_index} conflict"
                 )
-            for group_index, group in enumerate(leaf["param_groups"]):
-                normalized_group = copy.deepcopy(dict(group))
-                previous_group = groups[leaf_index].setdefault(
-                    group_index, normalized_group
+            local_owned_groups: set[int] = set()
+            group_count = len(leaf["param_groups"])
+            if (
+                group_count
+                and group_counts.setdefault(leaf_index, group_count) != group_count
+            ):
+                raise ValueError(
+                    "Muon checkpoint param-group count conflicts across owners"
                 )
-                if previous_group != normalized_group:
-                    raise ValueError(
-                        f"Muon checkpoint leaf {leaf_index} param-group "
-                        f"{group_index} conflicts across owners"
-                    )
             for parameter in leaf["parameters"]:
                 invariant = _muon_checkpoint_parameter_invariant(parameter)
                 domain = invariant["domain"]
@@ -1879,9 +1889,58 @@ def merge_muon_checkpoint_metadata(
                     contributor_rank=participant_rank,
                     contributor_topology=participant_topology,
                 )
+                group_index = source_owner["group_index"]
+                if group_index >= len(leaf["param_groups"]):
+                    raise ValueError(
+                        "Muon checkpoint source owner group_index is out of range"
+                    )
+                local_owned_groups.add(group_index)
                 parameters[leaf_index][identity] = copy.deepcopy(dict(parameter))
 
+            for group_index, group in enumerate(leaf["param_groups"]):
+                normalized_group = copy.deepcopy(dict(group))
+                previous_group = groups[leaf_index].setdefault(
+                    group_index, normalized_group
+                )
+                has_params = group_index in local_owned_groups
+                had_params = group_index in owned_groups[leaf_index]
+                # Empty AdamW groups do not advance step. Compare their shared
+                # settings, but take the step counter from a real owner.
+                compared_previous = previous_group
+                compared_current = normalized_group
+                if not (has_params and had_params):
+                    compared_previous = {
+                        key: value
+                        for key, value in previous_group.items()
+                        if key != "step"
+                    }
+                    compared_current = {
+                        key: value
+                        for key, value in normalized_group.items()
+                        if key != "step"
+                    }
+                if compared_previous != compared_current:
+                    raise ValueError(
+                        f"Muon checkpoint leaf {leaf_index} param-group "
+                        f"{group_index} conflicts across owners"
+                    )
+                if has_params:
+                    groups[leaf_index][group_index] = normalized_group
+                    owned_groups[leaf_index].add(group_index)
+                else:
+                    empty_groups[leaf_index].setdefault(group_index, []).append(
+                        normalized_group
+                    )
+
     for leaf_index, merged_leaf in enumerate(merged_leaves):
+        for group_index, candidates in empty_groups[leaf_index].items():
+            if group_index not in owned_groups[leaf_index] and any(
+                candidate != candidates[0] for candidate in candidates[1:]
+            ):
+                raise ValueError(
+                    f"Muon checkpoint leaf {leaf_index} param-group "
+                    f"{group_index} conflicts across owners"
+                )
         merged_leaf["parameters"] = [
             parameters[leaf_index][identity]
             for identity in sorted(parameters[leaf_index], key=repr)
