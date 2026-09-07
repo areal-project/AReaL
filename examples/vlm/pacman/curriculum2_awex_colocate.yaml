@@ -1,0 +1,6 @@
+defaults:
+- curriculum2
+- awex_colocate
+- _self_
+
+trial_name: curriculum2-sglang-megatron-awex-colocate

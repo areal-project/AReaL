@@ -1,0 +1,33 @@
+# Shared placement overlay; compose with one curriculum, not as a standalone recipe.
+enable_offload: true
+actor:
+  _version: v1
+  backend: megatron:d4p1t2
+  weight_update_mode: awex
+  offload: true
+  scheduling_strategy:
+    type: separation
+  scheduling_spec:
+  - task_type: worker
+    port_count: 2
+    gpu: 1
+    cmd: python3 -m areal.infra.rpc.rpc_server
+    env_vars:
+      NCCL_DEBUG: WARN
+      SGLANG_RETURN_ORIGINAL_LOGPROB: '0'
+      AREAL_ROOT: ${oc.env:AREAL_ROOT}
+      MAAPACMAN_PACMAN_ROOT: ${oc.env:MAAPACMAN_PACMAN_ROOT}
+      PYTORCH_ALLOC_CONF: expandable_segments:True
+      TMS_INIT_ENABLE: '0'
+      TMS_INIT_ENABLE_CPU_BACKUP: '0'
+rollout:
+  _version: v1
+  backend: sglang:d8p1t1
+  scheduling_strategy:
+    type: colocation
+    target: actor
+ref:
+  _version: v1
+  offload: true
+sglang:
+  enable_memory_saver: true
