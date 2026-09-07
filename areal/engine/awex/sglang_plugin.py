@@ -951,7 +951,7 @@ class AwexSchedulerPlugin:
         n_gpus_per_node = max(1, infer_world_size // nnodes)
         transfer_rank = _resolve_transfer_rank(
             infer_world_size=infer_world_size,
-            gpu_id=gpu_id,
+            gpu_id=physical_gpu_id,
             node_id=node_id,
             nnodes=nnodes,
             instance_world_size=self._instance_world_size(),

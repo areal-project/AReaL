@@ -62,9 +62,13 @@ optimizers retain AWEX's original phase-boundary GPU-to-CPU migration and are co
 back before training resumes. The optional HybridDeviceOptimizer compatibility path is
 not supported.
 
-Run with:
+Set `QWEN3_30B_A3B_BASE_MODEL_PATH` and `DAPO_MATH_17K_PATH` to your model and dataset
+locations. The agent proxy requires a unique admin key when binding to a non-loopback
+address. Run on a local eight-GPU node with:
 
 ```bash
+export AREAL_PROXY_ADMIN_API_KEY="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"
 uv run python examples/cpu_staged_offload/dapo-math_rl_cpu_staged.py \
-  --config examples/cpu_staged_offload/dapo-math_grpo_cpu_staged.yaml
+  --config examples/cpu_staged_offload/dapo-math_grpo_cpu_staged.yaml \
+  scheduler.type=local
 ```
