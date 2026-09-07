@@ -55,6 +55,13 @@ def assert_alloc_conf_supports_memory_saver(conf: str) -> None:
 
 assert_alloc_conf_supports_memory_saver(os.environ.get("PYTORCH_CUDA_ALLOC_CONF", ""))
 
+
+from areal.engine.sglang_fork_contract import (  # noqa: E402
+    check_scheduler_contract,
+    check_static_contract,
+    resolve_scheduler_memory_method,
+    resolve_scheduler_parallel_value,
+)
 from areal.utils import pkg_version  # noqa: E402
 from areal.utils.environ import (  # noqa: E402
     get_bool_env_var,
@@ -65,17 +72,26 @@ from areal.utils.logging import getLogger  # noqa: E402
 
 logger = getLogger("AwexSGLangPlugin")
 SUPPORTED_SGLANG_VERSIONS = ("0.5.9", "0.5.10.post1")
+THETA_FORK_ENV = "AREAL_SGLANG_FORK"
 
 
 def assert_supported_sglang_version() -> None:
     """Refuse to patch a SGLang build whose internals were not verified."""
     installed = pkg_version.get_version("sglang")
     if installed not in SUPPORTED_SGLANG_VERSIONS:
+        if os.environ.get(THETA_FORK_ENV, "").strip().lower() == "theta":
+            logger.info(
+                "[AWEX] accepting explicitly selected Theta SGLang fork %s; "
+                "the structural fork contract remains mandatory",
+                installed,
+            )
+            return
         raise RuntimeError(
             "AWEX colocate patches SGLang internals and was verified against "
             f"{', '.join(SUPPORTED_SGLANG_VERSIONS)}, but found {installed}. "
-            "Re-check Scheduler.__init__, the event loops, and "
-            "execute_task_in_model_worker before allowing this version."
+            f"Re-check Scheduler.__init__, the event loops, and "
+            f"execute_task_in_model_worker before allowing this version. "
+            f"Set {THETA_FORK_ENV}=theta only for the reviewed Theta fork."
         )
 
 
@@ -170,6 +186,217 @@ def _try_get_writer_version(
         return None
 
 
+def _is_retract_paused(scheduler: Any) -> bool:
+    """Exclude parked waiters while preserving every other native idle check.
+
+    Called on the scheduler thread. An empty running batch alone does not
+    prove that overlap results, chunked prefill or cache transfers have drained.
+    Only the waiting queue is temporarily hidden from the native predicate.
+    """
+    if (
+        not getattr(scheduler, "_engine_paused", False)
+        or getattr(scheduler, "_areal_pause_mode", None) != "retract"
+    ):
+        return False
+    waiting_queue = scheduler.waiting_queue
+    if not waiting_queue:
+        return False
+    scheduler.waiting_queue = []
+    try:
+        return bool(scheduler.is_fully_idle())
+    finally:
+        scheduler.waiting_queue = waiting_queue
+
+
+def _patch_pause_mode_tracking() -> None:
+    """Remember the completed pause mode before relaxing any cache idle gate."""
+    from sglang.srt.managers.scheduler import Scheduler
+
+    if getattr(Scheduler, "_areal_pause_mode_tracking", False):
+        return
+    orig_pause = Scheduler.pause_generation
+
+    def pause_generation(self, request):
+        self._areal_pause_mode = None
+        result = orig_pause(self, request)
+        self._areal_pause_mode = request.mode
+        return result
+
+    Scheduler.pause_generation = pause_generation
+    Scheduler._areal_pause_mode_tracking = True
+
+
+def _patch_theta_memory_transitions() -> None:
+    """Make modern manager callbacks retry-safe before the dispatcher binds them."""
+    if os.environ.get(THETA_FORK_ENV, "").strip().lower() != "theta":
+        return
+    module_name = "sglang.srt.managers.scheduler_components.weight_updater"
+    try:
+        updater_module = importlib.import_module(module_name)
+    except ModuleNotFoundError as exc:
+        if exc.name == module_name or module_name.startswith(f"{exc.name}."):
+            return  # Older SGLang keeps these methods on Scheduler itself.
+        raise
+
+    manager_cls = updater_module.SchedulerWeightUpdaterManager
+    if getattr(manager_cls, "_areal_awex_memory_transitions_patched", False):
+        return
+
+    from sglang.srt.constants import GPU_MEMORY_ALL_TYPES
+    from sglang.srt.managers.io_struct import (
+        ReleaseMemoryOccupationReqOutput,
+        ResumeMemoryOccupationReqOutput,
+    )
+
+    def wrap(method: Callable, *, release: bool) -> Callable:
+        response_type = (
+            ReleaseMemoryOccupationReqOutput
+            if release
+            else ResumeMemoryOccupationReqOutput
+        )
+
+        def memory_transition(self, request):
+            # Native SGLang treats both None and [] as all memory regions,
+            # including CUDA graphs. Filter against the manager's native state.
+            tags = request.tags or GPU_MEMORY_ALL_TYPES
+            effective_tags = [
+                tag
+                for tag in tags
+                if (
+                    tag not in self.offload_tags
+                    if release
+                    else tag in self.offload_tags
+                )
+            ]
+            if not effective_tags:
+                # None would suppress the dispatcher reply and force HTTP retries.
+                return response_type()
+            filtered = copy(request)
+            filtered.tags = effective_tags
+            return method(self, filtered)
+
+        return memory_transition
+
+    # Modern managers use dataclass slots, and Scheduler captures bound methods
+    # during construction. Patching instances after __init__ handles neither.
+    manager_cls.release_memory_occupation = wrap(
+        manager_cls.release_memory_occupation, release=True
+    )
+    manager_cls.resume_memory_occupation = wrap(
+        manager_cls.resume_memory_occupation, release=False
+    )
+    manager_cls._areal_awex_memory_transitions_patched = True
+
+
+def _patch_release_memory_for_retract_pause() -> None:
+    """Allow memory release while retract-paused requests wait for resume."""
+
+    try:
+        from sglang.srt.managers.scheduler_components.weight_updater import (
+            SchedulerWeightUpdaterManager,
+        )
+    except ImportError:
+        from sglang.srt.managers.scheduler import Scheduler
+
+        if getattr(Scheduler, "_areal_retract_pause_release", False):
+            return
+        if not callable(getattr(Scheduler, "is_fully_idle", None)):
+            if callable(getattr(Scheduler, "_is_no_request", None)):
+                return
+            raise RuntimeError("Scheduler memory release has no supported idle gate")
+
+        orig_release = Scheduler.release_memory_occupation
+
+        def release_memory_occupation(self, recv_req):
+            if not _is_retract_paused(self):
+                return orig_release(self, recv_req)
+            logger.info(
+                "[AWEX] releasing memory under retract pause (waiting_queue=%d)",
+                len(self.waiting_queue),
+            )
+            had_instance_idle_gate = "is_fully_idle" in self.__dict__
+            orig_idle_gate = self.is_fully_idle
+            self.is_fully_idle = lambda *args, **kwargs: True
+            try:
+                return orig_release(self, recv_req)
+            finally:
+                if had_instance_idle_gate:
+                    self.is_fully_idle = orig_idle_gate
+                else:
+                    del self.is_fully_idle
+
+        Scheduler.release_memory_occupation = release_memory_occupation
+        Scheduler._areal_retract_pause_release = True
+        return
+
+    if getattr(SchedulerWeightUpdaterManager, "_areal_retract_pause_release", False):
+        return
+
+    orig_release = SchedulerWeightUpdaterManager.release_memory_occupation
+
+    def release_memory_occupation(self, recv_req):
+        scheduler = self.scheduler
+        if scheduler is None or not _is_retract_paused(scheduler):
+            return orig_release(self, recv_req)
+
+        logger.info(
+            "[AWEX] releasing memory under retract pause (waiting_queue=%d)",
+            len(scheduler.waiting_queue),
+        )
+        orig_idle_gate = self.is_fully_idle
+        had_scheduler_idle_gate = "is_fully_idle" in scheduler.__dict__
+        orig_scheduler_idle_gate = scheduler.is_fully_idle
+        self.is_fully_idle = lambda *args, **kwargs: True
+        scheduler.is_fully_idle = lambda *args, **kwargs: True
+        try:
+            return orig_release(self, recv_req)
+        finally:
+            self.is_fully_idle = orig_idle_gate
+            if had_scheduler_idle_gate:
+                scheduler.is_fully_idle = orig_scheduler_idle_gate
+            else:
+                del scheduler.is_fully_idle
+
+    SchedulerWeightUpdaterManager.release_memory_occupation = release_memory_occupation
+    SchedulerWeightUpdaterManager._areal_retract_pause_release = True
+
+
+def _patch_flush_cache_for_retract_pause() -> None:
+    """Allow cache flush while retract-paused requests wait for resume."""
+
+    from sglang.srt.managers.scheduler import Scheduler
+
+    if getattr(Scheduler, "_areal_retract_pause_flush", False):
+        return
+    if not callable(getattr(Scheduler, "is_fully_idle", None)):
+        if callable(getattr(Scheduler, "_is_no_request", None)):
+            return
+        raise RuntimeError("Scheduler.flush_cache has no supported idle gate")
+
+    orig_flush = Scheduler.flush_cache
+
+    def flush_cache(self, *args, **kwargs):
+        if not _is_retract_paused(self):
+            return orig_flush(self, *args, **kwargs)
+        logger.info(
+            "[AWEX] flushing cache under retract pause (waiting_queue=%d)",
+            len(self.waiting_queue),
+        )
+        had_instance_idle_gate = "is_fully_idle" in self.__dict__
+        orig_idle_gate = self.is_fully_idle
+        self.is_fully_idle = lambda *args_, **kwargs_: True
+        try:
+            return orig_flush(self, *args, **kwargs)
+        finally:
+            if had_instance_idle_gate:
+                self.is_fully_idle = orig_idle_gate
+            else:
+                del self.is_fully_idle
+
+    Scheduler.flush_cache = flush_cache
+    Scheduler._areal_retract_pause_flush = True
+
+
 class AwexSchedulerPlugin:
     """Binds awex weight-receive to a SGLang Scheduler instance.
 
@@ -253,6 +480,7 @@ class AwexSchedulerPlugin:
         )
 
     def bind(self) -> None:
+        check_scheduler_contract(self._scheduler)
         methods = [
             "awex_init_receiver",
             "awex_receive_weights",
@@ -379,7 +607,7 @@ class AwexSchedulerPlugin:
         import torch.distributed
 
         tp_cpu_group = self._scheduler.tp_cpu_group
-        tp_size = self._int_attr(self._scheduler, "tp_size", 1)
+        tp_size = resolve_scheduler_parallel_value(self._scheduler, "tp_size")
 
         has_item = 1 if (extra_ready and not self._weight_queue.empty()) else 0
 
@@ -399,7 +627,7 @@ class AwexSchedulerPlugin:
 
         item = self._weight_queue.get_nowait()
         version = item["version"]
-        gpu_id = getattr(self._scheduler, "gpu_id", "?")
+        gpu_id = resolve_scheduler_parallel_value(self._scheduler, "gpu_id")
         logger.info(
             f"[AWEX] main loop: processing weight update v{version} (gpu_id={gpu_id})",
         )
@@ -422,10 +650,9 @@ class AwexSchedulerPlugin:
 
         # Step 2: Resume weight memory (memory_saver re-allocates buffers).
         resume_req = ResumeMemoryOccupationReqInput(tags=["weights"])
-        resume_memory_occupation = self._callable(
-            self._scheduler, "resume_memory_occupation"
+        resolve_scheduler_memory_method(self._scheduler, "resume_memory_occupation")(
+            resume_req
         )
-        resume_memory_occupation(resume_req)
         logger.info(
             f"[AWEX] main loop: resumed weight memory for v{version} (gpu_id={gpu_id})",
         )
@@ -461,6 +688,29 @@ class AwexSchedulerPlugin:
         """
         scheduler = self._scheduler
         plugin = self
+
+        # Theta-derived schedulers receive through ``request_receiver`` and
+        # keep their evolving loop state in ``running_batch``/``last_batch``.
+        # Replacing those loops with the legacy 0.5.10 copy would discard new
+        # scheduling invariants.  Hook the stable request-processing boundary
+        # instead: every TP rank reaches it immediately after the same request
+        # broadcast, so the collective queue vote remains lockstep.
+        if hasattr(scheduler, "ps") and hasattr(scheduler, "request_receiver"):
+            orig_process_input_requests = scheduler.process_input_requests
+
+            def _process_input_requests_with_awex(recv_reqs):
+                result = orig_process_input_requests(recv_reqs)
+                if scheduler._engine_paused:
+                    plugin.process_awex_queue()
+                    time.sleep(plugin._paused_poll_interval_s)
+                return result
+
+            scheduler.process_input_requests = _process_input_requests_with_awex
+            logger.info(
+                "[AWEX] patched modern Scheduler.process_input_requests with "
+                "paused queue processing"
+            )
+            return
 
         decode_stats_name = next(
             (
@@ -992,8 +1242,12 @@ def register_awex_plugin() -> None:
     start method, which doesn't inherit parent-process monkey-patches.
     """
     assert_supported_sglang_version()
+    check_static_contract()
+
     from sglang.srt.managers.scheduler import Scheduler
 
+    if getattr(Scheduler, "_areal_awex_registered", False):
+        return
     _orig_init = Scheduler.__init__
 
     def _patched_init(self, *args, **kwargs):
@@ -1026,6 +1280,7 @@ def register_awex_plugin() -> None:
         logger.info("[AWEX] Scheduler.__init__ AWEX bind complete")
 
     Scheduler.__init__ = _patched_init
+    Scheduler._areal_awex_registered = True
     logger.info("[AWEX] Patched Scheduler.__init__ with awex plugin")
 
 
@@ -1045,8 +1300,8 @@ def _patch_execute_task_in_model_worker(
 
     def execute_task_in_model_worker(task_spec):
         model_context = dict(
-            tp_rank=plugin._int_attr(scheduler, "tp_rank", 0),
-            tp_size=plugin._int_attr(scheduler, "tp_size", 1),
+            tp_rank=resolve_scheduler_parallel_value(scheduler, "tp_rank"),
+            tp_size=resolve_scheduler_parallel_value(scheduler, "tp_size"),
             server_args=scheduler.server_args,
             scheduler=scheduler,
         )
@@ -1091,6 +1346,11 @@ def awex_run_scheduler_process(*args, **kwargs):
     )
     if meta_addr:
         register_awex_plugin()
+        if os.environ.get(THETA_FORK_ENV, "").strip().lower() == "theta":
+            _patch_pause_mode_tracking()
+            _patch_release_memory_for_retract_pause()
+            _patch_flush_cache_for_retract_pause()
+            _patch_theta_memory_transitions()
     else:
         logger.info(
             "[AWEX] No AWEX_META_SERVER_ADDR, skipping plugin registration",

@@ -86,6 +86,108 @@ With `scheduler.type=slurm`, AReaL launches the rollout / actor / proxy workers;
 rollout calls into AReaL-SWEAgent, which runs the agent in a sandbox and returns the
 reward.
 
+### Bailing V3 with AWEX colocation
+
+Bailing V3 uses a Theta-derived SGLang runtime and an AWEX build with the
+`BailingMoeV3ForCausalLM` converter. Pin both source revisions before starting a run:
+
+- [SGLang compatibility source](https://github.com/dingzhiqiang/sglang/commit/1743a69fbeb48f1e2d1daa2f7963a82074fce0b9):
+  `1743a69fbeb48f1e2d1daa2f7963a82074fce0b9`, based on the public Theta-derived
+  [Ling V3 branch](https://github.com/inclusionAI/sglang/commit/3127285c7de5b5d3f5379146c3abe17101a57ac7).
+- [AWEX V3 source](https://github.com/dingzhiqiang/asystem-awex/commit/a3c26c7d5a8e5c33b09eeaf46d18c5aabebd04fd):
+  `a3c26c7d5a8e5c33b09eeaf46d18c5aabebd04fd`, submitted in
+  [AWEX #120](https://github.com/inclusionAI/Awex/pull/120).
+
+The compatibility changes are covered by CPU tests; the combined public runtime still
+requires the GPU checks below before production use.
+
+Use separate actor and rollout images/environments: AReaL's default dependency set pins
+SGLang 0.5.10.post1 and Transformers \<=5.3.0, while the Theta-derived runtime has its
+own dependency requirements. Installing its dependencies into the actor's environment is
+not supported by this recipe. Both images need the same AReaL and AWEX sources, and the
+rollout image also needs the pinned SGLang runtime and its matching kernels. Source
+paths alone do not resolve kernel or Python dependency incompatibilities.
+
+Starting from `qwen3_30b_a3b_grpo.yaml`, merge the following settings into a copy. This
+example uses eight 8-GPU nodes: the actor and rollout each use the same 64 physical
+GPUs. Set `V3_MODEL`, `AWEX_ROOT`, `AREAL_ROOT`, `SWE_AGENT_ROOT`, `THETA_SGLANG_ROOT`
+(the fork's `python` directory), and `V3_ROLLOUT_IMAGE` in your launch environment. Keep
+the existing actor image, sandbox settings and other site-specific fields. Add the
+pinned AWEX source to the actor's existing `scheduling_spec[0].env_vars.PYTHONPATH` as
+well.
+
+```yaml
+cluster:
+  n_nodes: 8
+  n_gpus_per_node: 8
+
+train_dataset:
+  batch_size: 8
+
+rollout:
+  backend: "sglang:d8t8p1"
+  request_timeout: 20000.0
+  pause_grace_period: 30
+  scheduling_strategy:
+    type: colocation
+    target: actor
+  # A separate rollout image keeps the fork dependencies and allocator settings
+  # independent from the actor. Configure reservation/nodelist for your cluster.
+  scheduling_spec:
+    - task_type: worker
+      port_count: 2
+      gpu: 1
+      cpu: 4
+      mem: 32
+      image: ${oc.env:V3_ROLLOUT_IMAGE}
+      cmd: python3 -m areal.infra.rpc.rpc_server
+      env_vars:
+        AREAL_SGLANG_FORK: theta
+        AREAL_SGLANG_CONTRACT: strict
+        AREAL_AWEX_SENTINEL: "1"
+        PYTORCH_CUDA_ALLOC_CONF: ""
+        PYTHONPATH: ${oc.env:THETA_SGLANG_ROOT}:${oc.env:AWEX_ROOT}:${oc.env:SWE_AGENT_ROOT}:${oc.env:AREAL_ROOT}
+        AENV_SYSTEM_URL: ${oc.env:AENV_SYSTEM_URL}
+        SWE_AGENT_ROOT: ${oc.env:SWE_AGENT_ROOT}
+        AWEAGENT_ROOT: ${oc.env:SWE_AGENT_ROOT}
+  agent:
+    tool_call_parser: ling3
+    reasoning_parser: ling3
+
+actor:
+  backend: "megatron:(attn:d4p2t4c2|ffn:d4p2e8)"
+  path: ${oc.env:V3_MODEL}
+  weight_update_mode: awex
+  megatron:
+    use_deterministic_algorithms: false
+sglang:
+  enable_memory_saver: true
+  mem_fraction_static: 0.45
+  disable_cuda_graph: true
+  attention_backend: fa3
+  disable_radix_cache: false
+```
+
+`AREAL_SGLANG_FORK=theta` selects `abort` followed by `retract`: the first request
+returns partial generations to AReaL; the second pauses scheduler execution before
+weight transfer. Any remaining retracted requests recompute their KV cache after resume.
+Cache release still requires every native idle condition except an empty waiting queue,
+and this exemption is limited to a successful retract pause.
+
+For Slurm, propagate `SBATCH_DISTRIBUTION=block:block` and
+`SLURM_DISTRIBUTION=block:block` through the launch environment/container so rank
+placement stays consistent with AWEX colocation. Retain shared cache paths from your
+cluster setup. Resource and memory limits must be checked on that cluster.
+
+Before a long run, validate that the checkpoint's EOS token matches the assistant turn
+terminator in its chat template. Check the strict SGLang contract at startup, then run
+at least two RL steps with weight updates. After each update, compare AWEX sentinel
+values with the expected shard of a saved checkpoint (different TP ranks alone are not
+proof of correctness), and check temperature-zero generation. Disable
+`AREAL_AWEX_SENTINEL` after bring-up because it adds GPU to CPU synchronization. Full
+TP8/NCCL, request retraction and model-quality validation cannot be replaced by the CPU
+unit tests.
+
 ## 6. Set up the AEnvironment backend
 
 `AENV_SYSTEM_URL` (section 2) must point at a running

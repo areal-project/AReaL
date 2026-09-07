@@ -23,6 +23,16 @@ def test_register_accepts_verified_sglang_versions():
             sglang_plugin.assert_supported_sglang_version()
 
 
+def test_register_accepts_explicit_theta_fork(monkeypatch):
+    """A reviewed Theta fork opts into structural compatibility checks."""
+    monkeypatch.setenv(sglang_plugin.THETA_FORK_ENV, "theta")
+
+    with mock.patch.object(
+        sglang_plugin.pkg_version, "get_version", return_value="0.5.14.dev0"
+    ):
+        sglang_plugin.assert_supported_sglang_version()
+
+
 def test_error_names_the_supported_versions():
     with mock.patch.object(
         sglang_plugin.pkg_version, "get_version", return_value="0.4.0"

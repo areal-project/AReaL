@@ -370,6 +370,16 @@ class SGLangBackend:
         watches before it services awex work, and by then the abort has already
         left nothing for that mode to retain.
         """
+        if os.environ.get("AREAL_SGLANG_FORK", "").strip().lower() == "theta":
+            # The reviewed Theta fork supports retract: running requests move
+            # back to its waiting queue without retaining KV and recompute
+            # after the weight update. Its stricter idle gate is adapted by
+            # the AWEX plugin before memory release and cache flush.
+            return [
+                self.get_pause_request(mode="abort"),
+                self.get_pause_request(mode="retract"),
+            ]
+
         return [
             self.get_pause_request(),
             self.get_pause_request(mode="in_place"),
