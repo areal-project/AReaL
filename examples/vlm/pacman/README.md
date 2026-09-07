@@ -86,10 +86,15 @@ and the same installed dependencies. The templates propagate the two required so
 paths through worker environment settings.
 
 The 8-GPU template allocates four one-GPU SGLang replicas and one four-GPU Megatron
-actor (TP=4). Reference shares actor GPUs with phase offload. DP=PP=CP=EP=1 is enforced
-in this initial recipe: upstream's synchronized microbatch splitter cannot always
-accommodate arbitrarily unequal episode row counts across DP ranks. Full prompt groups
-stay intact. A generic scheduler extension is needed before increasing actor DP.
+actor (TP=4). Reference shares actor GPUs with phase offload. PP=CP=EP=1 is enforced; DP
+and TP are configurable. To use DP=4, TP=1 on the same four actor GPUs, append
+`actor.backend=megatron:d4p1t1`; reference inherits this topology. Full prompt groups
+stay intact, and the group count in each batch must be divisible by DP. The current
+batch size of 4 satisfies DP=4. The synchronized microbatch splitter can still fail when
+a short group has too few decision rows to match the other ranks' microbatch count. This
+change only permits DP in the recipe configuration; it does not implement dummy
+microbatches or establish DP1/DP4 numerical equivalence. TP=1 also requires each GPU to
+hold the full model parameters; recheck peak memory for actor and reference.
 
 This is a placement template, not a hardware qualification. Verify model/vision
 initialization, TMS, available GPU memory, host RAM for retained episode images, shared
@@ -158,19 +163,45 @@ passing static checks does not establish SGLang/Megatron numerical agreement.
 
 ## Extension points and known differences
 
+- The workflow automatically uses AReaL's group-scoped processor cache for both
+  curricula. Identical full messages (including inline PNG contents) and the same
+  processor share one native processing call across the 12 candidate episodes. Each
+  decision keeps private containers and immutable shared processor tensors, so the
+  existing rollout RTensor transport can export repeated image tensors as one shard.
+  Image decoding and re-encoding are also reused on cache hits. Changed prompts or
+  images are processed separately; different rollout groups never share cache entries.
+  Group finalization closes the cache, including on cancellation.
+
+- `rollout/pacman_processor_cache_hit` (and its `eval-rollout` counterpart) records
+  whether each decision reused processing; its mean is the processor cache hit rate. It
+  is not a measurement of bytes saved or end-to-end speedup. JSON/Base64 transport and
+  full-batch reference input loading remain unchanged. Sampling, rewards, action
+  constraints and PPO settings are unchanged.
+
+- The existing `scripts/smoke.sh` includes the cache regression checks: concurrent
+  reuse, exact native tensor equivalence, input/group isolation, and alias preservation
+  through trajectory construction and RTensor export. To run just these checks in the
+  configured environment, use
+  `python -m pytest examples/vlm/pacman/tests/test_workflow.py`. Use `scripts/e2e.sh`
+  above for the real training path and inspect the cache metric alongside reference
+  forward timing. These tests and GPU scripts have **not been run locally**.
+
 - `GenerationHyperparameters.request_plugin` constructs a worker-local request plugin.
   This example uses SGLang's public
   [CustomLogitProcessor API](https://github.com/sgl-project/sglang/blob/v0.5.10.post1/python/sglang/srt/sampling/custom_logit_processor.py)
   to mask tokens before temperature/softmax. It is an exact allowed-token constraint;
   JSON-schema validation alone would not align the training distribution.
+
 - `MegatronEngineConfig.policy_distribution` replaces default logprob/entropy gathering
   in training and proximal/reference forward passes. This example gathers only allowed
   logits across TP and uses identity backward for replicated loss gradients. It requires
   CP=1, ordinary full-logit output and no tree training or fused chunked LM-head loss.
+
 - `PPOActorConfig.objective_plugin` prepares advantages and optionally wraps the
   existing PPO loss and its microbatch normalization mass. Implementations must preserve
   row order and count. `loss_reduction_weights` is a generic per-token reduction
   primitive.
+
 - `[B,S,K]` token metadata is split/padded/packed with the token axis preserved. The
   prediction-aligned support ledger uses token ID + 1, with zero reserved for padding.
   Infinite configuration bounds round-trip through strict JSON RPC; actual nonfinite
