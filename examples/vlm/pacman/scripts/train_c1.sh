@@ -9,10 +9,12 @@ set -euo pipefail
 : "${PACMAN_ARTIFACT_ROOT:?Use a fresh absolute output directory}"
 
 cd "$AREAL_ROOT"
+export AREAL_SPMD_MODE=0
 export SGLANG_RETURN_ORIGINAL_LOGPROB=0
 
 # Activate the GPU environment and install the pinned areal-pacman package first.
+# Start one controller; scheduler.type=local in the recipe creates the workers.
 # Additional arguments use AReaL's key=value configuration overrides.
-exec python -m areal.infra.launcher.local examples/vlm/pacman/train.py \
+exec python -m examples.vlm.pacman.train \
     --config examples/vlm/pacman/curriculum1.yaml \
     "$@"
