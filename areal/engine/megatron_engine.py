@@ -50,6 +50,7 @@ from areal.api import (
 )
 from areal.api.cli_args import MicroBatchSpec, PerfTracerConfig, TrainEngineConfig
 from areal.api.io_struct import DeviceRuntimeInfo
+from areal.api.rl_plugins import PolicyDistribution
 from areal.engine.core import (
     aggregate_eval_losses,
     compute_total_loss_weight,
@@ -352,6 +353,19 @@ class MegatronEngine(TrainEngine):
         self.device = None
         self.optimizer_config = config.optimizer
         self.mcore_config = config.megatron
+        self.policy_distribution = (
+            self.mcore_config.policy_distribution.build(PolicyDistribution)
+            if self.mcore_config.policy_distribution
+            else None
+        )
+        if self.policy_distribution is not None and (
+            config.is_critic
+            or config.enable_tree_training
+            or self.mcore_config.lm_head_loss_chunk_size > 0
+        ):
+            raise ValueError(
+                "Policy distribution plugins require full policy logits without tree training"
+            )
         self.parallel_strategy = None
         self.optimizer = None
         self.lr_scheduler = None
@@ -403,6 +417,11 @@ class MegatronEngine(TrainEngine):
         if parallel_strategy is None:
             parallel_strategy = ParallelStrategy()
         self.parallel_strategy = self._make_parallel_strategy(parallel_strategy)
+        if (
+            self.policy_distribution is not None
+            and self.parallel_strategy.context_parallel_size > 1
+        ):
+            raise ValueError("Policy distribution plugins currently require CP=1")
         backend = current_platform.communication_backend
         if not dist.is_initialized():
             # NOTE: device_id **SHOULD NOT** be passed into init_process_group,
@@ -3077,19 +3096,30 @@ class MegatronEngine(TrainEngine):
                     vocab_norm_logits = torch.linalg.vector_norm(
                         output.detach(), dim=-1, dtype=torch.float32
                     )
-                    logprobs, entropy = gather_logprobs_entropy(
-                        output,
-                        labels,
-                        temperature=self.config.temperature,
-                        tp_group=mpu.get_tensor_model_parallel_group()
-                        if mpu.get_tensor_model_parallel_world_size() > 1
-                        else None,
-                        chunk_size=self.config.logprobs_chunk_size,
-                        reuse_logits=_reuse_chunked_logits_storage(
-                            self.mcore_config.enable_chunked_logits,
-                            self.mcore_config.entropy_requires_grad,
-                        ),
-                    )
+                    if self.policy_distribution is not None:
+                        logprobs, entropy = self.policy_distribution.compute(
+                            output,
+                            labels,
+                            inputs,
+                            self.config.temperature,
+                            mpu.get_tensor_model_parallel_group()
+                            if mpu.get_tensor_model_parallel_world_size() > 1
+                            else None,
+                        )
+                    else:
+                        logprobs, entropy = gather_logprobs_entropy(
+                            output,
+                            labels,
+                            temperature=self.config.temperature,
+                            tp_group=mpu.get_tensor_model_parallel_group()
+                            if mpu.get_tensor_model_parallel_world_size() > 1
+                            else None,
+                            chunk_size=self.config.logprobs_chunk_size,
+                            reuse_logits=_reuse_chunked_logits_storage(
+                                self.mcore_config.enable_chunked_logits,
+                                self.mcore_config.entropy_requires_grad,
+                            ),
+                        )
                 if cp_padded_cu_seqlens is not None:
                     logprobs = reassemble_cp_packed_logprobs(
                         logprobs, cp_padded_cu_seqlens
@@ -3194,6 +3224,17 @@ class MegatronEngine(TrainEngine):
             labels = inputs.get("_cp_local_labels")
             if labels is None:
                 labels = torch.roll(inputs["input_ids"], shifts=-1, dims=-1)
+            if self.policy_distribution is not None:
+                logprobs, _ = self.policy_distribution.compute(
+                    output,
+                    labels,
+                    inputs,
+                    self.config.temperature,
+                    mpu.get_tensor_model_parallel_group()
+                    if mpu.get_tensor_model_parallel_world_size() > 1
+                    else None,
+                )
+                return logprobs
             logprobs = gather_logprobs(
                 output,
                 labels,
