@@ -51,24 +51,24 @@ from awex.util.tensor_util import (  # noqa: E402
     reconstruct_tensors_from_groups,
 )
 
-from areal.infra.platforms import current_platform  # noqa: E402
-from areal.utils import logging  # noqa: E402
-from areal.v2.weight_update.awex import (  # noqa: E402
-    awex_wu_use_group,
-    fetch_kv_metadata,
-)
-from areal.v2.weight_update.awex.delta_config import (  # noqa: E402
+from areal.engine.awex.delta_config import (  # noqa: E402
     DTERuntimeConfig,
     synchronize_wire_dtypes,
     validate_dte_world_size,
 )
-from areal.v2.weight_update.inference_adapter import (  # noqa: E402
+from areal.engine.awex.inference_adapter import (  # noqa: E402
     AwexInferenceAdapter,
 )
-from areal.v2.weight_update.nccl_group import (  # noqa: E402
+from areal.engine.awex.metadata import (  # noqa: E402
+    awex_wu_use_group,
+    fetch_kv_metadata,
+)
+from areal.engine.awex.nccl_group import (  # noqa: E402
     init_weights_update_group,
     setup_batch_isend_irecv,
 )
+from areal.infra.platforms import current_platform  # noqa: E402
+from areal.utils import logging  # noqa: E402
 
 logger = logging.getLogger("AwexSGLangAdapter")
 
@@ -1008,7 +1008,7 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
 
     def wait_for_training_offloaded(self, version: int) -> None:
         del version
-        from areal.engine.awex.megatron_adapter import awex_colocate_timeout_s
+        from areal.engine.awex.utils import awex_colocate_timeout_s
 
         if self._legacy_meta_server_client is None:
             raise RuntimeError("Legacy SGLang AWEX adapter is not initialized")
@@ -1023,7 +1023,7 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
     ) -> None:
         from awex.util.common import get_ip_address
 
-        from areal.engine.awex.megatron_adapter import awex_colocate_timeout_s
+        from areal.engine.awex.utils import awex_colocate_timeout_s
 
         if self._legacy_meta_server_client is None:
             raise RuntimeError("Legacy SGLang AWEX adapter is not initialized")
