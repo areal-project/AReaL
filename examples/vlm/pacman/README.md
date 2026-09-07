@@ -99,6 +99,11 @@ from an AWEX example into this XCCL recipe.
 
 ## Run
 
+Run the training module directly in **single-controller mode**. Both recipes use
+`scheduler.type: local`; the trainer starts the required workers and inference servers.
+The scripts set `AREAL_SPMD_MODE=0` explicitly; use the same setting for manual runs. Do
+not wrap this entry point with the legacy SPMD launcher or add `allocation_mode`.
+
 Use a fresh absolute artifact root for each invocation to keep manifests, checkpoints
 and stage transitions unambiguous.
 
@@ -140,7 +145,7 @@ To run a stage separately:
 
 ```bash
 # For C2, also export CURRICULUM1_CHECKPOINT to a complete C1 HF checkpoint.
-python -m areal.infra.launcher.local examples/vlm/pacman/train.py \
+AREAL_SPMD_MODE=0 python -m examples.vlm.pacman.train \
   --config examples/vlm/pacman/curriculum1.yaml total_train_steps=2
 ```
 
