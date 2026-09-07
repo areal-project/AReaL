@@ -6,6 +6,7 @@ import sys
 import uuid
 from collections.abc import Callable, Mapping
 from concurrent.futures import Future
+from copy import deepcopy
 from typing import Any
 
 import numpy as np
@@ -31,6 +32,7 @@ from areal.api.io_struct import (
     WeightUpdateRequests,
     get_versioned_lora_name,
 )
+from areal.api.rl_plugins import GenerationRequestPlugin
 from areal.infra import RemoteInfEngine, RolloutController, WorkflowExecutor
 from areal.infra.platforms import current_platform
 from areal.infra.utils.launcher import TRITON_CACHE_PATH
@@ -46,6 +48,8 @@ class SGLangBackend:
 
     def __init__(self) -> None:
         self._readiness_endpoint = "/health"
+        self._request_plugin_spec = None
+        self._request_plugin = None
 
     @staticmethod
     def build_server_env(env: Mapping[str, str]) -> dict[str, str]:
@@ -101,6 +105,14 @@ class SGLangBackend:
                     "LoRA name (gconfig.lora_name) is required when use_lora is enabled."
                 )
             payload["lora_path"] = get_versioned_lora_name(lora_name, version)
+
+        if gconfig.request_plugin is not None:
+            if self._request_plugin_spec != gconfig.request_plugin:
+                self._request_plugin = gconfig.request_plugin.build(
+                    GenerationRequestPlugin
+                )
+                self._request_plugin_spec = deepcopy(gconfig.request_plugin)
+            self._request_plugin.build_request(req, payload)
 
         return HttpRequest(endpoint="/generate", payload=payload)
 
