@@ -183,6 +183,90 @@ def _build_ppo_trainer(events: list[tuple], *, recovered: bool = False):
     return trainer
 
 
+def test_awex_reference_scoring_releases_rollout_before_restoring_models(monkeypatch):
+    """A shared GPU belongs to rollout, then reference, then the PPO actor."""
+    _disable_timing_contexts(monkeypatch, rl_trainer)
+    events = []
+    trainer = _build_ppo_trainer(events)
+    trainer.config.actor.weight_update_mode = "awex"
+    trainer.mopd_execution_plan = None
+    trainer.mopd_teacher_phase = None
+    trainer._should_offload_ref = True
+    trainer.actor.onload = lambda: events.append(("actor_onload", {}))
+    trainer.rollout = SimpleNamespace(
+        pause=lambda: events.append(("rollout_pause", {})),
+        pause_generation_sync=lambda: events.append(("generation_pause", {})),
+        offload=lambda tags: events.append(("rollout_offload", {"tags": tags})),
+    )
+
+    def score(batch):
+        events.append(("ref_score", {}))
+        return [0.0 for _ in batch]
+
+    trainer.ref = SimpleNamespace(
+        onload=lambda: events.append(("ref_onload", {})),
+        compute_logp=score,
+        offload=lambda: events.append(("ref_offload", {})),
+        get_device_stats=lambda: _FakeDeviceStats(),
+    )
+    with pytest.raises(_StopAfterFirstUpdate):
+        trainer.train(workflow="test-workflow")
+    phase_events = [
+        event for event, _ in events if event not in ("initial_eval", "commit")
+    ]
+    assert phase_events == [
+        "rollout_pause",
+        "generation_pause",
+        "rollout_offload",
+        "rollout_offload",
+        "rollout_offload",
+        "ref_onload",
+        "ref_score",
+        "ref_offload",
+        "actor_onload",
+        "update",
+    ]
+    assert [
+        details["tags"] for event, details in events if event == "rollout_offload"
+    ] == [
+        ["kv_cache"],
+        ["weights"],
+        ["cuda_graph"],
+    ]
+
+
+@pytest.mark.parametrize(
+    "version,mode,offload,expected",
+    [
+        ("v1", "awex", True, True),
+        ("v1", "awex", False, False),
+        ("v1", "xccl", True, False),
+        ("v2", "awex", True, False),
+    ],
+)
+def test_awex_reference_initialization_uses_independent_residency(
+    monkeypatch,
+    version,
+    mode,
+    offload,
+    expected,
+):
+    """Only an offloaded v1 AWEX reference needs manual residency before rollout init."""
+    _disable_timing_contexts(monkeypatch, rl_trainer)
+    events = []
+    trainer = _build_ppo_trainer(events)
+    trainer.config.actor._version = version
+    trainer.config.actor.weight_update_mode = mode
+    trainer.config.ref = SimpleNamespace(backend="megatron:d1p1t1")
+    trainer._should_offload_ref = offload
+    trainer.ref = SimpleNamespace(
+        init_weight_residency_adapter=lambda: events.append("residency"),
+        offload=lambda: events.append("offload"),
+    )
+    trainer._initialize_awex_reference_residency()
+    assert events == (["residency", "offload"] if expected else [])
+
+
 @pytest.mark.parametrize(
     ("module", "trainer_cls", "update_method"),
     [

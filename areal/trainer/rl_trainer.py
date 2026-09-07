@@ -340,6 +340,7 @@ class PPOTrainer:
             self.critic.initialize(**engine_init_kwargs, role="critic")
         if self.ref is not None:
             self.ref.initialize(**engine_init_kwargs, role="ref")
+            self._initialize_awex_reference_residency()
 
         if (
             self.config.teacher is not None
@@ -583,6 +584,19 @@ class PPOTrainer:
         ):
             engine.onload()
 
+    def _initialize_awex_reference_residency(self) -> None:
+        """Release a Megatron reference before colocated SGLang starts."""
+        if (
+            self._is_v1_awex_colocate(self.config)
+            and self.ref is not None
+            and ModelAllocation.from_str(self.config.ref.backend).backend == "megatron"
+            and self._should_offload_ref
+        ):
+            # AWEX disables training-side TMS regions. Scoring engines need
+            # independent flat-buffer residency, without a weight publisher.
+            self.ref.init_weight_residency_adapter()
+            self._offload_model(self.ref, role="ref")
+
     def _offload_model(self, engine, role: str) -> None:
         with (
             stats_tracker.record_timing(f"{role}_offload"),
@@ -793,6 +807,20 @@ class PPOTrainer:
             if self._should_offload_rollout:
                 self._offload_rollout()
 
+            # Reference/critic scoring can share the actor GPUs too. Release
+            # SGLang before restoring any scoring model, not just the actor.
+            if self._is_v1_awex_colocate(config):
+                logger.info("[AWEX] colocate: pausing rollout...")
+                self.rollout.pause()
+                logger.info("[AWEX] colocate: pause_generation_sync...")
+                self.rollout.pause_generation_sync()
+                logger.info("[AWEX] colocate: offload kv_cache...")
+                self.rollout.offload(tags=["kv_cache"])
+                logger.info("[AWEX] colocate: offload weights...")
+                self.rollout.offload(tags=["weights"])
+                logger.info("[AWEX] colocate: offload cuda_graph...")
+                self.rollout.offload(tags=["cuda_graph"])
+
             if self.critic is not None:
                 if self._should_offload_critic:
                     self._onload_model(self.critic, role="critic")
@@ -849,19 +877,9 @@ class PPOTrainer:
                 if self._should_offload_teacher:
                     self._offload_model(self.teacher, role="teacher")
 
-            # In colocate (awex) mode: switch GPU from inference to training.
-            # Release SGLang KV cache + weights to free GPU for actor.
+            # SGLang was released before scoring. Restore the actor only after
+            # the reference has finished and released its own weights.
             if self._is_v1_awex_colocate(self.config):
-                logger.info("[AWEX] colocate: pausing rollout...")
-                self.rollout.pause()
-                logger.info("[AWEX] colocate: pause_generation_sync...")
-                self.rollout.pause_generation_sync()
-                logger.info("[AWEX] colocate: offload kv_cache...")
-                self.rollout.offload(tags=["kv_cache"])
-                logger.info("[AWEX] colocate: offload weights...")
-                self.rollout.offload(tags=["weights"])
-                logger.info("[AWEX] colocate: offload cuda_graph...")
-                self.rollout.offload(tags=["cuda_graph"])
                 try:
                     if self.mopd_teacher_phase is not None:
                         rollout_batch = self.mopd_teacher_phase.materialize(
