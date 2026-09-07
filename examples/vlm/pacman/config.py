@@ -27,14 +27,13 @@ class PacmanConfig(PacmanAgentConfig):
         if actor.backend != "megatron" or any(
             size != 1
             for size in (
-                parallel.data_parallel_size,
                 parallel.pipeline_parallel_size,
                 parallel.context_parallel_size,
                 parallel.expert_parallel_size,
             )
         ):
             raise ValueError(
-                "This recipe requires Megatron with DP=PP=CP=EP=1; TP is configurable"
+                "This recipe requires Megatron with PP=CP=EP=1; DP and TP are configurable"
             )
         if ModelAllocation.from_str(self.rollout.backend).backend != "sglang":
             raise ValueError("This recipe uses SGLang rollout")
