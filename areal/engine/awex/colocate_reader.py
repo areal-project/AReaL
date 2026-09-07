@@ -28,7 +28,6 @@ signal-finished); see ``awex_sglang_plugin.process_awex_queue``.
 
 from __future__ import annotations
 
-import os
 from typing import Any
 
 import torch
@@ -46,10 +45,6 @@ from awex.reader.nccl_reader import NCCLWorkerWeightsReader  # noqa: E402
 from awex.sharding import get_sharding_strategy_builder  # noqa: E402
 from awex.util.common import simple_hf_config  # noqa: E402
 
-from areal.engine.sglang_fork_contract import (  # noqa: E402
-    resolve_scheduler_memory_method,
-    resolve_scheduler_parallel_value,
-)
 from areal.utils.logging import getLogger  # noqa: E402
 
 logger = getLogger("AwexColocateReader")
@@ -213,19 +208,6 @@ class _SingleInstanceMetaResolver(ParamMetaResolver):
 class AwexColocateReader:
     """Thin adapter binding awex's native worker reader into a SGLang scheduler."""
 
-    _SENTINEL_NAMES = (
-        "embed_tokens.weight",
-        "word_embeddings.weight",
-        "lm_head.weight",
-        "layers.0.attention.q_proj.weight",
-        "layers.0.attention.k_proj.weight",
-        "layers.0.attention.fused_qkvbfg_proj.weight",
-        "layers.0.attention.fused_qkvbfg_a_proj.weight",
-        "layers.0.attention.qkv_conv1d.weight",
-        "layers.0.self_attn.q_proj.weight",
-        "layers.0.self_attn.k_proj.weight",
-    )
-
     def __init__(self, scheduler: Any):
         self._scheduler = scheduler
         self._meta_server_client = None
@@ -271,7 +253,7 @@ class AwexColocateReader:
         tp_size = int(getattr(server_args, "tp_size", 1))
         pp_size = int(getattr(server_args, "pp_size", 1))
         dp_size = int(getattr(server_args, "dp_size", 1))
-        tp_rank = resolve_scheduler_parallel_value(scheduler, "tp_rank")
+        tp_rank = int(getattr(scheduler, "tp_rank", 0))
 
         if self._infer_instance_world_size is not None:
             world_size = self._infer_instance_world_size
@@ -285,23 +267,15 @@ class AwexColocateReader:
             "infer_engine_config": server_args,
             "tp_rank": tp_rank,
             "tp_size": tp_size,
-            "pp_rank": resolve_scheduler_parallel_value(
-                scheduler, "pp_rank", default=0
-            ),
+            "pp_rank": int(getattr(scheduler, "pp_rank", 0)),
             "pp_size": pp_size,
             "dp_size": dp_size,
             "world_size": world_size,
             "global_rank": global_rank,
             "local_rank": tp_rank,
-            "attn_tp_rank": resolve_scheduler_parallel_value(
-                scheduler, "attn_tp_rank", default=tp_rank
-            ),
-            "attn_tp_size": resolve_scheduler_parallel_value(
-                scheduler, "attn_tp_size", default=tp_size
-            ),
-            "attn_dp_rank": resolve_scheduler_parallel_value(
-                scheduler, "attn_dp_rank", default=0
-            ),
+            "attn_tp_rank": int(getattr(scheduler, "attn_tp_rank", tp_rank)),
+            "attn_tp_size": int(getattr(scheduler, "attn_tp_size", tp_size)),
+            "attn_dp_rank": int(getattr(scheduler, "attn_dp_rank", 0)),
         }
 
     def get_parallelism(self) -> dict:
@@ -555,35 +529,7 @@ class AwexColocateReader:
         reader = self._ensure_reader()
         reader.update_weights(step_id=version)
         self._rebuild_derived_weights()
-        self._log_weight_sentinels(version)
         logger.info("Colocate weight update completed: version=%d", version)
-
-    def _log_weight_sentinels(self, version: int) -> None:
-        """Log opt-in tensor fingerprints after an AWEX weight update."""
-
-        enabled = os.environ.get("AREAL_AWEX_SENTINEL", "0").strip().lower()
-        if enabled not in {"1", "true", "yes", "on"}:
-            return
-
-        for name, parameter in self._get_model().named_parameters():
-            if not any(name.endswith(sentinel) for sentinel in self._SENTINEL_NAMES):
-                continue
-            try:
-                tensor = parameter.detach()
-                first_values = tensor.reshape(-1)[:4].float().tolist()
-                norm = torch.linalg.vector_norm(tensor, dtype=torch.float32).item()
-                logger.info(
-                    "[AWEX-SENTINEL] version=%d transfer_rank=%s name=%s "
-                    "shape=%s norm=%.6f first4=%s",
-                    version,
-                    self._transfer_rank,
-                    name,
-                    tuple(tensor.shape),
-                    norm,
-                    [round(value, 8) for value in first_values],
-                )
-            except Exception as exc:
-                logger.warning("[AWEX-SENTINEL] failed for %s: %s", name, exc)
 
     def _rebuild_derived_weights(self) -> None:
         """Re-derive non-parameter tensors after an in-place AWEX weight write.
@@ -620,9 +566,7 @@ class AwexColocateReader:
         native_tags = [t for t in tags if t not in self._released_tags]
         if native_tags:
             req = ReleaseMemoryOccupationReqInput(tags=native_tags)
-            resolve_scheduler_memory_method(
-                self._scheduler, "release_memory_occupation"
-            )(req)
+            self._scheduler.release_memory_occupation(req)
             self._released_tags.update(native_tags)
         logger.info("release_memory: tags=%s", tags)
 
@@ -633,9 +577,7 @@ class AwexColocateReader:
         resume_tags = [t for t in tags if t in self._released_tags]
         if resume_tags:
             req = ResumeMemoryOccupationReqInput(tags=resume_tags)
-            resolve_scheduler_memory_method(
-                self._scheduler, "resume_memory_occupation"
-            )(req)
+            self._scheduler.resume_memory_occupation(req)
             self._released_tags.difference_update(resume_tags)
         logger.info("resume_memory: tags=%s", tags)
 

@@ -133,7 +133,6 @@ LOGGER_COLORS_EXACT = {
     "MegatronResidency": "light_cyan",
     "MOPDTeacherPhase": "light_cyan",
     "AwexSGLangPlugin": "light_cyan",
-    "SGLangForkContract": "light_cyan",
 }
 
 # Prefix patterns checked in order (first match wins)

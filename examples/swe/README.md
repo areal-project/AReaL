@@ -86,107 +86,62 @@ With `scheduler.type=slurm`, AReaL launches the rollout / actor / proxy workers;
 rollout calls into AReaL-SWEAgent, which runs the agent in a sandbox and returns the
 reward.
 
-### Bailing V3 with AWEX colocation
+### Bailing V3 with NCCL weight updates
 
-Bailing V3 uses a Theta-derived SGLang runtime and an AWEX build with the
-`BailingMoeV3ForCausalLM` converter. Pin both source revisions before starting a run:
+Use [bailing_v3_grpo.yaml](bailing_v3_grpo.yaml) for **separate training and rollout
+GPUs**, with the v1 controllers and `actor.weight_update_mode: xccl`. On CUDA, this uses
+NCCL to broadcast HF-layout tensors directly to SGLang. It does not use the AWEX
+colocation plugin or the AWEX V3 converter.
 
-- [SGLang compatibility source](https://github.com/dingzhiqiang/sglang/commit/1743a69fbeb48f1e2d1daa2f7963a82074fce0b9):
-  `1743a69fbeb48f1e2d1daa2f7963a82074fce0b9`, based on the public Theta-derived
-  [Ling V3 branch](https://github.com/inclusionAI/sglang/commit/3127285c7de5b5d3f5379146c3abe17101a57ac7).
-- [AWEX V3 source](https://github.com/dingzhiqiang/asystem-awex/commit/a3c26c7d5a8e5c33b09eeaf46d18c5aabebd04fd):
-  `a3c26c7d5a8e5c33b09eeaf46d18c5aabebd04fd`, submitted in
-  [AWEX #120](https://github.com/inclusionAI/Awex/pull/120).
+The example starts from the Flash V3 parallel layout: eight 8-GPU actor nodes
+(`attn:d4p2t4c2|ffn:d4p2e8`) and eight separate 8-GPU rollout nodes (`d8t8p1`), for 128
+GPUs total. Adapt the topology and worker resource requests to your checkpoint and
+cluster. The two-step, 16K-token settings are an integration starting point, not a
+throughput benchmark.
 
-The compatibility changes are covered by CPU tests; the combined public runtime still
-requires the GPU checks below before production use.
+Set these environment variables before launching:
 
-Use separate actor and rollout images/environments: AReaL's default dependency set pins
-SGLang 0.5.10.post1 and Transformers \<=5.3.0, while the Theta-derived runtime has its
-own dependency requirements. Installing its dependencies into the actor's environment is
-not supported by this recipe. Both images need the same AReaL and AWEX sources, and the
-rollout image also needs the pinned SGLang runtime and its matching kernels. Source
-paths alone do not resolve kernel or Python dependency incompatibilities.
-
-Starting from `qwen3_30b_a3b_grpo.yaml`, merge the following settings into a copy. This
-example uses eight 8-GPU nodes: the actor and rollout each use the same 64 physical
-GPUs. Set `V3_MODEL`, `AWEX_ROOT`, `AREAL_ROOT`, `SWE_AGENT_ROOT`, `THETA_SGLANG_ROOT`
-(the fork's `python` directory), and `V3_ROLLOUT_IMAGE` in your launch environment. Keep
-the existing actor image, sandbox settings and other site-specific fields. Add the
-pinned AWEX source to the actor's existing `scheduling_spec[0].env_vars.PYTHONPATH` as
-well.
-
-```yaml
-cluster:
-  n_nodes: 8
-  n_gpus_per_node: 8
-
-train_dataset:
-  batch_size: 8
-
-rollout:
-  backend: "sglang:d8t8p1"
-  request_timeout: 20000.0
-  pause_grace_period: 30
-  scheduling_strategy:
-    type: colocation
-    target: actor
-  # A separate rollout image keeps the fork dependencies and allocator settings
-  # independent from the actor. Configure reservation/nodelist for your cluster.
-  scheduling_spec:
-    - task_type: worker
-      port_count: 2
-      gpu: 1
-      cpu: 4
-      mem: 32
-      image: ${oc.env:V3_ROLLOUT_IMAGE}
-      cmd: python3 -m areal.infra.rpc.rpc_server
-      env_vars:
-        AREAL_SGLANG_FORK: theta
-        AREAL_SGLANG_CONTRACT: strict
-        AREAL_AWEX_SENTINEL: "1"
-        PYTORCH_CUDA_ALLOC_CONF: ""
-        PYTHONPATH: ${oc.env:THETA_SGLANG_ROOT}:${oc.env:AWEX_ROOT}:${oc.env:SWE_AGENT_ROOT}:${oc.env:AREAL_ROOT}
-        AENV_SYSTEM_URL: ${oc.env:AENV_SYSTEM_URL}
-        SWE_AGENT_ROOT: ${oc.env:SWE_AGENT_ROOT}
-        AWEAGENT_ROOT: ${oc.env:SWE_AGENT_ROOT}
-  agent:
-    tool_call_parser: ling3
-    reasoning_parser: ling3
-
-actor:
-  backend: "megatron:(attn:d4p2t4c2|ffn:d4p2e8)"
-  path: ${oc.env:V3_MODEL}
-  weight_update_mode: awex
-  megatron:
-    use_deterministic_algorithms: false
-sglang:
-  enable_memory_saver: true
-  mem_fraction_static: 0.45
-  disable_cuda_graph: true
-  attention_backend: fa3
-  disable_radix_cache: false
+```bash
+export V3_MODEL=/path/to/Bailing-V3
+export SWE_RL_DATASET=/path/to/swe_bench_rl.jsonl
+export AREAL_ROOT=/path/to/AReaL
+export SWE_AGENT_ROOT=/path/to/AReaL-SWEAgent
+export AREAL_SHARED_ROOT=/path/to/shared/areal-data
+export V3_ACTOR_IMAGE=/path/to/actor.sif
+export V3_ROLLOUT_IMAGE=/path/to/rollout.sif
+export THETA_SGLANG_ROOT=/path/to/pinned/sglang/python
+export SWE_RL_ADMIN_API_KEY="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"
+# Configure AENV_SYSTEM_URL and sandbox dependencies as described below.
+python -m examples.swe.train_swe_rl --config examples/swe/bailing_v3_grpo.yaml
 ```
 
-`AREAL_SGLANG_FORK=theta` selects `abort` followed by `retract`: the first request
-returns partial generations to AReaL; the second pauses scheduler execution before
-weight transfer. Any remaining retracted requests recompute their KV cache after resume.
-Cache release still requires every native idle condition except an empty waiting queue,
-and this exemption is limited to a successful retract pause.
+Pin the SGLang source to
+[`1743a69fbeb48f1e2d1daa2f7963a82074fce0b9`](https://github.com/dingzhiqiang/sglang/commit/1743a69fbeb48f1e2d1daa2f7963a82074fce0b9),
+based on the public Theta-derived Ling V3 runtime. Its RoPE/FA3 compatibility fixes are
+independent of the weight transport. Prepare a rollout image with the fork's matching
+Python and kernel dependencies; AReaL's default SGLang/Transformers pins are different,
+so setting `PYTHONPATH` alone is insufficient. Keep actor and rollout environments
+separate and make AReaL and the agent checkout importable in both.
 
-For Slurm, propagate `SBATCH_DISTRIBUTION=block:block` and
-`SLURM_DISTRIBUTION=block:block` through the launch environment/container so rank
-placement stays consistent with AWEX colocation. Retain shared cache paths from your
-cluster setup. Resource and memory limits must be checked on that cluster.
+`AREAL_SGLANG_FORK=theta` in the rollout worker environment selects the native
+`sglang.launch_server` entrypoint. The initial support envelope is BF16, no inference
+quantization, no training LoRA, no speculative decoding/MTP, inference PP=1 and SGLang
+attention-DP=1. Rollout replicas (`d8` above) are separate servers and are distinct from
+SGLang's internal `dp_size`. Training PP/TP/EP are handled by AReaL's existing gather
+and broadcast groups. V2 controllers use a different weight-update path; retain the
+explicit `_version: v1` in this example.
 
-Before a long run, validate that the checkpoint's EOS token matches the assistant turn
-terminator in its chat template. Check the strict SGLang contract at startup, then run
-at least two RL steps with weight updates. After each update, compare AWEX sentinel
-values with the expected shard of a saved checkpoint (different TP ranks alone are not
-proof of correctness), and check temperature-zero generation. Disable
-`AREAL_AWEX_SENTINEL` after bring-up because it adds GPU to CPU synchronization. Full
-TP8/NCCL, request retraction and model-quality validation cannot be replaced by the CPU
-unit tests.
+Before broadcasting, AReaL aborts/drains requests and pauses scheduler execution. The
+native receiver loads each HF tensor bucket, refreshes derived MLA weights and flushes
+old caches before generation resumes. Low-rank MLA input projections must arrive
+together in one bucket; the V3 sender preserves that pairing.
+
+Before production use, run two RL steps and compare the receiver weights with the
+corresponding exported HF tensors, including each inference TP shard. Check
+temperature-zero generation and log probabilities after updates, and verify that the
+checkpoint EOS token matches its chat-template turn terminator. CPU conversion and
+protocol tests do not replace a GPU/NCCL run; this combined public stack still requires
+that end-to-end validation.
 
 ## 6. Set up the AEnvironment backend
 

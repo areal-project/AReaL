@@ -28,18 +28,6 @@ def test_default_pause_request_matches_upstream_payload():
     assert SGLangBackend().get_pause_request().payload == {}
 
 
-def test_theta_pause_aborts_then_retracts(monkeypatch):
-    """Theta colocation drains clients before retracting scheduler requests."""
-    monkeypatch.setenv("AREAL_SGLANG_FORK", "theta")
-
-    requests = SGLangBackend().get_pause_requests()
-
-    assert [request.payload for request in requests] == [
-        {"mode": "abort"},
-        {"mode": "retract"},
-    ]
-
-
 def test_pause_generation_keeps_single_request_backends_compatible():
     requests = []
 

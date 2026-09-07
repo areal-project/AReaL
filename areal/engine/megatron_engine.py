@@ -68,6 +68,11 @@ from areal.engine.core.model import (
     resolve_sequence_packing_mode,
 )
 from areal.engine.megatron_utils import megatron_bridge_patches  # noqa: F401
+from areal.engine.megatron_utils.bailing_v3 import (
+    BailingV3MlaWeightPairs,
+    is_bailing_v3,
+    validate_bailing_v3_weight_update,
+)
 from areal.engine.megatron_utils.checkpointer import MegatronCheckpointManager
 from areal.engine.megatron_utils.deterministic import set_deterministic_algorithms
 from areal.engine.megatron_utils.fp8 import FP8BlockwiseTensorHelper
@@ -2266,13 +2271,17 @@ class MegatronEngine(TrainEngine):
         converted_named_tensors: list[tuple[str, nn.Parameter | torch.Tensor]],
         buffer_size: int,
         weight_chunked_mem_size: int,
+        mla_weight_pairs: BailingV3MlaWeightPairs | None = None,
     ) -> int:
         param, param_size = self._collect_param(name, param)
 
         if not self.is_pipeline_parallel_head():
             return buffer_size
 
-        if buffer_size + param_size > weight_chunked_mem_size:
+        if (
+            mla_weight_pairs is None
+            and buffer_size + param_size > weight_chunked_mem_size
+        ):
             self._update_bucket_weights_from_distributed(meta, converted_named_tensors)
             buffer_size = 0
 
@@ -2280,17 +2289,27 @@ class MegatronEngine(TrainEngine):
         if self.config.use_lora:
             model_name = f"{model_name}_lora"
 
-        converted_named_tensors.extend(
-            convert_to_hf(
-                self.tf_config,
-                model_name,
-                name,
-                param,
-                quantization_config=self.quantization_config,
-                fp8_direct_convert=self.fp8_direct_convert,
-                hf_config=self.hf_config,
-            )
+        converted = convert_to_hf(
+            self.tf_config,
+            model_name,
+            name,
+            param,
+            quantization_config=self.quantization_config,
+            fp8_direct_convert=self.fp8_direct_convert,
+            hf_config=self.hf_config,
+            bridge=getattr(self, "bridge", None),
         )
+        if mla_weight_pairs is not None:
+            converted = mla_weight_pairs.group(converted)
+            if not converted:
+                return buffer_size
+            param_size = sum(t.numel() * t.element_size() for _, t in converted)
+            if buffer_size + param_size > weight_chunked_mem_size:
+                self._update_bucket_weights_from_distributed(
+                    meta, converted_named_tensors
+                )
+                buffer_size = 0
+        converted_named_tensors.extend(converted)
         buffer_size += param_size
         return buffer_size
 
@@ -2362,6 +2381,7 @@ class MegatronEngine(TrainEngine):
                     quantization_config=self.quantization_config,
                     fp8_direct_convert=self.fp8_direct_convert,
                     hf_config=self.hf_config,
+                    bridge=getattr(self, "bridge", None),
                 )
             )
 
@@ -2390,6 +2410,13 @@ class MegatronEngine(TrainEngine):
 
     def _init_weight_update_from_distributed(self, meta: WeightUpdateMeta) -> None:
         assert meta.type == "xccl"
+        if is_bailing_v3(self.hf_config):
+            validate_bailing_v3_weight_update(
+                self.hf_config,
+                use_lora=self.config.use_lora,
+                quantization_config=self.quantization_config,
+                fp8_direct_convert=self.fp8_direct_convert,
+            )
         gen_pp_size = meta.gen_allocation.parallel.pp_size if meta.gen_allocation else 1
         gen_backend = meta.gen_allocation.backend if meta.gen_allocation else None
 
@@ -2570,6 +2597,12 @@ class MegatronEngine(TrainEngine):
 
         buffer_size = 0
         converted_named_tensors = []
+        mla_weight_pairs = (
+            BailingV3MlaWeightPairs()
+            if is_bailing_v3(self.hf_config)
+            and getattr(self.hf_config, "q_lora_rank", None) is not None
+            else None
+        )
 
         for name, param in get_named_parameters(self.model, num_moe_experts):
             if ".experts." in name and not self.config.use_lora:
@@ -2585,7 +2618,11 @@ class MegatronEngine(TrainEngine):
                 converted_named_tensors,
                 buffer_size,
                 weight_chunked_mem_size,
+                mla_weight_pairs=mla_weight_pairs,
             )
+
+        if mla_weight_pairs is not None:
+            mla_weight_pairs.finish()
 
         # Only pipeline parallel heads CAN contain named tensors here
         if converted_named_tensors:
