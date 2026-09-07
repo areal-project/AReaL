@@ -233,7 +233,8 @@ curriculum: 1
 sglang:
   model_path: ${actor.path}
   random_seed: ${seed}
-  skip_tokenizer_init: false
+  # The workflow sends processor-expanded image token IDs.
+  skip_tokenizer_init: true
   dtype: ${actor.dtype}
   context_length: 1024
   mem_fraction_static: 0.65
