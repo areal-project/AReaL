@@ -96,11 +96,64 @@ change only permits DP in the recipe configuration; it does not implement dummy
 microbatches or establish DP1/DP4 numerical equivalence. TP=1 also requires each GPU to
 hold the full model parameters; recheck peak memory for actor and reference.
 
-This is a placement template, not a hardware qualification. Verify model/vision
-initialization, TMS, available GPU memory, host RAM for retained episode images, shared
-filesystem paths and checkpoint disk space on the target machine. Actor and reference
-have an initialization overlap before phase offload. Do not copy `TMS_INIT_ENABLE=0`
-from an AWEX example into this XCCL recipe.
+The XCCL template is a placement template, not a hardware qualification. Verify
+model/vision initialization, TMS, available GPU memory, host RAM for retained episode
+images, shared filesystem paths and checkpoint disk space on the target machine. Actor
+and reference have an initialization overlap before phase offload. Do not copy
+`TMS_INIT_ENABLE=0` from an AWEX example into this XCCL recipe.
+
+## AWEX colocation
+
+`curriculum1_awex_colocate.yaml` and `curriculum2_awex_colocate.yaml` compose the
+original curricula with `awex_colocate.yaml`. They retain the rewards, KL=0.01,
+sampled12 decoding, batch size 4, 512-step horizon and optimizer settings. They use
+single-controller v1 with a local scheduler, an eight-GPU Megatron actor (DP=4, TP=2), a
+reference with the same topology, and eight colocated SGLang TP=1 instances. The
+original XCCL recipes remain available.
+
+AWEX 0.8.1 with its Qwen3.5 converter is required (already in AReaL's CUDA dependency
+set). Training workers disable automatic TMS regions; actor and reference use explicit
+Megatron residency, while SGLang enables its memory saver. Keep the overlay's worker
+environment and `ref.offload=true`. The generic trainer releases the reference before
+starting SGLang and orders each update as:
+
+```text
+rollout -> release SGLang -> reference onload/score/offload
+        -> actor onload/recompute/advantages/PPO/save
+        -> AWEX weight publication -> restore SGLang -> next rollout
+```
+
+On the same eight GPUs this doubles training DP relative to a separated DP=2/TP=2 actor.
+It does **not** double rollout concurrency: local colocation requires eight rollout
+workers to match the eight actor workers, but the current batch of four initial-state
+groups and zero staleness allow only four groups at once. Each group runs its twelve
+episodes on one SGLang instance. The remaining instances are idle in that rollout batch;
+increasing global batch size or staleness would change the recipe. Variable-length
+episodes can still expose the DP microbatch splitting limitation.
+
+Launch C1 with a fresh artifact root and the setup variables above:
+
+```bash
+bash examples/vlm/pacman/scripts/train_c1_awex.sh \
+  actor.path=/absolute/path/to/Qwen3.5-9B \
+  environment.max_steps=2 planner_audit.max_steps=2 total_train_steps=2
+```
+
+The short horizon above is a startup check. Omit those overrides for the release
+horizon. To validate on the target GPU environment:
+
+```bash
+# Small-model check: two GPUs for existing numerical tests, one for colocated RL.
+bash examples/vlm/pacman/scripts/smoke_awex.sh
+# Full eight-GPU topology: two updates per curriculum and C1 -> C2 checkpoints.
+bash examples/vlm/pacman/scripts/e2e_awex.sh
+```
+
+Use different fresh artifact roots for those commands. Expected results are successful
+reference residency transitions, two finite PPO updates, AWEX publication followed by
+rollout with the new weight version, and complete checkpoints. These scripts and runtime
+behavior have **not been GPU-validated**; static checks alone do not establish
+weight-transfer correctness or throughput.
 
 ## Run
 
