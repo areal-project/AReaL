@@ -233,7 +233,10 @@ def test_awex_weight_update_requires_initialized_publisher():
         engine.update_weights(WeightUpdateMeta(type="awex", version=1))
 
 
-def test_megatron_engine_uses_residency_without_awex_publisher(monkeypatch):
+@pytest.mark.parametrize("is_offload_before_onload", [False, True])
+def test_megatron_engine_uses_residency_without_awex_publisher(
+    monkeypatch, is_offload_before_onload
+):
     events = []
 
     class _Residency:
@@ -269,6 +272,8 @@ def test_megatron_engine_uses_residency_without_awex_publisher(monkeypatch):
     )
 
     engine.offload()
+    # AWEX publication can release weights while leaving is_offload=False.
+    engine.is_offload = is_offload_before_onload
     engine.onload()
 
     assert ("release", ["optimizer", "weights"]) in events
@@ -480,14 +485,32 @@ def test_megatron_teacher_offload_skips_non_ddp_model_chunks(monkeypatch):
         lambda: events.append(("pause", None)),
     )
     monkeypatch.setattr(
+        "areal.engine.megatron_engine.torch_memory_saver.resume",
+        lambda: events.append(("resume", None)),
+    )
+    monkeypatch.setattr(
         "areal.engine.megatron_engine.dist.barrier",
         lambda group: events.append(("barrier", group)),
     )
 
-    engine.offload()
+    engine.onload()
+    assert events == []
+    for cycle in range(1, 3):
+        engine.offload()
+        assert engine.is_offload is True
+        after_offload = list(events)
+        engine.offload()
+        assert events == after_offload
 
-    assert engine.is_offload is True
-    assert ("pause", None) in events
+        engine.onload()
+        assert engine.is_offload is False
+        after_onload = list(events)
+        engine.onload()
+        assert events == after_onload
+        assert events.count(("pause", None)) == cycle
+        assert events.count(("resume", None)) == cycle
+        assert events.count(("barrier", engine.cpu_group)) == 2 * cycle
+
     assert events.index(("synchronize", None)) < events.index(
         ("barrier", engine.cpu_group)
     )

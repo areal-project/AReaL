@@ -1774,6 +1774,11 @@ class MegatronEngine(TrainEngine):
             self.is_offload = True
             return
 
+        # Initialization and phase transitions can both request offload. TMS
+        # cannot pause allocations that are already paused.
+        if self.is_offload:
+            return
+
         if not is_tms_enabled():
             raise RuntimeError(
                 "torch_memory_saver requires `enable_offload=True` in yaml config."
@@ -1817,6 +1822,11 @@ class MegatronEngine(TrainEngine):
             self._log_weight_residency_stats("after_onload")
             self.get_device_stats().log("after onload model")
             self.is_offload = False
+            return
+
+        # Explicit residency above tracks released tags independently of this
+        # flag; only the TMS path uses it to skip repeated transitions.
+        if not self.is_offload:
             return
 
         torch_memory_saver.resume()
