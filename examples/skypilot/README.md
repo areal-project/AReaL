@@ -2,7 +2,7 @@
 
 This README includes examples and guidelines to running AReaL experiments with SkyPilot.
 Make sure you have SkyPilot properly installed following
-[our installation guide](../../docs/tutorial/installation.md#optional-install-skypilot)
+[our installation guide](../../docs/en/tutorial/installation.md#optional-install-skypilot)
 before running this example. Note that all command lines shown in this file are assumed
 to be execute under the root of AReaL repository.
 
