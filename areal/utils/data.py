@@ -299,14 +299,14 @@ def concat_padded_tensors(
 
 
 def _unpad_splits(
-    splits: list[torch.Tensor], traj_seqlens: list[int] | None
+    splits: list[torch.Tensor], traj_seqlens: list[int] | None, sequence_dim: int = -1
 ) -> list[torch.Tensor]:
-    """Trim each split tensor's last dim to its original sequence length."""
+    """Trim the sequence axis of each split tensor to its original length."""
     if traj_seqlens is None:
         return splits
     for i, s in enumerate(splits):
-        if s.ndim >= 2 and s.shape[-1] > traj_seqlens[i]:
-            splits[i] = s[..., : traj_seqlens[i]]
+        if s.ndim >= 2 and s.shape[sequence_dim] > traj_seqlens[i]:
+            splits[i] = s.narrow(sequence_dim, 0, traj_seqlens[i])
     return splits
 
 
@@ -346,7 +346,15 @@ def split_and_unpad_tensor(
         for key, value in result.items():
             if isinstance(value, torch.Tensor) and value.shape[0] == total:
                 splits = _unpad_splits(
-                    list(value.split(traj_group_sizes, dim=0)), traj_seqlens
+                    list(value.split(traj_group_sizes, dim=0)),
+                    traj_seqlens,
+                    sequence_dim=(
+                        1
+                        if value.ndim >= 3
+                        and isinstance(result.get("attention_mask"), torch.Tensor)
+                        and value.shape[:2] == result["attention_mask"].shape
+                        else -1
+                    ),
                 )
                 for i, s in enumerate(splits):
                     split_result[i][key] = s
@@ -772,14 +780,18 @@ def split_padded_tensor_dict_into_mb_list(
     # check for multimodal input data
     multimodal_keys = {key for key in data if is_multi_modal_key(key)}
 
-    # check tensor shape, split only 1d tensors with length "total_lens"
+    # Split token-aligned tensors, including metadata with trailing feature axes.
     to_split = {}
     not_to_split = {}
     for key, value in data.items():
         if key in multimodal_keys:
             continue
         if key == "position_ids" or (
-            torch.is_tensor(value) and value.numel() == bs * max_seqlen
+            torch.is_tensor(value)
+            and (
+                value.numel() == bs * max_seqlen
+                or (value.ndim >= 2 and value.shape[:2] == (bs, max_seqlen))
+            )
         ):
             # NOTE: qwen2.5-vl position_ids.numel() == bs * max_seqlen * 3
             to_split[key] = value
