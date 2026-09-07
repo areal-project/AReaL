@@ -4,6 +4,7 @@
 
 import asyncio
 import hashlib
+import json
 import math
 import threading
 import uuid
@@ -19,6 +20,8 @@ from areal_pacman.level1.workflow import (
 
 from areal.api import ModelRequest, RolloutWorkflow
 from areal.api.cli_args import GenerationHyperparameters
+from areal.infra import workflow_context
+from areal.utils import stats_tracker
 from areal.utils.data import concat_padded_tensors
 from areal.utils.hf_utils import load_hf_processor_and_tokenizer
 from areal.utils.image import image2base64
@@ -48,14 +51,49 @@ class _Episode(PacmanImageOnlyWorkflow):
     ) -> tuple[Any, list[dict[str, Any]]]:
         return PacmanNativeVisionWorkflow._pil_and_chat_messages(messages)
 
+    def _prepare_model_input(
+        self, messages: list[dict[str, Any]]
+    ) -> tuple[list[str], dict[str, Any], list[int]]:
+        """Reuse identical inputs within a group, on the episode worker thread."""
+        computed = False
+
+        def process_input() -> tuple[list[str], dict[str, Any], list[int]]:
+            nonlocal computed
+            computed = True
+            image, _, processed, input_ids = (
+                PacmanNativeVisionWorkflow._process_messages(self, messages)
+            )
+            return image2base64(image), processed, input_ids
+
+        cache = workflow_context.get().processor_cache
+        if cache is None:
+            prepared = process_input()
+        else:
+            # Include all prompt text and inline PNGs, not just the initial state
+            # or step number: sampled trajectories can diverge within a group.
+            # Keep the key compact instead of retaining another full message.
+            message_digest = hashlib.blake2b(
+                json.dumps(messages, sort_keys=True, separators=(",", ":")).encode(),
+                digest_size=32,
+            ).digest()
+            key = cache.make_key(
+                "pacman_native_vision_v1", id(self.processor), message_digest
+            )
+            prepared = cache.get_or_compute(key, process_input)
+        stats_tracker.get(workflow_context.stat_scope()).scalar(
+            pacman_processor_cache_hit=cache is not None and not computed
+        )
+        image_data, processed, input_ids = prepared
+        # Containers belong to each decision; processor tensors are immutable
+        # aliases, retained by _tensor_sample and concat_padded_tensors for RTensor.
+        return list(image_data), dict(processed), list(input_ids)
+
     async def _call_model(
         self, messages: list[dict[str, Any]], **options: Any
     ) -> ModelTurn:
         if self.cancelled.is_set():
             raise asyncio.CancelledError
-        image, _, processed, input_ids = PacmanNativeVisionWorkflow._process_messages(
-            self, messages
-        )
+        image_data, processed, input_ids = self._prepare_model_input(messages)
         constraint = options.get("objective_constraint")
         if constraint is not None:
             if constraint.max_new_tokens != 1:
@@ -75,7 +113,7 @@ class _Episode(PacmanImageOnlyWorkflow):
         request = ModelRequest(
             rid=request_id,
             input_ids=input_ids,
-            image_data=image2base64(image),
+            image_data=image_data,
             gconfig=gconfig,
             tokenizer=self.tokenizer,
             processor=self.processor,
@@ -193,6 +231,12 @@ class PacmanWorkflow(RolloutWorkflow):
         self.processor, self.tokenizer = load_hf_processor_and_tokenizer(tokenizer)
         if self.processor is None:
             raise ValueError("Pacman requires a multimodal processor")
+
+    async def _afinalize_processor_cache_group(
+        self, context: workflow_context.WorkflowContext
+    ) -> None:
+        if context.processor_cache is not None:
+            context.processor_cache.close()
 
     async def arun_episode(
         self, engine: Any, data: dict[str, Any]
