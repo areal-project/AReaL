@@ -1,0 +1,249 @@
+# Eight-GPU template: four SGLang replicas, one Megatron actor with TP=4.
+# Reference shares actor GPUs. Requires the pinned external game/recipe checkouts.
+# Not hardware-validated. See README.md and scripts/.
+recipe_version: maapacman-level1-ghostdoor-v3
+artifact_root: ${oc.env:PACMAN_ARTIFACT_ROOT}/curriculum2
+trajectory_dir: ${artifact_root}/trajectories
+experiment_name: pacman-agentic-rl
+trial_name: curriculum2-sglang-megatron
+environment:
+  ghost_mode: normal
+  max_steps: 512
+dataset_generation:
+  train_episodes: 80
+  validation_episodes: 4
+  seed: 28
+planner_audit:
+  max_steps: 512
+seed: 1
+enable_offload: true
+enable_thinking: false
+validation_contract: sampled12_uniform_shaped
+reward_objective_contract: episode_return_group_v1
+image_prompt_style: live_state_v3
+prompt_version: edward-option-code-v1
+action_protocol: edward-option-code-v1
+total_train_epochs: 5
+total_train_steps: null
+tokenizer_path: ${actor.path}
+workflow: examples.vlm.pacman.workflow.PacmanWorkflow
+eval_workflow: ${workflow}
+contract_violation_return: -1.0
+use_base_reward: false
+normal_pellet_reward: 1.0
+power_pellet_reward: 1.0
+ghost_reward: 5.0
+fruit_reward: 0.0
+reward_recipe_version: maapacman-level1-event-reward-v3
+death_penalty: 100.0
+completion_reward: 50.0
+safety_refusal_penalty: 100.0
+step_penalty: 0.05
+step_penalty_cleared_ratio_scale: 0.0
+wall_penalty: 0.5
+nearest_pellet_alpha: 0.1
+nearest_pellet_remaining_ratio_threshold: 1.0
+nearest_pellet_scale_by_cleared_ratio: true
+nearest_pellet_skip_on_eat: true
+observation_mode: rgb
+action_token_choice: false
+open_action_mask: false
+edward_options: true
+objective_encoding: edward-option-code-v1
+completion_api: chat
+critic: null
+teacher: null
+cluster:
+  n_nodes: 1
+  n_gpus_per_node: 8
+  fileroot: ${artifact_root}/training
+  name_resolve:
+    type: nfs
+    nfs_record_root: ${artifact_root}/name_resolve
+scheduler:
+  type: local
+rollout:
+  backend: sglang:d4p1t1
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  tokenizer_path: ${tokenizer_path}
+  max_concurrent_rollouts: 4
+  queue_size: null
+  consumer_batch_size: ${train_dataset.batch_size}
+  max_head_offpolicyness: 0
+  enable_rollout_tracing: false
+  scheduling_spec: ${actor.scheduling_spec}
+  dump_to_file: true
+gconfig:
+  n_samples: 12
+  min_new_tokens: 1
+  max_new_tokens: 1
+  max_tokens: 1024
+  greedy: false
+  temperature: 0.7
+  top_p: 1.0
+  request_plugin:
+    target: examples.vlm.pacman.policy.TokenSetRequest
+  drop_incomplete_group: true
+eval_gconfig:
+  n_samples: 12
+  min_new_tokens: 1
+  max_new_tokens: 1
+  max_tokens: 1024
+  greedy: false
+  temperature: 0.7
+  top_p: 1.0
+  request_plugin:
+    target: examples.vlm.pacman.policy.TokenSetRequest
+  drop_incomplete_group: true
+actor:
+  backend: megatron:d1p1t4
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  path: ${oc.env:CURRICULUM1_CHECKPOINT}
+  attn_impl: sdpa
+  init_from_scratch: false
+  disable_dropout: true
+  offload: true
+  gradient_checkpointing: true
+  dtype: bfloat16
+  optimizer_dtype: bfloat16
+  mb_spec:
+    max_tokens_per_mb: 1024
+  optimizer:
+    type: adam_bf16
+    lr: 5.0e-07
+    weight_decay: 0.0
+    beta1: 0.9
+    beta2: 0.999
+    eps: 1.0e-08
+    lr_scheduler_type: constant
+    gradient_clipping: 1.0
+    warmup_steps_proportion: 0.0
+  eps_clip: 0.05
+  temperature: ${gconfig.temperature}
+  reward_scaling: 1.0
+  reward_bias: 0.0
+  reward_clip: 20.0
+  kl_ctl: 0.01
+  ppo_n_minibatches: 1
+  recompute_logprob: true
+  use_decoupled_loss: true
+  prox_logp_method: recompute
+  rejection_sampling:
+    level: sequence
+    action: mask
+    metric: ratio
+    agg: sum
+    lower: 0.8
+    upper: 1.25
+  reward_norm:
+    mean_level: group
+    mean_leave1out: false
+    std_level: group
+    std_unbiased: true
+    eps: 1.0e-05
+    group_size: ${gconfig.n_samples}
+  adv_norm: null
+  weight_update_mode: xccl
+  max_new_tokens: ${gconfig.max_new_tokens}
+  scheduling_spec:
+  - task_type: worker
+    port_count: 2
+    gpu: 1
+    cmd: python3 -m areal.infra.rpc.rpc_server
+    env_vars:
+      NCCL_DEBUG: WARN
+      SGLANG_RETURN_ORIGINAL_LOGPROB: '0'
+      AREAL_ROOT: ${oc.env:AREAL_ROOT}
+      MAAPACMAN_PACMAN_ROOT: ${oc.env:MAAPACMAN_PACMAN_ROOT}
+  objective_plugin:
+    target: examples.vlm.pacman.objectives.PacmanObjective
+    kwargs:
+      curriculum: 2
+  megatron:
+    bridge_type: megatron-bridge
+    use_bridge_for_update_weights: true
+    policy_distribution:
+      target: examples.vlm.pacman.policy.TokenSetDistribution
+  mask_no_eos_with_zero: false
+ref:
+  backend: ${actor.backend}
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  path: ${actor.path}
+  attn_impl: ${actor.attn_impl}
+  init_from_scratch: false
+  disable_dropout: true
+  dtype: ${actor.dtype}
+  optimizer_dtype: bfloat16
+  temperature: ${actor.temperature}
+  mb_spec:
+    max_tokens_per_mb: 1024
+  optimizer: null
+  offload: true
+  scheduling_strategy:
+    type: colocation
+    target: actor
+  scheduling_spec: ${actor.scheduling_spec}
+  megatron:
+    bridge_type: megatron-bridge
+    policy_distribution:
+      target: examples.vlm.pacman.policy.TokenSetDistribution
+train_dataset:
+  batch_size: 4
+  shuffle: true
+  pin_memory: true
+  num_workers: 0
+  path: regenerated-curriculum2
+  type: rl
+  max_length: 1024
+valid_dataset:
+  batch_size: 4
+  shuffle: false
+  pin_memory: true
+  num_workers: 0
+  path: regenerated-curriculum2
+  type: rl
+  max_length: 1024
+saver:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: null
+  freq_steps: 1
+  freq_secs: null
+recover:
+  mode: disabled
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: null
+  freq_steps: 1
+  freq_secs: null
+evaluator:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: null
+  freq_steps: 1
+  freq_secs: null
+stats_logger:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  wandb:
+    mode: disabled
+curriculum: 2
+sglang:
+  model_path: ${actor.path}
+  random_seed: ${seed}
+  skip_tokenizer_init: false
+  dtype: ${actor.dtype}
+  context_length: 1024
+  mem_fraction_static: 0.65
+  enable_multimodal: true
+  enable_custom_logit_processor: true
+  disable_cuda_graph: true
+  max_running_requests: 48
