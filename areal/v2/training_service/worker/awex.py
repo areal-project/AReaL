@@ -204,12 +204,12 @@ def create_awex_blueprint(
 
 
 def _create_training_adapter(engine):
-    from areal.engine.fsdp_engine import FSDPEngine
-    from areal.engine.megatron_engine import MegatronEngine
-    from areal.v2.weight_update.awex.fsdp_adapter import AwexFSDPAdapter
-    from areal.v2.weight_update.awex.megatron_adapter import (
+    from areal.engine.awex.fsdp_adapter import AwexFSDPAdapter
+    from areal.engine.awex.megatron_adapter import (
         AwexMegatronAdapter,
     )
+    from areal.engine.fsdp_engine import FSDPEngine
+    from areal.engine.megatron_engine import MegatronEngine
 
     if isinstance(engine, FSDPEngine):
         return AwexFSDPAdapter(engine)
