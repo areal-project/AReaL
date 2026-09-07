@@ -331,3 +331,8 @@ def test_awex_adapters_destroy_payload_and_sidecar_groups(
     assert destroy.call_args_list == [call(payload_group), call(sidecar_group)]
     assert adapter._weights_update_group is None
     assert adapter._weights_update_group_gloo is None
+    if adapter_cls in (
+        megatron_adapter.AwexMegatronAdapter,
+        sglang_adapter.AwexSGLangAdapter,
+    ):
+        assert adapter._separation_wire_dtypes is None

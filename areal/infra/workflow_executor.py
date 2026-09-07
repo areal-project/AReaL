@@ -2,6 +2,7 @@
 
 from __future__ import annotations  # noqa
 
+import asyncio
 import json
 import os
 import random
@@ -38,12 +39,14 @@ from areal.experimental.openai.types import (
 from areal.utils import logging, perf_tracer, stats_tracker
 from areal.infra.utils.concurrent import get_executor
 from areal.utils.data import concat_padded_tensors, cycle_dataloader
-from areal.utils.data_hook import DataHookManager
 from areal.utils.perf_tracer import trace_perf, trace_session_event
 from logging import Logger
 
 if TYPE_CHECKING:
     from .remote_inf_engine import RemoteInfEngine
+
+
+_REJECTED_TRAJECTORY_CLEAR_TIMEOUT_SECONDS = 5.0
 
 
 def check_trajectory_format(
@@ -261,6 +264,27 @@ TInput = TypeVar("TInput", bound=WithTaskID)
 TResult = TypeVar("TResult")
 
 
+def _select_results(
+    drained: list,
+    count: int,
+    deterministic: bool,
+) -> tuple[list, list]:
+    """Order drained results, then split them into (selected, pending).
+
+    Normally results are taken oldest-first and the returned batch is
+    shuffled to avoid systematic ordering bias. Under deterministic sampling,
+    completed results are ordered by task ID and are not shuffled.
+    """
+    if deterministic:
+        drained.sort(key=lambda x: x.task_id)
+    else:
+        drained.sort(key=lambda x: x.create_time)
+    selected, pending = drained[:count], drained[count:]
+    if not deterministic:
+        random.shuffle(selected)
+    return selected, pending
+
+
 class BatchTaskDispatcher(Generic[TInput, TResult]):
     """Generic dispatcher for asynchronous task execution with staleness control.
 
@@ -280,6 +304,7 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
         task_factory: Callable[[TInput], Callable[[], Awaitable[TResult | None]]],
         staleness_manager: StalenessManager,
         enable_tracing: bool = False,
+        deterministic_order: bool = False,
     ):
         self.runner = AsyncTaskRunner(
             max_queue_size=max_queue_size,
@@ -288,6 +313,7 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
         self.task_factory = task_factory
         self.staleness_manager = staleness_manager
         self.enable_tracing = enable_tracing
+        self.deterministic_order = deterministic_order
         self.logger: Logger
 
         # Unbounded deques for producer/consumer pattern
@@ -563,6 +589,7 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
         -------
         list[TResult | None]
             List of task results, None for rejected tasks.
+
         """
         if count <= 0:
             raise ValueError(f"count must be positive, got {count}")
@@ -590,8 +617,11 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
             drained: list[TimedResult[TResult]] = list(self._pending_results.values())
             self._pending_results.clear()
 
-        drained.sort(key=lambda x: x.create_time)
-        selected, pending = drained[:count], drained[count:]
+        selected, pending = _select_results(
+            drained,
+            count,
+            self.deterministic_order,
+        )
         with self._result_cv:
             if pending:
                 for result in pending:
@@ -599,8 +629,6 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
                 self._result_cv.notify_all()
             for r in selected:
                 self._active_task_ids.discard(r.task_id)
-
-        random.shuffle(selected)
 
         return [r.data for r in selected]
 
@@ -767,10 +795,6 @@ class WorkflowExecutor:
 
         self.config = config
         self.inference_engine = inference_engine
-        self.data_hooks = DataHookManager(
-            getattr(config, "data_hooks", None), role="rollout"
-        )
-
         # Use provided staleness manager or create a default one
         # The manager will be properly initialized in initialize()
         self._staleness_manager = staleness_manager
@@ -1070,6 +1094,7 @@ class WorkflowExecutor:
             task_factory=self._create_workflow_task,
             staleness_manager=self._staleness_manager,
             enable_tracing=self.config.enable_rollout_tracing,
+            deterministic_order=getattr(self.config, "deterministic_sampling", False),
         )
 
         # Initialize the dispatcher's async task runner
@@ -1082,11 +1107,8 @@ class WorkflowExecutor:
         then flushes the performance tracer.
         """
         # Stop background threads and shutdown the async task runner
-        try:
-            if self._dispatcher is not None:
-                self._dispatcher.destroy()
-        finally:
-            self.data_hooks.close()
+        if self._dispatcher is not None:
+            self._dispatcher.destroy()
 
         # Flush performance tracer
         tracer = perf_tracer.get_session_tracer()
@@ -1111,6 +1133,39 @@ class WorkflowExecutor:
             f"accepted: {stats.accepted}, "
             f"rejected: {stats.rejected}."
         )
+
+    async def _clear_rejected_trajectory(self, traj: dict[str, Any] | None) -> None:
+        """Best-effort cleanup for remote shards that will not reach training."""
+        shards_by_node = RTensor.collect_shards(traj)
+        if not shards_by_node:
+            return
+
+        async def _clear_node(node_addr: str, shard_ids: list[Any]) -> None:
+            await asyncio.wait_for(
+                RTensor.clear_node(node_addr, shard_ids),
+                timeout=_REJECTED_TRAJECTORY_CLEAR_TIMEOUT_SECONDS,
+            )
+
+        results = await asyncio.gather(
+            *(
+                _clear_node(node_addr, shard_ids)
+                for node_addr, shard_ids in shards_by_node.items()
+            ),
+            return_exceptions=True,
+        )
+        for node_addr, result in zip(shards_by_node, results):
+            if isinstance(result, TimeoutError):
+                self.logger.warning(
+                    "Timed out after %.1fs clearing rejected trajectory shards on %s",
+                    _REJECTED_TRAJECTORY_CLEAR_TIMEOUT_SECONDS,
+                    node_addr,
+                )
+            elif isinstance(result, BaseException):
+                self.logger.warning(
+                    "Failed to clear rejected trajectory shards on %s: %s",
+                    node_addr,
+                    result,
+                )
 
     def _create_workflow_task(
         self, pending_task: _RolloutTaskInput
@@ -1151,13 +1206,7 @@ class WorkflowExecutor:
             reason: str | None = None
 
             try:
-                hook_state = []
-                if pending_task.is_eval:
-                    workflow_data = pending_task.data
-                else:
-                    workflow_data, hook_state = self.data_hooks.run_pre(
-                        "rollout_pre", pending_task.data
-                    )
+                workflow_data = pending_task.data
                 if workflow_data is not None:
                     traj = await pending_task.workflow.arun_episode(
                         self.inference_engine, workflow_data
@@ -1195,14 +1244,9 @@ class WorkflowExecutor:
 
                 assert traj is None or isinstance(traj, dict), traj
 
-                if traj is not None and not pending_task.is_eval:
-                    traj = self.data_hooks.run_post("rollout_post", traj, hook_state)
-
                 if traj is None:
                     should_accept_traj = False
-                    reason = (
-                        "hook_filtered" if workflow_data is None else "returned_none"
-                    )
+                    reason = "returned_none"
                 else:
                     if should_accept_fn is None:
                         should_accept = True
@@ -1249,6 +1293,7 @@ class WorkflowExecutor:
                     self.logger.info(
                         f"Finish but reject rollout. {self._rollout_stats()}",
                     )
+                await self._clear_rejected_trajectory(traj)
                 return None
 
             except Exception as exc:  # pragma: no cover - workflow execution errors
@@ -1264,6 +1309,7 @@ class WorkflowExecutor:
                     self.logger.error(
                         "Workflow execution failed: %s", exc, exc_info=True
                     )
+                await self._clear_rejected_trajectory(traj)
                 return None
 
         return _execute_workflow

@@ -13,8 +13,10 @@ import pytest
 import torch
 
 from areal.api import WeightUpdateMeta, Worker
-from areal.engine import MegatronEngine
+from areal.engine import MegatronEngine, MegatronScoringEngine
+from areal.engine.awex.colocate_writer import AwexWeightPublisher
 from areal.infra.controller.train_controller import TrainController
+from areal.trainer.mopd.scoring import MOPDTeacherController
 from areal.trainer.rl_trainer import PPOTrainer
 
 
@@ -64,16 +66,119 @@ def test_mopd_runtime_topology_rejects_config_runtime_mismatch(monkeypatch):
         engine.assert_mopd_runtime_topology()
 
 
+def test_megatron_scoring_engine_computes_logp_without_ppo_actor():
+    events = []
+    engine = object.__new__(MegatronScoringEngine)
+    engine.eval = lambda: events.append("eval")
+    engine.forward = lambda *, input_, aggregate_fn: aggregate_fn(
+        [input_["part0"], input_["part1"]]
+    )
+
+    result = engine._compute_logp(
+        {"part0": torch.tensor([1.0]), "part1": torch.tensor([2.0])}
+    )
+
+    assert events == ["eval"]
+    torch.testing.assert_close(result, torch.tensor([1.0, 2.0]), rtol=0.0, atol=0.0)
+
+
+def test_mopd_teacher_controller_preserves_pipeline_active_dummies(monkeypatch):
+    controller = object.__new__(MOPDTeacherController)
+    controller.train_alloc = SimpleNamespace(
+        parallel=SimpleNamespace(pp_size=2, dp_size=1)
+    )
+    controller.config = SimpleNamespace(mb_spec=SimpleNamespace(n_mbs=1, granularity=1))
+    calls = []
+
+    def pad(args, kwargs, **options):
+        calls.append(options)
+        return ([{"id": index} for index in range(4)],), kwargs
+
+    monkeypatch.setattr(controller, "_pad_eval_dispatch_args", pad)
+    monkeypatch.setattr(
+        controller,
+        "_custom_function_call",
+        lambda *_args, **_kwargs: ["real", "dummy1", "dummy2", "dummy3"],
+    )
+
+    real, dummies = controller.compute_logp_padded([{"id": 0}])
+
+    assert real == ["real"]
+    assert dummies == ["dummy1", "dummy2", "dummy3"]
+    assert calls == [
+        {
+            "group_size": 1,
+            "min_items_per_dp": 4,
+            "items_per_dp_divisor": 2,
+            "active_dummies": True,
+        }
+    ]
+
+
 def test_teacher_weight_residency_adapter_has_no_awex_publication_state():
     engine = object.__new__(MegatronEngine)
-    engine._awex_adapter = None
+    engine._weight_residency = None
+    engine._awex_publisher = None
     engine.logger = SimpleNamespace(info=lambda *_args, **_kwargs: None)
 
     engine.init_weight_residency_adapter()
 
-    assert engine._awex_adapter is not None
-    assert engine._awex_adapter._meta_server_client is None
-    assert engine._awex_adapter._initialized is False
+    assert engine._weight_residency is not None
+    assert engine._awex_publisher is None
+
+
+def test_awex_publisher_composes_engine_weight_residency(monkeypatch):
+    engine = object.__new__(MegatronEngine)
+    engine._weight_residency = None
+    engine._awex_publisher = None
+    engine.logger = SimpleNamespace(info=lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        "areal.engine.awex.colocate_writer.AwexWeightPublisher.eager_publish_train_info",
+        lambda *_args, **_kwargs: None,
+    )
+
+    engine.init_awex_adapter()
+    first_publisher = engine._awex_publisher
+    engine.init_awex_adapter()
+
+    assert engine._weight_residency is not None
+    assert engine._awex_publisher is first_publisher
+    assert engine._awex_publisher.residency is engine._weight_residency
+
+
+@pytest.mark.parametrize("weights_released", [False, True])
+def test_awex_publisher_prepares_residency_in_oom_safe_order(
+    weights_released: bool,
+):
+    events = []
+
+    class _Residency:
+        def is_released(self, tag):
+            events.append(("is_released", tag))
+            return weights_released
+
+        def release_memory(self, tags):
+            events.append(("release", tags))
+
+        def release_grad_memory(self):
+            events.append(("release_grad", None))
+
+        def resume_memory(self, tags):
+            events.append(("resume", tags))
+
+    publisher = AwexWeightPublisher(SimpleNamespace(), _Residency())
+
+    publisher._prepare_residency_for_publish()
+
+    assert events[:3] == [
+        ("is_released", "weights"),
+        ("release", ["optimizer"]),
+        ("release_grad", None),
+    ]
+    if weights_released:
+        assert events[3:] == [("resume", ["weights"])]
+    else:
+        assert len(events) == 3
 
 
 def test_awex_actor_worker_does_not_reenter_rollout(monkeypatch):
@@ -94,7 +199,7 @@ def test_awex_actor_worker_does_not_reenter_rollout(monkeypatch):
             raise AssertionError("actor worker re-entered rollout generation")
 
     engine = object.__new__(MegatronEngine)
-    engine._awex_adapter = _Adapter()
+    engine._awex_publisher = _Adapter()
     engine.rollout_engine = _Rollout()
     engine.rollout_coordinator = object()
     engine.process_group_initialized = True
@@ -116,6 +221,59 @@ def test_awex_actor_worker_does_not_reenter_rollout(monkeypatch):
         ("finish", 8),
         ("barrier", engine.cpu_group),
     ]
+
+
+def test_awex_weight_update_requires_initialized_publisher():
+    engine = object.__new__(MegatronEngine)
+    engine._awex_publisher = None
+    engine.rollout_engine = object()
+    engine.rollout_coordinator = object()
+
+    with pytest.raises(RuntimeError, match="before publisher initialization"):
+        engine.update_weights(WeightUpdateMeta(type="awex", version=1))
+
+
+def test_megatron_engine_uses_residency_without_awex_publisher(monkeypatch):
+    events = []
+
+    class _Residency:
+        def release_memory(self, tags):
+            events.append(("release", tags))
+
+        def resume_memory(self, tags):
+            events.append(("resume", tags))
+
+    class _Stats:
+        def log(self, message):
+            events.append(("stats", message))
+
+    engine = object.__new__(MegatronEngine)
+    engine._weight_residency = _Residency()
+    engine._awex_publisher = None
+    engine.process_group_initialized = True
+    engine._cpu_group = object()
+    engine.is_offload = False
+    engine.get_device_stats = lambda: _Stats()
+    engine._log_weight_residency_stats = lambda phase: events.append(("log", phase))
+    monkeypatch.setattr(
+        "areal.engine.megatron_engine.current_platform.clear_memory",
+        lambda: events.append(("clear", None)),
+    )
+    monkeypatch.setattr(
+        "areal.engine.megatron_engine.current_platform.synchronize",
+        lambda: events.append(("synchronize", None)),
+    )
+    monkeypatch.setattr(
+        "areal.engine.megatron_engine.dist.barrier",
+        lambda group: events.append(("barrier", group)),
+    )
+
+    engine.offload()
+    engine.onload()
+
+    assert ("release", ["optimizer", "weights"]) in events
+    assert ("resume", ["optimizer", "weights"]) in events
+    assert engine.is_offload is False
 
 
 def test_awex_controller_discards_unfinished_requests_before_restoring_kv():
@@ -301,7 +459,7 @@ def test_megatron_teacher_offload_skips_non_ddp_model_chunks(monkeypatch):
             events.append(("stats", message))
 
     engine = object.__new__(MegatronEngine)
-    engine._awex_adapter = None
+    engine._weight_residency = None
     engine.mcore_config = SimpleNamespace(disable_grad_buffers_cpu_backup=True)
     engine.model = [object()]
     engine.process_group_initialized = True

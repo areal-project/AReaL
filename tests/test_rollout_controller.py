@@ -225,27 +225,6 @@ class TestRolloutControllerInitialization:
 
         controller.destroy()
 
-    def test_initialize_colocated_rollout_skips_second_gpu_gres_request(self):
-        config = create_test_config(
-            backend="sglang:d2",
-            scheduling_strategy=SchedulingStrategy(
-                type="colocation",
-                target="actor",
-            ),
-        )
-        scheduler = MockScheduler()
-        controller = RolloutController(
-            inf_engine=MockInferenceEngine,
-            config=config,
-            scheduler=scheduler,
-        )
-
-        controller.initialize(role="rollout", server_args={})
-
-        assert scheduler.jobs[0].tasks[0].request_gpu_gres is False
-
-        controller.destroy()
-
     def test_initialize_nonfork_colocation_uses_port_after_actor_rendezvous(self):
         """A reused actor worker reserves port 2 for SGLang NCCL."""
         config = create_test_config(

@@ -22,7 +22,11 @@ GUARD_APP = "areal.infra.rpc.guard.app"
 @pytest.fixture(autouse=True)
 def _reset_guard_globals():
     """Reset all guard state between tests."""
+    for lock_file in guard_module._state.port_lock_files.values():
+        lock_file.close()
     guard_module._state.allocated_ports = set()
+    guard_module._state.owned_ports = {}
+    guard_module._state.port_lock_files = {}
     guard_module._state.forked_children = []
     guard_module._state.forked_children_map = {}
     guard_module._state.server_host = "10.0.0.1"
@@ -30,7 +34,11 @@ def _reset_guard_globals():
     guard_module._state.trial_name = "test-trial"
     guard_module._state.fileroot = None
     yield
+    for lock_file in guard_module._state.port_lock_files.values():
+        lock_file.close()
     guard_module._state.allocated_ports = set()
+    guard_module._state.owned_ports = {}
+    guard_module._state.port_lock_files = {}
     guard_module._state.forked_children = []
     guard_module._state.forked_children_map = {}
 

@@ -15,10 +15,42 @@ import orjson
 import torch
 
 from areal.infra.utils.concurrent import run_async_task
-from areal.infra.utils.http import DEFAULT_REQUEST_TIMEOUT, get_default_connector
+from areal.infra.utils.http import (
+    DEFAULT_REQUEST_TIMEOUT,
+    arequest_with_retry,
+    get_default_connector,
+)
 from areal.utils import logging
 
 logger = logging.getLogger("HttpRTensor")
+
+
+@dataclass(frozen=True)
+class RTensorDrainReceipt:
+    """Typed proof that one controller drained its registered consumers.
+
+    This receipt describes one controller fan-out. Cross-role lease ownership
+    remains with the caller until the runtime has a dynamic consumer registry;
+    callers must collect a receipt from every role that localized the batch
+    before releasing its storage owner.
+    """
+
+    consumer_role: str
+    shard_count: int
+    source_node_count: int
+    consumer_dp_head_count: int
+
+    def __post_init__(self) -> None:
+        if not self.consumer_role:
+            raise ValueError("consumer_role must be a non-empty string")
+        for name in (
+            "shard_count",
+            "source_node_count",
+            "consumer_dp_head_count",
+        ):
+            value = getattr(self, name)
+            if value < 0:
+                raise ValueError(f"{name} must be non-negative, got {value}")
 
 
 class RTensorBackend(Protocol):
@@ -52,7 +84,9 @@ class RTensorBackend(Protocol):
         """
         ...
 
-    async def delete(self, node_addr: str, shard_ids: list[Any]) -> int:
+    async def delete(
+        self, node_addr: str, shard_ids: list[Any]
+    ) -> dict[str, Any] | None:
         """Delete shards from storage.
 
         Parameters
@@ -61,6 +95,11 @@ class RTensorBackend(Protocol):
             The node address where shards are stored
         shard_ids : list[Any]
             List of shard IDs to delete
+
+        Returns
+        -------
+        dict[str, Any] | None
+            Storage-node cleanup statistics when provided by the backend.
         """
         ...
 
@@ -252,26 +291,24 @@ class HttpRTensorBackend:
         _store_local(shard_id, tensor)
         return shard_id
 
-    async def delete(self, node_addr: str, shard_ids: list[str]) -> None:
-        """Delete shards via HTTP DELETE request."""
-        from areal.utils.network import format_hostport, split_hostport
-
-        try:
-            host, port = split_hostport(node_addr)
-            base = format_hostport(host, port)
-        except ValueError:
-            base = node_addr
+    async def delete(self, node_addr: str, shard_ids: list[str]) -> dict[str, Any]:
+        """Delete shards with retries and return storage-node cleanup statistics."""
         async with self._create_session() as session:
-            async with session.delete(
-                f"http://{base}/data/clear", json={"shard_ids": shard_ids}
-            ) as resp:
-                payload = await resp.json()
-                if resp.status != 200 or payload.get("status") != "ok":
-                    raise RuntimeError(
-                        f"Failed to clear RTensor shards on {base}: "
-                        f"status={resp.status}, response={payload}"
-                    )
-                return int(payload.get("cleared_count", 0))
+            result = await arequest_with_retry(
+                node_addr,
+                "/data/clear",
+                payload={"shard_ids": shard_ids},
+                session=session,
+                method="DELETE",
+                max_retries=3,
+                timeout=10,
+            )
+        if not isinstance(result, dict) or result.get("status") != "ok":
+            raise RuntimeError(
+                f"Invalid response while clearing RTensor shards on {node_addr}: "
+                f"{result!r}"
+            )
+        return result
 
 
 _backend: RTensorBackend | None = None
@@ -384,11 +421,15 @@ class RTensor:
         return self.data
 
     @staticmethod
-    def remotize(obj: Any, node_addr: str) -> Any:
+    def remotize(
+        obj: Any, node_addr: str, *, preserve_tensor_aliases: bool = False
+    ) -> Any:
         """Convert tensors to RTensors in nested structures.
 
         For dict objects that look like trajectory dicts (contain attention_mask),
         trailing padding is trimmed before storage to keep each RTensor compact.
+        When ``preserve_tensor_aliases`` is enabled, repeated references to the
+        same tensor object share one stored shard for this root call.
 
         Parameters
         ----------
@@ -396,23 +437,44 @@ class RTensor:
             Object potentially containing tensors
         node_addr : str
             Node address for shard storage
+        preserve_tensor_aliases : bool, default=False
+            Preserve tensor object aliases as shared RTensor shards. Distinct
+            tensor objects are never merged, even when their values match.
 
         Returns
         -------
         Any
             Object with tensors converted to RTensors
         """
+        tensor_memo = {} if preserve_tensor_aliases else None
+        return RTensor._remotize_recursive(obj, node_addr, tensor_memo)
+
+    @staticmethod
+    def _remotize_recursive(
+        obj: Any,
+        node_addr: str,
+        tensor_memo: dict[int, tuple[torch.Tensor, RTensor]] | None,
+    ) -> Any:
         if obj is None:
             return None
 
         if isinstance(obj, torch.Tensor):
+            tensor_id = id(obj)
+            if tensor_memo is not None and tensor_id in tensor_memo:
+                return tensor_memo[tensor_id][1]
+
             tensor = obj.detach().cpu()
             shard_id = get_backend().store(tensor)
             shard = TensorShardInfo(
                 shard_id=shard_id,
                 node_addr=node_addr,
             )
-            return RTensor(shard=shard, data=tensor.to("meta"))
+            remote_tensor = RTensor(shard=shard, data=tensor.to("meta"))
+            if tensor_memo is not None:
+                # Compaction creates temporary tensor objects. Keep them alive
+                # until this root call ends so their Python IDs cannot be reused.
+                tensor_memo[tensor_id] = (obj, remote_tensor)
+            return remote_tensor
 
         if isinstance(obj, dict):
             # Compact trajectory dicts by trimming padding before storage.
@@ -428,27 +490,41 @@ class RTensor:
                 )
                 if compacted is not None:
                     obj = compacted[0]
-            return {k: RTensor.remotize(v, node_addr=node_addr) for k, v in obj.items()}
+            return {
+                k: RTensor._remotize_recursive(v, node_addr, tensor_memo)
+                for k, v in obj.items()
+            }
 
         if isinstance(obj, list):
-            return [RTensor.remotize(item, node_addr=node_addr) for item in obj]
+            return [
+                RTensor._remotize_recursive(item, node_addr, tensor_memo)
+                for item in obj
+            ]
 
         if isinstance(obj, tuple):
-            return tuple(RTensor.remotize(item, node_addr=node_addr) for item in obj)
+            return tuple(
+                RTensor._remotize_recursive(item, node_addr, tensor_memo)
+                for item in obj
+            )
 
         return obj
 
     @staticmethod
-    def localize(obj: Any) -> Any:
+    def localize(obj: Any, *, preserve_tensor_aliases: bool = False) -> Any:
         """Convert RTensors to local tensors in nested structures.
 
         Inverse of remotize() - fetches remote data and converts to local tensors.
         All remote fetches are batched concurrently for performance.
+        When ``preserve_tensor_aliases`` is enabled, RTensors that reference the
+        same shard are fetched once and resolve to the same local tensor object.
 
         Parameters
         ----------
         obj : Any
             Object potentially containing RTensors
+        preserve_tensor_aliases : bool, default=False
+            Preserve aliases represented by repeated shard IDs within this root
+            call. The default retains the existing localization behavior.
 
         Returns
         -------
@@ -458,6 +534,10 @@ class RTensor:
         # Pre-fetch all remote tensors concurrently
         rtensors: list[RTensor] = []
         RTensor._collect_all(obj, rtensors)
+        if preserve_tensor_aliases:
+            RTensor._localize_preserving_aliases(rtensors)
+            return RTensor._localize_recursive(obj)
+
         meta_rtensors = [rt for rt in rtensors if rt.data.is_meta]
         if meta_rtensors:
             # Resolve as many as possible from the client-side fetch buffer.
@@ -481,6 +561,46 @@ class RTensor:
 
         # Recursively replace RTensors with local tensors (all buffer hits now)
         return RTensor._localize_recursive(obj)
+
+    @staticmethod
+    def _localize_preserving_aliases(rtensors: list[RTensor]) -> None:
+        """Resolve each shard once and assign its tensor to every reference."""
+        references_by_shard: dict[Any, list[RTensor]] = {}
+        for rtensor in rtensors:
+            references_by_shard.setdefault(rtensor.shard.shard_id, []).append(rtensor)
+
+        misses: dict[Any, list[RTensor]] = {}
+
+        with _fetch_buffer_lock:
+            for shard_id, references in references_by_shard.items():
+                tensor = next(
+                    (
+                        rtensor.data
+                        for rtensor in references
+                        if not rtensor.data.is_meta
+                    ),
+                    None,
+                )
+                if tensor is None:
+                    tensor = _fetch_buffer.get(shard_id)
+
+                if tensor is not None:
+                    for rtensor in references:
+                        rtensor.data = tensor
+                else:
+                    misses[shard_id] = references
+
+        if not misses:
+            return
+
+        representatives = [references[0] for references in misses.values()]
+        results = get_backend().fetch([rtensor.shard for rtensor in representatives])
+        with _fetch_buffer_lock:
+            for references, tensor in zip(misses.values(), results, strict=True):
+                shard_id = references[0].shard.shard_id
+                _fetch_buffer[shard_id] = tensor
+                for rtensor in references:
+                    rtensor.data = tensor
 
     @staticmethod
     def _collect_all(obj: Any, result: list[RTensor]) -> None:
@@ -543,7 +663,7 @@ class RTensor:
         return shards_by_node
 
     @staticmethod
-    async def clear_node(node_addr: str, shard_ids: list[Any]) -> int:
+    async def clear_node(node_addr: str, shard_ids: list[Any]) -> dict[str, Any] | None:
         """Clear shards from a node and evict them from the fetch buffer.
 
         Parameters
@@ -552,6 +672,11 @@ class RTensor:
             The node address
         shard_ids : list[Any]
             List of shard IDs to delete
+
+        Returns
+        -------
+        dict[str, Any] | None
+            Storage-node cleanup statistics when provided by the backend.
         """
         with _fetch_buffer_lock:
             for sid in shard_ids:

@@ -2039,9 +2039,12 @@ class FSDPEngine(TrainEngine):
                 self.parallel_helper.sp_size,
             )
         else:
-            inputs = mb_item.padded_mb
+            inputs = dict(mb_item.padded_mb)
             trie_node = inputs.pop("trie_node", None)
             ulysses_pad_size = 0
+
+        inputs.pop("turn_ids", None)
+        inputs.pop("is_truncated", None)
 
         ctx = FSDPTrainContext(
             model_inputs=inputs,
@@ -2261,35 +2264,8 @@ class FSDPPPOActor(FSDPEngine):
         super().__init__(config)
         self.actor = PPOActor(config, self)
 
-    def initialize(
-        self,
-        addr: str | None,
-        ft_spec: FinetuneSpec,
-        *args,
-        data_hook_role: str | None = None,
-        role: str | None = None,
-        **kwargs,
-    ) -> None:
-        super().initialize(addr, ft_spec, *args, **kwargs)
-        hook_role = data_hook_role or role
-        if hook_role is None and self.actor._data_hook_specs:
-            raise RuntimeError("Configured data hooks require an explicit worker role")
-        self.actor.setup_data_hooks(hook_role or "actor")
-
-    def destroy(self) -> None:
-        errors: list[BaseException] = []
-        try:
-            super().destroy()
-        except BaseException as exc:
-            errors.append(exc)
-        try:
-            self.actor.close_data_hooks()
-        except BaseException as exc:
-            errors.append(exc)
-        if len(errors) == 1:
-            raise errors[0]
-        if errors:
-            raise BaseExceptionGroup("FSDP PPO actor cleanup failed", errors)
+    def configure_mopd_loss(self, config) -> None:
+        self.actor.configure_mopd_loss(config)
 
     @torch.no_grad()
     def compute_logp(self, *args, **kwargs) -> list[torch.Tensor] | None:
@@ -2299,8 +2275,8 @@ class FSDPPPOActor(FSDPEngine):
     def compute_advantages(self, *args, **kwargs) -> list[dict[str, Any]]:
         return self.actor.compute_advantages(*args, **kwargs)
 
-    def aggregate_mopd_targets(self, *args, **kwargs):
-        return self.actor.aggregate_mopd_targets(*args, **kwargs)
+    def prepare_mopd_batch(self, *args, **kwargs) -> list[dict[str, Any]]:
+        return self.actor.prepare_mopd_batch(*args, **kwargs)
 
     def ppo_update(self, *args, **kwargs) -> None:
         self.actor.ppo_update(*args, **kwargs)

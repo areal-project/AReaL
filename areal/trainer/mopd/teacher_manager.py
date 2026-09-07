@@ -8,7 +8,6 @@ import shutil
 import uuid
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass
 from enum import Enum, auto
 from pathlib import Path
 from threading import Lock
@@ -16,29 +15,25 @@ from typing import Any, Protocol
 
 from areal.api import SaveLoadMeta
 from areal.api.cli_args import MOPDConfig
+from areal.infra.rpc.rtensor import RTensorDrainReceipt
 
 
 class TeacherController(Protocol):
-    def load(self, meta: SaveLoadMeta) -> None: ...
+    def compute_logp_padded(
+        self, data: list[dict[str, Any]]
+    ) -> tuple[list[Any] | None, list[Any]]: ...
 
-    def assert_worker_identity(self) -> None: ...
+    def assert_mopd_runtime_topology(self) -> None: ...
+
+    def load(self, meta: SaveLoadMeta) -> None: ...
 
     def onload(self) -> None: ...
 
     def offload(self) -> None: ...
 
-    def strict_clear_batches(self, *targets: Any) -> dict[str, int | bool]: ...
+    def strict_clear_batches(self, *targets: Any) -> RTensorDrainReceipt: ...
 
     def destroy(self) -> None: ...
-
-
-@dataclass(frozen=True)
-class DrainReceipt:
-    """Proof that actor-owned targets no longer reference teacher storage."""
-
-    complete: bool
-    source_shards_cleared: int = 0
-    actor_fetch_buffers_cleared: int = 0
 
 
 class TeacherManager(Protocol):
@@ -46,7 +41,7 @@ class TeacherManager(Protocol):
 
     def load(self, teacher_id: str) -> TeacherController: ...
 
-    def release(self, receipt: DrainReceipt) -> None: ...
+    def release(self, receipt: RTensorDrainReceipt) -> None: ...
 
     def close(self) -> None: ...
 
@@ -62,7 +57,7 @@ class TeacherManagerState(Enum):
 
 
 class DiskCheckpointProvider:
-    """Resolve already-local teacher snapshots without copying checkpoint bytes."""
+    """Resolve teacher snapshots already available on shared storage."""
 
     def __init__(self, config: MOPDConfig):
         self._config = config
@@ -321,9 +316,8 @@ class PersistentTeacherManager:
 
     def pre_fetch(self, teacher_id: str) -> None:
         self._ensure_usable()
-        if teacher_id == self._loaded_teacher:
-            return
-        self._provider.pre_fetch(teacher_id)
+        if teacher_id != self._loaded_teacher:
+            self._provider.pre_fetch(teacher_id)
 
     def load(self, teacher_id: str) -> TeacherController:
         self._ensure_usable()
@@ -341,7 +335,6 @@ class PersistentTeacherManager:
             else:
                 assert self._controller is not None
                 if self._state is TeacherManagerState.OFFLOADED:
-                    self._controller.assert_worker_identity()
                     self._controller.onload()
                     self._state = TeacherManagerState.RESIDENT
                 if self._loaded_teacher != teacher_id:
@@ -364,11 +357,11 @@ class PersistentTeacherManager:
             if loaded:
                 self._provider.consumed(teacher_id)
 
-    def release(self, receipt: DrainReceipt) -> None:
+    def release(self, receipt: RTensorDrainReceipt) -> None:
         self._ensure_usable()
-        if not receipt.complete:
+        if receipt.consumer_role != "actor":
             raise RuntimeError(
-                "Cannot release MOPD teacher before actor RTensor drain completes"
+                "Cannot release MOPD teacher without an actor RTensor drain receipt"
             )
         if self._state in (
             TeacherManagerState.EMPTY,
@@ -409,21 +402,7 @@ class PersistentTeacherManager:
         if controller is None:
             return
         try:
-            try:
-                controller.destroy()
-            except BaseException as first_error:
-                # Guard termination can finish immediately after its bounded
-                # final liveness check. Scheduler metadata is deliberately
-                # retained on that failure, so one whole-group cleanup retry
-                # is safe and lets the parent reap those already-signalled
-                # processes. Collective lifecycle calls are never retried.
-                try:
-                    controller.destroy()
-                except BaseException as retry_error:
-                    raise BaseExceptionGroup(
-                        "Persistent MOPD teacher cleanup failed after retry",
-                        [first_error, retry_error],
-                    ) from retry_error
+            controller.destroy()
         finally:
             self._controller = None
             self._loaded_teacher = None

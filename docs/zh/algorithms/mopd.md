@@ -1,8 +1,8 @@
 # 多 Teacher On-Policy Distillation（MOPD）
 
-MOPD 将 on-policy 强化学习与一个或多个 teacher checkpoint 的 token 级目标结合。每条
-sample 选择一个已配置的 route，route 为各 teacher 指定非负权重。权重按配置值直接使用，
-不会自动归一化。
+MOPD 将 on-policy 强化学习与一个或多个 teacher checkpoint 的 token 级目标结合。每个
+dataset source 必须选择一个 teacher group，group 可以为任意数量的 teacher 指定非负权重。
+权重按配置值直接使用，不会自动归一化。
 
 MOPD 当前运行于 single-controller 模式，使用 Megatron actor 和 teacher engine、SGLang
 rollout engine 及 AWEX 共卡权重传输。actor、rollout 和常驻的 teacher companion 共用同一组
@@ -12,7 +12,8 @@ GPU，但大模型权重不会同时驻留。
 
 每个训练 step 包含三个互斥阶段：
 
-1. **Rollout：** SGLang 生成 trajectory，并将 route 透传为 `mopd_route`。
+1. **Rollout：** SGLang 生成 trajectory，AReaL 将数据源的 teacher group 作为内部 task
+   metadata 透传；dataset sample 和 workflow 输入都不需要路由字段。
 2. **Teacher：** offload rollout 权重和 KV cache。fork 出的 Megatron teacher 进程 onload，
    依次加载当前 batch 所需的 checkpoint，并为路由到它的 sample 计算分数；actor 完成
    teacher RTensor 的物化与清理后，再次 offload teacher 权重。companion 进程保持常驻，供
@@ -37,12 +38,17 @@ rollout:
   backend: sglang:d8t1
   scheduling_strategy: {type: colocation, target: actor, fork: true}
 
+train_dataset:
+  mixture_sampling_policy: proportional
+  sources:
+    - {path: /data/code, type: rl, teacher_group: coding}
+    - {path: /data/mixed, type: rl, teacher_group: mixed}
+
 mopd:
-  task_type_identifier: task_type
   teachers:
     coder: {path: /models/teacher-coder}
     reasoning: {path: /models/teacher-reasoning}
-  routes:
+  teacher_groups:
     coding: {coder: 1.0}
     mixed: {coder: 0.3, reasoning: 0.7}
   teacher_engine:
@@ -56,30 +62,40 @@ mopd:
     staging_root: /dev/shm/areal-mopd
   loss:
     rl_coefficient: 0.0
-    distillation_coefficient: 0.005
+    distillation_coefficient: 1.0
 ```
 
-每条 dataset item 必须包含 `task_type_identifier` 指定的字段，其值必须匹配 `routes` 中的
-key。route 只能引用已知 teacher ID，并且必须至少包含一个正权重。
+启用 MOPD 时，`train_dataset.sources` 中的每个数据源都必须显式设置
+`teacher_group`，且必须匹配 `mopd.teacher_groups` 中的 key；配置 valid dataset 时也遵循
+相同规则。非 MOPD 场景下，`teacher_group` 默认为 `null`。sample 不能覆盖数据源的
+teacher group，也不需要 `task_type` 字段。每个 teacher group 可以引用任意数量的已知
+teacher ID，并且必须至少包含一个正权重。
+`mixture_sampling_policy: proportional` 保持各数据源按长度占比采样；`uniform`
+则通过确定性循环较短数据源，使每个数据源在一个 epoch 中贡献相同数量的样本，再由分布式
+sampler 对全局索引进行 shuffle。
 
-`manager.type: disk` 从共享存储加载 checkpoint，支持多节点运行。`local_memory` 将
-checkpoint 暂存到 `staging_root`，仅支持 controller 与 teacher worker 同机的
-LocalScheduler；Ray 和 Slurm 不保证本地文件系统可见。启动时会清理由已退出 owner 遗留的
-MOPD 暂存目录。
+`manager.type: disk` 从共享存储加载 checkpoint，支持多节点运行。`local_memory`
+会在 `staging_root` 下异步暂存下一个 checkpoint，使用原子发布后交给常驻 teacher
+加载，并在加载完成后删除。由于该路径只在 controller 所在节点可见，
+`local_memory` 要求 `scheduler.type: local` 且 actor/teacher 为单机拓扑；可通过
+`min_free_bytes` 为暂存目录预留可用空间。
 
 对 teacher 权重 $w_j$，定义 $S_T(a)=\sum_j w_j\log\pi_{T_j}(a)$ 和
 $W=\sum_j w_j$。MOPD 使用 on-policy score-function surrogate 最小化未归一化的加权
 reverse KL：$\sum_j w_j D_{KL}(\pi_\theta \parallel \pi_{T_j})$。
 
 ```text
-rho(a) = exp(log pi_theta(a) - log pi_old(a))
+rho(a) = min(exp(log pi_theta(a) - log pi_old(a)), importance_ratio_cap)
 reward(a) = S_T(a) - W * stop_gradient(log pi_theta(a))
 mopd_loss = -mean(rho(a) * reward(a))
 loss = rl_coefficient * rl_loss + distillation_coefficient * mopd_loss
 ```
 
+`importance_ratio_cap` 默认值为 `5.0`，用于限制重要性采样乘数并避免指数溢出。
+
 该目标是多个 reverse-KL 的加权和；忽略与 student 无关的常数后，也等价于几何 teacher
-ensemble。它不是 teacher cross-entropy，也不是 teacher 概率的算术混合。route 权重直接生效，
+ensemble。它不是 teacher cross-entropy，也不是 teacher 概率的算术混合。teacher group
+权重直接生效，
 不会自动归一化。
 
 设置 `rl_coefficient: 0.0` 可执行纯 distillation；两个 coefficient 都设为正数时执行 RL 与

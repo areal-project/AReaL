@@ -453,7 +453,7 @@ class _HeadContainer(torch.nn.Module):
 
 
 def test_areal_lm_head_tensor_and_sequence_parallel():
-    """Test native and FP32 output with TP, SP, and an externally tied weight."""
+    """Test native, FP32-output, and FP32-operand heads with TP and SP."""
     if not parallel_state.is_initialized():
         parallel_state.initialize_model_parallel(
             tensor_model_parallel_size=dist.get_world_size()
@@ -467,7 +467,11 @@ def test_areal_lm_head_tensor_and_sequence_parallel():
     tp_group = get_tp_group()
 
     for sequence_parallel in (False, True):
-        for fp32_output in (False, True):
+        for fp32_output, fp32_operands in (
+            (False, False),
+            (True, False),
+            (True, True),
+        ):
             for weight_requires_grad in (False, True):
                 _test_areal_lm_head_tensor_and_sequence_parallel_case(
                     rank=rank,
@@ -479,6 +483,7 @@ def test_areal_lm_head_tensor_and_sequence_parallel():
                     tp_group=tp_group,
                     sequence_parallel=sequence_parallel,
                     fp32_output=fp32_output,
+                    fp32_operands=fp32_operands,
                     weight_requires_grad=weight_requires_grad,
                 )
 
@@ -497,6 +502,7 @@ def _test_areal_lm_head_tensor_and_sequence_parallel_case(
     tp_group: dist.ProcessGroup,
     sequence_parallel: bool,
     fp32_output: bool,
+    fp32_operands: bool,
     weight_requires_grad: bool,
 ) -> None:
     config = TransformerConfig(
@@ -522,6 +528,7 @@ def _test_areal_lm_head_tensor_and_sequence_parallel_case(
     replace_output_layer_with_areal_lm_head(
         container,
         fp32_output=fp32_output,
+        fp32_operands=fp32_operands,
     )
 
     torch.manual_seed(1000 + rank)
@@ -548,7 +555,11 @@ def _test_areal_lm_head_tensor_and_sequence_parallel_case(
         total_input = torch.cat(gathered_inputs, dim=0)
     else:
         total_input = local_input.detach()
-    if fp32_output:
+    if fp32_operands:
+        expected_output = torch.matmul(
+            total_input.float(), tied_weight.detach().float().t()
+        )
+    elif fp32_output:
         expected_output = torch.mm(
             total_input.reshape(-1, hidden_size),
             tied_weight.detach().t(),
@@ -564,8 +575,13 @@ def _test_areal_lm_head_tensor_and_sequence_parallel_case(
     torch.manual_seed(2000 + rank)
     grad_output = torch.randn_like(output)
     output.backward(grad_output)
-    grad_output_bf16 = grad_output.to(torch.bfloat16)
-    expected_full_dgrad = grad_output_bf16.matmul(tied_weight.detach())
+    if fp32_operands:
+        expected_full_dgrad = grad_output.matmul(tied_weight.detach().float()).to(
+            torch.bfloat16
+        )
+    else:
+        grad_output_bf16 = grad_output.to(torch.bfloat16)
+        expected_full_dgrad = grad_output_bf16.matmul(tied_weight.detach())
 
     if sequence_parallel:
         expected_input_grad = torch.empty_like(local_input)
@@ -582,11 +598,19 @@ def _test_areal_lm_head_tensor_and_sequence_parallel_case(
         local_input.grad, expected_input_grad, rtol=0.0, atol=0.0
     )
     if weight_requires_grad:
-        expected_weight_grad = (
-            grad_output_bf16.reshape(-1, local_vocab_size)
-            .t()
-            .matmul(total_input.reshape(-1, hidden_size))
-        )
+        if fp32_operands:
+            expected_weight_grad = (
+                grad_output.reshape(-1, local_vocab_size)
+                .t()
+                .matmul(total_input.float().reshape(-1, hidden_size))
+                .to(torch.bfloat16)
+            )
+        else:
+            expected_weight_grad = (
+                grad_output_bf16.reshape(-1, local_vocab_size)
+                .t()
+                .matmul(total_input.reshape(-1, hidden_size))
+            )
         torch.testing.assert_close(
             tied_weight.grad, expected_weight_grad, rtol=0.0, atol=0.0
         )
@@ -728,8 +752,8 @@ def test_areal_lm_head_packed_dlogits_tensor_and_sequence_parallel():
         print("✓ test_areal_lm_head_packed_dlogits_tensor_and_sequence_parallel passed")
 
 
-def test_chunked_lm_head_tensor_and_sequence_parallel():
-    """Compare chunked LM Head logprobs and gradients under TP and SP."""
+def test_chunked_fp32_lm_head_tensor_and_sequence_parallel():
+    """Compare chunked FP32-operand LM Head results under TP and SP."""
     rank = dist.get_rank()
     world_size = dist.get_world_size()
     device = current_platform.current_device()
@@ -759,7 +783,9 @@ def test_chunked_lm_head_tensor_and_sequence_parallel():
             tp_group=tp_group,
         )
         container = _HeadContainer(head)
-        replace_output_layer_with_areal_lm_head(container, fp32_output=True)
+        replace_output_layer_with_areal_lm_head(
+            container, fp32_output=True, fp32_operands=True
+        )
 
         torch.manual_seed(5000 + rank)
         local_input = torch.randn(
@@ -803,10 +829,9 @@ def test_chunked_lm_head_tensor_and_sequence_parallel():
             total_input = torch.cat(gathered_inputs, dim=0)
         else:
             total_input = local_input.detach()
-        local_logits = torch.mm(
-            total_input.reshape(-1, hidden_size),
-            tied_weight.detach().t(),
-            out_dtype=torch.float32,
+        local_logits = torch.matmul(
+            total_input.float().reshape(-1, hidden_size),
+            tied_weight.detach().float().t(),
         )
         gathered_logits = [torch.empty_like(local_logits) for _ in range(world_size)]
         dist.all_gather(gathered_logits, local_logits, group=tp_group)
@@ -833,9 +858,11 @@ def test_chunked_lm_head_tensor_and_sequence_parallel():
         (output.logprobs * loss_weights).sum().backward()
         local_dlogits = reference_logits.grad[
             :, rank * local_vocab_size : (rank + 1) * local_vocab_size
-        ].to(torch.bfloat16)
-        expected_full_dgrad = local_dlogits.matmul(tied_weight.detach()).view_as(
-            total_input
+        ]
+        expected_full_dgrad = (
+            local_dlogits.matmul(tied_weight.detach().float())
+            .to(torch.bfloat16)
+            .view_as(total_input)
         )
         if sequence_parallel:
             expected_input_grad = torch.empty_like(local_input)
@@ -845,8 +872,10 @@ def test_chunked_lm_head_tensor_and_sequence_parallel():
         else:
             expected_input_grad = expected_full_dgrad
             dist.all_reduce(expected_input_grad, group=tp_group)
-        expected_weight_grad = local_dlogits.t().matmul(
-            total_input.reshape(-1, hidden_size)
+        expected_weight_grad = (
+            local_dlogits.t()
+            .matmul(total_input.float().reshape(-1, hidden_size))
+            .to(torch.bfloat16)
         )
 
         torch.testing.assert_close(
@@ -857,7 +886,7 @@ def test_chunked_lm_head_tensor_and_sequence_parallel():
         )
 
     if rank == 0:
-        print("✓ test_chunked_lm_head_tensor_and_sequence_parallel passed")
+        print("✓ test_chunked_fp32_lm_head_tensor_and_sequence_parallel passed")
 
 
 def run_all_tests():
@@ -900,7 +929,7 @@ def run_all_tests():
     test_areal_lm_head_packed_dlogits_tensor_and_sequence_parallel()
     dist.barrier()
 
-    test_chunked_lm_head_tensor_and_sequence_parallel()
+    test_chunked_fp32_lm_head_tensor_and_sequence_parallel()
     dist.barrier()
 
     if rank == 0:

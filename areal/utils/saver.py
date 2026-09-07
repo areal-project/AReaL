@@ -130,6 +130,12 @@ class Saver:
         processor: AutoProcessor | None = None,
         base_model_path: str | None = None,
     ):
+        if (
+            self.config.freq_epochs is None
+            and self.config.freq_steps is None
+            and self.config.freq_secs is None
+        ):
+            return
         if not self.freq_ctl.check(
             epochs=int(step == self.ft_spec.steps_per_epoch - 1), steps=1
         ):
@@ -161,17 +167,6 @@ class Saver:
                         "engine model path is not a local directory: %s",
                         configured_model_path,
                     )
-            if (
-                base_model_path
-                and os.path.isdir(base_model_path)
-                and os.path.samefile(base_model_path, path)
-            ):
-                logger.warning(
-                    "Skipping source HuggingFace asset copy because the source and "
-                    "checkpoint directories are the same: %s",
-                    path,
-                )
-                base_model_path = None
             meta = SaveLoadMeta(
                 path=path,
                 weight_format="hf",

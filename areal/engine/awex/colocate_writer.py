@@ -28,20 +28,12 @@ from typing import TYPE_CHECKING
 import torch
 import torch.distributed as dist
 
+from areal.engine.megatron_utils.weight_residency import MegatronWeightResidency
+from areal.utils.environ import get_float_env_var
+from areal.utils.logging import getLogger
+
 if TYPE_CHECKING:
     from areal.engine.megatron_engine import MegatronEngine
-
-from areal.engine.megatron_utils.optimizer_chain import (
-    OptimizerResidencyEntry,
-    OptimizerResidencyPlan,
-    build_optimizer_residency_plan,
-    checkpoint_awex_residency,
-)
-from areal.engine.weight_finite import (
-    check_named_tensors_finite,
-    iter_module_named_tensors,
-)
-from areal.utils.logging import getLogger
 
 logger = getLogger("AwexColocate")
 
@@ -124,50 +116,46 @@ def resolve_physical_gpu_id(relative_gpu_id: int) -> int:
     transfer have to agree on physical GPU ids. Inside a process that was
     given a device mask, ``torch.cuda.current_device()`` and SGLang's
     ``gpu_id`` are indices into that mask rather than physical ids, so the
-    mask itself is the only ground truth. Falls back to the relative index
-    when the mask is absent or holds GPU UUIDs.
+    mask itself is the only ground truth. UUID masks and invalid indices are
+    rejected because they cannot produce the node-local ordinal AWEX keys use.
     """
     cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
     if not cuda_visible:
         return relative_gpu_id
-    try:
-        gpu_ids = [int(x) for x in cuda_visible.split(",") if x.strip()]
-        return gpu_ids[relative_gpu_id]
-    except (ValueError, IndexError):
-        return relative_gpu_id
+    visible_devices = [item.strip() for item in cuda_visible.split(",") if item.strip()]
+    if not all(item.isdigit() for item in visible_devices):
+        raise ValueError(
+            "AWEX colocate requires numeric CUDA_VISIBLE_DEVICES entries; "
+            f"got {visible_devices!r}"
+        )
+    if relative_gpu_id >= len(visible_devices):
+        raise ValueError(
+            f"CUDA device {relative_gpu_id} is outside "
+            f"CUDA_VISIBLE_DEVICES={visible_devices!r}"
+        )
+    return int(visible_devices[relative_gpu_id])
 
 
 def awex_colocate_timeout_s(default: float = 1800.0) -> float:
-    value = os.environ.get("AWEX_COLOCATE_TIMEOUT_S", "").strip()
-    if not value:
-        return default
-    try:
-        return float(value)
-    except ValueError:
-        logger.warning(
-            "Invalid AWEX_COLOCATE_TIMEOUT_S=%r; using default %.1fs",
-            value,
-            default,
-        )
-        return default
+    return get_float_env_var("AWEX_COLOCATE_TIMEOUT_S", default)
 
 
-class AwexMegatronAdapter:
-    """Training-side adapter for AWEX colocated weight transfer.
+class AwexWeightPublisher:
+    """Publish Megatron weights to a colocated SGLang engine through AWEX.
 
     Uses CUDA IPC (share_memory + ForkingPickler serialization) for zero-copy
     weight transfer to the colocated SGLang process on the same GPU. The infer
-    side handles redistribution among infer ranks via its own NCCL group.
+    side handles redistribution among infer ranks via its own NCCL group. GPU
+    residency is delegated to one shared :class:`MegatronWeightResidency`.
     """
 
-    def __init__(self, engine: MegatronEngine):
+    def __init__(
+        self,
+        engine: MegatronEngine,
+        residency: MegatronWeightResidency | None = None,
+    ) -> None:
         self._engine = engine
-        self._offloaded_weights: dict[str, torch.Tensor] = {}
-        self._released_tags: set[str] = set()
-        self._optimizer_residency_plan: OptimizerResidencyPlan | None = None
-        self._ordinary_optimizer_restores: dict[
-            int, list[tuple[torch.Tensor, torch.device]]
-        ] = {}
+        self._residency = residency or MegatronWeightResidency(engine)
         self._meta_server_addr: str | None = None
         self._meta_server_client = None
         self._transfer_rank: int | None = None
@@ -181,6 +169,11 @@ class AwexMegatronAdapter:
         self._pending_ipc_export: (
             tuple[list[torch.Tensor], list[torch.Tensor]] | None
         ) = None
+
+    @property
+    def residency(self) -> MegatronWeightResidency:
+        """Return the sole residency manager used during publication."""
+        return self._residency
 
     def init_colocate_weight_update(
         self,
@@ -220,10 +213,30 @@ class AwexMegatronAdapter:
             )
 
         logger.info(
-            "AwexMegatronAdapter initialized: meta_server=%s, transfer_rank=%d",
+            "AwexWeightPublisher initialized: meta_server=%s, transfer_rank=%d",
             meta_server_addr,
             transfer_rank,
         )
+
+    def eager_publish_train_info(self, meta_server_addr: str | None) -> None:
+        """Publish train world metadata before the colocated reader starts."""
+        addr = meta_server_addr or os.environ.get("AWEX_META_SERVER_ADDR", "")
+        if not addr or (dist.is_initialized() and dist.get_rank() != 0):
+            return
+        try:
+            from awex.meta.meta_server import MetaServerClient
+
+            host, port = addr.rsplit(":", 1)
+            client = MetaServerClient(host, int(port))
+            world = dist.get_world_size() if dist.is_initialized() else 1
+            client.put_object("awex_train_info", {"train_world_size": world})
+            logger.info(
+                "Eager-published awex_train_info (train_world_size=%d) to %s",
+                world,
+                addr,
+            )
+        except Exception as exc:
+            logger.warning("Eager publish awex_train_info failed: %s", exc)
 
     def _lazy_initialize(self) -> None:
         """Perform deferred initialization: metadata exchange and weight converter setup.
@@ -272,11 +285,6 @@ class AwexMegatronAdapter:
             "infer_conf", timeout=self._timeout_s
         )
         logger.info("Got infer_conf from MetaServer: %s", infer_conf)
-
-        if isinstance(infer_conf.get("hf_config"), dict):
-            from types import SimpleNamespace
-
-            infer_conf["hf_config"] = SimpleNamespace(**infer_conf["hf_config"])
 
         meta_resolver = McoreParamMetaResolver(shim, self._engine.hf_config, infer_conf)
         parameters_meta = meta_resolver.get_parameters_meta()
@@ -334,33 +342,13 @@ class AwexMegatronAdapter:
             training_world_size,
         )
 
-    def _release_grad_memory(self) -> None:
-        """Release gradient buffers to free GPU memory before weight conversion.
-
-        Mirrors the AWEX reference release_grad_memory().
-        Saves original sizes to buffer.grad_data_size for later restoration.
-        """
-        from megatron.core.distributed import DistributedDataParallel as DDP
-
-        model = self._engine.model
-        if model is None:
-            return
-        if not isinstance(model, (list, tuple)):
-            model = [model]
-        count = 0
-        for chunk in model:
-            if isinstance(chunk, DDP):
-                for buffers in [chunk.buffers, chunk.expert_parallel_buffers]:
-                    for buf in buffers:
-                        if buf.grad_data.storage().size() > 0:
-                            buf.grad_data_size = buf.grad_data.storage().size()
-                            buf.grad_data.storage().resize_(0)
-                            count += 1
-        if count > 0:
-            torch.cuda.synchronize()
-            gc.collect()
-            torch.cuda.empty_cache()
-        logger.info("Released %d grad buffers", count)
+    def _prepare_residency_for_publish(self) -> None:
+        """Free optimizer/grad memory before making weights resident."""
+        weights_were_offloaded = self._residency.is_released("weights")
+        self._residency.release_memory(tags=["optimizer"])
+        self._residency.release_grad_memory()
+        if weights_were_offloaded:
+            self._residency.resume_memory(tags=["weights"])
 
     @torch.no_grad()
     def execute_colocate_weight_update(self, version: int) -> None:
@@ -386,8 +374,6 @@ class AwexMegatronAdapter:
                 "Previous CUDA IPC export is still pending final reader completion"
             )
 
-        weights_were_offloaded = "weights" in self._released_tags
-
         # Reclaim any legacy IPC-exported blocks from a previous version.
         torch.cuda.ipc_collect()
 
@@ -401,20 +387,7 @@ class AwexMegatronAdapter:
         # _release_memory_for_weights_exchange).
         # Optimizer/grad offload operate on independent Megatron buffers and do
         # not require the weights to be resumed, so reordering is safe.
-        self.release_memory(tags=["optimizer"])
-
-        self._release_grad_memory()
-
-        if weights_were_offloaded:
-            self.resume_memory(tags=["weights"])
-
-        check_named_tensors_finite(
-            iter_module_named_tensors(self._engine.model),
-            stage="awex_writer_source",
-            version=version,
-            logger=logger,
-            process_group=self._engine.cpu_group,
-        )
+        self._prepare_residency_for_publish()
 
         # _lazy_initialize AFTER the weights resume — its meta resolver
         # runs convert_param over live params, which dies with CUDA invalid
@@ -425,13 +398,6 @@ class AwexMegatronAdapter:
         self._lazy_initialize()
 
         parameters = self._convert_parameters()
-        check_named_tensors_finite(
-            parameters.items(),
-            stage="awex_writer_converted",
-            version=version,
-            logger=logger,
-            process_group=self._engine.cpu_group,
-        )
         tensors = list(parameters.values())
         names = list(parameters.keys())
         logger.info(
@@ -481,7 +447,7 @@ class AwexMegatronAdapter:
         gc.collect()
         torch.cuda.empty_cache()
 
-        self.release_memory(tags=["weights"])
+        self._residency.release_memory(tags=["weights"])
 
         ip_address = self._ip_address
         device_id = self._physical_gpu_id
@@ -643,250 +609,31 @@ class AwexMegatronAdapter:
 
     def checkpoint_residency(self, *, with_model: bool, with_optimizer: bool):
         """Temporarily restore only resources required by a checkpoint."""
-        return checkpoint_awex_residency(
-            self,
-            self._engine.optimizer,
+        return self._residency.checkpoint_residency(
             with_model=with_model,
             with_optimizer=with_optimizer,
         )
 
     def release_memory(self, tags: list[str] | None = None) -> None:
-        tags = tags or ["optimizer", "weights"]
-        tags_to_release = [t for t in tags if t not in self._released_tags]
-        if not tags_to_release:
-            return
-
-        if "optimizer" in tags_to_release:
-            self._offload_optimizer_states()
-        if "weights" in tags_to_release:
-            self._offload_model_weights()
-
-        torch.cuda.synchronize()
-        gc.collect()
-        torch.cuda.empty_cache()
-
-        self._released_tags.update(tags_to_release)
-        logger.info("release_memory done: tags=%s", tags_to_release)
+        """Compatibility delegate for callers of the former combined adapter."""
+        self._residency.release_memory(tags)
 
     def resume_memory(self, tags: list[str] | None = None) -> None:
-        tags = tags or ["optimizer", "weights"]
-        tags_to_resume = [t for t in tags if t in self._released_tags]
-        if not tags_to_resume:
-            return
+        """Compatibility delegate for callers of the former combined adapter."""
+        self._residency.resume_memory(tags)
 
-        if "weights" in tags_to_resume:
-            self._reload_model_weights(load_grad=False)
-        if "optimizer" in tags_to_resume:
-            self._reload_optimizer_states()
-        torch.cuda.synchronize()
-        self._released_tags.difference_update(tags_to_resume)
-        if "optimizer" in tags_to_resume:
-            self._optimizer_residency_plan = None
-            self._ordinary_optimizer_restores.clear()
-        logger.info("resume_memory done: tags=%s", tags_to_resume)
+    @property
+    def _released_tags(self) -> set[str]:
+        """Compatibility view of the composed residency state."""
+        return set(self._residency.released_tags)
 
-    def _offload_model_weights(self) -> None:
-        from megatron.core.distributed import DistributedDataParallel as DDP
-
-        model = self._engine.model
-        if model is None:
-            return
-        if not isinstance(model, (list, tuple)):
-            model = [model]
-        count = 0
-        for chunk in model:
-            if isinstance(chunk, DDP):
-                for buffers in [chunk.buffers, chunk.expert_parallel_buffers]:
-                    for buf in buffers:
-                        if hasattr(buf, "offload_to_cpu"):
-                            buf.offload_to_cpu()
-                            count += 1
-                            continue
-                        if buf.param_data.storage().size() > 0:
-                            if not hasattr(buf.param_data, "cpu_data"):
-                                buf.param_data.cpu_data = torch.zeros(
-                                    buf.param_data.data.shape,
-                                    dtype=buf.param_data.data.dtype,
-                                    pin_memory=True,
-                                    device="cpu",
-                                )
-                            buf.param_data.cpu_data.copy_(buf.param_data.data)
-                            buf.param_data_size = buf.param_data.storage().size()
-                            buf.param_data.storage().resize_(0)
-                            count += 1
-                        if buf.grad_data.storage().size() > 0:
-                            buf.grad_data_size = buf.grad_data.storage().size()
-                            buf.grad_data.storage().resize_(0)
-            else:
-                raise RuntimeError(
-                    "AWEX Megatron colocation requires MCore DDP flat buffers; "
-                    "per-parameter weight offload is forbidden"
-                )
-        torch.cuda.synchronize()
-        logger.info("Offloaded %d weight buffers to CPU", count)
-
-    def _reload_model_weights(self, load_grad: bool = False) -> None:
-        from megatron.core.distributed import DistributedDataParallel as DDP
-
-        model = self._engine.model
-        if model is None:
-            return
-        if not isinstance(model, (list, tuple)):
-            model = [model]
-        for chunk in model:
-            if isinstance(chunk, DDP):
-                for buffers in [chunk.buffers, chunk.expert_parallel_buffers]:
-                    for buf in buffers:
-                        if hasattr(buf, "reload_from_cpu"):
-                            buf.reload_from_cpu(move_grads=load_grad)
-                            continue
-                        if buf.param_data.storage().size() == 0:
-                            buf.param_data.storage().resize_(buf.param_data_size)
-                        buf.param_data.copy_(buf.param_data.cpu_data, non_blocking=True)
-                        if (
-                            load_grad
-                            and hasattr(buf, "grad_data_size")
-                            and buf.grad_data.storage().size() == 0
-                        ):
-                            buf.grad_data.storage().resize_(buf.grad_data_size)
-                            buf.grad_data.zero_()
-            else:
-                raise RuntimeError(
-                    "Cannot reload AWEX Megatron weights without MCore DDP flat buffers"
-                )
-        self._offloaded_weights.clear()
-        torch.cuda.synchronize()
-        logger.info("Reloaded model weights to GPU (load_grad=%s)", load_grad)
+    def _release_grad_memory(self) -> None:
+        """Compatibility delegate for the former combined adapter."""
+        self._residency.release_grad_memory()
 
     def ensure_grad_buffers(self) -> None:
-        """Allocate grad buffers if they were freed during offload.
-
-        Called before forward_backward (training) to ensure grad storage
-        is available for backward pass. Separate from _reload_model_weights
-        because compute_logp (inference-only) should not allocate grad buffers.
-        """
-        from megatron.core.distributed import DistributedDataParallel as DDP
-
-        model = self._engine.model
-        if model is None:
-            return
-        if not isinstance(model, (list, tuple)):
-            model = [model]
-        count = 0
-        for chunk in model:
-            if isinstance(chunk, DDP):
-                for buffers in [chunk.buffers, chunk.expert_parallel_buffers]:
-                    for buf in buffers:
-                        if (
-                            hasattr(buf, "grad_data_size")
-                            and buf.grad_data.storage().size() == 0
-                        ):
-                            buf.grad_data.storage().resize_(buf.grad_data_size)
-                            buf.grad_data.zero_()
-                            count += 1
-        if count > 0:
-            torch.cuda.synchronize()
-            logger.info("Allocated %d grad buffers for training", count)
-
-    def _offload_optimizer_states(self) -> None:
-        optimizer = self._engine.optimizer
-        plan = build_optimizer_residency_plan(optimizer, logger=logger)
-        if self._ordinary_optimizer_restores:
-            raise RuntimeError("stale ordinary optimizer state before AWEX release")
-        ordinary_restores: dict[int, list[tuple[torch.Tensor, torch.device]]] = {}
-        for index, entry in enumerate(plan.entries):
-            if entry.managed_optimizer is not None:
-                entry.managed_optimizer.offload_to_cpu()
-            else:
-                ordinary_restores[index] = self._release_ordinary_optimizer(entry)
-        torch.cuda.synchronize()
-        self._purge_te_cache()
-        self._ordinary_optimizer_restores = ordinary_restores
-        self._optimizer_residency_plan = plan
-        logger.info(
-            "Released optimizer state for %d managed and %d ordinary leaves",
-            sum(entry.managed_optimizer is not None for entry in plan.entries),
-            sum(entry.managed_optimizer is None for entry in plan.entries),
-        )
-
-    def _reload_optimizer_states(self) -> None:
-        plan = self._optimizer_residency_plan
-        if plan is None:
-            return
-        for index, entry in enumerate(plan.entries):
-            if entry.managed_optimizer is not None:
-                entry.managed_optimizer.restore_from_cpu()
-                continue
-            for tensor, device in self._ordinary_optimizer_restores.get(index, []):
-                tensor.data = tensor.data.to(device, non_blocking=True)
-        logger.info("Restored managed and ordinary optimizer state")
-
-    def _release_ordinary_optimizer(
-        self, entry: OptimizerResidencyEntry
-    ) -> list[tuple[torch.Tensor, torch.device]]:
-        """Mirror AWEX's original ordinary Megatron optimizer migration."""
-        restores: list[tuple[torch.Tensor, torch.device]] = []
-        seen: set[int] = set()
-
-        def move_tensor(tensor: torch.Tensor, description: str) -> None:
-            if id(tensor) in seen or not tensor.data.is_cuda:
-                return
-            if type(tensor) is not torch.Tensor:
-                raise TypeError(
-                    "AWEX ordinary optimizer migration supports only plain "
-                    f"Tensor values, got {type(tensor).__module__}."
-                    f"{type(tensor).__qualname__} for {description}"
-                )
-            seen.add(id(tensor))
-            device = tensor.device
-            tensor.data = tensor.data.to("cpu", non_blocking=True)
-            restores.append((tensor, device))
-
-        leaf = entry.leaf
-        for group in getattr(leaf, "shard_fp32_from_float16_groups", ()):
-            tensors = group if isinstance(group, list) else [group]
-            for tensor in tensors:
-                if tensor is not None:
-                    move_tensor(tensor, "legacy FP32 main parameter")
-
-        base_optimizer = entry.base_optimizer
-        if base_optimizer is None:
-            return restores
-        state = getattr(base_optimizer, "state", None)
-        if state is None:
-            return restores
-        if getattr(base_optimizer, "capturable", False):
-            raise RuntimeError(
-                "AWEX optimizer-state migration does not support capturable optimizers"
-            )
-        for param_state in state.values():
-            for key in (
-                "master_param",
-                "exp_avg",
-                "exp_avg_sq",
-                "momentum_buffer",
-            ):
-                value = param_state.get(key)
-                if isinstance(value, torch.Tensor):
-                    move_tensor(value, f"optimizer state {key}")
-        return restores
-
-    def _purge_te_cache(self) -> None:
-        """Release Transformer Engine's private cached gradient buffers."""
-        try:
-            import transformer_engine.pytorch.module.base as te_base
-        except ImportError:
-            return
-        cache = te_base._dummy_wgrads
-        if not isinstance(cache, dict):
-            raise TypeError(
-                "Transformer Engine 2.14.1 _dummy_wgrads must be a dict or "
-                f"dict subclass, got {type(cache).__module__}.{type(cache).__qualname__}"
-            )
-        count = len(cache)
-        cache.clear()
-        if count:
-            logger.info("Purged %d TE _dummy_wgrads cache entries", count)
+        """Compatibility delegate for the former combined adapter."""
+        self._residency.ensure_grad_buffers()
 
 
 def _get_tf_config(models):
@@ -898,3 +645,15 @@ def _get_tf_config(models):
             if cfg is not None:
                 return cfg
     return None
+
+
+# Backward-compatible name for callers that imported the former combined
+# adapter. New engine code uses AwexWeightPublisher and injects its residency.
+AwexMegatronAdapter = AwexWeightPublisher
+
+__all__ = [
+    "AwexMegatronAdapter",
+    "AwexWeightPublisher",
+    "awex_colocate_timeout_s",
+    "resolve_physical_gpu_id",
+]

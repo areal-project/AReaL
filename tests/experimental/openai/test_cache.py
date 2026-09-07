@@ -1,6 +1,7 @@
 from unittest.mock import MagicMock
 
 import pytest
+import torch
 from openai.types.responses.response import Response
 from openai.types.responses.response_output_message import ResponseOutputMessage
 from openai.types.responses.response_output_text import ResponseOutputText
@@ -102,6 +103,18 @@ def test_set_reward(mock_interaction):
     cache["1"] = interaction
     cache.set_reward("1", 10.0)
     assert cache["1"].reward == 10.0
+
+
+def test_set_reward_updates_cached_reward_tensors():
+    cache = InteractionCache()
+    cache["1"] = InteractionWithTokenLogpReward(_cache={"rewards": torch.tensor([0.0])})
+
+    cache.set_reward("1", 3.0)
+
+    torch.testing.assert_close(cache["1"]._cache["rewards"], torch.tensor([3.0]))
+    torch.testing.assert_close(
+        cache["1"]._cache["original_rewards"], torch.tensor([3.0])
+    )
 
 
 def test_set_last_reward(mock_interaction):

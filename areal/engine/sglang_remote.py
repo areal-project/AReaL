@@ -96,6 +96,9 @@ def _resolve_colocated_base_gpu_id(
 class SGLangBackend:
     """SGLang-specific backend implementation for remote inference."""
 
+    def __init__(self) -> None:
+        self._readiness_endpoint = "/health"
+
     @staticmethod
     def build_server_env(env: Mapping[str, str]) -> dict[str, str]:
         _env = dict(env)
@@ -128,6 +131,8 @@ class SGLangBackend:
         }
         if stop:
             sample_params["stop"] = stop
+        if gconfig.seed is not None:
+            sample_params["sampling_seed"] = gconfig.seed
 
         payload = {
             "input_ids": req.input_ids.copy(),
@@ -171,12 +176,19 @@ class SGLangBackend:
                 pybase64.b64decode(routed_experts.encode("utf-8")), dtype=np.int32
             ).reshape(num_sgl_token, -1)
 
+        # Speculative-decoding acceptance metrics (present only when SGLang is
+        # launched with a speculative_algorithm; None otherwise).
+        spec_accept_rate = meta_info.get("spec_accept_rate")
+        spec_accept_length = meta_info.get("spec_accept_length")
+
         if stop_reason == "abort" and stop_message.startswith("Abort before prefill"):
             return HttpGenerationResult(
                 output_tokens=[],
                 output_logprobs=[],
                 stop_reason=stop_reason,
                 routed_experts=routed_experts,
+                spec_accept_rate=spec_accept_rate,
+                spec_accept_length=spec_accept_length,
             )
 
         output_tokens = [x[1] for x in meta_info["output_token_logprobs"]]
@@ -187,6 +199,8 @@ class SGLangBackend:
             output_logprobs=output_logprobs,
             stop_reason=stop_reason,
             routed_experts=routed_experts,
+            spec_accept_rate=spec_accept_rate,
+            spec_accept_length=spec_accept_length,
         )
 
     def build_score_request(
@@ -423,12 +437,7 @@ class SGLangBackend:
 
     def get_health_check_request(self) -> HttpRequest:
         """Get SGLang readiness check request."""
-        # SGLang's /health is a functional 1-token generation probe in recent
-        # versions. During AWEX colocated startup, generation can legitimately
-        # wait for the first train-side weight publication, so using /health for
-        # launch readiness deadlocks rollout initialization. /model_info only
-        # requires the HTTP server and model metadata to be ready.
-        return HttpRequest(endpoint="/model_info", payload={}, method="GET")
+        return HttpRequest(endpoint=self._readiness_endpoint, payload={}, method="GET")
 
     def get_offload_request(self, tags: list[str] | None = None) -> HttpRequest:
         """Get SGLang offload request."""
@@ -448,10 +457,22 @@ class SGLangBackend:
 
     def launch_server(self, server_args: dict[str, Any]) -> subprocess.Popen:
         """Launch SGLang server subprocess."""
+        if server_args.get("enable_multimodal") and not server_args.get(
+            "skip_tokenizer_init", False
+        ):
+            logger.warning(
+                "SGLang multimodal rollout is running with "
+                "skip_tokenizer_init=False. Requests that send processor-expanded "
+                "input IDs together with image data may be processed again by the "
+                "server. Set skip_tokenizer_init=True for VLM rollout recipes."
+            )
         awex_meta_addr = server_args.pop(
             "awex_meta_server_addr", None
         ) or os.environ.get("AWEX_META_SERVER_ADDR")
         awex_colocate = server_args.pop("awex_colocate_mode", False)
+        self._readiness_endpoint = (
+            "/model_info" if awex_colocate or awex_meta_addr else "/health"
+        )
         # `_awex_gpus_per_server` is injected by the controller exclusively for
         # real colocation. Resolve base_gpu_id in the worker because scheduler
         # device isolation is only observable here, after Local/Slurm/Ray launch.

@@ -183,7 +183,7 @@ APPTAINER_CMD_TEMPLATE: str = """singularity exec --no-home --writable-tmpfs --n
 def cancel_jobs(
     slurm_names: list[str] | None = None,
     slurm_ids: list[int] | None = None,
-    signal: Literal["SIGINT", "SIGTERM", "SIGKILL"] = "SIGKILL",
+    signal: Literal["SIGINT", "SIGKILL"] = "SIGKILL",
 ):
     if slurm_names is None and slurm_ids is None:
         raise RuntimeError("Must specify slurm_names or slurm_ids.")
@@ -194,11 +194,14 @@ def cancel_jobs(
         cmd += ["-n", ",".join(slurm_names)]
     elif slurm_ids is not None:
         cmd += [",".join(str(s) for s in slurm_ids)]
-    subprocess.check_call(cmd)
-    logger.info(
-        f"Cancelled Slurm job with signal {signal}: "
-        f"slurm identifiers {slurm_names if slurm_ids is None else slurm_ids}. CMD: {cmd}"
-    )
+    try:
+        subprocess.check_call(cmd)
+        logger.info(
+            f"Cancelled Slurm job with signal {signal}: "
+            f"slurm identifiers {slurm_names if slurm_ids is None else slurm_ids}. CMD: {cmd}"
+        )
+    except subprocess.CalledProcessError as e:
+        logger.warning(f"Cancel slurm job failed, reason: {e}")
 
 
 def query_jobs(

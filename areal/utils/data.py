@@ -570,13 +570,19 @@ def tensor_container_to(
     if torch.is_tensor(d):
         return d.to(*args, **kwargs)
 
-    if isinstance(d, list) or isinstance(d, tuple):
+    if isinstance(d, list):
         return [tensor_container_to(v, *args, **kwargs) for v in d]
+
+    if isinstance(d, tuple):
+        values = [tensor_container_to(v, *args, **kwargs) for v in d]
+        if hasattr(d, "_fields"):
+            return type(d)(*values)
+        return tuple(values)
 
     if isinstance(d, dict):
         new_dict = {}
         for key, value in d.items():
-            if isinstance(value, dict) or isinstance(value, list):
+            if isinstance(value, (dict, list, tuple)):
                 new_dict[key] = tensor_container_to(value, *args, **kwargs)
             elif torch.is_tensor(value):
                 new_dict[key] = value.to(*args, **kwargs)
@@ -603,6 +609,35 @@ class MicroBatchItem(NamedTuple):
     padding_length: int
     old_cu_seqlens: torch.Tensor | None
     padded_to_length: int | None = None
+
+    def to(
+        self,
+        *args,
+        **kwargs,
+    ) -> "MicroBatchItem":
+        """Return a device-local copy without mutating the CPU source item.
+
+        Tree batches intentionally alias ``orig_mb`` and ``padded_mb``;
+        preserve that alias so the input is not duplicated on the accelerator.
+        """
+        padded_mb = tensor_container_to(self.padded_mb, *args, **kwargs)
+        orig_mb = (
+            padded_mb
+            if self.orig_mb is self.padded_mb
+            else tensor_container_to(self.orig_mb, *args, **kwargs)
+        )
+        old_cu_seqlens = (
+            self.old_cu_seqlens.to(*args, **kwargs)
+            if self.old_cu_seqlens is not None
+            else None
+        )
+        return MicroBatchItem(
+            orig_mb=orig_mb,
+            padded_mb=padded_mb,
+            padding_length=self.padding_length,
+            old_cu_seqlens=old_cu_seqlens,
+            padded_to_length=self.padded_to_length,
+        )
 
 
 @dataclass
@@ -826,10 +861,10 @@ N_TOKENS_PER_PAGE = 256
 
 def pad_packed_tensor_dict(
     data: dict[str, Any],
-    pad_to_length: int,
+    pad_to_length: int | None,
     pad_value: float = 0.0,
     seq_align_to: int | None = None,
-) -> tuple[dict[str, Any], int, torch.Tensor, int]:
+) -> tuple[dict[str, Any], int, torch.Tensor, int | None]:
     """Pad a packed dict of tensors to a specified length.
     This function assumes that the input data contains "cu_seqlens" and "max_seqlen" key,
     and all other tensors of shape [total_length, ] will be padded to `pad_to_length`.
@@ -838,7 +873,9 @@ def pad_packed_tensor_dict(
 
     Args:
         data (Dict): Dictionary containing tensors to be packed.
-        pad_to_length (int): The length to pad the tensors to. All tensors
+        pad_to_length (int | None): The total packed length to pad tensors to.
+            If None, only align individual sequences without appending a
+            batch-level padding sequence.
 
     Returns:
         Dict: Dictionary with padded tensors and modified "cu_seqlens" and
@@ -924,18 +961,21 @@ def pad_packed_tensor_dict(
 
         data = sequence_padded_data
         align_to_length = cu_seqlens_padded[-1].item()
-        # ensure pad_to_length is a integer multiple of both seq_align_to and N_TOKENS_PER_PAGE
-        lcm = np.lcm(seq_align_to, N_TOKENS_PER_PAGE).item()
-        pad_to_length = (pad_to_length + lcm - 1) // lcm * lcm
-
         cu_seqlens = data["cu_seqlens"]
         max_seqlen = data["max_seqlen"]
         total_length = data["cu_seqlens"][-1].item()
-        if pad_to_length < total_length:
-            # NOTE: In some occasion where sequence lengths, sequence padding will make total length
-            # exceed expected `pad_to_length`. This happens more often when sequence lengths are small.
-            # In this case, we increase pad_to_length.
-            pad_to_length = (total_length + lcm - 1) // lcm * lcm
+        if pad_to_length is not None:
+            # Ensure pad_to_length is an integer multiple of both
+            # seq_align_to and N_TOKENS_PER_PAGE.
+            lcm = np.lcm(seq_align_to, N_TOKENS_PER_PAGE).item()
+            pad_to_length = (pad_to_length + lcm - 1) // lcm * lcm
+            if pad_to_length < total_length:
+                # Sequence alignment can make the total exceed the original
+                # target, especially when sequences are short.
+                pad_to_length = (total_length + lcm - 1) // lcm * lcm
+
+    if pad_to_length is None:
+        return data, 0, old_cu_seqlens, align_to_length
 
     # Pad batch
     pad_length = pad_to_length - total_length
@@ -985,6 +1025,40 @@ def pad_packed_tensor_dict(
         old_cu_seqlens,
         align_to_length,
     )
+
+
+def align_mb_list_sequences(
+    mb_list: MicroBatchList,
+    pad_value: float = 0.0,
+    seq_align_to: int = 1,
+) -> MicroBatchList:
+    """Align real sequences without adding a synthetic padding sequence.
+
+    This projection is for model inputs that are reconstructed as BSHD. A
+    trailing batch-level padding segment in ``cu_seqlens`` would become an
+    extra batch row rather than inert packed-token padding.
+    """
+    padded_mbs = []
+    old_cu_seqlens_list = []
+    align_to_lengths = []
+    for mb in mb_list.mbs:
+        padded_mb, _, old_cu_seqlens, align_to_length = pad_packed_tensor_dict(
+            mb,
+            pad_to_length=None,
+            pad_value=pad_value,
+            seq_align_to=seq_align_to,
+        )
+        assert align_to_length is not None
+        padded_mbs.append(padded_mb)
+        old_cu_seqlens_list.append(old_cu_seqlens)
+        align_to_lengths.append(align_to_length)
+
+    mb_list.padded_mbs = padded_mbs
+    mb_list.padding_lengths = [0] * len(padded_mbs)
+    mb_list.padded_to_lengths = align_to_lengths.copy()
+    mb_list.old_cu_seqlens_list = old_cu_seqlens_list
+    mb_list.align_to_lengths = align_to_lengths
+    return mb_list
 
 
 def pad_mb_list(
@@ -1272,6 +1346,15 @@ def broadcast_tensor_container(data, src_rank=0, group=None):
                 broadcast_tensor_container(None, src_rank=src_rank, group=group)
                 for _ in range(length)
             ]
+        elif data_type == "tuple":
+            length, container_type = info
+            values = [
+                broadcast_tensor_container(None, src_rank=src_rank, group=group)
+                for _ in range(length)
+            ]
+            if container_type is not None:
+                return container_type(*values)
+            return tuple(values)
         elif data_type == "dict":
             keys = info
             return {
@@ -1300,6 +1383,17 @@ def broadcast_tensor_container(data, src_rank=0, group=None):
                 broadcast_tensor_container(d, src_rank=src_rank, group=group)
                 for d in data
             ]
+        elif isinstance(data, tuple):
+            container_type = type(data) if hasattr(data, "_fields") else None
+            metadata = [("tuple", (len(data), container_type))]
+            dist.broadcast_object_list(metadata, src=src_rank, group=group)
+            values = [
+                broadcast_tensor_container(d, src_rank=src_rank, group=group)
+                for d in data
+            ]
+            if container_type is not None:
+                return container_type(*values)
+            return tuple(values)
         elif isinstance(data, dict):
             metadata = [("dict", list(data.keys()))]
             dist.broadcast_object_list(metadata, src=src_rank, group=group)

@@ -1,7 +1,7 @@
 # Installation (Ascend NPU)
 
 **Note**: Ascend NPU support is maintained on the
-[`ascend-v1.0.4`](https://github.com/areal-project/AReaL/tree/ascend-v1.0.4) branch
+[`ascend-v1.0.5`](https://github.com/areal-project/AReaL/tree/ascend-v1.0.5) branch
 rather than `main`. All code, configurations, and examples referenced in this document
 refer to that branch — make sure to check it out as described below.
 
@@ -24,12 +24,12 @@ The following hardware configuration has been extensively tested:
 | Component        |                                                                                                Version                                                                                                 |
 | ---------------- | :----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------: |
 | Operating System |                                                                      Ubuntu, EulerOS or any system meeting the requirements below                                                                      |
-| Ascend HDK       |                                                                                                 25.2.1                                                                                                 |
-| CANN             |                                                                                                 9.0.0                                                                                                  |
+| Ascend HDK       |                                                                                                 25.5.1                                                                                                 |
+| CANN             |                                                                                                 9.0.1                                                                                                  |
 | Git LFS          | Required for downloading models, datasets, and AReaL code. See [installation guide](https://docs.github.com/en/repositories/working-with-files/managing-large-files/installing-git-large-file-storage) |
 | Docker           |                                                                                                 27.2.0                                                                                                 |
-| AReaL Image (A2) |                                                                       `ghcr.io/hwvanici/areal_npu:v1.0.4-a2` (see details below)                                                                       |
-| AReaL Image (A3) |                                                                       `ghcr.io/hwvanici/areal_npu:v1.0.4-a3` (see details below)                                                                       |
+| AReaL Image (A2) |                                                                       `ghcr.io/hwvanici/areal_npu:v1.0.5-a2` (see details below)                                                                       |
+| AReaL Image (A3) |                                                                       `ghcr.io/hwvanici/areal_npu:v1.0.5-a3` (see details below)                                                                       |
 
 **Note**: This tutorial does not cover the installation of CANN, or shared storage
 mounting, as these depend on your specific node configuration and system version. Please
@@ -41,20 +41,27 @@ vLLM-Ascend community at
 
 We recommend using Docker with our provided image for NPU. The A2 image targets Atlas A2
 and the A3 image targets Atlas A3; both are built from the same recipe (see
-[`Dockerfile.a2`](https://github.com/areal-project/AReaL/blob/ascend-v1.0.4/Dockerfile.a2)
+[`Dockerfile.a2`](https://github.com/areal-project/AReaL/blob/ascend-v1.0.5/Dockerfile.a2)
 /
-[`Dockerfile.a3`](https://github.com/areal-project/AReaL/blob/ascend-v1.0.4/Dockerfile.a3)
-on the `ascend-v1.0.4` branch) and ship the following pre-built stack:
+[`Dockerfile.a3`](https://github.com/areal-project/AReaL/blob/ascend-v1.0.5/Dockerfile.a3)
+on the `ascend-v1.0.5` branch) and ship the following pre-built stack. The versions
+below match the published `v1.0.5` image:
 
-| Component       |                         Version                         |
-| --------------- | :-----------------------------------------------------: |
-| Base image      | `quay.io/ascend/cann:9.0.0` (Ubuntu 22.04, Python 3.11) |
-| torch_npu       |                       2.9.0.post2                       |
-| vLLM-Ascend     |                         v0.18.0                         |
-| triton-ascend   |                          3.2.1                          |
-| Megatron-Core   |                         v0.16.1                         |
-| MindSpeed       |              core_r0.16.0 (pinned commit)               |
-| Megatron-Bridge |   pinned commit compatible with Megatron-Core 0.16.x    |
+| Component       |                       Version                       |
+| --------------- | :-------------------------------------------------: |
+| Base image (A2) | `quay.io/ascend/cann:9.0.1-910b-ubuntu22.04-py3.11` |
+| Base image (A3) |  `quay.io/ascend/cann:9.0.1-a3-ubuntu22.04-py3.11`  |
+| Runtime OS      |                 Ubuntu 22.04.5 LTS                  |
+| Python          |                       3.11.15                       |
+| CANN            |                        9.0.1                        |
+| PyTorch         |                       2.10.0                        |
+| torch_npu       |                    2.10.0.post2                     |
+| vLLM            |           0.23.0 (patched v0.23.0 source)           |
+| vLLM-Ascend     |          `releases/v0.23.0` at `eaefc536`           |
+| Transformers    |                        5.5.4                        |
+| Megatron-Core   |                    core_v0.16.1                     |
+| MindSpeed       |             core_r0.16.0 at `79626c13`              |
+| Megatron-Bridge |  `de93536e` (compatible with Megatron-Core 0.16.x)  |
 
 All other AReaL Python dependencies are pre-installed from `pyproject.npu.toml`.
 Megatron-LM, MindSpeed, and Megatron-Bridge sources live under `/areal-workspace` and
@@ -67,8 +74,8 @@ WORK_DIR=<your_workspace>
 CONTAINER_WORK_DIR=<your_container_workspace>
 
 # Use A2/A3 image depending on your hardware type
-# IMAGE=ghcr.io/hwvanici/areal_npu:v1.0.4-a2
-IMAGE=ghcr.io/hwvanici/areal_npu:v1.0.4-a3
+# IMAGE=ghcr.io/hwvanici/areal_npu:v1.0.5-a2
+IMAGE=ghcr.io/hwvanici/areal_npu:v1.0.5-a3
 CONTAINER_NAME=areal_npu
 
 cd ${WORK_DIR}
@@ -127,7 +134,7 @@ git clone https://github.com/areal-project/AReaL
 cd AReaL
 
 # Checkout to ascend branch
-git checkout ascend-v1.0.4
+git checkout ascend-v1.0.5
 
 # Install AReaL. All Python dependencies (from pyproject.npu.toml) are already
 # installed in the image, so only the AReaL package itself needs to be installed.
@@ -159,8 +166,8 @@ script will automatically detect the resources and allocate workers to the clust
 
 Check the [quickstart section](quickstart.md) to get familiar with launching AReaL jobs.
 On NPU, we recommend starting from the vision-language model (VLM) GRPO examples in
-[`examples/vlm_npu/`](https://github.com/areal-project/AReaL/tree/ascend-v1.0.4/examples/vlm_npu)
-on the `ascend-v1.0.4` branch, which train on the Geometry3K dataset. For example, to
+[`examples/vlm_npu/`](https://github.com/areal-project/AReaL/tree/ascend-v1.0.5/examples/vlm_npu)
+on the `ascend-v1.0.5` branch, which train on the Geometry3K dataset. For example, to
 train Qwen2.5-VL-3B on a single node (16 NPUs, vLLM rollout + Megatron training):
 
 ```bash
@@ -173,8 +180,8 @@ python examples/vlm/geometry3k_grpo.py \
 ```
 
 See the
-[`examples/vlm_npu/README.md`](https://github.com/areal-project/AReaL/blob/ascend-v1.0.4/examples/vlm_npu/README.md)
-on the `ascend-v1.0.4` branch for the full list of configurations (Qwen2.5-VL, Qwen3-VL,
+[`examples/vlm_npu/README.md`](https://github.com/areal-project/AReaL/blob/ascend-v1.0.5/examples/vlm_npu/README.md)
+on the `ascend-v1.0.5` branch for the full list of configurations (Qwen2.5-VL, Qwen3-VL,
 Qwen3.5, Qwen3.6 dense and MoE), dataset preparation, and multi-node training with Ray.
 If you want to run multi-node training, make sure your Ray cluster is started as
 described above before launching the job.

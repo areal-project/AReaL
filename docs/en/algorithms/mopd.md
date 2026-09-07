@@ -1,9 +1,9 @@
 # Multi-Teacher On-Policy Distillation (MOPD)
 
 MOPD combines on-policy reinforcement learning with token-level targets from one or
-more teacher checkpoints. Each sample selects a configured route, and a route assigns
-non-negative weights to its teachers. The weights are applied directly and are not
-normalized.
+more teacher checkpoints. Each dataset source selects one required teacher group,
+which assigns non-negative weights to any number of teachers. The weights are applied
+directly and are not normalized.
 
 MOPD currently runs in single-controller mode with Megatron actor and teacher engines,
 an SGLang rollout engine, and AWEX colocated weight transfer. Actor, rollout, and a
@@ -14,8 +14,9 @@ at the same time.
 
 Each training step follows three exclusive phases:
 
-1. **Rollout:** SGLang generates trajectories and propagates the route as
-   `mopd_route`.
+1. **Rollout:** SGLang generates trajectories while AReaL propagates the source's
+   teacher group as internal task metadata. Dataset samples and workflow inputs need
+   no routing field.
 2. **Teacher:** rollout weights and KV cache are offloaded. A forked Megatron teacher
    process onloads, loads each required checkpoint, and scores its routed samples. The
    actor materializes and clears all teacher RTensors before the teacher weights are
@@ -42,12 +43,17 @@ rollout:
   backend: sglang:d8t1
   scheduling_strategy: {type: colocation, target: actor, fork: true}
 
+train_dataset:
+  mixture_sampling_policy: proportional
+  sources:
+    - {path: /data/code, type: rl, teacher_group: coding}
+    - {path: /data/mixed, type: rl, teacher_group: mixed}
+
 mopd:
-  task_type_identifier: task_type
   teachers:
     coder: {path: /models/teacher-coder}
     reasoning: {path: /models/teacher-reasoning}
-  routes:
+  teacher_groups:
     coding: {coder: 1.0}
     mixed: {coder: 0.3, reasoning: 0.7}
   teacher_engine:
@@ -61,18 +67,25 @@ mopd:
     staging_root: /dev/shm/areal-mopd
   loss:
     rl_coefficient: 0.0
-    distillation_coefficient: 0.005
+    distillation_coefficient: 1.0
 ```
 
-Every dataset item must contain the field named by `task_type_identifier`. Its value
-must match a key in `routes`. A route must reference known teacher IDs and contain at
-least one positive weight.
+When MOPD is enabled, every entry in `train_dataset.sources` must declare a
+`teacher_group` that matches a key in `mopd.teacher_groups`; validation datasets follow
+the same rule when configured. Outside MOPD, `teacher_group` defaults to `null`.
+Samples cannot override their source's teacher group and need no `task_type` field. A
+teacher group can reference any number of known teacher IDs and must contain at least
+one positive weight.
+`mixture_sampling_policy: proportional` preserves source-size proportions.
+`uniform` gives every source the same number of samples per epoch by cycling shorter
+sources deterministically before the distributed sampler shuffles global indices.
 
 `manager.type: disk` loads checkpoints from shared storage and supports multi-node
-runs. `local_memory` stages checkpoints below `staging_root` and is restricted to the
-same-host LocalScheduler; Ray and Slurm controllers may not share their local
-filesystem with teacher workers. Startup removes stale MOPD staging directories whose
-owner process is no longer alive.
+runs. `local_memory` asynchronously stages one upcoming checkpoint below
+`staging_root`, atomically publishes it to the persistent teacher, and removes it
+after loading. Because this path is visible only on the controller host,
+`local_memory` requires `scheduler.type: local` and a single-node actor/teacher
+topology. `min_free_bytes` can reserve free space below the staging root.
 
 For teacher weights $w_j$, define $S_T(a)=\sum_j w_j\log\pi_{T_j}(a)$ and
 $W=\sum_j w_j$. MOPD minimizes the raw weighted reverse KL
@@ -80,11 +93,14 @@ $\sum_j w_j D_{KL}(\pi_\theta \parallel \pi_{T_j})$ with the on-policy
 score-function surrogate:
 
 ```text
-rho(a) = exp(log pi_theta(a) - log pi_old(a))
+rho(a) = min(exp(log pi_theta(a) - log pi_old(a)), importance_ratio_cap)
 reward(a) = S_T(a) - W * stop_gradient(log pi_theta(a))
 mopd_loss = -mean(rho(a) * reward(a))
 loss = rl_coefficient * rl_loss + distillation_coefficient * mopd_loss
 ```
+
+`importance_ratio_cap` defaults to `5.0` and bounds the importance-sampling
+multiplier to prevent exponential overflow.
 
 This is a weighted sum of reverse-KL objectives, equivalently a geometric teacher
 ensemble up to an additive constant. It is not teacher cross-entropy or an arithmetic

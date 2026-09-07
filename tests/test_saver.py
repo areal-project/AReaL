@@ -21,7 +21,9 @@ def _make_saver(tmp_path) -> Saver:
         dataset_size=1,
         train_batch_size=1,
     )
-    return Saver(config, ft_spec)
+    saver = Saver(config, ft_spec)
+    saver._should_use_async = Mock(return_value=False)
+    return saver
 
 
 def test_save_without_base_model_path_uses_engine_config_path(tmp_path):
@@ -68,8 +70,8 @@ def test_save_with_hub_model_path_does_not_treat_it_as_local_directory(tmp_path)
     assert meta.base_model_path is None
 
 
-def test_save_with_source_matching_destination_skips_asset_copy(tmp_path):
-    """A resumed save cannot copy Hugging Face assets onto themselves."""
+def test_save_with_source_matching_destination_preserves_source_path(tmp_path):
+    """The exporter receives the source path so it can snapshot config fields."""
     saver = _make_saver(tmp_path)
     save_path = Saver.get_model_save_path(
         "test_exp",
@@ -85,4 +87,4 @@ def test_save_with_source_matching_destination_skips_asset_copy(tmp_path):
     saver.save(engine, epoch=0, step=0, global_step=0)
 
     meta = engine.save.call_args.args[0]
-    assert meta.base_model_path is None
+    assert meta.base_model_path == str(save_path)

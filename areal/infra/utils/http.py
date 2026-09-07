@@ -172,7 +172,7 @@ async def arequest_with_retry(
             elif method.upper() == "PUT":
                 ctx = _session.put(url, json=payload, timeout=timeo)
             elif method.upper() == "DELETE":
-                ctx = _session.delete(url, timeout=timeo)
+                ctx = _session.delete(url, json=payload, timeout=timeo)
             else:
                 raise ValueError(f"Unsupported HTTP method: {method}")
             async with ctx as response:

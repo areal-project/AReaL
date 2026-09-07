@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 import torch
 
-from areal.engine.awex.colocate_writer import AwexMegatronAdapter
+from areal.engine.megatron_utils.weight_residency import MegatronWeightResidency
 
 
 class _FallbackFlatBuffer:
@@ -70,7 +70,7 @@ def main(mode: str) -> None:
     buffer_type = _NativeFlatBuffer if mode == "native" else _FallbackFlatBuffer
     flat_buffer = buffer_type()
     ddp = _FakeMCoreDDP(flat_buffer)
-    adapter = AwexMegatronAdapter(
+    residency = MegatronWeightResidency(
         SimpleNamespace(model=[ddp], optimizer=None, device=torch.device("cuda"))
     )
     expected = flat_buffer.param_data.cpu()
@@ -83,20 +83,23 @@ def main(mode: str) -> None:
                 resident_bytes = torch.cuda.memory_allocated()
                 resident_reserved_bytes = torch.cuda.memory_reserved()
 
-                adapter.release_memory(tags=["optimizer", "weights"])
+                residency.release_memory(tags=["optimizer", "weights"])
 
                 torch.cuda.synchronize()
                 offloaded_bytes = torch.cuda.memory_allocated()
                 offloaded_reserved_bytes = torch.cuda.memory_reserved()
                 assert flat_buffer.param_data.untyped_storage().nbytes() == 0
                 assert flat_buffer.grad_data.untyped_storage().nbytes() == 0
+                if mode == "fallback":
+                    assert hasattr(flat_buffer, "cpu_param_data")
+                    assert not hasattr(flat_buffer.param_data, "cpu_data")
                 assert resident_bytes - offloaded_bytes >= int(param_bytes * 0.75)
                 assert resident_reserved_bytes - offloaded_reserved_bytes >= int(
                     param_bytes * 0.75
                 )
-                assert adapter._released_tags == {"optimizer", "weights"}
+                assert residency.released_tags == frozenset({"optimizer", "weights"})
 
-                adapter.resume_memory(tags=["optimizer", "weights"])
+                residency.resume_memory(tags=["optimizer", "weights"])
 
                 torch.cuda.synchronize()
                 restored_bytes = torch.cuda.memory_allocated()
@@ -115,14 +118,14 @@ def main(mode: str) -> None:
                     rtol=0.0,
                     atol=0.0,
                 )
-                assert adapter._released_tags == set()
+                assert residency.released_tags == frozenset()
             if isinstance(flat_buffer, _NativeFlatBuffer):
                 assert flat_buffer.offload_calls == 2
                 assert flat_buffer.reload_calls == [False, False]
         finally:
-            adapter.release_memory(tags=["optimizer", "weights"])
+            residency.release_memory(tags=["optimizer", "weights"])
 
-    del ddp, flat_buffer, adapter, expected
+    del ddp, flat_buffer, residency, expected
     torch.cuda.empty_cache()
     print(f"Passed mode={mode}")
 

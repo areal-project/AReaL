@@ -15,9 +15,14 @@ from megatron.core.transformer import TransformerConfig
 from transformers import AutoConfig, PretrainedConfig
 
 from areal.api.cli_args import MegatronEngineConfig
+from areal.engine.megatron_utils.deterministic import set_deterministic_algorithms
 from areal.models.mcore.bailing_moe import (
     hf_to_mcore_config_bailing_moe,
     make_mcore_layer_specs_bailing_moe,
+)
+from areal.models.mcore.bailing_v3 import (
+    hf_to_mcore_config_bailing_v3,
+    make_mcore_layer_specs_bailing_v3,
 )
 from areal.models.mcore.qwen3 import (
     hf_to_mcore_config_qwen3_dense,
@@ -302,6 +307,7 @@ def _replace_actor_output_layers(
     models: list[GPTModel | DDP],
     *,
     enabled: bool,
+    fp32_operands: bool = False,
 ) -> None:
     if not enabled:
         return
@@ -310,6 +316,7 @@ def _replace_actor_output_layers(
         replace_output_layer_with_areal_lm_head(
             gpt_model,
             fp32_output=True,
+            fp32_operands=fp32_operands,
         )
 
 
@@ -320,7 +327,11 @@ def _configure_actor_output_layers(
     if mcore_config is None:
         return
     if mcore_config.enable_chunked_logits:
-        _replace_actor_output_layers(models, enabled=True)
+        _replace_actor_output_layers(
+            models,
+            enabled=True,
+            fp32_operands=mcore_config.enable_fp32_lm_head,
+        )
     else:
         _enable_fp32_lm_head_forward(
             models,
@@ -359,6 +370,8 @@ def make_hf_and_mcore_config(
             "BailingHybridForCausalLM",
         ):
             return hf_config, hf_to_mcore_config_bailing_moe(hf_config, dtype)
+        elif architecture == "BailingMoeV3ForCausalLM":
+            return hf_config, hf_to_mcore_config_bailing_v3(hf_config, dtype)
         else:
             raise ValueError(
                 f"Architecture not registered for config conversion: {architecture}."
@@ -376,6 +389,8 @@ def make_mcore_layer_specs(hf_config: PretrainedConfig, tf_config: TransformerCo
         "BailingHybridForCausalLM",
     ):
         return make_mcore_layer_specs_bailing_moe(tf_config, hf_config, use_te=True)
+    elif architecture == "BailingMoeV3ForCausalLM":
+        return make_mcore_layer_specs_bailing_v3(tf_config, hf_config, use_te=True)
     else:
         raise ValueError(
             f"Architecture not registered for config conversion: {architecture}."
@@ -451,6 +466,15 @@ def make_mcore_model(
                 raise ValueError(
                     "megatron.enable_mtp=True but the model has no MTP layers."
                 )
+            if mcore_config.enable_mtp_training:
+                if provider.mtp_num_layers != 1:
+                    raise ValueError(
+                        "MTP training currently supports exactly one prediction "
+                        f"layer, got mtp_num_layers={provider.mtp_num_layers}."
+                    )
+                # Weight of the auxiliary MTP loss; consumed by Megatron-Core's
+                # process_mtp_loss via config.mtp_loss_scaling_factor.
+                provider.mtp_loss_scaling_factor = mcore_config.mtp_loss_scaling_factor
         elif has_mtp:
             logger.warning(
                 "Dropping MTP head (mtp_num_layers=%s -> None); not used in RL and not "
@@ -482,6 +506,13 @@ def make_mcore_model(
         tf_config.moe_token_dispatcher_type = provider.moe_token_dispatcher_type
         tf_config.batch_p2p_comm = provider.batch_p2p_comm
         tf_config.overlap_p2p_comm = provider.overlap_p2p_comm
+
+        # Megatron-Bridge creates a new provider instead of building from
+        # ``tf_config`` directly. Apply the prebuild deterministic settings to
+        # the actual provider so construction-time consumers (TP layers and TE
+        # attention) see the same configuration.
+        if mcore_config.use_deterministic_algorithms:
+            set_deterministic_algorithms(provider, prebuild=True)
 
         provider.finalize()
 

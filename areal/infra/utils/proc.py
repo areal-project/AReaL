@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import errno
 import os
 import shlex
 import shutil
@@ -24,49 +23,42 @@ if TYPE_CHECKING:
     from typing import IO
 
 
-def _is_process_alive(proc: psutil.Process) -> bool:
-    """Return whether a process still owns live execution resources."""
-    try:
-        # is_running() also protects against PID reuse.  A zombie still returns
-        # True, but it has already exited and must not be killed again.
-        return proc.is_running() and proc.status() != psutil.STATUS_ZOMBIE
-    except (psutil.NoSuchProcess, psutil.ZombieProcess):
-        return False
+def build_target_cmd(
+    cmd: str | list[str],
+    *,
+    env_vars: dict[str, str] | None = None,
+    use_stdbuf: bool = False,
+    target_env: dict[str, str] | None = None,
+) -> str:
+    """Build a shell command with optional environment and line buffering.
 
-
-def _wait_procs_with_pidfd_race_fallback(
-    procs: list[psutil.Process],
-    timeout: int,
-) -> tuple[list[psutil.Process], list[psutil.Process]]:
-    """Wait for processes while tolerating psutil's Linux pidfd exit race.
-
-    psutil 7.2.2 may propagate ``EINVAL`` from ``pidfd_open()`` when a process
-    exits between the SIGTERM and wait calls (psutil issue #2715).  The desired
-    cleanup state may already have been reached, so re-check each process and
-    let the caller escalate only the processes that are genuinely still alive.
-    Other OS errors remain fatal.
+    GNU ``stdbuf`` injects ``libstdbuf`` through ``LD_PRELOAD``. Avoid wrapping a
+    target whose effective environment already contains ``LD_PRELOAD`` so the
+    caller-provided preload value reaches the target unchanged. A ``None`` target
+    environment follows :class:`subprocess.Popen` semantics and inherits
+    :data:`os.environ`; an explicit empty mapping does not.
     """
-    try:
-        gone, candidates = psutil.wait_procs(procs, timeout=timeout)
-    except OSError as exc:
-        if exc.errno != errno.EINVAL:
-            raise
-        logger.warning(
-            "psutil.wait_procs hit the pidfd_open EINVAL exit race; "
-            "rechecking process state"
+    if isinstance(cmd, list):
+        cmd_str = " ".join(shlex.quote(str(part)) for part in cmd)
+    else:
+        cmd_str = cmd
+
+    command_parts: list[str] = []
+    if env_vars:
+        command_parts.append(
+            " ".join(
+                f"{key}={shlex.quote(str(value))}" for key, value in env_vars.items()
+            )
         )
 
-        gone = []
-        candidates = procs
-
-    # ``wait_procs`` can return a non-child zombie in ``alive`` because this
-    # process cannot reap it.  Such a process has already exited and owns no
-    # execution resources, so normalize the result in both the regular and
-    # pidfd-race paths instead of retrying SIGKILL forever.
-    alive: list[psutil.Process] = []
-    for proc in candidates:
-        (alive if _is_process_alive(proc) else gone).append(proc)
-    return gone, alive
+    inherited_env = os.environ if target_env is None else target_env
+    target_has_preload = (
+        "LD_PRELOAD" in (env_vars or {}) or "LD_PRELOAD" in inherited_env
+    )
+    if use_stdbuf and not target_has_preload:
+        command_parts.append("stdbuf -oL")
+    command_parts.append(cmd_str)
+    return " ".join(command_parts)
 
 
 def build_streaming_log_cmd(
@@ -76,6 +68,7 @@ def build_streaming_log_cmd(
     role: str,
     *,
     env_vars: dict[str, str] | None = None,
+    target_env: dict[str, str] | None = None,
 ) -> str:
     """Build a shell command that streams output to stdout and log files.
 
@@ -96,32 +89,24 @@ def build_streaming_log_cmd(
         Role name for log prefix (e.g., "actor", "master")
     env_vars : dict[str, str] | None
         Optional environment variables to prefix the command with KEY=VALUE
+    target_env : dict[str, str] | None
+        Optional environment passed directly to the target process. ``None``
+        means that the target inherits :data:`os.environ`.
 
     Returns
     -------
     str
         Shell command string ready for execution with bash
     """
-    # Escape command if it's a list
-    if isinstance(cmd, list):
-        cmd_str = " ".join(shlex.quote(str(c)) for c in cmd)
-    else:
-        cmd_str = cmd
-
     # Check if stdbuf is available (not present on macOS by default)
     _has_stdbuf = shutil.which("stdbuf") is not None
 
-    # Build prefix with env vars if provided
-    prefix_parts = []
-    if env_vars:
-        prefix_parts.append(
-            " ".join(f"{k}={shlex.quote(str(v))}" for k, v in env_vars.items())
-        )
-    if _has_stdbuf:
-        prefix_parts.append(f"stdbuf -oL {cmd_str}")
-    else:
-        prefix_parts.append(cmd_str)
-    full_cmd = " ".join(prefix_parts)
+    full_cmd = build_target_cmd(
+        cmd,
+        env_vars=env_vars,
+        use_stdbuf=_has_stdbuf,
+        target_env=target_env,
+    )
 
     # Build log prefix for merged log
     log_prefix = f"[{role}]".ljust(LOG_PREFIX_WIDTH)
@@ -170,7 +155,12 @@ def run_with_streaming_logs(
         The spawned process
     """
     shell_cmd = build_streaming_log_cmd(
-        cmd, str(log_file), str(merged_log), role, env_vars=env_vars_in_cmd
+        cmd,
+        str(log_file),
+        str(merged_log),
+        role,
+        env_vars=env_vars_in_cmd,
+        target_env=env,
     )
 
     return subprocess.Popen(
@@ -235,10 +225,7 @@ def kill_process_tree(
 
         # Wait for graceful shutdown
         procs_to_wait = children + ([parent] if include_parent else [])
-        _, alive = _wait_procs_with_pidfd_race_fallback(
-            procs_to_wait,
-            timeout=timeout,
-        )
+        gone, alive = psutil.wait_procs(procs_to_wait, timeout=timeout)
 
         # Force kill any remaining processes
         if alive:
@@ -251,14 +238,8 @@ def kill_process_tree(
                 except psutil.NoSuchProcess:
                     pass
 
-            # Final wait to ensure they're gone.  The same pidfd race can occur
-            # here after SIGKILL, so use the guarded wait for both phases.
-            _, still_alive = _wait_procs_with_pidfd_race_fallback(alive, timeout=1)
-            if still_alive:
-                live_pids = [proc.pid for proc in still_alive]
-                raise RuntimeError(
-                    f"Failed to terminate process tree; still alive: {live_pids}"
-                )
+            # Final wait to ensure they're gone
+            psutil.wait_procs(alive, timeout=1)
 
         logger.info(f"Successfully cleaned up process tree for PID {parent_pid}")
     else:

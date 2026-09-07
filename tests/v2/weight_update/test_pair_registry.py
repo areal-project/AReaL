@@ -36,28 +36,6 @@ def test_get_by_name_returns_none_for_unregistered_name(registry: PairRegistry) 
     assert result is None
 
 
-def test_reserve_blocks_duplicate_until_released(registry: PairRegistry) -> None:
-    """An in-progress initialization owns its pair name atomically."""
-    assert registry.try_reserve("test_pair") is True
-    assert registry.try_reserve("test_pair") is False
-
-    registry.release_reservation("test_pair")
-
-    assert registry.try_reserve("test_pair") is True
-
-
-def test_register_reserved_commits_pair(
-    registry: PairRegistry, sample_pair_info: PairInfo
-) -> None:
-    """A committed reservation becomes the registered pair."""
-    assert registry.try_reserve("test_pair") is True
-
-    registry.register_reserved(sample_pair_info)
-
-    assert registry.get_by_name("test_pair") is sample_pair_info
-    assert registry.try_reserve("test_pair") is False
-
-
 def test_register_raises_for_duplicate_pair_name(
     registry: PairRegistry, sample_pair_info: PairInfo
 ) -> None:

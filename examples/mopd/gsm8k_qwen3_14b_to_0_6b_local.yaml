@@ -87,10 +87,9 @@ rollout:
     admin_api_key: ${oc.env:AREAL_ADMIN_API_KEY}
 
 mopd:
-  task_type_identifier: task_type
   teachers:
     qwen3_14b: {path: "${oc.env:MOPD_TEACHER_MODEL_PATH}"}
-  routes:
+  teacher_groups:
     gsm8k: {qwen3_14b: 1.0}
   teacher_engine:
     _version: v1
@@ -121,16 +120,22 @@ sglang:
   mem_fraction_static: 0.8
 
 train_dataset:
-  path: ${oc.env:MOPD_GSM8K_PATH}
-  type: rl
+  mixture_sampling_policy: proportional
+  sources:
+    - path: ${oc.env:MOPD_GSM8K_PATH}
+      type: rl
+      teacher_group: gsm8k
   batch_size: 256
   shuffle: true
   pin_memory: true
   num_workers: 4
 
 valid_dataset:
-  path: ${oc.env:MOPD_GSM8K_PATH}
-  type: rl
+  mixture_sampling_policy: proportional
+  sources:
+    - path: ${oc.env:MOPD_GSM8K_PATH}
+      type: rl
+      teacher_group: gsm8k
   batch_size: 256
   shuffle: false
   num_workers: 4

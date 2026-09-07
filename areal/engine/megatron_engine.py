@@ -36,6 +36,7 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import PretrainedConfig
 
 import areal.models.mcore.bailing_moe_bridge  # noqa: F401  # register bridge
+import areal.models.mcore.bailing_v3_bridge  # noqa: F401  # register bridge
 from areal.api import (
     FinetuneSpec,
     InferenceEngine,
@@ -59,10 +60,12 @@ from areal.engine.core.distributed import (
     warmup_process_groups,
 )
 from areal.engine.core.model import (
+    SequencePackingMode,
     disable_dropout_in_model,
     is_valid_vision_model,
     lang_config,
     requires_padded_seq,
+    resolve_sequence_packing_mode,
 )
 from areal.engine.megatron_utils import megatron_bridge_patches  # noqa: F401
 from areal.engine.megatron_utils.activation_storage import (
@@ -88,23 +91,20 @@ from areal.engine.megatron_utils.megatron import (
     remove_padding,
 )
 from areal.engine.megatron_utils.megatron_lora import get_vllm_lora_target_modules
-from areal.engine.megatron_utils.optimizer_chain import checkpoint_awex_residency
 from areal.engine.megatron_utils.packed_context_parallel import (
     _is_multi_modal_payload_key,
     extract_vision_from_multi_modal,
     packed_context_parallel_forward,
+    prepare_microbatches_for_sequence_layout,
     reassemble_cp_packed_logprobs,
     split_packed_seqs_for_context_parallel,
 )
 from areal.engine.megatron_utils.pipeline_parallel import (
     configure_pipeline_layer_splits,
 )
-from areal.engine.weight_finite import (
-    check_named_tensors_finite,
-    iter_module_named_tensors,
-)
 from areal.infra.dist_rollout import DistRolloutCoordinator
 from areal.infra.platforms import current_platform, is_npu_available
+from areal.models.mcore.bailing_v3_bridge import BailingV3Bridge
 from areal.models.mcore.hf_load import load_weights_from_hf_with_mbridge_fast
 from areal.models.mcore.hf_save import (
     save_critic_value_head,
@@ -139,26 +139,40 @@ from areal.utils.data import (
     MicroBatchItem,
     MicroBatchList,
     amend_position_ids,
+    batched_call,
     broadcast_tensor,
     concat_batch,
     pack_tensor_dict,
-    pad_mb_list,
     split_batch,
     split_padded_tensor_dict_into_mb_list,
+    tensor_container_to,
     unpad_logits,
 )
 from areal.utils.functional import gather_logprobs, gather_logprobs_entropy
-from areal.utils.hf_utils import load_hf_processor_and_tokenizer, load_hf_tokenizer
+from areal.utils.hf_utils import (
+    finalize_hf_export,
+    load_hf_config_snapshot,
+    load_hf_processor_and_tokenizer,
+    load_hf_tokenizer,
+)
 from areal.utils.lock import DistributedLock
 from areal.utils.lr_scheduler import get_num_warmup_steps
 from areal.utils.network import find_free_ports, format_host_for_url, gethostip
 from areal.utils.offload import is_tms_enabled, torch_memory_saver
 from areal.utils.perf_tracer import trace_perf, trace_scope
 from areal.utils.seeding import get_seed
+from areal.v2.weight_update.awex.delta_config import DTERuntimeConfig
 
 if TYPE_CHECKING:
     from areal.api import Scheduler
-    from areal.api.cli_args import DPOEngineConfig, PPOActorConfig, PPOCriticConfig
+    from areal.api.cli_args import (
+        DPOEngineConfig,
+        MOPDTeacherEngineConfig,
+        PPOActorConfig,
+        PPOCriticConfig,
+    )
+    from areal.engine.awex.colocate_writer import AwexWeightPublisher
+    from areal.engine.megatron_utils.weight_residency import MegatronWeightResidency
 
 
 # `model.named_modules()` yields LOCAL layer indices on each PP rank, while
@@ -321,6 +335,27 @@ class _MegatronModelList(list):
 
 
 class MegatronEngine(TrainEngine):
+    # Trainers use this capability flag to release RPC/full-batch GPU payloads
+    # before constructing optimizer microbatches.
+    stream_microbatches_from_cpu = True
+    cpu_staged_rpc_methods = frozenset(
+        {
+            "compute_logp",
+            "compute_values",
+            "eval_batch",
+            "evaluate_dpo",
+            "evaluate_lm",
+            "evaluate_rw",
+            "forward",
+            "forward_batch",
+            "ppo_update",
+            "train_batch",
+            "train_dpo",
+            "train_lm",
+            "train_rw",
+        }
+    )
+
     def __init__(self, config: TrainEngineConfig):
         install_activation_storage_tracking()
         self.config = config
@@ -354,7 +389,10 @@ class MegatronEngine(TrainEngine):
         self.own_global_group: bool = False
         self.is_offload: bool = False
         self._offload_depth: int = 0
-        self._awex_adapter = None  # AwexMegatronAdapter for colocate mode
+        self._weight_residency: MegatronWeightResidency | None = None
+        self._awex_publisher: AwexWeightPublisher | None = None
+        self._dte_runtime_config = DTERuntimeConfig.from_env()
+        self._warned_unbounded_microbatch = False
         self.enable_tree_training: bool = self.config.enable_tree_training
         _validate_areal_lm_head_compatibility(
             self.mcore_config.enable_chunked_logits,
@@ -371,6 +409,8 @@ class MegatronEngine(TrainEngine):
         self.bridge_cls: str = getattr(self.mcore_config, "bridge_type", "mbridge")
         self.bridge_lora: MegatronBridgeLoRA | None = None
         self.is_vision_model: bool = False
+        self.sequence_packing_mode: SequencePackingMode | None = None
+        self.use_model_packed_seq: bool = False
         self.processor = None
 
     def create_process_group(self, parallel_strategy: ParallelStrategy | None = None):
@@ -405,18 +445,6 @@ class MegatronEngine(TrainEngine):
             tensor_parallel.model_parallel_cuda_manual_seed(self.seed)
             self.own_global_group = True
         self.logger = logging.getLogger(f"[MegatronEngine Rank {dist.get_rank()}]")
-        if self.mcore_config.enable_fp32_lm_head and dist.get_rank() == 0:
-            if self.mcore_config.enable_chunked_logits:
-                self.logger.warning(
-                    "megatron.enable_fp32_lm_head is deprecated and ignored when "
-                    "enable_chunked_logits=True; the fused AReaL LM Head always produces "
-                    "FP32 logits."
-                )
-            else:
-                self.logger.warning(
-                    "megatron.enable_fp32_lm_head is deprecated; preserving its "
-                    "legacy mbridge behavior because enable_chunked_logits=False."
-                )
         self._context_and_model_parallel_group = None
         self._cpu_model_parallel_group = None
         self._init_context_and_model_parallel_group()
@@ -528,9 +556,15 @@ class MegatronEngine(TrainEngine):
                 set_deterministic_algorithms(self.tf_config, prebuild=True)
 
             self.is_vision_model = is_valid_vision_model(self.hf_config.model_type)
-            # GDN/SSM models (e.g. Qwen3.5) reject packed THD input and must run
-            # the padded BSHD forward. Derived from model type rather than a
-            # config flag so the layout can't be mis-set.
+            self.sequence_packing_mode = resolve_sequence_packing_mode(
+                self.hf_config.model_type, self.bridge_cls
+            )
+            self.use_model_packed_seq = (
+                self.sequence_packing_mode == SequencePackingMode.MODEL_THD
+            )
+            # ``PADDED`` is the input-routing fallback for every VLM without a
+            # model-owned THD contract. ``use_padded_seq`` is narrower: it
+            # enables Qwen3.5/GDN-specific dense-mask and LM-head semantics.
             self.use_padded_seq = requires_padded_seq(self.hf_config.model_type)
             if self.is_vision_model:
                 if self.parallel_strategy.context_parallel_size > 1:
@@ -683,7 +717,27 @@ class MegatronEngine(TrainEngine):
         model_config.finalize_model_grads_func = finalize_model_grads
         self._mark_duplicated_params()
         self._create_optimizer(ft_spec)
+        self._set_optimizer_grad_scale_func()
         self._initialized = True
+
+    def _set_optimizer_grad_scale_func(self) -> None:
+        """Use one optimizer loss scale for the main and auxiliary losses.
+
+        MCore seeds MTP and MoE auxiliary-loss gradients separately from the
+        main backward graph. Wiring the optimizer hook here ensures FP16
+        unscaling does not shrink those auxiliary gradients by the loss scale.
+        """
+        if self.optimizer is None:
+            return
+
+        grad_scale_func = self.optimizer.scale_loss
+        configured: set[int] = set()
+        for model_chunk in self.model:
+            model_config = get_model_config(model_chunk)
+            if id(model_config) in configured:
+                continue
+            model_config.grad_scale_func = grad_scale_func
+            configured.add(id(model_config))
 
     def _build_glu_fc1_names(self) -> set[str]:
         """Detect which `linear_fc1` parameters belong to GLU MLPs.
@@ -734,9 +788,30 @@ class MegatronEngine(TrainEngine):
 
     def _build_hf_mcore_bridge(self):
         if self.bridge_cls == "mbridge":
-            self.bridge = mbridge.AutoBridge.from_pretrained(
+            hf_config = PretrainedConfig.from_pretrained(
                 self.config.path, trust_remote_code=True
             )
+            architectures = getattr(hf_config, "architectures", None) or []
+            if "BailingMoeV3ForCausalLM" in architectures:
+                if self.mcore_config.enable_mtp:
+                    raise ValueError(
+                        "BailingMoeV3 mbridge does not support enable_mtp; "
+                        "the first open-source implementation intentionally "
+                        "drops the MTP head."
+                    )
+                if (self.mcore_config.virtual_pipeline_parallel_size or 1) > 1:
+                    raise ValueError(
+                        "BailingMoeV3 does not support virtual pipeline "
+                        "parallelism; set virtual_pipeline_parallel_size=1."
+                    )
+                # BailingMoeV3 flash checkpoints keep model_type="bailing_hybrid",
+                # which overlaps the v2.5 bridge registration. Dispatch by
+                # architecture so KDA + gated-MLA weights use the v3 bridge.
+                self.bridge = BailingV3Bridge(hf_config)
+            else:
+                self.bridge = mbridge.AutoBridge.from_pretrained(
+                    self.config.path, trust_remote_code=True
+                )
             self.bridge.dtype = self.dtype
             if self.config.gradient_checkpointing:
                 self.bridge.set_extra_args(
@@ -748,13 +823,23 @@ class MegatronEngine(TrainEngine):
                 )
 
             # Set MoE configuration overrides (aux-loss-free balancing, z-loss).
+            # mbridge extra_args override per-model bridge kwargs, so fields
+            # whose cli default may disagree with a bridge's deliberate
+            # default are forwarded only when explicitly configured
+            # (None = keep the bridge default).
             moe_extra_args: dict = {
                 "moe_token_dispatcher_type": self.mcore_config.moe_token_dispatcher_type,
                 "moe_permute_fusion": self.mcore_config.moe_permute_fusion,
                 "moe_router_fusion": self.mcore_config.moe_router_fusion,
-                "moe_shared_expert_overlap": self.mcore_config.moe_shared_expert_overlap,
-                "moe_router_bias_update_rate": self.mcore_config.moe_router_bias_update_rate,
             }
+            if self.mcore_config.moe_shared_expert_overlap is not None:
+                moe_extra_args["moe_shared_expert_overlap"] = (
+                    self.mcore_config.moe_shared_expert_overlap
+                )
+            if self.mcore_config.moe_router_bias_update_rate is not None:
+                moe_extra_args["moe_router_bias_update_rate"] = (
+                    self.mcore_config.moe_router_bias_update_rate
+                )
             if self.mcore_config.moe_router_dtype is not None:
                 moe_extra_args["moe_router_dtype"] = self.mcore_config.moe_router_dtype
             if self.mcore_config.moe_z_loss_coeff is not None:
@@ -927,11 +1012,8 @@ class MegatronEngine(TrainEngine):
             self._init_weight_update_from_distributed(meta)
             self.weight_update_group_initialized = True
         elif meta.type == "awex":
-            from areal.engine.awex.colocate_writer import AwexMegatronAdapter
-
-            if self._awex_adapter is None:
-                self._awex_adapter = AwexMegatronAdapter(self)
-            self._awex_adapter.init_colocate_weight_update(
+            publisher = self._ensure_awex_publisher()
+            publisher.init_colocate_weight_update(
                 meta_server_addr=meta.nccl_master_address,
                 pair_name=meta.nccl_group_name or "default",
                 transfer_rank=self.rank or 0,
@@ -995,16 +1077,20 @@ class MegatronEngine(TrainEngine):
             # actor worker returns. Calling back into the rollout from this RPC
             # creates a nested controller/rollout call while the actor collective
             # is still active and deadlocks at the final barrier.
-            self._awex_adapter.execute_colocate_weight_update(meta.version or 0)
-            # Do NOT flip is_offload here: the AWEX adapter tracks released
-            # memory via _released_tags, and the trainer onloads explicitly
+            if self._awex_publisher is None:
+                raise RuntimeError(
+                    "AWEX weight update requested before publisher initialization"
+                )
+            self._awex_publisher.execute_colocate_weight_update(meta.version or 0)
+            # Do NOT flip is_offload here: residency tracks released memory,
+            # and the trainer onloads explicitly
             # at the next train phase. Marking is_offload would make every
             # _offload_aware_context RPC (e.g. export_stats) reload optimizer
             # states onto a GPU already fully occupied by the resumed rollout.
 
             dist.barrier(group=self.cpu_group)
 
-            self._awex_adapter.finish_colocate_weight_update(
+            self._awex_publisher.finish_colocate_weight_update(
                 training_world_size=dist.get_world_size(self.cpu_group)
             )
 
@@ -1026,12 +1112,12 @@ class MegatronEngine(TrainEngine):
         return self._version
 
     def save(self, meta: SaveLoadMeta):
-        if self._awex_adapter is not None:
+        if self._weight_residency is not None:
             # Post-ppo_update the fp32 grad buffers (~2x param bytes) are
             # dead weight until the next train_batch (which rebuilds them via
             # ensure_grad_buffers); drop them here to fund the HF saver's TP
             # coalesced all-gather transient.
-            self._awex_adapter._release_grad_memory()
+            self._weight_residency.release_grad_memory()
             gc.collect()
             torch.cuda.empty_cache()
         with self._checkpoint_aware_context(
@@ -1042,6 +1128,11 @@ class MegatronEngine(TrainEngine):
                     raise ValueError(
                         "HF format does not support optimizer state saving, please use DCP format instead."
                     )
+                # HF export all-gathers full tensors across TP; reclaim allocator
+                # headroom first. Kept out of the dcp/recover path, which is
+                # frequency-driven and should not pay a full-heap GC per save.
+                gc.collect()
+                current_platform.empty_cache()
                 self._save_model_to_hf(
                     meta.path,
                     tokenizer=meta.tokenizer,
@@ -1088,21 +1179,14 @@ class MegatronEngine(TrainEngine):
     @contextmanager
     def _checkpoint_aware_context(self, *, with_model: bool, with_optimizer: bool):
         """Lease AWEX-released resources without onloading managed state."""
-        if self._awex_adapter is None:
+        if self._weight_residency is None:
             with self._offload_aware_context():
                 yield
             return
 
-        lease_factory = getattr(self._awex_adapter, "checkpoint_residency", None)
-        if callable(lease_factory):
-            lease = lease_factory(with_model=with_model, with_optimizer=with_optimizer)
-        else:
-            lease = checkpoint_awex_residency(
-                self._awex_adapter,
-                self.optimizer,
-                with_model=with_model,
-                with_optimizer=with_optimizer,
-            )
+        lease = self._weight_residency.checkpoint_residency(
+            with_model=with_model, with_optimizer=with_optimizer
+        )
         with lease:
             if with_model:
                 self._assert_checkpoint_model_resident()
@@ -1146,15 +1230,14 @@ class MegatronEngine(TrainEngine):
             model.zero_grad_buffer()
 
     def optimizer_step(self):
+        if self._dte_runtime_config.enabled:
+            # The LR scheduler advances before the subsequent weight update.
+            # Preserve the LR consumed by this optimizer step for AdamW
+            # inversion instead of reading the next-step LR later.
+            for param_group in self.optimizer.param_groups:
+                param_group["_areal_last_step_lr"] = float(param_group["lr"])
         with trace_scope("megatron_engine.step"):
             update_successful, grad_norm, _ = self.optimizer.step()
-        check_named_tensors_finite(
-            iter_module_named_tensors(self.model),
-            stage="actor_post_optimizer",
-            version=self._version + 1,
-            logger=self.logger,
-            process_group=self.cpu_group,
-        )
         current_lr = self.optimizer.param_groups[0]["lr"]
 
         return dict(
@@ -1180,7 +1263,14 @@ class MegatronEngine(TrainEngine):
         self._ensure_ready()
 
         def forward_step(batch_iter, model):
-            mb_input: MicroBatchItem = next(batch_iter)
+            source_mb: MicroBatchItem = next(batch_iter)
+            # Keep MicroBatchList CPU-only. The returned accelerator dictionaries
+            # are owned solely by this forward step and cannot accumulate in the
+            # source list as the schedule consumes more microbatches.
+            mb_input = source_mb.to(
+                self.device,
+                non_blocking=True,
+            )
 
             cu_seqlens = mb_input.padded_mb.get("cu_seqlens", None)
 
@@ -1234,12 +1324,45 @@ class MegatronEngine(TrainEngine):
                     "BSHD is supported only for text-only models such as Qwen3.5"
                 )
 
+            # MTP training: feed the MTP head independent label and mask
+            # channels so the main forward keeps labels=None and returns
+            # logits. packed_context_parallel_forward converts both tensors to
+            # the model's actual THD or BSHD layout before forwarding them.
+            # This is intentionally enabled by the training config rather than
+            # gated by the model family: Qwen3.5 is registered as vision-capable
+            # but its text-only and multimodal batches use the same padded MTP
+            # label path. The token loss mask excludes prompt/image tokens;
+            # synchronized rolling additionally removes unavailable future-token
+            # targets at sequence and padding boundaries. For packed CP, the
+            # forward wrapper applies the same zigzag split to these channels as
+            # input_ids before MCore performs its CP-aware target rolling.
+            if not forward_only and self.mcore_config.enable_mtp_training:
+                mtp_loss_mask = mb_input.padded_mb.get("loss_mask")
+                if mtp_loss_mask is None:
+                    raise ValueError(
+                        "MTP training requires a token-aligned loss_mask so prompt, "
+                        "multimodal, padding, and sequence-boundary positions are "
+                        "not used as MTP supervision."
+                    )
+                mtp_labels = mb_input.padded_mb["input_ids"]
+                if mtp_loss_mask.shape != mtp_labels.shape:
+                    raise ValueError(
+                        "MTP training requires loss_mask to match input_ids before "
+                        f"layout conversion, got {mtp_loss_mask.shape} and "
+                        f"{mtp_labels.shape}."
+                    )
+                mb_input.padded_mb["mtp_kwargs"] = {
+                    "mtp_labels": mtp_labels,
+                    "mtp_loss_mask": mtp_loss_mask,
+                }
+
             output = packed_context_parallel_forward(
                 model,
                 mb_input.padded_mb,
                 gather_cp_output=not cp_local,
                 is_vision_model=self.is_vision_model,
                 use_padded_seq=self.use_padded_seq,
+                use_model_packed_seq=self.use_model_packed_seq,
                 fp32_output=_float16_wrapper_fp32_output(
                     self.mcore_config.enable_chunked_logits,
                     self.dtype,
@@ -1317,6 +1440,9 @@ class MegatronEngine(TrainEngine):
                         ),
                     )
 
+            # Release MTP label channel after forward pass
+            mb_input.padded_mb.pop("mtp_kwargs", None)
+
             # Release tree attention metadata after forward pass
             for key in tree_attn_keys:
                 del mb_input.padded_mb[key]
@@ -1389,14 +1515,14 @@ class MegatronEngine(TrainEngine):
         loss_weight_fn: Callable[[dict[str, Any]], torch.Tensor],
     ) -> dict[str, float]:
         self._ensure_ready()
-        if self._awex_adapter is not None:
-            self._awex_adapter.ensure_grad_buffers()
+        if self._weight_residency is not None:
+            self._weight_residency.ensure_grad_buffers()
         self.optimizer_zero_grad()
 
         input_batched, _ = self._normalize_batch_input(input_)
 
         # Step 1: Prepare micro-batches
-        mb_list = self._prepare_mb_list(input_batched).to(self.device)
+        mb_list = self._prepare_mb_list(tensor_container_to(input_batched, "cpu"))
 
         # Step 2: Compute total loss weight.
         # Use DP+CP group: after CP all-gather each rank computes the full-sequence
@@ -1407,6 +1533,7 @@ class MegatronEngine(TrainEngine):
             mb_list,
             loss_weight_fn,
             mpu.get_data_parallel_group(with_context_parallel=True),
+            device=self.device,
         )
 
         # Step 3: Forward-backward using Megatron's pipeline function.
@@ -1415,12 +1542,10 @@ class MegatronEngine(TrainEngine):
         # `megatron.core.pipeline_parallel.schedules._forward_step_helper`. Our
         # per-microbatch loss is already globally normalized via `w_i / W_total`, so
         # that extra division would shrink every gradient (and thus grad_norm and the
-        # effective optimizer step) by `num_microbatches`.
-        loss_multiplier = (
-            mpu.get_data_parallel_world_size()
-            * self.optimizer.get_loss_scale().item()
-            * len(mb_list)
-        )
+        # effective optimizer step) by `num_microbatches`. MCore applies the dynamic
+        # FP16 loss scale through `model_config.grad_scale_func` to both the main loss
+        # and auxiliary losses such as MTP and MoE.
+        loss_multiplier = mpu.get_data_parallel_world_size() * len(mb_list)
 
         def process_output(
             output: torch.Tensor, inputs: dict[str, Any]
@@ -1467,7 +1592,40 @@ class MegatronEngine(TrainEngine):
         # Step 4: Optimizer step
         stats = self.optimizer_step()
         stats["num_micro_batches"] = len(mb_list.mbs)
+
+        # Step 5: Surface the auxiliary MTP loss for logging (if enabled).
+        mtp_loss = self._collect_mtp_loss(len(mb_list.mbs))
+        if mtp_loss is not None:
+            stats["mtp_loss"] = mtp_loss
         return stats
+
+    def _collect_mtp_loss(self, num_microbatches: int) -> float | None:
+        """Reduce and return the per-microbatch Multi-Token-Prediction loss.
+
+        Megatron-Core's ``process_mtp_loss`` accumulates the (detached) per-layer
+        MTP loss across micro-batches into ``MTPLossLoggingHelper.tracker`` and
+        records the reduce/avg groups. The tracker only holds ``values`` on the
+        last pipeline stage (where the MTP loss is computed); other stages skip
+        the reduction. The reduce step's collectives stay matched because the
+        avg_group (data-parallel + context-parallel) is contained within a single
+        pipeline stage. Returns ``None`` on ranks without an MTP loss value.
+        """
+        if not self.mcore_config.enable_mtp_training:
+            return None
+
+        from megatron.core.transformer.multi_token_prediction import (
+            MTPLossLoggingHelper,
+        )
+
+        tracker = MTPLossLoggingHelper.tracker
+        if "values" not in tracker:
+            return None
+
+        MTPLossLoggingHelper.reduce_loss_in_tracker()
+        # `values` is summed over micro-batches; normalize to a per-microbatch loss.
+        mtp_loss = tracker["values"].sum().item() / max(num_microbatches, 1)
+        MTPLossLoggingHelper.clean_loss_in_tracker()
+        return mtp_loss
 
     @torch.no_grad()
     def eval_batch(
@@ -1481,13 +1639,14 @@ class MegatronEngine(TrainEngine):
         input_batched, _ = self._normalize_batch_input(input_)
 
         # Step 1: Prepare micro-batches
-        mb_list = self._prepare_mb_list(input_batched).to(self.device)
+        mb_list = self._prepare_mb_list(tensor_container_to(input_batched, "cpu"))
 
         # Step 2: Compute total loss weight (DP+CP, see train_batch comment).
         total_loss_weight = compute_total_loss_weight(
             mb_list,
             loss_weight_fn,
             mpu.get_data_parallel_group(with_context_parallel=True),
+            device=self.device,
         )
 
         # Step 3: Forward using Megatron's pipeline function, collecting losses
@@ -1533,14 +1692,18 @@ class MegatronEngine(TrainEngine):
                     f"inferred {inferred_seqlens} from attention_mask shapes."
                 )
             output_seqlens = inferred_seqlens
-        cu_seqlens = pack_tensor_dict(input_batched)["cu_seqlens"]
         if output_seqlens is None:
-            output_seqlens = (cu_seqlens[1:] - cu_seqlens[:-1]).cpu().numpy().tolist()
+            output_seqlens = (
+                input_batched["attention_mask"]
+                .sum(dim=1, dtype=torch.int64)
+                .cpu()
+                .tolist()
+            )
         assert output_seqlens is not None
         batch_size = len(output_seqlens)
 
         # Step 2: Prepare micro-batches
-        mb_list = self._prepare_mb_list(input_batched).to(self.device)
+        mb_list = self._prepare_mb_list(tensor_container_to(input_batched, "cpu"))
 
         # Step 3: Forward using Megatron's pipeline function, collecting results
         outputs: list[torch.Tensor] = []
@@ -1593,27 +1756,39 @@ class MegatronEngine(TrainEngine):
         return data
 
     def init_awex_adapter(self, meta_server_addr: str | None = None) -> None:
-        """Create awex adapter early for selective memory management.
+        """Create the AWEX publisher early for colocated weight transfer.
 
         Must be called before offload() in colocate mode so that offload uses
-        the adapter's tag-based mechanism instead of TMS (which is all-or-nothing
-        and causes OOM on resume when SGLang occupies GPU memory).
+        flat-buffer residency instead of TMS, which is all-or-nothing and can
+        OOM when SGLang already occupies the GPU.
         """
-        if self._awex_adapter is None:
-            from areal.engine.awex.colocate_writer import AwexMegatronAdapter
+        publisher = self._ensure_awex_publisher()
+        publisher.eager_publish_train_info(meta_server_addr)
 
-            self._awex_adapter = AwexMegatronAdapter(self)
-            self.logger.info("Created AWEX adapter for memory management")
+    def _ensure_weight_residency(self) -> MegatronWeightResidency:
+        if self._weight_residency is None:
+            from areal.engine.megatron_utils.weight_residency import (
+                MegatronWeightResidency,
+            )
 
-        self._eager_publish_awex_train_info(meta_server_addr)
+            self._weight_residency = MegatronWeightResidency(self)
+            self.logger.info("Created Megatron weight residency manager")
+        return self._weight_residency
+
+    def _ensure_awex_publisher(self) -> AwexWeightPublisher:
+        residency = self._ensure_weight_residency()
+        if self._awex_publisher is None:
+            from areal.engine.awex.colocate_writer import AwexWeightPublisher
+
+            self._awex_publisher = AwexWeightPublisher(self, residency)
+            self.logger.info("Created AWEX weight publisher")
+        elif self._awex_publisher.residency is not residency:
+            raise RuntimeError("AWEX publisher does not own the engine residency")
+        return self._awex_publisher
 
     def init_weight_residency_adapter(self) -> None:
         """Enable DDP-flat-buffer residency without AWEX publication state."""
-        if self._awex_adapter is None:
-            from areal.engine.awex.colocate_writer import AwexMegatronAdapter
-
-            self._awex_adapter = AwexMegatronAdapter(self)
-            self.logger.info("Created Megatron weight residency adapter")
+        self._ensure_weight_residency()
 
     def _log_weight_residency_stats(self, phase: str) -> None:
         """Log per-rank CUDA residency for persistent/AWEX flat buffers."""
@@ -1629,38 +1804,19 @@ class MegatronEngine(TrainEngine):
             os.environ.get("PYTORCH_CUDA_ALLOC_CONF", ""),
         )
 
-    def _eager_publish_awex_train_info(self, meta_server_addr: str | None) -> None:
-        addr = meta_server_addr or os.environ.get("AWEX_META_SERVER_ADDR", "")
-        if not addr or (dist.is_initialized() and dist.get_rank() != 0):
-            return
-        try:
-            from awex.meta.meta_server import MetaServerClient
-
-            host, port = addr.rsplit(":", 1)
-            client = MetaServerClient(host, int(port))
-            world = dist.get_world_size() if dist.is_initialized() else 1
-            client.put_object("awex_train_info", {"train_world_size": world})
-            self.logger.info(
-                "[AWEX] eager-published awex_train_info (train_world_size=%d) to %s",
-                world,
-                addr,
-            )
-        except Exception as e:
-            self.logger.warning("[AWEX] eager publish awex_train_info failed: %s", e)
-
     def offload(self) -> None:
         """Offload model memory to CPU.
 
-        In colocate mode (awex adapter active): manual tag-based offload via
-        storage resize. Otherwise: torch_memory_saver pause.
+        With explicit Megatron residency: manual tag-based flat-buffer offload.
+        Otherwise: torch_memory_saver pause.
 
         Ref: https://github.com/THUDM/slime/blob/main/slime/backends/megatron_utils/actor.py
         """
-        if self._awex_adapter is not None:
+        if self._weight_residency is not None:
             self._log_weight_residency_stats("before_offload")
             self.get_device_stats().log("before offload model")
             current_platform.clear_memory()
-            self._awex_adapter.release_memory(tags=["optimizer", "weights"])
+            self._weight_residency.release_memory(tags=["optimizer", "weights"])
             current_platform.synchronize()
             dist.barrier(group=self.cpu_group)
             self._log_weight_residency_stats("after_offload")
@@ -1699,13 +1855,12 @@ class MegatronEngine(TrainEngine):
     def onload(self) -> None:
         """Onload model memory from CPU back to GPU.
 
-        Uses awex adapter (selective, tag-based) when available, otherwise
-        torch_memory_saver.
+        Uses explicit Megatron residency when available, otherwise TMS.
 
         Ref: https://github.com/THUDM/slime/blob/main/slime/backends/megatron_utils/actor.py
         """
-        if self._awex_adapter is not None:
-            self._awex_adapter.resume_memory(tags=["optimizer", "weights"])
+        if self._weight_residency is not None:
+            self._weight_residency.resume_memory(tags=["optimizer", "weights"])
             current_platform.clear_memory()
             current_platform.synchronize()
             dist.barrier(group=self.cpu_group)
@@ -1902,12 +2057,9 @@ class MegatronEngine(TrainEngine):
             )
             if dp_rank == mpu.get_data_parallel_rank():
                 self._context_and_model_parallel_group = group
-        # The gloo mirror is only read once an offloaded engine has handed the
-        # accelerator to rollout and device collectives are unusable (see
-        # resolve_broadcast_target). Building it otherwise costs one collective
-        # per data-parallel group at startup for a group nothing ever uses;
-        # resolve_broadcast_target falls back to the device group when it is None.
-        if self.config.offload:
+        # Offloaded engines and CPU-staged streaming RPCs cannot use accelerator
+        # collectives for payload distribution, so both require a gloo mirror.
+        if self.config.offload or self.stream_microbatches_from_cpu:
             for dp_rank, ranks in enumerate(context_and_model_parallel_ranks):
                 cpu_group = dist.new_group(
                     ranks, timeout=DIST_GROUP_DEFAULT_TIMEOUT, backend="gloo"
@@ -2743,6 +2895,11 @@ class MegatronEngine(TrainEngine):
                 )
         else:
             if self.mcore_config.use_mbridge_save:
+                source_config = (
+                    load_hf_config_snapshot(base_model_path)
+                    if dist.get_rank() == 0
+                    else None
+                )
                 # when loading model using AreaL's fast hf load, the safetensor_io is never set
                 if (
                     not hasattr(self.bridge, "safetensor_io")
@@ -2752,6 +2909,13 @@ class MegatronEngine(TrainEngine):
                         self.config.path
                     )
                 self.bridge.save_weights(models=self.model, weights_path=path)
+                if dist.get_rank() == 0:
+                    finalize_hf_export(
+                        self.bridge.hf_config,
+                        path,
+                        source_model_path=base_model_path,
+                        source_config=source_config,
+                    )
             else:
                 save_weights_to_hf_with_mbridge_fast(
                     bridge=self.bridge,
@@ -2781,7 +2945,14 @@ class MegatronEngine(TrainEngine):
     @property
     def _mtp_head_dropped(self) -> bool:
         """True when the model declares an MTP head but enable_mtp left it unbuilt."""
-        if self.bridge_cls != "megatron-bridge" or self.mcore_config.enable_mtp:
+        is_bailing_v3_mbridge = self.bridge_cls == "mbridge" and isinstance(
+            self.bridge, BailingV3Bridge
+        )
+        if self.bridge_cls != "megatron-bridge" and not is_bailing_v3_mbridge:
+            return False
+        if not is_bailing_v3_mbridge and getattr(
+            self.mcore_config, "enable_mtp", False
+        ):
             return False
         text_config = getattr(self.hf_config, "text_config", self.hf_config)
         return any(
@@ -2917,6 +3088,9 @@ class MegatronEngine(TrainEngine):
                     f"Number of tree micro-batches ({len(mb_list)}) is less than recommended"
                     f" minimum ({recommended_min_n_mbs}) to avoid pipeline bubbles."
                 )
+            # The schedule only consumes mbs/padded_mbs and metadata. Releasing
+            # the original dense batch avoids retaining a third CPU copy.
+            mb_list.data = {}
             return mb_list
         # Amend position ids (skip for VLM — model computes mRoPE internally)
         if not self.is_vision_model:
@@ -2927,6 +3101,15 @@ class MegatronEngine(TrainEngine):
         min_n_mbs = (
             2 * pp_size if pp_size > 1 else 1
         )  # avoid pipeline bubbles in training
+        if self.config.mb_spec.max_tokens_per_mb is None and not getattr(
+            self, "_warned_unbounded_microbatch", False
+        ):
+            self.logger.warning(
+                "Megatron CPU streaming bounds full-batch input residency, but "
+                "mb_spec.max_tokens_per_mb is unset. A growing batch can still "
+                "form a growing microbatch and increase activation memory."
+            )
+            self._warned_unbounded_microbatch = True
         # NOTE: self.config.mb_spec.max_tokens_per_mb determines
         # the expected **total** number of tokens per micro-batch **in the forward pass**.
         # The micro batch list splitted here will be splitted to each
@@ -2953,14 +3136,15 @@ class MegatronEngine(TrainEngine):
             seq_align_to=align_to_multiple_of,
         )
         mb_list.mbs = [pack_tensor_dict(mb) for mb in mb_list.mbs]
-        # NOTE: Pad micro-batches to:
-        # 1. Reduce GPU memory fragmentation, pad actual # tokens per mb to integer multiples
-        #  of GPU page size or max_tokens_per_mb
-        # 2. Align sequence lengths to integer multiples of `align_to_multiple_of=tp_size*cp_size*2`
-        #    to satisfy the requirement of Megatron parallelism.
-        mb_list = pad_mb_list(
+        # Project each micro-batch to the model's sequence layout. Wrapper-owned
+        # THD can use a trailing padding segment to reduce memory fragmentation;
+        # The default BSHD/model-owned THD path cannot, because reconstruction
+        # would turn that segment into a synthetic batch row. Every layout
+        # still aligns each real sequence for Megatron parallelism.
+        assert self.sequence_packing_mode is not None
+        mb_list = prepare_microbatches_for_sequence_layout(
             mb_list,
-            pad_value=0.0,
+            sequence_packing_mode=self.sequence_packing_mode,
             pad_to_maximum=self.config.pad_to_maximum,
             seq_align_to=align_to_multiple_of,
         )
@@ -2994,6 +3178,10 @@ class MegatronEngine(TrainEngine):
                 for k, v in mb_list.data.items()
                 if not _is_multi_modal_payload_key(k)
             }
+
+        # No Megatron schedule or output reordering path consumes the original
+        # dense batch after packing. Keep only the CPU microbatch sources.
+        mb_list.data = {}
 
         return mb_list
 
@@ -3146,6 +3334,7 @@ class MegatronEngine(TrainEngine):
                     inputs = {
                         k: v for k, v in inputs.items() if not k.startswith("_cp_")
                     }
+
             loss = loss_fn(
                 logprobs,
                 entropy,
@@ -3235,6 +3424,38 @@ class MegatronEngine(TrainEngine):
 # =============================================================================
 
 
+class MegatronScoringEngine(MegatronEngine):
+    """Forward-only Megatron engine used by persistent MOPD teachers."""
+
+    def __init__(self, config: MOPDTeacherEngineConfig):
+        super().__init__(config)
+
+    @torch.no_grad()
+    def compute_logp(self, data: list[dict[str, Any]]) -> list[torch.Tensor] | None:
+        return batched_call(self._compute_logp, data)
+
+    def _compute_logp(self, data: dict[str, Any]) -> torch.Tensor | None:
+        self.eval()
+        return self.forward(
+            input_=data,
+            aggregate_fn=lambda xs: torch.cat(xs, dim=-1),
+        )
+
+    @classmethod
+    def as_controller(
+        cls,
+        config: MOPDTeacherEngineConfig,
+        scheduler: Scheduler,
+    ):
+        from areal.trainer.mopd.scoring import MOPDTeacherController
+
+        return MOPDTeacherController(
+            train_engine=cls,
+            config=config,
+            scheduler=scheduler,
+        )
+
+
 class MegatronPPOActor(MegatronEngine):
     """PPO Actor implementation using Megatron backend."""
 
@@ -3249,30 +3470,12 @@ class MegatronPPOActor(MegatronEngine):
         addr: str | None,
         ft_spec: FinetuneSpec,
         *args,
-        data_hook_role: str | None = None,
-        role: str | None = None,
         **kwargs,
     ) -> None:
         super().initialize(addr, ft_spec, *args, **kwargs)
-        hook_role = data_hook_role or role
-        if hook_role is None and self.actor._data_hook_specs:
-            raise RuntimeError("Configured data hooks require an explicit worker role")
-        self.actor.setup_data_hooks(hook_role or "actor")
 
-    def destroy(self) -> None:
-        errors: list[BaseException] = []
-        try:
-            super().destroy()
-        except BaseException as exc:
-            errors.append(exc)
-        try:
-            self.actor.close_data_hooks()
-        except BaseException as exc:
-            errors.append(exc)
-        if len(errors) == 1:
-            raise errors[0]
-        if errors:
-            raise BaseExceptionGroup("Megatron PPO actor cleanup failed", errors)
+    def configure_mopd_loss(self, config) -> None:
+        self.actor.configure_mopd_loss(config)
 
     @torch.no_grad()
     def compute_logp(self, *args, **kwargs) -> list[torch.Tensor] | None:
@@ -3281,6 +3484,9 @@ class MegatronPPOActor(MegatronEngine):
     @torch.no_grad()
     def compute_advantages(self, *args, **kwargs) -> list[dict[str, Any]]:
         return self.actor.compute_advantages(*args, **kwargs)
+
+    def prepare_mopd_batch(self, *args, **kwargs) -> list[dict[str, Any]]:
+        return self.actor.prepare_mopd_batch(*args, **kwargs)
 
     def aggregate_mopd_targets(self, *args, **kwargs):
         return self.actor.aggregate_mopd_targets(*args, **kwargs)

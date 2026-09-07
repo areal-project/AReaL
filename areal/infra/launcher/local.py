@@ -35,6 +35,7 @@ from areal.infra.utils.launcher import (
     validate_config_for_launcher,
     wait_llm_server_addrs,
 )
+from areal.infra.utils.proc import build_target_cmd
 from areal.utils import logging, name_resolve, names
 from areal.utils.network import find_free_ports
 from areal.utils.offload import get_tms_env_vars
@@ -143,11 +144,7 @@ class LocalLauncher:
                 env_vars[current_platform.device_control_env_var] = ",".join(
                     str(self._gpu_devices[j]) for j in visible_devices
                 )
-            c = (
-                " ".join(str(k) + "=" + str(v) for k, v in env_vars.items())
-                + " stdbuf -oL "
-                + cmd[i]
-            )
+            c = build_target_cmd(cmd[i], env_vars=env_vars, use_stdbuf=True)
             c = f"{c} 2>&1 | tee -a {self.log_path_of(job_name)}"
             logger.info("Starting local process with command: %s", c)
             process = subprocess.Popen(

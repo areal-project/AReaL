@@ -275,40 +275,6 @@ def test_launcher_worker_spec_rejects_custom_port_argument(cmd):
         )
 
 
-def test_launcher_stop_failure_retains_process_for_retry(monkeypatch):
-    """A failed Popen termination remains owned until a later stop succeeds."""
-    launcher_cls = (
-        ray_scheduler.RayWorkerProcessLauncher.__ray_metadata__.modified_class
-    )
-    launcher = object.__new__(launcher_cls)
-    launcher.backend_process_manager = None
-
-    class FakeProcess:
-        pid = 1234
-        returncode = None
-
-        def poll(self):
-            return self.returncode
-
-    process = FakeProcess()
-    launcher.worker_processes = {"actor/0": process}
-
-    def fail_kill(*args, **kwargs):
-        raise RuntimeError("kill failed")
-
-    monkeypatch.setattr(ray_scheduler, "kill_process_tree", fail_kill)
-    with pytest.raises(RuntimeError, match="kill failed"):
-        launcher.stop_all_processes()
-    assert launcher.worker_processes == {"actor/0": process}
-
-    def successful_kill(*args, **kwargs):
-        process.returncode = -15
-
-    monkeypatch.setattr(ray_scheduler, "kill_process_tree", successful_kill)
-    launcher.stop_all_processes()
-    assert launcher.worker_processes == {}
-
-
 def test_launcher_actor_starts_and_stops_worker_processes(tmp_path, local_ray_cluster):
     """Test RayWorkerProcessLauncher as a real Ray actor."""
     launcher = ray_scheduler.RayWorkerProcessLauncher.options(
@@ -513,8 +479,13 @@ def test_create_workers_with_fork_colocation_delegates_to_fork_workers(
     ]
     called = []
 
-    def fake_fork_workers(role: str, target_role: str, env_vars=None):
-        called.append((role, target_role, env_vars))
+    def fake_fork_workers(
+        role: str,
+        target_role: str,
+        command: str | None = None,
+        env_vars: list[dict[str, str]] | None = None,
+    ):
+        called.append((role, target_role, command, env_vars))
         return ["ref/0", "ref/1"]
 
     monkeypatch.setattr(scheduler, "fork_workers", fake_fork_workers)
@@ -526,7 +497,7 @@ def test_create_workers_with_fork_colocation_delegates_to_fork_workers(
                 cpu=1,
                 gpu=1,
                 mem=1,
-                env_vars={"PYTORCH_CUDA_ALLOC_CONF": ""},
+                env_vars={"ROLE_ENV": "ref"},
             )
         ],
         scheduling_strategy=SchedulingStrategy(
@@ -538,9 +509,10 @@ def test_create_workers_with_fork_colocation_delegates_to_fork_workers(
 
     assert worker_ids == ["ref/0", "ref/1"]
     assert len(called) == 1
-    role, target_role, env_vars = called[0]
-    assert (role, target_role) == ("ref", "actor")
-    assert [env["PYTORCH_CUDA_ALLOC_CONF"] for env in env_vars] == ["", ""]
+    role, target_role, command, env_vars = called[0]
+    assert (role, target_role, command) == ("ref", "actor", None)
+    assert env_vars is not None
+    assert [env["ROLE_ENV"] for env in env_vars] == ["ref", "ref"]
 
 
 def test_colocation_replica_mismatch_raises_error(tmp_path):

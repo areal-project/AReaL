@@ -90,16 +90,6 @@ class WorkerTimeoutError(SchedulerError):
         )
 
 
-class WorkerCleanupError(SchedulerError):
-    """Raised when one or more workers could not be completely removed."""
-
-    def __init__(self, role: str, failures: list[str]):
-        self.role = role
-        self.failures = failures
-        details = "; ".join(failures)
-        super().__init__(f"Failed to completely clean up role {role!r}: {details}")
-
-
 class PortAllocationError(SchedulerError):
     """Raised when port allocation fails."""
 

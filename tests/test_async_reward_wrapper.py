@@ -69,7 +69,8 @@ class TestAsyncRewardWrapperTimeout:
             _slow_reward, timeout_seconds=0.1, max_workers=1, max_retries=1
         )
         result = await wrapper(10.0)
-        assert result == 0
+        assert isinstance(result, float)
+        assert result == 0.0
 
     @pytest.mark.asyncio
     async def test_timeout_no_retries_returns_zero(self):
@@ -77,7 +78,8 @@ class TestAsyncRewardWrapperTimeout:
             _slow_reward, timeout_seconds=0.1, max_workers=1, max_retries=0
         )
         result = await wrapper(10.0)
-        assert result == 0
+        assert isinstance(result, float)
+        assert result == 0.0
 
 
 class TestAsyncRewardWrapperBrokenPool:

@@ -17,18 +17,22 @@ from tenacity import (
     wait_exponential,
 )
 
+from areal.infra.rpc.serialization import deserialize_value
 from areal.infra.utils.http import ensure_end_with_slash
 from areal.utils.logging import getLogger
 
 from .server import (
     EXPORT_TRAJECTORIES_PATHNAME,
     RL_END_SESSION_PATHNAME,
+    RL_FETCH_SHARED_TENSORS_PATHNAME,
     RL_SET_REWARD_PATHNAME,
     RL_START_SESSION_PATHNAME,
+    FetchSharedTensorsRequest,
     SetRewardRequest,
     StartSessionRequest,
     deserialize_interactions,
 )
+from .tensor_reference import SharedTensorResolver
 
 if TYPE_CHECKING:
     from ..types import InteractionWithTokenLogpReward
@@ -58,6 +62,12 @@ class OpenAIProxyClient:
         Unique identifier for this task
     admin_api_key : str
         Admin API key for management operations
+    processor_cache_group_id : str | None
+        Shared processor-cache identity for grouped rollout sessions.
+    processor_cache_group_size : int
+        Expected number of sessions sharing the processor cache.
+    shared_tensor_resolver : SharedTensorResolver | None
+        Group-local resolver used to fetch each referenced image tensor once.
 
     Example
     -------
@@ -85,11 +95,19 @@ class OpenAIProxyClient:
         base_url: str,
         task_id: str,
         admin_api_key: str,
+        processor_cache_group_id: str | None = None,
+        processor_cache_group_size: int = 1,
+        shared_tensor_resolver: SharedTensorResolver | None = None,
     ):
         self._session = session
         self.base_url = ensure_end_with_slash(base_url)
         self.task_id = task_id
         self._admin_api_key = admin_api_key
+        self._processor_cache_group_id = processor_cache_group_id
+        self._processor_cache_group_size = processor_cache_group_size
+        self._shared_tensor_resolver = shared_tensor_resolver
+        if processor_cache_group_id is not None and shared_tensor_resolver is None:
+            self._shared_tensor_resolver = SharedTensorResolver()
         self.session_id: str | None = None
         self._session_api_key: str | None = None
 
@@ -183,19 +201,55 @@ class OpenAIProxyClient:
             "discount": discount,
             "style": style,
             "drop_retry_orphans": drop_retry_orphans,
+            "supports_shared_tensor_references": (
+                self._processor_cache_group_id is not None
+            ),
         }
         headers = self._admin_auth_headers()
         async with self._session.post(url, json=payload, headers=headers) as resp:
             resp.raise_for_status()
             data = await resp.json()
-            return deserialize_interactions(data["interactions"])
+
+        serialized_interactions = data["interactions"]
+        tensor_group_id = data.get("tensor_reference_group_id")
+        if tensor_group_id is not None:
+            if self._shared_tensor_resolver is None:
+                raise RuntimeError(
+                    "Proxy returned shared tensor references without a resolver"
+                )
+
+            async def fetch_shared_tensors(ref_ids: list[str]):
+                fetch_payload = FetchSharedTensorsRequest(
+                    group_id=tensor_group_id,
+                    ref_ids=ref_ids,
+                )
+                async with self._session.post(
+                    f"{self.base_url}{RL_FETCH_SHARED_TENSORS_PATHNAME}",
+                    json=fetch_payload.model_dump(),
+                    headers=headers,
+                ) as response:
+                    response.raise_for_status()
+                    response_data = await response.json()
+                return deserialize_value(response_data["tensors"])
+
+            serialized_interactions = await self._shared_tensor_resolver.resolve(
+                serialized_interactions,
+                group_id=tensor_group_id,
+                fetch=fetch_shared_tensors,
+            )
+
+        return deserialize_interactions(serialized_interactions)
 
     async def __aenter__(self) -> OpenAIProxyClient:
         """Start the RL session via HTTP request."""
         data = await _start_session(
             self._session,
             url=f"{self.base_url}{RL_START_SESSION_PATHNAME}",
-            payload=StartSessionRequest(task_id=self.task_id),
+            payload=StartSessionRequest(
+                task_id=self.task_id,
+                processor_cache_group_id=self._processor_cache_group_id,
+                processor_cache_group_size=self._processor_cache_group_size,
+            ),
             headers=self._admin_auth_headers(),
         )
         self.session_id = data["session_id"]

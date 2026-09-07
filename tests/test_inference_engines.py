@@ -118,6 +118,32 @@ def test_resolve_colocated_base_gpu_id_rejects_invalid_namespaces(
         _resolve_colocated_base_gpu_id(env, gpus_per_server, fallback)
 
 
+def test_sglang_uses_functional_health_check_by_default() -> None:
+    from areal.engine.sglang_remote import SGLangBackend
+
+    assert SGLangBackend().get_health_check_request().endpoint == "/health"
+
+
+def test_sglang_awex_uses_metadata_readiness_check(monkeypatch) -> None:
+    from areal.engine.sglang_remote import SGLangBackend
+
+    backend = SGLangBackend()
+    monkeypatch.setattr(
+        "areal.engine.sglang_remote.SGLangConfig.build_cmd_from_args",
+        lambda args: ["sglang.launch_server"],
+    )
+    monkeypatch.setattr(
+        "areal.engine.sglang_remote.subprocess.Popen",
+        lambda *args, **kwargs: SimpleNamespace(pid=1, poll=lambda: None),
+    )
+
+    backend.launch_server(
+        {"model_path": "model", "awex_meta_server_addr": "127.0.0.1:1234"}
+    )
+
+    assert backend.get_health_check_request().endpoint == "/model_info"
+
+
 def test_wait_for_server_raises_when_subprocess_exits() -> None:
     from areal.infra.remote_inf_engine import RemoteInfEngine
 

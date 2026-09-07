@@ -1,7 +1,7 @@
 # 安装指南（昇腾 NPU）
 
 **注意**：昇腾 NPU 支持在
-[`ascend-v1.0.4`](https://github.com/areal-project/AReaL/tree/ascend-v1.0.4) 分支维护而非
+[`ascend-v1.0.5`](https://github.com/areal-project/AReaL/tree/ascend-v1.0.5) 分支维护而非
 `main` 分支。本文档中引用的所有代码、配置和示例均指该分支——请按照下文说明检出该分支。
 
 ## 前置要求
@@ -23,12 +23,12 @@
 | 组件            |                                                                                  版本                                                                                  |
 | --------------- | :--------------------------------------------------------------------------------------------------------------------------------------------------------------------: |
 | 操作系统        |                                                                Ubuntu、EulerOS 或满足以下要求的任何系统                                                                |
-| 昇腾 HDK        |                                                                                 25.2.1                                                                                 |
-| CANN            |                                                                                 9.0.0                                                                                  |
+| 昇腾 HDK        |                                                                                 25.5.1                                                                                 |
+| CANN            |                                                                                 9.0.1                                                                                  |
 | Git LFS         | 下载模型、数据集和 AReaL 代码所需。请参阅[安装指南](https://docs.github.com/en/repositories/working-with-files/managing-large-files/installing-git-large-file-storage) |
 | Docker          |                                                                                 27.2.0                                                                                 |
-| AReaL 镜像 (A2) |                                                           `ghcr.io/hwvanici/areal_npu:v1.0.4-a2`（详见下文）                                                           |
-| AReaL 镜像 (A3) |                                                           `ghcr.io/hwvanici/areal_npu:v1.0.4-a3`（详见下文）                                                           |
+| AReaL 镜像 (A2) |                                                           `ghcr.io/hwvanici/areal_npu:v1.0.5-a2`（详见下文）                                                           |
+| AReaL 镜像 (A3) |                                                           `ghcr.io/hwvanici/areal_npu:v1.0.5-a3`（详见下文）                                                           |
 
 **注意**：本教程不涵盖 CANN 的安装或共享存储挂载，因为这些取决于您特定的节点配置和系统版本。请独立完成这些安装。您可以从 vLLM-Ascend
 社区查看更多详情[此页面](https://docs.vllm.ai/projects/ascend/en/latest/installation.html)。
@@ -36,20 +36,27 @@
 ## 运行环境
 
 我们建议使用 Docker 和我们提供的 NPU 镜像。A2 镜像面向 Atlas A2，A3 镜像面向 Atlas A3；两者基于相同的方法构建（参见
-`ascend-v1.0.4` 分支上的
-[`Dockerfile.a2`](https://github.com/areal-project/AReaL/blob/ascend-v1.0.4/Dockerfile.a2)
+`ascend-v1.0.5` 分支上的
+[`Dockerfile.a2`](https://github.com/areal-project/AReaL/blob/ascend-v1.0.5/Dockerfile.a2)
 /
-[`Dockerfile.a3`](https://github.com/areal-project/AReaL/blob/ascend-v1.0.4/Dockerfile.a3)），并预装以下依赖栈：
+[`Dockerfile.a3`](https://github.com/areal-project/AReaL/blob/ascend-v1.0.5/Dockerfile.a3)），并预装以下依赖栈。下表版本与已发布的
+`v1.0.5` 镜像一致：
 
-| 组件            |                           版本                           |
-| --------------- | :------------------------------------------------------: |
-| 基础镜像        | `quay.io/ascend/cann:9.0.0`（Ubuntu 22.04、Python 3.11） |
-| torch_npu       |                       2.9.0.post2                        |
-| vLLM-Ascend     |                         v0.18.0                          |
-| triton-ascend   |                          3.2.1                           |
-| Megatron-Core   |                         v0.16.1                          |
-| MindSpeed       |               core_r0.16.0（固定 commit）                |
-| Megatron-Bridge |        固定 commit，与 Megatron-Core 0.16.x 兼容         |
+| 组件            |                        版本                         |
+| --------------- | :-------------------------------------------------: |
+| 基础镜像 (A2)   | `quay.io/ascend/cann:9.0.1-910b-ubuntu22.04-py3.11` |
+| 基础镜像 (A3)   |  `quay.io/ascend/cann:9.0.1-a3-ubuntu22.04-py3.11`  |
+| 运行时操作系统  |                 Ubuntu 22.04.5 LTS                  |
+| Python          |                       3.11.15                       |
+| CANN            |                        9.0.1                        |
+| PyTorch         |                       2.10.0                        |
+| torch_npu       |                    2.10.0.post2                     |
+| vLLM            |          0.23.0（基于 v0.23.0 源码打补丁）          |
+| vLLM-Ascend     |          `releases/v0.23.0` 的 `eaefc536`           |
+| Transformers    |                        5.5.4                        |
+| Megatron-Core   |                    core_v0.16.1                     |
+| MindSpeed       |             core_r0.16.0 的 `79626c13`              |
+| Megatron-Bridge |     `de93536e`（与 Megatron-Core 0.16.x 兼容）      |
 
 其余 AReaL Python 依赖均已根据 `pyproject.npu.toml` 预装。Megatron-LM、MindSpeed 和 Megatron-Bridge
 的源码位于 `/areal-workspace` 目录下，并通过 `PYTHONPATH` 使其可导入。
@@ -61,8 +68,8 @@ WORK_DIR=<your_workspace>
 CONTAINER_WORK_DIR=<your_container_workspace>
 
 # 根据您的硬件类型使用 A2/A3 镜像
-# IMAGE=ghcr.io/hwvanici/areal_npu:v1.0.4-a2
-IMAGE=ghcr.io/hwvanici/areal_npu:v1.0.4-a3
+# IMAGE=ghcr.io/hwvanici/areal_npu:v1.0.5-a2
+IMAGE=ghcr.io/hwvanici/areal_npu:v1.0.5-a3
 CONTAINER_NAME=areal_npu
 
 cd ${WORK_DIR}
@@ -117,7 +124,7 @@ git clone https://github.com/areal-project/AReaL
 cd AReaL
 
 # 切换到 ascend 分支
-git checkout ascend-v1.0.4
+git checkout ascend-v1.0.5
 
 # 安装 AReaL。所有 Python 依赖（来自 pyproject.npu.toml）已预装在镜像中，
 # 因此只需安装 AReaL 包本身。
@@ -146,9 +153,9 @@ ray start --address $RAY_HEAD_IP
 
 ## 下一步
 
-查看[快速入门部分](quickstart.md)来熟悉 AReaL 任务的启动方式。在 NPU 上，我们建议从 `ascend-v1.0.4`
+查看[快速入门部分](quickstart.md)来熟悉 AReaL 任务的启动方式。在 NPU 上，我们建议从 `ascend-v1.0.5`
 分支上的视觉语言模型（VLM）GRPO 示例
-[`examples/vlm_npu/`](https://github.com/areal-project/AReaL/tree/ascend-v1.0.4/examples/vlm_npu)
+[`examples/vlm_npu/`](https://github.com/areal-project/AReaL/tree/ascend-v1.0.5/examples/vlm_npu)
 开始，这些示例在 Geometry3K 数据集上进行训练。例如，在单节点上（16 个 NPU，vLLM 推理 + Megatron 训练）训练 Qwen2.5-VL-3B：
 
 ```bash
@@ -161,8 +168,8 @@ python examples/vlm/geometry3k_grpo.py \
 ```
 
 完整的配置列表（Qwen2.5-VL、Qwen3-VL、Qwen3.5、Qwen3.6 稠密与 MoE 模型）、数据集准备以及基于 Ray 的多节点训练，请参阅
-`ascend-v1.0.4` 分支上的
-[`examples/vlm_npu/README.md`](https://github.com/areal-project/AReaL/blob/ascend-v1.0.4/examples/vlm_npu/README.md)。如果要运行多节点训练，请在启动任务之前确保您的
+`ascend-v1.0.5` 分支上的
+[`examples/vlm_npu/README.md`](https://github.com/areal-project/AReaL/blob/ascend-v1.0.5/examples/vlm_npu/README.md)。如果要运行多节点训练，请在启动任务之前确保您的
 Ray 集群已按上述说明启动。
 
 **注意**：在昇腾 NPU 上，推理（rollout）通过 `vllm` 引擎（vLLM-Ascend 插件）支持；SGLang 不可用。`fsdp` 和

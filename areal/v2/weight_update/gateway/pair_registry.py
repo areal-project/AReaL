@@ -12,33 +12,7 @@ logger = logging.getLogger("PairRegistry")
 class PairRegistry:
     def __init__(self) -> None:
         self._by_name: dict[str, PairInfo] = {}
-        self._pending: set[str] = set()
         self._lock = threading.Lock()
-
-    def try_reserve(self, pair_name: str) -> bool:
-        """Atomically reserve a name before asynchronous pair initialization."""
-        with self._lock:
-            if pair_name in self._by_name or pair_name in self._pending:
-                return False
-            self._pending.add(pair_name)
-            return True
-
-    def register_reserved(self, pair_info: PairInfo) -> None:
-        """Commit a pair name previously acquired with :meth:`try_reserve`."""
-        with self._lock:
-            pair_name = pair_info.pair_name
-            if pair_name not in self._pending:
-                raise ValueError(f"Pair '{pair_name}' is not reserved")
-            if pair_name in self._by_name:
-                raise ValueError(f"Pair '{pair_name}' already registered")
-            self._by_name[pair_name] = pair_info
-            self._pending.remove(pair_name)
-            logger.info("Registered pair '%s'", pair_name)
-
-    def release_reservation(self, pair_name: str) -> None:
-        """Release an uncommitted pair-name reservation after initialization."""
-        with self._lock:
-            self._pending.discard(pair_name)
 
     def register(self, pair_info: PairInfo) -> None:
         with self._lock:

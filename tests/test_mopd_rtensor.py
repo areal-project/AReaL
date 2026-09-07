@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+from dataclasses import FrozenInstanceError
 from typing import Any
 
 import pytest
 import torch
 
 from areal.infra.controller.train_controller import TrainController
-from areal.infra.rpc.rtensor import RTensor, TensorShardInfo
+from areal.infra.rpc.rtensor import RTensor, RTensorDrainReceipt, TensorShardInfo
 from areal.trainer.mopd.targets import (
     MOPD_CONTRIBUTIONS_KEY,
     aggregate_mopd_targets,
@@ -22,19 +23,13 @@ def _rtensor(shard_id: str, node_addr: str = "teacher:8000") -> RTensor:
     )
 
 
-@pytest.mark.parametrize(
-    ("module_name", "class_name"),
-    [
-        ("areal.engine.fsdp_engine", "FSDPPPOActor"),
-        ("areal.engine.megatron_engine", "MegatronPPOActor"),
-        ("areal.experimental.engine.archon_engine", "ArchonPPOActor"),
-    ],
-)
-def test_ppo_backend_exposes_mopd_rpc_methods(module_name, class_name):
-    """Every remote PPO backend exposes the controller's MOPD RPC surface."""
+def test_megatron_backend_exposes_mopd_rpc_methods():
+    """The supported MOPD backend exposes the controller's RPC surface."""
     import importlib
 
-    actor_cls = getattr(importlib.import_module(module_name), class_name)
+    actor_cls = getattr(
+        importlib.import_module("areal.engine.megatron_engine"), "MegatronPPOActor"
+    )
 
     assert callable(getattr(actor_cls, "aggregate_mopd_targets", None))
 
@@ -57,9 +52,7 @@ def test_aggregate_mopd_targets_uses_raw_weights_and_removes_teacher_metadata():
         },
     ]
 
-    result = aggregate_mopd_targets(
-        batch, rl_coefficient=0.25, distillation_coefficient=0.005
-    )
+    result = aggregate_mopd_targets(batch)
 
     assert result is batch
     torch.testing.assert_close(
@@ -86,9 +79,9 @@ def test_aggregate_mopd_targets_uses_raw_weights_and_removes_teacher_metadata():
         assert set(trajectory) >= {
             "mopd_teacher_logp_sum",
             "mopd_teacher_weight_sum",
-            "mopd_rl_coefficient",
-            "mopd_distillation_coefficient",
         }
+        assert not any(key.endswith("coefficient") for key in trajectory)
+        assert "mopd_importance_ratio_cap" not in trajectory
 
 
 def test_aggregate_mopd_targets_rejects_mismatched_teacher_shapes():
@@ -104,9 +97,7 @@ def test_aggregate_mopd_targets_rejects_mismatched_teacher_shapes():
     ]
 
     with pytest.raises(ValueError, match="shape mismatch"):
-        aggregate_mopd_targets(
-            batch, rl_coefficient=0.0, distillation_coefficient=0.005
-        )
+        aggregate_mopd_targets(batch)
 
 
 def _strict_controller(
@@ -116,6 +107,7 @@ def _strict_controller(
 ) -> tuple[TrainController, list[tuple[str, tuple[Any, ...]]]]:
     controller = object.__new__(TrainController)
     controller.workers_is_dp_head = [True, False, True]
+    controller._worker_role = "actor"
     calls: list[tuple[str, tuple[Any, ...]]] = []
 
     def call_all(method: str, *args: Any, **_: Any) -> list[Any]:
@@ -154,11 +146,12 @@ def test_strict_clear_batches_covers_sources_and_every_actor_dp_head(monkeypatch
 
     receipt = controller.strict_clear_batches(targets)
 
-    assert receipt == {
-        "complete": True,
-        "source_shards_cleared": 2,
-        "actor_fetch_buffers_cleared": 2,
-    }
+    assert receipt == RTensorDrainReceipt(
+        consumer_role="actor",
+        shard_count=2,
+        source_node_count=2,
+        consumer_dp_head_count=2,
+    )
     assert source_calls == [
         ("teacher:8000", ["a"]),
         ("teacher:8001", ["b"]),
@@ -168,6 +161,18 @@ def test_strict_clear_batches_covers_sources_and_every_actor_dp_head(monkeypatch
         "fetch_buffer_stats",
     ]
     assert calls[0][1] == (["a", "b"],)
+
+
+def test_rtensor_drain_receipt_is_frozen_and_role_typed():
+    receipt = RTensorDrainReceipt(
+        consumer_role="actor",
+        shard_count=1,
+        source_node_count=1,
+        consumer_dp_head_count=2,
+    )
+
+    with pytest.raises(FrozenInstanceError):
+        receipt.consumer_role = "teacher"
 
 
 def test_strict_clear_batches_source_failure_prevents_receipt(monkeypatch):

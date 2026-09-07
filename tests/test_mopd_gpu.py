@@ -47,48 +47,6 @@ def _assigned_cuda_device_count() -> int:
     return torch.cuda.device_count()
 
 
-def _run_mopd_cuda_case(case: str) -> subprocess.CompletedProcess[str]:
-    env = os.environ.copy()
-    _restore_controller_hidden_devices(env)
-    env["AREAL_ROLE_WORKER"] = "1"
-    repo_root = str(Path(__file__).resolve().parents[1])
-    pythonpath = env.get("PYTHONPATH", "")
-    env["PYTHONPATH"] = repo_root if not pythonpath else f"{repo_root}:{pythonpath}"
-    runner = Path(__file__).parent / "torchrun" / "run_mopd_loss_logits.py"
-    return subprocess.run(
-        [sys.executable, str(runner), "--case", case],
-        capture_output=True,
-        text=True,
-        env=env,
-        cwd=repo_root,
-        timeout=120,
-    )
-
-
-@pytest.mark.gpu
-@pytest.mark.skipif(_assigned_cuda_device_count() == 0, reason="requires one CUDA GPU")
-def test_mopd_cuda_logits_and_reverse_kl_match_oracles():
-    """CUDA token logits and the MOPD surrogate match independent oracles."""
-    result = _run_mopd_cuda_case("logits_reverse_kl")
-    assert result.returncode == 0, (
-        f"CUDA logits/reverse-KL worker failed\n"
-        f"STDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
-    )
-    assert "Passed case=logits_reverse_kl" in result.stdout
-
-
-@pytest.mark.gpu
-@pytest.mark.skipif(_assigned_cuda_device_count() == 0, reason="requires one CUDA GPU")
-def test_mopd_cuda_masked_ratio_overflow_stays_finite():
-    """CUDA masked and active ratio extremes stay finite and bounded."""
-    result = _run_mopd_cuda_case("masked_overflow")
-    assert result.returncode == 0, (
-        f"CUDA masked-overflow worker failed\n"
-        f"STDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
-    )
-    assert "Passed case=masked_overflow" in result.stdout
-
-
 def _restore_controller_hidden_devices(env: dict[str, str]) -> None:
     """Let a fresh test controller see, then independently hide, its GPUs."""
     hidden_env = env.pop("AREAL_CONTROLLER_HIDDEN_DEVICE_ENV", None)

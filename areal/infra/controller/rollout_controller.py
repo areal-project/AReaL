@@ -36,6 +36,7 @@ from areal.api.cli_args import (
     SchedulingSpec,
     SchedulingStrategyType,
 )
+from areal.dataset.mopd import MOPD_ROUTE_METADATA_KEY, DatasetRoute
 from areal.infra.rpc.serialization import deserialize_value
 from areal.infra.utils.concurrent import run_async_task
 from areal.utils import logging, perf_tracer
@@ -59,6 +60,7 @@ class _RemoteRolloutTaskInput:
     workflow: str | None
     workflow_kwargs: dict[str, Any]
     should_accept_fn: str | None
+    mopd_route: str | None = None
     is_eval: bool = False
     group_size: int = 1
     proxy_addr: str | None = None
@@ -100,7 +102,7 @@ class RolloutController:
         self._version = 0
 
         self._task_id_generator = TaskIdGenerator()
-        self._mopd_route_identifier: str | None = None
+        self._mopd_routing_enabled = False
 
         # Use provided staleness manager or create a default one
         # The manager will be properly initialized in initialize()
@@ -160,41 +162,33 @@ class RolloutController:
         """
         return f"{self._worker_role}/{rank}"
 
-    def set_mopd_route_identifier(self, identifier: str) -> None:
-        """Configure source-field routing for single-controller MOPD."""
-        if not isinstance(identifier, str) or not identifier.strip():
-            raise ValueError("MOPD route identifier must be a non-empty string")
-        self._mopd_route_identifier = identifier
+    def enable_mopd_routing(self) -> None:
+        """Require dataset-source route metadata for training rollouts."""
+        self._mopd_routing_enabled = True
 
-    def _prepare_mopd_data(self, data: dict[str, Any]) -> dict[str, Any]:
-        """Copy the configured source route into the reserved stable field."""
-        identifier = self._mopd_route_identifier
-        if identifier is None:
-            return data
-        if identifier not in data:
-            raise ValueError(f"MOPD route field {identifier!r} is missing from sample")
-        route = data[identifier]
-        if isinstance(route, bool) or not isinstance(route, (str, int)):
+    def _extract_mopd_route(
+        self, data: dict[str, Any], *, required: bool
+    ) -> tuple[dict[str, Any], str | None]:
+        """Remove internal route metadata before data reaches the workflow."""
+        if MOPD_ROUTE_METADATA_KEY not in data:
+            if required:
+                raise ValueError("MOPD dataset-source route metadata is missing")
+            return data, None
+
+        provenance = data[MOPD_ROUTE_METADATA_KEY]
+        if not isinstance(provenance, DatasetRoute):
             raise ValueError(
-                f"MOPD route field {identifier!r} must be a string or integer, "
-                f"got {type(route).__name__}"
-            )
-        route = str(route)
-        existing = data.get("mopd_route")
-        if existing is not None and str(existing) != route:
-            raise ValueError(
-                f"Conflicting mopd_route {existing!r} for source route {route!r}"
+                "MOPD dataset-source route must contain DatasetRoute provenance"
             )
         prepared = dict(data)
-        prepared["mopd_route"] = route
-        return prepared
+        prepared.pop(MOPD_ROUTE_METADATA_KEY)
+        return prepared, provenance.route
 
     @staticmethod
     def _propagate_mopd_route(
-        source: dict[str, Any], trajectory: dict[str, Any]
+        route: str | None, trajectory: dict[str, Any]
     ) -> dict[str, Any]:
         """Attach one source route to every trajectory derived from that source."""
-        route = source.get("mopd_route")
         if route is None:
             return trajectory
         existing = trajectory.get("mopd_route")
@@ -232,12 +226,6 @@ class RolloutController:
         sch_spec = SchedulingSpec(**asdict(self.config.scheduling_spec[0]))
         sch_spec.cpu *= instance_size
         sch_spec.mem *= instance_size
-        if (
-            self.config.scheduling_strategy.type
-            == SchedulingStrategyType.colocation.value
-        ):
-            # Colocated rollout jobs share the actor's GPU allocation.
-            sch_spec.request_gpu_gres = False
         if sch_spec.gpu > 0:
             sch_spec.gpu = instance_size
 
@@ -274,6 +262,7 @@ class RolloutController:
             task_factory=self._create_submit_callback,
             staleness_manager=self._staleness_manager,
             enable_tracing=self.config.enable_rollout_tracing,
+            deterministic_order=getattr(self.config, "deterministic_sampling", False),
         )
         # Initialize the dispatcher's async task runner
         self._dispatcher.initialize(logger=logger)
@@ -1021,7 +1010,7 @@ class RolloutController:
 
                 traj = result
                 if traj is not None:
-                    traj = self._propagate_mopd_route(pending_task.data, traj)
+                    traj = self._propagate_mopd_route(pending_task.mopd_route, traj)
                     manager.on_rollout_accepted()
                     if self.config.enable_rollout_tracing:
                         logger.info(
@@ -1067,8 +1056,9 @@ class RolloutController:
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
     ) -> int:
-        if not is_eval:
-            data = self._prepare_mopd_data(data)
+        data, mopd_route = self._extract_mopd_route(
+            data, required=self._mopd_routing_enabled and not is_eval
+        )
         workflow_str = self._resolve_workflow_str(workflow)
         should_accept_fn = self._resolve_should_accept_fn(should_accept_fn)
         if workflow_kwargs is None:
@@ -1085,6 +1075,7 @@ class RolloutController:
             workflow_kwargs=workflow_kwargs,
             should_accept_fn=should_accept_fn,
             task_id=task_id,
+            mopd_route=mopd_route,
             is_eval=is_eval,
             group_size=group_size,
             proxy_addr=proxy_addr,
@@ -1164,12 +1155,16 @@ class RolloutController:
         def task_input_generator():
             for data in cycle_dataloader(dataloader):
                 for item in data:
+                    workflow_data, mopd_route = self._extract_mopd_route(
+                        item, required=self._mopd_routing_enabled
+                    )
                     yield _RemoteRolloutTaskInput(
-                        data=self._prepare_mopd_data(item),
+                        data=workflow_data,
                         workflow=workflow_str,
                         workflow_kwargs=workflow_kwargs,
                         should_accept_fn=should_accept_fn,
                         task_id=self._task_id_generator.next(),
+                        mopd_route=mopd_route,
                         group_size=group_size,
                         reward_normalization=reward_normalization,
                         drop_incomplete_group=drop_incomplete_group,
@@ -1304,10 +1299,14 @@ class RolloutController:
 
     def pause(self):
         self.dispatcher.pause()
+        if self._proxy_started:
+            self._proxy_collective_rpc("pause", http_timeout=60.0)
         self._collective_rpc("pause", http_timeout=60.0)
 
     def resume(self):
         self._collective_rpc("resume", http_timeout=60.0)
+        if self._proxy_started:
+            self._proxy_collective_rpc("resume", http_timeout=60.0)
         self.dispatcher.resume()
 
     def offload(self, tags: list[str] | None = None):

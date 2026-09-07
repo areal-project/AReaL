@@ -19,24 +19,23 @@ Key components:
 from __future__ import annotations
 
 import argparse
-import errno
+import fcntl
 import getpass
 import os
 import signal
-import socket
 import subprocess
+import tempfile
 import traceback
-import uuid
 from collections.abc import Callable
 from pathlib import Path
-from threading import Condition, Lock
+from threading import Lock
 from typing import Any
 
-from flask import Flask, current_app, g, jsonify, request
+from flask import Flask, current_app, jsonify, request
 
 from areal.infra.utils.proc import kill_process_tree, run_with_streaming_logs
 from areal.utils import logging
-from areal.utils.network import find_free_ports, format_hostport, is_port_free
+from areal.utils.network import find_free_ports, format_hostport
 
 logger = logging.getLogger("Guard")
 
@@ -72,25 +71,17 @@ class GuardState:
         # Worker identity
         self.role: str | None = None
         self.worker_index: int = -1
-        self.generation: str = uuid.uuid4().hex
 
         # Port tracking (thread-safe)
         self.allocated_ports: set[int] = set()
-        self.port_reservations: dict[int, socket.socket] = {}
-        self.fixed_worker_ports: dict[tuple[str, int], tuple[int, ...]] = {}
+        self.owned_ports: dict[tuple[str, int], set[int]] = {}
+        self.port_lock_files: dict[int, Any] = {}
         self.allocated_ports_lock = Lock()
 
         # Forked child processes (thread-safe)
         self.forked_children: list[subprocess.Popen] = []
         self.forked_children_map: dict[tuple[str, int], subprocess.Popen] = {}
-        self.forked_children_ports: dict[tuple[str, int], set[int]] = {}
-        self.deleted_forked_children: set[tuple[str, int]] = set()
         self.forked_children_lock = Lock()
-        self.fork_lifecycle_locks: dict[tuple[str, int], Lock] = {}
-        self.fork_lifecycle_locks_lock = Lock()
-        self.fork_requests_condition = Condition()
-        self.accepting_fork_requests = True
-        self.active_fork_requests = 0
 
         # Hook system — blueprints register hooks to extend core endpoints
         self._health_hooks: list[HealthHook] = []
@@ -133,212 +124,105 @@ def get_state() -> GuardState:
     return current_app.config["guard_state"]
 
 
-def _fork_lifecycle_lock(state: GuardState, key: tuple[str, int]) -> Lock:
-    """Return the stable per-worker lock that linearizes lifecycle requests."""
-    with state.fork_lifecycle_locks_lock:
-        return state.fork_lifecycle_locks.setdefault(key, Lock())
-
-
-_FORK_LIFECYCLE_PATHS = {
-    "/alloc_ports",
-    "/reserve_worker_ports",
-    "/fork",
-    "/forked_worker_status",
-    "/kill_forked_worker",
-}
-
-
-def begin_fork_request_drain(state: GuardState) -> None:
-    """Reject new fork lifecycle requests before final Guard cleanup."""
-    with state.fork_requests_condition:
-        state.accepting_fork_requests = False
-
-
-def wait_for_fork_request_drain(state: GuardState) -> None:
-    """Wait until every admitted fork lifecycle request has completed."""
-    with state.fork_requests_condition:
-        while state.active_fork_requests:
-            state.fork_requests_condition.wait()
-
-
-def _shutdown_guard(state: GuardState, server: Any) -> None:
-    """Drain lifecycle requests before final process and port cleanup."""
-    begin_fork_request_drain(state)
-    server.shutdown()
-    server.server_close()
-    wait_for_fork_request_drain(state)
-
-    for hook in state._cleanup_hooks:
-        try:
-            hook()
-        except Exception as e:
-            logger.error(f"Error in cleanup hook: {e}")
-    preserved_ports = cleanup_forked_children(state)
-    cleanup_port_reservations(state, preserve_ports=preserved_ports)
-
-
-_PORT_RESERVATION_PREFIX = "\0areal-port-reservation-v1-"
-
-
-def _reserve_free_ports(state: GuardState, count: int) -> list[int]:
-    """Atomically reserve node-wide ports for this Guard process.
-
-    ``find_free_ports`` alone has a check-to-bind race when several Guard
-    processes on one node allocate concurrently.  An abstract UNIX socket is
-    used as a node-local, crash-safe lease for each candidate TCP port.  The
-    socket remains open until the corresponding worker is removed.
-
-    The caller must hold ``state.allocated_ports_lock``.
-    """
-    reservations: dict[int, socket.socket] = {}
-    excluded_ports = set(state.allocated_ports)
-    max_rounds = max(10, count * 10)
-
-    try:
-        for _ in range(max_rounds):
-            remaining = count - len(reservations)
-            if remaining == 0:
-                break
-
-            candidates = find_free_ports(
-                remaining,
-                exclude_ports=excluded_ports,
-            )
-            for port in candidates:
-                excluded_ports.add(port)
-                reservation = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-                try:
-                    reservation.bind(f"{_PORT_RESERVATION_PREFIX}{port}")
-                except OSError as exc:
-                    reservation.close()
-                    if exc.errno == errno.EADDRINUSE:
-                        continue
-                    raise
-
-                # A non-AReaL process may have bound the TCP/UDP port between
-                # candidate discovery and acquiring our cooperative lease.
-                if not is_port_free(port):
-                    reservation.close()
-                    continue
-                reservations[port] = reservation
-
-        if len(reservations) != count:
-            raise ValueError(
-                f"Could only reserve {len(reservations)} node-wide ports "
-                f"out of {count} requested after {max_rounds} rounds"
-            )
-
-        state.allocated_ports.update(reservations)
-        state.port_reservations.update(reservations)
-        return sorted(reservations)
-    except Exception:
-        for reservation in reservations.values():
-            reservation.close()
-        raise
-
-
-def _release_reserved_ports_unlocked(
-    state: GuardState,
-    ports: set[int] | list[int],
-) -> None:
-    """Release port bookkeeping and node-wide leases with the lock held."""
-    for port in ports:
-        reservation = state.port_reservations.pop(port, None)
-        if reservation is not None:
-            reservation.close()
-    state.allocated_ports.difference_update(ports)
-
-
-def cleanup_port_reservations(
-    state: GuardState,
-    preserve_ports: set[int] | None = None,
-) -> None:
-    """Release node-wide leases except ports owned by children still alive."""
-    with state.allocated_ports_lock:
-        ports_to_preserve = set(preserve_ports or ())
-        # Fixed worker ports are allocated as one group. Preserve the whole
-        # group if any member still belongs to a child that failed to exit.
-        for fixed_ports in state.fixed_worker_ports.values():
-            if ports_to_preserve.intersection(fixed_ports):
-                ports_to_preserve.update(fixed_ports)
-        _release_reserved_ports_unlocked(
-            state,
-            set(state.port_reservations) - ports_to_preserve,
-        )
-        for key, fixed_ports in list(state.fixed_worker_ports.items()):
-            if not ports_to_preserve.intersection(fixed_ports):
-                state.fixed_worker_ports.pop(key, None)
-
-
 # ---------------------------------------------------------------------------
 # Helper utilities
 # ---------------------------------------------------------------------------
 
 
-def cleanup_forked_children(state: GuardState) -> set[int]:
+def cleanup_forked_children(state: GuardState) -> None:
     """Clean up all forked child processes.
 
-    Each child's node-wide port lease remains held until that child is
-    confirmed stopped. Failed terminations retain both tracking and leases so
-    callers can retry without exposing the ports to another Guard.
-
-    Returns
-    -------
-    set[int]
-        Ports that must remain reserved because their child did not exit.
+    Copies the child list under the lock, then releases before blocking
+    kills (avoids holding the lock for up to 4s × N children).
     """
     with state.forked_children_lock:
         children_to_kill = list(state.forked_children)
-        for child in state.forked_children_map.values():
-            if not any(existing is child for existing in children_to_kill):
-                children_to_kill.append(child)
-
-    if not children_to_kill:
-        return set()
+        state.forked_children.clear()
+        state.forked_children_map.clear()
 
     logger.info(f"Cleaning up {len(children_to_kill)} forked child processes")
     for child in children_to_kill:
         try:
             if child.poll() is None:  # Still running
                 kill_process_tree(child.pid, timeout=3, graceful=True)
-            if child.poll() is None:
-                raise RuntimeError("process tree is still alive after termination")
+                logger.info(f"Killed forked child process {child.pid}")
         except Exception as e:
             logger.error(f"Error killing forked child {child.pid}: {e}")
-            continue
-
-        with state.forked_children_lock:
-            owned_keys = [
-                key
-                for key, current in state.forked_children_map.items()
-                if current is child
-            ]
-            child_ports: set[int] = set()
-            for key in owned_keys:
-                state.forked_children_map.pop(key, None)
-                child_ports.update(state.forked_children_ports.pop(key, set()))
-                state.deleted_forked_children.add(key)
-            state.forked_children = [
-                current for current in state.forked_children if current is not child
-            ]
-
-        with state.allocated_ports_lock:
-            for key in owned_keys:
-                child_ports.update(state.fixed_worker_ports.pop(key, ()))
-            _release_reserved_ports_unlocked(state, child_ports)
-        logger.info(f"Killed forked child process {child.pid}")
-
-    with state.forked_children_lock:
-        remaining_keys = set(state.forked_children_map) | set(
-            state.forked_children_ports
-        )
-        preserved_ports: set[int] = set()
-        for ports in state.forked_children_ports.values():
-            preserved_ports.update(ports)
     with state.allocated_ports_lock:
-        for key in remaining_keys:
-            preserved_ports.update(state.fixed_worker_ports.get(key, ()))
-    return preserved_ports
+        lock_files = list(state.port_lock_files.values())
+        state.port_lock_files.clear()
+        state.allocated_ports.clear()
+        state.owned_ports.clear()
+    for lock_file in lock_files:
+        lock_file.close()
+
+
+def _release_owned_ports(state: GuardState, key: tuple[str, int]) -> list[int]:
+    """Release one fork owner's reserved ports. Caller need not hold a lock."""
+    with state.allocated_ports_lock:
+        ports = state.owned_ports.pop(key, set())
+        state.allocated_ports.difference_update(ports)
+        lock_files = [state.port_lock_files.pop(port, None) for port in ports]
+    for lock_file in lock_files:
+        if lock_file is not None:
+            lock_file.close()
+    return sorted(ports)
+
+
+def _normalize_owner_key(
+    role: Any,
+    worker_index: Any,
+    *,
+    optional: bool = False,
+) -> tuple[str, int] | None:
+    """Build the canonical owner key used by all Guard lifecycle routes."""
+    if role is None and worker_index is None and optional:
+        return None
+    if role is None or worker_index is None:
+        raise ValueError("'role' and 'worker_index' must be set together")
+    if isinstance(worker_index, bool) or not isinstance(worker_index, (int, str)):
+        raise ValueError("'worker_index' must be an integer")
+    try:
+        normalized_index = int(worker_index)
+    except ValueError as e:
+        raise ValueError("'worker_index' must be an integer") from e
+    return str(role), normalized_index
+
+
+def _reserve_node_ports(
+    state: GuardState, count: int, exclude_ports: set[int] | None = None
+) -> list[int]:
+    """Reserve free ports across all same-user Guards on this node."""
+    lock_dir = Path(tempfile.gettempdir()) / f"areal-port-locks-{os.getuid()}"
+    lock_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    ports: list[int] = []
+    skipped: set[int] = set(exclude_ports or ())
+    try:
+        while len(ports) < count:
+            candidates = find_free_ports(
+                count - len(ports),
+                exclude_ports=state.allocated_ports | skipped | set(ports),
+            )
+            for port in candidates:
+                lock_file = (lock_dir / str(port)).open("a+")
+                try:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    lock_file.close()
+                    skipped.add(port)
+                    continue
+                except BaseException:
+                    lock_file.close()
+                    raise
+                ports.append(port)
+                state.port_lock_files[port] = lock_file
+        return ports
+    except BaseException:
+        lock_files = [state.port_lock_files.pop(port, None) for port in ports]
+        for lock_file in lock_files:
+            if lock_file is not None:
+                lock_file.close()
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -354,7 +238,6 @@ def create_app(state: GuardState) -> Flask:
     - ``GET  /health`` — health check (extensible via health hooks)
     - ``POST /alloc_ports`` — allocate free ports
     - ``POST /fork`` — fork a child worker from a raw command
-    - ``POST /forked_worker_status`` — reconcile a fork transaction key
     - ``POST /kill_forked_worker`` — kill a specific forked child
     - ``POST /configure`` — configure worker (extensible via configure hooks)
 
@@ -371,38 +254,12 @@ def create_app(state: GuardState) -> Flask:
     app = Flask(__name__)
     app.config["guard_state"] = state
 
-    @app.before_request
-    def _admit_fork_lifecycle_request():
-        if request.path not in _FORK_LIFECYCLE_PATHS:
-            return None
-        with state.fork_requests_condition:
-            if not state.accepting_fork_requests:
-                return jsonify({"error": "Guard is shutting down"}), 503
-            state.active_fork_requests += 1
-            g.fork_lifecycle_admitted = True
-        return None
-
-    @app.teardown_request
-    def _release_fork_lifecycle_request(_error):
-        if not getattr(g, "fork_lifecycle_admitted", False):
-            return
-        g.fork_lifecycle_admitted = False
-        with state.fork_requests_condition:
-            assert state.active_fork_requests > 0
-            state.active_fork_requests -= 1
-            if state.active_fork_requests == 0:
-                state.fork_requests_condition.notify_all()
-
     @app.route("/health", methods=["GET"])
     def health_check():
         """Health check endpoint."""
         s = get_state()
         result: dict[str, Any] = {
             "status": "healthy",
-            "role": s.role,
-            "worker_index": s.worker_index,
-            "pid": os.getpid(),
-            "generation": s.generation,
             "forked_children": len(s.forked_children),
         }
         # Collect additional fields from health hooks
@@ -416,7 +273,7 @@ def create_app(state: GuardState) -> Flask:
 
         Expected JSON payload::
 
-            {"count": 5}
+            {"count": 5, "role": "actor", "worker_index": 0}
         """
         try:
             data = request.get_json(silent=True)
@@ -433,9 +290,34 @@ def create_app(state: GuardState) -> Flask:
                     400,
                 )
 
+            role = data.get("role")
+            worker_index = data.get("worker_index")
+            exclude_ports_raw = data.get("exclude_ports", [])
+            if not isinstance(exclude_ports_raw, list) or not all(
+                isinstance(port, int) for port in exclude_ports_raw
+            ):
+                return jsonify({"error": "'exclude_ports' must be a list of ints"}), 400
+            try:
+                owner = _normalize_owner_key(role, worker_index, optional=True)
+            except ValueError as e:
+                return jsonify({"error": str(e)}), 400
+
             s = get_state()
-            with s.allocated_ports_lock:
-                ports = _reserve_free_ports(s, count)
+            if owner is None:
+                with s.allocated_ports_lock:
+                    ports = _reserve_node_ports(s, count, set(exclude_ports_raw))
+                    s.allocated_ports.update(ports)
+            else:
+                # Cross-map transitions always acquire child state before port state.
+                with s.forked_children_lock, s.allocated_ports_lock:
+                    if owner in s.owned_ports or owner in s.forked_children_map:
+                        return (
+                            jsonify({"error": f"Port owner {owner} already exists"}),
+                            409,
+                        )
+                    ports = _reserve_node_ports(s, count, set(exclude_ports_raw))
+                    s.allocated_ports.update(ports)
+                    s.owned_ports[owner] = set(ports)
 
             return jsonify({"status": "success", "ports": ports, "host": s.server_host})
 
@@ -443,56 +325,22 @@ def create_app(state: GuardState) -> Flask:
             logger.error(f"Error in alloc_ports: {e}\n{traceback.format_exc()}")
             return jsonify({"error": f"Internal server error: {str(e)}"}), 500
 
-    @app.route("/reserve_worker_ports", methods=["POST"])
-    def reserve_worker_ports():
-        """Reserve one fixed port group for a repeatedly forked worker."""
+    @app.route("/release_ports", methods=["POST"])
+    def release_ports():
+        """Release a failed fork's owner-bound port reservation."""
+        data = request.get_json(silent=True) or {}
+        role = data.get("role")
+        worker_index = data.get("worker_index")
         try:
-            data = request.get_json(silent=True)
-            if data is None:
-                return jsonify({"error": "Invalid JSON in request body"}), 400
-
-            role = data.get("role")
-            worker_index = data.get("worker_index")
-            count = data.get("count")
-            if not isinstance(role, str) or not role:
-                return jsonify({"error": "'role' must be a non-empty string"}), 400
-            if not isinstance(worker_index, int) or worker_index < 0:
-                return jsonify(
-                    {"error": "'worker_index' must be a non-negative integer"}
-                ), 400
-            if not isinstance(count, int) or count <= 0:
-                return jsonify({"error": "'count' must be a positive integer"}), 400
-
-            s = get_state()
-            key = (role, worker_index)
-            with _fork_lifecycle_lock(s, key):
-                with s.allocated_ports_lock:
-                    ports = s.fixed_worker_ports.get(key)
-                    if ports is None:
-                        ports = tuple(_reserve_free_ports(s, count))
-                        s.fixed_worker_ports[key] = ports
-                    elif len(ports) != count:
-                        return jsonify(
-                            {
-                                "error": (
-                                    f"Fixed worker {role}/{worker_index} already has "
-                                    f"{len(ports)} ports, requested {count}"
-                                )
-                            }
-                        ), 409
-
-            return jsonify(
-                {
-                    "status": "success",
-                    "ports": list(ports),
-                    "host": s.server_host,
-                }
-            )
-        except Exception as e:
-            logger.error(
-                f"Error in reserve_worker_ports: {e}\n{traceback.format_exc()}"
-            )
-            return jsonify({"error": f"Internal server error: {str(e)}"}), 500
+            key = _normalize_owner_key(role, worker_index)
+        except ValueError as e:
+            return jsonify({"error": str(e)}), 400
+        assert key is not None
+        with state.forked_children_lock:
+            if key in state.forked_children_map:
+                return jsonify({"error": f"Forked worker {key} is still running"}), 409
+            ports = _release_owned_ports(state, key)
+        return jsonify({"status": "success", "ports": ports})
 
     @app.route("/fork", methods=["POST"])
     def fork_worker():
@@ -517,8 +365,6 @@ def create_app(state: GuardState) -> Flask:
         """
         s = get_state()
 
-        allocated_ports: list[int] = []
-        key: tuple[str, int] | None = None
         try:
             data = request.get_json(silent=True)
             if data is None:
@@ -527,7 +373,6 @@ def create_app(state: GuardState) -> Flask:
             role = data.get("role")
             worker_index = data.get("worker_index")
             raw_cmd = data.get("raw_cmd")
-            allocated_ports = data.get("allocated_ports", [])
 
             if role is None:
                 return (
@@ -544,95 +389,54 @@ def create_app(state: GuardState) -> Flask:
                     jsonify({"error": "Missing 'raw_cmd' field in request"}),
                     400,
                 )
-            if not isinstance(allocated_ports, list) or any(
-                not isinstance(port, int) for port in allocated_ports
-            ):
-                return jsonify(
-                    {"error": "'allocated_ports' must be a list of integers"}
-                ), 400
 
-            key = (role, worker_index)
+            try:
+                key = _normalize_owner_key(role, worker_index)
+            except ValueError as e:
+                return jsonify({"error": str(e)}), 400
+            assert key is not None
 
-            cmd = list(raw_cmd)
-
-            # Optional per-process environment overrides
-            env_overrides: dict[str, str] = data.get("env", {})
-
-            logger.info(
-                f"Forking new worker process for role '{role}' index {worker_index}"
-            )
-
-            # Build log paths
-            log_dir = (
-                Path(s.fileroot or "/tmp")
-                / "logs"
-                / getpass.getuser()
-                / (s.experiment_name or "default")
-                / (s.trial_name or "default")
-            )
-            log_dir.mkdir(parents=True, exist_ok=True)
-            log_file = log_dir / f"{role}.log"
-            merged_log = log_dir / "merged.log"
-
-            logger.info(f"Forked worker logs will be written to: {log_file}")
-
-            child_env = os.environ.copy()
-            child_env.update(env_overrides)
-
-            # Serialize the full lifecycle for this key without blocking other
-            # workers while process termination or spawning takes place.
-            with _fork_lifecycle_lock(s, key):
+            # Hold the lifecycle lock from reservation validation through process
+            # registration so duplicate forks and releases cannot interleave.
+            with s.forked_children_lock:
+                if key in s.forked_children_map:
+                    return jsonify(
+                        {"error": f"Forked worker {key} already exists"}
+                    ), 409
                 with s.allocated_ports_lock:
-                    fixed_ports = s.fixed_worker_ports.get(key)
-                    if fixed_ports is not None and set(fixed_ports) != set(
-                        allocated_ports
-                    ):
-                        return jsonify(
-                            {
-                                "error": (
-                                    f"Forked worker {role}/{worker_index} does not "
-                                    "match its fixed port reservation"
-                                )
-                            }
-                        ), 409
-                    if not set(allocated_ports).issubset(s.allocated_ports):
-                        return jsonify(
-                            {
-                                "error": (
-                                    f"Forked worker {role}/{worker_index} has stale "
-                                    "or unreserved ports"
-                                )
-                            }
-                        ), 409
-
-                with s.forked_children_lock:
-                    existing = s.forked_children_map.get(key)
-                    if existing is not None and existing.poll() is None:
-                        existing_ports = s.forked_children_ports.get(key, set())
-                        if existing_ports != set(allocated_ports):
-                            return jsonify(
-                                {
-                                    "error": (
-                                        f"Forked worker {role}/{worker_index} already "
-                                        "exists with different ports"
-                                    )
-                                }
-                            ), 409
-                        return jsonify(
-                            {
-                                "status": "success",
-                                "host": s.server_host,
-                                "pid": existing.pid,
-                                "reused": True,
-                            }
+                    if key not in s.owned_ports:
+                        return (
+                            jsonify({"error": f"No port reservation for {key}"}),
+                            409,
                         )
-                    if existing is not None:
-                        s.forked_children_map.pop(key, None)
-                        s.forked_children_ports.pop(key, None)
-                        try:
-                            s.forked_children.remove(existing)
-                        except ValueError:
-                            pass
+
+                try:
+                    cmd = list(raw_cmd)
+
+                    # Optional per-process environment overrides
+                    env_overrides: dict[str, str] = data.get("env", {})
+
+                    logger.info(
+                        f"Forking new worker process for role '{role}' "
+                        f"index {worker_index}"
+                    )
+
+                    # Build log paths
+                    log_dir = (
+                        Path(s.fileroot or "/tmp")
+                        / "logs"
+                        / getpass.getuser()
+                        / (s.experiment_name or "default")
+                        / (s.trial_name or "default")
+                    )
+                    log_dir.mkdir(parents=True, exist_ok=True)
+                    log_file = log_dir / f"{role}.log"
+                    merged_log = log_dir / "merged.log"
+
+                    logger.info(f"Forked worker logs will be written to: {log_file}")
+
+                    child_env = os.environ.copy()
+                    child_env.update(env_overrides)
 
                     child_process = run_with_streaming_logs(
                         cmd,
@@ -641,10 +445,14 @@ def create_app(state: GuardState) -> Flask:
                         role,
                         env=child_env,
                     )
+
                     s.forked_children.append(child_process)
                     s.forked_children_map[key] = child_process
-                    s.forked_children_ports[key] = set(allocated_ports)
-                    s.deleted_forked_children.discard(key)
+                except Exception:
+                    # Release the reservation before another request for the same
+                    # owner can pass lifecycle validation.
+                    _release_owned_ports(s, key)
+                    raise
 
             logger.info(
                 f"Forked worker for role '{role}' index "
@@ -660,58 +468,7 @@ def create_app(state: GuardState) -> Flask:
             )
 
         except Exception as e:
-            if allocated_ports:
-                assert key is not None
-                with _fork_lifecycle_lock(s, key):
-                    with s.forked_children_lock:
-                        child_ports = s.forked_children_ports.get(key, set())
-                    with s.allocated_ports_lock:
-                        fixed_ports = set(s.fixed_worker_ports.get(key, ()))
-                        transient_ports = (
-                            set(allocated_ports) - fixed_ports - child_ports
-                        )
-                        _release_reserved_ports_unlocked(s, transient_ports)
             logger.error(f"Error in fork: {e}\n{traceback.format_exc()}")
-            return jsonify({"error": f"Internal server error: {str(e)}"}), 500
-
-    @app.route("/forked_worker_status", methods=["POST"])
-    def forked_worker_status():
-        """Return the owner Guard's authoritative state for one fork key."""
-        try:
-            data = request.get_json(silent=True)
-            if data is None:
-                return jsonify({"error": "Invalid JSON in request body"}), 400
-            role = data.get("role")
-            worker_index = data.get("worker_index")
-            if not isinstance(role, str) or not role:
-                return jsonify({"error": "'role' must be a non-empty string"}), 400
-            if not isinstance(worker_index, int) or worker_index < 0:
-                return jsonify(
-                    {"error": "'worker_index' must be a non-negative integer"}
-                ), 400
-
-            s = get_state()
-            key = (role, worker_index)
-            with _fork_lifecycle_lock(s, key):
-                with s.forked_children_lock:
-                    process = s.forked_children_map.get(key)
-                    exists = process is not None
-                    alive = exists and process.poll() is None
-                    pid = process.pid if process is not None else None
-                    ports = sorted(s.forked_children_ports.get(key, set()))
-            return jsonify(
-                {
-                    "status": "success",
-                    "exists": exists,
-                    "alive": alive,
-                    "pid": pid,
-                    "ports": ports,
-                }
-            )
-        except Exception as e:
-            logger.error(
-                f"Error in forked_worker_status: {e}\n{traceback.format_exc()}"
-            )
             return jsonify({"error": f"Internal server error: {str(e)}"}), 500
 
     @app.route("/kill_forked_worker", methods=["POST"])
@@ -731,7 +488,6 @@ def create_app(state: GuardState) -> Flask:
 
             role = data.get("role")
             worker_index = data.get("worker_index")
-            release_ports = data.get("release_ports", False)
 
             if role is None:
                 return (
@@ -743,99 +499,74 @@ def create_app(state: GuardState) -> Flask:
                     jsonify({"error": "Missing 'worker_index' field in request"}),
                     400,
                 )
-            if not isinstance(release_ports, bool):
-                return jsonify({"error": "'release_ports' must be a boolean"}), 400
 
-            key = (role, worker_index)
+            try:
+                key = _normalize_owner_key(role, worker_index)
+            except ValueError as e:
+                return jsonify({"error": str(e)}), 400
+            assert key is not None
 
-            # Keep this key linearizable across the blocking process kill. The
-            # per-key lock allows unrelated workers to continue concurrently.
-            with _fork_lifecycle_lock(s, key):
-                # Read tracking state without removing it. Failed kills must
-                # remain retryable and keep their ports reserved.
-                with s.forked_children_lock:
-                    child_process = s.forked_children_map.get(key)
-                    already_deleted = key in s.deleted_forked_children
+            # Keep tracking until the process is confirmed dead. If the kill
+            # fails, a retry must still be able to find the child and its ports.
+            with s.forked_children_lock:
+                child_process = s.forked_children_map.get(key)
 
-                if child_process is None:
-                    if release_ports:
-                        with s.allocated_ports_lock:
-                            fixed_ports = set(s.fixed_worker_ports.pop(key, ()))
-                            _release_reserved_ports_unlocked(s, fixed_ports)
-                    message = (
-                        f"Forked worker {role}/{worker_index} already removed"
-                        if already_deleted
-                        else f"Forked worker {role}/{worker_index} was not running"
+            if child_process is None:
+                return (
+                    jsonify(
+                        {"error": (f"Forked worker {role}/{worker_index} not found")}
+                    ),
+                    404,
+                )
+
+            pid = child_process.pid
+
+            # Kill process tree (outside lock to avoid blocking)
+            try:
+                if child_process.poll() is None:  # Still running
+                    kill_process_tree(pid, timeout=3, graceful=True)
+                    logger.info(
+                        f"Killed forked worker {role}/{worker_index} (pid={pid})"
                     )
-                    return jsonify({"status": "success", "message": message})
+            except Exception as e:
+                logger.error(
+                    f"Error killing forked worker "
+                    f"{role}/{worker_index} (pid={pid}): {e}"
+                )
+                return (
+                    jsonify(
+                        {
+                            "error": f"Failed to kill forked worker: {str(e)}",
+                            "pid": pid,
+                        }
+                    ),
+                    500,
+                )
 
-                pid = child_process.pid
-
-                try:
-                    if child_process.poll() is None:  # Still running
-                        kill_process_tree(pid, timeout=3, graceful=True)
-                        if child_process.poll() is None:
-                            raise RuntimeError(
-                                "process tree is still alive after termination"
-                            )
-                        logger.info(
-                            f"Killed forked worker {role}/{worker_index} (pid={pid})"
-                        )
-                except Exception as e:
-                    logger.error(
-                        f"Error killing forked worker "
-                        f"{role}/{worker_index} (pid={pid}): {e}"
-                    )
-                    return (
-                        jsonify(
-                            {
-                                "error": f"Failed to kill forked worker: {str(e)}",
-                                "pid": pid,
-                            }
-                        ),
-                        500,
-                    )
-
-                with s.forked_children_lock:
-                    current_process = s.forked_children_map.get(key)
-                    if current_process is not child_process:
-                        return (
-                            jsonify(
-                                {
-                                    "error": (
-                                        f"Forked worker {role}/{worker_index} changed "
-                                        "during termination"
-                                    )
-                                }
-                            ),
-                            409,
-                        )
+            with s.forked_children_lock:
+                # A concurrent kill may already have cleaned up this process and
+                # allowed a new owner generation to reuse the same key.
+                if s.forked_children_map.get(key) is child_process:
                     s.forked_children_map.pop(key, None)
-                    child_ports = s.forked_children_ports.pop(key, set())
-                    s.deleted_forked_children.add(key)
                     try:
                         s.forked_children.remove(child_process)
                     except ValueError:
                         logger.warning(
                             f"Process for {role}/{worker_index} was in map but not in list"
                         )
-                with s.allocated_ports_lock:
-                    fixed_ports = set(s.fixed_worker_ports.get(key, ()))
-                    if release_ports:
-                        fixed_ports.update(s.fixed_worker_ports.pop(key, ()))
-                    ports_to_release = child_ports - fixed_ports
-                    if release_ports:
-                        ports_to_release.update(fixed_ports)
-                    _release_reserved_ports_unlocked(s, ports_to_release)
+                    released_ports = _release_owned_ports(s, key)
+                else:
+                    released_ports = []
 
-                return jsonify(
-                    {
-                        "status": "success",
-                        "message": (
-                            f"Killed forked worker {role}/{worker_index} (pid={pid})"
-                        ),
-                    }
-                )
+            return jsonify(
+                {
+                    "status": "success",
+                    "message": (
+                        f"Killed forked worker {role}/{worker_index} (pid={pid})"
+                    ),
+                    "released_ports": released_ports,
+                }
+            )
 
         except Exception as e:
             logger.error(f"Error in kill_forked_worker: {e}\n{traceback.format_exc()}")
@@ -988,13 +719,9 @@ def configure_state_from_args(state: GuardState, args: argparse.Namespace) -> st
     state.nfs_record_root = getattr(args, "nfs_record_root", "/tmp/areal/name_resolve")
     state.etcd3_addr = getattr(args, "etcd3_addr", "localhost:2379")
 
-    # An explicit scheduler argument is authoritative.  Login shells on a
-    # Slurm-allocated node can retain ``SLURM_PROCID`` even when AReaL uses the
-    # local scheduler; unconditionally preferring that variable collapses all
-    # local workers to index 0 and makes fork readiness identity checks fail.
-    # Fall back to the Slurm task id only for launchers that omit the argument.
+    # Worker index (SLURM override)
     worker_index = args.worker_index
-    if worker_index == -1 and "SLURM_PROCID" in os.environ:
+    if "SLURM_PROCID" in os.environ:
         worker_index = int(os.environ["SLURM_PROCID"])
     if worker_index == -1:
         raise ValueError("Invalid worker index. Not found from SLURM environ or args.")
@@ -1069,4 +796,11 @@ def run_server(
     except SystemExit:
         logger.info("Shutting down (SIGTERM)")
     finally:
-        _shutdown_guard(state, server)
+        # Run registered cleanup hooks (engine cleanup, perf_tracer, etc.)
+        for hook in state._cleanup_hooks:
+            try:
+                hook()
+            except Exception as e:
+                logger.error(f"Error in cleanup hook: {e}")
+        cleanup_forked_children(state)
+        server.shutdown()

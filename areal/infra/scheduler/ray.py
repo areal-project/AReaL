@@ -18,7 +18,10 @@ import ray.exceptions
 import requests
 from ray.actor import ActorHandle
 from ray.util.placement_group import placement_group, remove_placement_group
-from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
+from ray.util.scheduling_strategies import (
+    NodeAffinitySchedulingStrategy,
+    PlacementGroupSchedulingStrategy,
+)
 
 from areal.api import Job, Scheduler, Worker
 from areal.api.alloc_mode import ModelAllocation
@@ -35,27 +38,11 @@ from areal.infra.scheduler.exceptions import (
     EngineImportError,
     RPCConnectionError,
     SchedulerError,
-    WorkerCleanupError,
     WorkerConfigurationError,
     WorkerCreationError,
     WorkerFailedError,
     WorkerNotFoundError,
     WorkerTimeoutError,
-)
-from areal.infra.scheduler.fork_utils import (
-    ForkOwnership,
-    ForkRoleState,
-    discard_fork_reservation,
-    discard_provisional_worker,
-    ensure_fork_role_available,
-    ensure_fork_role_queryable,
-    ensure_fork_target_queryable,
-    fork_reservation_indices,
-    mark_fork_role_state,
-    reconcile_fork_response,
-    release_fork_reservation,
-    reserve_fork_ports,
-    retain_fork_reservation,
 )
 from areal.infra.utils.concurrent import run_async_task
 from areal.infra.utils.http import get_default_connector
@@ -141,14 +128,9 @@ class RayBackendWorkerProcessManager:
 
         node_rank = int(server_args.get("node_rank", 0))
         process_key = (group_key, backend, node_rank)
-        old_process = self.backend_worker_processes.get(process_key)
+        old_process = self.backend_worker_processes.pop(process_key, None)
         if old_process is not None and old_process.poll() is None:
             kill_process_tree(old_process.pid, timeout=5, graceful=True)
-            if old_process.poll() is None:
-                raise RuntimeError(
-                    f"backend worker {process_key} is still alive after termination"
-                )
-        self.backend_worker_processes.pop(process_key, None)
 
         if self.visible_devices:
             env[self.device_control_env_var] = ",".join(self.visible_devices)
@@ -168,15 +150,16 @@ class RayBackendWorkerProcessManager:
         self.backend_worker_processes[process_key] = process
         return {"host": self.host, "pid": process.pid, "key": process_key}
 
-    def iter_worker_processes(
+    def drain_worker_processes(
         self, group_key: tuple[str, str] | None = None
-    ) -> list[tuple[tuple[Any, ...], Any]]:
-        """Return tracked backend processes without relinquishing ownership."""
-        return [
-            (process_key, process)
-            for process_key, process in self.backend_worker_processes.items()
-            if group_key is None or process_key[0] == group_key
-        ]
+    ) -> list[tuple[str, Any]]:
+        processes = []
+        for process_key in list(self.backend_worker_processes):
+            if group_key is not None and process_key[0] != group_key:
+                continue
+            process = self.backend_worker_processes.pop(process_key)
+            processes.append((f"backend worker {process_key}", process))
+        return processes
 
 
 @ray.remote
@@ -237,6 +220,7 @@ class RayWorkerProcessLauncher:
         nfs_record_root: str,
         etcd3_addr: str,
         fileroot: str | None,
+        extra_env: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         worker_id = f"{role}/{worker_index}"
         if not cmd:
@@ -278,6 +262,8 @@ class RayWorkerProcessLauncher:
 
         env = os.environ.copy()
         env.update(self.env_vars)
+        if extra_env:
+            env.update(extra_env)
         env[self.device_control_env_var] = ",".join(gpu_devices)
 
         return {
@@ -369,77 +355,47 @@ class RayWorkerProcessLauncher:
             group_key, backend, server_args
         )
 
-    def _stop_processes(
-        self, processes: list[tuple[str, Any]]
-    ) -> dict[str, BaseException]:
-        async def stop_process(
-            name: str, process: Any
-        ) -> tuple[str, BaseException] | None:
+    def _stop_processes(self, processes: list[tuple[str, Any]]) -> None:
+        async def stop_process(name: str, process: Any) -> None:
             try:
                 if process.poll() is None:
                     await asyncio.to_thread(
                         kill_process_tree, process.pid, timeout=5, graceful=True
                     )
-                if process.poll() is None:
-                    raise RuntimeError("process tree is still alive after termination")
-            except BaseException as exc:  # noqa: BLE001
+            except Exception:
                 logger.warning("Failed to stop Ray-managed %s", name, exc_info=True)
-                return name, exc
-            return None
 
         if not processes:
-            return {}
+            return
 
-        async def stop_processes() -> list[tuple[str, BaseException] | None]:
-            return await asyncio.gather(
+        async def stop_processes() -> None:
+            await asyncio.gather(
                 *(stop_process(name, process) for name, process in processes)
             )
 
-        results = run_async_task(stop_processes)
-        return {name: exc for result in results if result for name, exc in [result]}
+        run_async_task(stop_processes)
 
     def stop_backend_worker_group(self, group_key: tuple[str, str]) -> None:
         if self.backend_process_manager is None:
             return
 
-        tracked = self.backend_process_manager.iter_worker_processes(group_key)
-        named = [(f"backend worker {key}", process) for key, process in tracked]
-        failures = self._stop_processes(named)
-        for key, _ in tracked:
-            if f"backend worker {key}" not in failures:
-                self.backend_process_manager.backend_worker_processes.pop(key, None)
-        if failures:
-            raise RuntimeError(
-                "; ".join(f"{name}: {exc}" for name, exc in failures.items())
-            )
+        self._stop_processes(
+            self.backend_process_manager.drain_worker_processes(group_key)
+        )
 
     def stop_all_processes(self) -> None:
-        backend_processes = (
-            self.backend_process_manager.iter_worker_processes()
-            if self.backend_process_manager is not None
-            else []
-        )
-        named_backend = [
-            (f"backend worker {key}", process) for key, process in backend_processes
-        ]
-        named_workers = [
-            (f"worker process {worker_id}", process)
-            for worker_id, process in self.worker_processes.items()
-        ]
-        failures = self._stop_processes([*named_backend, *named_workers])
-
-        if self.backend_process_manager is not None:
-            for key, _ in backend_processes:
-                if f"backend worker {key}" not in failures:
-                    self.backend_process_manager.backend_worker_processes.pop(key, None)
-        for worker_id in list(self.worker_processes):
-            if f"worker process {worker_id}" not in failures:
-                self.worker_processes.pop(worker_id, None)
-
-        if failures:
-            raise RuntimeError(
-                "; ".join(f"{name}: {exc}" for name, exc in failures.items())
+        try:
+            processes = []
+            if self.backend_process_manager is not None:
+                processes.extend(self.backend_process_manager.drain_worker_processes())
+            processes.extend(
+                (f"worker process {worker_id}", process)
+                for worker_id, process in self.worker_processes.items()
             )
+            self._stop_processes(processes)
+            self.worker_processes.clear()
+        except Exception:
+            logger.warning("Failed to stop Ray launcher processes", exc_info=True)
 
     def __ray_shutdown__(self) -> None:
         self.stop_all_processes()
@@ -454,6 +410,36 @@ class RayWorkerInfo:
     task_index: int
     launchers: list[ActorHandle] = field(default_factory=list)
     spec: SchedulingSpec | None = None
+
+
+def group_colocated_gpus(
+    node_infos: list[dict[str, Any]], gpus_per_worker: int
+) -> list[dict[str, Any]]:
+    """Chunk each target node's physical GPUs into per-worker groups.
+
+    Groups are contiguous within a node and never cross nodes, so every
+    grouped colocated worker shares exactly one node with the target
+    workers whose GPUs it reuses.
+    """
+    if gpus_per_worker <= 0:
+        raise ValueError(f"gpus_per_worker must be positive, got {gpus_per_worker}")
+    groups: list[dict[str, Any]] = []
+    for info in node_infos:
+        devices = list(info["visible_devices"])
+        if len(devices) % gpus_per_worker != 0:
+            raise ValueError(
+                f"Node {info['node_id']} has {len(devices)} visible GPUs, "
+                f"which is not a multiple of gpus_per_worker={gpus_per_worker}"
+            )
+        for start in range(0, len(devices), gpus_per_worker):
+            groups.append(
+                {
+                    "host": info["host"],
+                    "node_id": info["node_id"],
+                    "gpu_devices": devices[start : start + gpus_per_worker],
+                }
+            )
+    return groups
 
 
 class RayMultiNodeRolloutCoordinator:
@@ -681,8 +667,6 @@ class RayScheduler(Scheduler):
         # Colocation tracking: colocated roles reuse workers from target role
         # For forked roles, they also track target but have their own workers in _workers
         self._colocated_roles: dict[str, str] = {}  # colocated_role -> target_role
-        self._fork_parent_roles: dict[str, str] = {}
-        self._fork_reservations: dict[str, ForkOwnership] = {}
 
         logger.info(
             f"Initialized RayScheduler: exp={self.experiment_name}, "
@@ -727,23 +711,19 @@ class RayScheduler(Scheduler):
                     return worker_info
         return None
 
-    def _stop_launchers(self, role: str, timeout: float) -> list[str]:
-        failures: list[str] = []
+    def _stop_launchers(self, role: str, timeout: float) -> None:
         refs = []
         for launcher in self._launchers.get(role, []):
             try:
                 refs.append(launcher.stop_all_processes.remote())
             except Exception as e:
                 logger.error(f"Error submitting Ray launcher stop for role {role}: {e}")
-                failures.append(f"submit launcher stop: {e}")
 
         for ref in refs:
             try:
                 ray.get(ref, timeout=timeout)
             except Exception as e:
                 logger.error(f"Error stopping Ray launcher for role {role}: {e}")
-                failures.append(f"wait launcher stop: {e}")
-        return failures
 
     def _check_worker_process_status(self, role: str) -> None:
         """Check Ray worker process status and raise if failed."""
@@ -999,8 +979,6 @@ class RayScheduler(Scheduler):
         session: aiohttp.ClientSession,
         host: str,
         port: int,
-        expected_role: str | None = None,
-        expected_worker_index: int | None = None,
         timeout: float = 60,
     ) -> bool:
         url = f"http://{format_hostport(host, port)}/health"
@@ -1011,17 +989,7 @@ class RayScheduler(Scheduler):
                     url, timeout=aiohttp.ClientTimeout(total=2)
                 ) as resp:
                     if resp.status == 200:
-                        if expected_role is None and expected_worker_index is None:
-                            return True
-                        try:
-                            health = await resp.json(content_type=None)
-                        except (aiohttp.ClientError, ValueError):
-                            health = {}
-                        if (
-                            health.get("role") == expected_role
-                            and health.get("worker_index") == expected_worker_index
-                        ):
-                            return True
+                        return True
             except (TimeoutError, aiohttp.ClientError):
                 pass
             await asyncio.sleep(0.5)
@@ -1046,39 +1014,34 @@ class RayScheduler(Scheduler):
         """
         worker_id = f"{role}/{idx}"
         guard_url = f"http://{format_hostport(target_wi.worker.ip, int(target_wi.worker.worker_ports[0]))}"
-        port_cnt = len(self._workers[target_role][0].worker.worker_ports)
+        port_cnt = len(target_wi.worker.worker_ports)
+        ports_reserved = False
 
         try:
-            if not hasattr(self, "_fork_reservations"):
-                self._fork_reservations = {}
-            # Record ownership before the idempotent request. If every response
-            # is lost, delete_workers() can still release the Guard lease.
-            retain_fork_reservation(
-                self._fork_reservations,
-                self._colocated_roles,
-                self._fork_parent_roles,
-                role,
-                target_role,
-                idx,
-            )
-            forked_host, forked_ports = await reserve_fork_ports(
-                session, guard_url, role, idx, port_cnt
-            )
-            forked_port = forked_ports[0]
-
-            worker_info = RayWorkerInfo(
-                worker=Worker(
-                    id=worker_id,
-                    ip=forked_host,
-                    worker_ports=list(map(str, forked_ports)),
-                    engine_ports=[],
-                ),
-                role=role,
-                task_index=idx,
-                launchers=target_wi.launchers,
-                spec=target_wi.spec,
-            )
-            self._retain_fork_workers(role, target_role, [worker_info])
+            # 1. Allocate a port on the target guard
+            async with session.post(
+                f"{guard_url}/alloc_ports",
+                json={
+                    "count": port_cnt,
+                    "role": role,
+                    "worker_index": idx,
+                    "exclude_ports": [
+                        int(port) for port in target_wi.worker.worker_ports
+                    ],
+                },
+            ) as alloc_resp:
+                if alloc_resp.status != 200:
+                    error_text = await alloc_resp.text()
+                    raise WorkerCreationError(
+                        role,
+                        f"Port allocation failed for worker {idx}",
+                        f"HTTP {alloc_resp.status}: {error_text}",
+                    )
+                alloc_data = await alloc_resp.json()
+                forked_host = alloc_data["host"]
+                forked_ports = alloc_data["ports"]
+                forked_port = forked_ports[0]
+                ports_reserved = True
 
             # 2. Build the full raw command
             module_path = command or "areal.infra.rpc.rpc_server"
@@ -1115,88 +1078,41 @@ class RayScheduler(Scheduler):
                 "role": role,
                 "worker_index": idx,
                 "raw_cmd": raw_cmd,
-                "allocated_ports": forked_ports,
                 "env": env or {},
             }
-            try:
-                async with session.post(
-                    f"{guard_url}/fork",
-                    json=payload,
-                ) as response:
-                    if response.status != 200:
-                        error_text = await response.text()
-                        raise WorkerCreationError(
-                            role,
-                            f"Fork failed for worker {idx}",
-                            f"HTTP {response.status}: {error_text}",
-                        )
-
-                    result = await response.json()
-
-                    if result.get("status") != "success":
-                        raise WorkerCreationError(
-                            role,
-                            f"Fork failed for worker {idx}",
-                            result.get("error", "Unknown error"),
-                        )
-
-                    forked_pid = result.get("pid")
-            except Exception as fork_error:  # noqa: BLE001
-                try:
-                    forked_pid = await reconcile_fork_response(
-                        session,
-                        guard_url,
+            async with session.post(
+                f"{guard_url}/fork",
+                json=payload,
+            ) as response:
+                if response.status != 200:
+                    error_text = await response.text()
+                    raise WorkerCreationError(
                         role,
-                        idx,
-                        forked_ports,
+                        f"Fork failed for worker {idx}",
+                        f"HTTP {response.status}: {error_text}",
                     )
-                except Exception as cleanup_error:  # noqa: BLE001
-                    raise WorkerCleanupError(
-                        role,
-                        [f"uncertain fork outcome for {worker_id}: {cleanup_error}"],
-                    ) from fork_error
-                if forked_pid is None:
-                    discard_fork_reservation(self._fork_reservations, role, idx)
-                    discard_provisional_worker(
-                        self._workers,
-                        self._fork_reservations,
-                        self._colocated_roles,
-                        self._fork_parent_roles,
-                        role,
-                        worker_id,
-                    )
-                    if isinstance(fork_error, aiohttp.ClientError):
-                        raise WorkerCreationError(
-                            role,
-                            f"Failed to fork worker {idx} from {target_role}/{idx}",
-                            str(fork_error),
-                        ) from fork_error
-                    raise
 
-            # Require the exact role/index identity, not merely HTTP 200.
-            if not await self._wait_for_fork_ready(
-                session,
-                forked_host,
-                forked_port,
-                expected_role=role,
-                expected_worker_index=idx,
-            ):
-                try:
-                    await release_fork_reservation(session, guard_url, role, idx)
-                except Exception as cleanup_error:  # noqa: BLE001
-                    raise WorkerCleanupError(
+                result = await response.json()
+
+                if result.get("status") != "success":
+                    raise WorkerCreationError(
                         role,
-                        [f"failed to clean provisional {worker_id}: {cleanup_error}"],
-                    ) from cleanup_error
-                discard_fork_reservation(self._fork_reservations, role, idx)
-                discard_provisional_worker(
-                    self._workers,
-                    self._fork_reservations,
-                    self._colocated_roles,
-                    self._fork_parent_roles,
-                    role,
-                    worker_id,
-                )
+                        f"Fork failed for worker {idx}",
+                        result.get("error", "Unknown error"),
+                    )
+
+                forked_pid = result.get("pid")
+
+            # 4. Wait for the forked worker to become ready
+            if not await self._wait_for_fork_ready(session, forked_host, forked_port):
+                try:
+                    async with session.post(
+                        f"{guard_url}/kill_forked_worker",
+                        json={"role": role, "worker_index": idx},
+                    ):
+                        pass
+                except Exception:
+                    pass
                 raise WorkerCreationError(
                     role,
                     f"Forked worker {idx} failed to become ready",
@@ -1208,10 +1124,17 @@ class RayScheduler(Scheduler):
                 f"(pid={forked_pid}) from {target_role}/{idx}"
             )
 
-        except Exception as e:
-            mark_fork_role_state(
-                self._fork_reservations, role, ForkRoleState.CLEANUP_PENDING
-            )
+        except BaseException as e:
+            if ports_reserved:
+                for endpoint in ("kill_forked_worker", "release_ports"):
+                    try:
+                        async with session.post(
+                            f"{guard_url}/{endpoint}",
+                            json={"role": role, "worker_index": idx},
+                        ):
+                            pass
+                    except Exception:
+                        pass
             if isinstance(e, aiohttp.ClientError):
                 raise WorkerCreationError(
                     role,
@@ -1220,20 +1143,20 @@ class RayScheduler(Scheduler):
                 ) from e
             raise
 
-        return worker_info
+        worker = Worker(
+            id=worker_id,
+            ip=forked_host,
+            worker_ports=list(map(str, forked_ports)),
+            engine_ports=[],
+        )
 
-    def _retain_fork_workers(
-        self,
-        role: str,
-        target_role: str,
-        workers: list[RayWorkerInfo],
-    ) -> None:
-        """Retain provisional fork ownership when rollback cannot complete."""
-        retained = {worker.worker.id: worker for worker in self._workers.get(role, [])}
-        retained.update({worker.worker.id: worker for worker in workers})
-        self._workers[role] = list(retained.values())
-        self._colocated_roles[role] = target_role
-        self._fork_parent_roles[role] = target_role
+        return RayWorkerInfo(
+            worker=worker,
+            role=role,
+            task_index=idx,
+            launchers=target_wi.launchers,
+            spec=target_wi.spec,  # Inherit from target
+        )
 
     async def _kill_forked_worker(
         self,
@@ -1245,20 +1168,25 @@ class RayScheduler(Scheduler):
         """Kill a single forked worker via its parent's RPC server."""
         target_url = f"http://{format_hostport(target_wi.worker.ip, int(target_wi.worker.worker_ports[0]))}/kill_forked_worker"
 
-        payload = {"role": role, "worker_index": idx, "release_ports": True}
-        async with session.post(target_url, json=payload) as response:
-            if response.status != 200:
-                error_text = await response.text()
-                raise RuntimeError(
-                    f"Failed to kill forked worker {role}/{idx}: "
-                    f"HTTP {response.status}: {error_text}"
-                )
-            result = await response.json()
-            if result.get("status") != "success":
-                raise RuntimeError(
-                    result.get("error", f"Failed to kill forked worker {role}/{idx}")
-                )
-            logger.info(result.get("message", f"Killed forked worker {role}/{idx}"))
+        try:
+            payload = {"role": role, "worker_index": idx}
+            async with session.post(
+                target_url,
+                json=payload,
+            ) as response:
+                if response.status != 200:
+                    error_text = await response.text()
+                    logger.warning(
+                        f"Failed to kill forked worker {role}/{idx}: "
+                        f"HTTP {response.status}: {error_text}"
+                    )
+                else:
+                    result = await response.json()
+                    logger.info(
+                        result.get("message", f"Killed forked worker {role}/{idx}")
+                    )
+        except Exception as e:
+            logger.warning(f"Exception killing forked worker {role}/{idx}: {e}")
 
     async def _cleanup_forked_workers_async(
         self,
@@ -1269,8 +1197,8 @@ class RayScheduler(Scheduler):
         """Cleanup forked workers by calling kill endpoint on parent workers."""
         target_workers = self._workers.get(target_role, [])
         if not target_workers:
-            raise WorkerCleanupError(
-                role, [f"process owner {target_role!r} is unavailable"]
+            logger.warning(
+                f"Cannot cleanup forked workers: target role '{target_role}' not found"
             )
             return
 
@@ -1280,30 +1208,15 @@ class RayScheduler(Scheduler):
             connector=get_default_connector(),
         ) as session:
             tasks = []
-            failures = []
-            worker_indices = {
-                int(worker_info.worker.id.split("/")[-1]) for worker_info in workers
-            }
-            worker_indices.update(
-                fork_reservation_indices(getattr(self, "_fork_reservations", {}), role)
-            )
-            for worker_index in sorted(worker_indices):
+            for worker_info in workers:
+                worker_index = int(worker_info.worker.id.split("/")[-1])
                 if worker_index < len(target_workers):
                     tasks.append(
                         self._kill_forked_worker(
                             session, role, worker_index, target_workers[worker_index]
                         )
                     )
-                else:
-                    failures.append(
-                        f"rank {worker_index} has no owner worker in {target_role!r}"
-                    )
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            failures.extend(
-                str(result) for result in results if isinstance(result, BaseException)
-            )
-            if failures:
-                raise WorkerCleanupError(role, failures)
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _create_forked_workers_async(
         self,
@@ -1355,37 +1268,15 @@ class RayScheduler(Scheduler):
 
         # If any fork failed, cleanup successful workers and raise
         if failed_indices:
-            mark_fork_role_state(
-                self._fork_reservations, role, ForkRoleState.CLEANUP_PENDING
-            )
             if workers:
-                self._retain_fork_workers(role, target_role, workers)
-            if role in self._workers or role in getattr(self, "_fork_reservations", {}):
                 logger.warning(
-                    "Cleaning up provisional fork workers due to partial failure"
+                    f"Cleaning up {len(workers)} successfully forked workers due to partial failure"
                 )
                 # Kill the forked processes via parent RPC servers
                 try:
-                    await self._cleanup_forked_workers_async(
-                        role, target_role, self._workers.get(role, [])
-                    )
+                    await self._cleanup_forked_workers_async(role, target_role, workers)
                 except Exception as cleanup_error:
-                    raise ExceptionGroup(
-                        f"Fork creation and rollback failed for role {role!r}",
-                        [
-                            WorkerCreationError(
-                                role,
-                                f"Failed to fork {len(failed_indices)} out of "
-                                f"{len(target_workers)} workers",
-                                f"Failed indices: {failed_indices}",
-                            ),
-                            cleanup_error,
-                        ],
-                    ) from cleanup_error
-                self._workers.pop(role, None)
-                getattr(self, "_fork_reservations", {}).pop(role, None)
-                self._colocated_roles.pop(role, None)
-                self._fork_parent_roles.pop(role, None)
+                    logger.error(f"Failed to cleanup forked workers: {cleanup_error}")
 
             raise WorkerCreationError(
                 role,
@@ -1403,10 +1294,15 @@ class RayScheduler(Scheduler):
         )
 
         # Configure forked workers if exp_config is available
-        if self.exp_config is not None:
-            await self._configure_workers(workers)
+        try:
+            if self.exp_config is not None:
+                await self._configure_workers(workers)
+        except BaseException:
+            await self._cleanup_forked_workers_async(role, target_role, workers)
+            self._workers.pop(role, None)
+            self._colocated_roles.pop(role, None)
+            raise
 
-        mark_fork_role_state(self._fork_reservations, role, ForkRoleState.ACTIVE)
         return worker_ids
 
     def fork_workers(
@@ -1436,53 +1332,25 @@ class RayScheduler(Scheduler):
         list[str]
             List of worker IDs created (e.g., ["proxy/0", "proxy/1"])
         """
-        ensure_fork_role_available(
-            self._workers,
-            self._colocated_roles,
-            getattr(self, "_fork_reservations", {}),
-            role,
-        )
-        ensure_fork_target_queryable(
-            self._workers,
-            self._colocated_roles,
-            getattr(self, "_fork_reservations", {}),
-            target_role,
-        )
-        try:
-            owner_role = self._resolve_worker_owner(target_role)
-        except (KeyError, ValueError) as exc:
-            raise WorkerNotFoundError(
-                f"Target role '{target_role}' not found for fork: {exc}"
-            ) from exc
-        target_workers = self._workers[owner_role]
+        if target_role not in self._workers:
+            raise WorkerNotFoundError(f"Target role '{target_role}' not found for fork")
+        target_workers = self._workers[target_role]
 
         try:
-            worker_ids = run_async_task(
+            return run_async_task(
                 self._create_forked_workers_async,
                 role,
-                owner_role,
+                target_role,
                 target_workers,
                 command,
                 env_vars,
             )
-            self._colocated_roles[role] = target_role
-            if not hasattr(self, "_fork_parent_roles"):
-                self._fork_parent_roles = {}
-            self._fork_parent_roles[role] = owner_role
-            return worker_ids
         except Exception:
-            mark_fork_role_state(
-                getattr(self, "_fork_reservations", {}),
-                role,
-                ForkRoleState.CLEANUP_PENDING,
-            )
-            # Preserve provisional ownership when rollback failed so callers
-            # can retry through delete_workers().
-            if role not in self._workers and role not in getattr(
-                self, "_fork_reservations", {}
-            ):
-                self._colocated_roles.pop(role, None)
-                self._fork_parent_roles.pop(role, None)
+            # Cleanup on failure
+            if role in self._workers:
+                del self._workers[role]
+            if role in self._colocated_roles:
+                del self._colocated_roles[role]
             raise
 
     def _create_placement_group(
@@ -1646,18 +1514,14 @@ class RayScheduler(Scheduler):
             If worker creation fails
         """
         role = job.role
-        ensure_fork_role_available(
-            self._workers,
-            self._colocated_roles,
-            getattr(self, "_fork_reservations", {}),
-            role,
-        )
         replicas = job.replicas
         if ":" in role:
             raise ValueError("Invalid worker name.")
         num_workers = job.replicas
 
         # Validation
+        if role in self._workers:
+            raise WorkerCreationError(role, f"Role '{role}' already exists")
         if num_workers <= 0:
             raise WorkerCreationError(
                 role, "Invalid configuration", "replicas must be greater than 0"
@@ -1683,26 +1547,28 @@ class RayScheduler(Scheduler):
                     "Invalid strategy",
                     "Colocation strategy requires target role to be specified",
                 )
-            ensure_fork_target_queryable(
-                self._workers,
-                self._colocated_roles,
-                getattr(self, "_fork_reservations", {}),
-                colocate_role,
-            )
-            try:
-                owner_role = self._resolve_worker_owner(colocate_role)
-            except (KeyError, ValueError) as exc:
+            if colocate_role not in self._workers:
                 raise WorkerNotFoundError(
-                    f"Cannot colocate with role '{colocate_role}': {exc}"
-                ) from exc
+                    f"Cannot colocate with role '{colocate_role}' - role not found"
+                )
 
-            target_workers = self._workers[owner_role]
+            target_workers = self._workers[colocate_role]
             if num_workers != len(target_workers):
+                spec = schedulings[0]
+                target_gpus = sum(
+                    (worker.spec.gpu if worker.spec is not None else 1)
+                    for worker in target_workers
+                )
+                if spec.gpu > 0 and num_workers * spec.gpu == target_gpus:
+                    return self._create_grouped_colocated_workers(
+                        role, colocate_role, schedulings
+                    )
                 raise WorkerCreationError(
                     role,
                     "Replica count mismatch",
                     f"Colocated role must have same replica count as target "
-                    f"({num_workers} != {len(target_workers)})",
+                    f"({num_workers} != {len(target_workers)}) or reuse all "
+                    f"target GPUs ({num_workers} * {spec.gpu} != {target_gpus})",
                 )
 
             # Check if fork mode is enabled
@@ -1904,6 +1770,149 @@ class RayScheduler(Scheduler):
 
         return worker_ids
 
+    def _create_grouped_colocated_workers(
+        self,
+        role: str,
+        colocate_role: str,
+        schedulings: list[SchedulingSpec],
+    ) -> list[str]:
+        """Create multi-GPU workers colocated over the target role's GPUs.
+
+        One zero-GPU launcher is pinned to each target node via node
+        affinity; worker processes receive explicit physical GPU ids, so
+        CUDA_VISIBLE_DEVICES carries physical indices exactly like the
+        Slurm launcher does.
+        """
+        spec = schedulings[0]
+        target_launchers = self._launchers.get(colocate_role)
+        if not target_launchers:
+            raise WorkerCreationError(
+                role,
+                "Invalid grouped colocation target",
+                f"Target role '{colocate_role}' has no Ray launchers to colocate onto",
+            )
+        node_infos = ray.get(
+            [launcher.get_node_info.remote() for launcher in target_launchers],
+            timeout=self.startup_timeout,
+        )
+        groups = group_colocated_gpus(node_infos, gpus_per_worker=spec.gpu)
+        if len(groups) != len(schedulings):
+            raise WorkerCreationError(
+                role,
+                "Grouped colocation shape mismatch",
+                f"{len(schedulings)} replicas requested but target nodes "
+                f"provide {len(groups)} groups of {spec.gpu} GPUs",
+            )
+
+        logger.info(
+            f"Creating {len(groups)} grouped workers for role '{role}' over "
+            f"{len(node_infos)} nodes of target role '{colocate_role}'"
+        )
+
+        launchers: list[ActorHandle] = []
+        workers: list[RayWorkerInfo] = []
+        start_refs = []
+        try:
+            worker_idx = 0
+            for node_idx, info in enumerate(node_infos):
+                node_groups = [
+                    group for group in groups if group["node_id"] == info["node_id"]
+                ]
+                if not node_groups:
+                    continue
+                launcher = RayWorkerProcessLauncher.options(
+                    num_cpus=0,
+                    num_gpus=0,
+                    scheduling_strategy=NodeAffinitySchedulingStrategy(
+                        node_id=info["node_id"], soft=False
+                    ),
+                ).remote(
+                    role,
+                    self._log_path_of(role),
+                    self._merged_log_path(),
+                    self.ray_device_resource,
+                    self.device_control_env_var,
+                    spec.env_vars,
+                )
+                launchers.append(launcher)
+
+                batch = []
+                for local_idx, group in enumerate(node_groups):
+                    worker_spec = schedulings[worker_idx]
+                    # SGLang colocate derives its physical GPU range from
+                    # SLURM_LOCALID x gpus_per_server, and the AWEX plugin
+                    # derives its transfer rank from SLURM_NODEID/NNODES, so
+                    # grouped workers see the whole node (identity visible
+                    # devices) plus the same env contract the Slurm launcher
+                    # provides.
+                    extra_env = {
+                        "SLURM_LOCALID": str(local_idx),
+                        "SLURM_NODEID": str(node_idx),
+                        "SLURM_NNODES": str(len(node_infos)),
+                    }
+                    batch.append(
+                        dict(
+                            role=role,
+                            worker_index=worker_idx,
+                            gpu_devices=list(info["visible_devices"]),
+                            extra_env=extra_env,
+                            cmd=worker_spec.cmd,
+                            experiment_name=self.experiment_name,
+                            trial_name=self.trial_name,
+                            name_resolve_type=self.name_resolve_config.type,
+                            nfs_record_root=self.name_resolve_config.nfs_record_root,
+                            etcd3_addr=self.name_resolve_config.etcd3_addr,
+                            fileroot=self.fileroot,
+                        )
+                    )
+                    workers.append(
+                        RayWorkerInfo(
+                            worker=Worker(
+                                id=f"{role}/{worker_idx}",
+                                ip="",
+                                worker_ports=[],
+                                engine_ports=[],
+                            ),
+                            role=role,
+                            launchers=[launcher],
+                            task_index=worker_idx,
+                            spec=worker_spec,
+                        )
+                    )
+                    worker_idx += 1
+                start_refs.append(launcher.start_workers.remote(batch))
+
+            ray.get(start_refs, timeout=self.startup_timeout)
+        except Exception as e:
+            self._stop_launchers_of(launchers)
+            if isinstance(e, WorkerCreationError):
+                raise
+            raise WorkerCreationError(
+                role,
+                "Grouped colocated worker creation failed",
+                f"{type(e).__name__}: {e}",
+            ) from e
+
+        self._launchers[role] = launchers
+        self._workers[role] = workers
+        worker_ids = [worker_info.worker.id for worker_info in workers]
+        logger.info(
+            f"Created {len(worker_ids)} grouped colocated workers for role "
+            f"'{role}' on target '{colocate_role}' nodes"
+        )
+        return worker_ids
+
+    def _stop_launchers_of(self, launchers: list[ActorHandle]) -> None:
+        for launcher in launchers:
+            try:
+                ray.get(launcher.stop_all_processes.remote(), timeout=10)
+            except Exception:
+                logger.warning("Failed to stop grouped launcher", exc_info=True)
+            try:
+                ray.kill(launcher, no_restart=True)
+            except Exception:
+                pass
+
     def get_workers(self, role: str, timeout: float | None = None) -> list[Worker]:
         """Wait for workers to be ready and return their information.
 
@@ -1928,10 +1937,6 @@ class RayScheduler(Scheduler):
         WorkerFailedError
             If workers failed
         """
-        ensure_fork_role_queryable(
-            self._workers, getattr(self, "_fork_reservations", {}), role
-        )
-
         # Handle colocated/forked roles
         if role in self._colocated_roles:
             # Forked roles have their own workers in _workers
@@ -2101,60 +2106,34 @@ class RayScheduler(Scheduler):
         """
         del reverse_order  # unused, see docstring
         if role is None:
-            failures = []
-            for r in self._colocated_roles_leaf_first():
-                try:
-                    self.delete_workers(r)
-                except Exception as exc:  # noqa: BLE001
-                    failures.append(f"{r}: {exc}")
+            # Delete colocated/forked roles first (they don't own Ray launchers)
+            colocated_roles = list(self._colocated_roles.keys())
+            for r in colocated_roles:
+                self.delete_workers(r)
             # Then delete actual worker roles
             for r in list(self._workers.keys()):
-                if r in self._colocated_roles:
-                    continue
-                try:
-                    self.delete_workers(r)
-                except Exception as exc:  # noqa: BLE001
-                    failures.append(f"{r}: {exc}")
-            if failures:
-                raise WorkerCleanupError("<all>", failures)
+                self.delete_workers(r)
             return
-
-        descendant_failures = []
-        for descendant in self._colocated_descendants_leaf_first(role):
-            try:
-                self.delete_workers(descendant)
-            except Exception as exc:  # noqa: BLE001
-                descendant_failures.append(f"{descendant}: {exc}")
-        if descendant_failures:
-            raise WorkerCleanupError(role, descendant_failures)
 
         # Handle colocated/forked role
         if role in self._colocated_roles:
+            target_role = self._colocated_roles[role]
             # Forked roles have their own workers that need cleanup
-            if role in self._workers or role in getattr(self, "_fork_reservations", {}):
+            if role in self._workers:
                 logger.info(f"Removing forked role '{role}' (managed by parent worker)")
-                mark_fork_role_state(
-                    getattr(self, "_fork_reservations", {}),
-                    role,
-                    ForkRoleState.CLEANUP_PENDING,
-                )
-                target_role = getattr(self, "_fork_parent_roles", {}).get(role)
-                if target_role is None:
-                    target_role = self._resolve_worker_owner(
-                        self._colocated_roles[role]
+                try:
+                    run_async_task(
+                        self._cleanup_forked_workers_async,
+                        role,
+                        target_role,
+                        self._workers[role],
                     )
-                run_async_task(
-                    self._cleanup_forked_workers_async,
-                    role,
-                    target_role,
-                    self._workers.get(role, []),
-                )
-                self._workers.pop(role, None)
-                getattr(self, "_fork_reservations", {}).pop(role, None)
+                except Exception as e:
+                    logger.warning(f"Failed to cleanup forked role '{role}': {e}")
+                del self._workers[role]
             else:
                 logger.info(f"Removing colocated role '{role}' mapping")
             del self._colocated_roles[role]
-            getattr(self, "_fork_parent_roles", {}).pop(role, None)
             return
 
         if role not in self._workers:
@@ -2170,35 +2149,22 @@ class RayScheduler(Scheduler):
 
         # Phase 2: stop the Ray launchers. Process groups are already torn
         # down, so stopping actors will not cause TCPStore race conditions.
-        graceful_failures = self._stop_launchers(role, timeout=30)
-        if graceful_failures:
-            raise WorkerCleanupError(role, graceful_failures)
-
-        failed_launchers = []
-        cleanup_failures: list[str] = []
+        self._stop_launchers(role, timeout=30)
         for launcher in self._launchers.get(role, []):
             try:
                 ray.kill(launcher, no_restart=True)
-            except Exception as exc:  # noqa: BLE001
-                cleanup_failures.append(f"force-kill launcher: {exc}")
-                failed_launchers.append(launcher)
-
-        if cleanup_failures:
-            self._launchers[role] = failed_launchers
-            raise WorkerCleanupError(role, cleanup_failures)
-        self._launchers.pop(role, None)
+            except Exception:
+                pass
 
         if role in self._placement_groups:
             try:
                 remove_placement_group(self._placement_groups[role])
             except Exception as e:
-                cleanup_failures.append(f"remove placement group: {e}")
-
-        if cleanup_failures:
-            raise WorkerCleanupError(role, cleanup_failures)
+                logger.warning(f"Failed to remove placement group for role {role}: {e}")
 
         # Clean up internal state
         del self._workers[role]
+        self._launchers.pop(role, None)
         self._placement_groups.pop(role, None)
 
         logger.info(f"Successfully deleted workers for role '{role}'")

@@ -14,12 +14,17 @@ from areal.engine.megatron_utils.gpu_staged_optimizer import (
     GPUStagedAdamW,
     GPUStagedAdamWConfig,
 )
+from areal.engine.megatron_utils.weight_residency import MegatronWeightResidency
 from areal.v2.weight_update.awex.megatron_adapter import (
     AwexMegatronAdapter as V2AwexMegatronAdapter,
 )
 
 CUDA_AVAILABLE = torch.cuda.is_available()
-AWEX_ADAPTERS = [V1AwexMegatronAdapter, V2AwexMegatronAdapter]
+AWEX_ADAPTERS = [
+    V1AwexMegatronAdapter,
+    V2AwexMegatronAdapter,
+    MegatronWeightResidency,
+]
 
 
 def _make_adapter(adapter_cls, optimizer):
@@ -34,7 +39,7 @@ def _make_adapter(adapter_cls, optimizer):
 def test_awex_managed_release_resume_preserves_cpu_slab_views(
     adapter_cls, monkeypatch
 ) -> None:
-    """Both AWEX adapters recycle staging slots without replacing CPU views."""
+    """AWEX and shared residency recycle slots without replacing CPU views."""
     param = torch.nn.Parameter(
         torch.linspace(-1, 1, 23, device="cuda", dtype=torch.bfloat16)
     )
@@ -80,6 +85,9 @@ def test_awex_managed_release_resume_preserves_cpu_slab_views(
     original_values = {key: tensor.clone() for key, tensor in state.items()}
     optimizer.prepare_checkpoint_save()
     assert drain_calls == 2
+    with adapter.checkpoint_residency(with_model=False, with_optimizer=True):
+        assert optimizer._slots == []
+        assert "optimizer" in adapter._released_tags
     adapter.resume_memory(tags=["optimizer"])
     adapter.resume_memory(tags=["optimizer"])
     assert drain_calls == 2
