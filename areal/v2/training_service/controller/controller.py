@@ -58,6 +58,7 @@ class GatewayTrainController:
         self._own_process_group = False
         self.rollout: Any | None = None
         self._weight_update_ctrl: Any | None = None
+        self._stale_weight_update_ctrls: list[Any] = []
 
         # Version management
         self._version_lock = Lock()
@@ -1061,6 +1062,36 @@ class GatewayTrainController:
 
     # -- RL parity methods (connect_engine / update_weights / batch) --------
 
+    def _remember_stale_weight_update_ctrl(self, ctrl: Any) -> None:
+        if all(stale is not ctrl for stale in self._stale_weight_update_ctrls):
+            self._stale_weight_update_ctrls.append(ctrl)
+
+    def _retry_stale_weight_update_cleanup(self, timeout: float) -> None:
+        remaining = []
+        for stale in self._stale_weight_update_ctrls:
+            try:
+                stale.disconnect(timeout=timeout)
+            except Exception:
+                logger.warning(
+                    "Failed to clean up stale weight-update pair %r; "
+                    "cleanup will be retried",
+                    getattr(stale, "pair_name", None),
+                    exc_info=True,
+                )
+                remaining.append(stale)
+            else:
+                try:
+                    stale.destroy()
+                except Exception:
+                    logger.warning(
+                        "Disconnected stale weight-update pair %r but failed to "
+                        "destroy its gateway; cleanup will be retried",
+                        getattr(stale, "pair_name", None),
+                        exc_info=True,
+                    )
+                    remaining.append(stale)
+        self._stale_weight_update_ctrls = remaining
+
     def connect_engine(self, rollout: Any, meta: Any) -> None:
         self._ensure_initialized()
         import requests
@@ -1082,14 +1113,13 @@ class GatewayTrainController:
                 f"Ensure _version='v2' is set on InferenceEngineConfig."
             )
 
-        self.rollout = rollout
-
         if meta.type not in ("awex", "disk"):
             raise ValueError(
                 f"GatewayTrainController supports 'awex' or 'disk' weight "
                 f"updates, got '{meta.type}'"
             )
 
+        existing_ctrl = self._weight_update_ctrl
         ctrl = WeightUpdateController(
             WeightUpdateControllerConfig(
                 # Bind gateway to this node's outbound IP so cross-host
@@ -1098,45 +1128,99 @@ class GatewayTrainController:
                 host=gethostip(),
                 admin_api_key=self.config.admin_api_key,
                 log_level=self.config.log_level,
+                setup_timeout=self.config.setup_timeout,
+                request_timeout=self.config.request_timeout,
+                init_timeout_s=self.config.request_timeout,
+                update_timeout_s=self.config.request_timeout,
             )
         )
-        ctrl.initialize()
+
+        setup_timeout = self.config.setup_timeout
+        rollback_timeout = min(30.0, max(1.0, setup_timeout * 0.1))
+        setup_deadline = time.monotonic() + setup_timeout
+
+        def _remaining_setup_time() -> float:
+            remaining = setup_deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("Weight-update connection setup deadline exceeded")
+            return remaining
 
         inference_urls: list[str] = rollout.inference_worker_urls
-        pair_name = f"{self._role}-rollout"
-
+        base_pair_name = f"{self._role}-rollout"
+        pair_name = base_pair_name
+        if meta.type == "awex" and getattr(meta, "version", None) is not None:
+            pair_name = f"{base_pair_name}-v{meta.version}"
         if meta.type == "awex":
-            # NCCL rendezvous master must live on the rank-0 process's node.
-            # awex assigns rank 0 to inference[0], so allocate on the inference
-            # rank-0 guard rather than a train guard.
-            inf_guard_addrs = rollout.inference_guard_addrs
-            resp = requests.post(
-                f"{inf_guard_addrs[0]}/alloc_ports",
-                json={"count": 1},
-                timeout=30,
-            )
-            resp.raise_for_status()
-            port_data = resp.json()
-            ctrl.connect(
-                pair_name=pair_name,
-                train_worker_urls=self._worker_addrs,
-                inference_worker_urls=inference_urls,
-                mode="awex",
-                nccl_master_addr=port_data["host"],
-                nccl_master_port=port_data["ports"][0],
-            )
-        else:  # disk
-            ctrl.connect(
-                pair_name=pair_name,
-                train_worker_urls=self._worker_addrs,
-                inference_worker_urls=inference_urls,
-                mode="disk",
-                save_path=meta.path or "",
-                use_lora=meta.use_lora,
-                lora_name=meta.lora_name,
-                lora_keep_versions=meta.lora_keep_versions,
-            )
+            occupied_pair_names = {
+                existing_pair_name
+                for controller in [existing_ctrl, *self._stale_weight_update_ctrls]
+                if (existing_pair_name := getattr(controller, "pair_name", None))
+            }
+            candidate_pair_base_name = pair_name
+            while pair_name in occupied_pair_names:
+                pair_name = f"{candidate_pair_base_name}-{uuid4().hex[:8]}"
+
+        try:
+            ctrl.initialize(timeout=_remaining_setup_time())
+
+            if meta.type == "awex":
+                # NCCL rendezvous master must live on the rank-0 process's node.
+                # AWEX assigns rank 0 to inference[0], so allocate on the inference
+                # rank-0 guard rather than a train guard.
+                inf_guard_addrs = rollout.inference_guard_addrs
+                resp = requests.post(
+                    f"{inf_guard_addrs[0]}/alloc_ports",
+                    json={"count": 1},
+                    timeout=min(30.0, _remaining_setup_time()),
+                )
+                resp.raise_for_status()
+                port_data = resp.json()
+                gateway_setup_timeout = _remaining_setup_time() - rollback_timeout
+                if gateway_setup_timeout <= 0:
+                    raise TimeoutError(
+                        "No setup time remains after reserving AWEX rollback time"
+                    )
+                ctrl.connect(
+                    pair_name=pair_name,
+                    train_worker_urls=self._worker_addrs,
+                    inference_worker_urls=inference_urls,
+                    mode="awex",
+                    nccl_master_addr=port_data["host"],
+                    nccl_master_port=port_data["ports"][0],
+                    setup_timeout_s=gateway_setup_timeout,
+                    rollback_timeout_s=rollback_timeout,
+                    request_timeout=(gateway_setup_timeout + rollback_timeout + 1.0),
+                )
+            else:  # disk
+                ctrl.connect(
+                    pair_name=pair_name,
+                    train_worker_urls=self._worker_addrs,
+                    inference_worker_urls=inference_urls,
+                    mode="disk",
+                    save_path=meta.path or "",
+                    use_lora=meta.use_lora,
+                    lora_name=meta.lora_name,
+                    lora_keep_versions=meta.lora_keep_versions,
+                    request_timeout=_remaining_setup_time(),
+                )
+        except BaseException:
+            try:
+                ctrl.destroy(raise_on_error=True)
+            except Exception:
+                self._remember_stale_weight_update_ctrl(ctrl)
+                logger.warning(
+                    "Candidate pair %r rollback is incomplete; retaining its "
+                    "controller for stale cleanup",
+                    ctrl.pair_name,
+                    exc_info=True,
+                )
+            raise
+
         self._weight_update_ctrl = ctrl
+        self.rollout = rollout
+        if existing_ctrl is not None:
+            self._remember_stale_weight_update_ctrl(existing_ctrl)
+        self._retry_stale_weight_update_cleanup(timeout=rollback_timeout)
         logger.info(
             "WeightUpdateController connected (pair=%s, train=%d, inf=%d)",
             pair_name,
@@ -1149,12 +1233,47 @@ class GatewayTrainController:
             raise RuntimeError(
                 "connect_engine() must be called before update_weights()"
             )
-        self.rollout.pause_generation()
         assert meta.version is not None and meta.version > 0, (
             f"meta.version must be a positive integer, got {meta.version}"
         )
-        result = self._weight_update_ctrl.update_weights(version=meta.version)
-        self.rollout.continue_generation()
+        try:
+            self.rollout.pause_generation()
+        except BaseException as exc:
+            # No transfer has started, so callers may retry resume while still
+            # surfacing the partial-pause failure.
+            setattr(exc, "inference_weights_may_be_mutated", False)
+            raise
+        # A failed AWEX transfer can leave inference weights partly updated. Do
+        # not resume request handling in that state: recovery must restore a
+        # known-good checkpoint first. Errors explicitly marked as pre-mutation
+        # remain safe to resume.
+        should_continue_generation = False
+        update_error: BaseException | None = None
+        try:
+            result = self._weight_update_ctrl.update_weights(version=meta.version)
+            should_continue_generation = True
+        except BaseException as exc:
+            update_error = exc
+            should_continue_generation = not getattr(
+                exc, "inference_weights_may_be_mutated", True
+            )
+            raise
+        finally:
+            if should_continue_generation:
+                try:
+                    self.rollout.continue_generation()
+                except Exception:
+                    if update_error is None:
+                        raise
+                    logger.exception(
+                        "Failed to resume generation after a safe-to-resume "
+                        "weight-update error; preserving the original error"
+                    )
+            else:
+                logger.critical(
+                    "Weight update may have partially mutated inference weights; "
+                    "leaving generation paused until recovery completes"
+                )
         logger.info(
             "Weight update v%d completed (%s, %.0fms)",
             meta.version,
@@ -1229,6 +1348,98 @@ class GatewayTrainController:
 
     # -- Destroy -----------------------------------------------------------
 
+    def _direct_teardown_weight_update_pair(
+        self,
+        pair_name: str,
+        train_worker_urls: list[str],
+        inference_worker_urls: list[str],
+    ) -> bool:
+        """Best-effort per-pair fallback when gateway disconnect fails."""
+
+        async def _teardown_all() -> list[BaseException]:
+            timeout = aiohttp.ClientTimeout(total=30)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                results = await asyncio.gather(
+                    *[
+                        _teardown_one(session, addr)
+                        for addr in train_worker_urls + inference_worker_urls
+                    ],
+                    return_exceptions=True,
+                )
+            return [result for result in results if isinstance(result, BaseException)]
+
+        async def _teardown_one(session: aiohttp.ClientSession, addr: str) -> None:
+            async with session.post(
+                f"{addr}/awex/teardown",
+                json={"pair_name": pair_name},
+            ) as resp:
+                resp.raise_for_status()
+
+        errors = run_async_task(_teardown_all)
+        if errors:
+            logger.warning(
+                "Direct teardown for pair %r failed on %d endpoint(s): %s",
+                pair_name,
+                len(errors),
+                errors,
+            )
+            return False
+        return True
+
+    def _teardown_weight_update_controllers(self, controllers: list[Any]) -> list[Any]:
+        """Disconnect all known pairs without dropping unresolved ownership."""
+
+        unresolved: list[Any] = []
+        for controller in controllers:
+            pair_name = getattr(controller, "pair_name", None)
+            if pair_name is not None:
+                try:
+                    controller.disconnect(timeout=30.0)
+                except Exception:
+                    logger.warning(
+                        "Gateway disconnect failed for pair %r; trying direct "
+                        "worker teardown",
+                        pair_name,
+                        exc_info=True,
+                    )
+                    direct_ok = self._direct_teardown_weight_update_pair(
+                        pair_name,
+                        getattr(controller, "train_worker_urls", []),
+                        getattr(controller, "inference_worker_urls", []),
+                    )
+                    if direct_ok:
+                        try:
+                            # Let the gateway observe the now-idempotent worker
+                            # teardown and only then clear its registry/KV state.
+                            controller.disconnect(timeout=30.0)
+                        except Exception:
+                            logger.warning(
+                                "Gateway bookkeeping cleanup still failed for "
+                                "pair %r after direct teardown; terminating its "
+                                "private gateway",
+                                pair_name,
+                                exc_info=True,
+                            )
+                            # All worker resources are known to be gone. Registry
+                            # and KV state are private to this gateway process, so
+                            # it is now safe to terminate even if /disconnect is
+                            # unreachable.
+                            controller.destroy(raise_on_error=False)
+                            continue
+
+            if getattr(controller, "pair_name", None) is not None:
+                unresolved.append(controller)
+                continue
+            try:
+                controller.destroy(raise_on_error=True)
+            except Exception:
+                logger.warning(
+                    "Failed to destroy disconnected weight-update controller",
+                    exc_info=True,
+                )
+                unresolved.append(controller)
+        return unresolved
+
     def _graceful_shutdown_workers(self) -> None:
         """Destroy engines on all training workers before killing processes.
 
@@ -1250,15 +1461,6 @@ class GatewayTrainController:
                 await asyncio.gather(*tasks, return_exceptions=True)
 
         async def _shutdown_one(session: aiohttp.ClientSession, addr: str) -> None:
-            try:
-                async with session.post(f"{addr}/awex/teardown") as resp:
-                    resp.raise_for_status()
-            except Exception as e:
-                logger.warning(
-                    "Graceful shutdown: failed to call /awex/teardown on %s: %s",
-                    addr,
-                    e,
-                )
             try:
                 async with session.post(f"{addr}/destroy_engine", json={}) as resp:
                     resp.raise_for_status()
@@ -1342,5 +1544,25 @@ class GatewayTrainController:
         self._init_future = None
         if future is not None:
             future.cancel()
+
+        controllers = [
+            controller
+            for controller in [
+                self._weight_update_ctrl,
+                *self._stale_weight_update_ctrls,
+            ]
+            if controller is not None
+        ]
+        unresolved = self._teardown_weight_update_controllers(controllers)
+        self._weight_update_ctrl = None
+        self._stale_weight_update_ctrls = unresolved
+
+        if unresolved:
+            logger.error(
+                "Deferring runtime shutdown while %d weight-update pair(s) "
+                "still own live worker resources; call destroy() again to retry",
+                len(unresolved),
+            )
+            return
 
         self._cleanup_runtime_state()

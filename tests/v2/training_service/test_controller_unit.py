@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
@@ -334,3 +335,241 @@ class TestGatewayTrainControllerClearBatches:
             "cancel-node": {"s-cancel": 0},
         }
         mock_gateway_post.assert_not_called()
+
+
+class TestGatewayTrainControllerWeightUpdateReconnect:
+    @staticmethod
+    def _rollout():
+        from areal.v2.inference_service.controller.controller import (
+            RolloutControllerV2,
+        )
+
+        rollout = MagicMock(spec=RolloutControllerV2)
+        rollout.inference_worker_urls = ["http://inference-0"]
+        rollout.inference_guard_addrs = ["http://guard-0"]
+        return rollout
+
+    def test_failed_candidate_keeps_old_active_and_pending_cleanup(self):
+        controller = _make_controller()
+        controller._role = "actor"
+        controller._worker_addrs = ["http://train-0"]
+        old_ctrl = MagicMock()
+        old_ctrl.pair_name = "actor-rollout"
+        old_rollout = self._rollout()
+        controller._weight_update_ctrl = old_ctrl
+        controller.rollout = old_rollout
+
+        candidate = MagicMock()
+        candidate.pair_name = "actor-rollout-v1"
+        candidate.connect.side_effect = RuntimeError("candidate init failed")
+        candidate.destroy.side_effect = RuntimeError("rollback incomplete")
+        port_response = MagicMock()
+        port_response.json.return_value = {"host": "inference-host", "ports": [12345]}
+
+        with (
+            patch(
+                "areal.v2.weight_update.controller.controller.WeightUpdateController",
+                return_value=candidate,
+            ),
+            patch("requests.post", return_value=port_response),
+            pytest.raises(RuntimeError, match="candidate init failed"),
+        ):
+            controller.connect_engine(
+                self._rollout(),
+                SimpleNamespace(type="awex", version=1),
+            )
+
+        candidate.destroy.assert_called_once_with(raise_on_error=True)
+        assert controller._weight_update_ctrl is old_ctrl
+        assert controller.rollout is old_rollout
+        assert controller._stale_weight_update_ctrls == [candidate]
+
+    def test_same_recovery_version_uses_unique_candidate_pair_name(self):
+        controller = _make_controller()
+        controller._role = "actor"
+        controller._worker_addrs = ["http://train-0"]
+        old_ctrl = MagicMock()
+        old_ctrl.pair_name = "actor-rollout-v1"
+        old_ctrl.disconnect.side_effect = RuntimeError("keep stale")
+        controller._weight_update_ctrl = old_ctrl
+        candidate = MagicMock()
+        candidate.pair_name = "candidate"
+        port_response = MagicMock()
+        port_response.json.return_value = {"host": "inference-host", "ports": [12345]}
+
+        with (
+            patch(
+                "areal.v2.weight_update.controller.controller.WeightUpdateController",
+                return_value=candidate,
+            ),
+            patch("requests.post", return_value=port_response),
+        ):
+            controller.connect_engine(
+                self._rollout(),
+                SimpleNamespace(type="awex", version=1),
+            )
+
+        pair_name = candidate.connect.call_args.kwargs["pair_name"]
+        assert pair_name.startswith("actor-rollout-v1-")
+        assert pair_name != old_ctrl.pair_name
+        assert controller._weight_update_ctrl is candidate
+        assert controller._stale_weight_update_ctrls == [old_ctrl]
+
+    def test_mutating_update_failure_leaves_generation_paused(self):
+        controller = _make_controller()
+        controller.rollout = MagicMock()
+        controller._weight_update_ctrl = MagicMock()
+        controller._weight_update_ctrl.update_weights.side_effect = RuntimeError(
+            "transfer failed"
+        )
+
+        with pytest.raises(RuntimeError, match="transfer failed"):
+            controller.update_weights(SimpleNamespace(version=3))
+
+        controller.rollout.pause_generation.assert_called_once_with()
+        controller.rollout.continue_generation.assert_not_called()
+
+    def test_pause_failure_is_marked_pre_mutation_and_skips_transfer(self):
+        controller = _make_controller()
+        controller.rollout = MagicMock()
+        controller.rollout.pause_generation.side_effect = RuntimeError("partial pause")
+        controller._weight_update_ctrl = MagicMock()
+
+        with pytest.raises(RuntimeError, match="partial pause") as exc_info:
+            controller.update_weights(SimpleNamespace(version=3))
+
+        assert exc_info.value.inference_weights_may_be_mutated is False
+        controller._weight_update_ctrl.update_weights.assert_not_called()
+
+    def test_pre_mutation_failure_resumes_generation(self):
+        controller = _make_controller()
+        controller.rollout = MagicMock()
+        controller._weight_update_ctrl = MagicMock()
+        error = RuntimeError("preflight failed")
+        error.inference_weights_may_be_mutated = False
+        controller._weight_update_ctrl.update_weights.side_effect = error
+
+        with pytest.raises(RuntimeError, match="preflight failed"):
+            controller.update_weights(SimpleNamespace(version=3))
+
+        controller.rollout.continue_generation.assert_called_once_with()
+
+    def test_shutdown_fallback_covers_active_and_stale_pairs(self):
+        controller = _make_controller()
+
+        class FakeWeightController:
+            def __init__(self, pair_name: str, failures: int):
+                self.pair_name = pair_name
+                self.train_worker_urls = [f"http://train-{pair_name}"]
+                self.inference_worker_urls = [f"http://infer-{pair_name}"]
+                self.failures = failures
+                self.destroy_calls = 0
+
+            def disconnect(self, timeout: float) -> None:
+                assert timeout == 30.0
+                if self.failures:
+                    self.failures -= 1
+                    raise RuntimeError("gateway disconnect failed")
+                self.pair_name = None
+
+            def destroy(self, *, raise_on_error: bool) -> None:
+                assert raise_on_error
+                self.destroy_calls += 1
+
+        active = FakeWeightController("active", failures=1)
+        stale_a = FakeWeightController("stale-a", failures=1)
+        stale_b = FakeWeightController("stale-b", failures=0)
+
+        with patch.object(
+            controller,
+            "_direct_teardown_weight_update_pair",
+            return_value=True,
+        ) as direct_teardown:
+            unresolved = controller._teardown_weight_update_controllers(
+                [active, stale_a, stale_b]
+            )
+            repeated = controller._teardown_weight_update_controllers(
+                [active, stale_a, stale_b]
+            )
+
+        assert unresolved == repeated == []
+        assert [item.args[0] for item in direct_teardown.call_args_list] == [
+            "active",
+            "stale-a",
+        ]
+        assert all(item.destroy_calls == 2 for item in (active, stale_a, stale_b))
+
+    def test_direct_shutdown_fallback_sends_pair_json_to_all_endpoints(self):
+        controller = _make_controller()
+        calls = []
+
+        class FakeResponse:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return None
+
+            def raise_for_status(self):
+                return None
+
+        class FakeSession:
+            def __init__(self, **_kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return None
+
+            def post(self, url, json):
+                calls.append((url, json))
+                return FakeResponse()
+
+        with patch(f"{MODULE}.aiohttp.ClientSession", FakeSession):
+            assert controller._direct_teardown_weight_update_pair(
+                "pair-a",
+                ["http://train-0"],
+                ["http://infer-0", "http://infer-1"],
+            )
+
+        assert calls == [
+            ("http://train-0/awex/teardown", {"pair_name": "pair-a"}),
+            ("http://infer-0/awex/teardown", {"pair_name": "pair-a"}),
+            ("http://infer-1/awex/teardown", {"pair_name": "pair-a"}),
+        ]
+
+    def test_destroy_keeps_workers_alive_until_stale_pair_cleanup_succeeds(self):
+        controller = _make_controller()
+        stale = MagicMock()
+        stale.pair_name = "stale"
+        stale.train_worker_urls = ["http://train"]
+        stale.inference_worker_urls = ["http://infer"]
+        attempts = 0
+
+        def disconnect(*, timeout):
+            nonlocal attempts
+            assert timeout == 30.0
+            attempts += 1
+            if attempts == 1:
+                raise RuntimeError("busy")
+            stale.pair_name = None
+
+        stale.disconnect.side_effect = disconnect
+        controller._weight_update_ctrl = stale
+        controller._cleanup_runtime_state = MagicMock()
+
+        with patch.object(
+            controller,
+            "_direct_teardown_weight_update_pair",
+            return_value=False,
+        ):
+            controller.destroy()
+
+        controller._cleanup_runtime_state.assert_not_called()
+        assert controller._stale_weight_update_ctrls == [stale]
+
+        controller.destroy()
+
+        controller._cleanup_runtime_state.assert_called_once_with()

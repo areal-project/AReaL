@@ -1593,11 +1593,34 @@ class RolloutControllerV2:
             ],
             return_exceptions=True,
         )
-        failed = [r for r in results if isinstance(r, Exception)]
+        failed = [r for r in results if isinstance(r, BaseException)]
         for r in failed:
             logger.error("Failed to pause generation on a worker: %s", r)
-        if failed and len(failed) == len(results):
-            raise RuntimeError(f"pause_generation failed on ALL {len(failed)} workers")
+        if failed:
+            paused_addrs = [
+                addr
+                for addr, result in zip(self._data_proxy_addrs, results)
+                if not isinstance(result, BaseException)
+            ]
+            resume_results = await asyncio.gather(
+                *[
+                    self._async_data_proxy_post(addr, "/continue_generation", {})
+                    for addr in paused_addrs
+                ],
+                return_exceptions=True,
+            )
+            resume_failed = [
+                result for result in resume_results if isinstance(result, BaseException)
+            ]
+            for result in resume_failed:
+                logger.error(
+                    "Failed to resume a worker after partial pause: %s", result
+                )
+            raise RuntimeError(
+                f"pause_generation failed on {len(failed)}/{len(results)} workers; "
+                f"rollback resume failed on {len(resume_failed)}/"
+                f"{len(paused_addrs)} paused workers"
+            ) from failed[0]
 
     def continue_generation(self) -> None:
         """Continue generation on all workers."""
@@ -1616,13 +1639,13 @@ class RolloutControllerV2:
             ],
             return_exceptions=True,
         )
-        failed = [r for r in results if isinstance(r, Exception)]
+        failed = [r for r in results if isinstance(r, BaseException)]
         for r in failed:
             logger.error("Failed to continue generation on a worker: %s", r)
-        if failed and len(failed) == len(results):
+        if failed:
             raise RuntimeError(
-                f"continue_generation failed on ALL {len(failed)} workers"
-            )
+                f"continue_generation failed on {len(failed)}/{len(results)} workers"
+            ) from failed[0]
 
     # -- Stats -------------------------------------------------------------
 

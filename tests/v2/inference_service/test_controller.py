@@ -321,6 +321,43 @@ class TestRolloutControllerV2APISurface:
         assert bases == (object,), f"Unexpected bases: {bases}"
 
 
+class TestGenerationPauseResumeSafety:
+    @staticmethod
+    def _controller() -> RolloutControllerV2:
+        controller = RolloutControllerV2(
+            config=InferenceEngineConfig(backend="sglang:d1", admin_api_key="test-key"),
+            scheduler=MagicMock(n_gpus_per_node=8),
+        )
+        controller._data_proxy_addrs = ["http://worker-0", "http://worker-1"]
+        return controller
+
+    @pytest.mark.asyncio
+    async def test_partial_pause_rolls_back_successful_worker_and_raises(self):
+        controller = self._controller()
+        controller._async_data_proxy_post = AsyncMock(
+            side_effect=[None, RuntimeError("pause failed"), None]
+        )
+
+        with pytest.raises(RuntimeError, match="failed on 1/2 workers"):
+            await controller._async_pause_generation()
+
+        assert controller._async_data_proxy_post.call_args_list == [
+            call("http://worker-0", "/pause_generation", {}),
+            call("http://worker-1", "/pause_generation", {}),
+            call("http://worker-0", "/continue_generation", {}),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_partial_continue_is_reported_as_failure(self):
+        controller = self._controller()
+        controller._async_data_proxy_post = AsyncMock(
+            side_effect=[None, RuntimeError("resume failed")]
+        )
+
+        with pytest.raises(RuntimeError, match="failed on 1/2 workers"):
+            await controller._async_continue_generation()
+
+
 # =============================================================================
 # RolloutControllerV2 — construction + state
 # =============================================================================

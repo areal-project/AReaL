@@ -40,11 +40,29 @@ def _capture_weight_update_groups(monkeypatch, mod):
     return calls
 
 
+def _prepare_pair_lifecycle(adapter):
+    """Initialize fields skipped by object.__new__ in these focused tests."""
+    adapter._pair_states = {}
+    adapter._active_pair_name = None
+    for name in (
+        "_separation_delta_transport",
+        "_separation_wire_dtypes",
+        "_world_size",
+        "_delta_tracker",
+        "_delta_detector",
+        "_rank_info",
+        "_parameters",
+    ):
+        if not hasattr(adapter, name):
+            setattr(adapter, name, None)
+    return adapter
+
+
 def test_megatron_full_transfer_initializes_gloo_control_group(monkeypatch):
     """Separated Full sync must not fall back to a NCCL control barrier."""
     mod = common._load_megatron_adapter(monkeypatch)
     calls = _capture_weight_update_groups(monkeypatch, mod)
-    adapter = object.__new__(mod.AwexMegatronAdapter)
+    adapter = _prepare_pair_lifecycle(object.__new__(mod.AwexMegatronAdapter))
     adapter._dte_config = SimpleNamespace(enabled=False)
 
     adapter.init_weight_update_group(
@@ -68,7 +86,7 @@ def test_sglang_full_transfer_initializes_gloo_control_group(monkeypatch):
     """SGLang Full sync creates the same CPU control group as training."""
     mod = common._load_sglang_adapter(monkeypatch)
     calls = _capture_weight_update_groups(monkeypatch, mod)
-    adapter = object.__new__(mod.AwexSGLangAdapter)
+    adapter = _prepare_pair_lifecycle(object.__new__(mod.AwexSGLangAdapter))
     adapter._dte_config = SimpleNamespace(enabled=False)
     adapter._get_model_context = lambda: {
         "tp_size": 4,
@@ -104,7 +122,7 @@ def test_megatron_dte_init_caches_global_wire_dtypes_once(monkeypatch):
         "synchronize_wire_dtypes",
         lambda plan, group: calls.append((plan, group)) or expected,
     )
-    adapter = object.__new__(mod.AwexMegatronAdapter)
+    adapter = _prepare_pair_lifecycle(object.__new__(mod.AwexMegatronAdapter))
     adapter._dte_config = SimpleNamespace(enabled=True)
 
     adapter.init_weight_update_group(
@@ -133,7 +151,7 @@ def test_sglang_dte_init_caches_global_wire_dtypes_once(monkeypatch):
         "synchronize_wire_dtypes",
         lambda plan, group: calls.append((plan, group)) or expected,
     )
-    adapter = object.__new__(mod.AwexSGLangAdapter)
+    adapter = _prepare_pair_lifecycle(object.__new__(mod.AwexSGLangAdapter))
     adapter._dte_config = SimpleNamespace(enabled=True)
     adapter._get_model_context = lambda: {
         "tp_size": 4,
@@ -186,7 +204,7 @@ def test_dte_world_size_fails_before_group_or_metadata_init(
         "init_weights_update_group",
         lambda **kwargs: events.append(("group", kwargs)),
     )
-    adapter = object.__new__(getattr(mod, adapter_name))
+    adapter = _prepare_pair_lifecycle(object.__new__(getattr(mod, adapter_name)))
     adapter._dte_config = SimpleNamespace(enabled=True)
 
     with pytest.raises(ValueError, match="combined=5"):
@@ -213,7 +231,7 @@ def test_non_dte_megatron_keeps_odd_world_size_compatibility(monkeypatch):
         "validate_dte_world_size",
         lambda *args: pytest.fail("dense AWEX must not use the DTE world-size gate"),
     )
-    adapter = object.__new__(mod.AwexMegatronAdapter)
+    adapter = _prepare_pair_lifecycle(object.__new__(mod.AwexMegatronAdapter))
     adapter._dte_config = SimpleNamespace(enabled=False)
 
     adapter.init_weight_update_group(
@@ -251,7 +269,7 @@ def test_megatron_enters_empty_local_dtype_round(monkeypatch):
         lambda ops, masks, params: {"operation_count": len(ops)},
     )
     monkeypatch.setattr(mod.torch.cuda, "current_device", lambda: 0)
-    adapter = object.__new__(mod.AwexMegatronAdapter)
+    adapter = _prepare_pair_lifecycle(object.__new__(mod.AwexMegatronAdapter))
     adapter._transfer_plan = SimpleNamespace(operations={0: [op]})
     adapter._weights_update_group = object()
     adapter._transfer_rank = 1
@@ -287,7 +305,7 @@ def test_sglang_enters_empty_local_dtype_round(monkeypatch):
         lambda **kwargs: calls.append(kwargs),
     )
     monkeypatch.setattr(mod.torch.cuda, "current_device", lambda: 0)
-    adapter = object.__new__(mod.AwexSGLangAdapter)
+    adapter = _prepare_pair_lifecycle(object.__new__(mod.AwexSGLangAdapter))
     adapter._transfer_plan = SimpleNamespace(operations={1: [op]})
     adapter._weights_update_group = object()
     adapter._transfer_rank = 0
@@ -316,7 +334,7 @@ def test_megatron_full_transfer_uses_gloo_completion_barrier(monkeypatch):
     monkeypatch.setattr(mod, "batch_send_recv", lambda **kwargs: None)
     barriers = []
     monkeypatch.setattr(mod.dist, "barrier", lambda *, group: barriers.append(group))
-    adapter = object.__new__(mod.AwexMegatronAdapter)
+    adapter = _prepare_pair_lifecycle(object.__new__(mod.AwexMegatronAdapter))
     adapter._dte_config = SimpleNamespace(enabled=False)
     adapter._transfer_plan = object()
     adapter._weights_update_group = "nccl"
@@ -325,7 +343,8 @@ def test_megatron_full_transfer_uses_gloo_completion_barrier(monkeypatch):
     adapter._world_size = 16
     adapter.get_local_shard_parameters = lambda: {}
 
-    adapter.execute_weight_update(version=1)
+    adapter._active_pair_name = "pair"
+    adapter.execute_weight_update("pair", version=1)
 
     assert barriers == ["gloo"]
 
@@ -339,7 +358,7 @@ def test_sglang_full_transfer_uses_gloo_completion_barrier(monkeypatch):
     monkeypatch.setattr(mod, "batch_send_recv", lambda **kwargs: None)
     barriers = []
     monkeypatch.setattr(mod.dist, "barrier", lambda *, group: barriers.append(group))
-    adapter = object.__new__(mod.AwexSGLangAdapter)
+    adapter = _prepare_pair_lifecycle(object.__new__(mod.AwexSGLangAdapter))
     adapter._dte_config = SimpleNamespace(enabled=False)
     adapter._transfer_plan = object()
     adapter._weights_update_group = "nccl"
@@ -347,7 +366,8 @@ def test_sglang_full_transfer_uses_gloo_completion_barrier(monkeypatch):
     adapter._transfer_rank = 0
     adapter.get_local_shard_parameters = lambda: {}
 
-    adapter.execute_weight_update(version=1)
+    adapter._active_pair_name = "pair"
+    adapter.execute_weight_update("pair", version=1)
 
     assert barriers == ["gloo"]
 
@@ -369,7 +389,7 @@ def test_megatron_separation_delta_commits_tracker_after_receiver_barrier(
         "barrier",
         lambda *, group: events.append(("barrier", group)),
     )
-    adapter = object.__new__(mod.AwexMegatronAdapter)
+    adapter = _prepare_pair_lifecycle(object.__new__(mod.AwexMegatronAdapter))
     adapter._transfer_plan = object()
     adapter._weights_update_group = "nccl"
     adapter._weights_update_group_gloo = "gloo"
@@ -415,7 +435,7 @@ def test_megatron_separation_failed_delta_does_not_advance_tracker(monkeypatch):
         "barrier",
         lambda **kwargs: pytest.fail("failed transfer must not reach barrier"),
     )
-    adapter = object.__new__(mod.AwexMegatronAdapter)
+    adapter = _prepare_pair_lifecycle(object.__new__(mod.AwexMegatronAdapter))
     adapter._transfer_plan = object()
     adapter._weights_update_group = "nccl"
     adapter._weights_update_group_gloo = "gloo"
@@ -471,7 +491,7 @@ def test_reconstructed_override_preserves_tensor_parallel_metadata(monkeypatch):
         sys.modules, "areal.engine.megatron_utils.megatron", megatron_mod
     )
 
-    adapter = object.__new__(mod.AwexMegatronAdapter)
+    adapter = _prepare_pair_lifecycle(object.__new__(mod.AwexMegatronAdapter))
     adapter._engine = SimpleNamespace(
         model=object(),
         tf_config=SimpleNamespace(num_moe_experts=None),

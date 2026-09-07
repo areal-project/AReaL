@@ -59,8 +59,13 @@ def register_awex_endpoints(app: FastAPI, rpc_proxy: RpcProxy) -> None:
     async def update_weights(request: Request) -> JSONResponse:
         try:
             data = await request.json()
+            pair_name = data["pair_name"]
             version = data.get("version", 0)
-            rpc_proxy.collective_rpc("awex_execute_weight_update", version=version)
+            rpc_proxy.collective_rpc(
+                "awex_execute_weight_update",
+                pair_name=pair_name,
+                version=version,
+            )
             return JSONResponse(content={"status": "ok", "version": version})
         except Exception as e:
             logger.error("Failed to update weights: %s", e)
@@ -74,6 +79,20 @@ def register_awex_endpoints(app: FastAPI, rpc_proxy: RpcProxy) -> None:
             return JSONResponse(content={"status": "ok"})
         except Exception as e:
             logger.error("Failed batch_isend_irecv: %s", e)
+            return JSONResponse(status_code=500, content={"error": str(e)})
+
+    @app.post("/awex/teardown")
+    async def teardown(request: Request) -> JSONResponse:
+        try:
+            data = await request.json()
+            pair_name = data["pair_name"]
+            rpc_proxy.collective_rpc(
+                "awex_teardown_weight_update_group",
+                pair_name=pair_name,
+            )
+            return JSONResponse(content={"status": "ok"})
+        except Exception as e:
+            logger.error("Failed to teardown weights update group: %s", e)
             return JSONResponse(status_code=500, content={"error": str(e)})
 
     @app.post("/awex/debug/get_parameters")
@@ -109,9 +128,12 @@ def register_awex_endpoints(app: FastAPI, rpc_proxy: RpcProxy) -> None:
     async def execute_colocate_weight_update(request: Request) -> JSONResponse:
         try:
             data = await request.json()
+            pair_name = data["pair_name"]
             version = data.get("version", 0)
             rpc_proxy.collective_rpc(
-                "awex_execute_colocate_weight_update", version=version
+                "awex_execute_colocate_weight_update",
+                pair_name=pair_name,
+                version=version,
             )
             return JSONResponse(content={"status": "ok", "version": version})
         except Exception as e:
