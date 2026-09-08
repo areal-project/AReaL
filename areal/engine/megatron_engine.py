@@ -3134,6 +3134,7 @@ class MegatronEngine(TrainEngine):
             mb_spec,
             group=mpu.get_data_parallel_group(),
             seq_align_to=align_to_multiple_of,
+            padded=self.sequence_packing_mode == SequencePackingMode.PADDED,
         )
         mb_list.mbs = [pack_tensor_dict(mb) for mb in mb_list.mbs]
         # Project each micro-batch to the model's sequence layout. Wrapper-owned

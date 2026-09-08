@@ -130,6 +130,42 @@ def test_micro_batch_split(mock_padded_data, n_mbs, max_tokens_per_mb, n_mbs_div
         assert torch.allclose(mock_padded_data[key], y)
 
 
+@pytest.mark.parametrize("granularity", [1, 2])
+@pytest.mark.parametrize("n_mbs,divisor", [(1, 1), (4, 2)])
+def test_micro_batch_split_padded_input_respects_forward_budget(
+    granularity, n_mbs, divisor
+):
+    """Long and short sequences cannot hide rectangular padding from the budget."""
+    lengths = [207, 207, 41, 39, 37, 35, 33, 31]
+    data = pad_sequences_to_tensors(
+        [
+            {"input_ids": torch.full((length,), i, dtype=torch.int64)}
+            for i, length in enumerate(lengths)
+        ]
+    )
+    spec = MicroBatchSpec(
+        n_mbs=n_mbs,
+        n_mbs_divisor=divisor,
+        granularity=granularity,
+        max_tokens_per_mb=512,
+    )
+
+    mb_list = split_padded_tensor_dict_into_mb_list(
+        data, spec, seq_align_to=16, padded=True
+    )
+
+    assert len(mb_list.mbs) >= n_mbs
+    assert len(mb_list.mbs) % divisor == 0
+    assert sorted(mb_list.forward_indices) == list(range(len(lengths)))
+    seen = []
+    for mb in mb_list.mbs:
+        aligned_max = ((int(mb["attention_mask"].sum(1).max()) + 15) // 16) * 16
+        assert mb["input_ids"].shape[0] * aligned_max <= 512
+        assert mb["input_ids"].shape[0] % granularity == 0
+        seen.extend(mb["input_ids"][:, 0].tolist())
+    assert [seen[i] for i in mb_list.backward_indices] == list(range(len(lengths)))
+
+
 def test_micro_batch_split_accounts_for_sequence_alignment():
     sequences = [
         {

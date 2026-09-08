@@ -33,6 +33,8 @@ actor:
     use_precision_aware_optimizer: true
     enable_mtp: false
     enable_mtp_training: false
+    enable_chunked_logits: true
+    lm_head_loss_chunk_size: 1024
     # Use fused FLA kernels for Gated DeltaNet.
     use_deterministic_algorithms: false
     ddp:
