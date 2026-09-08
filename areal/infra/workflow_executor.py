@@ -460,6 +460,10 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
                 with self._input_cv:
                     self._input_cv.notify()
                 break
+            finally:
+                # Consumers may already have popped these from _pending_results.
+                # Release our aliases before the next wait (including timeouts).
+                results = result = None
 
     def _get_next_task_for_submission(self) -> TInput | None:
         with self._input_cv:
