@@ -652,6 +652,7 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
         infer_world_size: int,
         train_world_size: int,
         num_engines: int,
+        timeout_s: float = 300.0,
     ) -> None:
         if self._dte_config.enabled:
             validate_dte_world_size(world_size, infer_world_size, train_world_size)
@@ -675,7 +676,7 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
         self._transfer_rank = global_rank
         self._world_size = world_size
 
-        infer_meta, train_meta = fetch_kv_metadata(kv_store_url, pair_name)
+        infer_meta, train_meta = fetch_kv_metadata(kv_store_url, pair_name, timeout_s)
 
         builder = TransferPlanBuilder(
             infer_world_size=infer_world_size,

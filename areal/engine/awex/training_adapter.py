@@ -44,6 +44,7 @@ class AwexTrainingAdapter(Protocol):
         infer_world_size: int,
         train_world_size: int,
         num_engines: int,
+        timeout_s: float = 300.0,
     ) -> None:
         """Pull peer meta from KV store, build local send plan, join NCCL group."""
         ...
