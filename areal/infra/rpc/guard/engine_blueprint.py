@@ -520,12 +520,14 @@ def call_engine_method():
                         args_bcast,
                         src_rank=engine.current_data_parallel_head(),
                         group=bcast_group,
+                        preserve_tensor_aliases=preserve_input_tensor_aliases,
                     )
                     kwargs_bcast = tensor_container_to(kwargs, bcast_device)
                     kwargs_bcast = broadcast_tensor_container(
                         kwargs_bcast,
                         src_rank=engine.current_data_parallel_head(),
                         group=bcast_group,
+                        preserve_tensor_aliases=preserve_input_tensor_aliases,
                     )
                     logger.debug("Broadcasting RPC payload done.")
 

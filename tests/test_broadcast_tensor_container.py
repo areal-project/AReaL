@@ -53,3 +53,55 @@ def test_broadcast_tensor_container_preserves_tuple_types(tmp_path):
         nprocs=2,
         join=True,
     )
+
+
+def _run_alias_broadcast(rank: int, init_method: str) -> None:
+    dist.init_process_group(
+        backend="gloo", init_method=init_method, rank=rank, world_size=2
+    )
+    try:
+        # A nonzero source and non-contiguous tensor exercise both directions
+        # and the temporary contiguous buffer used by tensor broadcast.
+        expected = torch.arange(12).reshape(3, 4)[:, ::2]
+        previous = None
+        for preserve in (False, True, True):
+            payload = None
+            if rank == 1:
+                shared = expected.clone().t()
+                payload = (
+                    shared,
+                    TensorPair(
+                        shared,
+                        {
+                            "same": shared,
+                            "equal": shared.clone(),
+                            "view": shared.view_as(shared),
+                        },
+                    ),
+                    None,
+                )
+            result = broadcast_tensor_container(
+                payload, src_rank=1, preserve_tensor_aliases=preserve
+            )
+            assert isinstance(result[1], TensorPair)
+            torch.testing.assert_close(result[0], expected.t(), rtol=0, atol=0)
+            assert (result[0] is result[1].left) is preserve
+            assert (result[0] is result[1].right["same"]) is preserve
+            for key in ("equal", "view"):
+                assert result[0] is not result[1].right[key]
+                torch.testing.assert_close(
+                    result[0], result[1].right[key], rtol=0, atol=0
+                )
+            assert result[0] is not previous
+            previous = result[0]
+    finally:
+        dist.destroy_process_group()
+
+
+def test_broadcast_tensor_container_preserves_opt_in_aliases_per_call(tmp_path):
+    mp.spawn(
+        _run_alias_broadcast,
+        args=(f"file://{tmp_path / 'alias_init'}",),
+        nprocs=2,
+        join=True,
+    )
