@@ -94,6 +94,7 @@ from areal.models.fsdp.ulysses import (
     ulysses_prepare_inputs,
 )
 from areal.models.transformers.ulyssess_patch import apply_monkey_patch
+from areal.models.transformers.vision_dedup import apply_vision_dedup
 from areal.models.tree_attn.functional import (
     _gather_packed_tree_logprobs,
     gather_packed_tree_logprobs_entropy,
@@ -395,6 +396,12 @@ class FSDPEngine(TrainEngine):
             ulysses_sp_size=self.parallel_helper.sp_size,
             shard_vision_across_sp=self.config.fsdp.shard_vision_across_sp,
         )
+        # Monkey patch: encode each distinct image once per vision-tower forward.
+        # Must follow apply_monkey_patch so this wrapper sits outside Vision SP
+        # Shard's: dedup then runs before images are distributed across SP ranks.
+        n_dedup = apply_vision_dedup()
+        if n_dedup:
+            self.logger.info(f"Vision-tower dedup applied to {n_dedup} class(es)")
         # Monkey patch: replace attention's forward() with tree attention.
         patch_fsdp_for_tree_training(enable=self.enable_tree_training)
 
