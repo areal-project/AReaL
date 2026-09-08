@@ -1,6 +1,25 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import ctypes
+import gc
 from collections.abc import Callable, Iterable
+
+
+def reclaim_cpu_memory() -> bool:
+    """Collect unreachable objects and return free glibc heap pages to the OS.
+
+    Call only at batch boundaries, after releasing tensor owners and caches.
+    This does not free live tensors or CUDA pinned-memory allocator caches.
+    Platforms without ``malloc_trim`` still collect Python garbage.
+    """
+    gc.collect()
+    try:
+        malloc_trim = ctypes.CDLL(None).malloc_trim
+    except (AttributeError, OSError):
+        return False
+    malloc_trim.argtypes = [ctypes.c_size_t]
+    malloc_trim.restype = ctypes.c_int
+    return bool(malloc_trim(0))
 
 
 def run_batch_cleanups(
