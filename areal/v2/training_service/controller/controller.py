@@ -1098,6 +1098,9 @@ class GatewayTrainController:
                 host=gethostip(),
                 admin_api_key=self.config.admin_api_key,
                 log_level=self.config.log_level,
+                request_timeout=self.config.request_timeout,
+                init_timeout_s=self.config.request_timeout,
+                update_timeout_s=self.config.request_timeout,
             )
         )
         ctrl.initialize()
