@@ -131,8 +131,8 @@ def _get_own_ip() -> str:
         return "127.0.0.1"
 
 
-def _merge_training_meta_by_name(meta_list: list[dict]) -> list[dict]:
-    """Merge serialized training ParameterMeta entries by parameter name.
+def _merge_meta_by_name(meta_list: list[dict]) -> list[dict]:
+    """Merge serialized ParameterMeta entries by parameter name.
 
     Each FSDP worker reports metadata for its own local shard only.
     With ``dp_size > 1`` the same parameter name appears once per worker,
@@ -165,6 +165,30 @@ def _merge_training_meta_by_name(meta_list: list[dict]) -> list[dict]:
                     new_rep_data.get("shards", [])
                 )
     return list(by_name.values()) + overflow
+
+
+# Keep the existing training helper name for callers outside this module.
+_merge_training_meta_by_name = _merge_meta_by_name
+
+
+def _canonical_inference_meta(meta_responses: list[dict]) -> list[dict]:
+    """Merge TP shards and retain one layout shared by all inference instances.
+
+    AWEX expands this single-instance layout by ``num_infer_engines``. Passing
+    every instance duplicates metadata, while unmerged same-name TP entries
+    overwrite each other when the transfer planner indexes parameters by name.
+    """
+    canonical = None
+    for instance_idx, result in enumerate(meta_responses):
+        meta = result.get("result", result.get("meta", result))
+        instance_meta = _merge_meta_by_name(meta if isinstance(meta, list) else [meta])
+        if canonical is None:
+            canonical = instance_meta
+        elif instance_meta != canonical:
+            raise ValueError(
+                f"Inference instance {instance_idx} reported different weight metadata"
+            )
+    return canonical or []
 
 
 def _build_infer_converter_context(
@@ -336,13 +360,7 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
                 training_params_meta.append(meta)
         training_params_meta = _merge_training_meta_by_name(training_params_meta)
 
-        infer_params_meta = []
-        for result in infer_meta_resps:
-            meta = result.get("result", result.get("meta", result))
-            if isinstance(meta, list):
-                infer_params_meta.extend(meta)
-            else:
-                infer_params_meta.append(meta)
+        infer_params_meta = _canonical_inference_meta(infer_meta_resps)
 
         kv_store.put(pair_name, "training_params_meta", training_params_meta)
         kv_store.put(pair_name, "infer_params_meta", infer_params_meta)
@@ -362,6 +380,7 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
             "master_port": master_port,
             "world_size": total_world_size,
             "kv_store_url": kv_store_url,
+            "timeout_s": init_timeout_s,
             "infer_world_size": total_infer_ranks,
             "train_world_size": train_world_size,
             "num_engines": num_engines,
@@ -482,13 +501,7 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
                 training_params_meta.append(meta)
         training_params_meta = _merge_training_meta_by_name(training_params_meta)
 
-        infer_params_meta = []
-        for result in infer_meta_resps:
-            meta = result.get("result", result.get("meta", result))
-            if isinstance(meta, list):
-                infer_params_meta.extend(meta)
-            else:
-                infer_params_meta.append(meta)
+        infer_params_meta = _canonical_inference_meta(infer_meta_resps)
 
         kv_store.put(pair_name, "training_params_meta", training_params_meta)
         kv_store.put(pair_name, "infer_params_meta", infer_params_meta)
