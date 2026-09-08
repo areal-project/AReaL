@@ -156,6 +156,28 @@ rollout with the new weight version, and complete checkpoints. These scripts and
 behavior have **not been GPU-validated**; static checks alone do not establish
 weight-transfer correctness or throughput.
 
+The AWEX smoke script also checks evaluation result cleanup, opt-in tensor alias
+preservation during CPU broadcasts, and lazy vision microbatch assembly. These generic
+memory fixes preserve the recipe's sampling, loss and `actor.offload=false` setting.
+Repeated processor tensors remain shared through Megatron's CPU payload broadcast; image
+concatenation allocates only for the microbatch being consumed. Evaluation releases its
+remote result shards after each completed evaluation.
+
+For a longer memory regression check, use another fresh artifact root and run:
+
+```bash
+PACMAN_TRAIN_STEPS=3 bash examples/vlm/pacman/scripts/e2e_awex.sh \
+  actor.mb_spec.max_tokens_per_mb=4096 ref.mb_spec.max_tokens_per_mb=4096
+```
+
+This keeps the full episode horizon and evaluates every update. Check that all three
+updates and evaluations finish in each curriculum, and compare cgroup `memory.current`
+at the same phase across updates. Allocator caching and optimizer initialization can
+raise the baseline; summed process RSS double-counts shared memory. These fixes reduce
+known duplication and retained evaluation storage, but the full run's peak memory still
+needs measurement on the target host. The regression tests and GPU scripts are **unrun
+locally**.
+
 ## Run
 
 Run the training module directly in **single-controller mode**. Both recipes use
