@@ -182,6 +182,11 @@ def _init_engine_thread() -> None:
                     )
                     if work_item and len(work_item) > 3:
                         work_item[3].set_exception(e)
+                finally:
+                    # The next queue.get() can block indefinitely. Neither the
+                    # callable/arguments nor the Future's result belong to this
+                    # worker once the request has completed.
+                    work_item = func = args = kwargs = future = result = None
 
         _engine_thread = Thread(target=engine_worker, daemon=True, name="EngineWorker")
         _engine_thread.start()
