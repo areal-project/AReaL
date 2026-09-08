@@ -13,6 +13,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
+from areal.tools.kernel_operator_stats import ComponentRules, summarize_traces
 from areal.tools.perf_trace_converter import write_kernel_profile_trace_views
 
 _MEMORY_LOG_FIELDS = (
@@ -130,6 +131,10 @@ def _write_markdown_summary(
                 lines.append(f"  - `{output}`")
     else:
         lines.append("- No kernel trace views generated.")
+    if summary["cpu_operator_stats"]:
+        lines.extend(
+            ["", "## CPU Operator GPU Time", "", f"- `{summary['cpu_operator_stats']}`"]
+        )
     lines.extend(["", "## Archived Memory Snapshots", ""])
     if summary["archived_memory_snapshots"]:
         for snapshot in summary["archived_memory_snapshots"]:
@@ -148,6 +153,8 @@ def postprocess_profile(
     profile_step: int,
     trainer_log: Path | None = None,
     nvidia_smi_csv: Path | None = None,
+    operator_traces: Sequence[Path] = (),
+    component_rules: Path | None = None,
 ) -> dict[str, Any]:
     run_dir.mkdir(parents=True, exist_ok=True)
 
@@ -163,6 +170,14 @@ def postprocess_profile(
         run_dir=run_dir,
         profile_step=profile_step,
     )
+    operator_dir = run_dir / "cpu_operator_stats" if operator_traces else None
+    if operator_dir is not None:
+        rules = (
+            ComponentRules(json.loads(component_rules.read_text()))
+            if component_rules
+            else None
+        )
+        summarize_traces(list(operator_traces), operator_dir, rules)
     summary: dict[str, Any] = {
         "profile_kind": profile_kind,
         "profile_step": profile_step,
@@ -174,6 +189,7 @@ def postprocess_profile(
         "trainer_memory_gb": _max_trainer_memory_gb(trainer_log),
         "kernel_trace_views": kernel_views,
         "archived_memory_snapshots": archived_snapshots,
+        "cpu_operator_stats": str(operator_dir) if operator_dir is not None else None,
     }
 
     json_path = run_dir / "profile_summary.json"
@@ -199,6 +215,14 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--profile-step", type=int, required=True)
     parser.add_argument("--trainer-log", type=Path)
     parser.add_argument("--nvidia-smi-csv", type=Path)
+    parser.add_argument("--component-rules", type=Path)
+    parser.add_argument(
+        "--operator-traces",
+        type=Path,
+        nargs="+",
+        default=(),
+        help="Original per-rank Kineto Chrome JSON traces for direct CPU-operator attribution.",
+    )
     return parser.parse_args(argv)
 
 
@@ -211,6 +235,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         profile_step=args.profile_step,
         trainer_log=args.trainer_log,
         nvidia_smi_csv=args.nvidia_smi_csv,
+        operator_traces=args.operator_traces,
+        component_rules=args.component_rules,
     )
     print(json.dumps(summary, indent=2))
     return 0

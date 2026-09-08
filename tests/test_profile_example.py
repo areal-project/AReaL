@@ -134,6 +134,21 @@ def test_postprocess_profile_writes_kernel_views_and_summary(tmp_path: Path) -> 
         ],
     )
 
+    raw_trace = tmp_path / "raw-trace.json"
+    raw_trace.write_text(
+        json.dumps(
+            {
+                "traceEvents": [
+                    json.loads(line)
+                    for line in (trace_dir / "traces-r0.jsonl").read_text().splitlines()
+                ]
+            }
+        )
+    )
+    component_rules = tmp_path / "components.json"
+    component_rules.write_text(
+        json.dumps({"cpu_scopes": [], "gpu_kernels": [], "communications": []})
+    )
     summary = postprocess_profile(
         log_dir=log_dir,
         run_dir=run_dir,
@@ -141,9 +156,13 @@ def test_postprocess_profile_writes_kernel_views_and_summary(tmp_path: Path) -> 
         profile_step=1,
         trainer_log=trainer_log,
         nvidia_smi_csv=nvidia_smi,
+        operator_traces=[raw_trace],
+        component_rules=component_rules,
     )
 
     assert summary["trace_file_count"] == 1
+    assert (Path(summary["cpu_operator_stats"]) / "operators-all-traces.csv").exists()
+    assert (Path(summary["cpu_operator_stats"]) / "component-rules.json").exists()
     assert summary["memory_snapshot_count"] == 1
     assert summary["peak_nvidia_smi_mib"] == 456
     assert summary["trainer_memory_gb"]["memory allocated"] == 1.25

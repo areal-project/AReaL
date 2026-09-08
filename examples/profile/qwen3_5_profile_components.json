@@ -1,0 +1,28 @@
+{
+  "description": "Qwen3.5-35B-A3B text-only, all 40 blocks MoE, MTP off, 256 routed experts, shared expert enabled. Semantic CPU ancestry with recognizable normalization kernel overrides; unresolved projections remain separate.",
+  "cpu_scopes": [
+    {"pattern": "(_GroupedLinear|WeightedSwiGLUFunction)(Backward)?", "component": "MOE_EXPERT_MLP"},
+    {"pattern": "_moe_.*", "component": "MOE_ROUTING"},
+    {"pattern": "(RouterGatingLinearFunction|MoEAuxLossAutoScaler)(Backward)?", "component": "MOE_ROUTING"},
+    {"pattern": "SwiGLUFunction(Backward)?", "component": "MLP_SHARED_ACTIVATION"},
+    {"pattern": "FusedAttnFunc(Backward)?", "component": "ATTN_FULL"},
+    {"pattern": "ChunkGatedDeltaRuleFunction(Backward)?", "component": "ATTN_GDN"},
+    {"pattern": "aten::(_conv_depthwise2d|convolution_backward)", "component": "ATTN_GDN_CONV"},
+    {"pattern": "L2NormFunction(Backward)?", "component": "NORM"},
+    {"pattern": "_LayerNormLinear(Backward)?", "component": "ATTN_INPUT_PROJECTION"},
+    {"pattern": "_Linear(Backward)?", "component": "LINEAR_UNRESOLVED"},
+    {"pattern": "_ChunkedVocabParallelLMHead(Backward)?", "component": "LM_HEAD_LOSS"},
+    {"pattern": "areal.optimizer_step|Optimizer\\.step#GPUStagedAdamW\\.step|aten::_fused_adamw_", "component": "OPTIMIZER"}
+  ],
+  "gpu_kernels": [
+    {"pattern": "transformer_engine::normalization::(rmsnorm|layernorm)_|\\bl2norm_(fwd|bwd)_kernel\\b", "component": "NORM"}
+  ],
+  "communications": [
+    {"match": {"Process Group Description": "EXPERT_MODEL_PARALLEL_GROUP", "Collective name": "all_to_allv"}, "component": "MOE_COMM_DISPATCH"},
+    {"match": {"Process Group Description": "EXPERT_TENSOR_AND_MODEL_PARALLEL_GROUP", "Collective name": "_allgather_base", "In msg nelems": 256, "dtype": "Long"}, "component": "MOE_COMM_METADATA"},
+    {"match": {"Process Group Description": "TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP", "Collective name": "allreduce", "In msg nelems": 256, "dtype": "Long"}, "component": "MOE_COMM_GLOBAL_AUX"},
+    {"match": {"Process Group Description": "TENSOR_MODEL_PARALLEL_GROUP"}, "component": "TP_COMMUNICATION"},
+    {"match": {"Process Group Description": "DATA_PARALLEL_GROUP_WITH_CP"}, "component": "DP_COMMUNICATION"},
+    {"match": {"Process Group Description": "DATA_PARALLEL_GROUP"}, "component": "DP_COMMUNICATION"}
+  ]
+}

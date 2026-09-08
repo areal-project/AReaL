@@ -199,3 +199,87 @@ python examples/profile/postprocess_profile.py \
 - Qwen3-30B-A3B requires an eight-GPU profiling environment. Without suitable GPUs and
   model weights, only the scripts and postprocessing can be validated; CUDA traces and
   memory snapshots cannot be produced.
+
+## GPU time by launching CPU operator
+
+For original per-rank, per-capture Kineto Chrome JSON traces, run:
+
+```bash
+python -m areal.tools.kernel_operator_stats \
+  /path/to/traces/ppo_update-step1-rank*.trace.json \
+  --output-dir /path/to/cpu_operator_stats
+```
+
+The postprocessor also accepts these files via `--operator-traces TRACE...`.
+Gzip-compressed JSON is supported. Use original traces containing CPU operators and CUDA
+APIs, not GPU-only, track-rewritten, or merged multi-capture views.
+
+Each GPU event is matched through its correlation ID to a CUDA API, then to the shortest
+enclosing `cpu_op` interval on that API's original `(pid, tid)` at launch time. This
+supports asynchronous kernels that execute after the CPU operator returns. Nested
+runtime/driver APIs count as one launch; reused IDs with incompatible launch intervals
+remain unattributed. CPU user annotations are not treated as operators.
+
+Outputs:
+
+- `operators-per-trace.csv`: direct GPU time by CPU operator within each input trace.
+- `operators-all-traces.csv`: aggregates across the selected traces.
+- `validation.json`: input and aggregated event counts/durations, plus attribution
+  counts (`attributed`, `no_launch`, `ambiguous_launch`, `no_cpu_operator`).
+
+`gpu_time_us` sums each GPU event exactly once. It is **not** inclusive parent time or
+wall time: concurrent streams and ranks may overlap. `gpu_time_share_pct` uses all GPU
+events of the same category as its denominator, including unattributed events. Kernel,
+memcpy and memset statistics are separate. `cpu_calls_with_gpu` counts distinct CPU
+operator occurrences that own an event of that category; it is not the total number of
+calls to the operator. No tensor shapes or Python/C++ stacks are required.
+
+This offline path avoids `torch.profiler.key_averages()` and its inclusive aggregation;
+large captures should export the raw trace first and perform this aggregation outside
+the training process. Files are processed sequentially, retaining only one raw trace at
+a time. No GPU is needed.
+
+Communication rows also retain `collective`, `process_group` (the recorded group
+description), `group_name` (ID), `group_size`, and `group_ranks` from the owning CPU
+operator. Thus `record_param_comms` is split by collective and actual process group,
+including separate TP subgroups with the same description. The all-traces CSV keeps
+these dimensions; it does not silently merge different group IDs or memberships. Missing
+metadata on `record_param_comms` is labeled `unknown`; non-communication operators have
+empty communication fields. Group IDs are run-local, so group-type comparisons should
+use the description and size, retaining IDs/memberships when inspecting individual
+groups. This changes grouping only, not GPU event attribution or the percentage
+denominator.
+
+### Coarse components for Qwen3.5
+
+```bash
+python -m areal.tools.kernel_operator_stats \
+  /path/to/traces/ppo_update-step1-rank*.trace.json \
+  --component-rules examples/profile/qwen3_5_profile_components.json \
+  --output-dir /path/to/components
+```
+
+The postprocessor also accepts `--component-rules`. Rules are opt-in and
+model/run-specific: this file assumes text-only Qwen3.5-35B-A3B, 256 routed experts, a
+shared expert, all-MoE blocks, MTP disabled, and the recorded Megatron group names.
+Inspect the rules before using another model or configuration.
+
+The `component` column inherits the nearest enclosing *recognized* CPU scope on the CUDA
+launch thread, while `cpu_operator` retains the direct innermost operator. Recognizable
+normalization kernels override that scope so fused Norm/Linear scopes are not counted
+twice. Communication metadata overrides enclosing compute scopes; Memcpy is a separate
+component. Unrecognized scopes remain `OTHER`. Plain Linear projections remain
+`LINEAR_UNRESOLVED` because shared-expert FC and attention output projections cannot be
+distinguished from these CPU names. Recognizable shared-expert SwiGLU is labeled
+separately; there are no independent dense MLP blocks in this model.
+
+These are exclusive GPU-event categories, **not** complete module wall times. They
+include recomputation and any captured autotuning kernels. Generic compiled graphs and
+missing module scopes can leave work unclassified. One CPU operator call can own kernels
+in multiple components, so its per-component call counts must not be summed as distinct
+CPU calls. GPU event counts and durations still sum exactly once.
+
+With component rules enabled, `component-summary.csv` sums GPU events by component and
+event category. It provides both the share of all GPU event time (including
+Memcpy/Memset) and the share within that event category. The selected rules are saved as
+`component-rules.json` alongside the results.
