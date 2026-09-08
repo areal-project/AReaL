@@ -5,6 +5,7 @@ set -euo pipefail
 : "${AREAL_ROOT:?Export the current AReaL checkout}"
 cd "$AREAL_ROOT"
 python -m pytest tests/test_trainer_eval_before_train.py \
+    tests/test_recover.py \
     tests/test_broadcast_tensor_container.py \
     tests/test_megatron_engine_vlm.py::test_vision_microbatch_preparation_is_lazy_and_reusable
 exec bash "$AREAL_ROOT/examples/vlm/pacman/scripts/smoke.sh" \
