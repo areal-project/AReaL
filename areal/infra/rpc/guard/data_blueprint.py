@@ -12,6 +12,7 @@ Routes:
 - ``GET    /data/<shard_id>``  — retrieve a single shard
 - ``POST   /data/batch``       — retrieve multiple shards
 - ``DELETE /data/clear``       — clear specified shards
+- ``POST   /data/reclaim``     — reclaim free CPU pages after a batch
 """
 
 from __future__ import annotations
@@ -25,6 +26,7 @@ from pydantic import BaseModel, ValidationError
 from areal.infra.rpc import rtensor
 from areal.infra.rpc.serialization import deserialize_value, serialize_value
 from areal.utils import logging
+from areal.utils.cleanup import reclaim_cpu_memory
 
 logger = logging.getLogger("DataBP")
 
@@ -53,6 +55,23 @@ class ClearShardRequest(ShardListRequest):
 # ================================================================================
 # Flask Blueprint Definition
 # ================================================================================
+
+
+@data_bp.route("/data/reclaim", methods=["POST"])
+def reclaim_batch_memory():
+    """Reclaim allocator pages after the controller has drained a batch.
+
+    Keep this separate from shard deletion, which also runs for individual
+    RPC results and rejected trajectories. Prefetched/live tensors remain owned
+    by their existing stores; this endpoint only collects unreachable objects
+    and trims memory the CPU allocator has already freed.
+    """
+    try:
+        trimmed = reclaim_cpu_memory()
+        return jsonify({"status": "ok", "trimmed": trimmed})
+    except Exception as e:
+        logger.error(f"Error reclaiming batch memory: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
 
 
 @data_bp.route("/data/<shard_id>", methods=["PUT"])

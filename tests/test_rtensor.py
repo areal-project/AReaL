@@ -12,6 +12,7 @@ import orjson
 import pytest
 import requests
 import torch
+from flask import Flask
 
 from areal.infra.rpc.rtensor import (
     HttpRTensorBackend,
@@ -21,6 +22,70 @@ from areal.infra.rpc.rtensor import (
 from areal.infra.rpc.serialization import deserialize_value, serialize_value
 from areal.infra.utils.proc import kill_process_tree
 from areal.utils.network import find_free_ports
+
+
+def test_explicit_batch_reclaim_preserves_prefetch_and_follows_shard_release(
+    monkeypatch,
+):
+    """Shard/chunk deletes stay cheap; the batch request reclaims only free memory."""
+    from areal.infra.rpc import rtensor
+    from areal.infra.rpc.guard import data_blueprint
+
+    monkeypatch.setattr(rtensor, "_storage", {})
+    monkeypatch.setattr(rtensor, "_storage_stats", {})
+    monkeypatch.setattr(rtensor, "_fetch_buffer", {})
+    app = Flask(__name__)
+    app.register_blueprint(data_blueprint.data_bp)
+    client = app.test_client()
+
+    finished = torch.ones(2)
+    released = weakref.ref(finished)
+    rtensor.store("finished", finished)
+    rtensor._fetch_buffer["finished"] = finished
+    prefetched = torch.ones(3)
+    rtensor.store("next-batch", prefetched)
+    del finished
+    calls = []
+
+    def reclaim():
+        assert released() is None
+        assert rtensor.fetch("next-batch") is prefetched
+        calls.append("reclaim")
+        return True
+
+    monkeypatch.setattr(data_blueprint, "reclaim_cpu_memory", reclaim)
+
+    for _ in range(2):
+        response = client.delete("/data/clear", json={"shard_ids": ["finished"]})
+        assert response.status_code == 200
+    assert calls == []
+
+    response = client.post("/data/reclaim")
+
+    assert response.status_code == 200
+    assert response.get_json() == {"status": "ok", "trimmed": True}
+    assert calls == ["reclaim"]
+    assert rtensor.storage_stats() == {"num_tensors": 1, "total_bytes": 12}
+
+
+def test_batch_reclaim_failure_uses_data_endpoint_error_response(monkeypatch):
+    from areal.infra.rpc.guard import data_blueprint
+
+    app = Flask(__name__)
+    app.register_blueprint(data_blueprint.data_bp)
+
+    def fail():
+        raise RuntimeError("allocator unavailable")
+
+    monkeypatch.setattr(data_blueprint, "reclaim_cpu_memory", fail)
+
+    response = app.test_client().post("/data/reclaim")
+
+    assert response.status_code == 500
+    assert response.get_json() == {
+        "status": "error",
+        "message": "allocator unavailable",
+    }
 
 
 class _FakeDeleteResponse:
