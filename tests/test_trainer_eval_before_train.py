@@ -18,6 +18,62 @@ class _StopAfterFirstUpdate(Exception):
     pass
 
 
+@pytest.mark.parametrize("version", ["v1", "v2"])
+def test_ppo_evaluation_releases_v1_results_after_each_evaluation(monkeypatch, version):
+    monkeypatch.setattr(rl_trainer, "is_single_controller", lambda: True)
+    trainer = PPOTrainer.__new__(PPOTrainer)
+    trainer.config = SimpleNamespace(
+        actor=SimpleNamespace(_version=version),
+        eval_gconfig=SimpleNamespace(n_samples=2),
+    )
+    trainer.valid_dataloader = [[{"id": 1}], [{"id": 2}]]
+    results = [[{"remote_shard": object()}], [None, {"remote_shard": object()}]]
+    pending = iter(results)
+    cleaned = []
+    submitted = []
+    trainer.actor = SimpleNamespace(
+        is_data_parallel_head=lambda: True,
+        clear_batches=cleaned.append,
+    )
+
+    def wait(count, timeout):
+        assert count == 2 and timeout is None
+        return next(pending)
+
+    trainer.eval_rollout = SimpleNamespace(
+        submit=lambda *args, **kwargs: submitted.append((args, kwargs)),
+        wait=wait,
+    )
+    for _ in results:
+        trainer._evaluate_fn("eval-workflow", {})
+    assert cleaned == (results if version == "v1" else [])
+    assert len(submitted) == 4
+    assert all(kwargs["is_eval"] for _, kwargs in submitted)
+
+
+def test_ppo_evaluation_does_not_hide_result_cleanup_failure(monkeypatch):
+    monkeypatch.setattr(rl_trainer, "is_single_controller", lambda: True)
+    trainer = PPOTrainer.__new__(PPOTrainer)
+    trainer.config = SimpleNamespace(
+        actor=SimpleNamespace(_version="v1"),
+        eval_gconfig=SimpleNamespace(n_samples=1),
+    )
+    trainer.valid_dataloader = [[{}]]
+
+    def fail_cleanup(_results):
+        raise RuntimeError("storage deletion failed")
+
+    trainer.actor = SimpleNamespace(
+        is_data_parallel_head=lambda: True, clear_batches=fail_cleanup
+    )
+    trainer.eval_rollout = SimpleNamespace(
+        submit=lambda *args, **kwargs: None,
+        wait=lambda *args, **kwargs: [{}],
+    )
+    with pytest.raises(RuntimeError, match="storage deletion failed"):
+        trainer._evaluate_fn("eval-workflow", {})
+
+
 class _FakeSaver:
     def maybe_wait_for_staging(self) -> None:
         pass

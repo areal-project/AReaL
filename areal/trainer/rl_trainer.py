@@ -1676,7 +1676,12 @@ class PPOTrainer:
                         drop_incomplete_group=False,
                     )
                     cnt += 1
-            self.eval_rollout.wait(cnt, timeout=None)
+            eval_results = self.eval_rollout.wait(cnt, timeout=None)
+            if is_single_controller() and self.config.actor._version == "v1":
+                # Evaluation tensors live in inference-worker RTensor storage.
+                # Dropping these handles does not delete their remote shards;
+                # reuse the normal storage cleanup without fetching the images.
+                self.actor.clear_batches(eval_results)
 
         if not is_single_controller():
             dist.barrier(group=self.actor.cpu_group)
