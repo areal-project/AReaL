@@ -12,6 +12,40 @@ if TYPE_CHECKING:
 
 __all__ = ["varlen_attn", "VarlenAttentionWrapper"]
 
+# NPU npu_fusion_attention pre_tockens/next_tockens upper bound (INT32 max ~2.1B).
+_MAX_SEQ_TOKENS = 2147483647
+
+
+def _is_npu_device(tensor: torch.Tensor) -> bool:
+    """Check if tensor is on NPU device."""
+    return tensor.device.type == "npu"
+
+
+def _default_scale(head_dim: int, scale: float | None) -> float:
+    """Return the attention scale, defaulting to 1/sqrt(head_dim)."""
+    return scale if scale is not None else 1.0 / (head_dim**0.5)
+
+
+def _cu_seqlens_to_actual(cu_seqlens: torch.Tensor) -> list[int]:
+    """Convert cumulative sequence lengths [0, s1, s1+s2, ...] to actual lengths [s1, s1+s2, ...]."""
+    return cu_seqlens[1:].tolist()
+
+
+def _get_npu_sparse_config(
+    is_causal: bool,
+    max_q: int,
+    max_k: int,
+    device: torch.device,
+) -> tuple[torch.Tensor | None, int]:
+    """Return (atten_mask, sparse_mode) for NPU varlen attention.
+
+    When is_causal=True, builds an explicit bool causal mask and uses sparse_mode=1
+    (allMask). When False, returns (None, 0) for default (no mask) behavior.
+    """
+    if is_causal:
+        return _make_causal_mask_npu(max_q, max_k, device), 1
+    return None, 0
+
 
 # ── Custom Op: Forward ───────────────────────────────────────────────
 
@@ -27,8 +61,11 @@ def _varlen_attn(
     max_k: int,
     is_causal: bool = False,
     scale: float | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Internal custom op calling Flash Attention kernel.
+
+    Dispatches to CUDA (_flash_attention_forward) or NPU (npu_fusion_attention)
+    based on the device of the input tensors.
 
     Args:
         query: Query tensor, shape (T_q, H, D)
@@ -43,9 +80,16 @@ def _varlen_attn(
 
     Returns:
         output: Attention output, shape (T_q, H, D)
-        softmax_lse: Log-sum-exp of attention scores
-        rng_state: RNG state (unused, dropout=0)
+        lse_or_max: CUDA: softmax_lse [H, T_q]; NPU: softmax_max [T_q, H, S]
+        softmax_sum: CUDA: placeholder zeros [2]; NPU: softmax_sum [T_q, H, S]
+        aux: CUDA: placeholder zeros [2]; NPU: [seed, offset] [2]
     """
+    if _is_npu_device(query):
+        return _varlen_attn_npu(
+            query, key, value, cu_seq_q, cu_seq_k, max_q, max_k, is_causal, scale
+        )
+
+    # CUDA path: _flash_attention_forward
     output, softmax_lse, rng_state, _, _ = torch.ops.aten._flash_attention_forward(
         query,
         key,
@@ -59,9 +103,95 @@ def _varlen_attn(
         return_debug_mask=False,
         scale=scale,
     )
-    # Placeholder rng_state since dropout is disabled
-    rng_state_ = torch.zeros((2,), dtype=torch.uint64, device=query.device)
-    return output, softmax_lse, rng_state_
+    # CUDA path keeps softmax_lse in its native [H, T_q] shape — no format conversion.
+    # NPU path returns [T_q, H, S] shaped tensors. custom_op requires a fixed *count*
+    # of returns, but shapes may differ per device. _backward dispatches by device and
+    # handles each format accordingly.
+    softmax_sum = torch.zeros(2, dtype=torch.float, device=query.device)
+    aux = torch.zeros(2, device=query.device)
+    return output, softmax_lse, softmax_sum, aux
+
+
+def _make_causal_mask_npu(
+    max_q: int,
+    max_k: int,
+    device: torch.device,
+) -> torch.Tensor | None:
+    """Build a bool causal mask for npu_fusion_attention varlen mode.
+
+    NPU atten_mask semantics: 1 = masked out (not attend), 0 = attend.
+    For causal attention, the upper triangle is masked (1), lower triangle is kept (0).
+
+    In varlen mode, the mask shape is [maxSq, maxSkv] (SS format) and is applied
+    per-sequence: each sequence uses the top-left Lq x Lkv submatrix where L is the
+    sequence length. Sequence isolation is handled by actual_seq_qlen/kvlen, not the mask.
+
+    Returns None for non-causal attention (no mask needed).
+    """
+    return torch.triu(
+        torch.ones(max_q, max_k, dtype=torch.bool, device=device), diagonal=1
+    )
+
+
+def _varlen_attn_npu(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    cu_seq_q: torch.Tensor,
+    cu_seq_k: torch.Tensor,
+    max_q: int,
+    max_k: int,
+    is_causal: bool,
+    scale: float | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """NPU forward using torch_npu.npu_fusion_attention (TND varlen layout).
+
+    NOTE: When atten_mask=None, npu_fusion_attention ignores sparse_mode and
+    computes full (non-causal) attention regardless of the sparse_mode value.
+    Therefore we must pass an explicit causal mask when is_causal=True, using
+    sparse_mode=1 (allMask) which accepts an arbitrary [maxSq, maxSkv] bool mask.
+    sparse_mode=3 (rightDownCausal) requires a fixed [2048, 2048] compressed mask
+    which is incompatible with dynamic max_seqlen in varlen scenarios.
+    """
+    import torch_npu
+
+    head_num = query.size(1)
+    scale_val = _default_scale(query.size(-1), scale)
+
+    actual_seq_qlen = _cu_seqlens_to_actual(cu_seq_q)
+    actual_seq_kvlen = _cu_seqlens_to_actual(cu_seq_k)
+
+    atten_mask, sparse_mode = _get_npu_sparse_config(
+        is_causal, max_q, max_k, query.device
+    )
+
+    output, softmax_max, softmax_sum, _, seed, offset, _ = (
+        torch_npu.npu_fusion_attention(
+            query,
+            key,
+            value,
+            head_num=head_num,
+            input_layout="TND",
+            pse=None,
+            padding_mask=None,
+            atten_mask=atten_mask,
+            scale=scale_val,
+            keep_prob=1.0,
+            pre_tockens=_MAX_SEQ_TOKENS,
+            next_tockens=_MAX_SEQ_TOKENS,
+            inner_precise=0,
+            prefix=None,
+            actual_seq_qlen=actual_seq_qlen,
+            actual_seq_kvlen=actual_seq_kvlen,
+            sparse_mode=sparse_mode,
+        )
+    )
+
+    # Keep softmax_max/softmax_sum in their original shape [T, H, S]
+    # and encode seed/offset as tensor for autograd
+    aux = torch.tensor([seed, offset], dtype=torch.int64, device=query.device)
+
+    return output, softmax_max, softmax_sum, aux
 
 
 @_varlen_attn.register_fake
@@ -101,16 +231,37 @@ def _varlen_attn_backward(
     key: torch.Tensor,
     value: torch.Tensor,
     out: torch.Tensor,
-    lse: torch.Tensor,
+    lse_or_max: torch.Tensor,
+    softmax_sum: torch.Tensor,
+    aux: torch.Tensor,
     cu_seq_q: torch.Tensor,
     cu_seq_k: torch.Tensor,
     max_q: int,
     max_k: int,
     is_causal: bool,
-    rng_state: torch.Tensor,
     scale: float | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Backward pass calling Flash Attention backward kernel."""
+    """Backward pass for varlen attention, dispatching to CUDA or NPU."""
+    if _is_npu_device(query):
+        return _varlen_attn_backward_npu(
+            grad_out,
+            query,
+            key,
+            value,
+            out,
+            lse_or_max,
+            softmax_sum,
+            aux,
+            cu_seq_q,
+            cu_seq_k,
+            max_q,
+            max_k,
+            is_causal,
+            scale,
+        )
+
+    # CUDA path: lse_or_max is already softmax_lse [H, T_q] — use directly
+    rng_state = torch.zeros((2,), dtype=torch.uint64, device=query.device)
     unused = torch.empty(0, device=query.device)
 
     dq, dk, dv = torch.ops.aten._flash_attention_backward(
@@ -119,7 +270,7 @@ def _varlen_attn_backward(
         key,
         value,
         out,
-        lse,
+        lse_or_max,
         cu_seq_q,
         cu_seq_k,
         max_q,
@@ -130,6 +281,73 @@ def _varlen_attn_backward(
         unused,
         scale=scale,
     )
+    return dq, dk, dv
+
+
+def _varlen_attn_backward_npu(
+    grad_out: torch.Tensor,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    out: torch.Tensor,
+    softmax_max: torch.Tensor,
+    softmax_sum: torch.Tensor,
+    aux: torch.Tensor,
+    cu_seq_q: torch.Tensor,
+    cu_seq_k: torch.Tensor,
+    max_q: int,
+    max_k: int,
+    is_causal: bool,
+    scale: float | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """NPU backward using torch_npu.npu_fusion_attention_grad.
+
+    Must pass the same causal mask and sparse_mode as the forward pass.
+    NOTE (#2): The causal mask is rebuilt here rather than cached from forward.
+    Rebuilding is *better* than caching for memory: the mask is created, used, and
+    freed in each pass. Caching via ctx would hold the mask in memory throughout
+    the forward-to-backward gap, increasing peak memory by one mask size
+    (e.g. [65536, 65536] bool = 512 MB). The mask itself is cheap to build
+    (torch.triu of ones, pure memory init).
+    """
+    import torch_npu
+
+    head_num = query.size(1)
+    scale_val = _default_scale(query.size(-1), scale)
+
+    seed = int(aux[0].item())
+    offset = int(aux[1].item())
+
+    actual_seq_qlen = _cu_seqlens_to_actual(cu_seq_q)
+    actual_seq_kvlen = _cu_seqlens_to_actual(cu_seq_k)
+
+    atten_mask, sparse_mode = _get_npu_sparse_config(
+        is_causal, max_q, max_k, query.device
+    )
+
+    dq, dk, dv, _, _ = torch_npu.npu_fusion_attention_grad(
+        query,
+        key,
+        value,
+        grad_out,  # dy
+        head_num,
+        "TND",
+        softmax_max=softmax_max,
+        softmax_sum=softmax_sum,
+        attention_in=out,
+        atten_mask=atten_mask,
+        scale_value=scale_val,
+        keep_prob=1.0,
+        pre_tockens=_MAX_SEQ_TOKENS,
+        next_tockens=_MAX_SEQ_TOKENS,
+        inner_precise=0,
+        seed=seed,
+        offset=offset,
+        actual_seq_qlen=actual_seq_qlen,
+        actual_seq_kvlen=actual_seq_kvlen,
+        sparse_mode=sparse_mode,
+    )
+
     return dq, dk, dv
 
 
@@ -162,9 +380,11 @@ def _varlen_attn_backward_fake(
 def _setup_context(ctx: Any, inputs: tuple[Any, ...], output: Any) -> None:
     """Save tensors for backward pass."""
     query, key, value, cu_seq_q, cu_seq_k, max_q, max_k, is_causal, scale = inputs
-    out, lse, rng_state = output
+    out, lse_or_max, softmax_sum, aux = output
 
-    ctx.save_for_backward(query, key, value, cu_seq_q, cu_seq_k, out, lse, rng_state)
+    ctx.save_for_backward(
+        query, key, value, cu_seq_q, cu_seq_k, out, lse_or_max, softmax_sum, aux
+    )
 
     ctx.max_q = max_q
     ctx.max_k = max_k
@@ -173,10 +393,28 @@ def _setup_context(ctx: Any, inputs: tuple[Any, ...], output: Any) -> None:
 
 
 def _backward(
-    ctx: Any, grad_out: torch.Tensor, grad_lse: torch.Tensor, grad_rng: torch.Tensor
+    ctx: Any,
+    grad_out: torch.Tensor,
+    grad_lse: torch.Tensor,
+    grad_sum: torch.Tensor,
+    grad_aux: torch.Tensor,
 ) -> tuple[torch.Tensor | None, ...]:
     """Compute gradients for backward pass."""
-    query, key, value, cu_seq_q, cu_seq_k, out, lse, rng_state = ctx.saved_tensors
+    # grad_sum and grad_aux correspond to non-differentiable outputs (softmax_sum, aux).
+    # PyTorch autograd passes zero tensors (not None) for these; they carry no gradient
+    # signal and are safely ignored.
+
+    (
+        query,
+        key,
+        value,
+        cu_seq_q,
+        cu_seq_k,
+        out,
+        lse_or_max,
+        softmax_sum,
+        aux,
+    ) = ctx.saved_tensors
 
     max_q = ctx.max_q
     max_k = ctx.max_k
@@ -189,13 +427,14 @@ def _backward(
         key,
         value,
         out,
-        lse,
+        lse_or_max,
+        softmax_sum,
+        aux,
         cu_seq_q,
         cu_seq_k,
         max_q,
         max_k,
         is_causal,
-        rng_state,
         scale,
     )
     # Return gradients for all inputs (None for non-tensor inputs)
@@ -247,7 +486,7 @@ def varlen_attn(
         - H: Number of attention heads
         - D: Head dimension
     """
-    out, _, _ = torch.ops.areal._varlen_attn(
+    out, _, _, _ = torch.ops.areal._varlen_attn(
         query, key, value, cu_seq_q, cu_seq_k, max_q, max_k, is_causal, scale
     )
     return out
