@@ -106,6 +106,7 @@ def _strict_controller(
     stats: list[dict[str, int]],
 ) -> tuple[TrainController, list[tuple[str, tuple[Any, ...]]]]:
     controller = object.__new__(TrainController)
+    controller.workers = []
     controller.workers_is_dp_head = [True, False, True]
     controller._worker_role = "actor"
     calls: list[tuple[str, tuple[Any, ...]]] = []

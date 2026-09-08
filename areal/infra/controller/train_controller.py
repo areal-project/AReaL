@@ -24,9 +24,10 @@ from areal.api.alloc_mode import ModelAllocation
 from areal.api.cli_args import PerfTracerConfig, TrainEngineConfig
 from areal.infra.rpc.rtensor import RTensor, RTensorDrainReceipt
 from areal.infra.utils.concurrent import run_async_task
+from areal.infra.utils.http import arequest_with_retry
 from areal.utils import logging, stats_tracker
 from areal.utils.data import make_dummy_eval_item
-from areal.utils.network import find_free_ports
+from areal.utils.network import find_free_ports, format_hostport
 from areal.utils.seqpack import balanced_greedy_partition
 
 from .rollout_callback import RolloutCallback
@@ -1020,6 +1021,9 @@ class TrainController:
             self._clear_batches_locked(*targets)
 
     def _clear_batches_locked(self, *targets: dict[str, RTensor]) -> None:
+        source_nodes = set(RTensor.collect_shards(targets))
+        with self._clear_shards_lock:
+            source_nodes.update(self._pending_clear_shards)
         sids, exhausted = run_async_task(self._async_clear_batches, *targets)
         if not sids:
             return
@@ -1061,6 +1065,8 @@ class TrainController:
                     self._worker_role,
                 )
 
+        self._reclaim_batch_memory(source_nodes)
+
         if exhausted:
             summary = ", ".join(
                 f"{addr}: {len(sids)}" for addr, sids in sorted(exhausted.items())
@@ -1069,6 +1075,47 @@ class TrainController:
                 "RTensor storage cleanup failed across two clear_batches calls "
                 f"({summary})"
             )
+
+    def _reclaim_batch_memory(self, source_nodes: set[str]) -> None:
+        """Best-effort CPU reclamation after source and consumer batch drains."""
+        if not self.workers:
+            return
+        # Include non-DP-head ranks: their broadcast payloads can leave large
+        # free allocator heaps even though their RTensor fetch buffers are empty.
+        node_addrs = source_nodes | {
+            format_hostport(worker.ip, int(worker.worker_ports[0]))
+            for worker in self.workers
+        }
+
+        async def reclaim() -> None:
+            results = await asyncio.gather(
+                *[
+                    arequest_with_retry(
+                        addr, "/data/reclaim", max_retries=1, timeout=30
+                    )
+                    for addr in sorted(node_addrs)
+                ],
+                return_exceptions=True,
+            )
+            for addr, result in zip(sorted(node_addrs), results, strict=True):
+                if isinstance(result, BaseException) and not isinstance(
+                    result, Exception
+                ):
+                    raise result
+                if isinstance(result, Exception) or not (
+                    isinstance(result, dict) and result.get("status") == "ok"
+                ):
+                    # Reclamation is an optimization. Storage/consumer drain
+                    # failures keep their existing semantics; a trim failure
+                    # must not invalidate an otherwise completed training step.
+                    logger.warning(
+                        "CPU memory reclamation failed on %s (role=%s): %s",
+                        addr,
+                        self._worker_role,
+                        result,
+                    )
+
+        run_async_task(reclaim)
 
     def strict_clear_batches(self, *targets: Any) -> RTensorDrainReceipt:
         """Clear source shards and prove every consumer DP head drained them.
@@ -1119,6 +1166,7 @@ class TrainController:
                 f"RTensor drain incomplete on {self._worker_role} DP heads "
                 f"{leaking_heads}: stats={stats}"
             )
+        self._reclaim_batch_memory(set(shards_by_node))
         return RTensorDrainReceipt(
             consumer_role=self._worker_role,
             shard_count=len(shard_ids),

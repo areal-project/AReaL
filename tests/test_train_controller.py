@@ -768,6 +768,97 @@ class TestTrainControllerDispatchInputs:
 
 
 class TestTrainControllerClearBatches:
+    @pytest.mark.parametrize("strict", [False, True])
+    @pytest.mark.parametrize("reclaim_fails", [False, True])
+    def test_batch_reclaim_follows_drains_and_covers_all_workers(
+        self, train_controller, monkeypatch, strict, reclaim_fails
+    ):
+        """Reclaim once per source/rank, after deletion and consumer drain."""
+        controller = train_controller
+        controller.workers = [
+            Worker(
+                id=f"actor/{rank}",
+                ip="127.0.0.1",
+                worker_ports=[str(8000 + rank)],
+                engine_ports=[],
+            )
+            for rank in range(3)
+        ]
+        controller.workers_is_dp_head = [True, False, True]
+        target = {
+            "actor": create_mock_rtensor("a", "127.0.0.1:8000"),
+            "rollout": create_mock_rtensor("b", "rollout:9000"),
+            "eval": create_mock_rtensor("c", "eval:9001"),
+        }
+        source_nodes = {rt.shard.node_addr for rt in target.values()}
+        if not strict:
+            controller._pending_clear_shards = {"retry:9002": {"previous": 1}}
+            source_nodes.add("retry:9002")
+        deleted = set()
+        events = []
+        reclaimed = []
+
+        async def clear_node(addr, _shard_ids):
+            deleted.add(addr)
+            # Ensure addresses were saved before batch owners can be released.
+            target.clear()
+            return {"status": "ok", "cleared_count": 1}
+
+        def call_workers(method, *_args, **_kwargs):
+            assert deleted == source_nodes
+            events.append(method)
+            if method == "fetch_buffer_stats":
+                if strict:
+                    return [{"matching_entries": 0}, {"matching_entries": 0}]
+                return {"num_entries": 0}
+            return [1, 1] if strict else 1
+
+        async def reclaim(addr, endpoint, **kwargs):
+            assert events == ["clear_batches", "fetch_buffer_stats"]
+            assert endpoint == "/data/reclaim"
+            assert kwargs == {"max_retries": 1, "timeout": 30}
+            reclaimed.append(addr)
+            if reclaim_fails and addr == "rollout:9000":
+                raise RuntimeError("reclaim unavailable")
+            return {"status": "ok", "trimmed": True}
+
+        monkeypatch.setattr(RTensor, "clear_node", clear_node)
+        monkeypatch.setattr(controller, "_custom_function_call", call_workers)
+        monkeypatch.setattr(
+            controller, "_custom_function_call_all_dp_heads", call_workers
+        )
+        monkeypatch.setattr(
+            "areal.infra.controller.train_controller.arequest_with_retry", reclaim
+        )
+        warning = Mock()
+        monkeypatch.setattr(
+            "areal.infra.controller.train_controller.logger.warning", warning
+        )
+
+        clear = controller.strict_clear_batches if strict else controller.clear_batches
+        clear(target)
+
+        expected = source_nodes | {f"127.0.0.1:{8000 + rank}" for rank in range(3)}
+        assert set(reclaimed) == expected
+        assert len(reclaimed) == len(expected)
+        assert warning.call_count == int(reclaim_fails)
+        assert controller._pending_clear_shards == {}
+        clear({})
+        assert len(reclaimed) == len(expected)
+
+    def test_batch_reclaim_without_workers_does_not_contact_sources(
+        self, train_controller, monkeypatch
+    ):
+        """A controller before initialization/after destruction owns no workers."""
+        request = Mock(side_effect=AssertionError("unexpected reclaim request"))
+        monkeypatch.setattr(
+            "areal.infra.controller.train_controller.arequest_with_retry", request
+        )
+
+        train_controller._reclaim_batch_memory({"unused-source:9000"})
+
+        request.assert_not_called()
+
     def test_storage_clear_surfaces_per_node_failures_and_stats(self):
         controller = TrainController.__new__(TrainController)
         controller._pending_clear_shards = {}
@@ -832,6 +923,7 @@ class TestTrainControllerClearBatches:
 
     def test_second_storage_clear_failure_cleans_workers_then_raises(self):
         controller = TrainController.__new__(TrainController)
+        controller.workers = []
         controller._pending_clear_shards = {}
         controller._clear_shards_lock = Lock()
         controller._clear_batches_lock = Lock()
@@ -861,6 +953,7 @@ class TestTrainControllerClearBatches:
 
     def test_worker_cleanup_failure_preserves_exhausted_storage_state(self):
         controller = TrainController.__new__(TrainController)
+        controller.workers = []
         controller._pending_clear_shards = {}
         controller._clear_shards_lock = Lock()
         controller._clear_batches_lock = Lock()
