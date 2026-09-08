@@ -163,6 +163,7 @@ actor:
     kwargs:
       curriculum: 2
   megatron:
+    async_save: false
     bridge_type: megatron-bridge
     use_bridge_for_update_weights: true
     policy_distribution:
@@ -215,7 +216,9 @@ saver:
   freq_steps: 1
   freq_secs: null
 recover:
-  mode: disabled
+  mode: auto
+  no_save_optim: false
+  no_load_optim: false
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
   fileroot: ${cluster.fileroot}
