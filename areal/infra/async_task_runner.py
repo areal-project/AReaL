@@ -341,6 +341,9 @@ class AsyncTaskRunner(Generic[T]):
                     timeout=self.poll_wait_time,
                     return_when=asyncio.FIRST_COMPLETED,
                 )
+                # running_tasks owns pending tasks; do not keep completed task
+                # results alive through this snapshot while idle or paused.
+                del tasks, _
 
                 if not done:
                     continue
@@ -366,9 +369,10 @@ class AsyncTaskRunner(Generic[T]):
                             )
                         result = None
 
+                    timed_result: TimedResult[T] | None = None
                     try:
                         # Place result in output queue
-                        timed_result: TimedResult[T] = TimedResult(
+                        timed_result = TimedResult(
                             create_time=task_obj.create_time,
                             data=cast(T, result),
                             task_id=task_obj.task_input.task_id,
@@ -397,6 +401,12 @@ class AsyncTaskRunner(Generic[T]):
                         raise TaskQueueFullError(
                             "Output queue full. Please increase max_queue_size."
                         )
+                    finally:
+                        del task_obj, result, timed_result
+
+                # asyncio.Task retains its result even after output is consumed.
+                done.clear()
+                del async_task
         finally:
             self._input_event = None
             # Cancel all remaining tasks on shutdown

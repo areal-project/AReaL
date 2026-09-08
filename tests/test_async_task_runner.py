@@ -6,11 +6,47 @@ async task executor.
 """
 
 import asyncio
+import gc
 import time
+import weakref
 
 import pytest
 
 from areal.infra.async_task_runner import AsyncTaskRunner
+
+
+@pytest.mark.parametrize("paused", [False, True])
+def test_consumed_results_are_released_without_another_task(paused):
+    """Idle and paused runners must release tasks, inputs, and output aliases."""
+
+    class Payload:
+        pass
+
+    async def echo(payload):
+        return payload
+
+    runner = AsyncTaskRunner[Payload](max_queue_size=10)
+    runner.initialize()
+    try:
+        payloads = [Payload() for _ in range(3)]
+        refs = [weakref.ref(payload) for payload in payloads]
+        for task_id, payload in enumerate(payloads):
+            runner.submit(echo, payload, task_id=task_id)
+        results = runner.wait(count=3, timeout=2.0, with_timing=True)
+        assert {id(result.data) for result in results} == {
+            id(payload) for payload in payloads
+        }
+        if paused:
+            runner.pause()
+        del payloads, payload, results
+
+        deadline = time.monotonic() + 2.0
+        while any(ref() is not None for ref in refs) and time.monotonic() < deadline:
+            gc.collect()
+            time.sleep(0.01)
+        assert all(ref() is None for ref in refs)
+    finally:
+        runner.destroy()
 
 
 class TestAsyncTaskRunnerBasic:
