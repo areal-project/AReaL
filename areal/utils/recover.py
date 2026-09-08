@@ -24,6 +24,7 @@ from areal.api import (
 )
 from areal.api.cli_args import RecoverConfig
 from areal.infra import TrainController
+from areal.infra.utils.concurrent import call_maybe_async
 from areal.utils import logging, timeutil
 from areal.utils.evaluator import Evaluator
 from areal.utils.saver import Saver
@@ -241,19 +242,25 @@ class RecoverHandler:
         inference_engine: InferenceEngine,
     ) -> None:
         missing = []
-        if not callable(getattr(inference_engine, "pause_generation_sync", None)):
-            missing.append("pause_generation_sync()")
+        for method in (
+            "pause_generation_sync",
+            "abort_all_requests",
+            "continue_generation",
+        ):
+            if not callable(getattr(inference_engine, method, None)):
+                missing.append(f"{method}()")
 
-        offload = getattr(inference_engine, "offload", None)
-        if not callable(offload):
-            missing.append("offload(tags=...)")
-        else:
+        for method in ("offload", "onload"):
+            fn = getattr(inference_engine, method, None)
+            if not callable(fn):
+                missing.append(f"{method}(tags=...)")
+                continue
             try:
-                accepts_tags = "tags" in inspect.signature(offload).parameters
+                accepts_tags = "tags" in inspect.signature(fn).parameters
             except (TypeError, ValueError):
                 accepts_tags = True
             if not accepts_tags:
-                missing.append("offload(tags=...)")
+                missing.append(f"{method}(tags=...)")
 
         if missing:
             raise NotImplementedError(
@@ -349,69 +356,85 @@ class RecoverHandler:
         logger.info(f"Loading recover info from {recover_info_path}")
         try:
             recover_info: RecoverInfo = RecoverInfo.load(recover_info_path)
-            logger.info(f"Recovering from {recover_info.last_step_info.next()}.")
-            saver.load_state_dict(recover_info.saver_info)
-            self.freq_ctl.load_state_dict(recover_info.checkpoint_info)
-            evaluator.load_state_dict(recover_info.evaluator_info)
-            stats_logger.load_state_dict(recover_info.stats_logger_info)
-            dataloader.load_state_dict(recover_info.dataloader_info)
-
-            global_step = recover_info.last_step_info.global_step
-            recovery_version = global_step + 1
-
-            is_awex_colocate = self._should_run_awex_colocate_transfer(
-                inference_engine=inference_engine,
-                weight_update_meta=weight_update_meta,
-                colocated_rollout=colocated_rollout,
-            )
-            if is_awex_colocate:
-                self._require_colocate_rollout_protocol(inference_engine)
-
-            if not is_awex_colocate:
-                for name, engine_ in normalized_engine.items():
-                    self._load_checkpoint(engine_, name=name)
-
-            if inference_engine is not None:
-                assert weight_update_meta is not None
-                update_engine = normalized_engine[inference_engine_update_from]
-                versioned_meta = weight_update_meta.with_version(recovery_version)
-                update_engine.connect_engine(inference_engine, versioned_meta)
-                inference_engine.pause()
-                try:
-                    # AWEX colocate transfer requires the full engine-level
-                    # pause/offload protocol, not just the controller pause. The
-                    # sglang plugin's patched event loop only drains the weight-
-                    # update queue while scheduler._engine_paused is True (set by
-                    # pause_generation), and the reader-side protocol expects the
-                    # engine's kv/weights released before the writer publishes.
-                    # Without this the recover-path transfer deadlocks: reader
-                    # never consumes the queued version marker, writer blocks on
-                    # weights_update_finished forever.
-                    # Mirror of the trainer's pre-update sequence; the reverse
-                    # side (kv_cache onload) happens inside update_weights.
-                    if is_awex_colocate:
-                        inference_engine.pause_generation_sync()
-                        inference_engine.offload(tags=["kv_cache"])
-                        inference_engine.offload(tags=["weights"])
-                        # Load the actor checkpoint only after the colocated
-                        # rollout engine has released its GPU memory; loading
-                        # first would stack DCP weights/optimizer on top of the
-                        # still-resident sglang allocation and risk OOM.
-                        for name, engine_ in normalized_engine.items():
-                            self._load_checkpoint(engine_, name=name)
-                    update_engine.update_weights(versioned_meta)
-                finally:
-                    # Always resume: leaving rollout paused after a failed
-                    # checkpoint load or transfer would hang every later step.
-                    inference_engine.resume()
-                update_engine.set_version(recovery_version)
-                inference_engine.set_version(recovery_version)
-            return recover_info
         except (FileNotFoundError, InValidRecoverInfo):
             logger.warning(
                 f"Resume info not found at {recover_info_path}. "
                 f"This should not be a resumed experiment!"
             )
+            return None
+
+        # Once metadata exists, checkpoint/transfer failures must propagate.
+        # Falling back to a fresh run here can leave a partially restored actor
+        # and a paused inference engine while silently discarding Adam state.
+        logger.info(f"Recovering from {recover_info.last_step_info.next()}.")
+        saver.load_state_dict(recover_info.saver_info)
+        self.freq_ctl.load_state_dict(recover_info.checkpoint_info)
+        evaluator.load_state_dict(recover_info.evaluator_info)
+        stats_logger.load_state_dict(recover_info.stats_logger_info)
+        dataloader.load_state_dict(recover_info.dataloader_info)
+
+        global_step = recover_info.last_step_info.global_step
+        recovery_version = global_step + 1
+
+        is_awex_colocate = self._should_run_awex_colocate_transfer(
+            inference_engine=inference_engine,
+            weight_update_meta=weight_update_meta,
+            colocated_rollout=colocated_rollout,
+        )
+        if is_awex_colocate:
+            self._require_colocate_rollout_protocol(inference_engine)
+
+        if not is_awex_colocate:
+            for name, engine_ in normalized_engine.items():
+                self._load_checkpoint(engine_, name=name)
+
+        if inference_engine is not None:
+            assert weight_update_meta is not None
+            update_engine = normalized_engine[inference_engine_update_from]
+            versioned_meta = weight_update_meta.with_version(recovery_version)
+            update_engine.connect_engine(inference_engine, versioned_meta)
+            inference_engine.pause()
+            try:
+                # AWEX colocate transfer requires the full engine-level
+                # pause/offload protocol, not just the controller pause. The
+                # sglang plugin's patched event loop only drains the weight-
+                # update queue while scheduler._engine_paused is True (set by
+                # pause_generation), and the reader-side protocol expects the
+                # engine's kv/weights released before the writer publishes.
+                # Without this the recover-path transfer deadlocks: reader
+                # never consumes the queued version marker, writer blocks on
+                # weights_update_finished forever.
+                # Mirror the trainer's pre-update and post-publication handover.
+                if is_awex_colocate:
+                    inference_engine.pause_generation_sync()
+                    inference_engine.offload(tags=["kv_cache"])
+                    inference_engine.offload(tags=["weights"])
+                    inference_engine.offload(tags=["cuda_graph"])
+                    # Load the actor checkpoint only after the colocated
+                    # rollout engine has released its GPU memory; loading
+                    # first would stack DCP weights/optimizer on top of the
+                    # still-resident sglang allocation and risk OOM.
+                    for name, engine_ in normalized_engine.items():
+                        self._load_checkpoint(engine_, name=name)
+                update_engine.update_weights(versioned_meta)
+                update_engine.set_version(recovery_version)
+                inference_engine.set_version(recovery_version)
+                if is_awex_colocate:
+                    # Match PPOTrainer's publication handover: the AWEX reader
+                    # installs weights, then the controller restores generation.
+                    inference_engine.abort_all_requests()
+                    inference_engine.onload(tags=["cuda_graph"])
+                    inference_engine.onload(tags=["kv_cache"])
+                    call_maybe_async(inference_engine.continue_generation)
+            except BaseException:
+                if not is_awex_colocate:
+                    inference_engine.resume()
+                # An incomplete AWEX load/transfer has no valid memory owner.
+                # Keep rollout paused and let trainer construction tear down.
+                raise
+            else:
+                inference_engine.resume()
+        return recover_info
 
     def _save_checkpoint(
         self,

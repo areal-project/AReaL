@@ -3,6 +3,7 @@
 import dataclasses
 import os
 import tempfile
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -11,6 +12,7 @@ from areal.api.cli_args import RecoverConfig
 from areal.api.io_struct import FinetuneSpec, StepInfo
 from areal.utils.recover import (
     RecoverHandler,
+    RecoverInfo,
     check_if_auto_recover,
     check_if_recover,
 )
@@ -360,8 +362,17 @@ class TestColocateRolloutProtocol:
     """Engines lacking the colocate protocol must fail before any side effect."""
 
     def test_engine_with_full_protocol_is_accepted(self):
-        engine = Mock(spec=["pause_generation_sync", "offload"])
+        engine = Mock(
+            spec=[
+                "pause_generation_sync",
+                "offload",
+                "onload",
+                "abort_all_requests",
+                "continue_generation",
+            ]
+        )
         engine.offload = lambda tags=None: None
+        engine.onload = lambda tags=None: None
 
         RecoverHandler._require_colocate_rollout_protocol(engine)
 
@@ -382,3 +393,105 @@ class TestColocateRolloutProtocol:
             RecoverHandler._require_colocate_rollout_protocol(engine)
 
         assert "tags" in str(exc_info.value)
+
+
+@pytest.mark.parametrize("failure", [None, "load", "transfer"])
+def test_awex_recovery_restores_generation_only_after_success(
+    tmp_path, monkeypatch, failure
+):
+    handler = TestRecoverHandler._make_handler(str(tmp_path), "auto")
+    events = []
+    info = SimpleNamespace(
+        last_step_info=StepInfo(
+            epoch=0, epoch_step=2, global_step=2, steps_per_epoch=4
+        ),
+        saver_info={},
+        evaluator_info={},
+        stats_logger_info={},
+        dataloader_info={},
+        checkpoint_info={},
+    )
+    monkeypatch.setattr(RecoverInfo, "load", lambda path: info)
+    handler.freq_ctl = Mock()
+
+    def load(engine, name):
+        events.append("load")
+        if failure == "load":
+            raise FileNotFoundError("missing DCP shard")
+
+    def update(meta):
+        events.append("update")
+        assert meta == 3
+        if failure == "transfer":
+            raise RuntimeError("transfer failed")
+
+    handler._load_checkpoint = load
+    engine = SimpleNamespace(
+        connect_engine=lambda *args: events.append("connect"),
+        update_weights=update,
+        set_version=lambda v: events.append(("actor_version", v)),
+    )
+    rollout = SimpleNamespace(
+        pause=lambda: events.append("pause"),
+        pause_generation_sync=lambda: events.append("pause_generation"),
+        offload=lambda tags: events.append(("offload", tags)),
+        onload=lambda tags: events.append(("onload", tags)),
+        abort_all_requests=lambda: events.append("abort"),
+        continue_generation=lambda: events.append("continue"),
+        resume=lambda: events.append("resume"),
+        set_version=lambda v: events.append(("rollout_version", v)),
+    )
+    meta = SimpleNamespace(type="awex", with_version=lambda v: v)
+
+    def recover():
+        return handler.load(
+            engine,
+            Mock(),
+            Mock(),
+            Mock(),
+            Mock(),
+            inference_engine=rollout,
+            weight_update_meta=meta,
+            colocated_rollout=True,
+        )
+
+    if failure is None:
+        assert recover() is info
+    else:
+        error = FileNotFoundError if failure == "load" else RuntimeError
+        with pytest.raises(error):
+            recover()
+    expected = [
+        "connect",
+        "pause",
+        "pause_generation",
+        ("offload", ["kv_cache"]),
+        ("offload", ["weights"]),
+        ("offload", ["cuda_graph"]),
+        "load",
+    ]
+    if failure != "load":
+        expected.append("update")
+    if failure is None:
+        expected += [
+            ("actor_version", 3),
+            ("rollout_version", 3),
+            "abort",
+            ("onload", ["cuda_graph"]),
+            ("onload", ["kv_cache"]),
+            "continue",
+            "resume",
+        ]
+    assert events == expected
+
+
+def test_recovery_without_metadata_starts_fresh_without_loading(tmp_path, monkeypatch):
+    handler = TestRecoverHandler._make_handler(str(tmp_path), "auto")
+
+    def missing(path):
+        raise FileNotFoundError(path)
+
+    monkeypatch.setattr(RecoverInfo, "load", missing)
+    handler._load_checkpoint = Mock()
+    assert handler.load(Mock(), Mock(), Mock(), Mock(), Mock()) is None
+    handler._load_checkpoint.assert_not_called()
