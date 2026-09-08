@@ -2,6 +2,7 @@
 
 from contextlib import nullcontext
 from types import SimpleNamespace
+from weakref import ref
 
 import pytest
 
@@ -289,6 +290,96 @@ def test_awex_reference_scoring_releases_rollout_before_restoring_models(monkeyp
         ["weights"],
         ["cuda_graph"],
     ]
+
+
+@pytest.mark.parametrize("mode", ["awex", "xccl"])
+@pytest.mark.parametrize("cleanup_fails", [False, True])
+def test_ppo_releases_training_payloads_before_save_and_eval(
+    monkeypatch, mode, cleanup_fails
+):
+    _disable_timing_contexts(monkeypatch, rl_trainer)
+    monkeypatch.setattr(rl_trainer, "is_single_controller", lambda: True)
+    events, cache, images = [], {}, []
+    trainer = _build_ppo_trainer(events)
+    trainer.config.actor.weight_update_mode = mode
+    trainer.mopd_execution_plan = trainer.mopd_teacher_phase = None
+    trainer._should_offload_ref = trainer._should_offload_critic = False
+    trainer._evaluate_before_train = lambda **kwargs: False
+
+    class ImagePayload:
+        pass
+
+    def prepare(*args, **kwargs):
+        payload = ImagePayload()
+        images.append(ref(payload))
+        batch = [{"multi_modal_input": payload}]
+        cache.update(actor=batch, ref=batch, critic=batch, data=batch)
+        return batch
+
+    def clear(role, *args):
+        events.append(("clear_" + role, {}))
+        cache.pop(role)
+        if cleanup_fails and role == "actor":
+            raise RuntimeError("actor cleanup failed")
+
+    def after_release(phase, **kwargs):
+        assert not cache
+        assert images[0]() is None
+        events.append((phase, {}))
+
+    trainer.actor.prepare_batch = prepare
+    trainer.actor.compute_advantages = lambda batch: batch
+    trainer.actor.ppo_update = lambda batch: events.append(("actor_update", {}))
+    trainer.actor.step_lr_scheduler = lambda: None
+    trainer.actor.onload = lambda: None
+    trainer.actor.clear_batches = lambda *args: clear("actor", *args)
+    trainer.ref = SimpleNamespace(
+        compute_logp=lambda batch: [0.0 for _ in batch],
+        get_device_stats=lambda: _FakeDeviceStats(),
+        clear_batches=lambda *args: clear("ref", *args),
+    )
+    trainer.critic = SimpleNamespace(
+        compute_values=lambda batch: [0.0 for _ in batch],
+        get_device_stats=lambda: _FakeDeviceStats(),
+        ppo_update=lambda batch: events.append(("critic_update", {})),
+        step_lr_scheduler=lambda: None,
+        clear_batches=lambda *args: clear("critic", *args),
+    )
+    trainer.data_controller = SimpleNamespace(clear_batches=lambda: clear("data"))
+    trainer.rollout = SimpleNamespace(
+        pause=lambda: None,
+        pause_generation_sync=lambda: None,
+        offload=lambda tags: None,
+    )
+    trainer.weight_update_meta = SimpleNamespace(with_version=lambda version: version)
+    trainer._update_weights_and_publish_version = lambda *args: after_release("publish")
+    trainer._save_hf = lambda **kwargs: after_release("save_hf")
+    trainer._save_recover_checkpoint = lambda **kwargs: after_release("save_recover")
+    trainer._evaluate = lambda **kwargs: after_release("eval")
+    trainer._save_perf_tracer = lambda **kwargs: None
+
+    if cleanup_fails:
+        with pytest.raises(RuntimeError, match="actor cleanup failed"):
+            trainer.train(workflow="test-workflow", eval_workflow="test-eval")
+    else:
+        trainer.train(workflow="test-workflow", eval_workflow="test-eval")
+
+    phases = [name for name, _ in events]
+    expected = [
+        "actor_update",
+        "critic_update",
+        "clear_actor",
+        "clear_critic",
+        "clear_ref",
+        "clear_data",
+    ]
+    if not cleanup_fails:
+        expected += (
+            ["save_hf", "save_recover", "publish"]
+            if mode == "awex"
+            else ["publish", "save_hf", "save_recover"]
+        ) + ["eval", "commit"]
+    assert phases == expected
 
 
 @pytest.mark.parametrize(

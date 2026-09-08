@@ -1000,6 +1000,54 @@ class PPOTrainer:
                 if self._should_offload_critic:
                     self._offload_model(self.critic, role="critic")
 
+            # Training tensors are no longer consumed after both updates.
+            # Release source shards and consumer caches before checkpoint
+            # staging and evaluation allocate another batch of images.
+            with (
+                stats_tracker.record_timing("clear_batches"),
+                perf_tracer.trace_scope(
+                    "train.clear_batches",
+                    category=Category.INSTR,
+                    args={"global_step": global_step},
+                ),
+            ):
+                # Each role runs in its own Python process with a
+                # process-local ``_fetch_buffer``; one HTTP DELETE to the
+                # storage owner clears ``_storage`` but not per-consumer
+                # caches. Fan out ``clear_batches`` to every role that
+                # localized the batch — see areal-project/AReaL#1209.
+                # SPMD mode never populates ``_fetch_buffer`` (no RTensor
+                # round-trip), so the fan-out is single-controller only.
+                if is_single_controller():
+                    cleanups = [
+                        (
+                            "actor",
+                            lambda: self.actor.clear_batches(rollout_batch, adv_batch),
+                        )
+                    ]
+                    if self.critic is not None:
+                        cleanups.append(
+                            (
+                                "critic",
+                                lambda: self.critic.clear_batches(
+                                    rollout_batch, adv_batch
+                                ),
+                            )
+                        )
+                    if self.ref is not None:
+                        cleanups.append(
+                            ("ref", lambda: self.ref.clear_batches(rollout_batch))
+                        )
+                    if self.data_controller is not None:
+                        cleanups.append(
+                            ("data", lambda: self.data_controller.clear_batches())
+                        )
+                    run_batch_cleanups(cleanups)
+
+            # Scoring loop targets may still reference the last trajectory.
+            traj = None
+            rollout_batch = adv_batch = None
+
             # Save BEFORE update_weights. In AWEX colocate mode the
             # transfer ends with actor weights offloaded, so saving afterwards
             # would resume weights onto a card already crowded by the
@@ -1065,47 +1113,6 @@ class PPOTrainer:
                 )
             if self._should_offload_rollout:
                 self._offload_rollout(is_eval=True)
-
-            with (
-                stats_tracker.record_timing("clear_batches"),
-                perf_tracer.trace_scope(
-                    "train.clear_batches",
-                    category=Category.INSTR,
-                    args={"global_step": global_step},
-                ),
-            ):
-                # Each role runs in its own Python process with a
-                # process-local ``_fetch_buffer``; one HTTP DELETE to the
-                # storage owner clears ``_storage`` but not per-consumer
-                # caches. Fan out ``clear_batches`` to every role that
-                # localized the batch — see areal-project/AReaL#1209.
-                # SPMD mode never populates ``_fetch_buffer`` (no RTensor
-                # round-trip), so the fan-out is single-controller only.
-                if is_single_controller():
-                    cleanups = [
-                        (
-                            "actor",
-                            lambda: self.actor.clear_batches(rollout_batch, adv_batch),
-                        )
-                    ]
-                    if self.critic is not None:
-                        cleanups.append(
-                            (
-                                "critic",
-                                lambda: self.critic.clear_batches(
-                                    rollout_batch, adv_batch
-                                ),
-                            )
-                        )
-                    if self.ref is not None:
-                        cleanups.append(
-                            ("ref", lambda: self.ref.clear_batches(rollout_batch))
-                        )
-                    if self.data_controller is not None:
-                        cleanups.append(
-                            ("data", lambda: self.data_controller.clear_batches())
-                        )
-                    run_batch_cleanups(cleanups)
 
             with perf_tracer.trace_scope(
                 "train.log_stats",
