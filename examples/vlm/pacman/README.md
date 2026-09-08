@@ -114,7 +114,8 @@ original XCCL recipes remain available.
 AWEX 0.8.1 with its Qwen3.5 converter is required (already in AReaL's CUDA dependency
 set). Training workers disable automatic TMS regions; actor and reference use explicit
 Megatron residency, while SGLang enables its memory saver. Keep the overlay's worker
-environment and `ref.offload=true`. The generic trainer releases the reference before
+environment, `actor.offload=false`, and `ref.offload=true`. AWEX manages the actor's
+residency transitions explicitly. The generic trainer releases the reference before
 starting SGLang and orders each update as:
 
 ```text

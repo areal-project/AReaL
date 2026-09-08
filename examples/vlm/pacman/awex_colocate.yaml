@@ -4,7 +4,7 @@ actor:
   _version: v1
   backend: megatron:d4p1t2
   weight_update_mode: awex
-  offload: true
+  offload: false
   scheduling_strategy:
     type: separation
   scheduling_spec:
