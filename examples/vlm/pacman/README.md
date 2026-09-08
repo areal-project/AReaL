@@ -120,8 +120,9 @@ starting SGLang and orders each update as:
 
 ```text
 rollout -> release SGLang -> reference onload/score/offload
-        -> actor onload/recompute/advantages/PPO/save
-        -> AWEX weight publication -> restore SGLang -> next rollout
+        -> actor onload/recompute/advantages/PPO -> clear training batches
+        -> HF + recovery save -> AWEX weight publication -> restore SGLang
+        -> evaluation -> clear evaluation batches -> next rollout
 ```
 
 On the same eight GPUs this doubles training DP relative to a separated DP=2/TP=2 actor.
@@ -161,7 +162,10 @@ preservation during CPU broadcasts, and lazy vision microbatch assembly. These g
 memory fixes preserve the recipe's sampling, loss and `actor.offload=false` setting.
 Repeated processor tensors remain shared through Megatron's CPU payload broadcast; image
 concatenation allocates only for the microbatch being consumed. Evaluation releases its
-remote result shards after each completed evaluation.
+remote result shards after each completed evaluation. Training source shards and
+actor/reference consumer caches are released after the updates, before checkpoint
+staging and evaluation, so training and evaluation images do not remain live together
+through the full evaluation phase.
 
 For a longer memory regression check, use another fresh artifact root and run:
 
@@ -177,6 +181,51 @@ raise the baseline; summed process RSS double-counts shared memory. These fixes 
 known duplication and retained evaluation storage, but the full run's peak memory still
 needs measurement on the target host. The regression tests and GPU scripts are **unrun
 locally**.
+
+## Recovery
+
+Both curricula, including the AWEX overlays, enable `recover.mode=auto` and save a
+recovery checkpoint every update. `recover.no_save_optim=false` and
+`recover.no_load_optim=false` preserve Adam state. `actor.megatron.async_save=false`
+keeps DCP saving synchronous so recovery metadata is written after the checkpoint
+finishes. HF model exports remain separate; recovery adds optimizer and training state
+I/O on each update.
+
+For a fresh run, use a new `PACMAN_ARTIFACT_ROOT` and trial name. For recovery, rerun
+the same launch command with the same experiment/trial names, `cluster.fileroot`,
+topology, dataset and original actor/reference model paths. Do not replace `actor.path`
+with the HF export: the recovery handler loads the DCP weights and Adam state, restores
+the data-loader progress, and publishes the saved model version to SGLang. If overriding
+`cluster.fileroot`, remember that recovery follows that directory, not the artifact
+root. The single-controller script does not automatically relaunch a failed process;
+rerun it after its old workers have exited.
+
+Checkpoints live under `<cluster.fileroot>/checkpoints/<user>/<experiment>/<trial>/`:
+`default/recover_checkpoint/` contains DCP state and `recover_info/` contains step,
+data-loader and controller metadata. With AWEX they are saved before weight publication
+and evaluation, while the actor owns the GPUs. Recovery continues with the next training
+update; an interrupted evaluation or in-flight episode is not resumed. KV cache starts
+empty and CUDA graphs are initialized by the new SGLang process; neither is restored
+from the training checkpoint. Recovery temporarily releases these runtime allocations
+while loading weights, then re-enables them and generation before resuming requests.
+Missing DCP files after recovery metadata has been found fail the run instead of
+silently resetting the optimizer.
+
+Run the minimal checks with `scripts/smoke_awex.sh`. To exercise a real controller
+restart on eight GPUs, use a separate fresh artifact root:
+
+```bash
+bash examples/vlm/pacman/scripts/recover_awex.sh \
+  actor.path=/absolute/path/to/Qwen3.5-9B \
+  environment.max_steps=2 planner_audit.max_steps=2 \
+  actor.mb_spec.max_tokens_per_mb=4096 ref.mb_spec.max_tokens_per_mb=4096
+```
+
+The script runs one update, restarts with the same identity, checks the recovery log,
+and verifies that the saved global step advances from 0 to 1. Remove the horizon
+overrides for the full recipe. This script and the prepared regression tests are **unrun
+locally**; full CPU/GPU memory peaks and optimizer continuity need target-host
+validation.
 
 ## Run
 
