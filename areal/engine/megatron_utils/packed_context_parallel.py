@@ -11,6 +11,7 @@ from megatron.core.packed_seq_params import PackedSeqParams
 
 from areal.engine.core.model import SequencePackingMode
 from areal.utils.data import (
+    MicroBatchItem,
     MicroBatchList,
     align_mb_list_sequences,
     is_multi_modal_key,
@@ -340,6 +341,14 @@ def extract_vision_from_multi_modal(
                 padded_mb[key] = torch.cat(items, dim=0)
 
     _drop_multi_modal_payload(mb)
+
+
+def prepare_vision_microbatch(source: MicroBatchItem) -> MicroBatchItem:
+    """Concatenate only the current microbatch, without mutating VPP sources."""
+    orig_mb = dict(source.orig_mb)
+    padded_mb = dict(source.padded_mb)
+    extract_vision_from_multi_modal(orig_mb, padded_mb)
+    return source._replace(orig_mb=orig_mb, padded_mb=padded_mb)
 
 
 def _reconstruct_padded_2d(
