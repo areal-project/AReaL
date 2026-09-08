@@ -34,6 +34,7 @@ from areal.engine.awex.metadata import (
     fetch_kv_metadata,
 )
 from areal.engine.awex.nccl_group import (
+    batch_send_recv_by_peer,
     init_weights_update_group,
     setup_batch_isend_irecv,
 )
@@ -404,10 +405,9 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
             self._weights_update_group,
             copy_rank=self._transfer_rank,
         )
-        batch_send_recv(
+        batch_send_recv_by_peer(
             send_ops=send_ops,
             recv_ops=[],
-            blocking=True,
             use_group=awex_wu_use_group(),
         )
         dist.barrier(group=self._weights_update_group_gloo)
