@@ -349,7 +349,7 @@ def _load_delta_detect(monkeypatch):
         "areal.engine.awex.dte.delta_config",
         _load_delta_config(),
     )
-    path = _ROOT / "areal/engine/awex/delta_detect.py"
+    path = _ROOT / "areal/engine/awex/dte/delta_detect.py"
     spec = importlib.util.spec_from_file_location("awex_delta_detect", path)
     mod = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
@@ -523,11 +523,11 @@ def _load_megatron_adapter(monkeypatch):
         delta_config_mod,
     )
 
-    delta_detect_mod = types.ModuleType("areal.engine.awex.delta_detect")
+    delta_detect_mod = types.ModuleType("areal.engine.awex.dte.delta_detect")
     delta_detect_mod.AdamWInversionDetector = lambda *args, **kwargs: None
     monkeypatch.setitem(
         sys.modules,
-        "areal.engine.awex.delta_detect",
+        "areal.engine.awex.dte.delta_detect",
         delta_detect_mod,
     )
 
