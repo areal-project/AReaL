@@ -23,6 +23,9 @@ from awex.util.tensor_util import (
     group_tensors_by_shape_and_dtype,
 )
 
+from areal.engine.awex.adapters.training_adapter import (
+    AwexTrainingAdapter,
+)
 from areal.engine.awex.delta_config import (
     DTERuntimeConfig,
     synchronize_wire_dtypes,
@@ -37,9 +40,6 @@ from areal.engine.awex.nccl_group import (
     batch_send_recv_by_peer,
     init_weights_update_group,
     setup_batch_isend_irecv,
-)
-from areal.engine.awex.training_adapter import (
-    AwexTrainingAdapter,
 )
 from areal.engine.awex.utils import (
     awex_colocate_timeout_s,

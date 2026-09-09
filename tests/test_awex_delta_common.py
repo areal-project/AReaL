@@ -282,7 +282,14 @@ def test_invert_adamw_roundtrip():
 def _stub_areal_packages(monkeypatch):
     monkeypatch.setitem(sys.modules, "httpx", types.ModuleType("httpx"))
     monkeypatch.setitem(sys.modules, "areal", types.ModuleType("areal"))
-    for package in ("areal.engine", "areal.engine.awex", "areal.engine.megatron_utils"):
+    for package in (
+        "areal.engine",
+        "areal.engine.awex",
+        "areal.engine.awex.adapters",
+        "areal.engine.awex.dte",
+        "areal.engine.awex.transport",
+        "areal.engine.megatron_utils",
+    ):
         module = types.ModuleType(package)
         module.__path__ = []
         monkeypatch.setitem(sys.modules, package, module)
@@ -334,6 +341,7 @@ def _load_delta_detect(monkeypatch):
     for package in (
         "areal.engine",
         "areal.engine.awex",
+        "areal.engine.awex.dte",
     ):
         monkeypatch.setitem(sys.modules, package, types.ModuleType(package))
     monkeypatch.setitem(
@@ -456,7 +464,9 @@ def _load_sglang_adapter(monkeypatch):
         delta_config_mod,
     )
 
-    inference_adapter_mod = types.ModuleType("areal.engine.awex.inference_adapter")
+    inference_adapter_mod = types.ModuleType(
+        "areal.engine.awex.adapters.inference_adapter"
+    )
 
     class _AwexInferenceAdapter:
         pass
@@ -464,7 +474,7 @@ def _load_sglang_adapter(monkeypatch):
     inference_adapter_mod.AwexInferenceAdapter = _AwexInferenceAdapter
     monkeypatch.setitem(
         sys.modules,
-        "areal.engine.awex.inference_adapter",
+        "areal.engine.awex.adapters.inference_adapter",
         inference_adapter_mod,
     )
 
@@ -530,7 +540,9 @@ def _load_megatron_adapter(monkeypatch):
         nccl_group_mod,
     )
 
-    training_adapter_mod = types.ModuleType("areal.engine.awex.training_adapter")
+    training_adapter_mod = types.ModuleType(
+        "areal.engine.awex.adapters.training_adapter"
+    )
 
     class _AwexTrainingAdapter:
         pass
@@ -538,7 +550,7 @@ def _load_megatron_adapter(monkeypatch):
     training_adapter_mod.AwexTrainingAdapter = _AwexTrainingAdapter
     monkeypatch.setitem(
         sys.modules,
-        "areal.engine.awex.training_adapter",
+        "areal.engine.awex.adapters.training_adapter",
         training_adapter_mod,
     )
 
