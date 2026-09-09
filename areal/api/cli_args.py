@@ -3593,6 +3593,20 @@ class MOPDLossConfig:
         default=5.0,
         metadata={"help": "Positive cap applied to the behavior-policy ratio."},
     )
+    score_reward_min: float | None = field(
+        default=None,
+        metadata={"help": "Optional lower bound applied to the MOPD score reward."},
+    )
+    score_reward_max: float | None = field(
+        default=None,
+        metadata={"help": "Optional upper bound applied to the MOPD score reward."},
+    )
+    normalize_teacher_weights: bool = field(
+        default=False,
+        metadata={
+            "help": "Normalize teacher log-probabilities by teacher weight sum across heterogeneous routes."
+        },
+    )
 
     def __post_init__(self):
         for name in ("rl_coefficient", "distillation_coefficient"):
@@ -3614,6 +3628,28 @@ class MOPDLossConfig:
             raise ValueError(
                 "mopd.loss.importance_ratio_cap must be finite and positive"
             )
+        for name in ("score_reward_min", "score_reward_max"):
+            val = getattr(self, name)
+            if val is not None:
+                if not isinstance(val, (int, float)) or isinstance(val, bool):
+                    raise ValueError(
+                        f"mopd.loss.{name} must be a finite number or None"
+                    )
+                if not math.isfinite(val):
+                    raise ValueError(
+                        f"mopd.loss.{name} must be a finite number, got {val}"
+                    )
+        if (
+            self.score_reward_min is not None
+            and self.score_reward_max is not None
+            and self.score_reward_min > self.score_reward_max
+        ):
+            raise ValueError(
+                f"mopd.loss.score_reward_min ({self.score_reward_min}) cannot exceed "
+                f"mopd.loss.score_reward_max ({self.score_reward_max})"
+            )
+        if not isinstance(self.normalize_teacher_weights, bool):
+            raise ValueError("mopd.loss.normalize_teacher_weights must be a boolean")
 
 
 @dataclass
