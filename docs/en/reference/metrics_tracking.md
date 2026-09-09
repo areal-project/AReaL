@@ -304,7 +304,7 @@ stats_logger:
   fileroot: "/path/to/logs"
 
   wandb:
-    mode: "online"  # "online", "offline", or "disabled"
+    mode: "online"  # "online", "offline", "shared", or "disabled"
     project: "my-project"
     entity: "my-team"
 
@@ -315,6 +315,33 @@ stats_logger:
   tensorboard:
     path: "/path/to/tensorboard/logs"  # null to disable
 ```
+
+### W&B GPU System Metrics
+
+W&B collects system metrics from the process that calls `wandb.init()`. In
+single-controller training, the controller may run on a CPU node while actor and rollout
+workers run on GPU nodes. In that setup, ordinary `wandb.mode: "online"` only reports
+controller process metrics.
+
+To collect GPU utilization and memory from worker nodes, use W&B shared mode and enable
+worker system metrics:
+
+```yaml
+stats_logger:
+  wandb:
+    mode: "shared"
+    project: "my-project"
+    entity: "my-team"
+    system_metrics:
+      enabled: true
+      roles: ["actor", "rollout"]  # null enables every non-service worker role
+      gpu_device_ids: null         # let W&B use the worker's visible GPUs
+```
+
+The controller initializes the primary W&B run. Each selected worker initializes a
+non-primary W&B client with `x_primary=False`, a role/rank label, and
+`x_update_finish_state=False`, so workers contribute only their system metrics and do
+not finish the run.
 
 ## Best Practices
 
