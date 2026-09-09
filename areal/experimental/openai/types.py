@@ -138,6 +138,13 @@ class InteractionWithTokenLogpReward:
             return None
 
     @property
+    def turn_id(self) -> int:
+        """The 0-indexed turn index of this interaction in the conversation chain."""
+        if self.parent is None:
+            return 0
+        return self.parent.turn_id + 1
+
+    @property
     def remaining_messages(self) -> list[dict]:
         if self.parent is None:
             return self.messages
@@ -161,6 +168,7 @@ class InteractionWithTokenLogpReward:
                 "input tokens. The trajectory cannot be trained safely."
             )
         self.seq_tokens = seq = resp.input_tokens + resp.output_tokens
+        own_turn_id = self.turn_id
         if self.chat_template_type == "concat" and self.parent is not None:
             parent_res = self.parent.to_tensor_dict()
             parent_logprobs = parent_res["logprobs"].squeeze(0).tolist()
@@ -174,8 +182,6 @@ class InteractionWithTokenLogpReward:
                 == len(parent_versions)
                 == len(parent_turn_ids)
             )
-            valid_parent_turn_ids = [tid for tid in parent_turn_ids if tid >= 0]
-            own_turn_id = max(valid_parent_turn_ids) + 1 if valid_parent_turn_ids else 0
             if resp.input_len > parent_len:
                 logprobs = (
                     parent_logprobs
@@ -215,12 +221,12 @@ class InteractionWithTokenLogpReward:
                 logprobs = [0.0] * resp.input_len + resp.output_logprobs
                 loss_mask = [0] * resp.input_len + [1] * resp.output_len
                 versions = [-1] * resp.input_len + resp.output_versions
-                turn_ids = [-1] * resp.input_len + [0] * resp.output_len
+                turn_ids = [-1] * resp.input_len + [own_turn_id] * resp.output_len
         else:
             logprobs = [0.0] * resp.input_len + resp.output_logprobs
             loss_mask = [0] * resp.input_len + [1] * resp.output_len
             versions = [-1] * resp.input_len + resp.output_versions
-            turn_ids = [-1] * resp.input_len + [0] * resp.output_len
+            turn_ids = [-1] * resp.input_len + [own_turn_id] * resp.output_len
         reward = self.reward if self.reward is not None else 0.0
         original_reward = (
             self.original_reward if self.original_reward is not None else reward
