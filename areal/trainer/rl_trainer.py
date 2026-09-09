@@ -821,7 +821,9 @@ class PPOTrainer:
                         args={"global_step": global_step},
                     ),
                 ):
-                    ref_logps = self.ref.compute_logp(rollout_batch)
+                    ref_logps = self.ref.compute_logp(
+                        rollout_batch, peak_memory_phase="ref logp"
+                    )
                     for traj, logp in zip(rollout_batch, ref_logps):
                         traj["ref_logp"] = logp
                     self.ref.get_device_stats().log("ref logp")
@@ -839,7 +841,12 @@ class PPOTrainer:
                         args={"global_step": global_step},
                     ),
                 ):
-                    teacher_logps = self.teacher.compute_logp(rollout_batch)
+                    if self.config.teacher.engine_type == "train":
+                        teacher_logps = self.teacher.compute_logp(
+                            rollout_batch, peak_memory_phase="teacher logp"
+                        )
+                    else:
+                        teacher_logps = self.teacher.compute_logp(rollout_batch)
                     for traj, logp in zip(rollout_batch, teacher_logps):
                         traj["teacher_logp"] = logp
                         traj["rl_loss_weight"] = self.config.teacher.rl_loss_weight
@@ -911,7 +918,9 @@ class PPOTrainer:
                         args={"global_step": global_step},
                     ),
                 ):
-                    prox_logps = self.actor.compute_logp(rollout_batch)
+                    prox_logps = self.actor.compute_logp(
+                        rollout_batch, peak_memory_phase="recompute logp"
+                    )
                     for traj, logp in zip(rollout_batch, prox_logps):
                         traj["prox_logp"] = logp
                     self.actor.get_device_stats().log("recompute logp")
@@ -951,7 +960,7 @@ class PPOTrainer:
                     args={"global_step": global_step},
                 ),
             ):
-                self.actor.ppo_update(adv_batch)
+                self.actor.ppo_update(adv_batch, peak_memory_phase="actor ppo update")
                 self.actor.step_lr_scheduler()
                 self.actor.get_device_stats().log("ppo update")
 
