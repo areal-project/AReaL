@@ -478,12 +478,12 @@ def _load_sglang_adapter(monkeypatch):
         inference_adapter_mod,
     )
 
-    nccl_group_mod = types.ModuleType("areal.engine.awex.nccl_group")
+    nccl_group_mod = types.ModuleType("areal.engine.awex.transport.nccl_group")
     nccl_group_mod.init_weights_update_group = lambda *args, **kwargs: None
     nccl_group_mod.setup_batch_isend_irecv = lambda *args, **kwargs: None
     monkeypatch.setitem(
         sys.modules,
-        "areal.engine.awex.nccl_group",
+        "areal.engine.awex.transport.nccl_group",
         nccl_group_mod,
     )
 
@@ -531,12 +531,12 @@ def _load_megatron_adapter(monkeypatch):
         delta_detect_mod,
     )
 
-    nccl_group_mod = types.ModuleType("areal.engine.awex.nccl_group")
+    nccl_group_mod = types.ModuleType("areal.engine.awex.transport.nccl_group")
     nccl_group_mod.init_weights_update_group = lambda *args, **kwargs: None
     nccl_group_mod.setup_batch_isend_irecv = lambda *args, **kwargs: None
     monkeypatch.setitem(
         sys.modules,
-        "areal.engine.awex.nccl_group",
+        "areal.engine.awex.transport.nccl_group",
         nccl_group_mod,
     )
 

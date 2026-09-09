@@ -12,7 +12,7 @@ from tests.v2.weight_update.torchrun.dist_utils import (
     write_result,
 )
 
-from areal.engine.awex.nccl_group import (
+from areal.engine.awex.transport.nccl_group import (
     init_weights_update_group,
     setup_batch_isend_irecv,
 )

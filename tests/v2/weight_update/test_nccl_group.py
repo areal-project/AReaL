@@ -5,7 +5,8 @@ from unittest.mock import MagicMock, call
 import pytest
 import torch
 
-from areal.engine.awex import fsdp_adapter, megatron_adapter, nccl_group, sglang_adapter
+from areal.engine.awex import fsdp_adapter, megatron_adapter, sglang_adapter
+from areal.engine.awex.transport import nccl_group
 
 
 def test_setup_batch_isend_irecv_uses_sidecar_for_final_barrier(monkeypatch):

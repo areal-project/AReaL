@@ -23,14 +23,14 @@ from torch.distributed.tensor.placement_types import Shard
 from areal.engine.awex.adapters.training_adapter import (
     AwexTrainingAdapter,
 )
-from areal.engine.awex.nccl_group import (
-    batch_send_recv_by_peer,
-    init_weights_update_group,
-    setup_batch_isend_irecv,
-)
 from areal.engine.awex.transport.metadata import (
     awex_wu_use_group,
     fetch_kv_metadata,
+)
+from areal.engine.awex.transport.nccl_group import (
+    batch_send_recv_by_peer,
+    init_weights_update_group,
+    setup_batch_isend_irecv,
 )
 from areal.engine.core.model import is_qwen_vl_model
 from areal.utils import logging

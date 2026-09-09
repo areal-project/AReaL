@@ -59,14 +59,14 @@ from areal.engine.awex.delta_config import (  # noqa: E402
     synchronize_wire_dtypes,
     validate_dte_world_size,
 )
-from areal.engine.awex.nccl_group import (  # noqa: E402
-    batch_send_recv_by_peer,
-    init_weights_update_group,
-    setup_batch_isend_irecv,
-)
 from areal.engine.awex.transport.metadata import (  # noqa: E402
     awex_wu_use_group,
     fetch_kv_metadata,
+)
+from areal.engine.awex.transport.nccl_group import (  # noqa: E402
+    batch_send_recv_by_peer,
+    init_weights_update_group,
+    setup_batch_isend_irecv,
 )
 from areal.infra.platforms import current_platform  # noqa: E402
 from areal.utils import logging  # noqa: E402

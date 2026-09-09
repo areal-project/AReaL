@@ -32,14 +32,14 @@ from areal.engine.awex.delta_config import (
     validate_dte_world_size,
 )
 from areal.engine.awex.delta_detect import AdamWInversionDetector
-from areal.engine.awex.nccl_group import (
-    batch_send_recv_by_peer,
-    init_weights_update_group,
-    setup_batch_isend_irecv,
-)
 from areal.engine.awex.transport.metadata import (
     awex_wu_use_group,
     fetch_kv_metadata,
+)
+from areal.engine.awex.transport.nccl_group import (
+    batch_send_recv_by_peer,
+    init_weights_update_group,
+    setup_batch_isend_irecv,
 )
 from areal.engine.awex.utils import (
     awex_colocate_timeout_s,
