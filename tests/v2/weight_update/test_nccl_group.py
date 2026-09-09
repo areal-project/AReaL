@@ -5,7 +5,8 @@ from unittest.mock import MagicMock, call
 import pytest
 import torch
 
-from areal.engine.awex import fsdp_adapter, megatron_adapter, sglang_adapter
+from areal.engine.awex import megatron_adapter, sglang_adapter
+from areal.engine.awex.adapters import fsdp_adapter
 from areal.engine.awex.transport import nccl_group
 
 

@@ -31,7 +31,7 @@ def is_qwen3_vl_model(model_type: str) -> bool:
     """True for the Qwen3-VL family (dense and MoE).
 
     Existing call sites in ``fsdp_engine``, ``fsdp_utils/parallel``, and
-    ``awex/fsdp_adapter`` gate family-level behaviour (mRoPE index,
+    ``awex/adapters/fsdp_adapter`` gate family-level behaviour (mRoPE index,
     attention-mask handling) that is identical for dense and MoE, so this
     helper covers both. Use ``is_qwen3_vl_moe_model`` when the MoE-vs-dense
     distinction matters.
