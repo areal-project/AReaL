@@ -500,7 +500,9 @@ class SGLangBackend:
                 "areal.v2.inference_service.sglang.launch_server",
             )
             cmd = [
-                "areal.engine.awex.sglang_plugin" if c in sglang_entrypoints else c
+                "areal.engine.awex.plugins.sglang_plugin"
+                if c in sglang_entrypoints
+                else c
                 for c in cmd
             ]
             if awex_meta_addr:

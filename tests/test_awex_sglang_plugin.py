@@ -10,7 +10,7 @@ from areal.engine.awex.adapters.sglang_adapter import (
     _PhysicalDeviceMetaServerClient,
 )
 from areal.engine.awex.memory_saver import patch_tms_hook_mode
-from areal.engine.awex.sglang_plugin import (
+from areal.engine.awex.plugins.sglang_plugin import (
     AwexSchedulerPlugin,
     _load_sglang_plugins_if_available,
     _resolve_transfer_rank,
@@ -19,7 +19,7 @@ from areal.engine.awex.sglang_plugin import (
 
 
 def test_load_sglang_plugins_accepts_runtime_without_registry(monkeypatch):
-    import areal.engine.awex.sglang_plugin as plugin_module
+    import areal.engine.awex.plugins.sglang_plugin as plugin_module
 
     def _missing_registry(name):
         assert name == "sglang.srt.plugins"

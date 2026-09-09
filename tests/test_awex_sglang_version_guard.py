@@ -4,7 +4,7 @@ from unittest import mock
 
 import pytest
 
-from areal.engine.awex import sglang_plugin
+from areal.engine.awex.plugins import sglang_plugin
 
 
 def test_register_rejects_unverified_sglang_version():

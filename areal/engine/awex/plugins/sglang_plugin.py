@@ -15,11 +15,11 @@ Weight transfer flow (aligned with Asystem colocate mode):
 
 Usage:
     # Option 1: Register plugin then launch SGLang
-    from areal.engine.awex.sglang_plugin import register_awex_plugin
+    from areal.engine.awex.plugins.sglang_plugin import register_awex_plugin
     register_awex_plugin()
 
     # Option 2: Run as entry module (replaces sglang.launch_server)
-    # python3 -m areal.engine.awex.sglang_plugin --model-path ...
+    # python3 -m areal.engine.awex.plugins.sglang_plugin --model-path ...
 """
 
 from __future__ import annotations
