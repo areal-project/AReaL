@@ -54,7 +54,7 @@ from awex.util.tensor_util import (  # noqa: E402
 from areal.engine.awex.adapters.inference_adapter import (  # noqa: E402
     AwexInferenceAdapter,
 )
-from areal.engine.awex.delta_config import (  # noqa: E402
+from areal.engine.awex.dte.delta_config import (  # noqa: E402
     DTERuntimeConfig,
     synchronize_wire_dtypes,
     validate_dte_world_size,

@@ -26,12 +26,12 @@ from awex.util.tensor_util import (
 from areal.engine.awex.adapters.training_adapter import (
     AwexTrainingAdapter,
 )
-from areal.engine.awex.delta_config import (
+from areal.engine.awex.delta_detect import AdamWInversionDetector
+from areal.engine.awex.dte.delta_config import (
     DTERuntimeConfig,
     synchronize_wire_dtypes,
     validate_dte_world_size,
 )
-from areal.engine.awex.delta_detect import AdamWInversionDetector
 from areal.engine.awex.transport.metadata import (
     awex_wu_use_group,
     fetch_kv_metadata,

@@ -21,7 +21,7 @@ import pytest
 torch = pytest.importorskip("torch")
 
 _ROOT = Path(__file__).resolve().parent.parent
-_DC_PATH = _ROOT / "areal/engine/awex/delta_config.py"
+_DC_PATH = _ROOT / "areal/engine/awex/dte/delta_config.py"
 
 
 def _make_environ_stub():
@@ -346,7 +346,7 @@ def _load_delta_detect(monkeypatch):
         monkeypatch.setitem(sys.modules, package, types.ModuleType(package))
     monkeypatch.setitem(
         sys.modules,
-        "areal.engine.awex.delta_config",
+        "areal.engine.awex.dte.delta_config",
         _load_delta_config(),
     )
     path = _ROOT / "areal/engine/awex/delta_detect.py"
@@ -448,7 +448,7 @@ def _load_sglang_adapter(monkeypatch):
 
     _stub_areal_packages(monkeypatch)
 
-    delta_config_mod = types.ModuleType("areal.engine.awex.delta_config")
+    delta_config_mod = types.ModuleType("areal.engine.awex.dte.delta_config")
 
     class _DTERuntimeConfig:
         @classmethod
@@ -460,7 +460,7 @@ def _load_sglang_adapter(monkeypatch):
     delta_config_mod.validate_dte_world_size = lambda *args, **kwargs: None
     monkeypatch.setitem(
         sys.modules,
-        "areal.engine.awex.delta_config",
+        "areal.engine.awex.dte.delta_config",
         delta_config_mod,
     )
 
@@ -504,7 +504,7 @@ def _load_megatron_adapter(monkeypatch):
 
     _stub_areal_packages(monkeypatch)
 
-    delta_config_mod = types.ModuleType("areal.engine.awex.delta_config")
+    delta_config_mod = types.ModuleType("areal.engine.awex.dte.delta_config")
 
     class _DTERuntimeConfig:
         @classmethod
@@ -519,7 +519,7 @@ def _load_megatron_adapter(monkeypatch):
     delta_config_mod.validate_dte_world_size = lambda *args, **kwargs: None
     monkeypatch.setitem(
         sys.modules,
-        "areal.engine.awex.delta_config",
+        "areal.engine.awex.dte.delta_config",
         delta_config_mod,
     )
 

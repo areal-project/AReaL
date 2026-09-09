@@ -50,7 +50,7 @@ from areal.api import (
 )
 from areal.api.cli_args import MicroBatchSpec, PerfTracerConfig, TrainEngineConfig
 from areal.api.io_struct import DeviceRuntimeInfo
-from areal.engine.awex.delta_config import DTERuntimeConfig
+from areal.engine.awex.dte.delta_config import DTERuntimeConfig
 from areal.engine.core import (
     aggregate_eval_losses,
     compute_total_loss_weight,
