@@ -294,10 +294,10 @@ def _stub_areal_packages(monkeypatch):
         module.__path__ = []
         monkeypatch.setitem(sys.modules, package, module)
 
-    awex_mod = types.ModuleType("areal.engine.awex.metadata")
+    awex_mod = types.ModuleType("areal.engine.awex.transport.metadata")
     awex_mod.awex_wu_use_group = lambda: False
     awex_mod.fetch_kv_metadata = lambda *args, **kwargs: ([], [])
-    monkeypatch.setitem(sys.modules, "areal.engine.awex.metadata", awex_mod)
+    monkeypatch.setitem(sys.modules, "areal.engine.awex.transport.metadata", awex_mod)
 
     awex_utils_mod = types.ModuleType("areal.engine.awex.utils")
     awex_utils_mod.resolve_physical_gpu_id = lambda relative_gpu_id: relative_gpu_id
