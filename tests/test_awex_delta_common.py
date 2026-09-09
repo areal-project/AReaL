@@ -487,7 +487,7 @@ def _load_sglang_adapter(monkeypatch):
         nccl_group_mod,
     )
 
-    path = _ROOT / "areal/engine/awex/sglang_adapter.py"
+    path = _ROOT / "areal/engine/awex/adapters/sglang_adapter.py"
     spec = importlib.util.spec_from_file_location("awex_sglang_adapter_test", path)
     mod = importlib.util.module_from_spec(spec)
     assert spec.loader is not None

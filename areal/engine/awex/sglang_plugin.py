@@ -276,7 +276,7 @@ class AwexSchedulerPlugin:
 
     def _require_receiver(self):
         if self._receiver is None:
-            from areal.engine.awex.sglang_adapter import AwexSGLangAdapter
+            from areal.engine.awex.adapters.sglang_adapter import AwexSGLangAdapter
 
             self._receiver = AwexSGLangAdapter(self._scheduler)
         return self._receiver

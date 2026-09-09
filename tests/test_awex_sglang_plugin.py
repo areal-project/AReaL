@@ -6,10 +6,10 @@ import pytest
 import torch
 
 from areal.api.cli_args import MegatronEngineConfig, PPOActorConfig
-from areal.engine.awex.memory_saver import patch_tms_hook_mode
-from areal.engine.awex.sglang_adapter import (
+from areal.engine.awex.adapters.sglang_adapter import (
     _PhysicalDeviceMetaServerClient,
 )
+from areal.engine.awex.memory_saver import patch_tms_hook_mode
 from areal.engine.awex.sglang_plugin import (
     AwexSchedulerPlugin,
     _load_sglang_plugins_if_available,
@@ -144,7 +144,7 @@ def test_awex_meta_client_uses_physical_device_for_colocate_identity():
 
 
 def test_awex_weight_update_runs_without_grad_tracking():
-    from areal.engine.awex.sglang_adapter import AwexSGLangAdapter
+    from areal.engine.awex.adapters.sglang_adapter import AwexSGLangAdapter
 
     grad_modes = []
     reader = SimpleNamespace(

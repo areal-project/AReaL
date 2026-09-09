@@ -18,7 +18,7 @@ from awex.models.registry import (  # noqa: E402
 )
 from awex.sharding.param_sharding import ShardingType  # noqa: E402
 
-from areal.engine.awex.sglang_adapter import (  # noqa: E402
+from areal.engine.awex.adapters.sglang_adapter import (  # noqa: E402
     _get_legacy_awex_hf_config,
     _get_router_dtype,
 )

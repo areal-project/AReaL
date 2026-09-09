@@ -72,7 +72,7 @@ class AwexSchedulerBridge:
 
     def _require_adapter(self) -> Any:
         if self._adapter is None:
-            from areal.engine.awex.sglang_adapter import (
+            from areal.engine.awex.adapters.sglang_adapter import (
                 AwexSGLangAdapter,
             )
 
