@@ -57,7 +57,10 @@ from pydantic import BaseModel
 from areal.api import ModelRequest, ModelResponse
 from areal.api.cli_args import GenerationHyperparameters
 from areal.experimental.openai.cache import InteractionCache
-from areal.experimental.openai.prompt_renderer import IncrementalPromptRenderer
+from areal.experimental.openai.prompt_renderer import (
+    IncrementalPromptRenderer,
+    tools_signature,
+)
 from areal.experimental.openai.tool_call_parser import process_tool_calls
 from areal.experimental.openai.types import InteractionWithTokenLogpReward
 from areal.utils import logging
@@ -768,7 +771,9 @@ async def _prepare_prompt(
             )
         ):
             delta_messages = tokenizer_messages[len(parent.messages) :]
+            current_tools_signature = tools_signature(tools)
             parent_base = parent.prompt_base_token_ids
+            parent_tools_signature = parent.prompt_tools_signature
             if parent_base is None:
                 parent_base = apply_chat_template(
                     tokenizer,
@@ -779,17 +784,23 @@ async def _prepare_prompt(
                     **chat_template_kwargs,
                 )
                 parent.prompt_base_token_ids = parent_base
+                # Re-rendered here with the current tool set, so it is up to date.
+                parent_tools_signature = current_tools_signature
+                parent.prompt_tools_signature = parent_tools_signature
             rendered = IncrementalPromptRenderer.render_incremental(
                 tokenizer,
                 parent_base,
                 delta_messages,
                 tools=tools,
                 chat_template_kwargs=chat_template_kwargs,
+                parent_tools_signature=parent_tools_signature,
+                parent_messages=parent.messages,
             )
             if rendered is not None:
                 input_ids, new_base = rendered
                 if interaction is not None:
                     interaction.prompt_base_token_ids = new_base
+                    interaction.prompt_tools_signature = current_tools_signature
                     interaction.prompt_token_ids = list(input_ids)
             else:
                 input_ids = apply_chat_template(
@@ -803,8 +814,19 @@ async def _prepare_prompt(
                 if interaction is not None:
                     interaction.prompt_token_ids = list(input_ids)
         else:
-            if processor is None and IncrementalPromptRenderer.is_supported(
-                tokenizer, tools=tools, chat_template_kwargs=chat_template_kwargs
+            # Rendering the base prefix costs an extra chat-template pass, so only
+            # pay for it when a later turn could actually reuse it.
+            if (
+                processor is None
+                and IncrementalPromptRenderer.is_supported(
+                    tokenizer, tools=tools, chat_template_kwargs=chat_template_kwargs
+                )
+                and IncrementalPromptRenderer.is_history_safe(
+                    tokenizer,
+                    tokenizer_messages,
+                    tools=tools,
+                    chat_template_kwargs=chat_template_kwargs,
+                )
             ):
                 input_ids, base_ids = IncrementalPromptRenderer.render_initial(
                     tokenizer,
@@ -814,6 +836,7 @@ async def _prepare_prompt(
                 )
                 if interaction is not None:
                     interaction.prompt_base_token_ids = base_ids
+                    interaction.prompt_tools_signature = tools_signature(tools)
                     interaction.prompt_token_ids = list(input_ids)
             else:
                 input_ids = apply_chat_template(

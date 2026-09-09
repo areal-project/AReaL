@@ -13,6 +13,8 @@ from areal.experimental.openai.client import (
 from areal.experimental.openai.prompt_renderer import (
     IncrementalPromptRenderer,
     _find_kth,
+    has_superseded_reasoning,
+    tools_signature,
 )
 from areal.experimental.openai.types import InteractionWithTokenLogpReward
 from areal.utils.hf_utils import apply_chat_template, load_hf_tokenizer
@@ -155,6 +157,8 @@ class TestIncrementalPromptRenderingParity:
             base_ids,
             delta,
             tools=[WEATHER_TOOL],
+            parent_tools_signature=tools_signature([WEATHER_TOOL]),
+            parent_messages=messages[: -len(delta)],
         )
         assert rendered is not None
         incr_prompt, _ = rendered
@@ -206,6 +210,8 @@ class TestIncrementalPromptRenderingParity:
                 current_base,
                 delta,
                 tools=[WEATHER_TOOL, CALCULATOR_TOOL],
+                parent_tools_signature=tools_signature([WEATHER_TOOL, CALCULATOR_TOOL]),
+                parent_messages=messages[: -len(delta)],
             )
             assert rendered is not None
             incr_prompt, current_base = rendered
@@ -268,6 +274,8 @@ class TestIncrementalPromptRenderingParity:
             base_ids,
             delta,
             tools=[WEATHER_TOOL],
+            parent_tools_signature=tools_signature([WEATHER_TOOL]),
+            parent_messages=messages[: -len(delta)],
         )
         assert rendered is not None
         incr_prompt, _ = rendered
@@ -302,11 +310,223 @@ class TestIncrementalPromptRenderingParity:
             base_ids,
             delta1,
             tools=[CALCULATOR_TOOL],
+            parent_tools_signature=tools_signature([CALCULATOR_TOOL]),
+            parent_messages=messages[: -len(delta1)],
         )
         assert rendered is not None
         incr_prompt, _ = rendered
 
         assert incr_prompt == canonical_prompt
+
+
+class TestIncrementalRenderingGuards:
+    """Regression tests for prefixes that an append-only cache cannot represent."""
+
+    def test_has_superseded_reasoning(self):
+        reasoning_turn = {"role": "assistant", "content": "<think>r</think>a"}
+        # No later user turn: nothing supersedes the reasoning.
+        assert not has_superseded_reasoning(
+            [{"role": "user", "content": "q"}, reasoning_turn]
+        )
+        # A later user turn supersedes it.
+        assert has_superseded_reasoning(
+            [
+                {"role": "user", "content": "q1"},
+                reasoning_turn,
+                {"role": "user", "content": "q2"},
+            ]
+        )
+        assert not has_superseded_reasoning([])
+
+    def test_reasoning_history_falls_back_for_qwen3(self, qwen3_tokenizer):
+        """Qwen3 drops reasoning before the last user turn, so the cache is stale."""
+        messages = [
+            {"role": "user", "content": "What is 2+2?"},
+            {"role": "assistant", "content": "<think>simple sum</think>It is 4."},
+        ]
+        _, base_ids = IncrementalPromptRenderer.render_initial(
+            qwen3_tokenizer, messages
+        )
+        delta = [{"role": "user", "content": "And 3+3?"}]
+
+        assert not IncrementalPromptRenderer.is_history_safe(
+            qwen3_tokenizer, messages + delta
+        )
+        assert (
+            IncrementalPromptRenderer.render_incremental(
+                qwen3_tokenizer,
+                base_ids,
+                delta,
+                parent_messages=messages,
+            )
+            is None
+        )
+
+        # The cached prefix would have kept the reasoning the template removes.
+        canonical = apply_chat_template(
+            qwen3_tokenizer,
+            messages + delta,
+            add_generation_prompt=True,
+            tokenize=True,
+        )
+        stale = (
+            base_ids
+            + apply_chat_template(
+                qwen3_tokenizer,
+                [{"role": "user", "content": "x"}] + delta,
+                add_generation_prompt=True,
+                tokenize=True,
+            )[
+                len(
+                    apply_chat_template(
+                        qwen3_tokenizer,
+                        [{"role": "user", "content": "x"}],
+                        add_generation_prompt=False,
+                        tokenize=True,
+                    )
+                ) :
+            ]
+        )
+        assert stale != canonical
+
+    def test_reasoning_tool_loop_stays_incremental(self, qwen3_tokenizer):
+        """Tool-only deltas keep the current turn's reasoning, so the cache holds."""
+        messages = [{"role": "user", "content": "Weather in Paris?"}]
+        _, base_ids = IncrementalPromptRenderer.render_initial(
+            qwen3_tokenizer, messages, tools=[WEATHER_TOOL]
+        )
+        delta = [
+            {
+                "role": "assistant",
+                "content": "<think>call the tool</think>",
+                "tool_calls": [
+                    {
+                        "id": "c1",
+                        "type": "function",
+                        "function": {
+                            "name": "get_weather",
+                            "arguments": '{"location": "Paris"}',
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "c1",
+                "name": "get_weather",
+                "content": "20C",
+            },
+        ]
+        rendered = IncrementalPromptRenderer.render_incremental(
+            qwen3_tokenizer,
+            base_ids,
+            delta,
+            tools=[WEATHER_TOOL],
+            parent_tools_signature=tools_signature([WEATHER_TOOL]),
+            parent_messages=messages,
+        )
+        assert rendered is not None
+        assert rendered[0] == apply_chat_template(
+            qwen3_tokenizer,
+            messages + delta,
+            tools=[WEATHER_TOOL],
+            add_generation_prompt=True,
+            tokenize=True,
+        )
+
+    def test_reasoning_history_allowed_for_qwen25(self, qwen25_tokenizer):
+        """Qwen2.5 never rewrites history, so reasoning is safe to cache."""
+        messages = [
+            {"role": "user", "content": "What is 2+2?"},
+            {"role": "assistant", "content": "<think>simple sum</think>It is 4."},
+        ]
+        _, base_ids = IncrementalPromptRenderer.render_initial(
+            qwen25_tokenizer, messages
+        )
+        delta = [{"role": "user", "content": "And 3+3?"}]
+
+        assert IncrementalPromptRenderer.is_history_safe(
+            qwen25_tokenizer, messages + delta
+        )
+        rendered = IncrementalPromptRenderer.render_incremental(
+            qwen25_tokenizer,
+            base_ids,
+            delta,
+            parent_messages=messages,
+        )
+        assert rendered is not None
+        assert rendered[0] == apply_chat_template(
+            qwen25_tokenizer,
+            messages + delta,
+            add_generation_prompt=True,
+            tokenize=True,
+        )
+
+    def test_tools_signature_is_order_stable(self):
+        assert tools_signature(None) == tools_signature([]) == ""
+        assert tools_signature([WEATHER_TOOL]) == tools_signature([WEATHER_TOOL])
+        assert tools_signature([WEATHER_TOOL]) != tools_signature(
+            [WEATHER_TOOL, CALCULATOR_TOOL]
+        )
+
+    @pytest.mark.parametrize(
+        "parent_tools,current_tools",
+        [
+            ([WEATHER_TOOL], [WEATHER_TOOL, CALCULATOR_TOOL]),
+            ([WEATHER_TOOL, CALCULATOR_TOOL], [WEATHER_TOOL]),
+            ([WEATHER_TOOL], None),
+            (None, [WEATHER_TOOL]),
+        ],
+    )
+    def test_changed_tools_fall_back(
+        self, qwen3_tokenizer, parent_tools, current_tools
+    ):
+        """A prefix built with one tool set cannot serve a turn declaring another."""
+        messages = [{"role": "user", "content": "Weather in Paris?"}]
+        _, base_ids = IncrementalPromptRenderer.render_initial(
+            qwen3_tokenizer, messages, tools=parent_tools
+        )
+        delta = [
+            {"role": "assistant", "content": "Let me check."},
+            {"role": "user", "content": "Also compute 2+2"},
+        ]
+        assert (
+            IncrementalPromptRenderer.render_incremental(
+                qwen3_tokenizer,
+                base_ids,
+                delta,
+                tools=current_tools,
+                parent_tools_signature=tools_signature(parent_tools),
+                parent_messages=messages,
+            )
+            is None
+        )
+
+    def test_unchanged_tools_stay_incremental(self, qwen3_tokenizer):
+        messages = [{"role": "user", "content": "Weather in Paris?"}]
+        _, base_ids = IncrementalPromptRenderer.render_initial(
+            qwen3_tokenizer, messages, tools=[WEATHER_TOOL]
+        )
+        delta = [
+            {"role": "assistant", "content": "Let me check."},
+            {"role": "user", "content": "Also, thanks"},
+        ]
+        rendered = IncrementalPromptRenderer.render_incremental(
+            qwen3_tokenizer,
+            base_ids,
+            delta,
+            tools=[WEATHER_TOOL],
+            parent_tools_signature=tools_signature([WEATHER_TOOL]),
+            parent_messages=messages,
+        )
+        assert rendered is not None
+        assert rendered[0] == apply_chat_template(
+            qwen3_tokenizer,
+            messages + delta,
+            tools=[WEATHER_TOOL],
+            add_generation_prompt=True,
+            tokenize=True,
+        )
 
 
 class TestIncrementalConcatPromptRendering:

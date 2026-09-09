@@ -48,6 +48,9 @@ class InteractionWithTokenLogpReward:
     # Prompt token cache
     prompt_token_ids: list[int] | None = None
     prompt_base_token_ids: list[int] | None = None
+    # Tool set the cached base prefix was rendered with; see
+    # IncrementalPromptRenderer.render_incremental.
+    prompt_tools_signature: str | None = None
     mm_token_type_ids: list[int] | None = None
     multi_modal_input: dict[str, torch.Tensor] | None = None
 

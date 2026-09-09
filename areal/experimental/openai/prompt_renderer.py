@@ -20,6 +20,7 @@ This module provides incremental prompt rendering:
 
 from __future__ import annotations
 
+import json
 import threading
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
@@ -46,10 +47,50 @@ def _find_kth(lst: list[int], val: int, k: int) -> int:
     return -1
 
 
+_THINK_START = "<think>"
+_THINK_END = "</think>"
+
+
+def tools_signature(tools: Iterable[ChatCompletionToolParam] | None) -> str:
+    """Return a stable signature for the tool set rendered into a prompt prefix."""
+    if not tools:
+        return ""
+    try:
+        return json.dumps(list(tools), sort_keys=True, default=str)
+    except (TypeError, ValueError):
+        return repr(list(tools))
+
+
+def contains_reasoning(message: dict[str, Any]) -> bool:
+    """Check whether a message carries an inline reasoning block."""
+    content = message.get("content")
+    return isinstance(content, str) and _THINK_END in content
+
+
+def has_superseded_reasoning(messages: Iterable[dict[str, Any]] | None) -> bool:
+    """Check whether reasoning appears before the final user turn of a history.
+
+    Templates such as Qwen3's keep the reasoning of the current turn but drop it
+    from every turn preceding the last user message. Such a history cannot be
+    served from an append-only token cache, because appending the new user turn
+    is supposed to remove tokens that are already in the cached prefix.
+    """
+    if not messages:
+        return False
+    message_list = list(messages)
+    last_user_idx = -1
+    for idx, message in enumerate(message_list):
+        if message.get("role") == "user":
+            last_user_idx = idx
+    if last_user_idx <= 0:
+        return False
+    return any(contains_reasoning(m) for m in message_list[:last_user_idx])
+
+
 class IncrementalPromptRenderer:
     """Renders multi-turn agent prompts incrementally with token parity guarantees."""
 
-    _capability_cache: dict[tuple[Any, ...], bool] = {}
+    _capability_cache: dict[tuple[Any, ...], tuple[bool, bool]] = {}
     _dummy_d0_cache: dict[tuple[Any, ...], int] = {}
     _lock = threading.Lock()
 
@@ -78,30 +119,56 @@ class IncrementalPromptRenderer:
         chat_template_kwargs: dict[str, Any] | None = None,
     ) -> bool:
         """Check whether the tokenizer chat template supports incremental delta rendering."""
+        return cls._get_capability(tokenizer, tools, chat_template_kwargs)[0]
+
+    @classmethod
+    def is_history_safe(
+        cls,
+        tokenizer: PreTrainedTokenizerFast,
+        messages: Iterable[dict[str, Any]] | None,
+        tools: Iterable[ChatCompletionToolParam] | None = None,
+        chat_template_kwargs: dict[str, Any] | None = None,
+    ) -> bool:
+        """Check whether ``messages`` can be served from an append-only token cache."""
+        if not has_superseded_reasoning(messages):
+            return True
+        return cls._get_capability(tokenizer, tools, chat_template_kwargs)[1]
+
+    @classmethod
+    def _get_capability(
+        cls,
+        tokenizer: PreTrainedTokenizerFast,
+        tools: Iterable[ChatCompletionToolParam] | None,
+        chat_template_kwargs: dict[str, Any] | None,
+    ) -> tuple[bool, bool]:
+        """Return (delta rendering supported, reasoning history safe) for a tokenizer."""
         if not hasattr(tokenizer, "chat_template") or not tokenizer.chat_template:
-            return False
+            return False, False
 
         key = cls._get_cache_key(tokenizer, chat_template_kwargs)
         with cls._lock:
             if key in cls._capability_cache:
                 return cls._capability_cache[key]
 
-        # Probe capability with a synthetic 2-turn sequence
-        supported = cls._probe_capability(tokenizer, tools, chat_template_kwargs)
+        # Probe capability with synthetic sequences
+        capability = cls._probe_capability(tokenizer, tools, chat_template_kwargs)
         with cls._lock:
-            cls._capability_cache[key] = supported
+            cls._capability_cache[key] = capability
 
+        supported, reasoning_safe = capability
         if supported:
             logger.debug(
-                "Incremental prompt rendering verified and enabled for tokenizer: %s",
+                "Incremental prompt rendering verified and enabled for tokenizer: %s "
+                "(reasoning history safe: %s)",
                 getattr(tokenizer, "name_or_path", type(tokenizer).__name__),
+                reasoning_safe,
             )
         else:
             logger.debug(
                 "Incremental prompt rendering not supported for tokenizer: %s; using full fallback.",
                 getattr(tokenizer, "name_or_path", type(tokenizer).__name__),
             )
-        return supported
+        return capability
 
     @classmethod
     def _probe_capability(
@@ -109,8 +176,13 @@ class IncrementalPromptRenderer:
         tokenizer: PreTrainedTokenizerFast,
         tools: Iterable[ChatCompletionToolParam] | None,
         chat_template_kwargs: dict[str, Any] | None,
-    ) -> bool:
-        """Run a probe to verify token-for-token equality between incremental and full rendering."""
+    ) -> tuple[bool, bool]:
+        """Run probes to verify token-for-token equality between incremental and full rendering.
+
+        The first probe covers an append-only tool-calling delta. The second probe
+        covers a cached prefix that already contains a reasoning block, which some
+        templates rewrite once a later turn is appended.
+        """
         kwargs = chat_template_kwargs or {}
         try:
             m1 = [{"role": "user", "content": "probe user query"}]
@@ -168,11 +240,73 @@ class IncrementalPromptRenderer:
                 **kwargs,
             )
             if not isinstance(full_2, list) or not isinstance(base_1, list):
-                return False
+                return False, False
             incr_2 = base_1 + d_gen[len(d0) :]
-            return full_2 == incr_2
+            supported = full_2 == incr_2
         except Exception as e:
             logger.debug("PromptRenderer probe failed with error: %s", e)
+            return False, False
+
+        if not supported:
+            return False, False
+        return True, cls._probe_reasoning_history(
+            tokenizer, tools, chat_template_kwargs
+        )
+
+    @classmethod
+    def _probe_reasoning_history(
+        cls,
+        tokenizer: PreTrainedTokenizerFast,
+        tools: Iterable[ChatCompletionToolParam] | None,
+        chat_template_kwargs: dict[str, Any] | None,
+    ) -> bool:
+        """Verify that a cached prefix containing reasoning survives appending a turn."""
+        kwargs = chat_template_kwargs or {}
+        try:
+            history = [
+                {"role": "user", "content": "probe user query"},
+                {
+                    "role": "assistant",
+                    "content": f"{_THINK_START}probe reasoning{_THINK_END}probe answer",
+                },
+            ]
+            delta = [{"role": "user", "content": "probe follow-up"}]
+            base = apply_chat_template(
+                tokenizer,
+                history,
+                tools=tools,
+                add_generation_prompt=False,
+                tokenize=True,
+                **kwargs,
+            )
+            full = apply_chat_template(
+                tokenizer,
+                history + delta,
+                tools=tools,
+                add_generation_prompt=True,
+                tokenize=True,
+                **kwargs,
+            )
+            dummy = [{"role": "user", "content": "x"}]
+            d0 = apply_chat_template(
+                tokenizer,
+                dummy,
+                add_generation_prompt=False,
+                tokenize=True,
+                **kwargs,
+            )
+            d_gen = apply_chat_template(
+                tokenizer,
+                dummy + delta,
+                add_generation_prompt=True,
+                tokenize=True,
+                **kwargs,
+            )
+            if not isinstance(full, list) or not isinstance(base, list):
+                return False
+            return full == base + d_gen[len(d0) :]
+        except Exception as e:
+            logger.debug("PromptRenderer reasoning probe failed with error: %s", e)
             return False
 
     @classmethod
@@ -235,12 +369,42 @@ class IncrementalPromptRenderer:
         delta_messages: list[dict[str, Any]],
         tools: Iterable[ChatCompletionToolParam] | None = None,
         chat_template_kwargs: dict[str, Any] | None = None,
+        parent_tools_signature: str | None = "",
+        parent_messages: list[dict[str, Any]] | None = None,
     ) -> tuple[list[int], list[int]] | None:
         """Render prompt tokens for delta messages appended to parent base tokens.
+
+        Only the delta is rendered, so the tool definitions baked into the parent
+        prefix are reused as-is. ``parent_tools_signature`` records the tools that
+        prefix was built with; when the current turn declares a different tool set
+        the prefix is stale and rendering is refused.
+
+        ``parent_messages`` are the messages the prefix was built from. Together
+        with ``delta_messages`` they are checked against
+        :meth:`is_history_safe`, so a prefix whose reasoning blocks a later turn
+        would strip is never produced or consumed.
 
         Returns (prompt_token_ids, new_base_token_ids) or None on failure.
         """
         if not delta_messages:
+            return None
+
+        if (parent_tools_signature or "") != tools_signature(tools):
+            logger.debug(
+                "Tool set changed between turns; skipping incremental prompt rendering."
+            )
+            return None
+
+        if not cls.is_history_safe(
+            tokenizer,
+            list(parent_messages or []) + delta_messages,
+            tools=tools,
+            chat_template_kwargs=chat_template_kwargs,
+        ):
+            logger.debug(
+                "Chat template rewrites reasoning history; skipping incremental "
+                "prompt rendering."
+            )
             return None
 
         kwargs = chat_template_kwargs or {}
