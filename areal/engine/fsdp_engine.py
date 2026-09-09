@@ -7,6 +7,7 @@ import dataclasses
 import gc
 import math
 import os
+import re
 import time
 from collections.abc import Callable, Iterator
 from concurrent.futures import Future
@@ -129,10 +130,12 @@ from areal.utils.data import (
 from areal.utils.functional import gather_logprobs, gather_logprobs_entropy
 from areal.utils.hf_utils import load_hf_processor_and_tokenizer, load_hf_tokenizer
 from areal.utils.lr_scheduler import get_num_warmup_steps
+from areal.utils.moe_metrics import MoEMetrics
 from areal.utils.network import find_free_ports, format_host_for_url, gethostip
 from areal.utils.offload import is_tms_enabled, torch_memory_saver
 from areal.utils.perf_tracer import trace_perf, trace_scope
 from areal.utils.save_load import get_state_dict_from_repo_id_or_path
+from areal.utils.training_metrics import export_training_metrics, record_training_batch
 
 if TYPE_CHECKING:
     from areal.api import Scheduler
@@ -470,6 +473,24 @@ class FSDPEngine(TrainEngine):
 
         self._create_optimizer(ft_spec)
 
+        self._moe_metrics = MoEMetrics()
+        routers = []
+        for name, module in self.model.named_modules():
+            if type(module).__name__ in ("Qwen3MoeTopKRouter", "Qwen3_5MoeTopKRouter"):
+                match = re.search(r"layers\.(\d+)\.", name)
+                if match is not None:
+                    routers.append((match.group(1), module))
+        if routers:
+            num_experts = routers[0][1].num_experts
+
+            def extract_counts(output: tuple[torch.Tensor, ...]) -> torch.Tensor:
+                indices = output[2].reshape(-1)
+                return torch.zeros(
+                    num_experts, dtype=torch.int64, device=indices.device
+                ).scatter_add_(0, indices, torch.ones_like(indices, dtype=torch.int64))
+
+            self._moe_metrics.attach(self.model, routers, extract_counts)
+
         if self.config.fsdp.per_layer_optim_step:
             if self.optimizer_config.type != "adam":
                 raise ValueError(
@@ -506,6 +527,8 @@ class FSDPEngine(TrainEngine):
         return self._cpu_group
 
     def destroy(self):
+        if hasattr(self, "_moe_metrics"):
+            self._moe_metrics.close()
         self._initialized = False
         if hasattr(self, "optimizer"):
             del self.optimizer
@@ -778,38 +801,38 @@ class FSDPEngine(TrainEngine):
         loss_weight_fn: Callable[[dict[str, Any]], torch.Tensor],
     ) -> dict[str, float]:
         self._ensure_ready()
-        self.optimizer_zero_grad()
-
         input_batched, _ = self._normalize_batch_input(input_)
+        with record_training_batch(self, input_batched, self.model_config):
+            self.optimizer_zero_grad()
 
-        # Step 1: Prepare micro-batches
-        mb_list = self._prepare_mb_list(input_batched).to(self.device)
+            # Step 1: Prepare micro-batches
+            mb_list = self._prepare_mb_list(input_batched).to(self.device)
 
-        # Step 2: Compute total loss weight
-        total_loss_weight = compute_total_loss_weight(
-            mb_list, loss_weight_fn, self.dp_group
-        )
-
-        # Step 3: Forward-backward using process_output_fn callback
-        def process_output(
-            logits: torch.Tensor, ctx_dict: dict[str, Any]
-        ) -> torch.Tensor:
-            ctx = FSDPTrainContext(**ctx_dict)
-            return self._compute_logprobs_and_loss(
-                logits,
-                ctx,
-                loss_fn,
-                loss_weight_fn,
-                total_loss_weight,
-                loss_multiplier=self.parallel_helper.dp_size,
+            # Step 2: Compute total loss weight
+            total_loss_weight = compute_total_loss_weight(
+                mb_list, loss_weight_fn, self.dp_group
             )
 
-        self.forward_backward_batch(mb_list, process_output, forward_only=False)
+            # Step 3: Forward-backward using process_output_fn callback
+            def process_output(
+                logits: torch.Tensor, ctx_dict: dict[str, Any]
+            ) -> torch.Tensor:
+                ctx = FSDPTrainContext(**ctx_dict)
+                return self._compute_logprobs_and_loss(
+                    logits,
+                    ctx,
+                    loss_fn,
+                    loss_weight_fn,
+                    total_loss_weight,
+                    loss_multiplier=self.parallel_helper.dp_size,
+                )
 
-        # Step 4: Optimizer step
-        stats = self.optimizer_step()
-        stats["num_micro_batches"] = len(mb_list.mbs)
-        return stats
+            self.forward_backward_batch(mb_list, process_output, forward_only=False)
+
+            # Step 4: Optimizer step
+            stats = self.optimizer_step()
+            stats["num_micro_batches"] = len(mb_list.mbs)
+            return stats
 
     @torch.no_grad()
     def eval_batch(
@@ -921,9 +944,17 @@ class FSDPEngine(TrainEngine):
 
     def export_stats(self) -> dict[str, float]:
         with self._offload_aware_context():
-            return stats_tracker.export_all(
+            data = stats_tracker.export_all(
                 reduce_group=self.data_parallel_group,
             )
+            data.update(
+                self._moe_metrics.export(
+                    reduce_group=self.world_mesh["dp_sp"].get_group()
+                )
+            )
+            data.update(export_training_metrics(self))
+
+        return data
 
     def offload(self) -> None:
         """Offload model memory to CPU using torch_memory_saver.
