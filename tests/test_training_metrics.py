@@ -369,3 +369,35 @@ def test_distributed_nccl_metrics_reduce_cuda_work_and_cpu_timing(tmp_path):
         nprocs=2,
         join=True,
     )
+
+
+def test_stats_logger_large_expert_table_serializes_every_layer(monkeypatch):
+    """W&B run-media serialization must retain Qwen3.5's 10,240 experts."""
+    from areal.utils import stats_logger
+
+    monkeypatch.setattr(stats_logger.wandb.Table, "MAX_ROWS", 10000)
+    serialized = []
+    monkeypatch.setattr(
+        stats_logger.wandb,
+        "log",
+        lambda data, step: serialized.append(
+            data["moe_balance/expert_loads"]._to_table_json()
+        ),
+    )
+    monkeypatch.setattr(stats_logger.swanlab, "log", lambda *args, **kwargs: None)
+    logger = stats_logger.StatsLogger.__new__(stats_logger.StatsLogger)
+    logger.ft_spec = SimpleNamespace(
+        total_train_epochs=1, steps_per_epoch=1, total_train_steps=1
+    )
+    logger._last_commit_step = -1
+    logger.summary_writer = None
+    logger.print_stats = lambda data: None
+    metrics = {}
+    for layer in range(40):
+        for expert in range(256):
+            prefix = f"moe_balance/layer_{layer}/expert_{expert}"
+            metrics[prefix + "/tokens"] = 1
+            metrics[prefix + "/load_percent"] = 100 / 256
+    logger.commit(0, 0, 0, metrics)
+    assert len(serialized[0]["data"]) == 10240
+    assert serialized[0]["data"][-1] == [39, 255, 1, 100 / 256]

@@ -153,6 +153,9 @@ class StatsLogger:
             self.print_stats(scalar_item)
             wandb_item = dict(scalar_item)
             if expert_rows:
+                # W&B's run-media Table limit defaults to 10,000 rows, below
+                # Qwen3.5's 40 x 256 experts. Preserve every expert in snapshots.
+                wandb.Table.MAX_ROWS = max(wandb.Table.MAX_ROWS, len(expert_rows))
                 wandb_item["moe_balance/expert_loads"] = wandb.Table(
                     columns=["layer", "expert", "tokens", "load_percent"],
                     data=expert_rows,
