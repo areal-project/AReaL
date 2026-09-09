@@ -158,7 +158,7 @@ if TYPE_CHECKING:
         PPOActorConfig,
         PPOCriticConfig,
     )
-    from areal.engine.awex.megatron_adapter import AwexMegatronAdapter
+    from areal.engine.awex.adapters.megatron_adapter import AwexMegatronAdapter
     from areal.engine.megatron_utils.weight_residency import MegatronWeightResidency
 
 
@@ -1709,7 +1709,7 @@ class MegatronEngine(TrainEngine):
     def _ensure_awex_adapter(self) -> AwexMegatronAdapter:
         residency = self._ensure_weight_residency()
         if self._awex_adapter is None:
-            from areal.engine.awex.megatron_adapter import AwexMegatronAdapter
+            from areal.engine.awex.adapters.megatron_adapter import AwexMegatronAdapter
 
             self._awex_adapter = AwexMegatronAdapter(self, residency)
             self.logger.info("Created AWEX weight adapter")

@@ -205,7 +205,7 @@ def create_awex_blueprint(
 
 def _create_training_adapter(engine):
     from areal.engine.awex.adapters.fsdp_adapter import AwexFSDPAdapter
-    from areal.engine.awex.megatron_adapter import (
+    from areal.engine.awex.adapters.megatron_adapter import (
         AwexMegatronAdapter,
     )
     from areal.engine.fsdp_engine import FSDPEngine

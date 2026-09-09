@@ -14,7 +14,7 @@ import torch
 
 from areal.api import WeightUpdateMeta, Worker
 from areal.engine import MegatronEngine, MegatronScoringEngine
-from areal.engine.awex.megatron_adapter import AwexMegatronAdapter
+from areal.engine.awex.adapters.megatron_adapter import AwexMegatronAdapter
 from areal.infra.controller.train_controller import TrainController
 from areal.trainer.mopd.scoring import MOPDTeacherController
 from areal.trainer.rl_trainer import PPOTrainer
@@ -133,7 +133,7 @@ def test_awex_adapter_composes_engine_weight_residency(monkeypatch):
     engine._awex_adapter = None
     engine.logger = SimpleNamespace(info=lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
-        "areal.engine.awex.megatron_adapter.AwexMegatronAdapter.eager_publish_train_info",
+        "areal.engine.awex.adapters.megatron_adapter.AwexMegatronAdapter.eager_publish_train_info",
         lambda *_args, **_kwargs: None,
     )
 

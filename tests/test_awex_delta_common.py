@@ -554,7 +554,7 @@ def _load_megatron_adapter(monkeypatch):
         training_adapter_mod,
     )
 
-    path = _ROOT / "areal/engine/awex/megatron_adapter.py"
+    path = _ROOT / "areal/engine/awex/adapters/megatron_adapter.py"
     spec = importlib.util.spec_from_file_location("awex_megatron_adapter_test", path)
     mod = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
