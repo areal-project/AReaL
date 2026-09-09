@@ -209,6 +209,148 @@ def test_qwen3_coder_xml_literal_closing_tag_is_not_silently_truncated():
     assert finish_reason == "stop"
 
 
+def test_qwen3_coder_xml_zero_argument_tool():
+    tools: list[ChatCompletionToolParam] = [
+        {
+            "type": "function",
+            "function": {
+                "name": "pwd",
+                "description": "Print working directory",
+                "parameters": {
+                    "type": "object",
+                    "properties": {},
+                    "required": [],
+                },
+            },
+        }
+    ]
+    text = "Checking directory:\n<tool_call>\n<function=pwd>\n</function>\n</tool_call>"
+
+    tool_calls, new_text, finish_reason = (
+        parser_module._process_tool_calls_qwen3_coder_xml(
+            text=text,
+            tools=tools,
+            finish_reason="stop",
+        )
+    )
+
+    assert finish_reason == "tool_calls"
+    assert tool_calls is not None
+    assert len(tool_calls) == 1
+    assert tool_calls[0].function.name == "pwd"
+    assert tool_calls[0].function.arguments == "{}"
+    assert "<tool_call>" not in new_text
+    assert "Checking directory:" in new_text
+
+
+def test_qwen3_coder_xml_self_closing_function_tag():
+    tools: list[ChatCompletionToolParam] = [
+        {
+            "type": "function",
+            "function": {
+                "name": "git_status",
+                "description": "Check git repository status",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+    ]
+    text = "<tool_call>\n<function=git_status/>\n</tool_call>"
+
+    tool_calls, new_text, finish_reason = (
+        parser_module._process_tool_calls_qwen3_coder_xml(
+            text=text,
+            tools=tools,
+            finish_reason="stop",
+        )
+    )
+
+    assert finish_reason == "tool_calls"
+    assert tool_calls is not None
+    assert len(tool_calls) == 1
+    assert tool_calls[0].function.name == "git_status"
+    assert tool_calls[0].function.arguments == "{}"
+
+
+def test_qwen3_coder_xml_json_body_fallback():
+    tools: list[ChatCompletionToolParam] = [
+        {
+            "type": "function",
+            "function": {
+                "name": "search",
+                "description": "Search web",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}},
+                    "required": ["query"],
+                },
+            },
+        }
+    ]
+    text = (
+        '<tool_call>\n<function=search>{"query": "AReaL RL"}</function>\n</tool_call>'
+    )
+
+    tool_calls, new_text, finish_reason = (
+        parser_module._process_tool_calls_qwen3_coder_xml(
+            text=text,
+            tools=tools,
+            finish_reason="stop",
+        )
+    )
+
+    assert finish_reason == "tool_calls"
+    assert tool_calls is not None
+    assert len(tool_calls) == 1
+    assert tool_calls[0].function.name == "search"
+    assert json.loads(tool_calls[0].function.arguments) == {"query": "AReaL RL"}
+
+
+def test_qwen3_coder_xml_unescapes_xml_entities():
+    text = (
+        "<tool_call>\n<function=Bash>\n"
+        "<parameter=command>\n"
+        "cat file.py | grep &quot;foo &amp;&amp; bar&quot; &gt; out.txt\n"
+        "</parameter>\n"
+        "</function>\n</tool_call>"
+    )
+
+    tool_calls, new_text, finish_reason = (
+        parser_module._process_tool_calls_qwen3_coder_xml(
+            text=text,
+            tools=QWEN3_CODER_TOOLS,
+            finish_reason="stop",
+        )
+    )
+
+    assert finish_reason == "tool_calls"
+    assert tool_calls is not None
+    assert len(tool_calls) == 1
+    assert (
+        json.loads(tool_calls[0].function.arguments)["command"]
+        == 'cat file.py | grep "foo && bar" > out.txt'
+    )
+
+
+def test_qwen3_coder_xml_missing_required_params_rejected():
+    text = (
+        "<tool_call>\n<function=Write>\n"
+        "<parameter=file_path>\na.py\n</parameter>\n"
+        "</function>\n</tool_call>"
+    )
+
+    tool_calls, new_text, finish_reason = (
+        parser_module._process_tool_calls_qwen3_coder_xml(
+            text=text,
+            tools=QWEN3_CODER_TOOLS,
+            finish_reason="stop",
+        )
+    )
+
+    assert tool_calls is None
+    assert new_text == text
+    assert finish_reason == "stop"
+
+
 @pytest.mark.sglang
 @pytest.mark.parametrize("reasoning_parser", ["", None], ids=["empty", "none"])
 def test_process_tool_calls_without_reasoning_parser_returns_plain_text(
