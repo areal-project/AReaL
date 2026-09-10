@@ -10,7 +10,7 @@ import os
 import secrets
 import threading
 import time
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Mapping
 from typing import TYPE_CHECKING, Any
 
 import uvicorn
@@ -31,10 +31,11 @@ from areal.experimental.openai.anthropic import (
     translate_anthropic_stream,
 )
 from areal.experimental.openai.client import ArealOpenAI
+from areal.experimental.openai.types import InteractionWithTokenLogpReward
 from areal.infra.processor_cache import ProcessorCacheRegistry
 from areal.infra.rpc.serialization import deserialize_value, serialize_value
 from areal.infra.utils.http import validate_admin_api_key
-from areal.utils import name_resolve, names, seeding
+from areal.utils import name_resolve, names, seeding, stats_tracker
 from areal.utils.dynamic_import import import_from_string
 from areal.utils.hf_utils import load_hf_processor_and_tokenizer
 from areal.utils.logging import getLogger
@@ -67,6 +68,7 @@ from .tensor_reference import GroupTensorStoreRegistry
 
 if TYPE_CHECKING:
     from areal.api import InferenceEngine
+    from areal.reward.prm import PRMRunner, PRMTurnResult
 
 
 logger = getLogger("ProxyRolloutServer")
@@ -107,6 +109,7 @@ def _warn_once(msg: str) -> None:
 # Engine and client (created via /create_engine and /call with method "initialize")
 _engine: InferenceEngine | None = None
 _openai_client: ArealOpenAI | None = None
+_prm_runner = None
 
 # Session management
 _session_cache: dict[str, SessionData] = {}
@@ -310,6 +313,7 @@ async def alloc_ports(raw_request: Request):
 def _setup_openai_client():
     global _openai_client, _session_timeout_seconds, _admin_api_key
     global _message_preprocessors, _prefix_matcher, _deterministic_sampling
+    global _prm_runner
     config = _engine.config
     _deterministic_sampling = bool(getattr(config, "deterministic_sampling", False))
     processor, tokenizer = load_hf_processor_and_tokenizer(config.tokenizer_path)
@@ -356,6 +360,17 @@ def _setup_openai_client():
         logger.info("Loaded prefix matcher: %s", agent_cfg.prefix_matcher)
     else:
         _prefix_matcher = None
+
+    if agent_cfg.prm.enabled and agent_cfg.prm.scorers:
+        from areal.reward.prm import PRMRunner
+
+        _prm_runner = PRMRunner(agent_cfg.prm)
+        logger.info(
+            "Loaded PRM runner with scorers: %s",
+            [scorer.name for scorer in _prm_runner.scorers],
+        )
+    else:
+        _prm_runner = None
 
 
 @app.post("/configure")
@@ -854,12 +869,45 @@ async def responses(
     )
 
 
+def _anthropic_tool_error_ids(anthropic_request: dict[str, Any]) -> set[str]:
+    """Return IDs of Anthropic tool results explicitly marked as errors."""
+    failed_ids: set[str] = set()
+    for message in anthropic_request.get("messages") or []:
+        content = message.get("content") if isinstance(message, Mapping) else None
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if (
+                isinstance(block, Mapping)
+                and block.get("type") == "tool_result"
+                and block.get("is_error")
+                and block.get("tool_use_id")
+            ):
+                failed_ids.add(str(block["tool_use_id"]))
+    return failed_ids
+
+
 def _translate_anthropic_to_openai_request(anthropic_request: dict[str, Any]) -> dict:
     """Translate an Anthropic Messages API request to OpenAI format."""
-    return translate_anthropic_request(
+    openai_request = translate_anthropic_request(
         anthropic_request,
         message_preprocessors=_message_preprocessors,
     )
+    if openai_request is None:
+        raise ValueError("Failed to translate request")
+    openai_request = dict(openai_request)
+
+    failed_ids = _anthropic_tool_error_ids(anthropic_request)
+    if failed_ids:
+        for message in openai_request.get("messages") or []:
+            if (
+                isinstance(message, dict)
+                and message.get("role") == "tool"
+                and message.get("tool_call_id") in failed_ids
+            ):
+                message["is_error"] = True
+
+    return openai_request
 
 
 async def _safe_stream_wrapper(
@@ -997,6 +1045,71 @@ async def anthropic_messages(
 # =============================================================================
 
 
+async def _score_prm_branches(
+    interactions: dict[str, InteractionWithTokenLogpReward],
+    runner: PRMRunner,
+    *,
+    session_id: str,
+    is_eval: bool,
+) -> dict[str, InteractionWithTokenLogpReward]:
+    """Score each exported root-to-leaf trajectory in branch-local isolation.
+
+    Concat export represents a branch by its leaf and parent pointers. Ancestors
+    can be shared by multiple leaves, while process rewards can depend on the
+    branch's later tool results. Clone each path before scoring so every exported
+    trajectory receives rewards computed from its own complete conversation.
+    Turn observations count each duplicated turn occurrence, and trajectory reward
+    metrics sum the turn rewards once per exported branch.
+    """
+    from areal.experimental.openai.cache import InteractionCache
+    from areal.reward.prm import record_prm_results
+
+    if len(interactions) > 1:
+        logger.warning(
+            "Session %s exported %d trajectory branches; scoring each PRM "
+            "root-to-leaf path independently",
+            session_id,
+            len(interactions),
+        )
+
+    scored_interactions: dict[str, InteractionWithTokenLogpReward] = {}
+    committed_turn_results: list[PRMTurnResult] = []
+    committed_trajectory_metrics: list[tuple[str, float]] = []
+    for leaf_id, leaf in interactions.items():
+        branch_cache, cloned_leaf = InteractionCache.clone_chain(
+            leaf, session_id=session_id
+        )
+        if cloned_leaf.interaction_id != leaf_id:
+            raise ValueError(
+                "PRM exported leaf ID mismatch: "
+                f"mapping key {leaf_id!r}, interaction ID "
+                f"{cloned_leaf.interaction_id!r}"
+            )
+        full_messages = list(cloned_leaf.messages or []) + list(
+            cloned_leaf.output_message_list or []
+        )
+        branch_results = await runner.run(
+            branch_cache,
+            ctx={"messages": full_messages},
+            is_eval=is_eval,
+            record_metrics=False,
+        )
+        committed_turn_results.extend(branch_results)
+        branch_totals: dict[str, float] = {}
+        for result in branch_results:
+            branch_totals[result.scorer_name] = (
+                branch_totals.get(result.scorer_name, 0.0) + result.reward
+            )
+        committed_trajectory_metrics.extend(branch_totals.items())
+        scored_interactions[leaf_id] = cloned_leaf
+
+    record_prm_results(committed_turn_results, is_eval=is_eval)
+    tracker = stats_tracker.get("eval-rollout" if is_eval else "rollout")
+    for scorer_name, metric in committed_trajectory_metrics:
+        tracker.scalar(**{f"prm_trajectory_reward/{scorer_name}": metric})
+    return scored_interactions
+
+
 @app.post(
     f"/{EXPORT_TRAJECTORIES_PATHNAME}",
     dependencies=[Depends(_require_admin_key)],
@@ -1028,6 +1141,20 @@ async def export_trajectories(
         style=request.style,
         drop_retry_orphans=request.drop_retry_orphans,
     )
+
+    if _prm_runner is not None and interactions:
+        try:
+            interactions = await _score_prm_branches(
+                interactions,
+                _prm_runner,
+                session_id=session_id,
+                is_eval=request.is_eval,
+            )
+        except Exception:
+            logger.exception(
+                "PRM runner failed for session %s; rejecting trajectory", session_id
+            )
+            interactions = {}
 
     # Remove session from cache and clean up API key mapping
     with _lock:

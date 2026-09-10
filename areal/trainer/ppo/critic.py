@@ -61,6 +61,7 @@ class PPOCritic:
             "kl_rewards",
             "versions",
             "is_truncated",
+            "token_rewards",
         ]:
             data.pop(key, None)
 

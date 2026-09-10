@@ -76,6 +76,7 @@ class ExportTrajectoriesRequest(BaseModel):
     style: str = "individual"
     drop_retry_orphans: bool = False
     supports_shared_tensor_references: bool = False
+    is_eval: bool = False
 
 
 class ExportTrajectoriesResponse(BaseModel):
@@ -175,10 +176,11 @@ class SessionData:
     ) -> dict[str, InteractionWithTokenLogpReward]:
         if len(self.completions) == 0:
             return {}
-        if drop_retry_orphans:
-            self.completions.drop_retry_orphans()
-        self.completions.apply_reward_discount(turn_discount=discount)
-        return self.completions.export_interactions(style=style)
+        return self.completions.export_interactions(
+            style=style,
+            reward_discount=discount,
+            drop_retry_orphans=drop_retry_orphans,
+        )
 
 
 # =============================================================================

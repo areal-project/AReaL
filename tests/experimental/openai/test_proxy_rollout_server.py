@@ -9,12 +9,16 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
+from areal.api import ModelResponse
+from areal.experimental.openai.cache import InteractionCache
 from areal.experimental.openai.proxy import proxy_rollout_server as srv
 from areal.experimental.openai.proxy.server import SessionData
 from areal.experimental.openai.proxy.tensor_reference import GroupTensorStoreRegistry
 from areal.experimental.openai.types import InteractionWithTokenLogpReward
 from areal.infra.processor_cache import ProcessorCacheRegistry
 from areal.infra.rpc.serialization import deserialize_value
+from areal.reward.prm import BaseScorer, PRMConfig, PRMRunner
+from areal.utils import stats_tracker
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -227,6 +231,7 @@ def test_setup_openai_client_loads_and_passes_vlm_processor(monkeypatch):
         admin_api_key="test-admin-key",
         message_preprocessors=[],
         prefix_matcher=None,
+        prm=PRMConfig(),
     )
     engine_config = SimpleNamespace(
         tokenizer_path="test-vlm",
@@ -247,6 +252,180 @@ def test_setup_openai_client_loads_and_passes_vlm_processor(monkeypatch):
 
     assert client_cls.call_args.kwargs["processor"] is processor
     assert client_cls.call_args.kwargs["tokenizer"] is tokenizer
+
+
+def _prm_interaction(
+    interaction_id: str,
+    input_tokens: list[int],
+    output_tokens: list[int],
+    messages: list[dict],
+    *,
+    parent: InteractionWithTokenLogpReward | None = None,
+) -> InteractionWithTokenLogpReward:
+    interaction = InteractionWithTokenLogpReward(
+        model_response=ModelResponse(
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            output_logprobs=[0.0] * len(output_tokens),
+            output_versions=[0] * len(output_tokens),
+        ),
+        reward=0.0,
+        parent=parent,
+        chat_template_type="concat",
+        messages=messages,
+        output_message_list=[
+            {"role": "assistant", "content": f"output-{interaction_id}"}
+        ],
+    )
+    interaction._interaction_id = interaction_id
+    return interaction
+
+
+def test_concat_session_export_keeps_sibling_outcomes_independent():
+    """The real session export path must not discount across sibling leaves."""
+    root = _prm_interaction("root", [1], [2], [{"role": "user", "content": "task"}])
+    leaf_a = _prm_interaction(
+        "leaf-a", [1, 2, 3], [4], [{"role": "tool", "content": "branch-a"}], parent=root
+    )
+    leaf_b = _prm_interaction(
+        "leaf-b", [1, 2, 5], [6], [{"role": "tool", "content": "branch-b"}], parent=root
+    )
+    root.reward = 0.25
+    leaf_a.reward = 1.0
+    leaf_b.reward = 2.0
+    session = SessionData(session_id="branch-outcomes")
+    session._completions = InteractionCache.from_dict(
+        {"root": root, "leaf-a": leaf_a, "leaf-b": leaf_b},
+        session_id=session.session_id,
+    )
+
+    exported = session.export_interactions(discount=0.5, style="concat")
+
+    assert list(exported) == ["leaf-a", "leaf-b"]
+    assert exported["leaf-a"].reward == pytest.approx(1.0)
+    assert exported["leaf-b"].reward == pytest.approx(2.0)
+
+
+@pytest.mark.asyncio
+async def test_prm_scores_shared_ancestors_independently_per_branch():
+    """Each exported leaf must carry rewards derived from its own later context."""
+
+    class _BranchScorer(BaseScorer):
+        name = "branch"
+
+        async def evaluate(self, interaction, ctx):
+            messages = ctx["messages"]
+            branch = next(
+                message["content"]
+                for message in messages
+                if message.get("role") == "tool"
+            )
+            scale = 1.0 if branch == "branch-a" else 2.0
+            return scale if interaction.interaction_id == "root" else scale * 10
+
+    root = _prm_interaction(
+        "root",
+        [1],
+        [2],
+        [{"role": "user", "content": "task"}],
+    )
+    leaf_a = _prm_interaction(
+        "leaf-a",
+        [1, 2, 3],
+        [4],
+        [
+            {"role": "user", "content": "task"},
+            {"role": "assistant", "content": "root-output"},
+            {"role": "tool", "content": "branch-a"},
+        ],
+        parent=root,
+    )
+    leaf_b = _prm_interaction(
+        "leaf-b",
+        [1, 2, 5],
+        [6],
+        [
+            {"role": "user", "content": "task"},
+            {"role": "assistant", "content": "root-output"},
+            {"role": "tool", "content": "branch-b"},
+        ],
+        parent=root,
+    )
+    runner = PRMRunner(PRMConfig(scorers=[_BranchScorer()]))
+    stats_tracker.export_all(reduce_group=None)
+
+    scored = await srv._score_prm_branches(
+        {"leaf-a": leaf_a, "leaf-b": leaf_b},
+        runner,
+        session_id="branch-session",
+        is_eval=False,
+    )
+
+    assert list(scored) == ["leaf-a", "leaf-b"]
+    assert scored["leaf-a"].parent is not scored["leaf-b"].parent
+    assert root.token_rewards is None
+    assert leaf_a.token_rewards is None
+    assert leaf_b.token_rewards is None
+    torch.testing.assert_close(
+        scored["leaf-a"].to_tensor_dict()["token_rewards"].squeeze(0),
+        torch.tensor([0.0, 1.0, 0.0, 10.0]),
+        rtol=0.0,
+        atol=0.0,
+    )
+    torch.testing.assert_close(
+        scored["leaf-b"].to_tensor_dict()["token_rewards"].squeeze(0),
+        torch.tensor([0.0, 2.0, 0.0, 20.0]),
+        rtol=0.0,
+        atol=0.0,
+    )
+    metrics = stats_tracker.export_all(reduce_group=None)
+    assert metrics["rollout/prm_turn_reward/branch"] == pytest.approx(8.25)
+    assert metrics["rollout/prm_trajectory_reward/branch"] == pytest.approx(16.5)
+
+
+@pytest.mark.asyncio
+async def test_prm_branch_failure_does_not_publish_partial_metrics():
+    class _FailSecondBranchScorer(BaseScorer):
+        name = "branch_failure"
+
+        async def evaluate(self, interaction, ctx):
+            if any(
+                message.get("content") == "branch-b"
+                for message in ctx["messages"]
+                if isinstance(message, dict)
+            ):
+                raise RuntimeError("second branch failed")
+            return 1.0
+
+    root = _prm_interaction("root", [1], [2], [{"role": "user", "content": "task"}])
+    leaf_a = _prm_interaction(
+        "leaf-a",
+        [1, 2, 3],
+        [4],
+        [{"role": "tool", "content": "branch-a"}],
+        parent=root,
+    )
+    leaf_b = _prm_interaction(
+        "leaf-b",
+        [1, 2, 5],
+        [6],
+        [{"role": "tool", "content": "branch-b"}],
+        parent=root,
+    )
+    runner = PRMRunner(PRMConfig(scorers=[_FailSecondBranchScorer()]))
+    stats_tracker.export_all(reduce_group=None)
+
+    with pytest.raises(RuntimeError, match="second branch failed"):
+        await srv._score_prm_branches(
+            {"leaf-a": leaf_a, "leaf-b": leaf_b},
+            runner,
+            session_id="failing-branch-session",
+            is_eval=False,
+        )
+
+    metrics = stats_tracker.export_all(reduce_group=None)
+    assert "rollout/prm_turn_reward/branch_failure" not in metrics
+    assert "rollout/prm_trajectory_reward/branch_failure" not in metrics
 
 
 # ---------------------------------------------------------------------------
