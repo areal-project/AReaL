@@ -46,7 +46,7 @@ from areal.infra.utils.concurrent import get_executor
 from areal.infra.utils.http import arequest_with_retry, get_default_connector
 from areal.infra.utils.launcher import wait_llm_server_addrs
 from areal.infra.utils.proc import kill_process_tree
-from areal.utils import logging, name_resolve, names
+from areal.utils import logging, name_resolve, names, stats_tracker
 from areal.utils.data import concat_padded_tensors
 from areal.utils.dynamic_import import import_from_string
 from areal.utils.network import (
@@ -88,25 +88,61 @@ class GroupedRolloutWorkflow(RolloutWorkflow):
         self, engine: InferenceEngine, data: dict[str, Any]
     ) -> dict[str, Any] | None:
         from areal.experimental.openai import InteractionWithTokenLogpReward
+        from areal.infra import workflow_context
+        from areal.infra.processor_cache import ProcessorCallCache
+        from areal.infra.workflow_context import WorkflowContext
+
+        parent = workflow_context.get()
+        shared_processor_cache = ProcessorCallCache()
+        group_context = WorkflowContext(
+            is_eval=parent.is_eval,
+            task_id=parent.task_id,
+            group_size=self.group_size,
+            processor_cache=shared_processor_cache,
+        )
 
         async def run_sample(sample_idx: int) -> tuple[int, Any]:
-            from areal.infra import workflow_context
-            from areal.infra.workflow_context import WorkflowContext
-
-            parent = workflow_context.get()
             workflow_context.set(
                 WorkflowContext(
-                    is_eval=parent.is_eval,
-                    task_id=parent.task_id,
+                    is_eval=group_context.is_eval,
+                    task_id=group_context.task_id,
                     sample_idx=sample_idx,
+                    group_size=group_context.group_size,
+                    processor_cache=shared_processor_cache,
                 )
             )
             result = await self.workflow.arun_episode(engine, data)
             return sample_idx, result
 
-        indexed_results = await asyncio.gather(
-            *[run_sample(sample_idx) for sample_idx in range(self.group_size)]
-        )
+        group_tasks = [
+            asyncio.create_task(run_sample(sample_idx))
+            for sample_idx in range(self.group_size)
+        ]
+        try:
+            indexed_results = await asyncio.gather(*group_tasks)
+        except BaseException:
+            # gather does not cancel siblings when a child fails or is cancelled.
+            for task in group_tasks:
+                if not task.done():
+                    task.cancel()
+            raise
+        finally:
+            try:
+                # Drain cancellation handlers before releasing shared resources.
+                await asyncio.gather(*group_tasks, return_exceptions=True)
+            finally:
+                finalizer = getattr(
+                    self.workflow, "_afinalize_processor_cache_group", None
+                )
+                if finalizer is not None:
+                    try:
+                        await finalizer(group_context)
+                    except Exception as exc:
+                        self.logger.warning(
+                            "Failed to finalize rollout group resources (%s: %s).",
+                            type(exc).__name__,
+                            exc,
+                        )
         indexed_results.sort(key=lambda item: item[0])
         sample_indices = [sample_idx for sample_idx, _ in indexed_results]
         if sample_indices != list(range(self.group_size)):
@@ -1018,6 +1054,18 @@ class RemoteInfEngine(InferenceEngine):
             if gen_result.routed_experts is not None:
                 accumulated_routed_experts.append(gen_result.routed_experts)
 
+            # Record speculative-decoding acceptance metrics from SGLang
+            # meta_info. Recorded per generation segment (partial rollout may
+            # issue multiple /generate calls); exported as a segment-level mean.
+            if gen_result.spec_accept_rate is not None:
+                stats_tracker.get("rollout").scalar(
+                    spec_accept_rate=gen_result.spec_accept_rate
+                )
+            if gen_result.spec_accept_length is not None:
+                stats_tracker.get("rollout").scalar(
+                    spec_accept_length=gen_result.spec_accept_length
+                )
+
             # Update request for next iteration
             req.input_ids += gen_result.output_tokens
             req.gconfig.max_new_tokens -= len(gen_result.output_tokens)
@@ -1399,6 +1447,10 @@ class RemoteInfEngine(InferenceEngine):
     @trace_perf("remote_inf_engine.pause_generation", category="misc")
     def pause_generation(self):
         """Pause request submission for async rollout."""
+        # SGLang needs a two-stage pause before colocated memory can be
+        # released: ``abort`` closes admission and waits for in-flight work to
+        # drain, then ``retract`` puts the now-idle scheduler into its paused
+        # state. Other backends keep their existing single-request protocol.
         get_pause_requests = getattr(self.backend, "get_pause_requests", None)
         pause_requests = (
             get_pause_requests()

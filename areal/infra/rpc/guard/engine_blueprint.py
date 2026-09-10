@@ -492,9 +492,16 @@ def call_engine_method():
         # Deserialize data
         raw_args = deserialize_value(raw_args)
         raw_kwargs = deserialize_value(raw_kwargs)
-        # Fetch remote tensors
-        args = RTensor.localize(raw_args)
-        kwargs = RTensor.localize(raw_kwargs)
+        # CPU-staged engines (currently Megatron) can preserve shared rollout
+        # tensors until microbatch construction. Other v1 engines retain the
+        # existing per-reference localization behavior.
+        preserve_input_tensor_aliases = _should_stage_rpc_payload_on_cpu(
+            engine, method_name
+        )
+        args, kwargs = RTensor.localize(
+            (raw_args, raw_kwargs),
+            preserve_tensor_aliases=preserve_input_tensor_aliases,
+        )
 
         def execute_in_engine_thread():
             try:
@@ -626,7 +633,15 @@ def call_engine_method():
         is_init = is_train and engine.initialized
         if not is_train or not is_init or engine.is_data_parallel_head():
             state = get_state()
-            result = RTensor.remotize(result, node_addr=state.node_addr)
+            # wait_for_task is the v1 rollout boundary that returns the grouped
+            # trajectory. Preserve its shared image tensors as RTensor shards;
+            # unrelated engine results keep the existing behavior.
+            preserve_output_tensor_aliases = method_name == "wait_for_task"
+            result = RTensor.remotize(
+                result,
+                node_addr=state.node_addr,
+                preserve_tensor_aliases=preserve_output_tensor_aliases,
+            )
             serialized_result = serialize_value(result)
         else:
             # Non-DP-head: result is discarded by controller. Skip remotize

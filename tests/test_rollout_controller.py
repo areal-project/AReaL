@@ -17,6 +17,7 @@ from areal.api.cli_args import (
     GenerationHyperparameters,
     InferenceEngineConfig,
     SchedulingSpec,
+    SchedulingStrategy,
     SGLangConfig,
 )
 from areal.infra import RolloutController
@@ -43,6 +44,7 @@ def create_test_config(backend="sglang:d2", **kwargs):
 class MockScheduler:
     def __init__(self):
         self.workers = []
+        self.jobs = []
         self.call_count = 0
         self.engine_calls = []
         self._pending_results = {}  # worker_id -> dict[task_id -> result]
@@ -50,6 +52,7 @@ class MockScheduler:
 
     def create_workers(self, job, *args, **kwargs):
         """Create workers based on Job specification."""
+        self.jobs.append(job)
         role = job.role
         replicas = job.replicas
         worker_ids = [f"{role}/{i}" for i in range(replicas)]
@@ -57,7 +60,11 @@ class MockScheduler:
             Worker(
                 id=wid,
                 ip="127.0.0.1",
-                worker_ports=["8000", "8001"],
+                worker_ports=(
+                    ["8000", "8001"]
+                    if job.scheduling_strategy.fork
+                    else ["8000", "8001", "8002"]
+                ),
                 engine_ports=["9000", "9001"],
             )
             for wid in worker_ids
@@ -76,7 +83,9 @@ class MockScheduler:
     async def async_call_engine(self, worker_id, method, *args, **kwargs):
         self.engine_calls.append((worker_id, method, args, kwargs))
         self.call_count += 1
-        if method == "agenerate":
+        if method == "launch_server":
+            return Mock(host="127.0.0.1", port=8000)
+        elif method == "agenerate":
             return Mock()
         # Handle submit method - return a task_id and store the result
         elif method == "submit":
@@ -216,6 +225,93 @@ class TestRolloutControllerInitialization:
 
         controller.destroy()
 
+    def test_initialize_nonfork_colocation_uses_port_after_actor_rendezvous(self):
+        """A reused actor worker reserves port 2 for SGLang NCCL."""
+        config = create_test_config(
+            backend="sglang:d2",
+            scheduling_strategy=SchedulingStrategy(
+                type="colocation",
+                target="actor",
+                fork=False,
+            ),
+        )
+        scheduler = MockScheduler()
+        controller = RolloutController(
+            inf_engine=MockInferenceEngine,
+            config=config,
+            scheduler=scheduler,
+        )
+
+        controller.initialize(role="rollout", server_args={"dist_init_addr": None})
+
+        launch_calls = [
+            call for call in scheduler.engine_calls if call[1] == "launch_server"
+        ]
+        assert len(launch_calls) == 2
+        for _, _, _, kwargs in launch_calls:
+            server_args = kwargs["server_args"]
+            assert server_args["nccl_port"] == 8002
+            assert server_args["dist_init_addr"] is None
+
+        controller.destroy()
+
+    def test_initialize_forked_colocation_uses_owned_rendezvous_port(self):
+        """A forked rollout worker can use its own port 1 for SGLang NCCL."""
+        config = create_test_config(
+            backend="sglang:d2",
+            scheduling_strategy=SchedulingStrategy(
+                type="colocation",
+                target="actor",
+                fork=True,
+            ),
+        )
+        scheduler = MockScheduler()
+        controller = RolloutController(
+            inf_engine=MockInferenceEngine,
+            config=config,
+            scheduler=scheduler,
+        )
+
+        controller.initialize(role="rollout", server_args={})
+
+        launch_calls = [
+            call for call in scheduler.engine_calls if call[1] == "launch_server"
+        ]
+        assert len(launch_calls) == 2
+        for _, _, _, kwargs in launch_calls:
+            assert kwargs["server_args"]["nccl_port"] == 8001
+
+        controller.destroy()
+
+    def test_initialize_nonfork_colocation_without_third_port_fails(self):
+        """A reused actor worker must not silently reuse its train TCPStore."""
+        config = create_test_config(
+            backend="sglang:d2",
+            scheduling_strategy=SchedulingStrategy(
+                type="colocation",
+                target="actor",
+                fork=False,
+            ),
+        )
+        scheduler = MockScheduler()
+        original_create_workers = scheduler.create_workers
+
+        def create_workers_with_two_ports(job, *args, **kwargs):
+            worker_ids = original_create_workers(job, *args, **kwargs)
+            for worker in scheduler.workers:
+                worker.worker_ports = ["8000", "8001"]
+            return worker_ids
+
+        scheduler.create_workers = create_workers_with_two_ports
+        controller = RolloutController(
+            inf_engine=MockInferenceEngine,
+            config=config,
+            scheduler=scheduler,
+        )
+
+        with pytest.raises(ValueError, match="needs at least 3 allocated ports"):
+            controller.initialize(role="rollout", server_args={})
+
     def test_initialize_creates_staleness_manager(self):
         config = create_test_config(
             consumer_batch_size=32,
@@ -321,7 +417,8 @@ class TestRolloutControllerDestroy:
 
         controller.initialize(role="rollout", server_args={})
 
-        controller.destroy()
+        with pytest.raises(RuntimeError, match="rollout worker delete"):
+            controller.destroy()
 
 
 class TestRolloutControllerCapacity:

@@ -31,6 +31,7 @@ from areal.experimental.openai.anthropic import (
     translate_anthropic_stream,
 )
 from areal.experimental.openai.client import ArealOpenAI
+from areal.infra.processor_cache import ProcessorCacheRegistry
 from areal.infra.rpc.serialization import deserialize_value, serialize_value
 from areal.infra.utils.http import validate_admin_api_key
 from areal.utils import name_resolve, names, seeding
@@ -46,17 +47,23 @@ from .server import (
     EXPORT_TRAJECTORIES_PATHNAME,
     GRANT_CAPACITY_PATHNAME,
     RESPONSES_PATHNAME,
+    RL_END_PROCESSOR_CACHE_GROUP_PATHNAME,
     RL_END_SESSION_PATHNAME,
+    RL_FETCH_SHARED_TENSORS_PATHNAME,
     RL_SET_REWARD_PATHNAME,
     RL_START_SESSION_PATHNAME,
     ExportTrajectoriesRequest,
     ExportTrajectoriesResponse,
+    FetchSharedTensorsRequest,
+    FetchSharedTensorsResponse,
+    ProcessorCacheGroupRequest,
     SessionData,
     SetRewardRequest,
     StartSessionRequest,
     StartSessionResponse,
     serialize_interactions,
 )
+from .tensor_reference import GroupTensorStoreRegistry
 
 if TYPE_CHECKING:
     from areal.api import InferenceEngine
@@ -107,6 +114,8 @@ _lock = threading.Lock()
 _capacity = 0
 _last_cleanup_time: float = 0
 _session_timeout_seconds: int = 3600  # Default timeout (overridden by config)
+_processor_cache_registry = ProcessorCacheRegistry()
+_group_tensor_store_registry = GroupTensorStoreRegistry()
 
 # API key authentication
 # Initialized to a random value so pre-configuration requests cannot bypass auth.
@@ -126,6 +135,8 @@ _prefix_matcher = None
 # Server address (set at startup)
 _server_host: str = "0.0.0.0"
 _server_port: int = 8000
+_worker_role: str | None = None
+_worker_index: int | None = None
 
 # Port allocation tracking
 _allocated_ports: set[int] = set()
@@ -140,6 +151,24 @@ _trial_name: str | None = None
 _name_resolve_type: str = "nfs"
 _nfs_record_root: str = "/tmp/areal/name_resolve"
 _etcd3_addr: str = "localhost:2379"
+
+
+def _resolve_worker_index(cli_worker_index: int) -> int:
+    """Resolve identity without clobbering an explicit scheduler value.
+
+    A local launch can inherit ``SLURM_PROCID`` from its parent login shell.
+    Treating that stale value as an unconditional override makes every local
+    proxy identify as rank 0, so exact fork readiness checks reject ranks
+    1..N. Slurm-only launchers still use the environment fallback when they
+    leave ``--worker-index`` at its sentinel value.
+    """
+    worker_index = cli_worker_index
+    if worker_index == -1 and "SLURM_PROCID" in os.environ:
+        worker_index = int(os.environ["SLURM_PROCID"])
+    if worker_index == -1:
+        raise ValueError("Invalid worker index. Not found from SLURM environ or args.")
+    return worker_index
+
 
 # =============================================================================
 # Request Validation
@@ -229,7 +258,12 @@ app = FastAPI()
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "initialized": _engine is not None}
+    return {
+        "status": "ok",
+        "initialized": _engine is not None,
+        "role": _worker_role,
+        "worker_index": _worker_index,
+    }
 
 
 @app.post("/alloc_ports")
@@ -421,7 +455,14 @@ def _cleanup_stale_sessions():
 
     for session_id in stale_sessions:
         logger.warning(f"Removing stale session: {session_id}")
-        _session_cache.pop(session_id, None)
+        session_data = _session_cache.pop(session_id, None)
+        if session_data is not None:
+            cache_group_id = session_data.take_processor_cache_group_id()
+            if cache_group_id is not None:
+                _processor_cache_registry.release(cache_group_id)
+
+    _processor_cache_registry.discard_stale(_session_timeout_seconds)
+    _group_tensor_store_registry.discard_stale(_session_timeout_seconds)
 
     # Clean up API key mappings for stale sessions
     if stale_sessions:
@@ -450,6 +491,15 @@ def start_session(request: StartSessionRequest) -> StartSessionResponse:
     """
     global _capacity
     task_id = request.task_id
+
+    if (
+        request.processor_cache_group_id is not None
+        and request.processor_cache_group_size < 2
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="processor_cache_group_size must be at least 2 for grouped caching",
+        )
 
     with _lock:
         # Periodically cleanup stale sessions
@@ -494,11 +544,20 @@ def start_session(request: StartSessionRequest) -> StartSessionResponse:
             ):
                 session_api_key = secrets.token_urlsafe(32)
 
+        processor_cache = None
+        if request.processor_cache_group_id is not None:
+            processor_cache = _processor_cache_registry.acquire(
+                request.processor_cache_group_id,
+                request.processor_cache_group_size,
+            )
+
         _capacity -= 1
         _session_cache[session_id] = SessionData(
             session_id=session_id,
             prefix_matcher=_prefix_matcher,
             sampling_seed_identity=task_id,
+            processor_cache=processor_cache,
+            processor_cache_group_id=request.processor_cache_group_id,
         )
         _api_key_to_session[session_api_key] = session_id
         _session_to_api_key[session_id] = session_api_key
@@ -524,7 +583,36 @@ def end_session(session_id: str = Depends(_require_session_key)):
 
     # finish() outside lock to avoid holding lock during potential I/O
     session.finish()
+    cache_group_id = session.take_processor_cache_group_id()
+    if cache_group_id is not None:
+        _processor_cache_registry.release(cache_group_id)
     return {"message": "success", "interaction_count": interaction_count}
+
+
+@app.post(
+    f"/{RL_END_PROCESSOR_CACHE_GROUP_PATHNAME}",
+    dependencies=[Depends(_require_admin_key)],
+)
+def end_processor_cache_group(request: ProcessorCacheGroupRequest):
+    """Discard processor and shared-tensor state after a rollout group finishes."""
+    _processor_cache_registry.discard(request.group_id)
+    _group_tensor_store_registry.discard(request.group_id)
+    return {"message": "success"}
+
+
+@app.post(
+    f"/{RL_FETCH_SHARED_TENSORS_PATHNAME}",
+    dependencies=[Depends(_require_admin_key)],
+)
+def fetch_shared_tensors(
+    request: FetchSharedTensorsRequest,
+) -> FetchSharedTensorsResponse:
+    """Fetch each unique multimodal tensor once for a grouped rollout."""
+    try:
+        tensors = _group_tensor_store_registry.fetch(request.group_id, request.ref_ids)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return FetchSharedTensorsResponse(tensors=serialize_value(tensors))
 
 
 @app.post(f"/{RL_SET_REWARD_PATHNAME}")
@@ -592,8 +680,16 @@ async def _call_client_create(
     )
 
     sig = inspect.signature(create_fn)
-    areal_client_ignored_args = ["model"] + (extra_ignored_args or [])
-    areal_client_disallowed_args = ["areal_cache"]
+    supports_processor_cache = "processor_cache" in sig.parameters or any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in sig.parameters.values()
+    )
+    # Keep the request model when the AReaL client supports it. Anthropic's
+    # LiteLLM response adapter uses this field to select the model family;
+    # dropping it leaves the generated ChatCompletion with no usable model
+    # identity and fails with ``Model type must be specified``.
+    areal_client_ignored_args = extra_ignored_args or []
+    areal_client_disallowed_args = ["areal_cache", "processor_cache"]
     areal_client_allowed_args = list(
         k
         for k in sig.parameters.keys()
@@ -660,7 +756,13 @@ async def _call_client_create(
         kwargs["stream"] = True
 
     try:
-        return await create_fn(areal_cache=session_data.completions, **kwargs)
+        client_kwargs: dict[str, Any] = {
+            "areal_cache": session_data.completions,
+            **kwargs,
+        }
+        if supports_processor_cache:
+            client_kwargs["processor_cache"] = session_data.processor_cache
+        return await create_fn(**client_kwargs)
     except ValueError as e:
         raise HTTPException(status_code=500, detail=str(e))
     except Exception as e:
@@ -932,9 +1034,23 @@ async def export_trajectories(
         _session_cache.pop(session_id, None)
         _remove_api_keys_for_session(session_id)
 
-    # Serialize for HTTP transport
-    serialized = serialize_interactions(interactions)
-    return ExportTrajectoriesResponse(interactions=serialized)
+    # Grouped inline/subproc sessions export only multimodal tensor references.
+    # The workflow fetches each unique tensor once through the group endpoint.
+    tensor_reference_group_id = (
+        session_data.processor_cache_group_id
+        if request.supports_shared_tensor_references
+        else None
+    )
+    tensor_store = (
+        _group_tensor_store_registry.get_or_create(tensor_reference_group_id)
+        if tensor_reference_group_id is not None
+        else None
+    )
+    serialized = serialize_interactions(interactions, tensor_store=tensor_store)
+    return ExportTrajectoriesResponse(
+        interactions=serialized,
+        tensor_reference_group_id=tensor_reference_group_id,
+    )
 
 
 # =============================================================================
@@ -994,7 +1110,7 @@ def main():
     args, _ = parser.parse_known_args()
 
     # Set global server address variables
-    global _server_host, _server_port
+    global _server_host, _server_port, _worker_role, _worker_index
     global \
         _experiment_name, \
         _trial_name, \
@@ -1014,13 +1130,9 @@ def main():
 
     # Get worker identity
     worker_role = args.role
-    worker_index = args.worker_index
-
-    if "SLURM_PROCID" in os.environ:
-        # Overwriting with slurm task id
-        worker_index = int(os.environ["SLURM_PROCID"])
-    if worker_index == -1:
-        raise ValueError("Invalid worker index. Not found from SLURM environ or args.")
+    worker_index = _resolve_worker_index(args.worker_index)
+    _worker_role = worker_role
+    _worker_index = worker_index
     worker_id = f"{worker_role}/{worker_index}"
 
     # Determine port

@@ -481,11 +481,24 @@ def allocate_balanced_mbs_synced(
     lens: list[int],
     group: dist.ProcessGroup | None = None,
 ) -> list[list[int]]:
-    group_indices = allocate_balanced_mbs(mb_spec, lens)
     if not dist.is_initialized():
-        return group_indices
-    all_n_mbs = [None for _ in range(dist.get_world_size(group))]
-    dist.all_gather_object(all_n_mbs, len(group_indices), group=group)
+        return allocate_balanced_mbs(mb_spec, lens)
+
+    # Allocation can fail on only one rank, including after a synchronized
+    # retry increases n_mbs beyond that rank's number of atomic prompt groups.
+    # Share failures before any rank returns or enters the next collective.
+    group_indices = []
+    error = None
+    try:
+        group_indices = allocate_balanced_mbs(mb_spec, lens)
+    except (ValueError, RuntimeError) as exc:
+        error = str(exc)
+    outcomes = [None for _ in range(dist.get_world_size(group))]
+    dist.all_gather_object(outcomes, (len(group_indices), error), group=group)
+    for _, message in outcomes:
+        if message is not None:
+            raise RuntimeError(message)
+    all_n_mbs = [count for count, _ in outcomes]
     if all(mbs == len(group_indices) for mbs in all_n_mbs):
         return group_indices
     return allocate_balanced_mbs_synced(
@@ -771,9 +784,8 @@ def _infeasible_atomic_groups_message(
     """Return why prompt groups cannot be packed as atomic units, if at all.
 
     ``group_sizes`` changes the allocation unit from one sequence to one whole
-    prompt group. When a process group is supplied, the caller all-gathers this
-    message so every rank raises together. Without a group the check is
-    rank-local, matching other packing errors.
+    prompt group. With distributed execution the caller all-gathers this
+    message so every rank raises together; a missing group uses WORLD.
     """
     counts = [int(n) for n in group_token_counts]
     capacity = mb_spec.max_tokens_per_mb
@@ -790,6 +802,9 @@ def _infeasible_atomic_groups_message(
     n_groups_divisor = mb_spec.n_mbs_divisor
     if min_groups is None or min_groups < n_groups_divisor:
         min_groups = n_groups_divisor
+    min_groups = (
+        (min_groups + n_groups_divisor - 1) // n_groups_divisor
+    ) * n_groups_divisor
     if len(counts) < min_groups:
         return (
             "group_sizes keeps each prompt group in one microbatch, so the "
@@ -804,7 +819,7 @@ def _raise_synced_infeasible_atomic_groups(
     message: str | None,
     group: dist.ProcessGroup | None,
 ) -> None:
-    if dist.is_initialized() and group is not None:
+    if dist.is_initialized():
         gathered: list[str | None] = [None] * dist.get_world_size(group)
         dist.all_gather_object(gathered, message, group=group)
         message = next((item for item in gathered if item is not None), None)
@@ -1878,33 +1893,58 @@ class KLEstimator:
         return log_ratio
 
 
-def make_dummy_eval_item(template: dict[str, Any]) -> dict[str, Any]:
+def make_dummy_eval_item(
+    template: dict[str, Any], *, active_attention: bool = False
+) -> dict[str, Any]:
     """Create a zero-contribution dummy item matching *template*'s schema.
 
     Every tensor field is replaced with a minimal all-zeros tensor that
-    preserves dtype and device.  ``attention_mask`` and ``loss_mask`` are
-    set to zero so that downstream loss/metric code treats the item as
-    contributing nothing.
+    preserves dtype, device, and all leading dimensions.  Keeping the
+    trajectory group dimension is required when distributed ranks synchronize
+    their microbatch counts: a padded rank must be able to create as many
+    microbatches as a rank holding a real multi-sample trajectory.
+    ``attention_mask`` and ``loss_mask`` are normally zero so downstream
+    loss/metric code treats the item as contributing nothing.
+    ``active_attention=True`` creates one attended token per sequence for
+    pipeline evaluation; callers must discard its output.
     """
+    from areal.infra.rpc.rtensor import RTensor
 
-    def _zero_tensor_like(tensor: torch.Tensor) -> torch.Tensor:
-        return torch.zeros((1, 1), dtype=tensor.dtype, device=tensor.device)
+    def _minimal_tensor_like(
+        tensor: torch.Tensor | RTensor, *, fill_value: int = 0
+    ) -> torch.Tensor:
+        if isinstance(tensor, RTensor):
+            device = torch.device("cpu")
+        else:
+            device = tensor.device
+        shape = (*tensor.shape[:-1], 1) if tensor.ndim > 0 else (1,)
+        return torch.full(shape, fill_value, dtype=tensor.dtype, device=device)
+
+    group_size = 1
+    attention_mask = template.get("attention_mask")
+    if isinstance(attention_mask, (torch.Tensor, RTensor)) and attention_mask.ndim >= 2:
+        group_size = attention_mask.shape[0]
 
     dummy: dict[str, Any] = {}
     for key, value in template.items():
         if key in {"attention_mask", "loss_mask"}:
-            if isinstance(value, torch.Tensor):
-                dummy[key] = _zero_tensor_like(value)
+            if isinstance(value, (torch.Tensor, RTensor)):
+                fill_value = int(active_attention and key == "attention_mask")
+                dummy[key] = _minimal_tensor_like(value, fill_value=fill_value)
             else:
-                dummy[key] = torch.zeros((1, 1), dtype=torch.bool)
+                dummy[key] = torch.full(
+                    (1, 1),
+                    int(active_attention and key == "attention_mask"),
+                    dtype=torch.bool,
+                )
             continue
 
         if key.startswith("multi_modal_input"):
-            dummy[key] = [{}]
+            dummy[key] = [{} for _ in range(group_size)]
             continue
 
-        if isinstance(value, torch.Tensor):
-            dummy[key] = _zero_tensor_like(value)
+        if isinstance(value, (torch.Tensor, RTensor)):
+            dummy[key] = _minimal_tensor_like(value)
         else:
             dummy[key] = copy.deepcopy(value)
 

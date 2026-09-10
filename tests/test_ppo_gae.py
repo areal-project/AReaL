@@ -25,12 +25,16 @@ def _make_actor(
     gae_lambda: float | str = 1.0,
     gae_lambda_kwargs: dict | None = None,
     kl_ctl: float = 0.0,
+    recompute_logprob: bool = False,
+    use_decoupled_loss: bool = False,
 ) -> PPOActor:
     config = PPOActorConfig(
         gae_timestep_unit=gae_timestep_unit,
         gae_lambda=gae_lambda,
         gae_lambda_kwargs=gae_lambda_kwargs or {},
         kl_ctl=kl_ctl,
+        recompute_logprob=recompute_logprob,
+        use_decoupled_loss=use_decoupled_loss,
     )
     actor = PPOActor.__new__(PPOActor)
     actor.config = config
@@ -51,6 +55,34 @@ def _make_actor(
     actor.mask_no_eos_with_zero = False
     actor.m2_threshold = None
     return actor
+
+
+def test_mopd_preserves_rollout_behavior_logprobs_when_recomputing_proximal():
+    actor = _make_actor(recompute_logprob=True, use_decoupled_loss=False)
+    rollout_logprobs = torch.tensor([[0.0, -1.0, -2.0, -3.0]])
+    prox_logprobs = torch.tensor([[-0.2, -0.3, -0.4, -0.5]])
+    batch = {
+        "input_ids": torch.zeros(1, 4, dtype=torch.long),
+        "loss_mask": torch.tensor([[0, 1, 1, 1]], dtype=torch.float32),
+        "logprobs": rollout_logprobs.clone(),
+        "prox_logp": prox_logprobs.clone(),
+        "attention_mask": torch.ones(1, 4, dtype=torch.bool),
+        "rewards": torch.tensor([1.0]),
+        "mopd_teacher_logp_sum": torch.zeros(1, 4),
+    }
+
+    result = actor._compute_advantages(batch)
+
+    expected_behavior = torch.tensor([[-1.0, -2.0, -3.0, 0.0]])
+    torch.testing.assert_close(
+        result["mopd_behavior_logprobs"], expected_behavior, rtol=0.0, atol=0.0
+    )
+    torch.testing.assert_close(
+        result["logprobs"],
+        prox_logprobs * result["loss_mask"],
+        rtol=0.0,
+        atol=0.0,
+    )
 
 
 def _make_interaction(

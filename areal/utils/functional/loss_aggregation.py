@@ -202,7 +202,6 @@ class PolicyGradientReduction:
         sizes = [int(size) for size in group_sizes]
         if any(size <= 0 for size in sizes):
             raise ValueError(f"group_sizes must be positive, got {sizes}.")
-            raise ValueError(f"group_sizes must be positive, got {sizes}.")
         if sum(sizes) != n_sequences:
             raise ValueError(
                 f"group_sizes sum to {sum(sizes)} but sequence count is {n_sequences}."

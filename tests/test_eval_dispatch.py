@@ -13,6 +13,7 @@ from areal.infra.controller.train_controller import (
     _dispatch_tensors,
     _pad_eval_batch,
 )
+from areal.infra.rpc.rtensor import RTensor, TensorShardInfo
 from areal.trainer.rw.rw_engine import (
     RWController,
     RWEngine,
@@ -99,6 +100,46 @@ class TestEvalBatchPadding:
         assert len(padded) == 4
         assert _count_dummies(padded) == 2
 
+    def test_pad_eval_batch_reserves_active_pp_microbatches_per_dp(self):
+        items = [_make_item(0)]
+
+        (padded,) = _pad_eval_batch(
+            (items,),
+            dp_size=2,
+            min_items_per_dp=16,
+            items_per_dp_divisor=8,
+            active_dummies=True,
+        )
+        splits, _ = _dispatch_tensors(padded, dp_size=2)
+
+        assert len(padded) == 32
+        assert [len(split) for split in splits] == [16, 16]
+        assert all(
+            cast(torch.Tensor, item["attention_mask"]).count_nonzero() == 1
+            for item in padded[1:]
+        )
+
+    @pytest.mark.parametrize(
+        ("input_size", "expected_size"),
+        [(17, 32), (33, 48), (34, 48)],
+    )
+    def test_pad_eval_batch_aligns_each_dp_shard_for_pp8(
+        self, input_size, expected_size
+    ):
+        items = [_make_item(index) for index in range(input_size)]
+
+        (padded,) = _pad_eval_batch(
+            (items,),
+            dp_size=2,
+            min_items_per_dp=16,
+            items_per_dp_divisor=8,
+            active_dummies=True,
+        )
+        splits, _ = _dispatch_tensors(padded, dp_size=2)
+
+        assert len(padded) == expected_size
+        assert all(len(split) % 8 == 0 for split in splits)
+
     def test_dispatch_tensors_raises_when_not_divisible(self):
         items = [_make_item(i) for i in range(7)]
         with pytest.raises(ValueError, match="divisible"):
@@ -143,6 +184,47 @@ class TestEvalBatchPadding:
         )
         cast(dict[str, list[str]], template["meta"])["tag"].append("y")
         assert dummy["meta"] == {"tag": ["x"]}
+
+    def test_make_dummy_eval_item_materializes_rtensor_metadata_locally(self):
+        remote = RTensor(
+            shard=TensorShardInfo(shard_id="input-ids", node_addr="node:1"),
+            data=torch.empty((1, 128), dtype=torch.long, device="meta"),
+        )
+        template = {
+            "input_ids": remote,
+            "attention_mask": RTensor(
+                shard=TensorShardInfo(shard_id="attention-mask", node_addr="node:1"),
+                data=torch.empty((1, 128), dtype=torch.bool, device="meta"),
+            ),
+        }
+
+        dummy = make_dummy_eval_item(template, active_attention=True)
+
+        assert isinstance(dummy["input_ids"], torch.Tensor)
+        assert dummy["input_ids"].device.type == "cpu"
+        assert dummy["input_ids"].shape == (1, 1)
+        assert dummy["attention_mask"].tolist() == [[True]]
+
+    def test_make_dummy_eval_item_preserves_multi_sample_group_for_microbatches(self):
+        """A padded DP rank can match real multi-sample microbatch counts."""
+        template = {
+            "input_ids": torch.ones((8, 16), dtype=torch.long),
+            "attention_mask": torch.ones((8, 16), dtype=torch.bool),
+            "loss_mask": torch.ones((8, 16), dtype=torch.bool),
+            "multi_modal_input": [{} for _ in range(8)],
+        }
+
+        dummy = make_dummy_eval_item(template, active_attention=True)
+        mb_list = split_padded_tensor_dict_into_mb_list(
+            cast(dict[str, Any], dummy),
+            MicroBatchSpec(n_mbs=4, max_tokens_per_mb=8),
+        )
+
+        assert cast(torch.Tensor, dummy["input_ids"]).shape == (8, 1)
+        assert cast(torch.Tensor, dummy["attention_mask"]).shape == (8, 1)
+        assert cast(torch.Tensor, dummy["attention_mask"]).count_nonzero() == 8
+        assert len(cast(list[dict[str, Any]], dummy["multi_modal_input"])) == 8
+        assert len(mb_list.mbs) == 4
 
     def test_pad_eval_batch_keeps_multimodal_payload_aligned(self):
         items: list[dict[str, object]] = []

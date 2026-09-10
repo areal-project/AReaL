@@ -107,7 +107,7 @@ def test_teacher_logp_requires_token_mean_loss_aggregation():
         mock_tracker.scope.return_value.__enter__ = MagicMock()
         mock_tracker.scope.return_value.__exit__ = MagicMock()
 
-        with pytest.raises(ValueError, match="teacher_logp distillation"):
+        with pytest.raises(ValueError, match="Distillation is only supported"):
             grpo_loss_fn(
                 logprobs=torch.zeros(1, 2),
                 entropy=torch.zeros(1, 2),

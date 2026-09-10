@@ -220,7 +220,8 @@ def test_atomic_prompt_groups_reject_oversize_token_cap():
         )
 
 
-def test_atomic_prompt_groups_reject_more_microbatches_than_groups():
+@pytest.mark.parametrize("n_mbs, divisor", [(4, 1), (3, 2)])
+def test_atomic_prompt_groups_reject_more_microbatches_than_groups(n_mbs, divisor):
     data = {
         "attention_mask": torch.ones(2, 3, dtype=torch.bool),
         "input_ids": torch.arange(6).view(2, 3),
@@ -229,7 +230,9 @@ def test_atomic_prompt_groups_reject_more_microbatches_than_groups():
     }
 
     with pytest.raises(RuntimeError, match="at least 4 groups"):
-        split_padded_tensor_dict_into_mb_list(data, MicroBatchSpec(n_mbs=4))
+        split_padded_tensor_dict_into_mb_list(
+            data, MicroBatchSpec(n_mbs=n_mbs, n_mbs_divisor=divisor)
+        )
 
 
 def test_token_mean_split_allows_groups_that_exceed_token_cap():
