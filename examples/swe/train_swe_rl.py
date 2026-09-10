@@ -68,6 +68,12 @@ def get_swe_dataset(
         while len(dataset_items) < min_items:
             dataset_items.extend(original_items)
 
+    # Dataset.from_list infers columns from the first record. SWE sources can
+    # add optional fields on later records, so materialize their union before
+    # Arrow conversion instead of silently dropping those fields.
+    all_keys = sorted(set().union(*(item.keys() for item in dataset_items)))
+    dataset_items = [{key: item.get(key) for key in all_keys} for item in dataset_items]
+
     dataset = Dataset.from_list(dataset_items)
     logger.info(
         f"Created SWE dataset with {len(dataset)} items "
