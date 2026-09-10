@@ -115,3 +115,47 @@ def test_call_engine_scopes_alias_preservation_to_supported_v1_boundaries(
     assert response.status_code == 200
     assert localize_calls == [expected_localize]
     assert remotize_calls == [expected_remotize]
+
+
+@pytest.mark.parametrize(
+    ("is_vision_model", "cpu_staged", "expected"),
+    [(False, True, False), (True, False, False), (True, True, True)],
+)
+def test_call_engine_only_opts_vision_cpu_staging_into_alias_broadcast(
+    client, monkeypatch, is_vision_model, cpu_staged, expected
+):
+    """Text engines keep the existing broadcast even when CPU staging is enabled."""
+    from types import SimpleNamespace
+
+    engine = SimpleNamespace(
+        is_vision_model=is_vision_model,
+        cpu_staged_rpc_methods={"echo"} if cpu_staged else set(),
+        current_data_parallel_head=lambda: 0,
+        echo=lambda value: value,
+    )
+    calls = []
+
+    def broadcast(value, **kwargs):
+        calls.append(kwargs["preserve_tensor_aliases"])
+        return value
+
+    monkeypatch.setitem(engine_blueprint._engines, "test", engine)
+    monkeypatch.setattr(
+        engine_blueprint, "_submit_to_engine_thread", lambda name, fn: fn()
+    )
+    monkeypatch.setattr(
+        engine_blueprint, "_should_broadcast_payload", lambda **kw: True
+    )
+    monkeypatch.setattr(
+        engine_blueprint, "resolve_broadcast_target", lambda *a: (None, "cpu")
+    )
+    monkeypatch.setattr(engine_blueprint, "broadcast_tensor_container", broadcast)
+    monkeypatch.setattr(engine_blueprint.RTensor, "localize", lambda obj, **kw: obj)
+    monkeypatch.setattr(engine_blueprint.RTensor, "remotize", lambda obj, *a, **kw: obj)
+
+    response = client.post(
+        "/call", json={"method": "echo", "engine_name": "test", "args": ["text"]}
+    )
+
+    assert response.status_code == 200
+    assert calls == [expected, expected]

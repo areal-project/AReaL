@@ -90,6 +90,28 @@ def is_multi_modal_key(key: str) -> bool:
     return key.startswith("multi_modal_input")
 
 
+def has_multi_modal_tensors(data: Any) -> bool:
+    """Whether a nested payload contains nonempty multi_modal_input* tensors."""
+    pending = [(data, False)]
+    while pending:
+        value, in_multi_modal = pending.pop()
+        if torch.is_tensor(value):
+            if in_multi_modal and value.numel() > 0:
+                return True
+        elif isinstance(value, dict):
+            pending.extend(
+                (
+                    child,
+                    in_multi_modal
+                    or (isinstance(key, str) and is_multi_modal_key(key)),
+                )
+                for key, child in value.items()
+            )
+        elif isinstance(value, (list, tuple)):
+            pending.extend((child, in_multi_modal) for child in value)
+    return False
+
+
 def _get_first_non_multimodal_seq(item: dict[str, Any]) -> Any:
     """Get the first non-multimodal sequence from a dict item."""
     for key, seq in item.items():
@@ -1326,11 +1348,30 @@ def all_gather_tensor_container(data, group=None) -> list:
     return results
 
 
-def broadcast_tensor_container(data, src_rank=0, group=None):
+def broadcast_tensor_container(
+    data, src_rank=0, group=None, *, preserve_tensor_aliases: bool = False
+):
+    """Broadcast nested tensors; alias preservation is an internal VLM opt-in.
+
+    Only a source payload with nonempty multi_modal_input* tensors activates
+    the opt-in. Receivers follow source metadata, even when their input is None.
+    Text-only calls retain the original wire format and per-reference buffers.
+    """
+    if (
+        preserve_tensor_aliases
+        and dist.get_rank() == src_rank
+        and has_multi_modal_tensors(data)
+    ):
+        dist.broadcast_object_list(
+            [("tensor_aliases", None)], src=src_rank, group=group
+        )
+        return _broadcast_tensor_container_with_aliases(data, src_rank, group)
     if dist.get_rank() != src_rank:
         metadata = [None]
         dist.broadcast_object_list(metadata, src=src_rank, group=group)
         data_type, info = metadata[0]
+        if data_type == "tensor_aliases":
+            return _broadcast_tensor_container_with_aliases(None, src_rank, group)
         if data_type == "none":
             return None
         if data_type == "tensor":
@@ -1402,6 +1443,97 @@ def broadcast_tensor_container(data, src_rank=0, group=None):
             to_broadcast = [data]
             dist.broadcast_object_list(to_broadcast, src=src_rank, group=group)
             return to_broadcast[0]
+
+
+def _broadcast_tensor_container_with_aliases(data, src_rank=0, group=None):
+    """Preserve repeated tensor objects within a source-selected VLM payload.
+
+    Distinct views are not merged, even when they share a backing storage.
+    """
+    source_indices: dict[int, int] = {}
+    tensor_memo: list[tuple[torch.Tensor | None, torch.Tensor]] = []
+
+    def _broadcast(data):
+        if dist.get_rank() != src_rank:
+            metadata = [None]
+            dist.broadcast_object_list(metadata, src=src_rank, group=group)
+            data_type, info = metadata[0]
+            if data_type == "none":
+                return None
+            if data_type == "tensor_ref":
+                return tensor_memo[info][1]
+            if data_type == "tensor":
+                result = broadcast_tensor(data, src_rank=src_rank, group=group)
+                tensor_memo.append((None, result))
+                return result
+            elif data_type == "list":
+                length = info
+                return [_broadcast(None) for _ in range(length)]
+            elif data_type == "tuple":
+                length, container_type = info
+                values = [_broadcast(None) for _ in range(length)]
+                if container_type is not None:
+                    return container_type(*values)
+                return tuple(values)
+            elif data_type == "dict":
+                keys = info
+                return {k: _broadcast(None) for k in keys}
+            elif data_type == "object":
+                to_broadcast = [None]
+                dist.broadcast_object_list(to_broadcast, src=src_rank, group=group)
+                return to_broadcast[0]
+            else:
+                raise ValueError(f"Unknown data type: {data_type}")
+        else:
+            if data is None:
+                metadata = [("none", None)]
+                dist.broadcast_object_list(metadata, src=src_rank, group=group)
+                return None
+            elif torch.is_tensor(data):
+                if id(data) in source_indices:
+                    index = source_indices[id(data)]
+                    dist.broadcast_object_list(
+                        [("tensor_ref", index)], src=src_rank, group=group
+                    )
+                    return tensor_memo[index][1]
+                metadata = [("tensor", None)]
+                dist.broadcast_object_list(metadata, src=src_rank, group=group)
+                result = broadcast_tensor(data, src_rank=src_rank, group=group)
+                source_indices[id(data)] = len(tensor_memo)
+                # Retain the source too: contiguous() can create a temporary,
+                # and id reuse must never alias two different input tensors.
+                tensor_memo.append((data, result))
+                return result
+            elif isinstance(data, list):
+                metadata = [("list", len(data))]
+                dist.broadcast_object_list(metadata, src=src_rank, group=group)
+                return [_broadcast(d) for d in data]
+            elif isinstance(data, tuple):
+                container_type = type(data) if hasattr(data, "_fields") else None
+                metadata = [("tuple", (len(data), container_type))]
+                dist.broadcast_object_list(metadata, src=src_rank, group=group)
+                values = [_broadcast(d) for d in data]
+                if container_type is not None:
+                    return container_type(*values)
+                return tuple(values)
+            elif isinstance(data, dict):
+                metadata = [("dict", list(data.keys()))]
+                dist.broadcast_object_list(metadata, src=src_rank, group=group)
+                return {k: _broadcast(v) for k, v in data.items()}
+            else:
+                metadata = [("object", None)]
+                dist.broadcast_object_list(metadata, src=src_rank, group=group)
+                to_broadcast = [data]
+                dist.broadcast_object_list(to_broadcast, src=src_rank, group=group)
+                return to_broadcast[0]
+
+    try:
+        return _broadcast(data)
+    finally:
+        # The recursive closure can form a reference cycle. Drop tensor
+        # ownership immediately instead of waiting for cyclic GC.
+        source_indices.clear()
+        tensor_memo.clear()
 
 
 def bcast_mb_list(

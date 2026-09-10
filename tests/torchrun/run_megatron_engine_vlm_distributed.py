@@ -32,7 +32,7 @@ from areal.api.cli_args import (
 )
 from areal.engine import MegatronEngine
 from areal.engine.core.model import SequencePackingMode
-from areal.utils.data import broadcast_tensor_container
+from areal.utils.data import broadcast_tensor_container, tensor_container_to
 from areal.utils.testing_utils import DENSE_MODEL_PATHS
 
 VLM_MODEL_PATH = os.environ.get("VLM_MODEL_PATH", DENSE_MODEL_PATHS["qwen2_5_vl"])
@@ -428,6 +428,57 @@ def test_vlm_train(backend: str, output: str | None = None):
     print(f"rank {rank}: test_vlm_train({backend}) Done.")
 
 
+def test_vlm_memory_isolation(backend: str, output: str | None = None):
+    """Exercise CPU alias broadcast, repeated VLM forward, text, and an update."""
+    rank = int(os.environ["RANK"])
+    engine = make_vlm_engine(backend, init_optimizer=True)
+    num_rows = max(2, 2 * engine.parallel_strategy.pipeline_parallel_size)
+    source = None
+    if rank == engine.current_data_parallel_head():
+        source = tensor_container_to(mock_vlm_input(engine), "cpu")
+        source["input_ids"] = source["input_ids"].repeat(num_rows, 1)
+        source["attention_mask"] = source["attention_mask"].repeat(num_rows, 1)
+        source["multi_modal_input"] *= num_rows
+    data = broadcast_tensor_container(
+        source,
+        src_rank=engine.current_data_parallel_head(),
+        group=engine.cpu_model_parallel_group,
+        preserve_tensor_aliases=True,
+    )
+    images = data["multi_modal_input"]
+    assert images[0]["pixel_values"] is images[1]["pixel_values"]
+    engine.eval()
+    before = engine.forward(data)
+    repeated = engine.forward(data)
+    torch.testing.assert_close(before, repeated, rtol=1e-5, atol=1e-5)
+    assert images[0]["pixel_values"].device.type == "cpu"
+    assert data["multi_modal_input"] is images
+
+    text = None
+    if rank == engine.current_data_parallel_head():
+        text = tensor_container_to(mock_text_only_vlm_input(engine), "cpu")
+        text = {key: value.repeat(num_rows // 2, 1) for key, value in text.items()}
+    text = broadcast_tensor_container(
+        text,
+        src_rank=engine.current_data_parallel_head(),
+        group=engine.cpu_model_parallel_group,
+        preserve_tensor_aliases=True,
+    )
+    text_result = engine.forward(text)
+    assert text_result.shape == text["input_ids"].shape
+    engine.train()
+    result = engine.train_batch(
+        input_=data,
+        loss_fn=lambda logprobs, entropy, input_data, **kwargs: logprobs.mean(),
+        loss_weight_fn=lambda x: torch.tensor(1.0, device=engine.device),
+    )
+    assert torch.isfinite(torch.tensor(result["grad_norm"]))
+    assert images[0]["pixel_values"].device.type == "cpu"
+    _cleanup(engine)
+    if rank == 0 and output is not None:
+        write_result(output, "Passed")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--backend", type=str, default="megatron:d1p1t2")
@@ -443,6 +494,7 @@ def main():
             "save_load",
             "dcp_save_load",
             "train",
+            "memory_isolation",
         ],
         default="train",
     )
@@ -461,6 +513,8 @@ def main():
         test_vlm_dcp_save_load(args.backend, output=args.output)
     elif args.test_type == "train":
         test_vlm_train(args.backend, output=args.output)
+    elif args.test_type == "memory_isolation":
+        test_vlm_memory_isolation(args.backend, output=args.output)
     else:
         raise NotImplementedError(f"Unknown test type: {args.test_type}")
 
