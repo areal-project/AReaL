@@ -3125,6 +3125,25 @@ class ClusterSpecConfig:
         default=8,
         metadata={"help": "Number of GPUs per node (physical)."},
     )
+    ray_port: int = field(
+        default=6379,
+        metadata={
+            "help": "Port of the Ray head (GCS). Used by the in-package Ray "
+            "bootstrap of the Ray launcher when assembling a multi-node "
+            "cluster inside a platform job."
+        },
+    )
+    ray_dashboard_port: int = field(
+        default=8265,
+        metadata={"help": "Port of the Ray dashboard on the head node."},
+    )
+    ray_bootstrap_timeout_seconds: int = field(
+        default=900,
+        metadata={
+            "help": "How long the Ray bootstrap head waits for all "
+            "cluster.n_nodes nodes to join before failing."
+        },
+    )
 
 
 @dataclass

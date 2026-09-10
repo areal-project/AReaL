@@ -44,6 +44,7 @@ LOGGER_COLORS_EXACT = {
     # Launchers - blue
     "LocalLauncher": "blue",
     "RayLauncher": "blue",
+    "RayBootstrap": "blue",
     "SlurmLauncher": "blue",
     "InfCli": "blue",
     # Workflows - purple
