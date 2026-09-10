@@ -2,6 +2,7 @@
 
 """CPU coverage for model work estimates and distributed metric aggregation."""
 
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -93,12 +94,19 @@ def test_training_metrics_interval_and_cumulative_are_ratios_of_sums(monkeypatch
     metrics = TrainingMetrics(lambda n: n * n)
     times = iter([0.0, 2.0, 3.0, 7.0, 10.0, 12.0])
     monkeypatch.setattr(
-        "areal.utils.training_metrics.time.perf_counter", lambda: next(times)
+        "areal.utils.training_metrics.time",
+        SimpleNamespace(perf_counter=lambda: next(times)),
     )
     batch = {"attention_mask": torch.tensor([[1, 1, 0], [1, 1, 1]])}
     synchronizations = []
+
+    def synchronize():
+        # Other components must keep the real clock, not consume our finite timeline.
+        time.perf_counter()
+        synchronizations.append(True)
+
     for _ in range(2):
-        with metrics.measure(batch, lambda: synchronizations.append(True)):
+        with metrics.measure(batch, synchronize):
             pass
     result = metrics.export(dp_group=None, timing_group=None)
     assert len(synchronizations) == 4

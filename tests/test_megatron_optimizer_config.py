@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -76,8 +77,13 @@ def test_train_batch_does_not_apply_optimizer_loss_scale_manually(
     engine = megatron_engine_module.MegatronEngine.__new__(
         megatron_engine_module.MegatronEngine
     )
-    engine._awex_adapter = None
+    engine._weight_residency = None
+    engine.hf_config = None
     engine.device = torch.device("cpu")
+    # This test isolates loss scaling; metrics have their own batch-aware tests.
+    monkeypatch.setattr(
+        megatron_engine_module, "record_training_batch", lambda *args: nullcontext()
+    )
     engine.optimizer = _Optimizer()
     engine._ensure_ready = lambda: None
     engine.optimizer_zero_grad = lambda: None
