@@ -15,6 +15,7 @@ from functools import partial
 
 import ray
 import ray.exceptions
+from ray.actor import ActorHandle
 from ray.runtime_env import RuntimeEnv
 from ray.util.placement_group import PlacementGroup
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
@@ -335,10 +336,12 @@ class RayLauncher:
         kwargs: (
             dict[str, str] | None
         ) = None,  # keyword arguments to pass to the function
+        log_writer: ActorHandle | None = None,
     ):
         if kwargs is None:
             kwargs = {}
-        log_writer = self._log_writer_of(job_name)
+        if log_writer is None:
+            log_writer = self._log_writer_of(job_name)
         runtime_env = RuntimeEnv(
             env_vars=env_vars or dict(),
         )
@@ -457,6 +460,10 @@ class RayLauncher:
         if env_hook:
             extra_env_vars = env_hook(placement_group)
 
+        # Resolve and probe the shared writer once for this job submission.
+        # Calling through submit() for every rank would serialize startup behind
+        # repeated health checks when the writer is busy on slow storage.
+        log_writer = self._log_writer_of(job_name)
         futures = []
         for i in range(count):
             args = list_args[i]
@@ -489,6 +496,7 @@ class RayLauncher:
                 placement_group=placement_group,
                 bundle_index=node_id,
                 kwargs=kwargs,
+                log_writer=log_writer,
             )
             futures.append(future)
 

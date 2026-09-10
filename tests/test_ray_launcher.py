@@ -197,3 +197,44 @@ def test_run_func_waits_for_merged_log_drain(monkeypatch):
         name == "write" and args == (b"tail-log-line\n",) for name, args, _ in calls
     )
     assert waited_refs == [(calls[-1][2], ray_launcher.LOG_WRITER_DRAIN_TIMEOUT)]
+
+
+def test_submit_array_resolves_log_writer_once(monkeypatch, tmp_path):
+    """All ranks in one array submission reuse a single writer probe."""
+    # Arrange
+    import areal.infra.launcher.ray as ray_launcher
+
+    launcher = ray_launcher.RayLauncher("exp", "trial", str(tmp_path))
+    launcher.placement_groups["trainer"] = object()
+    log_writer = object()
+    writer_lookups = []
+    submitted_writers = []
+
+    def fake_log_writer_of(job_name):
+        writer_lookups.append(job_name)
+        return log_writer
+
+    def fake_submit(**kwargs):
+        submitted_writers.append(kwargs["log_writer"])
+        return object()
+
+    monkeypatch.setattr(launcher, "_log_writer_of", fake_log_writer_of)
+    monkeypatch.setattr(launcher, "submit", fake_submit)
+
+    # Act
+    futures = launcher.submit_array(
+        job_name="trainer",
+        file_path="entry.py",
+        func_name="main",
+        count=4,
+        nodes=2,
+        list_args=[[] for _ in range(4)],
+        gpus_per_task=1,
+        cpus_per_task=1,
+        mem_per_task=1,
+    )
+
+    # Assert
+    assert writer_lookups == ["trainer"]
+    assert submitted_writers == [log_writer] * 4
+    assert len(futures) == 4
