@@ -173,6 +173,7 @@ def _build_ppo_trainer(events: list[tuple], *, recovered: bool = False):
     trainer.critic = None
     trainer.ref = None
     trainer.teacher = None
+    trainer.mopd_execution_plan = None
     trainer._should_offload_rollout = False
     trainer._should_offload_actor = False
     trainer._requires_proxy_workflow = lambda _workflow: False
