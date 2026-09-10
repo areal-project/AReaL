@@ -454,8 +454,10 @@ Recommended panels, built with
    reference line at `100 / E`. Keep expert IDs on the x-axis to reveal persistent hot
    or idle experts.
 
-Use a Table-backed custom chart for snapshots. For a cross-step Table visualization,
-combine the desired logged Table versions with their run steps in W&B postprocessing; a
-single snapshot Table does not contain the complete run history. Quantiles, entropy,
-coefficient of variation and other summaries can be derived there from these raw loads
-without adding training-side metrics.
+Use `historyTable` and the step selector to switch snapshots directly. To display
+multiple steps simultaneously in a Table-based chart, combine snapshots with their log
+steps in postprocessing. Per-layer maximum load ratios already have scalar history.
+Quantiles, entropy, and coefficient of variation can be derived from the raw loads.
+
+See [MoE expert load visualization](moe_visualization.md) for the UI walkthrough, a
+ready-to-paste Vega specification, and recovery from 10,000-row preview truncation.
