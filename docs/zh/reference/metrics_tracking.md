@@ -315,3 +315,98 @@ stats_logger:
 
 1. **使用命名跟踪器**：使用 `stats_tracker.get(workflow_context.stat_scope()).scalar(...)` 将
    Rollout（`"rollout"`）和评估（`"eval-rollout"`）指标与训练指标隔离。
+
+## 训练吞吐、预估 FLOPs 与 MoE 均衡度
+
+Archon、Megatron 和 FSDP 在 `train_perf` scope 上报训练指标。每个统计窗口包含上次 export 以来的所有 `train_batch`
+调用，包括 PPO 中重复执行的更新。tokens 为原始 `attention_mask` 的有效 token 数，包含 prompt 和 response，不包含
+padding；只沿 DP 维度求和，不重复乘以 TP、CP/SP、PP 或 EP。
+
+耗时为设备同步后的训练 wall time，从梯度清零前开始，包含微批准备、前向、反向和 optimizer 工作；不包含
+rollout、参考模型/评估前向、读取下一批数据、存盘和统计导出。 分母取所有训练 rank 的累计训练耗时最大值。
+
+| 指标                                                  | 含义                                  |
+| ----------------------------------------------------- | ------------------------------------- |
+| `train_perf/tokens`                                   | 当前窗口训练侧总有效 tokens           |
+| `train_perf/seconds`                                  | 当前窗口训练耗时                      |
+| `train_perf/tokens_per_second`                        | 当前窗口 tokens / 耗时                |
+| `train_perf/estimated_flops`                          | 对各条序列的前向＋反向 FLOPs 估算求和 |
+| `train_perf/estimated_flops_per_second`               | 当前窗口预估 FLOPs / 耗时             |
+| `train_perf/total_tokens`、`train_perf/total_seconds` | engine 初始化以来的累计量             |
+| `train_perf/cumulative_tokens_per_second`             | 累计 tokens / 累计训练耗时            |
+| `train_perf/cumulative_estimated_flops_per_second`    | 累计预估 FLOPs / 累计训练耗时         |
+
+这些指标表示整个训练集群的吞吐，不是单卡吞吐。重建 engine（包括恢复训练）会重新累计。 没有注册 FLOPs 函数的架构仍然上报 tokens 和耗时，省略 FLOPs
+指标。
+
+### FLOPs 口径与自定义注册
+
+`areal.utils.flops` 预置 `qwen3_moe` 和 `qwen3_5_moe[_text]` 架构的计算工厂，覆盖 Qwen3-30B-A3B 和
+Qwen3.5-35B-A3B。计算使用实际 checkpoint 的 text config，支持本地 模型目录，无须匹配目录名。模型参考配置来自官方
+[Qwen3 配置](https://huggingface.co/Qwen/Qwen3-30B-A3B/blob/main/config.json)和
+[Qwen3.5 配置](https://huggingface.co/Qwen/Qwen3.5-35B-A3B/blob/main/config.json)。
+
+一次乘加计为 2 FLOPs，训练估算为前向的 3 倍（前向＋约 2 倍前向的反向）。包括激活的 专家投影、router、共享专家及 gate、attention 投影和 LM
+head。每层因果全注意力的前向 计算包含 `2 * query_heads * head_dim * L * (L + 1)`，所以 packed batch 必须对各条
+序列的 `estimate(L_i)` 求和，不能把总长度传入一次。
+
+Qwen3.5 分别计算全注意力与 GatedDeltaNet 线性注意力。后者包括各个投影和 depthwise 卷积，状态计算采用每个 value head、每个
+token 三次 key-by-value 乘加的递归等价估算 （状态预测、更新、读出），随序列长度线性增长，不刻画具体 chunk kernel 的额外操作。
+
+估算不包含激活重计算、optimizer、逐元素操作、softmax/归一化、视觉编码器和额外 MTP。 它表示文本骨干全参数训练的模型数学工作量，不等同于实际硬件执行
+FLOPs，也不是 LoRA/冻结参数时的精确反向计算量。树训练按原始序列估算，不扣除共享前缀节省的计算。
+
+在**每个训练 worker 的 engine 初始化前**注册自定义工厂；仅在 controller 注册不会 自动传到远程
+worker。工厂接收模型配置，返回一个只接收单条序列长度、输出训练总 FLOPs 的函数。同名注册会覆盖预置工厂：
+
+```python
+from areal.utils.flops import register_flops_estimator
+
+
+def my_model_factory(config):
+    active_parameters = config.active_parameters
+    heads = config.num_attention_heads
+    head_dim = config.head_dim
+    layers = config.num_hidden_layers
+
+    def total_training_flops(sequence_length: int) -> float:
+        linear = 6 * active_parameters * sequence_length
+        attention = 6 * layers * heads * head_dim * sequence_length * (sequence_length + 1)
+        return float(linear + attention)
+
+    return total_training_flops
+
+
+register_flops_estimator("my_model_type", my_model_factory)
+```
+
+### MoE 均衡度与 W&B 可视化
+
+MoE 使用独立的 `moe_balance` scope。Archon 支持通用 MoE 模块，Megatron 支持 `TopKRouter`，FSDP 支持
+Transformers 的 `Qwen3MoeTopKRouter` 和 `Qwen3_5MoeTopKRouter` 返回值契约。层编号从 0 开始，在 PP
+之间保持全局唯一；共享专家 和额外 MTP router 不纳入统计。不支持的 router 不产生均衡度指标。
+
+设一层有 `E` 个专家，专家 `e` 的累计路由分配数为 `c_e`：
+
+- 每个专家占比为 `100 * c_e / sum(c_e)`，同层合计 100%。
+- 理想负载为 `sum(c_e) / E`，分配数包含 top-k 的重复路由。
+- `moe_balance/layer_<id>/max_over_ideal` 为最大负载除以理想负载，完全均衡时为 1。 没有路由分配的层上报 0。
+
+先跨微批和并行 rank 累加负载，再归一化。只计原始训练前向，不计评估和 backward 重计算。这是**实际执行的路由负载**：包含 packing/alignment
+padding；Megatron 使用 capacity/drop 之后的 routing map。因此负载总数可能与吞吐指标中的逻辑 tokens 不同。
+
+W&B 每个日志 step 收到一个 `moe_balance/expert_loads` Table，列为 `layer`、`expert`、
+`tokens`、`load_percent`。每层 `max_over_ideal` 保持标量，避免产生上万个专家标量序列。 其他标量日志后端保留
+`moe_balance/layer_<id>/expert_<id>/{tokens,load_percent}`；控制台 仅打印每层摘要。
+
+建议用 [W&B Custom Charts](https://docs.wandb.ai/models/app/features/custom-charts) 制作以下面板：
+
+1. **选定 step 的“层 × 专家”热力图**：颜色表示负载百分比，tooltip 显示 tokens。 固定专家顺序；跨模型比较时可二次计算
+   `load_percent / (100 / E)`，以 1 为颜色中心。
+1. **“训练步 × 层”热力图**：颜色表示 `max_over_ideal`，定位从何时起、哪些层发生失衡。
+1. **单层专家柱状图**：按层筛选 Table，加入理想占比 `100 / E` 的参考线，观察长期热点 或闲置专家。
+
+单个 Table 是一个 step 的快照。使用 `historyTable` 和 step 滑块可直接切换快照； 若要同时展示多个 step 的 Table
+数据，则需在后处理中合并快照并添加 step 列。 每层最大负载比可直接使用标量历史。分位数、熵、变异系数等额外指标可用原始负载在 W&B 二次计算。
+
+完整操作步骤、可粘贴的 Vega 配置和 10,000 行截断处理见 [MoE 专家负载可视化](moe_visualization.md)。
