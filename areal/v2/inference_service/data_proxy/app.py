@@ -244,10 +244,12 @@ def _create_areal_client(
     return ArealOpenAI(
         engine=inf_bridge,
         tokenizer=tok._tok,
+        processor=tok.processor,
         tool_call_parser=config.tool_call_parser,
         reasoning_parser=config.reasoning_parser,
         engine_max_tokens=config.engine_max_tokens,
         chat_template_type=config.chat_template_type,
+        require_multimodal_processor=True,
     )
 
 
