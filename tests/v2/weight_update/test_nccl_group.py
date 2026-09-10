@@ -251,7 +251,7 @@ def test_awex_adapters_use_sidecar_for_setup_barrier(adapter_cls, module, monkey
 def test_awex_adapters_use_sidecar_for_completion_barrier(
     adapter_cls, module, build_ops_name, use_group, monkeypatch
 ):
-    """Peer transfer completes before the Gloo completion barrier."""
+    """Payload transfer completes before the Gloo completion barrier."""
     monkeypatch.setenv("DTE_DELTA_TRANSFER", "0")
     adapter = adapter_cls(MagicMock())
     payload_group = MagicMock(name="nccl_group")
@@ -266,7 +266,7 @@ def test_awex_adapters_use_sidecar_for_completion_barrier(
     monkeypatch.setattr(module, "awex_wu_use_group", lambda: use_group)
     events = []
     transfer = MagicMock(side_effect=lambda **kwargs: events.append("transfer"))
-    monkeypatch.setattr(module, "batch_send_recv_by_peer", transfer)
+    monkeypatch.setattr(module, "batch_send_recv", transfer)
     if module is sglang_adapter:
         monkeypatch.setattr(module, "current_platform", MagicMock())
     barrier = MagicMock(side_effect=lambda **kwargs: events.append("barrier"))
@@ -278,6 +278,7 @@ def test_awex_adapters_use_sidecar_for_completion_barrier(
     transfer.assert_called_once_with(
         send_ops=ops if build_ops_name == "nccl_build_send_ops" else [],
         recv_ops=ops if build_ops_name == "nccl_build_recv_ops" else [],
+        blocking=True,
         use_group=use_group,
     )
     barrier.assert_called_once_with(group=sidecar_group)
@@ -306,7 +307,7 @@ def test_sglang_synchronizes_weight_copies_before_gloo_barrier(monkeypatch):
     )
     monkeypatch.setattr(sglang_adapter, "awex_wu_use_group", lambda: True)
     transfer = MagicMock(side_effect=lambda **kwargs: events.append("transfer"))
-    monkeypatch.setattr(sglang_adapter, "batch_send_recv_by_peer", transfer)
+    monkeypatch.setattr(sglang_adapter, "batch_send_recv", transfer)
     platform = MagicMock()
     platform.synchronize.side_effect = lambda: events.append("synchronize")
     monkeypatch.setattr(sglang_adapter, "current_platform", platform, raising=False)
@@ -318,7 +319,9 @@ def test_sglang_synchronizes_weight_copies_before_gloo_barrier(monkeypatch):
 
     adapter.execute_weight_update(version=1)
 
-    transfer.assert_called_once_with(send_ops=[], recv_ops=recv_ops, use_group=True)
+    transfer.assert_called_once_with(
+        send_ops=[], recv_ops=recv_ops, blocking=True, use_group=True
+    )
     original.copy_.assert_called_once_with(contiguous)
     assert events == ["transfer", "copy", "synchronize", "barrier"]
 

@@ -64,7 +64,6 @@ from areal.engine.awex.transport.metadata import (  # noqa: E402
     fetch_kv_metadata,
 )
 from areal.engine.awex.transport.nccl_group import (  # noqa: E402
-    batch_send_recv_by_peer,
     init_weights_update_group,
     setup_batch_isend_irecv,
 )
@@ -739,9 +738,10 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
             self._transfer_plan,
             self._weights_update_group,
         )
-        batch_send_recv_by_peer(
+        batch_send_recv(
             send_ops=[],
             recv_ops=recv_ops,
+            blocking=True,
             use_group=awex_wu_use_group(),
         )
 

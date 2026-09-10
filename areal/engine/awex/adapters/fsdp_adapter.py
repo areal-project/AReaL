@@ -15,7 +15,7 @@ from awex.meta.weight_meta import (
 )
 from awex.sharding.param_sharding import ShardingType
 from awex.sharding.rank_info import RankInfo
-from awex.transfer.nccl_comm import nccl_build_send_ops
+from awex.transfer.nccl_comm import batch_send_recv, nccl_build_send_ops
 from awex.transfer.transfer_plan import TransferPlan, TransferPlanBuilder
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.placement_types import Shard
@@ -28,7 +28,6 @@ from areal.engine.awex.transport.metadata import (
     fetch_kv_metadata,
 )
 from areal.engine.awex.transport.nccl_group import (
-    batch_send_recv_by_peer,
     init_weights_update_group,
     setup_batch_isend_irecv,
 )
@@ -203,9 +202,10 @@ class AwexFSDPAdapter(AwexTrainingAdapter):
             self._weights_update_group,
             copy_rank=self._transfer_rank,
         )
-        batch_send_recv_by_peer(
+        batch_send_recv(
             send_ops=send_ops,
             recv_ops=[],
+            blocking=True,
             use_group=awex_wu_use_group(),
         )
         torch.distributed.barrier(group=self._weights_update_group_gloo)
