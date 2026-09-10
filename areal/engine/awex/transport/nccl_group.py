@@ -1,9 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-"""NCCL process group and transfer utilities for AWEX weight updates."""
+"""NCCL process group initialization utilities for weight updates."""
 
 import os
-from collections import defaultdict
-from collections.abc import Sequence
 
 import torch
 import torch.distributed as dist
@@ -12,51 +10,6 @@ from areal.infra.platforms import current_platform
 from areal.utils import logging
 
 logger = logging.getLogger("NCCLGroup")
-
-
-def batch_send_recv_by_peer(
-    *,
-    send_ops: Sequence[dist.P2POp],
-    recv_ops: Sequence[dist.P2POp],
-    use_group: bool,
-) -> None:
-    """Execute a separated weight transfer with at most one peer in flight.
-
-    Each rank must only send or only receive, and both sides must visit peers
-    in ascending rank order. This gives the bipartite transfer graph a consistent
-    edge ordering, including sparse plans and unequal training/inference sizes.
-    Preserve the plan's operation order within each peer so tensor slices match.
-
-    The group must already be warmed up via ``setup_batch_isend_irecv`` on all
-    ranks. AWEX's blocking grouped call waits AND synchronizes the device before
-    returning; waiting on NCCL Work objects alone would still allow multiple
-    peers' transfers to remain in flight. This matches the per-peer completion
-    boundary used by AWEX's colocate transport without its IPC/rank mapping.
-
-    ``use_group=False`` retains AWEX's existing manual-stream fallback.
-    """
-    from awex.transfer.nccl_comm import batch_send_recv
-
-    if send_ops and recv_ops:
-        raise ValueError("Separated weight transfer must only send or only receive")
-    if not use_group:
-        batch_send_recv(
-            send_ops=send_ops, recv_ops=recv_ops, blocking=True, use_group=False
-        )
-        return
-
-    ops_by_peer: dict[int, list[dist.P2POp]] = defaultdict(list)
-    for op in send_ops or recv_ops:
-        ops_by_peer[op.peer].append(op)
-
-    for peer in sorted(ops_by_peer):
-        peer_ops = ops_by_peer[peer]
-        batch_send_recv(
-            send_ops=peer_ops if send_ops else [],
-            recv_ops=peer_ops if recv_ops else [],
-            blocking=True,
-            use_group=True,
-        )
 
 
 # Copy from pytorch and OpenRLHF to allow creating multiple main groups.
