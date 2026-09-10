@@ -740,8 +740,13 @@ class TestRemotize:
     """Test remotize method with various input types."""
 
     @pytest.mark.parametrize("preserve_tensor_aliases", [False, True])
-    def test_remotize_list_of_dicts(self, rpc_server, preserve_tensor_aliases):
+    def test_remotize_list_of_dicts(self, monkeypatch, preserve_tensor_aliases):
         """Test remotizing list of dicts with different attention masks."""
+        # Remotize stores locally; node_addr alone does not upload to an RPC server.
+        backend = _RecordingRTensorBackend()
+        monkeypatch.setattr("areal.infra.rpc.rtensor.get_backend", lambda: backend)
+        monkeypatch.setattr("areal.infra.rpc.rtensor._fetch_buffer", {})
+
         # Create two trajectory dicts with different seqlens
         traj1 = {
             "attention_mask": torch.tensor([[1, 1, 1, 0], [1, 1, 0, 0]]),
@@ -758,7 +763,7 @@ class TestRemotize:
 
         result = RTensor.remotize(
             [traj1, traj2],
-            node_addr=rpc_server,
+            node_addr="node-a",
             preserve_tensor_aliases=preserve_tensor_aliases,
         )
 
