@@ -38,7 +38,6 @@ from areal.v2.weight_update.awex.delta_config import (
 from areal.v2.weight_update.awex.delta_detect import AdamWInversionDetector
 from areal.v2.weight_update.awex.state import (
     AwexPairState,
-    MegatronColocatePairState,
     teardown_pair_process_groups,
 )
 from areal.v2.weight_update.nccl_group import (
@@ -73,7 +72,6 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
         self._engine = engine
         self._pair_states: dict[str, AwexPairState] = {}
         self._active_pair_name: str | None = None
-        self._colocate_pair_states: dict[str, MegatronColocatePairState] = {}
         self._transfer_plan: TransferPlan | None = None
         self._weights_update_group = None
         self._weights_update_group_gloo = None
@@ -85,6 +83,9 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
         self._offloaded_weights: dict[str, torch.Tensor] = {}
         self._released_tags: set[str] = set()
         self._colocate_lock = threading.Lock()
+        self._colocate_admin_api_key = "areal-admin-key"
+        self._colocate_http_client: httpx.Client | None = None
+        self._colocate_timeout_s = 120.0
         self._dte_config = DTERuntimeConfig.from_env()
         self._delta_tracker = None
         self._delta_detector = None
@@ -639,10 +640,12 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
         ):
             self._pair_states.pop(pair_name, None)
 
-        colocate_state = self._colocate_pair_states.get(pair_name)
-        if colocate_state is not None:
+        if (
+            getattr(self, "_colocate_pair_name", None) == pair_name
+            and self._colocate_http_client is not None
+        ):
             try:
-                colocate_state.http_client.close()
+                self._colocate_http_client.close()
             except Exception as exc:
                 logger.warning(
                     "Failed to close colocate client for AWEX pair '%s'",
@@ -651,7 +654,7 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
                 )
                 errors.append(exc)
             else:
-                self._colocate_pair_states.pop(pair_name, None)
+                self._colocate_http_client = None
 
         if errors:
             raise RuntimeError(
@@ -811,23 +814,14 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
         process_group_timeout_s: float | None = None,
     ) -> None:
         del process_group_timeout_s
-        existing_state = self._colocate_pair_states.get(pair_name)
-        if existing_state is not None:
-            if existing_state.http_client is None:
-                raise RuntimeError(
-                    f"AWEX colocate pair {pair_name!r} is partially torn down; "
-                    "teardown must complete before retrying initialization"
-                )
-            logger.info("AWEX colocate pair '%s' is already initialized", pair_name)
-            return
-        self._colocate_pair_states[pair_name] = MegatronColocatePairState(
-            kv_store_url=kv_store_url,
-            transfer_rank=transfer_rank,
-            infer_world_size=infer_world_size,
-            admin_api_key=admin_api_key,
-            timeout_s=timeout_s,
-            http_client=httpx.Client(),
-        )
+        self._colocate_pair_name = pair_name
+        self._colocate_kv_store_url = kv_store_url
+        self._colocate_transfer_rank = transfer_rank
+        self._colocate_infer_world_size = infer_world_size
+        self._colocate_admin_api_key = admin_api_key
+        self._colocate_timeout_s = timeout_s
+        if self._colocate_http_client is None:
+            self._colocate_http_client = httpx.Client()
         logger.info(
             "Initialized colocate weight update for pair '%s', transfer_rank=%d",
             pair_name,
@@ -841,14 +835,14 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
     def _execute_colocate_weight_update_locked(
         self, pair_name: str, version: int
     ) -> None:
-        state = self._colocate_pair_states.get(pair_name)
-        if state is None:
+        if getattr(self, "_colocate_pair_name", None) != pair_name:
             raise RuntimeError(f"AWEX colocate pair {pair_name!r} is not initialized")
-        kv_store_url = state.kv_store_url
-        transfer_rank = state.transfer_rank
-        client = state.http_client
-        auth_headers = {"Authorization": f"Bearer {state.admin_api_key}"}
-        timeout_s = state.timeout_s
+        assert self._colocate_http_client is not None
+        kv_store_url = self._colocate_kv_store_url
+        transfer_rank = self._colocate_transfer_rank
+        client = self._colocate_http_client
+        auth_headers = {"Authorization": f"Bearer {self._colocate_admin_api_key}"}
+        timeout_s = self._colocate_timeout_s
 
         weights_offloaded = "weights" in self._released_tags
         if weights_offloaded:

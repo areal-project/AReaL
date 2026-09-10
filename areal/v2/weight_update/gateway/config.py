@@ -52,6 +52,7 @@ class PairInfo:
     pair_name: str
     train_worker_urls: list[str]
     inference_worker_urls: list[str]
+    operation_id: str = ""
     train_world_size: int = 0
     inference_world_size: int = 0
     master_addr: str = ""

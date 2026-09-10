@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import functools
 import os
+import time
 from collections.abc import Callable
 from copy import deepcopy
 from typing import TYPE_CHECKING, Any, cast
@@ -120,13 +121,17 @@ class PPOTrainer:
     ):
         try:
             self._init_impl(config, train_dataset, valid_dataset)
-        except Exception:
+        except Exception as original_error:
             logger.error(
                 "PPOTrainer construction failed; tearing down partially "
                 "created workers",
                 exc_info=True,
             )
-            self.close()
+            try:
+                self.close()
+            except Exception as cleanup_error:
+                original_error.add_note(f"Cleanup also failed: {cleanup_error}")
+                logger.warning("Cleanup failed after construction error", exc_info=True)
             raise
 
     def _init_impl(
@@ -495,6 +500,17 @@ class PPOTrainer:
         else:
             raise ValueError(
                 f"Invalid weight update mode: {self.config.actor.weight_update_mode}"
+            )
+
+        if (
+            isinstance(self.rollout, RolloutControllerV2)
+            and self.weight_update_meta.type == "awex"
+            and self._is_actor_rollout_colocated(config)
+            and config.recover.mode not in ("disabled", "off")
+        ):
+            raise NotImplementedError(
+                "V2 colocated AWEX recovery is not supported; disable "
+                "`recover.mode` or use separated actor/rollout placement."
             )
 
         self.actor.connect_engine(self.rollout, self.weight_update_meta)
@@ -1198,7 +1214,17 @@ class PPOTrainer:
                 logger.warning(
                     "mopd_teacher_phase.close() failed during close", exc_info=True
                 )
+        actor = getattr(self, "actor", None)
+        cleanup_pairs = getattr(actor, "cleanup_weight_update_pairs", None)
+        cleanup_error = None
+        if cleanup_pairs is not None:
+            try:
+                cleanup_pairs(time.monotonic() + 30.0)
+            except Exception as exc:
+                cleanup_error = exc
         for attr in ("eval_rollout", "rollout", "teacher", "ref", "critic", "actor"):
+            if cleanup_error is not None and attr in ("rollout", "actor"):
+                continue
             engine = getattr(self, attr, None)
             if engine is not None:
                 try:
@@ -1208,6 +1234,8 @@ class PPOTrainer:
                         f"{attr}.destroy() failed during close", exc_info=True
                     )
         perf_tracer.save(force=True)
+        if cleanup_error is not None:
+            raise cleanup_error
 
     def _config_perf_tracer(self):
         rank = int(os.getenv("RANK", "0"))
@@ -1918,5 +1946,12 @@ class PPOTrainer:
     def __exit__(self, exc_type, exc_value, traceback):
         if exc_type is not None:
             logger.error(f"Training failed with exception: {exc_value}", exc_info=True)
-        self.close()
+            try:
+                self.close()
+            except Exception as cleanup_error:
+                if exc_value is not None:
+                    exc_value.add_note(f"Cleanup also failed: {cleanup_error}")
+                logger.warning("Cleanup failed after training error", exc_info=True)
+        else:
+            self.close()
         return False

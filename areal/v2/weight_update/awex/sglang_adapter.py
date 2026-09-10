@@ -43,7 +43,6 @@ from areal.v2.weight_update.awex.delta_config import (
 )
 from areal.v2.weight_update.awex.state import (
     AwexPairState,
-    SGLangColocatePairState,
     teardown_pair_process_groups,
 )
 from areal.v2.weight_update.inference_adapter import (
@@ -64,7 +63,6 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
         self._scheduler = scheduler
         self._pair_states: dict[str, AwexPairState] = {}
         self._active_pair_name: str | None = None
-        self._colocate_pair_states: dict[str, SGLangColocatePairState] = {}
         self._transfer_plan: TransferPlan | None = None
         self._weights_update_group = None
         self._weights_update_group_gloo = None
@@ -75,6 +73,12 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
         self._rank_info: RankInfo | None = None
         self._parameters: dict[str, torch.Tensor] | None = None
         self._released_tags: set[str] = set()
+        self._colocate_admin_api_key = "areal-admin-key"
+        self._colocate_http_client: httpx.Client | None = None
+        self._colocate_timeout_s = 120.0
+        self._colocate_transport = None
+        self._train_to_infer_device_mapping: dict | None = None
+        self._infer_to_train_device_mapping: dict | None = None
         self._dte_config = DTERuntimeConfig.from_env()
 
     def _capture_active_pair_state(self) -> AwexPairState:
@@ -87,8 +91,6 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
                 "world_size": self._world_size,
                 "separation_delta_transport": self._separation_delta_transport,
                 "separation_wire_dtypes": self._separation_wire_dtypes,
-                "rank_info": self._rank_info,
-                "parameters": self._parameters,
             },
         )
 
@@ -100,8 +102,6 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
         self._world_size = None
         self._separation_delta_transport = None
         self._separation_wire_dtypes = None
-        self._rank_info = None
-        self._parameters = None
 
     def _park_active_pair(self) -> None:
         if self._active_pair_name is not None:
@@ -129,8 +129,6 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
             self._world_size = runtime.get("world_size")
             self._separation_delta_transport = runtime.get("separation_delta_transport")
             self._separation_wire_dtypes = runtime.get("separation_wire_dtypes")
-            self._rank_info = runtime.get("rank_info")
-            self._parameters = runtime.get("parameters")
             self._active_pair_name = pair_name
         if state.weights_update_group is None or state.control_group is None:
             raise RuntimeError(f"AWEX pair {pair_name!r} is partially torn down")
@@ -533,8 +531,6 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
                     "world_size": world_size,
                     "separation_delta_transport": None,
                     "separation_wire_dtypes": separation_wire_dtypes,
-                    "rank_info": None,
-                    "parameters": None,
                 },
             )
             try:
@@ -556,8 +552,6 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
         self._world_size = world_size
         self._separation_delta_transport = None
         self._separation_wire_dtypes = separation_wire_dtypes
-        self._rank_info = None
-        self._parameters = None
         self._active_pair_name = pair_name
         logger.info(
             "Initialized AWEX weight update groups for pair=%s role=inference "
@@ -744,12 +738,11 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
         ):
             self._pair_states.pop(pair_name, None)
 
-        colocate_state = self._colocate_pair_states.get(pair_name)
-        if colocate_state is not None:
-            if colocate_state.weights_update_group is not None:
+        if getattr(self, "_colocate_pair_name", None) == pair_name:
+            if self._weights_update_group is not None:
                 if dist.is_initialized():
                     try:
-                        dist.destroy_process_group(colocate_state.weights_update_group)
+                        dist.destroy_process_group(self._weights_update_group)
                     except Exception as exc:
                         logger.warning(
                             "Failed to teardown colocate group for AWEX pair '%s'",
@@ -758,28 +751,16 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
                         )
                         errors.append(exc)
                     else:
-                        colocate_state.weights_update_group = None
+                        self._weights_update_group = None
                 else:
-                    colocate_state.weights_update_group = None
-            if colocate_state.transport is not None:
-                cleanup = getattr(colocate_state.transport, "close", None)
-                if cleanup is None:
-                    cleanup = getattr(colocate_state.transport, "destroy", None)
+                    self._weights_update_group = None
+            if self._weights_update_group is None:
+                # The pinned transport has no close/destroy protocol. Its
+                # resources are owned by the process group destroyed above.
+                self._colocate_transport = None
+            if self._colocate_http_client is not None:
                 try:
-                    if cleanup is not None:
-                        cleanup()
-                except Exception as exc:
-                    logger.warning(
-                        "Failed to close colocate transport for AWEX pair '%s'",
-                        pair_name,
-                        exc_info=True,
-                    )
-                    errors.append(exc)
-                else:
-                    colocate_state.transport = None
-            if colocate_state.http_client is not None:
-                try:
-                    colocate_state.http_client.close()
+                    self._colocate_http_client.close()
                 except Exception as exc:
                     logger.warning(
                         "Failed to close colocate client for AWEX pair '%s'",
@@ -788,13 +769,7 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
                     )
                     errors.append(exc)
                 else:
-                    colocate_state.http_client = None
-            if (
-                colocate_state.weights_update_group is None
-                and colocate_state.transport is None
-                and colocate_state.http_client is None
-            ):
-                self._colocate_pair_states.pop(pair_name, None)
+                    self._colocate_http_client = None
 
         if errors:
             raise RuntimeError(
@@ -816,19 +791,6 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
         timeout_s: float = 120.0,
         process_group_timeout_s: float | None = None,
     ) -> None:
-        existing_state = self._colocate_pair_states.get(pair_name)
-        if existing_state is not None:
-            if (
-                existing_state.weights_update_group is None
-                or existing_state.transport is None
-                or existing_state.http_client is None
-            ):
-                raise RuntimeError(
-                    f"AWEX colocate pair {pair_name!r} is partially initialized; "
-                    "teardown must complete before retrying initialization"
-                )
-            logger.info("AWEX colocate pair '%s' is already initialized", pair_name)
-            return
         if infer_world_size != train_world_size:
             raise ValueError(
                 f"Colocate mode requires infer_world_size == train_world_size. "
@@ -849,6 +811,16 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
                 raise TimeoutError("AWEX process-group setup deadline exceeded")
             return remaining
 
+        self._colocate_pair_name = pair_name
+        self._colocate_kv_store_url = kv_store_url
+        self._transfer_rank = transfer_rank
+        self._colocate_infer_world_size = infer_world_size
+        self._colocate_train_world_size = train_world_size
+        self._colocate_admin_api_key = admin_api_key
+        self._colocate_timeout_s = timeout_s
+        if self._colocate_http_client is None:
+            self._colocate_http_client = httpx.Client()
+
         infer_meta, train_meta = fetch_kv_metadata(
             kv_store_url, pair_name, timeout_s=_remaining()
         )
@@ -865,58 +837,32 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
             train_rank = infer_world_size + i
             train_to_infer[train_rank] = i
             infer_to_train[i] = train_rank
-        send_transfer_plan = builder.build_local_transfer_plan(
+        self._send_transfer_plan = builder.build_local_transfer_plan(
             infer_meta,
             train_meta,
             global_transfer_rank=infer_to_train[transfer_rank],
         )
-        recv_transfer_plan = builder.build_local_transfer_plan(
+        self._recv_transfer_plan = builder.build_local_transfer_plan(
             infer_meta,
             train_meta,
             global_transfer_rank=transfer_rank,
         )
 
         os.environ["TORCHELASTIC_USE_AGENT_STORE"] = str(False)
-        state = SGLangColocatePairState(
-            weights_update_group=None,
-            transfer_rank=transfer_rank,
-            kv_store_url=kv_store_url,
-            infer_world_size=infer_world_size,
-            train_world_size=train_world_size,
-            admin_api_key=admin_api_key,
-            timeout_s=timeout_s,
-            http_client=httpx.Client(),
-            transport=None,
-            train_to_infer_device_mapping=train_to_infer,
-            infer_to_train_device_mapping=infer_to_train,
-            send_transfer_plan=send_transfer_plan,
-            recv_transfer_plan=recv_transfer_plan,
+        self._train_to_infer_device_mapping = train_to_infer
+        self._infer_to_train_device_mapping = infer_to_train
+        self._weights_update_group = init_weights_update_group(
+            master_address="127.0.0.1",
+            master_port=master_port,
+            rank=transfer_rank,
+            world_size=infer_world_size,
+            group_name=f"awex_colocate_{pair_name}",
+            role="inference",
+            timeout_s=_remaining(),
         )
-        self._colocate_pair_states[pair_name] = state
-        try:
-            state.weights_update_group = init_weights_update_group(
-                master_address="127.0.0.1",
-                master_port=master_port,
-                rank=transfer_rank,
-                world_size=infer_world_size,
-                group_name=f"awex_colocate_{pair_name}",
-                role="inference",
-                timeout_s=_remaining(),
-            )
-            state.transport = NcclColocateStreamBatchTransport(
-                transfer_rank, infer_world_size
-            )
-        except BaseException:
-            try:
-                self.teardown_weight_update_group(pair_name)
-            except Exception:
-                logger.warning(
-                    "Failed to roll back colocate AWEX pair %r; retaining its "
-                    "remaining resources for retry",
-                    pair_name,
-                    exc_info=True,
-                )
-            raise
+        self._colocate_transport = NcclColocateStreamBatchTransport(
+            transfer_rank, infer_world_size
+        )
 
         logger.info(
             "Initialized colocate weight update for pair '%s', "
@@ -927,20 +873,18 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
         )
 
     def execute_colocate_weight_update(self, pair_name: str, version: int) -> None:
-        state = self._colocate_pair_states.get(pair_name)
-        if state is None:
+        if getattr(self, "_colocate_pair_name", None) != pair_name:
             raise RuntimeError(f"AWEX colocate pair {pair_name!r} is not initialized")
-        kv_store_url = state.kv_store_url
-        transfer_rank = state.transfer_rank
-        client = state.http_client
-        if client is None or state.transport is None:
-            raise RuntimeError(
-                f"AWEX colocate pair {pair_name!r} is partially torn down"
-            )
-        auth_headers = {"Authorization": f"Bearer {state.admin_api_key}"}
-        timeout_s = state.timeout_s
+        assert self._colocate_http_client is not None
+        assert self._infer_to_train_device_mapping is not None
+        assert self._colocate_transport is not None
+        kv_store_url = self._colocate_kv_store_url
+        transfer_rank = self._transfer_rank
+        client = self._colocate_http_client
+        auth_headers = {"Authorization": f"Bearer {self._colocate_admin_api_key}"}
+        timeout_s = self._colocate_timeout_s
 
-        paired_train_rank = state.infer_to_train_device_mapping[transfer_rank]
+        paired_train_rank = self._infer_to_train_device_mapping[transfer_rank]
         kv_key = f"colocate_weights_rank{paired_train_rank}_{version}"
 
         deadline = time.monotonic() + timeout_s
@@ -977,15 +921,15 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
         rank_info = self._build_rank_info()
         rank_coordinate = f"infer_{rank_info.global_rank}"
 
-        state.transport.update_weights_in_colocate_mode(
-            state.train_to_infer_device_mapping,
-            state.infer_to_train_device_mapping,
+        self._colocate_transport.update_weights_in_colocate_mode(
+            self._train_to_infer_device_mapping,
+            self._infer_to_train_device_mapping,
             transfer_rank,
             rank_coordinate,
-            state.infer_world_size,
-            state.send_transfer_plan,
-            state.recv_transfer_plan,
-            state.weights_update_group,
+            self._colocate_infer_world_size,
+            self._send_transfer_plan,
+            self._recv_transfer_plan,
+            self._weights_update_group,
             deserialized_weights,
             recv_parameters,
             step_id=version,

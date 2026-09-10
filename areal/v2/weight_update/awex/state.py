@@ -21,37 +21,6 @@ class AwexPairState:
     runtime_state: dict[str, Any] | None = None
 
 
-@dataclass
-class MegatronColocatePairState:
-    """Per-pair state for the training side of colocated AWEX."""
-
-    kv_store_url: str
-    transfer_rank: int
-    infer_world_size: int
-    admin_api_key: str
-    timeout_s: float
-    http_client: Any | None
-
-
-@dataclass
-class SGLangColocatePairState:
-    """Per-pair state for the inference side of colocated AWEX."""
-
-    weights_update_group: Any | None
-    transfer_rank: int
-    kv_store_url: str
-    infer_world_size: int
-    train_world_size: int
-    admin_api_key: str
-    timeout_s: float
-    http_client: Any | None
-    transport: Any | None
-    train_to_infer_device_mapping: dict[int, int]
-    infer_to_train_device_mapping: dict[int, int]
-    send_transfer_plan: Any
-    recv_transfer_plan: Any
-
-
 def teardown_pair_process_groups(
     state: AwexPairState,
     pair_name: str,

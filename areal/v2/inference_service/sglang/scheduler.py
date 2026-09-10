@@ -6,6 +6,7 @@ from __future__ import annotations
 import logging
 import os
 import tempfile
+import time
 from typing import Any
 
 import torch.distributed as dist
@@ -35,6 +36,8 @@ class AwexSchedulerBridge:
         self._scheduler = scheduler
         self._adapter: Any | None = None
         self._result_push: zmq.Socket | None = None
+        self._current_rid: str | None = None
+        self._cancelled_operations: set[tuple[str, str]] = set()
 
         result_ipc = os.environ.get(RESULT_IPC_ENV)
         # Only tp_rank==0 AND dp_rank==0 should push results to avoid
@@ -71,6 +74,23 @@ class AwexSchedulerBridge:
         for name in methods:
             setattr(self._scheduler, name, getattr(self, name))
 
+        original_handler = self._scheduler.handle_rpc_request
+
+        def handle_rpc_request(request):
+            self._current_rid = request.rid
+            try:
+                response = original_handler(request)
+                response.rid = request.rid
+                return response
+            finally:
+                self._current_rid = None
+
+        # Scheduler.__init__ caches bound handlers in _request_dispatcher.
+        # Rebuild it after replacing handle_rpc_request so the real dispatch
+        # path, not just the instance attribute, copies the request rid.
+        self._scheduler.handle_rpc_request = handle_rpc_request
+        self._scheduler.init_request_dispatcher()
+
     def _require_adapter(self) -> Any:
         if self._adapter is None:
             from areal.v2.weight_update.awex.sglang_adapter import (
@@ -82,7 +102,30 @@ class AwexSchedulerBridge:
 
     def _push_result(self, result: Any) -> None:
         if self._result_push is not None:
-            self._result_push.send_pyobj(result)
+            self._result_push.send_pyobj({"rid": self._current_rid, "value": result})
+
+    def _check_operation(self, kwargs: dict[str, Any]) -> float | None:
+        pair_name = kwargs["pair_name"]
+        operation_id = kwargs.pop("operation_id", "")
+        expiry = kwargs.pop("operation_expiry_monotonic", None)
+        remaining = None if expiry is None else float(expiry) - time.monotonic()
+        if remaining is not None and remaining <= 0:
+            raise TimeoutError(f"AWEX init for pair {pair_name!r} expired in queue")
+        if operation_id and (pair_name, operation_id) in self._cancelled_operations:
+            raise RuntimeError(
+                f"AWEX operation {operation_id!r} for pair {pair_name!r} was cancelled"
+            )
+        return remaining
+
+    @staticmethod
+    def _apply_remaining_pg_timeout(
+        kwargs: dict[str, Any], remaining: float | None
+    ) -> None:
+        if remaining is not None:
+            configured = kwargs.get("process_group_timeout_s")
+            kwargs["process_group_timeout_s"] = min(
+                remaining, remaining if configured is None else float(configured)
+            )
 
     def awex_report_weight_meta(self) -> None:
         adapter = self._require_adapter()
@@ -104,15 +147,24 @@ class AwexSchedulerBridge:
         self._push_result(self._require_adapter().parallelism_strategy)
 
     def awex_init_weights_update_group(self, **kwargs: Any) -> None:
+        remaining = self._check_operation(kwargs)
+        self._apply_remaining_pg_timeout(kwargs, remaining)
         self._require_adapter().init_weight_update_group(**kwargs)
 
     def awex_execute_weight_update(self, pair_name: str, version: int = 0) -> None:
         self._require_adapter().execute_weight_update(pair_name, version)
 
     def awex_batch_isend_irecv(self, pair_name: str, **kwargs: Any) -> None:
+        self._check_operation({"pair_name": pair_name, **kwargs})
+        kwargs.pop("operation_id", None)
+        kwargs.pop("operation_expiry_monotonic", None)
         self._require_adapter().batch_isend_irecv(pair_name, **kwargs)
 
-    def awex_teardown_weight_update_group(self, pair_name: str) -> None:
+    def awex_teardown_weight_update_group(
+        self, pair_name: str, operation_id: str = ""
+    ) -> None:
+        if operation_id:
+            self._cancelled_operations.add((pair_name, operation_id))
         if self._adapter is not None:
             self._adapter.teardown_weight_update_group(pair_name)
 
@@ -127,6 +179,8 @@ class AwexSchedulerBridge:
         self._require_adapter().randomize_parameters()
 
     def awex_init_colocate_weight_update(self, **kwargs: Any) -> None:
+        remaining = self._check_operation(kwargs)
+        self._apply_remaining_pg_timeout(kwargs, remaining)
         self._require_adapter().init_colocate_weight_update(**kwargs)
 
     def awex_execute_colocate_weight_update(

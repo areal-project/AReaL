@@ -4,18 +4,19 @@ import dataclasses
 import os
 import tempfile
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 import pytest
 
 from areal.api.cli_args import RecoverConfig
-from areal.api.io_struct import FinetuneSpec, StepInfo
+from areal.api.io_struct import FinetuneSpec
 from areal.utils.recover import (
     RecoverHandler,
     check_if_auto_recover,
     check_if_recover,
 )
 from areal.utils.saver import Saver
+from areal.v2.inference_service.controller.controller import RolloutControllerV2
 from areal.v2.training_service.controller.controller import (
     GatewayTrainController,
 )
@@ -238,63 +239,18 @@ class TestRecoverHandler:
     def _make_gateway_controller() -> GatewayTrainController:
         return GatewayTrainController.__new__(GatewayTrainController)
 
-    @pytest.mark.parametrize("mode", ["on", "auto"])
-    def test_load_accepts_gateway_train_controller(self, mode):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            handler = self._make_handler(tmpdir, mode)
-            handler.freq_ctl = Mock()
-            controller = self._make_gateway_controller()
-            recover_info = SimpleNamespace(
-                last_step_info=SimpleNamespace(global_step=0, next=lambda: "step-1"),
-                saver_info={},
-                evaluator_info={},
-                stats_logger_info={},
-                dataloader_info={},
-                checkpoint_info={},
-            )
-            saver = Mock()
-            evaluator = Mock()
-            stats_logger = Mock()
-            dataloader = Mock()
-            handler._load_checkpoint = Mock()
-
-            with patch(
-                "areal.utils.recover.RecoverInfo.load", return_value=recover_info
-            ):
-                result = handler.load(
-                    controller, saver, evaluator, stats_logger, dataloader
-                )
-
-            assert result is recover_info
-            handler._load_checkpoint.assert_called_once_with(controller, name="default")
-
-    @pytest.mark.parametrize("mode", ["on", "auto"])
-    def test_dump_accepts_gateway_train_controller(self, mode):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            handler = self._make_handler(tmpdir, mode)
-            handler.freq_ctl.check = Mock(return_value=True)
-            handler.freq_ctl.state_dict = Mock(return_value={})
-            handler._save_checkpoint = Mock()
-            controller = self._make_gateway_controller()
-            step_info = StepInfo(
-                epoch=0,
-                epoch_step=0,
-                global_step=0,
-                steps_per_epoch=handler.ft_spec.steps_per_epoch,
-            )
-
-            with patch("areal.utils.recover.RecoverInfo.dump") as dump_info:
-                handler.dump(
-                    controller,
-                    step_info,
-                    Mock(state_dict=Mock(return_value={})),
-                    Mock(state_dict=Mock(return_value={})),
-                    Mock(state_dict=Mock(return_value={})),
-                    Mock(state_dict=Mock(return_value={})),
-                )
-
-            handler._save_checkpoint.assert_called_once()
-            dump_info.assert_called_once()
+    @staticmethod
+    def _recover_info(global_step: int = 2):
+        return SimpleNamespace(
+            last_step_info=SimpleNamespace(
+                global_step=global_step, next=lambda: f"step-{global_step + 1}"
+            ),
+            saver_info={},
+            evaluator_info={},
+            stats_logger_info={},
+            dataloader_info={},
+            checkpoint_info={},
+        )
 
     def test_failed_weight_sync_does_not_advance_versions(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -307,14 +263,7 @@ class TestRecoverHandler:
                 side_effect=RuntimeError("weight transfer failed")
             )
             controller.set_version = Mock()
-            recover_info = SimpleNamespace(
-                last_step_info=SimpleNamespace(global_step=2, next=lambda: "step-3"),
-                saver_info={},
-                evaluator_info={},
-                stats_logger_info={},
-                dataloader_info={},
-                checkpoint_info={},
-            )
+            recover_info = self._recover_info()
             inference_engine = Mock()
             weight_update_meta = Mock(type="awex")
             weight_update_meta.with_version.return_value = Mock(version=3)
@@ -339,33 +288,91 @@ class TestRecoverHandler:
             controller.set_version.assert_not_called()
             inference_engine.set_version.assert_not_called()
 
-    def test_colocate_checkpoint_failure_resumes_before_transfer(self):
+    def test_publish_retry_does_not_repeat_transfer_and_commits_last(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             handler = self._make_handler(tmpdir, "auto")
             handler.freq_ctl = Mock()
-            handler._require_colocate_rollout_protocol = Mock()
-            handler._load_checkpoint = Mock(side_effect=RuntimeError("load failed"))
+            handler._load_checkpoint = Mock()
+            order = []
+            controller = self._make_gateway_controller()
+            controller.connect_engine = Mock()
+            controller.update_weights = Mock(
+                side_effect=lambda *_args, **_kwargs: order.append("transfer")
+            )
+            controller.broadcast_version = Mock(
+                side_effect=lambda *_args, **_kwargs: order.append("train-broadcast")
+            )
+            controller.commit_local_version = Mock(
+                side_effect=lambda *_args: order.append("train-commit")
+            )
+            inference_engine = Mock()
+            inference_engine.pause.side_effect = lambda: order.append(
+                "pause-dispatcher"
+            )
+            infer_publish_attempts = 0
+
+            def infer_broadcast(*_args, **_kwargs):
+                nonlocal infer_publish_attempts
+                infer_publish_attempts += 1
+                order.append("infer-broadcast")
+                if infer_publish_attempts == 1:
+                    raise RuntimeError("publish response lost")
+
+            inference_engine.broadcast_version.side_effect = infer_broadcast
+            inference_engine.commit_local_version.side_effect = (
+                lambda *_args: order.append("infer-commit")
+            )
+            inference_engine.continue_generation.side_effect = lambda: order.append(
+                "continue"
+            )
+            inference_engine.resume.side_effect = lambda: order.append("resume")
+            weight_update_meta = Mock(type="awex")
+            versioned_meta = Mock(version=3)
+            weight_update_meta.with_version.return_value = versioned_meta
+            recover_info = self._recover_info()
+
+            with patch(
+                "areal.utils.recover.RecoverInfo.load", return_value=recover_info
+            ):
+                handler.load(
+                    controller,
+                    Mock(),
+                    Mock(),
+                    Mock(),
+                    Mock(),
+                    inference_engine=inference_engine,
+                    weight_update_meta=weight_update_meta,
+                )
+
+            controller.update_weights.assert_called_once_with(
+                versioned_meta, resume_generation=False
+            )
+            assert controller.broadcast_version.call_args_list == [
+                call(3, timeout=pytest.approx(30.0, abs=1.0)),
+                call(3, timeout=pytest.approx(30.0, abs=1.0)),
+            ]
+            assert order.count("transfer") == 1
+            assert order[-4:] == [
+                "train-commit",
+                "infer-commit",
+                "continue",
+                "resume",
+            ]
+
+    def test_v2_colocate_recovery_rejected_before_side_effects(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            handler = self._make_handler(tmpdir, "auto")
+            handler._load_checkpoint = Mock()
             controller = self._make_gateway_controller()
             controller.connect_engine = Mock()
             controller.update_weights = Mock()
-            controller.set_version = Mock()
-            recover_info = SimpleNamespace(
-                last_step_info=SimpleNamespace(global_step=2, next=lambda: "step-3"),
-                saver_info={},
-                evaluator_info={},
-                stats_logger_info={},
-                dataloader_info={},
-                checkpoint_info={},
-            )
-            inference_engine = Mock()
+            inference_engine = RolloutControllerV2.__new__(RolloutControllerV2)
+            inference_engine.pause = Mock()
             weight_update_meta = Mock(type="awex")
-            weight_update_meta.with_version.return_value = Mock(version=3)
 
             with (
-                patch(
-                    "areal.utils.recover.RecoverInfo.load", return_value=recover_info
-                ),
-                pytest.raises(RuntimeError, match="load failed"),
+                patch("areal.utils.recover.RecoverInfo.load") as load_info,
+                pytest.raises(NotImplementedError, match="not supported"),
             ):
                 handler.load(
                     controller,
@@ -378,10 +385,11 @@ class TestRecoverHandler:
                     colocated_rollout=True,
                 )
 
-            inference_engine.resume.assert_called_once_with()
+            load_info.assert_not_called()
+            handler._load_checkpoint.assert_not_called()
+            inference_engine.pause.assert_not_called()
+            controller.connect_engine.assert_not_called()
             controller.update_weights.assert_not_called()
-            controller.set_version.assert_not_called()
-            inference_engine.set_version.assert_not_called()
 
     @pytest.mark.parametrize("no_save_optim", [False, True])
     def test_save_checkpoint_passes_with_optim_from_config(self, no_save_optim):
@@ -415,75 +423,3 @@ class TestRecoverHandler:
 
             meta = engine.load.call_args[0][0]
             assert meta.with_optim is (not no_load_optim)
-
-
-class TestAwexColocateGate:
-    """The AWEX pre-transfer sequence must run only for colocated rollouts."""
-
-    @staticmethod
-    def _awex_meta():
-        return Mock(type="awex")
-
-    def test_awex_transport_without_colocation_is_not_colocate(self):
-        assert not RecoverHandler._should_run_awex_colocate_transfer(
-            inference_engine=Mock(),
-            weight_update_meta=self._awex_meta(),
-            colocated_rollout=False,
-        )
-
-    def test_awex_transport_with_colocation_is_colocate(self):
-        assert RecoverHandler._should_run_awex_colocate_transfer(
-            inference_engine=Mock(),
-            weight_update_meta=self._awex_meta(),
-            colocated_rollout=True,
-        )
-
-    @pytest.mark.parametrize("meta_type", ["disk", "xccl"])
-    def test_non_awex_transport_is_never_colocate(self, meta_type):
-        assert not RecoverHandler._should_run_awex_colocate_transfer(
-            inference_engine=Mock(),
-            weight_update_meta=Mock(type=meta_type),
-            colocated_rollout=True,
-        )
-
-    def test_missing_inference_engine_is_not_colocate(self):
-        assert not RecoverHandler._should_run_awex_colocate_transfer(
-            inference_engine=None,
-            weight_update_meta=self._awex_meta(),
-            colocated_rollout=True,
-        )
-
-    def test_meta_without_type_attribute_is_not_colocate(self):
-        assert not RecoverHandler._should_run_awex_colocate_transfer(
-            inference_engine=Mock(),
-            weight_update_meta=None,
-            colocated_rollout=True,
-        )
-
-
-class TestColocateRolloutProtocol:
-    """Engines lacking the colocate protocol must fail before any side effect."""
-
-    def test_engine_with_full_protocol_is_accepted(self):
-        engine = Mock(spec=["pause_generation_sync", "offload"])
-        engine.offload = lambda tags=None: None
-
-        RecoverHandler._require_colocate_rollout_protocol(engine)
-
-    def test_engine_without_pause_generation_sync_is_rejected(self):
-        engine = Mock(spec=["offload"])
-        engine.offload = lambda tags=None: None
-
-        with pytest.raises(NotImplementedError) as exc_info:
-            RecoverHandler._require_colocate_rollout_protocol(engine)
-
-        assert "pause_generation_sync" in str(exc_info.value)
-
-    def test_engine_with_untagged_offload_is_rejected(self):
-        engine = Mock(spec=["pause_generation_sync", "offload"])
-        engine.offload = lambda: None
-
-        with pytest.raises(NotImplementedError) as exc_info:
-            RecoverHandler._require_colocate_rollout_protocol(engine)
-
-        assert "tags" in str(exc_info.value)

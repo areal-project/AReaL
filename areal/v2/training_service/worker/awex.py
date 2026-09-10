@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+from threading import Lock
 from typing import TYPE_CHECKING, Any
 
 from areal.utils import logging
@@ -28,7 +30,43 @@ def create_awex_blueprint(
     """
     bp = flask_module.Blueprint("awex", __name__, url_prefix="/awex")
 
-    _state: dict[str, Any] = {"adapter": None}
+    _state: dict[str, Any] = {
+        "adapter": None,
+        "cancelled_operations": set(),
+        "operation_lock": Lock(),
+    }
+
+    def _operation(data: dict[str, Any]) -> tuple[str, str, float | None]:
+        pair_name = data["pair_name"]
+        operation_id = data.pop("operation_id", "")
+        ttl = data.pop("operation_ttl_s", None)
+        expiry = None if ttl is None else time.monotonic() + max(0.0, float(ttl))
+        return pair_name, operation_id, expiry
+
+    def _check_operation(
+        pair_name: str, operation_id: str, expiry: float | None
+    ) -> float | None:
+        remaining = None if expiry is None else expiry - time.monotonic()
+        if remaining is not None and remaining <= 0:
+            raise TimeoutError(f"AWEX init for pair {pair_name!r} expired in queue")
+        if operation_id:
+            with _state["operation_lock"]:
+                cancelled = (pair_name, operation_id) in _state["cancelled_operations"]
+            if cancelled:
+                raise RuntimeError(
+                    f"AWEX operation {operation_id!r} for pair {pair_name!r} "
+                    "was cancelled"
+                )
+        return remaining
+
+    def _apply_remaining_pg_timeout(
+        data: dict[str, Any], remaining: float | None
+    ) -> None:
+        if remaining is not None:
+            configured = data.get("process_group_timeout_s")
+            data["process_group_timeout_s"] = min(
+                remaining, remaining if configured is None else float(configured)
+            )
 
     def _require_adapter():
         if _state["adapter"] is None:
@@ -60,8 +98,11 @@ def create_awex_blueprint(
     @bp.route("/init_weights_update_group", methods=["POST"])
     def init_weights_update_group():
         data = flask_module.request.get_json(force=True)
+        pair_name, operation_id, expiry = _operation(data)
 
         def action():
+            remaining = _check_operation(pair_name, operation_id, expiry)
+            _apply_remaining_pg_timeout(data, remaining)
             adapter = _require_adapter()
             adapter.init_weight_update_group(**data)
 
@@ -88,9 +129,11 @@ def create_awex_blueprint(
     @bp.route("/batch_isend_irecv", methods=["POST"])
     def batch_isend_irecv():
         data = flask_module.request.get_json(force=True)
-        pair_name = data.pop("pair_name")
+        pair_name, operation_id, expiry = _operation(data)
+        data.pop("pair_name")
 
         def action():
+            _check_operation(pair_name, operation_id, expiry)
             adapter = _require_adapter()
             adapter.batch_isend_irecv(pair_name, **data)
 
@@ -105,12 +148,15 @@ def create_awex_blueprint(
         pair_name = data.get("pair_name")
         if not pair_name:
             return flask_module.jsonify({"error": "pair_name is required"}), 400
-        adapter = _state.get("adapter")
-        if adapter is None:
-            return flask_module.jsonify({"status": "success"})
+        operation_id = data.get("operation_id", "")
+        if operation_id:
+            with _state["operation_lock"]:
+                _state["cancelled_operations"].add((pair_name, operation_id))
 
         def action():
-            adapter.teardown_weight_update_group(pair_name)
+            adapter = _state.get("adapter")
+            if adapter is not None:
+                adapter.teardown_weight_update_group(pair_name)
 
         return run_endpoint(
             "awex_teardown",
@@ -121,8 +167,11 @@ def create_awex_blueprint(
     @bp.route("/init_colocate_weight_update", methods=["POST"])
     def init_colocate_weight_update():
         data = flask_module.request.get_json(force=True)
+        pair_name, operation_id, expiry = _operation(data)
 
         def action():
+            remaining = _check_operation(pair_name, operation_id, expiry)
+            _apply_remaining_pg_timeout(data, remaining)
             adapter = _require_adapter()
             adapter.init_colocate_weight_update(**data)
 

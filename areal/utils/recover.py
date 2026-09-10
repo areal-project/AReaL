@@ -2,10 +2,10 @@
 from __future__ import annotations
 
 import dataclasses
-import inspect
 import json
 import os
 import pickle
+import time
 from typing import TYPE_CHECKING, Any
 
 import torch.distributed as dist
@@ -198,38 +198,16 @@ class RecoverHandler:
         non-LoRA run regardless of placement, so the caller has to state whether
         actor and rollout physically share devices.
         """
+        from areal.v2.inference_service.controller.controller import (
+            RolloutControllerV2,
+        )
+
         return (
-            inference_engine is not None
+            isinstance(inference_engine, RolloutControllerV2)
+            and inference_engine is not None
             and getattr(weight_update_meta, "type", None) == "awex"
             and colocated_rollout
         )
-
-    @staticmethod
-    def _require_colocate_rollout_protocol(
-        inference_engine: InferenceEngine,
-    ) -> None:
-        missing = []
-        if not callable(getattr(inference_engine, "pause_generation_sync", None)):
-            missing.append("pause_generation_sync()")
-
-        offload = getattr(inference_engine, "offload", None)
-        if not callable(offload):
-            missing.append("offload(tags=...)")
-        else:
-            try:
-                accepts_tags = "tags" in inspect.signature(offload).parameters
-            except (TypeError, ValueError):
-                accepts_tags = True
-            if not accepts_tags:
-                missing.append("offload(tags=...)")
-
-        if missing:
-            raise NotImplementedError(
-                "Colocated AWEX recovery needs a rollout engine implementing "
-                f"{', '.join(missing)}, which {type(inference_engine).__name__} "
-                "does not provide. Disable `recover.mode` or run this "
-                "configuration without actor-rollout colocation."
-            )
 
     def dump(
         self,
@@ -298,6 +276,15 @@ class RecoverHandler:
             return
         if inference_engine is not None and weight_update_meta is None:
             raise ValueError("Weight update meta is required for recovery.")
+        if self._should_run_awex_colocate_transfer(
+            inference_engine,
+            weight_update_meta,
+            colocated_rollout,
+        ):
+            raise NotImplementedError(
+                "V2 colocated AWEX recovery is not supported; disable "
+                "`recover.mode` or use separated actor/rollout placement."
+            )
 
         normalized_engine: dict[str, TrainEngine | TrainController] = (
             self._normalize_recover_engines(engine)
@@ -321,17 +308,8 @@ class RecoverHandler:
             global_step = recover_info.last_step_info.global_step
             recovery_version = global_step + 1
 
-            is_awex_colocate = self._should_run_awex_colocate_transfer(
-                inference_engine=inference_engine,
-                weight_update_meta=weight_update_meta,
-                colocated_rollout=colocated_rollout,
-            )
-            if is_awex_colocate:
-                self._require_colocate_rollout_protocol(inference_engine)
-
-            if not is_awex_colocate:
-                for name, engine_ in normalized_engine.items():
-                    self._load_checkpoint(engine_, name=name)
+            for name, engine_ in normalized_engine.items():
+                self._load_checkpoint(engine_, name=name)
 
             if inference_engine is not None:
                 assert weight_update_meta is not None
@@ -339,52 +317,82 @@ class RecoverHandler:
                 versioned_meta = weight_update_meta.with_version(recovery_version)
                 update_engine.connect_engine(inference_engine, versioned_meta)
                 inference_engine.pause()
-                should_resume_inference = True
                 transfer_started = False
+                transfer_completed = False
+                transactional_publish = all(
+                    callable(getattr(controller, method, None))
+                    for controller, method in (
+                        (update_engine, "broadcast_version"),
+                        (update_engine, "commit_local_version"),
+                        (inference_engine, "broadcast_version"),
+                        (inference_engine, "commit_local_version"),
+                    )
+                )
                 try:
-                    # AWEX colocate transfer requires the full engine-level
-                    # pause/offload protocol, not just the controller pause. The
-                    # sglang plugin's patched event loop only drains the weight-
-                    # update queue while scheduler._engine_paused is True (set by
-                    # pause_generation), and the reader-side protocol expects the
-                    # engine's kv/weights released before the writer publishes.
-                    # Without this the recover-path transfer deadlocks: reader
-                    # never consumes the queued version marker, writer blocks on
-                    # weights_update_finished forever.
-                    # Mirror of the trainer's pre-update sequence; the reverse
-                    # side (kv_cache onload) happens inside update_weights.
-                    if is_awex_colocate:
-                        inference_engine.pause_generation_sync()
-                        inference_engine.offload(tags=["kv_cache"])
-                        inference_engine.offload(tags=["weights"])
-                        # Load the actor checkpoint only after the colocated
-                        # rollout engine has released its GPU memory; loading
-                        # first would stack DCP weights/optimizer on top of the
-                        # still-resident sglang allocation and risk OOM.
-                        for name, engine_ in normalized_engine.items():
-                            self._load_checkpoint(engine_, name=name)
                     transfer_started = True
-                    update_engine.update_weights(versioned_meta)
-                except BaseException as exc:
-                    # A transfer error is unsafe by default: inference may have
-                    # applied only part of the payload. The controller can
-                    # explicitly mark errors that occurred before any mutation.
-                    if transfer_started:
-                        should_resume_inference = not getattr(
-                            exc, "inference_weights_may_be_mutated", True
+                    if transactional_publish:
+                        update_engine.update_weights(
+                            versioned_meta, resume_generation=False
                         )
-                    raise
-                finally:
-                    if should_resume_inference:
-                        inference_engine.resume()
                     else:
-                        logger.critical(
-                            "Recovery weight synchronization may have partially "
-                            "mutated inference weights; leaving inference paused "
-                            "until a known-good recovery succeeds"
-                        )
-                update_engine.set_version(recovery_version)
-                inference_engine.set_version(recovery_version)
+                        update_engine.update_weights(versioned_meta)
+                    transfer_completed = True
+
+                    if transactional_publish:
+                        publish_deadline = time.monotonic() + 30.0
+                        for attempt in range(3):
+                            try:
+                                remaining = publish_deadline - time.monotonic()
+                                if remaining <= 0:
+                                    raise TimeoutError(
+                                        "Recovery version publish deadline exceeded"
+                                    )
+                                update_engine.broadcast_version(
+                                    recovery_version, timeout=remaining
+                                )
+                                remaining = publish_deadline - time.monotonic()
+                                inference_engine.broadcast_version(
+                                    recovery_version, timeout=max(0.001, remaining)
+                                )
+                                break
+                            except BaseException:
+                                if attempt == 2 or time.monotonic() >= publish_deadline:
+                                    raise
+                                time.sleep(
+                                    min(
+                                        0.1,
+                                        max(
+                                            0.0,
+                                            publish_deadline - time.monotonic(),
+                                        ),
+                                    )
+                                )
+                        update_engine.commit_local_version(recovery_version)
+                        inference_engine.commit_local_version(recovery_version)
+                        inference_engine.continue_generation()
+                    else:
+                        update_engine.set_version(recovery_version)
+                        inference_engine.set_version(recovery_version)
+                    inference_engine.resume()
+                except BaseException as exc:
+                    setattr(exc, "weight_transfer_completed", transfer_completed)
+                    safe_to_resume = (
+                        transfer_started
+                        and not transfer_completed
+                        and not getattr(exc, "inference_weights_may_be_mutated", True)
+                        and not getattr(exc, "generation_pause_state_unresolved", False)
+                    )
+                    if safe_to_resume:
+                        try:
+                            if transactional_publish:
+                                inference_engine.continue_generation()
+                            inference_engine.resume()
+                        except BaseException as resume_error:
+                            exc.add_note(
+                                f"Generation/dispatcher rollback also failed: "
+                                f"{resume_error}"
+                            )
+                    raise
             return recover_info
         except (FileNotFoundError, InValidRecoverInfo):
             logger.warning(

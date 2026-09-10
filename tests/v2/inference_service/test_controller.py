@@ -335,16 +335,18 @@ class TestGenerationPauseResumeSafety:
     async def test_partial_pause_rolls_back_successful_worker_and_raises(self):
         controller = self._controller()
         controller._async_data_proxy_post = AsyncMock(
-            side_effect=[None, RuntimeError("pause failed"), None]
+            side_effect=[None, RuntimeError("pause failed"), None, None]
         )
 
-        with pytest.raises(RuntimeError, match="failed on 1/2 workers"):
+        with pytest.raises(RuntimeError, match="failed on 1/2 workers") as exc_info:
             await controller._async_pause_generation()
+        assert exc_info.value.generation_pause_state_unresolved is False
 
         assert controller._async_data_proxy_post.call_args_list == [
             call("http://worker-0", "/pause_generation", {}),
             call("http://worker-1", "/pause_generation", {}),
             call("http://worker-0", "/continue_generation", {}),
+            call("http://worker-1", "/continue_generation", {}),
         ]
 
     @pytest.mark.asyncio
@@ -356,6 +358,19 @@ class TestGenerationPauseResumeSafety:
 
         with pytest.raises(RuntimeError, match="failed on 1/2 workers"):
             await controller._async_continue_generation()
+
+    def test_set_version_does_not_commit_after_partial_broadcast_failure(self):
+        controller = self._controller()
+        controller._gateway_addr = "http://gateway"
+        controller._version = 2
+        controller._async_data_proxy_post = AsyncMock(
+            side_effect=[None, RuntimeError("publish failed")]
+        )
+
+        with pytest.raises(RuntimeError, match="failed on 1/2 workers"):
+            controller.set_version(3)
+
+        assert controller.get_version() == 2
 
 
 # =============================================================================

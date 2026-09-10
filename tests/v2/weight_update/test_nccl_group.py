@@ -423,3 +423,27 @@ def test_awex_adapters_destroy_payload_and_sidecar_groups(
         sglang_adapter.AwexSGLangAdapter,
     ):
         assert adapter._separation_wire_dtypes is None
+
+
+@pytest.mark.parametrize(
+    "adapter_cls",
+    [megatron_adapter.AwexMegatronAdapter, sglang_adapter.AwexSGLangAdapter],
+)
+def test_parked_pair_can_be_reactivated_without_crossing_state(adapter_cls):
+    adapter = adapter_cls(MagicMock())
+    a_payload, a_control = MagicMock(), MagicMock()
+    b_payload, b_control = MagicMock(), MagicMock()
+    adapter._active_pair_name = "pair-a"
+    adapter._weights_update_group = a_payload
+    adapter._weights_update_group_gloo = a_control
+    adapter._transfer_plan = MagicMock(name="plan-a")
+    adapter._transfer_rank = 1
+    adapter._pair_states["pair-b"] = AwexPairState(
+        b_payload, b_control, MagicMock(name="plan-b"), 2
+    )
+
+    adapter._activate_pair("pair-b")
+    assert (adapter._weights_update_group, adapter._transfer_rank) == (b_payload, 2)
+    adapter._activate_pair("pair-a")
+    assert (adapter._weights_update_group, adapter._transfer_rank) == (a_payload, 1)
+    assert adapter._pair_states["pair-b"].control_group is b_control
