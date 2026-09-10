@@ -459,7 +459,9 @@ def _validate_multimodal_agent_backend(
         if isinstance(backend, str) and backend
         else type(engine).__name__.lower()
     )
-    if "vllm" in backend_name:
+    # v2 InfBridge keeps the concrete backend on .backend, without engine.config.
+    backend_impl = getattr(engine, "backend", None)
+    if "vllm" in backend_name or "vllm" in type(backend_impl).__name__.lower():
         raise ValueError(
             "Multimodal agent trajectories are currently supported only with "
             "the SGLang rollout backend; vLLM support is deferred."
