@@ -169,6 +169,25 @@ class _Model(nn.Module):
 
 
 @pytest.mark.parametrize("buffers", [False, True])
+@pytest.mark.parametrize("as_iterator", [False, True])
+def test_moe_collector_empty_modules_registers_no_hooks(buffers, as_iterator):
+    """Dense model parts must not pay per-forward Python hook overhead."""
+    model = nn.Identity()
+    metrics = MoEMetrics()
+    modules = iter(()) if as_iterator else []
+    if buffers:
+        metrics.attach_buffers(model, modules)
+    else:
+        metrics.attach(model, modules, lambda output: output)
+    assert not model._forward_pre_hooks
+    assert not model._forward_hooks
+    with metrics.measure():
+        model(torch.ones(2))
+    assert metrics.export(reduce_group=None) == {}
+    metrics.close()
+
+
+@pytest.mark.parametrize("buffers", [False, True])
 @pytest.mark.parametrize("recompute", [False, True])
 def test_moe_collector_excludes_eval_and_backward_recomputation(buffers, recompute):
     """Original model forwards count once even when inner layers are replayed."""
@@ -293,7 +312,12 @@ def test_stats_logger_logs_expert_table_without_expert_scalar_series(monkeypatch
         total_train_epochs=1, steps_per_epoch=1, total_train_steps=1
     )
     logger._last_commit_step = -1
-    logger.summary_writer = None
+    tensorboard_logged = []
+    logger.summary_writer = SimpleNamespace(
+        add_scalar=lambda key, value, step: tensorboard_logged.append(
+            (key, value, step)
+        )
+    )
     logger.print_stats = lambda data: None
     logger.commit(
         0,
@@ -318,6 +342,11 @@ def test_stats_logger_logs_expert_table_without_expert_scalar_series(monkeypatch
     assert payload["moe_balance/layer_0/max_over_ideal"] == 1.5
     assert payload["train_perf/tokens_per_second"] == 123
     assert not any("/expert_0/" in key for key in payload)
+
+    assert tensorboard_logged == [
+        ("moe_balance/layer_0/max_over_ideal", 1.5, 0),
+        ("train_perf/tokens_per_second", 123, 0),
+    ]
 
 
 @pytest.mark.skipif(

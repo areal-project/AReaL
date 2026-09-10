@@ -396,8 +396,8 @@ Transformers 的 `Qwen3MoeTopKRouter` 和 `Qwen3_5MoeTopKRouter` 返回值契约
 padding；Megatron 使用 capacity/drop 之后的 routing map。因此负载总数可能与吞吐指标中的逻辑 tokens 不同。
 
 W&B 每个日志 step 收到一个 `moe_balance/expert_loads` Table，列为 `layer`、`expert`、
-`tokens`、`load_percent`。每层 `max_over_ideal` 保持标量，避免产生上万个专家标量序列。 其他标量日志后端保留
-`moe_balance/layer_<id>/expert_<id>/{tokens,load_percent}`；控制台 仅打印每层摘要。
+`tokens`、`load_percent`。每层 `max_over_ideal` 保持标量，避免产生上万个专家标量序列。 SwanLab 和 Trackio 保留
+`moe_balance/layer_<id>/expert_<id>/{tokens,load_percent}`；TensorBoard 和控制台仅输出每层摘要。
 
 建议用 [W&B Custom Charts](https://docs.wandb.ai/models/app/features/custom-charts) 制作以下面板：
 

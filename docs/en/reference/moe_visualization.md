@@ -47,7 +47,7 @@ field-mapping steps follow the
 [W&B tutorial](https://docs.wandb.ai/models/app/features/custom-charts/walkthrough).
 Enable **Other settings → Show step selector** to switch snapshots. This requires
 `historyTable`; `summaryTable` only reads the summary snapshot. See the
-[step selector documentation](https://docs.wandb.ai/support/models/articles/how-do-you-show-a-step-slider-in-a-custo).
+[step selector documentation](https://docs.wandb.ai/models/app/features/custom-charts#build-the-graphql-query).
 Use **Save as** to save a reusable preset and apply it to the panel.
 
 ## Vega specification

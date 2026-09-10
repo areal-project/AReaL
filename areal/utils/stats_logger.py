@@ -165,7 +165,7 @@ class StatsLogger:
             if getattr(self, "_trackio_enabled", False):
                 trackio.log(item, step=log_step + i)
             if self.summary_writer is not None:
-                for key, val in item.items():
+                for key, val in scalar_item.items():
                     self.summary_writer.add_scalar(f"{key}", val, log_step + i)
         self._last_commit_step = log_step + len(data) - 1
 

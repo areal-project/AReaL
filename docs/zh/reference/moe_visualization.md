@@ -39,7 +39,7 @@ experts，也不是每个 token 的 top-k。
 
 `load_multiple` 是图表内部计算的字段，不需要映射。 在 **Other settings** 中开启 **Show step
 selector**，通过滑块选择日志 step。 该选项需要 `historyTable`；`summaryTable` 只读取 summary 中的快照。
-参见[官方 step 滑块说明](https://docs.wandb.ai/support/models/articles/how-do-you-show-a-step-slider-in-a-custo)。
+参见[官方 step 滑块说明](https://docs.wandb.ai/models/app/features/custom-charts#build-the-graphql-query)。
 最后使用 **Save as** 保存 preset，再应用到面板。
 
 ## 可直接粘贴的 Vega 配置

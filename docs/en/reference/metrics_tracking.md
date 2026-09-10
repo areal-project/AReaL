@@ -438,9 +438,9 @@ map. Consequently routed counts can differ from logical throughput token counts.
 
 W&B receives one `moe_balance/expert_loads` Table per logged step with columns `layer`,
 `expert`, `tokens`, and `load_percent`. Per-layer `max_over_ideal` remains a scalar.
-This avoids thousands of individual W&B expert scalar series. Other scalar loggers
-retain `moe_balance/layer_<id>/expert_<id>/{tokens,load_percent}`. The console prints
-layer summaries without printing every expert.
+This avoids thousands of individual W&B expert scalar series. SwanLab and Trackio retain
+`moe_balance/layer_<id>/expert_<id>/{tokens,load_percent}`. TensorBoard and the console
+report layer summaries without individual expert scalar series.
 
 Recommended panels, built with
 [W&B custom charts](https://docs.wandb.ai/models/app/features/custom-charts):

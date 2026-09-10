@@ -39,6 +39,9 @@ class MoEMetrics:
         routers: Iterable[tuple[str, nn.Module]],
         extract_counts: Callable[[Any], torch.Tensor],
     ) -> None:
+        routers = list(routers)
+        if not routers:
+            return
         in_forward = False
 
         def enter(module: nn.Module, args: tuple[Any, ...]) -> None:
@@ -76,6 +79,8 @@ class MoEMetrics:
         model's hook. This keeps all metrics accumulation outside fullgraph code.
         """
         layers = list(layers)
+        if not layers:
+            return
 
         def record(module: nn.Module, args: tuple[Any, ...], output: Any) -> None:
             if self.active:
