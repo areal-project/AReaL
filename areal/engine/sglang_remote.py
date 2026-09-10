@@ -36,7 +36,7 @@ from areal.infra.platforms import current_platform
 from areal.infra.utils.launcher import TRITON_CACHE_PATH
 from areal.utils import perf_tracer, stats_tracker
 from areal.utils.logging import getLogger
-from areal.utils.network import format_host_for_url
+from areal.utils.network import find_free_ports, format_host_for_url
 
 logger = getLogger("SGLangRemote")
 
@@ -457,6 +457,15 @@ class SGLangBackend:
 
     def launch_server(self, server_args: dict[str, Any]) -> subprocess.Popen:
         """Launch SGLang server subprocess."""
+        if server_args.get("nccl_port") is None and not server_args.get(
+            "dist_init_addr"
+        ):
+            # SGLang's automatic port is in the OS ephemeral range and can be
+            # claimed by an outgoing connection before its TCPStore starts.
+            server_args["nccl_port"] = find_free_ports(
+                1,
+                exclude_ports={server_args["port"]} if "port" in server_args else None,
+            )[0]
         if server_args.get("enable_multimodal") and not server_args.get(
             "skip_tokenizer_init", False
         ):
