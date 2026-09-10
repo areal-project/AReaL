@@ -5,11 +5,198 @@ Distributed integration tests live in
 subprocesses and require GPUs.
 """
 
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
 import torch
+
+
+def test_vision_microbatch_preparation_is_lazy_and_reusable(monkeypatch):
+    from areal.engine import megatron_engine as module
+    from areal.engine.core.model import SequencePackingMode
+    from areal.engine.megatron_utils.packed_context_parallel import (
+        prepare_vision_microbatch,
+    )
+    from areal.utils.data import MicroBatchList, MicroBatchSpec
+
+    shared = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+    rows = []
+    for value in (shared, shared + 10):
+        rows.append(
+            {
+                "input_ids": torch.tensor([1, 2]),
+                "max_seqlen": 2,
+                "pixel_values": torch.full((20, 4), -1.0),
+                "image_grid_thw": torch.tensor([[1, 2, 2]]),
+                "multi_modal_input": [{"pixel_values": value}, {"pixel_values": value}],
+            }
+        )
+    original_images = [item for row in rows for item in row["multi_modal_input"]]
+    batch = {
+        "input_ids": torch.ones(2, 2),
+        "attention_mask": torch.ones(2, 2),
+        "multi_modal_input": original_images,
+    }
+    spec = MicroBatchSpec(max_tokens_per_mb=4)
+    mb_list = MicroBatchList(
+        data=batch,
+        mb_spec=spec,
+        mbs=rows,
+        group_lens=[2, 2],
+        padded_mbs=[dict(row) for row in rows],
+        padding_lengths=[0, 0],
+        padded_to_lengths=[2, 2],
+        old_cu_seqlens_list=[None, None],
+    )
+    engine = module.MegatronEngine.__new__(module.MegatronEngine)
+    engine.parallel_strategy = SimpleNamespace(
+        pipeline_parallel_size=1, context_parallel_size=1, tensor_parallel_size=1
+    )
+    engine.enable_tree_training = False
+    engine.enable_fp8 = False
+    engine.is_vision_model = True
+    engine.sequence_packing_mode = SequencePackingMode.MODEL_THD
+    engine.config = SimpleNamespace(mb_spec=spec, pad_to_maximum=False)
+    engine.logger = MagicMock()
+    monkeypatch.setattr(module.mpu, "get_data_parallel_group", lambda: None)
+    monkeypatch.setattr(
+        module, "split_padded_tensor_dict_into_mb_list", lambda *args, **kwargs: mb_list
+    )
+    monkeypatch.setattr(module, "pack_tensor_dict", lambda row: row)
+    monkeypatch.setattr(
+        module,
+        "prepare_microbatches_for_sequence_layout",
+        lambda value, **kwargs: value,
+    )
+    cat = MagicMock(wraps=torch.cat)
+    monkeypatch.setattr(torch, "cat", cat)
+
+    prepared = engine._prepare_mb_list(batch)
+
+    cat.assert_not_called()
+    assert "pixel_values" not in prepared.padded_mbs[0]
+    assert "multi_modal_input" not in prepared.mbs[0]
+    assert "pixel_values" not in prepared.mbs[0]
+    # A top-level-only grid is retained; only the overridden pixels are dropped.
+    assert prepared.padded_mbs[0]["image_grid_thw"] is rows[0]["image_grid_thw"]
+    source = next(iter(prepared))
+    assert source.padded_mb["multi_modal_input"][0]["pixel_values"] is shared
+    # Two VPP chunks can consume the same CPU source without popping its data.
+    for _ in range(2):
+        staged = prepare_vision_microbatch(source)
+        torch.testing.assert_close(
+            staged.padded_mb["pixel_values"], shared.repeat(2, 1), rtol=0, atol=0
+        )
+        assert "multi_modal_input" not in staged.padded_mb
+        assert "pixel_values" not in staged.orig_mb
+        device_mb = staged.to("meta")
+        assert device_mb.padded_mb["pixel_values"].device.type == "meta"
+        assert source.padded_mb["multi_modal_input"][0]["pixel_values"] is shared
+        assert shared.device.type == "cpu"
+    assert cat.call_count == 2
+    assert "multi_modal_input" in source.padded_mb
+    assert "pixel_values" not in source.padded_mb
+    assert "pixel_values" not in prepared.padded_mbs[1]
+    assert batch["multi_modal_input"] is original_images
+    assert original_images[0]["pixel_values"] is shared
+
+
+@pytest.mark.parametrize("is_vision_model", [False, True])
+@pytest.mark.parametrize("payload_kind", ["missing", "empty", "top_level"])
+def test_text_forward_keeps_original_microbatch_staging(
+    monkeypatch, is_vision_model, payload_kind
+):
+    """Ordinary text and empty-image VLM input never enter lazy vision assembly."""
+    from areal.engine import megatron_engine as module
+    from areal.utils.data import MicroBatchItem, MicroBatchList, MicroBatchSpec
+
+    row = {
+        "input_ids": torch.tensor([1, 2]),
+        "max_seqlen": 2,
+        "cu_seqlens": torch.tensor([0, 2], dtype=torch.int32),
+    }
+    if payload_kind == "empty":
+        row["multi_modal_input"] = [{}, {"pixel_values": torch.empty(0)}]
+    elif payload_kind == "top_level":
+        row["pixel_values"] = torch.ones(2, 4)
+    batch = MicroBatchList(
+        data={},
+        mb_spec=MicroBatchSpec(),
+        mbs=[row],
+        padded_mbs=[dict(row)],
+        group_lens=[2],
+        padding_lengths=[0],
+        padded_to_lengths=[2],
+    )
+    engine = module.MegatronEngine.__new__(module.MegatronEngine)
+    engine._ensure_ready = lambda: None
+    engine.is_vision_model = is_vision_model
+    engine.enable_tree_training = False
+    engine.device = "cpu"
+    engine.model = [object()]
+    staged = []
+
+    class StagingReached(Exception):
+        pass
+
+    def to(source, *args, **kwargs):
+        staged.append(source)
+        raise StagingReached
+
+    def schedule(**kwargs):
+        kwargs["forward_step_func"](kwargs["data_iterator"], kwargs["model"])
+
+    monkeypatch.setattr(module, "get_forward_backward_func", lambda: schedule)
+    monkeypatch.setattr(MicroBatchItem, "to", to)
+    lazy = MagicMock(side_effect=AssertionError("text path entered vision preparation"))
+    monkeypatch.setattr(module, "prepare_vision_microbatch", lazy)
+
+    with pytest.raises(StagingReached):
+        engine.forward_backward_batch(batch, lambda *args: None, forward_only=True)
+
+    lazy.assert_not_called()
+    assert staged[0].orig_mb is row
+    assert staged[0].padded_mb is batch.padded_mbs[0]
+
+
+@pytest.mark.parametrize("with_text_row", [False, True])
+def test_lazy_vision_matches_eager_preparation_and_retains_source(with_text_row):
+    """Keep image/video ordering and CP sequence metadata across repeat consumers."""
+    from areal.engine.megatron_utils.packed_context_parallel import (
+        extract_vision_from_multi_modal,
+        prepare_vision_microbatch,
+    )
+    from areal.utils.data import MicroBatchItem
+
+    images = [
+        {"pixel_values": torch.ones(2, 4), "image_grid_thw": torch.tensor([[1, 1, 2]])},
+        {
+            "pixel_values": torch.full((3, 4), 2.0),
+            "video_grid_thw": torch.tensor([[3, 1, 1]]),
+        },
+    ]
+    if with_text_row:
+        images.insert(1, {})
+    padded = {
+        "input_ids": torch.arange(8),
+        "multi_modal_input": images,
+        "cu_seqlens": torch.tensor([0, 4, 8], dtype=torch.int32),
+        "max_seqlen": 4,
+    }
+    source = MicroBatchItem({"loss_mask": torch.ones(8)}, padded, 0, None, 8)
+    eager_orig, eager_padded = dict(source.orig_mb), dict(source.padded_mb)
+    extract_vision_from_multi_modal(eager_orig, eager_padded)
+    for _ in range(2):
+        result = prepare_vision_microbatch(source)
+        assert result.orig_mb.keys() == eager_orig.keys()
+        assert result.padded_mb.keys() == eager_padded.keys()
+        for key, value in eager_padded.items():
+            if torch.is_tensor(value):
+                torch.testing.assert_close(result.padded_mb[key], value, rtol=0, atol=0)
+        assert result.padded_mb["cu_seqlens"] is padded["cu_seqlens"]
+        assert source.padded_mb["multi_modal_input"] is images
 
 
 class TestUnwrapToGptModel:
