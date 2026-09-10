@@ -47,6 +47,7 @@ class DPOEngine:
         self.engine = engine
         self.beta = engine.config.beta
         self.loss_type = engine.config.loss_type
+        self.simpo_gamma = getattr(engine.config, "simpo_gamma", 0.5)
 
     @trace_perf("dpo_engine.train_dpo", category="compute")
     @stats_tracker.scope_func_wrapper("dpo")
@@ -59,7 +60,10 @@ class DPOEngine:
         stats = self.engine.train_batch(
             input_=data,
             loss_fn=functools.partial(
-                compute_dpo_loss, beta=self.beta, loss_type=self.loss_type
+                compute_dpo_loss,
+                beta=self.beta,
+                loss_type=self.loss_type,
+                simpo_gamma=self.simpo_gamma,
             ),
             loss_weight_fn=_dpo_loss_weight,
         )
@@ -76,7 +80,10 @@ class DPOEngine:
         self.engine.eval_batch(
             input_=data,
             loss_fn=functools.partial(
-                compute_dpo_loss, beta=self.beta, loss_type=self.loss_type
+                compute_dpo_loss,
+                beta=self.beta,
+                loss_type=self.loss_type,
+                simpo_gamma=self.simpo_gamma,
             ),
             loss_weight_fn=_dpo_loss_weight,
         )
@@ -155,6 +162,7 @@ def compute_dpo_loss(
     *,
     beta: float,
     loss_type: str = "sigmoid",
+    simpo_gamma: float = 0.5,
     vocab_min_logits: torch.Tensor | None = None,
     vocab_max_logits: torch.Tensor | None = None,
     vocab_mean_logits: torch.Tensor | None = None,
@@ -174,7 +182,13 @@ def compute_dpo_loss(
         logprobs, ref_logprobs, cu_seqlens, loss_mask, valid_pairs
     )
 
-    if loss_type == "ipo":
+    if loss_type == "simpo":
+        # SimPO (Meng et al. 2024): length-normalized policy log-probabilities
+        # with reference-free target reward margin gamma.
+        chosen_avg = policy_logps[:, 0] / completion_lens[:, 0].clamp(min=1)
+        rejected_avg = policy_logps[:, 1] / completion_lens[:, 1].clamp(min=1)
+        logits = chosen_avg - rejected_avg
+    elif loss_type == "ipo":
         # IPO (Azar et al. 2023): normalize per-sequence logratios by
         # completion length (per-token average) before computing the squared
         # loss. This matches trl's author-confirmed convention so that beta
@@ -191,11 +205,21 @@ def compute_dpo_loss(
             ref_logps[:, 0] - ref_logps[:, 1]
         )
 
-    per_pair_loss = dpo_preference_loss(logits, beta=beta, loss_type=loss_type)
+    per_pair_loss = dpo_preference_loss(
+        logits, beta=beta, loss_type=loss_type, simpo_gamma=simpo_gamma
+    )
 
     with torch.no_grad():
-        chosen_rewards = beta * (policy_logps[:, 0] - ref_logps[:, 0]).float()
-        rejected_rewards = beta * (policy_logps[:, 1] - ref_logps[:, 1]).float()
+        if loss_type == "simpo":
+            chosen_rewards = (
+                beta * policy_logps[:, 0] / completion_lens[:, 0].clamp(min=1)
+            ).float()
+            rejected_rewards = (
+                beta * policy_logps[:, 1] / completion_lens[:, 1].clamp(min=1)
+            ).float()
+        else:
+            chosen_rewards = beta * (policy_logps[:, 0] - ref_logps[:, 0]).float()
+            rejected_rewards = beta * (policy_logps[:, 1] - ref_logps[:, 1]).float()
         stats_tracker.denominator(
             n_pairs=torch.ones(
                 chosen_rewards.shape[0], dtype=torch.bool, device=device
