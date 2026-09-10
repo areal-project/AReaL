@@ -6,6 +6,7 @@ import subprocess
 from types import SimpleNamespace
 
 import pytest
+from omegaconf import OmegaConf
 
 pytestmark = pytest.mark.skipif(
     importlib.util.find_spec("ray") is None,
@@ -136,3 +137,39 @@ def test_head_bootstrap_failure_is_cleaned_up_by_main(monkeypatch):
         ray_launcher.main()
 
     assert stop_calls == [True, True]
+
+
+@pytest.mark.parametrize("ray_port", [0, -1, 65536, True])
+def test_cluster_spec_config_rejects_invalid_ray_port(ray_port):
+    """The public cluster config requires a fixed valid Ray head port."""
+    from areal.api.cli_args import ClusterSpecConfig
+
+    with pytest.raises(ValueError, match="cluster.ray_port"):
+        ClusterSpecConfig(ray_port=ray_port)
+
+
+def test_ray_launcher_main_rejects_dynamic_ray_port(monkeypatch):
+    """CLI/YAML configuration rejects port zero before changing Ray state."""
+    import areal.infra.launcher.ray as ray_launcher
+
+    config = SimpleNamespace(
+        cluster=OmegaConf.create(
+            {
+                "n_nodes": 2,
+                "n_gpus_per_node": 8,
+                "ray_port": 0,
+            }
+        )
+    )
+    stop_calls = []
+    monkeypatch.setattr(ray_launcher, "parse_cli_args", lambda args: (config, None))
+    monkeypatch.setattr(
+        ray_launcher,
+        "stop_local_ray",
+        lambda: stop_calls.append(True),
+    )
+
+    with pytest.raises(ValueError, match="cluster.ray_port"):
+        ray_launcher.main()
+
+    assert stop_calls == []

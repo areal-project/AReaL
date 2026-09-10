@@ -3130,7 +3130,8 @@ class ClusterSpecConfig:
         metadata={
             "help": "Port of the Ray head (GCS). Used by the in-package Ray "
             "bootstrap of the Ray launcher when assembling a multi-node "
-            "cluster inside a platform job."
+            "cluster inside a platform job. Must be between 1 and 65535; "
+            "dynamic port selection with 0 is not supported."
         },
     )
     ray_dashboard_port: int = field(
@@ -3144,6 +3145,22 @@ class ClusterSpecConfig:
             "cluster.n_nodes nodes to join before failing."
         },
     )
+
+    @staticmethod
+    def validate_ray_port(ray_port: int) -> None:
+        if (
+            not isinstance(ray_port, int)
+            or isinstance(ray_port, bool)
+            or not 1 <= ray_port <= 65535
+        ):
+            raise ValueError(
+                "cluster.ray_port must be an integer between 1 and 65535; "
+                "0 is unsupported because workers cannot discover a "
+                f"dynamically selected Ray head port. Got {ray_port!r}."
+            )
+
+    def __post_init__(self) -> None:
+        self.validate_ray_port(self.ray_port)
 
 
 @dataclass

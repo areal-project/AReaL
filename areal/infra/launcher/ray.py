@@ -627,6 +627,10 @@ class RayLauncher:
 def main():
     config, _ = parse_cli_args(sys.argv[1:])
     config.cluster = to_structured_cfg(config.cluster, ClusterSpecConfig)
+    # `to_structured_cfg` returns a DictConfig, so merged CLI/YAML values do
+    # not invoke ClusterSpecConfig.__post_init__. Validate the runtime value
+    # explicitly before any local Ray processes are stopped or started.
+    ClusterSpecConfig.validate_ray_port(config.cluster.ray_port)
     n_nodes = config.cluster.n_nodes
     n_gpus_per_node = config.cluster.n_gpus_per_node
 
