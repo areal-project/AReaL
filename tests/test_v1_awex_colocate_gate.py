@@ -79,7 +79,7 @@ class TestQwen2WeightUpdateGuard:
     )
     @pytest.mark.parametrize(
         "version,mode",
-        [("v1", "awex"), ("v2", "awex"), ("v2", "xccl"), ("v2", "disk")],
+        [("v1", "awex"), ("v2", "awex"), ("v2", "xccl")],
     )
     def test_qwen2_rejects_unsupported_weight_update(
         self, monkeypatch, model_config, version, mode
@@ -90,15 +90,19 @@ class TestQwen2WeightUpdateGuard:
         load_config = Mock(return_value=(model_config, {}))
         monkeypatch.setattr(PretrainedConfig, "get_config_dict", load_config)
 
-        with pytest.raises(ValueError, match="actor.weight_update_mode=xccl or disk"):
+        with pytest.raises(
+            ValueError, match="actor.weight_update_mode=disk with v1 or v2"
+        ):
             trainer._validate_weight_update_model()
 
         load_config.assert_called_once_with("renamed-checkpoint")
 
-    @pytest.mark.parametrize("mode", ["xccl", "disk"])
-    def test_v1_xccl_and_disk_do_not_load_model_config(self, monkeypatch, mode):
+    @pytest.mark.parametrize(
+        "version,mode", [("v1", "xccl"), ("v1", "disk"), ("v2", "disk")]
+    )
+    def test_supported_modes_do_not_load_model_config(self, monkeypatch, version, mode):
         trainer = object.__new__(PPOTrainer)
-        trainer.config = _config("v1", mode, colocated=False)
+        trainer.config = _config(version, mode, colocated=False)
         load_config = Mock(side_effect=AssertionError("must not load model config"))
         monkeypatch.setattr(PretrainedConfig, "get_config_dict", load_config)
 

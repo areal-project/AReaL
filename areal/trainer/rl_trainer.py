@@ -1743,9 +1743,11 @@ class PPOTrainer:
             current_platform.synchronize()
 
     def _validate_weight_update_model(self) -> None:
-        """Restrict Qwen2/Qwen2.5 text-model weight updates to v1 XCCL/disk."""
+        """Allow Qwen2/Qwen2.5 text-model weight updates via disk or v1 XCCL."""
         actor = self.config.actor
-        if actor._version == "v1" and actor.weight_update_mode in ("xccl", "disk"):
+        if actor.weight_update_mode == "disk" or (
+            actor._version == "v1" and actor.weight_update_mode == "xccl"
+        ):
             return
 
         from transformers import PretrainedConfig
@@ -1758,9 +1760,9 @@ class PPOTrainer:
         ):
             raise ValueError(
                 "Qwen2/Qwen2.5 text models do not support AWEX weight updates. "
-                "For RL, set actor._version=v1, rollout._version=v1, and "
-                "actor.weight_update_mode=xccl or disk. Controller v2 is not "
-                "supported for these models' RL weight updates."
+                "For RL, set actor.weight_update_mode=disk with v1 or v2, "
+                "or use actor.weight_update_mode=xccl with actor._version=v1 "
+                "and rollout._version=v1."
             )
 
     def _validate_cfg(self):
