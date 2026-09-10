@@ -3440,18 +3440,31 @@ class DPOEngineConfig(TrainEngineConfig):
         metadata={
             "help": "DPO loss variant. "
             "'sigmoid': original DPO loss (Rafailov et al. 2023). "
-            "'ipo': Identity Preference Optimization with per-token length normalization (Azar et al. 2023).",
-            "choices": ["sigmoid", "ipo"],
+            "'ipo': Identity Preference Optimization with per-token length normalization (Azar et al. 2023). "
+            "'simpo': Simple Preference Optimization with reference-free length normalization and target margin (Meng et al. 2024).",
+            "choices": ["sigmoid", "ipo", "simpo"],
+        },
+    )
+
+    simpo_gamma: float = field(
+        default=0.5,
+        metadata={
+            "help": "Target reward margin for SimPO loss (Meng et al. 2024). "
+            "Only used when loss_type='simpo'."
         },
     )
 
     def __post_init__(self):
         super().__post_init__()
-        _valid = {"sigmoid", "ipo"}
+        _valid = {"sigmoid", "ipo", "simpo"}
         if self.loss_type not in _valid:
             raise ValueError(
                 f"Unsupported DPO loss_type '{self.loss_type}'. "
                 f"Must be one of {sorted(_valid)}."
+            )
+        if self.simpo_gamma < 0:
+            raise ValueError(
+                f"simpo_gamma must be non-negative, got {self.simpo_gamma}"
             )
 
 
