@@ -336,10 +336,15 @@ updates). Tokens are the sum of the original attention masks: prompt and respons
 count, masked padding does not. Counts are summed across data-parallel replicas only;
 TP, CP/SP, PP and EP do not multiply the logical batch size.
 
-Timing uses synchronized wall time around batch preparation, forward, backward and
-optimizer work, starting before gradient zeroing. Rollout, reference/evaluation
-forwards, loading the next batch, checkpointing and statistics export are excluded. The
-denominator is the maximum accumulated training time across training ranks.
+Timing spans batch preparation, forward, backward and optimizer work, starting before
+gradient zeroing. CUDA/ROCm uses events on the captured training stream and waits once
+per device at statistics export, without adding per-batch synchronization. This measures
+stream elapsed time, including stream waits and host submission gaps after the start
+event executes; side-stream work not joined before the end event is excluded. It is not
+a device-wide synchronized wall-time measurement. CPU/NPU retain synchronized wall
+timing. Rollout, reference/evaluation forwards, loading the next batch, checkpointing
+and statistics export are excluded. The denominator is the maximum accumulated training
+time across training ranks.
 
 | Metric                                                | Meaning                                                 |
 | ----------------------------------------------------- | ------------------------------------------------------- |

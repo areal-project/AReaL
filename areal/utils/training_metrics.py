@@ -17,20 +17,39 @@ from areal.utils.flops import FlopsEstimator
 class TrainingMetrics:
     def __init__(self, estimator: FlopsEstimator | None) -> None:
         self.estimator = estimator
-        self._pending: list[tuple[torch.Tensor, float]] = []
+        self._pending: list[
+            tuple[torch.Tensor, float | tuple[torch.cuda.Event, torch.cuda.Event]]
+        ] = []
         self._totals = [0.0, 0.0, 0.0]
 
     @contextmanager
     def measure(
-        self, batch: dict[str, Any], synchronize: Callable[[], None]
+        self,
+        batch: dict[str, Any],
+        synchronize: Callable[[], None],
+        *,
+        device: torch.device | None = None,
     ) -> Iterator[None]:
         # Keep lengths on their existing device; transfer once at export.
         lengths = batch["attention_mask"].detach().bool().sum(dim=-1)
-        synchronize()
-        start = time.perf_counter()
-        yield
-        synchronize()
-        self._pending.append((lengths, time.perf_counter() - start))
+        device = lengths.device if device is None else device
+        if device.type == "cuda":
+            # Input masks can still be on CPU before microbatch preparation.
+            # Capture the training stream so both timestamps use the same stream.
+            stream = torch.cuda.current_stream(device)
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+            start_event.record(stream)
+            yield
+            end_event.record(stream)
+            self._pending.append((lengths, (start_event, end_event)))
+        else:
+            # Retain synchronized wall timing for backends without CUDA events.
+            synchronize()
+            start = time.perf_counter()
+            yield
+            synchronize()
+            self._pending.append((lengths, time.perf_counter() - start))
 
     def export(
         self,
@@ -43,7 +62,19 @@ class TrainingMetrics:
         timing_group is an explicit CPU group containing all training ranks.
         Empty intervals (e.g. evaluation-only exports) produce no metrics.
         """
-        elapsed = sum(t for _, t in self._pending)
+        # Wait once per device at export, covering events on all training streams.
+        # Event intervals still exclude side-stream work not joined by their stream.
+        devices = {
+            timing[1].device for _, timing in self._pending if isinstance(timing, tuple)
+        }
+        for device in devices:
+            torch.cuda.synchronize(device)
+        elapsed = sum(
+            timing[0].elapsed_time(timing[1]) / 1000
+            if isinstance(timing, tuple)
+            else timing
+            for _, timing in self._pending
+        )
         lengths = [n for lens, _ in self._pending for n in lens.cpu().tolist()]
         tokens = sum(lengths)
         flops = sum(self.estimator(n) for n in lengths) if self.estimator else 0.0
@@ -107,7 +138,9 @@ def record_training_batch(
         engine._training_metrics = TrainingMetrics(estimator)
     moe = getattr(engine, "_moe_metrics", None)
     with (
-        engine._training_metrics.measure(batch, current_platform.synchronize),
+        engine._training_metrics.measure(
+            batch, current_platform.synchronize, device=engine.device
+        ),
         moe.measure() if moe is not None else nullcontext(),
     ):
         yield

@@ -322,7 +322,9 @@ Archon、Megatron 和 FSDP 在 `train_perf` scope 上报训练指标。每个统
 调用，包括 PPO 中重复执行的更新。tokens 为原始 `attention_mask` 的有效 token 数，包含 prompt 和 response，不包含
 padding；只沿 DP 维度求和，不重复乘以 TP、CP/SP、PP 或 EP。
 
-耗时为设备同步后的训练 wall time，从梯度清零前开始，包含微批准备、前向、反向和 optimizer 工作；不包含
+计时从梯度清零前开始，覆盖微批准备、前向、反向和 optimizer 工作。CUDA/ROCm 在进入计时区间时捕获训练流， 使用该流上的 events
+记录区间，仅在统计导出时对每个设备同步一次，不额外插入批次级同步。 该时间包含流上的等待及起始 event 执行后的主机提交间隙，但不包含结束 event
+前未汇合的其他流异步工作， 因此不是设备全局同步后的 wall time。CPU/NPU 保留同步 wall time 计时。不包含
 rollout、参考模型/评估前向、读取下一批数据、存盘和统计导出。 分母取所有训练 rank 的累计训练耗时最大值。
 
 | 指标                                                  | 含义                                  |

@@ -112,6 +112,94 @@ def test_training_metrics_interval_and_cumulative_are_ratios_of_sums(monkeypatch
     assert result["train_perf/cumulative_tokens_per_second"] == 15 / 8
 
 
+@pytest.mark.parametrize("fail", [False, True])
+def test_training_metrics_cuda_events_defer_sync_and_ignore_failed_batches(
+    monkeypatch, fail
+):
+    """CPU masks use engine-device events; export waits once for all batches."""
+    events = []
+    waits = []
+    device = torch.device("cuda:0")
+    stream = object()
+    current_stream = [stream]
+
+    class Event:
+        def __init__(self, *, enable_timing):
+            assert enable_timing
+            self.device = device
+            self.index = len(events)
+            events.append(self)
+
+        def record(self, recorded_stream):
+            assert recorded_stream is stream
+
+        def elapsed_time(self, end):
+            assert waits == [device]
+            assert end.index == self.index + 1
+            return 2000.0 if self.index == 0 else 4000.0
+
+    monkeypatch.setattr(torch.cuda, "Event", Event)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda device: current_stream[0])
+    monkeypatch.setattr(torch.cuda, "synchronize", waits.append)
+    metrics = TrainingMetrics(lambda n: n * n)
+    batch = {"attention_mask": torch.tensor([[1, 1, 0], [1, 1, 1]])}
+
+    def unexpected_sync():
+        pytest.fail("Per-batch synchronization must not run for CUDA")
+
+    if fail:
+        with pytest.raises(RuntimeError, match="training failed"):
+            with metrics.measure(batch, unexpected_sync, device=device):
+                raise RuntimeError("training failed")
+        assert metrics.export(dp_group=None, timing_group=None) == {}
+        assert waits == []
+    else:
+        for _ in range(2):
+            current_stream[0] = stream
+            with metrics.measure(batch, unexpected_sync, device=device):
+                current_stream[0] = object()  # End event must use the entry stream.
+            assert waits == []
+        result = metrics.export(dp_group=None, timing_group=None)
+        assert waits == [device]
+        assert result["train_perf/seconds"] == 6
+        assert result["train_perf/tokens_per_second"] == pytest.approx(10 / 6)
+        assert result["train_perf/estimated_flops_per_second"] == pytest.approx(26 / 6)
+        assert metrics.export(dp_group=None, timing_group=None) == {}
+        assert waits == [device]
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="CUDA required for timing events"
+)
+def test_training_metrics_real_cuda_events_measure_cpu_input_batch(monkeypatch):
+    """Resolve real CUDA timestamps only after the export-time device wait."""
+    metrics = TrainingMetrics(None)
+    device = torch.device("cuda", torch.cuda.current_device())
+    batch = {"attention_mask": torch.ones((1, 4), dtype=torch.int64, device="cpu")}
+    x = torch.randn((256, 256), dtype=torch.float32, device=device)
+    waits = []
+    synchronize = torch.cuda.synchronize
+
+    def wait(device):
+        waits.append(device)
+        synchronize(device)
+
+    monkeypatch.setattr(torch.cuda, "synchronize", wait)
+    for _ in range(2):
+        with metrics.measure(
+            batch, lambda: pytest.fail("Batch synchronization"), device=device
+        ):
+            x = x @ x
+    assert waits == []
+    intervals = [timing for _, timing in metrics._pending]
+    result = metrics.export(dp_group=None, timing_group=None)
+    assert waits == [device]
+    expected = sum(start.elapsed_time(end) / 1000 for start, end in intervals)
+    assert result["train_perf/seconds"] == pytest.approx(expected)
+    assert result["train_perf/seconds"] > 0
+    assert result["train_perf/tokens"] == 8
+
+
 def test_training_metrics_unknown_model_omits_flops():
     """Unsupported architectures still provide token throughput."""
     metrics = TrainingMetrics(None)
