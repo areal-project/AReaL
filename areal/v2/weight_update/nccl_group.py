@@ -2,6 +2,7 @@
 """NCCL process group initialization utilities for weight updates."""
 
 import os
+from datetime import timedelta
 
 import torch
 import torch.distributed as dist
@@ -92,6 +93,7 @@ def init_weights_update_group(
     group_name,
     backend="nccl",
     role="",
+    timeout_s: float | None = None,
 ):
     """Initialize the Torch process group for model parameter updates."""
     assert torch.distributed.is_initialized(), (
@@ -108,6 +110,9 @@ def init_weights_update_group(
         f"Local rank env {os.environ.get('LOCAL_RANK')} DEVICE env {os.environ.get('DEVICE')} "
         f"Global rank env {os.environ.get('RANK')}"
     )
+
+    if timeout_s is not None and timeout_s <= 0:
+        raise TimeoutError("Process-group initialization deadline exceeded")
 
     try:
         options = None
@@ -128,6 +133,7 @@ def init_weights_update_group(
             rank=rank,
             group_name=group_name,
             pg_options=options,
+            timeout=(timedelta(seconds=timeout_s) if timeout_s is not None else None),
         )
         logger.info(f"Initialized custom process group: {group}")
         return group

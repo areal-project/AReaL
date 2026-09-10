@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
-from unittest.mock import MagicMock
+import subprocess
+from unittest.mock import MagicMock, patch
 
 import httpx
 import pytest
@@ -12,6 +13,7 @@ from areal.v2.weight_update.controller.config import (
 )
 from areal.v2.weight_update.controller.controller import (
     WeightUpdateController,
+    WeightUpdateError,
 )
 from areal.v2.weight_update.gateway.config import WeightUpdateResult
 
@@ -69,12 +71,13 @@ class TestConnect:
         train_urls = ["http://train1:8000", "http://train2:8000"]
         infer_urls = ["http://infer1:8000"]
 
-        ctrl.connect("pair0", train_urls, infer_urls)
+        ctrl.connect("pair0", train_urls, infer_urls, operation_id="op-1")
 
         ctrl._session.post.assert_called_once_with(
             f"{GATEWAY_URL}/connect",
             json={
                 "pair_name": "pair0",
+                "operation_id": "op-1",
                 "train_worker_urls": train_urls,
                 "inference_worker_urls": infer_urls,
                 "mode": "awex",
@@ -85,6 +88,8 @@ class TestConnect:
                 "colocate": False,
                 "nccl_master_addr": "",
                 "nccl_master_port": 0,
+                "setup_timeout_s": None,
+                "rollback_timeout_s": 30.0,
             },
             timeout=10.0,
         )
@@ -102,12 +107,14 @@ class TestConnect:
             save_path="/shared/weights",
             use_lora=True,
             lora_name="my-lora",
+            operation_id="op-1",
         )
 
         ctrl._session.post.assert_called_once_with(
             f"{GATEWAY_URL}/connect",
             json={
                 "pair_name": "pair0",
+                "operation_id": "op-1",
                 "train_worker_urls": train_urls,
                 "inference_worker_urls": infer_urls,
                 "mode": "disk",
@@ -118,6 +125,8 @@ class TestConnect:
                 "colocate": False,
                 "nccl_master_addr": "",
                 "nccl_master_port": 0,
+                "setup_timeout_s": None,
+                "rollback_timeout_s": 30.0,
             },
             timeout=10.0,
         )
@@ -144,6 +153,25 @@ class TestUpdateWeights:
             timeout=10.0,
         )
 
+    @pytest.mark.parametrize("may_be_mutated", [True, False])
+    def test_update_weights_raises_on_error_status(self, ctrl, may_be_mutated):
+        ctrl._pair_name = "pair0"
+        ctrl._session.post.return_value = _mock_response(
+            200,
+            {
+                "status": "error",
+                "version": 5,
+                "duration_ms": 12.0,
+                "error": "collective failed",
+                "inference_weights_may_be_mutated": may_be_mutated,
+            },
+        )
+
+        with pytest.raises(WeightUpdateError, match="collective failed") as exc_info:
+            ctrl.update_weights(version=5)
+
+        assert exc_info.value.inference_weights_may_be_mutated is may_be_mutated
+
     def test_update_weights_raises_when_not_connected(self, ctrl):
         with pytest.raises(RuntimeError, match="Not connected"):
             ctrl.update_weights(version=1)
@@ -152,6 +180,7 @@ class TestUpdateWeights:
 class TestDisconnect:
     def test_disconnect_clears_state(self, ctrl):
         ctrl._pair_name = "pair0"
+        ctrl._operation_id = "op-1"
         ctrl._session.post.return_value = _mock_response(
             200, {"status": "ok", "pair_name": "pair0"}
         )
@@ -161,13 +190,27 @@ class TestDisconnect:
         assert ctrl._pair_name is None
         ctrl._session.post.assert_called_once_with(
             f"{GATEWAY_URL}/disconnect",
-            json={"pair_name": "pair0"},
+            json={
+                "pair_name": "pair0",
+                "operation_id": "op-1",
+                "timeout_s": None,
+            },
             timeout=10.0,
         )
 
     def test_disconnect_noop_when_not_connected(self, ctrl):
         ctrl.disconnect()
         assert ctrl._pair_name is None
+
+    def test_disconnect_failure_preserves_pending_identity_and_endpoints(self, ctrl):
+        ctrl._session.post.return_value = _mock_response(500, {"error": "busy"})
+
+        with pytest.raises(requests.HTTPError):
+            ctrl.connect("pair0", ["http://train"], ["http://infer"])
+
+        assert ctrl.pair_name == "pair0"
+        assert ctrl.train_worker_urls == ["http://train"]
+        assert ctrl.inference_worker_urls == ["http://infer"]
 
 
 class TestLifecycle:
@@ -195,3 +238,56 @@ class TestLifecycle:
 
         with pytest.raises(requests.HTTPError):
             ctrl.update_weights(version=1)
+
+
+class TestDestroy:
+    def test_disconnect_failure_preserves_private_gateway_for_retry(self, ctrl):
+        ctrl.retain_pending_connection(
+            "pair0", "op-1", ["http://train"], ["http://infer"]
+        )
+        ctrl._gateway_proc = MagicMock(spec=subprocess.Popen)
+        session = ctrl._session
+        process = ctrl._gateway_proc
+        ctrl._session.post.side_effect = [
+            _mock_response(500, {"error": "busy"}),
+            _mock_response(200, {"status": "ok", "pair_name": "pair0"}),
+        ]
+
+        with patch.object(ctrl, "terminate_private_gateway") as terminate:
+            ctrl.destroy(timeout=1.0)
+
+            terminate.assert_not_called()
+            assert ctrl.pair_name == "pair0"
+            assert ctrl.operation_id == "op-1"
+            assert ctrl._session is session
+            assert ctrl._gateway_proc is process
+
+            ctrl.destroy(timeout=1.0)
+
+        terminate.assert_called_once()
+        assert ctrl.pair_name is None
+
+    def test_initialize_failure_terminates_without_disconnect(self):
+        ctrl = WeightUpdateController(
+            WeightUpdateControllerConfig(port=7080, setup_timeout=30.0)
+        )
+        gateway_process = MagicMock(spec=subprocess.Popen)
+
+        with (
+            patch(
+                "areal.v2.weight_update.controller.controller.subprocess.Popen",
+                return_value=gateway_process,
+            ),
+            patch.object(
+                ctrl,
+                "_wait_for_health",
+                side_effect=TimeoutError("gateway health timeout"),
+            ),
+            patch.object(ctrl, "disconnect") as disconnect,
+            patch.object(ctrl, "terminate_private_gateway") as terminate,
+            pytest.raises(TimeoutError, match="gateway health timeout"),
+        ):
+            ctrl.initialize(timeout=0.25)
+
+        disconnect.assert_not_called()
+        terminate.assert_called_once_with(timeout=0.25, raise_on_error=False)

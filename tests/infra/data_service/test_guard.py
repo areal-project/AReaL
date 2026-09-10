@@ -77,6 +77,51 @@ def test_alloc_ports_success(mock_find, client, state: GuardState):
 
 
 @patch("areal.infra.rpc.guard.app.find_free_ports")
+def test_token_port_reservation_is_idempotent_and_releasable(
+    mock_find, client, state: GuardState
+):
+    mock_find.return_value = [9003]
+    payload = {"count": 1, "token": "pair-operation-token"}
+
+    first = client.post("/alloc_ports", json=payload)
+    repeated = client.post("/alloc_ports", json=payload)
+    conflict = client.post(
+        "/alloc_ports", json={"count": 2, "token": "pair-operation-token"}
+    )
+    released = client.post("/release_ports", json={"token": "pair-operation-token"})
+    released_again = client.post(
+        "/release_ports", json={"token": "pair-operation-token"}
+    )
+
+    assert first.get_json()["ports"] == repeated.get_json()["ports"] == [9003]
+    assert conflict.status_code == 409
+    assert released.get_json()["ports"] == [9003]
+    assert released_again.get_json()["ports"] == []
+    assert state.token_ports == {}
+    assert 9003 not in state.allocated_ports
+    mock_find.assert_called_once()
+
+
+@patch("areal.infra.rpc.guard.app.find_free_ports")
+def test_released_token_rejects_late_alloc(mock_find, client, state: GuardState):
+    token = "released-before-alloc"
+
+    released = client.post("/release_ports", json={"token": token})
+    late_alloc = client.post("/alloc_ports", json={"count": 1, "token": token})
+
+    assert released.status_code == 200
+    assert released.get_json()["ports"] == []
+    assert late_alloc.status_code == 410
+    assert token in state.released_port_tokens
+    assert token not in state.token_ports
+    assert not state.allocated_ports
+    mock_find.assert_not_called()
+
+    cleanup_forked_children(state)
+    assert not state.released_port_tokens
+
+
+@patch("areal.infra.rpc.guard.app.find_free_ports")
 def test_owned_ports_release_after_failed_fork(mock_find, client, state: GuardState):
     mock_find.return_value = [9010]
     alloc = client.post(

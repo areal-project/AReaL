@@ -75,6 +75,8 @@ class GuardState:
         # Port tracking (thread-safe)
         self.allocated_ports: set[int] = set()
         self.owned_ports: dict[tuple[str, int], set[int]] = {}
+        self.token_ports: dict[str, tuple[tuple[int, tuple[int, ...]], set[int]]] = {}
+        self.released_port_tokens: set[str] = set()
         self.port_lock_files: dict[int, Any] = {}
         self.allocated_ports_lock = Lock()
 
@@ -153,6 +155,8 @@ def cleanup_forked_children(state: GuardState) -> None:
         state.port_lock_files.clear()
         state.allocated_ports.clear()
         state.owned_ports.clear()
+        state.token_ports.clear()
+        state.released_port_tokens.clear()
     for lock_file in lock_files:
         lock_file.close()
 
@@ -161,6 +165,22 @@ def _release_owned_ports(state: GuardState, key: tuple[str, int]) -> list[int]:
     """Release one fork owner's reserved ports. Caller need not hold a lock."""
     with state.allocated_ports_lock:
         ports = state.owned_ports.pop(key, set())
+        state.allocated_ports.difference_update(ports)
+        lock_files = [state.port_lock_files.pop(port, None) for port in ports]
+    for lock_file in lock_files:
+        if lock_file is not None:
+            lock_file.close()
+    return sorted(ports)
+
+
+def _release_token_ports(state: GuardState, token: str) -> list[int]:
+    """Idempotently release one client-token port reservation."""
+    with state.allocated_ports_lock:
+        # Retain a tombstone so a delayed alloc request cannot recreate a
+        # reservation after cleanup has already observed a successful release.
+        state.released_port_tokens.add(token)
+        reservation = state.token_ports.pop(token, None)
+        ports = set() if reservation is None else reservation[1]
         state.allocated_ports.difference_update(ports)
         lock_files = [state.port_lock_files.pop(port, None) for port in ports]
     for lock_file in lock_files:
@@ -292,6 +312,13 @@ def create_app(state: GuardState) -> Flask:
 
             role = data.get("role")
             worker_index = data.get("worker_index")
+            token = data.get("token")
+            if token is not None and (not isinstance(token, str) or not token):
+                return jsonify({"error": "'token' must be a non-empty string"}), 400
+            if token is not None and (role is not None or worker_index is not None):
+                return jsonify(
+                    {"error": "token and role owner are mutually exclusive"}
+                ), 400
             exclude_ports_raw = data.get("exclude_ports", [])
             if not isinstance(exclude_ports_raw, list) or not all(
                 isinstance(port, int) for port in exclude_ports_raw
@@ -303,7 +330,30 @@ def create_app(state: GuardState) -> Flask:
                 return jsonify({"error": str(e)}), 400
 
             s = get_state()
-            if owner is None:
+            if token is not None:
+                signature = (count, tuple(sorted(exclude_ports_raw)))
+                with s.allocated_ports_lock:
+                    if token in s.released_port_tokens:
+                        return jsonify(
+                            {"error": "token has already been released"}
+                        ), 410
+                    existing = s.token_ports.get(token)
+                    if existing is not None:
+                        if existing[0] != signature:
+                            return (
+                                jsonify(
+                                    {
+                                        "error": "token already has a different reservation"
+                                    }
+                                ),
+                                409,
+                            )
+                        ports = sorted(existing[1])
+                    else:
+                        ports = _reserve_node_ports(s, count, set(exclude_ports_raw))
+                        s.allocated_ports.update(ports)
+                        s.token_ports[token] = (signature, set(ports))
+            elif owner is None:
                 with s.allocated_ports_lock:
                     ports = _reserve_node_ports(s, count, set(exclude_ports_raw))
                     s.allocated_ports.update(ports)
@@ -331,6 +381,16 @@ def create_app(state: GuardState) -> Flask:
         data = request.get_json(silent=True) or {}
         role = data.get("role")
         worker_index = data.get("worker_index")
+        token = data.get("token")
+        if token is not None:
+            if role is not None or worker_index is not None:
+                return jsonify(
+                    {"error": "token and role owner are mutually exclusive"}
+                ), 400
+            if not isinstance(token, str) or not token:
+                return jsonify({"error": "'token' must be a non-empty string"}), 400
+            ports = _release_token_ports(state, token)
+            return jsonify({"status": "success", "ports": ports})
         try:
             key = _normalize_owner_key(role, worker_index)
         except ValueError as e:

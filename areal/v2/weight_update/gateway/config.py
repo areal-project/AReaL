@@ -41,6 +41,10 @@ class WeightUpdateResult(BaseModel):
     version: int
     duration_ms: float
     error: str | None = None
+    # ``True`` means inference may have received a prefix of the transfer and
+    # must be restored before generation resumes.  The default keeps responses
+    # from older gateways safely fail-closed.
+    inference_weights_may_be_mutated: bool = True
 
 
 @dataclass
@@ -48,6 +52,7 @@ class PairInfo:
     pair_name: str
     train_worker_urls: list[str]
     inference_worker_urls: list[str]
+    operation_id: str = ""
     train_world_size: int = 0
     inference_world_size: int = 0
     master_addr: str = ""
@@ -67,8 +72,14 @@ class PairInfo:
     # Colocated mode (training and inference share GPUs)
     colocate: bool = False
 
+    # A connecting/cleanup-pending record remains registered so retries retain
+    # the pair identity and worker endpoints needed for teardown.
+    status: str = "active"
+
     def __post_init__(self):
         if not self.pair_name:
             raise ValueError("pair_name must not be empty")
         if self.mode not in ("awex", "disk"):
             raise ValueError(f"mode must be 'awex' or 'disk', got '{self.mode}'")
+        if self.status not in ("connecting", "active", "cleanup_pending"):
+            raise ValueError(f"invalid pair status: {self.status!r}")

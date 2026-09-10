@@ -42,19 +42,20 @@ class AwexTrainingAdapter(Protocol):
         infer_world_size: int,
         train_world_size: int,
         num_engines: int,
+        process_group_timeout_s: float | None = None,
     ) -> None:
         """Pull peer meta from KV store, build local send plan, join NCCL group."""
         ...
 
-    def execute_weight_update(self, version: int) -> None:
+    def execute_weight_update(self, pair_name: str, version: int) -> None:
         """Execute cached local P2P send plan."""
         ...
 
-    def batch_isend_irecv(self, **kwargs) -> None:
+    def batch_isend_irecv(self, pair_name: str, **kwargs) -> None:
         """Execute awex batch P2P send/recv operations."""
         ...
 
-    def teardown_weight_update_group(self) -> None:
+    def teardown_weight_update_group(self, pair_name: str) -> None:
         """Destroy NCCL group and clear cached state."""
         ...
 
@@ -69,11 +70,12 @@ class AwexTrainingAdapter(Protocol):
         master_port: int,
         admin_api_key: str = "areal-admin-key",
         timeout_s: float = 120.0,
+        process_group_timeout_s: float | None = None,
     ) -> None:
         """Register device info in KV store for colocated weight transfer."""
         ...
 
-    def execute_colocate_weight_update(self, version: int) -> None:
+    def execute_colocate_weight_update(self, pair_name: str, version: int) -> None:
         """Serialize weights via IPC and put to KV store."""
         ...
 

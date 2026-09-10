@@ -1160,35 +1160,47 @@ class RolloutControllerV2:
     # -- Version management ------------------------------------------------
 
     def set_version(self, version: int) -> None:
-        """Set version locally and broadcast to all data proxy workers."""
+        """Broadcast a version, then commit it locally."""
+        self.broadcast_version(version)
+        self.commit_local_version(version)
+
+    def broadcast_version(self, version: int, timeout: float | None = None) -> None:
         from areal.infra.utils.concurrent import run_async_task
 
         self._ensure_initialized()
+        if not self._gateway_addr:
+            return
+        run_async_task(self._async_set_version, version, timeout)
 
+    def commit_local_version(self, version: int) -> None:
         with self._version_lock:
             self._version = version
 
-        if not self._gateway_addr:
-            return
-
-        run_async_task(self._async_set_version, version)
-
-    async def _async_set_version(self, version: int) -> None:
+    async def _async_set_version(
+        self, version: int, timeout: float | None = None
+    ) -> None:
         payload = {"version": version}
-        results = await asyncio.gather(
+        gather = asyncio.gather(
             *[
-                self._async_data_proxy_post(addr, "/set_version", payload)
+                self._async_data_proxy_post(
+                    addr, "/set_version", payload, timeout=timeout
+                )
                 for addr in self._data_proxy_addrs
             ],
             return_exceptions=True,
         )
-        failed = [r for r in results if isinstance(r, Exception)]
+        results = (
+            await gather
+            if timeout is None
+            else await asyncio.wait_for(gather, timeout=timeout)
+        )
+        failed = [r for r in results if isinstance(r, BaseException)]
         for r in failed:
             logger.error("Failed to set version on a worker: %s", r)
-        if failed and len(failed) == len(results):
+        if failed:
             raise RuntimeError(
-                f"set_version({version}) failed on ALL {len(failed)} workers"
-            )
+                f"set_version({version}) failed on {len(failed)}/{len(results)} workers"
+            ) from failed[0]
 
     def get_version(self) -> int:
         """Return the local version (compatible with VersionProvider protocol)."""
@@ -1593,11 +1605,32 @@ class RolloutControllerV2:
             ],
             return_exceptions=True,
         )
-        failed = [r for r in results if isinstance(r, Exception)]
+        failed = [r for r in results if isinstance(r, BaseException)]
         for r in failed:
             logger.error("Failed to pause generation on a worker: %s", r)
-        if failed and len(failed) == len(results):
-            raise RuntimeError(f"pause_generation failed on ALL {len(failed)} workers")
+        if failed:
+            resume_results = await asyncio.gather(
+                *[
+                    self._async_data_proxy_post(addr, "/continue_generation", {})
+                    for addr in self._data_proxy_addrs
+                ],
+                return_exceptions=True,
+            )
+            resume_failed = [
+                result for result in resume_results if isinstance(result, BaseException)
+            ]
+            for result in resume_failed:
+                logger.error(
+                    "Failed to resume a worker after partial pause: %s", result
+                )
+            error = RuntimeError(
+                f"pause_generation failed on {len(failed)}/{len(results)} workers; "
+                f"rollback resume failed on {len(resume_failed)}/"
+                f"{len(self._data_proxy_addrs)} workers"
+            )
+            error.generation_pause_state_unresolved = bool(resume_failed)
+            error.inference_weights_may_be_mutated = False
+            raise error from failed[0]
 
     def continue_generation(self) -> None:
         """Continue generation on all workers."""
@@ -1616,13 +1649,13 @@ class RolloutControllerV2:
             ],
             return_exceptions=True,
         )
-        failed = [r for r in results if isinstance(r, Exception)]
+        failed = [r for r in results if isinstance(r, BaseException)]
         for r in failed:
             logger.error("Failed to continue generation on a worker: %s", r)
-        if failed and len(failed) == len(results):
+        if failed:
             raise RuntimeError(
-                f"continue_generation failed on ALL {len(failed)} workers"
-            )
+                f"continue_generation failed on {len(failed)}/{len(results)} workers"
+            ) from failed[0]
 
     # -- Stats -------------------------------------------------------------
 
@@ -2010,13 +2043,18 @@ class RolloutControllerV2:
 
     @async_http_retry
     async def _async_data_proxy_post(
-        self, addr: str, endpoint: str, payload: dict[str, Any]
+        self,
+        addr: str,
+        endpoint: str,
+        payload: dict[str, Any],
+        timeout: float | None = None,
     ) -> None:
         """POST directly to a data proxy, bypassing gateway/router resolution."""
         url = f"{addr}{endpoint}"
         try:
             client = await self._get_async_client()
-            resp = await client.post(url, json=payload)
+            request_kwargs = {} if timeout is None else {"timeout": timeout}
+            resp = await client.post(url, json=payload, **request_kwargs)
             if resp.status_code >= 400:
                 raise RuntimeError(
                     f"Data proxy {url} returned {resp.status_code}: {resp.text}"
