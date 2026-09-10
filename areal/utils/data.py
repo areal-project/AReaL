@@ -481,11 +481,24 @@ def allocate_balanced_mbs_synced(
     lens: list[int],
     group: dist.ProcessGroup | None = None,
 ) -> list[list[int]]:
-    group_indices = allocate_balanced_mbs(mb_spec, lens)
     if not dist.is_initialized():
-        return group_indices
-    all_n_mbs = [None for _ in range(dist.get_world_size(group))]
-    dist.all_gather_object(all_n_mbs, len(group_indices), group=group)
+        return allocate_balanced_mbs(mb_spec, lens)
+
+    # Allocation can fail on only one rank, including after a synchronized
+    # retry increases n_mbs beyond that rank's number of atomic prompt groups.
+    # Share failures before any rank returns or enters the next collective.
+    group_indices = []
+    error = None
+    try:
+        group_indices = allocate_balanced_mbs(mb_spec, lens)
+    except (ValueError, RuntimeError) as exc:
+        error = str(exc)
+    outcomes = [None for _ in range(dist.get_world_size(group))]
+    dist.all_gather_object(outcomes, (len(group_indices), error), group=group)
+    for _, message in outcomes:
+        if message is not None:
+            raise RuntimeError(message)
+    all_n_mbs = [count for count, _ in outcomes]
     if all(mbs == len(group_indices) for mbs in all_n_mbs):
         return group_indices
     return allocate_balanced_mbs_synced(
@@ -732,6 +745,88 @@ class MicroBatchList:
 DEFAULT_MAX_TOKENS_PER_MB = int(1e12)
 
 
+def _resolve_microbatch_sequence_groups(
+    bs: int,
+    granularity: int,
+    group_sizes: Sequence[int] | torch.Tensor | None,
+) -> tuple[list[list[int]], list[int] | None]:
+    if group_sizes is None:
+        if bs % granularity != 0:
+            raise RuntimeError(
+                f"Batch size {bs} cannot divide granularity {granularity}."
+            )
+        return [
+            list(range(i * granularity, (i + 1) * granularity))
+            for i in range(bs // granularity)
+        ], None
+
+    if torch.is_tensor(group_sizes):
+        group_sizes = group_sizes.detach().cpu().tolist()
+    sizes = [int(size) for size in group_sizes]
+    if any(size <= 0 for size in sizes):
+        raise ValueError(f"group_sizes must be positive, got {sizes}.")
+    total = sum(sizes)
+    if total != bs:
+        raise ValueError(f"group_sizes sum to {total} but batch size is {bs}.")
+
+    groups = []
+    offset = 0
+    for size in sizes:
+        groups.append(list(range(offset, offset + size)))
+        offset += size
+    return groups, sizes
+
+
+def _infeasible_atomic_groups_message(
+    mb_spec: MicroBatchSpec,
+    group_token_counts: Sequence[int],
+) -> str | None:
+    """Return why prompt groups cannot be packed as atomic units, if at all.
+
+    ``group_sizes`` changes the allocation unit from one sequence to one whole
+    prompt group. With distributed execution the caller all-gathers this
+    message so every rank raises together; a missing group uses WORLD.
+    """
+    counts = [int(n) for n in group_token_counts]
+    capacity = mb_spec.max_tokens_per_mb
+    if capacity is not None:
+        oversized = [n for n in counts if n > capacity]
+        if oversized:
+            return (
+                "group_sizes keeps each prompt group in one microbatch, but a "
+                f"group has {max(oversized)} tokens which exceeds "
+                f"max_tokens_per_mb={capacity}. Raise max_tokens_per_mb or "
+                "reduce n_samples / sequence length."
+            )
+    min_groups = mb_spec.n_mbs
+    n_groups_divisor = mb_spec.n_mbs_divisor
+    if min_groups is None or min_groups < n_groups_divisor:
+        min_groups = n_groups_divisor
+    min_groups = (
+        (min_groups + n_groups_divisor - 1) // n_groups_divisor
+    ) * n_groups_divisor
+    if len(counts) < min_groups:
+        return (
+            "group_sizes keeps each prompt group in one microbatch, so the "
+            f"split needs at least {min_groups} groups, but this batch has "
+            f"{len(counts)}. Lower ppo_n_minibatches / n_mbs, or include more "
+            "prompts per update."
+        )
+    return None
+
+
+def _raise_synced_infeasible_atomic_groups(
+    message: str | None,
+    group: dist.ProcessGroup | None,
+) -> None:
+    if dist.is_initialized():
+        gathered: list[str | None] = [None] * dist.get_world_size(group)
+        dist.all_gather_object(gathered, message, group=group)
+        message = next((item for item in gathered if item is not None), None)
+    if message is not None:
+        raise RuntimeError(message)
+
+
 def split_padded_tensor_dict_into_mb_list(
     data: dict[str, Any],
     mb_spec: MicroBatchSpec,
@@ -756,18 +851,17 @@ def split_padded_tensor_dict_into_mb_list(
         )
     granularity = mb_spec.granularity
     bs = data["attention_mask"].shape[0]
-    if bs % granularity != 0:
-        raise RuntimeError(f"Batch size {bs} cannot divide granularity {granularity}.")
+    seq_groups, explicit_group_sizes = _resolve_microbatch_sequence_groups(
+        bs, granularity, data.get("group_sizes")
+    )
     max_seqlen = data["attention_mask"].shape[1]
     seq_lens = data["attention_mask"].sum(1).long().cpu().numpy().tolist()
-    input_lens = (
-        data["attention_mask"]
-        .view(bs // granularity, granularity, -1)
-        .sum(dim=(1, 2))
-        .long()
-        .cpu()
-        .numpy()
-    )
+    input_lens = [sum(seq_lens[i] for i in group) for group in seq_groups]
+    if explicit_group_sizes is not None:
+        _raise_synced_infeasible_atomic_groups(
+            _infeasible_atomic_groups_message(mb_spec, input_lens),
+            group,
+        )
 
     # check for multimodal input data
     multimodal_keys = {key for key in data if is_multi_modal_key(key)}
@@ -776,6 +870,8 @@ def split_padded_tensor_dict_into_mb_list(
     to_split = {}
     not_to_split = {}
     for key, value in data.items():
+        if key == "group_sizes":
+            continue
         if key in multimodal_keys:
             continue
         if key == "position_ids" or (
@@ -788,10 +884,13 @@ def split_padded_tensor_dict_into_mb_list(
 
     # split
     group_indices = allocate_balanced_mbs_synced(mb_spec, input_lens, group=group)
+    mb_group_sizes = (
+        [[len(seq_groups[i]) for i in group_index] for group_index in group_indices]
+        if explicit_group_sizes is not None
+        else None
+    )
     group_indices = [
-        seqpack.flat2d(
-            [list(range(i * granularity, (i + 1) * granularity)) for i in group_index]
-        )
+        seqpack.flat2d([seq_groups[i] for i in group_index])
         for group_index in group_indices
     ]
     splitted_lens = [
@@ -839,6 +938,8 @@ def split_padded_tensor_dict_into_mb_list(
     # organize splitted micro batches
     assert len(mbs) == len(splitted_lens), (len(mbs), len(splitted_lens))
     for i, (mb, lens) in enumerate(zip(mbs, splitted_lens)):
+        if mb_group_sizes is not None:
+            mb["group_sizes"] = mb_group_sizes[i]
         results.append({**mb, **not_to_split})
 
     return MicroBatchList(
