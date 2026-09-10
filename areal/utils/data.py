@@ -449,7 +449,9 @@ def unpack_sequence(
     raise ValueError("Either cu_seqlens or input_lens must be provided.")
 
 
-def allocate_balanced_mbs(mb_spec: MicroBatchSpec, lens: list[int]) -> list[list[int]]:
+def allocate_balanced_mbs(
+    mb_spec: MicroBatchSpec, lens: list[int], padded: bool = False
+) -> list[list[int]]:
     """Allocate sequences into balanced micro-batches using the configured algorithm.
 
     The packing algorithm is determined by ``mb_spec.packing_algorithm``:
@@ -465,7 +467,11 @@ def allocate_balanced_mbs(mb_spec: MicroBatchSpec, lens: list[int]) -> list[list
         List of lists of indices, one per micro-batch.
     """
     assert mb_spec.max_tokens_per_mb is not None
-    allocate_fn = get_allocate_fn(getattr(mb_spec, "packing_algorithm", "ffd"))
+    allocate_fn = (
+        seqpack.padded_allocate
+        if padded
+        else get_allocate_fn(getattr(mb_spec, "packing_algorithm", "ffd"))
+    )
     group_indices = allocate_fn(
         lens,
         mb_spec.max_tokens_per_mb,
@@ -480,8 +486,9 @@ def allocate_balanced_mbs_synced(
     mb_spec: MicroBatchSpec,
     lens: list[int],
     group: dist.ProcessGroup | None = None,
+    padded: bool = False,
 ) -> list[list[int]]:
-    group_indices = allocate_balanced_mbs(mb_spec, lens)
+    group_indices = allocate_balanced_mbs(mb_spec, lens, padded=padded)
     if not dist.is_initialized():
         return group_indices
     all_n_mbs = [None for _ in range(dist.get_world_size(group))]
@@ -489,7 +496,10 @@ def allocate_balanced_mbs_synced(
     if all(mbs == len(group_indices) for mbs in all_n_mbs):
         return group_indices
     return allocate_balanced_mbs_synced(
-        MicroBatchSpec.new(mb_spec, n_mbs=max(all_n_mbs)), lens, group=group
+        MicroBatchSpec.new(mb_spec, n_mbs=max(all_n_mbs)),
+        lens,
+        group=group,
+        padded=padded,
     )
 
 
@@ -736,6 +746,8 @@ def split_padded_tensor_dict_into_mb_list(
     data: dict[str, Any],
     mb_spec: MicroBatchSpec,
     group: dist.ProcessGroup | None = None,
+    seq_align_to: int | None = None,
+    padded: bool = False,
 ) -> MicroBatchList:
     """Split a padded dict of tensors into micro-batches based on the attention mask.
 
@@ -743,6 +755,11 @@ def split_padded_tensor_dict_into_mb_list(
         data (Dict): Dictionary containing padded tensors.
         mb_spec (MicroBatchSpec): Specification for micro-batch splitting.
         group (Optional[dist.ProcessGroup]): Process group for distributed synchronization.
+        seq_align_to: Optional per-sequence alignment applied after packing. When set,
+            aligned lengths are used for micro-batch allocation so padding cannot make
+            a micro-batch exceed ``max_tokens_per_mb``.
+        padded: Budget the rectangular forward input (batch size times aligned
+            maximum sequence length), grouping similar lengths together.
 
     Returns:
         MicroBatchList: A structure containing the split micro-batches and metadata.
@@ -759,14 +776,18 @@ def split_padded_tensor_dict_into_mb_list(
     if bs % granularity != 0:
         raise RuntimeError(f"Batch size {bs} cannot divide granularity {granularity}.")
     max_seqlen = data["attention_mask"].shape[1]
-    seq_lens = data["attention_mask"].sum(1).long().cpu().numpy().tolist()
+    seq_lens_array = data["attention_mask"].sum(1).long().cpu().numpy()
+    seq_lens = seq_lens_array.tolist()
+    packing_seq_lens = seq_lens_array
+    if seq_align_to is not None:
+        if seq_align_to <= 0:
+            raise ValueError(f"seq_align_to must be positive, got {seq_align_to}.")
+        packing_seq_lens = (
+            (packing_seq_lens + seq_align_to - 1) // seq_align_to * seq_align_to
+        )
+    grouped_lens = packing_seq_lens.reshape(bs // granularity, granularity)
     input_lens = (
-        data["attention_mask"]
-        .view(bs // granularity, granularity, -1)
-        .sum(dim=(1, 2))
-        .long()
-        .cpu()
-        .numpy()
+        grouped_lens.max(axis=1) * granularity if padded else grouped_lens.sum(axis=1)
     )
 
     # check for multimodal input data
@@ -787,7 +808,9 @@ def split_padded_tensor_dict_into_mb_list(
             not_to_split[key] = value
 
     # split
-    group_indices = allocate_balanced_mbs_synced(mb_spec, input_lens, group=group)
+    group_indices = allocate_balanced_mbs_synced(
+        mb_spec, input_lens, group=group, padded=padded
+    )
     group_indices = [
         seqpack.flat2d(
             [list(range(i * granularity, (i + 1) * granularity)) for i in group_index]
@@ -1109,7 +1132,9 @@ def pad_mb_list(
         )
         padded_mb_inputs.append(padded_mb)
         pad_lengths.append(pad_len)
-        pad_to_lengths.append(pad_to_length)
+        pad_to_lengths.append(
+            (align_to_length if align_to_length is not None else length) + pad_len
+        )
         old_cu_seqlens_list.append(old_cu_seqlens)
         align_to_lengths.append(align_to_length)
     mb_list.padded_mbs = padded_mb_inputs

@@ -38,6 +38,10 @@ from megatron.core.dist_checkpointing.strategies.fully_parallel import (
     FullyParallelSaveStrategyWrapper,
 )
 
+from areal.engine.megatron_utils.optimizer_chain import (
+    get_managed_base_optimizer,
+    iter_megatron_optimizer_leaves,
+)
 from areal.infra.platforms import current_platform
 from areal.utils import logging, stats_tracker
 
@@ -242,13 +246,19 @@ class MegatronCheckpointManager:
         self.lr_scheduler = lr_scheduler
 
         self.use_distributed_optimizer = use_distributed_optimizer
-        assert self.use_distributed_optimizer, (
-            "MegatronCheckpointManager now only support distributed optimizer"
-        )
+        if not self.use_distributed_optimizer and not getattr(
+            optimizer, "supports_non_distributed_checkpoint", False
+        ):
+            raise NotImplementedError(
+                "MegatronCheckpointManager requires either Megatron's distributed "
+                "optimizer or an optimizer with explicit non-distributed checkpoint "
+                "support"
+            )
         self.use_checkpoint_opt_param_scheduler = use_checkpoint_opt_param_scheduler
         self.rank = torch.distributed.get_rank()
         self.use_dist_checkpointing = use_dist_checkpointing
         self.async_save = async_save
+        self.load_failed = False
         # AsyncCallsQueue manages outstanding background save processes.
         # Created only when async_save is enabled; sync path keeps zero overhead.
         self._async_queue: AsyncCallsQueue | None = (
@@ -425,7 +435,48 @@ class MegatronCheckpointManager:
             rng_states["rng_tracker_states"]
         )
 
+    def _managed_optimizers(self) -> tuple[object, ...]:
+        managed = []
+        seen: set[int] = set()
+        for leaf in iter_megatron_optimizer_leaves(self.optimizer):
+            base = get_managed_base_optimizer(leaf)
+            if base is not None and id(base) not in seen:
+                seen.add(id(base))
+                managed.append(base)
+        return tuple(managed)
+
     def load_checkpoint(
+        self,
+        local_path: str,
+        with_model: bool = True,
+        with_optimizer: bool = True,
+        with_rng: bool = True,
+    ):
+        """Load synchronously; any failure requires process-level recovery."""
+        if self.load_failed:
+            raise RuntimeError(
+                "checkpoint manager is fail-stopped after a load error; restart "
+                "the process and recover from a durable checkpoint"
+            )
+        managed = self._managed_optimizers()
+        try:
+            for optimizer in managed:
+                optimizer.begin_checkpoint_load()
+            self._load_checkpoint(
+                local_path,
+                with_model=with_model,
+                with_optimizer=with_optimizer,
+                with_rng=with_rng,
+            )
+            for optimizer in managed:
+                optimizer.complete_checkpoint_load()
+        except BaseException as error:
+            self.load_failed = True
+            for optimizer in managed:
+                optimizer.mark_checkpoint_load_failed(error)
+            raise
+
+    def _load_checkpoint(
         self,
         local_path: str,
         with_model: bool = True,
@@ -478,6 +529,10 @@ class MegatronCheckpointManager:
             else:
                 raise NotImplementedError("Please use dist checkpointing!")
 
+            if not with_optimizer:
+                for optimizer in self._managed_optimizers():
+                    optimizer.reset_from_model_params()
+
         if with_optimizer:
             assert "optimizer" in state_dict, (
                 f"Optimizer state dict not found in {state_dict.keys()}. Please check the checkpoint file {local_path}."
@@ -516,6 +571,10 @@ class MegatronCheckpointManager:
         with_optimizer=True,
         with_rng: bool = True,
     ):
+        if self.load_failed:
+            raise RuntimeError(
+                "cannot save after a failed checkpoint load; restart and recover"
+            )
         dist_checkpoint_path = local_path
 
         if not self.use_dist_checkpointing:

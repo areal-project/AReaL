@@ -487,6 +487,17 @@ def make_mcore_model(
         # Megatron main_grad buffers required by fused grad accumulation kernels.
         if use_lora:
             provider.gradient_accumulation_fusion = False
+        elif provider.gradient_accumulation_fusion:
+            # Bridge also enables fusion when only TE is available, but the
+            # native ColumnParallelLinear output head requires the Apex kernel.
+            try:
+                import fused_weight_gradient_mlp_cuda  # noqa: F401
+            except ImportError:
+                provider.gradient_accumulation_fusion = False
+                logger.warning(
+                    "Disabling gradient accumulation fusion: the native output "
+                    "head requires fused_weight_gradient_mlp_cuda."
+                )
 
         # Keep these four flags aligned with mbridge base defaults.
         provider.variable_seq_lengths = True

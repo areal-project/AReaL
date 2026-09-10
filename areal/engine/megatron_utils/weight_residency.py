@@ -10,11 +10,16 @@ buffer residency used by both persistent scoring workers and AWEX publishers.
 from __future__ import annotations
 
 import gc
-import os
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 import torch
 
+from areal.engine.megatron_utils.optimizer_chain import (
+    OptimizerResidencyEntry,
+    OptimizerResidencyPlan,
+    build_optimizer_residency_plan,
+    checkpoint_awex_residency,
+)
 from areal.utils.logging import getLogger
 
 if TYPE_CHECKING:
@@ -30,6 +35,10 @@ class MegatronWeightResidency:
     def __init__(self, engine: MegatronEngine) -> None:
         self._engine = engine
         self._released_tags: set[str] = set()
+        self._optimizer_residency_plan: OptimizerResidencyPlan | None = None
+        self._ordinary_optimizer_restores: dict[
+            int, list[tuple[torch.Tensor, torch.device]]
+        ] = {}
 
     @property
     def released_tags(self) -> frozenset[str]:
@@ -40,42 +49,48 @@ class MegatronWeightResidency:
         """Return whether one residency tag is currently offloaded."""
         return tag in self._released_tags
 
+    def checkpoint_residency(self, *, with_model: bool, with_optimizer: bool):
+        """Temporarily restore only resources required by a checkpoint."""
+        return checkpoint_awex_residency(
+            self,
+            self._engine.optimizer,
+            with_model=with_model,
+            with_optimizer=with_optimizer,
+        )
+
     def release_memory(self, tags: list[str] | None = None) -> None:
-        """Offload the requested state classes to CPU exactly once."""
         tags = tags or ["optimizer", "weights"]
-        tags_to_release = [tag for tag in tags if tag not in self._released_tags]
+        tags_to_release = [t for t in tags if t not in self._released_tags]
         if not tags_to_release:
             return
 
         if "optimizer" in tags_to_release:
             self._offload_optimizer_states()
-            self._released_tags.add("optimizer")
-
         if "weights" in tags_to_release:
             self._offload_model_weights()
-            self._released_tags.add("weights")
 
         torch.cuda.synchronize()
         gc.collect()
         torch.cuda.empty_cache()
+
+        self._released_tags.update(tags_to_release)
         logger.info("release_memory done: tags=%s", tags_to_release)
 
     def resume_memory(self, tags: list[str] | None = None) -> None:
-        """Restore the requested state classes to GPU exactly once."""
         tags = tags or ["optimizer", "weights"]
-        tags_to_resume = [tag for tag in tags if tag in self._released_tags]
+        tags_to_resume = [t for t in tags if t in self._released_tags]
         if not tags_to_resume:
             return
 
         if "weights" in tags_to_resume:
             self._reload_model_weights(load_grad=False)
-            self._released_tags.discard("weights")
-
         if "optimizer" in tags_to_resume:
             self._reload_optimizer_states()
-            self._released_tags.discard("optimizer")
-
         torch.cuda.synchronize()
+        self._released_tags.difference_update(tags_to_resume)
+        if "optimizer" in tags_to_resume:
+            self._optimizer_residency_plan = None
+            self._ordinary_optimizer_restores.clear()
         logger.info("resume_memory done: tags=%s", tags_to_resume)
 
     def release_grad_memory(self) -> None:
@@ -199,113 +214,98 @@ class MegatronWeightResidency:
         torch.cuda.synchronize()
         logger.info("Reloaded model weights to GPU (load_grad=%s)", load_grad)
 
-    def _get_inner_optimizers(self) -> list[Any]:
-        optimizer = self._engine.optimizer
-        if optimizer is None:
-            return []
-        if hasattr(optimizer, "chained_optimizers"):
-            return optimizer.chained_optimizers
-        if hasattr(optimizer, "optimizers"):
-            return optimizer.optimizers
-        return [optimizer]
-
     def _offload_optimizer_states(self) -> None:
         optimizer = self._engine.optimizer
-        if optimizer is None:
-            return
-        if os.environ.get("AWEX_OPT_OFFLOAD_VIA_HDO", "").strip() == "1" and hasattr(
-            optimizer, "offload_to_cpu"
-        ):
-            optimizer.offload_to_cpu()
-            logger.info("Offloaded optimizer via offload_to_cpu()")
-            return
-
-        inner_optimizers = self._get_inner_optimizers()
-        if not inner_optimizers:
-            return
-
-        count = 0
-        for opt in inner_optimizers:
-            if hasattr(opt, "shard_fp32_from_float16_groups"):
-                for group in opt.shard_fp32_from_float16_groups:
-                    if isinstance(group, list):
-                        for tensor in group:
-                            if tensor is not None and tensor.data.is_cuda:
-                                tensor.data = tensor.data.to("cpu", non_blocking=True)
-                                count += 1
-                    elif group is not None and group.data.is_cuda:
-                        group.data = group.data.to("cpu", non_blocking=True)
-                        count += 1
-
-            base_opt = getattr(opt, "optimizer", opt)
-            if not hasattr(base_opt, "state") or base_opt.state is None:
-                continue
-            for state in base_opt.state.values():
-                for key in ("exp_avg", "exp_avg_sq"):
-                    if (
-                        key in state
-                        and isinstance(state[key], torch.Tensor)
-                        and state[key].is_cuda
-                    ):
-                        state[key] = state[key].to("cpu", non_blocking=True)
-                        count += 1
-
-        try:
-            from transformer_engine.pytorch.module.base import _dummy_wgrads
-
-            purged = len(_dummy_wgrads)
-            for key in list(_dummy_wgrads):
-                del _dummy_wgrads[key]
-            if purged:
-                logger.info("Purged %d TE _dummy_wgrads cache entries", purged)
-        except ImportError:
-            pass
+        plan = build_optimizer_residency_plan(optimizer)
+        if self._ordinary_optimizer_restores:
+            raise RuntimeError("stale ordinary optimizer state before AWEX release")
+        ordinary_restores: dict[int, list[tuple[torch.Tensor, torch.device]]] = {}
+        for index, entry in enumerate(plan.entries):
+            if entry.managed_optimizer is not None:
+                entry.managed_optimizer.offload_to_cpu()
+            else:
+                ordinary_restores[index] = self._release_ordinary_optimizer(entry)
         torch.cuda.synchronize()
-        logger.info("Offloaded %d optimizer state tensors to CPU", count)
+        self._purge_te_cache()
+        self._ordinary_optimizer_restores = ordinary_restores
+        self._optimizer_residency_plan = plan
+        logger.info(
+            "Released optimizer state for %d managed and %d ordinary leaves",
+            sum(entry.managed_optimizer is not None for entry in plan.entries),
+            sum(entry.managed_optimizer is None for entry in plan.entries),
+        )
 
     def _reload_optimizer_states(self) -> None:
-        optimizer = self._engine.optimizer
-        if optimizer is None:
+        plan = self._optimizer_residency_plan
+        if plan is None:
             return
-        if os.environ.get("AWEX_OPT_OFFLOAD_VIA_HDO", "").strip() == "1" and hasattr(
-            optimizer, "restore_from_cpu"
-        ):
-            optimizer.restore_from_cpu()
-            logger.info("Reloaded optimizer via restore_from_cpu()")
-            return
-
-        inner_optimizers = self._get_inner_optimizers()
-        if not inner_optimizers:
-            return
-
-        device = self._engine.device
-        count = 0
-        for opt in inner_optimizers:
-            if hasattr(opt, "shard_fp32_from_float16_groups"):
-                for group in opt.shard_fp32_from_float16_groups:
-                    if isinstance(group, list):
-                        for tensor in group:
-                            if tensor is not None and not tensor.data.is_cuda:
-                                tensor.data = tensor.data.to(device, non_blocking=True)
-                                count += 1
-                    elif group is not None and not group.data.is_cuda:
-                        group.data = group.data.to(device, non_blocking=True)
-                        count += 1
-
-            base_opt = getattr(opt, "optimizer", opt)
-            if not hasattr(base_opt, "state") or base_opt.state is None:
+        for index, entry in enumerate(plan.entries):
+            if entry.managed_optimizer is not None:
+                entry.managed_optimizer.restore_from_cpu()
                 continue
-            for state in base_opt.state.values():
-                for key in ("exp_avg", "exp_avg_sq"):
-                    if (
-                        key in state
-                        and isinstance(state[key], torch.Tensor)
-                        and not state[key].is_cuda
-                    ):
-                        state[key] = state[key].to(device, non_blocking=True)
-                        count += 1
-        torch.cuda.synchronize()
-        logger.info("Reloaded %d optimizer state tensors to GPU", count)
+            for tensor, device in self._ordinary_optimizer_restores.get(index, []):
+                tensor.data = tensor.data.to(device, non_blocking=True)
+        logger.info("Restored managed and ordinary optimizer state")
+
+    def _release_ordinary_optimizer(
+        self, entry: OptimizerResidencyEntry
+    ) -> list[tuple[torch.Tensor, torch.device]]:
+        """Mirror AWEX's original ordinary Megatron optimizer migration."""
+        restores: list[tuple[torch.Tensor, torch.device]] = []
+
+        def move_tensor(tensor: torch.Tensor, description: str) -> None:
+            if not tensor.data.is_cuda:
+                return
+            if type(tensor) is not torch.Tensor:
+                raise TypeError(
+                    "AWEX ordinary optimizer migration supports only plain "
+                    f"Tensor values, got {type(tensor).__module__}."
+                    f"{type(tensor).__qualname__} for {description}"
+                )
+            device = tensor.device
+            tensor.data = tensor.data.to("cpu", non_blocking=True)
+            restores.append((tensor, device))
+
+        leaf = entry.leaf
+        for group in getattr(leaf, "shard_fp32_from_float16_groups", ()):
+            tensors = group if isinstance(group, list) else [group]
+            for tensor in tensors:
+                if tensor is not None:
+                    move_tensor(tensor, "legacy FP32 main parameter")
+
+        base_optimizer = entry.base_optimizer
+        if base_optimizer is None:
+            return restores
+        state = getattr(base_optimizer, "state", None)
+        if state is None:
+            return restores
+        if getattr(base_optimizer, "capturable", False):
+            raise RuntimeError(
+                "AWEX optimizer-state migration does not support capturable optimizers"
+            )
+        for param_state in state.values():
+            for key in (
+                "master_param",
+                "exp_avg",
+                "exp_avg_sq",
+                "momentum_buffer",
+            ):
+                value = param_state.get(key)
+                if isinstance(value, torch.Tensor):
+                    move_tensor(value, f"optimizer state {key}")
+        return restores
+
+    def _purge_te_cache(self) -> None:
+        """Release Transformer Engine's private cached gradient buffers."""
+        try:
+            import transformer_engine.pytorch.module.base as te_base
+        except ImportError:
+            return
+        cache = te_base._dummy_wgrads
+        count = len(cache)
+        cache.clear()
+        if count:
+            logger.info("Purged %d TE _dummy_wgrads cache entries", count)
 
 
 __all__ = ["MegatronWeightResidency"]

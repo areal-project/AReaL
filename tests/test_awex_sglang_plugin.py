@@ -229,6 +229,42 @@ def test_physical_gpu_id_uses_noncontiguous_visible_device(monkeypatch):
     assert _writer_version_key("10.0.0.1", gpu_id) == "awex_writer_version_10.0.0.1_5"
 
 
+@pytest.mark.parametrize("node_id", [0, 1])
+def test_receiver_init_isolated_tp_servers_register_unique_ranks(monkeypatch, node_id):
+    """Each colocated GPU gets one transfer rank across isolated TP servers."""
+    import awex.meta.meta_server as meta_server
+
+    monkeypatch.delenv("AWEX_TRANSFER_RANK", raising=False)
+    monkeypatch.setenv("RANK", "0")
+    monkeypatch.setenv("WORLD_SIZE", "16")
+    monkeypatch.setenv("SLURM_NODEID", str(node_id))
+    monkeypatch.setenv("SLURM_NNODES", "2")
+    client = SimpleNamespace(
+        get_object=lambda *args, **kwargs: {"train_world_size": 16}
+    )
+    monkeypatch.setattr(meta_server, "MetaServerClient", lambda *args: client)
+    registrations = []
+
+    for first_gpu in range(0, 8, 2):
+        monkeypatch.setenv("CUDA_VISIBLE_DEVICES", f"{first_gpu},{first_gpu + 1}")
+        for logical_gpu in range(2):
+            scheduler = SimpleNamespace(
+                gpu_id=logical_gpu,
+                server_args=SimpleNamespace(tp_size=2, pp_size=1),
+            )
+            plugin = AwexSchedulerPlugin(scheduler)
+            plugin._receiver = SimpleNamespace(
+                initialize=lambda **kwargs: registrations.append(kwargs)
+            )
+
+            plugin._init_receiver_from_meta_server("127.0.0.1:1")
+
+    assert [r["transfer_rank"] for r in registrations] == list(
+        range(node_id * 8, (node_id + 1) * 8)
+    )
+    assert [r["local_gpu_id"] for r in registrations] == list(range(8))
+
+
 def test_physical_gpu_id_rejects_uuid_visible_device(monkeypatch):
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "GPU-deadbeef")
 
