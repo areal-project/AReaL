@@ -9,7 +9,8 @@
 1. 首先阅读 [`RolloutWorkflow` 参考](../reference/rollout_workflow.md)，因为代理工作流建立在
    `RolloutWorkflow` 之上。
 
-1. **调度器兼容性**：代理工作流仅在 `local` 和 `slurm` 调度器上受支持。`ray` 调度器与 HTTP 代理架构不兼容。
+1. **调度器兼容性**：代理工作流在 `local`、`slurm` 和 `ray` 调度器上均受支持。代理服务器以 fork 出的 HTTP worker 进程形式，与其
+   rollout worker 部署在同一节点。
 
 ## 概述
 

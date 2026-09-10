@@ -26,6 +26,7 @@ from areal.infra.data_service import DataController
 from areal.infra.data_service.controller.config import DataServiceConfig
 from areal.infra.data_service.rdataset import RDataset
 from areal.utils import logging, perf_tracer, seeding, stats_tracker
+from areal.utils.cleanup import run_batch_cleanups
 from areal.utils.data import (
     broadcast_tensor_container,
     collate_samples_to_list,
@@ -33,7 +34,11 @@ from areal.utils.data import (
     tensor_container_to,
 )
 from areal.utils.dataloader import create_dataloader
-from areal.utils.environ import is_single_controller
+from areal.utils.environ import (
+    get_bool_env_var,
+    is_single_controller,
+    rank_in_env_filter,
+)
 from areal.utils.evaluator import Evaluator
 from areal.utils.hf_utils import load_hf_processor_and_tokenizer
 from areal.utils.perf_tracer import Category
@@ -147,6 +152,13 @@ class SFTTrainer:
 
     def train(self):
         config = self.config
+        rank = int(os.getenv("RANK", "0"))
+        memory_profile_this_rank = rank_in_env_filter(
+            "AREAL_MEMORY_PROFILER_RANKS", rank
+        )
+        torch_profiler_profile_memory = get_bool_env_var(
+            "AREAL_TORCH_PROFILER_PROFILE_MEMORY", default="true"
+        )
         start_step = (
             self.recover_info.last_step_info.next().global_step
             if self.recover_info is not None
@@ -159,6 +171,12 @@ class SFTTrainer:
 
         global_step = 0
         data_generator = cycle_dataloader(self.train_dataloader)
+        if self.recover_info is None and self._evaluate_before_train():
+            self._export_and_commit_stats(
+                epoch=-1,
+                epoch_step=-1,
+                global_step=-1,
+            )
         for global_step in range(start_step, max_steps):
             if (
                 config.total_train_steps is not None
@@ -183,6 +201,7 @@ class SFTTrainer:
             if (
                 config.memory_profiler is not None
                 and global_step in config.memory_profiler.profile_steps
+                and memory_profile_this_rank
             ):
                 self.actor.start_memory_profile(config.memory_profiler.max_entries)
 
@@ -191,6 +210,12 @@ class SFTTrainer:
                 perf_tracer.trace_scope(
                     "train.sft_step",
                     category=Category.COMPUTE,
+                    enable_profiler=True,
+                    profiler_args={
+                        "record_shapes": True,
+                        "with_stack": False,
+                        "profile_memory": torch_profiler_profile_memory,
+                    },
                     args={"global_step": global_step},
                 ),
             ):
@@ -201,6 +226,7 @@ class SFTTrainer:
             if (
                 config.memory_profiler is not None
                 and global_step in config.memory_profiler.profile_steps
+                and memory_profile_this_rank
             ):
                 log_dir = StatsLogger.get_log_path(config.stats_logger)
                 snapshot_dir = os.path.join(
@@ -259,9 +285,12 @@ class SFTTrainer:
                 # SPMD mode never populates ``_fetch_buffer`` (no RTensor
                 # round-trip), so the fan-out is single-controller only.
                 if is_single_controller():
-                    self.actor.clear_batches(batch)
+                    cleanups = [("actor", lambda: self.actor.clear_batches(batch))]
                     if self.data_controller is not None:
-                        self.data_controller.clear_batches()
+                        cleanups.append(
+                            ("data", lambda: self.data_controller.clear_batches())
+                        )
+                    run_batch_cleanups(cleanups)
 
             with perf_tracer.trace_scope(
                 "train.log_stats",
@@ -411,6 +440,27 @@ class SFTTrainer:
 
         dist.barrier(group=self.actor.cpu_group)
         current_platform.synchronize()
+
+    def _evaluate_before_train(self) -> bool:
+        if self.valid_dataloader is None:
+            return self.evaluator.evaluate_before_train(None)
+
+        def evaluate_fn() -> None:
+            with (
+                stats_tracker.record_timing("eval"),
+                perf_tracer.trace_scope(
+                    "train.eval",
+                    category=Category.COMPUTE,
+                    args={"global_step": -1},
+                ),
+            ):
+                self._evaluate_fn()
+
+        evaluated = self.evaluator.evaluate_before_train(evaluate_fn)
+        if evaluated:
+            dist.barrier(group=self.actor.cpu_group)
+            current_platform.synchronize()
+        return evaluated
 
     def _evaluate(
         self,

@@ -43,9 +43,9 @@ We demonstrate several concrete examples below. More examples can be found in th
 [`workflow/` directory](https://github.com/areal-project/AReaL/tree/main/areal/workflow).
 
 > **Scheduler Compatibility**: Agent workflows with the proxy approach are supported on
-> `local` and `slurm` schedulers only. The `ray` scheduler is not supported because
-> Ray's actor-based programming model is inherently incompatible with HTTP proxy servers
-> that require persistent connections between workers.
+> the `local`, `slurm`, and `ray` schedulers. Under `ray`, each proxy server runs as an
+> HTTP worker subprocess launched next to its rollout worker, the same as under `local`
+> and `slurm`.
 
 ## Examples
 

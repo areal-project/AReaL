@@ -7,6 +7,7 @@ from areal.engine.core.train_engine import (
     compute_microbatch_loss_weight,
     compute_total_loss_weight,
     reorder_and_pad_outputs,
+    stage_batch_for_engine,
 )
 
 __all__ = [
@@ -14,4 +15,5 @@ __all__ = [
     "compute_microbatch_loss_weight",
     "compute_total_loss_weight",
     "reorder_and_pad_outputs",
+    "stage_batch_for_engine",
 ]

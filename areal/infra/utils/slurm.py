@@ -33,9 +33,40 @@ STATUS_MAPPING = {
     "FAILED": JobState.FAILED,
     "COMPLETED": JobState.COMPLETED,
     "OUT_OF_MEMORY": JobState.FAILED,
+    "NODE_FAIL": JobState.FAILED,
     "DEADLINE": JobState.COMPLETED,
     "TIMEOUT": JobState.COMPLETED,
 }
+
+
+def query_terminal_state_sacct(job_id: int) -> JobState | None:
+    """Look up a job's state via sacct after it has left the squeue window.
+
+    squeue forgets jobs almost immediately after they finish and then exits
+    non-zero for ``squeue -j <id>``, so callers polling a finished job cannot
+    tell "job done" from "slurmctld hiccup". sacct keeps the terminal state.
+    Returns None when sacct is unavailable or has no record yet.
+    """
+    try:
+        out = (
+            subprocess.check_output(
+                ["sacct", "-j", str(job_id), "--format=State", "-X", "-n"],
+                stderr=subprocess.DEVNULL,
+            )
+            .decode()
+            .strip()
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return None
+    if not out:
+        return None
+    # First token of the first line; strip sacct suffixes ("CANCELLED by 0").
+    state = out.split("\n")[0].split()[0].rstrip("+")
+    for key, js in STATUS_MAPPING.items():
+        if state.startswith(key):
+            return js
+    return None
+
 
 SBATCH_SCRIPT_TEMPLATE = """#!/bin/bash
 {sbatch_options}

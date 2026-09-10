@@ -17,6 +17,7 @@ class DataProxyConfig:
     resubmit_wait: float = 0.5  # seconds between is_paused polls
     admin_api_key: str = "areal-admin-key"  # admin key for authentication
     callback_server_addr: str = ""
+    deterministic_sampling: bool = False
     # Resolved serving address (host:port) used as node_addr for RTensor shards.
     # Set at startup by __main__.py after the host is resolved.
     serving_addr: str = ""
@@ -26,3 +27,5 @@ class DataProxyConfig:
     reasoning_parser: str = "qwen3"
     engine_max_tokens: int | None = None
     chat_template_type: str = "hf"
+    message_preprocessors: tuple[str, ...] = ()
+    prefix_matcher: str | None = None

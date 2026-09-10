@@ -15,10 +15,12 @@ that the manager correctly:
 
 from __future__ import annotations
 
+import gc
 import importlib
 import importlib.util
 import sys
 import types
+import weakref
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -137,12 +139,17 @@ def test_async_disabled_creates_no_queue():
 def test_save_schedules_async_request(patched_checkpointer, tmp_path):
     mod, manager, queue = patched_checkpointer
     fake_request = object()
+    tensor_lists = [[]]
 
     with (
         patch.object(manager, "generate_state_dict", return_value={"model": {}}),
         patch.object(
             mod, "save_dist_checkpointing", return_value=fake_request
         ) as save_fn,
+        patch.object(
+            mod, "_inspect_retained_payload", return_value=tensor_lists
+        ) as inspect_fn,
+        patch.object(mod, "_release_retained_payload") as release_fn,
         patch("torch.cuda.empty_cache"),
         patch("torch.distributed.barrier"),
     ):
@@ -150,7 +157,9 @@ def test_save_schedules_async_request(patched_checkpointer, tmp_path):
 
     save_fn.assert_called_once()
     assert save_fn.call_args.kwargs["async_save"] is True
+    inspect_fn.assert_called_once_with(fake_request)
     queue.schedule_async_request.assert_called_once_with(fake_request)
+    release_fn.assert_called_once_with(tensor_lists)
 
 
 def test_save_reaps_before_scheduling_next(patched_checkpointer, tmp_path):
@@ -159,6 +168,7 @@ def test_save_reaps_before_scheduling_next(patched_checkpointer, tmp_path):
     with (
         patch.object(manager, "generate_state_dict", return_value={"model": {}}),
         patch.object(mod, "save_dist_checkpointing", side_effect=["r1", "r2"]),
+        patch.object(mod, "_inspect_retained_payload", return_value=[]),
         patch("torch.cuda.empty_cache"),
         patch("torch.distributed.barrier"),
     ):
@@ -220,6 +230,7 @@ def test_async_save_reports_queue_depth_only(patched_checkpointer, tmp_path):
     with (
         patch.object(manager, "generate_state_dict", return_value={"model": {}}),
         patch.object(mod, "save_dist_checkpointing", side_effect=["r1", "r2"]),
+        patch.object(mod, "_inspect_retained_payload", return_value=[]),
         patch("torch.cuda.empty_cache"),
         patch("torch.distributed.barrier"),
     ):
@@ -299,3 +310,78 @@ def test_load_checkpoint_builds_optimizer_template_with_is_loading(
     assert kwargs["is_loading"] is True
     assert kwargs["metadata"] == {"distrib_optim_sharding_type": "dp_reshardable"}
     manager.optimizer.load_state_dict.assert_called_once_with({"step": 1})
+
+
+class _FakeRequest:
+    def __init__(self, args, preload_fn, finalize_fns):
+        self.async_fn_args = args
+        self.preload_fn = preload_fn
+        self.finalize_fns = finalize_fns
+
+
+def _request_with_pending_payload(buckets, finalize_fns=None):
+    return _FakeRequest(
+        args=(0, buckets, "results_queue"),
+        preload_fn=lambda: buckets,
+        finalize_fns=finalize_fns or [lambda: None],
+    )
+
+
+def test_release_retained_payload_clears_tensor_data_and_preserves_finalize():
+    mod = _import_checkpointer()
+
+    class Payload:
+        pass
+
+    tensor = Payload()
+    tensor_ref = weakref.ref(tensor)
+    writer = types.SimpleNamespace(
+        write_buckets=[
+            (
+                "file",
+                "key",
+                ([("byte-item", b"payload")], [("tensor-item", tensor)]),
+            )
+        ]
+    )
+    buckets = writer.write_buckets
+
+    def finalize_fn():
+        return len(writer.write_buckets), writer.write_buckets[0][2][0]
+
+    request = _request_with_pending_payload(buckets, [finalize_fn])
+    tensor_lists = mod._inspect_retained_payload(request)
+    del tensor
+
+    mod._release_retained_payload(tensor_lists)
+    gc.collect()
+
+    assert tensor_ref() is None
+    assert writer.write_buckets is buckets
+    assert writer.write_buckets == [("file", "key", ([("byte-item", b"payload")], []))]
+    assert request.async_fn_args == (0, buckets, "results_queue")
+    assert request.preload_fn() is buckets
+    assert request.finalize_fns == [finalize_fn]
+    assert finalize_fn() == (1, [("byte-item", b"payload")])
+
+
+def test_save_unknown_payload_layout_fails_before_scheduling(
+    patched_checkpointer, tmp_path
+):
+    mod, manager, queue = patched_checkpointer
+    buckets = ["opaque-bucket"]
+    request = _request_with_pending_payload(buckets)
+
+    with (
+        patch.object(manager, "generate_state_dict", return_value={"model": {}}),
+        patch.object(mod, "save_dist_checkpointing", return_value=request),
+        patch.object(mod, "_mcore_version", return_value="0.18.0"),
+        pytest.raises(
+            mod._UnsupportedMCoreAsyncLayout,
+            match=r"megatron-core=0\.18\.0.*write_buckets\[0\]",
+        ),
+    ):
+        manager.save_checkpoint(str(tmp_path / "step0"))
+
+    queue.schedule_async_request.assert_not_called()
+    assert buckets == ["opaque-bucket"]

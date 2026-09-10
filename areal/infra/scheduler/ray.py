@@ -18,7 +18,10 @@ import ray.exceptions
 import requests
 from ray.actor import ActorHandle
 from ray.util.placement_group import placement_group, remove_placement_group
-from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
+from ray.util.scheduling_strategies import (
+    NodeAffinitySchedulingStrategy,
+    PlacementGroupSchedulingStrategy,
+)
 
 from areal.api import Job, Scheduler, Worker
 from areal.api.alloc_mode import ModelAllocation
@@ -217,6 +220,7 @@ class RayWorkerProcessLauncher:
         nfs_record_root: str,
         etcd3_addr: str,
         fileroot: str | None,
+        extra_env: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         worker_id = f"{role}/{worker_index}"
         if not cmd:
@@ -258,6 +262,8 @@ class RayWorkerProcessLauncher:
 
         env = os.environ.copy()
         env.update(self.env_vars)
+        if extra_env:
+            env.update(extra_env)
         env[self.device_control_env_var] = ",".join(gpu_devices)
 
         return {
@@ -404,6 +410,36 @@ class RayWorkerInfo:
     task_index: int
     launchers: list[ActorHandle] = field(default_factory=list)
     spec: SchedulingSpec | None = None
+
+
+def group_colocated_gpus(
+    node_infos: list[dict[str, Any]], gpus_per_worker: int
+) -> list[dict[str, Any]]:
+    """Chunk each target node's physical GPUs into per-worker groups.
+
+    Groups are contiguous within a node and never cross nodes, so every
+    grouped colocated worker shares exactly one node with the target
+    workers whose GPUs it reuses.
+    """
+    if gpus_per_worker <= 0:
+        raise ValueError(f"gpus_per_worker must be positive, got {gpus_per_worker}")
+    groups: list[dict[str, Any]] = []
+    for info in node_infos:
+        devices = list(info["visible_devices"])
+        if len(devices) % gpus_per_worker != 0:
+            raise ValueError(
+                f"Node {info['node_id']} has {len(devices)} visible GPUs, "
+                f"which is not a multiple of gpus_per_worker={gpus_per_worker}"
+            )
+        for start in range(0, len(devices), gpus_per_worker):
+            groups.append(
+                {
+                    "host": info["host"],
+                    "node_id": info["node_id"],
+                    "gpu_devices": devices[start : start + gpus_per_worker],
+                }
+            )
+    return groups
 
 
 class RayMultiNodeRolloutCoordinator:
@@ -967,6 +1003,7 @@ class RayScheduler(Scheduler):
         target_wi: RayWorkerInfo,
         target_role: str,
         command: str | None = None,
+        env: dict[str, str] | None = None,
     ) -> RayWorkerInfo:
         """Fork a single worker asynchronously.
 
@@ -977,12 +1014,21 @@ class RayScheduler(Scheduler):
         """
         worker_id = f"{role}/{idx}"
         guard_url = f"http://{format_hostport(target_wi.worker.ip, int(target_wi.worker.worker_ports[0]))}"
+        port_cnt = len(target_wi.worker.worker_ports)
+        ports_reserved = False
 
         try:
             # 1. Allocate a port on the target guard
             async with session.post(
                 f"{guard_url}/alloc_ports",
-                json={"count": 1},
+                json={
+                    "count": port_cnt,
+                    "role": role,
+                    "worker_index": idx,
+                    "exclude_ports": [
+                        int(port) for port in target_wi.worker.worker_ports
+                    ],
+                },
             ) as alloc_resp:
                 if alloc_resp.status != 200:
                     error_text = await alloc_resp.text()
@@ -993,7 +1039,9 @@ class RayScheduler(Scheduler):
                     )
                 alloc_data = await alloc_resp.json()
                 forked_host = alloc_data["host"]
-                forked_port = alloc_data["ports"][0]
+                forked_ports = alloc_data["ports"]
+                forked_port = forked_ports[0]
+                ports_reserved = True
 
             # 2. Build the full raw command
             module_path = command or "areal.infra.rpc.rpc_server"
@@ -1030,6 +1078,7 @@ class RayScheduler(Scheduler):
                 "role": role,
                 "worker_index": idx,
                 "raw_cmd": raw_cmd,
+                "env": env or {},
             }
             async with session.post(
                 f"{guard_url}/fork",
@@ -1075,34 +1124,31 @@ class RayScheduler(Scheduler):
                 f"(pid={forked_pid}) from {target_role}/{idx}"
             )
 
-        except aiohttp.ClientError as e:
-            raise WorkerCreationError(
-                role,
-                f"Failed to fork worker {idx} from {target_role}/{idx}",
-                str(e),
-            ) from e
+        except BaseException as e:
+            if ports_reserved:
+                for endpoint in ("kill_forked_worker", "release_ports"):
+                    try:
+                        async with session.post(
+                            f"{guard_url}/{endpoint}",
+                            json={"role": role, "worker_index": idx},
+                        ):
+                            pass
+                    except Exception:
+                        pass
+            if isinstance(e, aiohttp.ClientError):
+                raise WorkerCreationError(
+                    role,
+                    f"Failed to fork worker {idx} from {target_role}/{idx}",
+                    str(e),
+                ) from e
+            raise
 
         worker = Worker(
             id=worker_id,
             ip=forked_host,
-            worker_ports=[str(forked_port)],
+            worker_ports=list(map(str, forked_ports)),
             engine_ports=[],
         )
-        port_cnt = len(self._workers[target_role][0].worker.worker_ports)
-        if port_cnt > 1:
-            async with session.post(
-                f"http://{format_hostport(forked_host, forked_port)}/alloc_ports",
-                json=dict(count=port_cnt - 1),
-            ) as response:
-                if response.status != 200:
-                    error_text = await response.text()
-                    raise WorkerCreationError(
-                        role,
-                        f"Fork failed for worker {idx}",
-                        f"HTTP {response.status}: {error_text}",
-                    )
-                new_ports = (await response.json())["ports"]
-                worker.worker_ports += list(map(str, new_ports))
 
         return RayWorkerInfo(
             worker=worker,
@@ -1178,6 +1224,7 @@ class RayScheduler(Scheduler):
         target_role: str,
         target_workers: list[RayWorkerInfo],
         command: str | None = None,
+        env_vars: list[dict[str, str]] | None = None,
     ) -> list[str]:
         """Create forked workers concurrently using async requests.
 
@@ -1195,7 +1242,13 @@ class RayScheduler(Scheduler):
             # Launch all fork requests concurrently with exception handling
             tasks = [
                 self._fork_single_worker(
-                    session, role, idx, target_wi, target_role, command
+                    session,
+                    role,
+                    idx,
+                    target_wi,
+                    target_role,
+                    command,
+                    None if env_vars is None else env_vars[idx],
                 )
                 for idx, target_wi in enumerate(target_workers)
             ]
@@ -1241,8 +1294,14 @@ class RayScheduler(Scheduler):
         )
 
         # Configure forked workers if exp_config is available
-        if self.exp_config is not None:
-            await self._configure_workers(workers)
+        try:
+            if self.exp_config is not None:
+                await self._configure_workers(workers)
+        except BaseException:
+            await self._cleanup_forked_workers_async(role, target_role, workers)
+            self._workers.pop(role, None)
+            self._colocated_roles.pop(role, None)
+            raise
 
         return worker_ids
 
@@ -1251,6 +1310,7 @@ class RayScheduler(Scheduler):
         role: str,
         target_role: str,
         command: str | None = None,
+        env_vars: list[dict[str, str]] | None = None,
     ) -> list[str]:
         """Fork new worker processes from existing workers.
 
@@ -1283,6 +1343,7 @@ class RayScheduler(Scheduler):
                 target_role,
                 target_workers,
                 command,
+                env_vars,
             )
         except Exception:
             # Cleanup on failure
@@ -1493,17 +1554,31 @@ class RayScheduler(Scheduler):
 
             target_workers = self._workers[colocate_role]
             if num_workers != len(target_workers):
+                spec = schedulings[0]
+                target_gpus = sum(
+                    (worker.spec.gpu if worker.spec is not None else 1)
+                    for worker in target_workers
+                )
+                if spec.gpu > 0 and num_workers * spec.gpu == target_gpus:
+                    return self._create_grouped_colocated_workers(
+                        role, colocate_role, schedulings
+                    )
                 raise WorkerCreationError(
                     role,
                     "Replica count mismatch",
                     f"Colocated role must have same replica count as target "
-                    f"({num_workers} != {len(target_workers)})",
+                    f"({num_workers} != {len(target_workers)}) or reuse all "
+                    f"target GPUs ({num_workers} * {spec.gpu} != {target_gpus})",
                 )
 
             # Check if fork mode is enabled
             if strategy.fork:
                 # Fork mode: spawn new processes on same nodes via /fork endpoint
-                return self.fork_workers(role, colocate_role)
+                return self.fork_workers(
+                    role,
+                    colocate_role,
+                    env_vars=[scheduling.env_vars for scheduling in schedulings],
+                )
 
             # Reuse existing workers - no new Ray launchers created
             worker_ids = [w.worker.id for w in target_workers]
@@ -1694,6 +1769,149 @@ class RayScheduler(Scheduler):
             ) from e
 
         return worker_ids
+
+    def _create_grouped_colocated_workers(
+        self,
+        role: str,
+        colocate_role: str,
+        schedulings: list[SchedulingSpec],
+    ) -> list[str]:
+        """Create multi-GPU workers colocated over the target role's GPUs.
+
+        One zero-GPU launcher is pinned to each target node via node
+        affinity; worker processes receive explicit physical GPU ids, so
+        CUDA_VISIBLE_DEVICES carries physical indices exactly like the
+        Slurm launcher does.
+        """
+        spec = schedulings[0]
+        target_launchers = self._launchers.get(colocate_role)
+        if not target_launchers:
+            raise WorkerCreationError(
+                role,
+                "Invalid grouped colocation target",
+                f"Target role '{colocate_role}' has no Ray launchers to colocate onto",
+            )
+        node_infos = ray.get(
+            [launcher.get_node_info.remote() for launcher in target_launchers],
+            timeout=self.startup_timeout,
+        )
+        groups = group_colocated_gpus(node_infos, gpus_per_worker=spec.gpu)
+        if len(groups) != len(schedulings):
+            raise WorkerCreationError(
+                role,
+                "Grouped colocation shape mismatch",
+                f"{len(schedulings)} replicas requested but target nodes "
+                f"provide {len(groups)} groups of {spec.gpu} GPUs",
+            )
+
+        logger.info(
+            f"Creating {len(groups)} grouped workers for role '{role}' over "
+            f"{len(node_infos)} nodes of target role '{colocate_role}'"
+        )
+
+        launchers: list[ActorHandle] = []
+        workers: list[RayWorkerInfo] = []
+        start_refs = []
+        try:
+            worker_idx = 0
+            for node_idx, info in enumerate(node_infos):
+                node_groups = [
+                    group for group in groups if group["node_id"] == info["node_id"]
+                ]
+                if not node_groups:
+                    continue
+                launcher = RayWorkerProcessLauncher.options(
+                    num_cpus=0,
+                    num_gpus=0,
+                    scheduling_strategy=NodeAffinitySchedulingStrategy(
+                        node_id=info["node_id"], soft=False
+                    ),
+                ).remote(
+                    role,
+                    self._log_path_of(role),
+                    self._merged_log_path(),
+                    self.ray_device_resource,
+                    self.device_control_env_var,
+                    spec.env_vars,
+                )
+                launchers.append(launcher)
+
+                batch = []
+                for local_idx, group in enumerate(node_groups):
+                    worker_spec = schedulings[worker_idx]
+                    # SGLang colocate derives its physical GPU range from
+                    # SLURM_LOCALID x gpus_per_server, and the AWEX plugin
+                    # derives its transfer rank from SLURM_NODEID/NNODES, so
+                    # grouped workers see the whole node (identity visible
+                    # devices) plus the same env contract the Slurm launcher
+                    # provides.
+                    extra_env = {
+                        "SLURM_LOCALID": str(local_idx),
+                        "SLURM_NODEID": str(node_idx),
+                        "SLURM_NNODES": str(len(node_infos)),
+                    }
+                    batch.append(
+                        dict(
+                            role=role,
+                            worker_index=worker_idx,
+                            gpu_devices=list(info["visible_devices"]),
+                            extra_env=extra_env,
+                            cmd=worker_spec.cmd,
+                            experiment_name=self.experiment_name,
+                            trial_name=self.trial_name,
+                            name_resolve_type=self.name_resolve_config.type,
+                            nfs_record_root=self.name_resolve_config.nfs_record_root,
+                            etcd3_addr=self.name_resolve_config.etcd3_addr,
+                            fileroot=self.fileroot,
+                        )
+                    )
+                    workers.append(
+                        RayWorkerInfo(
+                            worker=Worker(
+                                id=f"{role}/{worker_idx}",
+                                ip="",
+                                worker_ports=[],
+                                engine_ports=[],
+                            ),
+                            role=role,
+                            launchers=[launcher],
+                            task_index=worker_idx,
+                            spec=worker_spec,
+                        )
+                    )
+                    worker_idx += 1
+                start_refs.append(launcher.start_workers.remote(batch))
+
+            ray.get(start_refs, timeout=self.startup_timeout)
+        except Exception as e:
+            self._stop_launchers_of(launchers)
+            if isinstance(e, WorkerCreationError):
+                raise
+            raise WorkerCreationError(
+                role,
+                "Grouped colocated worker creation failed",
+                f"{type(e).__name__}: {e}",
+            ) from e
+
+        self._launchers[role] = launchers
+        self._workers[role] = workers
+        worker_ids = [worker_info.worker.id for worker_info in workers]
+        logger.info(
+            f"Created {len(worker_ids)} grouped colocated workers for role "
+            f"'{role}' on target '{colocate_role}' nodes"
+        )
+        return worker_ids
+
+    def _stop_launchers_of(self, launchers: list[ActorHandle]) -> None:
+        for launcher in launchers:
+            try:
+                ray.get(launcher.stop_all_processes.remote(), timeout=10)
+            except Exception:
+                logger.warning("Failed to stop grouped launcher", exc_info=True)
+            try:
+                ray.kill(launcher, no_restart=True)
+            except Exception:
+                pass
 
     def get_workers(self, role: str, timeout: float | None = None) -> list[Worker]:
         """Wait for workers to be ready and return their information.

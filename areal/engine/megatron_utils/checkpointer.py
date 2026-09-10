@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import os
 import random
+from importlib import metadata
 
 import numpy as np
 import torch
@@ -54,6 +55,79 @@ def get_device_name() -> str:
     else:
         device = "cpu"
     return device
+
+
+class _UnsupportedMCoreAsyncLayout(RuntimeError):
+    """Raised when MCore's retained async payload cannot be released safely.
+
+    This includes malformed async request arguments, write buckets, bucket
+    payload tuples, or tensor payloads that are not mutable lists. The error
+    is raised before the async save request is scheduled.
+    """
+
+    pass
+
+
+def _mcore_version() -> str:
+    try:
+        return metadata.version("megatron-core")
+    except metadata.PackageNotFoundError:
+        return "unknown"
+
+
+def _inspect_retained_payload(async_request: AsyncRequest) -> list[list]:
+    """Validate MCore's retained payload layout before scheduling the save."""
+
+    def unsupported(detail: str) -> _UnsupportedMCoreAsyncLayout:
+        return _UnsupportedMCoreAsyncLayout(
+            "Unsupported MCore async checkpoint layout "
+            f"(megatron-core={_mcore_version()}): {detail}. "
+            "Refusing to schedule the save because actor GPU payload references "
+            "cannot be released safely."
+        )
+
+    # TODO(agent): Revalidate this internal contract when MCore's async
+    # checkpoint request or write-bucket layout changes.
+    args = getattr(async_request, "async_fn_args", None)
+    if not isinstance(args, (list, tuple)) or len(args) != 3:
+        raise unsupported("expected three async_fn_args")
+
+    buckets = args[1]
+    if not isinstance(buckets, list):
+        raise unsupported("expected async_fn_args[1] to be a write_buckets list")
+
+    tensor_lists = []
+    for index, bucket in enumerate(buckets):
+        if not isinstance(bucket, tuple) or len(bucket) != 3:
+            raise unsupported(f"write_buckets[{index}] is not a three-item tuple")
+        payload = bucket[2]
+        if not isinstance(payload, tuple) or len(payload) != 2:
+            raise unsupported(
+                f"write_buckets[{index}][2] is not a (bytes_data, tensor_data) tuple"
+            )
+        tensor_data = payload[1]
+        if not isinstance(tensor_data, list):
+            raise unsupported(
+                f"write_buckets[{index}] tensor_data is not a mutable list"
+            )
+        tensor_lists.append(tensor_data)
+
+    return tensor_lists
+
+
+def _release_retained_payload(tensor_lists: list[list]) -> None:
+    """Drop parent-side GPU references after MCore finishes D2H staging.
+
+    MCore retains the original request for finalization, whose writer still owns
+    the original tensor lists through ``write_buckets``. Scheduling returns only
+    after the child owns the staged CPU payload, while finalization needs the
+    writer and outer bucket count but not the tensor contents. Preserve that
+    structure and clear only the parent-side tensor lists.
+    """
+    for tensor_data in tensor_lists:
+        tensor_data.clear()
+    if any(tensor_data for tensor_data in tensor_lists):
+        raise RuntimeError("Failed to release MCore's retained async-save payload")
 
 
 def save_dist_checkpointing(
@@ -470,7 +544,9 @@ class MegatronCheckpointManager:
                 "Megatron returned no AsyncRequest despite async_sharded_save=True."
             )
             assert self._async_queue is not None
+            tensor_lists = _inspect_retained_payload(async_save_request)
             call_idx = self._async_queue.schedule_async_request(async_save_request)
+            _release_retained_payload(tensor_lists)
             # By the time schedule_async_request returns, AsyncCallsQueue has
             # already done torch.cuda.synchronize() and forked the background
             # save process — so weights are durably staged off the GPU. The

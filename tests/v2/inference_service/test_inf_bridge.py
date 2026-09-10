@@ -67,6 +67,7 @@ def _make_request(
     n_samples: int = 1,
     greedy: bool = False,
     temperature: float = 1.0,
+    seed: int | None = None,
     metadata: dict[str, Any] | None = None,
     lora_name: str | None = None,
 ) -> ModelRequest:
@@ -79,6 +80,7 @@ def _make_request(
         max_tokens=max_tokens,
         greedy=greedy,
         temperature=temperature,
+        seed=seed,
     )
     if lora_name is not None:
         gconfig.lora_name = lora_name
@@ -472,6 +474,19 @@ class TestVLLMBridgeBackend:
         assert http_req.payload["prompt"] == [11, 12]
         assert http_req.payload["max_tokens"] == 7
         assert http_req.payload["stream"] is False
+
+    @pytest.mark.parametrize("seed", [None, 12345])
+    def test_vllm_build_generation_request_forwards_seed_when_set(self, seed):
+        """vLLM bridge forwards explicit seeds and omits unspecified seeds."""
+        backend = VLLMBridgeBackend()
+        req = _make_request(input_ids=[11, 12], max_new_tokens=7, seed=seed)
+
+        http_req = backend.build_generation_request(req, with_lora=False, version=0)
+
+        if seed is None:
+            assert "seed" not in http_req.payload
+        else:
+            assert http_req.payload["seed"] == seed
 
     def test_vllm_parse_generation_response_for_chat_format(self):
         """vLLM bridge parses chat logprobs content format."""

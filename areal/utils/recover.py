@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import dataclasses
+import inspect
 import json
 import os
 import pickle
@@ -217,6 +218,51 @@ class RecoverHandler:
             return engine
         return {"default": engine}
 
+    @staticmethod
+    def _should_run_awex_colocate_transfer(
+        inference_engine: InferenceEngine | None,
+        weight_update_meta: WeightUpdateMeta | None,
+        colocated_rollout: bool,
+    ) -> bool:
+        """Whether recovery must drive the AWEX colocate pre-transfer sequence.
+
+        The transport type alone is not enough: v2 selects AWEX for every
+        non-LoRA run regardless of placement, so the caller has to state whether
+        actor and rollout physically share devices.
+        """
+        return (
+            inference_engine is not None
+            and getattr(weight_update_meta, "type", None) == "awex"
+            and colocated_rollout
+        )
+
+    @staticmethod
+    def _require_colocate_rollout_protocol(
+        inference_engine: InferenceEngine,
+    ) -> None:
+        missing = []
+        if not callable(getattr(inference_engine, "pause_generation_sync", None)):
+            missing.append("pause_generation_sync()")
+
+        offload = getattr(inference_engine, "offload", None)
+        if not callable(offload):
+            missing.append("offload(tags=...)")
+        else:
+            try:
+                accepts_tags = "tags" in inspect.signature(offload).parameters
+            except (TypeError, ValueError):
+                accepts_tags = True
+            if not accepts_tags:
+                missing.append("offload(tags=...)")
+
+        if missing:
+            raise NotImplementedError(
+                "Colocated AWEX recovery needs a rollout engine implementing "
+                f"{', '.join(missing)}, which {type(inference_engine).__name__} "
+                "does not provide. Disable `recover.mode` or run this "
+                "configuration without actor-rollout colocation."
+            )
+
     def dump(
         self,
         engine: TrainEngine
@@ -279,6 +325,7 @@ class RecoverHandler:
         inference_engine: InferenceEngine | None = None,
         weight_update_meta: WeightUpdateMeta | None = None,
         inference_engine_update_from: str = "default",
+        colocated_rollout: bool = False,
     ) -> RecoverInfo | None:
         if self.config.mode in ("disabled", "off"):
             return
@@ -309,19 +356,54 @@ class RecoverHandler:
             stats_logger.load_state_dict(recover_info.stats_logger_info)
             dataloader.load_state_dict(recover_info.dataloader_info)
 
-            for name, engine_ in normalized_engine.items():
-                self._load_checkpoint(engine_, name=name)
             global_step = recover_info.last_step_info.global_step
+            recovery_version = global_step + 1
+
+            is_awex_colocate = self._should_run_awex_colocate_transfer(
+                inference_engine=inference_engine,
+                weight_update_meta=weight_update_meta,
+                colocated_rollout=colocated_rollout,
+            )
+            if is_awex_colocate:
+                self._require_colocate_rollout_protocol(inference_engine)
+
+            if not is_awex_colocate:
+                for name, engine_ in normalized_engine.items():
+                    self._load_checkpoint(engine_, name=name)
 
             if inference_engine is not None:
                 assert weight_update_meta is not None
                 update_engine = normalized_engine[inference_engine_update_from]
-                recovery_version = global_step + 1
                 versioned_meta = weight_update_meta.with_version(recovery_version)
                 update_engine.connect_engine(inference_engine, versioned_meta)
                 inference_engine.pause()
-                update_engine.update_weights(versioned_meta)
-                inference_engine.resume()
+                try:
+                    # AWEX colocate transfer requires the full engine-level
+                    # pause/offload protocol, not just the controller pause. The
+                    # sglang plugin's patched event loop only drains the weight-
+                    # update queue while scheduler._engine_paused is True (set by
+                    # pause_generation), and the reader-side protocol expects the
+                    # engine's kv/weights released before the writer publishes.
+                    # Without this the recover-path transfer deadlocks: reader
+                    # never consumes the queued version marker, writer blocks on
+                    # weights_update_finished forever.
+                    # Mirror of the trainer's pre-update sequence; the reverse
+                    # side (kv_cache onload) happens inside update_weights.
+                    if is_awex_colocate:
+                        inference_engine.pause_generation_sync()
+                        inference_engine.offload(tags=["kv_cache"])
+                        inference_engine.offload(tags=["weights"])
+                        # Load the actor checkpoint only after the colocated
+                        # rollout engine has released its GPU memory; loading
+                        # first would stack DCP weights/optimizer on top of the
+                        # still-resident sglang allocation and risk OOM.
+                        for name, engine_ in normalized_engine.items():
+                            self._load_checkpoint(engine_, name=name)
+                    update_engine.update_weights(versioned_meta)
+                finally:
+                    # Always resume: leaving rollout paused after a failed
+                    # checkpoint load or transfer would hang every later step.
+                    inference_engine.resume()
                 update_engine.set_version(recovery_version)
                 inference_engine.set_version(recovery_version)
             return recover_info

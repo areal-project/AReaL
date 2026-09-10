@@ -1,14 +1,29 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import functools
+import math
 from typing import Any
 
 import torch
 
 from areal.api import TrainEngine
-from areal.api.cli_args import MicroBatchSpec, PPOActorConfig, RejectionSamplingConfig
+from areal.api.cli_args import (
+    MicroBatchSpec,
+    MOPDLossConfig,
+    PPOActorConfig,
+    RejectionSamplingConfig,
+)
+from areal.engine.core import stage_batch_for_engine
 from areal.infra import TrainController
 from areal.infra.rpc.serialization import serialize_value
+from areal.trainer.mopd.loss import compose_mopd_loss
+from areal.trainer.mopd.targets import aggregate_mopd_targets
+from areal.trainer.ppo.gae import (
+    _build_gae_lambda_context,
+    _compute_token_level_gae,
+    _compute_turn_level_gae,
+)
+from areal.trainer.ppo.lambda_fn import resolve_gae_lambda_fn
 from areal.trainer.ppo.stats import infer_token_denominator
 from areal.utils import logging, stats_tracker
 from areal.utils.constants import (
@@ -26,9 +41,11 @@ from areal.utils.data import (
     Normalization,
     TrajBatchMeta,
     batched_call,
+    is_multi_modal_key,
     split_padded_tensor_dict_into_mb_list,
 )
 from areal.utils.functional import (
+    apply_rejection_sampling,
     cispo_loss_fn,
     ppo_actor_loss_fn,
     reward_overlong_penalty,
@@ -40,6 +57,37 @@ from areal.v2.training_service.controller.controller import (
 )
 
 logger = logging.getLogger("PPOActor")
+
+
+def _infer_prompt_lens(
+    attention_mask: torch.Tensor, loss_mask: torch.Tensor
+) -> torch.Tensor:
+    """Return the index of the first generated token for each trajectory.
+
+    ``loss_mask`` arrives rolled left by one (see ``_compute_advantages``), so it
+    marks the position that *predicts* each generated token. Undo the roll before
+    locating the first one, otherwise every prompt length comes out one short.
+    """
+    loss_mask_long = torch.roll(loss_mask.long(), shifts=1, dims=-1)
+    first_gen_idx = loss_mask_long.argmax(dim=-1)
+    has_gen = loss_mask_long.any(dim=-1)
+    return torch.where(has_gen, first_gen_idx, attention_mask.long().sum(-1))
+
+
+def _get_truncated_mask(data: dict[str, Any], seqlens: torch.Tensor) -> torch.Tensor:
+    is_truncated = data.get("is_truncated")
+    if is_truncated is None:
+        # Preserve compatibility with custom tensor workflows that predate the
+        # explicit per-trajectory termination metadata.
+        return seqlens == data["attention_mask"].shape[-1]
+    if not torch.is_tensor(is_truncated):
+        raise TypeError("`is_truncated` must be a tensor")
+    if is_truncated.shape != seqlens.shape:
+        raise ValueError(
+            "`is_truncated` must have one value per trajectory, got "
+            f"shape {tuple(is_truncated.shape)} for batch shape {tuple(seqlens.shape)}"
+        )
+    return is_truncated.to(device=seqlens.device, dtype=torch.bool)
 
 
 class PPOActor:
@@ -61,14 +109,28 @@ class PPOActor:
 
         self.discount = config.discount
         self.gae_lambda = config.gae_lambda
+        self.gae_lambda_fn, self._gae_lambda_is_custom = resolve_gae_lambda_fn(
+            config.gae_lambda
+        )
+        self.gae_lambda_kwargs = (
+            dict(config.gae_lambda_kwargs) if self._gae_lambda_is_custom else {}
+        )
+        self.gae_timestep_unit = config.gae_timestep_unit
         self.mask_no_eos_with_zero = config.mask_no_eos_with_zero
 
         self.temperature = config.temperature
 
         self.m2_threshold = config.m2_threshold
+        self._mopd_loss_config: MOPDLossConfig | None = None
 
         # Log critical GSPO/GRPO configuration for reproducibility
         self._log_configuration()
+
+    def configure_mopd_loss(self, config: MOPDLossConfig) -> None:
+        """Bind static MOPD loss settings once on each actor worker."""
+        if self._mopd_loss_config is not None and self._mopd_loss_config != config:
+            raise RuntimeError("MOPD loss configuration is already bound")
+        self._mopd_loss_config = config
 
     def _log_configuration(self):
         """Log PPO configuration including how proximal policy is computed."""
@@ -125,6 +187,8 @@ class PPOActor:
         logger.info(
             f"  reward_norm: {config.reward_norm if config.reward_norm else 'DISABLED (None)'}"
         )
+        logger.info(f"  gae_lambda: {config.gae_lambda}")
+        logger.info(f"  gae_timestep_unit: {config.gae_timestep_unit}")
         logger.info(f"  eps_clip: {config.eps_clip}")
         logger.info("=" * 70)
 
@@ -135,20 +199,50 @@ class PPOActor:
 
     def _compute_logp(self, data: dict[str, Any]) -> torch.Tensor | None:
         self.engine.eval()
+        stage_batch_for_engine(data, self.engine)
         return self.engine.forward(
             input_=data,
             aggregate_fn=lambda xs: torch.cat(xs, dim=-1),
         )
 
+    def aggregate_mopd_targets(
+        self,
+        data: list[dict[str, Any]] | None = None,
+    ) -> list[dict[str, Any]] | None:
+        """Fetch-localized teacher contributions and create actor-owned targets."""
+        return aggregate_mopd_targets(data)
+
+    def assert_mopd_runtime_topology(self) -> None:
+        """Validate the live Megatron process groups used for MOPD scoring."""
+        self.engine.assert_mopd_runtime_topology()
+
     @trace_perf("ppo_actor.compute_advantages", category="compute")
     def compute_advantages(self, data: list[dict[str, Any]]) -> list[dict[str, Any]]:
         return batched_call(self._compute_advantages, data, pass_meta=True)
+
+    @trace_perf("ppo_actor.prepare_mopd_batch", category="compute")
+    def prepare_mopd_batch(self, data: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Align pure-distillation inputs without computing rewards or GAE."""
+        return batched_call(self._prepare_mopd_batch, data)
+
+    def _prepare_mopd_batch(self, data: dict[str, Any]) -> dict[str, Any]:
+        if self._mopd_loss_config is None:
+            raise RuntimeError("MOPD loss configuration is not bound")
+        if self._mopd_loss_config.rl_coefficient != 0:
+            raise RuntimeError("prepare_mopd_batch is only valid for pure distillation")
+        if "mopd_teacher_logp_sum" not in data:
+            raise RuntimeError("Pure MOPD distillation requires teacher targets")
+        loss_mask = torch.roll(data["loss_mask"].float(), shifts=-1, dims=-1)
+        behavior_logp = torch.roll(data["logprobs"], shifts=-1, dims=-1)
+        data["mopd_behavior_logprobs"] = (behavior_logp * loss_mask).detach()
+        data["logprobs"] = behavior_logp * loss_mask
+        data["loss_mask"] = loss_mask
+        return data
 
     def _compute_advantages(
         self, data: dict[str, Any], meta: TrajBatchMeta | None = None
     ) -> dict[str, Any]:
         bs = data["input_ids"].shape[0]
-        max_seqlen = data["input_ids"].shape[1]
         batch_indices = torch.arange(
             bs, device=data["input_ids"].device, dtype=torch.long
         )
@@ -183,6 +277,26 @@ class PPOActor:
 
         loss_mask = data["loss_mask"].float()
         loss_mask = torch.roll(loss_mask, shifts=-1, dims=-1)
+
+        if "mopd_teacher_logp_sum" in data:
+            # MOPD's correction is always relative to the immutable rollout
+            # behavior policy, even when standard PPO recomputes its proximal
+            # policy and overwrites ``logprobs`` below.
+            data["mopd_behavior_logprobs"] = (
+                torch.roll(data["logprobs"], shifts=-1, dims=-1) * loss_mask
+            ).detach()
+
+        # Align structural turn IDs to the same next-token prediction
+        # convention used by loss_mask and log probabilities.
+        turn_ids = data.get("turn_ids")
+        if turn_ids is not None:
+            turn_ids = torch.roll(turn_ids, shifts=-1, dims=-1)
+            turn_ids[:, -1] = -1
+        elif self.gae_timestep_unit == "turn":
+            raise ValueError(
+                "actor.gae_timestep_unit='turn' requires rollout data to "
+                "include 'turn_ids'."
+            )
         # Apply the mask to log probabilities.
         if not self.config.use_decoupled_loss and self.config.recompute_logprob:
             # Overwrite logprobs produced by the inference engine
@@ -207,41 +321,66 @@ class PPOActor:
         # Compute KL-regularized rewards.
         attn_mask = data["attention_mask"]
         seqlens = attn_mask.sum(-1).long()
-        seq_no_eos_mask = seqlens == attn_mask.shape[1]
+        seq_truncated_mask = _get_truncated_mask(data, seqlens)
+        data["is_truncated"] = seq_truncated_mask
         rewards = -self.kl_ctl * self.kl_estimator(old_logp, ref_logp)
         kl_rewards = rewards.clone()
         # KL rewards at the next token after eos is zero.
         rewards[batch_indices, seqlens - 1] = 0
+        gae_kl_rewards = rewards.clone()
         indices = torch.clip(seqlens - 2, min=0)
+        gae_outcome_rewards = torch.zeros_like(rewards)
         if self.mask_no_eos_with_zero:
-            rewards[batch_indices, indices] += torch.where(
-                seq_no_eos_mask, 0, reward_score
+            gae_outcome_rewards[batch_indices, indices] = torch.where(
+                seq_truncated_mask, 0, reward_score
             )
         else:
-            rewards[batch_indices, indices] += reward_score
+            gae_outcome_rewards[batch_indices, indices] = reward_score
+
+        # Turn-level GAE treats each generated turn as a macro timestep. Keep
+        # token KL as a local actor penalty rather than broadcasting a turn's
+        # summed KL into every token and into critic targets.
+        if self.gae_timestep_unit == "turn":
+            rewards = gae_outcome_rewards
+        else:
+            rewards = gae_kl_rewards + gae_outcome_rewards
 
         # Compute GAE.
         if "values" not in data:
             values = torch.zeros_like(rewards)
         else:
             values = data["values"]
-        advantages_reversed = [
-            torch.zeros(bs, dtype=torch.float32, device=values.device)
-        ]
-        lastgaelam = 0
-        nextvalues = values[:, max_seqlen - 1] * seq_no_eos_mask
-        for t in reversed(range(max_seqlen - 1)):
-            delta = rewards[:, t] + self.discount * nextvalues - values[:, t]
-            newgaelam = delta + self.discount * self.gae_lambda * lastgaelam
-
-            # Skip tokens that do not contribute to the loss
-            mask = loss_mask[:, t]
-            nextvalues = nextvalues * (1 - mask) + values[:, t] * mask
-            lastgaelam = lastgaelam * (1 - mask) + newgaelam * mask
-            advantages_reversed.append(lastgaelam)
-
-        advantages = torch.stack(advantages_reversed[::-1], dim=1)
-        data["returns"] = advantages + values
+        bootstrap_values = values[batch_indices, seqlens - 1]
+        if self._gae_lambda_is_custom:
+            gae_lambda = self._compute_gae_lambda(loss_mask, turn_ids)
+        else:
+            gae_lambda = float(self.gae_lambda)
+            if not math.isfinite(gae_lambda):
+                raise ValueError(f"Static gae_lambda must be finite, got {gae_lambda}")
+        if self.gae_timestep_unit == "turn":
+            assert turn_ids is not None
+            advantages, returns = _compute_turn_level_gae(
+                rewards=rewards,
+                values=values,
+                loss_mask=loss_mask,
+                turn_ids=turn_ids,
+                seq_no_eos_mask=seq_truncated_mask,
+                bootstrap_values=bootstrap_values,
+                discount=self.discount,
+                gae_lambda=gae_lambda,
+            )
+            advantages = advantages + gae_kl_rewards
+        else:
+            advantages, returns = _compute_token_level_gae(
+                rewards=rewards,
+                values=values,
+                loss_mask=loss_mask,
+                seq_no_eos_mask=seq_truncated_mask,
+                bootstrap_values=bootstrap_values,
+                discount=self.discount,
+                gae_lambda=gae_lambda,
+            )
+        data["returns"] = returns
 
         # Optionally perform advantage normalization.
         if self.adv_norm is not None:
@@ -252,12 +391,51 @@ class PPOActor:
         # Store data in the dict.
         data["advantages"] = advantages
         data["kl_rewards"] = kl_rewards
-        data["tot_rewards"] = rewards
+        data["tot_rewards"] = gae_kl_rewards + gae_outcome_rewards
         data["loss_mask"] = loss_mask
         # because we have rolled old_logp by -1
         data["logprobs"] = old_logp
 
         return data
+
+    def _compute_gae_lambda(
+        self,
+        loss_mask: torch.Tensor,
+        turn_ids: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Resolve one lambda value per local trajectory without changing masks."""
+        context = _build_gae_lambda_context(
+            loss_mask,
+            turn_ids,
+            gae_timestep_unit=self.gae_timestep_unit,
+        )
+        gae_lambda = self.gae_lambda_fn(context, **self.gae_lambda_kwargs)
+        if not isinstance(gae_lambda, torch.Tensor):
+            raise TypeError(
+                "gae_lambda function must return a torch.Tensor with shape "
+                f"[{loss_mask.shape[0]}], got {type(gae_lambda).__name__}"
+            )
+        expected_shape = torch.Size([loss_mask.shape[0]])
+        if gae_lambda.shape != expected_shape:
+            raise ValueError(
+                "gae_lambda function must return one value per local trajectory: "
+                f"expected shape {expected_shape}, got {gae_lambda.shape}"
+            )
+        if gae_lambda.device != loss_mask.device:
+            raise ValueError(
+                "gae_lambda output and loss_mask must be on the same device, got "
+                f"{gae_lambda.device} and {loss_mask.device}"
+            )
+        if not torch.is_floating_point(gae_lambda):
+            raise TypeError(
+                "gae_lambda function must return a floating-point tensor, got "
+                f"{gae_lambda.dtype}"
+            )
+        torch._assert_async(
+            torch.all(torch.isfinite(gae_lambda)),
+            "gae_lambda function returned a non-finite value",
+        )
+        return gae_lambda.detach().float()
 
     @trace_perf("ppo_actor.ppo_update", category="compute")
     @stats_tracker.scope_func_wrapper("ppo_actor")
@@ -305,16 +483,22 @@ class PPOActor:
             incorrect_seq_len=seqlens.float(), denominator="incorrect_n_seqs"
         )
 
-        stats = dict(
-            advantages=data["advantages"],
-            kl_rewards=data["kl_rewards"],
-            final_reward=data["tot_rewards"],
+        pure_mopd_distillation = (
+            self._mopd_loss_config is not None
+            and self._mopd_loss_config.rl_coefficient == 0
         )
-        stats_tracker.stat(**stats, denominator="n_valid_tokens")
+        if not pure_mopd_distillation:
+            stats_tracker.stat(
+                advantages=data["advantages"],
+                kl_rewards=data["kl_rewards"],
+                final_reward=data["tot_rewards"],
+                denominator="n_valid_tokens",
+            )
 
-        prompt_lens = data["attention_mask"].sum(-1) - data["loss_mask"].sum(-1)
+        prompt_lens = _infer_prompt_lens(data["attention_mask"], data["loss_mask"])
+        seq_truncated_mask = _get_truncated_mask(data, seqlens)
         seq_stats = dict(
-            no_eos_ratios=(seqlens == attn_mask.shape[-1]).float(),
+            no_eos_ratios=seq_truncated_mask.float(),
             task_reward=task_reward,
             prompt_len=prompt_lens.float(),
             seq_len=seqlens.float(),
@@ -345,8 +529,12 @@ class PPOActor:
 
         # Pop keys that are no longer needed after advantage computation
         # Note: "versions" is kept if needed for approximation/metrics in loss function
-        for key in ["rewards", "tot_rewards", "kl_rewards"]:
+        for key in ["rewards", "tot_rewards", "kl_rewards", "is_truncated"]:
             data.pop(key, None)
+        # Megatron keeps the full batch on CPU and streams only the current
+        # microbatch to the accelerator. Stage before the outer PPO split so
+        # that split does not retain every optimizer minibatch on GPU.
+        stage_batch_for_engine(data, self.engine)
         # NOTE: calling engine.train() is critical to enabling gradient checkpointing
         self.engine.train()
         mb_inputs = split_padded_tensor_dict_into_mb_list(
@@ -376,6 +564,7 @@ class PPOActor:
                         sapo_tau_neg=self.config.sapo_tau_neg,
                         use_cispo_loss=self.config.use_cispo_loss,
                         use_decoupled_loss=self.config.use_decoupled_loss,
+                        mopd_loss_config=self._mopd_loss_config,
                     ),
                     loss_weight_fn=lambda x: x["loss_mask"].count_nonzero(),
                 )
@@ -383,14 +572,111 @@ class PPOActor:
 
 
 class PPOActorController(TrainController):
+    def configure_mopd_loss(self, config: MOPDLossConfig) -> None:
+        self._custom_function_call(
+            "configure_mopd_loss", config, rpc_meta={"broadcast": True}
+        )
+
     def compute_logp(self, *args, **kwargs):
         return self._custom_function_call(
             "compute_logp", *args, rpc_meta={"broadcast": True}, **kwargs
         )
 
+    def compute_logp_padded(self, data: list[dict[str, Any]]):
+        """Compute logp with DP/PP padding and retain dummy outputs for drain."""
+        original_size = len(data)
+        pp_size = self.parallel_strategy.pp_size
+        min_microbatches = max(
+            2 * pp_size if pp_size > 1 else 1,
+            self.config.mb_spec.n_mbs,
+        )
+        min_items_per_dp = (
+            ((min_microbatches + pp_size - 1) // pp_size)
+            * pp_size
+            * self.config.mb_spec.granularity
+        )
+        args, kwargs = self._pad_eval_dispatch_args(
+            (data,),
+            {},
+            group_size=1,
+            min_items_per_dp=min_items_per_dp,
+            items_per_dp_divisor=pp_size * self.config.mb_spec.granularity,
+            active_dummies=True,
+        )
+        results = self._custom_function_call(
+            "compute_logp", *args, rpc_meta={"broadcast": True}, **kwargs
+        )
+        if results is None:
+            return None, []
+        return results[:original_size], results[original_size:]
+
     def compute_advantages(self, *args, **kwargs):
+        if (
+            self.train_alloc.backend != "megatron"
+            or not args
+            or not isinstance(args[0], list)
+            or not all(isinstance(item, dict) for item in args[0])
+        ):
+            return self._custom_function_call(
+                "compute_advantages", *args, rpc_meta={"broadcast": True}, **kwargs
+            )
+
+        data = args[0]
+        multi_modal_payloads = [
+            {key: value for key, value in item.items() if is_multi_modal_key(key)}
+            for item in data
+        ]
+        if not any(multi_modal_payloads):
+            return self._custom_function_call(
+                "compute_advantages", *args, rpc_meta={"broadcast": True}, **kwargs
+            )
+
+        # Advantage computation never consumes vision inputs. Keep the original
+        # RTensor references on the controller so the grouped image shards do
+        # not make an unnecessary worker round trip before ppo_update.
+        rpc_data = [
+            {key: value for key, value in item.items() if not is_multi_modal_key(key)}
+            for item in data
+        ]
+        results = self._custom_function_call(
+            "compute_advantages",
+            rpc_data,
+            *args[1:],
+            rpc_meta={"broadcast": True},
+            **kwargs,
+        )
+        if not isinstance(results, list) or len(results) != len(multi_modal_payloads):
+            raise RuntimeError(
+                "Megatron compute_advantages returned an invalid trajectory batch: "
+                f"expected {len(multi_modal_payloads)} items, got "
+                f"{type(results).__name__} of length "
+                f"{len(results) if isinstance(results, list) else 'unknown'}"
+            )
+        for result, payload in zip(results, multi_modal_payloads, strict=True):
+            if not isinstance(result, dict):
+                raise RuntimeError(
+                    "Megatron compute_advantages returned a non-dict trajectory: "
+                    f"{type(result).__name__}"
+                )
+            result.update(payload)
+        return results
+
+    def prepare_mopd_batch(self, *args, **kwargs):
         return self._custom_function_call(
-            "compute_advantages", *args, rpc_meta={"broadcast": True}, **kwargs
+            "prepare_mopd_batch", *args, rpc_meta={"broadcast": True}, **kwargs
+        )
+
+    def aggregate_mopd_targets(self, *args, **kwargs):
+        return self._custom_function_call(
+            "aggregate_mopd_targets",
+            *args,
+            rpc_meta={"broadcast": False},
+            **kwargs,
+        )
+
+    def assert_mopd_runtime_topology(self) -> None:
+        self._custom_function_call(
+            "assert_mopd_runtime_topology", rpc_meta={"broadcast": False}
         )
 
     def ppo_update(self, *args, **kwargs) -> None:
@@ -439,6 +725,7 @@ def grpo_loss_fn(
     sapo_tau_neg: float = 1.05,
     use_cispo_loss: bool = False,
     use_decoupled_loss: bool = False,
+    mopd_loss_config: MOPDLossConfig | None = None,
     vocab_min_logits: torch.Tensor | None = None,
     vocab_max_logits: torch.Tensor | None = None,
     vocab_mean_logits: torch.Tensor | None = None,
@@ -446,9 +733,70 @@ def grpo_loss_fn(
 ):
     """Loss function for actor step, all inputs should be splitted into
     pipeline micro batches, returns loss and logging stats."""
+    loss_mask = input_data["loss_mask"].bool()
+    if mopd_loss_config is not None and mopd_loss_config.rl_coefficient == 0:
+        teacher_logp_sum = input_data.get("mopd_teacher_logp_sum")
+        teacher_weight_sum = input_data.get("mopd_teacher_weight_sum")
+        behavior_logp = input_data.get("mopd_behavior_logprobs")
+        if teacher_logp_sum is None or teacher_weight_sum is None:
+            raise RuntimeError("Pure MOPD distillation requires teacher targets")
+        if behavior_logp is None:
+            raise RuntimeError(
+                "MOPD targets require immutable rollout behavior log-probabilities"
+            )
+        normalization_mask = loss_mask
+        prox_logp_gt = input_data.get("prox_logp")
+        if m2_threshold is not None or rejection_sampling is not None:
+            prox_logp = _resolve_proximal_logp(
+                prox_logp_gt=prox_logp_gt,
+                prox_logp_method=prox_logp_method,
+                old_logp=input_data["logprobs"],
+                logprobs=logprobs.detach(),
+                versions=input_data.get("versions"),
+                current_version=current_version,
+            )
+            if m2_threshold is not None:
+                loss_mask = _apply_m2po_masking(
+                    input_data["logprobs"], prox_logp, loss_mask, m2_threshold
+                )
+                normalization_mask = loss_mask
+            if rejection_sampling is not None:
+                loss_mask = apply_rejection_sampling(
+                    proximal_logprobs=prox_logp,
+                    old_logprobs=input_data["logprobs"],
+                    loss_mask=loss_mask,
+                    cu_seqlens=input_data.get("cu_seqlens"),
+                    config=rejection_sampling,
+                ).loss_mask
+        loss, mopd_stats = compose_mopd_loss(
+            logprobs.new_zeros(()),
+            config=mopd_loss_config,
+            logprobs=logprobs,
+            old_logprobs=behavior_logp,
+            teacher_logp_sum=teacher_logp_sum,
+            teacher_weight_sum=teacher_weight_sum,
+            loss_mask=loss_mask,
+            normalization_mask=normalization_mask,
+        )
+        stats_tracker.denominator(
+            n_tokens=infer_token_denominator(input_data, loss_mask),
+            n_valid_tokens=normalization_mask,
+            n_mopd_tokens=normalization_mask,
+        )
+        stats_tracker.stat(
+            mopd_loss=mopd_stats["loss_per_token"].float(),
+            mopd_reward=mopd_stats["score_reward"].float(),
+            mopd_importance_weight=mopd_stats["importance_weight"].float(),
+            mopd_teacher_weight_sum=mopd_stats["teacher_weight_sum"].float(),
+            new_logp=logprobs.detach(),
+            old_logp=behavior_logp,
+            entropy=entropy.detach().float(),
+            denominator="n_mopd_tokens",
+        )
+        return loss
+
     old_logp = input_data["logprobs"]
     advantages = input_data["advantages"]
-    loss_mask = input_data["loss_mask"].bool()
     prox_logp_gt = input_data.get("prox_logp")  # Could be None if skipped
 
     entropy = entropy.detach()
@@ -524,36 +872,67 @@ def grpo_loss_fn(
             cu_seqlens=input_data.get("cu_seqlens"),
         )
 
-    # Joint Distillation KL Loss
+    # M2 is part of the shared training-validity contract. Behavioral
+    # rejection may narrow the MOPD numerator further, while its denominator
+    # stays at the pre-rejection count to avoid amplifying accepted tokens.
+    mopd_normalization_mask = loss_mask
+    mopd_loss_mask = stat.get("behave_mask", loss_mask).bool()
+
+    # Multi-teacher on-policy distillation. The deprecated single-teacher
+    # fields retain their original joint-loss semantics for compatibility.
     teacher_logp = input_data.get("teacher_logp")
+    mopd_teacher_logp_sum = input_data.get("mopd_teacher_logp_sum")
     rkl_stat = None
-    if teacher_logp is not None:
-        # Coefficients for RL and Knowledge Distillation
+    mopd_stats = {}
+    if teacher_logp is not None and mopd_teacher_logp_sum is not None:
+        raise ValueError(
+            "teacher_logp and mopd_teacher_logp_sum cannot both be provided"
+        )
+    if mopd_teacher_logp_sum is not None:
+        teacher_weight_sum = input_data.get("mopd_teacher_weight_sum")
+        if mopd_loss_config is None:
+            raise RuntimeError(
+                "MOPD targets require actor-local MOPDLossConfig initialization"
+            )
+        behavior_logp = input_data.get("mopd_behavior_logprobs")
+        if behavior_logp is None:
+            raise RuntimeError(
+                "MOPD targets require immutable rollout behavior log-probabilities"
+            )
+        loss, mopd_stats = compose_mopd_loss(
+            loss,
+            config=mopd_loss_config,
+            logprobs=logprobs,
+            old_logprobs=behavior_logp,
+            teacher_logp_sum=mopd_teacher_logp_sum,
+            teacher_weight_sum=teacher_weight_sum,
+            loss_mask=mopd_loss_mask,
+            normalization_mask=mopd_normalization_mask,
+        )
+        rkl_stat = mopd_stats["reverse_kl"].float()
+    elif mopd_loss_config is not None:
+        if mopd_loss_config.distillation_coefficient != 0:
+            raise RuntimeError("MOPD distillation is enabled but targets are missing")
+        loss = mopd_loss_config.rl_coefficient * loss
+    elif teacher_logp is not None:
         rl_loss_weight = input_data.get("rl_loss_weight", 1.0)
         distill_loss_weight = input_data.get("distill_loss_weight", 0.005)
-
-        teacher_logp = (
-            teacher_logp.detach()
-        )  # detach to prevent gradient backprop to teacher
+        teacher_logp = teacher_logp.detach()
 
         if rl_loss_weight == 0:
-            # Pure KD using reverse KL (importance-sampling)
             rkl_reward = teacher_logp - logprobs.detach()
             importance_weight = torch.exp(logprobs - old_logp)
-
             rkl_weighted_term = importance_weight * rkl_reward * loss_mask
-
-            kd_coef = -1 * distill_loss_weight
-            loss = kd_coef * rkl_weighted_term.sum() / loss_mask.sum().clamp(min=1)
-
-            rkl_stat = -1 * rkl_weighted_term
+            loss = (
+                -distill_loss_weight
+                * rkl_weighted_term.sum()
+                / loss_mask.sum().clamp(min=1)
+            )
+            rkl_stat = -rkl_weighted_term
         else:
-            # KDRL: Knowledge Distillation + Reinforcement Learning (joint loss)
             rkl_penalty_per_token = (logprobs - teacher_logp) * loss_mask
             rkl_penalty = rkl_penalty_per_token.sum() / loss_mask.sum().clamp(min=1)
-
             loss = rl_loss_weight * loss + distill_loss_weight * rkl_penalty
-
             rkl_stat = rkl_penalty_per_token
 
     # Log training statistics
@@ -565,11 +944,22 @@ def grpo_loss_fn(
     )
 
     if rkl_stat is not None:
-        stats_tracker.stat(
-            rkl_loss=rkl_stat,
-            denominator="n_valid_tokens",
-        )
+        if mopd_stats:
+            stats_tracker.denominator(n_mopd_tokens=mopd_normalization_mask.bool())
+            stats_tracker.stat(
+                mopd_loss=mopd_stats["loss_per_token"].float(),
+                mopd_reward=mopd_stats["score_reward"].float(),
+                mopd_importance_weight=mopd_stats["importance_weight"].float(),
+                mopd_teacher_weight_sum=mopd_stats["teacher_weight_sum"].float(),
+                denominator="n_mopd_tokens",
+            )
+        else:
+            stats_tracker.stat(
+                rkl_loss=rkl_stat,
+                denominator="n_valid_tokens",
+            )
 
+    logp_diff = (old_logp - logprobs.detach()) * loss_mask
     stats_tracker.stat(
         importance_weight=stat["importance_weight"],
         approx_kl=stat["approx_kl"],
@@ -579,14 +969,30 @@ def grpo_loss_fn(
         actor_loss=stat["loss"],
         clip_ratio=stat["clip_mask"].float(),
         dual_clip_ratio=stat["dual_clip_mask"].float(),
+        logp_diff=logp_diff,
+        logp_abs_diff=logp_diff.abs(),
         denominator="n_valid_tokens",
     )
+
     if "behave_imp_weight" in stat:
         stats_tracker.denominator(unclipped_behave_tokens=stat["behave_mask"])
         stats_tracker.stat(
             behave_imp_weight=stat["behave_imp_weight"],
             behave_approx_kl=stat["behave_approx_kl"],
             denominator="unclipped_behave_tokens",
+        )
+        behave_filtered_mask = loss_mask & ~stat["behave_mask"]
+        stats_tracker.stat(
+            behave_filtered_ratio=behave_filtered_mask.float(),
+            denominator="n_valid_tokens",
+        )
+
+    if "n_valid_tokens" in stat:
+        stats_tracker.scalar(
+            n_total_tokens=stat["n_total_tokens"],
+            n_valid_tokens_in_loss=stat["n_valid_tokens"],
+            n_masked_tokens=stat["n_masked_tokens"],
+            masked_token_ratio=stat["masked_token_ratio"],
         )
     if "filtered_fraction" in stat:
         stats_tracker.scalar(rs_filtered_fraction=stat["filtered_fraction"])

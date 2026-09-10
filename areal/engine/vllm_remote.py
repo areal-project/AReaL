@@ -79,6 +79,8 @@ class VLLMBackend:
         }
         if gconfig.stop:
             payload["stop"] = gconfig.stop
+        if gconfig.seed is not None:
+            payload["seed"] = gconfig.seed
 
         if with_lora:
             lora_name = gconfig.lora_name
@@ -257,11 +259,20 @@ class VLLMBackend:
         """Get vLLM health check request."""
         return HttpRequest(endpoint="/health", payload={}, method="GET")
 
-    def get_offload_request(self) -> HttpRequest:
+    def get_abort_all_request(self) -> HttpRequest:
+        raise NotImplementedError("vLLM does not support abort_all_requests")
+
+    def get_offload_request(self, tags: list[str] | None = None) -> HttpRequest:
         """Get vLLM offload request.
 
         Uses vLLM's /sleep endpoint to offload model memory to CPU.
         Default level is 1.
+
+        Parameters
+        ----------
+        tags : list[str], optional
+            Accepted for RemoteInfEngine API compatibility. vLLM sleep does not
+            support component-specific tags, so this value is ignored.
         """
         return HttpRequest(endpoint="/sleep", payload={}, method="POST")
 
@@ -522,8 +533,8 @@ class RemotevLLMEngine(InferenceEngine):
     def teardown_server(self):
         return self._engine.teardown_server()
 
-    def offload(self):
-        return self._engine.offload()
+    def offload(self, tags: list[str] | None = None):
+        return self._engine.offload(tags=tags)
 
     def onload(self, tags: list[str] | None = None):
         return self._engine.onload(tags=tags)

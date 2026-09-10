@@ -479,15 +479,27 @@ def test_create_workers_with_fork_colocation_delegates_to_fork_workers(
     ]
     called = []
 
-    def fake_fork_workers(role: str, target_role: str):
-        called.append((role, target_role))
+    def fake_fork_workers(
+        role: str,
+        target_role: str,
+        command: str | None = None,
+        env_vars: list[dict[str, str]] | None = None,
+    ):
+        called.append((role, target_role, command, env_vars))
         return ["ref/0", "ref/1"]
 
     monkeypatch.setattr(scheduler, "fork_workers", fake_fork_workers)
     job = Job(
         role="ref",
         replicas=2,
-        tasks=[SchedulingSpec(cpu=1, gpu=1, mem=1)],
+        tasks=[
+            SchedulingSpec(
+                cpu=1,
+                gpu=1,
+                mem=1,
+                env_vars={"ROLE_ENV": "ref"},
+            )
+        ],
         scheduling_strategy=SchedulingStrategy(
             type=SchedulingStrategyType.colocation, target="actor", fork=True
         ),
@@ -496,7 +508,11 @@ def test_create_workers_with_fork_colocation_delegates_to_fork_workers(
     worker_ids = scheduler.create_workers(job)
 
     assert worker_ids == ["ref/0", "ref/1"]
-    assert called == [("ref", "actor")]
+    assert len(called) == 1
+    role, target_role, command, env_vars = called[0]
+    assert (role, target_role, command) == ("ref", "actor", None)
+    assert env_vars is not None
+    assert [env["ROLE_ENV"] for env in env_vars] == ["ref", "ref"]
 
 
 def test_colocation_replica_mismatch_raises_error(tmp_path):

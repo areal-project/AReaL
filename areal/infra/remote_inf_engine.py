@@ -46,7 +46,7 @@ from areal.infra.utils.concurrent import get_executor
 from areal.infra.utils.http import arequest_with_retry, get_default_connector
 from areal.infra.utils.launcher import wait_llm_server_addrs
 from areal.infra.utils.proc import kill_process_tree
-from areal.utils import logging, name_resolve, names
+from areal.utils import logging, name_resolve, names, stats_tracker
 from areal.utils.data import concat_padded_tensors
 from areal.utils.dynamic_import import import_from_string
 from areal.utils.network import (
@@ -88,10 +88,69 @@ class GroupedRolloutWorkflow(RolloutWorkflow):
         self, engine: InferenceEngine, data: dict[str, Any]
     ) -> dict[str, Any] | None:
         from areal.experimental.openai import InteractionWithTokenLogpReward
+        from areal.infra import workflow_context
+        from areal.infra.processor_cache import ProcessorCallCache
+        from areal.infra.workflow_context import WorkflowContext
 
-        results = await asyncio.gather(
-            *[self.workflow.arun_episode(engine, data) for _ in range(self.group_size)]
+        parent = workflow_context.get()
+        shared_processor_cache = ProcessorCallCache()
+        group_context = WorkflowContext(
+            is_eval=parent.is_eval,
+            task_id=parent.task_id,
+            group_size=self.group_size,
+            processor_cache=shared_processor_cache,
         )
+
+        async def run_sample(sample_idx: int) -> tuple[int, Any]:
+            workflow_context.set(
+                WorkflowContext(
+                    is_eval=group_context.is_eval,
+                    task_id=group_context.task_id,
+                    sample_idx=sample_idx,
+                    group_size=group_context.group_size,
+                    processor_cache=shared_processor_cache,
+                )
+            )
+            result = await self.workflow.arun_episode(engine, data)
+            return sample_idx, result
+
+        group_tasks = [
+            asyncio.create_task(run_sample(sample_idx))
+            for sample_idx in range(self.group_size)
+        ]
+        try:
+            indexed_results = await asyncio.gather(*group_tasks)
+        except BaseException:
+            # gather does not cancel siblings when a child fails or is cancelled.
+            for task in group_tasks:
+                if not task.done():
+                    task.cancel()
+            raise
+        finally:
+            try:
+                # Drain cancellation handlers before releasing shared resources.
+                await asyncio.gather(*group_tasks, return_exceptions=True)
+            finally:
+                finalizer = getattr(
+                    self.workflow, "_afinalize_processor_cache_group", None
+                )
+                if finalizer is not None:
+                    try:
+                        await finalizer(group_context)
+                    except Exception as exc:
+                        self.logger.warning(
+                            "Failed to finalize rollout group resources (%s: %s).",
+                            type(exc).__name__,
+                            exc,
+                        )
+        indexed_results.sort(key=lambda item: item[0])
+        sample_indices = [sample_idx for sample_idx, _ in indexed_results]
+        if sample_indices != list(range(self.group_size)):
+            raise RuntimeError(
+                "Grouped rollout returned invalid sample indices: "
+                f"expected {list(range(self.group_size))}, got {sample_indices}"
+            )
+        results = [result for _, result in indexed_results]
 
         valid_results = [r for r in results if r is not None]
 
@@ -150,44 +209,21 @@ class GroupedRolloutWorkflow(RolloutWorkflow):
         dropped so the normalization base always matches the configured group
         size.
         """
-        import torch
+        from areal.experimental.openai.types import normalize_group_rewards
 
-        reward_per_result: list[float | None] = []
-        for result in results:
-            if not result:
-                reward_per_result.append(None)
-                continue
-            last_id = next(reversed(result))
-            reward_per_result.append(result[last_id].reward)
-
-        none_count = sum(1 for reward in reward_per_result if reward is None)
-        if none_count > 0:
+        if normalize_group_rewards(results):
+            return True
+        invalid_count = sum(
+            1
+            for result in results
+            if not result or result[next(reversed(result))].reward is None
+        )
+        if invalid_count > 0:
             self.logger.warning(
-                f"reward_normalization: dropping group ({none_count}/"
+                f"reward_normalization: dropping group ({invalid_count}/"
                 f"{self.group_size} rollouts have None reward)"
             )
-            return False
-
-        rewards = torch.tensor(reward_per_result, dtype=torch.float32)
-        mean = rewards.mean()
-        std = rewards.std(unbiased=False) if rewards.numel() > 1 else torch.tensor(1.0)
-        normalized = ((rewards - mean) / (std + 1e-8)).tolist()
-
-        for result, norm_reward in zip(results, normalized):
-            if not result:
-                continue
-            for interaction in result.values():
-                if interaction.reward is not None:
-                    interaction.original_reward = interaction.reward
-                    interaction.reward = norm_reward
-                    if interaction._cache is not None:
-                        interaction._cache["rewards"] = torch.tensor(
-                            [float(norm_reward)]
-                        )
-                        interaction._cache["original_rewards"] = torch.tensor(
-                            [float(interaction.original_reward)]
-                        )
-        return True
+        return False
 
 
 class RemoteInfBackendProtocol(Protocol):
@@ -353,7 +389,11 @@ class RemoteInfBackendProtocol(Protocol):
         """
         ...
 
-    def get_offload_request(self) -> HttpRequest:
+    def get_abort_all_request(self) -> HttpRequest:
+        """Get request to abort all in-flight requests."""
+        ...
+
+    def get_offload_request(self, tags: list[str] | None = None) -> HttpRequest:
         """Get request to offload model memory.
 
         Returns
@@ -452,11 +492,33 @@ class RemoteInfEngine(InferenceEngine):
         except ValueError:
             base_url = f"http://{address}"
         tik = time.time()
+        last_report = tik
         while time.time() - tik < self.config.setup_timeout:
+            if process is not None and process.poll() is not None:
+                raise RuntimeError(
+                    f"Inference server process (pid={process.pid}) exited with "
+                    f"code {process.returncode} before becoming healthy at "
+                    f"{address}. Search the worker log above for the server "
+                    "traceback (e.g. scheduler init errors, port EADDRINUSE)."
+                )
             if self.check_health(base_url):
                 return
+            now = time.time()
+            if now - last_report >= 60:
+                logger.info(
+                    "Still waiting for inference server at %s to become "
+                    "healthy (%.0fs elapsed, timeout %.0fs, process alive=%s)",
+                    address,
+                    now - tik,
+                    self.config.setup_timeout,
+                    process is not None and process.poll() is None,
+                )
+                last_report = now
             time.sleep(1)
-        raise TimeoutError("server launch failed")
+        raise TimeoutError(
+            f"Inference server at {address} failed to become healthy within "
+            f"{self.config.setup_timeout}s"
+        )
 
     def check_health(self, base_url):
         """Check if server is healthy."""
@@ -937,11 +999,17 @@ class RemoteInfEngine(InferenceEngine):
             while self.workflow_executor.is_paused():
                 await asyncio.sleep(0.5)
 
+            # Pin the version that serves this request. A trajectory may span
+            # several weight versions, so each segment must be attributed to the
+            # version that actually generated it rather than to whichever
+            # version is current once the response arrives.
+            request_version = self.get_version()
+
             # Build request using backend
             http_req = self.backend.build_generation_request(
                 req,
                 with_lora=self.config.use_lora,
-                version=self.get_version(),
+                version=request_version,
             )
 
             # Loop until the generation is complete
@@ -980,11 +1048,23 @@ class RemoteInfEngine(InferenceEngine):
             accumulated_output_tokens.extend(gen_result.output_tokens)
             accumulated_output_logprobs.extend(gen_result.output_logprobs)
             accumulated_versions.extend(
-                [self.get_version()] * len(gen_result.output_tokens)
+                [request_version] * len(gen_result.output_tokens)
             )
             # Accumulate routed_experts for MoE models
             if gen_result.routed_experts is not None:
                 accumulated_routed_experts.append(gen_result.routed_experts)
+
+            # Record speculative-decoding acceptance metrics from SGLang
+            # meta_info. Recorded per generation segment (partial rollout may
+            # issue multiple /generate calls); exported as a segment-level mean.
+            if gen_result.spec_accept_rate is not None:
+                stats_tracker.get("rollout").scalar(
+                    spec_accept_rate=gen_result.spec_accept_rate
+                )
+            if gen_result.spec_accept_length is not None:
+                stats_tracker.get("rollout").scalar(
+                    spec_accept_length=gen_result.spec_accept_length
+                )
 
             # Update request for next iteration
             req.input_ids += gen_result.output_tokens
@@ -1367,8 +1447,18 @@ class RemoteInfEngine(InferenceEngine):
     @trace_perf("remote_inf_engine.pause_generation", category="misc")
     def pause_generation(self):
         """Pause request submission for async rollout."""
-        pause_req = self.backend.get_pause_request()
-        self._run_request_on_all_servers(pause_req)
+        # SGLang needs a two-stage pause before colocated memory can be
+        # released: ``abort`` closes admission and waits for in-flight work to
+        # drain, then ``retract`` puts the now-idle scheduler into its paused
+        # state. Other backends keep their existing single-request protocol.
+        get_pause_requests = getattr(self.backend, "get_pause_requests", None)
+        pause_requests = (
+            get_pause_requests()
+            if get_pause_requests is not None
+            else [self.backend.get_pause_request()]
+        )
+        for pause_req in pause_requests:
+            self._run_request_on_all_servers(pause_req)
 
         # The above http request may require some time to be scheduled and executed.
         # The following line waits until all requests are indeed dropped.
@@ -1390,10 +1480,22 @@ class RemoteInfEngine(InferenceEngine):
         """Resume request submission for async rollout."""
         return self.workflow_executor.resume()
 
-    def offload(self) -> None:
+    def offload(self, tags: list[str] | None = None) -> None:
         """Offload model memory on all servers."""
-        offload_req = self.backend.get_offload_request()
+        offload_req = self.backend.get_offload_request(tags=tags)
+        self.logger.info(
+            "RemoteInfEngine.offload(tags=%s) sending to %s: endpoint=%s",
+            tags,
+            self.addresses,
+            offload_req.endpoint,
+        )
         self._run_request_on_all_servers(offload_req)
+        self.logger.info("RemoteInfEngine.offload(tags=%s) completed", tags)
+
+    def abort_all_requests(self) -> None:
+        """Abort all in-flight requests on all servers."""
+        abort_req = self.backend.get_abort_all_request()
+        self._run_request_on_all_servers(abort_req)
 
     def onload(self, tags: list[str] | None = None) -> None:
         """Onload model memory on all servers."""
@@ -1439,10 +1541,8 @@ class RemoteInfEngine(InferenceEngine):
             self._wait_for_server(address, process=process)
             self.local_server_processes.append(server_info)
             return server_info
-        except TimeoutError:
-            logger.warning(
-                f"Launch local server timeouted at {address} after {self.config.setup_timeout}s."
-            )
+        except (TimeoutError, RuntimeError) as e:
+            logger.warning(f"Launch local server failed at {address}: {e}")
             self._shutdown_one_server(server_info)
             raise
 

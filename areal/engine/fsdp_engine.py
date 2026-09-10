@@ -129,6 +129,7 @@ from areal.utils.data import (
 )
 from areal.utils.functional import gather_logprobs, gather_logprobs_entropy
 from areal.utils.hf_utils import load_hf_processor_and_tokenizer, load_hf_tokenizer
+from areal.utils.lr_scheduler import get_num_warmup_steps
 from areal.utils.network import find_free_ports, format_host_for_url, gethostip
 from areal.utils.offload import is_tms_enabled, torch_memory_saver
 from areal.utils.perf_tracer import trace_perf, trace_scope
@@ -1224,8 +1225,9 @@ class FSDPEngine(TrainEngine):
                 weight_decay=weight_decay,
             )
         total_train_steps = ft_spec.total_train_steps
-        num_warmup_steps = int(
-            self.optimizer_config.warmup_steps_proportion * total_train_steps
+        num_warmup_steps = get_num_warmup_steps(
+            self.optimizer_config,
+            total_train_steps,
         )
 
         if self.optimizer_config.lr_scheduler_type == "cosine":
@@ -1769,7 +1771,13 @@ class FSDPEngine(TrainEngine):
                 full_param = param.data
 
             if dist.get_rank() == 0:
-                clean_name = re.sub(r"^base_model\.model\.", "", name)
+                # Emit PEFT-serving-standard keys. Drop the active-adapter
+                # segment (".default") so names match what
+                # PeftModel.save_pretrained produces
+                # (e.g. "...down_proj.lora_A.weight"). Keeping ".default"
+                # makes vLLM's parse_fine_tuned_lora_name reject the adapter
+                # with "unsupported LoRA weight" on disk-mode load.
+                clean_name = re.sub(r"\.default\.(weight|bias)$", r".\1", name)
                 adapter_state[clean_name] = (
                     self._cast_to_compute_dtype(full_param.cpu())
                     if full_param.is_floating_point()
@@ -2048,9 +2056,12 @@ class FSDPEngine(TrainEngine):
                 self.parallel_helper.sp_size,
             )
         else:
-            inputs = mb_item.padded_mb
+            inputs = dict(mb_item.padded_mb)
             trie_node = inputs.pop("trie_node", None)
             ulysses_pad_size = 0
+
+        inputs.pop("turn_ids", None)
+        inputs.pop("is_truncated", None)
 
         ctx = FSDPTrainContext(
             model_inputs=inputs,
@@ -2101,6 +2112,7 @@ class FSDPEngine(TrainEngine):
             tp_group=self.parallel_helper.tp_group
             if self.parallel_helper.tp_size > 1
             else None,
+            chunk_size=self.config.logprobs_chunk_size,
         )
         if self.parallel_helper.sp_size > 1:
             logprobs = self._sp_all_gather(logprobs)
@@ -2131,6 +2143,7 @@ class FSDPEngine(TrainEngine):
             tp_group=self.parallel_helper.tp_group
             if self.parallel_helper.tp_size > 1
             else None,
+            chunk_size=self.config.logprobs_chunk_size,
         )
         if self.parallel_helper.sp_size > 1:
             logprobs = self._sp_all_gather(logprobs)
@@ -2191,6 +2204,7 @@ class FSDPEngine(TrainEngine):
                     tp_group=self.parallel_helper.tp_group
                     if self.parallel_helper.tp_size > 1
                     else None,
+                    chunk_size=self.config.logprobs_chunk_size,
                 )
             else:
                 logprobs, entropy = self._compute_logprobs_entropy(
@@ -2240,6 +2254,7 @@ class FSDPEngine(TrainEngine):
                     tp_group=self.parallel_helper.tp_group
                     if self.parallel_helper.tp_size > 1
                     else None,
+                    chunk_size=self.config.logprobs_chunk_size,
                 )
                 return result
             result = self._compute_logprobs(
@@ -2266,6 +2281,9 @@ class FSDPPPOActor(FSDPEngine):
         super().__init__(config)
         self.actor = PPOActor(config, self)
 
+    def configure_mopd_loss(self, config) -> None:
+        self.actor.configure_mopd_loss(config)
+
     @torch.no_grad()
     def compute_logp(self, *args, **kwargs) -> list[torch.Tensor] | None:
         return self.actor.compute_logp(*args, **kwargs)
@@ -2273,6 +2291,9 @@ class FSDPPPOActor(FSDPEngine):
     @torch.no_grad()
     def compute_advantages(self, *args, **kwargs) -> list[dict[str, Any]]:
         return self.actor.compute_advantages(*args, **kwargs)
+
+    def prepare_mopd_batch(self, *args, **kwargs) -> list[dict[str, Any]]:
+        return self.actor.prepare_mopd_batch(*args, **kwargs)
 
     def ppo_update(self, *args, **kwargs) -> None:
         self.actor.ppo_update(*args, **kwargs)

@@ -58,7 +58,7 @@ class MultiTurnWorkflow(RolloutWorkflow):
     async def arun_episode(self, engine: InferenceEngine, data: dict[str, Any]):
         # Enforces `n_samples=1`
         # Placeholders for the results
-        seq, logprobs, loss_mask, versions = [], [], [], []
+        seq, logprobs, loss_mask, versions, turn_ids = [], [], [], [], []
         messages = data["messages"]
         # Convert the prompt into input_ids
         input_ids: list[int] = apply_chat_template(
@@ -73,6 +73,7 @@ class MultiTurnWorkflow(RolloutWorkflow):
         discount = 1.0
         prompt_str = ""
         completions_str = ""
+        is_truncated = False
         while reward == 0.0 and t < self.max_turns:
             # Send generate request to get the response.
             req = ModelRequest(
@@ -82,6 +83,9 @@ class MultiTurnWorkflow(RolloutWorkflow):
                 tokenizer=self.tokenizer,
             )
             resp = await engine.agenerate(req)
+            # Only the final turn determines whether the trajectory itself was
+            # truncated; a later turn supersedes an earlier length stop.
+            is_truncated = resp.stop_reason == "length"
             # compute reward: 1 for correct and 0 otherwise
             prompt_str = self.tokenizer.decode(input_ids)
             completions_str = self.tokenizer.decode(resp.output_tokens)
@@ -104,6 +108,7 @@ class MultiTurnWorkflow(RolloutWorkflow):
             logprobs += [0.0] * input_len + resp.output_logprobs
             loss_mask += [0] * input_len + [1] * resp.output_len
             versions += [-1] * input_len + resp.output_versions
+            turn_ids += [-1] * input_len + [t] * resp.output_len
             # Increase counter
             t += 1
             # Amend a prompt if the previous answer is incorrect
@@ -129,7 +134,9 @@ class MultiTurnWorkflow(RolloutWorkflow):
             logprobs=torch.tensor(logprobs, dtype=torch.float32),
             loss_mask=torch.tensor(loss_mask, dtype=torch.int32),
             versions=torch.tensor(versions, dtype=torch.int32),
+            turn_ids=torch.tensor(turn_ids, dtype=torch.int32),
             rewards=torch.tensor(reward, dtype=torch.float32),
             attention_mask=torch.ones(len(seq), dtype=torch.bool),
+            is_truncated=torch.tensor(is_truncated, dtype=torch.bool),
         )
         return {k: v.unsqueeze(0) for k, v in res.items()}

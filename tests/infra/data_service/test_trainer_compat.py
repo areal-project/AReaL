@@ -161,6 +161,39 @@ class TestTrainerDataServicePath:
 
         assert dataset is sentinel
 
+    def test_get_custom_dataset_forwards_kwargs_to_remote_dataset(self, monkeypatch):
+        from areal.api.cli_args import TrainDatasetConfig
+        from areal.dataset import get_custom_dataset
+
+        monkeypatch.setenv("AREAL_SPMD_MODE", "0")
+        configured_kwargs = {
+            "num_proc": 4,
+            "filter_errors": False,
+            "configured_only": "preserved",
+        }
+        cfg = TrainDatasetConfig(
+            path="swe-data.jsonl",
+            type="sft",
+            dataset_kwargs=configured_kwargs,
+        )
+
+        dataset = get_custom_dataset(
+            split="train",
+            dataset_config=cfg,
+            split_mode="trajectory",
+            filter_errors=True,
+            cache_dir="/tmp/swe-cache",
+        )
+
+        assert dataset._dataset_kwargs == {
+            "num_proc": 4,
+            "filter_errors": True,
+            "configured_only": "preserved",
+            "split_mode": "trajectory",
+            "cache_dir": "/tmp/swe-cache",
+        }
+        assert cfg.dataset_kwargs == configured_kwargs
+
 
 class TestGenericDatasetFallback:
     def test_none_split_uses_first_available_split(self, tmp_path: Path):

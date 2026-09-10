@@ -35,11 +35,17 @@ from areal.infra import RemoteInfEngine, RolloutController, WorkflowExecutor
 from areal.infra.platforms import current_platform
 from areal.infra.utils.launcher import TRITON_CACHE_PATH
 from areal.utils import perf_tracer, stats_tracker
+from areal.utils.logging import getLogger
 from areal.utils.network import format_host_for_url
+
+logger = getLogger("SGLangRemote")
 
 
 class SGLangBackend:
     """SGLang-specific backend implementation for remote inference."""
+
+    def __init__(self) -> None:
+        self._readiness_endpoint = "/health"
 
     @staticmethod
     def build_server_env(env: Mapping[str, str]) -> dict[str, str]:
@@ -73,6 +79,8 @@ class SGLangBackend:
         }
         if stop:
             sample_params["stop"] = stop
+        if gconfig.seed is not None:
+            sample_params["sampling_seed"] = gconfig.seed
 
         payload = {
             "input_ids": req.input_ids.copy(),
@@ -116,12 +124,19 @@ class SGLangBackend:
                 pybase64.b64decode(routed_experts.encode("utf-8")), dtype=np.int32
             ).reshape(num_sgl_token, -1)
 
+        # Speculative-decoding acceptance metrics (present only when SGLang is
+        # launched with a speculative_algorithm; None otherwise).
+        spec_accept_rate = meta_info.get("spec_accept_rate")
+        spec_accept_length = meta_info.get("spec_accept_length")
+
         if stop_reason == "abort" and stop_message.startswith("Abort before prefill"):
             return HttpGenerationResult(
                 output_tokens=[],
                 output_logprobs=[],
                 stop_reason=stop_reason,
                 routed_experts=routed_experts,
+                spec_accept_rate=spec_accept_rate,
+                spec_accept_length=spec_accept_length,
             )
 
         output_tokens = [x[1] for x in meta_info["output_token_logprobs"]]
@@ -132,6 +147,8 @@ class SGLangBackend:
             output_logprobs=output_logprobs,
             stop_reason=stop_reason,
             routed_experts=routed_experts,
+            spec_accept_rate=spec_accept_rate,
+            spec_accept_length=spec_accept_length,
         )
 
     def build_score_request(
@@ -331,21 +348,49 @@ class SGLangBackend:
 
         return HttpRequest(endpoint="/init_weights_update_group", payload=payload)
 
-    def get_pause_request(self) -> HttpRequest:
+    def get_pause_request(self, mode: str | None = None) -> HttpRequest:
         """Get SGLang pause request."""
-        return HttpRequest(endpoint="/pause_generation", payload={})
+        payload = {} if mode is None else {"mode": mode}
+        return HttpRequest(endpoint="/pause_generation", payload=payload)
+
+    def get_pause_requests(self) -> list[HttpRequest]:
+        """Pause in two steps so memory can be released safely.
+
+        The first request keeps SGLang's default mode, which aborts in-flight
+        requests and returns their partial output so the client resumes them by
+        extending the prompt. That also leaves the scheduler fully idle, which
+        SGLang requires before releasing memory.
+
+        The second request looks redundant because Scheduler.pause_generation
+        sets its paused flag unconditionally, but the abort path never reaches
+        the scheduler: TokenizerManager forwards the request only for non-abort
+        modes, and otherwise just drains via abort_request(). Abort therefore
+        raises the tokenizer's own gate while the scheduler keeps scheduling.
+        Only an in-place pause raises the scheduler flag that the colocate loop
+        watches before it services awex work, and by then the abort has already
+        left nothing for that mode to retain.
+        """
+        return [
+            self.get_pause_request(),
+            self.get_pause_request(mode="in_place"),
+        ]
 
     def get_resume_request(self) -> HttpRequest:
         """Get SGLang resume request."""
         return HttpRequest(endpoint="/continue_generation", payload={})
 
-    def get_health_check_request(self) -> HttpRequest:
-        """Get SGLang health check request."""
-        return HttpRequest(endpoint="/health", payload={}, method="GET")
+    def get_abort_all_request(self) -> HttpRequest:
+        """Get SGLang abort all requests."""
+        return HttpRequest(endpoint="/abort_request", payload={"abort_all": True})
 
-    def get_offload_request(self) -> HttpRequest:
+    def get_health_check_request(self) -> HttpRequest:
+        """Get SGLang readiness check request."""
+        return HttpRequest(endpoint=self._readiness_endpoint, payload={}, method="GET")
+
+    def get_offload_request(self, tags: list[str] | None = None) -> HttpRequest:
         """Get SGLang offload request."""
-        return HttpRequest(endpoint="/release_memory_occupation", payload={})
+        payload = {"tags": tags} if tags is not None else {}
+        return HttpRequest(endpoint="/release_memory_occupation", payload=payload)
 
     def get_onload_request(self, tags: list[str] | None = None) -> HttpRequest:
         """Get SGLang onload request.
@@ -353,15 +398,99 @@ class SGLangBackend:
         Parameters:
         ----------
         tags: list[str], optional
-            Available tags for multi-stage resume: weights, kv_cache
+            Available tags for multi-stage resume: weights, kv_cache, cuda_graph
         """
         payload = {"tags": tags} if tags is not None else {}
         return HttpRequest(endpoint="/resume_memory_occupation", payload=payload)
 
     def launch_server(self, server_args: dict[str, Any]) -> subprocess.Popen:
         """Launch SGLang server subprocess."""
+        if server_args.get("enable_multimodal") and not server_args.get(
+            "skip_tokenizer_init", False
+        ):
+            logger.warning(
+                "SGLang multimodal rollout is running with "
+                "skip_tokenizer_init=False. Requests that send processor-expanded "
+                "input IDs together with image data may be processed again by the "
+                "server. Set skip_tokenizer_init=True for VLM rollout recipes."
+            )
+        awex_meta_addr = server_args.pop(
+            "awex_meta_server_addr", None
+        ) or os.environ.get("AWEX_META_SERVER_ADDR")
+        awex_colocate = server_args.pop("awex_colocate_mode", False)
+        self._readiness_endpoint = (
+            "/model_info" if awex_colocate or awex_meta_addr else "/health"
+        )
+        # Colocate placement: derive base_gpu_id from SLURM_LOCALID so two SGLang
+        # servers sharing a node never claim the same GPU range. The controller
+        # cannot do this reliably because its global rank -> node-slot mapping is
+        # not guaranteed by SLURM task dispatch (a collision degrades the
+        # TP group into an unsharded single-GPU load -> OOM). SLURM_LOCALID is the
+        # only id guaranteed unique per node-slot, and only the worker sees it at
+        # runtime. `_awex_gpus_per_server` is injected by the controller exclusively
+        # for real colocation, so its presence doubles as the colocate gate; it is
+        # absent for separated mode (where CVD isolation keeps base_gpu_id at 0).
+        awex_gpus_per_server = server_args.pop("_awex_gpus_per_server", None)
+        if awex_gpus_per_server is not None:
+            slurm_localid = os.environ.get("SLURM_LOCALID")
+            if slurm_localid is not None:
+                base_gpu_id = int(slurm_localid) * int(awex_gpus_per_server)
+                server_args["base_gpu_id"] = base_gpu_id
+                logger.info(
+                    "AWEX colocate base_gpu_id override: SLURM_LOCALID=%s x "
+                    "gpus_per_server=%s -> base_gpu_id=%s",
+                    slurm_localid,
+                    awex_gpus_per_server,
+                    base_gpu_id,
+                )
         cmd = SGLangConfig.build_cmd_from_args(server_args)
         _env = self.build_server_env(os.environ)
+        _env.setdefault("PYTHONFAULTHANDLER", "1")
+
+        awex_graph_memory_saver = bool(
+            (awex_colocate or awex_meta_addr)
+            and server_args.get("enable_memory_saver", False)
+        )
+        if awex_graph_memory_saver:
+            # SGLang 0.5.10 gates CUDA-graph region registration separately
+            # from --enable-memory-saver. This must be set before graph capture.
+            _env.setdefault("SGLANG_MEMORY_SAVER_CUDA_GRAPH", "1")
+
+        drop_ld_preload_default = "1" if (awex_colocate or awex_meta_addr) else "0"
+        if _env.get(
+            "AREAL_SGLANG_DROP_LD_PRELOAD", drop_ld_preload_default
+        ).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "y",
+            "on",
+        }:
+            dropped = _env.pop("LD_PRELOAD", "")
+            dropped_tms = {
+                key: _env.pop(key)
+                for key in ("TMS_INIT_ENABLE", "TMS_INIT_ENABLE_CPU_BACKUP")
+                if key in _env
+            }
+            logger.info(
+                "Dropping training TMS environment for SGLang child: "
+                "LD_PRELOAD=%s, TMS=%s",
+                dropped,
+                dropped_tms,
+            )
+
+        if awex_colocate or awex_meta_addr:
+            sglang_entrypoints = (
+                "sglang.launch_server",
+                "areal.v2.inference_service.sglang.launch_server",
+            )
+            cmd = [
+                "areal.engine.awex.sglang_plugin" if c in sglang_entrypoints else c
+                for c in cmd
+            ]
+            if awex_meta_addr:
+                _env["AWEX_META_SERVER_ADDR"] = awex_meta_addr
+            logger.info("AWEX mode: using awex_sglang_plugin entry, cmd=%s", cmd[:4])
 
         return subprocess.Popen(
             cmd,
@@ -594,8 +723,14 @@ class RemoteSGLangEngine(InferenceEngine):
     def teardown_server(self):
         return self._engine.teardown_server()
 
-    def offload(self):
-        return self._engine.offload()
+    def offload(self, tags: list[str] | None = None):
+        logger.info("RemoteSGLangEngine.offload(tags=%s) called", tags)
+        result = self._engine.offload(tags=tags)
+        logger.info("RemoteSGLangEngine.offload(tags=%s) done", tags)
+        return result
+
+    def abort_all_requests(self):
+        return self._engine.abort_all_requests()
 
     def onload(self, tags: list[str] | None = None):
         return self._engine.onload(tags=tags)

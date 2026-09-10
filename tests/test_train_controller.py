@@ -5,7 +5,8 @@ RPC wrappers, PPO/SFT methods, weight management, and error handling.
 """
 
 import asyncio
-from unittest.mock import Mock
+from threading import Lock
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
@@ -21,6 +22,7 @@ from areal.api import (
 from areal.api.cli_args import SchedulingSpec, TrainEngineConfig
 from areal.infra import TrainController
 from areal.infra.controller.train_controller import _merge_tensors
+from areal.infra.rpc.rtensor import RTensor, TensorShardInfo
 
 
 class MockTrainEngine(TrainEngine):
@@ -164,6 +166,13 @@ def create_mock_distributed_batch(size=4, seq_len=10):
         }
         for _ in range(size)
     ]
+
+
+def create_mock_rtensor(shard_id: str, node_addr: str) -> RTensor:
+    return RTensor(
+        shard=TensorShardInfo(shard_id=shard_id, node_addr=node_addr),
+        data=torch.empty(1, device="meta"),
+    )
 
 
 # ==================== TEST CLASSES ====================
@@ -756,3 +765,188 @@ class TestTrainControllerDispatchInputs:
         assert "learning_rate" in split_kwargs
         assert len(split_kwargs["input_"]) == train_controller.parallel_strategy.dp_size
         assert all(lr == 0.001 for lr in split_kwargs["learning_rate"])
+
+
+class TestTrainControllerClearBatches:
+    def test_storage_clear_surfaces_per_node_failures_and_stats(self):
+        controller = TrainController.__new__(TrainController)
+        controller._pending_clear_shards = {}
+        controller._clear_shards_lock = Lock()
+        target = {
+            "good": create_mock_rtensor("s-good", "good-node"),
+            "bad": create_mock_rtensor("s-bad", "bad-node"),
+        }
+        calls = []
+
+        async def fake_clear_node(addr, shard_ids):
+            calls.append((addr, shard_ids))
+            if addr == "bad-node":
+                raise RuntimeError("delete failed")
+            return {
+                "status": "ok",
+                "cleared_count": 1,
+                "num_tensors": 2,
+                "total_bytes": 64,
+            }
+
+        with (
+            patch.object(RTensor, "clear_node", new=fake_clear_node),
+            patch(
+                "areal.infra.controller.train_controller.logger.warning"
+            ) as mock_warning,
+            patch("areal.infra.controller.train_controller.logger.debug") as mock_debug,
+        ):
+            asyncio.run(controller._async_clear_batches(target))
+
+        assert calls == [
+            ("good-node", ["s-good"]),
+            ("bad-node", ["s-bad"]),
+        ]
+        mock_warning.assert_called_once()
+        assert "bad-node" in str(mock_warning.call_args)
+        mock_debug.assert_called_once()
+        assert "good-node" in str(mock_debug.call_args)
+        assert "64" in str(mock_debug.call_args)
+        assert controller._pending_clear_shards == {"bad-node": {"s-bad": 1}}
+
+    def test_failed_storage_clear_is_retried_on_next_call(self):
+        controller = TrainController.__new__(TrainController)
+        controller._pending_clear_shards = {}
+        controller._clear_shards_lock = Lock()
+        target = {"batch": create_mock_rtensor("s0", "node-a")}
+        next_target = {"batch": create_mock_rtensor("s1", "node-a")}
+        calls = []
+
+        async def fail_then_succeed(addr, shard_ids):
+            calls.append((addr, shard_ids))
+            if len(calls) == 1:
+                raise RuntimeError("delete failed")
+            return {"status": "ok", "cleared_count": 1}
+
+        with patch.object(RTensor, "clear_node", new=fail_then_succeed):
+            asyncio.run(controller._async_clear_batches(target))
+            asyncio.run(controller._async_clear_batches(next_target))
+
+        assert calls == [("node-a", ["s0"]), ("node-a", ["s0", "s1"])]
+        assert controller._pending_clear_shards == {}
+
+    def test_second_storage_clear_failure_cleans_workers_then_raises(self):
+        controller = TrainController.__new__(TrainController)
+        controller._pending_clear_shards = {}
+        controller._clear_shards_lock = Lock()
+        controller._clear_batches_lock = Lock()
+        controller._worker_role = "test"
+        target = {"batch": create_mock_rtensor("s0", "node-a")}
+        calls = []
+
+        async def fail_clear(addr, shard_ids):
+            calls.append((addr, shard_ids))
+            raise RuntimeError("delete failed")
+
+        with (
+            patch.object(RTensor, "clear_node", new=fail_clear),
+            patch.object(
+                controller,
+                "_custom_function_call",
+                return_value={"num_entries": 0},
+            ) as mock_worker_call,
+        ):
+            controller.clear_batches(target)
+            with pytest.raises(RuntimeError, match="two clear_batches calls"):
+                controller.clear_batches({})
+
+        assert calls == [("node-a", ["s0"]), ("node-a", ["s0"])]
+        assert controller._pending_clear_shards == {}
+        assert mock_worker_call.call_count == 4
+
+    def test_worker_cleanup_failure_preserves_exhausted_storage_state(self):
+        controller = TrainController.__new__(TrainController)
+        controller._pending_clear_shards = {}
+        controller._clear_shards_lock = Lock()
+        controller._clear_batches_lock = Lock()
+        controller._worker_role = "test"
+        target = {"batch": create_mock_rtensor("s0", "node-a")}
+        storage_calls = []
+        worker_clear_calls = 0
+
+        async def fail_clear(addr, shard_ids):
+            storage_calls.append((addr, shard_ids))
+            raise RuntimeError("delete failed")
+
+        def fail_second_worker_clear(method, *_args, **_kwargs):
+            nonlocal worker_clear_calls
+            if method == "clear_batches":
+                worker_clear_calls += 1
+                if worker_clear_calls == 2:
+                    raise RuntimeError("worker cleanup failed")
+                return None
+            return {"num_entries": 0}
+
+        with (
+            patch.object(RTensor, "clear_node", new=fail_clear),
+            patch.object(
+                controller,
+                "_custom_function_call",
+                side_effect=fail_second_worker_clear,
+            ) as mock_worker_call,
+        ):
+            controller.clear_batches(target)
+            with pytest.raises(RuntimeError, match="worker cleanup failed"):
+                controller.clear_batches({})
+
+        assert storage_calls == [("node-a", ["s0"]), ("node-a", ["s0"])]
+        assert controller._pending_clear_shards == {"node-a": {"s0": 2}}
+        assert mock_worker_call.call_count == 3
+
+    def test_storage_clear_propagates_cancellation(self):
+        controller = TrainController.__new__(TrainController)
+        controller._pending_clear_shards = {}
+        controller._clear_shards_lock = Lock()
+        target = {"batch": create_mock_rtensor("s0", "node-a")}
+
+        async def cancel_clear(_addr, _shard_ids):
+            raise asyncio.CancelledError
+
+        with patch.object(RTensor, "clear_node", new=cancel_clear):
+            with pytest.raises(asyncio.CancelledError):
+                asyncio.run(controller._async_clear_batches(target))
+
+        assert controller._pending_clear_shards == {"node-a": {"s0": 0}}
+
+    def test_storage_clear_cancellation_keeps_batch_state_atomic(self):
+        controller = TrainController.__new__(TrainController)
+        controller._pending_clear_shards = {"retry-node": {"s-retry": 1}}
+        controller._clear_shards_lock = Lock()
+        controller._clear_batches_lock = Lock()
+        target = {
+            "good": create_mock_rtensor("s-good", "good-node"),
+            "cancel": create_mock_rtensor("s-cancel", "cancel-node"),
+        }
+        calls = []
+
+        async def mixed_results(addr, shard_ids):
+            calls.append((addr, shard_ids))
+            if addr == "retry-node":
+                raise RuntimeError("second failure")
+            if addr == "cancel-node":
+                raise asyncio.CancelledError
+            return {"status": "ok", "cleared_count": 1}
+
+        with (
+            patch.object(RTensor, "clear_node", new=mixed_results),
+            patch.object(controller, "_custom_function_call") as mock_worker_call,
+        ):
+            with pytest.raises(asyncio.CancelledError):
+                controller.clear_batches(target)
+
+        assert {addr: sids for addr, sids in calls} == {
+            "retry-node": ["s-retry"],
+            "good-node": ["s-good"],
+            "cancel-node": ["s-cancel"],
+        }
+        assert controller._pending_clear_shards == {
+            "retry-node": {"s-retry": 1},
+            "good-node": {"s-good": 0},
+            "cancel-node": {"s-cancel": 0},
+        }
+        mock_worker_call.assert_not_called()

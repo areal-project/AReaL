@@ -12,9 +12,9 @@ learning.
 1. Read the [`RolloutWorkflow` reference](../reference/rollout_workflow.md) first, as
    agent workflows are built on top of `RolloutWorkflow`.
 
-1. **Scheduler compatibility**: Agent workflows are supported on `local` and `slurm`
-   schedulers only. The `ray` scheduler is incompatible with the HTTP proxy
-   architecture.
+1. **Scheduler compatibility**: Agent workflows are supported on the `local`, `slurm`,
+   and `ray` schedulers. Proxy servers are forked as HTTP worker processes colocated
+   with their rollout workers.
 
 ## Overview
 

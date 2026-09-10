@@ -432,6 +432,7 @@ class RolloutControllerV2:
                 inf_workers,
                 dp_size,
                 nnodes_per_instance,
+                dict(inf_spec.env_vars),
                 server_args,
             )
         logger.info("Inference servers: %s", self._inf_addrs)
@@ -475,6 +476,18 @@ class RolloutControllerV2:
             data_proxy_base_cmd += [
                 "--engine-max-tokens",
                 str(agent_cfg.engine_max_tokens),
+            ]
+        if cfg.deterministic_sampling:
+            data_proxy_base_cmd.append("--deterministic-sampling")
+        for preprocessor_path in agent_cfg.message_preprocessors:
+            data_proxy_base_cmd += [
+                "--message-preprocessor",
+                preprocessor_path,
+            ]
+        if agent_cfg.prefix_matcher:
+            data_proxy_base_cmd += [
+                "--prefix-matcher",
+                agent_cfg.prefix_matcher,
             ]
 
         async def _fork_data_proxy(group_idx: int) -> tuple[str, int, str]:
@@ -549,6 +562,7 @@ class RolloutControllerV2:
         inf_workers: list,
         dp_size: int,
         nnodes_per_instance: int,
+        worker_env: dict[str, str],
         server_args: dict[str, Any] | None,
     ) -> None:
         if inf_backend == "sglang":
@@ -562,41 +576,94 @@ class RolloutControllerV2:
         else:
             raise ValueError(f"Unsupported inference backend: {inf_backend!r}")
 
+        async def _cleanup_forks(
+            owners: list[tuple[str, int]],
+        ) -> None:
+            """Best-effort rollback for owner-bound inference reservations."""
+            client = await self._get_async_client()
+
+            async def _cleanup_owner(guard_addr: str, worker_index: int) -> None:
+                payload = {"role": "inf-server", "worker_index": worker_index}
+                for endpoint in ("kill_forked_worker", "release_ports"):
+                    try:
+                        await client.post(
+                            f"{guard_addr}/{endpoint}",
+                            json=payload,
+                            timeout=10.0,
+                        )
+                    except Exception:
+                        pass
+
+            await asyncio.gather(
+                *[_cleanup_owner(guard, index) for guard, index in owners]
+            )
+
         async def _fork_group(
             group_idx: int,
         ) -> tuple[str, int, list[tuple[str, str, int]]]:
             group_workers = inf_workers[
                 group_idx * nnodes_per_instance : (group_idx + 1) * nnodes_per_instance
             ]
-            head_worker = group_workers[0]
-            head_guard_addr = f"http://{format_hostport(head_worker.ip, int(head_worker.worker_ports[0]))}"
             client = await self._get_async_client()
 
-            dist_init_addr = None
-            if nnodes_per_instance > 1:
-                resp = await client.post(
-                    f"{head_guard_addr}/alloc_ports",
-                    json={"count": 1},
-                    timeout=30.0,
+            owners = [
+                (
+                    f"http://{format_hostport(worker.ip, int(worker.worker_ports[0]))}",
+                    group_idx * nnodes_per_instance + node_rank,
                 )
-                resp.raise_for_status()
-                rendezvous_data = resp.json()
-                rendezvous_host = rendezvous_data["host"]
-                rendezvous_port = rendezvous_data["ports"][0]
-                dist_init_addr = format_hostport(rendezvous_host, rendezvous_port)
+                for node_rank, worker in enumerate(group_workers)
+            ]
 
-            async def _fork_node(node_rank: int, worker: Any) -> tuple[str, int, str]:
-                guard_addr = (
-                    f"http://{format_hostport(worker.ip, int(worker.worker_ports[0]))}"
-                )
-
+            async def _alloc_node(
+                node_rank: int, guard_addr: str, worker_index: int
+            ) -> dict[str, Any]:
+                # The group head owns both its inference port and the distributed
+                # rendezvous port. Guard permits one reservation per owner.
+                count = 2 if node_rank == 0 and nnodes_per_instance > 1 else 1
                 resp = await client.post(
                     f"{guard_addr}/alloc_ports",
-                    json={"count": 1},
+                    json={
+                        "count": count,
+                        "role": "inf-server",
+                        "worker_index": worker_index,
+                    },
                     timeout=30.0,
                 )
                 resp.raise_for_status()
-                port_data = resp.json()
+                return resp.json()
+
+            allocation_results = await asyncio.gather(
+                *[
+                    _alloc_node(rank, guard, worker_index)
+                    for rank, (guard, worker_index) in enumerate(owners)
+                ],
+                return_exceptions=True,
+            )
+            allocation_error = next(
+                (
+                    result
+                    for result in allocation_results
+                    if isinstance(result, BaseException)
+                ),
+                None,
+            )
+            if allocation_error is not None:
+                await _cleanup_forks(owners)
+                raise allocation_error
+
+            port_data_by_node = cast(list[dict[str, Any]], allocation_results)
+            dist_init_addr = None
+            if nnodes_per_instance > 1:
+                rendezvous_host = port_data_by_node[0]["host"]
+                rendezvous_port = port_data_by_node[0]["ports"][1]
+                dist_init_addr = format_hostport(rendezvous_host, rendezvous_port)
+
+            async def _fork_node(
+                node_rank: int,
+                worker_index: int,
+                guard_addr: str,
+                port_data: dict[str, Any],
+            ) -> tuple[str, int, str]:
                 inf_host: str = port_data["host"]
                 inf_port: int = port_data["ports"][0]
 
@@ -612,9 +679,33 @@ class RolloutControllerV2:
 
                 fork_payload: dict[str, Any] = {
                     "role": "inf-server",
-                    "worker_index": group_idx * nnodes_per_instance + node_rank,
+                    "worker_index": worker_index,
                     "raw_cmd": cmd,
                 }
+                if inf_backend == "sglang":
+                    from areal.infra.utils.launcher import (
+                        TRITON_CACHE_PATH as _TRITON_CACHE,
+                    )
+
+                    cache_suffix = (
+                        f"inf-server-{fork_payload['worker_index']}-{uuid.uuid4()}"
+                    )
+                    triton_cache_dir = worker_env.get(
+                        "TRITON_CACHE_DIR",
+                        os.environ.get("TRITON_CACHE_DIR", _TRITON_CACHE),
+                    )
+                    triton_cache_path = worker_env.get(
+                        "TRITON_CACHE_PATH",
+                        os.environ.get("TRITON_CACHE_PATH", triton_cache_dir),
+                    )
+                    fork_payload["env"] = {
+                        "TRITON_CACHE_DIR": os.path.join(
+                            triton_cache_dir, cache_suffix
+                        ),
+                        "TRITON_CACHE_PATH": os.path.join(
+                            triton_cache_path, cache_suffix
+                        ),
+                    }
                 if inf_backend == "vllm":
                     from areal.infra.utils.launcher import (
                         TRITON_CACHE_PATH as _TRITON_CACHE,
@@ -644,20 +735,88 @@ class RolloutControllerV2:
                 return inf_host, inf_port, guard_addr
 
             node_results = await asyncio.gather(
-                *[_fork_node(rank, w) for rank, w in enumerate(group_workers)]
+                *[
+                    _fork_node(rank, worker_index, guard, port_data_by_node[rank])
+                    for rank, (guard, worker_index) in enumerate(owners)
+                ],
+                return_exceptions=True,
             )
 
-            head_inf_host, head_inf_port, _ = node_results[0]
+            fork_error = next(
+                (
+                    result
+                    for result in node_results
+                    if isinstance(result, BaseException)
+                ),
+                None,
+            )
+            if fork_error is not None:
+                await _cleanup_forks(owners)
+                raise fork_error
+
+            successful_nodes = cast(list[tuple[str, int, str]], node_results)
+            head_inf_host, head_inf_port, _ = successful_nodes[0]
             forked: list[tuple[str, str, int]] = [
                 (guard_addr, "inf-server", group_idx * nnodes_per_instance + rank)
-                for rank, (_, _, guard_addr) in enumerate(node_results)
+                for rank, (_, _, guard_addr) in enumerate(successful_nodes)
             ]
             return (head_inf_host, head_inf_port, forked)
 
-        group_results = await asyncio.gather(*[_fork_group(i) for i in range(dp_size)])
+        raw_group_results = await asyncio.gather(
+            *[_fork_group(i) for i in range(dp_size)], return_exceptions=True
+        )
+        group_error = next(
+            (
+                result
+                for result in raw_group_results
+                if isinstance(result, BaseException)
+            ),
+            None,
+        )
+        successful_groups = [
+            result
+            for result in raw_group_results
+            if not isinstance(result, BaseException)
+        ]
+        if group_error is not None:
+            await _cleanup_forks(
+                [
+                    (guard_addr, worker_index)
+                    for _, _, forked in successful_groups
+                    for guard_addr, _, worker_index in forked
+                ]
+            )
+            raise group_error
 
-        for host, port, forked in group_results:
-            addr = f"http://{format_hostport(host, port)}"
+        group_results = cast(
+            list[tuple[str, int, list[tuple[str, str, int]]]], successful_groups
+        )
+
+        inf_addrs = [
+            f"http://{format_hostport(host, port)}" for host, port, _ in group_results
+        ]
+
+        try:
+            # Wait for all inference servers to be healthy in parallel.
+            await asyncio.gather(
+                *[
+                    self._async_wait_for_service(
+                        f"{addr}/health", f"InfServer-{i}", timeout=cfg.setup_timeout
+                    )
+                    for i, addr in enumerate(inf_addrs)
+                ]
+            )
+        except BaseException:
+            await _cleanup_forks(
+                [
+                    (guard_addr, worker_index)
+                    for _, _, forked in group_results
+                    for guard_addr, _, worker_index in forked
+                ]
+            )
+            raise
+
+        for addr, (host, port, forked) in zip(inf_addrs, group_results, strict=True):
             self._inf_addrs.append(addr)
             self._server_infos.append(
                 LocalInfServerInfo(
@@ -667,16 +826,6 @@ class RolloutControllerV2:
                 )
             )
             self._forked_services.extend(forked)
-
-        # Wait for all inference servers to be healthy in parallel
-        await asyncio.gather(
-            *[
-                self._async_wait_for_service(
-                    f"{addr}/health", f"InfServer-{i}", timeout=cfg.setup_timeout
-                )
-                for i, addr in enumerate(self._inf_addrs)
-            ]
-        )
 
     # -- Service health checks & registration ------------------------------
 
@@ -1068,15 +1217,15 @@ class RolloutControllerV2:
         drop_incomplete_group: bool = False,
     ) -> int:
         self._ensure_initialized()
-        if reward_normalization or drop_incomplete_group:
+        if drop_incomplete_group:
             raise ValueError(
-                "RolloutControllerV2 does not support reward_normalization or "
-                "drop_incomplete_group yet."
+                "RolloutControllerV2 does not support drop_incomplete_group yet."
             )
         resolved_workflow = self._resolve_workflow(
             workflow,
             workflow_kwargs,
             group_size,
+            reward_normalization,
         )
         resolved_accept_fn = self._resolve_should_accept_fn(should_accept_fn)
         return self.workflow_executor.submit(
@@ -1152,10 +1301,9 @@ class RolloutControllerV2:
             A list of trajectory dicts (one per completed rollout).
         """
         self._ensure_initialized()
-        if reward_normalization or drop_incomplete_group:
+        if drop_incomplete_group:
             raise ValueError(
-                "RolloutControllerV2 does not support reward_normalization or "
-                "drop_incomplete_group yet."
+                "RolloutControllerV2 does not support drop_incomplete_group yet."
             )
         if not self._gateway_addr:
             raise RuntimeError("RolloutControllerV2.initialize() must be called first")
@@ -1173,6 +1321,7 @@ class RolloutControllerV2:
             workflow,
             workflow_kwargs,
             group_size,
+            reward_normalization,
         )
         resolved_accept_fn = self._resolve_should_accept_fn(should_accept_fn)
         for item in data:
@@ -1229,10 +1378,9 @@ class RolloutControllerV2:
             A list of trajectory dicts (matching ``RolloutController`` API).
         """
         self._ensure_initialized()
-        if reward_normalization or drop_incomplete_group:
+        if drop_incomplete_group:
             raise ValueError(
-                "RolloutControllerV2 does not support reward_normalization or "
-                "drop_incomplete_group yet."
+                "RolloutControllerV2 does not support drop_incomplete_group yet."
             )
         if not self._gateway_addr:
             raise RuntimeError("RolloutControllerV2.initialize() must be called first")
@@ -1247,6 +1395,7 @@ class RolloutControllerV2:
             workflow,
             workflow_kwargs,
             group_size,
+            reward_normalization,
         )
         resolved_accept_fn = self._resolve_should_accept_fn(should_accept_fn)
         results = self.workflow_executor.prepare_batch(
@@ -1534,7 +1683,12 @@ class RolloutControllerV2:
 
     # -- Workflow resolution helpers ----------------------------------------
 
-    def _wrap_agent(self, agent: Any, group_size: int = 1):
+    def _wrap_agent(
+        self,
+        agent: Any,
+        group_size: int = 1,
+        reward_normalization: bool = False,
+    ):
         """Wrap an agent in an InferenceServiceWorkflow.
 
         Parameters
@@ -1543,6 +1697,8 @@ class RolloutControllerV2:
             The agent to wrap (any object with an async ``run()`` method).
         group_size : int
             Number of parallel trajectories per episode.
+        reward_normalization : bool
+            Normalize rewards across the episode's trajectory group before export.
         """
         from areal.v2.inference_service.controller.workflow import (
             InferenceServiceWorkflow,
@@ -1566,6 +1722,9 @@ class RolloutControllerV2:
             discount=turn_discount,
             export_style=export_style,
             group_size=group_size,
+            serialize_group_samples=self.config.serialize_group_samples,
+            drop_retry_orphans=agent_cfg.drop_retry_orphans,
+            reward_normalization=reward_normalization,
         )
 
     def _resolve_workflow(
@@ -1573,6 +1732,7 @@ class RolloutControllerV2:
         workflow,
         workflow_kwargs=None,
         group_size=1,
+        reward_normalization=False,
     ):
         """Resolve a workflow-like input to an InferenceServiceWorkflow.
 
@@ -1589,6 +1749,8 @@ class RolloutControllerV2:
             Keyword arguments passed to the agent constructor.
         group_size : int
             Number of times to run the workflow per input.
+        reward_normalization : bool
+            Normalize rewards across each offline agent trajectory group.
         """
         from areal.api.workflow_api import RolloutWorkflow
         from areal.utils.dynamic_import import import_from_string
@@ -1608,6 +1770,10 @@ class RolloutControllerV2:
 
         # (a) None → online mode: create InferenceServiceWorkflow without agent
         if workflow is None:
+            if reward_normalization:
+                raise ValueError(
+                    "Online mode (workflow=None) does not support reward_normalization."
+                )
             if group_size > 1:
                 raise ValueError(
                     "Online mode (workflow=None) does not support group_size > 1. "
@@ -1620,6 +1786,9 @@ class RolloutControllerV2:
 
             online_kwargs = dict(workflow_kwargs or {})
             online_kwargs.pop("controller", None)
+            online_kwargs.setdefault(
+                "drop_retry_orphans", self._agent_config.drop_retry_orphans
+            )
             return InferenceServiceWorkflow(
                 controller=self,
                 agent=None,
@@ -1658,7 +1827,11 @@ class RolloutControllerV2:
             )
 
         # (d) Wrap the agent in InferenceServiceWorkflow (with group_size)
-        resolved = self._wrap_agent(agent, group_size=group_size)
+        resolved = self._wrap_agent(
+            agent,
+            group_size=group_size,
+            reward_normalization=reward_normalization,
+        )
 
         return resolved
 
@@ -1701,7 +1874,7 @@ class RolloutControllerV2:
         """
         resp = self._sync_client.post(
             f"{guard_addr}/alloc_ports",
-            json={"count": 1},
+            json={"count": 1, "role": role, "worker_index": worker_index},
         )
         resp.raise_for_status()
         port_data = resp.json()
@@ -1710,20 +1883,29 @@ class RolloutControllerV2:
 
         cmd = list(raw_cmd) + ["--host", host, "--port", str(port)]
 
-        resp = self._sync_client.post(
-            f"{guard_addr}/fork",
-            json={
-                "role": role,
-                "worker_index": worker_index,
-                "raw_cmd": cmd,
-            },
-        )
-        resp.raise_for_status()
-
-        self._forked_services.append((guard_addr, role, worker_index))
-
-        addr = f"http://{format_hostport(host, port)}"
-        self._wait_for_service(f"{addr}{health_path}", role)
+        try:
+            resp = self._sync_client.post(
+                f"{guard_addr}/fork",
+                json={
+                    "role": role,
+                    "worker_index": worker_index,
+                    "raw_cmd": cmd,
+                },
+            )
+            resp.raise_for_status()
+            self._forked_services.append((guard_addr, role, worker_index))
+            addr = f"http://{format_hostport(host, port)}"
+            self._wait_for_service(f"{addr}{health_path}", role)
+        except BaseException:
+            for endpoint in ("kill_forked_worker", "release_ports"):
+                try:
+                    self._sync_client.post(
+                        f"{guard_addr}/{endpoint}",
+                        json={"role": role, "worker_index": worker_index},
+                    )
+                except Exception:
+                    pass
+            raise
 
         return host, port
 
@@ -1743,7 +1925,9 @@ class RolloutControllerV2:
         """
         client = await self._get_async_client()
         resp = await client.post(
-            f"{guard_addr}/alloc_ports", json={"count": 1}, timeout=30.0
+            f"{guard_addr}/alloc_ports",
+            json={"count": 1, "role": role, "worker_index": worker_index},
+            timeout=30.0,
         )
         resp.raise_for_status()
         port_data = resp.json()
@@ -1757,11 +1941,24 @@ class RolloutControllerV2:
             "raw_cmd": cmd,
         }
 
-        resp = await client.post(f"{guard_addr}/fork", json=fork_payload, timeout=30.0)
-        resp.raise_for_status()
-
-        addr = f"http://{format_hostport(host, port)}"
-        await self._async_wait_for_service(f"{addr}{health_path}", role)
+        try:
+            resp = await client.post(
+                f"{guard_addr}/fork", json=fork_payload, timeout=30.0
+            )
+            resp.raise_for_status()
+            addr = f"http://{format_hostport(host, port)}"
+            await self._async_wait_for_service(f"{addr}{health_path}", role)
+        except BaseException:
+            for endpoint in ("kill_forked_worker", "release_ports"):
+                try:
+                    await client.post(
+                        f"{guard_addr}/{endpoint}",
+                        json={"role": role, "worker_index": worker_index},
+                        timeout=10.0,
+                    )
+                except Exception:
+                    pass
+            raise
 
         return host, port
 

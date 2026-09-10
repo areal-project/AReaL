@@ -15,13 +15,13 @@ def test_tree_transport_dummy_bypasses_objective_weight(monkeypatch):
     }
     monkeypatch.setattr(dist, "is_initialized", lambda: True)
     monkeypatch.setattr(dist, "get_world_size", lambda _group=None: 2)
+    monkeypatch.setattr(dist, "get_backend", lambda _group=None: "gloo")
 
-    def _all_gather(outputs, local_count, group=None):
-        del group
-        outputs[0].copy_(local_count)
-        outputs[1].fill_(2)
+    def _all_reduce(max_count, op, group=None):
+        assert op == dist.ReduceOp.MAX
+        max_count.fill_(2)
 
-    monkeypatch.setattr(dist, "all_gather", _all_gather)
+    monkeypatch.setattr(dist, "all_reduce", _all_reduce)
 
     mb_list = build_packed_tree_batch(
         data,
