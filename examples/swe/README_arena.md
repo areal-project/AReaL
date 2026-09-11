@@ -123,3 +123,63 @@ This port applies selected changes from `swe-dev` commits `da1da65c7`, `1d0fc7ba
 preserves main's processor cache, sample identity, and cancellation cleanup. Training
 engine APIs, mean-only reward normalization, internal Astra launch scripts, AWEX/Qwen3.8
 changes, and PRM/RewardSystem are outside this port.
+
+## Flash V3 Megatron profile
+
+`arena_flash_v3.yaml` and `submit_arena_flash_v3.sh` adapt the model, resource and
+sampling settings from `swe-dev@5478d6384`'s `submit_arena_astra_multi_stream.sh`. The
+default is eight shared training/inference nodes, 128K context, batch 32, 12 samples per
+prompt, 1500 concurrent rollouts and 500 training steps. Generation leaves one token of
+context headroom. `N_NODES` selects the following 8-GPU-node profiles; the CPU
+controller is additional:
+
+| Nodes | Megatron actor                | SGLang rollout |
+| ----- | ----------------------------- | -------------- |
+| 2     | `(attn:d1p2t4c2\|ffn:d1p2e8)` | `d4t4p1`       |
+| 4     | `(attn:d2p2t4c2\|ffn:d2p2e8)` | `d8t4p1`       |
+| 8     | `(attn:d2p2t2c8\|ffn:d4p2e8)` | `d16t4p1`      |
+| 16    | `(attn:d4p2t2c8\|ffn:d8p2e8)` | `d32t4p1`      |
+
+Use a checkpoint with architecture `BailingMoeV3ForCausalLM`. The profile uses the
+existing `mbridge` bridge, CP-capable KDA, Adam at `3e-6`, FP32 LM head, and AWEX weight
+updates. MTP is disabled and virtual pipeline size is one. Supply the common submission
+environment above, then set deployment-specific paths:
+
+```bash
+export MODEL_PATH="$FLASH_V3_CHECKPOINT"
+export ROLLOUT_IMAGE="$FLASH_V3_SGLANG_IMAGE"
+export AWEX_ROOT="$FLASH_V3_AWEX_SOURCE"
+export FLASH_LINEAR_ATTENTION_ROOT="$FLASH_V3_FLA_SOURCE"
+# Optional colon-separated module directories, visible inside worker containers:
+export ACTOR_RUNTIME_PYTHONPATH="$FLASH_V3_ACTOR_MODULES"
+export ROLLOUT_RUNTIME_PYTHONPATH="$FLASH_V3_ROLLOUT_MODULES"
+
+N_NODES=2 bash examples/swe/submit_arena_flash_v3.sh --print-profile
+N_NODES=2 bash examples/swe/submit_arena_flash_v3.sh --check-arena
+N_NODES=2 TRAIN_BATCH_SIZE=4 N_SAMPLES=2 TOTAL_TRAIN_STEPS=1 \
+  MAX_CONCURRENT_ROLLOUTS=4 bash examples/swe/submit_arena_flash_v3.sh
+```
+
+The small trial retains the 128K context. Set `CONTEXT_LENGTH` to change it together
+with the default generation and microbatch budgets. Adjust worker/controller time limits
+for long runs. This is a resource profile, not a guarantee that the selected checkpoint
+and sequence lengths fit available GPU memory.
+
+The default dataset file pins the two source streams, their Harnesses and reward
+versions at equal sampling weights. Set `DATASET_CONFIG` to another shared streams YAML
+when needed. Submission runs the existing Arena preflight before creating GPU workers;
+`--print-profile` neither contacts Arena nor submits a job.
+
+The runtime must supply Ling3 tool/reasoning parsers and Flash V3 inference support. The
+current AWEX plugin accepts SGLang `0.5.9` or `0.5.10.post1`; the external AWEX checkout
+must register the Flash V3 converter. FLA must support the checkpoint's KDA `safe_gate`
+and `lower_bound` arguments. The script does not install dependencies. GPU workers
+explicitly disable expandable-segment allocation for AWEX compatibility.
+
+This profile keeps main's outcome-only GRPO: rollout group normalization includes
+standard deviation, and incomplete groups are dropped. It does not reproduce `swe-dev`'s
+PRM/RewardSystem rewards, mean-only group normalization, minimum-eight partial groups,
+or adaptive thinking controls. Chat rendering uses the checkpoint's template defaults
+and any Harness request overrides. These differences affect training semantics; the
+profile is intended for Arena integration validation, not a claim of full recipe
+equivalence.

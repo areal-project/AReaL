@@ -1,0 +1,19 @@
+streams:
+- name: vn_greenfield
+  stream_id: vn-greenfield-fixed
+  sampling_weight: 1
+  harness: flash-vn-agent@2.0.3
+  llm_protocol: anthropic
+  expected_reward_ref:
+    key: vn-creation-x2env-greenfield-reward
+    version: 2.0.8
+  reward_transform_fn: examples.swe.reward_transforms.identity_reward
+- name: favor_app_online_scratch
+  stream_id: favor-app-online-scratch-fixed
+  sampling_weight: 1
+  harness: claude-code@1.2.31-native-direct-sfx-260821
+  llm_protocol: anthropic
+  expected_reward_ref:
+    key: favor-app-online-scratch-reward
+    version: 2.0.2
+  reward_transform_fn: examples.swe.reward_transforms.identity_reward
