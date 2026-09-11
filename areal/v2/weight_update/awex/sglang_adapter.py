@@ -138,6 +138,21 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
             "num_engines": 1,
         }
 
+    def _expert_id_offset(self, num_local_experts: int) -> int:
+        """Global id of this rank's first routed expert.
+
+        Under expert parallelism SGLang holds only ``num_experts // ep_size``
+        experts per rank, so the fused tensor's leading index is local. The
+        training side publishes global HuggingFace names and the transfer plan is
+        indexed by name, so without the offset every rank claims the same
+        low-numbered experts and the rest are never advertised at all.
+        """
+        rank_info = self._rank_info or self._build_rank_info()
+        ep_size = getattr(rank_info, "ep_size", 1) or 1
+        if ep_size <= 1:
+            return 0
+        return getattr(rank_info, "ep_rank", 0) * num_local_experts
+
     def _unfuse_params(
         self, name: str, tensor: torch.Tensor
     ) -> list[tuple[str, torch.Tensor]]:
@@ -196,13 +211,15 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
             prefix = name.replace(".w13_weight", "")
             result = []
             ffn_hidden = tensor.shape[1] // 2
+            id_offset = self._expert_id_offset(tensor.shape[0])
             for i in range(tensor.shape[0]):
                 expert_tensor = tensor[i]
-                if i < num_routed:
-                    expert_prefix = f"{prefix}.{i}"
+                expert_id = i + id_offset
+                if expert_id < num_routed:
+                    expert_prefix = f"{prefix}.{expert_id}"
                 else:
-                    shared_idx = i - num_routed
-                    num_shared = tensor.shape[0] - num_routed
+                    shared_idx = expert_id - num_routed
+                    num_shared = tensor.shape[0] + id_offset - num_routed
                     if num_shared > 1:
                         expert_prefix = prefix.replace(
                             "experts", f"shared_experts.{shared_idx}"
@@ -222,12 +239,14 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
             num_routed = getattr(cfg, "num_experts", None) or cfg.n_routed_experts
             prefix = name.replace(".w2_weight", "")
             result = []
+            id_offset = self._expert_id_offset(tensor.shape[0])
             for i in range(tensor.shape[0]):
-                if i < num_routed:
-                    expert_prefix = f"{prefix}.{i}"
+                expert_id = i + id_offset
+                if expert_id < num_routed:
+                    expert_prefix = f"{prefix}.{expert_id}"
                 else:
-                    shared_idx = i - num_routed
-                    num_shared = tensor.shape[0] - num_routed
+                    shared_idx = expert_id - num_routed
+                    num_shared = tensor.shape[0] + id_offset - num_routed
                     if num_shared > 1:
                         expert_prefix = prefix.replace(
                             "experts", f"shared_experts.{shared_idx}"
@@ -341,6 +360,10 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
     ) -> dict[str, torch.Tensor]:
         required = set(required_names) if required_names else None
         local_params: dict[str, torch.Tensor] = {}
+        # Expert ids below come from this rank's expert-parallel position, and
+        # the payload has to use the same names the metadata advertised.
+        if self._rank_info is None:
+            self._rank_info = self._build_rank_info()
 
         for name, param in self._get_model().named_parameters():
             for hf_name, hf_tensor in self._unfuse_params(name, param.data):
