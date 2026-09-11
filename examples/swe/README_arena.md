@@ -7,8 +7,9 @@ integration does not require AReaL-SWEAgent, PRM, or RewardSystem.
 ## Configuration
 
 `arena_grpo.yaml` is a two-node FSDP/SGLang smoke profile: eight training GPUs, eight
-inference GPUs, two samples per prompt, and one training step. Set these environment
-variables to your deployment's values:
+inference GPUs, two samples per prompt, and one training step. The request budget is
+32767 tokens against a 32768-token SGLang context, leaving its required one-token
+margin. Set these environment variables to your deployment's values:
 
 ```bash
 export AREAL_DIR=/path/to/AReaL
@@ -22,9 +23,15 @@ export ARENA_CREDENTIALS_FILE=/shared/private/arena.env
 Keep only credentials and the Arena API base in the private credentials file. It must
 export `ARENA_OPENAPI_BASE`, `ARENA_OPENAPI_TOKEN`, `ARENA_LLM_API_KEY`, and
 `SWE_RL_ADMIN_API_KEY`. Load it in the controller environment as well. Workers load the
-same file; credentials are not embedded in worker commands or committed YAML. The
-example assumes a compatible container with Slurm available to the controller, shared
-storage, and network reachability from Arena to rollout proxies. Use the included
+same file; credentials are not embedded in worker commands or committed YAML.
+
+`ARENA_LLM_API_KEY` must authenticate to Arena's model gateway. It is not an upstream
+model-provider key. If your deployment uses the same Arena bearer token for both APIs,
+set `export ARENA_LLM_API_KEY="$ARENA_OPENAPI_TOKEN"` in the credentials file.
+Control-plane preflight success alone does not validate model-gateway authentication.
+
+The example assumes a compatible container with Slurm available to the controller,
+shared storage, and network reachability from Arena to rollout proxies. Use the included
 submission script after setting the site-specific mounts:
 
 ```bash

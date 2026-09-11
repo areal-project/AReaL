@@ -33,3 +33,4 @@ def test_arena_profile_loads_with_main_schema(monkeypatch, tmp_path, profile):
     assert config.econfig.dataset_source == "arena"
     assert len(streams) == (2 if profile == "arena_multi_stream.yaml" else 1)
     assert config.rollout.agent.mode == "inline"
+    assert config.rollout.agent.engine_max_tokens < config.sglang.context_length

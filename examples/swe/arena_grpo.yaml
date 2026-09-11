@@ -42,7 +42,7 @@ gconfig:
   n_samples: 2
   min_new_tokens: 0
   max_new_tokens: 8192
-  max_tokens: 32768
+  max_tokens: 32767
   greedy: false
   temperature: 1.0
 actor:
@@ -122,7 +122,8 @@ sglang:
   skip_tokenizer_init: true
   dtype: ${actor.dtype}
   max_running_requests: null
-  context_length: ${gconfig.max_tokens}
+  # SGLang reserves one token when checking prompt + completion length.
+  context_length: 32768
   mem_fraction_static: 0.7
 vllm:
   model: ${actor.path}
