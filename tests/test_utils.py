@@ -208,12 +208,8 @@ def test_noop_packed_padding_preserves_semantic_transport_marker(sequence_alignm
     assert mb_list.padded_mbs is not None
     assert TRANSPORT_DUMMY_KEY not in mb_list.padded_mbs[0]
 
-    callback_called = False
-
     def _loss_weight(_microbatch):
-        nonlocal callback_called
-        callback_called = True
-        return torch.tensor(1.0)
+        pytest.fail("transport dummy reached the objective weight callback")
 
     torch.testing.assert_close(
         compute_microbatch_loss_weight(mb_list.mbs[0], _loss_weight),
@@ -221,7 +217,6 @@ def test_noop_packed_padding_preserves_semantic_transport_marker(sequence_alignm
         rtol=0.0,
         atol=0.0,
     )
-    assert callback_called is False
 
 
 def test_forward_transport_padding_is_removed_from_outputs():

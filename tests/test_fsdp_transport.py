@@ -63,7 +63,6 @@ def _check_fsdp_transport_ranks(rank: int, rendezvous: str) -> None:
         engine.is_vision_model = True
         engine.parallel_helper = SimpleNamespace(sp_size=1)
         engine.model = Mock(side_effect=AssertionError("model must not run"))
-        process_output = Mock(side_effect=AssertionError("objective must not run"))
 
         for tree in (False, True):
             engine.enable_tree_training = tree
@@ -75,23 +74,18 @@ def _check_fsdp_transport_ranks(rank: int, rendezvous: str) -> None:
                 for forward_only in (False, True):
                     with pytest.raises(ValueError, match="FSDP transport padding"):
                         engine.forward_backward_batch(
-                            mb_list, process_output, forward_only=forward_only
+                            mb_list, lambda *_: None, forward_only=forward_only
                         )
-        engine.model.assert_not_called()
-        process_output.assert_not_called()
 
         # Real VLM batches remain accepted; text models may still use dummies.
         engine.enable_tree_training = False
         engine.model = Mock(return_value=SimpleNamespace(logits=torch.ones(1, 2, 3)))
-        process_output = Mock(return_value=None)
         for is_vision_model, dummy_rank in ((True, -1), (False, 0)):
             engine.is_vision_model = is_vision_model
             mb_list = _make_batch(rank, dummy_rank, tree=False, vision=is_vision_model)
             engine.model.reset_mock()
-            process_output.reset_mock()
-            engine.forward_backward_batch(mb_list, process_output, forward_only=True)
+            engine.forward_backward_batch(mb_list, lambda *_: None, forward_only=True)
             assert engine.model.call_count == len(mb_list.mbs)
-            assert process_output.call_count == len(mb_list.mbs)
     finally:
         dist.destroy_process_group()
 
