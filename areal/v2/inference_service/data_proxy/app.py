@@ -591,10 +591,17 @@ def create_app(config: DataProxyConfig) -> FastAPI:
             )
 
         try:
-            reward_result = session.set_reward(
-                interaction_id=body.interaction_id,
-                reward=body.reward,
-            )
+            if body.rewards is not None:
+                if not body.rewards:
+                    raise HTTPException(
+                        status_code=400, detail="rewards must not be empty"
+                    )
+                reward_result = session.set_rewards(body.rewards)
+            else:
+                reward_result = session.set_reward(
+                    interaction_id=body.interaction_id,
+                    reward=body.reward,
+                )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 

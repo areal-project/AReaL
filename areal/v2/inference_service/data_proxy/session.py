@@ -9,6 +9,7 @@ import threading
 import time
 import uuid
 from collections import OrderedDict
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -58,6 +59,7 @@ class SetRewardRequest(BaseModel):
 
     interaction_id: str | None = None
     reward: float
+    rewards: dict[str, float] | None = None
     model: str | None = None
 
 
@@ -253,11 +255,28 @@ class SessionData:
         reward: float,
     ) -> RewardResult:
         """Record reward for the active trajectory."""
+        return self.set_rewards({interaction_id: reward})
+
+    def set_rewards(
+        self,
+        rewards: Mapping[str | None, float],
+    ) -> RewardResult:
+        """Record rewards for one or more interactions of the active trajectory.
+
+        All rewards are applied under a single lock acquisition and the
+        trajectory is finalized at most once, so a caller may attribute
+        step-level rewards without the first entry finalizing the trajectory
+        out from under the remaining ones.
+        """
+        if not rewards:
+            raise ValueError("No rewards provided")
+
         with self._lock:
             now = time.time()
             self._last_access_time = now
 
-            duplicate_ready = self._resolve_duplicate_ready_locked(interaction_id)
+            last_interaction_id = next(reversed(list(rewards)))
+            duplicate_ready = self._resolve_duplicate_ready_locked(last_interaction_id)
             if duplicate_ready is not None:
                 return RewardResult(
                     session_id=self.session_id,
@@ -270,12 +289,15 @@ class SessionData:
             if len(completions) == 0:
                 raise ValueError("No interactions in session")
 
-            resolved_interaction_id = interaction_id or completions.last_interaction_id
-            if resolved_interaction_id not in completions:
-                raise ValueError(f"Interaction {resolved_interaction_id} not found")
+            for interaction_id, reward in rewards.items():
+                resolved_interaction_id = (
+                    interaction_id or completions.last_interaction_id
+                )
+                if resolved_interaction_id not in completions:
+                    raise ValueError(f"Interaction {resolved_interaction_id} not found")
 
-            completions.set_reward(resolved_interaction_id, reward)
-            self._last_reward_interaction_id = resolved_interaction_id
+                completions.set_reward(resolved_interaction_id, reward)
+                self._last_reward_interaction_id = resolved_interaction_id
             self._last_set_reward_time = now
 
             ready_result = self._finalize_if_reward_timeout_elapsed_locked(now)
