@@ -83,7 +83,7 @@ def test_train_batch_does_not_apply_optimizer_loss_scale_manually(
     engine._ensure_ready = lambda: None
     engine.optimizer_zero_grad = lambda: None
     engine._normalize_batch_input = lambda input_: (input_, None)
-    engine._prepare_mb_list = lambda input_: _MicroBatchList()
+    engine._prepare_mb_list = lambda input_, **kwargs: _MicroBatchList()
     engine.optimizer_step = lambda: {}
     engine._collect_mtp_loss = lambda num_microbatches: None
 
