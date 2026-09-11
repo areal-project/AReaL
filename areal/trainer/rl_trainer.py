@@ -1745,6 +1745,29 @@ class PPOTrainer:
             dist.barrier(group=self.actor.cpu_group)
             current_platform.synchronize()
 
+    def _validate_weight_update_model(self) -> None:
+        """Allow Qwen2/Qwen2.5 text-model weight updates via disk or v1 XCCL."""
+        actor = self.config.actor
+        if actor.weight_update_mode == "disk" or (
+            actor._version == "v1" and actor.weight_update_mode == "xccl"
+        ):
+            return
+
+        from transformers import PretrainedConfig
+
+        # Read the checkpoint metadata, not its directory/repository name. Qwen2.5
+        # text models also identify as Qwen2ForCausalLM, unlike Qwen2.5-VL.
+        model_config, _ = PretrainedConfig.get_config_dict(actor.path)
+        if model_config.get("model_type") == "qwen2" or "Qwen2ForCausalLM" in (
+            model_config.get("architectures") or []
+        ):
+            raise ValueError(
+                "Qwen2/Qwen2.5 text models do not support AWEX weight updates. "
+                "For RL, set actor.weight_update_mode=disk with v1 or v2, "
+                "or use actor.weight_update_mode=xccl with actor._version=v1 "
+                "and rollout._version=v1."
+            )
+
     def _validate_cfg(self):
         """validate config for incompatible settings before weight initialization, to avoid wasted resources on spawning workers and loading models."""
         rollout_backend = self.rollout_alloc.backend
@@ -1810,6 +1833,7 @@ class PPOTrainer:
                 f"actor._version ('{actor_version}') and rollout._version "
                 f"('{rollout_version}') must match. Both must be 'v1' or both 'v2'."
             )
+        self._validate_weight_update_model()
         if self.config.mopd is not None:
             requires_teacher_scoring = (
                 self.mopd_execution_plan is not None

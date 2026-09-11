@@ -1,4 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
+"""Shared contract for AWEX inference adapters."""
+
 from __future__ import annotations
 
 from typing import Protocol, runtime_checkable
@@ -7,8 +9,8 @@ import torch
 
 
 @runtime_checkable
-class AwexTrainingAdapter(Protocol):
-    """Protocol for training-side weight update adapters."""
+class AwexInferenceAdapter(Protocol):
+    """Protocol for inference-side weight update adapters."""
 
     @property
     def parallelism_strategy(self) -> dict:
@@ -42,12 +44,13 @@ class AwexTrainingAdapter(Protocol):
         infer_world_size: int,
         train_world_size: int,
         num_engines: int,
+        timeout_s: float = 300.0,
     ) -> None:
-        """Pull peer meta from KV store, build local send plan, join NCCL group."""
+        """Pull peer meta from KV store, build local recv plan, join NCCL group."""
         ...
 
     def execute_weight_update(self, version: int) -> None:
-        """Execute cached local P2P send plan."""
+        """Execute cached local P2P recv plan."""
         ...
 
     def batch_isend_irecv(self, **kwargs) -> None:
@@ -70,15 +73,15 @@ class AwexTrainingAdapter(Protocol):
         admin_api_key: str = "areal-admin-key",
         timeout_s: float = 120.0,
     ) -> None:
-        """Register device info in KV store for colocated weight transfer."""
+        """Build device mapping, inference-only NCCL group, and colocate transport."""
         ...
 
     def execute_colocate_weight_update(self, version: int) -> None:
-        """Serialize weights via IPC and put to KV store."""
+        """Fetch IPC weights from KV store and apply via colocate transport."""
         ...
 
     def release_memory(self, tags: list[str] | None = None) -> None:
-        """Release GPU memory (optimizer/weights) for colocated mode."""
+        """Release GPU memory (KV cache/weights) for colocated mode."""
         ...
 
     def resume_memory(self, tags: list[str] | None = None) -> None:

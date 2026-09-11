@@ -50,6 +50,7 @@ from areal.api import (
 )
 from areal.api.cli_args import MicroBatchSpec, PerfTracerConfig, TrainEngineConfig
 from areal.api.io_struct import DeviceRuntimeInfo
+from areal.engine.awex.dte.delta_config import DTERuntimeConfig
 from areal.engine.core import (
     aggregate_eval_losses,
     compute_total_loss_weight,
@@ -148,7 +149,6 @@ from areal.utils.network import find_free_ports, format_host_for_url, gethostip
 from areal.utils.offload import is_tms_enabled, torch_memory_saver
 from areal.utils.perf_tracer import trace_perf, trace_scope
 from areal.utils.seeding import get_seed
-from areal.v2.weight_update.awex.delta_config import DTERuntimeConfig
 
 if TYPE_CHECKING:
     from areal.api import Scheduler
@@ -158,7 +158,7 @@ if TYPE_CHECKING:
         PPOActorConfig,
         PPOCriticConfig,
     )
-    from areal.engine.awex.colocate_writer import AwexWeightPublisher
+    from areal.engine.awex.adapters.megatron_adapter import AwexMegatronAdapter
     from areal.engine.megatron_utils.weight_residency import MegatronWeightResidency
 
 
@@ -376,7 +376,7 @@ class MegatronEngine(TrainEngine):
         self.is_offload: bool = False
         self._offload_depth: int = 0
         self._weight_residency: MegatronWeightResidency | None = None
-        self._awex_publisher: AwexWeightPublisher | None = None
+        self._awex_adapter: AwexMegatronAdapter | None = None
         self._dte_runtime_config = DTERuntimeConfig.from_env()
         self._warned_unbounded_microbatch = False
         self.enable_tree_training: bool = self.config.enable_tree_training
@@ -998,8 +998,8 @@ class MegatronEngine(TrainEngine):
             self._init_weight_update_from_distributed(meta)
             self.weight_update_group_initialized = True
         elif meta.type == "awex":
-            publisher = self._ensure_awex_publisher()
-            publisher.init_colocate_weight_update(
+            adapter = self._ensure_awex_adapter()
+            adapter.init_legacy_colocate_weight_update(
                 meta_server_addr=meta.nccl_master_address,
                 pair_name=meta.nccl_group_name or "default",
                 transfer_rank=self.rank or 0,
@@ -1055,7 +1055,7 @@ class MegatronEngine(TrainEngine):
         self._check_rollout_engine_connected()
         if meta.type == "awex":
             # Colocate mode flow (mirrors the AWEX reference integration):
-            # 1. execute_colocate_weight_update: release grad → convert → offload
+            # 1. execute_legacy_colocate_weight_update: release grad → convert → offload
             #    weights → signal offloaded → IPC serialize → wait reader done →
             #    cleanup shared → signal write_finished
             # 2. finish: wait all infer engines done → cleanup MetaServer keys
@@ -1063,11 +1063,11 @@ class MegatronEngine(TrainEngine):
             # actor worker returns. Calling back into the rollout from this RPC
             # creates a nested controller/rollout call while the actor collective
             # is still active and deadlocks at the final barrier.
-            if self._awex_publisher is None:
+            if self._awex_adapter is None:
                 raise RuntimeError(
-                    "AWEX weight update requested before publisher initialization"
+                    "AWEX weight update requested before adapter initialization"
                 )
-            self._awex_publisher.execute_colocate_weight_update(meta.version or 0)
+            self._awex_adapter.execute_legacy_colocate_weight_update(meta.version or 0)
             # Do NOT flip is_offload here: residency tracks released memory,
             # and the trainer onloads explicitly
             # at the next train phase. Marking is_offload would make every
@@ -1076,7 +1076,7 @@ class MegatronEngine(TrainEngine):
 
             dist.barrier(group=self.cpu_group)
 
-            self._awex_publisher.finish_colocate_weight_update(
+            self._awex_adapter.finish_legacy_colocate_weight_update(
                 training_world_size=dist.get_world_size(self.cpu_group)
             )
 
@@ -1719,14 +1719,14 @@ class MegatronEngine(TrainEngine):
         return data
 
     def init_awex_adapter(self, meta_server_addr: str | None = None) -> None:
-        """Create the AWEX publisher early for colocated weight transfer.
+        """Create the AWEX adapter early for colocated weight transfer.
 
         Must be called before offload() in colocate mode so that offload uses
         flat-buffer residency instead of TMS, which is all-or-nothing and can
         OOM when SGLang already occupies the GPU.
         """
-        publisher = self._ensure_awex_publisher()
-        publisher.eager_publish_train_info(meta_server_addr)
+        adapter = self._ensure_awex_adapter()
+        adapter.eager_publish_train_info(meta_server_addr)
 
     def _ensure_weight_residency(self) -> MegatronWeightResidency:
         if self._weight_residency is None:
@@ -1738,16 +1738,16 @@ class MegatronEngine(TrainEngine):
             self.logger.info("Created Megatron weight residency manager")
         return self._weight_residency
 
-    def _ensure_awex_publisher(self) -> AwexWeightPublisher:
+    def _ensure_awex_adapter(self) -> AwexMegatronAdapter:
         residency = self._ensure_weight_residency()
-        if self._awex_publisher is None:
-            from areal.engine.awex.colocate_writer import AwexWeightPublisher
+        if self._awex_adapter is None:
+            from areal.engine.awex.adapters.megatron_adapter import AwexMegatronAdapter
 
-            self._awex_publisher = AwexWeightPublisher(self, residency)
-            self.logger.info("Created AWEX weight publisher")
-        elif self._awex_publisher.residency is not residency:
-            raise RuntimeError("AWEX publisher does not own the engine residency")
-        return self._awex_publisher
+            self._awex_adapter = AwexMegatronAdapter(self, residency)
+            self.logger.info("Created AWEX weight adapter")
+        elif self._awex_adapter.residency is not residency:
+            raise RuntimeError("AWEX adapter does not share the engine residency")
+        return self._awex_adapter
 
     def init_weight_residency_adapter(self) -> None:
         """Enable DDP-flat-buffer residency without AWEX publication state."""

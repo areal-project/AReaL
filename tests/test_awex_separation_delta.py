@@ -2,8 +2,6 @@
 """Separation-specific distributed ordering tests for AWEX delta transfer."""
 
 import importlib.util
-import sys
-import types
 from types import SimpleNamespace
 
 import pytest
@@ -441,52 +439,92 @@ def test_megatron_separation_failed_delta_does_not_advance_tracker(monkeypatch):
     assert commits == []
 
 
-def test_reconstructed_override_preserves_tensor_parallel_metadata(monkeypatch):
-    """A plain theta_old tensor must gather like its live TP parameter."""
+@pytest.mark.parametrize("tp_rank", [0, 1])
+@pytest.mark.parametrize("consume_overrides", [False, True])
+def test_reconstructed_override_preserves_tensor_parallel_metadata(
+    monkeypatch, tp_rank, consume_overrides
+):
+    """Convert plain theta_old shards with the native converter's TP context."""
     mod = common._load_megatron_adapter(monkeypatch)
-    param = torch.nn.Parameter(torch.arange(8, dtype=torch.float32))
+    pytest.importorskip(
+        "awex.converter.mcore_converter",
+        reason="requires Megatron for the native AWEX converter",
+    )
+
+    from awex.models.registry import get_train_weights_converter
+    from awex.util import mindspeed
+
+    monkeypatch.setattr(mindspeed, "ensure_mindspeed_patched", lambda *args: None)
+    param = torch.nn.Parameter(torch.full((8, 8), -1.0, dtype=torch.float32))
     param.tensor_model_parallel = True
     param.partition_dim = 0
     param.partition_stride = 1
-    override = param.detach().clone()
+    override = torch.arange(64, dtype=torch.float32).reshape(8, 8) + tp_rank * 64
     overrides = {id(param): override}
-    captured = {}
-
-    megatron_mod = types.ModuleType("areal.engine.megatron_utils.megatron")
-    megatron_mod.get_named_parameters = lambda model, experts: [("qkv", param)]
-
-    def _all_gather_param(name, tensor, **kwargs):
-        del name, kwargs
-        captured["uses_override"] = tensor is override
-        captured["metadata"] = (
-            tensor.tensor_model_parallel,
-            tensor.partition_dim,
-            tensor.partition_stride,
-        )
-        return tensor
-
-    megatron_mod.all_gather_param = _all_gather_param
-    megatron_mod.convert_to_hf = lambda config, model, name, tensor: [("w", tensor)]
-    monkeypatch.setitem(
-        sys.modules, "areal.engine.megatron_utils.megatron", megatron_mod
+    model = SimpleNamespace(
+        named_parameters=lambda: [
+            ("decoder.layers.0.self_attention.linear_qkv.weight", param)
+        ],
+        state_dict=lambda: {},
+    )
+    hf_config = SimpleNamespace(
+        model_type="qwen3",
+        architectures=["Qwen3ForCausalLM"],
+        hidden_size=8,
+        num_attention_heads=8,
+        num_key_value_heads=4,
+        num_hidden_layers=1,
+        tie_word_embeddings=False,
+    )
+    rank_info = SimpleNamespace(
+        tp_rank=tp_rank,
+        tp_size=2,
+        attn_tp_rank=tp_rank,
+        attn_tp_size=2,
+        pp_rank=0,
+        pp_size=1,
     )
 
     adapter = object.__new__(mod.AwexMegatronAdapter)
-    adapter._engine = SimpleNamespace(
-        model=object(),
-        tf_config=SimpleNamespace(num_moe_experts=None),
-        hf_config=SimpleNamespace(model_type="qwen3", tie_word_embeddings=False),
-        _duplicated_param_names=set(),
+    adapter._engine = SimpleNamespace(model=[model], hf_config=hf_config)
+    adapter._rank_info = rank_info
+    adapter._weight_converter = get_train_weights_converter(
+        "mcore",
+        "Qwen3ForCausalLM",
+        hf_config,
+        rank_info,
+        {"infer_atten_tp_size": 2, "device_backend": "cpu"},
+        tf_config=SimpleNamespace(
+            hidden_size=8,
+            num_attention_heads=8,
+            num_query_groups=4,
+            kv_channels=1,
+            num_layers=1,
+        ),
     )
 
-    items = list(adapter._iter_hf_params(overrides, consume_overrides=True))
+    items = dict(
+        adapter._iter_hf_params(overrides, consume_overrides=consume_overrides)
+    )
 
-    assert len(items) == 1
-    assert items[0][0] == "w"
-    torch.testing.assert_close(items[0][1], override, rtol=0, atol=0)
-    assert captured["uses_override"] is True
-    assert captured["metadata"] == (True, 0, 1)
-    assert overrides == {}
+    # Each local GQA group is [Q, Q, K, V]; the converter separates both groups.
+    expected_rows = {"q": [0, 1, 4, 5], "k": [2, 6], "v": [3, 7]}
+    assert set(items) == {
+        f"model.layers.0.self_attn.{projection}_proj.weight"
+        for projection in expected_rows
+    }
+    for projection, rows in expected_rows.items():
+        torch.testing.assert_close(
+            items[f"model.layers.0.self_attn.{projection}_proj.weight"],
+            override[rows],
+            rtol=0,
+            atol=0,
+        )
+    torch.testing.assert_close(param, torch.full_like(param, -1), rtol=0, atol=0)
+    if consume_overrides:
+        assert overrides == {}
+    else:
+        assert overrides[id(param)] is override
 
 
 def test_streaming_generator_waits_async_batch_before_yield(monkeypatch):

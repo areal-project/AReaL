@@ -24,9 +24,13 @@ def register_awex_endpoints(app: FastAPI, rpc_proxy: RpcProxy) -> None:
     """
 
     @app.post("/awex/report_weight_meta")
-    async def report_weight_meta() -> JSONResponse:
+    async def report_weight_meta(request: Request) -> JSONResponse:
         try:
-            result = rpc_proxy.collective_rpc_with_result("awex_report_weight_meta")
+            data = await request.json() if await request.body() else {}
+            result = rpc_proxy.collective_rpc_with_result(
+                "awex_report_weight_meta",
+                parameter_layout=data.get("parameter_layout", "hf"),
+            )
             return JSONResponse(content={"status": "ok", "meta": result})
         except Exception as e:
             logger.error("Failed to report weight meta: %s", e)

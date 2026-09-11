@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Runtime configuration for separation AdamW delta transfer.
+"""Shared runtime configuration for separation AdamW delta transfer.
 
 The delta algorithm itself lives in the standalone ``dte`` package. This
 module snapshots the environment propagated to a GPU worker and lazily creates

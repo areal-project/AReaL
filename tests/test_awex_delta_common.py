@@ -21,7 +21,7 @@ import pytest
 torch = pytest.importorskip("torch")
 
 _ROOT = Path(__file__).resolve().parent.parent
-_DC_PATH = _ROOT / "areal/v2/weight_update/awex/delta_config.py"
+_DC_PATH = _ROOT / "areal/engine/awex/dte/delta_config.py"
 
 
 def _make_environ_stub():
@@ -279,40 +279,42 @@ def test_invert_adamw_roundtrip():
     torch.testing.assert_close(recovered, theta_prev, rtol=1e-3, atol=1e-4)
 
 
-def _stub_colocate_device(monkeypatch):
-    colocate_device_mod = types.ModuleType(
-        "areal.v2.weight_update.awex.colocate_device"
-    )
-    colocate_device_mod.device_mapping_key = lambda ip, device: f"{ip}_{device}"
-    colocate_device_mod.get_colocate_ip_address = lambda: "127.0.0.1"
-    colocate_device_mod.get_physical_cuda_device_id = lambda local_index=None: str(
-        local_index or 0
-    )
-    monkeypatch.setitem(
-        sys.modules,
-        "areal.v2.weight_update.awex.colocate_device",
-        colocate_device_mod,
-    )
-
-
 def _stub_areal_packages(monkeypatch):
     monkeypatch.setitem(sys.modules, "httpx", types.ModuleType("httpx"))
     monkeypatch.setitem(sys.modules, "areal", types.ModuleType("areal"))
-    monkeypatch.setitem(sys.modules, "areal.v2", types.ModuleType("areal.v2"))
-    monkeypatch.setitem(
-        sys.modules,
-        "areal.v2.weight_update",
-        types.ModuleType("areal.v2.weight_update"),
-    )
+    for package in (
+        "areal.engine",
+        "areal.engine.awex",
+        "areal.engine.awex.adapters",
+        "areal.engine.awex.dte",
+        "areal.engine.awex.transport",
+        "areal.engine.megatron_utils",
+    ):
+        module = types.ModuleType(package)
+        module.__path__ = []
+        monkeypatch.setitem(sys.modules, package, module)
 
-    awex_mod = types.ModuleType("areal.v2.weight_update.awex")
+    awex_mod = types.ModuleType("areal.engine.awex.transport.metadata")
     awex_mod.awex_wu_use_group = lambda: False
     awex_mod.fetch_kv_metadata = lambda *args, **kwargs: ([], [])
-    awex_mod.load_kv_metadata_file = lambda *args, **kwargs: None
-    awex_mod.resolve_physical_gpu_id = lambda *args, **kwargs: 0
-    awex_mod.__path__ = []
-    monkeypatch.setitem(sys.modules, "areal.v2.weight_update.awex", awex_mod)
-    _stub_colocate_device(monkeypatch)
+    monkeypatch.setitem(sys.modules, "areal.engine.awex.transport.metadata", awex_mod)
+
+    awex_utils_mod = types.ModuleType("areal.engine.awex.utils")
+    awex_utils_mod.resolve_physical_gpu_id = lambda relative_gpu_id: relative_gpu_id
+    awex_utils_mod.awex_colocate_timeout_s = lambda default=1800.0: default
+    monkeypatch.setitem(sys.modules, "areal.engine.awex.utils", awex_utils_mod)
+
+    memory_saver_mod = types.ModuleType("areal.engine.awex.memory_saver")
+    memory_saver_mod.patch_tms_hook_mode = lambda: None
+    monkeypatch.setitem(sys.modules, "areal.engine.awex.memory_saver", memory_saver_mod)
+
+    residency_mod = types.ModuleType("areal.engine.megatron_utils.weight_residency")
+    residency_mod.MegatronWeightResidency = lambda engine: SimpleNamespace(
+        released_tags=frozenset()
+    )
+    monkeypatch.setitem(
+        sys.modules, "areal.engine.megatron_utils.weight_residency", residency_mod
+    )
 
     logging_mod = types.ModuleType("areal.utils.logging")
     logging_mod.getLogger = stdlib_logging.getLogger
@@ -327,14 +329,6 @@ def _stub_areal_packages(monkeypatch):
     monkeypatch.setitem(sys.modules, "areal.infra", infra_mod)
     monkeypatch.setitem(sys.modules, "areal.infra.platforms", platforms_mod)
 
-    weight_digest_mod = types.ModuleType("areal.v2.weight_update.awex.weight_digest")
-    weight_digest_mod.log_tensor_digest = lambda *args, **kwargs: None
-    monkeypatch.setitem(
-        sys.modules,
-        "areal.v2.weight_update.awex.weight_digest",
-        weight_digest_mod,
-    )
-
 
 def _load_delta_detect(monkeypatch):
     """Load delta_detect.py without the full AReaL runtime."""
@@ -345,17 +339,17 @@ def _load_delta_detect(monkeypatch):
     monkeypatch.setitem(sys.modules, "areal.utils.logging", fake)
     monkeypatch.setitem(sys.modules, "areal.utils.environ", _make_environ_stub())
     for package in (
-        "areal.v2",
-        "areal.v2.weight_update",
-        "areal.v2.weight_update.awex",
+        "areal.engine",
+        "areal.engine.awex",
+        "areal.engine.awex.dte",
     ):
         monkeypatch.setitem(sys.modules, package, types.ModuleType(package))
     monkeypatch.setitem(
         sys.modules,
-        "areal.v2.weight_update.awex.delta_config",
+        "areal.engine.awex.dte.delta_config",
         _load_delta_config(),
     )
-    path = _ROOT / "areal/v2/weight_update/awex/delta_detect.py"
+    path = _ROOT / "areal/engine/awex/dte/delta_detect.py"
     spec = importlib.util.spec_from_file_location("awex_delta_detect", path)
     mod = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
@@ -454,7 +448,7 @@ def _load_sglang_adapter(monkeypatch):
 
     _stub_areal_packages(monkeypatch)
 
-    delta_config_mod = types.ModuleType("areal.v2.weight_update.awex.delta_config")
+    delta_config_mod = types.ModuleType("areal.engine.awex.dte.delta_config")
 
     class _DTERuntimeConfig:
         @classmethod
@@ -466,11 +460,13 @@ def _load_sglang_adapter(monkeypatch):
     delta_config_mod.validate_dte_world_size = lambda *args, **kwargs: None
     monkeypatch.setitem(
         sys.modules,
-        "areal.v2.weight_update.awex.delta_config",
+        "areal.engine.awex.dte.delta_config",
         delta_config_mod,
     )
 
-    inference_adapter_mod = types.ModuleType("areal.v2.weight_update.inference_adapter")
+    inference_adapter_mod = types.ModuleType(
+        "areal.engine.awex.adapters.inference_adapter"
+    )
 
     class _AwexInferenceAdapter:
         pass
@@ -478,20 +474,20 @@ def _load_sglang_adapter(monkeypatch):
     inference_adapter_mod.AwexInferenceAdapter = _AwexInferenceAdapter
     monkeypatch.setitem(
         sys.modules,
-        "areal.v2.weight_update.inference_adapter",
+        "areal.engine.awex.adapters.inference_adapter",
         inference_adapter_mod,
     )
 
-    nccl_group_mod = types.ModuleType("areal.v2.weight_update.nccl_group")
+    nccl_group_mod = types.ModuleType("areal.engine.awex.transport.nccl_group")
     nccl_group_mod.init_weights_update_group = lambda *args, **kwargs: None
     nccl_group_mod.setup_batch_isend_irecv = lambda *args, **kwargs: None
     monkeypatch.setitem(
         sys.modules,
-        "areal.v2.weight_update.nccl_group",
+        "areal.engine.awex.transport.nccl_group",
         nccl_group_mod,
     )
 
-    path = _ROOT / "areal/v2/weight_update/awex/sglang_adapter.py"
+    path = _ROOT / "areal/engine/awex/adapters/sglang_adapter.py"
     spec = importlib.util.spec_from_file_location("awex_sglang_adapter_test", path)
     mod = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
@@ -508,7 +504,7 @@ def _load_megatron_adapter(monkeypatch):
 
     _stub_areal_packages(monkeypatch)
 
-    delta_config_mod = types.ModuleType("areal.v2.weight_update.awex.delta_config")
+    delta_config_mod = types.ModuleType("areal.engine.awex.dte.delta_config")
 
     class _DTERuntimeConfig:
         @classmethod
@@ -523,28 +519,30 @@ def _load_megatron_adapter(monkeypatch):
     delta_config_mod.validate_dte_world_size = lambda *args, **kwargs: None
     monkeypatch.setitem(
         sys.modules,
-        "areal.v2.weight_update.awex.delta_config",
+        "areal.engine.awex.dte.delta_config",
         delta_config_mod,
     )
 
-    delta_detect_mod = types.ModuleType("areal.v2.weight_update.awex.delta_detect")
+    delta_detect_mod = types.ModuleType("areal.engine.awex.dte.delta_detect")
     delta_detect_mod.AdamWInversionDetector = lambda *args, **kwargs: None
     monkeypatch.setitem(
         sys.modules,
-        "areal.v2.weight_update.awex.delta_detect",
+        "areal.engine.awex.dte.delta_detect",
         delta_detect_mod,
     )
 
-    nccl_group_mod = types.ModuleType("areal.v2.weight_update.nccl_group")
+    nccl_group_mod = types.ModuleType("areal.engine.awex.transport.nccl_group")
     nccl_group_mod.init_weights_update_group = lambda *args, **kwargs: None
     nccl_group_mod.setup_batch_isend_irecv = lambda *args, **kwargs: None
     monkeypatch.setitem(
         sys.modules,
-        "areal.v2.weight_update.nccl_group",
+        "areal.engine.awex.transport.nccl_group",
         nccl_group_mod,
     )
 
-    training_adapter_mod = types.ModuleType("areal.v2.weight_update.training_adapter")
+    training_adapter_mod = types.ModuleType(
+        "areal.engine.awex.adapters.training_adapter"
+    )
 
     class _AwexTrainingAdapter:
         pass
@@ -552,11 +550,11 @@ def _load_megatron_adapter(monkeypatch):
     training_adapter_mod.AwexTrainingAdapter = _AwexTrainingAdapter
     monkeypatch.setitem(
         sys.modules,
-        "areal.v2.weight_update.training_adapter",
+        "areal.engine.awex.adapters.training_adapter",
         training_adapter_mod,
     )
 
-    path = _ROOT / "areal/v2/weight_update/awex/megatron_adapter.py"
+    path = _ROOT / "areal/engine/awex/adapters/megatron_adapter.py"
     spec = importlib.util.spec_from_file_location("awex_megatron_adapter_test", path)
     mod = importlib.util.module_from_spec(spec)
     assert spec.loader is not None

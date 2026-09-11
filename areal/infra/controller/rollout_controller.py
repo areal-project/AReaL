@@ -340,11 +340,11 @@ class RolloutController:
             self.config.scheduling_strategy.type
             == SchedulingStrategyType.colocation.value
         ):
-            # Colocation (AWEX) path: multiple servers share a node, so SLURM does
-            # NOT isolate GPUs per worker. We must compute base_gpu_id explicitly and
-            # inject `_awex_gpus_per_server` so the worker recomputes base_gpu_id from
-            # its own SLURM_LOCALID at runtime (the only value guaranteed unique per
-            # node-slot). See SGLangBackend.launch_server.
+            # Colocation (AWEX) path: compute a fallback node-local GPU offset.
+            # The worker uses `_awex_gpus_per_server` to resolve placement against
+            # its actual CUDA_VISIBLE_DEVICES: forked/reused workers may already
+            # be isolated, while other workers need a SLURM_LOCALID-based offset.
+            # See SGLangBackend.launch_server.
             #
             # NOTE: this assumes a server fits within one node
             # (gpus_per_server <= n_gpus_per_node). Cross-node TP servers would

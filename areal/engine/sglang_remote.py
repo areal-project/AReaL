@@ -421,7 +421,10 @@ class SGLangBackend:
         self._readiness_endpoint = (
             "/model_info" if awex_colocate or awex_meta_addr else "/health"
         )
-        # Colocate placement: derive base_gpu_id from SLURM_LOCALID so two SGLang
+        # Colocate placement: forked/reused workers may already have exactly the
+        # server's GPUs isolated via CUDA_VISIBLE_DEVICES. In that namespace the
+        # server starts at logical device 0, regardless of the physical GPU IDs.
+        # Otherwise, derive base_gpu_id from SLURM_LOCALID so two SGLang
         # servers sharing a node never claim the same GPU range. The controller
         # cannot do this reliably because its global rank -> node-slot mapping is
         # not guaranteed by SLURM task dispatch (a collision degrades the
@@ -432,8 +435,20 @@ class SGLangBackend:
         # absent for separated mode (where CVD isolation keeps base_gpu_id at 0).
         awex_gpus_per_server = server_args.pop("_awex_gpus_per_server", None)
         if awex_gpus_per_server is not None:
+            visible_devices = [
+                device.strip()
+                for device in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",")
+                if device.strip()
+            ]
             slurm_localid = os.environ.get("SLURM_LOCALID")
-            if slurm_localid is not None:
+            if len(visible_devices) == int(awex_gpus_per_server):
+                server_args["base_gpu_id"] = 0
+                logger.info(
+                    "AWEX colocate using isolated CUDA_VISIBLE_DEVICES=%s "
+                    "with base_gpu_id=0",
+                    ",".join(visible_devices),
+                )
+            elif slurm_localid is not None:
                 base_gpu_id = int(slurm_localid) * int(awex_gpus_per_server)
                 server_args["base_gpu_id"] = base_gpu_id
                 logger.info(
@@ -485,7 +500,9 @@ class SGLangBackend:
                 "areal.v2.inference_service.sglang.launch_server",
             )
             cmd = [
-                "areal.engine.awex.sglang_plugin" if c in sglang_entrypoints else c
+                "areal.engine.awex.plugins.sglang_plugin"
+                if c in sglang_entrypoints
+                else c
                 for c in cmd
             ]
             if awex_meta_addr:

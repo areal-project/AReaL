@@ -1,4 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
+"""AWEX training adapter for FSDP engines."""
+
 from __future__ import annotations
 
 # pyright: reportMissingImports=false
@@ -18,19 +20,19 @@ from awex.transfer.transfer_plan import TransferPlan, TransferPlanBuilder
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.placement_types import Shard
 
-from areal.engine.core.model import is_qwen_vl_model
-from areal.utils import logging
-from areal.v2.weight_update.awex import (
+from areal.engine.awex.adapters.training_adapter import (
+    AwexTrainingAdapter,
+)
+from areal.engine.awex.transport.metadata import (
     awex_wu_use_group,
     fetch_kv_metadata,
 )
-from areal.v2.weight_update.nccl_group import (
+from areal.engine.awex.transport.nccl_group import (
     init_weights_update_group,
     setup_batch_isend_irecv,
 )
-from areal.v2.weight_update.training_adapter import (
-    AwexTrainingAdapter,
-)
+from areal.engine.core.model import is_qwen_vl_model
+from areal.utils import logging
 
 if TYPE_CHECKING:
     from areal.engine.fsdp_engine import FSDPEngine
@@ -61,6 +63,7 @@ class AwexFSDPAdapter(AwexTrainingAdapter):
             "dp_size": self._engine.data_parallel_world_size,
             "ep_size": 1,
             "dp_replicated": False,
+            "parameter_layout": "hf",
         }
 
     @property
@@ -138,10 +141,11 @@ class AwexFSDPAdapter(AwexTrainingAdapter):
         infer_world_size: int,
         train_world_size: int,
         num_engines: int,
+        timeout_s: float = 300.0,
     ) -> None:
         self._transfer_rank = transfer_rank
 
-        infer_meta, train_meta = fetch_kv_metadata(kv_store_url, pair_name)
+        infer_meta, train_meta = fetch_kv_metadata(kv_store_url, pair_name, timeout_s)
 
         builder = TransferPlanBuilder(
             infer_world_size=infer_world_size,

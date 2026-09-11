@@ -129,8 +129,9 @@ LOGGER_COLORS_EXACT = {
     "InferenceGateway": "white",
     "RPCGuard": "white",
     # AWEX weight exchange - cyan (compute backend)
-    "AwexColocate": "light_cyan",
-    "AwexColocateReader": "light_cyan",
+    "AwexMegatronAdapter": "light_cyan",
+    "AwexSGLangAdapter": "light_cyan",
+    "AwexFSDPAdapter": "light_cyan",
     "MegatronResidency": "light_cyan",
     "MOPDTeacherPhase": "light_cyan",
     "AwexSGLangPlugin": "light_cyan",

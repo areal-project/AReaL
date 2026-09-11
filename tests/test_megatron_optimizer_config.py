@@ -76,7 +76,7 @@ def test_train_batch_does_not_apply_optimizer_loss_scale_manually(
     engine = megatron_engine_module.MegatronEngine.__new__(
         megatron_engine_module.MegatronEngine
     )
-    engine._awex_adapter = None
+    engine._weight_residency = None
     engine.device = torch.device("cpu")
     engine.optimizer = _Optimizer()
     engine._ensure_ready = lambda: None
